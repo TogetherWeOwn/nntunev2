@@ -29,10 +29,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@f0c1228b8a2e0c71c04a5c6085f8a7b0e8e2db3 # stable
+      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
+      # (2026-08-06); re-pin deliberately, never float.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@01d516d182d0e59130757632d4ea53e54336daf5 # v2.8.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy -p nntune-core --all-targets -- -D warnings
       - run: cargo test -p nntune-core
@@ -45,10 +47,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@f0c1228b8a2e0c71c04a5c6085f8a7b0e8e2db3 # stable
+      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
+      # (2026-08-06); re-pin deliberately, never float.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@01d516d182d0e59130757632d4ea53e54336daf5 # v2.8.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Scalar core (no transport features) and the Workers transport build.
       - run: cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
       - run: cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features --features worker-transport
@@ -56,9 +60,12 @@ jobs:
       # Wasm SIMD; the deploy enables it via this RUSTFLAGS).
       - run: RUSTFLAGS="-C target-feature=+simd128" cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
 
-  # Aggregate required check. Add every real job id to `needs` (and keep
-  # `!cancelled()` + `contains(needs.*.result, 'failure')` logic) so ci-ok
+  # Aggregate required check. Add every real job id to `needs` so ci-ok
   # stays red when any job fails and green only when all succeed.
+  # The grep pattern tolerates whitespace: `toJSON` pretty-prints
+  # `"result": "failure"` (with a space) — matching the spaceless form
+  # turned ci-ok into a rubber stamp (observed 2026-10-13: red jobs, green
+  # ci-ok). Never "simplify" this pattern without re-checking the log.
   ci-ok:
     name: ci-ok
     needs: [rust-test, rust-wasm]
@@ -67,7 +74,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - run: |
-          if printf '%s' '${{ toJSON(needs) }}' | grep -q '"result":"failure"'; then
+          if printf '%s' '${{ toJSON(needs) }}' | grep -q '"result": *"failure"'; then
             echo "ci-ok: a required job failed"
             exit 1
           fi
