@@ -67,7 +67,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - run: |
-          if printf '%s\n' ${{ toJSON(needs) }} | grep -q '"result": "failure"'; then
+          if printf '%s' '${{ toJSON(needs) }}' | grep -q '"result":"failure"'; then
             echo "ci-ok: a required job failed"
             exit 1
           fi
