@@ -367,16 +367,37 @@ async fn mid_body_disconnect_drops_connection() {
 async fn nzb_fixtures_match_served_ids() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/nzb");
     let mut referenced = HashSet::new();
+    // message-id -> declared segment bytes (NZB `bytes=` attribute).
+    let mut declared_bytes: HashMap<String, u64> = HashMap::new();
     for entry in std::fs::read_dir(dir).unwrap() {
         let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+        // Parse each <segment bytes="N" ...>&lt;id&gt;</segment>.
         let mut rest = text.as_str();
-        while let Some(i) = rest.find("&lt;") {
-            rest = &rest[i + 4..];
-            if let Some(j) = rest.find("&gt;") {
-                referenced.insert(format!("<{}>", &rest[..j]));
-                rest = &rest[j + 4..];
-            } else {
-                break;
+        while let Some(seg) = rest.find("<segment") {
+            rest = &rest[seg..];
+            let bytes_start = rest.find("bytes=\"").expect("segment bytes=");
+            let bytes_rest = &rest[bytes_start + 7..];
+            let bytes_end = bytes_rest.find('"').expect("closing quote");
+            let bytes: u64 = bytes_rest[..bytes_end].parse().expect("bytes number");
+            let lt = rest.find("&lt;").expect("segment id");
+            let gt = rest[lt..].find("&gt;").expect("segment id end");
+            let id = format!("<{}>", &rest[lt + 4..lt + gt]);
+            referenced.insert(id.clone());
+            declared_bytes.insert(id, bytes);
+            rest = &rest[lt + gt + 4..];
+        }
+        // Fallback for files without <segment> (should not happen, but keeps
+        // the old ID-only extraction working).
+        if referenced.is_empty() {
+            let mut r2 = text.as_str();
+            while let Some(i) = r2.find("&lt;") {
+                r2 = &r2[i + 4..];
+                if let Some(j) = r2.find("&gt;") {
+                    referenced.insert(format!("<{}>", &r2[..j]));
+                    r2 = &r2[j + 4..];
+                } else {
+                    break;
+                }
             }
         }
     }
@@ -395,6 +416,15 @@ async fn nzb_fixtures_match_served_ids() {
             "NZB references unknown article {id}"
         );
     }
+    // Declared segment bytes must match the served decoded payload size.
+    for (id, bytes) in &declared_bytes {
+        let article = corpus.get(id).expect("known id");
+        assert_eq!(
+            *bytes,
+            article.payload.len() as u64,
+            "NZB bytes mismatch for {id}"
+        );
+    }
 
     let server = TestNntpServer::spawn_for_test().await;
     let mut c = Client::connect(&server).await;
@@ -403,4 +433,214 @@ async fn nzb_fixtures_match_served_ids() {
         let r = c.cmd(&format!("STAT {id}")).await;
         assert!(r.starts_with("223"), "{id}: {r:?}");
     }
+}
+
+// --- Regression tests for Paperclip Review findings (PR #7, head 42c6b82) ---
+
+fn framing_lines(body: &[u8]) -> (String, Option<String>, String) {
+    let text = String::from_utf8_lossy(body);
+    let mut ybegin = None;
+    let mut ypart = None;
+    let mut yend = None;
+    for line in text.lines() {
+        if line.starts_with("=ybegin") {
+            ybegin = Some(line.to_string());
+        } else if line.starts_with("=ypart") {
+            ypart = Some(line.to_string());
+        } else if line.starts_with("=yend") {
+            yend = Some(line.to_string());
+        }
+    }
+    (
+        ybegin.expect("missing =ybegin"),
+        ypart,
+        yend.expect("missing =yend"),
+    )
+}
+
+fn param(line: &str, key: &str) -> Option<String> {
+    for token in line.split_whitespace() {
+        if let Some(v) = token.strip_prefix(&format!("{key}=")) {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+#[tokio::test]
+async fn multipart_framing_uses_file_offsets_and_crc() {
+    let server = TestNntpServer::spawn_for_test().await;
+    let mut c = Client::connect(&server).await;
+    c.auth("testuser", "testpass").await;
+
+    let expected = nntune_test_nntp::generate_wav_bytes(660.0, 210, 8000);
+    let full_size = expected.len().to_string();
+    let mut names = Vec::new();
+    let mut reassembled = vec![0u8; expected.len()];
+
+    // Parts are 575, 575, 574 bytes at offsets 0, 575, 1150.
+    let ranges = [(1u64, 575u64), (576, 1150), (1151, 1724)];
+    for n in 1..=3u32 {
+        let n_s = n.to_string();
+        let id = format!("<multi-660-part{n}-of-3@nntune.test>");
+        let (first, block) = c.cmd_block(&format!("ARTICLE {id}")).await;
+        assert!(first.starts_with("220"), "part {n}: {first:?}");
+        let body = article_body(&block);
+        let (ybegin, ypart, yend) = framing_lines(body);
+        // =ybegin carries the whole file size, not the part size.
+        assert_eq!(param(&ybegin, "size").as_deref(), Some(full_size.as_str()));
+        assert_eq!(param(&ybegin, "part").as_deref(), Some(n_s.as_str()));
+        assert_eq!(param(&ybegin, "total").as_deref(), Some("3"));
+        names.push(param(&ybegin, "name").expect("ybegin name"));
+        // =ypart carries this part's 1-based offset range.
+        let yp = ypart.expect("multipart must have =ypart");
+        let (exp_begin, exp_end) = ranges[(n - 1) as usize];
+        let exp_begin_s = exp_begin.to_string();
+        let exp_end_s = exp_end.to_string();
+        assert_eq!(
+            param(&yp, "begin").as_deref(),
+            Some(exp_begin_s.as_str()),
+            "part {n} begin"
+        );
+        assert_eq!(
+            param(&yp, "end").as_deref(),
+            Some(exp_end_s.as_str()),
+            "part {n} end"
+        );
+        // =yend carries part length + pcrc32.
+        let part_len = (exp_end - exp_begin + 1).to_string();
+        assert_eq!(param(&yend, "size").as_deref(), Some(part_len.as_str()));
+        assert_eq!(
+            param(&yend, "part").as_deref(),
+            Some(n_s.as_str()),
+            "yend part {n}"
+        );
+        let decoded = nntune_test_nntp::yenc::decode(body);
+        assert_eq!(decoded.len() as u64, exp_end - exp_begin + 1);
+        let expect_pcrc = format!("{:08x}", nntune_test_nntp::yenc::crc32(&decoded));
+        assert_eq!(
+            param(&yend, "pcrc32").as_deref(),
+            Some(expect_pcrc.as_str())
+        );
+        // Reassemble strictly by the advertised offset.
+        let begin: usize = param(&yp, "begin").unwrap().parse().unwrap();
+        reassembled[begin - 1..begin - 1 + decoded.len()].copy_from_slice(&decoded);
+    }
+    // All parts share one yEnc file name for name-based grouping.
+    assert_eq!(names.len(), 3);
+    assert!(
+        names.iter().all(|n| n == &names[0]),
+        "multipart yEnc names diverge: {names:?}"
+    );
+    assert_eq!(reassembled, expected);
+}
+
+#[tokio::test]
+async fn obfuscated_parts_share_yenc_name() {
+    let server = TestNntpServer::spawn_for_test().await;
+    let mut c = Client::connect(&server).await;
+    c.auth("testuser", "testpass").await;
+    let mut names = Vec::new();
+    for n in 1..=3 {
+        let id = format!("<obf-550-part{n}-of-3@nntune.test>");
+        let (first, block) = c.cmd_block(&format!("ARTICLE {id}")).await;
+        assert!(first.starts_with("220"));
+        let (ybegin, _, _) = framing_lines(article_body(&block));
+        names.push(param(&ybegin, "name").expect("ybegin name"));
+    }
+    assert!(
+        names.iter().all(|n| n == &names[0]),
+        "obfuscated yEnc names diverge: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn served_corpus_has_no_dangling_yenc_escapes() {
+    let server = TestNntpServer::spawn_for_test().await;
+    let mut c = Client::connect(&server).await;
+    c.auth("testuser", "testpass").await;
+    for id in [
+        "<single-yenc-001@nntune.test>",
+        "<multi-660-part2-of-3@nntune.test>",
+        "<enc-rar-001@nntune.test>",
+    ] {
+        let (first, block) = c.cmd_block(&format!("ARTICLE {id}")).await;
+        assert!(first.starts_with("220"), "{id}: {first:?}");
+        let body = article_body(&block);
+        // Encoded lines (non-framing) must not end with a bare '='.
+        for line in body.split(|&b| b == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let line = line.strip_suffix(b"\n").unwrap_or(line);
+            if line.is_empty() || line.starts_with(b"=y") {
+                continue;
+            }
+            assert!(
+                !line.ends_with(b"="),
+                "{id}: encoded line ends with dangling escape"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn server_stops_serving_after_drop() {
+    let server = TestNntpServer::spawn_for_test().await;
+    let addr = server.addr();
+    drop(server);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        TcpStream::connect(addr).await.is_err(),
+        "server still accepts connections after drop"
+    );
+}
+
+#[tokio::test]
+async fn reauth_does_not_consume_cap_slot() {
+    let server = TestNntpServer::spawn_for_test().await;
+    let mut c = Client::connect(&server).await;
+    let (_, p1) = c.auth("testuser", "testpass").await;
+    assert!(p1.starts_with("281"), "first auth: {p1:?}");
+    // RFC 4643: second AUTHINFO on an authenticated connection gets 502.
+    let u2 = c.cmd("AUTHINFO USER testuser").await;
+    assert!(
+        u2.starts_with("502"),
+        "re-auth USER should be 502, got {u2:?}"
+    );
+    let _ = c.cmd("QUIT").await;
+    // Both cap slots must still be free: two fresh logins succeed.
+    let mut a = Client::connect(&server).await;
+    let (_, pa) = a.auth("testuser", "testpass").await;
+    assert!(pa.starts_with("281"), "slot leaked: {pa:?}");
+    let mut b = Client::connect(&server).await;
+    let (_, pb) = b.auth("testuser", "testpass").await;
+    assert!(pb.starts_with("281"), "slot leaked: {pb:?}");
+}
+
+#[tokio::test]
+async fn list_reports_high_before_low() {
+    let server = TestNntpServer::spawn_for_test().await;
+    let mut c = Client::connect(&server).await;
+    c.auth("testuser", "testpass").await;
+    let g = c.cmd("GROUP alt.binaries.nntune.test").await;
+    assert!(g.starts_with("211"), "GROUP: {g:?}");
+    let parts: Vec<_> = g.split_whitespace().collect();
+    // 211 count low high group
+    let (low, high) = (
+        parts[2].parse::<u32>().unwrap(),
+        parts[3].parse::<u32>().unwrap(),
+    );
+    let (first, block) = c.cmd_block("LIST").await;
+    assert!(first.starts_with("215"), "LIST: {first:?}");
+    let text = String::from_utf8_lossy(&block);
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("alt.binaries.nntune.test"))
+        .expect("LIST active line");
+    let cols: Vec<_> = line.split_whitespace().collect();
+    let (list_high, list_low) = (
+        cols[1].parse::<u32>().unwrap(),
+        cols[2].parse::<u32>().unwrap(),
+    );
+    assert_eq!((list_low, list_high), (low, high));
+    assert!(list_high >= list_low, "LIST high/low reversed: {line:?}");
 }

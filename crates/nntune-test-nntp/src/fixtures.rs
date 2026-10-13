@@ -63,33 +63,70 @@ pub fn pseudo_random(seed: u32, len: usize) -> Vec<u8> {
     out
 }
 
-fn article(
+/// Single-part article with spec-conformant framing (`size` + `crc32`).
+fn article_single(
     number: u32,
     group: &str,
     subject: &str,
     message_id: &str,
     payload: Vec<u8>,
     yenc_file: &str,
-    part: Option<(u32, u32)>,
 ) -> Article {
     let total = payload.len() as u64;
+    let crc = crate::yenc::crc32(&payload);
     let mut body: Vec<u8> = Vec::new();
-    match part {
-        Some((n, total_parts)) => {
-            body.extend_from_slice(
-                format!("=ybegin part={n} total={total_parts} line=128 size={total} name={yenc_file}\r\n")
-                    .as_bytes(),
-            );
-            body.extend_from_slice(format!("=ypart begin=1 end={total}\r\n").as_bytes());
-        }
-        None => {
-            body.extend_from_slice(
-                format!("=ybegin line=128 size={total} name={yenc_file}\r\n").as_bytes(),
-            );
-        }
-    }
+    body.extend_from_slice(
+        format!("=ybegin line=128 size={total} name={yenc_file}\r\n").as_bytes(),
+    );
     body.extend_from_slice(&crate::yenc::encode(&payload, 128));
-    body.extend_from_slice(b"\r\n=yend\r\n");
+    body.extend_from_slice(format!("\r\n=yend size={total} crc32={crc:08x}\r\n").as_bytes());
+    finish_article(number, group, subject, message_id, payload, body)
+}
+
+/// Multi-part article: `=ybegin size=` is the whole file size, `=ypart`
+/// carries this part's 1-based byte offset range, and `=yend` carries the
+/// part length plus `pcrc32`. All parts of one file share `yenc_file` so
+/// name-based grouping sees a single file.
+#[allow(clippy::too_many_arguments)]
+fn article_part(
+    number: u32,
+    group: &str,
+    subject: &str,
+    message_id: &str,
+    part_payload: Vec<u8>,
+    yenc_file: &str,
+    n: u32,
+    total_parts: u32,
+    full_size: u64,
+    offset: u64,
+) -> Article {
+    let part_len = part_payload.len() as u64;
+    let begin = offset + 1;
+    let end = offset + part_len;
+    let pcrc = crate::yenc::crc32(&part_payload);
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "=ybegin part={n} total={total_parts} line=128 size={full_size} name={yenc_file}\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(format!("=ypart begin={begin} end={end}\r\n").as_bytes());
+    body.extend_from_slice(&crate::yenc::encode(&part_payload, 128));
+    body.extend_from_slice(
+        format!("\r\n=yend size={part_len} part={n} pcrc32={pcrc:08x}\r\n").as_bytes(),
+    );
+    finish_article(number, group, subject, message_id, part_payload, body)
+}
+
+fn finish_article(
+    number: u32,
+    group: &str,
+    subject: &str,
+    message_id: &str,
+    payload: Vec<u8>,
+    body: Vec<u8>,
+) -> Article {
     let mut raw = format!(
         "From: fixture@nntune.test\r\nNewsgroups: {group}\r\nSubject: {subject}\r\nDate: Mon, 13 Oct 2026 00:00:00 +0000\r\nMessage-ID: {message_id}\r\nLines: 8\r\n\r\n"
     )
@@ -115,77 +152,90 @@ pub fn default_corpus() -> Vec<Article> {
 
     // 1. Single-part yEnc WAV (440 Hz, 120 ms).
     let wav = generate_wav_bytes(440.0, 120, 8000);
-    articles.push(article(
+    articles.push(article_single(
         number,
         group,
         "NNTune-Fixture sine-440 [01/01] - \"sine-440.wav\" yEnc (1/1)",
         "<single-yenc-001@nntune.test>",
         wav,
         "sine-440.wav",
-        None,
     ));
     number += 1;
 
-    // 2. Multi-part (3 parts) 660 Hz tone, split into thirds.
+    // 2. Multi-part (3 parts) 660 Hz tone, split into thirds. All parts share
+    // one yEnc file name; offsets are 1-based byte ranges into the full file.
     let wav3 = generate_wav_bytes(660.0, 210, 8000);
+    let full3 = wav3.len() as u64;
     let chunk = wav3.len().div_ceil(3);
+    let mut offset3 = 0u64;
     for (i, part) in wav3.chunks(chunk).enumerate() {
         let n = (i + 1) as u32;
-        articles.push(article(
+        articles.push(article_part(
             number,
             group,
             &format!("NNTune-Fixture sine-660 [0{n}/03] - \"sine-660.wav\" yEnc ({n}/3)"),
             &format!("<multi-660-part{n}-of-3@nntune.test>"),
             part.to_vec(),
             "sine-660.wav",
-            Some((n, 3)),
+            n,
+            3,
+            full3,
+            offset3,
         ));
+        offset3 += part.len() as u64;
         number += 1;
     }
 
-    // 3. Obfuscated subjects (same 550 Hz payload, 3 parts, opaque names).
+    // 3. Obfuscated subjects (same 550 Hz payload, 3 parts). Subjects stay
+    // opaque per part, but the yEnc file name is shared so name-based
+    // grouping sees one 3-part file.
     let wav_obf = generate_wav_bytes(550.0, 180, 8000);
+    let full_obf = wav_obf.len() as u64;
     let chunk = wav_obf.len().div_ceil(3);
     let opaque = ["a8f3k2m9zq71", "q7w2e9r4t6y1", "z1x2c3v4b5n6"];
+    let shared_name = format!("{}.dat", opaque[0]);
+    let mut offset_obf = 0u64;
     for (i, part) in wav_obf.chunks(chunk).enumerate() {
         let n = (i + 1) as u32;
-        articles.push(article(
+        articles.push(article_part(
             number,
             group,
-            &format!("{} [0{n}/03] - \"{}.dat\" yEnc", opaque[i], opaque[i]),
+            &format!("{} [0{n}/03] - \"{shared_name}\" yEnc", opaque[i]),
             &format!("<obf-550-part{n}-of-3@nntune.test>"),
             part.to_vec(),
-            &format!("{}.dat", opaque[i]),
-            Some((n, 3)),
+            &shared_name,
+            n,
+            3,
+            full_obf,
+            offset_obf,
         ));
+        offset_obf += part.len() as u64;
         number += 1;
     }
 
     // 4. Rar-style payload: "Rar!" marker + filler (simulated encrypted header).
     let mut rar_payload = b"Rar!\x1a\x07\x01\x00".to_vec();
     rar_payload.extend(pseudo_random(0xC0FFEE, 512));
-    articles.push(article(
+    articles.push(article_single(
         number,
         group,
         "NNTune-Fixture enc-rar [01/01] - \"enc-audio.rar\" yEnc (1/1)",
         "<enc-rar-001@nntune.test>",
         rar_payload,
         "enc-audio.rar",
-        None,
     ));
     number += 1;
 
     // 5. 7z-style payload: "7z" marker + filler.
     let mut seven_payload = b"7z\xbc\xaf\x27\x1c".to_vec();
     seven_payload.extend(pseudo_random(0x7E57, 512));
-    articles.push(article(
+    articles.push(article_single(
         number,
         group,
         "NNTune-Fixture enc-7z [01/01] - \"enc-audio.7z\" yEnc (1/1)",
         "<enc-7z-001@nntune.test>",
         seven_payload,
         "enc-audio.7z",
-        None,
     ));
     number += 1;
 

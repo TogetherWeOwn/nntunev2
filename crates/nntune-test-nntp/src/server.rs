@@ -125,6 +125,14 @@ impl TestNntpServer {
     }
 }
 
+impl Drop for TestNntpServer {
+    fn drop(&mut self) {
+        // Dropping a JoinHandle detaches by default; abort so the accept loop
+        // (which owns the listener) stops and the port refuses new connections.
+        self._task.abort();
+    }
+}
+
 /// Serve forever on an already-bound listener (used by the standalone binary).
 pub async fn serve(listener: TcpListener, config: ServerConfig) {
     let shared = Arc::new(Shared {
@@ -180,6 +188,12 @@ async fn handle_connection(stream: TcpStream, shared: Arc<Shared>) {
                 let _ = writer.write_all(b"200 Reader mode\r\n").await;
             }
             "AUTHINFO" => {
+                // RFC 4643: AUTHINFO after successful authentication gets 502,
+                // and must not consume another connection-cap slot.
+                if authed.is_some() {
+                    let _ = writer.write_all(b"502 Command unavailable\r\n").await;
+                    continue;
+                }
                 let upper = arg.to_ascii_uppercase();
                 if upper.starts_with("USER ") {
                     let user = arg[5..].trim().to_string();
@@ -256,14 +270,19 @@ async fn handle_connection(stream: TcpStream, shared: Arc<Shared>) {
                 if !check_auth(&shared.config, &authed, &mut writer).await {
                     continue;
                 }
-                let count = shared.config.articles.len();
+                // RFC 3977 §7.6.3: `group high low status` (high first).
+                let g = shared.config.group.clone();
+                let (low, high) = shared
+                    .config
+                    .articles
+                    .iter()
+                    .filter(|a| a.group == g)
+                    .map(|a| a.number)
+                    .fold((u32::MAX, 0u32), |(lo, hi), n| (lo.min(n), hi.max(n)));
+                let (low, high) = if low == u32::MAX { (0, 0) } else { (low, high) };
                 let _ = writer
                     .write_all(
-                        format!(
-                            "215 List follows\r\n{} 1 {count} y\r\n.\r\n",
-                            shared.config.group
-                        )
-                        .as_bytes(),
+                        format!("215 List follows\r\n{g} {high} {low} y\r\n.\r\n").as_bytes(),
                     )
                     .await;
             }
