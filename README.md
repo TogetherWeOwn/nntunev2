@@ -55,3 +55,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Every PR must pass `ci-ok`,
 
 See [SECURITY.md](SECURITY.md). Please report vulnerabilities privately via
 GitHub's private vulnerability reporting.
+
+<!-- ci-probe: throwaway PR to verify hosted runners -->
