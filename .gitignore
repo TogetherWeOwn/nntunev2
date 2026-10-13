@@ -1,0 +1,50 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+.cargo/
+
+# Rust wasm / workers
+/pkg/
+/wasm-pack.log
+/workers/*/*.wasm
+
+# Node / SvelteKit
+node_modules/
+.svelte-kit/
+build/
+dist/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+.output/
+.vercel/
+.netlify/
+
+# Wrangler / Cloudflare
+.wrangler/
+.dev.vars
+wrangler.toml.bak
+
+# Env / secrets — never commit
+.env
+.env.*
+!.env.example
+
+# PlanetScale / DB
+*.sql.gz
+/dump/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+
+# Test / coverage
+/coverage/
+lcov.info
+tarpaulin-report.html

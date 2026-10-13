@@ -1,0 +1,51 @@
+name: ci
+
+# Placeholder CI. The scaffold card replaces the placeholder jobs below with
+# real build/test/lint jobs and adds each new job id to `ci-ok`'s `needs`.
+# `ci-ok` is a required check on main: its NAME must stay `ci-ok`.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # Placeholder: real jobs (build, test, lint, …) go here as siblings.
+  # Example for the scaffold card:
+  #   build:
+  #     name: build
+  #     runs-on: ubuntu-latest
+  #     steps: [...]
+  # then add `build` to ci-ok's `needs` list.
+  placeholder:
+    name: placeholder
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: echo "scaffold card: replace me with real jobs"
+
+  # Aggregate required check. Add every real job id to `needs` (and keep
+  # `!cancelled()` + `contains(needs.*.result, 'failure')` logic) so ci-ok
+  # stays red when any job fails and green only when all succeed.
+  ci-ok:
+    name: ci-ok
+    needs: [placeholder]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: |
+          if printf '%s\n' ${{ toJSON(needs) }} | grep -q '"result": "failure"'; then
+            echo "ci-ok: a required job failed"
+            exit 1
+          fi
+          echo "ci-ok: all required jobs passed"
