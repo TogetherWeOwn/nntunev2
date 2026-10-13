@@ -21,6 +21,17 @@ fn session_roundtrip_and_cookie_attributes() {
     let claims = session::verify_session(&secret, &token, now + 60).expect("valid token");
     assert_eq!(claims.user_id, "user-123");
     assert_eq!(claims.rotation_counter, 0);
+    // Revocation join key: every token carries a unique, non-empty session id.
+    assert!(
+        !claims.session_id.is_empty(),
+        "jti present for row revocation"
+    );
+    let other = session::issue_session(&secret, "user-123", now, 3600);
+    let other_claims = session::verify_session(&secret, &other, now + 60).expect("valid token");
+    assert_ne!(
+        claims.session_id, other_claims.session_id,
+        "ids unique per session"
+    );
 
     let header = session::set_cookie_header(&token, 3600);
     assert!(header.contains("HttpOnly"), "cookie must be HttpOnly");
@@ -56,10 +67,14 @@ fn session_rotation_bumps_counter_and_stays_valid() {
     let secret = test_secret();
     let now = 1_700_000_000u64;
     let token = session::issue_session(&secret, "user-123", now, 3600);
+    let old_id = session::verify_session(&secret, &token, now + 5)
+        .expect("valid token")
+        .session_id;
     let rotated = session::rotate_session(&secret, &token, now + 10, 3600).expect("rotation works");
     let claims = session::verify_session(&secret, &rotated, now + 20).expect("rotated valid");
     assert_eq!(claims.rotation_counter, 1);
     assert_eq!(claims.user_id, "user-123");
+    assert_eq!(claims.session_id, old_id, "rotation keeps the row id");
 }
 
 // --- Auth: email magic link --------------------------------------------------
@@ -102,7 +117,8 @@ fn magic_link_expired_and_wrong_token_rejected_with_generic_error() {
 fn passkey_challenge_origin_rp_expiry_single_use_enforced() {
     let now = 1_700_000_000u64;
     let c =
-        auth::new_registration_challenge("nntune.example.com", "https://nntune.example.com", now);
+        auth::new_registration_challenge("nntune.example.com", "https://nntune.example.com", now)
+            .expect("valid config");
     // Happy path: exact origin + rp match, fresh, first use.
     let c2 = auth::verify_and_consume_challenge(
         c,
@@ -122,7 +138,8 @@ fn passkey_challenge_origin_rp_expiry_single_use_enforced() {
     .is_err());
     // Wrong origin / wrong rp rejected.
     let c3 =
-        auth::new_registration_challenge("nntune.example.com", "https://nntune.example.com", now);
+        auth::new_registration_challenge("nntune.example.com", "https://nntune.example.com", now)
+            .expect("valid config");
     assert!(auth::verify_and_consume_challenge(
         c3,
         "nntune.example.com",
@@ -132,7 +149,8 @@ fn passkey_challenge_origin_rp_expiry_single_use_enforced() {
     .is_err());
     // Expired (5-min window).
     let c4 =
-        auth::new_registration_challenge("nntune.example.com", "https://nntune.example.com", now);
+        auth::new_registration_challenge("nntune.example.com", "https://nntune.example.com", now)
+            .expect("valid config");
     assert!(auth::verify_and_consume_challenge(
         c4,
         "nntune.example.com",
@@ -140,6 +158,20 @@ fn passkey_challenge_origin_rp_expiry_single_use_enforced() {
         now + 301
     )
     .is_err());
+}
+
+#[test]
+fn passkey_challenge_misconfiguration_rejected_without_panic() {
+    let now = 1_700_000_000u64;
+    // Empty RP id and non-https origins are generic rejections, never panics.
+    assert!(auth::new_registration_challenge("", "https://nntune.example.com", now).is_err());
+    assert!(
+        auth::new_registration_challenge("nntune.example.com", "http://evil.example.com", now)
+            .is_err()
+    );
+    assert!(auth::new_registration_challenge("nntune.example.com", "not-a-url", now).is_err());
+    // Localhost http stays allowed for dev.
+    assert!(auth::new_registration_challenge("localhost", "http://localhost:8787", now).is_ok());
 }
 
 // --- Vault: envelope encryption ----------------------------------------------
@@ -189,8 +221,13 @@ impl vault::DnsResolver for FakeDns {
     fn resolve(&self, host: &str) -> Vec<IpAddr> {
         match host {
             "news.example.com" => vec!["93.184.216.34".parse().unwrap()],
+            "index.example.com" => vec!["93.184.216.34".parse().unwrap()],
             "internal.example.com" => vec!["10.0.0.5".parse().unwrap()],
             "loop.example.com" => vec!["127.0.0.1".parse().unwrap()],
+            // Attacker-controlled name resolving to an IPv4-mapped IPv6
+            // address hiding a private target: must still be rejected.
+            "mapped.example.com" => vec!["::ffff:10.0.0.5".parse().unwrap()],
+            "doc.example.com" => vec!["2001:db8::1".parse().unwrap()],
             _ => vec![],
         }
     }
@@ -238,9 +275,17 @@ fn vault_ssrf_guard_rejects_private_and_loopback() {
     for host in [
         "internal.example.com",
         "loop.example.com",
+        "mapped.example.com",
+        "doc.example.com",
         "10.1.2.3",
         "127.0.0.1",
         "169.254.169.254",
+        "0.1.2.3",
+        "100.64.0.1",
+        "192.0.0.1",
+        "198.18.0.1",
+        "240.0.0.1",
+        "::1",
         "",
         "evil.com/x",
         "http://evil.com",
@@ -254,13 +299,39 @@ fn vault_ssrf_guard_rejects_private_and_loopback() {
 }
 
 #[test]
+fn vault_indexer_url_has_ssrf_guard() {
+    let good = vault::IndexerConfig {
+        url: "https://index.example.com/api".into(),
+        api_key: "idx-key".into(),
+    };
+    assert!(good.validate(&FakeDns).is_ok());
+    for url in [
+        "http://169.254.169.254/latest/meta-data/",
+        "http://127.0.0.1:8080/",
+        "http://10.0.0.5/",
+        "http://[::ffff:127.0.0.1]/",
+        "http://internal.example.com/",
+        "ftp://index.example.com/",
+        "not-a-url",
+    ] {
+        let c = vault::IndexerConfig {
+            url: url.into(),
+            api_key: "idx-key".into(),
+        };
+        assert!(c.validate(&FakeDns).is_err(), "indexer url rejected: {url}");
+    }
+}
+
+#[test]
 fn vault_responses_never_contain_secrets() {
     let summary = vault::redacted_summary(true, true, 1_700_000_000u64);
     let json = serde_json::to_string(&summary).unwrap();
     assert!(json.contains("provider_configured"));
     assert!(!json.contains("s3cret"), "no secret material in responses");
-    // Audit events carry ids and results only.
-    let ev = vault::audit_event("user-1", "vault.update", true, "203.0.113.7");
+    // Audit events carry ids, results, and a real timestamp — never secrets.
+    let now = 1_700_000_000u64;
+    let ev = vault::audit_event("user-1", "vault.update", true, "203.0.113.7", now);
+    assert_eq!(ev.at, now, "audit timestamp is the event time");
     let ev_json = serde_json::to_string(&ev).unwrap();
     assert!(!ev_json.contains("s3cret"));
 }

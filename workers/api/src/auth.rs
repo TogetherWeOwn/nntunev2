@@ -158,20 +158,27 @@ pub struct PasskeyChallenge {
 
 /// Start a registration (or authentication) ceremony. Validates the RP/origin
 /// shape now so misconfiguration fails before any credential is created.
-pub fn new_registration_challenge(rp_id: &str, origin: &str, now: u64) -> PasskeyChallenge {
-    assert!(!rp_id.is_empty(), "rp_id must be pinned to the real host");
-    assert!(
-        origin.starts_with("https://") || origin.starts_with("http://localhost"),
-        "origin must be https (http only for localhost dev)"
-    );
-    PasskeyChallenge {
+/// Returns [`AuthError::Invalid`] (never panics): in a Worker a panic is a
+/// 500, and request-adjacent misconfiguration must stay a generic rejection.
+pub fn new_registration_challenge(
+    rp_id: &str,
+    origin: &str,
+    now: u64,
+) -> Result<PasskeyChallenge, AuthError> {
+    if rp_id.is_empty() {
+        return Err(AuthError::Invalid);
+    }
+    if !(origin.starts_with("https://") || origin.starts_with("http://localhost")) {
+        return Err(AuthError::Invalid);
+    }
+    Ok(PasskeyChallenge {
         id: random_b64url_32(),
         rp_id: rp_id.to_string(),
         origin: origin.to_string(),
         issued_at: now,
         expires_at: now.saturating_add(CHALLENGE_TTL_SECS),
         consumed: false,
-    }
+    })
 }
 
 /// Verify the ceremony environment and consume the challenge (single-use).

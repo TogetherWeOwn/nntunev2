@@ -96,29 +96,45 @@ fn host_shape_ok(host: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
 }
 
+fn v4_is_forbidden(o: &[u8; 4]) -> bool {
+    let v4 = Ipv4Addr::from(*o);
+    v4.is_loopback()         // 127/8
+        || v4.is_multicast() // 224.0.0.0/4
+        || v4.is_link_local() // 169.254/16
+        || v4.is_private() // 10/8, 172.16/12, 192.168/16
+        || v4.is_broadcast()
+        || v4.is_documentation() // 192.0.2/24, 198.51.100/24, 203.0.113/24
+        || o[0] == 0 // 0.0.0.0/8 ("this network")
+        || (o[0] == 100 && (o[1] & 0xC0) == 64) // 100.64/10 carrier-grade NAT
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 (IETF protocol assignments)
+        || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // 198.18.0.0/15 benchmarking
+        || o[0] >= 240 // 240.0.0.0/4 reserved + 255.255.255.255 broadcast
+}
+
 fn ip_is_forbidden(ip: &IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()       // 127/8
-            || v4.is_unspecified() // 0.0.0.0
-            || v4.is_multicast()   // 224/4
-            || v4.is_link_local()  // 169.254/16
-            || v4.is_private()     // 10/8, 172.16/12, 192.168/16
-            || v4.is_broadcast()
-            || v4.is_documentation() // 192.0.2/24, 198.51.100/24, 203.0.113/24
-            // Carrier-grade NAT shared space 100.64/10 is internal-ish: forbid.
-            || Ipv4Addr::new(100, 64, 0, 0).octets()[0] == v4.octets()[0] && v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64
-            || *v4 == Ipv4Addr::new(0, 0, 0, 0)
-        }
+        IpAddr::V4(v4) => v4_is_forbidden(&v4.octets()),
         IpAddr::V6(v6) => {
+            // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d):
+            // judge the embedded IPv4 address by the v4 rules.
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return v4_is_forbidden(&mapped.octets());
+            }
+            if let Some(compat) = v6.to_ipv4() {
+                // to_ipv4 also covers mapped; compatible ::a.b.c.d is
+                // deprecated but must still not bypass the guard.
+                return v4_is_forbidden(&compat.octets());
+            }
             v6.is_loopback()
-            || v6.is_unspecified()
-            || v6.is_multicast()
-            // Unique-local fc00::/7.
-            || (v6.segments()[0] & 0xFE00) == 0xFC00
-            // Link-local fe80::/10.
-            || (v6.segments()[0] & 0xFFC0) == 0xFE80
-            || *v6 == Ipv6Addr::LOCALHOST
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // Unique-local fc00::/7.
+                || (v6.segments()[0] & 0xFE00) == 0xFC00
+                // Link-local fe80::/10.
+                || (v6.segments()[0] & 0xFFC0) == 0xFE80
+                || *v6 == Ipv6Addr::LOCALHOST
+                // Documentation 2001:db8::/32.
+                || (v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0DB8)
         }
     }
 }
@@ -163,13 +179,35 @@ impl ProviderConfig {
 }
 
 impl IndexerConfig {
-    pub fn validate(&self) -> Result<(), VaultError> {
+    /// Validate the indexer URL + key, including the same SSRF guard as
+    /// providers: the URL host is user-supplied and later fetched, so
+    /// non-public targets (metadata endpoints, loopback, RFC 1918) are
+    /// rejected at save time. Redirects stay forbidden at fetch time
+    /// ([`INDEXER_ALLOW_REDIRECTS`]).
+    pub fn validate(&self, dns: &impl DnsResolver) -> Result<(), VaultError> {
         let parsed = url::Url::parse(&self.url).map_err(|_| VaultError::Invalid)?;
         if parsed.scheme() != "https" && parsed.scheme() != "http" {
             return Err(VaultError::Invalid);
         }
-        if parsed.host_str().is_none_or(|h| h.is_empty()) {
+        let host = parsed
+            .host_str()
+            .filter(|h| !h.is_empty())
+            .ok_or(VaultError::Invalid)?;
+        // URL hosts may carry brackets (IPv6) or a port — strip both, then
+        // run the same shape + resolve-ALL + reject-non-public guard.
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        if !host_shape_ok(bare) {
             return Err(VaultError::Invalid);
+        }
+        if let Ok(ip) = bare.parse::<IpAddr>() {
+            if ip_is_forbidden(&ip) {
+                return Err(VaultError::Invalid);
+            }
+        } else {
+            let addrs = dns.resolve(bare);
+            if addrs.is_empty() || addrs.iter().any(ip_is_forbidden) {
+                return Err(VaultError::Invalid);
+            }
         }
         if self.api_key.is_empty() || self.api_key.len() > 1024 {
             return Err(VaultError::Invalid);
@@ -322,7 +360,7 @@ pub fn decrypt_vault(
     if wrap_nonce.len() != 12 {
         return Err(VaultError::Invalid);
     }
-    let dek_bytes = kek_cipher
+    let mut dek_bytes = kek_cipher
         .decrypt(
             Nonce::from_slice(&wrap_nonce),
             Payload {
@@ -332,12 +370,14 @@ pub fn decrypt_vault(
         )
         .map_err(|_| VaultError::Crypto)?;
     if dek_bytes.len() != 32 {
+        dek_bytes.zeroize();
         return Err(VaultError::Crypto);
     }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&dek_bytes);
+    // Clear the AES-GCM output buffer: the DEK now lives only in `dek`.
+    dek_bytes.zeroize();
     let dek = Dek(arr);
-    dek_bytes.as_slice().to_vec().zeroize();
 
     let dek_cipher = Aes256Gcm::new_from_slice(&dek.0).map_err(|_| VaultError::Crypto)?;
     let payload_nonce = unb64url(&blob.payload_nonce_b64url)?;
@@ -372,7 +412,7 @@ pub fn rewrap_dek(
     if wrap_nonce.len() != 12 {
         return Err(VaultError::Invalid);
     }
-    let dek_bytes = old_cipher
+    let mut dek_bytes = old_cipher
         .decrypt(
             Nonce::from_slice(&wrap_nonce),
             Payload {
@@ -382,21 +422,23 @@ pub fn rewrap_dek(
         )
         .map_err(|_| VaultError::Crypto)?;
     if dek_bytes.len() != 32 {
+        dek_bytes.zeroize();
         return Err(VaultError::Crypto);
     }
 
     // Re-wrap with the new KEK (new AAD: new version).
     let new_cipher = Aes256Gcm::new_from_slice(new_kek).map_err(|_| VaultError::Crypto)?;
     let new_nonce = random_nonce();
-    let new_wrapped = new_cipher
-        .encrypt(
-            Nonce::from_slice(&new_nonce),
-            Payload {
-                msg: &dek_bytes,
-                aad: dek_aad(user_id, new_version).as_bytes(),
-            },
-        )
-        .map_err(|_| VaultError::Crypto)?;
+    let wrap_result = new_cipher.encrypt(
+        Nonce::from_slice(&new_nonce),
+        Payload {
+            msg: &dek_bytes,
+            aad: dek_aad(user_id, new_version).as_bytes(),
+        },
+    );
+    // Clear the unwrapped DEK regardless of the re-wrap outcome.
+    dek_bytes.zeroize();
+    let new_wrapped = wrap_result.map_err(|_| VaultError::Crypto)?;
 
     Ok(VaultBlob {
         kek_version: new_version,
@@ -445,14 +487,15 @@ pub struct AuditEvent {
 }
 
 /// Audit log event. By construction there is no field for secret material:
-/// callers pass ids and results only.
-pub fn audit_event(user_id: &str, action: &str, ok: bool, source_ip: &str) -> AuditEvent {
+/// callers pass ids and results only. `now` is Unix epoch seconds — the
+/// audit row's ordering depends on it, so it is a required parameter.
+pub fn audit_event(user_id: &str, action: &str, ok: bool, source_ip: &str, now: u64) -> AuditEvent {
     AuditEvent {
         user_id: user_id.to_string(),
         action: action.to_string(),
         ok,
         source_ip: source_ip.to_string(),
-        at: 0,
+        at: now,
     }
 }
 

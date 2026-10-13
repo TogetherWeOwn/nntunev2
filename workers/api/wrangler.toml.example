@@ -19,5 +19,4 @@ SESSION_TTL_SECS = "86400"
 #   VAULT_KEK_BASE64        32-byte KEK, base64 (versioned; rotate via rewrap job)
 #   VAULT_KEK_VERSION       integer version matching the KEK
 #   SESSION_SECRET_BASE64   HMAC secret for session cookies
-#   MAGIC_LINK_SECRET_BASE64  HMAC secret for magic-link signing (if used)
-#   EMAIL_API_KEY           transactional email provider key
+#   EMAIL_API_KEY           transactional email provider key (magic-link delivery)

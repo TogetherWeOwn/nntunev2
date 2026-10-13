@@ -6,6 +6,7 @@
 //! layer. Secret comes from the Worker env, never code.
 
 use hmac::{Hmac, Mac};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -19,10 +20,20 @@ pub const COOKIE_NAME: &str = "nntune_session";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionClaims {
+    /// Random per-session id (`jti`): joins the token to its server-side
+    /// `sessions` row so a single session can be revoked without killing
+    /// every session the user holds.
+    pub session_id: String,
     pub user_id: String,
     pub issued_at: u64,
     pub expires_at: u64,
     pub rotation_counter: u32,
+}
+
+fn new_session_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    b64url_encode(&bytes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +122,7 @@ fn sign(secret: &[u8], payload_b64: &str) -> Vec<u8> {
 /// Issue a new session token for `user_id` valid for `ttl_secs` from `now`.
 pub fn issue_session(secret: &[u8], user_id: &str, now: u64, ttl_secs: u64) -> String {
     let claims = SessionClaims {
+        session_id: new_session_id(),
         user_id: user_id.to_string(),
         issued_at: now,
         expires_at: now.saturating_add(ttl_secs),
@@ -133,7 +145,7 @@ pub fn verify_session(secret: &[u8], token: &str, now: u64) -> Result<SessionCla
     let payload = b64url_decode(payload_b64)?;
     let claims: SessionClaims =
         serde_json::from_slice(&payload).map_err(|_| SessionError::Invalid)?;
-    if claims.user_id.is_empty() {
+    if claims.user_id.is_empty() || claims.session_id.is_empty() {
         return Err(SessionError::Invalid);
     }
     if now > claims.expires_at {
@@ -154,6 +166,7 @@ pub fn rotate_session(
 ) -> Result<String, SessionError> {
     let claims = verify_session(secret, token, now)?;
     let next = SessionClaims {
+        session_id: claims.session_id,
         user_id: claims.user_id,
         issued_at: now,
         expires_at: now.saturating_add(ttl_secs),

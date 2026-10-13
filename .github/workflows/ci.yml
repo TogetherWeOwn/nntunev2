@@ -45,9 +45,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
       - run: cargo test --manifest-path workers/api/Cargo.toml --all-targets
       - run: cargo clippy --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/api/Cargo.toml -- --check
+      # The Worker deploys to wasm32: the crate must check on that target
+      # (native-only CI once missed a getrandom/RNG breakage there).
+      - run: cargo check --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
 
   # Aggregate required check. Add every real job id to `needs` (and keep
   # `!cancelled()` + `contains(needs.*.result, 'failure')` logic) so ci-ok
