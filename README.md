@@ -40,11 +40,17 @@ web/                 # SvelteKit frontend (adapter-cloudflare)
 | Secret | Purpose |
 |---|---|
 | `CLOUDFLARE_API_TOKEN` | Cloudflare deploys (Workers, R2, KV, Queues) |
-| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account scope |
-| `HYPERDRIVE_*` ids | PlanetScale Postgres connection(s) via Hyperdrive |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account scope (full value kept private by repo policy) |
+| `PLANETSCALE_MIGRATOR_URL_STAGING` | Staging migrations; production migrator remains deferred to its gated workflow |
 
-No secret values live in this repo. CI fails closed on leaks (`gitleaks`
-required check; secret scanning + push protection enabled).
+`HYPERDRIVE_ID_STAGING`, `HYPERDRIVE_ID_PROD`, and `HYPERDRIVE_ID_MB` are
+non-credential GitHub Actions **variables**, not database URLs or secrets.
+Their IDs and the environment-specific resource inventory are in
+[the operations runbook](docs/ops.md). Database credentials remain private.
+
+No secret values live in this repo. `gitleaks` is a required credential-pattern
+scan; secret scanning + push protection are enabled. These checks do not replace
+review for personal data or the policy keeping the full account ID private.
 
 ## Contributing
 
