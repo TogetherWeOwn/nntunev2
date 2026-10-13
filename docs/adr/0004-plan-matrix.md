@@ -36,7 +36,11 @@ size, ingest jobs/day, cache priority. NNTune never bundles Usenet access
 ## Consequences
 
 - The API worker enforces caps from `usage_ledger` + `plans` on every stream
-  start; enforcement reads must be Hyperdrive-cached, never cold.
-- Analytics Engine events (`stream_start`, `ingest_job`) are the metering
-  source of truth; `usage_ledger` is the rollup.
+  start; enforcement reads must be Hyperdrive-cached, never cold. The
+  effective plan is derived (active subscription, else the free/trial row) —
+  no stored `users.plan_id` to diverge (ADR 0002 rule 4).
+- `play_events` → `usage_ledger` is the metering authority for cap
+  enforcement. Analytics Engine events (`stream_start`, `ingest_job`) are
+  analytics/observability only — sampled and approximate, never used for
+  enforcement or billing.
 - Overage/degrade behavior is user-visible copy owned by the frontend card.

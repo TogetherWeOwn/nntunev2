@@ -20,8 +20,8 @@ codecs between edge and native targets.
 | Backend | **Rust** (`workers-rs` → `wasm32`) for **ALL** backend Workers, including Durable Objects |
 | Shared core | `crates/nntune-core`: NNTP client, SIMD yEnc, NZB parsing, decrypt, par2-verify — compiled to `wasm32` **and** native |
 | Frontend | **SvelteKit** on Cloudflare (`adapter-cloudflare`) |
-| Relational data | **PlanetScale Postgres via Cloudflare Hyperdrive** for ALL relational data, including our own MusicBrainz mirror |
-| Object cache | **R2** for audio / artwork cache |
+| Relational data | **PlanetScale Postgres via Cloudflare Hyperdrive** for ALL relational data (no D1): app database `nntunev2` + MusicBrainz mirror database `nntunev2-mb` in one account, each via its own Hyperdrive binding |
+| Object cache | **R2** per-env buckets `nntunev2-{audio,art,archive}-{staging,prod}` (key layout in ADR 0003) |
 | Ingest | **Queues + Workflows** |
 | Config | **KV** |
 | Metering | **Analytics Engine** |
@@ -33,7 +33,7 @@ codecs between edge and native targets.
 crates/nntune-core   # shared Rust core (wasm32 + native)
 workers/{api,stream,ingest,mb}  # Rust workers-rs backends incl. Durable Objects
 apps/web             # SvelteKit frontend (adapter-cloudflare)
-migrations/          # PlanetScale Postgres migrations
+migrations/{app,mb}/  # Postgres migrations: app DB vs mirror DB, independent sequences
 docs/adr/            # this directory
 ```
 
@@ -45,8 +45,9 @@ docs/adr/            # this directory
 - **TypeScript Workers backend:** rejected — yEnc/par2 hot paths need SIMD Rust,
   and one language for edge + native avoids a dual implementation.
 - **D1 for relational data:** rejected — the data model (ADR 0002) needs Postgres
-  features (partitioning, full-text, pgvector-adjacent MB matching); one Postgres
-  via Hyperdrive keeps a single source of truth.
+  features (partitioning, full-text, pgvector-adjacent MB matching); PlanetScale
+  via Hyperdrive keeps one relational platform (app DB + mirror DB,
+  ADR 0002 rule 8).
 - **Next.js / self-hosted frontend:** rejected — SvelteKit + adapter-cloudflare
   keeps the whole product on the Cloudflare edge with zero servers.
 

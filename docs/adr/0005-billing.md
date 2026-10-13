@@ -10,16 +10,16 @@ records. Candidates: Stripe Billing, Paddle, Lemon Squeezy, homegrown.
 
 ## Decision
 
-**Stripe Billing with usage-based metering.** Subscriptions map 1:1 to
-`subscriptions` rows (ADR 0002); `stripe_customer_id` /
-`stripe_subscription_id` are the join keys. Monthly stream usage is reported as
-Stripe usage records from the `usage_ledger` rollup (idempotent per
-`user_id + period`).
+**Stripe Billing with flat-rate subscriptions — no metered billing.**
+Subscriptions map 1:1 to `subscriptions` rows (ADR 0002);
+`stripe_customer_id` / `stripe_subscription_id` are the join keys. Stream
+usage stays internal (`usage_ledger` drives cap enforcement only); nothing
+usage-based is reported to Stripe, so plan caps can never produce a bill.
 
 ### Why Stripe (no reason not to)
 
-- Native trial → paid conversion, proration on 5x/20x upgrades, and
-  usage-based line items out of the box — exactly our plan shape.
+- Native trial → paid conversion, flat recurring prices per plan, and
+  proration on 5x/20x upgrades out of the box — exactly our plan shape.
 - Webhook contract (`customer.subscription.*`, `invoice.*`) is well-understood;
   the API worker reconciles webhook state into `subscriptions.status`.
 - No merchant-of-record need (we sell direct SaaS, not a marketplace), so
@@ -36,3 +36,6 @@ Stripe usage records from the `usage_ledger` rollup (idempotent per
   on the hot path; Stripe is reconciled async.
 - Test mode covers the full trial → upgrade → downgrade matrix in CI with
   Stripe test clocks.
+- No metered Stripe prices exist for stream usage. If informational usage
+  reporting is ever wanted, it must point at a $0 meter behind a new ADR —
+  never at a billed meter (ADR 0004 promises no overage bills).
