@@ -54,9 +54,16 @@ dependencies this harness needs.
 
 How the suite uses them:
 
-- Every request carries the Access headers when the pair is set; an Access
-  wall (401/403 with Access markers) fails closed with a remediation message
-  instead of masquerading as an app failure.
+- Every request carries the Access headers when the pair is set:
+  `playwright.config.ts` installs them at context level so page navigations
+  are covered, and API calls attach them per request. A half-set pair fails
+  closed at startup. An Access wall (wall status + Access markers, including
+  302s to the Access login) fails closed with a remediation message instead
+  of masquerading as an app failure; plain app 4xx responses pass through.
+- Test-account sessions minted by the seam travel as
+  `Authorization: Bearer <session>` (contract owned by the auth card —
+  `helpers/accounts.ts` names it; cookie sessions would update the helper +
+  specs together).
 - Test accounts are throwaway (`e2e+<stamp>@example.test`); the API seam is
   tried first, UI signup second. The over-limit check needs the seam to
   support `{plan:"overlimit"}` (metering card); until then it skips with the

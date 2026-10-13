@@ -1,13 +1,46 @@
-import type { APIRequestContext } from '@playwright/test';
+import type { APIRequestContext, Page } from '@playwright/test';
 import { API, uniqueTestEmail } from './contract.js';
 import { accessHeaders, qaAuthHeader } from './access.js';
 
 export interface TestAccount {
   email: string;
-  /** Session cookie/header value when the seam provisions a session directly. */
+  /**
+   * Opaque session for the minted account, when the seam provisions one.
+   * Contract (owned by the auth card): the staging API accepts it as
+   * `Authorization: Bearer <session>`, taking precedence over QA_AUTH_TOKEN.
+   * If the auth card implements cookie sessions instead, update
+   * accountHeaders/applyAccountToPage together with the specs.
+   */
   session?: string;
   /** True when minted via the API seam (skip the UI signup form). */
   viaApi: boolean;
+}
+
+/**
+ * Headers for API calls as a specific test account: Access pair +
+ * per-account session (preferred) falling back to the QA seam token.
+ */
+export function accountHeaders(account: TestAccount | null): Record<string, string> {
+  const headers: Record<string, string> = { ...accessHeaders(), ...qaAuthHeader() };
+  if (account?.session) headers.Authorization = `Bearer ${account.session}`;
+  return headers;
+}
+
+/**
+ * Authenticate a browser page as a minted account. Call BEFORE the first
+ * navigation: page-level headers apply to subsequent loads, never past ones.
+ * Access headers are repeated here so a page-level override cannot drop them
+ * (the context-level config already sets them; this is belt and braces).
+ */
+export async function applyAccountToPage(
+  page: Page,
+  account: TestAccount | null,
+): Promise<void> {
+  const headers: Record<string, string> = { ...accessHeaders() };
+  if (account?.session) headers.Authorization = `Bearer ${account.session}`;
+  if (Object.keys(headers).length > 0) {
+    await page.setExtraHTTPHeaders(headers);
+  }
 }
 
 /**

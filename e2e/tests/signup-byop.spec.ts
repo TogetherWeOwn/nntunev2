@@ -1,7 +1,16 @@
 import { test, expect } from '@playwright/test';
 import { TESTIDS, uniqueTestEmail } from '../helpers/contract.js';
-import { accessHeaders, stagingBaseUrl, syntheticNntpEndpoint } from '../helpers/access.js';
-import { tryMintTestAccount } from '../helpers/accounts.js';
+import { stagingBaseUrl, syntheticNntpEndpoint } from '../helpers/access.js';
+import {
+  applyAccountToPage,
+  tryMintTestAccount,
+  type TestAccount,
+} from '../helpers/accounts.js';
+
+// Serial file: the signup test shares its account with the BYOP test so the
+// wizard runs authenticated. Retries re-run a single test, so the BYOP test
+// mints a fallback account when no shared one exists.
+let sharedAccount: TestAccount | null = null;
 
 // Golden path part 1: signup → BYOP wizard pointing at the synthetic NNTP
 // endpoint. Each run mints a fresh account so reruns never collide.
@@ -21,6 +30,10 @@ test.describe.serial('signup → BYOP wizard', () => {
       return;
     }
     const minted = await tryMintTestAccount(request, baseURL);
+    // Authenticate before the first navigation: headers apply to subsequent
+    // loads only, so this must precede every goto in the spec.
+    await applyAccountToPage(page, minted);
+    sharedAccount = minted;
     if (minted?.viaApi) {
       // API seam minted the account; the wizard must still be reachable.
       await page.goto(`${baseURL}/onboarding/byop`, {
@@ -53,12 +66,18 @@ test.describe.serial('signup → BYOP wizard', () => {
     expect(page.url()).toContain('/onboarding/byop');
   });
 
-  test('BYOP wizard connects to the synthetic NNTP endpoint and saves', async ({ page }) => {
+  test('BYOP wizard connects to the synthetic NNTP endpoint and saves', async ({
+    page,
+    request,
+  }) => {
     const baseURL = stagingBaseUrl('skip', 'byop');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
+    // Prefer the signup test's account; mint a fallback on retry isolation.
+    const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    await applyAccountToPage(page, account);
     const endpoint = syntheticNntpEndpoint();
     const password = process.env.SYNTHETIC_NNTP_PASS;
     if (!password) {
@@ -72,10 +91,6 @@ test.describe.serial('signup → BYOP wizard', () => {
       waitUntil: 'domcontentloaded',
       timeout: 30_000,
     });
-    const extraHeaders = accessHeaders();
-    if (Object.keys(extraHeaders).length > 0) {
-      await page.setExtraHTTPHeaders(extraHeaders);
-    }
     await expect(page.getByTestId(TESTIDS.byopHost)).toBeVisible({ timeout: 15_000 });
     await page.getByTestId(TESTIDS.byopHost).fill(endpoint.host);
     await page.getByTestId(TESTIDS.byopPort).fill(String(endpoint.port));

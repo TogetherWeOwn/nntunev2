@@ -42,20 +42,27 @@ export function qaAuthHeader(): Record<string, string> {
 
 /**
  * Fail closed when a response is the Cloudflare Access wall instead of the
- * app: a 401/403/302 that carries Access markers means the service token is
- * missing or wrong. Never silently treat the wall as an app response.
+ * app: a wall-status code (401/403/302) TOGETHER WITH Access markers means
+ * the service token is missing or wrong. Status and markers are checked
+ * jointly so a legitimate app 401/403 is never misreported as a wall.
+ * Never silently treat the wall as an app response.
  */
 export function assertNoAccessWall(probe: WallProbe, context: string): void {
   const headerDump = Object.entries(probe.headers)
     .map(([k, v]) => `${k}: ${v}`)
     .join('\n');
-  const looksLikeWall =
-    probe.status === 401 ||
-    probe.status === 403 ||
-    /cf-access|cloudflare access|cf_clearance/i.test(headerDump) ||
+  const location = probe.headers['location'] ?? probe.headers['Location'] ?? '';
+  const redirectToAccess =
+    probe.status === 302 && /cloudflareaccess\.com|\/cdn-cgi\/access/i.test(location);
+  const wallStatus =
+    probe.status === 401 || probe.status === 403 || probe.status === 302 || redirectToAccess;
+  const hasMarkers =
+    /cf-access|cf_authorization|cf-mitigated|cf_clearance/i.test(headerDump) ||
+    /cloudflare.?access/i.test(headerDump) ||
+    /cloudflare.?access/i.test(probe.bodyText) ||
     /<title>\s*Access/i.test(probe.bodyText) ||
-    /CF_Authorization|cf-authorization/i.test(probe.bodyText);
-  if (looksLikeWall) {
+    redirectToAccess;
+  if (wallStatus && hasMarkers) {
     throw new Error(
       `[${context}] hit the Cloudflare Access wall at ${probe.url} ` +
         `(HTTP ${probe.status}). Set CF_ACCESS_CLIENT_ID + ` +
@@ -63,6 +70,28 @@ export function assertNoAccessWall(probe: WallProbe, context: string): void {
         'See e2e/README.md. No secret values are logged here by design.',
     );
   }
+}
+
+interface ApiResponseLike {
+  status(): number;
+  headers(): Record<string, string>;
+  text(): Promise<string>;
+}
+
+/**
+ * Read an API response body, probe it for the Access wall, and return the
+ * text for the caller to parse. Use for JSON/error bodies (small). For
+ * binary success bodies (e.g. 206 stream segments) probe headers only via
+ * assertNoAccessWall with an empty bodyText instead of buffering megabytes.
+ */
+export async function readApiBody(
+  res: ApiResponseLike,
+  url: string,
+  context: string,
+): Promise<string> {
+  const bodyText = await res.text().catch(() => '');
+  assertNoAccessWall({ status: res.status(), headers: res.headers(), bodyText, url }, context);
+  return bodyText;
 }
 
 /**

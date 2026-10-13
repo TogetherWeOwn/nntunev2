@@ -2,6 +2,7 @@ import { test, expect } from '@playwright/test';
 import {
   accessHeaders,
   assertNoAccessWall,
+  readApiBody,
   stagingBaseUrl,
   syntheticNntpEndpoint,
 } from '../helpers/access.js';
@@ -82,6 +83,77 @@ test.describe('assertNoAccessWall', () => {
         'health',
       ),
     ).not.toThrow();
+  });
+
+  test('a legitimate app 403 without markers is NOT a wall', () => {
+    expect(() =>
+      assertNoAccessWall(
+        {
+          status: 403,
+          headers: { 'content-type': 'application/json' },
+          bodyText: '{"error":"plan_limit_exceeded"}',
+          url: 'https://staging.example/api/stream/abc',
+        },
+        'plan-limit',
+      ),
+    ).not.toThrow();
+  });
+
+  test('a 302 to the Access login is a wall', () => {
+    expect(() =>
+      assertNoAccessWall(
+        {
+          status: 302,
+          headers: { location: 'https://example.cloudflareaccess.com/cdn-cgi/access/login' },
+          bodyText: '',
+          url: 'https://staging.example/api/usage',
+        },
+        'meter',
+      ),
+    ).toThrow(/Access wall/);
+  });
+
+  test('a plain app 302 without markers is NOT a wall', () => {
+    expect(() =>
+      assertNoAccessWall(
+        {
+          status: 302,
+          headers: { location: '/login' },
+          bodyText: '',
+          url: 'https://staging.example/library',
+        },
+        'app-shell',
+      ),
+    ).not.toThrow();
+  });
+});
+
+test.describe('readApiBody', () => {
+  test('returns the body text for a clean response', async () => {
+    const body = await readApiBody(
+      {
+        status: () => 200,
+        headers: () => ({ 'content-type': 'application/json' }),
+        text: async () => '{"ok":true}',
+      },
+      'https://staging.example/api/health',
+      'health',
+    );
+    expect(body).toBe('{"ok":true}');
+  });
+
+  test('throws on a walled response instead of returning it', async () => {
+    await expect(
+      readApiBody(
+        {
+          status: () => 403,
+          headers: () => ({ 'cf-mitigated': 'challenge' }),
+          text: async () => '<title>Access | Cloudflare</title>',
+        },
+        'https://staging.example/api/library',
+        'range',
+      ),
+    ).rejects.toThrow(/Access wall/);
   });
 });
 
