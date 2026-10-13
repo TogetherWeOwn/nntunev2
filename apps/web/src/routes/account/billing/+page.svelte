@@ -1,0 +1,139 @@
+<script lang="ts">
+	import { getPlan } from '$lib/billing/plans';
+	import { evaluateUsage } from '$lib/billing/usage';
+	import type { SubscriptionDTO } from '$lib/billing/billingClient';
+
+	export let data: {
+		planId: string;
+		subscription: SubscriptionDTO | null;
+		usage: {
+			period: string;
+			streamSecondsMonth: number;
+			concurrentNow: number;
+			libraryTracks: number;
+			ingestToday: number;
+		} | null;
+		loadError: string | null;
+	};
+
+	const plan = getPlan(data.planId) ?? getPlan('plus')!;
+	const status = data.usage ? evaluateUsage(plan, data.usage) : null;
+
+	let actionError: string | null = null;
+	let busy: 'checkout' | 'portal' | null = null;
+
+	async function checkout() {
+		actionError = null;
+		busy = 'checkout';
+		try {
+			const { startCheckout } = await import('$lib/billing/billingClient');
+			const target = status?.upgradeTo ?? 'plus';
+			window.location.href = await startCheckout(target);
+		} catch (err) {
+			actionError = err instanceof Error ? err.message : 'Checkout failed';
+			busy = null;
+		}
+	}
+
+	async function portal() {
+		actionError = null;
+		busy = 'portal';
+		try {
+			const { openPortal } = await import('$lib/billing/billingClient');
+			window.location.href = await openPortal();
+		} catch (err) {
+			actionError = err instanceof Error ? err.message : 'Portal failed';
+			busy = null;
+		}
+	}
+</script>
+
+<svelte:head>
+	<title>Billing — NNTune v2</title>
+</svelte:head>
+
+<main>
+	<h1>Billing</h1>
+
+	{#if data.loadError}
+		<p role="alert">{data.loadError}</p>
+	{/if}
+
+	<section aria-labelledby="plan">
+		<h2 id="plan">Current plan: {plan.name}</h2>
+		{#if data.subscription}
+			<p>
+				Status: {data.subscription.status}
+				{#if data.subscription.currentPeriodEnd}
+					· renews {new Date(data.subscription.currentPeriodEnd).toLocaleDateString()}
+				{/if}
+				{#if data.subscription.trialEndsAt}
+					· trial ends {new Date(data.subscription.trialEndsAt).toLocaleDateString()}
+				{/if}
+			</p>
+		{/if}
+	</section>
+
+	{#if data.usage && status}
+		<section aria-labelledby="usage" aria-live="polite">
+			<h2 id="usage">Usage for {data.usage.period}</h2>
+			<ul>
+				<li>
+					Streaming: {(data.usage.streamSecondsMonth / 3600).toFixed(1)} / {plan.streamHoursMonth} hrs
+					<progress
+						max={plan.streamHoursMonth * 3600}
+						value={Math.min(data.usage.streamSecondsMonth, plan.streamHoursMonth * 3600)}
+					>
+						{Math.round(status.streamFraction * 100)}%
+					</progress>
+				</li>
+				<li>Concurrent streams: {data.usage.concurrentNow} / {plan.maxConcurrentStreams}</li>
+				<li>
+					Library: {data.usage.libraryTracks.toLocaleString()} / {plan.maxLibraryTracks.toLocaleString()}
+				</li>
+				<li>Ingest today: {data.usage.ingestToday} / {plan.ingestJobsDay}</li>
+			</ul>
+
+			{#if status.state !== 'ok'}
+				<div role={status.state === 'hard' ? 'alert' : 'status'}>
+					<p><strong>{status.headline}</strong></p>
+					{#if status.detail}<p>{status.detail}</p>{/if}
+				</div>
+			{/if}
+		</section>
+	{/if}
+
+	{#if actionError}
+		<p role="alert">{actionError}</p>
+	{/if}
+
+	<div>
+		{#if status?.upgradeTo}
+			<button disabled={busy !== null} on:click={checkout}>
+				{busy === 'checkout' ? 'Starting…' : `Upgrade to ${status.upgradeTo}`}
+			</button>
+		{/if}
+		<button disabled={busy !== null} on:click={portal}>
+			{busy === 'portal' ? 'Opening…' : 'Manage billing'}
+		</button>
+	</div>
+
+	<p><a href="/pricing">Compare all plans</a></p>
+</main>
+
+<style>
+	main {
+		max-width: 44rem;
+		margin: 2rem auto;
+		padding: 0 1rem;
+		font-family: system-ui, sans-serif;
+	}
+	progress {
+		width: 100%;
+	}
+	div:has(button) {
+		display: flex;
+		gap: 0.75rem;
+		margin-top: 1rem;
+	}
+</style>

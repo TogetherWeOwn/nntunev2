@@ -1,0 +1,35 @@
+{
+	"name": "@nntune/web",
+	"version": "0.1.0",
+	"private": true,
+	"description": "NNTune v2 web frontend (SvelteKit on Cloudflare). Billing slice: pricing, usage meters, checkout/portal.",
+	"type": "module",
+	"scripts": {
+		"dev": "vite dev",
+		"build": "vite build",
+		"preview": "vite preview",
+		"check": "svelte-kit sync && tsc --noEmit",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"lint": "prettier --check .",
+		"format": "prettier --write ."
+	},
+	"dependencies": {
+		"@sveltejs/kit": "2.20.8",
+		"svelte": "^5.0.0"
+	},
+	"devDependencies": {
+		"@sveltejs/adapter-cloudflare": "4.7.0",
+		"@sveltejs/vite-plugin-svelte": "5.1.0",
+		"prettier": "^3.3.3",
+		"prettier-plugin-svelte": "^3.2.6",
+		"typescript": "^5.6.3",
+		"vite": "6.3.5",
+		"vitest": "^3.2.4"
+	},
+	"allowScripts": {
+		"esbuild@0.21.5": true,
+		"esbuild@0.25.12": true,
+		"esbuild@0.17.19": true
+	}
+}

@@ -34,12 +34,30 @@ jobs:
       - run: |
           echo "scaffold card: replace me with real jobs"
 
+  web:
+    name: web
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # No npm cache: the repo gitignores lockfiles, so there is no
+      # lockfile to hash for cache restore. Revisit when lockfiles land.
+      - run: npm install --no-audit --no-fund --include=dev
+      - run: npm test -- --run
+      - run: npm run check
+
   # Aggregate required check. Add every real job id to `needs` (and keep
   # `!cancelled()` + `contains(needs.*.result, 'failure')` logic) so ci-ok
   # stays red when any job fails and green only when all succeed.
   ci-ok:
     name: ci-ok
-    needs: [placeholder]
+    needs: [placeholder, web]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
