@@ -33,12 +33,29 @@ jobs:
     steps:
       - run: echo "scaffold card: replace me with real jobs"
 
+  # Public-repo hygiene: fail on internal tracker ids (TOG-<digits>),
+  # internal hostnames, instance-UI paths and agent names in tracked text.
+  # CONTRIBUTING.md states the rule; this job enforces it (F-HYG-02).
+  public-text:
+    name: public-text
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Lint public text for internal identifiers
+        run: python3 .github/scripts/public_text_lint.py
+      - name: Unit-test the lint
+        run: python3 .github/scripts/test_public_text_lint.py
+
   # Aggregate required check. Add every real job id to `needs` (and keep
   # `!cancelled()` + `contains(needs.*.result, 'failure')` logic) so ci-ok
   # stays red when any job fails and green only when all succeed.
   ci-ok:
     name: ci-ok
-    needs: [placeholder]
+    needs: [placeholder, public-text]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

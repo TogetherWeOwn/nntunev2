@@ -15,7 +15,8 @@ Conventional Commits header: `type(scope): summary`, <= 100 chars, no
 trailing period. The `pr-lint` check enforces this.
 
 No tracker IDs (e.g. `TOG-*`) are required in PR titles or bodies — this is a
-public repo. Do not paste internal links or card IDs.
+public repo. Do not paste internal links or card IDs. The `public-text` CI
+job (part of `ci-ok`) enforces this on all tracked files.
 
 ## PR body
 
