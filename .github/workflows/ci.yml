@@ -31,7 +31,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - run: echo "scaffold card: replace me with real jobs"
+      - run: |
+          echo "scaffold card: replace me with real jobs"
 
   # Aggregate required check. Add every real job id to `needs` (and keep
   # `!cancelled()` + `contains(needs.*.result, 'failure')` logic) so ci-ok
@@ -44,7 +45,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - run: |
-          if printf '%s\n' ${{ toJSON(needs) }} | grep -q '"result": "failure"'; then
+          if printf '%s' '${{ toJSON(needs) }}' | grep -q '"result":"failure"'; then
             echo "ci-ok: a required job failed"
             exit 1
           fi
