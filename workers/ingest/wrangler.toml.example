@@ -1,0 +1,30 @@
+# Example binding map for workers/ingest. Copy to wrangler.toml locally;
+# never commit real ids or secrets (see repo root .gitignore).
+name = "nntune-ingest"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+
+# Slice 2 bindings (placeholders — uncomment when the slices land):
+# [[queues.producers]]
+# binding = "INGEST_QUEUE"
+# queue = "nntune-ingest-jobs"
+#
+# [[queues.consumers]]
+# queue = "nntune-ingest-jobs"
+# max_batch_size = 10
+# max_retries = 4
+#
+# [workflows]
+# binding = "INGEST_WORKFLOW"
+# name = "nntune-ingest-workflow"
+#
+# [hyperdrive]
+# id = "<HYPERDRIVE_ID_FOR_nntunev2>"
+#
+# [[kv_namespaces]]
+# binding = "INGEST_STATE"
+# id = "<KV_NAMESPACE_ID>"
+#
+# [analytics_engine_datasets]
+# binding = "INGEST_METER"
+# dataset = "nntune_ingest_meter"
