@@ -23,13 +23,24 @@ Hyperdrive. The STRIDE threat model (§3–§4) is the binding security spec.
    prod never shared); AAD binds `user_id` (+ KEK version on the wrap);
    reads return booleans only; `test connection` returns a boolean only;
    audit carries ids/results, never secrets; SSRF guard resolves ALL DNS
-   records and rejects non-public ranges (v4+v6); timeouts and per-user caps
-   are code constants.
-3. **Sessions:** HMAC-SHA256 cookies (`HttpOnly; Secure; SameSite=Lax`,
-   bounded `Max-Age`), rotation counter, server-side rows for revocation.
-4. **Magic links:** 256-bit random, SHA-256 at rest, single-use, 15-minute
-   expiry, one generic failure message.
-5. **Passkeys:** challenge lifecycle (RP pin, exact origin, 5-minute
+   records and rejects non-public ranges (v4+v6), including IPv6 translation
+   and transition space; validation returns the vetted target addresses.
+   The Worker must revalidate at connection time and pin the dial/fetch to
+   that set (no second DNS resolution), retaining the original TLS hostname;
+   timeouts and per-user caps are code constants.
+3. **Sessions:** HMAC-SHA256 cookies (`HttpOnly; Secure; SameSite=Lax`),
+   immutable authentication time with a one-day absolute cap, rotation
+   counter and server-side row verification (`verify_stored_session`).
+   Refresh requires a conditional counter update before the cookie is sent;
+   privilege changes revoke the old row and issue a new id after reauthentication.
+4. **Magic links:** 256-bit random, SHA-256 at rest, 15-minute expiry,
+   one generic failure message. Single-use is a database invariant, not
+   an in-memory flag: the atomic entry points require `SingleUseStore`
+   conditional UPDATE/RETURNING and exactly one returned row. The Worker
+   adapter must commit that claim (with session/signup insertion where
+   applicable) before returning success; database wiring is still slice 2.
+5. **Passkeys:** challenge lifecycle (RP equals exact host, canonical
+   serialized origin; http only on exact loopback dev hosts; 5-minute
    single-use) + credential storage shapes now; attestation/assertion
    signature verification + HTTP/Hyperdrive Worker entry in the follow-up
    slice (child card) once staging secrets are provisioned.

@@ -1,9 +1,11 @@
 //! Signed-cookie sessions: HMAC-SHA256, server-secret from env, rotation.
 //!
 //! Threat-model §4: cookies are `HttpOnly; Secure; SameSite=Lax`, bounded
-//! `Max-Age`, rotated on privilege change. The server-side session row
-//! (see migrations) is the revocation source; this module is the token
-//! layer. Secret comes from the Worker env, never code.
+//! `Max-Age`, refreshed with a row counter and a fixed authentication-age
+//! cap. Privilege changes require reauthentication and a new session id.
+//! The server-side session row is authoritative: request authentication uses
+//! `verify_stored_session`, not signature-only verification. Secret comes
+//! from the Worker env, never code.
 
 use hmac::{Hmac, Mac};
 use rand::RngCore;
@@ -15,6 +17,8 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Clock skew tolerated when checking `iat` (seconds).
 pub const CLOCK_SKEW_SECS: u64 = 60;
+/// Absolute lifetime from authentication, not refreshed by rotation (one day).
+pub const MAX_SESSION_SECS: u64 = 86_400;
 /// Cookie name for the web session.
 pub const COOKIE_NAME: &str = "nntune_session";
 
@@ -25,6 +29,8 @@ pub struct SessionClaims {
     /// every session the user holds.
     pub session_id: String,
     pub user_id: String,
+    /// Immutable authentication time, preserved across rotations.
+    pub created_at: u64,
     pub issued_at: u64,
     pub expires_at: u64,
     pub rotation_counter: u32,
@@ -124,8 +130,9 @@ pub fn issue_session(secret: &[u8], user_id: &str, now: u64, ttl_secs: u64) -> S
     let claims = SessionClaims {
         session_id: new_session_id(),
         user_id: user_id.to_string(),
+        created_at: now,
         issued_at: now,
-        expires_at: now.saturating_add(ttl_secs),
+        expires_at: now.saturating_add(ttl_secs.min(MAX_SESSION_SECS)),
         rotation_counter: 0,
     };
     let payload = serde_json::to_vec(&claims).expect("claims serialize");
@@ -134,7 +141,9 @@ pub fn issue_session(secret: &[u8], user_id: &str, now: u64, ttl_secs: u64) -> S
     format!("{}.{}", payload_b64, b64url_encode(&sig))
 }
 
-/// Verify a token at time `now`. Generic error: no reason is exposed.
+/// Verify signature and time bounds only; this does NOT authenticate a
+/// request. Use it to locate the session row, then require
+/// [`verify_stored_session`] against that current row before authorization.
 pub fn verify_session(secret: &[u8], token: &str, now: u64) -> Result<SessionClaims, SessionError> {
     let (payload_b64, sig_b64) = token.split_once('.').ok_or(SessionError::Invalid)?;
     let sig = b64url_decode(sig_b64)?;
@@ -148,7 +157,12 @@ pub fn verify_session(secret: &[u8], token: &str, now: u64) -> Result<SessionCla
     if claims.user_id.is_empty() || claims.session_id.is_empty() {
         return Err(SessionError::Invalid);
     }
-    if now > claims.expires_at {
+    if now >= claims.expires_at
+        || now >= claims.created_at.saturating_add(MAX_SESSION_SECS)
+        || claims.expires_at > claims.created_at.saturating_add(MAX_SESSION_SECS)
+        || claims.created_at > claims.issued_at
+        || claims.expires_at <= claims.issued_at
+    {
         return Err(SessionError::Invalid);
     }
     if claims.issued_at > now.saturating_add(CLOCK_SKEW_SECS) {
@@ -157,7 +171,47 @@ pub fn verify_session(secret: &[u8], token: &str, now: u64) -> Result<SessionCla
     Ok(claims)
 }
 
-/// Rotate: verify the old token, re-issue with `rotation_counter + 1`.
+/// Current server-side row from `sessions`; absence of a row must reject.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRecord {
+    pub id: String,
+    pub user_id: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub rotation_counter: u32,
+    pub revoked: bool,
+}
+
+/// Request authentication: reject revocation, stale rotations, mismatched
+/// ownership and row expiry in addition to the signed-token lifetime cap.
+pub fn verify_stored_session(
+    secret: &[u8],
+    token: &str,
+    now: u64,
+    record: &SessionRecord,
+) -> Result<SessionClaims, SessionError> {
+    let claims = verify_session(secret, token, now)?;
+    if record.revoked
+        || claims.session_id != record.id
+        || claims.user_id != record.user_id
+        || claims.created_at != record.created_at
+        || claims.expires_at != record.expires_at
+        || claims.rotation_counter != record.rotation_counter
+        || now >= record.expires_at
+    {
+        return Err(SessionError::Invalid);
+    }
+    Ok(claims)
+}
+
+/// Prepare a refresh with `rotation_counter + 1`, without extending the
+/// immutable authentication lifetime. This is NOT a database rotation:
+/// first require [`verify_stored_session`], then atomically UPDATE the row
+/// WHERE id/user_id/counter match AND revoked = FALSE, persisting the next
+/// counter and expiry. Require exactly one row and commit before Set-Cookie.
+/// Once committed, the previous token fails [`verify_stored_session`].
+/// For privilege changes, revoke the old row and use [`issue_session`] after
+/// reauthentication to create a NEW session id; never use refresh for that.
 pub fn rotate_session(
     secret: &[u8],
     token: &str,
@@ -168,9 +222,15 @@ pub fn rotate_session(
     let next = SessionClaims {
         session_id: claims.session_id,
         user_id: claims.user_id,
+        created_at: claims.created_at,
         issued_at: now,
-        expires_at: now.saturating_add(ttl_secs),
-        rotation_counter: claims.rotation_counter.saturating_add(1),
+        expires_at: now
+            .saturating_add(ttl_secs)
+            .min(claims.created_at.saturating_add(MAX_SESSION_SECS)),
+        rotation_counter: claims
+            .rotation_counter
+            .checked_add(1)
+            .ok_or(SessionError::Invalid)?,
     };
     let payload = serde_json::to_vec(&next).expect("claims serialize");
     let payload_b64 = b64url_encode(&payload);

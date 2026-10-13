@@ -21,7 +21,7 @@ use aes_gcm::{
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Dial timeout for `test connection` (ms).
@@ -115,35 +115,62 @@ fn ip_is_forbidden(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4_is_forbidden(&v4.octets()),
         IpAddr::V6(v6) => {
-            // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d):
-            // judge the embedded IPv4 address by the v4 rules.
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return v4_is_forbidden(&mapped.octets());
-            }
-            if let Some(compat) = v6.to_ipv4() {
-                // to_ipv4 also covers mapped; compatible ::a.b.c.d is
-                // deprecated but must still not bypass the guard.
-                return v4_is_forbidden(&compat.octets());
-            }
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                // Unique-local fc00::/7.
-                || (v6.segments()[0] & 0xFE00) == 0xFC00
-                // Link-local fe80::/10.
-                || (v6.segments()[0] & 0xFFC0) == 0xFE80
-                || *v6 == Ipv6Addr::LOCALHOST
-                // Documentation 2001:db8::/32.
-                || (v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0DB8)
+            let s = v6.segments();
+            // Only native global unicast (2000::/3). This excludes NAT64,
+            // mapped/translated/compatible IPv4, site-local and discard.
+            // Also reject transition and special-use space inside that range
+            // rather than trusting a translator's embedded IPv4 destination.
+            (s[0] & 0xE000) != 0x2000
+                || s[0] == 0x2002 // 6to4 (2002::/16)
+                || (s[0] == 0x2001 && s[1] < 0x0200) // IETF special-use, incl. Teredo/ORCHID
+                || (s[0] == 0x2001 && s[1] == 0x0DB8) // documentation
+                || (s[0] == 0x3FFF && (s[1] & 0xF000) == 0) // documentation (3fff::/20)
         }
     }
 }
 
+/// Vetted destination for one immediate outbound connection. Do not store
+/// this across requests: validate again at dial/fetch time, connect only to
+/// an address from this set, and retain `host` for TLS SNI/certificate checks
+/// and the HTTP Host header. Never let the transport re-resolve the hostname.
+#[derive(Debug)]
+pub struct ValidatedTarget {
+    host: String,
+    addresses: Vec<IpAddr>,
+}
+
+impl ValidatedTarget {
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn addresses(&self) -> &[IpAddr] {
+        &self.addresses
+    }
+}
+
+fn resolve_public_target(
+    host: &str,
+    dns: &impl DnsResolver,
+) -> Result<ValidatedTarget, VaultError> {
+    let addresses = match host.parse::<IpAddr>() {
+        Ok(ip) => vec![ip],
+        Err(_) => dns.resolve(host),
+    };
+    if addresses.is_empty() || addresses.iter().any(ip_is_forbidden) {
+        return Err(VaultError::Invalid);
+    }
+    Ok(ValidatedTarget {
+        host: host.to_string(),
+        addresses,
+    })
+}
+
 impl ProviderConfig {
-    /// Validate shape + SSRF guard. Every failure maps to generic
-    /// [`VaultError::Invalid`] (no oracle distinguishing "bad host" from
-    /// "blocked target").
-    pub fn validate(&self, dns: &impl DnsResolver) -> Result<(), VaultError> {
+    /// Validate shape + SSRF guard and retain ALL vetted addresses for a
+    /// pinned dial. Call at save AND immediately before dial. Every failure
+    /// maps to generic [`VaultError::Invalid`] (no target/existence oracle).
+    pub fn validate(&self, dns: &impl DnsResolver) -> Result<ValidatedTarget, VaultError> {
         if !host_shape_ok(&self.host) {
             return Err(VaultError::Invalid);
         }
@@ -159,22 +186,7 @@ impl ProviderConfig {
         if self.max_connections == 0 || self.max_connections > MAX_CONNECTIONS_CEILING {
             return Err(VaultError::Invalid);
         }
-        // Literal IPs are checked directly; names resolve ALL records and
-        // every record must be public.
-        if let Ok(ip) = self.host.parse::<IpAddr>() {
-            if ip_is_forbidden(&ip) {
-                return Err(VaultError::Invalid);
-            }
-            return Ok(());
-        }
-        let addrs = dns.resolve(&self.host);
-        if addrs.is_empty() {
-            return Err(VaultError::Invalid);
-        }
-        if addrs.iter().any(ip_is_forbidden) {
-            return Err(VaultError::Invalid);
-        }
-        Ok(())
+        resolve_public_target(&self.host, dns)
     }
 }
 
@@ -182,9 +194,10 @@ impl IndexerConfig {
     /// Validate the indexer URL + key, including the same SSRF guard as
     /// providers: the URL host is user-supplied and later fetched, so
     /// non-public targets (metadata endpoints, loopback, RFC 1918) are
-    /// rejected at save time. Redirects stay forbidden at fetch time
+    /// rejected at save time AND immediately before fetch. Use the returned
+    /// addresses for a pinned fetch; redirects stay forbidden
     /// ([`INDEXER_ALLOW_REDIRECTS`]).
-    pub fn validate(&self, dns: &impl DnsResolver) -> Result<(), VaultError> {
+    pub fn validate(&self, dns: &impl DnsResolver) -> Result<ValidatedTarget, VaultError> {
         let parsed = url::Url::parse(&self.url).map_err(|_| VaultError::Invalid)?;
         if parsed.scheme() != "https" && parsed.scheme() != "http" {
             return Err(VaultError::Invalid);
@@ -199,20 +212,10 @@ impl IndexerConfig {
         if !host_shape_ok(bare) {
             return Err(VaultError::Invalid);
         }
-        if let Ok(ip) = bare.parse::<IpAddr>() {
-            if ip_is_forbidden(&ip) {
-                return Err(VaultError::Invalid);
-            }
-        } else {
-            let addrs = dns.resolve(bare);
-            if addrs.is_empty() || addrs.iter().any(ip_is_forbidden) {
-                return Err(VaultError::Invalid);
-            }
-        }
         if self.api_key.is_empty() || self.api_key.len() > 1024 {
             return Err(VaultError::Invalid);
         }
-        Ok(())
+        resolve_public_target(bare, dns)
     }
 }
 

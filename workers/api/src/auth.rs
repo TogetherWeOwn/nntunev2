@@ -97,9 +97,10 @@ pub fn issue_magic_link(user_id: &str, email: &str, now: u64) -> (String, MagicL
     (token, record)
 }
 
-/// Consume a presented token against its stored record. Returns the `user_id`
-/// on success. Single-use: callers must persist the returned record (with
-/// `used: true`) before issuing a session.
+/// Pure record validation/preparation, NOT authentication or a database claim.
+/// Independent snapshots may both pass. HTTP callers must instead use
+/// [`consume_magic_link_atomically`], which requires a committed conditional
+/// database update before returning an authenticated result.
 pub fn consume_magic_link(
     mut record: MagicLinkRecord,
     presented_token: &str,
@@ -127,7 +128,9 @@ pub fn consume_magic_link(
     })
 }
 
-/// Successful consumption: the authenticated user plus the spent record to persist.
+/// Validated candidate and prepared spent record. It becomes an authenticated
+/// result ONLY when returned by [`consume_magic_link_atomically`] after the
+/// database claim commits; the pure preparation helper grants no session.
 #[derive(Debug, Clone)]
 pub struct ConsumedMagicLink {
     pub user_id: String,
@@ -165,10 +168,24 @@ pub fn new_registration_challenge(
     origin: &str,
     now: u64,
 ) -> Result<PasskeyChallenge, AuthError> {
-    if rp_id.is_empty() {
-        return Err(AuthError::Invalid);
-    }
-    if !(origin.starts_with("https://") || origin.starts_with("http://localhost")) {
+    let parsed = url::Url::parse(origin).map_err(|_| AuthError::Invalid)?;
+    let host = parsed.host_str().ok_or(AuthError::Invalid)?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let local = matches!(host, "localhost" | "127.0.0.1" | "::1");
+    if !(parsed.scheme() == "https" || (parsed.scheme() == "http" && local))
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        // Require an actual serialized origin, not a URL that normalizes
+        // away empty userinfo, a path, or other non-origin components.
+        || origin != parsed.origin().ascii_serialization()
+        // This application pins the RP to the exact host, not a parent
+        // suffix. Cross-subdomain credentials are intentionally unsupported.
+        || rp_id != host
+        || (!local && !host.contains('.'))
+    {
         return Err(AuthError::Invalid);
     }
     Ok(PasskeyChallenge {
@@ -181,10 +198,10 @@ pub fn new_registration_challenge(
     })
 }
 
-/// Verify the ceremony environment and consume the challenge (single-use).
-/// Credential signature verification happens in the follow-up slice against
-/// the stored public key; this gate (origin/RP/expiry/single-use) runs first
-/// and independently.
+/// Pure ceremony validation/preparation, NOT a database single-use claim.
+/// HTTP callers must use [`consume_challenge_atomically`] and complete
+/// credential signature verification before issuing any session. The Worker
+/// must not treat a passing lifecycle gate alone as WebAuthn authentication.
 pub fn verify_and_consume_challenge(
     mut challenge: PasskeyChallenge,
     rp_id: &str,
@@ -245,7 +262,9 @@ pub fn hash_invite_code(code: &str) -> String {
     sha256_hex(code)
 }
 
-/// Validate a presented invite code against its stored record.
+/// Pure invite validation/preparation, NOT a database single-use claim.
+/// Signup callers must use [`consume_invite_atomically`] inside their signup
+/// transaction; two in-memory snapshots are not a uniqueness boundary.
 pub fn consume_invite(
     mut record: InviteRecord,
     presented_code: &str,
@@ -264,6 +283,110 @@ pub fn consume_invite(
     }
     record.used = true;
     Ok(record)
+}
+
+/// A validated candidate for one atomic, parameterized Postgres claim.
+/// Bind the listed parameters; never interpolate a record into SQL.
+pub enum SingleUseClaim<'a> {
+    /// Parameters: token_hash, user_id, email, expires_at, now.
+    MagicLink {
+        record: &'a MagicLinkRecord,
+        now: u64,
+    },
+    /// Parameters: id, rp_id, origin, expires_at, now.
+    Challenge {
+        record: &'a PasskeyChallenge,
+        now: u64,
+    },
+    /// Parameter: code_hash.
+    Invite { record: &'a InviteRecord },
+}
+
+impl SingleUseClaim<'_> {
+    /// Execute this statement once and count its returned rows. The primary
+    /// key + conditional flag transition makes concurrent claims exclusive.
+    pub fn statement(&self) -> &'static str {
+        match self {
+            Self::MagicLink { .. } => "UPDATE magic_link_tokens SET used = TRUE WHERE token_hash = $1 AND user_id = $2 AND email = $3 AND expires_at = $4 AND expires_at > $5 AND used = FALSE RETURNING token_hash",
+            Self::Challenge { .. } => "UPDATE auth_challenges SET consumed = TRUE WHERE id = $1 AND rp_id = $2 AND origin = $3 AND expires_at = $4 AND expires_at > $5 AND consumed = FALSE RETURNING id",
+            Self::Invite { .. } => "UPDATE invite_codes SET used = TRUE WHERE code_hash = $1 AND used = FALSE RETURNING code_hash",
+        }
+    }
+}
+
+/// Worker/Hyperdrive boundary. Implementations must execute the conditional
+/// UPDATE from [`SingleUseClaim::statement`] and return the number of rows
+/// it returned, NOT perform SELECT + unconditional UPDATE. Return an error
+/// on storage failure. Success is usable only after the transaction commits;
+/// signup/session insertion may share that transaction, but nothing may be
+/// sent to the client before commit. An in-memory flag is not an implementation.
+pub trait SingleUseStore {
+    fn claim(
+        &self,
+        candidate: SingleUseClaim<'_>,
+    ) -> impl std::future::Future<Output = Result<u64, AuthError>>;
+}
+
+/// HTTP magic-link entry: validation plus an exclusive database claim.
+/// Zero rows (replay/expiry), multiple rows, or a store error all fail closed.
+pub async fn consume_magic_link_atomically(
+    record: MagicLinkRecord,
+    presented_token: &str,
+    now: u64,
+    store: &impl SingleUseStore,
+) -> Result<ConsumedMagicLink, AuthError> {
+    let prepared = consume_magic_link(record, presented_token, now)?;
+    if store
+        .claim(SingleUseClaim::MagicLink {
+            record: &prepared.used_record,
+            now,
+        })
+        .await?
+        != 1
+    {
+        return Err(AuthError::Invalid);
+    }
+    Ok(prepared)
+}
+
+/// HTTP ceremony gate: exclusive challenge claim; still requires WebAuthn
+/// signature verification before authentication (not provided in this slice).
+pub async fn consume_challenge_atomically(
+    challenge: PasskeyChallenge,
+    rp_id: &str,
+    origin: &str,
+    now: u64,
+    store: &impl SingleUseStore,
+) -> Result<PasskeyChallenge, AuthError> {
+    let prepared = verify_and_consume_challenge(challenge, rp_id, origin, now)?;
+    if store
+        .claim(SingleUseClaim::Challenge {
+            record: &prepared,
+            now,
+        })
+        .await?
+        != 1
+    {
+        return Err(AuthError::Invalid);
+    }
+    Ok(prepared)
+}
+
+/// Signup invite gate: validation plus an exclusive database claim.
+pub async fn consume_invite_atomically(
+    record: InviteRecord,
+    presented_code: &str,
+    store: &impl SingleUseStore,
+) -> Result<InviteRecord, AuthError> {
+    let prepared = consume_invite(record, presented_code)?;
+    if store
+        .claim(SingleUseClaim::Invite { record: &prepared })
+        .await?
+        != 1
+    {
+        return Err(AuthError::Invalid);
+    }
+    Ok(prepared)
 }
 
 #[cfg(test)]
