@@ -69,6 +69,12 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_with_crcs(block_crcs(&file_bytes()), BLOCK_SIZE)
+}
+
+/// Builds the fixture around caller-supplied block CRCs and slice size, so
+/// tests can forge IFSC/packet values the honest builder never emits.
+fn fixture_with_crcs(crcs: Vec<u32>, block_size: u64) -> Fixture {
     let data = file_bytes();
     let whole_md5 = md5::compute(&data).0;
     let first16k = md5::compute(&data[..data.len().min(16 * 1024)]).0;
@@ -79,7 +85,7 @@ fn fixture() -> Fixture {
     let file_id = md5::compute(&seed).0;
 
     let mut main_body = Vec::new();
-    main_body.extend_from_slice(&BLOCK_SIZE.to_le_bytes());
+    main_body.extend_from_slice(&block_size.to_le_bytes());
     main_body.extend_from_slice(&1u32.to_le_bytes()); // 1 recoverable file
     main_body.extend_from_slice(&file_id);
 
@@ -97,7 +103,7 @@ fn fixture() -> Fixture {
 
     let mut ifsc_body = Vec::new();
     ifsc_body.extend_from_slice(&file_id);
-    for crc in block_crcs(&data) {
+    for crc in crcs {
         ifsc_body.extend_from_slice(&[0u8; 16]); // per-slice MD5 (unused by verify)
         ifsc_body.extend_from_slice(&crc.to_le_bytes());
     }
@@ -215,6 +221,62 @@ fn rejects_structural_forgeries() {
 }
 
 // --- Verify ---------------------------------------------------------------
+
+/// A forged IFSC carrying MORE block checksums than the file admits must
+/// return an error, never panic with an out-of-bounds index (remote panic
+/// from a ~200-byte packet). A 1000-byte file at 256-byte slices needs
+/// exactly 4; this set carries 5 correct-looking CRCs.
+#[test]
+fn verify_and_precheck_reject_extra_block_crcs_without_panicking() {
+    let mut crcs = block_crcs(&file_bytes());
+    crcs.push(0xdead_beef);
+    let f = fixture_with_crcs(crcs, BLOCK_SIZE);
+    // The set itself still parses (IFSC order/count is only meaningful
+    // against the file length at verify time).
+    let set = RecoverySet::parse(&f.set_bytes).expect("over-long IFSC parses");
+    let err = set.verify(FILENAME, &f.data).unwrap_err();
+    assert!(
+        matches!(err, Error::Par2Unhealthy { .. }),
+        "want Par2Unhealthy, got: {err}"
+    );
+    let cuts = [0usize, 500, 1000];
+    let segments: Vec<(u32, u64)> = cuts
+        .windows(2)
+        .map(|w| (crc32fast::hash(&f.data[w[0]..w[1]]), (w[1] - w[0]) as u64))
+        .collect();
+    assert!(set.precheck(FILENAME, &segments).is_err());
+}
+
+/// Same for FEWER checksums than required: 3 instead of 4.
+#[test]
+fn verify_rejects_missing_block_crcs() {
+    let mut crcs = block_crcs(&file_bytes());
+    crcs.pop();
+    let f = fixture_with_crcs(crcs, BLOCK_SIZE);
+    let set = RecoverySet::parse(&f.set_bytes).expect("short IFSC parses");
+    assert!(set.verify(FILENAME, &f.data).is_err());
+}
+
+/// An absurd Main slice size is rejected at parse with a bounded error —
+/// crucially WITHOUT allocating or hashing gigabytes of zeroes. A 1 GiB
+/// slice over a 1000-byte file would otherwise burn ~1 GiB of zero-hash CPU
+/// per verify call from one small packet.
+#[test]
+fn parse_rejects_absurd_block_size() {
+    let f = fixture();
+    let huge = 1u64 << 32;
+    let mut main_body = Vec::new();
+    main_body.extend_from_slice(&huge.to_le_bytes());
+    main_body.extend_from_slice(&1u32.to_le_bytes());
+    main_body.extend_from_slice(&f.file_id);
+    let set_id = md5::compute(&main_body).0;
+    let set_bytes = packet(&set_id, &ptype(b"Main\0\0\0\0"), &main_body);
+    let err = RecoverySet::parse(&set_bytes).unwrap_err();
+    assert!(
+        err.to_string().contains("exceeds the supported bound"),
+        "got: {err}"
+    );
+}
 
 #[test]
 fn verify_accepts_healthy_and_rejects_damaged() {

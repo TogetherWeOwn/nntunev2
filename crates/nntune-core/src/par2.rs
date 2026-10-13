@@ -29,6 +29,20 @@ const PACKET_MAGIC: [u8; 8] = *b"PAR2\0PKT";
 const MAIN_HEADER_SIZE: usize = 12;
 const IFSC_ENTRY_SIZE: usize = 20;
 
+/// Largest accepted Main-packet slice size (256 MiB). The PAR2 spec sets no
+/// bound, but `verify`/`precheck` hash up to one slice of zeroes for the
+/// last-block padding, so an unbounded slice size turns a ~200-byte packet
+/// into unbounded CPU work (and, before chunked hashing, unbounded memory).
+/// 256 MiB slices imply multi-terabyte files at par2cmdline's block-count
+/// limits — far outside anything on Usenet, let alone music posts. A set
+/// beyond this must go straight to the repair binary (the reconstruction
+/// authority), never through in-Worker verification.
+pub const MAX_BLOCK_SIZE: u64 = 256 << 20;
+
+/// Streaming zero-run hasher chunk: zero padding is hashed in pieces of this
+/// size so verification never holds a slice-sized zero allocation.
+const ZERO_CHUNK_SIZE: usize = 8192;
+
 fn packet_type(suffix: &[u8]) -> [u8; 16] {
     let mut t = [0u8; 16];
     t[..8].copy_from_slice(b"PAR 2.0\0");
@@ -232,21 +246,51 @@ impl RecoverySet {
                 detail: "whole-file MD5 mismatch".into(),
             });
         }
+        if self.block_size == 0 {
+            // `parse` never produces this (Main requires a non-zero slice
+            // size), but a hand-built set could — and `div_ceil` below would
+            // divide by zero.
+            return Err(Error::Par2Unhealthy {
+                filename: name.to_string(),
+                detail: "recovery set block size must be positive".into(),
+            });
+        }
         if file.block_crc32s.is_empty() {
             return Err(Error::Par2Unhealthy {
                 filename: name.to_string(),
                 detail: "recovery set carries no block checksums for this file".into(),
             });
         }
-        let bs = self.block_size as usize;
+        // A crafted IFSC may carry more (or fewer) checksums than the file's
+        // length admits. Without this check the loop below indexes past the
+        // data and panics — a remote panic from a ~200-byte packet.
+        let bs = self.block_size;
+        let blocks = file.length.div_ceil(bs);
+        if file.block_crc32s.len() as u64 != blocks {
+            return Err(Error::Par2Unhealthy {
+                filename: name.to_string(),
+                detail: format!(
+                    "recovery set carries {} block checksums for a {}-byte file at {}-byte slices (want {blocks})",
+                    file.block_crc32s.len(),
+                    file.length,
+                    bs
+                ),
+            });
+        }
         for (i, &want) in file.block_crc32s.iter().enumerate() {
-            let start = i * bs;
-            let end = (start + bs).min(data.len());
+            // u64 arithmetic throughout: `block_size` is parse-capped, and
+            // `start`/`end` never exceed `data.len()` (which equals
+            // `file.length`, checked above), so the `as usize` casts below
+            // cannot truncate on any target.
+            let start = i as u64 * bs;
+            let end = (start + bs).min(data.len() as u64);
             let mut hash = crc32fast::Hasher::new();
-            hash.update(&data[start..end]);
+            hash.update(&data[start as usize..end as usize]);
             if end - start < bs {
-                // Last slice is checksummed zero-padded to the full size.
-                hash.update(&vec![0u8; bs - (end - start)]);
+                // Last slice is checksummed zero-padded to the full size,
+                // hashed in fixed chunks so verification never allocates a
+                // slice-sized zero buffer from an untrusted size.
+                update_zero_run(&mut hash, bs - (end - start));
             }
             if hash.finalize() != want {
                 return Err(Error::Par2Unhealthy {
@@ -280,6 +324,15 @@ impl RecoverySet {
             return Err(Error::Malformed(
                 "par2 precheck: recovery set carries no block checksums for this file".into(),
             ));
+        }
+        // Same count check as `verify`: a crafted IFSC must not change the
+        // padding arithmetic below (which assumes exactly ceil(len/bs) blocks).
+        if file.block_crc32s.len() as u64 != file.length.div_ceil(self.block_size) {
+            return Err(Error::Malformed(format!(
+                "par2 precheck: recovery set carries {} block checksums for a {}-byte file",
+                file.block_crc32s.len(),
+                file.length
+            )));
         }
         let mut actual_len = 0u64;
         let mut actual_crc = 0u32;
@@ -353,6 +406,11 @@ fn parse_main_body(
     if block_size == 0 || block_size % 4 != 0 {
         return Err(malformed(format!(
             "Main packet slice size {block_size} is not a non-zero multiple of 4"
+        )));
+    }
+    if block_size > MAX_BLOCK_SIZE {
+        return Err(malformed(format!(
+            "Main packet slice size {block_size} exceeds the supported bound of {MAX_BLOCK_SIZE}"
         )));
     }
     // PAR2 derives the set ID from the Main packet: setid == MD5(body). A set
@@ -566,13 +624,27 @@ fn gf2_matrix_square(square: &mut [u32; GF2_DIMENSION], mat: &[u32; GF2_DIMENSIO
     }
 }
 
+/// Feeds `n` zero bytes into the hasher in fixed chunks, so padding work
+/// never allocates proportionally to an untrusted block size.
+fn update_zero_run(hash: &mut crc32fast::Hasher, mut n: u64) {
+    let zeros = [0u8; ZERO_CHUNK_SIZE];
+    while n > 0 {
+        let take = n.min(ZERO_CHUNK_SIZE as u64) as usize;
+        hash.update(&zeros[..take]);
+        n -= take as u64;
+    }
+}
+
 /// CRC-32 of a run of `n` zero bytes (used to pad the last block; `n` is
-/// bounded by the block size, so this stays a small one-off computation).
+/// bounded by the block size, hashed in chunks, so this stays a small
+/// one-off computation even at the [`MAX_BLOCK_SIZE`] cap).
 fn zero_run_crc32(n: u64) -> u32 {
     if n == 0 {
         return 0;
     }
-    crc32fast::hash(&vec![0u8; n as usize])
+    let mut hash = crc32fast::Hasher::new();
+    update_zero_run(&mut hash, n);
+    hash.finalize()
 }
 
 // ---------------------------------------------------------------------------

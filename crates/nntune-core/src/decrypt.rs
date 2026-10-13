@@ -22,10 +22,13 @@ pub trait ReadAt {
 
 impl ReadAt for [u8] {
     fn read_at(&self, buf: &mut [u8], off: u64) -> io::Result<usize> {
-        let off = off as usize;
-        if off >= self.len() {
+        // Compare in u64 first: `off as usize` truncates above 32 bits on
+        // 32-bit targets (including wasm32), which would silently return the
+        // wrong bytes instead of end-of-source.
+        if off >= self.len() as u64 {
             return Ok(0);
         }
+        let off = off as usize;
         let n = buf.len().min(self.len() - off);
         buf[..n].copy_from_slice(&self[off..off + n]);
         Ok(n)

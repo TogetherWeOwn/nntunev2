@@ -203,6 +203,19 @@ fn rclone_multiblock_ranges() {
     assert_eq!(&dst, &file[..100]);
 }
 
+/// Offsets beyond the source end report end-of-source even past 32 bits
+/// (guards the `u64`-before-cast comparison used by the slice impl; on
+/// 32-bit targets a plain `as usize` cast would wrap and return wrong data).
+#[test]
+fn slice_read_at_huge_offset_is_end_of_source() {
+    let src = vec![0xabu8; 10];
+    let mut dst = [0u8; 4];
+    assert_eq!(src.read_at(&mut dst, u64::from(u32::MAX) + 10).unwrap(), 0);
+    assert_eq!(src.read_at(&mut dst, 10).unwrap(), 0);
+    assert_eq!(src.read_at(&mut dst, 9).unwrap(), 1);
+    assert_eq!(dst[0], 0xab);
+}
+
 /// `ReadAt` over a source that returns short reads (exercises `read_exact_at`).
 #[test]
 fn decrypt_tolerates_short_reads() {
