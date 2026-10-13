@@ -1,0 +1,151 @@
+name: e2e-staging
+
+# Staging E2E + synthetic smoke for NNTune v2.
+# Runs the Playwright suite in e2e/ against STAGING_BASE_URL (behind
+# Cloudflare Access via the QA service-token pair). A red run on main blocks
+# prod promotion: the production environment requires this workflow's result
+# on the same SHA (wired by the provision card).
+#
+# Pre-deploy there is no staging yet: jobs skip at step level with a notice
+# when secrets.STAGING_BASE_URL is unset. Once staging is configured the
+# same file fails closed — no workflow change needed for activation.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Synthetic monitor cadence (off-minute to avoid thundering herd).
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-staging
+  cancel-in-progress: false
+
+jobs:
+  synthetic:
+    name: synthetic smoke (health)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check staging configuration
+        id: staging
+        env:
+          STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${STAGING_BASE_URL:-}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::STAGING_BASE_URL not configured (pre-deploy) — synthetic smoke skips."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d682002 # v6.0.0
+        if: steps.staging.outputs.configured == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Install dependencies
+        if: steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        run: npm ci
+
+      - name: Install Playwright chromium
+        if: steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Run synthetic smoke
+        if: steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        env:
+          STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
+        run: npm run e2e:smoke
+
+      - name: Upload failure artifacts
+        if: failure() && steps.staging.outputs.configured == 'true'
+        uses: actions/upload-artifact@b7c566a772e6e0e8c07d0575765d0d2df6327d0 # v6.0.0
+        with:
+          name: e2e-synthetic-report
+          path: |
+            e2e/playwright-report/
+            e2e/test-results/
+          retention-days: 7
+
+  e2e:
+    name: full journey (signup → byop → ingest → meter → limits)
+    needs: [synthetic]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check staging configuration
+        id: staging
+        env:
+          STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${STAGING_BASE_URL:-}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::STAGING_BASE_URL not configured (pre-deploy) — full journey skips."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d682002 # v6.0.0
+        if: steps.staging.outputs.configured == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Install dependencies
+        if: steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        run: npm ci
+
+      - name: Install Playwright chromium
+        if: steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Run full journey
+        if: steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        env:
+          STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
+          SYNTHETIC_NNTP_HOST: ${{ secrets.SYNTHETIC_NNTP_HOST }}
+          SYNTHETIC_NNTP_PORT: ${{ secrets.SYNTHETIC_NNTP_PORT }}
+          SYNTHETIC_NNTP_USER: ${{ secrets.SYNTHETIC_NNTP_USER }}
+          SYNTHETIC_NNTP_TLS: ${{ secrets.SYNTHETIC_NNTP_TLS }}
+          SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
+        run: npm run e2e:staging
+
+      - name: Upload failure artifacts
+        if: failure() && steps.staging.outputs.configured == 'true'
+        uses: actions/upload-artifact@b7c566a772e6e0e8c07d0575765d0d2df6327d0 # v6.0.0
+        with:
+          name: e2e-journey-report
+          path: |
+            e2e/playwright-report/
+            e2e/test-results/
+          retention-days: 7

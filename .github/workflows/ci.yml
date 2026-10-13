@@ -81,11 +81,47 @@ jobs:
       # (native-only CI once missed a getrandom/RNG breakage there).
       - run: cargo check --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
 
-  # Aggregate required check: every dependency must succeed, including
-  # when a required job fails, is cancelled, or is skipped.
+  # E2E harness static checks: typecheck + spec discovery with no staging
+  # needed, so every PR proves the harness still compiles. The live suite
+  # runs in e2e-staging.yml (post-deploy). Keep this job id in ci-ok's needs.
+  e2e-lint:
+    name: e2e-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d682002 # v6.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Install e2e dependencies
+        working-directory: e2e
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: e2e
+        run: npm run typecheck
+
+      - name: Helper self-tests (fail-closed behavior, no staging)
+        working-directory: e2e
+        run: npm run test:unit
+
+      - name: List specs (compiles the suite without staging)
+        working-directory: e2e
+        run: npm run e2e:list
+
+  # Aggregate required check. Add every real job id to `needs` (and keep
+  # `always()` + the all-success assertion) so ci-ok runs and stays red
+  # when any job fails, is cancelled, or is skipped, and green only when
+  # all succeed.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, api]
+    needs: [rust-test, rust-wasm, api, e2e-lint]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
