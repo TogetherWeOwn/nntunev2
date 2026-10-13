@@ -4,11 +4,16 @@ name: codeql
 # Rust coverage comes from cargo audit/clippy jobs the scaffold card adds.
 # Feeds the `CodeQL` code_scanning rule on main.
 
+# No JS/TS exists yet (scaffold card adds web/): only run when JS/TS or this
+# workflow changes, so docs PRs do not burn a failing "no code" scan. The
+# code_scanning ruleset rule follows once scans pass on real code.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    paths: ['**.js', '**.jsx', '**.ts', '**.tsx', 'web/**', '.github/workflows/codeql.yml']
   push:
     branches: [main]
+    paths: ['**.js', '**.jsx', '**.ts', '**.tsx', 'web/**', '.github/workflows/codeql.yml']
   schedule:
     - cron: '23 3 * * 1'
 
