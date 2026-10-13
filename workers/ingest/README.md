@@ -1,6 +1,6 @@
-# workers/ingest — ingest pipeline (slice 1: contracts + edge guards)
+# workers/ingest — ingest pipeline (slices 1–2: contracts + Queue wiring)
 
-User-scoped ingest jobs via Queues/Workflows (bindings land in slice 2):
+User-scoped ingest jobs via Queues/Workflows:
 
 ```text
 Indexer search (BYO key) ─┐
@@ -27,8 +27,8 @@ NZB upload ───────────────┘                     
   `workers/mb` read API (`/v1/mb/release/:mbid`, `/v1/mb/recording/:mbid`,
   `/v1/mb/search?type=…`).
 - Routes (`src/lib.rs`): `POST /v1/ingest/search`, `POST /v1/ingest/nzb`
-  (202 + validated envelope), `GET /v1/ingest/jobs/:id`. Queue/Workflow/DB
-  wiring returns `not_wired` until slice 2.
+  (202 + enqueue to `nntune-ingest-jobs` with job id + idempotency key),
+  `GET /v1/ingest/jobs/:id` (checkpoint reads land with the consumer).
 
 ## Security rules
 
@@ -49,11 +49,30 @@ Usenet in CI). Ingest needs from that card:
 3. Connection caps per credential + slow-link/mid-disconnect modes for the
    resume test (kill mid-`Probing`, redeliver, expect one library row).
 
-## Slice 2 (not here)
+## Slice 2 (this slice)
 
-Queue/Workflow bindings, Hyperdrive library writes, pool-DO probe calls,
-Container repair dispatch, `nntune-core` parse integration, Analytics
-Engine metering events.
+- Queue wiring (`src/dispatch.rs`): 202 routes build a `QueueMsg` with a
+  user-bound idempotency key and `send` it to `nntune-ingest-jobs`
+  (`worker` `queue` feature; bindings in `wrangler.toml.example`). A
+  missing/failing binding keeps the 202 contract but reports `not_wired`.
+- Request bodies carry self-asserted `user_id` (1..=128 chars) until the
+  accounts card authenticates callers; the key format already binds the
+  user, so keys stay valid when auth lands.
+- Hyperdrive library upsert (`src/library.rs`): one row per idempotency
+  key, `ON CONFLICT DO UPDATE` so replays converge on the latest MB match.
+- Repair dispatch (`src/repair.rs`): missing blocks + par2 set → Container
+  `POST /repair`; missing blocks with no par2 set fails the job.
+- Metering (`src/metering.rs`): one `nntune_ingest_meter` event per
+  workflow step (workers-rs 0.3 has no Analytics Engine client, so the edge
+  write goes through the dataset binding's HTTP API).
+- Probe envelope + resume mapping (`src/probe.rs`), parse shape +
+  intake cross-check + probe batching (`src/parse.rs`), synthetic fixtures
+  (`src/fixtures.rs`), pipeline E2E (`tests/pipeline_e2e.rs`): happy path
+  reaches `Done` with one library row; the gapped set repairs then finishes.
+
+Blocked on siblings for the live half: pool-DO wire contract, `nntune-core`
+parse output, synthetic NNTP fixture server + CI E2E against it, checkpoint
+KV reads in `GET /v1/ingest/jobs/:id`, and the repair Container runtime.
 
 ## Develop
 

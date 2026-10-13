@@ -49,9 +49,12 @@ pub struct LibraryWrite {
 
 /// Search request body for `POST /v1/ingest/search`.
 ///
-/// `indexer_ref` is an opaque BYOP vault handle, never a raw key.
+/// `indexer_ref` is an opaque BYOP vault handle, never a raw key. `user_id`
+/// is self-asserted until the accounts card authenticates callers; it binds
+/// the idempotency key so today's queued jobs stay valid when auth lands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchRequest {
+    pub user_id: String,
     pub query: String,
     pub indexer_ref: String,
     pub categories: Vec<u32>,
@@ -60,8 +63,10 @@ pub struct SearchRequest {
 }
 
 /// NZB upload body for `POST /v1/ingest/nzb` (JSON; caps in `nzb_intake`).
+/// `user_id` is self-asserted, as in [`SearchRequest`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NzbUploadRequest {
+    pub user_id: String,
     pub filename: String,
     pub nzb_xml: String,
 }
@@ -142,5 +147,23 @@ mod tests {
         assert!(!validate_indexer_ref(""));
         assert!(!validate_indexer_ref("https://indexer.example?apikey=x"));
         assert!(!validate_indexer_ref("key with spaces"));
+    }
+
+    #[test]
+    fn search_request_carries_user_scope() {
+        let req: SearchRequest = serde_json::from_str(
+            r#"{"query":"q","indexer_ref":"vault_01","categories":[],"limit":10,"page":0,"user_id":"user_01"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.user_id, "user_01");
+    }
+
+    #[test]
+    fn upload_request_carries_user_scope() {
+        let req: NzbUploadRequest = serde_json::from_str(
+            r#"{"filename":"r.nzb","nzb_xml":"<nzb></nzb>","user_id":"user_01"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.user_id, "user_01");
     }
 }

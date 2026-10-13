@@ -10,22 +10,31 @@
 //! Pipeline: search/upload → parse (`nntune-core`) → segment availability
 //! probe through the user's pool DO → par2 verify (Container batch repair
 //! when needed) → tag/fingerprint + MusicBrainz match (`workers/mb`) →
-//! library rows. Queue/Workflow bindings and DB wiring land in the next
-//! slice; today each route validates its contract and returns the durable
-//! envelope so the surface is reviewable first. See `README.md`.
+//! library rows. Routes validate the contract and enqueue to
+//! `nntune-ingest-jobs`; the Queue consumer (Workflow steps in
+//! `queue::WORKFLOW_STEPS`) runs parse → probe → verify → repair → match →
+//! write. See `README.md`.
 
 use worker::{console_log, Env, Request, Response, Result, RouteContext, Router};
 
+pub mod dispatch;
+pub mod fixtures;
 pub mod jobs;
+pub mod library;
+pub mod metering;
 pub mod newznab;
 pub mod nzb_intake;
+pub mod parse;
+pub mod probe;
 pub mod queue;
 pub mod rate_limit;
+pub mod repair;
 
+use dispatch::validate_user_id;
 use jobs::validate_job_id;
 use newznab::MAX_LIMIT;
 use nzb_intake::{estimate_nzb, IntakeRejection};
-use queue::{validate_indexer_ref, NzbUploadRequest, SearchRequest};
+use queue::{validate_indexer_ref, NzbUploadRequest, QueueMsg, SearchRequest};
 
 #[derive(Debug, serde::Serialize)]
 struct ApiError {
@@ -53,8 +62,54 @@ fn accepted(body: serde_json::Value) -> Result<Response> {
     Ok(Response::from_json(&body)?.with_status(202))
 }
 
-/// Validate a search body; Queue enqueue lands in the next slice.
-async fn search(req: &mut Request, _ctx: &RouteContext<()>) -> Result<Response> {
+/// Send one dispatch message. Returns true when the Queue accepted it; a
+/// missing or failing binding keeps the 202 contract but reports `not_wired`
+/// so callers (and tail logs) distinguish accepted-from-validated.
+async fn try_enqueue(env: &Env, msg: &QueueMsg) -> bool {
+    match env.queue(dispatch::INGEST_QUEUE_BINDING) {
+        Ok(queue) => match queue.send(msg.clone()).await {
+            Ok(()) => true,
+            Err(e) => {
+                console_log!("ingest enqueue failed: {:?}", e);
+                false
+            }
+        },
+        Err(e) => {
+            console_log!("ingest queue binding missing: {:?}", e);
+            false
+        }
+    }
+}
+
+fn queued_envelope(
+    msg: &QueueMsg,
+    source: &str,
+    queued: bool,
+    extra: serde_json::Value,
+) -> Result<Response> {
+    let mut body = serde_json::json!({
+        "stage": "queued",
+        "source": source,
+        "status": if queued { "queued" } else { "not_wired" },
+        "job_id": msg.job_id,
+        "idempotency_key": msg.idempotency_key,
+    });
+    if !queued {
+        body["hint"] = serde_json::Value::String(
+            "Queue unavailable; contract is validated, retry shortly.".into(),
+        );
+    }
+    if let serde_json::Value::Object(map) = extra {
+        if let serde_json::Value::Object(ref mut body_map) = body {
+            body_map.extend(map);
+        }
+    }
+    accepted(body)
+}
+
+/// Validate a search body and enqueue it; the Queue consumer runs the
+/// search → parse → probe → verify → match → write workflow.
+async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
     let text = req.text().await.unwrap_or_default();
     let parsed: SearchRequest =
         serde_json::from_str(&text).map_err(|_| "body must be SearchRequest JSON")?;
@@ -68,22 +123,31 @@ async fn search(req: &mut Request, _ctx: &RouteContext<()>) -> Result<Response> 
     if parsed.limit == 0 || parsed.limit > MAX_LIMIT {
         return json_error("limit must be 1..=100", 400);
     }
-    console_log!("ingest search q_len={}", q.len());
-    accepted(serde_json::json!({
-        "stage": "queued",
-        "source": "indexer_search",
-        "status": "not_wired",
-        "hint": "Queue enqueue lands in the next slice; contract is idempotent search-then-parse.",
-    }))
+    if !validate_user_id(&parsed.user_id) {
+        return json_error("user_id must be 1..=128 chars", 400);
+    }
+    let msg = dispatch::build_search_dispatch(&parsed.user_id, q, &parsed.indexer_ref)
+        .map_err(|e| e.to_string());
+    let msg = match msg {
+        Ok(msg) => msg,
+        Err(message) => return json_error(&message, 400),
+    };
+    console_log!("ingest search q_len={} job={}", q.len(), msg.job_id);
+    let queued = try_enqueue(&ctx.env, &msg).await;
+    queued_envelope(&msg, "indexer_search", queued, serde_json::json!({}))
 }
 
-/// Validate an NZB upload; pool probe + verify land in the next slice.
-async fn upload_nzb(req: &mut Request, _ctx: &RouteContext<()>) -> Result<Response> {
+/// Validate an NZB upload and enqueue it; the consumer parses with
+/// `nntune-core`, probes the pool DO, and verifies before matching.
+async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
     let text = req.text().await.unwrap_or_default();
     let parsed: NzbUploadRequest =
         serde_json::from_str(&text).map_err(|_| "body must be NzbUploadRequest JSON")?;
     if parsed.filename.is_empty() || parsed.filename.len() > 255 {
         return json_error("filename must be 1..=255 chars", 400);
+    }
+    if !validate_user_id(&parsed.user_id) {
+        return json_error("user_id must be 1..=128 chars", 400);
     }
     match estimate_nzb(&parsed.nzb_xml) {
         Err(IntakeRejection::Empty) => json_error("nzb_xml must not be empty", 400),
@@ -92,19 +156,28 @@ async fn upload_nzb(req: &mut Request, _ctx: &RouteContext<()>) -> Result<Respon
         Err(IntakeRejection::TooManyFiles) => json_error("nzb has too many files", 413),
         Err(IntakeRejection::TooManySegments) => json_error("nzb has too many segments", 413),
         Ok(est) => {
+            let msg = dispatch::build_upload_dispatch(&parsed.user_id, &parsed.nzb_xml)
+                .map_err(|e| e.to_string());
+            let msg = match msg {
+                Ok(msg) => msg,
+                Err(message) => return json_error(&message, 400),
+            };
             console_log!(
-                "ingest upload files={} segments={}",
+                "ingest upload files={} segments={} job={}",
                 est.file_count,
-                est.segment_count
+                est.segment_count,
+                msg.job_id
             );
-            accepted(serde_json::json!({
-                "stage": "queued",
-                "source": "nzb_upload",
-                "file_count": est.file_count,
-                "segment_count": est.segment_count,
-                "status": "not_wired",
-                "hint": "nntune-core parse + pool probe land in the next slice.",
-            }))
+            let queued = try_enqueue(&ctx.env, &msg).await;
+            queued_envelope(
+                &msg,
+                "nzb_upload",
+                queued,
+                serde_json::json!({
+                    "file_count": est.file_count,
+                    "segment_count": est.segment_count,
+                }),
+            )
         }
     }
 }
@@ -118,7 +191,7 @@ async fn job_status(_req: &Request, ctx: &RouteContext<()>) -> Result<Response> 
     Response::from_json(&serde_json::json!({
         "job_id": id,
         "status": "not_wired",
-        "hint": "Checkpoint reads land with the Queue/Workflow slice.",
+        "hint": "Checkpoint reads land with the Queue consumer; enqueue is live.",
     }))
 }
 
