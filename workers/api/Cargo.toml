@@ -1,0 +1,13 @@
+[package]
+name = "nntune-api"
+version = "0.1.0"
+edition = "2021"
+description = "NNTune v2 API worker (Rust workers-rs): Subsonic-compatible surface backed by PlanetScale + stream worker"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nntune-subsonic = { path = "../../crates/nntune-subsonic" }
+worker = "0.8"

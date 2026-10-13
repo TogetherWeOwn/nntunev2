@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/nntune-subsonic", "workers/api"]
+resolver = "2"

@@ -34,12 +34,56 @@ jobs:
       - run: |
           echo "scaffold card: replace me with real jobs"
 
+  # Subsonic API slice: fmt + clippy + unit/fixture tests on the pure crate,
+  # wasm32 check on the worker shell. Toolchain comes from the runner image
+  # (rustup); no third-party setup actions, so nothing to pin.
+  rust:
+    name: rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy -p nntune-subsonic --all-targets -- -D warnings
+
+      - name: Unit + golden fixture tests
+        run: cargo test -p nntune-subsonic
+
+      - name: Worker shell (wasm32)
+        run: cargo check -p nntune-api --target wasm32-unknown-unknown
+
+  # Dependency-free shape validation of the golden fixtures (python3 is
+  # already required on runners by pr-lint). Byte-exact comparison against
+  # handler output lives in the Rust fixture suite above.
+  fixture-check:
+    name: fixture-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Validate golden fixtures
+        run: python3 scripts/check-subsonic-fixtures.py
+
   # Aggregate required check. Add every real job id to `needs` (and keep
   # `!cancelled()` + `contains(needs.*.result, 'failure')` logic) so ci-ok
   # stays red when any job fails and green only when all succeed.
   ci-ok:
     name: ci-ok
-    needs: [placeholder]
+    needs: [placeholder, rust, fixture-check]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
