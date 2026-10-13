@@ -18,3 +18,5 @@ acknowledge within 5 business days and keep you updated until resolution.
 - Secret scanning + push protection enabled.
 - `gitleaks` full-history scan is a required check on every PR.
 - Dependabot alerts enabled.
+
+<!-- gate-probe: verify ruleset merge blocking -->
