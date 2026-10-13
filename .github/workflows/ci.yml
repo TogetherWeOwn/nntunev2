@@ -1,8 +1,7 @@
 name: ci
 
-# Placeholder CI. The scaffold card replaces the placeholder jobs below with
-# real build/test/lint jobs and adds each new job id to `ci-ok`'s `needs`.
-# `ci-ok` is a required check on main: its NAME must stay `ci-ok`.
+# `ci-ok` is a required check on main: its NAME must stay `ci-ok`, and every
+# real job id must be listed in its `needs`.
 
 on:
   pull_request:
@@ -18,27 +17,51 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  # Placeholder: real jobs (build, test, lint, …) go here as siblings.
-  # Example for the scaffold card:
-  #   build:
-  #     name: build
-  #     runs-on: ubuntu-latest
-  #     steps: [...]
-  # then add `build` to ci-ok's `needs` list.
-  placeholder:
-    name: placeholder
+  rust-test:
+    name: rust test (native)
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     steps:
-      - run: echo "scaffold card: replace me with real jobs"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@f0c1228b8a2e0c71c04a5c6085f8a7b0e8e2db3 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@01d516d182d0e59130757632d4ea53e54336daf5 # v2.8.2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy -p nntune-core --all-targets -- -D warnings
+      - run: cargo test -p nntune-core
+
+  rust-wasm:
+    name: rust check (wasm32)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@f0c1228b8a2e0c71c04a5c6085f8a7b0e8e2db3 # stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@01d516d182d0e59130757632d4ea53e54336daf5 # v2.8.2
+      # Scalar core (no transport features) and the Workers transport build.
+      - run: cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
+      - run: cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features --features worker-transport
+      # The simd128 yEnc fast path must keep compiling (Workers run V8 with
+      # Wasm SIMD; the deploy enables it via this RUSTFLAGS).
+      - run: RUSTFLAGS="-C target-feature=+simd128" cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
 
   # Aggregate required check. Add every real job id to `needs` (and keep
   # `!cancelled()` + `contains(needs.*.result, 'failure')` logic) so ci-ok
   # stays red when any job fails and green only when all succeed.
   ci-ok:
     name: ci-ok
-    needs: [placeholder]
+    needs: [rust-test, rust-wasm]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

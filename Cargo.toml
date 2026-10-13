@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/nntune-core"]
+resolver = "2"
