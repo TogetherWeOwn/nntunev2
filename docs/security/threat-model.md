@@ -59,8 +59,9 @@ stream pool (accounts/auth/vault implementation card).
 | Denial of service | Vault row hammering; KEK-fetch storms | Rate-limit vault writes + test-connection per user (shared store, not in-memory — serverless); test-connection has dial + total timeouts and per-user concurrency cap |
 | Elevation | `test connection` SSRF: user-supplied host/port aimed at internal targets | **SSRF guard (F-VAULT-01):** allowlist scheme/host shape, resolve ALL DNS records, reject loopback/link-local/private/unique-local (v4+v6), forbid redirects, dial timeout; treat provider host as hostile input |
 
-Key rules: KEK rotation must be designed day one (versioned keys, re-wrap job —
-F-VAULT-02); DEK per user, never hard-coded; no credential in Analytics Engine,
+Key rules: KEK rotation is designed day one (versioned keys, dual-read
+decrypt, online re-wrap job — F-VAULT-02, normative design in
+`kek-rotation.md`); DEK per user, never hard-coded; no credential in Analytics Engine,
 KV, R2, Queues payloads, or error bodies.
 
 ## 4. Sessions, passkeys, magic links (STRIDE)
@@ -142,7 +143,7 @@ these paths do. The verdict checks, at the exact PR head:
 | Id | Finding | Card |
 |---|---|---|
 | F-VAULT-01 | `test connection` SSRF guard for user-supplied provider host/port | Paperclip child card (mapping in the threat-model card thread, never pasted here) |
-| F-VAULT-02 | KEK rotation + versioning designed day one (re-wrap job) | Paperclip child card (see above) |
+| F-VAULT-02 | KEK rotation + versioning designed day one (re-wrap job) | Normative design: `kek-rotation.md`; tracking on the Paperclip child card (see above) |
 | F-HYG-01 | Dependabot updates config (alerts ≠ updates) | Paperclip child card (see above) |
 | F-HYG-02 | CI lint banning internal ids/hosts/agent names in public text | Paperclip child card (see above) |
 | F-HYG-03 | PR-template secrets affirmation checkbox | Paperclip child card (see above) |
