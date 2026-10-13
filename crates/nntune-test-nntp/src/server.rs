@@ -1,0 +1,449 @@
+//! Synthetic NNTP server (RFC 3977 subset) for CI.
+//!
+//! Supported commands: `CAPABILITIES`, `MODE READER`, `AUTHINFO USER/PASS`,
+//! `GROUP`, `LIST`, `XOVER`, `ARTICLE`/`BODY`/`HEAD`/`STAT`, `QUIT`.
+//! Anything else is `500`. Responses are CRLF terminated and dot-stuffed.
+//!
+//! Fault injection (all configurable per [`ServerConfig`]):
+//! - per-credential connection caps (`502` + close when exceeded),
+//! - `430` for unknown or explicitly-missing message-IDs,
+//! - `481` on bad credentials,
+//! - throttled ("slow link") article bodies,
+//! - mid-body disconnects (partial write, then TCP reset by close).
+
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+
+use crate::fixtures::Article;
+
+/// Credentials + connection cap for one login.
+#[derive(Clone, Debug)]
+pub struct UserConfig {
+    pub password: String,
+    pub max_connections: usize,
+}
+
+/// Full server configuration. Built by hand or via [`ServerConfig::for_test`].
+#[derive(Clone, Debug)]
+pub struct ServerConfig {
+    pub users: HashMap<String, UserConfig>,
+    pub articles: Vec<Article>,
+    pub group: String,
+    pub require_auth: bool,
+    /// Explicitly-missing IDs: always `430`, even if present in `articles`.
+    pub missing_ids: HashSet<String>,
+    /// Throttle article bodies to this many bytes/sec (None = unthrottled).
+    pub slow_bytes_per_sec: Option<u64>,
+    /// Extra latency before each article response.
+    pub latency_ms: u64,
+    /// Per-message-ID mid-body disconnect: write only N bytes then close.
+    pub drop_after_bytes: HashMap<String, usize>,
+}
+
+impl ServerConfig {
+    /// Default config used by integration tests: two users, full corpus.
+    pub fn for_test() -> Self {
+        let articles = crate::fixtures::default_corpus();
+        let mut users = HashMap::new();
+        users.insert(
+            "testuser".to_string(),
+            UserConfig {
+                password: "testpass".to_string(),
+                max_connections: 2,
+            },
+        );
+        users.insert(
+            "otheruser".to_string(),
+            UserConfig {
+                password: "otherpass".to_string(),
+                max_connections: 8,
+            },
+        );
+        Self {
+            users,
+            articles,
+            group: "alt.binaries.nntune.test".to_string(),
+            require_auth: true,
+            missing_ids: crate::fixtures::always_missing_ids().into_iter().collect(),
+            slow_bytes_per_sec: None,
+            latency_ms: 0,
+            drop_after_bytes: HashMap::new(),
+        }
+    }
+
+    fn find_by_id(&self, id: &str) -> Option<&Article> {
+        let normalized = if id.starts_with('<') {
+            id.to_string()
+        } else {
+            format!("<{id}>")
+        };
+        self.articles.iter().find(|a| a.message_id == normalized)
+    }
+
+    fn find_by_number(&self, n: u32) -> Option<&Article> {
+        self.articles.iter().find(|a| a.number == n)
+    }
+}
+
+struct Shared {
+    config: ServerConfig,
+    /// Active authenticated connections per user.
+    active: Mutex<HashMap<String, usize>>,
+}
+
+/// A running test server. Binds an ephemeral loopback port; `shutdown` on drop.
+pub struct TestNntpServer {
+    addr: SocketAddr,
+    // Held so the accept loop stays alive; aborted on drop.
+    _task: tokio::task::JoinHandle<()>,
+}
+
+impl TestNntpServer {
+    /// Spawn with the default test config.
+    pub async fn spawn_for_test() -> Self {
+        Self::spawn(ServerConfig::for_test()).await
+    }
+
+    /// Spawn with an explicit config.
+    pub async fn spawn(config: ServerConfig) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test nntp");
+        let addr = listener.local_addr().expect("local addr");
+        let task = tokio::spawn(serve(listener, config));
+        Self { addr, _task: task }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+/// Serve forever on an already-bound listener (used by the standalone binary).
+pub async fn serve(listener: TcpListener, config: ServerConfig) {
+    let shared = Arc::new(Shared {
+        config,
+        active: Mutex::new(HashMap::new()),
+    });
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        let shared = Arc::clone(&shared);
+        tokio::spawn(async move {
+            handle_connection(stream, shared).await;
+        });
+    }
+}
+
+async fn handle_connection(stream: TcpStream, shared: Arc<Shared>) {
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader);
+    let mut authed: Option<String> = None;
+    let mut pending_user: Option<String> = None;
+    // Guard released on disconnect so caps are per *concurrent* connection.
+    let mut held_user: Option<String> = None;
+
+    let _ = writer
+        .write_all(b"200 fake-nntp.test NNTune synthetic server ready\r\n")
+        .await;
+
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        let n = match lines.read_line(&mut buf).await {
+            Ok(0) => break, // client closed
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        let _ = n;
+        let line = buf.trim_end_matches(['\r', '\n']).to_string();
+        if line.is_empty() {
+            continue;
+        }
+        let (cmd, arg) = split_cmd(&line);
+
+        match cmd.as_str() {
+            "CAPABILITIES" => {
+                let _ = writer
+                    .write_all(b"101 Capability list follows\r\nVERSION 2\r\nREADER\r\nAUTHINFO USER\r\n.\r\n")
+                    .await;
+            }
+            "MODE" => {
+                let _ = writer.write_all(b"200 Reader mode\r\n").await;
+            }
+            "AUTHINFO" => {
+                let upper = arg.to_ascii_uppercase();
+                if upper.starts_with("USER ") {
+                    let user = arg[5..].trim().to_string();
+                    pending_user = Some(user);
+                    let _ = writer.write_all(b"381 Password required\r\n").await;
+                } else if upper.starts_with("PASS ") {
+                    let pass = arg[5..].trim();
+                    let user = pending_user.clone().unwrap_or_default();
+                    let ok = shared
+                        .config
+                        .users
+                        .get(&user)
+                        .map(|u| u.password == pass)
+                        .unwrap_or(false);
+                    if !ok {
+                        pending_user = None;
+                        let _ = writer.write_all(b"481 Authentication failed\r\n").await;
+                        continue;
+                    }
+                    // Enforce per-credential cap.
+                    let max = shared
+                        .config
+                        .users
+                        .get(&user)
+                        .map(|u| u.max_connections)
+                        .unwrap_or(0);
+                    let mut active = shared.active.lock().await;
+                    let count = active.get(&user).copied().unwrap_or(0);
+                    if count >= max {
+                        drop(active);
+                        let _ = writer
+                            .write_all(b"502 Too many connections for user\r\n")
+                            .await;
+                        break;
+                    }
+                    active.insert(user.clone(), count + 1);
+                    drop(active);
+                    authed = Some(user.clone());
+                    held_user = Some(user);
+                    pending_user = None;
+                    let _ = writer.write_all(b"281 Authentication accepted\r\n").await;
+                } else {
+                    let _ = writer.write_all(b"500 Unknown AUTHINFO variant\r\n").await;
+                }
+            }
+            "GROUP" => {
+                if !check_auth(&shared.config, &authed, &mut writer).await {
+                    continue;
+                }
+                let g = if arg.is_empty() {
+                    shared.config.group.clone()
+                } else {
+                    arg.clone()
+                };
+                let count = shared
+                    .config
+                    .articles
+                    .iter()
+                    .filter(|a| a.group == g)
+                    .count();
+                let (low, high) = shared
+                    .config
+                    .articles
+                    .iter()
+                    .filter(|a| a.group == g)
+                    .map(|a| a.number)
+                    .fold((u32::MAX, 0u32), |(lo, hi), n| (lo.min(n), hi.max(n)));
+                let (low, high) = if count == 0 { (0, 0) } else { (low, high) };
+                let _ = writer
+                    .write_all(format!("211 {count} {low} {high} {g}\r\n").as_bytes())
+                    .await;
+            }
+            "LIST" => {
+                if !check_auth(&shared.config, &authed, &mut writer).await {
+                    continue;
+                }
+                let count = shared.config.articles.len();
+                let _ = writer
+                    .write_all(
+                        format!(
+                            "215 List follows\r\n{} 1 {count} y\r\n.\r\n",
+                            shared.config.group
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+            "XOVER" => {
+                if !check_auth(&shared.config, &authed, &mut writer).await {
+                    continue;
+                }
+                let _ = writer.write_all(b"224 Overview follows\r\n").await;
+                for a in &shared.config.articles {
+                    let overview = format!(
+                        "{}\t{}\t{}\t{}\t{}\t\t0\t0\r\n",
+                        a.number, a.subject, a.from, a.date, a.message_id
+                    );
+                    let _ = writer.write_all(overview.as_bytes()).await;
+                }
+                let _ = writer.write_all(b".\r\n").await;
+            }
+            "ARTICLE" | "BODY" | "HEAD" | "STAT" => {
+                if !check_auth(&shared.config, &authed, &mut writer).await {
+                    continue;
+                }
+                let article = if arg.starts_with('<') {
+                    shared.config.find_by_id(&arg)
+                } else if let Ok(n) = arg.parse::<u32>() {
+                    shared.config.find_by_number(n)
+                } else if arg.is_empty() {
+                    None
+                } else {
+                    shared.config.find_by_id(&arg)
+                };
+                let Some(article) = article else {
+                    let _ = writer.write_all(b"430 No such article\r\n").await;
+                    continue;
+                };
+                if shared.config.missing_ids.contains(&article.message_id) {
+                    let _ = writer.write_all(b"430 No such article\r\n").await;
+                    continue;
+                }
+                if shared.config.latency_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(shared.config.latency_ms)).await;
+                }
+                let code = match cmd.as_str() {
+                    "ARTICLE" => 220,
+                    "BODY" => 222,
+                    "HEAD" => 221,
+                    _ => 223,
+                };
+                let head_end = find_header_end(&article.raw);
+                let payload: &[u8] = match cmd.as_str() {
+                    "BODY" => &article.raw[head_end..],
+                    "HEAD" => &article.raw[..head_end],
+                    _ => &article.raw,
+                };
+                let header_line = format!("{code} {} {}\r\n", article.number, article.message_id);
+                // Mid-body disconnect: partial write then abrupt close.
+                if let Some(&cut) = shared.config.drop_after_bytes.get(&article.message_id) {
+                    let _ = writer.write_all(header_line.as_bytes()).await;
+                    let cut = cut.min(payload.len());
+                    let _ = writer.write_all(&payload[..cut]).await;
+                    break;
+                }
+                let _ = writer.write_all(header_line.as_bytes()).await;
+                if cmd.as_str() == "STAT" {
+                    continue;
+                }
+                if let Some(bps) = shared.config.slow_bytes_per_sec {
+                    write_throttled(&mut writer, payload, bps).await;
+                } else {
+                    let stuffed = dot_stuff(payload);
+                    let _ = writer.write_all(&stuffed).await;
+                }
+                let _ = writer.write_all(b".\r\n").await;
+            }
+            "QUIT" => {
+                let _ = writer.write_all(b"205 Bye\r\n").await;
+                break;
+            }
+            _ => {
+                let _ = writer.write_all(b"500 Unknown command\r\n").await;
+            }
+        }
+    }
+
+    // Release the per-user slot.
+    if let Some(user) = held_user {
+        let mut active = shared.active.lock().await;
+        if let Some(c) = active.get_mut(&user) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                active.remove(&user);
+            }
+        }
+    }
+}
+
+async fn check_auth(
+    config: &ServerConfig,
+    authed: &Option<String>,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> bool {
+    if config.require_auth && authed.is_none() {
+        let _ = writer.write_all(b"481 Authentication required\r\n").await;
+        return false;
+    }
+    true
+}
+
+fn split_cmd(line: &str) -> (String, String) {
+    match line.find(' ') {
+        Some(i) => (
+            line[..i].to_ascii_uppercase(),
+            line[i + 1..].trim().to_string(),
+        ),
+        None => (line.to_ascii_uppercase(), String::new()),
+    }
+}
+
+fn find_header_end(raw: &[u8]) -> usize {
+    for i in 0..raw.len().saturating_sub(3) {
+        if &raw[i..i + 4] == b"\r\n\r\n" {
+            return i + 4;
+        }
+    }
+    raw.len()
+}
+
+/// Dot-stuff (byte-oriented): prefix any CRLF-delimited line starting with
+/// `.` with an extra `.`. Never decodes the payload as UTF-8 — yEnc bodies
+/// are arbitrary bytes and `from_utf8_lossy` would corrupt them.
+fn dot_stuff(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 16);
+    let mut start = 0usize;
+    loop {
+        let rel = find_crlf(&data[start..]);
+        match rel {
+            Some(pos) => {
+                let line = &data[start..start + pos];
+                if line.first() == Some(&b'.') {
+                    out.push(b'.');
+                }
+                out.extend_from_slice(line);
+                out.extend_from_slice(b"\r\n");
+                start += pos + 2;
+            }
+            None => {
+                let line = &data[start..];
+                if !line.is_empty() {
+                    if line.first() == Some(&b'.') {
+                        out.push(b'.');
+                    }
+                    out.extend_from_slice(line);
+                    out.extend_from_slice(b"\r\n");
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn find_crlf(data: &[u8]) -> Option<usize> {
+    data.windows(2).position(|w| w == b"\r\n")
+}
+
+async fn write_throttled(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    data: &[u8],
+    bytes_per_sec: u64,
+) {
+    let bps = bytes_per_sec.max(1) as usize;
+    let stuffed = dot_stuff(data);
+    let mut offset = 0;
+    while offset < stuffed.len() {
+        let end = (offset + bps).min(stuffed.len());
+        if writer.write_all(&stuffed[offset..end]).await.is_err() {
+            break;
+        }
+        offset = end;
+        if offset < stuffed.len() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+}
