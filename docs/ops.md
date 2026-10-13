@@ -23,12 +23,22 @@ The provisioned layout is **one bucket per concern per environment**, not one
 shared bucket. Object key prefixes describe cache scope *within* those buckets;
 they do not replace the environment boundary. Worker configs and cache/MusicBrainz
 ADRs must use the exact names below. There is no bucket named `nntunev2-art`.
-Alignment is **not yet complete** on the sibling branches: the cache ADR in
-[PR #2](https://github.com/TogetherWeOwn/nntunev2/pull/2), MB docs/example in
-[PR #4](https://github.com/TogetherWeOwn/nntunev2/pull/4), and scaffold configs in
-[PR #14](https://github.com/TogetherWeOwn/nntunev2/pull/14) require their owners'
-coordinated corrections. This runbook does not change those branches or choose
-where the cache ADR's `tmp/` scratch prefix will live.
+Alignment is **not yet complete** on the sibling branches. Known integration
+prerequisites identified across the provisioning review rounds:
+
+| Owning PR | Required reconciliation |
+|---|---|
+| [#2](https://github.com/TogetherWeOwn/nntunev2/pull/2), cache ADR | Physical audio/art buckets are separate per environment; prefixes live inside them. |
+| [#4](https://github.com/TogetherWeOwn/nntunev2/pull/4), MB docs/example | Replace nonexistent `nntunev2-art` with the appropriate art bucket below. |
+| [#14](https://github.com/TogetherWeOwn/nntunev2/pull/14), scaffold | Replace placeholders only when activating the correct consumer bindings. |
+| [#8](https://github.com/TogetherWeOwn/nntunev2/pull/8), stream | `workers/stream/wrangler.toml` uses `nntune-audio-cache` without environment sections; bind `AUDIO_CACHE` to `nntunev2-audio-staging` / `nntunev2-audio-prod`. |
+| [#10](https://github.com/TogetherWeOwn/nntunev2/pull/10), ingest | Both producer and consumer in `workers/ingest/wrangler.toml.example` use `nntune-ingest-jobs`; use `nntunev2-ingest-staging` / `nntunev2-ingest-prod`. |
+| [#11](https://github.com/TogetherWeOwn/nntunev2/pull/11), E2E | Supply the two pending Access client secrets before enabling the staging URL; see the Access section. |
+
+Their owners must coordinate these fixes at the next permitted review round and
+recheck actual bindings before deployment. This runbook does not change those
+branches, certify a deploy, or choose where the cache ADR's `tmp/` scratch prefix
+will live. Archive buckets are not implicitly scratch storage.
 
 | Bucket | Env | Intended consumer |
 |---|---|---|
@@ -97,6 +107,14 @@ only; preserve the v1 hostname and any later Worker-owned record.
 - Created by the host executor; app metadata and both policy types independently
   GET-verified on 2026-10-13. This is configuration verification, not an end-to-end
   login or staging application smoke test.
+- **E2E wiring is pending:** [PR #11](https://github.com/TogetherWeOwn/nntunev2/pull/11)
+  consumes `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET`. Neither name is
+  present in the repository-secret inventory checked on 2026-10-13. Referencing
+  the QA token's resource ID above does not provide its client credentials.
+  Before enabling `STAGING_BASE_URL` for that workflow, its owner must arrange
+  authorized secure injection and verify both credentials are available to the
+  job. Do not bypass Access, publish values, or rotate the shared token for this
+  docs correction; credential distribution remains a separate gated operation.
 
 UNDO: delete only this Access app during authorized decommissioning. Do not delete
 or rotate the shared QA service token, and never remove the gate from a live app.
@@ -119,81 +137,104 @@ authorized decommissioning, after removing dependent deploy workflows.
 
 ## PlanetScale Postgres
 
-Host executor completion and cost-cut records on 2026-10-13 establish the layout
-below. PlanetScale sizing and SQL connectivity are host-reported, not an
-independent operator database check. Existing TWO databases were not touched.
+The host executor's **2026-10-13 ~19:40Z consolidation receipt supersedes** the
+original separate staging branch and the earlier PS-10/PS-40 allocations.
+Sizing, billing, branch deletion, and SQL privilege tests below are host-reported,
+not independently checked against PlanetScale by this documentation update.
+Existing TWO databases were not touched.
 
-- Organization: `togetherweown`; region: AWS `us-east-1`; Postgres `18.6`.
-- `nntunev2` / `main`: production **PS-10 ARM**, 2 replicas.
-- `nntunev2` / `staging`: non-production **PS-DEV**.
-- `nntunev2-mb` / `main`: MusicBrainz mirror, production **PS-10 ARM**, 2 replicas.
-  The earlier PS-40 allocation was superseded by the completed cost cut.
-- MB storage autoscale: gp3, 10 GB–4 TB. The ~100 GB import is a capacity target,
-  not already-imported data; host reported the DB was approximately 7 MB at resize.
-- Monthly cluster compute: **$60** ($30 app main + $0 staging + $30 MB).
-  Metered storage, backups, and egress are additional; $60 is not an all-in bill.
-- MB compute after resize: 1/8 CPU + 1 GB RAM (previously 1/2 CPU + 4 GB).
-  Expect a slower import and fewer available connections. Before import/deploy,
-  its owner must reconcile Worker/Hyperdrive pool limits with the actual branch
-  connection allowance; do not assume the prior PS-40 import throughput.
+- Organization: `togetherweown`; region: AWS `us-east-1`; Postgres `18.6` as
+  recorded at initial provisioning.
+- `nntunev2` / `main`: shared **PS-5 single-node** cluster. Staging now uses the
+  PostgreSQL database **`nntunev2_staging`** on this branch, not a separate branch.
+- The separate PlanetScale `staging` branch was deleted by the host executor.
+  The host reports it was empty (zero tables) and required no data migration;
+  this update did not independently inventory schema objects. The latest receipt records
+  that removed PS-DEV branch as $5/month, correcting the earlier $0 statement.
+- `nntunev2-mb` / `main`: separate MusicBrainz cluster, now reported as $5/month
+  compute. The latest receipt does not specify its final SKU/replica count;
+  do not carry forward the earlier PS-10 CPU/RAM/HA claims as current facts.
+- Monthly cluster compute: **$10** ($5 app main, including staging, + $5 MB).
+  Metered storage, backups, and egress are additional; $10 is not an all-in bill.
+- The ~100 GB MB import remains a capacity target, not already-imported data.
+  Initial storage was gp3 autoscale 10 GB–4 TB; verify current storage, connection
+  allowance, and import performance on the reduced allocation before importing.
+- **Launch remains gated:** prod will get its own clean PostgreSQL database on
+  the main cluster, with resize/split assessed then. The current prod Hyperdrive
+  still targets `postgres`; it is not evidence that the clean launch database
+  has been created or approved for migration. Do not enable the production app
+  binding or write application data to this current `postgres` target. Before
+  launch use, the authorized workflow must create the clean database, apply and
+  re-test its grants/isolation, and verify the prod config is repointed to it.
 
 ### Database roles and migrator wiring
 
-| Database / branch | Named roles |
-|---|---|
-| `nntunev2` / `main` | `nntunev2-migrator-main`, `nntunev2-runtime-main`, `nntunev2-ro-main` |
-| `nntunev2` / `staging` | `nntunev2-migrator-staging`, `nntunev2-runtime-staging`, `nntunev2-ro-staging` |
-| `nntunev2-mb` / `main` | `nntunev2-mb-migrator-main`, `nntunev2-mb-runtime-main`, `nntunev2-mb-ro-main` |
+The latest host receipt reports database-level app isolation: staging roles
+cannot CONNECT to the prod database and prod roles cannot CONNECT to staging;
+negative cross-connect tests returned `permission denied`. It also reports
+runtime = CRUD without DDL, read-only = SELECT only, and migrator owns schema
+`public`. These are **host-tested app-role properties**, not fresh SQL tests by
+this documentation update, nor evidence of separate compute/failure domains.
 
-These were created as plain PlanetScale BranchRoles. **Names alone do not enforce
-runtime/read-only SQL privileges.** The migration owner must apply and verify the
-application-level GRANT/REVOKE role matrix before application use. No claim of
-completed least-privilege enforcement is made here.
-
-- Host recorded nine URL files in secure credential storage with mode `0600`.
-  They are not present in the operator's local secure-drop view; do not copy them
-  into this repo, issue text, or logs.
-- Repo secret `PLANETSCALE_MIGRATOR_URL_STAGING` set at `18:59:43Z`;
-  name/update-time metadata independently re-listed.
+- Staging uses new runtime/migrator roles for `nntunev2_staging` on `main`.
+  The old staging-branch role names and URL-file inventory are superseded;
+  use the authorized secure wiring, not credentials from the deleted branch.
+  Exact replacement role names were not included in the receipt, and this
+  update does not attest to old credential revocation or secure-store retirement.
+- Repo secret `PLANETSCALE_MIGRATOR_URL_STAGING` was updated to the new migrator
+  URL. GitHub name/update-time metadata was independently re-listed:
+  **2026-10-13 `19:37:40Z`**. No secret value was read.
 - **Production migrator secret intentionally not set.** Its deployment remains
   deferred to the gated production workflow. This is not a missing-credentials
-  blocker and does not authorize a production migration.
-- Host reported 7/7 tested NNTune roles passed `select 1` after the resize.
-  Nine roles were created; this is not a claim that all nine were retested.
-  The seven-role subset was not identified in the report; do not assume it covers
-  every production runtime/read-only role. SQL role-matrix verification remains
-  an application-use prerequisite.
+  blocker and does not authorize a production migration or creation of the
+  clean launch database.
+- The migration owner must preserve and re-test the role matrix as schemas and
+  tables are added and whenever the clean launch database is created, including
+  default privileges, runtime DDL denial, read-only
+  write denial, and bidirectional cross-database CONNECT denial. The earlier
+  seven-role `select 1` probe predates consolidation and is not current proof.
+- MB migrator/runtime/read-only roles were provisioned separately. The latest
+  app-isolation receipt does not prove MB read-only enforcement; verify MB grants
+  before application use. Never copy database URLs into this repo, issues, or logs.
 
 ### Hyperdrive bindings
 
-| Config | ID / GitHub variable | Origin role | Intended binding |
+| Config | ID / GitHub variable | Current PostgreSQL database | Intended binding |
 |---|---|---|---|
-| `nntunev2-staging` | `61c87403f119430bbc3a7f571df47002` / `HYPERDRIVE_ID_STAGING` | `nntunev2-runtime-staging` | staging app relational data |
-| `nntunev2-prod` | `d38a229748f6452bb417c6d33d277a8d` / `HYPERDRIVE_ID_PROD` | `nntunev2-runtime-main` | prod app relational data |
-| `nntunev2-mb` | `1c6460d5112448888031973c87f671bc` / `HYPERDRIVE_ID_MB` | `nntunev2-mb-ro-main` | shared read-oriented MB mirror |
+| `nntunev2-staging` | `61c87403f119430bbc3a7f571df47002` / `HYPERDRIVE_ID_STAGING` | `nntunev2_staging` on app `main` | staging app, new runtime role (host-reported) |
+| `nntunev2-prod` | `d38a229748f6452bb417c6d33d277a8d` / `HYPERDRIVE_ID_PROD` | `postgres` on app `main` | reserved prod app; clean launch DB deferred |
+| `nntunev2-mb` | `1c6460d5112448888031973c87f671bc` / `HYPERDRIVE_ID_MB` | `postgres` on MB `main` | shared read-oriented MB mirror |
+
+All three configs independently GET-resolved on 2026-10-13 after consolidation.
+IDs are unchanged and match the repo variables set at `18:59:44Z`. Staging's
+config was modified at `19:37:25Z`; its database is `nntunev2_staging`. Prod and MB
+metadata retain their original `18:58:55Z` and `18:58:57Z` modification times. Fresh
+metadata confirms app staging/prod share an origin host but use different origin
+users and databases. A metadata GET is not an ongoing SQL connectivity or
+privilege test; no hostnames, usernames, or credentials need publishing here.
 
 There are **three** configs, not separate MB staging/prod configs. The MB origin
-role choice is host-reported and still subject to the SQL role matrix above.
-The MB import uses its migrator role, not this read-oriented binding.
-Staging and prod MB reads share this one config and PS-10 origin: load, cache
-behavior, and outages are coupled. The import also competes on that same MB
-branch's connection/compute allowance, even though it uses a separate role.
-The app staging/prod Hyperdrive configs target their own app branches, not MB.
+uses its read-only role per the original host receipt, subject to the MB grant
+check above. The MB import uses its migrator role, not this read-oriented binding.
+Staging and prod MB reads share one MB config/cluster: load, cache behavior, and
+outages are coupled. The import competes for that same MB connection/compute
+allowance even though it uses a separate role.
 
-All three configs independently GET-resolved on 2026-10-13; IDs match the repo
-variables set at `18:59:44Z`. All currently report caching enabled and
-`origin_connection_limit = 60`. Application owners must account for query-cache
-freshness and branch connection limits before deploying or starting the import.
-Creation-time origin connectivity was verified by the host executor; a metadata
-GET is not an ongoing SQL connectivity check.
+All three configs still report caching enabled and `origin_connection_limit = 60`.
+The two app pools now share one PS-5 single-node cluster, alongside direct
+migrator/admin connections; they do **not** have independent branch allowances.
+Before deploy/import, the owning lanes must validate the combined connection
+budget and cache freshness against the actual origin limits. Database CONNECT
+isolation does not isolate CPU, connections, storage/I/O, maintenance, or outages, and the
+app single-node allocation must not be described as highly available.
 
-UNDO: during authorized decommissioning, unbind consumers and remove the three
-Hyperdrive configs and corresponding repo variables, then revoke new roles and
-remove DBs only under the backup/data-retention approval gate. Never delete
-`main` data to reconcile docs. To undo the MB compute cost cut, the privileged
-executor would PATCH the MB main branch changes endpoint with
-`{"cluster_size":"PS_40_AWS_ARM"}`; this raises spend and is **not authorized**
-by this runbook. Credentials/hosts remained unchanged by the resize.
+UNDO: consolidation is not reversed by reusing the deleted branch's URLs or by
+blindly restoring the old PS-40 resize command. The authorized host executor's
+consolidation receipt records per-step rollback; consult it with current data,
+backup/retention requirements, credential-version fences, and spend authority.
+No resize, split, role change, branch recreation, deletion, or credential rotation
+is authorized here. Decommissioning would require consumer removal and the
+applicable data-retention gate before deleting configs, roles, or databases.
 
 ## Environments matrix
 
@@ -208,6 +249,6 @@ Binding names are chosen in Worker configs; resource names must match this table
 | Config KV | `nntunev2-config-staging` | `nntunev2-config-prod` |
 | Hostname | `v2-staging.nntune.com` (+ Access; deployment pending) | TBD at launch |
 | App Hyperdrive variable | `HYPERDRIVE_ID_STAGING` | `HYPERDRIVE_ID_PROD` |
-| App PlanetScale branch | `nntunev2` / `staging` | `nntunev2` / `main` |
+| App PlanetScale branch / PostgreSQL database | `nntunev2` / `main` / `nntunev2_staging` | same `main` cluster / currently `postgres`; clean launch DB deferred |
 | MB Hyperdrive variable | `HYPERDRIVE_ID_MB` (shared mirror) | `HYPERDRIVE_ID_MB` (shared mirror) |
 | Migration secret | `PLANETSCALE_MIGRATOR_URL_STAGING` | intentionally deferred to gated workflow |
