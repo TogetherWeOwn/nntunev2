@@ -1,0 +1,23 @@
+# Copy to wrangler.toml and fill in IDs. Never commit the real file:
+# secrets live only in Cloudflare (Worker secrets / Hyperdrive) and CI secrets.
+name = "nntune-api"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+
+[vars]
+# Public, non-secret config only.
+RP_ID = "example.com"
+RP_ORIGIN = "https://example.com"
+SESSION_TTL_SECS = "86400"
+
+# Hyperdrive binding for PlanetScale Postgres (ID filled per environment).
+# [[hyperdrive]]
+# binding = "HYPERDRIVE"
+# id = "<fill in staging/prod id>"
+
+# Secrets (set with `wrangler secret put`, never here):
+#   VAULT_KEK_BASE64        32-byte KEK, base64 (versioned; rotate via rewrap job)
+#   VAULT_KEK_VERSION       integer version matching the KEK
+#   SESSION_SECRET_BASE64   HMAC secret for session cookies
+#   MAGIC_LINK_SECRET_BASE64  HMAC secret for magic-link signing (if used)
+#   EMAIL_API_KEY           transactional email provider key

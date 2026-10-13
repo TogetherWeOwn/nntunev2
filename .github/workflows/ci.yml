@@ -34,12 +34,27 @@ jobs:
       - run: |
           echo "scaffold card: replace me with real jobs"
 
+  api:
+    name: api
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo test --manifest-path workers/api/Cargo.toml --all-targets
+      - run: cargo clippy --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
+      - run: cargo fmt --manifest-path workers/api/Cargo.toml -- --check
+
   # Aggregate required check. Add every real job id to `needs` (and keep
   # `!cancelled()` + `contains(needs.*.result, 'failure')` logic) so ci-ok
   # stays red when any job fails and green only when all succeed.
   ci-ok:
     name: ci-ok
-    needs: [placeholder]
+    needs: [placeholder, api]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
