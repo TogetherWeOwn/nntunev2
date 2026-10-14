@@ -12,19 +12,27 @@
 use sha2::{Digest, Sha256};
 
 use crate::jobs::{derive_idempotency_key, JobSource, JobState};
+use crate::newznab::{MAX_CATEGORIES, MAX_LIMIT, MAX_PAGE};
 use crate::nzb_intake::estimate_nzb;
 use crate::queue::{validate_indexer_ref, QueueMsg};
 
 /// Queue binding name: must match `[[queues.producers]]` in
 /// `wrangler.toml.example`.
 pub const INGEST_QUEUE_BINDING: &str = "INGEST_QUEUE";
-/// Queue name: must match `[[queues.consumers]]` in `wrangler.toml.example`.
+/// Queue name: must match `[[queues.producers]]` in `wrangler.toml.example`.
+/// (The consumer entry stays commented out there until the Queue handler and
+/// its dead-letter queue land.)
 pub const INGEST_QUEUE_NAME: &str = "nntune-ingest-jobs";
+/// KV binding holding uploaded NZB bytes keyed by [`payload_ref`](QueueMsg::payload_ref).
+pub const PAYLOAD_KV_BINDING: &str = "INGEST_PAYLOADS";
+/// Prefix for content-addressed upload payload keys (`nzb:sha256:<hex>`).
+pub const PAYLOAD_KEY_PREFIX: &str = "nzb:sha256:";
 
-/// Self-asserted user handles are 1..=128 chars; the accounts card replaces
-/// this with the authenticated subject without changing the key format.
+/// Self-asserted user handles are 1..=128 chars without `:` (the idempotency
+/// key delimiter); the accounts card replaces this with the authenticated
+/// subject without changing the key format.
 pub fn validate_user_id(raw: &str) -> bool {
-    !raw.is_empty() && raw.len() <= 128
+    !raw.is_empty() && raw.len() <= 128 && !raw.contains(':') && !raw.contains('\0')
 }
 
 /// Lowercase sha256 hex of canonical content bytes.
@@ -55,7 +63,7 @@ fn dispatch(
     source: JobSource,
 ) -> Result<QueueMsg, &'static str> {
     if !validate_user_id(user_id) {
-        return Err("user id must be 1..=128 chars");
+        return Err("user id must be 1..=128 chars without ':'");
     }
     let idempotency_key = derive_idempotency_key(user_id, content_sha, source_ref)?;
     Ok(QueueMsg {
@@ -65,18 +73,33 @@ fn dispatch(
         source,
         state: JobState::Queued,
         attempt: 1,
+        repair_rounds: 0,
+        query: None,
+        indexer_ref: None,
+        categories: vec![],
+        limit: None,
+        page: None,
+        payload_ref: None,
     })
 }
 
 /// Build the enqueue message for `POST /v1/ingest/search`.
 ///
+/// The message carries the full search input (query, indexer handle,
+/// categories, limit, page) so the consumer can run it with no second fetch.
+/// The idempotency key and job id bind *all* of those: page 1 and page 2 of
+/// one query — or one query in different categories — are different jobs.
+///
 /// The GUID is unknown until the workflow's `Searching` step runs, so the
-/// source ref binds the indexer handle; the workflow re-keys on the GUID
-/// before `Parsing`.
+/// source ref binds the indexer handle plus the request parameters (in
+/// colon-free form); the workflow re-keys on the GUID before `Parsing`.
 pub fn build_search_dispatch(
     user_id: &str,
     query: &str,
     indexer_ref: &str,
+    categories: &[u32],
+    limit: u32,
+    page: u32,
 ) -> Result<QueueMsg, &'static str> {
     let q = query.trim();
     if q.is_empty() || q.len() > 200 {
@@ -85,24 +108,51 @@ pub fn build_search_dispatch(
     if !validate_indexer_ref(indexer_ref) {
         return Err("indexer_ref must be a vault handle");
     }
-    let canonical = format!("search:{indexer_ref}:{q}");
+    if categories.len() > MAX_CATEGORIES {
+        return Err("too many categories (max 16)");
+    }
+    if limit == 0 || limit > MAX_LIMIT {
+        return Err("limit must be 1..=100");
+    }
+    if page > MAX_PAGE {
+        return Err("page out of range");
+    }
+    // Order-independent: the same set in a different order is the same job.
+    let mut cats = categories.to_vec();
+    cats.sort_unstable();
+    let cats_str = cats
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let canonical = format!("search:{indexer_ref}:{q}:cats={cats_str}:limit={limit}:page={page}");
     let sha = content_sha256_hex(canonical.as_bytes());
-    dispatch(
-        user_id,
-        &sha,
-        &format!("search:{indexer_ref}"),
-        JobSource::IndexerSearch,
-    )
+    let source_ref = format!("search/{indexer_ref}/p{page}l{limit}/c{cats_str}");
+    if source_ref.len() > 512 {
+        return Err("source ref must be 1..=512 chars");
+    }
+    let mut msg = dispatch(user_id, &sha, &source_ref, JobSource::IndexerSearch)?;
+    msg.query = Some(q.to_string());
+    msg.indexer_ref = Some(indexer_ref.to_string());
+    msg.categories = cats;
+    msg.limit = Some(limit);
+    msg.page = Some(page);
+    Ok(msg)
 }
 
 /// Build the enqueue message for `POST /v1/ingest/nzb`.
 ///
 /// Runs the intake guard first so oversize/non-NZB bytes never reach the
-/// Queue, let alone provider connections.
+/// Queue, let alone provider connections. The message carries a
+/// content-addressed [`payload_ref`](QueueMsg::payload_ref); the route
+/// writes the bytes to the payload KV under that key before enqueueing
+/// (the bytes cannot ride in the Queue message: 2 MiB vs the 128 KB limit).
 pub fn build_upload_dispatch(user_id: &str, nzb_xml: &str) -> Result<QueueMsg, &'static str> {
     estimate_nzb(nzb_xml).map_err(|_| "nzb_xml failed the intake guard")?;
     let sha = content_sha256_hex(nzb_xml.as_bytes());
-    dispatch(user_id, &sha, "upload", JobSource::NzbUpload)
+    let mut msg = dispatch(user_id, &sha, "upload", JobSource::NzbUpload)?;
+    msg.payload_ref = Some(format!("{PAYLOAD_KEY_PREFIX}{sha}"));
+    Ok(msg)
 }
 
 #[cfg(test)]
@@ -112,35 +162,74 @@ mod tests {
     const USER: &str = "user_01";
     const INDEXER: &str = "vault_idx_01-ab";
 
+    fn search(user: &str, query: &str, indexer: &str) -> QueueMsg {
+        build_search_dispatch(user, query, indexer, &[], 25, 0).unwrap()
+    }
+
     #[test]
     fn search_dispatch_binds_user_content_and_indexer() {
-        let a = build_search_dispatch(USER, "dark side", INDEXER).unwrap();
-        let b = build_search_dispatch(USER, "dark side", INDEXER).unwrap();
+        let a = search(USER, "dark side", INDEXER);
+        let b = search(USER, "dark side", INDEXER);
         assert_eq!(a, b);
         assert!(a.idempotency_key.starts_with("ingest:user_01:"));
         assert!(a.job_id.starts_with("job_"));
         assert_eq!(a.state, crate::jobs::JobState::Queued);
         assert_eq!(a.attempt, 1);
         assert_eq!(a.source, crate::jobs::JobSource::IndexerSearch);
+        // The consumer can run the job from the message alone.
+        assert_eq!(a.query.as_deref(), Some("dark side"));
+        assert_eq!(a.indexer_ref.as_deref(), Some(INDEXER));
+        assert_eq!((a.limit, a.page), (Some(25), Some(0)));
+        assert!(a.payload_ref.is_none());
     }
 
     #[test]
     fn search_dispatch_separates_users_and_queries() {
-        let a = build_search_dispatch(USER, "dark side", INDEXER).unwrap();
-        let other_user = build_search_dispatch("user_02", "dark side", INDEXER).unwrap();
-        let other_query = build_search_dispatch(USER, "kind of blue", INDEXER).unwrap();
+        let a = search(USER, "dark side", INDEXER);
+        let other_user = search("user_02", "dark side", INDEXER);
+        let other_query = search(USER, "kind of blue", INDEXER);
         assert_ne!(a.idempotency_key, other_user.idempotency_key);
         assert_ne!(a.idempotency_key, other_query.idempotency_key);
         assert_ne!(a.job_id, other_user.job_id);
     }
 
     #[test]
+    fn search_dispatch_separates_pages_categories_and_limits() {
+        // Same query, different page: different jobs (no silent drop after
+        // the first request). Same for categories and limit.
+        let p0 = build_search_dispatch(USER, "dark side", INDEXER, &[], 25, 0).unwrap();
+        let p1 = build_search_dispatch(USER, "dark side", INDEXER, &[], 25, 1).unwrap();
+        assert_ne!(p0.idempotency_key, p1.idempotency_key);
+        assert_ne!(p0.job_id, p1.job_id);
+        let c0 = build_search_dispatch(USER, "dark side", INDEXER, &[], 25, 0).unwrap();
+        let c1 = build_search_dispatch(USER, "dark side", INDEXER, &[3000], 25, 0).unwrap();
+        assert_ne!(c0.idempotency_key, c1.idempotency_key);
+        let l0 = build_search_dispatch(USER, "dark side", INDEXER, &[], 25, 0).unwrap();
+        let l1 = build_search_dispatch(USER, "dark side", INDEXER, &[], 50, 0).unwrap();
+        assert_ne!(l0.idempotency_key, l1.idempotency_key);
+        // Category order is irrelevant: same set, same job.
+        let o1 = build_search_dispatch(USER, "q", INDEXER, &[3040, 3000], 10, 0).unwrap();
+        let o2 = build_search_dispatch(USER, "q", INDEXER, &[3000, 3040], 10, 0).unwrap();
+        assert_eq!(o1, o2);
+    }
+
+    #[test]
     fn search_dispatch_rejects_bad_inputs() {
-        assert!(build_search_dispatch("", "q", INDEXER).is_err());
-        assert!(build_search_dispatch(USER, "", INDEXER).is_err());
-        assert!(build_search_dispatch(USER, &"x".repeat(201), INDEXER).is_err());
-        assert!(build_search_dispatch(USER, "q", "https://indexer.example?apikey=x").is_err());
-        assert!(build_search_dispatch(USER, "q", "").is_err());
+        let bad_user = |u: &str| build_search_dispatch(u, "q", INDEXER, &[], 10, 0).is_err();
+        assert!(bad_user(""));
+        assert!(build_search_dispatch(USER, "", INDEXER, &[], 10, 0).is_err());
+        assert!(build_search_dispatch(USER, &"x".repeat(201), INDEXER, &[], 10, 0).is_err());
+        assert!(
+            build_search_dispatch(USER, "q", "https://indexer.example?apikey=x", &[], 10, 0)
+                .is_err()
+        );
+        assert!(build_search_dispatch(USER, "q", "", &[], 10, 0).is_err());
+        assert!(build_search_dispatch(USER, "q", INDEXER, &[0; 17], 10, 0).is_err());
+        assert!(build_search_dispatch(USER, "q", INDEXER, &[], 0, 0).is_err());
+        assert!(build_search_dispatch(USER, "q", INDEXER, &[], 101, 0).is_err());
+        assert!(build_search_dispatch(USER, "q", INDEXER, &[], 10, 101).is_err());
+        // ':' would collide idempotency fields.
+        assert!(bad_user("user:01"));
     }
 
     #[test]
@@ -152,6 +241,11 @@ mod tests {
         assert_eq!(a.source, crate::jobs::JobSource::NzbUpload);
         assert!(a.idempotency_key.starts_with("ingest:user_01:"));
         assert!(a.idempotency_key.ends_with(":upload"));
+        // Content-addressed payload handle for the route's KV write; the
+        // search input stays empty on upload jobs.
+        let payload = a.payload_ref.expect("upload must carry a payload ref");
+        assert!(payload.starts_with(PAYLOAD_KEY_PREFIX));
+        assert!(a.query.is_none());
     }
 
     #[test]
@@ -176,5 +270,6 @@ mod tests {
     fn binding_names_match_wrangler_example() {
         assert_eq!(INGEST_QUEUE_BINDING, "INGEST_QUEUE");
         assert_eq!(INGEST_QUEUE_NAME, "nntune-ingest-jobs");
+        assert_eq!(PAYLOAD_KV_BINDING, "INGEST_PAYLOADS");
     }
 }

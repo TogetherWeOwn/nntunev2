@@ -17,6 +17,14 @@ pub const WORKFLOW_STEPS: [&str; 7] = [
 ];
 
 /// One unit of ingest work on the Queue.
+///
+/// The message carries everything the consumer needs to run the job: search
+/// jobs embed their parameters, upload jobs carry a content-addressed handle
+/// for the NZB bytes. The bytes themselves (up to 2 MiB) far exceed the
+/// 128 KB Queue message limit, so they never ride inline — the route writes
+/// them to the payload KV under [`payload_ref`](QueueMsg::payload_ref) before
+/// enqueueing. Fields added after slice 2 are `#[serde(default)]` so
+/// messages enqueued before them still deserialize.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueMsg {
     pub job_id: String,
@@ -25,6 +33,27 @@ pub struct QueueMsg {
     pub source: JobSource,
     pub state: JobState,
     pub attempt: u32,
+    /// Repair rounds started (see `jobs::MAX_REPAIR_ROUNDS`).
+    #[serde(default)]
+    pub repair_rounds: u32,
+    /// Search input for `IndexerSearch` jobs (the trimmed query).
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Vault handle of the BYO indexer for `IndexerSearch` jobs.
+    #[serde(default)]
+    pub indexer_ref: Option<String>,
+    /// Requested Newznab categories (capped, sorted so the same set is one job).
+    #[serde(default)]
+    pub categories: Vec<u32>,
+    /// Requested page size / page for `IndexerSearch` jobs.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub page: Option<u32>,
+    /// Content-addressed handle (`nzb:sha256:<hex>`) for the uploaded NZB
+    /// bytes of `NzbUpload` jobs, as stored in the payload KV.
+    #[serde(default)]
+    pub payload_ref: Option<String>,
 }
 
 /// Native par2 repair dispatched to the Container batch job.
@@ -115,9 +144,35 @@ mod tests {
             source: JobSource::NzbUpload,
             state: JobState::Queued,
             attempt: 1,
+            repair_rounds: 0,
+            query: None,
+            indexer_ref: None,
+            categories: vec![],
+            limit: None,
+            page: None,
+            payload_ref: Some("nzb:sha256:abc".into()),
         };
         let back: QueueMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
         assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn queue_msg_reads_pre_input_messages() {
+        // Messages enqueued before the input fields existed still decode,
+        // with job input empty: the consumer treats them as legacy.
+        let legacy = serde_json::json!({
+            "job_id": "job_1",
+            "user_id": "u1",
+            "idempotency_key": "ingest:u1:abc:upload",
+            "source": "nzb_upload",
+            "state": "queued",
+            "attempt": 1,
+        });
+        let msg: QueueMsg = serde_json::from_value(legacy).unwrap();
+        assert_eq!(msg.repair_rounds, 0);
+        assert!(msg.query.is_none());
+        assert!(msg.payload_ref.is_none());
+        assert!(msg.categories.is_empty());
     }
 
     #[test]

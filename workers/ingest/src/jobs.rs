@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 /// How many times a single job may attempt a step before it is `Failed`.
 pub const MAX_ATTEMPTS: u32 = 5;
 
+/// How many `Verifying -> Repairing` rounds one job may start before a
+/// still-failing verify fails the job instead of dispatching another paid
+/// Container repair (see [`advance_checkpoint`]).
+pub const MAX_REPAIR_ROUNDS: u32 = 3;
+
 /// All ingest stages. Serialized snake_case for Queue/Workflow payloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +42,12 @@ pub enum JobSource {
 }
 
 /// Durable resume point written after every completed step.
+///
+/// `attempt` is the Queue-delivery attempt (1-based): the consumer increments
+/// it on redelivery and [`can_retry`] gates another try. [`advance`] never
+/// touches it, so per-state retries cannot silently reset the job-level
+/// budget. `repair_rounds` counts started `Verifying -> Repairing` rounds and
+/// bounds the verify↔repair loop (see [`advance_checkpoint`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobCheckpoint {
     pub job_id: String,
@@ -45,6 +56,10 @@ pub struct JobCheckpoint {
     pub source: JobSource,
     pub state: JobState,
     pub attempt: u32,
+    /// Repair rounds started so far. `#[serde(default)]` keeps checkpoints
+    /// written before this field existed readable (they resume with 0).
+    #[serde(default)]
+    pub repair_rounds: u32,
     pub failure_reason: Option<String>,
 }
 
@@ -73,6 +88,33 @@ pub fn advance(state: JobState, source: JobSource, repair_needed: bool) -> JobSt
     }
 }
 
+/// Advance a checkpointed job one step, bounding the verify↔repair loop.
+///
+/// Every transition except `Verifying` with `repair_needed` delegates to
+/// [`advance`]. A repair start increments `repair_rounds` and moves to
+/// `Repairing` while `repair_rounds < MAX_REPAIR_ROUNDS`; once the budget is
+/// spent the job moves to `Failed` with `failure_reason` set instead of
+/// dispatching another Container repair. A par2 set with too few recovery
+/// blocks therefore terminates instead of cycling forever. `attempt` is left
+/// alone (it belongs to Queue redelivery, not to in-job loops).
+pub fn advance_checkpoint(cp: &mut JobCheckpoint, repair_needed: bool) -> JobState {
+    match cp.state {
+        JobState::Verifying if repair_needed => {
+            if cp.repair_rounds >= MAX_REPAIR_ROUNDS {
+                cp.failure_reason = Some("repair budget exhausted".to_string());
+                cp.state = JobState::Failed;
+            } else {
+                cp.repair_rounds += 1;
+                cp.state = JobState::Repairing;
+            }
+        }
+        _ => {
+            cp.state = advance(cp.state, cp.source, repair_needed);
+        }
+    }
+    cp.state
+}
+
 /// Move to `Failed`, unless already terminal (terminal states stick).
 pub fn fail(state: JobState) -> JobState {
     match state {
@@ -94,9 +136,15 @@ pub fn can_retry(attempt: u32) -> bool {
 /// Build the idempotency key for a job: `ingest:{user}:{sha}:{ref}`.
 ///
 /// - `content_sha256_hex`: sha256 of the canonical NZB bytes (upload) or of
-///   the indexer's GUID URL (search), lowercase hex.
-/// - `source_ref`: `"upload"` or the indexer's GUID, binding the key to the
-///   exact release so a retry of the same content reuses the job row.
+///   the indexer's GUID URL (search); 64 hex chars, case-insensitive on input
+///   and normalised to lowercase in the key.
+/// - `source_ref`: `"upload"` or the indexer-bound search ref, binding the key
+///   to the exact release so a retry of the same content reuses the job row.
+///
+/// `:` is the field delimiter, so `user_id` and `source_ref` must not contain
+/// it (nor NUL): without that check two different
+/// `(user, sha, ref)` triples can format to the same key and two unrelated
+/// jobs would converge on one library row.
 pub fn derive_idempotency_key(
     user_id: &str,
     content_sha256_hex: &str,
@@ -105,13 +153,19 @@ pub fn derive_idempotency_key(
     if user_id.is_empty() || user_id.len() > 128 {
         return Err("user id must be 1..=128 chars");
     }
+    if user_id.contains(':') || user_id.contains('\0') {
+        return Err("user id must not contain ':'");
+    }
     let hex_ok =
         content_sha256_hex.len() == 64 && content_sha256_hex.bytes().all(|b| b.is_ascii_hexdigit());
     if !hex_ok {
-        return Err("content sha256 must be 64 lowercase hex chars");
+        return Err("content sha256 must be 64 hex chars");
     }
     if source_ref.is_empty() || source_ref.len() > 512 {
         return Err("source ref must be 1..=512 chars");
+    }
+    if source_ref.contains(':') || source_ref.contains('\0') {
+        return Err("source ref must not contain ':'");
     }
     Ok(format!(
         "ingest:{user_id}:{}:{source_ref}",
@@ -205,6 +259,61 @@ mod tests {
         assert!(derive_idempotency_key("u", "xyz", "upload").is_err());
         assert!(derive_idempotency_key("u", &sha, "").is_err());
         assert!(derive_idempotency_key("u", &"A".repeat(64), "upload").is_ok());
+    }
+
+    #[test]
+    fn idempotency_key_rejects_delimiter_confusion() {
+        // Two different triples must never format to the same key: ':' is the
+        // field delimiter, so it is rejected in both variable fields.
+        let s1 = "c".repeat(64);
+        let s2 = "d".repeat(64);
+        assert!(derive_idempotency_key("u", &s1, "x/y/S2/r").is_ok());
+        assert!(derive_idempotency_key("u", &s1, "x:y").is_err());
+        assert!(derive_idempotency_key("u:y:x", &s2, "r").is_err());
+        assert!(derive_idempotency_key("u\0", &s1, "upload").is_err());
+        assert!(derive_idempotency_key("u", &s1, "up\0load").is_err());
+    }
+
+    fn checkpoint_at(state: JobState) -> JobCheckpoint {
+        JobCheckpoint {
+            job_id: "job_0123456789abcdef".to_string(),
+            user_id: "user_01".to_string(),
+            idempotency_key: format!("ingest:user_01:{}:upload", "a".repeat(64)),
+            source: JobSource::NzbUpload,
+            state,
+            attempt: 1,
+            repair_rounds: 0,
+            failure_reason: None,
+        }
+    }
+
+    #[test]
+    fn perpetual_repair_need_terminates_in_failed() {
+        let mut cp = checkpoint_at(JobState::Verifying);
+        for _ in 0..MAX_REPAIR_ROUNDS {
+            assert_eq!(advance_checkpoint(&mut cp, true), JobState::Repairing);
+            assert_eq!(advance_checkpoint(&mut cp, false), JobState::Verifying);
+        }
+        // Budget spent: the next failing verify fails the job, and attempt is
+        // untouched (it belongs to Queue redelivery, not to this loop).
+        assert_eq!(advance_checkpoint(&mut cp, true), JobState::Failed);
+        assert_eq!(cp.attempt, 1);
+        assert_eq!(cp.repair_rounds, MAX_REPAIR_ROUNDS);
+        assert!(is_terminal(cp.state));
+        assert_eq!(
+            cp.failure_reason.as_deref(),
+            Some("repair budget exhausted")
+        );
+    }
+
+    #[test]
+    fn checkpoint_advance_matches_pure_advance_off_the_repair_path() {
+        let mut cp = checkpoint_at(JobState::Queued);
+        assert_eq!(advance_checkpoint(&mut cp, false), JobState::Parsing);
+        assert_eq!(cp.repair_rounds, 0);
+        let mut cp = checkpoint_at(JobState::Verifying);
+        assert_eq!(advance_checkpoint(&mut cp, false), JobState::Matching);
+        assert_eq!(cp.repair_rounds, 0);
     }
 
     #[test]

@@ -5,22 +5,31 @@ name = "nntune-ingest"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
 
-# Slice 2: Queue + Workflow wiring (code: src/dispatch.rs, src/queue.rs).
+# Slice 2: Queue producer (code: src/dispatch.rs, src/queue.rs). The routes
+# only produce; nothing consumes yet (see below), so every accepted enqueue
+# waits in the queue until the consumer ships.
 [[queues.producers]]
 binding = "INGEST_QUEUE"
 queue = "nntune-ingest-jobs"
 
-[[queues.consumers]]
-queue = "nntune-ingest-jobs"
-max_batch_size = 10
-max_retries = 4
+# Consumer: NOT YET. This crate has only `event(fetch)` — no `event(queue)`
+# handler — so declaring this worker a consumer would deliver every message
+# to a handler that does not exist (retried `max_retries` times, then
+# dropped, while callers saw 202 queued). Uncomment together with the Queue
+# handler and a dead-letter queue, e.g.:
+#
+# [[queues.consumers]]
+# queue = "nntune-ingest-jobs"
+# max_batch_size = 10
+# max_retries = 4
+# [[queues.consumers.dead_letter_queue]]
+# queue = "nntune-ingest-dlq"
 
-# The consumer replays src/queue.rs WORKFLOW_STEPS. workers-rs 0.3 has no
-# Workflow client, so orchestration is Queue redelivery + job checkpoints
-# (src/jobs.rs) until the Workflow binding is adopted.
-[[workflows]]
-binding = "INGEST_WORKFLOW"
-name = "nntune-ingest-workflow"
+# Workflows: NOT YET. workers-rs 0.3 has no Workflow client and this crate
+# exports no Workflow class, and `[[workflows]]` requires a `class_name`, so
+# any entry here is rejected at deploy. Orchestration until then is Queue
+# redelivery + job checkpoints (src/jobs.rs). Re-add with `class_name` when
+# the Workflow class ships.
 
 # Slice 2: library writes (code: src/library.rs).
 [[hyperdrive]]
@@ -31,6 +40,15 @@ id = "<HYPERDRIVE_ID_FOR_nntunev2>"
 [[kv_namespaces]]
 binding = "INGEST_STATE"
 id = "<KV_NAMESPACE_ID>"
+
+# Upload payload store (code: src/lib.rs store_upload_payload). The route
+# writes the approved NZB bytes here under the content-addressed
+# `nzb:sha256:<hex>` key from the Queue message before enqueueing; the
+# consumer fetches them by that key. (Bytes cannot ride the Queue message:
+# 2 MiB vs the 128 KB message limit.)
+[[kv_namespaces]]
+binding = "INGEST_PAYLOADS"
+id = "<KV_NAMESPACE_ID_FOR_PAYLOADS>"
 
 # Slice 2: usage metering (code: src/metering.rs).
 [[analytics_engine_datasets]]

@@ -14,7 +14,9 @@ use nntune_ingest::library::{upsert_library_sql, validate_library_write};
 use nntune_ingest::metering::{meter_event, MeterOutcome};
 use nntune_ingest::nzb_intake::estimate_nzb;
 use nntune_ingest::parse::{check_parsed, probe_batches, ParsedNzb};
-use nntune_ingest::probe::{apply_probe, build_probe_request, ProbeOutcome};
+use nntune_ingest::probe::{
+    apply_probe, apply_probe_batch, build_probe_request, ProbeOutcome, ProbeTally,
+};
 use nntune_ingest::queue::{LibraryWrite, WORKFLOW_STEPS};
 use nntune_ingest::repair::decide_repair;
 
@@ -84,13 +86,15 @@ fn gapped_set_repairs_then_reaches_done() {
     let parsed = parsed_from(&["gap-one@synthetic.invalid", "gap-missing@synthetic.invalid"]);
     check_parsed(&est, &parsed).unwrap();
 
-    // Pool reports the 430: hold Probing, dispatch repair for one block.
+    // Pool reports the 430: probe completes into Verifying carrying the
+    // missing-segment count, which Verifying translates (via par2) into the
+    // repair dispatch below.
     let outcome = ProbeOutcome {
         present: vec!["gap-one@synthetic.invalid".into()],
         missing: vec!["gap-missing@synthetic.invalid".into()],
     };
     let (held, missing) = apply_probe(JobState::Probing, &outcome);
-    assert_eq!((held, missing), (JobState::Probing, 1));
+    assert_eq!((held, missing), (JobState::Verifying, 1));
     let repair = decide_repair(
         &msg.job_id,
         &msg.user_id,
@@ -122,4 +126,39 @@ fn gapped_set_repairs_then_reaches_done() {
     assert_eq!(again.job_id, msg.job_id);
     assert_eq!(again.idempotency_key, msg.idempotency_key);
     meter_event(&msg, "repair", MeterOutcome::Ok).unwrap();
+}
+
+#[test]
+fn multi_batch_probe_keeps_middle_gap_to_verify() {
+    // A parse over the 500-segment probe cap splits into two batches; the gap
+    // in the middle batch must survive the clean batch around it.
+    let total = nntune_ingest::probe::MAX_PROBE_SEGMENTS + 1;
+    let ids: Vec<String> = (0..total)
+        .map(|i| format!("seg-{i:05}@synthetic.invalid"))
+        .collect();
+    let parsed = ParsedNzb {
+        file_count: 1,
+        segment_count: ids.len(),
+        message_ids: ids,
+    };
+    let batches = probe_batches(&parsed);
+    assert_eq!(batches.len(), 2);
+    let mut tally = ProbeTally::new(batches.len());
+    let mut state = JobState::Probing;
+    let mut missing = 0;
+    for (n, batch) in batches.iter().enumerate() {
+        let batch_refs: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
+        // Every id except one middle-batch id answers ARTICLE.
+        let gap = &batches[1][0];
+        let outcome = ProbeOutcome {
+            present: batch_refs
+                .iter()
+                .filter(|id| *id != gap)
+                .map(|s| s.to_string())
+                .collect(),
+            missing: if n == 1 { vec![gap.clone()] } else { vec![] },
+        };
+        (state, missing) = apply_probe_batch(state, &mut tally, &outcome);
+    }
+    assert_eq!((state, missing), (JobState::Verifying, 1));
 }

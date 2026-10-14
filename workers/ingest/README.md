@@ -13,7 +13,9 @@ NZB upload ───────────────┘                     
 - Job state machine (`src/jobs.rs`): `Queued → Searching|Parsing →
   Probing → Verifying → (Repairing → Verifying)? → Matching → Writing →
   Done`, `Failed` terminal. Checkpoints make redelivery/replay converge;
-  idempotency keys bind user + content sha + source ref.
+  idempotency keys bind user + content sha + source ref (`:`-free fields, so
+  triples cannot collide). Repair rounds are budgeted (`MAX_REPAIR_ROUNDS`):
+  a perpetually failing verify ends in `Failed`, never in a loop.
 - Newznab search builder (`src/newznab.rs`): `t=music`, `https://` only,
   no embedded credentials. The URL is built **without** the key; the
   vault-resolved key is injected at request time and redacted in logs.
@@ -26,9 +28,12 @@ NZB upload ───────────────┘                     
   `LibraryWrite` — all carry the idempotency key. MB calls target the
   `workers/mb` read API (`/v1/mb/release/:mbid`, `/v1/mb/recording/:mbid`,
   `/v1/mb/search?type=…`).
-- Routes (`src/lib.rs`): `POST /v1/ingest/search`, `POST /v1/ingest/nzb`
-  (202 + enqueue to `nntune-ingest-jobs` with job id + idempotency key),
-  `GET /v1/ingest/jobs/:id` (checkpoint reads land with the consumer).
+- Routes (`src/lib.rs`): `POST /v1/ingest/search` (16 KiB body cap,
+  ≤16 categories, paged window), `POST /v1/ingest/nzb` (wire cap accounting
+  for JSON escaping, then the 2 MiB / 5k / 60k intake guard) — malformed JSON
+  is 400, over-cap is 413, busy store/queue is 503; success is 202 + enqueue
+  with job id + idempotency key. `GET /v1/ingest/jobs/:id` (checkpoint reads
+  land with the consumer).
 
 ## Security rules
 
@@ -51,10 +56,16 @@ Usenet in CI). Ingest needs from that card:
 
 ## Slice 2 (this slice)
 
-- Queue wiring (`src/dispatch.rs`): 202 routes build a `QueueMsg` with a
-  user-bound idempotency key and `send` it to `nntune-ingest-jobs`
-  (`worker` `queue` feature; bindings in `wrangler.toml.example`). A
-  missing/failing binding keeps the 202 contract but reports `not_wired`.
+- Queue wiring (`src/dispatch.rs`): routes build a `QueueMsg` carrying the
+  full job input (search params, or a content-addressed `INGEST_PAYLOADS`
+  handle for upload bytes written before enqueue) with a user-bound
+  idempotency key, and `send` it to `nntune-ingest-jobs` (`worker` `queue`
+  feature; bindings in `wrangler.toml.example`). Search keys bind query +
+  indexer + categories + limit + page, so no request is silently dropped.
+  Success is 202 `queued`; a missing/failing binding or payload store is 503
+  with `Retry-After` (never 202). The consumer/workflow entries stay
+  commented out in `wrangler.toml.example` until the Queue handler (with DLQ)
+  and the Workflow class ship — declaring them now would drop every message.
 - Request bodies carry self-asserted `user_id` (1..=128 chars) until the
   accounts card authenticates callers; the key format already binds the
   user, so keys stay valid when auth lands.

@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::nzb_intake::IntakeEstimate;
-use crate::probe::MAX_PROBE_SEGMENTS;
+use crate::probe::{validate_message_id, MAX_PROBE_SEGMENTS};
 
 /// What the `Parsing` step stores in the checkpoint: the segment map the
 /// pool probe walks. Produced by `nntune-core` once that card lands; until
@@ -30,12 +30,11 @@ pub fn check_parsed(estimate: &IntakeEstimate, parsed: &ParsedNzb) -> Result<(),
     if parsed.message_ids.len() != parsed.segment_count {
         return Err("message-id count must match the segment count");
     }
-    if parsed
-        .message_ids
-        .iter()
-        .any(|id| id.is_empty() || id.len() > 512)
-    {
-        return Err("message-ids must be 1..=512 chars");
+    // Ids flow into NNTP STAT/ARTICLE lines on the user's provider
+    // connection: only strict message-ids pass, so a hostile NZB (or BYO
+    // indexer) cannot inject CR/LF commands. Same bar as the probe envelope.
+    if parsed.message_ids.iter().any(|id| !validate_message_id(id)) {
+        return Err("message-ids must be valid msg-ids (printable ASCII, one @)");
     }
     Ok(())
 }
@@ -81,6 +80,17 @@ mod tests {
         let mut bad_id = parsed_small();
         bad_id.message_ids[0].clear();
         assert!(check_parsed(&est, &bad_id).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_command_injection_ids() {
+        let est = estimate_nzb(SMALL_NZB).unwrap();
+        let mut evil = parsed_small();
+        evil.message_ids[1] = "x@y>\r\nAUTHINFO USER attacker\r\nQUIT\r\n<z".to_string();
+        assert!(check_parsed(&est, &evil).is_err());
+        let mut space = parsed_small();
+        space.message_ids[0] = "has space@synthetic.invalid".to_string();
+        assert!(check_parsed(&est, &space).is_err());
     }
 
     #[test]
