@@ -12,11 +12,15 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from public_text_lint import FIXTURE_EXCLUSIONS, find_violations
+from public_text_lint import (
+    FIXTURE_EXCLUSIONS,
+    HOST_FIXTURE_EXCLUSIONS,
+    find_violations,
+)
 
 
-def rules_for(text):
-    return sorted({rule for _, rule in find_violations(text)})
+def rules_for(text, path=""):
+    return sorted({rule for _, rule in find_violations(text, path)})
 
 
 class TestTogIds(unittest.TestCase):
@@ -114,6 +118,34 @@ class TestAgentNames(unittest.TestCase):
 
     def test_role_titles_are_not_agent_names(self):
         self.assertEqual([], find_violations("Owner: CISO"))
+
+
+class TestHostFixtureExclusions(unittest.TestCase):
+    # SSRF-guard negative tests must name RFC-reserved ranges to assert
+    # rejection. Without a path-scoped exemption those tests are
+    # unmergeable; with a whole-file exemption a real leak there would
+    # be missed. So: internal-host only, exact paths only.
+    SSRF_FIXTURE = '"10.0.0.5",\n"http://169.254.169.254/latest/meta-data/"'
+
+    def test_reserved_ranges_flagged_without_path(self):
+        self.assertIn("internal-host", rules_for(self.SSRF_FIXTURE))
+
+    def test_exempt_paths_skip_internal_host_only(self):
+        self.assertTrue(HOST_FIXTURE_EXCLUSIONS)  # never an empty bypass
+        for path in sorted(HOST_FIXTURE_EXCLUSIONS):
+            self.assertNotIn("internal-host", rules_for(self.SSRF_FIXTURE, path))
+
+    def test_exempt_paths_still_flag_tog_ids(self):
+        for path in sorted(HOST_FIXTURE_EXCLUSIONS):
+            self.assertIn("tog-id", rules_for("see TOG-23644", path))
+
+    def test_exempt_paths_still_flag_agent_names(self):
+        for path in sorted(HOST_FIXTURE_EXCLUSIONS):
+            self.assertIn("agent-name", rules_for("run as paperclip-agent-7", path))
+
+    def test_exclusions_are_files_not_directories(self):
+        for path in HOST_FIXTURE_EXCLUSIONS:
+            self.assertFalse(path.endswith("/"))
 
 
 class TestMechanics(unittest.TestCase):

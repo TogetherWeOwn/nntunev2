@@ -53,6 +53,12 @@ property, so every entry names its reason):
   * FIXTURE_EXCLUSIONS: exact test-fixture paths holding manufactured
     violations for this lint's own unit tests. No directory, extension,
     or generated-file exemptions.
+  * HOST_FIXTURE_EXCLUSIONS: exact product-test paths exempt from the
+    internal-host rule ONLY. SSRF-guard negative tests must name
+    RFC-reserved ranges (10/8, 169.254/16, IPv4-mapped embeddings) to
+    assert rejection, so any private-IP pattern makes them unmergeable.
+    Every other rule still scans these files, and gitleaks plus secret
+    scanning still apply. Exact paths, never directories.
 
 Scope limit (by design, not a gap to widen silently): this lint scans
 tracked FILE CONTENTS only. Branch names, commit messages, and PR
@@ -78,6 +84,16 @@ import sys
 FIXTURE_EXCLUSIONS = frozenset(
     {
         ".github/scripts/test_public_text_lint.py",
+    }
+)
+
+# Exact product-test paths exempt from the internal-host rule ONLY (see
+# docstring). Each entry names its reason; never directories.
+HOST_FIXTURE_EXCLUSIONS = frozenset(
+    {
+        # SSRF negative-test vectors: reserved ranges asserted rejected.
+        "workers/api/tests/api_tests.rs",
+        "workers/api/tests/security_regressions.rs",
     }
 )
 
@@ -122,18 +138,23 @@ _DOCKER_HOST_MASK = re.compile(r"host\.docker\.(?:internal)\b", re.IGNORECASE)
 _ENV_LOCAL_MASK = re.compile(r"\.env\.(?:local)\b", re.IGNORECASE)
 
 
-def find_violations(text):
+def find_violations(text, path=""):
     """Return [(line_number, rule_id)] for banned shapes in text.
 
     One hit per rule per line at most. Never returns matched bytes —
     callers report file:line + rule id only. There is no sentence
     exemption: a real id matches on any line, including a rule line.
+    Paths in HOST_FIXTURE_EXCLUSIONS skip the internal-host rule only;
+    every other rule still applies to them.
     """
     masked = _DOCKER_HOST_MASK.sub("host.docker.example", text)
     masked = _ENV_LOCAL_MASK.sub(".env.example", masked)
+    host_exempt = path in HOST_FIXTURE_EXCLUSIONS
     hits = []
     for lineno, line in enumerate(masked.splitlines(), start=1):
         for rule_id, patterns in RULES:
+            if rule_id == "internal-host" and host_exempt:
+                continue
             if any(p.search(line) for p in patterns):
                 hits.append((lineno, rule_id))
     return hits
@@ -153,7 +174,7 @@ def scan_path(path):
         data = fh.read()
     if b"\0" in data:
         return []  # binary: not public text
-    return find_violations(data.decode("utf-8", errors="replace"))
+    return find_violations(data.decode("utf-8", errors="replace"), path)
 
 
 def main(argv):
