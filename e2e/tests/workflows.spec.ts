@@ -142,6 +142,16 @@ test.describe('credential scope (static pins)', () => {
     expect(accounts).toContain('unexpected redirect');
   });
 
+  // Raw API-context calls follow a staging 302 to another origin WITH the
+  // Access pair + bearer (Playwright follows up to 20 redirects by default).
+  // Live specs must go through apiGet/apiPost; helpers.spec.ts may use the
+  // raw fixture inside its own no-follow proof (it asserts the wrapper, not
+  // staging). The pin bans every method (get/post/put/patch/delete/head/fetch
+  // on request/page.request/context.request) without a headers condition: the
+  // old /request\.(get|post)\([^)]*headers/ stopped at the first ')' so a URL
+  // containing a nested call (every API.stream() stream URL) never matched,
+  // and request.fetch bypassed it entirely.
+  const RAW_API_CALL = /\b(?:request|page\.request|context\.request)\.(?:get|post|put|patch|delete|head|fetch)\s*\(/;
   test('live specs use the no-follow API wrapper, not raw credentialed calls', () => {
     // Raw request.get/post with headers would follow a staging 302 to another
     // origin WITH the Access pair + bearer. Live specs must go through
@@ -150,13 +160,27 @@ test.describe('credential scope (static pins)', () => {
     for (const name of ['health.spec.ts', 'ingest-play-meter.spec.ts', 'signup-byop.spec.ts']) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must not carry credentials on a raw request call`).not.toMatch(
-        /request\.(get|post)\([^)]*headers/,
+        RAW_API_CALL,
       );
     }
     for (const name of ['health.spec.ts', 'ingest-play-meter.spec.ts']) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must use the no-follow wrapper`).toContain('apiGet(');
     }
+  });
+
+  test('no-follow pin catches nested-paren and fetch mutants', () => {
+    // Regression proof for the pin above: the reviewer's bypass mutants must
+    // match (fail the pin), while the approved wrapper call must not.
+    const nestedStreamCall =
+      "await request.get(`${baseURL}${API.stream(trackId as string)}`, " +
+      "{ headers: { ...headers, Range: 'bytes=0-8' }, timeout: 30_000 })";
+    const fetchCall = 'await request.fetch(libraryUrl, { headers })';
+    const pageScoped = 'await page.request.get(`${baseURL}/api/usage`, { headers })';
+    expect(nestedStreamCall).toMatch(RAW_API_CALL);
+    expect(fetchCall).toMatch(RAW_API_CALL);
+    expect(pageScoped).toMatch(RAW_API_CALL);
+    expect("await apiGet(request, url, headers, 'range')").not.toMatch(RAW_API_CALL);
   });
 });
 

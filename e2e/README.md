@@ -97,8 +97,11 @@ How the suite uses them:
   them per request through `apiGet`/`apiPost` (`helpers/accounts.ts`), which
   fetch with `maxRedirects: 0`: a staging 302 to another origin is never
   followed with credentials — the foreign origin receives zero requests and
-  the 3xx fails by name (status + location, values never logged). Raw
-  `request.get`/`request.post` with credential headers is banned in specs.
+  the 3xx fails by name (status + location, values never logged). Any raw
+  `request.*` / `page.request.*` / `context.request.*` call
+  (`get`/`post`/`put`/`patch`/`delete`/`head`/`fetch`) is banned in live
+  specs — a headers-conditioned `get`/`post` pin is bypassable by nested-paren
+  stream URLs and `fetch`.
   Both missing or either
   missing fails closed;
   offline checks remain usable with no staging URL and no Access pair. An Access wall (wall status + Access markers, including
