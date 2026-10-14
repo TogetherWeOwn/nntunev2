@@ -548,6 +548,57 @@ fn atomic_invite_requires_exactly_one_row_and_emits_digest_claim() {
 }
 
 #[test]
+fn claim_statements_are_conditional_parameterized_updates() {
+    let magic = magic_record();
+    let chal = challenge_record();
+    let inv = invite_record();
+    for (sql, flag, params) in [
+        (
+            auth::SingleUseClaim::MagicLink {
+                record: &magic,
+                now: NOW,
+            }
+            .statement(),
+            "used = FALSE",
+            5,
+        ),
+        (
+            auth::SingleUseClaim::Challenge {
+                record: &chal,
+                now: NOW,
+            }
+            .statement(),
+            "consumed = FALSE",
+            5,
+        ),
+        (
+            auth::SingleUseClaim::Invite { record: &inv }.statement(),
+            "used = FALSE",
+            1,
+        ),
+    ] {
+        assert!(sql.starts_with("UPDATE "));
+        assert!(sql.contains(&format!("AND {flag} RETURNING")), "{sql}");
+        for n in 1..=params {
+            assert!(sql.contains(&format!("${n}")), "{sql}");
+        }
+        assert!(!sql.contains(&format!("${}", params + 1)), "{sql}");
+    }
+    assert!(auth::SingleUseClaim::MagicLink {
+        record: &magic,
+        now: NOW,
+    }
+    .statement()
+    .contains("expires_at > $5"));
+    assert!(auth::SingleUseClaim::Challenge {
+        record: &chal,
+        now: NOW,
+    }
+    .statement()
+    .contains("rp_id = $2 AND origin = $3"));
+}
+
+#[test]
 fn atomic_magic_link_invalid_inputs_never_reach_storage() {
     for (record, token, time) in [
         (magic_record(), "wrong-token", NOW + 60),
@@ -645,7 +696,20 @@ fn origins_reject_noncanonical_forms_and_nonexact_rp_bindings() {
         ("nntune", "https://nntune"),
         ("", ORIGIN),
         ("localhost", "http://localhost:80"),
-        ("localhost", "http://localhost.evil.example.com:8787"),
+        (
+            "localhost.evil.example.com",
+            "http://localhost.evil.example.com:8787",
+        ),
+        ("localhost.evil.com", "http://localhost.evil.com"),
+        ("evillocalhost", "http://evillocalhost:8787"),
+        (
+            "evil-localhost.example.com",
+            "http://evil-localhost.example.com:8787",
+        ),
+        (
+            "127.0.0.1.evil.example.com",
+            "http://127.0.0.1.evil.example.com:8787",
+        ),
         (RP, "http://nntune.example.com"),
     ] {
         assert_eq!(
