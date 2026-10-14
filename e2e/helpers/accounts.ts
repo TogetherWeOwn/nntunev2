@@ -43,7 +43,10 @@ export function accountHeaders(account: TestAccount | null): Record<string, stri
  * `extraHTTPHeaders`/`setExtraHTTPHeaders` would also send the Access
  * service token and session bearer to cross-origin subresources (fonts,
  * analytics, stream/store URLs, payment redirects). Anything off-origin
- * continues unmodified. Re-entrant: replaces any previous scope routing.
+ * continues unmodified. Staging requests are fetched with maxRedirects: 0
+ * and fulfilled back to the browser, so a 302 to another origin is followed
+ * WITHOUT the credential headers — the follow-up request is evaluated fresh
+ * by this handler. Re-entrant: replaces any previous scope routing.
  */
 export async function applyAccountToPage(
   page: Page,
@@ -59,7 +62,15 @@ export async function applyAccountToPage(
   await context.route('**/*', async (route) => {
     const url = route.request().url();
     if (isStagingOrigin(url, stagingOrigin)) {
-      await route.continue({ headers: { ...route.request().headers(), ...stagingHeaders } });
+      // No-redirect fetch: route.continue({ headers }) would keep the headers
+      // on the browser's automatic redirect follow to another origin. Fetching
+      // with maxRedirects: 0 and fulfilling hands the 3xx to the browser as-is
+      // so the next request re-enters this handler and goes out clean.
+      const response = await route.fetch({
+        headers: { ...route.request().headers(), ...stagingHeaders },
+        maxRedirects: 0,
+      });
+      await route.fulfill({ response });
     } else {
       await route.continue();
     }

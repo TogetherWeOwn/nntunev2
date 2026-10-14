@@ -68,8 +68,11 @@ How the suite uses them:
   attach them ONLY to the staging origin via an origin-checked
   `context.route` (`applyAccountToPage` + `isStagingOrigin`): cross-origin
   subresources (fonts, analytics, stream/store URLs) never receive the
-  service token or session bearer. API clients attach them per request (they
-  only talk to staging). Both missing or either missing fails closed;
+  service token or session bearer, and staging 302 redirects to another
+  origin are followed WITHOUT the headers (no-redirect fetch + fulfill, so
+  the follow-up request re-enters the scope check clean). API clients attach
+  them per request (they only talk to staging). Both missing or either
+  missing fails closed;
   offline checks remain usable with no staging URL and no Access pair. An Access wall (wall status + Access markers, including
   302s to the Access login) fails closed with a remediation message instead
   of masquerading as an app failure; plain app 4xx responses pass through.
@@ -113,15 +116,20 @@ How the suite uses them:
 
 ## Evidence
 
-On failure CI sanitizes then uploads `playwright-report/` +
-`test-results/` (7 days). Raw traces and screenshots are disabled: tracing
-records request headers/bodies and screenshots can expose account/provider
-information. Sanitization is still required with them off: Playwright 1.55
-writes `test-results/**/error-context.md` (an ARIA snapshot rendering filled
-input values, including the BYOP password) and embeds the same text in
-`playwright-report/data/*.md` — the workflow deletes both paths before
-upload, and offline self-tests execute the exact checked-in sanitize blocks
-against a marker password to prove nothing uploaded can carry it. Do not
-enable traces/screenshots for credential-bearing runs without a verified
-redaction path. A QA PASS verdict cites the green `e2e-staging` run URL +
-deployed head SHA; NEEDS WORK cites the failing spec + step.
+On failure CI sanitizes then uploads `test-results/` only (7 days, junit).
+Raw traces and screenshots are disabled: tracing records request
+headers/bodies and screenshots can expose account/provider information. CI
+uses the junit reporter only — the html reporter embeds step fill values
+(including the BYOP password) as a base64 zip in
+`playwright-report/index.html`, so it is never published. Sanitization is
+still required with traces off: Playwright 1.55 writes
+`test-results/**/error-context.md` (an ARIA snapshot rendering filled input
+values, including the BYOP password) — the workflow deletes
+error-context.md plus the whole `playwright-report/` dir before upload, and
+offline self-tests run a real failing fill under the CI reporter config,
+apply the exact checked-in sanitize blocks, and assert the marker password
+is absent from every uploaded file including base64-decoded payloads. Do not
+enable traces/screenshots or the html reporter for credential-bearing runs
+without a verified redaction path. A QA PASS verdict cites the green
+`e2e-staging` run URL + deployed head SHA; NEEDS WORK cites the failing
+spec + step.

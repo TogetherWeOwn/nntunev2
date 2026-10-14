@@ -88,13 +88,14 @@ jobs:
           set -euo pipefail
           # Playwright 1.55 writes test-results/**/error-context.md on any failed
           # page test — an ARIA snapshot rendering filled input values, including
-          # the BYOP password — and embeds the same text in
-          # playwright-report/data/*.md. Raw traces/screenshots are off, but these
-          # text snapshots would still publish SYNTHETIC_NNTP_PASS from a public
-          # repo. Delete them so the uploaded artifact can never carry secrets.
+          # the BYOP password — and the html reporter embeds step fill values as
+          # a base64 zip in playwright-report/index.html. CI uses the junit
+          # reporter only, but belt-and-braces: delete error-context.md AND the
+          # whole playwright-report/ dir so the uploaded artifact can never
+          # carry secrets. Only test-results/ (junit) is uploaded below.
           find test-results -name 'error-context.md' -delete 2>/dev/null || true
-          rm -rf playwright-report/data 2>/dev/null || true
-          echo "sanitized: error-context.md and html-report data/ removed"
+          rm -rf playwright-report 2>/dev/null || true
+          echo "sanitized: error-context.md and playwright-report/ removed"
 
       - name: Upload failure artifacts
         if: failure() && steps.staging.outputs.configured == 'true'
@@ -102,7 +103,6 @@ jobs:
         with:
           name: e2e-synthetic-report
           path: |
-            e2e/playwright-report/
             e2e/test-results/
           retention-days: 7
 
@@ -173,11 +173,13 @@ jobs:
         run: |
           set -euo pipefail
           # Same credential-bearing snapshot paths as the synthetic job above:
-          # error-context.md renders filled secrets and the html report embeds
-          # them under data/. Strip both before upload.
+          # error-context.md renders filled secrets and the html reporter would
+          # embed fill values in playwright-report/index.html. Strip
+          # error-context.md plus the whole playwright-report/ dir before
+          # upload (junit-only evidence in test-results/).
           find test-results -name 'error-context.md' -delete 2>/dev/null || true
-          rm -rf playwright-report/data 2>/dev/null || true
-          echo "sanitized: error-context.md and html-report data/ removed"
+          rm -rf playwright-report 2>/dev/null || true
+          echo "sanitized: error-context.md and playwright-report/ removed"
 
       - name: Upload failure artifacts
         if: failure() && steps.staging.outputs.configured == 'true'
@@ -185,6 +187,5 @@ jobs:
         with:
           name: e2e-journey-report
           path: |
-            e2e/playwright-report/
             e2e/test-results/
           retention-days: 7

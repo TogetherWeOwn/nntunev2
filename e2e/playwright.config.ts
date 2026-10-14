@@ -25,8 +25,12 @@ export default defineConfig({
   workers: 1,
   fullyParallel: false,
   retries: process.env.CI ? 1 : 0,
+  // CI evidence is junit-only: the html reporter embeds step titles
+  // (including fill values such as the BYOP password) as a base64 zip in
+  // playwright-report/index.html, which would publish SYNTHETIC_NNTP_PASS
+  // from a public repo on any failing job. junit.xml carries no step values.
   reporter: process.env.CI
-    ? [['list'], ['html', { open: 'never' }]]
+    ? [['list'], ['junit', { outputFile: 'test-results/junit.xml' }]]
     : [['list']],
   use: {
     baseURL,
@@ -34,8 +38,9 @@ export default defineConfig({
     // credentials); screenshots may expose account/provider details. Keep
     // CI evidence textual until a verified redaction path exists. Note:
     // Playwright still writes error-context.md snapshots (which render filled
-    // input values) on page-test failure — the workflow sanitizes those paths
-    // before uploading artifacts. See e2e-staging.yml.
+    // input values) on page-test failure — the workflow deletes those plus
+    // the whole playwright-report/ dir before uploading (junit only).
+    // See e2e-staging.yml.
     trace: 'off',
     screenshot: 'off',
   },

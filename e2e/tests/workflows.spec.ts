@@ -137,9 +137,10 @@ test.describe('credential scope (static pins)', () => {
 
 // Execute the exact checked-in sanitize blocks: Playwright 1.55 writes
 // test-results/**/error-context.md (ARIA snapshots rendering filled input
-// values, including the BYOP password) and embeds the same text in
-// playwright-report/data/*.md. Both directories are uploaded on failure, so
-// the sanitize step must strip a marker password from every uploaded path.
+// values, including the BYOP password) and the html reporter embeds step fill
+// values as a base64 zip in playwright-report/index.html. CI uses the junit
+// reporter only and uploads test-results/ alone; the sanitize step deletes
+// error-context.md plus the whole playwright-report/ dir belt-and-braces.
 const sanitizeBlocks = [...stagingWorkflow.matchAll(
   /      - name: Sanitize failure artifacts[\s\S]*?run: \|\n((?:          [^\n]*\n)+)/g,
 )];
@@ -154,13 +155,33 @@ function listFilesRecursive(dir: string): string[] {
   return out;
 }
 
+// Scan a file for a marker in plain text AND inside base64 blobs (the html
+// report embeds its payload as a base64 zip): decode every long base64 run
+// and check the decoded bytes too.
+function fileContainsMarker(file: string, marker: string): boolean {
+  const raw = readFileSync(file, 'utf8');
+  if (raw.includes(marker)) return true;
+  for (const match of raw.matchAll(/[A-Za-z0-9+/]{200,}={0,2}/g)) {
+    try {
+      const decoded = Buffer.from(match[0], 'base64').toString('utf8');
+      if (decoded.includes(marker)) return true;
+    } catch {
+      // Not decodable — ignore this run.
+    }
+  }
+  return false;
+}
+
 test.describe('failure-artifact sanitization', () => {
   test('both jobs sanitize before uploading', () => {
     expect(sanitizeBlocks).toHaveLength(2);
     for (const block of sanitizeBlocks) {
       const script = block[1]!.replace(/^ {10}/gm, '');
       expect(script).toContain('error-context.md');
-      expect(script).toContain('playwright-report/data');
+      // Whole-dir removal: the old `playwright-report/data`-only strip left
+      // index.html (with its embedded base64 zip) behind.
+      expect(script).toContain('rm -rf playwright-report');
+      expect(script).not.toContain('playwright-report/data');
     }
     // Each sanitize precedes its job's upload: nothing uploads raw first.
     for (const artifact of ['e2e-synthetic-report', 'e2e-journey-report']) {
@@ -170,38 +191,104 @@ test.describe('failure-artifact sanitization', () => {
     }
   });
 
-  for (const [index, block] of sanitizeBlocks.entries()) {
-    test(`sanitize script ${index} strips a marker password from every uploaded path`, () => {
-      const script = block[1]!.replace(/^ {10}/gm, '');
-      const artifacts = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'sanitize-test-'));
-      try {
-        mkdirSync(join(artifacts, 'test-results', 'spec-chunk'), { recursive: true });
-        mkdirSync(join(artifacts, 'playwright-report', 'data'), { recursive: true });
-        const marker = 'MARKER-NNTP-PASS-9f8e7d6c5b4a';
-        writeFileSync(
-          join(artifacts, 'test-results', 'spec-chunk', 'error-context.md'),
-          `- textbox [ref=e5]: ${marker}\n`,
-        );
-        writeFileSync(
-          join(artifacts, 'playwright-report', 'data', 'abc123.md'),
-          `snapshot with ${marker}\n`,
-        );
-        writeFileSync(join(artifacts, 'test-results', 'spec-chunk', 'junit.xml'), '<xml>safe</xml>');
-        writeFileSync(join(artifacts, 'playwright-report', 'index.html'), '<html>safe</html>');
-        const result = runShell(script, {}, artifacts);
-        expect(result.status).toBe(0);
-        expect(existsSync(join(artifacts, 'test-results', 'spec-chunk', 'error-context.md'))).toBe(false);
-        expect(existsSync(join(artifacts, 'playwright-report', 'data'))).toBe(false);
-        // Marker absent from every remaining path the workflow uploads.
-        for (const file of listFilesRecursive(artifacts)) {
-          expect(readFileSync(file, 'utf8'), file).not.toContain(marker);
-        }
-        // Non-credential evidence survives sanitization.
-        expect(existsSync(join(artifacts, 'test-results', 'spec-chunk', 'junit.xml'))).toBe(true);
-        expect(existsSync(join(artifacts, 'playwright-report', 'index.html'))).toBe(true);
-      } finally {
-        rmSync(artifacts, { recursive: true, force: true });
+  test('uploads are junit-only (no playwright-report)', () => {
+    // Both jobs upload test-results/ only. The html report (index.html with
+    // its embedded base64 zip of step fill values) must never be an upload
+    // path — the sanitize step may still NAME playwright-report/ to delete it.
+    const uploadPaths = [...stagingWorkflow.matchAll(/path: \|\n((?:            [^\n]*\n)+)/g)];
+    expect(uploadPaths).toHaveLength(2);
+    for (const upload of uploadPaths) {
+      expect(upload[1]).toContain('e2e/test-results/');
+      expect(upload[1]).not.toContain('playwright-report');
+    }
+  });
+
+  test('CI reporter is junit-only (html embeds fill values)', () => {
+    const configSource = readFileSync(new URL('../playwright.config.ts', import.meta.url), 'utf8');
+    expect(configSource).toContain('junit');
+    expect(configSource).toContain('test-results/junit.xml');
+    expect(configSource).not.toContain("'html'");
+    expect(configSource).not.toContain('"html"');
+  });
+
+  // Real-browser proof: run a genuinely failing Playwright test that fills a
+  // marker password under the CI reporter config (junit, no html,
+  // trace/screenshot off), apply the exact checked-in sanitize block, and
+  // assert the marker is absent from every file left under the upload path,
+  // including base64-decoded payloads.
+  test('real failing fill leaves no marker after the checked-in sanitize', async () => {
+    test.setTimeout(120_000);
+    const script = sanitizeBlocks[0]![1]!.replace(/^ {10}/gm, '');
+    const marker = 'MARKER-NNTP-PASS-9f8e7d6c5b4a';
+    // Probe lives under e2e/ so `import '@playwright/test'` in the generated
+    // spec resolves via e2e/node_modules (a system-temp dir has no ancestors
+    // with the package). Removed in `finally`.
+    const e2eDir = fileURLToPath(new URL('..', import.meta.url));
+    const probe = mkdtempSync(join(e2eDir, '.real-sanitize-'));
+    try {
+      writeFileSync(
+        join(probe, 'marker.spec.ts'),
+        `import { test, expect } from '@playwright/test';\n` +
+          `test('fills marker password then fails', async ({ page }) => {\n` +
+          `  await page.setContent('<input data-testid="byop-pass" type="password" />');\n` +
+          `  await page.getByTestId('byop-pass').fill('${marker}');\n` +
+          // Fail on a page assertion so the failure snapshots the filled page.
+          `  await expect(page.getByTestId('byop-pass')).toHaveValue('definitely-not-the-marker');\n` +
+          `});\n`,
+      );
+      writeFileSync(
+        join(probe, 'playwright.config.ts'),
+        `import { defineConfig } from '@playwright/test';\n` +
+          `export default defineConfig({\n` +
+          `  testDir: '.',\n` +
+          `  testMatch: 'marker.spec.ts',\n` +
+          `  timeout: 30_000,\n` +
+          `  retries: 0,\n` +
+          `  reporter: [['list'], ['junit', { outputFile: 'test-results/junit.xml' }]],\n` +
+          `  use: { trace: 'off', screenshot: 'off' },\n` +
+          `  outputDir: 'test-results',\n` +
+          `});\n`,
+      );
+      const cli = join(e2eDir, 'node_modules', '@playwright', 'test', 'cli.js');
+      const run = spawnSync(process.execPath, [cli, 'test', `--config=${join(probe, 'playwright.config.ts')}`], {
+        encoding: 'utf8',
+        timeout: 90_000,
+        cwd: probe,
+        env: { ...process.env, CI: '1' },
+      });
+      const probeOutput = `${run.stdout}\n${run.stderr}`;
+      // Minimal containers (no system browser libs) cannot launch Chromium;
+      // CI installs --with-deps so the probe runs for real there. Skip here
+      // rather than failing the suite on environment, never on assertion.
+      if (/cannot open shared object|browser has been closed|browserType\.launch|executable doesn't exist/i.test(probeOutput)) {
+        test.skip(true, 'Chromium system libraries unavailable in this container — probe runs in CI with --with-deps.');
+        return;
       }
-    });
-  }
+      // The probe must actually fail (otherwise it proved nothing).
+      expect(run.status, `probe run output:\n${probeOutput}`).not.toBe(0);
+      // The failing run must have produced the leak-prone snapshot with the
+      // marker (otherwise the sanitize assertion is vacuous).
+      const errorContexts = listFilesRecursive(probe).filter((f) => f.endsWith('error-context.md'));
+      expect(errorContexts.length).toBeGreaterThan(0);
+      expect(errorContexts.some((f) => readFileSync(f, 'utf8').includes(marker))).toBe(true);
+      // Junit evidence itself must be marker-free even before sanitize.
+      for (const file of listFilesRecursive(probe).filter((f) => f.endsWith('.xml'))) {
+        expect(readFileSync(file, 'utf8'), file).not.toContain(marker);
+      }
+
+      const sanitized = runShell(script, {}, probe);
+      expect(sanitized.status).toBe(0);
+      expect(listFilesRecursive(probe).filter((f) => f.endsWith('error-context.md'))).toHaveLength(0);
+      expect(existsSync(join(probe, 'playwright-report'))).toBe(false);
+      // Marker absent from every remaining file under the upload path,
+      // including inside base64 payloads.
+      for (const file of listFilesRecursive(join(probe, 'test-results'))) {
+        expect(fileContainsMarker(file, marker), file).toBe(false);
+      }
+      // Non-credential evidence survives sanitization.
+      expect(existsSync(join(probe, 'test-results', 'junit.xml'))).toBe(true);
+    } finally {
+      rmSync(probe, { recursive: true, force: true });
+    }
+  });
 });

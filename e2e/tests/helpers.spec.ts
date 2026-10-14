@@ -1,4 +1,6 @@
-import { test, expect, type APIRequestContext } from '@playwright/test';
+import { test, expect, chromium, type APIRequestContext } from '@playwright/test';
+import { createServer, type IncomingMessage, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import {
   accessHeaders,
   assertNoAccessWall,
@@ -8,7 +10,11 @@ import {
   syntheticNntpEndpoint,
 } from '../helpers/access.js';
 import { extractPlanMeta, extractUsageBytes } from '../helpers/contract.js';
-import { requireApiAccount, tryMintTestAccount } from '../helpers/accounts.js';
+import {
+  applyAccountToPage,
+  requireApiAccount,
+  tryMintTestAccount,
+} from '../helpers/accounts.js';
 
 // Helper self-tests (pure functions only): no browser page, no staging.
 // These run on every PR via e2e-lint AND inside the staging suite, pinning
@@ -326,6 +332,103 @@ test.describe('isStagingOrigin (credential scope gate)', () => {
     expect(foreign).toEqual({});
     expect(JSON.stringify(foreign)).not.toContain('dummy-client-secret');
     expect(JSON.stringify(foreign)).not.toContain('dummy-session');
+  });
+});
+
+test.describe('applyAccountToPage redirect scope (browser)', () => {
+  // Real Chromium repro for the redirect leak: staging answers /redir with a
+  // 302 to a foreign origin. route.continue({ headers }) keeps the headers on
+  // the automatic follow; fetch(maxRedirects: 0) + fulfill must not.
+  test('staging 302 to a foreign origin carries no credentials', async () => {
+    // Launch manually (not via the browser fixture) so containers without
+    // system browser libs skip with notice instead of failing setup; CI
+    // installs --with-deps so this runs for real there.
+    let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+    try {
+      browser = await chromium.launch();
+    } catch (error) {
+      test.skip(true, `Chromium unavailable in this container (${(error as Error).message.split('\n')[0]}); runs in CI with --with-deps.`);
+      return;
+    }
+    const markerSecret = 'dummy-client-secret-redirect-probe';
+    const markerSession = 'dummy-session-redirect-probe';
+    const markerId = 'dummy-client-id-redirect-probe';
+
+    const listen = (server: Server): Promise<number> =>
+      new Promise((resolve, reject) => {
+        server.on('error', reject);
+        server.listen(0, '127.0.0.1', () => resolve((server.address() as AddressInfo).port));
+      });
+    const close = (server: Server): Promise<void> =>
+      new Promise((resolve) => server.close(() => resolve()));
+
+    let foreignOrigin = '';
+    const foreignHits: Array<Record<string, string | string[] | undefined>> = [];
+    const foreign = createServer((req: IncomingMessage, res) => {
+      foreignHits.push({ ...req.headers });
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('landed');
+    });
+    const foreignPort = await listen(foreign);
+    foreignOrigin = `http://127.0.0.1:${foreignPort}`;
+
+    const stagingHits: Array<Record<string, string | string[] | undefined>> = [];
+    const staging = createServer((req: IncomingMessage, res) => {
+      stagingHits.push({ ...req.headers });
+      if (req.url === '/redir') {
+        res.writeHead(302, { location: `${foreignOrigin}/landed` });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('staging');
+    });
+    const stagingPort = await listen(staging);
+    const stagingOrigin = `http://127.0.0.1:${stagingPort}`;
+
+    const activeBrowser = browser;
+    try {
+      await withEnvAsync(
+        { CF_ACCESS_CLIENT_ID: markerId, CF_ACCESS_CLIENT_SECRET: markerSecret },
+        async () => {
+          const context = await activeBrowser.newContext();
+          try {
+            const page = await context.newPage();
+            await applyAccountToPage(
+              page,
+              { email: 'e2e@example.test', session: markerSession, viaApi: true },
+              stagingOrigin,
+            );
+            await page.goto(`${stagingOrigin}/redir`, { waitUntil: 'domcontentloaded' });
+            await expect(page.getByText('landed')).toBeVisible({ timeout: 15_000 });
+          } finally {
+            await context.close();
+          }
+        },
+      );
+
+      // Sanity: staging itself received the credentials (the test attached them).
+      expect(stagingHits.length).toBeGreaterThan(0);
+      const staged = JSON.stringify(stagingHits);
+      expect(staged).toContain(markerSecret);
+      expect(staged).toContain(markerSession);
+
+      // The foreign origin after the redirect must see neither header.
+      expect(foreignHits.length).toBeGreaterThan(0);
+      for (const headers of foreignHits) {
+        expect(headers['cf-access-client-id']).toBeUndefined();
+        expect(headers['cf-access-client-secret']).toBeUndefined();
+        expect(headers.authorization).toBeUndefined();
+      }
+      const dumped = JSON.stringify(foreignHits);
+      expect(dumped).not.toContain(markerSecret);
+      expect(dumped).not.toContain(markerSession);
+      expect(dumped).not.toContain(markerId);
+    } finally {
+      await close(staging).catch(() => {});
+      await close(foreign).catch(() => {});
+      await activeBrowser.close().catch(() => {});
+    }
   });
 });
 

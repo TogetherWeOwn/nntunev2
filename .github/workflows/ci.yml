@@ -103,6 +103,10 @@ jobs:
         working-directory: e2e
         run: npm ci
 
+      - name: Install Playwright chromium (browser-level self-tests)
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
       - name: Typecheck
         working-directory: e2e
         run: npm run typecheck
