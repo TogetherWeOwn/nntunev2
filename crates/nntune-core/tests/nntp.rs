@@ -58,12 +58,12 @@ impl Transport for Script {
 fn config() -> NntpConfig {
     NntpConfig {
         host: "nntp.example.com".into(),
-        port: 563,
         tls: true,
         username: Some("user".into()),
         password: Some("pass".into()),
         timeout: std::time::Duration::from_secs(5),
         max_pipelined: 4,
+        ..NntpConfig::default()
     }
 }
 
@@ -158,12 +158,12 @@ fn config_auth_user_only() -> NntpConfig {
     // Server answers 281 to AUTHINFO USER directly (no password needed).
     NntpConfig {
         host: "nntp.example.com".into(),
-        port: 563,
         tls: false,
         username: Some("user".into()),
         password: Some("pass".into()),
         timeout: std::time::Duration::from_secs(5),
         max_pipelined: 4,
+        ..NntpConfig::default()
     }
 }
 
@@ -245,11 +245,7 @@ async fn native_transport_against_loopback_server() {
     let cfg = NntpConfig {
         host: "127.0.0.1".into(),
         port,
-        tls: false,
-        username: Some("user".into()),
-        password: Some("pass".into()),
-        timeout: std::time::Duration::from_secs(5),
-        max_pipelined: 4,
+        ..config_auth_user_only()
     };
     let transport = nntune_core::transports::connect_native(&cfg)
         .await
