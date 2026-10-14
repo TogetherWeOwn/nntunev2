@@ -13,10 +13,19 @@ Actions secrets (CI) or shell exports (local).
 1. **Pre-deploy (now):** `STAGING_BASE_URL` is unset. Every spec skips with a
    notice. PRs and `main` stay green; the `e2e-lint` CI job still typechecks
    and lists the specs so the harness cannot rot silently.
-2. **Staging live:** the provision card stores `STAGING_BASE_URL` (+ Access +
-   NNTP secrets). The suite activates: failures fail closed and block prod
-   promotion via the production-environment protection rule.
-3. **Contract drift:** a renamed `data-testid` or reshaped JSON body fails
+2. **Activation hold:** keep the Actions secret `STAGING_BASE_URL` unset until
+   deployment exists and the authorized Operator provides a value-free delivery
+   receipt for the existing QA Access pair through an approved secure source and
+   repository-scoped contract. An Access policy or token resource ID is not
+   delivery of `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET`. Provisioning
+   alone does not authorize distributing credentials. Name-only availability
+   must then be rechecked; names and a receipt do not prove authentication.
+   NNTP and QA-auth prerequisites remain separate and must also be verified.
+3. **Staging live:** after the prerequisites are met, setting `STAGING_BASE_URL`
+   activates fail-closed checks. QA must verify the deployed head with Access
+   intact. Production promotion still requires exact-head staging evidence and
+   the deployment lane's promotion gate; neither is established by this harness.
+4. **Contract drift:** a renamed `data-testid` or reshaped JSON body fails
    with the contract key named. Update app + `helpers/contract.ts` together.
 
 ## Run locally
@@ -47,17 +56,18 @@ dependencies this harness needs.
 | Name | Required | Purpose |
 |---|---|---|
 | `STAGING_BASE_URL` | yes (post-deploy) | `https://` staging origin. Unset → skip with notice. |
-| `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | when Access fronts staging | QA service-token pair. Half-set → fail closed. |
+| `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | whenever staging is configured | QA service-token pair. Both absent or either absent → fail closed before requests. |
 | `QA_AUTH_TOKEN` | optional | Bearer for `POST /api/test-accounts` (staging-only seam). Absent → UI signup fallback. |
 | `SYNTHETIC_NNTP_HOST` / `_PORT` / `_USER` / `_TLS` | for BYOP spec | Hosted fixture server or test provider (defaults: `synthetic-nntp`, `563`, `e2e`, TLS on). |
 | `SYNTHETIC_NNTP_PASS` | for BYOP spec | No default — fail closed when missing. |
 
 How the suite uses them:
 
-- Every request carries the Access headers when the pair is set:
-  `playwright.config.ts` installs them at context level so page navigations
-  are covered, and API calls attach them per request. A half-set pair fails
-  closed at startup. An Access wall (wall status + Access markers, including
+- Configured staging requires both Access values before any request:
+  `playwright.config.ts` validates the URL and pair at startup, then installs
+  the headers at context level so page navigations are covered. API calls
+  attach them per request. Both missing or either missing fails closed;
+  offline checks remain usable with no staging URL and no Access pair. An Access wall (wall status + Access markers, including
   302s to the Access login) fails closed with a remediation message instead
   of masquerading as an app failure; plain app 4xx responses pass through.
 - Test-account sessions minted by the seam travel as
@@ -71,18 +81,28 @@ How the suite uses them:
 
 ## CI
 
-- `.github/workflows/e2e-staging.yml` — full suite on `push` to `main`
-  (post-deploy), manual dispatch, and a 6-hour synthetic schedule. Missing
-  `STAGING_BASE_URL` → step-level skip with notice (pre-deploy); configured
-  staging → fail closed. Failure artifacts kept 7 days.
+- `.github/workflows/e2e-staging.yml` — full suite on `push` to `main`,
+  manual dispatch, and a 6-hour synthetic schedule. The deployment lane must
+  sequence execution after staging deploy; a push alone is not deploy proof.
+  Missing `STAGING_BASE_URL` → step-level skip with notice (pre-deploy).
+  Both jobs require the Access pair in preflight before activating tests;
+  configured staging never skips for missing credentials. Failure artifacts
+  are kept 7 days.
 - `e2e-lint` inside `ci.yml` (part of `ci-ok`) — `npm ci`, `tsc --noEmit`,
-  `playwright test --list`. Runs on every PR with no staging needed.
-- **Prod promotion gate:** the production environment requires the
-  `e2e-staging` result on the same SHA (wired by the provision card). A red
-  staging suite blocks promotion — that is the acceptance criterion.
+  helper/workflow self-tests, and `playwright test --list`. Runs on every PR
+  with no staging needed. Offline tests execute both checked-in preflights
+  and the aggregate gate with dummy inputs; failures, cancellations and skips
+  of required jobs make `ci-ok` red.
+- **Prod promotion gate (required integration):** the deployment lane must
+  require the `e2e-staging` result on the deployed SHA and block promotion on
+  failure. Wiring and live enforcement are still acceptance prerequisites,
+  not a verified result of this PR.
 
 ## Evidence
 
-On failure CI uploads `playwright-report/` + `test-results/` (7 days). A QA
-PASS verdict cites the green `e2e-staging` run URL + head SHA; NEEDS WORK
-cites the failing spec + step.
+On failure CI uploads textual reports from `playwright-report/` +
+`test-results/` (7 days). Raw traces and screenshots are disabled: tracing
+records request headers/bodies and screenshots can expose account/provider
+information. Do not enable them for credential-bearing runs without a verified
+redaction path. A QA PASS verdict cites the green `e2e-staging` run URL +
+deployed head SHA; NEEDS WORK cites the failing spec + step.

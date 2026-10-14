@@ -29,10 +29,44 @@ function withEnv(vars: Record<string, string | undefined>, fn: () => void): void
   }
 }
 
+const dummyAccessPair = {
+  CF_ACCESS_CLIENT_ID: 'dummy-client-id',
+  CF_ACCESS_CLIENT_SECRET: 'dummy-client-secret',
+};
+
+const missingAccessPairs = [
+  { name: 'both missing', CF_ACCESS_CLIENT_ID: undefined, CF_ACCESS_CLIENT_SECRET: undefined },
+  { name: 'ID only', CF_ACCESS_CLIENT_ID: 'dummy-client-id', CF_ACCESS_CLIENT_SECRET: undefined },
+  { name: 'secret only', CF_ACCESS_CLIENT_ID: undefined, CF_ACCESS_CLIENT_SECRET: 'dummy-client-secret' },
+];
+
 test.describe('accessHeaders', () => {
-  test('empty when the pair is unset', () => {
-    withEnv({ CF_ACCESS_CLIENT_ID: undefined, CF_ACCESS_CLIENT_SECRET: undefined }, () => {
+  test('empty when staging and the pair are unset (offline)', () => {
+    withEnv({ STAGING_BASE_URL: undefined, CF_ACCESS_CLIENT_ID: undefined, CF_ACCESS_CLIENT_SECRET: undefined }, () => {
       expect(accessHeaders()).toEqual({});
+    });
+  });
+
+  for (const { name, ...pair } of missingAccessPairs) {
+    test(`configured staging rejects ${name} without echoing values`, () => {
+      withEnv({ STAGING_BASE_URL: 'https://staging.example', ...pair }, () => {
+        expect(() => accessHeaders()).toThrow(/CF_ACCESS_CLIENT_ID.*CF_ACCESS_CLIENT_SECRET/);
+        try {
+          accessHeaders();
+        } catch (error) {
+          expect((error as Error).message).not.toContain('dummy-client-id');
+          expect((error as Error).message).not.toContain('dummy-client-secret');
+        }
+      });
+    });
+  }
+
+  test('complete pair supplies the required headers', () => {
+    withEnv({ STAGING_BASE_URL: 'https://staging.example', ...dummyAccessPair }, () => {
+      expect(accessHeaders()).toEqual({
+        'CF-Access-Client-Id': dummyAccessPair.CF_ACCESS_CLIENT_ID,
+        'CF-Access-Client-Secret': dummyAccessPair.CF_ACCESS_CLIENT_SECRET,
+      });
     });
   });
 
@@ -176,8 +210,17 @@ test.describe('stagingBaseUrl', () => {
     });
   });
 
-  test('strips trailing slashes', () => {
-    withEnv({ STAGING_BASE_URL: 'https://staging.example///' }, () => {
+  for (const { name, ...pair } of missingAccessPairs) {
+    test(`URL resolution rejects ${name} before requests`, () => {
+      withEnv({ STAGING_BASE_URL: 'https://staging.example', ...pair }, () => {
+        expect(() => stagingBaseUrl('skip', 'health')).toThrow(/CF_ACCESS_CLIENT_ID/);
+        expect(() => stagingBaseUrl('fail-closed', 'journey')).toThrow(/CF_ACCESS_CLIENT_SECRET/);
+      });
+    });
+  }
+
+  test('strips trailing slashes with a complete Access pair', () => {
+    withEnv({ STAGING_BASE_URL: 'https://staging.example///', ...dummyAccessPair }, () => {
       expect(stagingBaseUrl('skip', 'health')).toBe('https://staging.example');
     });
   });

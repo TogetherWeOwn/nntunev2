@@ -93,7 +93,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d682002 # v6.0.0
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: 22
           cache: npm
@@ -115,10 +115,9 @@ jobs:
         working-directory: e2e
         run: npm run e2e:list
 
-  # Aggregate required check. Add every real job id to `needs` (and keep
-  # `always()` + the all-success assertion) so ci-ok runs and stays red
-  # when any job fails, is cancelled, or is skipped, and green only when
-  # all succeed.
+  # Aggregate required check. Add every real job id to `needs`. Parse its
+  # results as JSON: formatting must not hide failures, cancellations or skips.
+  # Green means every required job succeeded.
   ci-ok:
     name: ci-ok
     needs: [rust-test, rust-wasm, api, e2e-lint]
@@ -126,11 +125,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - env:
-          NEEDS_JSON: ${{ toJSON(needs) }}
-        run: |
-          if ! printf '%s' "$NEEDS_JSON" | jq -e 'length > 0 and all(.[]; .result == "success")' >/dev/null; then
+      - run: |
+          if ! jq -e 'length > 0 and all(.[]; .result == "success")' <<< "$NEEDS_JSON" > /dev/null; then
             echo "ci-ok: a required job did not succeed"
             exit 1
           fi
           echo "ci-ok: all required jobs passed"
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}

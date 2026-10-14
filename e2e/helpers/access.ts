@@ -25,10 +25,10 @@ export function accessHeaders(): Record<string, string> {
       'CF-Access-Client-Secret': secret,
     };
   }
-  if ((id && !secret) || (!id && secret)) {
+  if (process.env.STAGING_BASE_URL?.trim() || id || secret) {
     throw new Error(
-      'Cloudflare Access misconfigured: set both CF_ACCESS_CLIENT_ID and ' +
-        'CF_ACCESS_CLIENT_SECRET, or neither (secret names only — never values).',
+      'Cloudflare Access misconfigured: configured staging requires both ' +
+        'CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET (secret names only — never values).',
     );
   }
   return {};
@@ -116,6 +116,7 @@ export function stagingBaseUrl(required: 'skip' | 'fail-closed', context: string
         'Refusing to run against a non-TLS staging target.',
     );
   }
+  accessHeaders(); // Validate the pair before any caller can use the protected URL.
   return raw;
 }
 
