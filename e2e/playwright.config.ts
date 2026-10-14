@@ -28,7 +28,9 @@ export default defineConfig({
   // CI evidence is junit-only: the html reporter embeds step titles
   // (including fill values such as the BYOP password) as a base64 zip in
   // playwright-report/index.html, which would publish SYNTHETIC_NNTP_PASS
-  // from a public repo on any failing job. junit.xml carries no step values.
+  // from a public repo on any failing job. junit.xml can still embed filled
+  // secrets inside failure messages (e.g. toHaveValue Received strings), so
+  // the workflow scrubs secret values from test-results/ before uploading.
   reporter: process.env.CI
     ? [['list'], ['junit', { outputFile: 'test-results/junit.xml' }]]
     : [['list']],

@@ -137,13 +137,15 @@ test.describe('credential scope (static pins)', () => {
 
 // Execute the exact checked-in sanitize blocks: Playwright 1.55 writes
 // test-results/**/error-context.md (ARIA snapshots rendering filled input
-// values, including the BYOP password) and the html reporter embeds step fill
-// values as a base64 zip in playwright-report/index.html. CI uses the junit
-// reporter only and uploads test-results/ alone; the sanitize step deletes
-// error-context.md plus the whole playwright-report/ dir belt-and-braces.
-const sanitizeBlocks = [...stagingWorkflow.matchAll(
-  /      - name: Sanitize failure artifacts[\s\S]*?run: \|\n((?:          [^\n]*\n)+)/g,
+// values, including the BYOP password) and the junit reporter embeds failure
+// messages (e.g. toHaveValue Received strings) carrying the same filled
+// secrets. CI uses the junit reporter only and uploads test-results/ alone;
+// the sanitize step deletes error-context.md plus the whole
+// playwright-report/ dir, then scrubs secret values from test-results/.
+const sanitizeSections = [...stagingWorkflow.matchAll(
+  /      - name: Sanitize failure artifacts([\s\S]*?)run: \|\n((?:          [^\n]*\n)+)/g,
 )];
+const sanitizeBlocks = sanitizeSections.map((m) => m[2]!);
 
 function listFilesRecursive(dir: string): string[] {
   const out: string[] = [];
@@ -174,14 +176,33 @@ function fileContainsMarker(file: string, marker: string): boolean {
 
 test.describe('failure-artifact sanitization', () => {
   test('both jobs sanitize before uploading', () => {
+    expect(sanitizeSections).toHaveLength(2);
     expect(sanitizeBlocks).toHaveLength(2);
+    for (const section of sanitizeSections) {
+      // The scrub needs the secret VALUES, so each sanitize step must bind
+      // them (names only in source; values come from GitHub secrets).
+      for (const name of [
+        'CF_ACCESS_CLIENT_ID',
+        'CF_ACCESS_CLIENT_SECRET',
+        'QA_AUTH_TOKEN',
+        'SYNTHETIC_NNTP_HOST',
+        'SYNTHETIC_NNTP_USER',
+        'SYNTHETIC_NNTP_PASS',
+      ]) {
+        expect(section[1], `sanitize step env binds ${name}`).toContain(name);
+      }
+    }
     for (const block of sanitizeBlocks) {
-      const script = block[1]!.replace(/^ {10}/gm, '');
+      const script = block.replace(/^ {10}/gm, '');
       expect(script).toContain('error-context.md');
       // Whole-dir removal: the old `playwright-report/data`-only strip left
       // index.html (with its embedded base64 zip) behind.
       expect(script).toContain('rm -rf playwright-report');
       expect(script).not.toContain('playwright-report/data');
+      // junit.xml embeds failure messages (toHaveValue Received strings) that
+      // can carry filled secrets: the block must scrub test-results/.
+      expect(script).toContain('***REDACTED***');
+      expect(script).toContain('SYNTHETIC_NNTP_PASS');
     }
     // Each sanitize precedes its job's upload: nothing uploads raw first.
     for (const artifact of ['e2e-synthetic-report', 'e2e-journey-report']) {
@@ -213,12 +234,15 @@ test.describe('failure-artifact sanitization', () => {
 
   // Real-browser proof: run a genuinely failing Playwright test that fills a
   // marker password under the CI reporter config (junit, no html,
-  // trace/screenshot off), apply the exact checked-in sanitize block, and
-  // assert the marker is absent from every file left under the upload path,
-  // including base64-decoded payloads.
+  // trace/screenshot off). The junit reporter embeds the failure message
+  // (toHaveValue Received string), so junit.xml DOES carry the marker before
+  // sanitize. Apply the exact checked-in sanitize block with the marker bound
+  // as SYNTHETIC_NNTP_PASS (as CI binds the real secret) and assert the
+  // marker is absent from every file left under the upload path, including
+  // base64-decoded payloads.
   test('real failing fill leaves no marker after the checked-in sanitize', async () => {
     test.setTimeout(120_000);
-    const script = sanitizeBlocks[0]![1]!.replace(/^ {10}/gm, '');
+    const script = sanitizeBlocks[0]!.replace(/^ {10}/gm, '');
     const marker = 'MARKER-NNTP-PASS-9f8e7d6c5b4a';
     // Probe lives under e2e/ so `import '@playwright/test'` in the generated
     // spec resolves via e2e/node_modules (a system-temp dir has no ancestors
@@ -271,12 +295,15 @@ test.describe('failure-artifact sanitization', () => {
       const errorContexts = listFilesRecursive(probe).filter((f) => f.endsWith('error-context.md'));
       expect(errorContexts.length).toBeGreaterThan(0);
       expect(errorContexts.some((f) => readFileSync(f, 'utf8').includes(marker))).toBe(true);
-      // Junit evidence itself must be marker-free even before sanitize.
-      for (const file of listFilesRecursive(probe).filter((f) => f.endsWith('.xml'))) {
-        expect(readFileSync(file, 'utf8'), file).not.toContain(marker);
-      }
+      // junit.xml embeds the failure message (Received string), so it DOES
+      // carry the marker before sanitize — this is the leak the scrub fixes.
+      const junitBefore = listFilesRecursive(probe).filter((f) => f.endsWith('.xml'));
+      expect(junitBefore.length).toBeGreaterThan(0);
+      expect(junitBefore.some((f) => readFileSync(f, 'utf8').includes(marker))).toBe(true);
 
-      const sanitized = runShell(script, {}, probe);
+      // CI binds the real secret to the sanitize step; the probe binds the
+      // marker the same way so the exact checked-in scrub removes it.
+      const sanitized = runShell(script, { SYNTHETIC_NNTP_PASS: marker }, probe);
       expect(sanitized.status).toBe(0);
       expect(listFilesRecursive(probe).filter((f) => f.endsWith('error-context.md'))).toHaveLength(0);
       expect(existsSync(join(probe, 'playwright-report'))).toBe(false);

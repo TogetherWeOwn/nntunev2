@@ -84,18 +84,51 @@ jobs:
       - name: Sanitize failure artifacts (strip credential-bearing snapshots)
         if: failure() && steps.staging.outputs.configured == 'true'
         working-directory: e2e
+        env:
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
+          SYNTHETIC_NNTP_HOST: ${{ secrets.SYNTHETIC_NNTP_HOST }}
+          SYNTHETIC_NNTP_USER: ${{ secrets.SYNTHETIC_NNTP_USER }}
+          SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
         run: |
           set -euo pipefail
           # Playwright 1.55 writes test-results/**/error-context.md on any failed
           # page test — an ARIA snapshot rendering filled input values, including
-          # the BYOP password — and the html reporter embeds step fill values as
-          # a base64 zip in playwright-report/index.html. CI uses the junit
-          # reporter only, but belt-and-braces: delete error-context.md AND the
-          # whole playwright-report/ dir so the uploaded artifact can never
-          # carry secrets. Only test-results/ (junit) is uploaded below.
+          # the BYOP password — and the junit reporter embeds failure messages
+          # (e.g. toHaveValue Received strings) that can carry the same filled
+          # secrets. Belt-and-braces: delete error-context.md AND the whole
+          # playwright-report/ dir, then scrub secret values from every remaining
+          # file under test-results/ (junit.xml) so the uploaded artifact can
+          # never carry secrets. Only test-results/ (junit) is uploaded below.
           find test-results -name 'error-context.md' -delete 2>/dev/null || true
           rm -rf playwright-report 2>/dev/null || true
-          echo "sanitized: error-context.md and playwright-report/ removed"
+          python3 - <<'PY'
+          import os
+          import pathlib
+          root = pathlib.Path("test-results")
+          values = [
+              os.environ.get("CF_ACCESS_CLIENT_ID", ""),
+              os.environ.get("CF_ACCESS_CLIENT_SECRET", ""),
+              os.environ.get("QA_AUTH_TOKEN", ""),
+              os.environ.get("SYNTHETIC_NNTP_HOST", ""),
+              os.environ.get("SYNTHETIC_NNTP_USER", ""),
+              os.environ.get("SYNTHETIC_NNTP_PASS", ""),
+          ]
+          values = [v for v in values if v]
+          if root.is_dir() and values:
+              for path in root.rglob("*"):
+                  if not path.is_file():
+                      continue
+                  try:
+                      data = path.read_bytes()
+                  except OSError:
+                      continue
+                  for value in values:
+                      data = data.replace(value.encode(), b"***REDACTED***")
+                  path.write_bytes(data)
+          PY
+          echo "sanitized: error-context.md and playwright-report/ removed, test-results scrubbed"
 
       - name: Upload failure artifacts
         if: failure() && steps.staging.outputs.configured == 'true'
@@ -170,16 +203,49 @@ jobs:
       - name: Sanitize failure artifacts (strip credential-bearing snapshots)
         if: failure() && steps.staging.outputs.configured == 'true'
         working-directory: e2e
+        env:
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
+          SYNTHETIC_NNTP_HOST: ${{ secrets.SYNTHETIC_NNTP_HOST }}
+          SYNTHETIC_NNTP_USER: ${{ secrets.SYNTHETIC_NNTP_USER }}
+          SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
         run: |
           set -euo pipefail
-          # Same credential-bearing snapshot paths as the synthetic job above:
-          # error-context.md renders filled secrets and the html reporter would
-          # embed fill values in playwright-report/index.html. Strip
-          # error-context.md plus the whole playwright-report/ dir before
-          # upload (junit-only evidence in test-results/).
+          # Same credential-bearing paths as the synthetic job above:
+          # error-context.md renders filled secrets and junit failure messages
+          # (e.g. toHaveValue Received strings) can carry the same filled
+          # values. Strip error-context.md plus the whole playwright-report/
+          # dir, then scrub secret values from test-results/ (junit.xml)
+          # before upload (junit-only evidence in test-results/).
           find test-results -name 'error-context.md' -delete 2>/dev/null || true
           rm -rf playwright-report 2>/dev/null || true
-          echo "sanitized: error-context.md and playwright-report/ removed"
+          python3 - <<'PY'
+          import os
+          import pathlib
+          root = pathlib.Path("test-results")
+          values = [
+              os.environ.get("CF_ACCESS_CLIENT_ID", ""),
+              os.environ.get("CF_ACCESS_CLIENT_SECRET", ""),
+              os.environ.get("QA_AUTH_TOKEN", ""),
+              os.environ.get("SYNTHETIC_NNTP_HOST", ""),
+              os.environ.get("SYNTHETIC_NNTP_USER", ""),
+              os.environ.get("SYNTHETIC_NNTP_PASS", ""),
+          ]
+          values = [v for v in values if v]
+          if root.is_dir() and values:
+              for path in root.rglob("*"):
+                  if not path.is_file():
+                      continue
+                  try:
+                      data = path.read_bytes()
+                  except OSError:
+                      continue
+                  for value in values:
+                      data = data.replace(value.encode(), b"***REDACTED***")
+                  path.write_bytes(data)
+          PY
+          echo "sanitized: error-context.md and playwright-report/ removed, test-results scrubbed"
 
       - name: Upload failure artifacts
         if: failure() && steps.staging.outputs.configured == 'true'
