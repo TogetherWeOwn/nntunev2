@@ -1,3 +1,8 @@
 [workspace]
 members = ["crates/nntune-core"]
+# workers/api is a standalone crate owned by the api card (standalone on
+# main, no [workspace] table): exclude it so this parent workspace never
+# swallows it after merges from main. Revisit if the scaffold card unifies
+# the workspace.
+exclude = ["workers/api"]
 resolver = "2"
