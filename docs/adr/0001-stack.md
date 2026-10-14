@@ -20,7 +20,7 @@ codecs between edge and native targets.
 | Backend | **Rust** (`workers-rs` → `wasm32`) for **ALL** backend Workers, including Durable Objects |
 | Shared core | `crates/nntune-core`: NNTP client, SIMD yEnc, NZB parsing, decrypt, par2-verify — compiled to `wasm32` **and** native |
 | Frontend | **SvelteKit** on Cloudflare (`adapter-cloudflare`) |
-| Relational data | **PlanetScale Postgres via Cloudflare Hyperdrive** for ALL relational data (no D1): app database `nntunev2` + MusicBrainz mirror database `nntunev2-mb` in one account, each via its own Hyperdrive binding |
+| Relational data | **PlanetScale Postgres via Cloudflare Hyperdrive** for ALL relational data (no D1): app database (cluster `nntunev2`, per-environment database — `nntunev2_staging` in staging, prod DB at prod provisioning) + shared `nntunev2-mb` mirror cluster, each via its own Hyperdrive binding (per-environment names from the ops runbook; Rev 2026-10-14) |
 | Object cache | **R2** per-env buckets `nntunev2-{audio,art,archive}-{staging,prod}` (key layout in ADR 0003) |
 | Ingest | **Queues + Workflows** |
 | Config | **KV** |

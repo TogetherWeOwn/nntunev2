@@ -6,6 +6,10 @@
   authorization via grants (finding 1), provisioned bucket names + mirror-DB
   split (finding 8), GC over the new mapping tables (finding 3), no
   client-visible hit/miss signal (hit oracle).
+- **Rev 2026-10-14 (review round 3):** bounded GC mark set (`last_served_at`
+  window) + eviction deletes grants; archive buckets reserved (scratch
+  placement open with ops owner); honest shared-vs-prefix trade-off with
+  stream/Subsonic rework listed.
 
 ## Context
 
@@ -44,17 +48,27 @@ nntunev2-audio-{staging,prod}    # immutable audio bytes
   {sha256hex[0:2]}/{sha256hex[2:4]}/{sha256hex}
 nntunev2-art-{staging,prod}      # derived artwork renditions
   {sha256hex[0:2]}/{sha256hex[2:4]}/{sha256hex}-{size}
-nntunev2-archive-{staging,prod}  # ingest scratch (NZB working copies, par2
-                                 # repair sets) + MB dump staging;
-                                 # lifecycle-expired
-  tmp/{upload-id}/...
+nntunev2-archive-{staging,prod}  # reserved archive capacity
+                                 # (retention-checked; no Worker binding
+                                 # by default — NOT scratch storage)
 ```
 
 - Audio/art objects are **immutable and content-addressed**: same bytes →
   same key. Overwrite never happens; corruption is detected by hash mismatch.
-- `ref_count` in `cache_objects` is advisory (GC hint), not authoritative;
-  collection is mark-and-sweep from `track_media` ∪ `user_cache_grants`
-  (reachable hashes survive; everything else is swept).
+- Ingest scratch (NZB working copies, par2 repair sets) and MB dump staging
+  placement is **open — to confirm with the ops owner** (candidates: a
+  dedicated scratch bucket, or `tmp/` in the audio bucket). This ADR does
+  not place `tmp/` and claims no lifecycle expiry on the archive buckets,
+  which the ops runbook treats as retention-checked.
+- `ref_count` in `cache_objects` is advisory (GC hint), not authoritative.
+  Collection is mark-and-sweep with a **bounded** mark set: `track_media` ∪
+  `user_cache_grants` with `last_served_at` inside the retention window
+  (per-plan, e.g. 30d Plus / 90d Pro). Grants older than the window are
+  eviction candidates, not survivors — so the sweep actually reclaims.
+  Eviction runs against the per-plan `cache_bytes` budget (`usage_ledger`,
+  ADR 0004) in `cache_priority` order (lower tiers first; higher tiers'
+  working sets are swept last), and eviction **deletes the grant rows**
+  (plus orphaned `track_media` rows) so no dangling grants survive.
 - Per-plan **cache priority** (ADR 0004) controls eviction order and prefetch
   depth, not visibility: higher tiers' working sets are swept last.
 - Note: ADR 0007's `nntunev2-art` reference must gain the environment suffix
@@ -62,10 +76,17 @@ nntunev2-archive-{staging,prod}  # ingest scratch (NZB working copies, par2
 
 ### Alternatives considered
 
-- **Per-user prefixes (`u/{user_id}/...`):** rejected — duplicates identical
-  bytes N times, multiplying R2 storage and Usenet egress with zero privacy
-  gain (bytes are identical; the real boundary is the grant check at serve
-  time, not the key prefix).
+- **Per-user prefixes (`u/{user_id}/...`):** rejected — but on a narrower
+  basis than first written. Under the grant model every user still fetches
+  bytes through their own provider before receiving a grant, so shared
+  storage saves **R2 storage only** (dedupe on overlapping libraries), not
+  Usenet egress or provider quota. The kept benefit is paid for with the
+  grant / `track_media` / GC-marking machinery, and per-user prefixes would
+  give isolation by construction. Shared-plus-grants is kept because R2
+  dedupe at our overlapping-library ratios outweighs that ops cost; if
+  grant ops cost bites in practice, per-user prefixes are the named
+  fallback (no new ADR needed to revisit, but the revisit must re-list the
+  rework below).
 - **Global mapping without grants (original draft of this ADR):** rejected on
   review — any user could add any track to their library and read bytes
   another user's provider fetched, redistributing BYOP content across
@@ -79,7 +100,16 @@ nntunev2-archive-{staging,prod}  # ingest scratch (NZB working copies, par2
   quarantined, never served. Indexing writes `track_media` + `user_cache_grants`
   for the fetching user only.
 - Serving checks the grant row on every request; missing grant → fetch via the
-  requesting user's own provider (or 404), never a cross-user byte serve.
+  requesting user's own provider (or 404), never a cross-user byte serve. A
+  granted-but-absent object (evicted between grant check and read) takes the
+  same path: re-fetch via the requesting user's own provider (or 404) —
+  never an error that leaks another tenant's state.
 - Cache GC is a batch Workflow (Containers-eligible), never inline on play.
 - Artwork renditions are derived deterministically (`{hash}-{size}`) so they
   dedupe too.
+- **Known rework this ADR imposes on sibling cards:** the stream worker's
+  global `track/<track_id>` pointer + signed-grant serve path and the
+  Subsonic card's cache reads must move to the per-user
+  `track_media` + `user_cache_grants` check; neither may serve on a bare
+  content hash. Owned by the stream and Subsonic compat cards —
+  non-blocking here, but their review must show the grant check.
