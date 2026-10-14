@@ -41,7 +41,11 @@ and the native repair runner own network I/O and deadlines.
 image-pinned binary, and an exclusive scratch directory. Default ceilings are
 120 seconds wall time, 60 seconds CPU, 1 MiB combined output, 8 GiB workspace
 (and per-file size), and 512 MiB address space. `repair_with_limits` accepts
-smaller budgets. Failed or unreported repair counts are `-1`, not a fabricated
+smaller budgets. The wrapper runs `par2 repair -q` (single `-q`: summary lines
+kept, progress suppressed; `-q -q` would silence the real binary entirely).
+`RepairReport` carries `exit_code`/`signal` for retry vs dead-letter decisions
+(v1 split: 0 success, 1/2 unrecoverable, other codes/signals resource or
+transient). Failed or unreported repair counts are `-1`, not a fabricated
 zero. The calling Container must remain unprivileged with quota-backed scratch:
 aggregate-size polling is neither a sandbox nor a hard disk quota.
 

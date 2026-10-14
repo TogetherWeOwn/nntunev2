@@ -2,7 +2,10 @@ use super::{RepairLimits, RepairReport};
 use crate::error::{Error, Result};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
-use std::os::unix::{fs::MetadataExt, process::CommandExt};
+use std::os::unix::{
+    fs::MetadataExt,
+    process::{CommandExt, ExitStatusExt},
+};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -169,7 +172,13 @@ pub(super) fn run(
         .arg(binary)
         .arg("repair")
         .arg(format!("-B{}", root.display()))
-        .args(["-m256", "-t1", "-T1", "-q", "-q", "--"])
+        // Single `-q`: suppresses progress spam but still emits the
+        // human-readable summary lines (`Repair complete.`,
+        // `All files are correct, repair is not required.`,
+        // `<N> recovery blocks will be used to repair.`). A second `-q`
+        // selects `nlSilent`, which prints nothing on success and leaves
+        // `repaired_blocks`/`tail` permanently empty against the real binary.
+        .args(["-m256", "-t1", "-T1", "-q", "--"])
         .args(&inputs)
         .current_dir(&root)
         .env_clear()
@@ -206,6 +215,8 @@ pub(super) fn run(
     lines.reverse();
     Ok(RepairReport {
         success: status.success(),
+        exit_code: status.code(),
+        signal: status.signal(),
         repaired_blocks: if status.success() {
             parse_repaired(&combined)
         } else {
@@ -217,7 +228,13 @@ pub(super) fn run(
 }
 
 fn parse_repaired(output: &str) -> i64 {
-    if output.contains("Repair is not required.") {
+    // Real par2cmdline-turbo prints `All files are correct, repair is not
+    // required.` (lowercase `r`); older fixtures print `Repair is not
+    // required.`. Match case-insensitively so both report zero.
+    if output
+        .to_ascii_lowercase()
+        .contains("repair is not required")
+    {
         return 0;
     }
     if !output.contains("Repair complete.") {
@@ -225,14 +242,38 @@ fn parse_repaired(output: &str) -> i64 {
     }
     for line in output.lines() {
         let line = line.trim();
-        let count = line
-            .strip_suffix(" recovery blocks will be used to repair.")
-            .or_else(|| {
-                line.strip_prefix("Need ")?
-                    .strip_suffix(" more recovery blocks to be able to repair.")
-            });
-        if let Some(n) = count {
-            if let Ok(n) = n.parse::<u64>() {
+        // Real: `<N> recovery blocks will be used to repair.`
+        if let Some(prefix) = line.strip_suffix(" recovery blocks will be used to repair.") {
+            if let Some(num) = prefix.split_whitespace().last() {
+                if let Ok(n) = num.parse::<u64>() {
+                    return i64::try_from(n).unwrap_or(-1);
+                }
+            }
+        }
+        // Real (unrecoverable sets): `You need <N> more recovery blocks...`;
+        // older fixtures: `Need <N> more recovery blocks to be able to
+        // repair.`. The unrecoverable line never co-occurs with
+        // `Repair complete.` on the real binary, but fixtures combine them,
+        // so accept either phrasing for the count whenever success text is
+        // present. Extract the first integer on the line.
+        if line.contains("more recovery blocks") {
+            let mut digits = String::new();
+            let mut found: Option<u64> = None;
+            for ch in line.chars() {
+                if ch.is_ascii_digit() {
+                    digits.push(ch);
+                } else if !digits.is_empty() {
+                    if let Ok(n) = digits.parse::<u64>() {
+                        found = Some(n);
+                        break;
+                    }
+                    digits.clear();
+                }
+            }
+            if found.is_none() && !digits.is_empty() {
+                found = digits.parse::<u64>().ok();
+            }
+            if let Some(n) = found {
                 return i64::try_from(n).unwrap_or(-1);
             }
         }
