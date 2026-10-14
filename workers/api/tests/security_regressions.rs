@@ -578,6 +578,8 @@ fn claim_statements_are_conditional_parameterized_updates() {
         ),
     ] {
         assert!(sql.starts_with("UPDATE "));
+        let column = flag.trim_end_matches(" = FALSE");
+        assert!(sql.contains(&format!("SET {column} = TRUE WHERE")), "{sql}");
         assert!(sql.contains(&format!("AND {flag} RETURNING")), "{sql}");
         for n in 1..=params {
             assert!(sql.contains(&format!("${n}")), "{sql}");
