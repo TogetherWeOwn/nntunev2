@@ -41,13 +41,17 @@ and the native repair runner own network I/O and deadlines.
 image-pinned binary, and an exclusive scratch directory. Default ceilings are
 120 seconds wall time, 60 seconds CPU, 1 MiB combined output, 8 GiB workspace
 (and per-file size), and 512 MiB address space. `repair_with_limits` accepts
-smaller budgets. The wrapper runs `par2 repair -q` (single `-q`: summary lines
-kept, progress suppressed; `-q -q` would silence the real binary entirely).
+smaller budgets. The wrapper runs `par2 repair -q` (single `-q`: `Repair
+complete.` / `All files are correct, repair is not required.` kept, progress
+suppressed; `-q -q` would silence the real binary entirely; the `<N> recovery
+blocks` count line is suppressed at `-q`, so `repaired_blocks` is 0 when
+nothing was needed and -1 when repair completed or the count is unknown).
 `RepairReport` carries `exit_code`/`signal` for retry vs dead-letter decisions
-(v1 split: 0 success, 1/2 unrecoverable, other codes/signals resource or
-transient). Failed or unreported repair counts are `-1`, not a fabricated
-zero. The calling Container must remain unprivileged with quota-backed scratch:
-aggregate-size polling is neither a sandbox nor a hard disk quota.
+(par2cmdline-turbo: 0 success; 1/2/4 permanently unusable inputs and 6 with
+`Recovery will not be possible` a corrupt set — dead-letter, do not retry;
+only 8 and signal kills are resource failures). The calling Container must
+remain unprivileged with quota-backed scratch: aggregate-size polling is
+neither a sandbox nor a hard disk quota.
 
 ## Checks
 

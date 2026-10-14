@@ -20,22 +20,95 @@ fn no_repair_required_reports_zero_blocks() {
 }
 
 #[test]
-fn needed_recovery_blocks_are_reported_after_completed_repair() {
+fn full_healthy_sentence_reports_zero_blocks() {
+    let f = Fixture::new("printf 'All files are correct, repair is not required.\\n'");
+    let result = repair_with_binary(&f.binary, &f.scratch, &[f.input()]).unwrap();
+    assert!(result.success);
+    assert_eq!(result.repaired_blocks, 0);
+}
+
+#[test]
+fn needed_recovery_blocks_line_reports_unknown_at_quiet_verbosity() {
+    // The real binary suppresses the `<N> more recovery blocks` count line at
+    // single `-q`; a count must never be extracted from it (and never from a
+    // `Target:` filename echo). Success without a healthy line is -1.
     let f = Fixture::new(
         "printf 'Need 7 more recovery blocks to be able to repair.\\nRepair complete.\\n'",
     );
     let result = repair_with_binary(&f.binary, &f.scratch, &[f.input()]).unwrap();
     assert!(result.success);
-    assert_eq!(result.repaired_blocks, 7);
+    assert_eq!(result.repaired_blocks, -1);
 }
 
 #[test]
-fn used_recovery_blocks_are_reported_after_completed_repair() {
+fn used_recovery_blocks_line_reports_unknown_at_quiet_verbosity() {
+    // Same as above: `<N> recovery blocks will be used to repair.` is not
+    // printed at `-q` by par2cmdline-turbo, so it reports -1 here.
     let f =
         Fixture::new("printf '7 recovery blocks will be used to repair.\\nRepair complete.\\n'");
     let result = repair_with_binary(&f.binary, &f.scratch, &[f.input()]).unwrap();
     assert!(result.success);
-    assert_eq!(result.repaired_blocks, 7);
+    assert_eq!(result.repaired_blocks, -1);
+}
+
+#[test]
+fn hostile_target_name_cannot_spoof_healthy_zero() {
+    // par2 echoes untrusted PAR2 target names in `Target: "<name>"` lines.
+    // A file named `x - repair is not required.bin` must not report 0.
+    let f = Fixture::new(
+        "printf 'Target: \"x - repair is not required.bin\" - damaged.\\nRepair complete.\\n'",
+    );
+    let result = repair_with_binary(&f.binary, &f.scratch, &[f.input()]).unwrap();
+    assert!(result.success);
+    assert_eq!(result.repaired_blocks, -1);
+}
+
+#[test]
+fn hostile_target_name_cannot_spoof_block_count() {
+    // A file named `9 more recovery blocks.bin` must not report 9.
+    let f = Fixture::new(
+        "printf 'Target: \"9 more recovery blocks.bin\" - damaged.\\nRepair complete.\\n'",
+    );
+    let result = repair_with_binary(&f.binary, &f.scratch, &[f.input()]).unwrap();
+    assert!(result.success);
+    assert_eq!(result.repaired_blocks, -1);
+}
+
+#[test]
+fn exit_code_and_signal_are_reported_on_success() {
+    let f = Fixture::new("printf 'Repair complete.\\n'");
+    let result = repair_with_binary(&f.binary, &f.scratch, &[f.input()]).unwrap();
+    assert!(result.success);
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(result.signal, None);
+}
+
+#[test]
+fn exit_code_is_reported_on_unrecoverable_failure() {
+    let f = Fixture::new("printf 'Repair failed.\\n'; exit 2");
+    let result = repair_with_binary(&f.binary, &f.scratch, &[f.input()]).unwrap();
+    assert!(!result.success);
+    assert_eq!(result.exit_code, Some(2));
+    assert_eq!(result.signal, None);
+    assert_eq!(result.repaired_blocks, -1);
+}
+
+#[test]
+fn exit_code_is_reported_on_corrupt_par2_input() {
+    let f = Fixture::new("printf 'Main packet not found.\\n'; exit 4");
+    let result = repair_with_binary(&f.binary, &f.scratch, &[f.input()]).unwrap();
+    assert!(!result.success);
+    assert_eq!(result.exit_code, Some(4));
+    assert_eq!(result.signal, None);
+}
+
+#[test]
+fn signal_is_reported_when_killed() {
+    let f = Fixture::new("kill -9 $$");
+    let result = repair_with_binary(&f.binary, &f.scratch, &[f.input()]).unwrap();
+    assert!(!result.success);
+    assert_eq!(result.exit_code, None);
+    assert_eq!(result.signal, Some(9));
 }
 
 #[test]
@@ -59,9 +132,12 @@ fn unrecognized_output_is_not_invented_as_a_count() {
 #[test]
 fn nonzero_exit_cannot_claim_success_even_with_success_text() {
     let f = Fixture::new("printf 'Repair complete.\\n'; exit 2");
-    if let Ok(result) = repair_with_binary(&f.binary, &f.scratch, &[f.input()]) {
-        assert!(!result.success);
-    }
+    let result = repair_with_binary(&f.binary, &f.scratch, &[f.input()])
+        .expect("wrapper reports nonzero exits as a report, not an error");
+    assert!(!result.success);
+    assert_eq!(result.exit_code, Some(2));
+    assert_eq!(result.signal, None);
+    assert_eq!(result.repaired_blocks, -1);
 }
 
 #[test]

@@ -41,19 +41,25 @@ impl Default for RepairLimits {
 pub struct RepairReport {
     /// Whether the binary reported success (exit status 0).
     pub success: bool,
-    /// Process exit code (`None` when killed by a signal). Mirrors the v1
-    /// runner split: 0 is success, 1/2 mean the set is unrecoverable
-    /// (dead-letter, do not retry), any other code is a resource/transient
-    /// failure. Combine with `signal` to separate OOM/IO/limit kills.
+    /// Process exit code (`None` when killed by a signal). Matches
+    /// par2cmdline-turbo: 0 is success; 1/2/4 mean the inputs are permanently
+    /// unusable for this set (dead-letter, do not retry — unrecoverable,
+    /// missing target, `Main packet not found`); 6 with a
+    /// `Recovery will not be possible` line is a corrupt set (dead-letter,
+    /// do not retry); only 8 (out of memory) and signal kills (including the
+    /// `prlimit` CPU/file-size/address-space ceilings) are resource failures.
+    /// Any other code is unexpected: bound retries and run `par2 verify`
+    /// first to separate unusable sets from transient failures. Combine with
+    /// `signal` to separate OOM/IO/limit kills.
     pub exit_code: Option<i32>,
     /// Terminating signal number on Unix (`None` on a normal exit). Set when
     /// the kernel (including the `prlimit` CPU/file-size/address-space
     /// ceilings) kills the repair process.
     pub signal: Option<i32>,
-    /// Best-effort repaired-block count parsed from the binary's human-readable
-    /// output at `-q` verbosity; -1 if failed or not reported. A success line
-    /// alone does not prove a block count. "Repair is not required" means 0.
-    /// Never use this for retry/dead-letter decisions; use `exit_code`.
+    /// Repaired-block count: 0 when the binary reports nothing needed, -1
+    /// when repair completed (the real binary prints no count at `-q`
+    /// verbosity) or when the run failed/unknown. Never use this for
+    /// retry/dead-letter decisions; use `exit_code`.
     pub repaired_blocks: i64,
     /// Target PAR2 paths supplied by the caller.
     pub targets: Vec<PathBuf>,

@@ -45,12 +45,14 @@ fn default_limits_are_finite_and_nonzero() {
 
 #[test]
 fn bounded_success_is_not_rejected_by_custom_limits() {
-    let f = Fixture::new(
-        "printf 'Need 3 more recovery blocks to be able to repair.\\nRepair complete.\\n'",
-    );
+    // No count is reported at `-q` verbosity: success without a healthy line
+    // is -1 (repaired or unknown), even when a count-like line is present.
+    let f = Fixture::new("printf 'Repair complete.\\n'");
     let result = repair_with_limits(&f.binary, &f.scratch, &[f.input()], &limits()).unwrap();
     assert!(result.success);
-    assert_eq!(result.repaired_blocks, 3);
+    assert_eq!(result.repaired_blocks, -1);
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(result.signal, None);
     assert!(result.tail.contains("Repair complete."));
 }
 

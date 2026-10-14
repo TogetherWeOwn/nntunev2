@@ -173,11 +173,14 @@ pub(super) fn run(
         .arg("repair")
         .arg(format!("-B{}", root.display()))
         // Single `-q`: suppresses progress spam but still emits the
-        // human-readable summary lines (`Repair complete.`,
-        // `All files are correct, repair is not required.`,
-        // `<N> recovery blocks will be used to repair.`). A second `-q`
-        // selects `nlSilent`, which prints nothing on success and leaves
-        // `repaired_blocks`/`tail` permanently empty against the real binary.
+        // terminal summary lines (`Repair complete.`,
+        // `All files are correct, repair is not required.`). The
+        // `<N> recovery blocks will be used to repair.` count line is
+        // suppressed at this verbosity, so a real repair never reports a
+        // positive count: `repaired_blocks` is 0 when nothing was needed
+        // and -1 when repair completed or the count is unknown. A second
+        // `-q` selects `nlSilent`, which prints nothing on success and
+        // leaves `tail` permanently empty against the real binary.
         .args(["-m256", "-t1", "-T1", "-q", "--"])
         .args(&inputs)
         .current_dir(&root)
@@ -228,55 +231,27 @@ pub(super) fn run(
 }
 
 fn parse_repaired(output: &str) -> i64 {
-    // Real par2cmdline-turbo prints `All files are correct, repair is not
-    // required.` (lowercase `r`); older fixtures print `Repair is not
-    // required.`. Match case-insensitively so both report zero.
-    if output
-        .to_ascii_lowercase()
-        .contains("repair is not required")
-    {
-        return 0;
-    }
-    if !output.contains("Repair complete.") {
-        return -1;
-    }
+    // Whole-trimmed-line equality only. par2 echoes untrusted target file
+    // names in `Target: "<name>"` lines, so any substring or integer scan
+    // is spoofable (a file named `9 more recovery blocks.bin` or
+    // `x - repair is not required.bin` would set the count). A `Target:`
+    // line never equals a bare summary sentence, so exact matches are safe.
+    // At single `-q` the real binary prints no repair count: healthy sets
+    // print exactly `All files are correct, repair is not required.`,
+    // repaired sets print exactly `Repair complete.`. Report 0 when nothing
+    // was needed, -1 (repaired or unknown) otherwise.
+    let mut healthy = false;
     for line in output.lines() {
-        let line = line.trim();
-        // Real: `<N> recovery blocks will be used to repair.`
-        if let Some(prefix) = line.strip_suffix(" recovery blocks will be used to repair.") {
-            if let Some(num) = prefix.split_whitespace().last() {
-                if let Ok(n) = num.parse::<u64>() {
-                    return i64::try_from(n).unwrap_or(-1);
-                }
+        match line.trim() {
+            "All files are correct, repair is not required." | "Repair is not required." => {
+                healthy = true;
             }
-        }
-        // Real (unrecoverable sets): `You need <N> more recovery blocks...`;
-        // older fixtures: `Need <N> more recovery blocks to be able to
-        // repair.`. The unrecoverable line never co-occurs with
-        // `Repair complete.` on the real binary, but fixtures combine them,
-        // so accept either phrasing for the count whenever success text is
-        // present. Extract the first integer on the line.
-        if line.contains("more recovery blocks") {
-            let mut digits = String::new();
-            let mut found: Option<u64> = None;
-            for ch in line.chars() {
-                if ch.is_ascii_digit() {
-                    digits.push(ch);
-                } else if !digits.is_empty() {
-                    if let Ok(n) = digits.parse::<u64>() {
-                        found = Some(n);
-                        break;
-                    }
-                    digits.clear();
-                }
-            }
-            if found.is_none() && !digits.is_empty() {
-                found = digits.parse::<u64>().ok();
-            }
-            if let Some(n) = found {
-                return i64::try_from(n).unwrap_or(-1);
-            }
+            _ => {}
         }
     }
-    -1
+    if healthy {
+        0
+    } else {
+        -1
+    }
 }
