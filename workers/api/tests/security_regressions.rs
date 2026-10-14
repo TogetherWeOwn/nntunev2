@@ -123,6 +123,114 @@ fn targets_reject_empty_dns_answers() {
 }
 
 #[test]
+fn nntp_port_allowlist_rejects_non_allowlisted_public_ports() {
+    // F-VAULT-03 Gap 1: only 119/563 (plus documented alternates) may be
+    // saved or dialed. A public-host answer on any other port is Invalid
+    // at both save time (`validate`) and the pool dial site
+    // (`authorize_pool_dial`) — otherwise `test connection` is a port-scan
+    // primitive aimed at 22/25/3306/6379/....
+    let public = dns(&["93.184.216.34"]);
+    for port in [119u16, 563] {
+        let cfg = vault::ProviderConfig { port, ..provider() };
+        assert!(
+            cfg.validate(&public).is_ok(),
+            "allowlisted port rejected at save: {port}"
+        );
+        let target = vault::authorize_pool_dial(HOST, port, &public)
+            .expect("allowlisted port rejected at dial");
+        assert_eq!(target.port(), port, "dial pins the vetted port");
+        assert_eq!(target.host(), HOST);
+    }
+    for port in [
+        0u16, 1, 22, 25, 80, 443, 1190, 3306, 6379, 8080, 8443, 65535,
+    ] {
+        let cfg = vault::ProviderConfig { port, ..provider() };
+        assert!(
+            cfg.validate(&public).is_err(),
+            "non-allowlisted port saved: {port}"
+        );
+        assert!(
+            vault::authorize_pool_dial(HOST, port, &public).is_err(),
+            "non-allowlisted port dialed: {port}"
+        );
+    }
+}
+
+#[test]
+fn pool_dial_guard_rejects_bad_shape_and_private_targets_at_connect_time() {
+    // The dial-site guard re-enforces the full invariant: DNS that changed
+    // after save (now private) and malformed hosts fail even on allowlisted
+    // ports.
+    let public = dns(&["93.184.216.34"]);
+    assert!(vault::authorize_pool_dial("https://service.example.com/", 563, &public).is_err());
+    assert!(vault::authorize_pool_dial("", 563, &public).is_err());
+    for private in [["10.0.0.5"], ["127.0.0.1"], ["::1"], ["2002:a00:1::1"]] {
+        assert!(
+            vault::authorize_pool_dial(HOST, 119, &dns(&private)).is_err(),
+            "dial allowed a non-public target: {private:?}"
+        );
+    }
+    let target = vault::authorize_pool_dial(HOST, 119, &public).unwrap();
+    assert_eq!(target.addresses(), public.0);
+}
+
+#[test]
+fn test_connection_rate_limit_and_concurrency_trip() {
+    // F-VAULT-03 Gap 2: per-user sliding window + concurrency cap. The
+    // timestamps here stand in for rows from the shared store (Postgres/KV);
+    // the gate itself is pure so the Worker wiring stays thin.
+    let recent: Vec<u64> = (0..5).map(|i| NOW - i).collect();
+    assert!(
+        !vault::test_attempt_allowed(&recent, NOW),
+        "5 attempts in the window must trip the limit"
+    );
+    let four: Vec<u64> = (0..4).map(|i| NOW - i).collect();
+    assert!(
+        vault::test_attempt_allowed(&four, NOW),
+        "4 attempts in the window must pass"
+    );
+    assert!(
+        vault::test_attempt_allowed(&[NOW - 61, NOW - 3600], NOW),
+        "attempts outside the window must age out"
+    );
+    assert!(
+        vault::test_attempt_allowed(&[], NOW),
+        "first attempt must pass"
+    );
+    assert!(
+        !vault::test_attempt_allowed(&[NOW + 1000; 5], NOW),
+        "future timestamps must fail closed, not bypass"
+    );
+    assert_eq!(vault::test_attempt_retention_cutoff(NOW), NOW - 60);
+    assert_eq!(vault::test_attempt_retention_cutoff(30), 0);
+    assert!(vault::concurrent_test_allowed(0));
+    assert!(vault::concurrent_test_allowed(1));
+    assert!(!vault::concurrent_test_allowed(2));
+    assert!(!vault::concurrent_test_allowed(99));
+}
+
+#[test]
+fn test_connection_budget_fires_dial_and_total_timeouts() {
+    // F-VAULT-03 Gap 2: the dial/total constants must actually bound the
+    // attempt. The pool aborts the handshake at the dial deadline and the
+    // whole attempt at the total deadline.
+    let budget = vault::TestConnectionBudget::new(1_000);
+    assert_eq!(
+        budget.dial_deadline_ms - budget.start_ms,
+        vault::DIAL_TIMEOUT_MS
+    );
+    assert_eq!(
+        budget.total_deadline_ms - budget.start_ms,
+        vault::TOTAL_TIMEOUT_MS
+    );
+    assert!(!budget.dial_expired(1_000));
+    assert!(!budget.dial_expired(5_999));
+    assert!(budget.dial_expired(6_000));
+    assert!(!budget.total_expired(15_999));
+    assert!(budget.total_expired(16_000));
+}
+
+#[test]
 fn targets_preserve_hostname_and_every_vetted_public_address() {
     let addresses = [
         "93.184.216.34",
