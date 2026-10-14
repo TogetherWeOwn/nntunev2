@@ -20,7 +20,9 @@ pub mod code {
     pub const GENERIC: i64 = 0;
     pub const REQUIRED_PARAM_MISSING: i64 = 10;
     pub const WRONG_CREDENTIALS: i64 = 40;
-    pub const TOKEN_AUTH_UNSUPPORTED: i64 = 41;
+    pub const CONFLICTING_AUTH: i64 = 43;
+    pub const INVALID_API_KEY: i64 = 44;
+    pub const NOT_AUTHORIZED: i64 = 50;
     pub const NOT_FOUND: i64 = 70;
 }
 
@@ -67,11 +69,13 @@ pub fn render_json(doc: &Value) -> Vec<u8> {
     format!("{{\"subsonic-response\":{}}}", doc.to_json()).into_bytes()
 }
 
-/// Render a document for `f=jsonp`. A missing/empty callback is itself
-/// error 10 JSON, exactly like v1's `toJsonp` fallback.
+/// Render a document for `f=jsonp`. A missing/empty/invalid callback is
+/// itself error 10 JSON, exactly like v1's `toJsonp` fallback (v1 goes
+/// through Symfony `setCallback`, which rejects anything that is not a
+/// dot-separated JS identifier path with optional `[...]` parts).
 pub fn render_jsonp(doc: &Value, callback: Option<&str>) -> (Vec<u8>, &'static str) {
     match callback {
-        Some(cb) if !cb.is_empty() => (
+        Some(cb) if is_valid_jsonp_callback(cb) => (
             format!("{}({{\"subsonic-response\":{}}})", cb, doc.to_json()).into_bytes(),
             JSONP_CONTENT_TYPE,
         ),
@@ -83,6 +87,65 @@ pub fn render_jsonp(doc: &Value, callback: Option<&str>) -> (Vec<u8>, &'static s
             JSON_CONTENT_TYPE,
         ),
     }
+}
+
+/// Symfony `JsonResponse::setCallback` equivalent: dot-separated JS
+/// identifiers (`foo`, `foo.bar`, `foo[0].bar`), nothing else. Anything with
+/// parens, semicolons, slashes or whitespace is rejected so the API origin
+/// can never serve attacker-chosen script.
+pub fn is_valid_jsonp_callback(cb: &str) -> bool {
+    if cb.is_empty() || cb.len() > 128 {
+        return false;
+    }
+    for segment in cb.split('.') {
+        if segment.is_empty() {
+            return false;
+        }
+        // Strip trailing `[...]` indexers: `foo[0][bar]`.
+        let mut rest = segment;
+        let base_end = rest.find('[').unwrap_or(rest.len());
+        if !is_js_identifier(&rest[..base_end]) {
+            return false;
+        }
+        rest = &rest[base_end..];
+        while !rest.is_empty() {
+            if !rest.starts_with('[') {
+                return false;
+            }
+            let close = match rest.find(']') {
+                Some(i) => i,
+                None => return false,
+            };
+            let inner = &rest[1..close];
+            if inner.is_empty() {
+                return false;
+            }
+            // Unquoted indexers allow alnum/`_`/`$`/`-`; quoted ones are
+            // rejected to keep the pattern tight (v1 clients never need them).
+            if !inner
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'-')
+            {
+                return false;
+            }
+            rest = &rest[close + 1..];
+        }
+    }
+    true
+}
+
+fn is_js_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {}
+        _ => return false,
+    }
+    for c in chars {
+        if !(c.is_ascii_alphanumeric() || c == '_' || c == '$') {
+            return false;
+        }
+    }
+    true
 }
 
 /// Render a document as XML (the default `f`).
@@ -114,5 +177,30 @@ mod tests {
         let (body, ct) = render_jsonp(&ok_document(vec![]), None);
         assert_eq!(ct, JSON_CONTENT_TYPE);
         assert!(String::from_utf8(body).unwrap().contains("\"code\":10"));
+    }
+
+    #[test]
+    fn jsonp_rejects_non_identifier_callbacks() {
+        for bad in [
+            "alert(document.domain);//",
+            "alert(1)",
+            "cb;evil()",
+            "foo bar",
+            "",
+            "foo..bar",
+            "123abc",
+            "a-b",
+        ] {
+            let (body, ct) = render_jsonp(&ok_document(vec![]), Some(bad));
+            assert_eq!(ct, JSON_CONTENT_TYPE, "{bad}");
+            assert!(
+                String::from_utf8(body).unwrap().contains("\"code\":10"),
+                "{bad}"
+            );
+        }
+        for good in ["cb", "myApp.cb_1", "$jQuery.foo", "ns.cb[0].done"] {
+            let (_, ct) = render_jsonp(&ok_document(vec![]), Some(good));
+            assert_eq!(ct, JSONP_CONTENT_TYPE, "{good}");
+        }
     }
 }

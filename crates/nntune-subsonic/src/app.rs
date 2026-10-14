@@ -45,13 +45,17 @@ impl<S: Library> SubsonicApp<S> {
 
     /// Handle one request. `method` is accepted as GET or POST (v1 registers
     /// both on every route); `path` is the URL path, `query` the raw query
-    /// string without `?`.
-    pub fn handle(&self, _method: &str, path: &str, query: &str) -> HttpResponse {
+    /// string without `?`, `body` the raw POST form body (empty for GET).
+    /// For POST, body pairs are merged after query pairs (v1 reads params
+    /// with `$request->input()`, query plus form body); query wins on
+    /// duplicates since `Params::get` returns the first value.
+    pub fn handle(&self, method: &str, path: &str, query: &str, body: &str) -> HttpResponse {
+        let merged = Self::merge_query(method, query, body);
         match route(path) {
             Route::Unknown => HttpResponse::document(404, "text/plain", b"Not Found".to_vec()),
             Route::Hls => HttpResponse::document(410, "text/plain", b"Gone".to_vec()),
             Route::Unsupported(op) => {
-                let params = Params::parse(query);
+                let params = Params::parse(&merged);
                 let doc = error_document(
                     crate::envelope::code::GENERIC,
                     &format!("The {op} operation is not supported by this server."),
@@ -59,7 +63,7 @@ impl<S: Library> SubsonicApp<S> {
                 self.render(&params, &doc)
             }
             Route::Endpoint(name) => {
-                let params = Params::parse(query);
+                let params = Params::parse(&merged);
                 let get = |key: &str| params.get(key).map(|s| s.to_string());
                 let creds = Credentials::from_params(get);
                 let mut store = self.store.borrow_mut();
@@ -82,6 +86,18 @@ impl<S: Library> SubsonicApp<S> {
         }
     }
 
+    fn merge_query(method: &str, query: &str, body: &str) -> String {
+        if method.eq_ignore_ascii_case("POST") && !body.is_empty() {
+            if query.is_empty() {
+                body.to_string()
+            } else {
+                format!("{query}&{body}")
+            }
+        } else {
+            query.to_string()
+        }
+    }
+
     fn render(&self, params: &Params, doc: &crate::value::Value) -> HttpResponse {
         match params.get("f") {
             Some("json") => HttpResponse::document(200, JSON_CONTENT_TYPE, render_json(doc)),
@@ -101,7 +117,7 @@ mod tests {
     use crate::library::MemStore;
 
     fn get(app: &SubsonicApp<MemStore>, path: &str, query: &str) -> HttpResponse {
-        app.handle("GET", path, query)
+        app.handle("GET", path, query, "")
     }
 
     #[test]
@@ -109,9 +125,25 @@ mod tests {
         let app = SubsonicApp::new(MemStore::seeded());
         let key = "apiKey=test-key-1&v=1.16.1&c=t";
         assert_eq!(
-            app.handle("POST", "/rest/ping", key),
+            app.handle("POST", "/rest/ping", key, ""),
             get(&app, "/rest/ping", key)
         );
+    }
+
+    #[test]
+    fn post_form_body_authenticates_like_query() {
+        let app = SubsonicApp::new(MemStore::seeded());
+        // Credentials entirely in the POST form body (v1 `$request->input()`).
+        let res = app.handle("POST", "/rest/ping", "v=1.16.1&c=t", "apiKey=test-key-1");
+        assert_eq!(res.status, 200);
+        assert!(String::from_utf8(res.body)
+            .unwrap()
+            .contains("status=\"ok\""));
+        // Query wins on duplicates; body-only password auth works too.
+        let res = app.handle("POST", "/rest/ping", "v=1.16.1&c=t", "u=test&p=test-pass");
+        assert!(String::from_utf8(res.body)
+            .unwrap()
+            .contains("status=\"ok\""));
     }
 
     #[test]

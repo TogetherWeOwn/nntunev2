@@ -18,7 +18,12 @@ data, R2 for bytes.
   (error 0 in a normal HTTP-200 envelope), `hls.m3u8` as plain 410,
   envelope shaped by `SubsonicResponse` (attributes/children/list rules,
   `value`-as-text, bool and null handling), auth order
-  `apiKey` → `u+p` → `u+t+s` with codes 40/41/10/70.
+  `apiKey` → `u+p` (incl. `p=enc:<hex>`) → `u+t+s` with codes
+  40/43/44/10/50/70 (43 apiKey mixed with legacy params, 44 invalid key,
+  10 token without salt or bad JSONP callback, 50 per-user forbidden).
+  Every user-state `Library` method takes the authenticated identity;
+  playlist/star/rating/queue rows are per-user, and the worker's
+  `MemStore::empty()` accepts no credentials until PlanetScale lands.
 - Pure-logic crate `crates/nntune-subsonic` (zero dependencies, native +
   `wasm32`) behind a `Library` trait; thin `workers/api` shell adapts the
   runtime. PlanetScale/R2 backends implement `Library` in a follow-up —
@@ -28,8 +33,9 @@ data, R2 for bytes.
   script validates fixture shape in CI.
 - Two deliberate deviations from v1, both client-invisible in practice:
   envelope `type` is `nntune` (v1 inherited `koel`); per-client API keys
-  (`subsonic_clients`, hash-only) replace the single per-user key so keys
-  revoke per device.
+  (`subsonic_clients`: HMAC-peppered lookup index plus sealed legacy
+  secret for `legacy_enabled` clients, with revocation) replace the
+  single per-user key so keys revoke per device.
 
 ## Consequences
 

@@ -1,13 +1,15 @@
 //! Credential handling, ported from v1 `AuthenticateSubsonicRequests` +
 //! `SubsonicCredentials` (spec section 5.3 behaviour).
 //!
-//! Accepted, in order: per-client `apiKey`; legacy `u` with `p`; token `u`
-//! with `t` and `s`. Raw values decide presence (v1 deliberately passes them
-//! through uncoerced so `?apiKey[]=x`-style smuggling cannot look absent).
-//! Failures are Subsonic 40, except token-without-salt which is 41. The `v`
-//! (client protocol version) parameter is accepted and ignored: v1
-//! authenticates before any version gate, and clients in the wild send a
-//! spread of values.
+//! Accepted, in order: per-client `apiKey`; legacy `u` with `p` (including
+//! `p=enc:<hex>`); token `u` with `t` and `s`. Raw values decide presence
+//! (v1 deliberately passes them through uncoerced so `?apiKey[]=x`-style
+//! smuggling cannot look absent). Codes match v1 exactly: 43 when `apiKey`
+//! is mixed with any of `u`/`p`/`t`/`s`, 44 for an invalid API key, 10 for
+//! token auth without `s`, 40 for any other credential failure (including
+//! malformed `enc:` hex). The `v` (client protocol version) parameter is
+//! accepted and ignored: v1 authenticates before any version gate, and
+//! clients in the wild send a spread of values.
 
 use crate::envelope::code;
 
@@ -16,6 +18,7 @@ use crate::envelope::code;
 pub struct Identity {
     pub username: String,
     pub email: String,
+    pub is_admin: bool,
 }
 
 /// Raw credential parameters straight off the query string.
@@ -53,15 +56,28 @@ pub trait AuthStore {
 }
 
 /// Check credentials, returning the identity or `(code, message)`.
+/// Mirrors v1 `SubsonicCredentials::make`: the apiKey/u-p-t-s conflict
+/// check runs before any authenticator.
 pub fn authenticate<S: AuthStore>(
     store: &S,
     creds: &Credentials,
 ) -> Result<Identity, (i64, String)> {
-    if Credentials::present(&creds.api_key) {
+    let api_key_present = Credentials::present(&creds.api_key);
+    let legacy_present = Credentials::present(&creds.username)
+        || Credentials::present(&creds.password)
+        || Credentials::present(&creds.token)
+        || Credentials::present(&creds.salt);
+    if api_key_present && legacy_present {
+        return Err((
+            code::CONFLICTING_AUTH,
+            "Conflicting authentication parameters.".to_string(),
+        ));
+    }
+    if api_key_present {
         let key = creds.api_key.clone().unwrap_or_default();
         return store
             .verify_api_key(&key)
-            .ok_or((code::WRONG_CREDENTIALS, wrong_creds()));
+            .ok_or((code::INVALID_API_KEY, "Invalid API key.".to_string()));
     }
     if !Credentials::present(&creds.username) {
         return Err((code::WRONG_CREDENTIALS, wrong_creds()));
@@ -70,8 +86,8 @@ pub fn authenticate<S: AuthStore>(
     if Credentials::present(&creds.token) {
         if !Credentials::present(&creds.salt) {
             return Err((
-                code::TOKEN_AUTH_UNSUPPORTED,
-                "Token authentication requires salt.".to_string(),
+                code::REQUIRED_PARAM_MISSING,
+                "Required parameter is missing.".to_string(),
             ));
         }
         let token = creds.token.clone().unwrap_or_default();
@@ -83,7 +99,11 @@ pub fn authenticate<S: AuthStore>(
     if !Credentials::present(&creds.password) {
         return Err((code::WRONG_CREDENTIALS, wrong_creds()));
     }
-    let password = creds.password.clone().unwrap_or_default();
+    let raw_password = creds.password.clone().unwrap_or_default();
+    let password = match decode_enc_password(&raw_password) {
+        Some(p) => p,
+        None => return Err((code::WRONG_CREDENTIALS, wrong_creds())),
+    };
     store
         .verify_password(&username, &password)
         .ok_or((code::WRONG_CREDENTIALS, wrong_creds()))
@@ -91,6 +111,39 @@ pub fn authenticate<S: AuthStore>(
 
 fn wrong_creds() -> String {
     "Wrong username or password.".to_string()
+}
+
+/// Decode `p=enc:<hex>` passwords as v1 does (`SubsonicCredentials` hex
+/// handling): the remainder must be even-length hex decoding to UTF-8.
+/// Returns `None` on malformed hex (caller answers 40); a plain password
+/// is returned unchanged.
+fn decode_enc_password(raw: &str) -> Option<String> {
+    let hex = match raw.strip_prefix("enc:") {
+        Some(hex) => hex,
+        None => return Some(raw.to_string()),
+    };
+    if hex.is_empty() || hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let digits = hex.as_bytes();
+    let mut i = 0;
+    while i < digits.len() {
+        let hi = hex_val(digits[i])?;
+        let lo = hex_val(digits[i + 1])?;
+        bytes.push((hi << 4) | lo);
+        i += 2;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// MD5 hex digest (RFC 1321), for `t = md5(password + salt)` token auth.
@@ -182,18 +235,21 @@ mod tests {
             (key == "k").then(|| Identity {
                 username: "u".into(),
                 email: "u@x".into(),
+                is_admin: false,
             })
         }
         fn verify_password(&self, u: &str, p: &str) -> Option<Identity> {
             (u == "u" && p == "p").then(|| Identity {
                 username: "u".into(),
                 email: "u@x".into(),
+                is_admin: false,
             })
         }
         fn verify_token(&self, u: &str, t: &str, s: &str) -> Option<Identity> {
             (u == "u" && t == md5_hex(format!("p{s}").as_bytes())).then(|| Identity {
                 username: "u".into(),
                 email: "u@x".into(),
+                is_admin: false,
             })
         }
     }
@@ -226,9 +282,10 @@ mod tests {
     fn auth_order_and_codes() {
         let s = Stub;
         assert!(authenticate(&s, &creds("k", "", "", "", "")).is_ok());
+        // Invalid API key is 44 (v1 `InvalidApiKeyException`), not 40.
         assert_eq!(
             authenticate(&s, &creds("bad", "", "", "", "")),
-            Err((40, wrong_creds()))
+            Err((44, "Invalid API key.".to_string()))
         );
         assert_eq!(
             authenticate(&s, &creds("", "", "", "", "")),
@@ -240,10 +297,49 @@ mod tests {
             Err((40, wrong_creds()))
         );
         let salted = md5_hex(b"ps");
+        // Token without salt is 10 (v1 `RequiredParameterMissingException`).
         assert_eq!(
             authenticate(&s, &creds("", "u", "", "t", "")),
-            Err((41, "Token authentication requires salt.".to_string()))
+            Err((10, "Required parameter is missing.".to_string()))
         );
         assert!(authenticate(&s, &creds("", "u", "", &salted, "s")).is_ok());
+    }
+
+    #[test]
+    fn api_key_conflicts_with_legacy_params() {
+        let s = Stub;
+        // apiKey + any of u/p/t/s is 43, even when the key itself is valid.
+        assert_eq!(
+            authenticate(&s, &creds("k", "u", "", "", "")),
+            Err((43, "Conflicting authentication parameters.".to_string()))
+        );
+        assert_eq!(
+            authenticate(&s, &creds("k", "", "p", "", "")),
+            Err((43, "Conflicting authentication parameters.".to_string()))
+        );
+        assert_eq!(
+            authenticate(&s, &creds("k", "u", "", "t", "s")),
+            Err((43, "Conflicting authentication parameters.".to_string()))
+        );
+    }
+
+    #[test]
+    fn enc_passwords_decode_like_v1() {
+        let s = Stub;
+        // "p" hex-encoded is accepted.
+        assert!(authenticate(&s, &creds("", "u", "enc:70", "", "")).is_ok());
+        // Malformed hex answers 40.
+        assert_eq!(
+            authenticate(&s, &creds("", "u", "enc:zz", "", "")),
+            Err((40, wrong_creds()))
+        );
+        assert_eq!(
+            authenticate(&s, &creds("", "u", "enc:7", "", "")),
+            Err((40, wrong_creds()))
+        );
+        assert_eq!(
+            authenticate(&s, &creds("", "u", "enc:", "", "")),
+            Err((40, wrong_creds()))
+        );
     }
 }

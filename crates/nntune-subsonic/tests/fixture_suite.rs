@@ -23,7 +23,17 @@ fn app() -> SubsonicApp<MemStore> {
 }
 
 fn get(app: &SubsonicApp<MemStore>, path: &str, query: &str) -> (u16, String, Vec<u8>) {
-    let res = app.handle("GET", path, query);
+    let res = app.handle("GET", path, query, "");
+    (res.status, res.content_type, res.body)
+}
+
+fn post(
+    app: &SubsonicApp<MemStore>,
+    path: &str,
+    query: &str,
+    body: &str,
+) -> (u16, String, Vec<u8>) {
+    let res = app.handle("POST", path, query, body);
     (res.status, res.content_type, res.body)
 }
 
@@ -55,13 +65,31 @@ fn auth_refusals_match_goldens() {
     let (status, _, body) = get(&app, "/rest/ping", "v=1.16.1&c=fixture");
     assert_eq!(status, 200);
     assert_eq!(body, fixture("error-auth-required.xml"));
-    // Bad key -> same 40 JSON envelope.
+    // Bad key -> 44 JSON envelope (v1 `InvalidApiKeyException`).
     let (_, _, body) = get(&app, "/rest/ping", "apiKey=nope&v=1.16.1&c=x&f=json");
     assert_eq!(body, fixture("error-auth-required.json"));
-    // Token without salt -> 41.
+    // Token without salt -> 10 (v1 `RequiredParameterMissingException`).
     let (status, _, body) = get(&app, "/rest/ping", "u=test&t=abc&v=1.16.1&c=x&f=json");
     assert_eq!(status, 200);
-    assert!(String::from_utf8(body).unwrap().contains("\"code\":41"));
+    assert!(String::from_utf8(body).unwrap().contains("\"code\":10"));
+    // apiKey mixed with legacy params -> 43.
+    let (status, _, body) = get(
+        &app,
+        "/rest/ping",
+        "apiKey=test-key-1&u=test&v=1.16.1&c=x&f=json",
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, fixture("error-auth-conflict.json"));
+    // enc: passwords decode like v1; malformed hex answers 40.
+    let (status, _, body) = get(
+        &app,
+        "/rest/ping",
+        "u=test&p=enc:746573742d70617373&v=1.16.1&c=x",
+    );
+    assert_eq!(status, 200);
+    assert!(String::from_utf8(body).unwrap().contains("status=\"ok\""));
+    let (_, _, body) = get(&app, "/rest/ping", "u=test&p=enc:zz&v=1.16.1&c=x&f=json");
+    assert!(String::from_utf8(body).unwrap().contains("\"code\":40"));
 }
 
 #[test]
@@ -174,7 +202,7 @@ fn catalogue_endpoints_match_goldens() {
 
 #[test]
 fn empty_library_behaves_like_v1() {
-    let app = SubsonicApp::new(MemStore::empty());
+    let app = SubsonicApp::new(MemStore::empty_with_test_auth());
     let (_, _, body) = get(&app, "/rest/getArtists", KEY);
     assert_eq!(body, fixture("getArtists-empty.xml"));
     let (_, _, body) = get(&app, "/rest/search3", &format!("{KEY}&query=nope"));
@@ -244,6 +272,101 @@ fn playqueue_roundtrip_matches_golden() {
     assert_eq!(body, fixture("ping.xml"));
     let (_, _, body) = get(&app, "/rest/getPlayQueue", &format!("{KEY}&f=json"));
     assert_eq!(body, fixture("getPlayQueue-saved.json"));
+}
+
+#[test]
+fn per_user_isolation_matches_v1() {
+    let app = app();
+    const OTHER_KEY: &str = "apiKey=other-key-1&v=1.16.1&c=fixture";
+    const ADMIN_KEY: &str = "apiKey=admin-key-1&v=1.16.1&c=fixture";
+    // test creates a playlist; other cannot read, update or delete it (50).
+    let (_, _, body) = get(
+        &app,
+        "/rest/createPlaylist",
+        &format!("{KEY}&name=Mine&f=json"),
+    );
+    assert!(String::from_utf8(body)
+        .unwrap()
+        .contains("\"name\":\"Mine\""));
+    for (path, query) in [
+        ("/rest/getPlaylist", format!("{OTHER_KEY}&id=pl-1&f=json")),
+        (
+            "/rest/updatePlaylist",
+            format!("{OTHER_KEY}&playlistId=pl-1&name=Hijacked&f=json"),
+        ),
+        (
+            "/rest/deletePlaylist",
+            format!("{OTHER_KEY}&id=pl-1&f=json"),
+        ),
+    ] {
+        let (status, _, body) = get(&app, path, &query);
+        assert_eq!(status, 200, "{path}");
+        assert!(
+            String::from_utf8(body).unwrap().contains("\"code\":50"),
+            "{path}"
+        );
+    }
+    // Other user's stars do not leak into test's starred set.
+    let (_, _, body) = get(&app, "/rest/star", &format!("{OTHER_KEY}&id=so-1"));
+    assert!(String::from_utf8(body).unwrap().contains("status=\"ok\""));
+    let (_, _, body) = get(&app, "/rest/getStarred2", KEY);
+    assert_eq!(body, fixture("starred2-empty.xml"));
+    // getUser: other username answers 50; admin may read anyone.
+    let (_, _, body) = get(
+        &app,
+        "/rest/getUser",
+        &format!("{KEY}&username=other&f=json"),
+    );
+    assert!(String::from_utf8(body).unwrap().contains("\"code\":50"));
+    let (status, _, body) = get(
+        &app,
+        "/rest/getUser",
+        &format!("{ADMIN_KEY}&username=test&f=json"),
+    );
+    assert_eq!(status, 200);
+    assert!(String::from_utf8(body)
+        .unwrap()
+        .contains("\"username\":\"test\""));
+}
+
+#[test]
+fn jsonp_and_post_body_match_v1() {
+    let app = app();
+    // Invalid JSONP callback falls back to error-10 JSON, never script.
+    let (_, ct, body) = get(
+        &app,
+        "/rest/ping",
+        &format!("{KEY}&f=jsonp&callback=alert(document.domain);//"),
+    );
+    assert_eq!(ct, "application/json");
+    assert_eq!(body, fixture("error-jsonp-callback.json"));
+    // POST form body authenticates exactly like the query string.
+    let (status, _, body) = post(
+        &app,
+        "/rest/ping",
+        "v=1.16.1&c=fixture",
+        "apiKey=test-key-1",
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, fixture("ping.xml"));
+}
+
+#[test]
+fn utf8_params_survive_roundtrip() {
+    let app = app();
+    // Percent-encoded UTF-8 decodes to real UTF-8 (no Latin-1 mojibake).
+    let (_, _, body) = get(
+        &app,
+        "/rest/createPlaylist",
+        &format!("{KEY}&name=Caf%C3%A9&f=json"),
+    );
+    assert_eq!(body, fixture("playlist-create-utf8.json"));
+    let (_, _, body) = get(
+        &app,
+        "/rest/search3",
+        &format!("{KEY}&query=Bj%C3%B6rk&f=json"),
+    );
+    assert!(String::from_utf8(body).unwrap().contains("searchResult3"));
 }
 
 #[test]

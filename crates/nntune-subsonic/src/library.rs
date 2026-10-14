@@ -54,6 +54,7 @@ pub struct Song {
 pub struct Playlist {
     pub id: String,
     pub name: String,
+    pub owner: String,
     pub song_ids: Vec<String>,
     pub created: String,
     pub changed: String,
@@ -77,6 +78,12 @@ pub enum StarKind {
 }
 
 /// Backing store contract. Reads take `&self`; mutations take `&mut self`.
+///
+/// Every user-state method takes the authenticated `Identity` so a
+/// PlanetScale implementation can scope rows per user (v1 authorizes each of
+/// these: playlist delete/collaborate/own checks, `getAllAccessibleByUser`,
+/// per-user queue/stars/ratings). Catalogue reads stay global; per-user
+/// writes that hit another user's rows answer error 50, never 70.
 pub trait Library: AuthStore {
     fn user_email(&self, username: &str) -> Option<String>;
     fn artists(&self) -> Vec<Artist>;
@@ -92,25 +99,26 @@ pub trait Library: AuthStore {
     fn cover(&self, cover_id: &str) -> Option<Vec<u8>>;
     fn avatar(&self, username: &str) -> Option<Vec<u8>>;
     fn lyrics(&self, artist: &str, title: &str) -> Option<String>;
-    fn playlists(&self) -> Vec<Playlist>;
-    fn playlist(&self, id: &str) -> Option<Playlist>;
-    fn create_playlist(&mut self, name: String) -> Playlist;
+    fn playlists(&self, identity: &Identity) -> Vec<Playlist>;
+    fn playlist(&self, identity: &Identity, id: &str) -> Option<Playlist>;
+    fn create_playlist(&mut self, identity: &Identity, name: String) -> Playlist;
     fn update_playlist(
         &mut self,
+        identity: &Identity,
         id: &str,
         name: Option<String>,
         add: Vec<String>,
         remove: Vec<usize>,
-    ) -> bool;
-    fn delete_playlist(&mut self, id: &str) -> bool;
-    fn star(&mut self, kind: StarKind, id: &str) -> bool;
-    fn unstar(&mut self, kind: StarKind, id: &str);
-    fn starred(&self, kind: StarKind) -> Vec<String>;
-    fn set_rating(&mut self, id: &str, rating: i64) -> bool;
-    fn rating(&self, id: &str) -> Option<i64>;
-    fn scrobble(&mut self, song_id: &str) -> bool;
-    fn queue(&self) -> Option<PlayQueue>;
-    fn save_queue(&mut self, queue: PlayQueue);
+    ) -> Result<(), (i64, String)>;
+    fn delete_playlist(&mut self, identity: &Identity, id: &str) -> Result<(), (i64, String)>;
+    fn star(&mut self, identity: &Identity, kind: StarKind, id: &str) -> bool;
+    fn unstar(&mut self, identity: &Identity, kind: StarKind, id: &str);
+    fn starred(&self, identity: &Identity, kind: StarKind) -> Vec<String>;
+    fn set_rating(&mut self, identity: &Identity, id: &str, rating: i64) -> bool;
+    fn rating(&self, identity: &Identity, id: &str) -> Option<i64>;
+    fn scrobble(&mut self, identity: &Identity, song_id: &str) -> bool;
+    fn queue(&self, identity: &Identity) -> Option<PlayQueue>;
+    fn save_queue(&mut self, identity: &Identity, queue: PlayQueue);
 }
 
 /// Transparent 1x1 PNG placeholder used for cover art / avatars in tests.
@@ -125,27 +133,87 @@ pub const DEMO_AUDIO: &[u8] = b"ID3\x04\x00\x00\x00\x00\x01\x02nntune-demo-audio
 
 /// In-memory `Library`: powers unit tests, golden fixtures, and local dev.
 /// Seeded content mirrors `fixtures/subsonic/README.md`.
+///
+/// `test_auth` gates the hard-coded fixture credentials: `empty()` (used by
+/// the production worker shell) accepts NOTHING — every auth attempt fails
+/// until the PlanetScale `Library` lands. `seeded()` and
+/// `empty_with_test_auth()` enable the fixture users below. The credentials
+/// are published in `fixtures/subsonic/README.md`, so they must never
+/// authenticate outside tests.
 #[derive(Clone, Debug, Default)]
 pub struct MemStore {
+    test_auth: bool,
     artists: Vec<Artist>,
     albums: Vec<Album>,
     songs: Vec<Song>,
     lyrics: BTreeMap<(String, String), String>,
     playlists: BTreeMap<String, Playlist>,
     playlist_seq: u64,
-    stars: HashSet<(StarKind, String)>,
-    ratings: BTreeMap<String, i64>,
-    scrobbles: Vec<String>,
-    queue: Option<PlayQueue>,
+    stars: HashSet<(String, StarKind, String)>,
+    ratings: BTreeMap<(String, String), i64>,
+    scrobbles: Vec<(String, String)>,
+    queues: BTreeMap<String, PlayQueue>,
+}
+
+fn test_identities() -> Vec<(String, String, String, String, bool)> {
+    vec![
+        (
+            "test".to_string(),
+            "test-pass".to_string(),
+            "test-key-1".to_string(),
+            "test@example.com".to_string(),
+            false,
+        ),
+        (
+            "other".to_string(),
+            "other-pass".to_string(),
+            "other-key-1".to_string(),
+            "other@example.com".to_string(),
+            false,
+        ),
+        (
+            "admin".to_string(),
+            "admin-pass".to_string(),
+            "admin-key-1".to_string(),
+            "admin@example.com".to_string(),
+            true,
+        ),
+    ]
+}
+
+fn not_authorized() -> (i64, String) {
+    (
+        crate::envelope::code::NOT_AUTHORIZED,
+        "Not authorized.".to_string(),
+    )
+}
+
+fn playlist_missing() -> (i64, String) {
+    (
+        crate::envelope::code::NOT_FOUND,
+        "Playlist not found.".to_string(),
+    )
 }
 
 impl MemStore {
+    /// Production-safe empty store: empty catalogue AND no credentials.
+    /// The worker shell uses this, so a deployed worker rejects all auth.
     pub fn empty() -> MemStore {
         MemStore::default()
     }
 
+    /// Empty catalogue that still accepts the fixture test users.
+    /// Used by the empty-library fixture suite (auth must succeed while
+    /// the catalogue stays empty, exactly like v1 with no rows).
+    pub fn empty_with_test_auth() -> MemStore {
+        MemStore {
+            test_auth: true,
+            ..MemStore::default()
+        }
+    }
+
     pub fn seeded() -> MemStore {
-        let mut store = MemStore::empty();
+        let mut store = MemStore::empty_with_test_auth();
         store.artists.push(Artist {
             id: "ar-1".into(),
             name: "Test Artist".into(),
@@ -189,31 +257,56 @@ impl MemStore {
 
 impl AuthStore for MemStore {
     fn verify_api_key(&self, api_key: &str) -> Option<Identity> {
-        (api_key == "test-key-1").then(|| Identity {
-            username: "test".into(),
-            email: "test@example.com".into(),
-        })
+        if !self.test_auth {
+            return None;
+        }
+        test_identities()
+            .into_iter()
+            .find(|(_, _, key, _, _)| key == api_key)
+            .map(|(username, _, _, email, is_admin)| Identity {
+                username,
+                email,
+                is_admin,
+            })
     }
 
     fn verify_password(&self, username: &str, password: &str) -> Option<Identity> {
-        (username == "test" && password == "test-pass").then(|| Identity {
-            username: "test".into(),
-            email: "test@example.com".into(),
-        })
+        if !self.test_auth {
+            return None;
+        }
+        test_identities()
+            .into_iter()
+            .find(|(u, p, _, _, _)| u == username && p == password)
+            .map(|(username, _, _, email, is_admin)| Identity {
+                username,
+                email,
+                is_admin,
+            })
     }
 
     fn verify_token(&self, username: &str, token: &str, salt: &str) -> Option<Identity> {
-        let expect = md5_hex(format!("test-pass{salt}").as_bytes());
-        (username == "test" && token == expect).then(|| Identity {
-            username: "test".into(),
-            email: "test@example.com".into(),
-        })
+        if !self.test_auth {
+            return None;
+        }
+        test_identities()
+            .into_iter()
+            .find(|(u, p, _, _, _)| {
+                u == username && token == md5_hex(format!("{p}{salt}").as_bytes())
+            })
+            .map(|(username, _, _, email, is_admin)| Identity {
+                username,
+                email,
+                is_admin,
+            })
     }
 }
 
 impl Library for MemStore {
     fn user_email(&self, username: &str) -> Option<String> {
-        (username == "test").then(|| "test@example.com".to_string())
+        test_identities()
+            .into_iter()
+            .find(|(u, _, _, _, _)| u == username)
+            .map(|(_, _, _, email, _)| email)
     }
 
     fn artists(&self) -> Vec<Artist> {
@@ -285,7 +378,7 @@ impl Library for MemStore {
     }
 
     fn avatar(&self, username: &str) -> Option<Vec<u8>> {
-        (username == "test").then(|| PLACEHOLDER_PNG.to_vec())
+        self.user_email(username).map(|_| PLACEHOLDER_PNG.to_vec())
     }
 
     fn lyrics(&self, artist: &str, title: &str) -> Option<String> {
@@ -294,20 +387,30 @@ impl Library for MemStore {
             .cloned()
     }
 
-    fn playlists(&self) -> Vec<Playlist> {
-        self.playlists.values().cloned().collect()
+    fn playlists(&self, identity: &Identity) -> Vec<Playlist> {
+        let mut out: Vec<Playlist> = self
+            .playlists
+            .values()
+            .filter(|p| p.owner == identity.username)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
     }
 
-    fn playlist(&self, id: &str) -> Option<Playlist> {
+    fn playlist(&self, _identity: &Identity, id: &str) -> Option<Playlist> {
+        // Returned regardless of owner so the endpoint can answer 50
+        // (forbidden) vs 70 (missing) distinctly; listing stays filtered.
         self.playlists.get(id).cloned()
     }
 
-    fn create_playlist(&mut self, name: String) -> Playlist {
+    fn create_playlist(&mut self, identity: &Identity, name: String) -> Playlist {
         self.playlist_seq += 1;
         let id = format!("pl-{}", self.playlist_seq);
         let playlist = Playlist {
             id: id.clone(),
             name,
+            owner: identity.username.clone(),
             song_ids: Vec::new(),
             created: NOW.into(),
             changed: NOW.into(),
@@ -318,14 +421,18 @@ impl Library for MemStore {
 
     fn update_playlist(
         &mut self,
+        identity: &Identity,
         id: &str,
         name: Option<String>,
         add: Vec<String>,
         remove: Vec<usize>,
-    ) -> bool {
+    ) -> Result<(), (i64, String)> {
         let Some(playlist) = self.playlists.get_mut(id) else {
-            return false;
+            return Err(playlist_missing());
         };
+        if playlist.owner != identity.username {
+            return Err(not_authorized());
+        }
         if let Some(name) = name {
             playlist.name = name;
         }
@@ -343,77 +450,106 @@ impl Library for MemStore {
             }
         }
         playlist.changed = NOW.into();
-        true
+        Ok(())
     }
 
-    fn delete_playlist(&mut self, id: &str) -> bool {
-        self.playlists.remove(id).is_some()
+    fn delete_playlist(&mut self, identity: &Identity, id: &str) -> Result<(), (i64, String)> {
+        match self.playlists.get(id) {
+            None => Err(playlist_missing()),
+            Some(p) if p.owner != identity.username => Err(not_authorized()),
+            Some(_) => {
+                self.playlists.remove(id);
+                Ok(())
+            }
+        }
     }
 
-    fn star(&mut self, kind: StarKind, id: &str) -> bool {
+    fn star(&mut self, identity: &Identity, kind: StarKind, id: &str) -> bool {
         let known = match kind {
             StarKind::Artist => self.artist(id).is_some(),
             StarKind::Album => self.album(id).is_some(),
             StarKind::Song => self.song(id).is_some(),
         };
         if known {
-            self.stars.insert((kind, id.to_string()));
+            self.stars
+                .insert((identity.username.clone(), kind, id.to_string()));
         }
         known
     }
 
-    fn unstar(&mut self, kind: StarKind, id: &str) {
-        self.stars.remove(&(kind, id.to_string()));
+    fn unstar(&mut self, identity: &Identity, kind: StarKind, id: &str) {
+        self.stars
+            .remove(&(identity.username.clone(), kind, id.to_string()));
     }
 
-    fn starred(&self, kind: StarKind) -> Vec<String> {
+    fn starred(&self, identity: &Identity, kind: StarKind) -> Vec<String> {
         let mut out: Vec<String> = self
             .stars
             .iter()
-            .filter(|(k, _)| *k == kind)
-            .map(|(_, id)| id.clone())
+            .filter(|(u, k, _)| u == &identity.username && *k == kind)
+            .map(|(_, _, id)| id.clone())
             .collect();
         out.sort();
         out
     }
 
-    fn set_rating(&mut self, id: &str, rating: i64) -> bool {
+    fn set_rating(&mut self, identity: &Identity, id: &str, rating: i64) -> bool {
         let known =
             self.song(id).is_some() || self.album(id).is_some() || self.artist(id).is_some();
         if known {
+            let key = (identity.username.clone(), id.to_string());
             if rating == 0 {
-                self.ratings.remove(id);
+                self.ratings.remove(&key);
             } else {
-                self.ratings.insert(id.to_string(), rating.clamp(1, 5));
+                self.ratings.insert(key, rating.clamp(1, 5));
             }
         }
         known
     }
 
-    fn rating(&self, id: &str) -> Option<i64> {
-        self.ratings.get(id).copied()
+    fn rating(&self, identity: &Identity, id: &str) -> Option<i64> {
+        self.ratings
+            .get(&(identity.username.clone(), id.to_string()))
+            .copied()
     }
 
-    fn scrobble(&mut self, song_id: &str) -> bool {
+    fn scrobble(&mut self, identity: &Identity, song_id: &str) -> bool {
         if self.song(song_id).is_none() {
             return false;
         }
-        self.scrobbles.push(song_id.to_string());
+        self.scrobbles
+            .push((identity.username.clone(), song_id.to_string()));
         true
     }
 
-    fn queue(&self) -> Option<PlayQueue> {
-        self.queue.clone()
+    fn queue(&self, identity: &Identity) -> Option<PlayQueue> {
+        self.queues.get(&identity.username).cloned()
     }
 
-    fn save_queue(&mut self, queue: PlayQueue) {
-        self.queue = Some(queue);
+    fn save_queue(&mut self, identity: &Identity, queue: PlayQueue) {
+        self.queues.insert(identity.username.clone(), queue);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_identity() -> Identity {
+        Identity {
+            username: "test".into(),
+            email: "test@example.com".into(),
+            is_admin: false,
+        }
+    }
+
+    fn other_identity() -> Identity {
+        Identity {
+            username: "other".into(),
+            email: "other@example.com".into(),
+            is_admin: false,
+        }
+    }
 
     #[test]
     fn seeded_store_holds_demo_library() {
@@ -427,9 +563,61 @@ mod tests {
     }
 
     #[test]
+    fn empty_store_rejects_all_auth() {
+        let store = MemStore::empty();
+        assert!(store.verify_api_key("test-key-1").is_none());
+        assert!(store.verify_password("test", "test-pass").is_none());
+        assert!(store
+            .verify_token("test", &md5_hex(b"test-passabc"), "abc")
+            .is_none());
+    }
+
+    #[test]
     fn playlist_ids_are_sequential() {
-        let mut store = MemStore::empty();
-        assert_eq!(store.create_playlist("a".into()).id, "pl-1");
-        assert_eq!(store.create_playlist("b".into()).id, "pl-2");
+        let mut store = MemStore::empty_with_test_auth();
+        let id = test_identity();
+        assert_eq!(store.create_playlist(&id, "a".into()).id, "pl-1");
+        assert_eq!(store.create_playlist(&id, "b".into()).id, "pl-2");
+    }
+
+    #[test]
+    fn playlists_are_per_user() {
+        let mut store = MemStore::empty_with_test_auth();
+        let a = test_identity();
+        let b = other_identity();
+        let pl = store.create_playlist(&a, "a".into());
+        // Owner sees it; the other user lists nothing and cannot mutate it.
+        assert_eq!(store.playlists(&a).len(), 1);
+        assert!(store.playlists(&b).is_empty());
+        assert_eq!(store.delete_playlist(&b, &pl.id), Err(not_authorized()));
+        assert!(store.delete_playlist(&a, &pl.id).is_ok());
+    }
+
+    #[test]
+    fn stars_ratings_and_queue_are_per_user() {
+        let mut store = MemStore::seeded();
+        let a = test_identity();
+        let b = other_identity();
+        assert!(store.star(&a, StarKind::Song, "so-1"));
+        assert!(store
+            .starred(&a, StarKind::Song)
+            .contains(&"so-1".to_string()));
+        assert!(store.starred(&b, StarKind::Song).is_empty());
+        assert!(store.set_rating(&a, "so-1", 5));
+        assert_eq!(store.rating(&a, "so-1"), Some(5));
+        assert_eq!(store.rating(&b, "so-1"), None);
+        store.save_queue(
+            &a,
+            PlayQueue {
+                username: "test".into(),
+                current: "so-1".into(),
+                position: 0,
+                ids: vec!["so-1".into()],
+                changed: NOW.into(),
+                changed_by: "test".into(),
+            },
+        );
+        assert!(store.queue(&a).is_some());
+        assert!(store.queue(&b).is_none());
     }
 }

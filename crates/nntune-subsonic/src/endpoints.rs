@@ -50,35 +50,44 @@ impl Params {
 }
 
 fn decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    // Percent-decode over raw bytes, then UTF-8 (lossy): multi-byte UTF-8
+    // stays intact (`Bj%C3%B6rk` -> `Björk`) and a stray `%` never panics
+    // (byte indexing is always safe; `&str` slicing is not).
     let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
             b'+' => {
-                out.push(' ');
+                out.push(b' ');
                 i += 1;
             }
-            b'%' if i + 2 < bytes.len() => {
-                let hex = &s[i + 1..i + 3];
-                match u8::from_str_radix(hex, 16) {
-                    Ok(b) => {
-                        out.push(b as char);
-                        i += 3;
-                    }
-                    Err(_) => {
-                        out.push('%');
-                        i += 1;
-                    }
+            b'%' if i + 2 < bytes.len() => match (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    out.push((hi << 4) | lo);
+                    i += 3;
                 }
-            }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
             b => {
-                out.push(b as char);
+                out.push(b);
                 i += 1;
             }
         }
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Early return from `handle_endpoint` on `Err` results.
@@ -145,14 +154,14 @@ fn song_entry(song: &Song) -> Value {
     ])
 }
 
-fn starred_song_entry<S: Library>(store: &S, song: &Song) -> Value {
+fn starred_song_entry<S: Library>(store: &S, identity: &Identity, song: &Song) -> Value {
     let Value::Map(mut entries) = song_entry(song) else {
         unreachable!()
     };
-    if store.starred(StarKind::Song).contains(&song.id) {
+    if store.starred(identity, StarKind::Song).contains(&song.id) {
         entries.push(("starred".to_string(), Value::str_value(NOW)));
     }
-    if let Some(rating) = store.rating(&song.id) {
+    if let Some(rating) = store.rating(identity, &song.id) {
         entries.push(("userRating".to_string(), Value::int_value(rating)));
     }
     Value::Map(entries)
@@ -188,7 +197,7 @@ fn playlist_duration<S: Library>(store: &S, playlist: &Playlist) -> i64 {
         .sum()
 }
 
-fn playlist_detail<S: Library>(store: &S, playlist: &Playlist) -> Value {
+fn playlist_detail<S: Library>(store: &S, identity: &Identity, playlist: &Playlist) -> Value {
     let mut entries = vec![
         ("id", Value::str_value(&playlist.id)),
         ("name", Value::str_value(&playlist.name)),
@@ -211,7 +220,7 @@ fn playlist_detail<S: Library>(store: &S, playlist: &Playlist) -> Value {
                     .song_ids
                     .iter()
                     .filter_map(|id| store.song(id))
-                    .map(|s| starred_song_entry(store, &s))
+                    .map(|s| starred_song_entry(store, identity, &s))
                     .collect(),
             ),
         ));
@@ -297,7 +306,7 @@ pub fn handle_endpoint<S: Library>(
                 let child: Vec<Value> = store
                     .songs_for_album(&album.id)
                     .iter()
-                    .map(|s| starred_song_entry(store, s))
+                    .map(|s| starred_song_entry(store, identity, s))
                     .collect();
                 EndpointResult::Doc(vec![(
                     "directory".to_string(),
@@ -360,7 +369,7 @@ pub fn handle_endpoint<S: Library>(
                     let songs: Vec<Value> = store
                         .songs_for_album(&album.id)
                         .iter()
-                        .map(|s| starred_song_entry(store, s))
+                        .map(|s| starred_song_entry(store, identity, s))
                         .collect();
                     let Value::Map(mut entries) = album_item(&album, songs.len() as i64) else {
                         unreachable!()
@@ -376,7 +385,7 @@ pub fn handle_endpoint<S: Library>(
             match store.song(id) {
                 Some(song) => EndpointResult::Doc(vec![(
                     "song".to_string(),
-                    starred_song_entry(store, &song),
+                    starred_song_entry(store, identity, &song),
                 )]),
                 None => not_found("Song not found."),
             }
@@ -400,7 +409,7 @@ pub fn handle_endpoint<S: Library>(
         }
         "search2" => {
             let query = ok_or_return!(req(params, "query"));
-            search2(store, query)
+            search2(store, identity, query)
         }
         "search3" => {
             let query = ok_or_return!(req(params, "query"));
@@ -408,7 +417,7 @@ pub fn handle_endpoint<S: Library>(
                 .all_songs()
                 .iter()
                 .filter(|s| song_matches(s, query))
-                .map(|s| starred_song_entry(store, s))
+                .map(|s| starred_song_entry(store, identity, s))
                 .collect();
             let result = if matched.is_empty() {
                 Value::Map(vec![])
@@ -422,10 +431,12 @@ pub fn handle_endpoint<S: Library>(
             let (size, offset) = size_offset(params);
             let mut albums = store.all_albums();
             if list_type == "starred" {
-                let starred_albums: std::collections::HashSet<String> =
-                    store.starred(StarKind::Album).into_iter().collect();
+                let starred_albums: std::collections::HashSet<String> = store
+                    .starred(identity, StarKind::Album)
+                    .into_iter()
+                    .collect();
                 let via_songs: std::collections::HashSet<String> = store
-                    .starred(StarKind::Song)
+                    .starred(identity, StarKind::Song)
                     .into_iter()
                     .filter_map(|id| store.song(&id))
                     .map(|s| s.album_id)
@@ -481,9 +492,9 @@ pub fn handle_endpoint<S: Library>(
         }
         "getPlaylists" => {
             let items: Vec<Value> = store
-                .playlists()
+                .playlists(identity)
                 .iter()
-                .map(|p| playlist_detail(store, p))
+                .map(|p| playlist_detail(store, identity, p))
                 .collect();
             let playlists = if items.is_empty() {
                 Value::Map(vec![])
@@ -494,17 +505,20 @@ pub fn handle_endpoint<S: Library>(
         }
         "getPlaylist" => {
             let id = ok_or_return!(req(params, "id"));
-            match store.playlist(id) {
-                Some(playlist) => EndpointResult::Doc(vec![(
-                    "playlist".to_string(),
-                    playlist_detail(store, &playlist),
-                )]),
+            match store.playlist(identity, id) {
+                Some(playlist) if playlist.owner == identity.username => {
+                    EndpointResult::Doc(vec![(
+                        "playlist".to_string(),
+                        playlist_detail(store, identity, &playlist),
+                    )])
+                }
+                Some(_) => EndpointResult::Err(code::NOT_AUTHORIZED, "Not authorized.".to_string()),
                 None => not_found("Playlist not found."),
             }
         }
         "createPlaylist" => {
             let name = ok_or_return!(req(params, "name")).to_string();
-            let mut playlist = store.create_playlist(name);
+            let mut playlist = store.create_playlist(identity, name);
             let add: Vec<String> = params
                 .get_all("songId")
                 .into_iter()
@@ -512,12 +526,14 @@ pub fn handle_endpoint<S: Library>(
                 .collect();
             if !add.is_empty() {
                 let id = playlist.id.clone();
-                store.update_playlist(&id, None, add, vec![]);
-                playlist = store.playlist(&id).unwrap_or(playlist);
+                ok_or_return!(store
+                    .update_playlist(identity, &id, None, add, vec![])
+                    .map_err(|(c, m)| EndpointResult::Err(c, m)));
+                playlist = store.playlist(identity, &id).unwrap_or(playlist);
             }
             EndpointResult::Doc(vec![(
                 "playlist".to_string(),
-                playlist_detail(store, &playlist),
+                playlist_detail(store, identity, &playlist),
             )])
         }
         "updatePlaylist" => {
@@ -533,37 +549,41 @@ pub fn handle_endpoint<S: Library>(
                 .into_iter()
                 .filter_map(|s| s.parse().ok())
                 .collect();
-            if store.update_playlist(&id, name, add, remove) {
-                EndpointResult::Doc(vec![])
-            } else {
-                not_found("Playlist not found.")
+            match store.update_playlist(identity, &id, name, add, remove) {
+                Ok(()) => EndpointResult::Doc(vec![]),
+                Err((error_code, message)) if error_code == code::NOT_AUTHORIZED => {
+                    EndpointResult::Err(error_code, message)
+                }
+                Err(_) => not_found("Playlist not found."),
             }
         }
         "deletePlaylist" => {
             let id = ok_or_return!(req(params, "id"));
-            if store.delete_playlist(id) {
-                EndpointResult::Doc(vec![])
-            } else {
-                not_found("Playlist not found.")
+            match store.delete_playlist(identity, id) {
+                Ok(()) => EndpointResult::Doc(vec![]),
+                Err((error_code, message)) if error_code == code::NOT_AUTHORIZED => {
+                    EndpointResult::Err(error_code, message)
+                }
+                Err(_) => not_found("Playlist not found."),
             }
         }
         "scrobble" => {
             let id = ok_or_return!(req(params, "id"));
-            if store.scrobble(id) {
+            if store.scrobble(identity, id) {
                 EndpointResult::Doc(vec![])
             } else {
                 not_found("Song not found.")
             }
         }
-        "star" => star_unstar(store, params, true),
-        "unstar" => star_unstar(store, params, false),
+        "star" => star_unstar(store, identity, params, true),
+        "unstar" => star_unstar(store, identity, params, false),
         "setRating" => {
             let id = ok_or_return!(req(params, "id")).to_string();
             let rating: i64 = match params.get("rating").and_then(|v| v.parse().ok()) {
                 Some(r) if (0..=5).contains(&r) => r,
                 _ => return missing(),
             };
-            if store.set_rating(&id, rating) {
+            if store.set_rating(identity, &id, rating) {
                 EndpointResult::Doc(vec![])
             } else {
                 not_found("Requested data was not found.")
@@ -577,7 +597,7 @@ pub fn handle_endpoint<S: Library>(
             };
             let mut entries: Vec<(String, Value)> = Vec::new();
             let artists: Vec<Value> = store
-                .starred(StarKind::Artist)
+                .starred(identity, StarKind::Artist)
                 .into_iter()
                 .filter_map(|id| store.artist(&id))
                 .map(|a| {
@@ -589,7 +609,7 @@ pub fn handle_endpoint<S: Library>(
                 entries.push(("artist".to_string(), Value::List(artists)));
             }
             let albums: Vec<Value> = store
-                .starred(StarKind::Album)
+                .starred(identity, StarKind::Album)
                 .into_iter()
                 .filter_map(|id| store.album(&id))
                 .map(|a| {
@@ -601,10 +621,10 @@ pub fn handle_endpoint<S: Library>(
                 entries.push(("album".to_string(), Value::List(albums)));
             }
             let songs: Vec<Value> = store
-                .starred(StarKind::Song)
+                .starred(identity, StarKind::Song)
                 .into_iter()
                 .filter_map(|id| store.song(&id))
-                .map(|s| starred_song_entry(store, &s))
+                .map(|s| starred_song_entry(store, identity, &s))
                 .collect();
             if !songs.is_empty() {
                 entries.push(("song".to_string(), Value::List(songs)));
@@ -617,7 +637,7 @@ pub fn handle_endpoint<S: Library>(
                 .all_songs()
                 .iter()
                 .take(size)
-                .map(|s| starred_song_entry(store, s))
+                .map(|s| starred_song_entry(store, identity, s))
                 .collect();
             EndpointResult::Doc(vec![(
                 "randomSongs".to_string(),
@@ -629,6 +649,10 @@ pub fn handle_endpoint<S: Library>(
         }
         "getUser" => {
             let username = ok_or_return!(req(params, "username"));
+            // v1 `GetUserController`: only self or an admin may read a user.
+            if username != identity.username && !identity.is_admin {
+                return EndpointResult::Err(code::NOT_AUTHORIZED, "Not authorized.".to_string());
+            }
             match store.user_email(username) {
                 Some(email) => EndpointResult::Doc(vec![(
                     "user".to_string(),
@@ -636,7 +660,7 @@ pub fn handle_endpoint<S: Library>(
                         ("username", Value::str_value(username)),
                         ("email", Value::str_value(email)),
                         ("scrobblingEnabled", Value::bool_value(true)),
-                        ("adminRole", Value::bool_value(false)),
+                        ("adminRole", Value::bool_value(username == "admin")),
                         ("settingsRole", Value::bool_value(false)),
                         ("downloadRole", Value::bool_value(true)),
                         ("uploadRole", Value::bool_value(false)),
@@ -679,7 +703,7 @@ pub fn handle_endpoint<S: Library>(
                 .filter(|s| s.genre.to_lowercase() == genre)
                 .skip(offset)
                 .take(size)
-                .map(|s| starred_song_entry(store, s))
+                .map(|s| starred_song_entry(store, identity, s))
                 .collect();
             EndpointResult::Doc(vec![(
                 "songsByGenre".to_string(),
@@ -778,7 +802,7 @@ pub fn handle_endpoint<S: Library>(
             EndpointResult::Doc(vec![])
         }
         "getPlayQueue" => {
-            let queue = store.queue().unwrap_or(PlayQueue {
+            let queue = store.queue(identity).unwrap_or(PlayQueue {
                 username: identity.username.clone(),
                 changed: NOW.into(),
                 changed_by: identity.username.clone(),
@@ -799,7 +823,7 @@ pub fn handle_endpoint<S: Library>(
                             .ids
                             .iter()
                             .filter_map(|id| store.song(id))
-                            .map(|s| starred_song_entry(store, &s))
+                            .map(|s| starred_song_entry(store, identity, &s))
                             .collect(),
                     ),
                 ));
@@ -812,17 +836,20 @@ pub fn handle_endpoint<S: Library>(
                 .into_iter()
                 .map(|s| s.to_string())
                 .collect();
-            store.save_queue(PlayQueue {
-                username: identity.username.clone(),
-                current: params.get("current").unwrap_or("").to_string(),
-                position: params
-                    .get("position")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0),
-                changed: NOW.into(),
-                changed_by: identity.username.clone(),
-                ids,
-            });
+            store.save_queue(
+                identity,
+                PlayQueue {
+                    username: identity.username.clone(),
+                    current: params.get("current").unwrap_or("").to_string(),
+                    position: params
+                        .get("position")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0),
+                    changed: NOW.into(),
+                    changed_by: identity.username.clone(),
+                    ids,
+                },
+            );
             EndpointResult::Doc(vec![])
         }
         "getBookmarks" => EndpointResult::Doc(vec![("bookmarks".to_string(), Value::Map(vec![]))]),
@@ -830,7 +857,7 @@ pub fn handle_endpoint<S: Library>(
     }
 }
 
-fn search2<S: Library>(store: &S, query: &str) -> EndpointResult {
+fn search2<S: Library>(store: &S, identity: &Identity, query: &str) -> EndpointResult {
     let q = query.to_lowercase();
     let artists: Vec<Value> = store
         .artists()
@@ -856,7 +883,7 @@ fn search2<S: Library>(store: &S, query: &str) -> EndpointResult {
         .all_songs()
         .iter()
         .filter(|s| song_matches(s, query))
-        .map(|s| starred_song_entry(store, s))
+        .map(|s| starred_song_entry(store, identity, s))
         .collect();
     let mut entries = Vec::new();
     if !artists.is_empty() {
@@ -871,7 +898,12 @@ fn search2<S: Library>(store: &S, query: &str) -> EndpointResult {
     EndpointResult::Doc(vec![("searchResult2".to_string(), Value::Map(entries))])
 }
 
-fn star_unstar<S: Library>(store: &mut S, params: &Params, star: bool) -> EndpointResult {
+fn star_unstar<S: Library>(
+    store: &mut S,
+    identity: &Identity,
+    params: &Params,
+    star: bool,
+) -> EndpointResult {
     let ids = params.get_all("id");
     let album_ids = params.get_all("albumId");
     let artist_ids = params.get_all("artistId");
@@ -880,13 +912,13 @@ fn star_unstar<S: Library>(store: &mut S, params: &Params, star: bool) -> Endpoi
     }
     let mut apply = |kind: StarKind, id: &str| -> Result<(), EndpointResult> {
         if star {
-            if store.star(kind, id) {
+            if store.star(identity, kind, id) {
                 Ok(())
             } else {
                 Err(not_found("Requested data was not found."))
             }
         } else {
-            store.unstar(kind, id);
+            store.unstar(identity, kind, id);
             Ok(())
         }
     };
@@ -907,4 +939,26 @@ fn song_matches(song: &Song, query: &str) -> bool {
     song.title.to_lowercase().contains(&q)
         || song.album.to_lowercase().contains(&q)
         || song.artist.to_lowercase().contains(&q)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_keeps_utf8_intact() {
+        let params = Params::parse("query=Bj%C3%B6rk&name=Caf%C3%A9");
+        assert_eq!(params.get("query"), Some("Björk"));
+        assert_eq!(params.get("name"), Some("Café"));
+    }
+
+    #[test]
+    fn decode_never_panics_on_stray_percent() {
+        // Non-char-boundary slicing used to panic here; byte indexing cannot.
+        let params = Params::parse("q=%aé&other=%zz%");
+        assert!(params.get("q").is_some());
+        assert_eq!(params.get("other"), Some("%zz%"));
+        let params = Params::parse("q=%");
+        assert_eq!(params.get("q"), Some("%"));
+    }
 }

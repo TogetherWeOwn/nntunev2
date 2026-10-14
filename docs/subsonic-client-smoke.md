@@ -24,15 +24,16 @@ acceptance checklist. Results are recorded here when the staging run lands
 | 7 | Feishin (desktop) | Add server; full library scan | `getArtists`, `getAlbum`, `getSong` shapes accepted |
 | 8 | Feishin | Scrobble a play; rate 5 stars | `scrobble`, `setRating` ok |
 | 9 | All | Open an unsupported op path (`getVideos`) | Graceful "not supported" (error 0), no crash |
-| 10 | All | Wrong API key | Clean auth failure (error 40), no retry storm |
+| 10 | All | Wrong API key | Clean auth failure (error 44), no retry storm |
 
 ## Quick curl equivalents (pre-client sanity)
 
 ```bash
 BASE=https://<staging-api>
-curl "$BASE/rest/ping?u=test&apiKey=<key>&v=1.16.1&c=smoke"
-curl "$BASE/rest/getArtists?u=test&apiKey=<key>&v=1.16.1&c=smoke&f=json"
-curl -o /tmp/s.bin "$BASE/rest/stream?u=test&apiKey=<key>&v=1.16.1&c=smoke&id=<song-id>"
+# apiKey alone (v1 answers 43 if apiKey is mixed with u/p/t/s).
+curl "$BASE/rest/ping?apiKey=<key>&v=1.16.1&c=smoke"
+curl "$BASE/rest/getArtists?apiKey=<key>&v=1.16.1&c=smoke&f=json"
+curl -o /tmp/s.bin "$BASE/rest/stream?apiKey=<key>&v=1.16.1&c=smoke&id=<song-id>"
 ```
 
 ## Results

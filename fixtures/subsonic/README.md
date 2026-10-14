@@ -24,7 +24,13 @@ return for the seeded demo library below. The fixture suite
 - Artist `ar-1` "Test Artist" (1 album); album `al-1` "Test Album" (1 song,
   200s, coverArt `al-1`); song `so-1` "Test Song" (track 1, 200s,
   `audio/mpeg`, genre Rock).
-- User `test` / `test@example.com`; apiKey `test-key-1`; password `test-pass`.
+- Fixture users (enabled only in `seeded()` / `empty_with_test_auth()`;
+  production `MemStore::empty()` accepts nothing): `test` /
+  `test@example.com` (apiKey `test-key-1`, password `test-pass`), `other` /
+  `other@example.com` (apiKey `other-key-1`), `admin` /
+  `admin@example.com` (apiKey `admin-key-1`, `adminRole` true).
+  Playlists, stars, ratings, scrobbles and queues are per-user; another
+  user's playlist answers 50, and `getUser` answers 50 unless self or admin.
 - Empty-library fixtures assert v1 behaviour with no rows: empty collections
   serialize to self-closed elements (`<artists/>`), never to 404.
 
@@ -33,10 +39,17 @@ return for the seeded demo library below. The fixture suite
 - `0` refused ops (`jukeboxControl`, `getVideos`, `getVideoInfo`,
   `getCaptions`, `savePlayQueueByIndex`, 4 internet-radio ops) with
   `The {op} operation is not supported by this server.` — HTTP 200.
-- `10` required parameter missing; `40` wrong username/password;
-  `41` token auth without salt; `70` data not found
-  (unknown stream id: `Song not found.`). `hls.m3u8` is not a Subsonic
-  document: plain HTTP 410 (as in v1, matching Navidrome).
+- `10` required parameter missing (also token auth without `s`, and an
+  invalid JSONP callback, which falls back to JSON error 10 as in v1);
+  `40` wrong username/password (incl. malformed `enc:` hex);
+  `43` apiKey mixed with `u`/`p`/`t`/`s`;
+  `44` invalid API key; `50` per-user forbidden;
+  `70` data not found (unknown stream id: `Song not found.`).
+  `hls.m3u8` is not a Subsonic document: plain HTTP 410 (as in v1,
+  matching Navidrome).
+- `p=enc:<hex>` passwords hex-decode as in v1; query decoding is byte-based
+  UTF-8 (no Latin-1 mojibake, no panic on stray `%`); POST form bodies merge
+  with the query string as in v1 (`$request->input()`).
 
 ## Byte routes
 
