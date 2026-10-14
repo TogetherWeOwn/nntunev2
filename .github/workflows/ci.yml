@@ -51,8 +51,10 @@ jobs:
         run: python3 .github/scripts/test_public_text_lint.py
 
   # Aggregate required check. Add every real job id to `needs` (and keep
-  # `!cancelled()` + `contains(needs.*.result, 'failure')` logic) so ci-ok
-  # stays red when any job fails and green only when all succeed.
+  # `!cancelled()` + the RESULTS check below) so ci-ok stays red when any
+  # job fails and green only when all succeed. The check reads
+  # join(needs.*.result, ' ') — never grep pretty-printed JSON for a
+  # result string (whitespace-sensitive, silently never matches).
   ci-ok:
     name: ci-ok
     needs: [placeholder, public-text]
@@ -61,8 +63,12 @@ jobs:
     timeout-minutes: 5
     steps:
       - run: |
-          if printf '%s\n' ${{ toJSON(needs) }} | grep -q '"result": "failure"'; then
-            echo "ci-ok: a required job failed"
-            exit 1
-          fi
-          echo "ci-ok: all required jobs passed"
+          case " $RESULTS " in
+            *" failure "*|*" cancelled "*)
+              echo "ci-ok: a required job failed (results: $RESULTS)"
+              exit 1
+              ;;
+          esac
+          echo "ci-ok: all required jobs passed (results: $RESULTS)"
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}

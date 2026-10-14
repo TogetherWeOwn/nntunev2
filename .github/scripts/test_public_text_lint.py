@@ -26,10 +26,13 @@ class TestTogIds(unittest.TestCase):
     def test_star_form_is_not_an_id(self):
         self.assertEqual([], find_violations("no `TOG-*` ids in public text"))
 
-    def test_rule_sentence_is_allowlisted(self):
-        self.assertEqual(
-            [],
-            find_violations("No tracker IDs (e.g. `TOG-*`) are required here"),
+    def test_rule_sentence_with_real_id_is_flagged(self):
+        # No sentence exemption exists: a real id on a rule line fails
+        # like anywhere else. (Manufactured id; this file is excluded
+        # from the lint via FIXTURE_EXCLUSIONS.)
+        self.assertIn(
+            "tog-id",
+            rules_for("No tracker IDs (e.g. TOG-00000) are required here"),
         )
 
     def test_finding_ids_are_public(self):
@@ -61,6 +64,22 @@ class TestInternalHosts(unittest.TestCase):
         self.assertEqual(
             [], find_violations("connect to host.docker.internal:5432")
         )
+
+    def test_dotenv_filename_is_allowed(self):
+        self.assertEqual(
+            [], find_violations("copy .env.example to .env.local")
+        )
+
+    def test_attribute_access_is_not_a_hostname(self):
+        self.assertEqual([], find_violations("value = self.internal()"))
+        self.assertEqual([], find_violations("value = self.internal.timeout"))
+
+    def test_bare_dotted_name_at_end_still_flags(self):
+        # Indistinguishable from a hostname: reword instead of widening.
+        self.assertIn("internal-host", rules_for("point it at db.internal"))
+
+    def test_private_suffix_with_path_flags(self):
+        self.assertIn("internal-host", rules_for("fetch db.local/rows"))
 
     def test_loopback_and_localhost_are_dev_docs(self):
         self.assertEqual([], find_violations("listen on 127.0.0.1:3000"))

@@ -11,6 +11,16 @@
 # Directories are forward-looking: entries stay dormant until their
 # manifests land (`Cargo.toml` at the workspace root, `package.json`
 # under `web/` for the SvelteKit frontend).
+#
+# When those manifests land, commit their lockfiles too (remove the
+# corresponding ignore lines first): without a committed lockfile the
+# dependency graph cannot see transitive versions, so the cargo/npm
+# entries above cannot do their job.
+#
+# First Dependabot PR: confirm the required checks (`ci-ok`, `gitleaks`,
+# `pr-lint`, Paperclip Review) all appear on it before relying on them —
+# automated authorship may not trigger every check. If the review check
+# is missing, a maintainer mentions the reviewer on the PR.
 
 version: 2
 

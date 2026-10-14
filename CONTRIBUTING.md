@@ -16,7 +16,10 @@ trailing period. The `pr-lint` check enforces this.
 
 No tracker IDs (e.g. `TOG-*`) are required in PR titles or bodies — this is a
 public repo. Do not paste internal links or card IDs. The `public-text` CI
-job (part of `ci-ok`) enforces this on all tracked files.
+job (part of `ci-ok`, which fails on any needed-job failure) enforces this
+on all tracked file contents. Scope is file contents only: branch names,
+commit messages, and PR text stay clean by contributor discipline (prefer
+id-free branch names; squash-merge keeps branch names off main).
 
 ## PR body
 

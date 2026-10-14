@@ -53,16 +53,16 @@ stream pool (accounts/auth/vault implementation card).
 | Threat | Attack | Mitigation (required) |
 |---|---|---|
 | Spoofing | Attacker calls vault read/write as another user | Auth needed on EVERY vault endpoint; authenticated user must own the row (IDOR check first, cf. v1 avatar-oracle lesson: authorization precedes existence-oracle — non-owner gets the same response for "no vault" as "not yours") |
-| Tampering | Ciphertext swapped between rows; KEK confusion across envs | AEAD (AES-256-GCM) with per-row nonce + associated data binding `user_id`; KEK version column; staging and prod KEKs never shared |
+| Tampering | Ciphertext swapped between rows; KEK confusion across envs | AEAD (AES-256-GCM) with per-row nonce + associated data binding the domain separator and `user_id` (plus the KEK version on the DEK wrap; exact tuples in `kek-rotation.md` §1); KEK version column; staging and prod KEKs never shared |
 | Repudiation | "I never stored that provider" / silent credential overwrite | Audit log: vault create/update/delete + test-connection attempts (who/when/source IP/result — NEVER the secret); no log line may contain credential material |
 | Information disclosure | SQL dump, log leak, error echo, backup exposure | Envelope encryption at rest; parameterized queries only; generic errors ("vault unavailable"); `test connection` returns boolean only, never provider banners; backups inherit encryption (ciphertext only) |
 | Denial of service | Vault row hammering; KEK-fetch storms | Rate-limit vault writes + test-connection per user (shared store, not in-memory — serverless); test-connection has dial + total timeouts and per-user concurrency cap |
-| Elevation | `test connection` SSRF: user-supplied host/port aimed at internal targets | **SSRF guard (F-VAULT-01):** allowlist scheme/host shape, resolve ALL DNS records, reject loopback/link-local/private/unique-local (v4+v6), forbid redirects, dial timeout; treat provider host as hostile input |
+| Elevation | SSRF at `test connection` AND at every pool dial: user-supplied host/port aimed at internal targets | **SSRF guard (F-VAULT-01, dial-time invariant):** the check runs on EVERY provider connect, not only at save/test time — a hostname's DNS can change after it is saved. Allowlist scheme/host shape and NNTP ports (119/563 plus documented alternates only); resolve ALL DNS records and reject loopback/link-local/private/unique-local (v4+v6); forbid redirects; dial timeout; pool Worker carries no private-network or service bindings; treat provider host as hostile input. **Accepted residual (decision):** re-resolution at connect time has a DNS-rebinding TOCTOU gap (the runtime resolves the hostname itself); contained by the per-dial private-range rejection + port allowlist, not eliminated |
 
-Key rules: KEK rotation is designed day one (versioned keys, dual-read
-decrypt, online re-wrap job — F-VAULT-02, normative design in
-`kek-rotation.md`); DEK per user, never hard-coded; no credential in Analytics Engine,
-KV, R2, Queues payloads, or error bodies.
+Key rules: KEK rotation is designed day one (versioned keys,
+version-pinned decrypt, online re-wrap job — F-VAULT-02, normative design
+in `kek-rotation.md`); DEK per user, never hard-coded; no credential in
+Analytics Engine, KV, R2, Queues payloads, or error bodies.
 
 ## 4. Sessions, passkeys, magic links (STRIDE)
 
@@ -70,10 +70,10 @@ KV, R2, Queues payloads, or error bodies.
 |---|---|---|
 | Spoofing | Session theft / fixation; WebAuthn registration hijack | Signed cookies (`httpOnly`, `Secure`, `SameSite=Lax` minimum), server-side session row, rotation on privilege change; WebAuthn RP ID pinned to the real origin; challenge single-use + short expiry |
 | Tampering | Cookie editing; magic-link reuse | Cookies are signed (secret from env, never code); magic-link tokens are cryptographic-random (≥128-bit), hashed at rest, single-use, ≤15-min expiry |
-| Repudiation | Disputed logins | Audit log: login/register/magic-link issue+consume/session revoke (who/when/result) |
+| Repudiation | Disputed logins | Audit log: login/register/magic-link issue+consume/session revoke/account-email change (who/when/result) |
 | Information disclosure | Session/token leak via logs or error pages | No token material in logs or error bodies; login errors are generic ("check your email") — no user-enumeration oracle |
 | Denial of service | Magic-link email bombing; auth-endpoint hammering | Strict rate limits on auth endpoints (shared store), email-send cooldown per address; invite-code gate if abuse appears |
-| Elevation | Fixed/forever sessions; leaked logout | Bounded `maxAge`, rotation, explicit revoke-all on password/passkey change; every endpoint re-checks authz, not just auth |
+| Elevation | Fixed/forever sessions; leaked logout; account-email takeover (there are no passwords — whoever controls the account email controls the account via magic link, so changing it is the main takeover/persistence path) | Bounded `maxAge`, rotation, explicit revoke-all on passkey add/remove; every endpoint re-checks authz, not just auth. **Email change requires** fresh passkey authentication (or confirmation via the OLD address), notification to the old address with a revert link, and revocation of ALL sessions plus outstanding magic links; the change is audit-logged (see Repudiation row) |
 
 ## 5. Signed stream grants (STRIDE)
 
@@ -84,7 +84,7 @@ Stream Worker serves Range requests with R2 cache; grants authorize fetches.
 | Spoofing | Forged or replayed grant | Grants are MAC-signed (server key), short TTL (minutes), bound to `user_id` + content id; `nbf`/`exp` enforced with clock-skew cap |
 | Tampering | Grant edited to another track/user | MAC covers ALL grant fields; any field change invalidates |
 | Repudiation | Disputed fetches for metering | Metering events keyed to authenticated grant (Analytics Engine carries ids, never secrets) |
-| Information disclosure | Grant URL leaks (logs, Referer) | Grants travel in `Authorization` header or POST body, not query strings; cache keys namespaced per user — NEVER serve user A's bytes for user B's grant (cache-poisoning = cross-user disclosure) |
+| Information disclosure | Grant URL leaks (logs, Referer) | Grants travel in `Authorization` header or POST body, never query strings; cache keys namespaced per user — NEVER serve user A's bytes for user B's grant (cache-poisoning = cross-user disclosure). **Browser media elements** (plain GET + Range, no custom headers): playback auth uses EITHER a fetch/MSE player sending the `Authorization` header, OR a path-scoped, short-TTL, `HttpOnly`/`Secure`/`SameSite=Lax` grant cookie minted alongside the signed grant — never a signed query-string grant; `Referrer-Policy: no-referrer`; logs scrub grant bytes |
 | Denial of service | Grant minting loop; Range-abuse on origin | Mint rate-limited; Range clamped; R2 absorbs repeats; per-user concurrency cap in pool |
 | Elevation | Grant for track X used against pool/account Y | Grant audience binds worker + user; pool DO re-validates grant before dialing provider |
 
@@ -100,14 +100,21 @@ Per-user NNTP pool Durable Object + streaming Worker (pool/streaming implementat
 | Information disclosure | Provider creds leak into pool logs/errors; NNTP banners echo secrets | Pool never logs credentials; provider errors mapped to generic codes before leaving the DO; `max connections` from the vault row is a ceiling, not a target |
 | Denial of service | One tenant exhausts shared egress / provider connection cap | Per-user connection + rate caps (plan-tiered); per-user queues so one tenant's backlog never blocks another; total timeouts on every NNTP op |
 | Elevation | Tenant escapes pool to read another tenant's vault row | Vault read path enforces owner check inside the DO call path too — defense in depth, not edge-only |
+| Elevation | Pool dials a provider host whose DNS changed after save (save-time check bypass) | The §3 SSRF guard is a dial-time invariant: enforced on every connect inside the DO (resolve all records, reject private/reserved, NNTP-port allowlist); DNS-rebinding residual accepted, see §3 |
 
 ## 7. Public-repo hygiene (verified 2026-10-13)
 
 Verified against the scaffold at `11d1f03`:
 
-- `gitleaks` full-history scan is a required check; config uses the base branch's
-  policy on PRs so a PR cannot silence its own scan; `--ignore-gitleaks-allow`
-  means inline `gitleaks:allow` comments FAIL the scan (fail-closed). ✅
+- `gitleaks` full-history scan is a required check; on PRs BOTH the config
+  policy AND the ignore file come from the base branch (`--gitleaks-ignore-path`
+  pinned to a base-ref extraction, empty when the base has no ignore file),
+  so a PR-added ignore cannot silence its own scan — it takes effect only
+  after merge, and the merge required this scan to pass. A PR touching the
+  ignore file raises a warning annotation for reviewers. Inline
+  `gitleaks:allow` comments never suppress findings (`--ignore-gitleaks-allow`;
+  note: the flag stops suppression, it does not turn allows into failures —
+  an allow comment on a real leak still reports the leak). ✅
 - All three workflows declare least-privilege `permissions:` (`contents: read`,
   plus `pull-requests: read` where the title must be read). ✅
 - No `pull_request_target` anywhere (privilege-escalation vector banned). ✅
@@ -116,9 +123,10 @@ Verified against the scaffold at `11d1f03`:
   `.wrangler/`, dumps. ✅
 - `CONTRIBUTING.md` bans internal ids/links in public text. ✅
 
-Residual hygiene findings are filed as cards (see §9) — they are hardening, not
-holes: Dependabot updates config, a CI lint for internal identifiers in public
-text, and a PR-template secrets affirmation.
+The hygiene findings below are implemented in this PR series (Dependabot
+updates config, the `public-text` CI lint, the PR-template secrets
+affirmation); their cards track review + merge, not future work. The vault
+findings are normative designs the implementation PR must satisfy (§8 gate).
 
 ## 8. Vault + auth review gate (standing)
 
@@ -137,6 +145,12 @@ these paths do. The verdict checks, at the exact PR head:
 5. Migrations reviewed for secret handling (no plaintext backfill, no secret in
    migration output).
 6. Workflow changes keep least-privilege permissions and no `pull_request_target`.
+7. Auth changes implement the §4 email-change rule (fresh auth, old-address
+   notice + revert, revoke-all); media playback uses a §5 transport (header
+   player or grant cookie, never signed query strings).
+8. KEK retire honors backup/PITR retention (`kek-rotation.md` §5, retire-after
+   date); a KEK-exposure response follows the §10 compromise path, never
+   routine rotation alone.
 
 ## 9. Findings index
 

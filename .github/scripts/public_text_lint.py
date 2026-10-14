@@ -13,12 +13,17 @@ Banned classes (rule id -> shape):
     The ``TOG-*`` star form used by rule statements is NOT an id and
     never matches (a ``*`` is not a digit).
   internal-host
-    Host shapes that only exist inside our walls: private DNS suffixes
-    (the bare names ``internal``, ``local``, ``lan``, ``intranet``,
-    ``corp`` — see ``_INTERNAL_SUFFIX`` for the exact shape),
-    RFC-1918 IPv4, the cloud metadata IP, ``workforce`` control-plane
-    hosts, and absolute instance-UI links
+    Host shapes that only exist inside our walls: dotted hostnames under
+    a private DNS suffix (a label, a dot, then ``internal``, ``local``,
+    ``lan``, ``intranet`` or ``corp``, followed by a port, a slash, or
+    the end of the token — see ``_INTERNAL_SUFFIX`` for the exact
+    shape), RFC-1918 IPv4, the cloud metadata IP, ``workforce``
+    control-plane hosts, and absolute instance-UI links
     (``https`` + ``://`` + any host + ``/<PREFIX>/issues|agents|.../``).
+    Bare ``name.suffix`` at end-of-line still flags: it is
+    indistinguishable from a hostname, so reword or extend the
+    allowlist instead of widening the rule. Attribute access followed
+    by ``(`` or ``.`` (calls, chains) does not match.
   instance-path
     Relative instance-UI paths (``/<PREFIX>/issues|agents|projects|
     approvals|runs/``). These deep-link the internal tracker even with
@@ -38,12 +43,21 @@ property, so every entry names its reason):
   * ``host.docker.internal`` is a standard Docker dev hostname, not our
     infrastructure: it is masked before matching. (The mask pattern below
     spells the suffix via a group so this file itself stays clean.)
-  * Lines stating the rule itself (they contain ``No tracker IDs``) are
-    exempt from the tog-id rule only. Examples in those sentences MUST
-    use the ``TOG-*`` star form, never a real id.
+  * The dotenv filename ``.env.local`` is the standard local-dev file
+    for this stack, not our infrastructure: it is masked before
+    matching. (The mask pattern below spells it via a group so this
+    file itself stays clean.) Rule statements use the ``TOG-*`` star
+    form, which never matches the id pattern — there is deliberately NO
+    sentence exemption, so a real id pasted onto a rule line fails like
+    anywhere else.
   * FIXTURE_EXCLUSIONS: exact test-fixture paths holding manufactured
     violations for this lint's own unit tests. No directory, extension,
     or generated-file exemptions.
+
+Scope limit (by design, not a gap to widen silently): this lint scans
+tracked FILE CONTENTS only. Branch names, commit messages, and PR
+titles/bodies are contributor discipline (CONTRIBUTING.md); squash-merge
+keeps branch names off main. Prefer id-free branch names for new work.
 
 Reports print file:line + rule id only — never the matched bytes. CI
 logs on this repo are public (threat-model section 2), so the report
@@ -69,7 +83,14 @@ FIXTURE_EXCLUSIONS = frozenset(
 
 _TOG = re.compile(r"\bTOG-\d+\b")
 
-_INTERNAL_SUFFIX = re.compile(r"\.(?:internal|local|lan|intranet|corp)\b", re.IGNORECASE)
+# Hostname-looking only: one or more labels, a private suffix, then a
+# port, a slash, or the end of the token. Attribute access (`.foo(`,
+# `.foo.bar`) and bare suffix words never match.
+_INTERNAL_SUFFIX = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?:[A-Za-z0-9-]+\.)+(?:internal|local|lan|intranet|corp)"
+    r"(?::\d+)?(?=$|[\s\"'`,;)\]:/])",
+    re.IGNORECASE,
+)
 _WORKFORCE_HOST = re.compile(r"\bworkforce\.[A-Za-z0-9.-]+", re.IGNORECASE)
 _ABSOLUTE_UI_LINK = re.compile(
     r"\bhttps?://\S+/[A-Z]{2,6}/(?:issues|agents|projects|approvals|runs)/"
@@ -96,25 +117,23 @@ RULES = (
     ("agent-name", (_AGENT_DEEPLINK, _RUNNER_HANDLE, _UUID_VALUED_ID)),
 )
 
-# Lines stating the rule itself; exempt from the tog-id rule only.
-TOG_SENTENCE_ALLOW = re.compile(r"No tracker IDs")
-
-# Group form keeps this definitional line out of its own suffix rule.
+# Group forms keep these definitional lines out of their own rules.
 _DOCKER_HOST_MASK = re.compile(r"host\.docker\.(?:internal)\b", re.IGNORECASE)
+_ENV_LOCAL_MASK = re.compile(r"\.env\.(?:local)\b", re.IGNORECASE)
 
 
 def find_violations(text):
     """Return [(line_number, rule_id)] for banned shapes in text.
 
     One hit per rule per line at most. Never returns matched bytes —
-    callers report file:line + rule id only.
+    callers report file:line + rule id only. There is no sentence
+    exemption: a real id matches on any line, including a rule line.
     """
     masked = _DOCKER_HOST_MASK.sub("host.docker.example", text)
+    masked = _ENV_LOCAL_MASK.sub(".env.example", masked)
     hits = []
     for lineno, line in enumerate(masked.splitlines(), start=1):
         for rule_id, patterns in RULES:
-            if rule_id == "tog-id" and TOG_SENTENCE_ALLOW.search(line):
-                continue
             if any(p.search(line) for p in patterns):
                 hits.append((lineno, rule_id))
     return hits
