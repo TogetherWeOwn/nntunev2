@@ -1,9 +1,14 @@
 //! Route table, ported from v1 `routes/subsonic.php`.
 //!
-//! 48 supported endpoints (GET or POST, optional `.view` suffix), 9 explicit
+//! 49 supported endpoints (GET or POST, optional `.view` suffix), 9 explicit
 //! refusals answered inside the envelope with error 0 (`UnsupportedOperation`
 //! in v1), and `hls.m3u8` as a plain 410 (a stream URL, not a document).
 //! Anything else under `/rest/` is a plain 404 outside the envelope.
+//!
+//! `getOpenSubsonicExtensions` is public per the OpenSubsonic spec (v1 serves
+//! it outside the auth group): capability advertisement cannot require the
+//! credential it helps obtain. It still merges POST bodies and enforces the
+//! body cap like every other route — only authentication is skipped.
 
 /// Supported endpoints, in v1 route order.
 pub const SUPPORTED_ENDPOINTS: &[&str] = &[
@@ -38,6 +43,7 @@ pub const SUPPORTED_ENDPOINTS: &[&str] = &[
     "getNowPlaying",
     "getUser",
     "getAvatar",
+    "tokenInfo",
     "getOpenSubsonicExtensions",
     "download",
     "getSongsByGenre",
@@ -70,9 +76,13 @@ pub const UNSUPPORTED_ENDPOINTS: &[&str] = &[
     "deleteInternetRadioStation",
 ];
 
+/// Supported endpoints served without authentication (v1 public group).
+pub const PUBLIC_ENDPOINTS: &[&str] = &["getOpenSubsonicExtensions"];
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Route<'a> {
     Endpoint(&'a str),
+    PublicEndpoint(&'a str),
     Unsupported(&'a str),
     Hls,
     Unknown,
@@ -91,6 +101,9 @@ pub fn route(path: &str) -> Route<'_> {
         return Route::Hls;
     }
     if let Some(hit) = SUPPORTED_ENDPOINTS.iter().find(|e| **e == op) {
+        if PUBLIC_ENDPOINTS.contains(hit) {
+            return Route::PublicEndpoint(hit);
+        }
         return Route::Endpoint(hit);
     }
     if let Some(hit) = UNSUPPORTED_ENDPOINTS.iter().find(|e| **e == op) {
@@ -115,7 +128,12 @@ mod tests {
         assert_eq!(route("/rest/bogus"), Route::Unknown);
         assert_eq!(route("/other/ping"), Route::Unknown);
         assert_eq!(route("/rest/"), Route::Unknown);
-        assert_eq!(SUPPORTED_ENDPOINTS.len(), 48);
+        assert_eq!(
+            route("/rest/getOpenSubsonicExtensions"),
+            Route::PublicEndpoint("getOpenSubsonicExtensions")
+        );
+        assert_eq!(route("/rest/tokenInfo"), Route::Endpoint("tokenInfo"));
+        assert_eq!(SUPPORTED_ENDPOINTS.len(), 49);
         assert_eq!(UNSUPPORTED_ENDPOINTS.len(), 9);
     }
 }

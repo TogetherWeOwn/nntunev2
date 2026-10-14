@@ -1,0 +1,1 @@
+{"subsonic-response":{"status":"failed","version":"1.16.1","type":"nntune","serverVersion":"0.1.0","openSubsonic":true,"error":{"code":50,"message":"User is not authorized for the given operation."}}}

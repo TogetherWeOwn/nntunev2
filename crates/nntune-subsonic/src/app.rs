@@ -4,12 +4,17 @@
 //! Cloudflare worker shell, native tests, and the golden fixture suite.
 //! Mutations go through `RefCell` so `handle` stays `&self`.
 
-use crate::auth::{authenticate, Credentials};
+use crate::auth::{authenticate, Credentials, Identity};
 use crate::endpoints::{handle_endpoint, EndpointResult, Params};
 use crate::envelope::{
     error_document, ok_document, render_json, render_jsonp, render_xml, JSON_CONTENT_TYPE,
     XML_CONTENT_TYPE,
 };
+
+/// v1 `MergeFormPostParams::MAX_BODY_BYTES`: a POST body over 10 MB is
+/// refused with error 10 before any parsing — its parameters cannot be
+/// trusted, so nothing downstream may act on a prefix of them.
+pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 use crate::library::Library;
 use crate::routes::{route, Route};
 use std::cell::RefCell;
@@ -50,6 +55,11 @@ impl<S: Library> SubsonicApp<S> {
     /// with `$request->input()`, query plus form body); query wins on
     /// duplicates since `Params::get` returns the first value.
     pub fn handle(&self, method: &str, path: &str, query: &str, body: &str) -> HttpResponse {
+        // v1 caps the body before routing or auth: only the query string is
+        // parsed for `f`, since body parameters are untrusted past the cap.
+        if method.eq_ignore_ascii_case("POST") && body.len() > MAX_BODY_BYTES {
+            return oversized_body_response(query);
+        }
         let merged = Self::merge_query(method, query, body);
         match route(path) {
             Route::Unknown => HttpResponse::document(404, "text/plain", b"Not Found".to_vec()),
@@ -60,7 +70,18 @@ impl<S: Library> SubsonicApp<S> {
                     crate::envelope::code::GENERIC,
                     &format!("The {op} operation is not supported by this server."),
                 );
-                self.render(&params, &doc)
+                Self::render(&params, &doc)
+            }
+            // Public per the OpenSubsonic spec: body merge and cap apply,
+            // authentication is skipped (v1 serves it outside the auth group).
+            Route::PublicEndpoint(name) => {
+                let params = Params::parse(&merged);
+                let identity = Identity::for_public_route();
+                let mut store = self.store.borrow_mut();
+                Self::render_endpoint(
+                    &params,
+                    handle_endpoint(&mut *store, &identity, name, &params),
+                )
             }
             Route::Endpoint(name) => {
                 let params = Params::parse(&merged);
@@ -70,18 +91,25 @@ impl<S: Library> SubsonicApp<S> {
                 let identity = match authenticate(&*store, &creds) {
                     Ok(identity) => identity,
                     Err((error_code, message)) => {
-                        return self.render(&params, &error_document(error_code, &message));
+                        return Self::render(&params, &error_document(error_code, &message));
                     }
                 };
-                match handle_endpoint(&mut *store, &identity, name, &params) {
-                    EndpointResult::Doc(payload) => self.render(&params, &ok_document(payload)),
-                    EndpointResult::Err(error_code, message) => {
-                        self.render(&params, &error_document(error_code, &message))
-                    }
-                    EndpointResult::Binary { content_type, body } => {
-                        HttpResponse::document(200, &content_type, body)
-                    }
-                }
+                Self::render_endpoint(
+                    &params,
+                    handle_endpoint(&mut *store, &identity, name, &params),
+                )
+            }
+        }
+    }
+
+    fn render_endpoint(params: &Params, result: EndpointResult) -> HttpResponse {
+        match result {
+            EndpointResult::Doc(payload) => Self::render(params, &ok_document(payload)),
+            EndpointResult::Err(error_code, message) => {
+                Self::render(params, &error_document(error_code, &message))
+            }
+            EndpointResult::Binary { content_type, body } => {
+                HttpResponse::document(200, &content_type, body)
             }
         }
     }
@@ -98,7 +126,7 @@ impl<S: Library> SubsonicApp<S> {
         }
     }
 
-    fn render(&self, params: &Params, doc: &crate::value::Value) -> HttpResponse {
+    fn render(params: &Params, doc: &crate::value::Value) -> HttpResponse {
         match params.get("f") {
             Some("json") => HttpResponse::document(200, JSON_CONTENT_TYPE, render_json(doc)),
             Some("jsonp") => {
@@ -108,6 +136,25 @@ impl<S: Library> SubsonicApp<S> {
             }
             _ => HttpResponse::document(200, XML_CONTENT_TYPE, render_xml(doc)),
         }
+    }
+}
+
+/// Error-10 document for an over-cap POST body, answered without touching
+/// the store. The worker shell calls this on the `Content-Length` fast path
+/// (before buffering the body); `handle` calls it on the actual byte length.
+pub fn oversized_body_response(query: &str) -> HttpResponse {
+    let params = Params::parse(query);
+    let doc = error_document(
+        crate::envelope::code::REQUIRED_PARAM_MISSING,
+        "POST body exceeds the 10 MB limit.",
+    );
+    match params.get("f") {
+        Some("json") => HttpResponse::document(200, JSON_CONTENT_TYPE, render_json(&doc)),
+        Some("jsonp") => {
+            let (body, content_type) = render_jsonp(&doc, params.get("callback"));
+            HttpResponse::document(200, content_type, body)
+        }
+        _ => HttpResponse::document(200, XML_CONTENT_TYPE, render_xml(&doc)),
     }
 }
 

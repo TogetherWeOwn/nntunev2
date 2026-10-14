@@ -1,9 +1,14 @@
 # Subsonic golden fixtures
 
-Captured from v1 (`routes/subsonic.php` + `SubsonicResponse`) behaviour, not
-from live traffic: every file is the exact byte body the Rust handler must
-return for the seeded demo library below. The fixture suite
+Derived from v1 source (`routes/subsonic.php`, `SubsonicResponse`, the
+`Subsonic/*` controllers/resources, `MergeFormPostParams`, Symfony
+`JsonResponse`), not from live traffic: no v1 instance was available in
+this environment, so every file is the exact byte body the Rust handler
+returns for the seeded demo library below, with shapes verified field by
+field against v1 source. The fixture suite
 (`crates/nntune-subsonic/tests/fixture_suite.rs`) asserts byte equality.
+A live capture against a seeded v1 instance remains future work; until
+then these fixtures pin the port's v1-derived contract, not v1 bytes.
 
 ## Envelope (v1 `SubsonicResponse`, ported exactly)
 
@@ -13,8 +18,13 @@ return for the seeded demo library below. The fixture suite
   a `value` key becomes element text, bools render `true`/`false`, nulls are
   stripped. No pretty-printing.
 - `f=json`: `{"subsonic-response":{...}}`, compact, native JSON types.
-- `f=jsonp`: `callback({...})`; missing `callback` falls back to JSON
-  error 10 (as in v1).
+- `f=jsonp`: `/**/{callback}({...});` as `text/javascript` (Symfony
+  `JsonResponse`, incl. the `/**/` sniffing guard); missing/empty/invalid
+  `callback` falls back to JSON error 10 (as in v1). Callbacks must be
+  dot-separated JS identifier paths with `[...]` indexers holding digits
+  or quoted strings only (Symfony `setCallback` pattern + reserved words,
+  ported exactly); unquoted `[name]`/`[a-b]` and reserved words are
+  rejected.
 - Envelope attributes: `status`, `version="1.16.1"`, `type="nntune"`,
   `serverVersion` (crate version), `openSubsonic="true"`. Errors add
   `<error code message/>` / `"error":{"code","message"}` with HTTP 200.
@@ -27,10 +37,21 @@ return for the seeded demo library below. The fixture suite
 - Fixture users (enabled only in `seeded()` / `empty_with_test_auth()`;
   production `MemStore::empty()` accepts nothing): `test` /
   `test@example.com` (apiKey `test-key-1`, password `test-pass`), `other` /
-  `other@example.com` (apiKey `other-key-1`), `admin` /
-  `admin@example.com` (apiKey `admin-key-1`, `adminRole` true).
+  `other@example.com` (apiKey `other-key-1`), `manager` /
+  `manager@example.com` (apiKey `manager-key-1`, admin-or-manager roles),
+  `admin` / `admin@example.com` (apiKey `admin-key-1`, `adminRole` true).
   Playlists, stars, ratings, scrobbles and queues are per-user; another
-  user's playlist answers 50, and `getUser` answers 50 unless self or admin.
+  user's playlist answers 50, and `getUser`/`getAvatar` answer 50 unless
+  self or admin.
+- 49 supported endpoints: the v1 authenticated table plus `tokenInfo`
+  (reports the caller's username); `getOpenSubsonicExtensions` is public
+  (no credentials needed) and claims exactly `apiKeyAuthentication` v1 +
+  `formPost` v1 — `songLyrics` is not claimed because `getLyrics` is a
+  stub, per v1.
+- `getUser` roles are v1 `UserResource` exactly (`settingsRole` true,
+  `uploadRole`/`coverArtRole` for admin-or-manager, `commentRole` false,
+  no `folder`); song entries never emit `bitRate`/`path`/`playCount` and
+  always emit empty `transcodedContentType`/`transcodedSuffix`.
 - Empty-library fixtures assert v1 behaviour with no rows: empty collections
   serialize to self-closed elements (`<artists/>`), never to 404.
 
@@ -43,13 +64,17 @@ return for the seeded demo library below. The fixture suite
   invalid JSONP callback, which falls back to JSON error 10 as in v1);
   `40` wrong username/password (incl. malformed `enc:` hex);
   `43` apiKey mixed with `u`/`p`/`t`/`s`;
-  `44` invalid API key; `50` per-user forbidden;
-  `70` data not found (unknown stream id: `Song not found.`).
+  `44` invalid API key; `50` is always
+  `User is not authorized for the given operation.`;
+  `70` is always `The requested data was not found.` (v1
+  `SubsonicAwareErrorRenderer`/`findOrFail` texts).
   `hls.m3u8` is not a Subsonic document: plain HTTP 410 (as in v1,
   matching Navidrome).
 - `p=enc:<hex>` passwords hex-decode as in v1; query decoding is byte-based
   UTF-8 (no Latin-1 mojibake, no panic on stray `%`); POST form bodies merge
-  with the query string as in v1 (`$request->input()`).
+  with the query string as in v1 (`$request->input()`); POST bodies over
+  10 MB are refused with error 10 `POST body exceeds the 10 MB limit.`
+  before routing or auth (v1 `MergeFormPostParams::MAX_BODY_BYTES`).
 
 ## Byte routes
 

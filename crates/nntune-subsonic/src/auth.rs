@@ -21,6 +21,19 @@ pub struct Identity {
     pub is_admin: bool,
 }
 
+impl Identity {
+    /// Placeholder for public routes (`getOpenSubsonicExtensions`): no
+    /// public arm reads the identity, so empty strings can never leak into
+    /// a response. Exists only because dispatch shares one handler shape.
+    pub fn for_public_route() -> Identity {
+        Identity {
+            username: String::new(),
+            email: String::new(),
+            is_admin: false,
+        }
+    }
+}
+
 /// Raw credential parameters straight off the query string.
 #[derive(Clone, Debug, Default)]
 pub struct Credentials {

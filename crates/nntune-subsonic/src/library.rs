@@ -41,9 +41,6 @@ pub struct Song {
     pub content_type: String,
     pub suffix: String,
     pub duration: i64,
-    pub bitrate: i64,
-    pub path: String,
-    pub play_count: i64,
     pub disc: i64,
     pub created: String,
     pub album_id: String,
@@ -77,6 +74,24 @@ pub enum StarKind {
     Song,
 }
 
+/// Target user record for `getUser`/`getAvatar`. v1 `UserResource` derives
+/// `adminRole` from the target's role (not the caller's) and
+/// `uploadRole`/`coverArtRole` from admin-or-manager (`$canManage`); the
+/// remaining roles are fixed constants. The seam returns the record so a
+/// PlanetScale implementation reads the real role instead of guessing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UserAccount {
+    pub email: String,
+    pub is_admin: bool,
+    pub is_manager: bool,
+}
+
+impl UserAccount {
+    pub fn can_manage(&self) -> bool {
+        self.is_admin || self.is_manager
+    }
+}
+
 /// Backing store contract. Reads take `&self`; mutations take `&mut self`.
 ///
 /// Every user-state method takes the authenticated `Identity` so a
@@ -85,7 +100,7 @@ pub enum StarKind {
 /// per-user queue/stars/ratings). Catalogue reads stay global; per-user
 /// writes that hit another user's rows answer error 50, never 70.
 pub trait Library: AuthStore {
-    fn user_email(&self, username: &str) -> Option<String>;
+    fn user_account(&self, username: &str) -> Option<UserAccount>;
     fn artists(&self) -> Vec<Artist>;
     fn artist(&self, id: &str) -> Option<Artist>;
     fn albums_for_artist(&self, artist_id: &str) -> Vec<Album>;
@@ -155,13 +170,14 @@ pub struct MemStore {
     queues: BTreeMap<String, PlayQueue>,
 }
 
-fn test_identities() -> Vec<(String, String, String, String, bool)> {
+fn test_identities() -> Vec<(String, String, String, String, bool, bool)> {
     vec![
         (
             "test".to_string(),
             "test-pass".to_string(),
             "test-key-1".to_string(),
             "test@example.com".to_string(),
+            false,
             false,
         ),
         (
@@ -170,6 +186,15 @@ fn test_identities() -> Vec<(String, String, String, String, bool)> {
             "other-key-1".to_string(),
             "other@example.com".to_string(),
             false,
+            false,
+        ),
+        (
+            "manager".to_string(),
+            "manager-pass".to_string(),
+            "manager-key-1".to_string(),
+            "manager@example.com".to_string(),
+            false,
+            true,
         ),
         (
             "admin".to_string(),
@@ -177,21 +202,24 @@ fn test_identities() -> Vec<(String, String, String, String, bool)> {
             "admin-key-1".to_string(),
             "admin@example.com".to_string(),
             true,
+            false,
         ),
     ]
 }
 
 fn not_authorized() -> (i64, String) {
+    // v1 `SubsonicAwareErrorRenderer`: authorization failures share one text.
     (
         crate::envelope::code::NOT_AUTHORIZED,
-        "Not authorized.".to_string(),
+        "User is not authorized for the given operation.".to_string(),
     )
 }
 
-fn playlist_missing() -> (i64, String) {
+fn data_missing() -> (i64, String) {
+    // v1 `findOrFail` misses share one text via the same renderer.
     (
         crate::envelope::code::NOT_FOUND,
-        "Playlist not found.".to_string(),
+        "The requested data was not found.".to_string(),
     )
 }
 
@@ -239,9 +267,6 @@ impl MemStore {
             content_type: "audio/mpeg".into(),
             suffix: "mp3".into(),
             duration: 200,
-            bitrate: 128,
-            path: "Test Artist/Test Album/01 Test Song.mp3".into(),
-            play_count: 0,
             disc: 1,
             created: NOW.into(),
             album_id: "al-1".into(),
@@ -262,8 +287,8 @@ impl AuthStore for MemStore {
         }
         test_identities()
             .into_iter()
-            .find(|(_, _, key, _, _)| key == api_key)
-            .map(|(username, _, _, email, is_admin)| Identity {
+            .find(|(_, _, key, _, _, _)| key == api_key)
+            .map(|(username, _, _, email, is_admin, _)| Identity {
                 username,
                 email,
                 is_admin,
@@ -276,8 +301,8 @@ impl AuthStore for MemStore {
         }
         test_identities()
             .into_iter()
-            .find(|(u, p, _, _, _)| u == username && p == password)
-            .map(|(username, _, _, email, is_admin)| Identity {
+            .find(|(u, p, _, _, _, _)| u == username && p == password)
+            .map(|(username, _, _, email, is_admin, _)| Identity {
                 username,
                 email,
                 is_admin,
@@ -290,10 +315,10 @@ impl AuthStore for MemStore {
         }
         test_identities()
             .into_iter()
-            .find(|(u, p, _, _, _)| {
+            .find(|(u, p, _, _, _, _)| {
                 u == username && token == md5_hex(format!("{p}{salt}").as_bytes())
             })
-            .map(|(username, _, _, email, is_admin)| Identity {
+            .map(|(username, _, _, email, is_admin, _)| Identity {
                 username,
                 email,
                 is_admin,
@@ -302,11 +327,15 @@ impl AuthStore for MemStore {
 }
 
 impl Library for MemStore {
-    fn user_email(&self, username: &str) -> Option<String> {
+    fn user_account(&self, username: &str) -> Option<UserAccount> {
         test_identities()
             .into_iter()
-            .find(|(u, _, _, _, _)| u == username)
-            .map(|(_, _, _, email, _)| email)
+            .find(|(u, _, _, _, _, _)| u == username)
+            .map(|(_, _, _, email, is_admin, is_manager)| UserAccount {
+                email,
+                is_admin,
+                is_manager,
+            })
     }
 
     fn artists(&self) -> Vec<Artist> {
@@ -378,7 +407,8 @@ impl Library for MemStore {
     }
 
     fn avatar(&self, username: &str) -> Option<Vec<u8>> {
-        self.user_email(username).map(|_| PLACEHOLDER_PNG.to_vec())
+        self.user_account(username)
+            .map(|_| PLACEHOLDER_PNG.to_vec())
     }
 
     fn lyrics(&self, artist: &str, title: &str) -> Option<String> {
@@ -428,7 +458,7 @@ impl Library for MemStore {
         remove: Vec<usize>,
     ) -> Result<(), (i64, String)> {
         let Some(playlist) = self.playlists.get_mut(id) else {
-            return Err(playlist_missing());
+            return Err(data_missing());
         };
         if playlist.owner != identity.username {
             return Err(not_authorized());
@@ -455,7 +485,7 @@ impl Library for MemStore {
 
     fn delete_playlist(&mut self, identity: &Identity, id: &str) -> Result<(), (i64, String)> {
         match self.playlists.get(id) {
-            None => Err(playlist_missing()),
+            None => Err(data_missing()),
             Some(p) if p.owner != identity.username => Err(not_authorized()),
             Some(_) => {
                 self.playlists.remove(id);

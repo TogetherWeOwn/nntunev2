@@ -2,7 +2,7 @@
 """Validate Subsonic golden fixtures without the Rust toolchain.
 
 Checks every file in fixtures/subsonic/: XML prolog + envelope shape, JSON
-parse + `subsonic-response` root, the routes manifest counts (48 supported,
+parse + `subsonic-response` root, the routes manifest counts (49 supported,
 9 unsupported), and that the README documents the contract. The byte-exact
 comparison against handler output lives in the Rust fixture suite; this is
 the cheap CI gate that catches malformed or misnamed fixtures.
@@ -71,8 +71,8 @@ def main():
     manifest = FIX / "routes-table.json"
     if manifest.exists():
         doc = json.loads(manifest.read_text())
-        if len(doc.get("supported", [])) != 48:
-            fail(f"routes-table.json: want 48 supported, got {len(doc.get('supported', []))}")
+        if len(doc.get("supported", [])) != 49:
+            fail(f"routes-table.json: want 49 supported, got {len(doc.get('supported', []))}")
         if len(doc.get("unsupported", [])) != 9:
             fail(f"routes-table.json: want 9 unsupported, got {len(doc.get('unsupported', []))}")
     else:

@@ -113,8 +113,20 @@ fn missing() -> EndpointResult {
     )
 }
 
-fn not_found(message: &str) -> EndpointResult {
-    EndpointResult::Err(code::NOT_FOUND, message.to_string())
+// v1 `findOrFail` misses share one text via `SubsonicAwareErrorRenderer`.
+fn not_found() -> EndpointResult {
+    EndpointResult::Err(
+        code::NOT_FOUND,
+        "The requested data was not found.".to_string(),
+    )
+}
+
+// v1 authorization failures share one text via the same renderer.
+fn forbidden() -> EndpointResult {
+    EndpointResult::Err(
+        code::NOT_AUTHORIZED,
+        "User is not authorized for the given operation.".to_string(),
+    )
 }
 
 fn req<'a>(params: &'a Params, name: &str) -> Result<&'a str, EndpointResult> {
@@ -126,6 +138,10 @@ fn req<'a>(params: &'a Params, name: &str) -> Result<&'a str, EndpointResult> {
 
 // --- shared shapes (key order is the wire order) ---
 
+// v1 `SongResource::toArray` order: `bitRate`/`path`/`playCount` are not
+// emitted, and `transcodedContentType`/`transcodedSuffix` are always present
+// (empty: no transcoding exists). Nullable fields stay non-null here because
+// the seeded store fills every column; a real backend omits empties.
 fn song_entry(song: &Song) -> Value {
     Value::map(vec![
         ("id", Value::str_value(&song.id)),
@@ -142,14 +158,11 @@ fn song_entry(song: &Song) -> Value {
         ("contentType", Value::str_value(&song.content_type)),
         ("suffix", Value::str_value(&song.suffix)),
         ("duration", Value::int_value(song.duration)),
-        ("bitRate", Value::int_value(song.bitrate)),
-        ("path", Value::str_value(&song.path)),
-        ("playCount", Value::int_value(song.play_count)),
-        ("discNumber", Value::int_value(song.disc)),
         ("created", Value::str_value(&song.created)),
         ("albumId", Value::str_value(&song.album_id)),
         ("artistId", Value::str_value(&song.artist_id)),
         ("type", Value::str_value("music")),
+        ("discNumber", Value::int_value(song.disc)),
         ("isVideo", Value::bool_value(false)),
     ])
 }
@@ -158,12 +171,14 @@ fn starred_song_entry<S: Library>(store: &S, identity: &Identity, song: &Song) -
     let Value::Map(mut entries) = song_entry(song) else {
         unreachable!()
     };
-    if store.starred(identity, StarKind::Song).contains(&song.id) {
-        entries.push(("starred".to_string(), Value::str_value(NOW)));
-    }
     if let Some(rating) = store.rating(identity, &song.id) {
         entries.push(("userRating".to_string(), Value::int_value(rating)));
     }
+    if store.starred(identity, StarKind::Song).contains(&song.id) {
+        entries.push(("starred".to_string(), Value::str_value(NOW)));
+    }
+    entries.push(("transcodedContentType".to_string(), Value::str_value("")));
+    entries.push(("transcodedSuffix".to_string(), Value::str_value("")));
     Value::Map(entries)
 }
 
@@ -334,7 +349,7 @@ pub fn handle_endpoint<S: Library>(
                     ]),
                 )])
             } else {
-                not_found("Directory not found.")
+                not_found()
             }
         }
         "getArtist" => {
@@ -359,7 +374,7 @@ pub fn handle_endpoint<S: Library>(
                         ]),
                     )])
                 }
-                None => not_found("Artist not found."),
+                None => not_found(),
             }
         }
         "getAlbum" => {
@@ -377,7 +392,7 @@ pub fn handle_endpoint<S: Library>(
                     entries.push(("song".to_string(), Value::List(songs)));
                     EndpointResult::Doc(vec![("album".to_string(), Value::Map(entries))])
                 }
-                None => not_found("Album not found."),
+                None => not_found(),
             }
         }
         "getSong" => {
@@ -387,7 +402,7 @@ pub fn handle_endpoint<S: Library>(
                     "song".to_string(),
                     starred_song_entry(store, identity, &song),
                 )]),
-                None => not_found("Song not found."),
+                None => not_found(),
             }
         }
         "getGenres" => {
@@ -477,7 +492,7 @@ pub fn handle_endpoint<S: Library>(
                         body: bytes,
                     }
                 }
-                None => not_found("Song not found."),
+                None => not_found(),
             }
         }
         "getCoverArt" => {
@@ -487,7 +502,7 @@ pub fn handle_endpoint<S: Library>(
                     content_type: "image/png".to_string(),
                     body: bytes,
                 },
-                None => not_found("Cover art not found."),
+                None => not_found(),
             }
         }
         "getPlaylists" => {
@@ -512,8 +527,8 @@ pub fn handle_endpoint<S: Library>(
                         playlist_detail(store, identity, &playlist),
                     )])
                 }
-                Some(_) => EndpointResult::Err(code::NOT_AUTHORIZED, "Not authorized.".to_string()),
-                None => not_found("Playlist not found."),
+                Some(_) => forbidden(),
+                None => not_found(),
             }
         }
         "createPlaylist" => {
@@ -554,7 +569,7 @@ pub fn handle_endpoint<S: Library>(
                 Err((error_code, message)) if error_code == code::NOT_AUTHORIZED => {
                     EndpointResult::Err(error_code, message)
                 }
-                Err(_) => not_found("Playlist not found."),
+                Err(_) => not_found(),
             }
         }
         "deletePlaylist" => {
@@ -564,7 +579,7 @@ pub fn handle_endpoint<S: Library>(
                 Err((error_code, message)) if error_code == code::NOT_AUTHORIZED => {
                     EndpointResult::Err(error_code, message)
                 }
-                Err(_) => not_found("Playlist not found."),
+                Err(_) => not_found(),
             }
         }
         "scrobble" => {
@@ -572,7 +587,7 @@ pub fn handle_endpoint<S: Library>(
             if store.scrobble(identity, id) {
                 EndpointResult::Doc(vec![])
             } else {
-                not_found("Song not found.")
+                not_found()
             }
         }
         "star" => star_unstar(store, identity, params, true),
@@ -586,7 +601,7 @@ pub fn handle_endpoint<S: Library>(
             if store.set_rating(identity, &id, rating) {
                 EndpointResult::Doc(vec![])
             } else {
-                not_found("Requested data was not found.")
+                not_found()
             }
         }
         "getStarred" | "getStarred2" => {
@@ -651,48 +666,72 @@ pub fn handle_endpoint<S: Library>(
             let username = ok_or_return!(req(params, "username"));
             // v1 `GetUserController`: only self or an admin may read a user.
             if username != identity.username && !identity.is_admin {
-                return EndpointResult::Err(code::NOT_AUTHORIZED, "Not authorized.".to_string());
+                return forbidden();
             }
-            match store.user_email(username) {
-                Some(email) => EndpointResult::Doc(vec![(
+            // Roles are v1 `UserResource::toArray` exactly: `adminRole` from
+            // the target's role, `uploadRole`/`coverArtRole` from
+            // admin-or-manager, the rest fixed constants, no `folder`.
+            match store.user_account(username) {
+                Some(account) => EndpointResult::Doc(vec![(
                     "user".to_string(),
                     Value::map(vec![
                         ("username", Value::str_value(username)),
-                        ("email", Value::str_value(email)),
+                        ("email", Value::str_value(&account.email)),
                         ("scrobblingEnabled", Value::bool_value(true)),
-                        ("adminRole", Value::bool_value(username == "admin")),
-                        ("settingsRole", Value::bool_value(false)),
+                        ("adminRole", Value::bool_value(account.is_admin)),
+                        ("settingsRole", Value::bool_value(true)),
                         ("downloadRole", Value::bool_value(true)),
-                        ("uploadRole", Value::bool_value(false)),
+                        ("uploadRole", Value::bool_value(account.can_manage())),
                         ("playlistRole", Value::bool_value(true)),
-                        ("coverArtRole", Value::bool_value(true)),
-                        ("commentRole", Value::bool_value(true)),
+                        ("coverArtRole", Value::bool_value(account.can_manage())),
+                        ("commentRole", Value::bool_value(false)),
                         ("podcastRole", Value::bool_value(true)),
                         ("streamRole", Value::bool_value(true)),
                         ("jukeboxRole", Value::bool_value(false)),
                         ("shareRole", Value::bool_value(false)),
-                        ("folder", Value::List(vec![Value::int_value(1)])),
                     ]),
                 )]),
-                None => not_found("User not found."),
+                None => not_found(),
             }
         }
         "getAvatar" => {
             let username = ok_or_return!(req(params, "username"));
+            // v1 `GetAvatarController`: same self-or-admin rule as getUser,
+            // so one account's avatar is never an oracle for another's.
+            if username != identity.username && !identity.is_admin {
+                return forbidden();
+            }
             match store.avatar(username) {
                 Some(bytes) => EndpointResult::Binary {
                     content_type: "image/png".to_string(),
                     body: bytes,
                 },
-                None => not_found("User not found."),
+                None => not_found(),
             }
         }
+        // v1 `TokenInfoController` (TOG-9725): the `apiKeyAuthentication`
+        // endpoint — reports the username the credential authenticated as.
+        "tokenInfo" => EndpointResult::Doc(vec![(
+            "tokenInfo".to_string(),
+            Value::map(vec![("username", Value::str_value(&identity.username))]),
+        )]),
+        // v1 `GetOpenSubsonicExtensionsController` (TOG-9725): exactly
+        // `apiKeyAuthentication` + `formPost`. `songLyrics` is deliberately
+        // NOT claimed because `getLyrics` is a stub; `transcodeOffset` is
+        // not claimed because no transcoding exists. Served without auth
+        // (see `Route::PublicEndpoint`).
         "getOpenSubsonicExtensions" => EndpointResult::Doc(vec![(
             "openSubsonicExtensions".to_string(),
-            Value::List(vec![Value::map(vec![
-                ("name", Value::str_value("songLyrics")),
-                ("versions", Value::List(vec![Value::int_value(1)])),
-            ])]),
+            Value::List(vec![
+                Value::map(vec![
+                    ("name", Value::str_value("apiKeyAuthentication")),
+                    ("versions", Value::List(vec![Value::int_value(1)])),
+                ]),
+                Value::map(vec![
+                    ("name", Value::str_value("formPost")),
+                    ("versions", Value::List(vec![Value::int_value(1)])),
+                ]),
+            ]),
         )]),
         "getSongsByGenre" => {
             let genre = ok_or_return!(req(params, "genre")).to_lowercase();
@@ -722,7 +761,7 @@ pub fn handle_endpoint<S: Library>(
                         ("value", Value::str_value(text)),
                     ]),
                 )]),
-                None => not_found("Lyrics not found."),
+                None => not_found(),
             }
         }
         "getLyricsBySongId" => {
@@ -737,15 +776,15 @@ pub fn handle_endpoint<S: Library>(
                             ("value", Value::str_value(text)),
                         ]),
                     )]),
-                    None => not_found("Lyrics not found."),
+                    None => not_found(),
                 },
-                None => not_found("Song not found."),
+                None => not_found(),
             }
         }
         "getArtistInfo" | "getArtistInfo2" => {
             let id = ok_or_return!(req(params, "id"));
             if store.artist(id).is_none() {
-                return not_found("Artist not found.");
+                return not_found();
             }
             EndpointResult::Doc(vec![(
                 "artistInfo".to_string(),
@@ -762,7 +801,7 @@ pub fn handle_endpoint<S: Library>(
         "getAlbumInfo" | "getAlbumInfo2" => {
             let id = ok_or_return!(req(params, "id"));
             if store.album(id).is_none() {
-                return not_found("Album not found.");
+                return not_found();
             }
             EndpointResult::Doc(vec![(
                 "albumInfo".to_string(),
@@ -915,7 +954,7 @@ fn star_unstar<S: Library>(
             if store.star(identity, kind, id) {
                 Ok(())
             } else {
-                Err(not_found("Requested data was not found."))
+                Err(not_found())
             }
         } else {
             store.unstar(identity, kind, id);

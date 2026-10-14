@@ -54,8 +54,32 @@ fn ping_xml_and_json_match_goldens() {
 fn jsonp_wraps_envelope() {
     let app = app();
     let (_, ct, body) = get(&app, "/rest/ping", &format!("{KEY}&f=jsonp&callback=cb"));
-    assert_eq!(ct, "application/javascript");
+    // Symfony framing: `/**/cb({...});` as `text/javascript`.
+    assert_eq!(ct, "text/javascript");
     assert_eq!(body, fixture("ping-jsonp.txt"));
+}
+
+#[test]
+fn jsonp_validator_matches_symfony() {
+    let app = app();
+    // Unquoted non-digit indexers and reserved words fall back to error 10.
+    for bad in ["top[name]", "a[b-c]", "this", "function", "new"] {
+        let (_, ct, body) = get(&app, "/rest/ping", &format!("{KEY}&f=jsonp&callback={bad}"));
+        assert_eq!(ct, "application/json", "{bad}");
+        assert!(
+            String::from_utf8(body).unwrap().contains("\"code\":10"),
+            "{bad}"
+        );
+    }
+    // Quoted indexers (either quote, `]` inside quotes) serve script.
+    for good in ["ns.cb[0].done", "app.fn[\"b-ar\"]", "app.fn['x']"] {
+        let (_, ct, _) = get(
+            &app,
+            "/rest/ping",
+            &format!("{KEY}&f=jsonp&callback={good}"),
+        );
+        assert_eq!(ct, "text/javascript", "{good}");
+    }
 }
 
 #[test]
@@ -153,6 +177,111 @@ fn license_and_extensions_match_goldens() {
         &format!("{KEY}&f=json"),
     );
     assert_eq!(body, fixture("getOpenSubsonicExtensions.json"));
+}
+
+#[test]
+fn extensions_are_public_and_tokeninfo_reports_caller() {
+    let app = app();
+    // v1 serves `getOpenSubsonicExtensions` outside the auth group: no
+    // credentials at all still answers 200 with the capability list.
+    let (status, _, body) = get(
+        &app,
+        "/rest/getOpenSubsonicExtensions",
+        "v=1.16.1&c=fixture",
+    );
+    assert_eq!(status, 200);
+    let text = String::from_utf8(body).unwrap();
+    assert!(text.contains("apiKeyAuthentication"), "{text}");
+    assert!(text.contains("formPost"), "{text}");
+    assert!(!text.contains("songLyrics"), "{text}");
+    // `tokenInfo` is authenticated and reports the caller.
+    let (_, _, body) = get(&app, "/rest/tokenInfo", &format!("{KEY}&f=json"));
+    assert_eq!(body, fixture("tokenInfo.json"));
+    let (status, _, body) = get(&app, "/rest/tokenInfo", "v=1.16.1&c=fixture&f=json");
+    assert_eq!(status, 200);
+    assert!(
+        String::from_utf8(body).unwrap().contains("\"code\":40"),
+        "tokenInfo without credentials must refuse"
+    );
+}
+
+#[test]
+fn avatar_requires_self_or_admin() {
+    let app = app();
+    const OTHER_KEY: &str = "apiKey=other-key-1&v=1.16.1&c=fixture";
+    const ADMIN_KEY: &str = "apiKey=admin-key-1&v=1.16.1&c=fixture";
+    // Another user's avatar answers 50 (never 200, never an existence
+    // oracle beyond what getUser already enforces).
+    let (status, _, body) = get(
+        &app,
+        "/rest/getAvatar",
+        &format!("{OTHER_KEY}&username=test&f=json"),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, fixture("getAvatar-forbidden.json"));
+    // Admin may fetch anyone's avatar; unknown users are 70 on the
+    // self/admin path.
+    let (status, ct, _) = get(
+        &app,
+        "/rest/getAvatar",
+        &format!("{ADMIN_KEY}&username=test"),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(ct, "image/png");
+    let (status, _, body) = get(
+        &app,
+        "/rest/getAvatar",
+        &format!("{ADMIN_KEY}&username=nobody&f=json"),
+    );
+    assert_eq!(status, 200);
+    assert!(
+        String::from_utf8(body).unwrap().contains("\"code\":70"),
+        "unknown avatar must be 70"
+    );
+}
+
+#[test]
+fn oversized_post_body_answers_error_10() {
+    let app = app();
+    let big = "x".repeat(nntune_subsonic::MAX_BODY_BYTES + 1);
+    let (status, _, body) = post(&app, "/rest/ping", &format!("{KEY}&f=json"), &big);
+    assert_eq!(status, 200);
+    let text = String::from_utf8(body).unwrap();
+    assert!(text.contains("\"code\":10"), "{text}");
+    assert!(
+        text.contains("POST body exceeds the 10 MB limit."),
+        "{text}"
+    );
+    // Exactly at the cap still parses (the cap refuses *over* 10 MB).
+    let exact = "y".repeat(nntune_subsonic::MAX_BODY_BYTES);
+    let (status, _, _) = post(&app, "/rest/ping", KEY, &exact);
+    assert_eq!(status, 200);
+}
+
+#[test]
+fn user_roles_match_v1_resource() {
+    let app = app();
+    const MANAGER_KEY: &str = "apiKey=manager-key-1&v=1.16.1&c=fixture";
+    // Manager: not admin, but manages (upload/coverArt true).
+    let (_, _, body) = get(
+        &app,
+        "/rest/getUser",
+        &format!("{MANAGER_KEY}&username=manager&f=json"),
+    );
+    let text = String::from_utf8(body).unwrap();
+    for want in [
+        "\"adminRole\":false",
+        "\"settingsRole\":true",
+        "\"uploadRole\":true",
+        "\"coverArtRole\":true",
+        "\"commentRole\":false",
+    ] {
+        assert!(text.contains(want), "{want} in {text}");
+    }
+    assert!(
+        !text.contains("folder"),
+        "v1 UserResource has no folder: {text}"
+    );
 }
 
 #[test]
@@ -394,7 +523,7 @@ fn byte_routes_return_typed_bodies() {
 fn route_table_covers_v1_surface() {
     let supported = nntune_subsonic::SUPPORTED_ENDPOINTS;
     let unsupported = nntune_subsonic::UNSUPPORTED_ENDPOINTS;
-    assert_eq!(supported.len(), 48);
+    assert_eq!(supported.len(), 49);
     assert_eq!(unsupported.len(), 9);
     let want: serde_like::Table = serde_like::parse(&fixture("routes-table.json"));
     let supported_str: Vec<&str> = supported.to_vec();
