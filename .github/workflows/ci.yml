@@ -1,7 +1,6 @@
 name: ci
 
-# Placeholder CI. The scaffold card replaces the placeholder jobs below with
-# real build/test/lint jobs and adds each new job id to `ci-ok`'s `needs`.
+# Real jobs live as siblings below; add each new job id to `ci-ok`'s `needs`.
 # `ci-ok` is a required check on main: its NAME must stay `ci-ok`.
 
 on:
@@ -19,13 +18,20 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  # Placeholder: real jobs (build, test, lint, …) go here as siblings.
-  # Example for the scaffold card:
-  #   build:
-  #     name: build
-  #     runs-on: ubuntu-latest
-  #     steps: [...]
-  # then add `build` to ci-ok's `needs` list.
+  # Rust workspace: fmt, clippy (warnings are errors) and every test,
+  # including the synthetic-NNTP integration suite and its TTFB budget.
+  rust:
+    name: rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
   placeholder:
     name: placeholder
     runs-on: ubuntu-latest
@@ -39,14 +45,19 @@ jobs:
   # stays red when any job fails and green only when all succeed.
   ci-ok:
     name: ci-ok
-    needs: [placeholder]
+    needs: [placeholder, rust]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      RESULTS: ${{ join(needs.*.result, ' ') }}
     steps:
       - run: |
-          if printf '%s' '${{ toJSON(needs) }}' | grep -q '"result":"failure"'; then
-            echo "ci-ok: a required job failed"
-            exit 1
-          fi
-          echo "ci-ok: all required jobs passed"
+          # `needs.*.result` is failure / cancelled / skipped / success.
+          for r in $RESULTS; do
+            if [ "$r" != "success" ]; then
+              echo "ci-ok: a required job did not succeed ($RESULTS)"
+              exit 1
+            fi
+          done
+          echo "ci-ok: all required jobs passed ($RESULTS)"

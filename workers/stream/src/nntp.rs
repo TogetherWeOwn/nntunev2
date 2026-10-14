@@ -17,6 +17,15 @@ pub enum NntpError {
     UnexpectedResponse(String),
 }
 
+impl NntpError {
+    /// True when the provider (or the connection to it) is unhealthy, as
+    /// opposed to one article being gone (`430`/`423`), which says nothing
+    /// about the provider and must not quarantine the user's pool.
+    pub fn is_provider_failure(&self) -> bool {
+        !matches!(self, NntpError::NoSuchArticle(_))
+    }
+}
+
 impl From<std::io::Error> for NntpError {
     fn from(e: std::io::Error) -> Self {
         NntpError::Io(e.to_string())
@@ -96,6 +105,13 @@ pub(crate) fn unstuff(line: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_missing_article_is_not_a_provider_failure() {
+        assert!(!NntpError::NoSuchArticle("m".into()).is_provider_failure());
+        assert!(NntpError::Io("reset".into()).is_provider_failure());
+        assert!(NntpError::UnexpectedResponse("502".into()).is_provider_failure());
+    }
 
     #[test]
     fn unstuff_strips_exactly_one_dot() {

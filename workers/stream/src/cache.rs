@@ -10,11 +10,12 @@
 //! calls with identical semantics (see `wrangler.toml` bindings).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::grant::sha256;
 
 pub struct ContentCache {
-    blobs: HashMap<String, Vec<u8>>,
+    blobs: HashMap<String, Arc<[u8]>>,
     index: HashMap<String, String>,
 }
 
@@ -29,13 +30,16 @@ impl ContentCache {
     /// Store `plaintext` for `track_id`; returns the blob hash hex.
     pub fn put_track(&mut self, track_id: &str, plaintext: Vec<u8>) -> String {
         let hash = Self::hex_hash(&plaintext);
-        self.blobs.entry(hash.clone()).or_insert(plaintext);
+        self.blobs
+            .entry(hash.clone())
+            .or_insert_with(|| Arc::from(plaintext));
         self.index.insert(track_id.to_string(), hash.clone());
         hash
     }
 
-    /// Fetch the cached plaintext for `track_id`, if any.
-    pub fn get_track(&self, track_id: &str) -> Option<Vec<u8>> {
+    /// Fetch the cached plaintext for `track_id`, if any. Shared, not
+    /// copied: a hit never duplicates the track in memory.
+    pub fn get_track(&self, track_id: &str) -> Option<Arc<[u8]>> {
         self.index
             .get(track_id)
             .and_then(|h| self.blobs.get(h))
@@ -59,32 +63,29 @@ impl Default for ContentCache {
     }
 }
 
-/// A streaming R2 multipart write: parts buffer until `complete`.
+/// A streaming R2 multipart write. Production uploads each part to R2 and
+/// retains nothing; this in-memory stand-in appends parts to one buffer (the
+/// bytes R2 would hold) so `complete` hands them over without a copy.
 pub struct MultipartUpload {
-    parts: Vec<Vec<u8>>,
-    staged: u64,
+    buf: Vec<u8>,
 }
 
 impl MultipartUpload {
     pub fn begin(track_id: &str) -> Self {
         let _ = track_id;
-        Self {
-            parts: Vec::new(),
-            staged: 0,
-        }
+        Self { buf: Vec::new() }
     }
 
     pub fn part(&mut self, data: &[u8]) {
-        self.staged += data.len() as u64;
-        self.parts.push(data.to_vec());
+        self.buf.extend_from_slice(data);
     }
 
     pub fn complete(self) -> Vec<u8> {
-        self.parts.concat()
+        self.buf
     }
 
     pub fn bytes_staged(&self) -> u64 {
-        self.staged
+        self.buf.len() as u64
     }
 }
 
@@ -95,9 +96,9 @@ mod tests {
     #[test]
     fn tracks_resolve_to_their_plaintext() {
         let mut cache = ContentCache::new();
-        assert_eq!(cache.get_track("t1"), None);
+        assert!(cache.get_track("t1").is_none());
         cache.put_track("t1", b"audio-bytes".to_vec());
-        assert_eq!(cache.get_track("t1"), Some(b"audio-bytes".to_vec()));
+        assert_eq!(cache.get_track("t1").as_deref(), Some(&b"audio-bytes"[..]));
     }
 
     #[test]
@@ -114,7 +115,7 @@ mod tests {
         let mut cache = ContentCache::new();
         cache.put_track("t1", b"v1".to_vec());
         cache.put_track("t1", b"v2-longer".to_vec());
-        assert_eq!(cache.get_track("t1"), Some(b"v2-longer".to_vec()));
+        assert_eq!(cache.get_track("t1").as_deref(), Some(&b"v2-longer"[..]));
     }
 
     #[test]

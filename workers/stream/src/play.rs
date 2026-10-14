@@ -1,30 +1,38 @@
-//! Play path: authorize → cache hit → `200`/`206`; miss → fetch segments
-//! via the pool → yEnc → decrypt → stream to the client while staging the
-//! R2 multipart write, then prefetch the next track.
+//! Play path: authorize → cache hit → `200`/`206`; miss → lease a pool
+//! connection → fetch segments one at a time → yEnc → decrypt → stream each
+//! to the client while staging the R2 multipart write, then prefetch the
+//! next track.
 //!
 //! Decryption here is a demo XOR stream cipher standing in for the
 //! ingest-owned content encryption (key delivery via the BYOP vault is a
 //! sibling card). The byte flow — fetch, decode, decrypt, fan out to client
 //! chunks *and* the multipart upload — is the production shape.
 //!
-//! Cache-write discipline: on a servable miss the fetched body is staged
-//! into a [`MultipartUpload`](crate::cache::MultipartUpload) owned by the
-//! [`PlayStream`]; [`PlayStream::finalize`] completes it into the cache once
-//! the client has been fully served (mirroring R2 multipart completion at
-//! end-of-stream). A miss with an unsatisfiable range caches inline instead,
-//! since there is no stream to finalize — the next play for the track still
-//! hits.
+//! Miss-path streaming: [`play`] fetches only the first segment (its yEnc
+//! `=ybegin size=` reveals the file size, so `Range`/`206` resolves before a
+//! byte is sent); later segments are fetched lazily as the client pulls
+//! [`PlayStream`] chunks. Memory is one decoded segment at a time (plus the
+//! staged write, which R2 holds in production). [`PlayStream::finalize`]
+//! drains any segments the client's range did not need so the cache still
+//! gets the whole track, then completes the upload and hands the healthy
+//! connection back to the pool. [`PlayStream::abort`] returns the connection
+//! without caching (client went away).
+//!
+//! Failure handling: only connection-level trouble (I/O, protocol errors)
+//! quarantines the pool. A missing article or a bad segment fails that play
+//! alone — the connection is fine and goes back to the pool warm.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use crate::cache::{ContentCache, MultipartUpload};
 use crate::grant::{self, GrantError};
 use crate::meter::{Meter, MeterEvent, MeterKind};
-use crate::nntp::NntpClient;
-use crate::pool::{Lane, Pool, PoolError};
+use crate::nntp::{NntpClient, NntpError};
+use crate::pool::{Lane, Lease, Pool, PoolError};
 use crate::prefetch::should_prefetch;
 use crate::range::{self, RangeOutcome};
-use crate::yenc::{self, YencError};
+use crate::yenc::{self, Decoded, YencError};
 
 /// Client chunk size for served streams.
 const CHUNK: usize = 16 * 1024;
@@ -36,8 +44,14 @@ pub enum PlayError {
     WrongTrack,
     RangeUnsatisfiable,
     PoolExhausted,
-    PoolQuarantined { retry_after_ms: u64 },
+    PoolQuarantined {
+        retry_after_ms: u64,
+    },
+    /// An article is gone (`430`/`423`): this track fails, the pool is fine.
+    ArticleMissing(String),
+    /// The provider connection failed or misbehaved (quarantines the pool).
     Upstream(String),
+    /// A segment could not be decoded (corrupt or mis-placed yEnc part).
     Decode(YencError),
 }
 
@@ -48,7 +62,7 @@ pub struct PlayInput<'a> {
     pub track_id: &'a str,
     /// Value of the HTTP `Range` header, if any.
     pub range: Option<&'a str>,
-    /// Provider NNTP address (one pooled connection dials this).
+    /// Provider NNTP address (a pooled connection dials this).
     pub server_addr: SocketAddr,
     /// Ordered segment message-IDs composing the track.
     pub segments: &'a [String],
@@ -66,29 +80,57 @@ pub struct PlayResponse {
     pub status: u16,
     /// `Content-Range` value for 206 responses.
     pub content_range: Option<String>,
-    /// Bytes actually served.
+    /// Bytes this response will serve.
     pub body_len: u64,
     pub cache_hit: bool,
     pub stream: PlayStream,
 }
 
-/// Chunked body. On a miss the chunks are served while the full body is
-/// staged into the R2 multipart upload; [`PlayStream::finalize`] completes
-/// it into the cache once the client has been fully served.
+/// A failure plus whether it indicts the provider connection.
+type Failure = (PlayError, bool);
+
+/// The pool that [`play`] drives.
+pub type StreamPool = Pool<NntpClient>;
+
+/// Chunked body. Pull chunks with [`Iterator::next`], then call
+/// [`PlayStream::finalize`] (or [`PlayStream::abort`]) so the lease returns
+/// to the pool and, on a miss, the cache write completes.
 pub struct PlayStream {
-    serve: Vec<Vec<u8>>,
-    pos: usize,
-    writeback: Option<Writeback>,
+    user_id: String,
+    track_id: String,
+    /// Next absolute byte to emit, and the exclusive end of the response.
+    pos: u64,
+    end: u64,
+    served: u64,
+    source: Source,
 }
 
-struct Writeback {
-    track_id: String,
+enum Source {
+    Cached(Arc<[u8]>),
+    Live(Box<Live>),
+}
+
+/// A miss in flight: the leased connection, the segment cursor and the
+/// staged cache write.
+struct Live {
+    client: NntpClient,
+    lease: Lease,
+    segments: Vec<String>,
+    next_seg: usize,
+    cipher_key: u8,
+    /// File size declared by the first segment.
+    total: u64,
+    /// Bytes decoded so far (end offset of `buf`).
+    fetched: u64,
+    buf: Vec<u8>,
+    buf_start: u64,
     upload: MultipartUpload,
+    failed: Option<Failure>,
 }
 
 /// Serve `track_id` to its granted owner.
 pub fn play(
-    pool: &mut Pool,
+    pool: &mut StreamPool,
     cache: &mut ContentCache,
     meter: &mut dyn Meter,
     secret: &[u8],
@@ -104,123 +146,253 @@ pub fn play(
 
     if let Some(full) = cache.get_track(input.track_id) {
         meter.emit(ev(MeterKind::CacheHit, &user, input.track_id, 0));
-        let (status, content_range, slice) = resolve_range(&full, input.range)?;
-        meter.emit(ev(
-            MeterKind::BytesServed,
+        let window = resolve_range(full.len() as u64, input.range)?;
+        return Ok(respond(
+            window,
+            true,
             &user,
             input.track_id,
-            slice.len() as u64,
+            Source::Cached(full),
         ));
-        return Ok(respond(status, content_range, slice, true, None));
     }
 
     meter.emit(ev(MeterKind::CacheMiss, &user, input.track_id, 0));
+    if input.segments.is_empty() {
+        return Err(PlayError::Upstream("track has no segments".into()));
+    }
     let lease = pool.try_acquire(Lane::Playback).map_err(|e| match e {
         PoolError::Quarantined { retry_after_ms } => PlayError::PoolQuarantined { retry_after_ms },
         PoolError::Exhausted => PlayError::PoolExhausted,
     })?;
-    let fetched = fetch_track(input);
-    match fetched {
-        Ok(plain) => {
-            pool.release(lease);
-            pool.record_success();
-            let (status, content_range, slice) = match resolve_range(&plain, input.range) {
-                Ok(resolved) => resolved,
-                Err(e) => {
-                    // No stream will exist to finalize; cache inline so the
-                    // next play still hits.
-                    cache.put_track(input.track_id, plain);
-                    return Err(e);
-                }
-            };
-            meter.emit(ev(
-                MeterKind::BytesServed,
+
+    let (client, first) = match open_and_fetch_first(pool, input) {
+        Ok(pair) => pair,
+        Err((client, failure)) => {
+            return Err(settle(
+                pool,
+                meter,
+                lease,
+                client,
+                failure,
                 &user,
                 input.track_id,
-                slice.len() as u64,
-            ));
-            let mut upload = MultipartUpload::begin(input.track_id);
-            for part in plain.chunks(CHUNK) {
-                upload.part(part);
-            }
-            if let Some(next) = input.up_next {
-                if should_prefetch(pool.in_use(), pool.capacity()) {
-                    meter.emit(ev(MeterKind::PrefetchEnqueued, &user, next, 0));
-                }
-            }
-            Ok(respond(
-                status,
-                content_range,
-                slice,
-                false,
-                Some(Writeback {
-                    track_id: input.track_id.to_string(),
-                    upload,
-                }),
             ))
         }
+    };
+    pool.record_success();
+    let mut live = Live {
+        client,
+        lease,
+        segments: input.segments.to_vec(),
+        next_seg: 0,
+        cipher_key: input.cipher_key,
+        total: first.file_size,
+        fetched: 0,
+        buf: Vec::new(),
+        buf_start: 0,
+        upload: MultipartUpload::begin(input.track_id),
+        failed: None,
+    };
+    if let Err(failure) = live.ingest(first) {
+        return Err(live.settle(pool, meter, Some(failure), &user, input.track_id));
+    }
+    let window = match resolve_range(live.total, input.range) {
+        Ok(window) => window,
         Err(e) => {
-            pool.release(lease);
-            pool.record_provider_error();
-            meter.emit(ev(MeterKind::ProviderError, &user, input.track_id, 0));
-            Err(e)
+            // The connection is healthy; hand it back warm.
+            pool.release(live.lease, Some(live.client));
+            return Err(e);
+        }
+    };
+    if let Some(next) = input.up_next {
+        if should_prefetch(pool) {
+            meter.emit(ev(MeterKind::PrefetchEnqueued, &user, next, 0));
         }
     }
+    Ok(respond(
+        window,
+        false,
+        &user,
+        input.track_id,
+        Source::Live(Box::new(live)),
+    ))
 }
 
-/// Fetch, yEnc-decode and decrypt every segment over one pooled connection.
-fn fetch_track(input: &PlayInput<'_>) -> Result<Vec<u8>, PlayError> {
-    let mut client = NntpClient::connect(&input.server_addr)
-        .map_err(|e| PlayError::Upstream(format!("{e:?}")))?;
-    let mut plain = Vec::new();
-    for mid in input.segments {
-        let raw = client
-            .article(mid)
-            .map_err(|e| PlayError::Upstream(format!("{e:?}")))?;
-        let mut decoded = yenc::decode(&raw).map_err(PlayError::Decode)?;
+/// Dial or reuse a connection and fetch + decode segment 0. A warm
+/// connection the provider silently closed is redialed once.
+fn open_and_fetch_first(
+    pool: &mut StreamPool,
+    input: &PlayInput<'_>,
+) -> Result<(NntpClient, Decoded), (Option<NntpClient>, Failure)> {
+    let mut warm = pool.take_idle();
+    let was_warm = warm.is_some();
+    for attempt in 0..2 {
+        let mut client = match warm.take() {
+            Some(client) => client,
+            None => match NntpClient::connect(&input.server_addr) {
+                Ok(client) => {
+                    pool.record_connect();
+                    client
+                }
+                Err(e) => return Err((None, nntp_failure(e, &input.segments[0]))),
+            },
+        };
+        match fetch_segment(&mut client, &input.segments[0]) {
+            Ok(decoded) => return Ok((client, decoded)),
+            Err(SegmentError::Nntp(e)) if was_warm && attempt == 0 && e.is_provider_failure() => {
+                // Stale pooled connection: drop it and redial once.
+                continue;
+            }
+            Err(SegmentError::Nntp(e)) => {
+                let failure = nntp_failure(e, &input.segments[0]);
+                let keep = if failure.1 { None } else { Some(client) };
+                return Err((keep, failure));
+            }
+            Err(SegmentError::Decode(e)) => {
+                return Err((Some(client), (PlayError::Decode(e), false)));
+            }
+        }
+    }
+    unreachable!("second attempt always returns")
+}
+
+enum SegmentError {
+    Nntp(NntpError),
+    Decode(YencError),
+}
+
+fn fetch_segment(client: &mut NntpClient, message_id: &str) -> Result<Decoded, SegmentError> {
+    let raw = client.article(message_id).map_err(SegmentError::Nntp)?;
+    yenc::decode_part(&raw).map_err(SegmentError::Decode)
+}
+
+fn nntp_failure(e: NntpError, message_id: &str) -> Failure {
+    let provider = e.is_provider_failure();
+    let err = match e {
+        NntpError::NoSuchArticle(_) => PlayError::ArticleMissing(message_id.to_string()),
+        other => PlayError::Upstream(format!("{other:?}")),
+    };
+    (err, provider)
+}
+
+/// Return the lease (and the connection, if still healthy) and account for
+/// the failure: only provider-level trouble quarantines the pool.
+fn settle(
+    pool: &mut StreamPool,
+    meter: &mut dyn Meter,
+    lease: Lease,
+    client: Option<NntpClient>,
+    (err, provider): Failure,
+    user: &str,
+    track: &str,
+) -> PlayError {
+    pool.release(lease, if provider { None } else { client });
+    if provider {
+        pool.record_provider_error();
+        meter.emit(ev(MeterKind::ProviderError, user, track, 0));
+    }
+    err
+}
+
+impl Live {
+    /// Take one decoded segment: check its placement, decrypt, stage the
+    /// upload part and make it the current buffer.
+    fn ingest(&mut self, mut d: Decoded) -> Result<(), Failure> {
+        let multi_segment = self.segments.len() > 1;
+        let misplaced = d.offset != self.fetched
+            || d.file_size != self.total
+            || (multi_segment && !d.multipart);
+        if misplaced {
+            return Err((PlayError::Decode(YencError::BadPart), false));
+        }
         // Demo cipher (see module docs): the production content key arrives
         // via the BYOP vault and the ingest-owned envelope.
-        for b in decoded.iter_mut() {
-            *b ^= input.cipher_key;
+        for b in d.data.iter_mut() {
+            *b ^= self.cipher_key;
         }
-        plain.extend_from_slice(&decoded);
+        self.upload.part(&d.data);
+        self.buf_start = self.fetched;
+        self.fetched += d.data.len() as u64;
+        self.buf = d.data;
+        self.next_seg += 1;
+        if self.next_seg == self.segments.len() && self.fetched != self.total {
+            return Err((
+                PlayError::Decode(YencError::SizeMismatch {
+                    expected: self.total,
+                    actual: self.fetched as usize,
+                }),
+                false,
+            ));
+        }
+        Ok(())
     }
-    Ok(plain)
+
+    fn load_next(&mut self) -> Result<(), Failure> {
+        let mid = self.segments[self.next_seg].clone();
+        match fetch_segment(&mut self.client, &mid) {
+            Ok(decoded) => self.ingest(decoded),
+            Err(SegmentError::Nntp(e)) => Err(nntp_failure(e, &mid)),
+            Err(SegmentError::Decode(e)) => Err((PlayError::Decode(e), false)),
+        }
+    }
+
+    /// Release the lease for good, returning how the play ended.
+    fn settle(
+        self,
+        pool: &mut StreamPool,
+        meter: &mut dyn Meter,
+        failure: Option<Failure>,
+        user: &str,
+        track: &str,
+    ) -> PlayError {
+        let failure = failure.unwrap_or((PlayError::Upstream("play failed".into()), false));
+        settle(
+            pool,
+            meter,
+            self.lease,
+            Some(self.client),
+            failure,
+            user,
+            track,
+        )
+    }
 }
 
-fn resolve_range(
-    full: &[u8],
-    range: Option<&str>,
-) -> Result<(u16, Option<String>, Vec<u8>), PlayError> {
-    match range::parse(range, full.len() as u64) {
-        RangeOutcome::Full => Ok((200, None, full.to_vec())),
-        RangeOutcome::Partial(r) => {
-            let slice = full[r.start as usize..=r.end as usize].to_vec();
-            let content_range = range::content_range_value(r, full.len() as u64);
-            Ok((206, Some(content_range), slice))
-        }
+/// `(status, content_range, start, end_exclusive)` for a body of `len`.
+type Window = (u16, Option<String>, u64, u64);
+
+fn resolve_range(len: u64, range: Option<&str>) -> Result<Window, PlayError> {
+    match range::parse(range, len) {
+        RangeOutcome::Full => Ok((200, None, 0, len)),
+        RangeOutcome::Partial(r) => Ok((
+            206,
+            Some(range::content_range_value(r, len)),
+            r.start,
+            r.end + 1,
+        )),
         RangeOutcome::Unsatisfiable => Err(PlayError::RangeUnsatisfiable),
     }
 }
 
 fn respond(
-    status: u16,
-    content_range: Option<String>,
-    slice: Vec<u8>,
+    (status, content_range, start, end): Window,
     cache_hit: bool,
-    writeback: Option<Writeback>,
+    user: &str,
+    track: &str,
+    source: Source,
 ) -> PlayResponse {
-    let body_len = slice.len() as u64;
-    let serve: Vec<Vec<u8>> = slice.chunks(CHUNK).map(|c| c.to_vec()).collect();
     PlayResponse {
         status,
         content_range,
-        body_len,
+        body_len: end - start,
         cache_hit,
         stream: PlayStream {
-            serve,
-            pos: 0,
-            writeback,
+            user_id: user.to_string(),
+            track_id: track.to_string(),
+            pos: start,
+            end,
+            served: 0,
+            source,
         },
     }
 }
@@ -237,14 +409,77 @@ fn ev(kind: MeterKind, user: &str, track: &str, bytes: u64) -> MeterEvent {
 impl PlayStream {
     /// True on the miss path (chunks feed a staged multipart upload).
     pub fn is_writeback(&self) -> bool {
-        self.writeback.is_some()
+        matches!(self.source, Source::Live(_))
     }
 
-    /// Complete the staged multipart write into `cache` (no-op on hits).
-    pub fn finalize(self, cache: &mut ContentCache) {
-        if let Some(writeback) = self.writeback {
-            let bytes = writeback.upload.complete();
-            cache.put_track(&writeback.track_id, bytes);
+    /// Why the stream stopped early, if it did (miss path only).
+    pub fn error(&self) -> Option<&PlayError> {
+        match &self.source {
+            Source::Live(live) => live.failed.as_ref().map(|(e, _)| e),
+            Source::Cached(_) => None,
+        }
+    }
+
+    /// Finish the play: meter the bytes served, and on a miss pull any
+    /// segments the client's range skipped, complete the staged write into
+    /// `cache` and return the connection to `pool`. Errors (a gone article,
+    /// a bad segment, a dead connection) leave the cache untouched.
+    pub fn finalize(
+        self,
+        pool: &mut StreamPool,
+        cache: &mut ContentCache,
+        meter: &mut dyn Meter,
+    ) -> Result<(), PlayError> {
+        meter.emit(ev(
+            MeterKind::BytesServed,
+            &self.user_id,
+            &self.track_id,
+            self.served,
+        ));
+        let mut live = match self.source {
+            Source::Cached(_) => return Ok(()),
+            Source::Live(live) => live,
+        };
+        while live.failed.is_none() && live.next_seg < live.segments.len() {
+            if let Err(failure) = live.load_next() {
+                live.failed = Some(failure);
+            }
+        }
+        match live.failed.take() {
+            None => {
+                let Live {
+                    client,
+                    lease,
+                    upload,
+                    ..
+                } = *live;
+                pool.release(lease, Some(client));
+                pool.record_success();
+                cache.put_track(&self.track_id, upload.complete());
+                Ok(())
+            }
+            Some(failure) => {
+                let live = *live;
+                let (client, lease) = (live.client, live.lease);
+                Err(settle(
+                    pool,
+                    meter,
+                    lease,
+                    Some(client),
+                    failure,
+                    &self.user_id,
+                    &self.track_id,
+                ))
+            }
+        }
+    }
+
+    /// The client went away: return the connection without caching.
+    pub fn abort(self, pool: &mut StreamPool) {
+        if let Source::Live(live) = self.source {
+            let live = *live;
+            let healthy = !matches!(live.failed, Some((_, true)));
+            pool.release(live.lease, healthy.then_some(live.client));
         }
     }
 }
@@ -253,13 +488,39 @@ impl Iterator for PlayStream {
     type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Vec<u8>> {
-        if self.pos < self.serve.len() {
-            let chunk = self.serve[self.pos].clone();
-            self.pos += 1;
-            Some(chunk)
-        } else {
-            None
+        if self.pos >= self.end {
+            return None;
         }
+        let chunk = match &mut self.source {
+            Source::Cached(bytes) => {
+                let to = (self.pos as usize + CHUNK).min(self.end as usize);
+                bytes[self.pos as usize..to].to_vec()
+            }
+            Source::Live(live) => loop {
+                if live.failed.is_some() {
+                    return None;
+                }
+                let buf_end = live.buf_start + live.buf.len() as u64;
+                if self.pos >= live.buf_start && self.pos < buf_end {
+                    let from = (self.pos - live.buf_start) as usize;
+                    let to = (from + CHUNK)
+                        .min(live.buf.len())
+                        .min((self.end - live.buf_start) as usize);
+                    break live.buf[from..to].to_vec();
+                }
+                if live.next_seg >= live.segments.len() {
+                    live.failed = Some((PlayError::Decode(YencError::Truncated), false));
+                    return None;
+                }
+                if let Err(failure) = live.load_next() {
+                    live.failed = Some(failure);
+                    return None;
+                }
+            },
+        };
+        self.pos += chunk.len() as u64;
+        self.served += chunk.len() as u64;
+        Some(chunk)
     }
 }
 

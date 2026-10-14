@@ -8,45 +8,69 @@ stream Worker and its per-user NNTP pool Durable Object.
 ```text
 client ── play(token, range?) ──▶ stream Worker
   1. authorize: verify the signed grant from the api Worker (grant.rs)
-  2. R2 hit: serve 200 / 206 from audio/<sha256> (cache.rs, range.rs)
-  3. R2 miss: lease a pool connection (Playback lane) → BODY each segment
-     over the warm connection (nntp.rs) → yEnc decode (yenc.rs) → decrypt
-     → 16 KiB chunks to the client while staging the R2 multipart write;
-     finalize() completes it into the cache (play.rs)
-  4. prefetch the next track while pool capacity is idle (prefetch.rs)
-  5. every step emits metering events (meter.rs)
+  2. R2 hit: serve 200 / 206 straight from the shared cached blob
+     (audio/<sha256>; cache.rs, range.rs) — no copy of the track
+  3. R2 miss: lease a pool slot (Playback lane), take a warm connection
+     (or dial one), BODY the FIRST segment, yEnc-decode it (multipart
+     =ybegin/=ypart/=yend, pcrc32) and read the file size from =ybegin so
+     Range/206 resolves before byte one. Later segments are fetched
+     lazily as the client pulls 16 KiB chunks: decode → decrypt → client
+     chunk + staged R2 multipart part (play.rs). Memory = one segment.
+  4. finalize(): drain any segments the client's range skipped, complete
+     the multipart write into the cache, hand the connection back warm.
+     abort(): client left — return the connection, cache nothing.
+  5. prefetch the next track while the pool has a spare slot (prefetch.rs)
+  6. every step emits metering events (meter.rs)
 ```
 
-Pool semantics (`pool.rs`): capacity = `min(provider_cap, plan_cap)` clamped
-to `[1, 50]`; released connections stay warm (no per-play reconnect);
-`Playback > Prefetch > Ingest` lanes order queued waiters; provider errors
-quarantine the pool with 1s → 5s → 30s → 5min backoff, cleared on success.
+Pool semantics (`pool.rs`):
+
+- capacity = `min(provider_cap, plan_cap)` clamped to `[1, 50]`.
+- The pool **owns the idle `NntpClient`s**: a lease takes one back
+  (`take_idle`) or the caller dials (`record_connect`); `release` parks the
+  healthy connection again. Two uncached tracks in a row cost one dial
+  (asserted against the synthetic server's own connection count). A warm
+  connection the provider closed is redialed once, transparently.
+- Lanes are enforced at acquire time: `Playback` may use every slot;
+  `Prefetch` and `Ingest` always leave one slot free for playback (so with a
+  cap of 1 they never run). Waiter ordering across async tasks arrives with
+  the Durable Object entry point; the reservation is what guarantees
+  playback priority today.
+- Only connection-level failures (I/O, protocol errors) quarantine the pool
+  with 1s → 5s → 30s → 5min backoff, cleared on success. A gone article
+  (`430`/`423`) or a corrupt segment fails that one play
+  (`ArticleMissing` / `Decode`) and returns the healthy connection.
 
 ## TTFB targets
 
-First-byte latency measured in CI by `tests/stream_integration.rs`
+First-byte latency is measured by `tests/stream_integration.rs`
 (authorize → first chunk; `-- --nocapture` prints both):
 
-| Path | Local reference (40 KB, loopback) | Staging p95 target |
+| Path | Local reference (loopback) | Staging p95 target |
 |---|---|---|
-| Cache hit | ~30 µs (2026-10-13 run) | ≤ 150 ms at the edge |
-| Cache miss | ~90 ms (2026-10-13 run: dial + 2×BODY + decode) | ≤ 1.5 s |
+| Cache hit | ~25 µs (2026-10-14 run) | ≤ 150 ms at the edge |
+| Cache miss | ~50 ms (2026-10-14 run: dial + first segment + decode) | ≤ 1.5 s |
 
-Method: the integration test asserts the local hit budget (< 100 ms) on
-every run; staging Darm-monitoring (Analytics Engine `PlayStart` →
-first-byte events) owns the p95 numbers above. If the local hit assertion
-ever goes red, treat it as a regression, not a flaky threshold.
+Miss TTFB is dial (skipped on a warm pool) + **one** article fetch + decode,
+independent of track length: the integration test asserts the server has
+received exactly one `BODY` when the first chunk arrives on a three-segment
+track. Staging p95 numbers are owned by Analytics Engine monitoring
+(`PlayStart` → first-byte events) once deployed.
+
+CI (`.github/workflows/ci.yml`, job `rust`, required through `ci-ok`) runs
+fmt, clippy `-D warnings` and every test; the integration test asserts the
+local hit budget (< 100 ms), so a regression turns `ci-ok` red.
 
 ## Test
 
 ```sh
-cargo test -p nntune-stream
-cargo clippy -p nntune-stream --all-targets   # must be warning-free
-cargo fmt -p nntune-stream --check            # must be clean
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
 ```
 
 No network, no Cloudflare account, no secrets: the synthetic NNTP server
-lives in `tests/stream_integration.rs` and serves canned yEnc articles.
+lives in `tests/stream_integration.rs` and serves canned yEnc multipart articles.
 
 ## Production notes
 

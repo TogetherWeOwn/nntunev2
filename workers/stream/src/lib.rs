@@ -16,7 +16,7 @@
 //! - [`play`]: miss-path orchestration (authorize → fetch → decode →
 //!   decrypt → chunked stream + writeback).
 //! - [`meter`]: Analytics Engine + usage-ledger events.
-//! - [`prefetch`]: next-track prefetch on idle pool capacity.
+//! - [`prefetch`]: next-track prefetch on spare pool capacity (never the last connection).
 //!
 //! Cloudflare bindings (DO storage, R2, Analytics Engine) are wired in
 //! `workers/stream/wrangler.toml`; this crate stays dependency-free so
