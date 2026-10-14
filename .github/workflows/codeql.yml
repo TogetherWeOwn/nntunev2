@@ -1,19 +1,19 @@
 name: codeql
 
-# CodeQL scan (javascript-typescript only: CodeQL has no Rust support).
+# CodeQL scans JavaScript/TypeScript and GitHub Actions; CodeQL has no Rust support.
 # Rust coverage comes from cargo audit/clippy jobs the scaffold card adds.
 # Feeds the `CodeQL` code_scanning rule on main.
 
-# No JS/TS exists yet (scaffold card adds web/): only run when JS/TS or this
-# workflow changes, so docs PRs do not burn a failing "no code" scan. The
-# code_scanning ruleset rule follows once scans pass on real code.
+# Web code lives in apps/web: run when JS/TS or workflow files change, so
+# docs/Rust-only PRs do not burn a needless scan. The code_scanning ruleset
+# rule follows once scans pass on real code.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    paths: ['**.js', '**.jsx', '**.ts', '**.tsx', 'web/**', '.github/workflows/codeql.yml']
+    paths: ['**.js', '**.jsx', '**.ts', '**.tsx', 'apps/web/**', '.github/workflows/**']
   push:
     branches: [main]
-    paths: ['**.js', '**.jsx', '**.ts', '**.tsx', 'web/**', '.github/workflows/codeql.yml']
+    paths: ['**.js', '**.jsx', '**.ts', '**.tsx', 'apps/web/**', '.github/workflows/**']
   schedule:
     - cron: '23 3 * * 1'
 
@@ -36,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [javascript-typescript]
+        language: [javascript-typescript, actions]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
