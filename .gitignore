@@ -17,6 +17,9 @@ dist/
 package-lock.json
 yarn.lock
 pnpm-lock.yaml
+# Web app ships its lockfile for reproducible installs until the monorepo
+# scaffold card moves to a single root lockfile.
+!apps/web/pnpm-lock.yaml
 .output/
 .vercel/
 .netlify/

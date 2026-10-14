@@ -55,11 +55,10 @@ fn json_error(message: &str, status: u16) -> Result<Response> {
         error: message.to_string(),
     })
     .unwrap_or_else(|_| r#"{"error":"internal"}"#.to_string());
-    Response::from_body(worker::ResponseBody::Body(body.into_bytes()))
-        .map(|r| {
-            r.with_status(status)
-                .with_headers(headers_json().unwrap_or_default())
-        })
+    Response::from_body(worker::ResponseBody::Body(body.into_bytes())).map(|r| {
+        r.with_status(status)
+            .with_headers(headers_json().unwrap_or_default())
+    })
 }
 
 fn headers_json() -> Result<worker::Headers> {
@@ -106,8 +105,7 @@ async fn lookup(kind: &str, ctx: &RouteContext<()>) -> Result<Response> {
 
 async fn search(req: &Request, _ctx: &RouteContext<()>) -> Result<Response> {
     let url = req.url()?;
-    let query: std::collections::HashMap<String, String> =
-        url.query_pairs().into_owned().collect();
+    let query: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
     let q = query.get("q").map(String::as_str).unwrap_or("").trim();
     if q.len() < 2 {
         return json_error("query too short (min 2 chars)", 400);
@@ -142,9 +140,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
         .get_async("/v1/mb/search", |req, ctx| async move {
             search(&req, &ctx).await
         })
-        .or_else_any_method_async("/*catchall", |_, _| async {
-            json_error("not found", 404)
-        })
+        .or_else_any_method_async("/*catchall", |_, _| async { json_error("not found", 404) })
         .run(req, env)
         .await
 }
