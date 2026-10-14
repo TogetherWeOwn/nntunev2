@@ -52,19 +52,39 @@ jobs:
       - run: npm test -- --run
       - run: npm run check
 
-  # Aggregate required check. Add every real job id to `needs` (and keep
-  # `!cancelled()` + `contains(needs.*.result, 'failure')` logic) so ci-ok
-  # stays red when any job fails and green only when all succeed.
+  api:
+    name: api
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - run: cargo test --manifest-path workers/api/Cargo.toml --all-targets
+      - run: cargo clippy --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
+      - run: cargo fmt --manifest-path workers/api/Cargo.toml -- --check
+      # The Worker deploys to wasm32: the crate must check on that target
+      # (native-only CI once missed a getrandom/RNG breakage there).
+      - run: cargo check --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
+
+  # Aggregate required check: every dependency must succeed, including
+  # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [placeholder, web]
-    if: ${{ !cancelled() }}
+    needs: [placeholder, api, web]
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - run: |
-          if printf '%s' '${{ toJSON(needs) }}' | grep -q '"result":"failure"'; then
-            echo "ci-ok: a required job failed"
+      - env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          if ! printf '%s' "$NEEDS_JSON" | jq -e 'length > 0 and all(.[]; .result == "success")' >/dev/null; then
+            echo "ci-ok: a required job did not succeed"
             exit 1
           fi
           echo "ci-ok: all required jobs passed"

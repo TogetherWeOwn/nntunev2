@@ -100,6 +100,40 @@ export function streamCapSeconds(plan: Plan): number {
 	return plan.streamHoursMonth * 3600;
 }
 
+/**
+ * Minimal subscription shape for plan resolution. Kept structural (instead
+ * of importing SubscriptionDTO) so this module stays dependency-free.
+ */
+export interface SubscriptionRef {
+	planId: string;
+	status: string;
+}
+
+export interface EffectivePlan {
+	plan: Plan;
+	/**
+	 * True when the subscription is missing, unknown, or not entitlement-
+	 * granting: the caller is seeing trial defaults, not the user's real
+	 * plan, and must say so instead of naming a paid tier.
+	 */
+	planUnknown: boolean;
+}
+
+const ENTITLED_STATUSES = new Set(['active', 'trialing']);
+
+/**
+ * Effective plan per ADR 0004: the subscription's plan while it grants
+ * entitlement (`active`/`trialing`) and names a known tier; the free trial
+ * row otherwise. Never invents a paid tier for an unknown state.
+ */
+export function resolveEffectivePlan(subscription: SubscriptionRef | null): EffectivePlan {
+	const plan = subscription ? getPlan(subscription.planId) : undefined;
+	if (subscription && plan && ENTITLED_STATUSES.has(subscription.status)) {
+		return { plan, planUnknown: false };
+	}
+	return { plan: getPlan('free')!, planUnknown: true };
+}
+
 /** Next upgrade step for prompts, or null when already at the top. */
 export function nextPlan(id: string): Plan | undefined {
 	const order = ['free', 'plus', 'pro-5x', 'pro-20x'];

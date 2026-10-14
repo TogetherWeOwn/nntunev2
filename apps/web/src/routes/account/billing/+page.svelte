@@ -5,6 +5,7 @@
 
 	export let data: {
 		planId: string;
+		planUnknown: boolean;
 		subscription: SubscriptionDTO | null;
 		usage: {
 			period: string;
@@ -16,7 +17,9 @@
 		loadError: string | null;
 	};
 
-	const plan = getPlan(data.planId) ?? getPlan('plus')!;
+	// The loader only emits known plan ids; free is the last-resort fallback
+	// so the page can never promote an unknown state to a paid tier.
+	const plan = getPlan(data.planId) ?? getPlan('free')!;
 	const status = data.usage ? evaluateUsage(plan, data.usage) : null;
 
 	let actionError: string | null = null;
@@ -57,6 +60,10 @@
 
 	{#if data.loadError}
 		<p role="alert">{data.loadError}</p>
+	{/if}
+
+	{#if data.planUnknown}
+		<p role="status">We couldn&apos;t confirm your plan — showing trial defaults.</p>
 	{/if}
 
 	<section aria-labelledby="plan">

@@ -5,6 +5,7 @@ import {
 	isTrialPlan,
 	listPlans,
 	nextPlan,
+	resolveEffectivePlan,
 	streamCapSeconds
 } from './plans';
 
@@ -43,4 +44,40 @@ describe('plan matrix', () => {
 		expect(nextPlan('pro-5x')?.id).toBe('pro-20x');
 		expect(nextPlan('pro-20x')).toBeUndefined();
 	});
+});
+
+describe('resolveEffectivePlan', () => {
+	it('uses the subscription plan when active', () => {
+		expect(resolveEffectivePlan({ planId: 'plus', status: 'active' })).toEqual({
+			plan: getPlan('plus'),
+			planUnknown: false
+		});
+	});
+
+	it('uses the subscription plan while trialing', () => {
+		const r = resolveEffectivePlan({ planId: 'pro-5x', status: 'trialing' });
+		expect(r.plan.id).toBe('pro-5x');
+		expect(r.planUnknown).toBe(false);
+	});
+
+	it('falls back to the trial row when there is no subscription', () => {
+		const r = resolveEffectivePlan(null);
+		expect(r.plan.id).toBe('free');
+		expect(r.planUnknown).toBe(true);
+	});
+
+	it('falls back to the trial row on an unknown plan id', () => {
+		const r = resolveEffectivePlan({ planId: 'legacy-2019', status: 'active' });
+		expect(r.plan.id).toBe('free');
+		expect(r.planUnknown).toBe(true);
+	});
+
+	it.each(['past_due', 'canceled', 'incomplete'] as const)(
+		'falls back to the trial row when status is %s',
+		(status) => {
+			const r = resolveEffectivePlan({ planId: 'pro-5x', status });
+			expect(r.plan.id).toBe('free');
+			expect(r.planUnknown).toBe(true);
+		}
+	);
 });

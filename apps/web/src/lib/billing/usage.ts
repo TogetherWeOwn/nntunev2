@@ -56,13 +56,17 @@ export function evaluateUsage(plan: Plan, usage: UsageSnapshot): LimitStatus {
 	const libraryBlocked = usage.libraryTracks >= plan.maxLibraryTracks;
 	const ingestBlocked = usage.ingestToday >= plan.ingestJobsDay;
 
+	const libraryFraction = usage.libraryTracks / Math.max(1, plan.maxLibraryTracks);
+	const ingestFraction = usage.ingestToday / Math.max(1, plan.ingestJobsDay);
+	const concurrentFraction = usage.concurrentNow / Math.max(1, plan.maxConcurrentStreams);
+
 	const anyHard = streamHardCapped || concurrentBlocked || libraryBlocked || ingestBlocked;
 	const soft =
 		!anyHard &&
 		(streamFraction >= SOFT_AT ||
-			usage.concurrentNow >= plan.maxConcurrentStreams - 0 ||
-			usage.libraryTracks / Math.max(1, plan.maxLibraryTracks) >= SOFT_AT ||
-			usage.ingestToday / Math.max(1, plan.ingestJobsDay) >= SOFT_AT);
+			concurrentFraction >= SOFT_AT ||
+			libraryFraction >= SOFT_AT ||
+			ingestFraction >= SOFT_AT);
 
 	const upgrade = nextPlan(plan.id);
 	const upgradeTo = upgrade ? upgrade.id : null;
@@ -119,6 +123,30 @@ export function evaluateUsage(plan: Plan, usage: UsageSnapshot): LimitStatus {
 	}
 
 	if (soft) {
+		// Name the dimension closest to its cap so the banner never reports
+		// a floored number from an unrelated dimension.
+		const candidates = [
+			{
+				fraction: streamFraction,
+				headline: `You're at ${pct(streamFraction)} of your ${plan.name} streaming hours.`
+			},
+			{
+				fraction: concurrentFraction,
+				headline: `You're using ${usage.concurrentNow} of ${plan.maxConcurrentStreams} ${plan.name} streams.`
+			},
+			{
+				fraction: libraryFraction,
+				headline: `Library is at ${pct(libraryFraction)} of ${plan.name} (${usage.libraryTracks.toLocaleString()} tracks).`
+			},
+			{
+				fraction: ingestFraction,
+				headline: `Ingest is at ${pct(ingestFraction)} of today's ${plan.name} limit.`
+			}
+		];
+		let top = candidates[0];
+		for (const c of candidates.slice(1)) {
+			if (c.fraction > top.fraction) top = c;
+		}
 		return {
 			state: 'soft',
 			streamFraction,
@@ -127,7 +155,7 @@ export function evaluateUsage(plan: Plan, usage: UsageSnapshot): LimitStatus {
 			libraryBlocked,
 			ingestBlocked,
 			upgradeTo,
-			headline: `You're at ${pct(Math.max(streamFraction, SOFT_AT))} of your ${plan.name} usage.`,
+			headline: top.headline,
 			detail: upgrade
 				? `Heads up before anything degrades: ${upgrade.name} raises every limit.`
 				: `Heads up before anything degrades.`

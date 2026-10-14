@@ -64,6 +64,41 @@ describe('evaluateUsage', () => {
 		expect(s.ingestBlocked).toBe(true);
 	});
 
+	it('names the real dimension when the library drives the soft state', () => {
+		const s = evaluateUsage(plus, {
+			streamSecondsMonth: 10 * 3600,
+			concurrentNow: 0,
+			libraryTracks: 24000,
+			ingestToday: 1
+		});
+		expect(s.state).toBe('soft');
+		expect(s.headline).toContain('96%');
+		expect(s.headline).toContain('Library');
+	});
+
+	it('names the real dimension when ingest drives the soft state', () => {
+		const s = evaluateUsage(plus, {
+			streamSecondsMonth: 0,
+			concurrentNow: 0,
+			libraryTracks: 100,
+			ingestToday: 24
+		});
+		expect(s.state).toBe('soft');
+		expect(s.headline).toContain('96%');
+		expect(s.headline).toContain('Ingest');
+	});
+
+	it('reports stream hours when streaming drives the soft state', () => {
+		const s = evaluateUsage(plus, {
+			streamSecondsMonth: 85 * 3600,
+			concurrentNow: 0,
+			libraryTracks: 100,
+			ingestToday: 1
+		});
+		expect(s.state).toBe('soft');
+		expect(s.headline).toContain('85%');
+	});
+
 	it('has no upgrade left at the top tier', () => {
 		const top = getPlan('pro-20x')!;
 		const s = evaluateUsage(top, {
