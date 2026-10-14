@@ -30,14 +30,12 @@ mod tests {
 
         let mut four = Pool::<()>::new(4);
         assert!(should_prefetch(&four));
-        for _ in 0..2 {
-            four.try_acquire(Lane::Playback).expect("playback");
-        }
-        assert!(
-            should_prefetch(&four),
-            "3 of 4 slots still leaves one spare"
-        );
-        four.try_acquire(Lane::Playback).expect("playback");
+        // Bind the leases: dropping one frees its slot (drop-safe guard),
+        // so temporaries would not hold anything.
+        let _p1 = four.try_acquire(Lane::Playback).expect("playback");
+        let _p2 = four.try_acquire(Lane::Playback).expect("playback");
+        assert!(should_prefetch(&four), "2 of 4 in use leaves one spare");
+        let _p3 = four.try_acquire(Lane::Playback).expect("playback");
         assert!(!should_prefetch(&four), "would take the last connection");
     }
 

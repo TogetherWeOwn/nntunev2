@@ -11,7 +11,10 @@
 //! Miss-path streaming: [`play`] fetches only the first segment (its yEnc
 //! `=ybegin size=` reveals the file size, so `Range`/`206` resolves before a
 //! byte is sent); later segments are fetched lazily as the client pulls
-//! [`PlayStream`] chunks. Memory is one decoded segment at a time (plus the
+//! [`PlayStream`] chunks. A mid-track `Range` still walks every earlier
+//! segment first — segment sizes live in NZB metadata this slice does not
+//! own yet, so the covering article cannot be addressed directly (see the
+//! README TTFB notes). Memory is one decoded segment at a time (plus the
 //! staged write, which R2 holds in production). [`PlayStream::finalize`]
 //! drains any segments the client's range did not need so the cache still
 //! gets the whole track, then completes the upload and hands the healthy
@@ -28,8 +31,8 @@ use std::sync::Arc;
 use crate::cache::{ContentCache, MultipartUpload};
 use crate::grant::{self, GrantError};
 use crate::meter::{Meter, MeterEvent, MeterKind};
-use crate::nntp::{NntpClient, NntpError};
-use crate::pool::{Lane, Lease, Pool, PoolError};
+use crate::nntp::{valid_message_id, NntpClient, NntpError};
+use crate::pool::{Lane, Lease, OrphanedPlay, Pool, PoolError};
 use crate::prefetch::should_prefetch;
 use crate::range::{self, RangeOutcome};
 use crate::yenc::{self, Decoded, YencError};
@@ -49,6 +52,9 @@ pub enum PlayError {
     },
     /// An article is gone (`430`/`423`): this track fails, the pool is fine.
     ArticleMissing(String),
+    /// A segment id from NZB metadata failed validation and was never sent
+    /// to the provider: this track fails, the pool is fine.
+    InvalidSegment(String),
     /// The provider connection failed or misbehaved (quarantines the pool).
     Upstream(String),
     /// A segment could not be decoded (corrupt or mis-placed yEnc part).
@@ -94,7 +100,10 @@ pub type StreamPool = Pool<NntpClient>;
 
 /// Chunked body. Pull chunks with [`Iterator::next`], then call
 /// [`PlayStream::finalize`] (or [`PlayStream::abort`]) so the lease returns
-/// to the pool and, on a miss, the cache write completes.
+/// to the pool and, on a miss, the cache write completes. Dropping the
+/// stream instead is still safe: the slot is freed, the half-read
+/// connection is discarded, and served bytes are metered on the next
+/// `play`/`finalize` — but the cache write is lost, so prefer `finalize`.
 pub struct PlayStream {
     user_id: String,
     track_id: String,
@@ -102,7 +111,27 @@ pub struct PlayStream {
     pos: u64,
     end: u64,
     served: u64,
-    source: Source,
+    /// `None` once `finalize`/`abort` consumed the stream (or it was dropped).
+    source: Option<Source>,
+}
+
+impl Drop for PlayStream {
+    fn drop(&mut self) {
+        // Only fires mid-flight: finalize/abort took `source` first. The
+        // guard's Drop frees the slot and the half-read client is discarded
+        // with `live` (its buffered position is untrustworthy, so it is
+        // never re-parked warm). Served bytes ride the shared slot state so
+        // the pool owner can still meter them.
+        if let Some(Source::Live(live)) = self.source.take() {
+            if self.served > 0 {
+                live.lease.record_orphan(OrphanedPlay {
+                    user_id: self.user_id.clone(),
+                    track_id: self.track_id.clone(),
+                    bytes: self.served,
+                });
+            }
+        }
+    }
 }
 
 enum Source {
@@ -142,6 +171,7 @@ pub fn play(
         return Err(PlayError::WrongTrack);
     }
     let user = grant.user_id.clone();
+    flush_orphaned(pool, meter);
     meter.emit(ev(MeterKind::PlayStart, &user, input.track_id, 0));
 
     if let Some(full) = cache.get_track(input.track_id) {
@@ -159,6 +189,11 @@ pub fn play(
     meter.emit(ev(MeterKind::CacheMiss, &user, input.track_id, 0));
     if input.segments.is_empty() {
         return Err(PlayError::Upstream("track has no segments".into()));
+    }
+    // Fail fast on hostile metadata: no lease, no dial, nothing on the wire.
+    // (`NntpClient::article` re-validates as defense in depth.)
+    if let Some(bad) = input.segments.iter().find(|s| !valid_segment_id(s)) {
+        return Err(PlayError::InvalidSegment(bad.clone()));
     }
     let lease = pool.try_acquire(Lane::Playback).map_err(|e| match e {
         PoolError::Quarantined { retry_after_ms } => PlayError::PoolQuarantined { retry_after_ms },
@@ -261,6 +296,11 @@ enum SegmentError {
     Decode(YencError),
 }
 
+/// Same stripping as `NntpClient::article`: outer whitespace and `<>`.
+fn valid_segment_id(message_id: &str) -> bool {
+    valid_message_id(message_id.trim().trim_matches(|c| c == '<' || c == '>'))
+}
+
 fn fetch_segment(client: &mut NntpClient, message_id: &str) -> Result<Decoded, SegmentError> {
     let raw = client.article(message_id).map_err(SegmentError::Nntp)?;
     yenc::decode_part(&raw).map_err(SegmentError::Decode)
@@ -270,6 +310,7 @@ fn nntp_failure(e: NntpError, message_id: &str) -> Failure {
     let provider = e.is_provider_failure();
     let err = match e {
         NntpError::NoSuchArticle(_) => PlayError::ArticleMissing(message_id.to_string()),
+        NntpError::InvalidMessageId(id) => PlayError::InvalidSegment(id),
         other => PlayError::Upstream(format!("{other:?}")),
     };
     (err, provider)
@@ -392,7 +433,7 @@ fn respond(
             pos: start,
             end,
             served: 0,
-            source,
+            source: Some(source),
         },
     }
 }
@@ -406,17 +447,29 @@ fn ev(kind: MeterKind, user: &str, track: &str, bytes: u64) -> MeterEvent {
     }
 }
 
+/// Emit `BytesServed` for plays that were dropped before `finalize` ran.
+fn flush_orphaned(pool: &mut StreamPool, meter: &mut dyn Meter) {
+    for orphan in pool.take_orphaned() {
+        meter.emit(ev(
+            MeterKind::BytesServed,
+            &orphan.user_id,
+            &orphan.track_id,
+            orphan.bytes,
+        ));
+    }
+}
+
 impl PlayStream {
     /// True on the miss path (chunks feed a staged multipart upload).
     pub fn is_writeback(&self) -> bool {
-        matches!(self.source, Source::Live(_))
+        matches!(self.source, Some(Source::Live(_)))
     }
 
     /// Why the stream stopped early, if it did (miss path only).
     pub fn error(&self) -> Option<&PlayError> {
         match &self.source {
-            Source::Live(live) => live.failed.as_ref().map(|(e, _)| e),
-            Source::Cached(_) => None,
+            Some(Source::Live(live)) => live.failed.as_ref().map(|(e, _)| e),
+            _ => None,
         }
     }
 
@@ -425,20 +478,21 @@ impl PlayStream {
     /// `cache` and return the connection to `pool`. Errors (a gone article,
     /// a bad segment, a dead connection) leave the cache untouched.
     pub fn finalize(
-        self,
+        mut self,
         pool: &mut StreamPool,
         cache: &mut ContentCache,
         meter: &mut dyn Meter,
     ) -> Result<(), PlayError> {
+        flush_orphaned(pool, meter);
         meter.emit(ev(
             MeterKind::BytesServed,
             &self.user_id,
             &self.track_id,
             self.served,
         ));
-        let mut live = match self.source {
-            Source::Cached(_) => return Ok(()),
-            Source::Live(live) => live,
+        let mut live = match self.source.take() {
+            Some(Source::Live(live)) => live,
+            _ => return Ok(()),
         };
         while live.failed.is_none() && live.next_seg < live.segments.len() {
             if let Err(failure) = live.load_next() {
@@ -475,8 +529,8 @@ impl PlayStream {
     }
 
     /// The client went away: return the connection without caching.
-    pub fn abort(self, pool: &mut StreamPool) {
-        if let Source::Live(live) = self.source {
+    pub fn abort(mut self, pool: &mut StreamPool) {
+        if let Some(Source::Live(live)) = self.source.take() {
             let live = *live;
             let healthy = !matches!(live.failed, Some((_, true)));
             pool.release(live.lease, healthy.then_some(live.client));
@@ -491,12 +545,12 @@ impl Iterator for PlayStream {
         if self.pos >= self.end {
             return None;
         }
-        let chunk = match &mut self.source {
-            Source::Cached(bytes) => {
+        let chunk = match self.source.as_mut() {
+            Some(Source::Cached(bytes)) => {
                 let to = (self.pos as usize + CHUNK).min(self.end as usize);
                 bytes[self.pos as usize..to].to_vec()
             }
-            Source::Live(live) => loop {
+            Some(Source::Live(live)) => loop {
                 if live.failed.is_some() {
                     return None;
                 }
@@ -517,6 +571,8 @@ impl Iterator for PlayStream {
                     return None;
                 }
             },
+            // finalize/abort consumed the stream; `next` after that is empty.
+            None => return None,
         };
         self.pos += chunk.len() as u64;
         self.served += chunk.len() as u64;

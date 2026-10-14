@@ -12,6 +12,15 @@
 //!
 //! Time is a virtual millisecond clock ([`Pool::advance`]) so tests are
 //! deterministic; the Durable Object drives it with wall-clock time.
+//!
+//! Leases are drop-safe: the slot count lives in shared state behind the
+//! [`Lease`]'s guard, so a play that is dropped without `release` (client
+//! disconnect, early `?`, panic unwind) still frees its slot. Only an
+//! explicit [`Pool::release`] parks the connection back warm — a dropped
+//! stream's connection is discarded, because its read position is unknown
+//! and re-parking it could attribute one article's bytes to another play.
+
+use std::sync::{Arc, Mutex};
 
 /// Priority lane. Ordering is priority order: `Playback < Prefetch < Ingest`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -21,11 +30,77 @@ pub enum Lane {
     Ingest,
 }
 
-/// A held pool connection. Drop it back via [`Pool::release`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A held pool connection. Hand it back via [`Pool::release`] (which may
+/// re-park the connection warm); dropping it frees the slot but discards
+/// the connection. `Lease` is not `Copy`/`Clone`: the guard must have a
+/// single owner so the slot is released exactly once.
+#[derive(Debug)]
 pub struct Lease {
     pub id: u64,
     pub lane: Lane,
+    guard: Option<SlotGuard>,
+}
+
+/// Metering owed to a play that was dropped before `finalize` ran.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrphanedPlay {
+    pub user_id: String,
+    pub track_id: String,
+    pub bytes: u64,
+}
+
+impl Lease {
+    /// Stash metering for a dropped play; the pool owner drains it via
+    /// [`Pool::take_orphaned`]. No-op once the lease was released.
+    pub fn record_orphan(&self, play: OrphanedPlay) {
+        if let Some(guard) = self.guard.as_ref() {
+            guard.record_orphan(play);
+        }
+    }
+}
+
+/// Slot bookkeeping shared between the pool and outstanding leases, so a
+/// dropped lease still frees its slot.
+#[derive(Debug, Default)]
+struct SlotState {
+    in_use: u32,
+    /// `BytesServed` records for dropped plays, drained by the pool owner
+    /// (which holds the meter) via [`Pool::take_orphaned`].
+    orphaned: Vec<OrphanedPlay>,
+}
+
+#[derive(Debug)]
+struct SlotGuard {
+    /// `None` once [`Pool::release`] took the slot back explicitly; `Drop`
+    /// only acts on a still-armed guard.
+    slots: Option<Arc<Mutex<SlotState>>>,
+}
+
+impl SlotGuard {
+    /// Disarm: the pool took the slot back, so dropping this guard is a no-op.
+    fn disarm(mut self) {
+        self.slots.take();
+    }
+
+    fn record_orphan(&self, play: OrphanedPlay) {
+        if let Some(slots) = self.slots.as_ref() {
+            if let Ok(mut state) = slots.lock() {
+                state.orphaned.push(play);
+            }
+        }
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        // A lock failure means another thread panicked while holding it;
+        // skip rather than panic inside a destructor.
+        if let Some(slots) = self.slots.take() {
+            if let Ok(mut state) = slots.lock() {
+                state.in_use = state.in_use.saturating_sub(1);
+            }
+        }
+    }
 }
 
 /// Why an acquire failed.
@@ -61,7 +136,7 @@ pub fn backoff_ms(consecutive_errors: u32) -> u64 {
 
 pub struct Pool<C> {
     capacity: u32,
-    in_use: u32,
+    slots: Arc<Mutex<SlotState>>,
     idle: Vec<C>,
     connects: u64,
     reuses: u64,
@@ -75,7 +150,7 @@ impl<C> Pool<C> {
     pub fn new(capacity: u32) -> Self {
         Self {
             capacity: capacity.clamp(1, HARD_MAX_CONNS),
-            in_use: 0,
+            slots: Arc::new(Mutex::new(SlotState::default())),
             idle: Vec::new(),
             connects: 0,
             reuses: 0,
@@ -84,6 +159,11 @@ impl<C> Pool<C> {
             quarantined_until_ms: None,
             now_ms: 0,
         }
+    }
+
+    /// Fail closed on a poisoned lock: report full so no new lease is issued.
+    fn in_use_locked(&self) -> u32 {
+        self.slots.lock().map(|s| s.in_use).unwrap_or(u32::MAX)
     }
 
     /// Slots a lane must leave free for playback: none for playback itself,
@@ -97,7 +177,7 @@ impl<C> Pool<C> {
 
     /// Would [`Pool::try_acquire`] succeed on `lane` right now?
     pub fn can_acquire(&self, lane: Lane) -> bool {
-        !self.quarantined() && self.in_use + Self::reserve(lane) < self.capacity
+        !self.quarantined() && self.in_use_locked() + Self::reserve(lane) < self.capacity
     }
 
     /// Try to lease one connection slot on `lane`.
@@ -109,15 +189,22 @@ impl<C> Pool<C> {
                 });
             }
         }
-        if self.in_use + Self::reserve(lane) >= self.capacity {
+        let mut state = match self.slots.lock() {
+            Ok(state) => state,
+            Err(_) => return Err(PoolError::Exhausted),
+        };
+        if state.in_use + Self::reserve(lane) >= self.capacity {
             return Err(PoolError::Exhausted);
         }
         let lease = Lease {
             id: self.next_id,
             lane,
+            guard: Some(SlotGuard {
+                slots: Some(Arc::clone(&self.slots)),
+            }),
         };
         self.next_id += 1;
-        self.in_use += 1;
+        state.in_use += 1;
         Ok(lease)
     }
 
@@ -137,16 +224,32 @@ impl<C> Pool<C> {
 
     /// Return a lease. `conn` is the still-healthy connection to keep warm;
     /// pass `None` after an I/O failure so the dead connection is dropped.
-    pub fn release(&mut self, lease: Lease, conn: Option<C>) {
-        debug_assert!(self.in_use > 0, "released without a matching acquire");
-        let _ = lease;
-        self.in_use = self.in_use.saturating_sub(1);
+    /// Dropping the lease without `release` also frees the slot (via the
+    /// guard) but never re-parks the connection.
+    pub fn release(&mut self, mut lease: Lease, conn: Option<C>) {
+        if let Some(guard) = lease.guard.take() {
+            guard.disarm();
+            if let Ok(mut state) = self.slots.lock() {
+                debug_assert!(state.in_use > 0, "released without a matching acquire");
+                state.in_use = state.in_use.saturating_sub(1);
+            }
+        }
         if let Some(conn) = conn {
             // Never hold more warm connections than the cap allows.
             if (self.idle.len() as u32) < self.capacity {
                 self.idle.push(conn);
             }
         }
+    }
+
+    /// Metering owed to plays that were dropped before `finalize` ran.
+    /// The pool owner (which holds the meter) drains these and emits
+    /// `BytesServed` for each; called from `play` and `finalize`.
+    pub fn take_orphaned(&mut self) -> Vec<OrphanedPlay> {
+        self.slots
+            .lock()
+            .map(|mut state| std::mem::take(&mut state.orphaned))
+            .unwrap_or_default()
     }
 
     /// A provider call failed: count it and (re)start quarantine backoff.
@@ -172,7 +275,7 @@ impl<C> Pool<C> {
     }
 
     pub fn in_use(&self) -> u32 {
-        self.in_use
+        self.in_use_locked()
     }
 
     /// Warm connections currently parked in the pool.
@@ -231,6 +334,19 @@ mod tests {
     }
 
     #[test]
+    fn dropping_a_lease_without_release_still_frees_its_slot() {
+        let mut pool = TestPool::new(1);
+        {
+            let _lease = pool.try_acquire(Lane::Playback).expect("acquire");
+            assert_eq!(pool.in_use(), 1);
+            // Dropped here without `release`.
+        }
+        assert_eq!(pool.in_use(), 0);
+        pool.try_acquire(Lane::Playback)
+            .expect("slot freed by drop");
+    }
+
+    #[test]
     fn failed_connection_is_dropped_not_parked() {
         let mut pool = TestPool::new(2);
         let lease = pool.try_acquire(Lane::Playback).expect("acquire");
@@ -243,23 +359,38 @@ mod tests {
     fn exhausted_at_capacity() {
         let mut pool = TestPool::new(1);
         let lease = pool.try_acquire(Lane::Playback).expect("acquire");
-        assert_eq!(pool.try_acquire(Lane::Playback), Err(PoolError::Exhausted));
+        assert!(matches!(
+            pool.try_acquire(Lane::Playback),
+            Err(PoolError::Exhausted)
+        ));
         pool.release(lease, None);
     }
 
     #[test]
     fn prefetch_and_ingest_always_leave_a_slot_for_playback() {
         let mut pool = TestPool::new(1);
-        assert_eq!(pool.try_acquire(Lane::Prefetch), Err(PoolError::Exhausted));
-        assert_eq!(pool.try_acquire(Lane::Ingest), Err(PoolError::Exhausted));
+        assert!(matches!(
+            pool.try_acquire(Lane::Prefetch),
+            Err(PoolError::Exhausted)
+        ));
+        assert!(matches!(
+            pool.try_acquire(Lane::Ingest),
+            Err(PoolError::Exhausted)
+        ));
         assert!(!pool.can_acquire(Lane::Prefetch));
         pool.try_acquire(Lane::Playback)
             .expect("playback still gets the only slot");
 
         let mut pool = TestPool::new(2);
         let prefetch = pool.try_acquire(Lane::Prefetch).expect("one prefetch");
-        assert_eq!(pool.try_acquire(Lane::Prefetch), Err(PoolError::Exhausted));
-        assert_eq!(pool.try_acquire(Lane::Ingest), Err(PoolError::Exhausted));
+        assert!(matches!(
+            pool.try_acquire(Lane::Prefetch),
+            Err(PoolError::Exhausted)
+        ));
+        assert!(matches!(
+            pool.try_acquire(Lane::Ingest),
+            Err(PoolError::Exhausted)
+        ));
         pool.try_acquire(Lane::Playback)
             .expect("playback takes the reserved slot");
         pool.release(prefetch, None);

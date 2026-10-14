@@ -15,7 +15,9 @@ client ── play(token, range?) ──▶ stream Worker
      =ybegin/=ypart/=yend, pcrc32) and read the file size from =ybegin so
      Range/206 resolves before byte one. Later segments are fetched
      lazily as the client pulls 16 KiB chunks: decode → decrypt → client
-     chunk + staged R2 multipart part (play.rs). Memory = one segment.
+     chunk + staged R2 multipart part (play.rs, `cache.rs`: segments
+     coalesce into fixed 5 MiB R2 parts, the remainder stages). Memory =
+     one 5 MiB part + one segment.
   4. finalize(): drain any segments the client's range skipped, complete
      the multipart write into the cache, hand the connection back warm.
      abort(): client left — return the connection, cache nothing.
@@ -49,13 +51,18 @@ First-byte latency is measured by `tests/stream_integration.rs`
 | Path | Local reference (loopback) | Staging p95 target |
 |---|---|---|
 | Cache hit | ~25 µs (2026-10-14 run) | ≤ 150 ms at the edge |
-| Cache miss | ~50 ms (2026-10-14 run: dial + first segment + decode) | ≤ 1.5 s |
+| Cache miss (range from byte 0) | ~50 ms (2026-10-14 run: dial + first segment + decode) | ≤ 1.5 s |
 
-Miss TTFB is dial (skipped on a warm pool) + **one** article fetch + decode,
-independent of track length: the integration test asserts the server has
-received exactly one `BODY` when the first chunk arrives on a three-segment
-track. Staging p95 numbers are owned by Analytics Engine monitoring
-(`PlayStart` → first-byte events) once deployed.
+Miss TTFB for a range starting at byte 0 is dial (skipped on a warm pool) +
+**one** article fetch + decode, independent of track length: the integration
+test asserts the server has received exactly one `BODY` when the first chunk
+arrives on a three-segment track. A mid-track seek on a cold cache instead
+walks every earlier segment first (TTFB grows with the seek position):
+`PlayInput` carries only message-ids, so without NZB segment sizes the play
+path cannot know which article covers an offset — covering-segment fetch is
+a follow-up once ingest exposes per-segment byte ranges. An integration test
+pins the current prefix cost. Staging p95 numbers are owned by Analytics
+Engine monitoring (`PlayStart` → first-byte events) once deployed.
 
 CI (`.github/workflows/ci.yml`, job `rust`, required through `ci-ok`) runs
 fmt, clippy `-D warnings` and every test; the integration test asserts the

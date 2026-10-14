@@ -15,15 +15,34 @@ pub enum NntpError {
     Io(String),
     NoSuchArticle(String),
     UnexpectedResponse(String),
+    /// The segment id failed RFC 5536 validation and was never sent.
+    InvalidMessageId(String),
 }
 
 impl NntpError {
     /// True when the provider (or the connection to it) is unhealthy, as
-    /// opposed to one article being gone (`430`/`423`), which says nothing
-    /// about the provider and must not quarantine the user's pool.
+    /// opposed to one article being gone (`430`/`423`) or one id being
+    /// malformed, which say nothing about the provider and must not
+    /// quarantine the user's pool.
     pub fn is_provider_failure(&self) -> bool {
-        !matches!(self, NntpError::NoSuchArticle(_))
+        !matches!(
+            self,
+            NntpError::NoSuchArticle(_) | NntpError::InvalidMessageId(_)
+        )
     }
+}
+
+/// Whether `mid` (outer whitespace / `<>` already stripped) is safe to put
+/// on the wire inside `BODY <…>`: RFC 5536 msg-id characters only, so a
+/// hostile NZB cannot smuggle CR/LF (extra NNTP commands) or desynchronize
+/// the pooled connection.
+pub fn valid_message_id(mid: &str) -> bool {
+    const MAX_LEN: usize = 250;
+    !mid.is_empty()
+        && mid.len() <= MAX_LEN
+        && !mid
+            .bytes()
+            .any(|b| matches!(b, b'\r' | b'\n' | b'\0' | b' ' | b'\t' | b'<' | b'>'))
 }
 
 impl From<std::io::Error> for NntpError {
@@ -54,8 +73,13 @@ impl NntpClient {
     }
 
     /// Fetch one article body; returns the raw dot-unstuffed bytes.
+    /// A malformed id is rejected before anything is written, so the
+    /// pooled connection can never carry an injected command.
     pub fn article(&mut self, message_id: &str) -> Result<Vec<u8>, NntpError> {
         let mid = message_id.trim().trim_matches(|c| c == '<' || c == '>');
+        if !valid_message_id(mid) {
+            return Err(NntpError::InvalidMessageId(message_id.to_string()));
+        }
         let cmd = format!("BODY <{mid}>\r\n");
         self.reader.get_mut().write_all(cmd.as_bytes())?;
         self.reader.get_mut().flush()?;
@@ -109,8 +133,23 @@ mod tests {
     #[test]
     fn only_a_missing_article_is_not_a_provider_failure() {
         assert!(!NntpError::NoSuchArticle("m".into()).is_provider_failure());
+        assert!(!NntpError::InvalidMessageId("x".into()).is_provider_failure());
         assert!(NntpError::Io("reset".into()).is_provider_failure());
         assert!(NntpError::UnexpectedResponse("502".into()).is_provider_failure());
+    }
+
+    #[test]
+    fn message_id_validation_rejects_wire_breakers() {
+        assert!(valid_message_id("abc123@synthetic.test"));
+        assert!(valid_message_id("a-seg0@synthetic.test"));
+        assert!(!valid_message_id(""));
+        assert!(!valid_message_id("x>\r\nBODY <other@article>"));
+        assert!(!valid_message_id("a\nb@c"));
+        assert!(!valid_message_id("a\rb@c"));
+        assert!(!valid_message_id("a b@c"));
+        assert!(!valid_message_id("a<b@c"));
+        assert!(!valid_message_id(&"a".repeat(251)));
+        assert!(valid_message_id(&format!("{}@c", "a".repeat(248))));
     }
 
     #[test]

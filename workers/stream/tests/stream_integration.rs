@@ -413,6 +413,45 @@ fn range_on_a_hit_returns_206_and_unsatisfiable_is_416() {
 }
 
 #[test]
+fn seek_on_a_cold_cache_fetches_the_prefix_before_the_first_byte() {
+    // Known limitation (see README TTFB notes): without NZB segment sizes
+    // the play path cannot know which article covers a mid-track offset, so
+    // it walks segments in order. A seek's TTFB costs the whole prefix.
+    let (plain, segments, articles) = fixture_track("a", 60_000, 20_000);
+    let server = FakeNntp::start(articles);
+    let mut pool: StreamPool = Pool::new(4);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+
+    let token = grant_for("track-a");
+    let inp = input(
+        &token,
+        "track-a",
+        Some("bytes=45000-45099"),
+        &server,
+        &segments,
+        None,
+    );
+    let resp = play(&mut pool, &mut cache, &mut meter, SECRET, &inp).expect("seek miss");
+    assert_eq!(resp.status, 206);
+    let mut stream = resp.stream;
+    let first = stream.next().expect("first chunk");
+    assert_eq!(
+        server.bodies(),
+        3,
+        "seek to segment 2 walks segments 0-2 first"
+    );
+    let mut body = first;
+    for chunk in stream.by_ref() {
+        body.extend_from_slice(&chunk);
+    }
+    assert_eq!(body, &plain[45_000..45_100]);
+    stream
+        .finalize(&mut pool, &mut cache, &mut meter)
+        .expect("finalize");
+}
+
+#[test]
 fn range_on_a_miss_serves_the_slice_and_still_caches_the_whole_track() {
     let (plain, segments, articles) = fixture_track("a", 60_000, 20_000);
     let (plain_b, segs_b, arts_b) = fixture_track("b", 30_000, 10_000);
@@ -469,6 +508,74 @@ fn range_on_a_miss_serves_the_slice_and_still_caches_the_whole_track() {
     stream_b.abort(&mut pool);
     assert!(cache.get_track("track-b").is_none(), "abort must not cache");
     assert_eq!(pool.in_use(), 0, "abort returns the lease");
+}
+
+#[test]
+fn a_segment_id_with_crlf_never_reaches_the_provider() {
+    let (_, _, articles) = fixture_track("ok", 20_000, 10_000);
+    let server = FakeNntp::start(articles);
+    let mut pool: StreamPool = Pool::new(4);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+
+    // NZB-supplied id smuggling a second NNTP command.
+    let evil = "x>\r\nBODY <injected@article>".to_string();
+    let segs = [evil];
+    let token = grant_for("track-evil");
+    let inp = input(&token, "track-evil", None, &server, &segs, None);
+    assert!(matches!(
+        play(&mut pool, &mut cache, &mut meter, SECRET, &inp),
+        Err(PlayError::InvalidSegment(_))
+    ));
+    assert_eq!(server.bodies(), 0, "nothing may be sent for a bad id");
+    assert_eq!(server.connects(), 0, "no dial for a bad id");
+    assert!(!pool.quarantined(), "bad metadata is not an outage");
+    assert_eq!(pool.in_use(), 0);
+}
+
+#[test]
+fn dropping_a_stream_frees_its_slot_and_still_meters_served_bytes() {
+    let (_plain_a, segs_a, arts_a) = fixture_track("a", 40_000, 20_000);
+    let (plain_b, segs_b, arts_b) = fixture_track("b", 20_000, 10_000);
+    let server = FakeNntp::start(merge(arts_a, arts_b));
+    let mut pool: StreamPool = Pool::new(1);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+
+    // Client disconnects mid-track: no finalize, no abort.
+    let token = grant_for("track-a");
+    let inp = input(&token, "track-a", None, &server, &segs_a, None);
+    let resp = play(&mut pool, &mut cache, &mut meter, SECRET, &inp).expect("miss play");
+    let mut stream = resp.stream;
+    let first = stream.next().expect("first chunk");
+    assert!(!first.is_empty());
+    let served_a = first.len() as u64;
+    drop(stream);
+    assert_eq!(pool.in_use(), 0, "a dropped stream must free its slot");
+    assert_eq!(
+        pool.idle(),
+        0,
+        "the half-read connection is dropped, never re-parked"
+    );
+
+    // The freed slot serves the next play, which also flushes the orphaned
+    // metering from the dropped stream.
+    let token_b = grant_for("track-b");
+    let inp_b = input(&token_b, "track-b", None, &server, &segs_b, None);
+    let resp_b =
+        play(&mut pool, &mut cache, &mut meter, SECRET, &inp_b).expect("slot freed by drop");
+    let (body_b, stream_b) = drain_to_vec(resp_b.stream);
+    assert_eq!(body_b, plain_b);
+    stream_b
+        .finalize(&mut pool, &mut cache, &mut meter)
+        .expect("finalize");
+    let orphaned: u64 = meter
+        .events
+        .iter()
+        .filter(|e| e.kind == MeterKind::BytesServed && e.track_id == "track-a")
+        .map(|e| e.bytes)
+        .sum();
+    assert_eq!(orphaned, served_a, "dropped play must still be metered");
 }
 
 #[test]

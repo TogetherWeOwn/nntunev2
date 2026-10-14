@@ -165,14 +165,15 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
         if line.starts_with(b"=ybegin") {
             in_body = true;
             seen_begin = true;
-            let header = std::str::from_utf8(line).map_err(|_| YencError::Truncated)?;
-            file_size = tag_u64(header, "size");
-            multipart = tag_u64(header, "part").is_some();
+            // Byte-based: the line carries `name=<poster bytes>`, which is
+            // often Latin-1/CP1252 and not UTF-8. The numeric tags precede it
+            // and are pure ASCII, so parse them from bytes.
+            file_size = tag_u64(line, b"size");
+            multipart = tag_u64(line, b"part").is_some();
             continue;
         }
         if line.starts_with(b"=ypart") {
-            let header = std::str::from_utf8(line).map_err(|_| YencError::BadPart)?;
-            part_range = match (tag_u64(header, "begin"), tag_u64(header, "end")) {
+            part_range = match (tag_u64(line, b"begin"), tag_u64(line, b"end")) {
                 (Some(b), Some(e)) if b >= 1 && e >= b => Some((b, e)),
                 _ => return Err(YencError::BadPart),
             };
@@ -181,10 +182,9 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
         if line.starts_with(b"=yend") {
             in_body = false;
             seen_trailer = true;
-            let trailer = std::str::from_utf8(line).map_err(|_| YencError::Truncated)?;
-            yend_size = tag_u64(trailer, "size");
-            crc = tag_hex_u32(trailer, "crc32");
-            pcrc = tag_hex_u32(trailer, "pcrc32");
+            yend_size = tag_u64(line, b"size");
+            crc = tag_hex_u32(line, b"crc32");
+            pcrc = tag_hex_u32(line, b"pcrc32");
             continue;
         }
         if !in_body || line.is_empty() {
@@ -247,18 +247,26 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
     })
 }
 
-fn tag_u64(trailer: &str, key: &str) -> Option<u64> {
-    let prefix = format!("{key}=");
-    trailer
-        .split_whitespace()
-        .find_map(|tok| tok.strip_prefix(prefix.as_str())?.parse().ok())
+/// Value of the ASCII `key=` tag on a yEnc header line, parsed from bytes so
+/// a non-UTF-8 `name=` later on the same line cannot break decoding.
+fn tag_value<'a>(line: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    line.split(|&b| b == b' ' || b == b'\t')
+        .filter_map(|tok| {
+            let (k, v) = tok.split_at_checked(key.len())?;
+            (k == key && v.first() == Some(&b'=')).then(|| &v[1..])
+        })
+        .next()
 }
 
-fn tag_hex_u32(trailer: &str, key: &str) -> Option<u32> {
-    let prefix = format!("{key}=");
-    trailer
-        .split_whitespace()
-        .find_map(|tok| u32::from_str_radix(tok.strip_prefix(prefix.as_str())?, 16).ok())
+fn tag_u64(line: &[u8], key: &[u8]) -> Option<u64> {
+    std::str::from_utf8(tag_value(line, key)?)
+        .ok()?
+        .parse()
+        .ok()
+}
+
+fn tag_hex_u32(line: &[u8], key: &[u8]) -> Option<u32> {
+    u32::from_str_radix(std::str::from_utf8(tag_value(line, key)?).ok()?, 16).ok()
 }
 
 #[cfg(test)]
@@ -402,6 +410,39 @@ mod tests {
         let mut wrong_len = good.clone();
         wrong_len[at + 4] = b'9';
         assert_eq!(decode_part(&wrong_len), Err(YencError::BadPart));
+    }
+
+    #[test]
+    fn latin1_filename_does_not_break_decode() {
+        // Legacy posters encode names in Latin-1/CP1252; the tags precede
+        // `name=` and are pure ASCII, so decode must not care.
+        let data: Vec<u8> = (0..=255u8).cycle().take(500).collect();
+        let text = part(
+            &data,
+            PartSpec {
+                file_size: 1500,
+                part: 1,
+                total: 3,
+                offset: 0,
+                file_crc: None,
+            },
+        );
+        let mut latin1 = text.clone();
+        let from = b"name=m.bin";
+        let at = latin1
+            .windows(from.len())
+            .position(|w| w == from)
+            .expect("name tag present");
+        latin1.splice(
+            at..at + from.len(),
+            b"name="
+                .iter()
+                .chain(b"Bj\xf6rk - Joga.flac".iter())
+                .copied(),
+        );
+        let got = decode_part(&latin1).expect("latin-1 name must decode");
+        assert_eq!(got.data, data);
+        assert_eq!((got.file_size, got.offset, got.multipart), (1500, 0, true));
     }
 
     #[test]
