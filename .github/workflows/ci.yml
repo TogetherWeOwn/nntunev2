@@ -31,7 +31,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - run: echo "scaffold card: replace me with real jobs"
+      - run: |
+          echo "scaffold card: replace me with real jobs"
 
   # Public-repo hygiene: fail on internal tracker ids (TOG-<digits>),
   # internal hostnames, instance-UI paths and agent names in tracked text.
@@ -50,25 +51,41 @@ jobs:
       - name: Unit-test the lint
         run: python3 .github/scripts/test_public_text_lint.py
 
-  # Aggregate required check. Add every real job id to `needs` (and keep
-  # `!cancelled()` + the RESULTS check below) so ci-ok stays red when any
-  # job fails and green only when all succeed. The check reads
-  # join(needs.*.result, ' ') — never grep pretty-printed JSON for a
+  api:
+    name: api
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - run: cargo test --manifest-path workers/api/Cargo.toml --all-targets
+      - run: cargo clippy --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
+      - run: cargo fmt --manifest-path workers/api/Cargo.toml -- --check
+      # The Worker deploys to wasm32: the crate must check on that target
+      # (native-only CI once missed a getrandom/RNG breakage there).
+      - run: cargo check --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
+
+  # Aggregate required check. Add every real job id to `needs` so ci-ok
+  # stays red when any job fails, is cancelled, or is skipped. The check
+  # parses toJSON(needs) with jq — never grep pretty-printed JSON for a
   # result string (whitespace-sensitive, silently never matches).
   ci-ok:
     name: ci-ok
-    needs: [placeholder, public-text]
-    if: ${{ !cancelled() }}
+    needs: [placeholder, api, public-text]
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - run: |
-          case " $RESULTS " in
-            *" failure "*|*" cancelled "*)
-              echo "ci-ok: a required job failed (results: $RESULTS)"
-              exit 1
-              ;;
-          esac
-          echo "ci-ok: all required jobs passed (results: $RESULTS)"
-        env:
-          RESULTS: ${{ join(needs.*.result, ' ') }}
+      - env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          if ! printf '%s' "$NEEDS_JSON" | jq -e 'length > 0 and all(.[]; .result == "success")' >/dev/null; then
+            echo "ci-ok: a required job did not succeed"
+            exit 1
+          fi
+          echo "ci-ok: all required jobs passed"
