@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { readFileSync, readdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, readdirSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -11,13 +11,14 @@ const stagingWorkflow = readFileSync(new URL('e2e-staging.yml', workflowDir), 'u
 
 // Execute the exact checked-in shell blocks, not a copy of their logic. Only
 // dummy inputs enter the child; no ambient credentials or network requests.
-function runShell(script: string, env: Record<string, string> = {}) {
+function runShell(script: string, env: Record<string, string> = {}, cwd?: string) {
   const scratch = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'workflow-test-'));
   const outputFile = join(scratch, 'github-output');
   try {
     const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', script], {
       encoding: 'utf8',
       timeout: 5_000,
+      ...(cwd ? { cwd } : {}),
       env: { PATH: process.env.PATH, GITHUB_OUTPUT: outputFile, ...env },
     });
     expect(result.error).toBeUndefined();
@@ -113,5 +114,94 @@ test('every workflow Action ref is a full commit SHA', () => {
     for (const match of workflow.matchAll(/uses:\s+[^\s@]+@([^\s#]+)/g)) {
       expect(match[1], `${name}: ${match[0]}`).toMatch(/^[a-f0-9]{40}$/);
     }
+  }
+});
+
+test.describe('credential scope (static pins)', () => {
+  test('no context-level extraHTTPHeaders in the Playwright config', () => {
+    // Usage patterns only (colons/parens): explanatory comments may name the
+    // APIs to document why they are banned.
+    const configSource = readFileSync(new URL('../playwright.config.ts', import.meta.url), 'utf8');
+    expect(configSource).not.toContain('extraHTTPHeaders:');
+    expect(configSource).not.toContain('setExtraHTTPHeaders(');
+  });
+
+  test('browser auth is origin-scoped through a context route', () => {
+    const accounts = readFileSync(new URL('../helpers/accounts.ts', import.meta.url), 'utf8');
+    expect(accounts).toContain('isStagingOrigin');
+    expect(accounts).toContain('context.route');
+    expect(accounts).not.toContain('extraHTTPHeaders:');
+    expect(accounts).not.toContain('setExtraHTTPHeaders(');
+  });
+});
+
+// Execute the exact checked-in sanitize blocks: Playwright 1.55 writes
+// test-results/**/error-context.md (ARIA snapshots rendering filled input
+// values, including the BYOP password) and embeds the same text in
+// playwright-report/data/*.md. Both directories are uploaded on failure, so
+// the sanitize step must strip a marker password from every uploaded path.
+const sanitizeBlocks = [...stagingWorkflow.matchAll(
+  /      - name: Sanitize failure artifacts[\s\S]*?run: \|\n((?:          [^\n]*\n)+)/g,
+)];
+
+function listFilesRecursive(dir: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...listFilesRecursive(full));
+    else out.push(full);
+  }
+  return out;
+}
+
+test.describe('failure-artifact sanitization', () => {
+  test('both jobs sanitize before uploading', () => {
+    expect(sanitizeBlocks).toHaveLength(2);
+    for (const block of sanitizeBlocks) {
+      const script = block[1]!.replace(/^ {10}/gm, '');
+      expect(script).toContain('error-context.md');
+      expect(script).toContain('playwright-report/data');
+    }
+    // Each sanitize precedes its job's upload: nothing uploads raw first.
+    for (const artifact of ['e2e-synthetic-report', 'e2e-journey-report']) {
+      const uploadAt = stagingWorkflow.indexOf(artifact);
+      const sanitizeAt = stagingWorkflow.lastIndexOf('Sanitize failure artifacts', uploadAt);
+      expect(sanitizeAt, `${artifact} uploads before any sanitize`).toBeGreaterThan(-1);
+    }
+  });
+
+  for (const [index, block] of sanitizeBlocks.entries()) {
+    test(`sanitize script ${index} strips a marker password from every uploaded path`, () => {
+      const script = block[1]!.replace(/^ {10}/gm, '');
+      const artifacts = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'sanitize-test-'));
+      try {
+        mkdirSync(join(artifacts, 'test-results', 'spec-chunk'), { recursive: true });
+        mkdirSync(join(artifacts, 'playwright-report', 'data'), { recursive: true });
+        const marker = 'MARKER-NNTP-PASS-9f8e7d6c5b4a';
+        writeFileSync(
+          join(artifacts, 'test-results', 'spec-chunk', 'error-context.md'),
+          `- textbox [ref=e5]: ${marker}\n`,
+        );
+        writeFileSync(
+          join(artifacts, 'playwright-report', 'data', 'abc123.md'),
+          `snapshot with ${marker}\n`,
+        );
+        writeFileSync(join(artifacts, 'test-results', 'spec-chunk', 'junit.xml'), '<xml>safe</xml>');
+        writeFileSync(join(artifacts, 'playwright-report', 'index.html'), '<html>safe</html>');
+        const result = runShell(script, {}, artifacts);
+        expect(result.status).toBe(0);
+        expect(existsSync(join(artifacts, 'test-results', 'spec-chunk', 'error-context.md'))).toBe(false);
+        expect(existsSync(join(artifacts, 'playwright-report', 'data'))).toBe(false);
+        // Marker absent from every remaining path the workflow uploads.
+        for (const file of listFilesRecursive(artifacts)) {
+          expect(readFileSync(file, 'utf8'), file).not.toContain(marker);
+        }
+        // Non-credential evidence survives sanitization.
+        expect(existsSync(join(artifacts, 'test-results', 'spec-chunk', 'junit.xml'))).toBe(true);
+        expect(existsSync(join(artifacts, 'playwright-report', 'index.html'))).toBe(true);
+      } finally {
+        rmSync(artifacts, { recursive: true, force: true });
+      }
+    });
   }
 });

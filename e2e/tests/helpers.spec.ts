@@ -1,12 +1,14 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type APIRequestContext } from '@playwright/test';
 import {
   accessHeaders,
   assertNoAccessWall,
+  isStagingOrigin,
   readApiBody,
   stagingBaseUrl,
   syntheticNntpEndpoint,
 } from '../helpers/access.js';
 import { extractPlanMeta, extractUsageBytes } from '../helpers/contract.js';
+import { requireApiAccount, tryMintTestAccount } from '../helpers/accounts.js';
 
 // Helper self-tests (pure functions only): no browser page, no staging.
 // These run on every PR via e2e-lint AND inside the staging suite, pinning
@@ -21,6 +23,26 @@ function withEnv(vars: Record<string, string | undefined>, fn: () => void): void
   }
   try {
     fn();
+  } finally {
+    for (const key of Object.keys(vars)) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  }
+}
+
+async function withEnvAsync(
+  vars: Record<string, string | undefined>,
+  fn: () => Promise<void>,
+): Promise<void> {
+  const saved: Record<string, string | undefined> = {};
+  for (const key of Object.keys(vars)) {
+    saved[key] = process.env[key];
+    if (vars[key] === undefined) delete process.env[key];
+    else process.env[key] = vars[key];
+  }
+  try {
+    await fn();
   } finally {
     for (const key of Object.keys(vars)) {
       if (saved[key] === undefined) delete process.env[key];
@@ -267,5 +289,152 @@ test.describe('extractPlanMeta', () => {
 
   test('throws when metadata is incomplete', () => {
     expect(() => extractPlanMeta({ plan: 'base' })).toThrow(/incomplete/);
+  });
+});
+
+test.describe('isStagingOrigin (credential scope gate)', () => {
+  const staging = 'https://staging.example';
+
+  test('attaches to same-origin paths', () => {
+    expect(isStagingOrigin('https://staging.example/api/usage', staging)).toBe(true);
+    expect(isStagingOrigin('https://staging.example/library', staging)).toBe(true);
+  });
+
+  test('withholds from a foreign origin', () => {
+    expect(isStagingOrigin('https://fonts.example/css', staging)).toBe(false);
+    expect(isStagingOrigin('https://cdn.example/stream/1', staging)).toBe(false);
+  });
+
+  test('withholds from a subdomain lookalike', () => {
+    expect(isStagingOrigin('https://staging.example.evil.test/x', staging)).toBe(false);
+  });
+
+  test('withholds on unparseable URLs', () => {
+    expect(isStagingOrigin('not a url', staging)).toBe(false);
+  });
+
+  test('two-origin simulation: the foreign origin sees neither header', () => {
+    const credentialed = {
+      'CF-Access-Client-Id': 'dummy-client-id',
+      'CF-Access-Client-Secret': 'dummy-client-secret',
+      Authorization: 'Bearer dummy-session',
+    };
+    const send = (url: string): Record<string, string> =>
+      isStagingOrigin(url, staging) ? credentialed : {};
+    expect(send('https://staging.example/library')).toEqual(credentialed);
+    const foreign = send('https://cdn.example/stream/1');
+    expect(foreign).toEqual({});
+    expect(JSON.stringify(foreign)).not.toContain('dummy-client-secret');
+    expect(JSON.stringify(foreign)).not.toContain('dummy-session');
+  });
+});
+
+test.describe('requireApiAccount', () => {
+  test('throws when no session and no seam token exist', () => {
+    withEnv({ QA_AUTH_TOKEN: undefined }, () => {
+      expect(() => requireApiAccount(null, 'range')).toThrow(/no authenticated account/);
+    });
+  });
+
+  test('passes with a minted session', () => {
+    withEnv({ QA_AUTH_TOKEN: undefined }, () => {
+      expect(() =>
+        requireApiAccount({ email: 'e2e@example.test', session: 's', viaApi: true }, 'range'),
+      ).not.toThrow();
+    });
+  });
+
+  test('passes on the seam token alone', () => {
+    withEnv({ QA_AUTH_TOKEN: 'dummy-qa-token' }, () => {
+      expect(() => requireApiAccount(null, 'meter')).not.toThrow();
+    });
+  });
+});
+
+test.describe('tryMintTestAccount fail-closed seam', () => {
+  const base = 'https://staging.example';
+  const seamEnv = {
+    STAGING_BASE_URL: base,
+    QA_AUTH_TOKEN: 'dummy-qa-token',
+    ...dummyAccessPair,
+  };
+  const fakeRequest = (post: () => Promise<unknown>): APIRequestContext =>
+    ({ post }) as unknown as APIRequestContext;
+  const fakeResponse = (status: number, headers: Record<string, string>, body: string) => ({
+    status: () => status,
+    headers: () => headers,
+    text: async () => body,
+  });
+
+  test('null when the seam is unconfigured (UI signup fallback)', async () => {
+    await withEnvAsync({ QA_AUTH_TOKEN: undefined }, async () => {
+      await expect(
+        tryMintTestAccount(
+          fakeRequest(async () => {
+            throw new Error('must not be called without a token');
+          }),
+          base,
+        ),
+      ).resolves.toBeNull();
+    });
+  });
+
+  test('throws on transport failure once the token is set', async () => {
+    await withEnvAsync(seamEnv, async () => {
+      await expect(
+        tryMintTestAccount(
+          fakeRequest(async () => {
+            throw new Error('boom');
+          }),
+          base,
+        ),
+      ).rejects.toThrow(/transport/);
+    });
+  });
+
+  test('throws with the bare status on non-2xx (no silent skip)', async () => {
+    await withEnvAsync(seamEnv, async () => {
+      await expect(
+        tryMintTestAccount(fakeRequest(async () => fakeResponse(500, {}, '{"error":"x"}')), base),
+      ).rejects.toThrow(/HTTP 500/);
+    });
+  });
+
+  test('names the Access wall on walled seam responses', async () => {
+    await withEnvAsync(seamEnv, async () => {
+      await expect(
+        tryMintTestAccount(
+          fakeRequest(
+            async () => fakeResponse(403, { 'cf-mitigated': 'challenge' }, '<title>Access</title>'),
+          ),
+          base,
+        ),
+      ).rejects.toThrow(/Access wall/);
+    });
+  });
+
+  test('throws on a non-JSON body', async () => {
+    await withEnvAsync(seamEnv, async () => {
+      await expect(
+        tryMintTestAccount(fakeRequest(async () => fakeResponse(200, {}, 'not json')), base),
+      ).rejects.toThrow(/non-JSON/);
+    });
+  });
+
+  test('mints from session and legacy token fields', async () => {
+    await withEnvAsync(seamEnv, async () => {
+      await expect(
+        tryMintTestAccount(
+          fakeRequest(async () => fakeResponse(200, {}, '{"email":"a@b","session":"s"}')),
+          base,
+        ),
+      ).resolves.toEqual({ email: 'a@b', session: 's', viaApi: true });
+      await expect(
+        tryMintTestAccount(
+          fakeRequest(async () => fakeResponse(200, {}, '{"email":"a@b","token":"t"}')),
+          base,
+        ),
+      ).resolves.toEqual({ email: 'a@b', session: 't', viaApi: true });
+    });
   });
 });

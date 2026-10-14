@@ -7,10 +7,13 @@ import { accessHeaders, stagingBaseUrl } from './helpers/access.js';
 // closed once it is. See e2e/README.md for the activation progression.
 const baseURL = stagingBaseUrl('skip', 'config') ?? undefined;
 
-// Cloudflare Access service-token headers at context level so EVERY page
-// navigation carries them — specs must never rely on per-call headers for
-// browser loads. Configured staging requires the pair at startup.
-const accessHeaderMap = accessHeaders();
+// Validate the Access pair at startup when staging is configured
+// (fail-closed before any request). Headers are deliberately NOT installed at
+// context level: extraHTTPHeaders would attach the service token and session
+// bearer to EVERY origin, including cross-origin subresources. Each spec
+// scopes them to the staging origin via applyAccountToPage (origin-checked
+// context.route), so fonts/analytics/stream URLs never see them.
+accessHeaders();
 
 export default defineConfig({
   testDir: './tests',
@@ -27,10 +30,12 @@ export default defineConfig({
     : [['list']],
   use: {
     baseURL,
-    ...(Object.keys(accessHeaderMap).length > 0 ? { extraHTTPHeaders: accessHeaderMap } : {}),
     // Raw traces capture request headers/bodies (Access, session and NNTP
     // credentials); screenshots may expose account/provider details. Keep
-    // CI evidence textual until a verified redaction path exists.
+    // CI evidence textual until a verified redaction path exists. Note:
+    // Playwright still writes error-context.md snapshots (which render filled
+    // input values) on page-test failure — the workflow sanitizes those paths
+    // before uploading artifacts. See e2e-staging.yml.
     trace: 'off',
     screenshot: 'off',
   },

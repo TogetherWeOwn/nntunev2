@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { API, TESTIDS } from '../helpers/contract.js';
 import { accessHeaders, assertNoAccessWall, stagingBaseUrl } from '../helpers/access.js';
+import { applyAccountToPage } from '../helpers/accounts.js';
 
 // Fast synthetic smoke: runs post-deploy AND on a schedule. Must stay under
 // ~2 minutes total — the deep journey lives in the other specs.
@@ -67,6 +68,9 @@ test.describe('staging synthetic smoke', () => {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
+    // Browser loads carry the Access pair via the staging-origin route
+    // (no context-level headers by design — see applyAccountToPage).
+    await applyAccountToPage(page, null, baseURL);
     const response = await page.goto(baseURL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     expect(response, 'no HTTP response for app shell').not.toBeNull();
     const bodyText = await page.content();

@@ -81,6 +81,21 @@ jobs:
           QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
         run: npm run e2e:smoke
 
+      - name: Sanitize failure artifacts (strip credential-bearing snapshots)
+        if: failure() && steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        run: |
+          set -euo pipefail
+          # Playwright 1.55 writes test-results/**/error-context.md on any failed
+          # page test — an ARIA snapshot rendering filled input values, including
+          # the BYOP password — and embeds the same text in
+          # playwright-report/data/*.md. Raw traces/screenshots are off, but these
+          # text snapshots would still publish SYNTHETIC_NNTP_PASS from a public
+          # repo. Delete them so the uploaded artifact can never carry secrets.
+          find test-results -name 'error-context.md' -delete 2>/dev/null || true
+          rm -rf playwright-report/data 2>/dev/null || true
+          echo "sanitized: error-context.md and html-report data/ removed"
+
       - name: Upload failure artifacts
         if: failure() && steps.staging.outputs.configured == 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -151,6 +166,18 @@ jobs:
           SYNTHETIC_NNTP_TLS: ${{ secrets.SYNTHETIC_NNTP_TLS }}
           SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
         run: npm run e2e:staging
+
+      - name: Sanitize failure artifacts (strip credential-bearing snapshots)
+        if: failure() && steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        run: |
+          set -euo pipefail
+          # Same credential-bearing snapshot paths as the synthetic job above:
+          # error-context.md renders filled secrets and the html report embeds
+          # them under data/. Strip both before upload.
+          find test-results -name 'error-context.md' -delete 2>/dev/null || true
+          rm -rf playwright-report/data 2>/dev/null || true
+          echo "sanitized: error-context.md and html-report data/ removed"
 
       - name: Upload failure artifacts
         if: failure() && steps.staging.outputs.configured == 'true'

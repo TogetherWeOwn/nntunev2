@@ -1,8 +1,9 @@
 import { test, expect } from '@playwright/test';
 import { TESTIDS, uniqueTestEmail } from '../helpers/contract.js';
-import { stagingBaseUrl, syntheticNntpEndpoint } from '../helpers/access.js';
+import { stagingBaseUrl } from '../helpers/access.js';
 import {
   applyAccountToPage,
+  completeByopWizard,
   tryMintTestAccount,
   type TestAccount,
 } from '../helpers/accounts.js';
@@ -30,9 +31,9 @@ test.describe.serial('signup → BYOP wizard', () => {
       return;
     }
     const minted = await tryMintTestAccount(request, baseURL);
-    // Authenticate before the first navigation: headers apply to subsequent
-    // loads only, so this must precede every goto in the spec.
-    await applyAccountToPage(page, minted);
+    // Authenticate before the first navigation: the origin-scoped route
+    // applies to subsequent loads only, so this must precede every goto.
+    await applyAccountToPage(page, minted, baseURL);
     sharedAccount = minted;
     if (minted?.viaApi) {
       // API seam minted the account; the wizard must still be reachable.
@@ -77,42 +78,10 @@ test.describe.serial('signup → BYOP wizard', () => {
     }
     // Prefer the signup test's account; mint a fallback on retry isolation.
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
-    await applyAccountToPage(page, account);
-    const endpoint = syntheticNntpEndpoint();
-    const password = process.env.SYNTHETIC_NNTP_PASS;
-    if (!password) {
-      throw new Error(
-        '[byop] SYNTHETIC_NNTP_PASS is not set. The wizard must point at the hosted ' +
-          'synthetic endpoint or test provider — refusing to submit an empty credential. ' +
-          'See e2e/README.md.',
-      );
-    }
-    await page.goto(`${baseURL}/onboarding/byop`, {
-      waitUntil: 'domcontentloaded',
-      timeout: 30_000,
-    });
-    await expect(page.getByTestId(TESTIDS.byopHost)).toBeVisible({ timeout: 15_000 });
-    await page.getByTestId(TESTIDS.byopHost).fill(endpoint.host);
-    await page.getByTestId(TESTIDS.byopPort).fill(String(endpoint.port));
-    await page.getByTestId(TESTIDS.byopUser).fill(endpoint.user);
-    await page.getByTestId(TESTIDS.byopPass).fill(password);
-    if (endpoint.tls) {
-      const tls = page.getByTestId(TESTIDS.byopTls);
-      if ((await tls.count()) > 0 && (await tls.getAttribute('type')) === 'checkbox') {
-        const checked = await tls.isChecked().catch(() => false);
-        if (!checked) await tls.check().catch(() => {});
-      }
-    }
-    await page.getByTestId(TESTIDS.byopTest).click();
-    const status = page.getByTestId(TESTIDS.byopStatus);
-    await expect(status, 'BYOP test-connection gave no status').toBeVisible({ timeout: 60_000 });
-    await expect(status, 'BYOP test-connection to the synthetic endpoint failed').toContainText(
-      /success|connected|ok/i,
-      { timeout: 60_000 },
-    );
-    await page.getByTestId(TESTIDS.byopSave).click();
-    await expect(page, 'BYOP save did not reach the library').toHaveURL(/\/library/, {
-      timeout: 30_000,
-    });
+    await applyAccountToPage(page, account, baseURL);
+    // Shared helper (also used by the ingest spec): connects the synthetic
+    // endpoint, asserts test-connection success, saves into the library.
+    // Fails closed when SYNTHETIC_NNTP_PASS is missing.
+    await completeByopWizard(page, baseURL);
   });
 });

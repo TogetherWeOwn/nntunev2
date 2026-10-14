@@ -41,6 +41,23 @@ export function qaAuthHeader(): Record<string, string> {
 }
 
 /**
+ * Same-origin gate for credentialed browser traffic (review finding: the
+ * Access service token and session bearer must never go to every origin).
+ * `extraHTTPHeaders` / `setExtraHTTPHeaders` attach to cross-origin
+ * subresources too, so pages scope headers through this predicate in a
+ * `context.route` handler instead: staging origin → attach, anything else →
+ * continue unmodified. Pure function so the two-origin behavior is pinned by
+ * offline self-tests without launching a browser.
+ */
+export function isStagingOrigin(requestUrl: string, baseURL: string): boolean {
+  try {
+    return new URL(requestUrl).origin === new URL(baseURL).origin;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Fail closed when a response is the Cloudflare Access wall instead of the
  * app: a wall-status code (401/403/302) TOGETHER WITH Access markers means
  * the service token is missing or wrong. Status and markers are checked

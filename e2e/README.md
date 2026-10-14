@@ -64,9 +64,12 @@ dependencies this harness needs.
 How the suite uses them:
 
 - Configured staging requires both Access values before any request:
-  `playwright.config.ts` validates the URL and pair at startup, then installs
-  the headers at context level so page navigations are covered. API calls
-  attach them per request. Both missing or either missing fails closed;
+  `playwright.config.ts` validates the URL and pair at startup. Browser pages
+  attach them ONLY to the staging origin via an origin-checked
+  `context.route` (`applyAccountToPage` + `isStagingOrigin`): cross-origin
+  subresources (fonts, analytics, stream/store URLs) never receive the
+  service token or session bearer. API clients attach them per request (they
+  only talk to staging). Both missing or either missing fails closed;
   offline checks remain usable with no staging URL and no Access pair. An Access wall (wall status + Access markers, including
   302s to the Access login) fails closed with a remediation message instead
   of masquerading as an app failure; plain app 4xx responses pass through.
@@ -75,9 +78,19 @@ How the suite uses them:
   `helpers/accounts.ts` names it; cookie sessions would update the helper +
   specs together).
 - Test accounts are throwaway (`e2e+<stamp>@example.test`); the API seam is
-  tried first, UI signup second. The over-limit check needs the seam to
-  support `{plan:"overlimit"}` (metering card); until then it skips with the
-  reason recorded, while usage/plan metadata is still asserted.
+  tried first, a fully-implemented UI signup second (each journey file signs
+  up its own identity — Playwright isolates module state per file, so there
+  is no cross-file account sharing). Once `QA_AUTH_TOKEN` is set the seam is
+  required infrastructure: transport errors, non-2xx and non-JSON mint
+  responses throw instead of collapsing into a silent skip, and API-driven
+  steps (`requireApiAccount`) refuse to run anonymously. The identity that
+  ingests always completes the BYOP wizard first (shared
+  `completeByopWizard` helper), because the ingest worker probes through the
+  user's provider connection. The over-limit check needs the seam to support
+  `{plan:"overlimit"}` (metering card); when the capped account's library is
+  empty the harness ingests the fixture as that account, so no pre-seeded
+  track is required. On CI an unavailable over-limit seam fails instead of
+  skipping, so plan-limit enforcement can never pass unexercised.
 
 ## CI
 
@@ -100,9 +113,15 @@ How the suite uses them:
 
 ## Evidence
 
-On failure CI uploads textual reports from `playwright-report/` +
+On failure CI sanitizes then uploads `playwright-report/` +
 `test-results/` (7 days). Raw traces and screenshots are disabled: tracing
 records request headers/bodies and screenshots can expose account/provider
-information. Do not enable them for credential-bearing runs without a verified
+information. Sanitization is still required with them off: Playwright 1.55
+writes `test-results/**/error-context.md` (an ARIA snapshot rendering filled
+input values, including the BYOP password) and embeds the same text in
+`playwright-report/data/*.md` — the workflow deletes both paths before
+upload, and offline self-tests execute the exact checked-in sanitize blocks
+against a marker password to prove nothing uploaded can carry it. Do not
+enable traces/screenshots for credential-bearing runs without a verified
 redaction path. A QA PASS verdict cites the green `e2e-staging` run URL +
 deployed head SHA; NEEDS WORK cites the failing spec + step.
