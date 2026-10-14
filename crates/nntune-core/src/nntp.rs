@@ -35,6 +35,9 @@ pub struct NntpConfig {
     pub timeout: Duration,
     /// Maximum `ARTICLE` commands in flight in [`NntpClient::fetch_many`].
     pub max_pipelined: usize,
+    /// Maximum bytes appended per ARTICLE/BODY/raw dot-block, including CRLF.
+    /// A limit violation makes the connection unusable; reconnect to retry.
+    pub max_article_bytes: usize,
 }
 
 impl Default for NntpConfig {
@@ -47,6 +50,7 @@ impl Default for NntpConfig {
             password: None,
             timeout: Duration::from_secs(20),
             max_pipelined: 16,
+            max_article_bytes: crate::transport::MAX_ARTICLE_BYTES,
         }
     }
 }
@@ -116,8 +120,15 @@ impl<T: Transport> NntpClient<T> {
                 "NntpConfig.max_pipelined must be at least 1".into(),
             ));
         }
+        if config.max_article_bytes == 0
+            || config.max_article_bytes > crate::transport::MAX_ARTICLE_BYTES
+        {
+            return Err(Error::Malformed(
+                "NntpConfig.max_article_bytes must be between 1 and 64 MiB".into(),
+            ));
+        }
         let mut client = NntpClient {
-            transport: BufferedTransport::new(transport),
+            transport: BufferedTransport::with_article_limit(transport, config.max_article_bytes),
             max_pipelined: config.max_pipelined,
         };
         let greeting = client.read_reply().await?;
@@ -226,12 +237,19 @@ impl<T: Transport> NntpClient<T> {
 
     /// Pipelined `ARTICLE` fetch: writes up to `max_pipelined` commands
     /// back-to-back (NNTP replies arrive in command order), then reads each
-    /// reply + dot-block in turn. A per-article `430` aborts the batch with
-    /// [`Error::ArticleNotFound`]; successfully read articles before the
-    /// failure are discarded because reply order no longer aligns with the
-    /// request order once a body is skipped — callers should retry the
-    /// remainder unpipelined or in a fresh batch.
+    /// reply + dot-block in turn. On any error, the batch is discarded and
+    /// the client becomes unusable: later pipelined replies may still be on
+    /// the wire. Reconnect before retrying; never reuse `into_inner()` after
+    /// a failed batch. A per-article `430` returns [`Error::ArticleNotFound`].
     pub async fn fetch_many(&mut self, message_ids: &[&str]) -> Result<Vec<FetchOutcome>> {
+        let result = self.fetch_many_inner(message_ids).await;
+        if result.is_err() {
+            self.transport.invalidate();
+        }
+        result
+    }
+
+    async fn fetch_many_inner(&mut self, message_ids: &[&str]) -> Result<Vec<FetchOutcome>> {
         let mut out = Vec::with_capacity(message_ids.len());
         for chunk in message_ids.chunks(self.max_pipelined()) {
             for id in chunk {

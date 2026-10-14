@@ -17,7 +17,7 @@
 //!   dependency on wasm.
 
 use std::collections::HashMap;
-use std::io::BufRead;
+use std::io::{self, BufRead, Read};
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -140,6 +140,47 @@ pub fn parse(xml: &[u8]) -> Result<Document> {
     Parser::with_default_limits()?.parse(xml)
 }
 
+// Enforce the limit at the BufRead boundary: quick-xml may accumulate a
+// complete event before returning control to any of the parser's loops.
+struct BoundedReader<R> {
+    inner: R,
+    remaining: u64,
+    exceeded: bool,
+}
+
+impl<R: BufRead> BufRead for BoundedReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        let bytes = self.inner.fill_buf()?;
+        if self.remaining == 0 && !bytes.is_empty() {
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "NZB document byte limit exceeded",
+            ));
+        }
+        let len = (bytes.len() as u64).min(self.remaining) as usize;
+        Ok(&bytes[..len])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.remaining -= amount as u64;
+        self.inner.consume(amount);
+    }
+}
+
+impl<R: BufRead> Read for BoundedReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let bytes = self.fill_buf()?;
+        let len = out.len().min(bytes.len());
+        out[..len].copy_from_slice(&bytes[..len]);
+        self.consume(len);
+        Ok(len)
+    }
+}
+
 /// Streaming parser over any buffered byte source.
 pub struct Parser {
     limits: Limits,
@@ -159,24 +200,28 @@ impl Parser {
         Ok(Parser { limits })
     }
 
-    /// Rejects the parse once the consumed input passes `document_bytes` —
-    /// the streaming equivalent of v1's `boundedReader`.
-    fn check_document_bound<R: BufRead>(&self, reader: &Reader<R>) -> Result<()> {
-        if reader.buffer_position() > self.limits.document_bytes {
-            return Err(Error::Bounds {
+    /// Parses one NZB document. A bounded byte source covers every XML event
+    /// (including large comments/attributes and trailing input), not just
+    /// transitions between events. The reusable event buffer is at most
+    /// `document_bytes`; the caller's own BufRead buffering is separate.
+    pub fn parse<R: BufRead>(&self, reader: R) -> Result<Document> {
+        let mut bounded = BoundedReader {
+            inner: reader,
+            remaining: self.limits.document_bytes,
+            exceeded: false,
+        };
+        let result = self.parse_bounded(&mut bounded);
+        if bounded.exceeded {
+            Err(Error::Bounds {
                 bound: "document bytes",
                 limit: self.limits.document_bytes as i64,
-            });
+            })
+        } else {
+            result
         }
-        Ok(())
     }
 
-    /// Parses one NZB document. The reader is consumed event by event with a
-    /// single reused scratch buffer — memory stays flat regardless of input
-    /// size. `document_bytes` is enforced via the stream position in every
-    /// event loop, so an over-long document aborts as soon as the bound is
-    /// crossed, not after it is fully parsed.
-    pub fn parse<R: BufRead>(&self, reader: R) -> Result<Document> {
+    fn parse_bounded<R: BufRead>(&self, reader: R) -> Result<Document> {
         let mut reader = Reader::from_reader(reader);
         reader.config_mut().trim_text(true);
 
@@ -184,7 +229,6 @@ impl Parser {
         // The root must appear within the prolog bound; quick-xml reports the
         // stream position so a gigabyte of comments/PIs before <nzb> fails.
         let root_name = loop {
-            self.check_document_bound(&reader)?;
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
                     if reader.buffer_position() > MAX_PROLOG_BYTES {
@@ -235,7 +279,6 @@ impl Parser {
         let mut message_ids: Vec<String> = Vec::new();
 
         loop {
-            self.check_document_bound(&reader)?;
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(e)) => {
                     let name = local_name(&e.name());
@@ -373,9 +416,6 @@ impl Parser {
         let mut message_ids = Vec::new();
 
         loop {
-            // Same document bound as the outer loop: a single over-long
-            // `<file>` aborts here instead of being fully parsed first.
-            self.check_document_bound(reader)?;
             match reader.read_event_into(buf) {
                 Ok(Event::Start(e)) => {
                     let name = local_name(&e.name());

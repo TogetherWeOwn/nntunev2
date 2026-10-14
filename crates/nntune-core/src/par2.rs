@@ -72,8 +72,10 @@ pub struct RecoveryFile {
     pub whole_md5: [u8; 16],
     /// MD5 of the first 16 KiB.
     pub first16k_md5: [u8; 16],
-    /// Declared file name (PAR2 metadata, never a storage key).
+    /// Lossy display name (PAR2 metadata, never a storage key).
     pub filename: String,
+    /// Original filename bytes, excluding NUL padding; authoritative identity.
+    pub filename_bytes: Vec<u8>,
     /// Declared file length in bytes.
     pub length: u64,
     /// Per-block CRC32s from the IFSC packet (each covers a full
@@ -108,7 +110,7 @@ impl RecoverySet {
         let mut set = RecoverySet::default();
         let mut members: HashMap<[u8; 16], ()> = HashMap::new();
         let mut protected: HashMap<[u8; 16], ()> = HashMap::new();
-        let mut filenames: HashMap<String, [u8; 16]> = HashMap::new();
+        let mut filenames: HashMap<Vec<u8>, [u8; 16]> = HashMap::new();
         let mut recovery_packets: HashMap<u32, [u8; 16]> = HashMap::new();
         let mut set_id_seen = false;
         let mut main_seen = false;
@@ -206,9 +208,26 @@ impl RecoverySet {
         Ok(set)
     }
 
-    /// Resolves a name to any description the set carries, protected or not.
+    /// Resolves a display name only when it identifies exactly one file.
+    /// Distinct legacy encodings may have the same lossy display name.
     pub fn file_by_name(&self, name: &str) -> Option<&RecoveryFile> {
-        self.files.values().find(|f| f.filename == name)
+        let mut matches = self
+            .files
+            .values()
+            .filter(|f| f.has_file_desc && f.filename == name);
+        let file = matches.next()?;
+        if matches.next().is_some() {
+            None
+        } else {
+            Some(file)
+        }
+    }
+
+    /// Resolves the original NUL-trimmed filename without lossy conversion.
+    pub fn file_by_name_bytes(&self, name: &[u8]) -> Option<&RecoveryFile> {
+        self.files
+            .values()
+            .find(|f| f.has_file_desc && f.filename_bytes == name)
     }
 
     /// Resolves a name only when the set actually protects that file. A
@@ -218,6 +237,11 @@ impl RecoverySet {
     pub fn protected_file_by_name(&self, name: &str) -> Option<&RecoveryFile> {
         self.file_by_name(name)
             .filter(|f| f.protected && f.has_file_desc)
+    }
+
+    /// Byte-precise counterpart of [`Self::protected_file_by_name`].
+    pub fn protected_file_by_name_bytes(&self, name: &[u8]) -> Option<&RecoveryFile> {
+        self.file_by_name_bytes(name).filter(|f| f.protected)
     }
 
     /// Verifies candidate bytes against a protected file's metadata: length,
@@ -230,6 +254,23 @@ impl RecoverySet {
                 filename: name.to_string(),
                 detail: "no protected recovery-set entry for this file".into(),
             })?;
+        self.verify_file(file, data)
+    }
+
+    /// Like [`Self::verify`], selecting by the original filename bytes rather
+    /// than a potentially ambiguous display name.
+    pub fn verify_bytes(&self, name: &[u8], data: &[u8]) -> Result<()> {
+        let file = self
+            .protected_file_by_name_bytes(name)
+            .ok_or_else(|| Error::Par2Unhealthy {
+                filename: String::from_utf8_lossy(name).into_owned(),
+                detail: "no protected recovery-set entry for this file".into(),
+            })?;
+        self.verify_file(file, data)
+    }
+
+    fn verify_file(&self, file: &RecoveryFile, data: &[u8]) -> Result<()> {
+        let name = &file.filename;
         if data.len() as u64 != file.length {
             return Err(Error::Par2Unhealthy {
                 filename: name.to_string(),
@@ -315,6 +356,18 @@ impl RecoverySet {
         let file = self.protected_file_by_name(name).ok_or_else(|| {
             Error::Malformed(format!("par2 precheck: no protected entry for {name:?}"))
         })?;
+        self.precheck_file(file, segments)
+    }
+
+    /// Like [`Self::precheck`], selecting by the original filename bytes.
+    pub fn precheck_bytes(&self, name: &[u8], segments: &[(u32, u64)]) -> Result<bool> {
+        let file = self.protected_file_by_name_bytes(name).ok_or_else(|| {
+            Error::Malformed(format!("par2 precheck: no protected entry for {name:?}"))
+        })?;
+        self.precheck_file(file, segments)
+    }
+
+    fn precheck_file(&self, file: &RecoveryFile, segments: &[(u32, u64)]) -> Result<bool> {
         if self.block_size == 0 {
             return Err(Error::Malformed(
                 "par2 precheck: block size must be positive".into(),
@@ -342,7 +395,9 @@ impl RecoverySet {
             } else {
                 crc32_combine(actual_crc, crc, len)
             };
-            actual_len += len;
+            actual_len = actual_len.checked_add(len).ok_or_else(|| {
+                Error::Malformed("par2 precheck: segment length sum overflows u64".into())
+            })?;
         }
         if actual_len != file.length {
             return Err(Error::Malformed(
@@ -448,7 +503,7 @@ fn parse_main_body(
 fn parse_filedesc_body(
     body: &[u8],
     set: &mut RecoverySet,
-    filenames: &mut HashMap<String, [u8; 16]>,
+    filenames: &mut HashMap<Vec<u8>, [u8; 16]>,
     digests: &mut HashMap<[u8; 16], [u8; 16]>,
 ) -> Result<()> {
     if body.len() < 56 {
@@ -461,21 +516,22 @@ fn parse_filedesc_body(
     let mut first16k = [0u8; 16];
     first16k.copy_from_slice(&body[32..48]);
     let length = u64::from_le_bytes(body[48..56].try_into().unwrap());
-    let filename = String::from_utf8_lossy(&body[56..])
-        .trim_end_matches('\0')
-        .to_string();
+    let name = &body[56..];
+    let end = name.iter().rposition(|&b| b != 0).map_or(0, |n| n + 1);
+    let name = &name[..end];
+    let filename = String::from_utf8_lossy(name).into_owned();
 
-    // The File ID must derive from the packet's own 16k hash, length, and
-    // (padding-stripped) name — otherwise a Main-listed ID is just a label.
-    let mut seed = Vec::with_capacity(24 + filename.len());
+    // Identity uses original bytes, not a UTF-8 replacement character. Legacy
+    // PAR2 writers commonly put ANSI filenames in the FileDesc packet.
+    let mut seed = Vec::with_capacity(24 + name.len());
     seed.extend_from_slice(&body[32..56]);
-    seed.extend_from_slice(filename.as_bytes());
+    seed.extend_from_slice(name);
     if md5::compute(&seed).0 != file_id {
         return Err(malformed(
             "FileDesc file ID is not derived from its own 16k hash, length, and name",
         ));
     }
-    if let Some(&other) = filenames.get(&filename) {
+    if let Some(&other) = filenames.get(name) {
         if other != file_id {
             return Err(malformed(
                 "duplicate filename belongs to different file IDs",
@@ -495,6 +551,7 @@ fn parse_filedesc_body(
         whole_md5: [0; 16],
         first16k_md5: [0; 16],
         filename: String::new(),
+        filename_bytes: Vec::new(),
         length: 0,
         block_crc32s: Vec::new(),
         protected: false,
@@ -503,9 +560,10 @@ fn parse_filedesc_body(
     file.whole_md5 = whole_md5;
     file.first16k_md5 = first16k;
     file.length = length;
-    file.filename = filename.clone();
+    file.filename = filename;
+    file.filename_bytes = name.to_vec();
     file.has_file_desc = true;
-    filenames.insert(filename, file_id);
+    filenames.insert(name.to_vec(), file_id);
     Ok(())
 }
 
@@ -542,6 +600,7 @@ fn parse_ifsc_body(
         whole_md5: [0; 16],
         first16k_md5: [0; 16],
         filename: String::new(),
+        filename_bytes: Vec::new(),
         length: 0,
         block_crc32s: Vec::new(),
         protected: false,
@@ -655,81 +714,4 @@ fn zero_run_crc32(n: u64) -> u32 {
 /// subprocess and needs a writable scratch directory: it is a Container batch
 /// job, never a Worker. On wasm32 the function exists but always reports
 /// [`Error::UnsupportedOnWasm`].
-pub mod repair {
-    use crate::error::{Error, Result};
-    use std::path::{Path, PathBuf};
-
-    /// Outcome of one `par2 repair` run.
-    #[derive(Debug, Clone)]
-    pub struct RepairReport {
-        /// Whether the binary reported success (exit status 0).
-        pub success: bool,
-        /// Damaged blocks the binary says it repaired (parsed from stdout,
-        /// best-effort; -1 when unparsable).
-        pub repaired_blocks: i64,
-        /// Target files the run was asked to repair.
-        pub targets: Vec<PathBuf>,
-        /// Last lines of the binary's combined output (bounded).
-        pub tail: String,
-    }
-
-    /// Runs `par2 repair` in `scratch_dir` over the given `.par2` files plus
-    /// their sibling data files (all paths must already be staged there —
-    /// filenames are PAR2 metadata and are never rewritten by this function).
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn repair_with_binary(
-        par2_bin: &Path,
-        scratch_dir: &Path,
-        par2_files: &[&Path],
-    ) -> Result<RepairReport> {
-        let mut cmd = std::process::Command::new(par2_bin);
-        cmd.arg("repair").current_dir(scratch_dir);
-        for f in par2_files {
-            cmd.arg(f);
-        }
-        let output = cmd.output().map_err(|e| {
-            Error::Malformed(format!(
-                "par2 repair: failed to spawn {}: {e}",
-                par2_bin.display()
-            ))
-        })?;
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let tail: String = combined
-            .lines()
-            .rev()
-            .take(20)
-            .collect::<Vec<_>>()
-            .join("\n");
-        Ok(RepairReport {
-            success: output.status.success(),
-            repaired_blocks: parse_repaired(&combined),
-            targets: par2_files.iter().map(|p| p.to_path_buf()).collect(),
-            tail,
-        })
-    }
-
-    /// wasm32 stub: repair needs a subprocess and never runs on Workers.
-    #[cfg(target_arch = "wasm32")]
-    pub fn repair_with_binary(
-        _par2_bin: &Path,
-        _scratch_dir: &Path,
-        _par2_files: &[&Path],
-    ) -> Result<RepairReport> {
-        Err(Error::UnsupportedOnWasm("par2 repair"))
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn parse_repaired(output: &str) -> i64 {
-        // par2cmdline-turbo prints e.g. "Repair complete." / "Repair failed."
-        // and a "Found N recoverable blocks" line; keep the parse forgiving.
-        if output.contains("Repair complete.") {
-            0
-        } else {
-            -1
-        }
-    }
-}
+pub mod repair;

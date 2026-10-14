@@ -13,9 +13,9 @@
 //! - [`par2`]: PAR2 recovery-set parsing and verification. Repair is
 //!   native-only (it shells out to `par2cmdline-turbo` in a Container).
 //!
-//! The crate itself never touches the network or the clock: timeouts and I/O
-//! are the transport implementation's job (see [`transport`] and
-//! [`transports`]).
+//! The protocol/parser core uses injected transports. Transport implementations
+//! own network I/O and per-operation timeouts (see [`transport`] and
+//! [`transports`]); the native repair runner owns its subprocess deadline.
 
 pub mod decrypt;
 pub mod error;

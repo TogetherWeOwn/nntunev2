@@ -1,8 +1,8 @@
 //! Portable NNTP transport abstraction.
 //!
-//! The crate never touches the network or the clock directly: [`Transport`]
-//! is a byte pipe, and every implementation enforces the configured timeout
-//! on each operation, reporting expiry as [`io::ErrorKind::TimedOut`].
+//! This module uses [`Transport`] as a byte pipe rather than accessing the
+//! network or clock directly. Every implementation enforces the configured
+//! per-operation timeout, reporting expiry as [`io::ErrorKind::TimedOut`].
 //!
 //! - Native (tokio + rustls): [`crate::transports::tokio_tls`] (feature
 //!   `native-tls`).
@@ -46,18 +46,48 @@ pub trait Transport {
 /// unbounded growth on a hostile or broken server).
 pub const MAX_LINE_BYTES: usize = 16 * 1024;
 
+/// Default maximum decoded wire bytes in a single article/dot-block (v1 parity).
+pub const MAX_ARTICLE_BYTES: usize = 64 * 1024 * 1024;
+
 /// CRLF line framing and NNTP dot-block reading over any [`Transport`].
 pub struct BufferedTransport<T: Transport> {
     inner: T,
     buf: Vec<u8>,
+    max_article_bytes: usize,
+    usable: bool,
 }
 
 impl<T: Transport> BufferedTransport<T> {
     /// Wraps a connected transport (the server greeting is still unread).
     pub fn new(inner: T) -> Self {
+        Self::with_article_limit(inner, MAX_ARTICLE_BYTES)
+    }
+
+    /// Wraps a transport with a per-dot-block byte limit, clamped to the hard
+    /// [`MAX_ARTICLE_BYTES`] ceiling. Zero permits only empty dot-blocks.
+    pub fn with_article_limit(inner: T, max_article_bytes: usize) -> Self {
         BufferedTransport {
             inner,
             buf: Vec::with_capacity(4096),
+            max_article_bytes: max_article_bytes.min(MAX_ARTICLE_BYTES),
+            usable: true,
+        }
+    }
+
+    /// Prevents reuse after reply framing or a pipeline is no longer aligned.
+    pub(crate) fn invalidate(&mut self) {
+        self.usable = false;
+        self.buf.clear();
+    }
+
+    fn ensure_usable(&self) -> io::Result<()> {
+        if self.usable {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "NNTP connection is unusable; reconnect before retrying",
+            ))
         }
     }
 
@@ -74,8 +104,23 @@ impl<T: Transport> BufferedTransport<T> {
     /// Reads one CRLF-terminated server line, returned WITHOUT the terminator.
     /// Bare-LF line endings are tolerated.
     pub async fn read_line(&mut self) -> io::Result<Vec<u8>> {
+        self.ensure_usable()?;
+        let result = self.read_line_inner().await;
+        if result.is_err() {
+            self.invalidate();
+        }
+        result
+    }
+
+    async fn read_line_inner(&mut self) -> io::Result<Vec<u8>> {
         loop {
             if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+                if pos >= MAX_LINE_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "NNTP line exceeds 16 KiB",
+                    ));
+                }
                 let mut line = self.buf.drain(..=pos).collect::<Vec<u8>>();
                 line.pop();
                 if line.last() == Some(&b'\r') {
@@ -109,18 +154,39 @@ impl<T: Transport> BufferedTransport<T> {
 
     /// Reads an NNTP multi-line (dot-terminated) data block into `out`,
     /// performing dot-unstuffing (`..X` → `.X`). The terminating lone `.`
-    /// line is consumed and not written. `out` is appended to, not cleared.
+    /// line is consumed and not written. The limit counts appended bytes,
+    /// including CRLF, not pre-existing contents. On failure, partial output is
+    /// rolled back and this connection cannot be reused.
     pub async fn read_dot_block(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
+        self.ensure_usable()?;
+        let start = out.len();
+        let result = self.read_dot_block_inner(out, start).await;
+        if result.is_err() {
+            out.truncate(start);
+            self.invalidate();
+        }
+        result
+    }
+
+    async fn read_dot_block_inner(&mut self, out: &mut Vec<u8>, start: usize) -> io::Result<()> {
         loop {
             let line = self.read_line().await?;
             if line == b"." {
                 return Ok(());
             }
-            if line.starts_with(b"..") {
-                out.extend_from_slice(&line[1..]);
+            let content = if line.starts_with(b"..") {
+                &line[1..]
             } else {
-                out.extend_from_slice(&line);
+                &line[..]
+            };
+            let remaining = self.max_article_bytes.saturating_sub(out.len() - start);
+            if content.len() + 2 > remaining {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "NNTP article exceeds byte limit",
+                ));
             }
+            out.extend_from_slice(content);
             out.extend_from_slice(b"\r\n");
         }
     }
@@ -128,9 +194,20 @@ impl<T: Transport> BufferedTransport<T> {
     /// Sends one protocol line (appends CRLF) in a single write, so one
     /// command is always one packet on the wire.
     pub async fn write_line(&mut self, line: &[u8]) -> io::Result<()> {
+        self.ensure_usable()?;
+        if line.contains(&b'\r') || line.contains(&b'\n') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "NNTP command contains a line break",
+            ));
+        }
         let mut framed = Vec::with_capacity(line.len() + 2);
         framed.extend_from_slice(line);
         framed.extend_from_slice(b"\r\n");
-        self.inner.write_all(&framed).await
+        let result = self.inner.write_all(&framed).await;
+        if result.is_err() {
+            self.invalidate();
+        }
+        result
     }
 }

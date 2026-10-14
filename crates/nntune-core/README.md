@@ -21,12 +21,34 @@ native targets (services, Container batch jobs).
 - `native-tls` — tokio + rustls transport (non-wasm).
 - `worker-transport` — Workers `connect()` socket transport (wasm32 only).
 
-The crate itself never touches the network or the clock.
+The protocol/parser core uses injected transports; the transport implementations
+and the native repair runner own network I/O and deadlines.
+
+## Resource limits and lookup behavior
+
+- **NNTP:** `NntpConfig.max_article_bytes` defaults to 64 MiB, counting CRLF
+  but excluding bytes already in the output buffer. Overflow rolls back partial
+  output and makes the connection unusable. A failed `fetch_many` also poisons
+  the client; reconnect before retrying. Successful results are all buffered, so
+  limit the requested batch size to your runtime's memory budget.
+- **NZB:** `document_bytes` is enforced at the `BufRead` boundary, including
+  during buffering of a single XML event. The input's own buffer is separate.
+- **PAR2:** Original `filename_bytes` determine identity. Ambiguous display-name
+  lookups return `None`; use `file_by_name_bytes`, `verify_bytes`, and
+  `precheck_bytes` for byte-precise selection and verification.
+
+**Native repair is Linux-only**, requiring `/usr/bin/prlimit`, a trusted
+image-pinned binary, and an exclusive scratch directory. Default ceilings are
+120 seconds wall time, 60 seconds CPU, 1 MiB combined output, 8 GiB workspace
+(and per-file size), and 512 MiB address space. `repair_with_limits` accepts
+smaller budgets. Failed or unreported repair counts are `-1`, not a fabricated
+zero. The calling Container must remain unprivileged with quota-backed scratch:
+aggregate-size polling is neither a sandbox nor a hard disk quota.
 
 ## Checks
 
 ```sh
-cargo test -p nntune-core                    # 33 tests, incl. Go-vector interop
+cargo test -p nntune-core                    # incl. Go-vector interop
 cargo clippy -p nntune-core --all-targets    # clean, `-D warnings` in CI
 cargo bench -p nntune-core                   # yEnc ms/MB for the bench gate
 cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features [--features worker-transport]

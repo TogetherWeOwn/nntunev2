@@ -27,6 +27,9 @@ webpki-roots = { version = "1", optional = true }
 worker = { version = "0.8", optional = true }
 futures-util = { version = "0.3", optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["io-util", "net", "time"], optional = true }
 
