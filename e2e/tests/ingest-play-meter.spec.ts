@@ -12,6 +12,7 @@ import {
 import { assertNoAccessWall, readApiBody, stagingBaseUrl } from '../helpers/access.js';
 import {
   accountHeaders,
+  apiGet,
   applyAccountToPage,
   completeByopWizard,
   requireApiAccount,
@@ -113,7 +114,7 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     requireApiAccount(account, 'range');
     const headers = accountHeaders(account);
     const libraryUrl = `${baseURL}${API.library}`;
-    const library = await request.get(libraryUrl, { headers, timeout: 30_000 });
+    const library = await apiGet(request, libraryUrl, headers, 'range');
     const libraryBody = await readApiBody(library, libraryUrl, 'range');
     expect(library.ok(), `library listing failed: HTTP ${library.status()}`).toBe(true);
     const items = JSON.parse(libraryBody) as Array<{ id?: string }>;
@@ -129,19 +130,23 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     ): void =>
       assertNoAccessWall({ status, headers: responseHeaders, bodyText: '', url }, 'range');
 
-    const head = await request.get(`${baseURL}${API.stream(trackId as string)}`, {
-      headers: { ...headers, Range: 'bytes=0-8' },
-      timeout: 30_000,
-    });
+    const head = await apiGet(
+      request,
+      `${baseURL}${API.stream(trackId as string)}`,
+      { ...headers, Range: 'bytes=0-8' },
+      'range',
+    );
     probeHeaders(head.status(), head.headers(), `${baseURL}${API.stream(trackId as string)}`);
     expect(head.status(), 'first Range seek did not return 206').toBe(206);
     expect(head.headers()['content-range'] !== undefined).toBe(true);
     expect(Number(head.headers()['content-length'])).toBe(9);
 
-    const seek = await request.get(`${baseURL}${API.stream(trackId as string)}`, {
-      headers: { ...headers, Range: 'bytes=9-17' },
-      timeout: 30_000,
-    });
+    const seek = await apiGet(
+      request,
+      `${baseURL}${API.stream(trackId as string)}`,
+      { ...headers, Range: 'bytes=9-17' },
+      'range',
+    );
     probeHeaders(seek.status(), seek.headers(), `${baseURL}${API.stream(trackId as string)}`);
     expect(seek.status(), 'mid-track Range seek did not return 206').toBe(206);
     expect((seek.headers()['content-range'] ?? '').startsWith('bytes 9-17/')).toBe(true);
@@ -160,7 +165,7 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     requireApiAccount(account, 'meter');
     const headers = accountHeaders(account);
     const usageUrl = `${baseURL}${API.usage}`;
-    const beforeRes = await request.get(usageUrl, { headers, timeout: 30_000 });
+    const beforeRes = await apiGet(request, usageUrl, headers, 'meter');
     const beforeBody = await readApiBody(beforeRes, usageUrl, 'meter');
     expect(beforeRes.ok(), `usage read failed: HTTP ${beforeRes.status()}`).toBe(true);
     const before = extractUsageBytes(JSON.parse(beforeBody));
@@ -169,17 +174,14 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     // ingested track. The previous test's seeks ran before `before` was read
     // and cannot be the source of `after > before`.
     const libraryUrl = `${baseURL}${API.library}`;
-    const library = await request.get(libraryUrl, { headers, timeout: 30_000 });
+    const library = await apiGet(request, libraryUrl, headers, 'meter');
     const libraryBody = await readApiBody(library, libraryUrl, 'meter');
     expect(library.ok(), `library listing failed: HTTP ${library.status()}`).toBe(true);
     const items = JSON.parse(libraryBody) as Array<{ id?: string }>;
     const trackId = Array.isArray(items) ? items[0]?.id : undefined;
     expect(trackId, 'meter needs the ingested track — ingest spec must run first').toBeTruthy();
     const streamUrl = `${baseURL}${API.stream(trackId as string)}`;
-    const rangeRes = await request.get(streamUrl, {
-      headers: { ...headers, Range: 'bytes=0-0' },
-      timeout: 30_000,
-    });
+    const rangeRes = await apiGet(request, streamUrl, { ...headers, Range: 'bytes=0-0' }, 'meter');
     assertNoAccessWall(
       { status: rangeRes.status(), headers: rangeRes.headers(), bodyText: '', url: streamUrl },
       'meter',
@@ -203,13 +205,13 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     }
 
     await expect(async () => {
-      const res = await request.get(usageUrl, { headers, timeout: 30_000 });
+      const res = await apiGet(request, usageUrl, headers, 'meter');
       const body = await readApiBody(res, usageUrl, 'meter');
       expect(res.ok()).toBe(true);
       expect(extractUsageBytes(JSON.parse(body))).toBeGreaterThan(before);
     }).toPass({ timeout: 60_000 });
 
-    const metaRes = await request.get(usageUrl, { headers, timeout: 30_000 });
+    const metaRes = await apiGet(request, usageUrl, headers, 'meter');
     const metaBody = await readApiBody(metaRes, usageUrl, 'meter');
     expect(metaRes.ok(), `usage read failed: HTTP ${metaRes.status()}`).toBe(true);
     const meta = extractPlanMeta(JSON.parse(metaBody));
@@ -254,7 +256,7 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     const headers = accountHeaders(capped);
     const libraryUrl = `${baseURL}${API.library}`;
     const readTrackId = async (): Promise<string | undefined> => {
-      const library = await request.get(libraryUrl, { headers, timeout: 30_000 });
+      const library = await apiGet(request, libraryUrl, headers, 'plan-limit');
       const libraryBody = await readApiBody(library, libraryUrl, 'plan-limit');
       let items: Array<{ id?: string }>;
       try {
@@ -293,10 +295,7 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
         'account (the overlimit seam must allow ingest or pre-seed a streamable track)',
     ).toBeTruthy();
     const streamUrl = `${baseURL}${API.stream(trackId as string)}`;
-    const res = await request.get(streamUrl, {
-      headers: { ...headers, Range: 'bytes=0-8' },
-      timeout: 30_000,
-    });
+    const res = await apiGet(request, streamUrl, { ...headers, Range: 'bytes=0-8' }, 'plan-limit');
     if (!((PLAN_LIMIT_STATUSES as readonly number[]).includes(res.status()))) {
       // Only read the body on the unexpected path: a wall here must name
       // itself instead of surfacing as a bare status mismatch below.

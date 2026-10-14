@@ -28,6 +28,29 @@ Actions secrets (CI) or shell exports (local).
 4. **Contract drift:** a renamed `data-testid` or reshaped JSON body fails
    with the contract key named. Update app + `helpers/contract.ts` together.
 
+## Contract drift (current app, 2026-10-14)
+
+`origin/main` now ships the SvelteKit app (PR #12), so the harness is
+checked against its real contract for the first time. The smoke stays green
+on the current app; the items below are future contract, documented here so
+the activation checklist is accurate:
+
+- `GET /api/health` returns exactly `{ok:true}`
+  (`apps/web/src/routes/api/health/+server.ts`, pinned by
+  `apps/web/tests/smoke.spec.ts` `toEqual({ok:true})`). `health.spec.ts`
+  requires `ok === true` and asserts `version` only when the app ships it.
+- `GET /api/ready` does not exist yet (staging answers 404). The smoke
+  tolerates 404 as "not yet implemented" and pins the 200/503 + Retry-After
+  shape once the route lands.
+- `apps/web/src` has no `data-testid` hooks yet. The app-shell smoke accepts
+  `data-testid="app-root"` when present and otherwise falls back to the
+  landing's `NNTune` heading; signup/BYOP/library/player/meter hooks
+  (`helpers/contract.ts` `TESTIDS`) and `/signup`'s real form, the BYOP
+  wizard, ingest/library/stream/usage endpoints arrive with the venture
+  slices that own them. The journey specs (`signup-byop`, `ingest-play-meter`)
+  therefore remain red until those slices land — that failure is the signal,
+  not noise.
+
 ## Run locally
 
 ```sh
@@ -71,7 +94,12 @@ How the suite uses them:
   service token or session bearer, and staging 302 redirects to another
   origin are followed WITHOUT the headers (no-redirect fetch + fulfill, so
   the follow-up request re-enters the scope check clean). API clients attach
-  them per request (they only talk to staging). Both missing or either
+  them per request through `apiGet`/`apiPost` (`helpers/accounts.ts`), which
+  fetch with `maxRedirects: 0`: a staging 302 to another origin is never
+  followed with credentials — the foreign origin receives zero requests and
+  the 3xx fails by name (status + location, values never logged). Raw
+  `request.get`/`request.post` with credential headers is banned in specs.
+  Both missing or either
   missing fails closed;
   offline checks remain usable with no staging URL and no Access pair. An Access wall (wall status + Access markers, including
   302s to the Access login) fails closed with a remediation message instead

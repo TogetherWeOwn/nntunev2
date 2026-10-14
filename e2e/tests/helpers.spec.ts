@@ -11,6 +11,8 @@ import {
 } from '../helpers/access.js';
 import { extractPlanMeta, extractUsageBytes } from '../helpers/contract.js';
 import {
+  apiGet,
+  apiPost,
   applyAccountToPage,
   requireApiAccount,
   tryMintTestAccount,
@@ -428,6 +430,92 @@ test.describe('applyAccountToPage redirect scope (browser)', () => {
       await close(staging).catch(() => {});
       await close(foreign).catch(() => {});
       await activeBrowser.close().catch(() => {});
+    }
+  });
+});
+
+test.describe('apiGet/apiPost redirect scope (no-follow)', () => {
+  // API repro for the redirect leak: Playwright's APIRequestContext follows
+  // redirects by default and forwards custom headers to the target. apiGet/
+  // apiPost fetch with maxRedirects: 0 so a staging 302 to another origin is
+  // returned as-is (foreign origin receives zero requests) and the 3xx fails
+  // by name instead of a bare status mismatch.
+  test('credentialed 302 to a foreign origin is not followed and fails by name', async ({
+    request,
+  }) => {
+    const markerSecret = 'dummy-client-secret-api-probe';
+    const markerSession = 'dummy-session-api-probe';
+    const markerId = 'dummy-client-id-api-probe';
+    const credentialed = {
+      'CF-Access-Client-Id': markerId,
+      'CF-Access-Client-Secret': markerSecret,
+      Authorization: `Bearer ${markerSession}`,
+    };
+
+    const listen = (server: Server): Promise<number> =>
+      new Promise((resolve, reject) => {
+        server.on('error', reject);
+        server.listen(0, '127.0.0.1', () => resolve((server.address() as AddressInfo).port));
+      });
+    const close = (server: Server): Promise<void> =>
+      new Promise((resolve) => server.close(() => resolve()));
+
+    const foreignHits: Array<Record<string, string | string[] | undefined>> = [];
+    const foreign = createServer((req: IncomingMessage, res) => {
+      foreignHits.push({ ...req.headers });
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('landed');
+    });
+    const foreignPort = await listen(foreign);
+    const foreignOrigin = `http://127.0.0.1:${foreignPort}`;
+
+    const staging = createServer((req: IncomingMessage, res) => {
+      if (req.url === '/redir') {
+        res.writeHead(302, { location: `${foreignOrigin}/landed` });
+        res.end();
+        return;
+      }
+      if (req.url === '/submit') {
+        res.writeHead(302, { location: `${foreignOrigin}/landed` });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    });
+    const stagingPort = await listen(staging);
+    const stagingOrigin = `http://127.0.0.1:${stagingPort}`;
+
+    try {
+      // Sanity: a non-redirect passes through with its body.
+      const ok = await apiGet(request, `${stagingOrigin}/ok`, credentialed, 'probe');
+      expect(ok.status()).toBe(200);
+
+      // GET 302 must throw naming the redirect; the foreign origin sees nothing.
+      await expect(
+        apiGet(request, `${stagingOrigin}/redir`, credentialed, 'probe'),
+        'apiGet followed a cross-origin 302 with credentials instead of failing',
+      ).rejects.toThrow(/unexpected redirect.*HTTP 302/);
+      expect(foreignHits, 'foreign origin received a credentialed follow-up to GET 302').toHaveLength(
+        0,
+      );
+
+      // POST 302 (the seam path) behaves the same.
+      await expect(
+        apiPost(request, `${stagingOrigin}/submit`, credentialed, { email: 'a@b' }, 'probe'),
+        'apiPost followed a cross-origin 302 with credentials instead of failing',
+      ).rejects.toThrow(/unexpected redirect.*HTTP 302/);
+      expect(foreignHits, 'foreign origin received a credentialed follow-up to POST 302').toHaveLength(
+        0,
+      );
+
+      // No credential value reached the foreign origin in any form.
+      expect(JSON.stringify(foreignHits)).not.toContain(markerSecret);
+      expect(JSON.stringify(foreignHits)).not.toContain(markerSession);
+      expect(JSON.stringify(foreignHits)).not.toContain(markerId);
+    } finally {
+      await close(staging).catch(() => {});
+      await close(foreign).catch(() => {});
     }
   });
 });

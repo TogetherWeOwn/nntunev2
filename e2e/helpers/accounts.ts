@@ -1,4 +1,4 @@
-import { expect, type APIRequestContext, type Page } from '@playwright/test';
+import { expect, type APIRequestContext, type APIResponse, type Page } from '@playwright/test';
 import { API, TESTIDS, uniqueTestEmail } from './contract.js';
 import {
   accessHeaders,
@@ -25,14 +25,83 @@ export interface TestAccount {
 /**
  * Headers for API calls as a specific test account: Access pair +
  * per-account session (preferred) falling back to the QA seam token.
- * API clients only ever talk to the staging origin, so per-request headers
- * are safe here — the cross-origin risk is browser traffic, which goes
- * through applyAccountToPage's origin-scoped route instead.
+ * Every credentialed API call MUST go through apiGet/apiPost below, which
+ * fetch with maxRedirects: 0: Playwright's APIRequestContext follows
+ * redirects by default (up to 20) and forwards custom headers — including
+ * the Access pair and session bearer — to the redirect target. A 3xx on a
+ * staging /api path (canonical-host/scheme redirect, object-store hand-off)
+ * must fail by name, never follow with credentials.
  */
 export function accountHeaders(account: TestAccount | null): Record<string, string> {
   const headers: Record<string, string> = { ...accessHeaders(), ...qaAuthHeader() };
   if (account?.session) headers.Authorization = `Bearer ${account.session}`;
   return headers;
+}
+
+/**
+ * Throw on a 3xx before any caller can follow it with credentials.
+ * Access-login redirects keep the wall remediation (not a generic redirect);
+ * any other 3xx fails naming the status + location. Names only, no values.
+ */
+function throwOnRedirect(status: number, headers: Record<string, string>, url: string, context: string): void {
+  if (status < 300 || status >= 400) return;
+  const location = headers['location'] ?? headers['Location'] ?? '(no location header)';
+  if (/cloudflareaccess\.com|\/cdn-cgi\/access/i.test(location)) {
+    throw new Error(
+      `[${context}] hit the Cloudflare Access wall at ${url} ` +
+        `(HTTP ${status} → ${location}). Set CF_ACCESS_CLIENT_ID + ` +
+        'CF_ACCESS_CLIENT_SECRET for a QA service token with staging access. ' +
+        'See e2e/README.md. No secret values are logged here by design.',
+    );
+  }
+  throw new Error(
+    `[${context}] unexpected redirect (HTTP ${status} → ${location}) at ${url}: ` +
+      'refusing to follow with credentials (names only — no values logged).',
+  );
+}
+
+/**
+ * Credentialed GET that never follows redirects with headers.
+ * Fetches with maxRedirects: 0 so a staging 302 to another origin is
+ * returned as-is (foreign origin receives zero requests); a 3xx throws
+ * via throwOnRedirect instead of surfacing as a bare status mismatch.
+ */
+export async function apiGet(
+  request: APIRequestContext,
+  url: string,
+  headers: Record<string, string>,
+  context: string,
+  opts?: { timeout?: number },
+): Promise<APIResponse> {
+  const res = await request.get(url, {
+    headers,
+    timeout: opts?.timeout ?? 30_000,
+    maxRedirects: 0,
+  });
+  throwOnRedirect(res.status(), res.headers(), url, context);
+  return res;
+}
+
+/**
+ * Credentialed POST that never follows redirects with headers.
+ * Same no-follow contract as apiGet; used by the test-account seam.
+ */
+export async function apiPost(
+  request: APIRequestContext,
+  url: string,
+  headers: Record<string, string>,
+  data: unknown,
+  context: string,
+  opts?: { timeout?: number },
+): Promise<APIResponse> {
+  const res = await request.post(url, {
+    headers,
+    data: data as Record<string, unknown>,
+    timeout: opts?.timeout ?? 30_000,
+    maxRedirects: 0,
+  });
+  throwOnRedirect(res.status(), res.headers(), url, context);
+  return res;
 }
 
 /**
@@ -112,15 +181,20 @@ export async function tryMintTestAccount(
   let headers: Record<string, string>;
   let bodyText: string;
   try {
-    const response = await request.post(url, {
-      headers: { ...accessHeaders(), ...qaAuthHeader(), 'Content-Type': 'application/json' },
-      data: { email: uniqueTestEmail(plan ? `e2e-${plan}` : 'e2e'), ...(plan ? { plan } : {}) },
-      timeout: 30_000,
-    });
+    const response = await apiPost(
+      request,
+      url,
+      { ...accessHeaders(), ...qaAuthHeader(), 'Content-Type': 'application/json' },
+      { email: uniqueTestEmail(plan ? `e2e-${plan}` : 'e2e'), ...(plan ? { plan } : {}) },
+      'seam',
+    );
     status = response.status();
     headers = response.headers();
     bodyText = await response.text().catch(() => '');
-  } catch {
+  } catch (error) {
+    // apiPost's no-follow throws (redirect/wall) already name the cause —
+    // preserve them instead of collapsing into a generic transport failure.
+    if (error instanceof Error && /unexpected redirect|Access wall/.test(error.message)) throw error;
     throw new Error(
       '[seam] POST /api/test-accounts transport failed (names only — no values logged). ' +
         'The seam is required once QA_AUTH_TOKEN is set; refusing to skip silently.',

@@ -133,6 +133,31 @@ test.describe('credential scope (static pins)', () => {
     expect(accounts).not.toContain('extraHTTPHeaders:');
     expect(accounts).not.toContain('setExtraHTTPHeaders(');
   });
+
+  test('credentialed API calls never follow redirects (maxRedirects: 0)', () => {
+    const accounts = readFileSync(new URL('../helpers/accounts.ts', import.meta.url), 'utf8');
+    expect(accounts).toContain('maxRedirects: 0');
+    expect(accounts).toContain('export async function apiGet');
+    expect(accounts).toContain('export async function apiPost');
+    expect(accounts).toContain('unexpected redirect');
+  });
+
+  test('live specs use the no-follow API wrapper, not raw credentialed calls', () => {
+    // Raw request.get/post with headers would follow a staging 302 to another
+    // origin WITH the Access pair + bearer. Live specs must go through
+    // apiGet/apiPost; helpers.spec.ts may use the raw fixture inside its own
+    // no-follow proof (it asserts the wrapper, not staging).
+    for (const name of ['health.spec.ts', 'ingest-play-meter.spec.ts', 'signup-byop.spec.ts']) {
+      const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
+      expect(source, `${name} must not carry credentials on a raw request call`).not.toMatch(
+        /request\.(get|post)\([^)]*headers/,
+      );
+    }
+    for (const name of ['health.spec.ts', 'ingest-play-meter.spec.ts']) {
+      const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
+      expect(source, `${name} must use the no-follow wrapper`).toContain('apiGet(');
+    }
+  });
 });
 
 // Execute the exact checked-in sanitize blocks: Playwright 1.55 writes
