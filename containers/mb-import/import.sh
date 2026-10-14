@@ -2,14 +2,26 @@
 # mbdump dumps -> Postgres COPY into nntunev2-mb (idempotent, resumable).
 # Usage: DATABASE_URL=<url> ./import.sh <dump-dir>
 # Never echo $DATABASE_URL; pass it only via env/secret store.
+#
+# Input contract (curated TSVs, NOT raw MusicBrainz dumps):
+#   <dump-dir>/mbdump-artist.tsv     mb_artist    (mbid, name, sort_name, type, country, updated_at)
+#   <dump-dir>/mbdump-release.tsv    mb_release   (mbid, artist_mbid, title, release_type, year, caa_url, updated_at)
+#   <dump-dir>/mbdump-recording.tsv  mb_recording (mbid, release_mbid, title, track_no, duration_ms, updated_at)
+# Produce them from an official mbdump/ extract (mbdump/artist, mbdump/release,
+# mbdump/recording with the full upstream column layout) by projecting the
+# curated columns in dump order, e.g. with a small ETL step that SELECTs the
+# columns above and writes tab-separated rows. Missing input is fatal: a
+# silent skip would report "import: done" with zero rows loaded.
 set -euo pipefail
 
 if [[ "${1:-}" == "--help" || $# -lt 1 ]]; then
   cat <<'USAGE'
 Usage: DATABASE_URL=<postgres-url> ./import.sh <dump-dir>
 
-Imports mbdump TSV dumps (artist, release, recording) with COPY ... FROM
-STDIN, staging per file so a rerun resumes at the first missing file.
+Imports curated mbdump TSV dumps (artist, release, recording) with COPY ...
+FROM STDIN, staging per file so a rerun resumes cleanly. See the header
+comment for the curated TSV contract and how to project it from official
+mbdump/ extracts.
 Requires: psql on PATH, DATABASE_URL in env (never as argv).
 USAGE
   exit 0
@@ -21,20 +33,33 @@ dump_dir="$1"
 for table in artist release recording; do
   tsv="$dump_dir/mbdump-$table.tsv"
   if [[ ! -f "$tsv" ]]; then
-    echo "import: skip $table (no $tsv)"
-    continue
+    echo "import: missing $tsv (expected curated TSV; see header comment)" >&2
+    exit 1
   fi
+  case "$table" in
+    artist)
+      columns="mbid, name, sort_name, \"type\", country, updated_at"
+      upsert="name = EXCLUDED.name, sort_name = EXCLUDED.sort_name, \"type\" = EXCLUDED.\"type\", country = EXCLUDED.country, updated_at = EXCLUDED.updated_at"
+      ;;
+    release)
+      columns="mbid, artist_mbid, title, release_type, year, caa_url, updated_at"
+      upsert="artist_mbid = EXCLUDED.artist_mbid, title = EXCLUDED.title, release_type = EXCLUDED.release_type, year = EXCLUDED.year, caa_url = EXCLUDED.caa_url, updated_at = EXCLUDED.updated_at"
+      ;;
+    recording)
+      columns="mbid, release_mbid, title, track_no, duration_ms, updated_at"
+      upsert="release_mbid = EXCLUDED.release_mbid, title = EXCLUDED.title, track_no = EXCLUDED.track_no, duration_ms = EXCLUDED.duration_ms, updated_at = EXCLUDED.updated_at"
+      ;;
+  esac
   echo "import: loading $table from $tsv"
-  # Staging table keeps reruns idempotent: INSERT ... ON CONFLICT DO NOTHING.
+  # Single psql session + single transaction: the TEMP stage table is
+  # session-scoped, so create, COPY and upsert must share one connection.
   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<SQL
+BEGIN;
 CREATE TEMP TABLE stage (LIKE mb_${table}) ON COMMIT DROP;
-SQL
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
-    -c "\\copy stage FROM '$tsv' WITH (FORMAT text)"
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<SQL
-INSERT INTO mb_${table} SELECT * FROM stage
-ON CONFLICT (mbid) DO UPDATE SET
-  updated_at = EXCLUDED.updated_at;
+\copy stage ($columns) FROM '$tsv' WITH (FORMAT text)
+INSERT INTO mb_${table} ($columns) SELECT $columns FROM stage
+ON CONFLICT (mbid) DO UPDATE SET $upsert;
+COMMIT;
 SQL
 done
 

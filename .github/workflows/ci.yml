@@ -1,7 +1,7 @@
 name: ci
 
-# Placeholder CI. The scaffold card replaces the placeholder jobs below with
-# real build/test/lint jobs and adds each new job id to `ci-ok`'s `needs`.
+# Placeholder CI plus the workers/mb Rust job. Add each new job id to
+# `ci-ok`'s `needs` so the required check stays red when any job fails.
 # `ci-ok` is a required check on main: its NAME must stay `ci-ok`.
 
 on:
@@ -20,12 +20,6 @@ concurrency:
 
 jobs:
   # Placeholder: real jobs (build, test, lint, …) go here as siblings.
-  # Example for the scaffold card:
-  #   build:
-  #     name: build
-  #     runs-on: ubuntu-latest
-  #     steps: [...]
-  # then add `build` to ci-ok's `needs` list.
   placeholder:
     name: placeholder
     runs-on: ubuntu-latest
@@ -34,12 +28,29 @@ jobs:
       - run: |
           echo "scaffold card: replace me with real jobs"
 
+  rust-mb:
+    name: rust (workers/mb)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+      - name: fmt
+        run: cargo fmt --check --manifest-path workers/mb/Cargo.toml
+      - name: clippy (wasm32, deny warnings)
+        run: cargo clippy --manifest-path workers/mb/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+      - name: test
+        run: cargo test --manifest-path workers/mb/Cargo.toml
+
   # Aggregate required check. Add every real job id to `needs` (and keep
   # `!cancelled()` + `contains(needs.*.result, 'failure')` logic) so ci-ok
   # stays red when any job fails and green only when all succeed.
   ci-ok:
     name: ci-ok
-    needs: [placeholder]
+    needs: [placeholder, rust-mb]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
