@@ -38,6 +38,7 @@ fn provider() -> vault::ProviderConfig {
         username: "synthetic-user".into(),
         password: "synthetic-password".into(),
         max_connections: 4,
+        allow_insecure_plaintext: false,
     }
 }
 

@@ -58,7 +58,21 @@ pub struct ProviderConfig {
     pub username: String,
     pub password: String,
     pub max_connections: u32,
+    /// Explicit opt-in to send the password over plaintext NNTP.
+    /// Default (`false`) requires TLS for password auth. When `true` with
+    /// `tls: false`, callers MUST surface a UI warning and record the
+    /// opt-in in the audit log (see [`ProviderConfig::audit_action`]).
+    /// Serde default keeps stored rows without this field on the secure
+    /// setting.
+    #[serde(default)]
+    pub allow_insecure_plaintext: bool,
 }
+
+/// Audit action for a vault save carrying the plaintext opt-in. Callers
+/// MUST emit this (not the plain `vault.update`) when
+/// [`ProviderConfig::insecure_plaintext_acknowledged`] is true so the
+/// acknowledgment is repudiation-safe.
+pub const INSECURE_PLAINTEXT_AUDIT_ACTION: &str = "vault.update.insecure_plaintext";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexerConfig {
@@ -170,6 +184,11 @@ impl ProviderConfig {
     /// Validate shape + SSRF guard and retain ALL vetted addresses for a
     /// pinned dial. Call at save AND immediately before dial. Every failure
     /// maps to generic [`VaultError::Invalid`] (no target/existence oracle).
+    ///
+    /// Transport confidentiality (threat-model §2 "TLS-everywhere"):
+    /// password auth without TLS is rejected unless the caller explicitly
+    /// sets [`ProviderConfig::allow_insecure_plaintext`]. There is no
+    /// STARTTLS upgrade path modeled here — `tls: false` means cleartext.
     pub fn validate(&self, dns: &impl DnsResolver) -> Result<ValidatedTarget, VaultError> {
         if !host_shape_ok(&self.host) {
             return Err(VaultError::Invalid);
@@ -186,7 +205,28 @@ impl ProviderConfig {
         if self.max_connections == 0 || self.max_connections > MAX_CONNECTIONS_CEILING {
             return Err(VaultError::Invalid);
         }
+        if !self.tls && !self.allow_insecure_plaintext {
+            return Err(VaultError::Invalid);
+        }
         resolve_public_target(&self.host, dns)
+    }
+
+    /// True when this config sends the password in cleartext with the
+    /// user's explicit acknowledgment. The UI MUST surface a warning and
+    /// the audit log MUST record [`INSECURE_PLAINTEXT_AUDIT_ACTION`].
+    pub fn insecure_plaintext_acknowledged(&self) -> bool {
+        !self.tls && self.allow_insecure_plaintext
+    }
+
+    /// Audit action for a vault save of this config: the insecure-opt-in
+    /// action when [`ProviderConfig::insecure_plaintext_acknowledged`] is
+    /// true, otherwise the plain `vault.update`.
+    pub fn audit_action(&self) -> &'static str {
+        if self.insecure_plaintext_acknowledged() {
+            INSECURE_PLAINTEXT_AUDIT_ACTION
+        } else {
+            "vault.update"
+        }
     }
 }
 
@@ -197,9 +237,14 @@ impl IndexerConfig {
     /// rejected at save time AND immediately before fetch. Use the returned
     /// addresses for a pinned fetch; redirects stay forbidden
     /// ([`INDEXER_ALLOW_REDIRECTS`]).
+    ///
+    /// Transport confidentiality (threat-model §2 "TLS-everywhere"):
+    /// https-only. An `http://` URL would send the indexer API key in
+    /// cleartext, so it is rejected even for public hosts. There is no
+    /// plaintext opt-in for indexers — a public indexer must serve TLS.
     pub fn validate(&self, dns: &impl DnsResolver) -> Result<ValidatedTarget, VaultError> {
         let parsed = url::Url::parse(&self.url).map_err(|_| VaultError::Invalid)?;
-        if parsed.scheme() != "https" && parsed.scheme() != "http" {
+        if parsed.scheme() != "https" {
             return Err(VaultError::Invalid);
         }
         let host = parsed
@@ -522,6 +567,8 @@ mod tests {
             username: "u".into(),
             password: "p".into(),
             max_connections: 2,
+            // Opt in so this test exercises the DNS guard, not the TLS gate.
+            allow_insecure_plaintext: true,
         };
         assert!(c.validate(&EmptyDns).is_err());
     }
@@ -536,8 +583,69 @@ mod tests {
                 username: "u".into(),
                 password: "p".into(),
                 max_connections: 2,
+                // Opt in so this test exercises the SSRF guard, not the TLS gate.
+                allow_insecure_plaintext: true,
             };
             assert!(c.validate(&EmptyDns).is_err(), "blocked: {host}");
         }
+    }
+
+    struct PublicDns;
+    impl DnsResolver for PublicDns {
+        fn resolve(&self, _host: &str) -> Vec<IpAddr> {
+            vec!["93.184.216.34".parse().unwrap()]
+        }
+    }
+
+    #[test]
+    fn plaintext_password_rejected_without_explicit_opt_in() {
+        // F-TRANS-01 Gap 2: password auth with `tls: false` must not pass
+        // silently — it needs the explicit per-row opt-in.
+        let denied = ProviderConfig {
+            host: "news.example.com".into(),
+            port: 119,
+            tls: false,
+            username: "u".into(),
+            password: "p".into(),
+            max_connections: 2,
+            allow_insecure_plaintext: false,
+        };
+        assert!(denied.validate(&PublicDns).is_err());
+        assert!(!denied.insecure_plaintext_acknowledged());
+        assert_eq!(denied.audit_action(), "vault.update");
+
+        // Explicit opt-in passes validation but stays flagged for the UI
+        // warning and the audit log.
+        let acknowledged = ProviderConfig {
+            allow_insecure_plaintext: true,
+            ..denied.clone()
+        };
+        assert!(acknowledged.validate(&PublicDns).is_ok());
+        assert!(acknowledged.insecure_plaintext_acknowledged());
+        assert_eq!(acknowledged.audit_action(), INSECURE_PLAINTEXT_AUDIT_ACTION);
+
+        // TLS stays the default: accepted, never flagged.
+        let tls = ProviderConfig {
+            tls: true,
+            allow_insecure_plaintext: false,
+            ..denied.clone()
+        };
+        assert!(tls.validate(&PublicDns).is_ok());
+        assert!(!tls.insecure_plaintext_acknowledged());
+    }
+
+    #[test]
+    fn http_indexer_url_rejected_for_public_host() {
+        // F-TRANS-01 Gap 1: `http://` would send the API key in cleartext.
+        let plaintext = IndexerConfig {
+            url: "http://news.example.com/api".into(),
+            api_key: "idx-key".into(),
+        };
+        assert!(plaintext.validate(&PublicDns).is_err());
+        let encrypted = IndexerConfig {
+            url: "https://news.example.com/api".into(),
+            api_key: "idx-key".into(),
+        };
+        assert!(encrypted.validate(&PublicDns).is_ok());
     }
 }

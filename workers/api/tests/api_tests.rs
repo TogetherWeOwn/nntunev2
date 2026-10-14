@@ -242,6 +242,7 @@ fn vault_config_validation() {
         username: "alice".into(),
         password: "s3cret".into(),
         max_connections: 10,
+        allow_insecure_plaintext: false,
     };
     assert!(good.validate(&FakeDns).is_ok());
     let bad_port = vault::ProviderConfig {
@@ -270,6 +271,7 @@ fn vault_ssrf_guard_rejects_private_and_loopback() {
         username: "alice".into(),
         password: "s3cret".into(),
         max_connections: 4,
+        allow_insecure_plaintext: false,
     };
     assert!(base.validate(&FakeDns).is_ok());
     for host in [
@@ -320,6 +322,66 @@ fn vault_indexer_url_has_ssrf_guard() {
         };
         assert!(c.validate(&FakeDns).is_err(), "indexer url rejected: {url}");
     }
+}
+
+#[test]
+fn vault_indexer_requires_https_even_for_public_host() {
+    // F-TRANS-01 Gap 1 (RED): `http://` to a public host must be Invalid —
+    // the indexer API key would otherwise travel in cleartext.
+    let plaintext = vault::IndexerConfig {
+        url: "http://index.example.com/api".into(),
+        api_key: "idx-key".into(),
+    };
+    assert!(
+        plaintext.validate(&FakeDns).is_err(),
+        "http indexer URL to a public host must be rejected"
+    );
+    let encrypted = vault::IndexerConfig {
+        url: "https://index.example.com/api".into(),
+        api_key: "idx-key".into(),
+    };
+    assert!(encrypted.validate(&FakeDns).is_ok());
+}
+
+#[test]
+fn vault_provider_plaintext_password_requires_explicit_opt_in() {
+    // F-TRANS-01 Gap 2: password auth with `tls: false` sends the password
+    // in cleartext — rejected by default, accepted only with the explicit
+    // per-row opt-in (flagged for the UI warning + audit log).
+    let denied = vault::ProviderConfig {
+        host: "news.example.com".into(),
+        port: 119,
+        tls: false,
+        username: "alice".into(),
+        password: "s3cret".into(),
+        max_connections: 4,
+        allow_insecure_plaintext: false,
+    };
+    assert!(
+        denied.validate(&FakeDns).is_err(),
+        "password auth without TLS must be rejected without the opt-in"
+    );
+    let acknowledged = vault::ProviderConfig {
+        allow_insecure_plaintext: true,
+        ..denied.clone()
+    };
+    assert!(
+        acknowledged.validate(&FakeDns).is_ok(),
+        "explicit opt-in passes validation"
+    );
+    assert!(acknowledged.insecure_plaintext_acknowledged());
+    assert_eq!(
+        acknowledged.audit_action(),
+        vault::INSECURE_PLAINTEXT_AUDIT_ACTION
+    );
+    // TLS default stays unflagged.
+    let tls = vault::ProviderConfig {
+        tls: true,
+        allow_insecure_plaintext: false,
+        ..denied.clone()
+    };
+    assert!(tls.validate(&FakeDns).is_ok());
+    assert!(!tls.insecure_plaintext_acknowledged());
 }
 
 #[test]
