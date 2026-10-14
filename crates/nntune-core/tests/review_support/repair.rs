@@ -2,17 +2,30 @@ use std::fs;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+// Serializes fake-binary repair tests within this test binary. `repair_with_*`
+// forks (via `/usr/bin/prlimit`); a fork in one libtest thread can inherit
+// another thread's still-open write fd to its script, so that thread's exec
+// fails with ETXTBSY (exit 126) and asserts on `exit_code`/`signal` flake.
+// Holding the guard for the fixture's lifetime keeps fixture setup, extra
+// staging writes, and the fork/exec from overlapping. Cross-process overlap
+// is harmless: fork only inherits fds of its own process.
+static SERIAL: Mutex<()> = Mutex::new(());
 
 pub struct Fixture {
     pub root: PathBuf,
     pub scratch: PathBuf,
     pub binary: PathBuf,
+    // Held for the test's lifetime; field order keeps it dropped last.
+    _serial: MutexGuard<'static, ()>,
 }
 
 impl Fixture {
     pub fn new(script: &str) -> Self {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let base = std::env::var_os("PAPERCLIP_RUN_SCRATCH_DIR")
             .or_else(|| std::env::var_os("PAPERCLIP_SCRATCH_DIR"))
             .map(PathBuf::from)
@@ -41,6 +54,7 @@ impl Fixture {
             root,
             scratch,
             binary,
+            _serial,
         }
     }
 

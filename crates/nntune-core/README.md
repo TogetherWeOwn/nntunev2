@@ -49,7 +49,9 @@ nothing was needed and -1 when repair completed or the count is unknown).
 `RepairReport` carries `exit_code`/`signal` for retry vs dead-letter decisions
 (par2cmdline-turbo: 0 success; 1/2/4 permanently unusable inputs and 6 with
 `Recovery will not be possible` a corrupt set — dead-letter, do not retry;
-only 8 and signal kills are resource failures). The calling Container must
+only 8 and signal kills are resource failures. Any other code (e.g. 3, 5, 7,
+or 6 without that line) is unexpected: bound retries and run `par2 verify`
+first to separate unusable sets from transient failures). The calling Container must
 remain unprivileged with quota-backed scratch: aggregate-size polling is
 neither a sandbox nor a hard disk quota.
 
