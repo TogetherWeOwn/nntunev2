@@ -54,8 +54,12 @@ pub struct QueueMsg {
     /// bytes of `NzbUpload` jobs, as stored in the payload KV under a
     /// [`PAYLOAD_TTL_SECS`](crate::dispatch::PAYLOAD_TTL_SECS) expiry. The
     /// consumer fetches with [`payload_retry_delay_ms`](crate::dispatch::payload_retry_delay_ms)
-    /// backoff: a first-read miss is expected (KV cross-location lag), never
-    /// a failed job.
+    /// backoff (5/15/30/60 s, 110 s cumulative over
+    /// [`PAYLOAD_RETRY_ATTEMPTS`](crate::dispatch::PAYLOAD_RETRY_ATTEMPTS)
+    /// retries): a first-read miss is expected (KV cross-location lag plus
+    /// edge-cached negative lookups), never a failed job. The consumer reads
+    /// with the minimum `cacheTtl` (30 s) so the cached miss expires before
+    /// the later retries.
     #[serde(default)]
     pub payload_ref: Option<String>,
 }

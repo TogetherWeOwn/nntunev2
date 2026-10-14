@@ -21,6 +21,10 @@ queue = "nntune-ingest-jobs"
 # [[queues.consumers]]
 # queue = "nntune-ingest-jobs"
 # max_batch_size = 10
+# Keep max_retries = PAYLOAD_RETRY_ATTEMPTS (4) in src/dispatch.rs: the
+# payload-fetch backoff (5/15/30/60 s, 110 s cumulative) needs all four
+# retries to cover the ~60 s KV lag plus the edge-cached negative-lookup
+# window (consumer reads with cacheTtl 30).
 # max_retries = 4
 # [[queues.consumers.dead_letter_queue]]
 # queue = "nntune-ingest-dlq"

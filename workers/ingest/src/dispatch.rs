@@ -33,18 +33,38 @@ pub const PAYLOAD_KEY_PREFIX: &str = "nzb:sha256:";
 /// and no consumer may delete on completion, because the key is shared by
 /// every user and job that uploads the same bytes.
 pub const PAYLOAD_TTL_SECS: u64 = 30 * 24 * 3_600;
-/// Ceiling for [`payload_retry_delay_ms`]: KV reads are eventually consistent
-/// across locations (up to ~60 s), so the schedule below tops out here and
-/// the consumer fails the job only after exhausting it.
-pub const MAX_PAYLOAD_RETRY_DELAY_MS: u64 = 8_000;
+/// Documented KV read lag the payload retry schedule must absorb: reads are
+/// eventually consistent across locations (up to ~60 s), and a first-read
+/// miss is cached at the edge for the `cacheTtl` window (default 60 s,
+/// minimum 30 s) — a consumer that retries too fast keeps serving the cached
+/// miss and fails a job whose bytes are stored.
+pub const PAYLOAD_KV_READ_LAG_MS: u64 = 60_000;
+
+/// Payload-fetch retries the consumer may spend: must match
+/// `[[queues.consumers]] max_retries` in `wrangler.toml.example` (and
+/// `jobs::MAX_ATTEMPTS - 1` redeliveries) so every retry has a slot.
+pub const PAYLOAD_RETRY_ATTEMPTS: u32 = 4;
+
+/// Ceiling for [`payload_retry_delay_ms`]: the longest single wait, equal to
+/// [`PAYLOAD_KV_READ_LAG_MS`] so the tail retry lands after the cached miss
+/// has expired.
+pub const MAX_PAYLOAD_RETRY_DELAY_MS: u64 = 60_000;
 
 /// Backoff for the Queue consumer's payload fetch: a KV miss right after the
-/// route's write proves nothing (cross-location visibility lags), so the
-/// consumer retries on this schedule instead of failing the job. Doubling
-/// from 1 s, capped at [`MAX_PAYLOAD_RETRY_DELAY_MS`]; saturating, so any
-/// `u32` attempt maps to a sane delay.
+/// route's write proves nothing (cross-location visibility lags and the miss
+/// itself is edge-cached), so the consumer retries on this schedule instead
+/// of failing the job: 5 s, 15 s, 30 s, 60 s (cumulative 110 s, covering the
+/// documented ~60 s lag). Saturating, so any `u32` attempt maps to a sane
+/// delay. Contract for the consumer card: fetch with the minimum `cacheTtl`
+/// (30 s) so a cached miss expires before the later retries, and keep
+/// `max_retries = PAYLOAD_RETRY_ATTEMPTS` so the full window is usable.
 pub fn payload_retry_delay_ms(attempt: u32) -> u64 {
-    (1_000u64 << attempt.min(3)).min(MAX_PAYLOAD_RETRY_DELAY_MS)
+    match attempt {
+        0 => 5_000,
+        1 => 15_000,
+        2 => 30_000,
+        _ => MAX_PAYLOAD_RETRY_DELAY_MS,
+    }
 }
 
 /// Self-asserted user handles are 1..=128 chars without `:` (the idempotency
@@ -306,19 +326,40 @@ mod tests {
     fn payload_retry_backoff_is_bounded_and_increasing() {
         // The consumer retries a KV miss against this schedule instead of
         // failing the job: KV reads are eventually consistent across
-        // locations, so the first miss proves nothing.
+        // locations (~60 s), and a first-read miss is cached at the edge for
+        // the cacheTtl window, so the cumulative delay across the allowed
+        // retries must cover the documented lag.
+        assert_eq!(payload_retry_delay_ms(0), 5_000);
+        assert_eq!(payload_retry_delay_ms(1), 15_000);
+        assert_eq!(payload_retry_delay_ms(2), 30_000);
+        assert_eq!(payload_retry_delay_ms(3), 60_000);
         let d0 = payload_retry_delay_ms(0);
         let d1 = payload_retry_delay_ms(1);
         let d2 = payload_retry_delay_ms(2);
-        assert!(d0 > 0);
+        let d3 = payload_retry_delay_ms(3);
         assert!(d1 > d0);
         assert!(d2 > d1);
+        assert!(d3 > d2);
         for attempt in 0..32 {
             assert!(payload_retry_delay_ms(attempt) <= MAX_PAYLOAD_RETRY_DELAY_MS);
         }
         assert_eq!(
             payload_retry_delay_ms(1_000_000),
             MAX_PAYLOAD_RETRY_DELAY_MS
+        );
+        // Retry budget matches the Queue consumer's max_retries and the
+        // job-level attempt budget (MAX_ATTEMPTS - 1 redeliveries).
+        assert_eq!(PAYLOAD_RETRY_ATTEMPTS, 4);
+        assert_eq!(PAYLOAD_RETRY_ATTEMPTS, crate::jobs::MAX_ATTEMPTS - 1);
+        // Cumulative delay across the allowed retries covers the documented
+        // KV read lag, so a job whose bytes are stored is not failed on a
+        // cached miss (5 + 15 + 30 + 60 = 110 s >= 60 s).
+        let total: u64 = (0..PAYLOAD_RETRY_ATTEMPTS)
+            .map(payload_retry_delay_ms)
+            .sum();
+        assert!(
+            total >= PAYLOAD_KV_READ_LAG_MS,
+            "payload retry window {total}ms must cover KV lag {PAYLOAD_KV_READ_LAG_MS}ms"
         );
     }
 
