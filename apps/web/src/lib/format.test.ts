@@ -34,4 +34,15 @@ describe('formatBytes', () => {
 	it('formats megabytes', () => {
 		expect(formatBytes(5 * 1024 * 1024)).toBe('5 MB');
 	});
+
+	it('rolls over to the next unit when rounding reaches 1024', () => {
+		expect(formatBytes(1048575)).toBe('1 MB');
+		expect(formatBytes(1073741823)).toBe('1 GB');
+	});
+
+	it('handles sub-byte and non-finite input as zero bytes', () => {
+		expect(formatBytes(0.5)).toBe('0.5 B');
+		expect(formatBytes(NaN)).toBe('0 B');
+		expect(formatBytes(Infinity)).toBe('0 B');
+	});
 });

@@ -15,6 +15,6 @@
 	</p>
 	<p>
 		<a class="nt-button" href="/signup">Get started</a>
-		<a class="nt-button nt-button--ghost" href="/plans">See plans</a>
+		<a class="nt-button nt-button--ghost" href="/pricing">See plans</a>
 	</p>
 </main>

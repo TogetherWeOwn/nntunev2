@@ -65,4 +65,25 @@ describe('ApiClient', () => {
 		expect(failure).toBeInstanceOf(ApiError);
 		expect((failure as ApiError).code).toBe('unauthorized');
 	});
+
+	it('uses the global fetch without an Illegal-invocation receiver', async () => {
+		const originalFetch = globalThis.fetch;
+		// Mimic browsers/workerd: a bare global fetch throws when `this` is wrong.
+		function strictFetch(this: unknown): Promise<Response> {
+			if (this !== undefined && this !== globalThis) {
+				throw new TypeError(
+					"Illegal invocation: function called with incorrect this reference"
+				);
+			}
+			return Promise.resolve(jsonResponse({ pong: true }));
+		}
+		vi.stubGlobal('fetch', strictFetch as typeof fetch);
+		try {
+			const client = new ApiClient({ baseUrl: 'https://api.example.com' });
+			await expect(client.get('/health')).resolves.toEqual({ pong: true });
+		} finally {
+			vi.unstubAllGlobals();
+			globalThis.fetch = originalFetch;
+		}
+	});
 });

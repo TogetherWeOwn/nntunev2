@@ -32,9 +32,12 @@ export class ApiClient {
 	private readonly fetchFn: FetchFn;
 	private token: string | null = null;
 
-	constructor({ baseUrl, fetchFn = fetch }: ApiClientOptions) {
+	constructor({ baseUrl, fetchFn }: ApiClientOptions) {
 		this.baseUrl = baseUrl.replace(/\/+$/, '');
-		this.fetchFn = fetchFn;
+		// Default to a wrapper (not a bare `fetch` reference): calling a stored
+		// `fetch` as `this.fetchFn(...)` sets `this` to the client instance and
+		// browsers/workerd reject it with "Illegal invocation".
+		this.fetchFn = fetchFn ?? ((input, init) => fetch(input, init));
 	}
 
 	setToken(token: string | null): void {
