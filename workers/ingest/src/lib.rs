@@ -17,6 +17,7 @@
 //! entries stay commented out in `wrangler.toml.example` until then).
 //! See `README.md`.
 
+use futures_util::StreamExt;
 use worker::{console_log, Env, Request, Response, Result, RouteContext, Router};
 
 pub mod dispatch;
@@ -39,9 +40,9 @@ use nzb_intake::{estimate_nzb, IntakeRejection};
 use queue::{validate_indexer_ref, NzbUploadRequest, QueueMsg, SearchRequest};
 
 /// Largest accepted `POST /v1/ingest/search` body: the request is a query plus
-/// a short category list, never content. Checked on `Content-Length` before a
-/// byte is buffered and again after the read (missing header must not widen
-/// the hole).
+/// a short category list, never content. Enforced while streaming
+/// ([`read_capped_text`]): at most `cap` bytes are ever buffered, whether or
+/// not the caller sent `Content-Length`.
 pub const MAX_SEARCH_BODY_BYTES: usize = 16 * 1024;
 /// Largest accepted `POST /v1/ingest/nzb` JSON body. The decoded NZB is capped
 /// at [`MAX_NZB_BYTES`], but JSON escaping can inflate hostile input ~6x on
@@ -94,20 +95,60 @@ fn content_length(req: &Request) -> Option<usize> {
         .and_then(|v| v.parse().ok())
 }
 
-/// Enforce a wire cap both before buffering (declared length) and after the
-/// read (lying or missing header). Pure so the policy is unit-tested.
-fn check_body_cap(
-    text_len: usize,
+/// Cheap fast path: reject an over-cap declared `Content-Length` before any
+/// byte is buffered. Pure so the policy is unit-tested.
+fn check_declared_len(
     declared_len: Option<usize>,
     cap: usize,
 ) -> core::result::Result<(), &'static str> {
     if declared_len.is_some_and(|len| len > cap) {
         return Err("request body too large");
     }
-    if text_len > cap {
+    Ok(())
+}
+
+/// Fold one more body chunk into the buffer, enforcing the wire cap on the
+/// running total. Pure so the streaming policy is unit-tested without a
+/// `Request`: a missing or lying `Content-Length` can never buffer more than
+/// `cap` bytes, because the 413 fires on the chunk that would cross it.
+fn push_chunk(
+    buf: &mut Vec<u8>,
+    chunk: &[u8],
+    cap: usize,
+) -> core::result::Result<(), &'static str> {
+    if buf.len().saturating_add(chunk.len()) > cap {
         return Err("request body too large");
     }
+    buf.extend_from_slice(chunk);
     Ok(())
+}
+
+/// Read a request body as text without ever buffering more than `cap` bytes.
+///
+/// `Request::text()` is deliberately not used: it buffers the entire body
+/// into a JS string before any cap applies, so a request without
+/// `Content-Length` (chunked HTTP/1.1, or HTTP/2 and HTTP/3 where the header
+/// is optional) could push the isolate toward its memory limit from an
+/// unauthenticated route. This reads through `Request::stream()` and bails
+/// with 413 on the chunk that would cross the cap; non-UTF-8 bodies are a
+/// 400, as is an unreadable stream.
+async fn read_capped_text(
+    req: &mut Request,
+    cap: usize,
+) -> core::result::Result<String, (String, u16)> {
+    if let Err(message) = check_declared_len(content_length(req), cap) {
+        return Err((message.to_string(), 413));
+    }
+    let stream = req
+        .stream()
+        .map_err(|_| ("failed to read request body".to_string(), 400))?;
+    let mut stream = Box::pin(stream);
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| ("failed to read request body".to_string(), 400))?;
+        push_chunk(&mut buf, &chunk, cap).map_err(|m| (m.to_string(), 413))?;
+    }
+    String::from_utf8(buf).map_err(|_| ("request body must be UTF-8".to_string(), 400))
 }
 
 /// Parse a search body: malformed JSON is a client error (400), never a 500.
@@ -214,14 +255,26 @@ fn queued_envelope(
 /// the Queue consumer can fetch the exact bytes the intake guard approved.
 /// `false` means the payload is not durably stored: the route answers 503
 /// and never enqueues.
+///
+/// The write carries [`PAYLOAD_TTL_SECS`](dispatch::PAYLOAD_TTL_SECS) so a
+/// payload stored before a failed enqueue, or for a job that later fails,
+/// expires instead of accumulating forever. A failed write is confirmed
+/// with a read before giving up: KV rate-limits same-key writes (1/s), and
+/// the key is the content hash, so a client retry inside a second — or a
+/// retry racing its own first write — can 429 even though the bytes are
+/// already stored. Bytes present means the job can run.
 async fn store_upload_payload(env: &Env, payload_ref: &str, nzb_xml: &str) -> bool {
     match env.kv(dispatch::PAYLOAD_KV_BINDING) {
         Ok(store) => match store.put(payload_ref, nzb_xml.to_string()) {
-            Ok(put) => match put.execute().await {
+            Ok(put) => match put
+                .expiration_ttl(dispatch::PAYLOAD_TTL_SECS)
+                .execute()
+                .await
+            {
                 Ok(()) => true,
                 Err(e) => {
                     console_log!("ingest payload write failed: {:?}", e);
-                    false
+                    matches!(store.get(payload_ref).text().await, Ok(Some(_)))
                 }
             },
             Err(e) => {
@@ -239,17 +292,10 @@ async fn store_upload_payload(env: &Env, payload_ref: &str, nzb_xml: &str) -> bo
 /// Validate a search body and enqueue it; the Queue consumer runs the
 /// search → parse → probe → verify → match → write workflow.
 async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
-    let declared = content_length(req);
-    if declared.is_some_and(|len| len > MAX_SEARCH_BODY_BYTES) {
-        return json_error("request body too large", 413);
-    }
-    let text = match req.text().await {
+    let text = match read_capped_text(req, MAX_SEARCH_BODY_BYTES).await {
         Ok(text) => text,
-        Err(_) => return json_error("failed to read request body", 400),
+        Err((message, status)) => return json_error(&message, status),
     };
-    if let Err(message) = check_body_cap(text.len(), declared, MAX_SEARCH_BODY_BYTES) {
-        return json_error(message, 413);
-    }
     let parsed = match parse_search(&text) {
         Ok(parsed) => parsed,
         Err(message) => return json_error(message, 400),
@@ -277,17 +323,10 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
 /// Validate an NZB upload and enqueue it; the consumer parses with
 /// `nntune-core`, probes the pool DO, and verifies before matching.
 async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
-    let declared = content_length(req);
-    if declared.is_some_and(|len| len > MAX_UPLOAD_BODY_BYTES) {
-        return json_error("request body too large", 413);
-    }
-    let text = match req.text().await {
+    let text = match read_capped_text(req, MAX_UPLOAD_BODY_BYTES).await {
         Ok(text) => text,
-        Err(_) => return json_error("failed to read request body", 400),
+        Err((message, status)) => return json_error(&message, status),
     };
-    if let Err(message) = check_body_cap(text.len(), declared, MAX_UPLOAD_BODY_BYTES) {
-        return json_error(message, 413);
-    }
     let parsed = match parse_upload(&text) {
         Ok(parsed) => parsed,
         Err(message) => return json_error(message, 400),
@@ -408,11 +447,32 @@ mod tests {
     }
 
     #[test]
-    fn body_caps_reject_declared_and_actual_overruns() {
-        assert!(check_body_cap(10, Some(10), 16).is_ok());
-        assert!(check_body_cap(10, Some(17), 16).is_err());
-        assert!(check_body_cap(17, None, 16).is_err());
-        assert!(check_body_cap(17, Some(10), 16).is_err());
+    fn chunked_bodies_accumulate_under_a_running_cap() {
+        // No declared length (chunked HTTP/1.1, or HTTP/2 and HTTP/3 where
+        // the header is optional): chunks summing past the cap must fail
+        // while only the capped prefix is buffered, never after a full read.
+        let mut buf = Vec::new();
+        assert!(push_chunk(&mut buf, b"hello", 16).is_ok());
+        assert!(push_chunk(&mut buf, b" world!", 16).is_ok());
+        assert_eq!(buf, b"hello world!");
+        assert!(push_chunk(&mut buf, b"overflow", 16).is_err());
+        // The failed push leaves the capped prefix intact for the 413 path.
+        assert_eq!(buf, b"hello world!");
+        // An exact fit is accepted; one byte more is not.
+        let mut exact = Vec::new();
+        assert!(push_chunk(&mut exact, &[0u8; 16], 16).is_ok());
+        assert!(push_chunk(&mut exact, &[0u8; 1], 16).is_err());
+    }
+
+    #[test]
+    fn declared_length_precheck_runs_before_any_read() {
+        assert!(check_declared_len(Some(10), 16).is_ok());
+        assert!(check_declared_len(None, 16).is_ok());
+        assert!(check_declared_len(Some(17), 16).is_err());
+    }
+
+    #[test]
+    fn body_caps_stay_small_and_fit_escaped_nzbs() {
         // Compile-time: the search cap stays small and the upload wire cap
         // always fits a maximally-escaped 2 MiB NZB.
         const {

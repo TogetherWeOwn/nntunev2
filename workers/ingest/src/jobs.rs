@@ -9,6 +9,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::probe::ProbeTally;
+
 /// How many times a single job may attempt a step before it is `Failed`.
 pub const MAX_ATTEMPTS: u32 = 5;
 
@@ -60,6 +62,12 @@ pub struct JobCheckpoint {
     /// written before this field existed readable (they resume with 0).
     #[serde(default)]
     pub repair_rounds: u32,
+    /// Probe answers collected while `Probing`, keyed by batch index (see
+    /// [`ProbeTally`](crate::probe::ProbeTally)). `None` outside `Probing`;
+    /// `#[serde(default)]` keeps pre-tally checkpoints readable (a crash
+    /// before this field existed resumes probing from batch zero).
+    #[serde(default)]
+    pub probe_tally: Option<ProbeTally>,
     pub failure_reason: Option<String>,
 }
 
@@ -283,6 +291,7 @@ mod tests {
             state,
             attempt: 1,
             repair_rounds: 0,
+            probe_tally: None,
             failure_reason: None,
         }
     }
@@ -314,6 +323,34 @@ mod tests {
         let mut cp = checkpoint_at(JobState::Verifying);
         assert_eq!(advance_checkpoint(&mut cp, false), JobState::Matching);
         assert_eq!(cp.repair_rounds, 0);
+    }
+
+    #[test]
+    fn checkpoint_carries_the_probe_tally_with_legacy_default() {
+        // The tally must survive a crash mid-Probing: it rides the
+        // checkpoint, and checkpoints written before the field existed
+        // still decode (tally empty, probing resumes from batch zero).
+        use crate::probe::ProbeTally;
+
+        let mut cp = checkpoint_at(JobState::Probing);
+        assert!(cp.probe_tally.is_none());
+        cp.probe_tally = Some(ProbeTally::new(2));
+        let back: JobCheckpoint =
+            serde_json::from_str(&serde_json::to_string(&cp).unwrap()).unwrap();
+        assert_eq!(back, cp);
+
+        let legacy = serde_json::json!({
+            "job_id": "job_0123456789abcdef",
+            "user_id": "user_01",
+            "idempotency_key": format!("ingest:user_01:{}:upload", "a".repeat(64)),
+            "source": "nzb_upload",
+            "state": "probing",
+            "attempt": 1,
+            "failure_reason": null,
+        });
+        let legacy_cp: JobCheckpoint = serde_json::from_value(legacy).unwrap();
+        assert!(legacy_cp.probe_tally.is_none());
+        assert_eq!(legacy_cp.repair_rounds, 0);
     }
 
     #[test]

@@ -41,9 +41,10 @@ fn happy_path_reaches_done_with_one_library_row() {
     check_parsed(&est, &parsed).unwrap();
     let batches = probe_batches(&parsed);
     assert_eq!(batches.len(), 1);
-    let req = build_probe_request(&msg, &SMALL_NZB_SEGMENTS).unwrap();
+    let req = build_probe_request(&msg, 0, &SMALL_NZB_SEGMENTS).unwrap();
     assert_eq!(req.idempotency_key, msg.idempotency_key);
     let outcome = ProbeOutcome {
+        batch_index: 0,
         present: req.segment_ids.clone(),
         missing: vec![],
     };
@@ -90,6 +91,7 @@ fn gapped_set_repairs_then_reaches_done() {
     // missing-segment count, which Verifying translates (via par2) into the
     // repair dispatch below.
     let outcome = ProbeOutcome {
+        batch_index: 0,
         present: vec!["gap-one@synthetic.invalid".into()],
         missing: vec!["gap-missing@synthetic.invalid".into()],
     };
@@ -151,6 +153,7 @@ fn multi_batch_probe_keeps_middle_gap_to_verify() {
         // Every id except one middle-batch id answers ARTICLE.
         let gap = &batches[1][0];
         let outcome = ProbeOutcome {
+            batch_index: n,
             present: batch_refs
                 .iter()
                 .filter(|id| *id != gap)

@@ -51,7 +51,11 @@ pub struct QueueMsg {
     #[serde(default)]
     pub page: Option<u32>,
     /// Content-addressed handle (`nzb:sha256:<hex>`) for the uploaded NZB
-    /// bytes of `NzbUpload` jobs, as stored in the payload KV.
+    /// bytes of `NzbUpload` jobs, as stored in the payload KV under a
+    /// [`PAYLOAD_TTL_SECS`](crate::dispatch::PAYLOAD_TTL_SECS) expiry. The
+    /// consumer fetches with [`payload_retry_delay_ms`](crate::dispatch::payload_retry_delay_ms)
+    /// backoff: a first-read miss is expected (KV cross-location lag), never
+    /// a failed job.
     #[serde(default)]
     pub payload_ref: Option<String>,
 }

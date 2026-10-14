@@ -27,6 +27,25 @@ pub const INGEST_QUEUE_NAME: &str = "nntune-ingest-jobs";
 pub const PAYLOAD_KV_BINDING: &str = "INGEST_PAYLOADS";
 /// Prefix for content-addressed upload payload keys (`nzb:sha256:<hex>`).
 pub const PAYLOAD_KEY_PREFIX: &str = "nzb:sha256:";
+/// Payload KV time-to-live: 30 days, comfortably longer than a full Queue
+/// retention window plus consumer backoff. A payload stored before a failed
+/// enqueue, or for a job that later fails or finishes, expires on its own —
+/// and no consumer may delete on completion, because the key is shared by
+/// every user and job that uploads the same bytes.
+pub const PAYLOAD_TTL_SECS: u64 = 30 * 24 * 3_600;
+/// Ceiling for [`payload_retry_delay_ms`]: KV reads are eventually consistent
+/// across locations (up to ~60 s), so the schedule below tops out here and
+/// the consumer fails the job only after exhausting it.
+pub const MAX_PAYLOAD_RETRY_DELAY_MS: u64 = 8_000;
+
+/// Backoff for the Queue consumer's payload fetch: a KV miss right after the
+/// route's write proves nothing (cross-location visibility lags), so the
+/// consumer retries on this schedule instead of failing the job. Doubling
+/// from 1 s, capped at [`MAX_PAYLOAD_RETRY_DELAY_MS`]; saturating, so any
+/// `u32` attempt maps to a sane delay.
+pub fn payload_retry_delay_ms(attempt: u32) -> u64 {
+    (1_000u64 << attempt.min(3)).min(MAX_PAYLOAD_RETRY_DELAY_MS)
+}
 
 /// Self-asserted user handles are 1..=128 chars without `:` (the idempotency
 /// key delimiter); the accounts card replaces this with the authenticated
@@ -147,8 +166,15 @@ pub fn build_search_dispatch(
 /// content-addressed [`payload_ref`](QueueMsg::payload_ref); the route
 /// writes the bytes to the payload KV under that key before enqueueing
 /// (the bytes cannot ride in the Queue message: 2 MiB vs the 128 KB limit).
+///
+/// An NZB with no files or segments is rejected here, not enqueued: it
+/// yields zero probe batches, so no outcome would ever arrive and the job
+/// would sit in `Probing` forever.
 pub fn build_upload_dispatch(user_id: &str, nzb_xml: &str) -> Result<QueueMsg, &'static str> {
-    estimate_nzb(nzb_xml).map_err(|_| "nzb_xml failed the intake guard")?;
+    let est = estimate_nzb(nzb_xml).map_err(|_| "nzb_xml failed the intake guard")?;
+    if est.file_count == 0 || est.segment_count == 0 {
+        return Err("nzb has no files or segments to probe");
+    }
     let sha = content_sha256_hex(nzb_xml.as_bytes());
     let mut msg = dispatch(user_id, &sha, "upload", JobSource::NzbUpload)?;
     msg.payload_ref = Some(format!("{PAYLOAD_KEY_PREFIX}{sha}"));
@@ -264,6 +290,44 @@ mod tests {
         assert!(a.starts_with("job_"));
         assert!(crate::jobs::validate_job_id(&a));
         assert_ne!(a, make_job_id("user_02", &sha, "upload"));
+    }
+
+    #[test]
+    fn payload_ttl_outlives_queue_retention() {
+        // Payload bytes must survive a full Queue retention window plus
+        // consumer backoff; otherwise the consumer fetches a miss for a
+        // live job and fails work that was already accepted.
+        const {
+            assert!(PAYLOAD_TTL_SECS >= 7 * 24 * 3_600);
+        }
+    }
+
+    #[test]
+    fn payload_retry_backoff_is_bounded_and_increasing() {
+        // The consumer retries a KV miss against this schedule instead of
+        // failing the job: KV reads are eventually consistent across
+        // locations, so the first miss proves nothing.
+        let d0 = payload_retry_delay_ms(0);
+        let d1 = payload_retry_delay_ms(1);
+        let d2 = payload_retry_delay_ms(2);
+        assert!(d0 > 0);
+        assert!(d1 > d0);
+        assert!(d2 > d1);
+        for attempt in 0..32 {
+            assert!(payload_retry_delay_ms(attempt) <= MAX_PAYLOAD_RETRY_DELAY_MS);
+        }
+        assert_eq!(
+            payload_retry_delay_ms(1_000_000),
+            MAX_PAYLOAD_RETRY_DELAY_MS
+        );
+    }
+
+    #[test]
+    fn upload_dispatch_rejects_zero_segment_nzb() {
+        // An NZB with no files or segments yields zero probe batches, so no
+        // outcome ever arrives and the job would sit in Probing forever.
+        assert!(build_upload_dispatch(USER, "<nzb></nzb>").is_err());
+        assert!(build_upload_dispatch(USER, "<nzb>  </nzb>").is_err());
     }
 
     #[test]
