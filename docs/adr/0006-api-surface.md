@@ -10,6 +10,11 @@
   hash-only lookup with reversible secret only for the `t`/`s` opt-in;
   `p=enc:` dropped; `/rest/*` log redaction, `scope` allowlist, per-credential
   rate limits + `last_used_at` alerting.
+- **Rev 2026-10-14 (review round 4, 4/5 → 5/5):** `api_key_hmac`
+  (HMAC-SHA256 + `SUBSONIC_INDEX_PEPPER`, ≥128-bit CSPRNG keys) replaces
+  bare SHA-256; token-form `u` defined as the per-credential generated
+  `subsonic_username` (email never accepted); Known-rework list for the
+  Subsonic sibling.
 
 ## Context
 
@@ -48,15 +53,20 @@ least-privilege credential.
   ADR 0002): random, revocable, scoped to the Subsonic surface. Two forms,
   negotiated per credential (`auth_mode`):
   - `apiKey` (default, OpenSubsonic extension): the client sends `apiKey`
-    **without** `u`; the server resolves it via `api_key_hash` (SHA-256,
-    UNIQUE lookup). A request carrying both `u` and `apiKey` is error 43;
-    an unknown key is error 44. Plaintext keys are shown once at creation
-    and never stored (hash-only).
-  - Token form (`t = md5(secret + salt)`, `s = salt`): only for credentials
-    that opt in (`auth_mode` includes `token`); the secret is
-    envelope-encrypted (reversible, KEK outside the DB) and shown once at
-    creation — see ADR 0002 rule 2. Reversibility exists **only** for this
-    form, which the OpenSubsonic extension page tells servers to phase out.
+    **without** `u`; the server resolves it via `api_key_hmac`
+    (HMAC-SHA256 keyed by the `SUBSONIC_INDEX_PEPPER` Worker secret,
+    UNIQUE lookup). Keys are ≥128-bit CSPRNG (prefer 256-bit); shorter /
+    procedural keys are rejected at creation. A request carrying both `u`
+    and `apiKey` is error 43; an unknown key is error 44. Plaintext keys
+    are shown once at creation and never stored (HMAC-lookup only).
+  - Token form (`u` + `t = md5(secret + salt)`, `s = salt`): only for
+    credentials that opt in (`auth_mode` includes `token`); `u` is the
+    credential's generated `subsonic_username` (non-PII UNIQUE, shown once
+    with the secret — ADR 0002 rule 2), and the server looks up by it then
+    unwraps exactly one envelope-encrypted secret (reversible, KEK outside
+    the DB, shown once at creation). Email is never accepted as `u`.
+    Reversibility exists **only** for this form, which the OpenSubsonic
+    extension page tells servers to phase out.
   Plaintext `p=` (and its hex alias `p=enc:`) is **rejected** — both put
   long-lived secrets in query strings (logs, threat-model §5); legacy
   clients use `t`/`s`. `/rest/*` logging MUST redact `u`, `p`, `t`, `s`
@@ -80,3 +90,10 @@ least-privilege credential.
   `apiKey`-without-`u`, error 43 on mixed `u`+`apiKey`, credential
   rotation/revocation, and redaction of auth params in emitted logs).
 - Deprecating any Subsonic endpoint needs a new ADR.
+- **Known rework this ADR imposes on sibling cards:** the Subsonic compat
+  card drops `u+p` (including `p=enc:`) entirely — legacy clients use
+  `t`/`s` with the generated `subsonic_username` as `u` — adopts the
+  `api_key_hmac` + pepper lookup, and serves cache reads only on the
+  per-user `track_media` + `user_cache_grants` check (ADR 0003), never on a
+  bare content hash. Owned by the Subsonic compat card — non-blocking here,
+  but its review must show the auth-order and grant-check changes.

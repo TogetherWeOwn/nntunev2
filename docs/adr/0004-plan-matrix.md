@@ -7,6 +7,11 @@
 - **Rev 2026-10-14 (review round 3):** every capped dimension names its
   authoritative writer (ingest/cache/concurrent included); `usage_ledger`
   rows are daily; trial is Stripe-native with a hard post-trial paywall.
+- **Rev 2026-10-14 (review round 4, 4/5 → 5/5):** trial pinned to
+  `trial_settings.missing_payment_method = cancel` with trial-plan caps
+  while `trialing` (not the converted price's caps); provisional signup row
+  + reconciler upsert (ADR 0002 rule 4); `past_due` entitled only inside
+  `grace_until`; Known-rework list for the ingest sibling.
 
 ## Context
 
@@ -38,9 +43,16 @@ size, ingest jobs/day, cache priority. NNTune never bundles Usenet access
   bills, ever.
 - **Free is a 14-day Stripe-native trial**, not a forever tier: signup creates
   a `trialing` subscription on the trial plan (ADR 0002 rule 4) — the only
-  trial clock. After the window with no paid subscription there is no
-  entitlement (hard paywall). Trial requires a BYOP provider (no bundled
-  Usenet to abuse).
+  trial clock — with `trial_settings.missing_payment_method = cancel`
+  (ADR 0005): a trial ending with no payment method **cancels** (never the
+  `create_invoice` default that would leave an `active` $0 row, and never
+  `pause`). After the window with no paid subscription there is no
+  entitlement (hard paywall). While `trialing`, trial-plan caps apply (10
+  stream hrs, 1 concurrent, 1k tracks, 5 ingest/day) — not the caps of the
+  price the trial converts to. `past_due` is entitled only inside
+  `grace_until` (7d, reconciler-set); past grace the reconciler moves the
+  row to local-terminal `expired` (ADR 0002 rule 4). Trial requires a BYOP
+  provider (no bundled Usenet to abuse).
 - Prices are launch proposals; the `plans` table (ADR 0002) makes them data,
   not code. Changing numbers needs no deploy, no ADR.
 
@@ -48,8 +60,15 @@ size, ingest jobs/day, cache priority. NNTune never bundles Usenet access
 
 - The API worker enforces caps from `usage_ledger` + `plans` on every stream
   start; enforcement reads must be Hyperdrive-cached, never cold. The
-  effective plan is derived (active subscription, else the free/trial row) —
-  no stored `users.plan_id` to diverge (ADR 0002 rule 4).
+  effective plan is derived (live subscription, else nothing — hard
+  paywall) — no stored `users.plan_id` to diverge (ADR 0002 rule 4).
+- **Known rework this ADR imposes on sibling cards:** the ingest worker
+  writes `ingest_jobs` in the accepting transaction and rolls counts into
+  `usage_ledger` (rule: same-transaction counts, AE analytics-only) instead
+  of metering only through Analytics Engine events (`metering.rs` today has
+  no `ingest_jobs` table); the stream worker enforces concurrent caps from
+  the per-user pool Durable Object. Owned by the ingest and stream cards —
+  non-blocking here, but their review must show the writers.
 - `usage_ledger` (daily rows; monthly caps sum the calendar month) is the
   metering authority for cap enforcement, fed by `play_events`
   (`stream_seconds`), the `ingest_jobs` table (`ingest_jobs`), and cache

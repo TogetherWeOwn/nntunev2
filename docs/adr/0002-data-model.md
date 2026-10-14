@@ -10,6 +10,15 @@
   opt-in for Subsonic creds; grant `last_served_at` lifecycle; deferrable
   playlist position; Stripe-native trial + explicit `active` + partial unique;
   `ingest_jobs` metering writer + daily ledger rows; per-env DB names.
+- **Rev 2026-10-14 (review round 4, 4/5 → 5/5):** `api_key_hmac`
+  (HMAC-SHA256 with `SUBSONIC_INDEX_PEPPER`, ≥128-bit CSPRNG keys) adopts the
+  Subsonic sibling's strictly-stronger column instead of bare SHA-256;
+  per-credential non-PII `subsonic_username` lookup for the `t`/`s` form
+  (email never accepted as `u`); `track_media.last_served_at` + new
+  `track_sources` refetch record (ingest writer); entitlement from
+  `trialing`/`active` or `past_due`-inside-`grace_until`, `canceled` terminal
+  with `cancel_at_period_end`/`trial_end` columns, provisional signup row +
+  reconciler upsert, local `expired` frees the partial-unique slot.
 - **Non-blocking note:** Sibling cards (auth, ingest, streaming) already build on
   these table assumptions; this ADR confirms or adjusts them without gating.
 
@@ -31,8 +40,13 @@ users            id (uuid pk), email (unique), created_at
 sessions         id (uuid pk), user_id (fk), created_at, expires_at, revoked_at
 subsonic_credentials
                  id (uuid pk), user_id (fk), label,
-                 api_key_hash (text, nullable, UNIQUE — SHA-256 of the
-                 apiKey; lookup column for the u-less apiKey form),
+                 subsonic_username (text, UNIQUE, non-PII, generated
+                 at creation and shown once — the `u` value for the
+                 md5 t/s form; email is never accepted as `u`),
+                 api_key_hmac (text, nullable, UNIQUE — HMAC-SHA256 of
+                 the apiKey keyed by the `SUBSONIC_INDEX_PEPPER` Worker
+                 secret; lookup column for the u-less apiKey form;
+                 keys are ≥128-bit CSPRNG (prefer 256), see rule 2),
                  token_secret_encrypted (bytea, nullable:
                  envelope-encrypted, present only for credentials opting
                  into the md5 t/s form, see rule 2),
@@ -44,9 +58,19 @@ plans            id (text pk, e.g. 'free','plus','pro-5x','pro-20x'),
                  price_cents, stream_hours_month, max_concurrent_streams,
                  max_library_tracks, ingest_jobs_day, cache_priority
 subscriptions    id (uuid pk), user_id (fk), plan_id (fk), stripe_customer_id,
-                 stripe_subscription_id, status, current_period_end,
+                 stripe_subscription_id (UNIQUE — reconciler upserts on this),
+                 status (text: trialing|active|past_due|canceled|expired —
+                 `canceled` is Stripe-terminal, `expired` is local-terminal),
+                 current_period_end (timestamptz),
+                 cancel_at_period_end (bool, default false — end-of-period
+                 cancel stays `active` with this true until Stripe ends it),
+                 trial_end (timestamptz, nullable),
+                 grace_until (timestamptz, nullable — reconciler-set, 7d from
+                 entering past_due; entitlement window, see rule 4),
                  partial UNIQUE (user_id) WHERE status IN
-                 ('trialing','active','past_due') — one live row per user
+                 ('trialing','active','past_due') — one live row per user;
+                 `canceled`/`expired` rows sit outside the predicate so a
+                 resubscribe (new stripe_subscription_id) never collides
 usage_ledger     id (bigserial pk), user_id (fk), period (date: calendar
                  day — monthly caps sum the days of the month),
                  stream_seconds, ingest_jobs, cache_bytes,
@@ -67,7 +91,17 @@ tracks           id (uuid pk), mbid (uuid, nullable, indexed),
 track_media      user_id (fk), track_id (fk),
                  content_hash (fk → cache_objects),
                  format (text), bitrate (int), verified_at,
+                 last_served_at (timestamptz, refreshed when this user's
+                 track is served — bounds the GC mark half, ADR 0003),
                  pk (user_id, track_id, content_hash)
+track_sources    user_id (fk), track_id (fk),
+                 indexer_id (fk → indexers, nullable),
+                 nzb_ref_encrypted (bytea: envelope-encrypted NZB ref /
+                 ordered segment message-id list — the refetch source,
+                 written by the ingest worker at accept time, kept for
+                 the life of the library track, deleted with it),
+                 created_at (timestamptz),
+                 pk (user_id, track_id)
 user_cache_grants
                  user_id (fk), content_hash (fk → cache_objects),
                  provider_id (fk → providers, nullable),
@@ -103,6 +137,7 @@ users ──< providers ──< user_cache_grants >── cache_objects
 users ──< user_cache_grants (per-user right to read cached bytes)
 users ──< track_media >── tracks (per-user track→bytes mapping)
 track_media >── cache_objects (via content_hash FK)
+users ──< track_sources >── tracks (per-user refetch source, ingest-written)
 users ──< indexers (nullable: global indexers have NULL user_id)
 users ──< libraries ──< library_tracks >── tracks ──< releases ──< artists
 users ──< playlists ──< playlist_tracks >── tracks
@@ -115,18 +150,30 @@ users ──< play_events >── tracks
    `indexers.api_key_encrypted`): a per-row DEK encrypted by a KEK held outside
    the DB (Cloudflare Secrets / provider vault). Plaintext creds never touch
    Postgres logs, dumps, or error messages. See the threat-model card.
-2. **Subsonic credentials are hash-only by default, reversible only for the
-   md5 `t`/`s` opt-in:** the default `auth_mode='apikey'` stores only
-   `api_key_hash` (SHA-256, UNIQUE lookup) — the plaintext key is shown once
-   at creation and never stored, and requests carry `apiKey` without `u`
-   (ADR 0006). Only credentials with `auth_mode` including `token` carry
+2. **Subsonic credentials are HMAC-lookup by default, reversible only for
+   the md5 `t`/`s` opt-in:** the default `auth_mode='apikey'` stores only
+   `api_key_hmac` = HMAC-SHA256(apiKey, `SUBSONIC_INDEX_PEPPER` Worker
+   secret), UNIQUE lookup — the plaintext key is shown once at creation and
+   never stored, and requests carry `apiKey` without `u` (ADR 0006). Bare
+   unsalted SHA-256 is rejected: a DB dump (backup, replica) would permit
+   offline guessing against a fast hash, so this ADR adopts the Subsonic
+   sibling's `api_key_hmac` + pepper column (same lookup shape, strictly
+   stronger) rather than downgrading it. Keys are ≥128-bit CSPRNG (prefer
+   256-bit); the server rejects shorter/procedural keys at creation. Only
+   credentials with `auth_mode` including `token` carry
    `token_secret_encrypted` (a per-row DEK ciphertext like rule 1), because
    Subsonic token auth (`t = md5(secret + salt)`) needs the plaintext at
-   verify time. Secrets are random, shown once, revocable per client, and
-   scoped to the Subsonic surface. They have no relationship to passkey /
+   verify time. Each token-enabled credential gets a generated non-PII
+   `subsonic_username` (UNIQUE, shown once with the secret) that **is** the
+   `u` value for the token form: the server looks up by it, then unwraps
+   exactly one secret — email is never accepted as `u` (PII in query
+   strings, plus trial-unwrap-per-credential KEK cost on every
+   `stream`/`getCoverArt` call). Secrets are revocable per client and scoped
+   to the Subsonic surface. They have no relationship to passkey /
    magic-link credentials, which have no password to map. Table name
    `subsonic_credentials` is canonical; the sibling Subsonic card's
-   `subsonic_clients` shape (`api_key_hash` UNIQUE) reconciles into it.
+   `subsonic_clients` shape (`api_key_hmac` UNIQUE) reconciles into it
+   (the sibling keeps its column, this ADR adopts it).
 3. **`cache_objects` is a storage dedupe index, never an authorization.**
    Serving R2 bytes additionally requires a `user_cache_grants` row for
    (user, hash), created only after that user's own provider fetched and
@@ -135,21 +182,51 @@ users ──< play_events >── tracks
    everyone. This reconciles threat-model §5 (never serve user A's bytes on
    user B's grant): storage sharing is invisible and unaddressable without
    the grant row. Grant/mapping lifecycle: removing a library track deletes
-   its `track_media` rows; cache eviction deletes the evicted grant rows
-   (ADR 0003); `last_served_at` refreshes on every serve so the GC mark set
-   is bounded and eviction actually reclaims. See ADR 0003.
+   its `track_media` + `track_sources` rows; cache eviction deletes the
+   evicted grant rows first, then the newly-orphaned `track_media` rows
+   (orphaned = a `track_media` row whose `(user_id, content_hash)` has no
+   matching `user_cache_grants` row, or whose `track_id` left the user's
+   libraries), then sweepable `cache_objects` — the FK
+   `track_media.content_hash → cache_objects` requires this order, a stale
+   grant alone never makes an object sweepable while a `track_media` row
+   still points at it. `last_served_at` refreshes on every serve on **both**
+   the grant row and the served `track_media` rows, so both halves of the
+   GC mark set are windowed (ADR 0003). Per-user charging for the shared
+   store: a user's `cache_bytes` = SUM(`byte_size`) over **that user's**
+   grants — a shared object's bytes count toward every granted user's
+   budget, and evicting user A's grant frees A's budget even while user B's
+   grant keeps the object alive (the object is deleted only at zero grants
+   plus zero referencing `track_media` rows). Refetch sources live in
+   `track_sources`, written by the ingest worker in the accepting
+   transaction and kept for the life of the library track, so eviction is
+   non-destructive (ADR 0003). See ADR 0003.
 4. **Entitlement has one source of truth:** the effective plan is derived —
-   the single active `subscriptions` row's plan, else nothing (hard paywall,
-   ADR 0004). `active` means `status` in (`trialing`, `active`), plus
-   `past_due` inside grace and `canceled` with `current_period_end` in the
-   future; a partial unique index permits one such row per user. Trial is
-   Stripe-native only: a `trialing` subscription on the trial plan created
-   at signup — there is no separate app-side `users.created_at` clock, so
-   the two trial mechanisms of the previous revision collapse into one.
-   After the 14-day window with no paid subscription there is no
-   entitlement. The `users` table carries no `plan_id`; the Stripe webhook
-   reconciler is the sole writer of `subscriptions`. Cap enforcement
-   (ADR 0004) reads this derived plan only.
+   the single live `subscriptions` row's plan, else nothing (hard paywall,
+   ADR 0004). Entitled means `status` in (`trialing`, `active`), **or**
+   `status = 'past_due'` with `grace_until > now()` (7-day reconciler-set
+   grace; ADR 0005). `canceled` is terminal and **never** entitled: an
+   end-of-period cancel stays `active` with `cancel_at_period_end = true`
+   until Stripe ends it (that is the paid-through case — not a `canceled`
+   row with a future period end), and a Stripe-side cancel after dunning
+   has already rolled into the unpaid period. The partial unique index
+   covers exactly the non-terminal set (`trialing`,`active`,`past_due`),
+   so a resubscribe (new `stripe_subscription_id`) never collides with an
+   old terminal row and "the single active row" is unambiguous. A `past_due`
+   row past grace no longer blocks its replacement: the reconciler moves it
+   to local-terminal `expired` (outside the predicate), freeing the slot —
+   the predicate cannot express "inside grace", so `grace_until` carries it.
+   Trial is Stripe-native only: signup creates a `trialing` subscription on
+   the trial plan with `trial_settings.missing_payment_method = cancel`
+   (ADR 0005) — there is no separate app-side `users.created_at` clock.
+   While `trialing`, trial-plan caps apply (10 stream hrs, ADR 0004), not
+   the converted price's caps. The signup handler writes the provisional
+   `trialing` row in the same transaction as user creation (so a new signup
+   is entitled before `customer.subscription.created` arrives); the Stripe
+   webhook reconciler upserts on `stripe_subscription_id` thereafter and is
+   the authoritative updater. After the 14-day window with no paid
+   subscription Stripe cancels the trial (per the pinned setting) and there
+   is no entitlement. The `users` table carries no `plan_id`. Cap
+   enforcement (ADR 0004) reads this derived plan only.
 5. **`play_events` is append-only and monthly-partitioned.** Retention/drop is
    by whole partition. Billing/metering aggregates roll up into `usage_ledger`
    (daily rows; monthly caps sum the calendar month), which is the metering
@@ -182,3 +259,12 @@ users ──< play_events >── tracks
 - Partition creation for `play_events` is automated (monthly job); missing
   future partitions must page, not silently drop writes.
 - Any new table touching auth/secrets/permissions needs the CISO gate.
+- **Known rework this ADR imposes on sibling cards:** the auth/vault card
+  migrates to uuid PKs + timestamptz (from TEXT ids / BIGINT epoch) and to
+  multi-row `providers` (one row per provider label, envelope-encrypted per
+  row) instead of a single `provider_vaults` row per user; the Subsonic card
+  adopts `api_key_hmac` + `subsonic_username` (rule 2) instead of bare
+  SHA-256 / email-as-`u`; the ingest card writes `ingest_jobs` in the
+  accepting transaction and `track_sources` alongside `track_media`
+  (rule 5 / rule 3). Owned by the auth, Subsonic compat and ingest cards —
+  non-blocking here, but their review must show the alignment.

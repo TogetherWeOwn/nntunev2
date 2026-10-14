@@ -2,6 +2,12 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-13
+- **Rev 2026-10-14 (review round 4, 4/5 → 5/5):** trial pinned to
+  `trial_settings.missing_payment_method = cancel`; webhook contract
+  extended (`customer.subscription.created/updated/deleted`,
+  `trial_will_end`, `invoice.*`); provisional signup row + reconciler
+  upsert; no persisting $0 subscription; 7-day `past_due` grace via
+  `grace_until`.
 
 ## Context
 
@@ -20,8 +26,22 @@ usage-based is reported to Stripe, so plan caps can never produce a bill.
 
 - Native trial → paid conversion, flat recurring prices per plan, and
   proration on 5x/20x upgrades out of the box — exactly our plan shape.
-- Webhook contract (`customer.subscription.*`, `invoice.*`) is well-understood;
-  the API worker reconciles webhook state into `subscriptions.status`.
+- Webhook contract (`customer.subscription.created/updated/deleted`,
+  `customer.subscription.trial_will_end`, `invoice.*`) is well-understood;
+  the API worker reconciler upserts `subscriptions` on
+  `stripe_subscription_id` (authoritative updater) and sets `grace_until`
+  (7d from entering `past_due`), `cancel_at_period_end`, and `trial_end`.
+  Trial creation pins `trial_settings[missing_payment_method] = cancel` —
+  never the `create_invoice` default: a trialing subscription on the $0
+  trial plan must not survive as an `active` $0 row (that would be the
+  forever tier ADR 0004 rules out), and a trial on a paid price must not
+  linger in `past_due`-inside-grace past the window. Signup writes the
+  provisional `trialing` row with the user (ADR 0002 rule 4) so entitlement
+  exists before `customer.subscription.created` arrives.
+  `customer.subscription.deleted` (and dunning-exhausted cancels) move the
+  local row to terminal `canceled`; a `past_due` row past `grace_until`
+  with no Stripe successor moves to local-terminal `expired` to free the
+  partial-unique slot for the replacement subscription.
 - No merchant-of-record need (we sell direct SaaS, not a marketplace), so
   Paddle's MoR value doesn't apply; Lemon Squeezy adds nothing over Stripe
   here. Homegrown billing is a liability, not a feature.
