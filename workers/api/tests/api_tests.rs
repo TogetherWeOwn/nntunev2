@@ -34,13 +34,29 @@ fn session_roundtrip_and_cookie_attributes() {
     );
 
     let header = session::set_cookie_header(&token, 3600);
+    // F-HARD-01 item 2: `__Host-` prefix requirements — Path=/, Secure,
+    // no Domain — are enforced by construction, not convention.
+    assert!(
+        header.starts_with("__Host-nntune-session="),
+        "cookie must carry the __Host- prefix: {header}"
+    );
     assert!(header.contains("HttpOnly"), "cookie must be HttpOnly");
     assert!(header.contains("Secure"), "cookie must be Secure");
+    assert!(header.contains("Path=/"), "cookie must be Path=/");
+    assert!(
+        !header.contains("Domain="),
+        "__Host- cookies must never carry Domain="
+    );
     assert!(
         header.contains("SameSite=Lax"),
         "cookie must be SameSite=Lax"
     );
     assert!(!header.contains("SameSite=None"), "SameSite=None is banned");
+    let cleared = session::clear_cookie_header();
+    assert!(
+        cleared.starts_with("__Host-nntune-session=;"),
+        "logout must clear the same __Host- cookie: {cleared}"
+    );
 }
 
 #[test]

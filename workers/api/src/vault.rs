@@ -424,61 +424,9 @@ fn random_nonce() -> [u8; 12] {
     n
 }
 
-fn b64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
-        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[((n >> 6) & 63) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[(n & 63) as usize] as char);
-        }
-    }
-    out
-}
-
-fn unb64url(s: &str) -> Result<Vec<u8>, VaultError> {
-    fn val(c: u8) -> Result<u32, VaultError> {
-        match c {
-            b'A'..=b'Z' => Ok((c - b'A') as u32),
-            b'a'..=b'z' => Ok((c - b'a' + 26) as u32),
-            b'0'..=b'9' => Ok((c - b'0' + 52) as u32),
-            b'-' => Ok(62),
-            b'_' => Ok(63),
-            _ => Err(VaultError::Invalid),
-        }
-    }
-    if s.len() % 4 == 1 {
-        return Err(VaultError::Invalid);
-    }
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.chunks(4) {
-        let mut n = 0u32;
-        let mut present = 0usize;
-        for &c in chunk {
-            n = (n << 6) | val(c)?;
-            present += 1;
-        }
-        n <<= 6 * (4 - present);
-        out.push(((n >> 16) & 0xFF) as u8);
-        if present > 2 {
-            out.push(((n >> 8) & 0xFF) as u8);
-        }
-        if present > 3 {
-            out.push((n & 0xFF) as u8);
-        }
-    }
-    Ok(out)
-}
-
+// Unpadded-base64url lives in one place: [`crate::b64`] over the `base64`
+// crate (F-HARD-01). The per-module hand-rolled copies are deleted; decode
+// errors map to generic [`VaultError::Invalid`] at each call site.
 fn dek_aad(user_id: &str, kek_version: u32) -> String {
     format!("v1|dek|{}|{}", user_id, kek_version)
 }
@@ -527,10 +475,10 @@ pub fn encrypt_vault(
 
     Ok(VaultBlob {
         kek_version,
-        dek_wrapped_nonce_b64url: b64url(&wrap_nonce),
-        dek_wrapped_b64url: b64url(&wrapped),
-        payload_nonce_b64url: b64url(&payload_nonce),
-        payload_b64url: b64url(&payload),
+        dek_wrapped_nonce_b64url: crate::b64::encode(&wrap_nonce),
+        dek_wrapped_b64url: crate::b64::encode(&wrapped),
+        payload_nonce_b64url: crate::b64::encode(&payload_nonce),
+        payload_b64url: crate::b64::encode(&payload),
     })
 }
 
@@ -543,8 +491,9 @@ pub fn decrypt_vault(
     blob: &VaultBlob,
 ) -> Result<Vec<u8>, VaultError> {
     let kek_cipher = Aes256Gcm::new_from_slice(kek).map_err(|_| VaultError::Crypto)?;
-    let wrap_nonce = unb64url(&blob.dek_wrapped_nonce_b64url)?;
-    let wrapped = unb64url(&blob.dek_wrapped_b64url)?;
+    let wrap_nonce =
+        crate::b64::decode(&blob.dek_wrapped_nonce_b64url).map_err(|_| VaultError::Invalid)?;
+    let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url).map_err(|_| VaultError::Invalid)?;
     if wrap_nonce.len() != 12 {
         return Err(VaultError::Invalid);
     }
@@ -568,8 +517,9 @@ pub fn decrypt_vault(
     let dek = Dek(arr);
 
     let dek_cipher = Aes256Gcm::new_from_slice(&dek.0).map_err(|_| VaultError::Crypto)?;
-    let payload_nonce = unb64url(&blob.payload_nonce_b64url)?;
-    let payload = unb64url(&blob.payload_b64url)?;
+    let payload_nonce =
+        crate::b64::decode(&blob.payload_nonce_b64url).map_err(|_| VaultError::Invalid)?;
+    let payload = crate::b64::decode(&blob.payload_b64url).map_err(|_| VaultError::Invalid)?;
     if payload_nonce.len() != 12 {
         return Err(VaultError::Invalid);
     }
@@ -595,8 +545,9 @@ pub fn rewrap_dek(
 ) -> Result<VaultBlob, VaultError> {
     // Unwrap with the old KEK (old AAD: old version).
     let old_cipher = Aes256Gcm::new_from_slice(old_kek).map_err(|_| VaultError::Crypto)?;
-    let wrap_nonce = unb64url(&blob.dek_wrapped_nonce_b64url)?;
-    let wrapped = unb64url(&blob.dek_wrapped_b64url)?;
+    let wrap_nonce =
+        crate::b64::decode(&blob.dek_wrapped_nonce_b64url).map_err(|_| VaultError::Invalid)?;
+    let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url).map_err(|_| VaultError::Invalid)?;
     if wrap_nonce.len() != 12 {
         return Err(VaultError::Invalid);
     }
@@ -630,8 +581,8 @@ pub fn rewrap_dek(
 
     Ok(VaultBlob {
         kek_version: new_version,
-        dek_wrapped_nonce_b64url: b64url(&new_nonce),
-        dek_wrapped_b64url: b64url(&new_wrapped),
+        dek_wrapped_nonce_b64url: crate::b64::encode(&new_nonce),
+        dek_wrapped_b64url: crate::b64::encode(&new_wrapped),
         payload_nonce_b64url: blob.payload_nonce_b64url.clone(),
         payload_b64url: blob.payload_b64url.clone(),
     })

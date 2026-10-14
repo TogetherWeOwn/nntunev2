@@ -5,6 +5,7 @@
 //! is contacted. These tests do not verify HTTP adapters, database concurrency,
 //! WebAuthn signatures, or connection-time DNS pinning.
 
+use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use nntune_api::{auth, session, vault};
 use sha2::Sha256;
@@ -251,17 +252,7 @@ fn targets_preserve_hostname_and_every_vetted_public_address() {
 // Independent HMAC fixture signer. It intentionally does not use the issuer,
 // which clamps TTLs and therefore cannot produce the over-age regression token.
 fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut result = String::new();
-    for chunk in bytes.chunks(3) {
-        let word = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        for shift in [18, 12, 6, 0].into_iter().take(chunk.len() + 1) {
-            result.push(ALPHABET[((word >> shift) & 63) as usize] as char);
-        }
-    }
-    result
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 fn signed_session(created_at: u64, issued_at: u64, expires_at: u64) -> String {

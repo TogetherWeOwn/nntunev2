@@ -16,7 +16,11 @@ SESSION_TTL_SECS = "86400"
 # id = "<fill in staging/prod id>"
 
 # Secrets (set with `wrangler secret put`, never here):
-#   VAULT_KEK_BASE64        32-byte KEK, base64 (versioned; rotate via rewrap job)
-#   VAULT_KEK_VERSION       integer version matching the KEK
-#   SESSION_SECRET_BASE64   HMAC secret for session cookies
-#   EMAIL_API_KEY           transactional email provider key (magic-link delivery)
+#   VAULT_KEK_BASE64              32-byte KEK, base64 (versioned; rotate via rewrap job)
+#   VAULT_KEK_VERSION             integer version matching the KEK
+#   SESSION_SECRET_BASE64         HMAC secret for session cookies (256-bit, base64)
+#   SESSION_SECRET_PREVIOUS_BASE64  verify-only previous HMAC secret: set ONLY
+#                                 during a rotation window, deleted at its end.
+#                                 See docs/security/session-secret-rotation.md —
+#                                 never two live minting secrets.
+#   EMAIL_API_KEY                 transactional email provider key (magic-link delivery)

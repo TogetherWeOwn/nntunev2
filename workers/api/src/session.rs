@@ -20,7 +20,12 @@ pub const CLOCK_SKEW_SECS: u64 = 60;
 /// Absolute lifetime from authentication, not refreshed by rotation (one day).
 pub const MAX_SESSION_SECS: u64 = 86_400;
 /// Cookie name for the web session.
-pub const COOKIE_NAME: &str = "nntune_session";
+///
+/// The `__Host-` prefix locks out `Domain=` overrides by construction:
+/// a `__Host-` cookie is only accepted with `Path=/`, `Secure` and no
+/// `Domain` attribute — all of which [`set_cookie_header`] already emits.
+/// Never add `Domain=` to this cookie: browsers would reject it outright.
+pub const COOKIE_NAME: &str = "__Host-nntune-session";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionClaims {
@@ -39,7 +44,7 @@ pub struct SessionClaims {
 fn new_session_id() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
-    b64url_encode(&bytes)
+    crate::b64::encode(&bytes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,71 +59,9 @@ impl std::fmt::Display for SessionError {
     }
 }
 
-fn b64url_encode(bytes: &[u8]) -> String {
-    base64_url_encode(bytes)
-}
-
-fn b64url_decode(s: &str) -> Result<Vec<u8>, SessionError> {
-    base64_url_decode(s).map_err(|_| SessionError::Invalid)
-}
-
-// Minimal base64url without a new dependency (core-compatible).
-fn base64_url_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
-        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[((n >> 6) & 63) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[(n & 63) as usize] as char);
-        }
-    }
-    out
-}
-
-fn base64_url_decode(s: &str) -> Result<Vec<u8>, ()> {
-    fn val(c: u8) -> Result<u32, ()> {
-        match c {
-            b'A'..=b'Z' => Ok((c - b'A') as u32),
-            b'a'..=b'z' => Ok((c - b'a' + 26) as u32),
-            b'0'..=b'9' => Ok((c - b'0' + 52) as u32),
-            b'-' => Ok(62),
-            b'_' => Ok(63),
-            _ => Err(()),
-        }
-    }
-    let bytes = s.as_bytes();
-    if bytes.len() % 4 == 1 {
-        return Err(());
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.chunks(4) {
-        let mut n = 0u32;
-        let mut present = 0usize;
-        for &c in chunk {
-            n = (n << 6) | val(c)?;
-            present += 1;
-        }
-        // Pad the final quantum with zero bits.
-        n <<= 6 * (4 - present);
-        out.push(((n >> 16) & 0xFF) as u8);
-        if present > 2 {
-            out.push(((n >> 8) & 0xFF) as u8);
-        }
-        if present > 3 {
-            out.push((n & 0xFF) as u8);
-        }
-    }
-    Ok(out)
-}
-
+// Unpadded-base64url lives in one place: [`crate::b64`] over the `base64`
+// crate (F-HARD-01). Decode errors map to [`SessionError::Invalid`] at each
+// call site; nothing secret or distinguishing is ever echoed.
 fn sign(secret: &[u8], payload_b64: &str) -> Vec<u8> {
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(payload_b64.as_bytes());
@@ -136,9 +79,9 @@ pub fn issue_session(secret: &[u8], user_id: &str, now: u64, ttl_secs: u64) -> S
         rotation_counter: 0,
     };
     let payload = serde_json::to_vec(&claims).expect("claims serialize");
-    let payload_b64 = b64url_encode(&payload);
+    let payload_b64 = crate::b64::encode(&payload);
     let sig = sign(secret, &payload_b64);
-    format!("{}.{}", payload_b64, b64url_encode(&sig))
+    format!("{}.{}", payload_b64, crate::b64::encode(&sig))
 }
 
 /// Verify signature and time bounds only; this does NOT authenticate a
@@ -146,12 +89,12 @@ pub fn issue_session(secret: &[u8], user_id: &str, now: u64, ttl_secs: u64) -> S
 /// [`verify_stored_session`] against that current row before authorization.
 pub fn verify_session(secret: &[u8], token: &str, now: u64) -> Result<SessionClaims, SessionError> {
     let (payload_b64, sig_b64) = token.split_once('.').ok_or(SessionError::Invalid)?;
-    let sig = b64url_decode(sig_b64)?;
+    let sig = crate::b64::decode(sig_b64).map_err(|_| SessionError::Invalid)?;
     let expected = sign(secret, payload_b64);
     if sig.len() != expected.len() || sig.ct_eq(&expected).unwrap_u8() != 1 {
         return Err(SessionError::Invalid);
     }
-    let payload = b64url_decode(payload_b64)?;
+    let payload = crate::b64::decode(payload_b64).map_err(|_| SessionError::Invalid)?;
     let claims: SessionClaims =
         serde_json::from_slice(&payload).map_err(|_| SessionError::Invalid)?;
     if claims.user_id.is_empty() || claims.session_id.is_empty() {
@@ -169,6 +112,22 @@ pub fn verify_session(secret: &[u8], token: &str, now: u64) -> Result<SessionCla
         return Err(SessionError::Invalid);
     }
     Ok(claims)
+}
+
+/// Rotation-window verification: accept tokens signed by the current
+/// `primary` secret OR the superseded `previous` secret (see
+/// `docs/security/session-secret-rotation.md`). Outside a rotation window
+/// callers pass the same secret twice or use [`verify_session`] directly —
+/// a standing second secret would needlessly broaden the signing scope.
+/// Both failures map to the same generic [`SessionError::Invalid`]; there
+/// is no oracle for which secret matched.
+pub fn verify_session_dual(
+    primary: &[u8],
+    previous: &[u8],
+    token: &str,
+    now: u64,
+) -> Result<SessionClaims, SessionError> {
+    verify_session(primary, token, now).or_else(|_| verify_session(previous, token, now))
 }
 
 /// Current server-side row from `sessions`; absence of a row must reject.
@@ -233,9 +192,9 @@ pub fn rotate_session(
             .ok_or(SessionError::Invalid)?,
     };
     let payload = serde_json::to_vec(&next).expect("claims serialize");
-    let payload_b64 = b64url_encode(&payload);
+    let payload_b64 = crate::b64::encode(&payload);
     let sig = sign(secret, &payload_b64);
-    Ok(format!("{}.{}", payload_b64, b64url_encode(&sig)))
+    Ok(format!("{}.{}", payload_b64, crate::b64::encode(&sig)))
 }
 
 /// `Set-Cookie` header value. Always HttpOnly + Secure + SameSite=Lax.
@@ -264,5 +223,32 @@ mod tests {
         assert!(verify_session(secret, "no-dot", 0).is_err());
         assert!(verify_session(secret, "!!!.@@@", 0).is_err());
         assert!(verify_session(secret, "", 0).is_err());
+    }
+
+    #[test]
+    fn dual_secret_accepts_previous_only_in_rotation_window() {
+        let primary = b"primary-secret-00000000000000000000";
+        let previous = b"previous-secret-0000000000000000000";
+        let now = 1_700_000_000u64;
+        // Token minted under the superseded secret verifies while the
+        // previous secret is still configured ...
+        let old_token = issue_session(previous, "user-1", now, 3600);
+        assert!(verify_session(primary, &old_token, now + 60).is_err());
+        assert!(verify_session_dual(primary, previous, &old_token, now + 60).is_ok());
+        // ... new tokens verify under the primary alone ...
+        let new_token = issue_session(primary, "user-1", now, 3600);
+        assert!(verify_session_dual(primary, previous, &new_token, now + 60).is_ok());
+        // ... and dropping the previous secret ends the window: old tokens
+        // fail under the primary with no oracle for which secret matched.
+        assert!(verify_session(primary, &old_token, now + 60).is_err());
+        assert_eq!(
+            verify_session_dual(
+                b"wrong-1-00000000000000000000000",
+                b"wrong-2-00000000000000000000000",
+                &new_token,
+                now + 60
+            ),
+            Err(SessionError::Invalid)
+        );
     }
 }
