@@ -6,13 +6,15 @@
 //! propagate to the response.
 
 use nntune_subsonic::library::{
-    Album, Artist, Library, PlayQueue, Playlist, Song, StarKind, UserAccount, NOW,
+    Album, AlbumListQuery, Artist, Library, PlayQueue, Playlist, Song, StarKind, UserAccount, NOW,
 };
 use nntune_subsonic::{AuthStore, Identity, MemStore, SubsonicApp};
 
 const KEY: &str = "apiKey=test-key-1&v=1.16.1&c=t";
 
-/// Store with a caller-supplied index timestamp.
+/// Store with a caller-supplied index timestamp and an empty catalogue.
+/// Sampling and history delegate to the real empty store so the seam carries
+/// no reimplemented shuffle or refusal text.
 #[derive(Clone, Debug)]
 struct TimestampStore {
     last_modified: i64,
@@ -81,6 +83,18 @@ impl Library for TimestampStore {
 
     fn all_albums(&self) -> Vec<Album> {
         Vec::new()
+    }
+
+    fn album_list(&self, query: AlbumListQuery<'_>) -> Vec<Album> {
+        MemStore::empty_with_test_auth().album_list(query)
+    }
+
+    fn album_list2(&self, query: AlbumListQuery<'_>) -> Result<Vec<Album>, (i64, String)> {
+        MemStore::empty_with_test_auth().album_list2(query)
+    }
+
+    fn random_songs(&self, identity: &Identity, size: usize) -> Vec<Song> {
+        MemStore::empty_with_test_auth().random_songs(identity, size)
     }
 
     fn songs_for_album(&self, _album_id: &str) -> Vec<Song> {
@@ -196,5 +210,24 @@ fn custom_store_timestamp_propagates_to_get_indexes() {
     assert!(
         text.contains("\"lastModified\":1700000000000"),
         "custom timestamp must propagate: {text}"
+    );
+}
+
+#[test]
+fn empty_seam_delegates_list2_refusal_text() {
+    let app = SubsonicApp::new(TimestampStore {
+        last_modified: 1_700_000_000_000,
+    });
+    let res = app.handle(
+        "GET",
+        "/rest/getAlbumList2",
+        &format!("{KEY}&type=frequent&f=json"),
+        "",
+    );
+    let text = String::from_utf8(res.body).unwrap();
+    assert!(text.contains("\"code\":0"), "{text}");
+    assert!(
+        text.contains("Unsupported album list type: frequent"),
+        "{text}"
     );
 }
