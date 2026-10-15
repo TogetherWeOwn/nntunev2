@@ -135,7 +135,7 @@ async fn requires_auth_before_group() {
     let server = TestNntpServer::spawn_for_test().await;
     let mut c = Client::connect(&server).await;
     let r = c.cmd("GROUP alt.binaries.nntune.test").await;
-    assert!(r.starts_with("481"), "got {r:?}");
+    assert!(r.starts_with("480"), "got {r:?}");
 }
 
 #[tokio::test]
@@ -592,6 +592,80 @@ async fn server_stops_serving_after_drop() {
         TcpStream::connect(addr).await.is_err(),
         "server still accepts connections after drop"
     );
+}
+
+#[tokio::test]
+async fn server_drop_closes_open_sessions() {
+    let server = TestNntpServer::spawn_for_test().await;
+    // Hold an authenticated session across the drop.
+    let stream = TcpStream::connect(server.addr()).await.unwrap();
+    let (r, mut w) = stream.into_split();
+    let mut reader = BufReader::new(r);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap(); // greeting
+    assert!(line.starts_with("200"), "greeting: {line:?}");
+    w.write_all(b"AUTHINFO USER testuser\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("381"), "got {line:?}");
+    w.write_all(b"AUTHINFO PASS testpass\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("281"), "got {line:?}");
+
+    drop(server);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The open session must be closed: no further command may be served.
+    let _ = w.write_all(b"STAT <single-yenc-001@nntune.test>\r\n").await;
+    let mut buf = [0u8; 1024];
+    let res = tokio::time::timeout(Duration::from_secs(5), reader.read(&mut buf))
+        .await
+        .expect("timed out waiting for session close");
+    match res {
+        Ok(0) => {} // EOF: session closed as required.
+        Ok(n) => panic!(
+            "open session still served after drop: {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        ),
+        Err(_) => {} // Connection error/reset: also a closed session.
+    }
+}
+
+#[tokio::test]
+async fn unauthenticated_commands_get_480() {
+    // RFC 4643 s2.3.1: missing auth is 480, not 481 (which means
+    // credentials were rejected).
+    let server = TestNntpServer::spawn_for_test().await;
+    let mut c = Client::connect(&server).await;
+    for cmd in [
+        "GROUP alt.binaries.nntune.test",
+        "LIST",
+        "XOVER 1-",
+        "ARTICLE <single-yenc-001@nntune.test>",
+        "STAT <single-yenc-001@nntune.test>",
+    ] {
+        let r = c.cmd(cmd).await;
+        assert!(r.starts_with("480"), "{cmd}: got {r:?}");
+    }
+}
+
+#[tokio::test]
+async fn pass_without_user_gets_482() {
+    // RFC 4643 s2.3.2: AUTHINFO PASS with no preceding USER is 482
+    // (out of sequence), not 481.
+    let server = TestNntpServer::spawn_for_test().await;
+    let mut c = Client::connect(&server).await;
+    let r = c.cmd("AUTHINFO PASS testpass").await;
+    assert!(r.starts_with("482"), "got {r:?}");
+}
+
+#[tokio::test]
+async fn unknown_group_gets_411() {
+    let server = TestNntpServer::spawn_for_test().await;
+    let mut c = Client::connect(&server).await;
+    c.auth("testuser", "testpass").await;
+    let r = c.cmd("GROUP nosuchgroup.example.invalid").await;
+    assert!(r.starts_with("411"), "got {r:?}");
 }
 
 #[tokio::test]

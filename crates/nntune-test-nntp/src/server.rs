@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 use crate::fixtures::Article;
 
@@ -102,6 +102,9 @@ pub struct TestNntpServer {
     addr: SocketAddr,
     // Held so the accept loop stays alive; aborted on drop.
     _task: tokio::task::JoinHandle<()>,
+    // Signalled on drop so already-open sessions close too, not just the
+    // accept loop (aborting the accept task alone detaches session tasks).
+    shutdown: watch::Sender<bool>,
 }
 
 impl TestNntpServer {
@@ -116,8 +119,13 @@ impl TestNntpServer {
             .await
             .expect("bind test nntp");
         let addr = listener.local_addr().expect("local addr");
-        let task = tokio::spawn(serve(listener, config));
-        Self { addr, _task: task }
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(serve_with_shutdown(listener, config, shutdown_rx));
+        Self {
+            addr,
+            _task: task,
+            shutdown,
+        }
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -127,31 +135,52 @@ impl TestNntpServer {
 
 impl Drop for TestNntpServer {
     fn drop(&mut self) {
-        // Dropping a JoinHandle detaches by default; abort so the accept loop
-        // (which owns the listener) stops and the port refuses new connections.
+        // Signal every open session to close, then abort the accept loop
+        // (which owns the listener) so the port refuses new connections.
+        // Dropping a JoinHandle alone detaches; abort is required.
+        let _ = self.shutdown.send(true);
         self._task.abort();
     }
 }
 
 /// Serve forever on an already-bound listener (used by the standalone binary).
 pub async fn serve(listener: TcpListener, config: ServerConfig) {
+    // The standalone binary serves until killed, so its shutdown signal is
+    // never sent; dropping the receiver also closes sessions (see below).
+    let (_shutdown, shutdown_rx) = watch::channel(false);
+    serve_with_shutdown(listener, config, shutdown_rx).await;
+}
+
+async fn serve_with_shutdown(
+    listener: TcpListener,
+    config: ServerConfig,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let shared = Arc::new(Shared {
         config,
         active: Mutex::new(HashMap::new()),
     });
     loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(v) => v,
-            Err(_) => break,
+        let (stream, _) = tokio::select! {
+            _ = shutdown.changed() => break,
+            accepted = listener.accept() => match accepted {
+                Ok(v) => v,
+                Err(_) => break,
+            },
         };
         let shared = Arc::clone(&shared);
+        let session_shutdown = shutdown.clone();
         tokio::spawn(async move {
-            handle_connection(stream, shared).await;
+            handle_connection(stream, shared, session_shutdown).await;
         });
     }
 }
 
-async fn handle_connection(stream: TcpStream, shared: Arc<Shared>) {
+async fn handle_connection(
+    stream: TcpStream,
+    shared: Arc<Shared>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader);
     let mut authed: Option<String> = None;
@@ -166,7 +195,13 @@ async fn handle_connection(stream: TcpStream, shared: Arc<Shared>) {
     let mut buf = String::new();
     loop {
         buf.clear();
-        let n = match lines.read_line(&mut buf).await {
+        // Select on the shutdown signal so dropping the server closes this
+        // session instead of leaving it served by a detached task.
+        let read = tokio::select! {
+            _ = shutdown.changed() => break,
+            read = lines.read_line(&mut buf) => read,
+        };
+        let n = match read {
             Ok(0) => break, // client closed
             Ok(n) => n,
             Err(_) => break,
@@ -201,7 +236,14 @@ async fn handle_connection(stream: TcpStream, shared: Arc<Shared>) {
                     let _ = writer.write_all(b"381 Password required\r\n").await;
                 } else if upper.starts_with("PASS ") {
                     let pass = arg[5..].trim();
-                    let user = pending_user.clone().unwrap_or_default();
+                    // RFC 4643 s2.3.2: PASS with no preceding USER is out
+                    // of sequence (482), not a credential failure (481).
+                    let Some(user) = pending_user.clone() else {
+                        let _ = writer
+                            .write_all(b"482 Authentication commands issued out of sequence\r\n")
+                            .await;
+                        continue;
+                    };
                     let ok = shared
                         .config
                         .users
@@ -248,6 +290,14 @@ async fn handle_connection(stream: TcpStream, shared: Arc<Shared>) {
                 } else {
                     arg.clone()
                 };
+                // RFC 3977 s3.1.2: a group that is neither the configured
+                // group nor carried by any article does not exist.
+                let known =
+                    g == shared.config.group || shared.config.articles.iter().any(|a| a.group == g);
+                if !known {
+                    let _ = writer.write_all(b"411 No such newsgroup\r\n").await;
+                    continue;
+                }
                 let count = shared
                     .config
                     .articles
@@ -384,7 +434,9 @@ async fn check_auth(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
 ) -> bool {
     if config.require_auth && authed.is_none() {
-        let _ = writer.write_all(b"481 Authentication required\r\n").await;
+        // RFC 4643 s2.3.1: authentication is required (480); 481 means the
+        // credentials that were presented were rejected.
+        let _ = writer.write_all(b"480 Authentication required\r\n").await;
         return false;
     }
     true
