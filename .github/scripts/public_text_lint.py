@@ -103,6 +103,10 @@ HOST_FIXTURE_EXCLUSIONS = frozenset(
         # SSRF negative-test vectors: reserved ranges asserted rejected.
         "workers/api/tests/api_tests.rs",
         "workers/api/tests/security_regressions.rs",
+        # SSRF negative-test vectors in api unit tests: reserved ranges
+        # asserted rejected (DNS-guard fake resolver, dial-prefix validation).
+        "workers/api/src/handlers.rs",
+        "workers/api/src/vault.rs",
     }
 )
 
