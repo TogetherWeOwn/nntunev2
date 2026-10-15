@@ -176,7 +176,11 @@ def find_violations(text, path=""):
     masked = _ENV_LOCAL_MASK.sub(".env.example", masked)
     host_exempt = path in HOST_FIXTURE_EXCLUSIONS
     hits = []
-    for lineno, line in enumerate(masked.splitlines(), start=1):
+    # Split on '\n' only: str.splitlines() also splits on U+0085 (NEL),
+    # U+000B, U+000C and U+001C-U+001E, and the latin-1 decode in scan_path
+    # turns UTF-8 continuation bytes (e.g. the ✅ in threat-model.md) into
+    # those code points — shifting every reported line number after one.
+    for lineno, line in enumerate(masked.split("\n"), start=1):
         for rule_id, patterns in RULES:
             if rule_id == "internal-host" and host_exempt:
                 patterns = _HOST_PATTERNS_STRICT

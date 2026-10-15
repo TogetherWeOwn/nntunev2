@@ -33,11 +33,14 @@ KEK[v] (Worker secret, 256-bit, never in repo/logs)
 
 Primitives: **AES-256-GCM** everywhere (96-bit random nonce per
 encryption; `aes-gcm` crate, works on `wasm32` + native). Associated
-data binds the row:
+data binds the row. The single source of truth is the code —
+`workers/api/src/vault.rs` (`dek_aad`, `payload_aad`); the re-wrap (§6)
+and compromise re-key (§10) jobs MUST call `vault::rewrap_dek` /
+`vault::encrypt_vault` rather than rebuild AAD by hand:
 
 ```text
-AAD(dek-wrap) = "nntune-vault/v1" || user_id || kek_version
-AAD(payload)  = "nntune-vault/v1" || user_id
+AAD(dek-wrap) = "v1|dek|<user_id>|<kek_version>"  (dek_aad)
+AAD(payload)  = "v1|vault|<user_id>"              (payload_aad)
 ```
 
 ## 2. Schema (PlanetScale Postgres via Hyperdrive)
@@ -77,15 +80,18 @@ Rules:
 ## 3. KEK provisioning and versioning
 
 Slice-1 reality (`wrangler.toml.example`): one KEK per environment —
-`VAULT_KEK_BASE64` (32 random bytes, base64) plus `VAULT_KEK_VERSION`
+`VAULT_KEK_BASE64` (32 random bytes, unpadded base64url, 43 chars,
+decodes via `nntune_api::b64::decode`) plus `VAULT_KEK_VERSION`
 (the integer version stamped on every row). The rotation target below
 kicks in at the FIRST rotation; until then the single key IS version 1.
 
 - At first rotation, the current key is re-provisioned as a **separate
   per-version Worker secret**: `VAULT_KEK_V1` (same bytes as the slice-1
-  key), then `VAULT_KEK_V2`, … — each 32 random bytes, base64-encoded at
-  rest (`openssl rand -base64 32`, generated inside the private operator
-  secrets store, provisioned via `wrangler secret put` or the dashboard).
+  key), then `VAULT_KEK_V2`, … — each 32 random bytes, unpadded-base64url
+  at rest (`openssl rand 32 | basenc --base64url | tr -d '='`, 43 chars,
+  decodes via `nntune_api::b64::decode`; generated inside the private
+  operator secrets store, provisioned via `wrangler secret put` or the
+  dashboard).
   The legacy `VAULT_KEK_BASE64` is deleted once V1 reads green.
 - The write version is a **non-secret** config var, e.g.
   `VAULT_KEK_CURRENT=2` (wrangler `vars`, not `secrets`), replacing
@@ -112,9 +118,9 @@ let v = env("VAULT_KEK_CURRENT").parse::<u32>()?;
 let kek = kek_by_version(v)?;                       // from Worker secret VAULT_KEK_V{v}
 let dek = if existing { unwrap(row)? } else { random_32() };
 let dek_nonce = random_12();
-let dek_wrapped = aes_gcm_encrypt(kek, dek_nonce, aad_wrap(user, v), dek)?;
+let dek_wrapped = aes_gcm_encrypt(kek, dek_nonce, dek_aad(user, v), dek)?;
 let payload_nonce = random_12();
-let ct = aes_gcm_encrypt(dek, payload_nonce, aad_payload(user), plaintext)?;
+let ct = aes_gcm_encrypt(dek, payload_nonce, payload_aad(user), plaintext)?;
 upsert(user, v, dek_wrapped, dek_nonce, ct, payload_nonce)
 ```
 
@@ -131,7 +137,7 @@ fn unwrap(row) -> Result<DEK> {
     // version. Every failure below returns the identical generic error.
     let kek = kek_by_version(row.kek_version).map_err(|_| generic("vault unavailable"))?;
     let dek = aes_gcm_decrypt(kek, row.dek_nonce,
-                              aad_wrap(row.user_id, row.kek_version),
+                              dek_aad(row.user_id, row.kek_version),
                               row.dek_wrapped).map_err(|_| generic("vault unavailable"))?;
     Ok(dek)
 }
@@ -194,7 +200,8 @@ SELECT user_id, kek_version, dek_wrapped, dek_wrapped_nonce
 Per row:
 
 1. `DEK = decrypt(KEK[row.kek_version], dek_wrapped)` (version-pinned §4).
-2. `dek_wrapped' = encrypt(KEK[current], fresh_nonce, aad_wrap(user, current), DEK)`.
+2. `dek_wrapped' = encrypt(KEK[current], fresh_nonce, dek_aad(user, current), DEK)`
+   via `vault::rewrap_dek` (never rebuild AAD by hand).
 3. Conditional write (optimistic concurrency — safe under retries):
    ```sql
    UPDATE provider_vaults
@@ -226,7 +233,7 @@ back); rotation window announced.
 
 ```text
 1. Confirm env: echo $ENV (staging|prod — exactly one; abort on ambiguity)
-2. Generate:  openssl rand -base64 32   # inside operator store only
+2. Generate:  openssl rand 32 | basenc --base64url | tr -d '='   # unpadded base64url, inside operator store only
 3. Pre-stage: wrangler secret put VAULT_KEK_V<N+1> --env $ENV
               deploy reader release; verify /health + one test-connection
 4. Flip:      set VAULT_KEK_CURRENT=N+1 in wrangler vars; deploy
@@ -268,7 +275,7 @@ core) already shows:
       (`provider_vaults`, not `vault_rows` — see §2).
 - [x] Encrypt writes current only (`VAULT_KEK_VERSION`); decrypt is
       version-pinned per row (`kek_version` + AAD) with generic errors
-      and no existence oracle; `rotate_kek` re-wraps DEK-only.
+      and no existence oracle; `vault::rewrap_dek` re-wraps DEK-only.
 - [x] Staging and prod KEK sets independently generated (operator
       attestation, never values).
 - [x] `gitleaks` + `ci-ok` + `pr-lint` green; no secret/key/credential
@@ -312,7 +319,8 @@ Instead:
 2. Per row, in ONE conditional UPDATE keyed on (`user_id`,
    `kek_version`, `updated_at`): decrypt the payload with the OLD DEK,
    generate a NEW random DEK, re-encrypt the payload under the new DEK,
-   wrap the new DEK under KEK[M] with `aad_wrap(user, M)`, bump
+   wrap the new DEK under KEK[M] with `dek_aad(user, M)` (via
+   `vault::encrypt_vault`, never hand-built AAD), bump
    `kek_version` to M. Retry-safe via the same claim-and-conditional-write
    pattern as §6 (a concurrent vault update changes `updated_at` and
    loses the race on purpose — it is re-driven, never overwritten).

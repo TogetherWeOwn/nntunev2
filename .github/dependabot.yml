@@ -11,9 +11,11 @@
 # One entry per manifest directory: Dependabot takes no globs, and each
 # ecosystem looks only in its configured directory. The root workspace
 # (`Cargo.toml`, members: `crates/nntune-core`) does NOT cover
-# `workers/api` or `workers/ingest` (excluded standalone crates), so they
-# get their own cargo entries. npm watches the SvelteKit app
-# (`apps/web`) and the e2e harness (`e2e`), not a top-level `web/`.
+# `workers/api`, `workers/ingest` or `workers/mb` (excluded standalone
+# crates), so they get their own cargo entries. The batch import image
+# (`containers/mb-import/Dockerfile`, FROM postgres) gets its own docker
+# entry. npm watches the SvelteKit app (`apps/web`) and the e2e harness
+# (`e2e`), not a top-level `web/`.
 #
 # Lockfiles: the repo ignores `Cargo.lock` (see root `.gitignore`), so the
 # cargo entries update direct dependencies without transitive visibility.
@@ -75,6 +77,36 @@ updates:
 
   - package-ecosystem: "cargo"
     directory: "/workers/ingest"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # MusicBrainz mirror worker (standalone crate, built by the rust-mb job).
+  - package-ecosystem: "cargo"
+    directory: "/workers/mb"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # Batch import image (FROM postgres).
+  - package-ecosystem: "docker"
+    directory: "/containers/mb-import"
     schedule:
       interval: "weekly"
       day: "monday"

@@ -74,7 +74,7 @@ impl std::fmt::Display for VaultError {
 
 // --- Config shapes --------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub host: String,
     pub port: u16,
@@ -98,10 +98,35 @@ pub struct ProviderConfig {
 /// acknowledgment is repudiation-safe.
 pub const INSECURE_PLAINTEXT_AUDIT_ACTION: &str = "vault.update.insecure_plaintext";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct IndexerConfig {
     pub url: String,
     pub api_key: String,
+}
+
+// Manual Debug impls: credential material (password, api_key) must never
+// appear in `{:#?}` output, `dbg!`, tracing fields, or assert messages
+// (threat-model §3: no log line may contain credential material; CI logs
+// are attacker-readable). Only connection-routing fields print.
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("tls", &self.tls)
+            .field("max_connections", &self.max_connections)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for IndexerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexerConfig")
+            .field("url", &self.url)
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
 }
 
 /// DNS resolution as a trait so tests use a fake and the Worker uses real DNS.
@@ -723,6 +748,45 @@ mod tests {
         };
         assert!(tls.validate(&PublicDns).is_ok());
         assert!(!tls.insecure_plaintext_acknowledged());
+    }
+
+    #[test]
+    fn debug_redacts_credential_material() {
+        // Threat-model §3: no log line may contain credential material.
+        // A `{:#?}`/`dbg!`/assert dump of these configs must not carry
+        // the password or API key.
+        let provider = ProviderConfig {
+            host: "news.example.com".into(),
+            port: 563,
+            tls: true,
+            username: "u".into(),
+            password: "super-secret-pw".into(),
+            max_connections: 2,
+            allow_insecure_plaintext: false,
+        };
+        let dumped = format!("{provider:?}");
+        assert!(
+            !dumped.contains("super-secret-pw"),
+            "password leaked: {dumped}"
+        );
+        assert!(
+            dumped.contains("<redacted>"),
+            "no redaction marker: {dumped}"
+        );
+
+        let indexer = IndexerConfig {
+            url: "https://news.example.com/api".into(),
+            api_key: "super-secret-key".into(),
+        };
+        let dumped = format!("{indexer:?}");
+        assert!(
+            !dumped.contains("super-secret-key"),
+            "api key leaked: {dumped}"
+        );
+        assert!(
+            dumped.contains("<redacted>"),
+            "no redaction marker: {dumped}"
+        );
     }
 
     #[test]

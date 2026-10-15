@@ -62,8 +62,9 @@ bound under either secret.
 
 ## 3. Procedure
 
-1. Generate: `openssl rand -base64 32` (256 bits) on the operator
-   machine. Do not reuse a KEK, password, or any other secret.
+1. Generate unpadded base64url (256 bits, 43 chars, decodes via
+   `nntune_api::b64::decode`): `openssl rand 32 | basenc --base64url | tr -d '='`
+   on the operator machine. Do not reuse a KEK, password, or any other secret.
 2. Stage the current primary as previous:
    `wrangler secret put SESSION_SECRET_PREVIOUS_BASE64` (paste current
    primary value), then `wrangler secret put SESSION_SECRET_BASE64`
@@ -113,9 +114,10 @@ A dual-accept window does NOT contain an exposure: anyone holding the old
 secret mints valid sessions until it is removed. On suspected or confirmed
 `SESSION_SECRET*` exposure, do NOT run §§2–4 and call it contained:
 
-1. Provision a fresh primary (`openssl rand -base64 32` in the operator
-   store; `wrangler secret put SESSION_SECRET_BASE64`), one environment
-   at a time, staging first.
+1. Provision a fresh primary (unpadded base64url, 43 chars, decodes via
+   `nntune_api::b64::decode`: `openssl rand 32 | basenc --base64url | tr -d '='`
+   in the operator store; `wrangler secret put SESSION_SECRET_BASE64`),
+   one environment at a time, staging first.
 2. Deploy with `SessionKeys::single(new)` — NO previous secret. A
    compromised secret must never be dual-accepted: the window would
    honor attacker-minted tokens.

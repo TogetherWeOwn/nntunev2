@@ -223,6 +223,14 @@ class TestMechanics(unittest.TestCase):
         lines = find_violations("clean line\nsee TOG-99 here\n")
         self.assertEqual([(2, "tog-id")], lines)
 
+    def test_emoji_before_violation_keeps_line_number(self):
+        # The ✅ glyph is bytes E2 9C 85 in UTF-8; under the scan_path
+        # latin-1 decode 0x85 becomes U+0085 (NEL), which splitlines()
+        # treats as a line break. Splitting on '\n' only must keep the
+        # violation on its real line.
+        text = "✅ ok\nx\nsee TOG-99 here\n"
+        self.assertEqual([(3, "tog-id")], find_violations(text))
+
     def test_fixture_path_is_excluded(self):
         self.assertIn(
             ".github/scripts/test_public_text_lint.py", FIXTURE_EXCLUSIONS
