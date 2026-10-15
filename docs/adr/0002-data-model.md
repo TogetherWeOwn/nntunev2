@@ -292,12 +292,28 @@ Retain the encrypted `track_sources` while **any own library membership OR own
 playlist entry** references that track. Delete the source only when both counts
 are zero, including after playlist-entry/playlist deletion. Serialize membership,
 playlist and source cleanup for `(user_id, track_id)` in one transaction; a
-concurrent re-add must not lose its source. For a local release, **every** source
-insert/delete/replace and membership change takes the release serialization first
+concurrent re-add must not lose its source. For a local release, every source
+insert/delete/replace and every membership change that alters the release's
+selected art source takes the release serialization first
 (ADR 0003) and, in that same transaction, clears its art pointer, timestamp and
-negative-cache fields and advances `updated_at`. This includes final-reference
-cleanup, not only a newer ingest; do not keep serving old artwork until TTL expiry.
-A retained source is recovery data,
+negative-cache fields and advances `updated_at`. A membership change that leaves
+the selected art source unchanged (for example removing one of several member
+tracks while the lowest-track-id art source remains) does not clear the pointer.
+This includes final-reference
+cleanup, not only a newer ingest; do not keep serving old artwork after its
+source is gone. Deleting a library, a playlist, or an account is an explicit
+batched procedure, never a bare FK `ON DELETE CASCADE`: the handler enumerates
+the affected `(user_id, track_id)` pairs and local release ids up front, takes
+serializers in the fixed order ascending release id, then `(user_id, track_id)`,
+then hash (release-then-hash per ADR 0003), and per batch deletes the membership
+rows, runs the both-counts-zero source cleanup, and clears/invalidates local
+`release_art` in the same transaction. A plain SQL `DELETE FROM libraries` /
+`playlists` that relies on cascading FKs alone must not be used; schema FKs use
+`ON DELETE RESTRICT` (or no cascade) on `library_tracks`/`playlist_tracks` so the
+procedure cannot be bypassed. A periodic orphan-source reconciliation step (ADR
+0003 GC) deletes `track_sources` rows with no `library_tracks` and no
+`playlist_tracks` row for that `(user_id, track_id)`, covering crashes between
+batches. A retained source is recovery data,
 not read/stream authorization: dormant entries still fail the library gate.
 A live audio grant is required even when an object or track id is known.
 `cache_bytes` is a live SUM of object sizes across that user's unique audio grants,
@@ -431,7 +447,11 @@ file. Each entry carries:
   selection where applicable, sufficient to reconstruct that audio file later.
 - Optional `embedded_art_selector`: tag container, picture-block ordinal and
   declared MIME type within that selected audio file, frozen by the tag producer.
-  Copy it with `source_selector` into the encrypted lifetime `track_sources`
+  While those bytes are already in hand the producer also extracts the indicated
+  picture and persists the validated bytes (or the bounded tag-header snapshot
+  per ADR 0003) with the checkpoint, so the post-write `art` stage publishes
+  without re-downloading audio in the common case. Copy it with
+  `source_selector` into the encrypted lifetime `track_sources`
   payload. It locates bytes for later validation, never an arbitrary URL or grant.
 - Separate job-local `artist_group_ref` and `release_group_ref`, so one artist can
   span several releases. Each release group refers to one artist group in this
@@ -597,8 +617,9 @@ new column: parse the row's `local_key` job id → `ingest_jobs.user_id`; that u
 is the sole owner, and the library-scope rule already restricts reads to it.
 Mirror-verified global rows (when they ship) use the same membership gate: shared
 metadata is readable only for tracks in the caller's library. Audio additionally
-requires its own-provider grant. **Artwork is membership-authorized metadata:**
-there are no art grants and art never contributes to `cache_bytes`. `release_art`
+requires its own-provider grant. **Artwork is membership-plus-entitlement-authorized metadata:**
+there are no art grants and art never contributes to `cache_bytes`; refills
+require current entitlement (rule 4 / ADR 0004) as well as membership. `release_art`
 holds a durable source descriptor and a nullable cache pointer; ingest `write`
 records the descriptor, then a separate idempotent **post-write `art` stage**
 acquires and caches bytes (ADR 0003). Local releases use tag-embedded art selected
@@ -611,7 +632,7 @@ ADR 0003 defines refill and FK-safe expiry.
 
 The `coverArt` id in `getAlbum`, `getSong` and `search3` is the opaque
 `coverart:{release_id}`, never the raw hash. `getCoverArt` checks release membership
-**before** resolving the art descriptor, reading R2 or scheduling a refill. It
+and current entitlement **before** resolving the art descriptor, reading R2 or scheduling a refill. It
 serves the original from `nntunev2-art-{staging,prod}`, or takes the art-specific
 refetch path. A non-member, unknown id, unavailable artwork or raw-hash request
 returns 404 (native) / Subsonic error 70; temporary upstream failures are retryable
@@ -633,22 +654,33 @@ FK, not an unrestricted FK.
 
 Playlist entries have their own ids so the same track may occur repeatedly.
 The deferrable `(playlist_id, position)` constraint allows transactional position
-shifts/reorders. Removal semantics: `libraries` deletion cascades its
-`library_tracks` rows; `playlists` deletion cascades its `playlist_tracks` rows;
-track-row deletion (consolidation only) remaps library/playlist references first
+shifts/reorders. Removal semantics: deleting a library, a playlist, or an
+account runs the explicit batched procedure in rule 3 (enumerate affected
+`(user_id, track_id)` pairs and release ids, fixed serializer order, per-batch
+membership delete plus both-counts-zero source cleanup and art invalidation) —
+never a bare FK cascade that silently drops `library_tracks`/`playlist_tracks`
+rows without running that cleanup. Track-row deletion (consolidation only)
+remaps library/playlist references first
 and never cascades silently. Removing a track from the caller's last library, or
 deleting the last library holding it, does NOT delete that caller's playlist
 entries for it: the rows are retained with stable positions and counts, but
-become dormant — reads return the entry id and position with a
-`dormant: track not in any library` tombstone instead of track metadata, and
+become dormant — reads return only the entry id and position with a
+`dormant: track not in any library` tombstone instead of track metadata (the
+tombstone exposes no track id; none is needed for the restore below), and
 `stream`/`scrobble` for a dormant entry return 404 (native) or Subsonic error
-70. The retained own `track_sources` row (rule 3) permits re-adding that same
-local or verified track to an own library; this re-activates the entries without
-reordering. Deleted media/grants are rebuilt by a full own-provider fetch before
+70. The retained own `track_sources` row (rule 3) permits restoring that same
+local or verified track to an own library **only** through the entry-keyed
+restore operation `POST /v1/playlists/{playlist_id}/entries/{entry_id}/restore`
+with body `{library_id}` (declared in ADR 0006): it resolves the playlist and
+entry ownership first, then the track through the entry and the caller's own
+`track_sources` row — never through a caller-supplied catalog id — inserts the
+library membership, and re-activates matching dormant entries in place without
+reordering. A plain `POST /v1/library` with a non-member track id cannot perform
+this restore and stays 404/70. Deleted media/grants are rebuilt by a full own-provider fetch before
 streaming. If neither library nor playlist references remained and the source was
-deleted, a library edit cannot restore playable content: require a new ingest.
-Ownership of a local id alone must not create a source-less membership; existing
-track re-adds also require the retained own source. Dormancy does not bypass caps.
+deleted, neither the restore operation nor a library edit can restore playable content: require a new ingest.
+Ownership of a local id alone must not create a source-less membership; the
+restore and any track re-add also require the retained own source. Dormancy does not bypass caps.
 
 Implementation acceptance covers concurrent cross-user and same-user/different-job
 imports of one matched release position (one global row, one library count), with
@@ -723,13 +755,24 @@ retaining its `release_mbid_hint` without guessing. Also require:
 - Playlist/library consistency: for both a local and a mirror-verified track T,
   remove T from its last library while P references it. Assert stable P entry ids,
   positions and counts, tombstones/no metadata and stream/scrobble 404/70; the own
-  source survives but audio mappings/unneeded grants do not. Re-add the **same T**
-  and assert entries re-activate in place and own-provider fetch makes streaming
-  work. Deleting the last playlist entry (or playlist) with no library membership
-  deletes the source; subsequent library-only re-add is rejected for both track
-  types. A non-final membership removal retains the source. Race re-add against
+  source survives but audio mappings/unneeded grants do not. Restore via the public
+  entry-keyed operation `POST /v1/playlists/{playlist_id}/entries/{entry_id}/restore`
+  with an own `{library_id}` and assert entries re-activate in place and
+  own-provider fetch makes streaming work; a plain `POST /v1/library` with the
+  dormant track id stays 404/70 and does not restore. Negative cases: restoring
+  with another user's entry id, or a dormant entry whose source was deleted,
+  returns 404/70. Deleting the last playlist entry (or playlist) with no library membership
+  deletes the source; subsequent library-only re-add and the restore operation are
+  rejected for both track types. Run a plain `DELETE` of a playlist holding a
+  dormant track with no library membership and a plain `DELETE` of a library
+  holding T with no playlist reference, and assert the orphaned source is removed
+  (including via the GC reconciliation step after a crash between batches) and the
+  re-add/restore is rejected; repeat with another reference present and assert the
+  source survives. A non-final membership removal retains the source. Race re-add against
   final-reference removal: no committed membership may lack its source. A playlist
-  write for a track in no caller library is rejected.
+  write for a track in no caller library is rejected. Schema FKs on
+  `library_tracks`/`playlist_tracks` are `RESTRICT`/non-cascading so a bare
+  cascading delete cannot bypass this procedure.
 - Cover art: B requests A's local art by `coverart:{release_id}` or raw hash and
   receives 404/70 **before any fetch**. A's member request refills embedded art from
   an own current source; a verified-release member refills CAA art without a

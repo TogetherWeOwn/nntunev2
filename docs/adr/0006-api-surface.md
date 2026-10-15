@@ -93,15 +93,22 @@ least-privilege credential.
   membership reads need plus an own track source, and entries whose track left
   every caller library stay as dormant tombstones (stable positions/counts;
   stream/scrobble 404/70). Retain their encrypted own source while any own playlist
-  entry survives; re-adding the same track restores membership, then an own-provider
-  fetch recreates evicted audio media/grants (ADR 0002 rule 3). Neither a dormant
-  entry nor its retained source authorizes a read. `getCoverArt` takes only the
+  entry survives; the entry-keyed restore `POST
+  /v1/playlists/{playlist_id}/entries/{entry_id}/restore` with body
+  `{library_id}` restores membership — it resolves playlist, entry, and library
+  ownership first, then the track through the entry plus the caller's own
+  `track_sources` row, never through a caller-supplied catalog id — then an
+  own-provider fetch recreates evicted audio media/grants (ADR 0002 rules 3 and
+  6). A plain library write with a non-member track id stays 404/70 and cannot
+  restore; another user's entry id or a source-less dormant entry is 404/70.
+  Neither a dormant entry nor its retained source authorizes a read. `getCoverArt` takes only the
   opaque `coverart:{release_id}` id from `getAlbum`/`getSong`/`search3` and checks
   release membership **before** resolving `release_art`, reading bytes or refilling.
-  The primary is the sole launch rendition, `original`. Art uses membership alone,
+  The primary is the sole launch rendition, `original`. Art uses membership plus
+  current entitlement (ADR 0002 rule 4 / ADR 0004),
   **no audio grant**: the post-write `art` stage/refill uses embedded selectors from
   the local owner's current member-track sources, or CAA from a verified release
-  MBID (ADR 0003). Expired/missing art pointers or objects use that same bounded
+  MBID (ADR 0003, bounded prefix, per-user concurrency cap, negative-cache rules). Expired/missing art pointers or objects use that same bounded
   refill; unavailable art returns 404/70, temporary upstream failure a retryable
   error. Serve privately, never by raw hash or public R2 URL. A new endpoint that
   takes or returns a catalog id is denied until it declares how it applies this gate.

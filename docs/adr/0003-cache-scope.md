@@ -83,17 +83,24 @@ Retain the encrypted source while any of the user's libraries **or playlist
 entries** references the track (ADR 0002 rule 3). Final library removal deletes
 that user's media mappings and grants not needed by other current mappings, but
 preserves the source for dormant playlist entries. They cannot read/stream until
-an own-library re-add passes the same source and cap checks; then a full
+the entry-keyed restore to an own library passes the same source and cap checks
+(ADR 0002 §6); then a full
 own-provider fetch rebuilds media/grants. Removing the last playlist reference
 while no library holds the track deletes the retained source. Membership changes,
-playlist deletion and source cleanup serialize on `(user_id, track_id)` and
-recheck both reference sets in one transaction. For local releases, acquire the
-release serializer first; every source insert/delete/replace or membership change
+playlist/library/account deletion and source cleanup serialize on `(user_id, track_id)` and
+recheck both reference sets in one transaction. Library/playlist/account deletion
+is the explicit batched procedure in ADR 0002 rule 3, never a bare FK cascade:
+enumerate affected pairs and release ids, lock in ascending release id, then
+`(user_id, track_id)`, then hash order, and delete plus clean up per batch.
+For local releases, acquire the
+release serializer first; a source insert/delete/replace or a membership change
+that alters the release's selected art source
 also clears `release_art.content_hash`, `last_served_at`, `retry_after` and
-`last_failure`, and advances `updated_at` in that transaction. This covers final
+`last_failure`, and advances `updated_at` in that transaction. Membership edits
+that keep the same selected source leave the pointer alone. This covers final
 playlist-reference cleanup as well as newer imports; it invalidates stale art
-immediately instead of waiting for retention. Without either reference, recovery
-requires a new ingest, not a library edit. Sources use ADR 0002's versioned,
+when its source is gone instead of waiting for retention. Without either reference, recovery
+requires a new ingest, not a library edit or restore. Sources use ADR 0002's versioned,
 row-bound encryption; retained sources do not retain cached bytes.
 
 ### Artwork acquisition, expiry and refill
@@ -114,24 +121,40 @@ an imported library: at most three attempts, obeying the retry-after rule below,
 then record unavailable art in the job result. A serve request makes at most one
 attempt; a later authorized request may retry only once eligible.
 
-- **Embedded/local:** require the caller's library membership and local ownership.
-  Select the lowest track id among the caller's current member tracks in that
-  release whose encrypted `track_sources` includes `embedded_art_selector` (tag
-  container/picture-block ordinal/MIME type, frozen in the accepted manifest).
-  Fetch that selected audio via the caller's provider using its lifetime
-  `source_selector`, then extract the indicated picture. Never use another user's
+- **Embedded/local:** require the caller's library membership, local ownership,
+  and current entitlement under ADR 0002 rule 4 / ADR 0004 (trial or paid plan;
+  no refill for paywalled or zero-entitlement callers). At most two concurrent
+  art refills per user; extra authorized requests coalesce onto the in-flight
+  attempt or return a retryable error without opening another provider fetch.
+  The tag/fingerprint subphase of `match` (ADR 0002 rule 6) extracts the indicated
+  picture while the audio bytes are already in hand and persists the validated
+  bytes (or the bounded tag-header snapshot below) with the checkpoint, so the
+  post-write `art` stage publishes without a second audio download in the common
+  case. Otherwise select the lowest track id among the caller's current member
+  tracks in that release whose encrypted `track_sources` includes
+  `embedded_art_selector` (tag container/picture-block ordinal/MIME type, frozen
+  in the accepted manifest). Fetch only a bounded prefix: the NZB segments
+  covering the tag header up to an explicit 8 MiB cap, never a whole audio file
+  or volume set; an archive-packed member that cannot yield its picture within
+  that cap is `unavailable`, not retried as transient. Never use another user's
   source or a tenant URL. If the selected source was removed/replaced, recompute
   from current sources; if none has art, return unavailable. Snapshot
-  `source_job_id` and recheck it plus membership before publication; stale work
-  cannot republish bytes for a superseded source. Source replacement/removal clears
-  the local release's art pointer under the same release lock; the next refill
+  `source_job_id` and recheck it, membership, and entitlement before publication;
+  stale work cannot republish bytes for a superseded source. Only a source
+  replacement/removal that changes the selected art source clears
+  the local release's art pointer under the same release lock; a membership edit
+  that keeps the same selected source leaves it alone. The next refill
   selects current sources. A playlist-only source does not authorize art reads.
+  Three consecutive transient timeouts escalate to `unavailable` with the
+  one-hour negative cache, so a 30-second attempt that can never finish does not
+  flap every minute.
 - **CAA/verified:** derive the front-image request from the trusted
   `releases.mbid`, not a claimed MBID or tenant URL. Use HTTPS and a fixed
   Cover Art Archive/image-host allowlist, validating redirects under the same
-  network policy. No provider/grant is required. Tenant embedded art can never
-  overwrite a verified release's art. Recheck the trusted release identity and
-  the requesting user's membership before publication/serve.
+  network policy. No provider/grant is required, but the same entitlement check
+  as embedded art applies before any upstream fetch. Tenant embedded art can never
+  overwrite a verified release's art. Recheck the trusted release identity,
+  the requesting user's membership, and entitlement before publication/serve.
 - **Bounds:** accept only fully validated JPEG/PNG/WebP, at most 5 MiB and 16
   megapixels; reject other types, including SVG, and never trust the declared
   MIME alone. Launch stores only `original`; other sizes use that image, not
@@ -198,7 +221,12 @@ The cache-GC Workflow runs in bounded batches and follows this order:
    still protects bytes used by another mapping for that user.
 3. Clear expired artwork pointers using the separate 30-day rule above; do not
    delete their durable descriptors. Audio budget/grant eviction never clears art.
-4. Sweep a `cache_objects` row/R2 object only with **zero `user_cache_grants`,
+4. Reconcile orphaned `track_sources`: delete rows with no `library_tracks` and
+   no `playlist_tracks` row for that `(user_id, track_id)` (left behind by a
+   crash between deletion batches), serialized per `(user_id, track_id)` with
+   the release lock first, and invalidate the local art pointer in the same
+   batch when the deleted source was the selected art source.
+5. Sweep a `cache_objects` row/R2 object only with **zero `user_cache_grants`,
    zero `track_media` references and zero non-NULL `release_art.content_hash`
    references**. Art is explicitly in the mark set; its FK uses RESTRICT, not a
    cascading descriptor deletion. Serialize publication and sweep for that hash
