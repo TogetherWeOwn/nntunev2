@@ -1094,14 +1094,19 @@ mod tests {
             assert!(sql.contains("LIMIT $2"), "{sql}");
             // The cursor is compared directly with the public ordering key,
             // so continuation does not depend on the boundary row existing.
+            // First-page guard + cursor predicate must stay grouped as one
+            // unit: `(owner OR public) AND (guard OR cursor_cmp)`. Without
+            // the parens, `AND` binds tighter than `OR` and a non-NULL
+            // cursor bypasses the visibility filter, leaking foreign private
+            // rows; deleting the guard breaks every first page (`NULL`
+            // comparison). Pin the whole `AND (...) ORDER BY` unit so
+            // neither mutant passes.
             assert!(
-                sql.contains("public_id COLLATE \"C\" < $3::TEXT COLLATE \"C\""),
+                sql.contains(
+                    "AND ($3::TEXT IS NULL OR public_id COLLATE \"C\" < $3::TEXT COLLATE \"C\") ORDER BY"
+                ),
                 "{sql}"
             );
-            // First-page guard: a NULL cursor ($3) must return the first
-            // page, not zero rows (`NULL` comparison). Deleting this guard
-            // breaks every first page.
-            assert!(sql.contains("$3::TEXT IS NULL OR"), "{sql}");
             // No cursor-row lookup exists to bypass or weaken visibility;
             // this predicate applies to every returned row.
             assert_eq!(
