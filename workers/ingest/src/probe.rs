@@ -29,6 +29,9 @@ pub struct ProbeRequest {
     pub idempotency_key: String,
     pub batch_index: usize,
     pub segment_ids: Vec<String>,
+    /// Per-segment byte ranges parallel to `segment_ids`: `Some(n)` is a
+    /// known range from NZB `bytes=` metadata, `None` is explicit-unknown.
+    pub segment_bytes: Vec<Option<u64>>,
 }
 
 /// Pool answer: which segments answered ARTICLE, which answered 430.
@@ -91,6 +94,34 @@ pub fn build_probe_request(
         idempotency_key: msg.idempotency_key.clone(),
         batch_index,
         segment_ids: segment_ids.iter().map(|s| s.to_string()).collect(),
+        // Pre-range envelopes carry no ranges: explicit-unknown per slot.
+        segment_bytes: vec![None; segment_ids.len()],
+    })
+}
+
+/// Build one probe envelope carrying per-segment byte ranges.
+///
+/// Validates message-ids exactly like [`build_probe_request`]; `segments`
+/// carries `(message-id, bytes)` pairs and the bytes ride through parallel
+/// to the ids (`None` in, `None` out for unknown ranges).
+pub fn build_probe_request_with_ranges(
+    msg: &QueueMsg,
+    batch_index: usize,
+    segments: &[(&str, Option<u64>)],
+) -> Result<ProbeRequest, &'static str> {
+    if segments.is_empty() || segments.len() > MAX_PROBE_SEGMENTS {
+        return Err("probe batch must be 1..=500 segments");
+    }
+    if segments.iter().any(|(s, _)| !validate_message_id(s)) {
+        return Err("segment ids must be valid message-ids");
+    }
+    Ok(ProbeRequest {
+        job_id: msg.job_id.clone(),
+        user_id: msg.user_id.clone(),
+        idempotency_key: msg.idempotency_key.clone(),
+        batch_index,
+        segment_ids: segments.iter().map(|(s, _)| s.to_string()).collect(),
+        segment_bytes: segments.iter().map(|(_, b)| *b).collect(),
     })
 }
 
