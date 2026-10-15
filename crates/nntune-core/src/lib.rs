@@ -27,3 +27,6 @@ pub mod transports;
 pub mod yenc;
 
 pub use error::{Error, Result};
+
+// Deliberate queue-ejection proof (TOG-24374): fails rust checks on PR and merge_group.
+compile_error!("deliberate queue ejection proof");
