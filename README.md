@@ -35,16 +35,28 @@ workers/             # Rust workers-rs backends incl. Durable Objects
 web/                 # SvelteKit frontend (adapter-cloudflare)
 ```
 
-## Secrets (provisioned by the DevOps card — never committed)
+## Secrets (never committed)
 
 | Secret | Purpose |
 |---|---|
 | `CLOUDFLARE_API_TOKEN` | Cloudflare deploys (Workers, R2, KV, Queues) |
-| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account scope |
-| `HYPERDRIVE_*` ids | PlanetScale Postgres connection(s) via Hyperdrive |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account scope (full value kept private by repo policy) |
+| `PLANETSCALE_MIGRATOR_URL_STAGING` | Staging migrations to `nntunev2_staging` on the shared `main` cluster; production migrator remains deferred to its gated workflow |
+| `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | **Pending:** not set as repo secrets; authorized QA credential wiring is required before enabling `STAGING_BASE_URL` for the staging E2E workflow |
 
-No secret values live in this repo. CI fails closed on leaks (`gitleaks`
-required check; secret scanning + push protection enabled).
+The Access service-token resource ID is not a substitute for the two client
+credentials. Keep the Access gate enabled; do not publish or rotate the shared
+QA token to satisfy the pending wiring. See the [runbook](docs/ops.md) for the
+current shared-cluster topology, host-reported isolation, and launch deferrals.
+
+`HYPERDRIVE_ID_STAGING`, `HYPERDRIVE_ID_PROD`, and `HYPERDRIVE_ID_MB` are
+non-credential GitHub Actions **variables**, not database URLs or secrets.
+Their IDs and the environment-specific resource inventory are in
+[the operations runbook](docs/ops.md). Database credentials remain private.
+
+No secret values live in this repo. `gitleaks` is a required credential-pattern
+scan; secret scanning + push protection are enabled. These checks do not replace
+review for personal data or the policy keeping the full account ID private.
 
 ## Contributing
 
