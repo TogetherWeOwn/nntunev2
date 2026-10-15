@@ -45,6 +45,17 @@ describe('billingClient redirects', () => {
 		);
 		await expect(openPortal(fetchFn as typeof fetch)).rejects.toThrow('404');
 	});
+
+	it('attaches the paywall model to limit errors for caller handling', async () => {
+		const fetchFn = vi.fn(
+			async () => new Response(JSON.stringify({ code: 'plan_limit_exceeded' }), { status: 402 })
+		);
+		const request = openPortal(fetchFn as typeof fetch);
+		await expect(request).rejects.toMatchObject({
+			status: 402,
+			paywall: { kind: 'terminal', code: 'plan_limit_exceeded' }
+		});
+	});
 });
 
 describe('signupUrlForCheckoutFailure', () => {

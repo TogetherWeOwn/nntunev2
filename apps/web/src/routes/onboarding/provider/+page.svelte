@@ -113,6 +113,13 @@
 			}
 		} catch (error) {
 			if (runId !== testRunId || inputKey !== currentTestKey()) return;
+			if (error instanceof ApiError && error.paywall) {
+				// The global paywall owns the limit response; avoid a duplicate
+				// inline failure state beneath the modal.
+				testState = 'idle';
+				testDetail = '';
+				return;
+			}
 			testState = 'failed';
 			testDetail =
 				error instanceof ApiError && error.status === 404
@@ -134,8 +141,9 @@
 		try {
 			await client.saveProviderConfig(input);
 			if (runId === testRunId && inputKey === currentTestKey()) saveState = 'saved';
-		} catch {
-			if (runId === testRunId && inputKey === currentTestKey()) saveState = 'failed';
+		} catch (error) {
+			if (runId !== testRunId || inputKey !== currentTestKey()) return;
+			saveState = error instanceof ApiError && error.paywall ? 'idle' : 'failed';
 		}
 	}
 </script>

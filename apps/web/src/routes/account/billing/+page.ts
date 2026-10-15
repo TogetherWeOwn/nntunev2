@@ -64,8 +64,11 @@ export const load: PageLoad = async ({ fetch }) => {
 	// nothing metered yet, and the meters simply don't render.
 	const subscription: SubscriptionDTO | null = sub.value;
 	const usage: UsageDTO | null = use.status === 404 ? null : use.value;
-	const subFailed = sub.failed;
-	const usageFailed = use.failed && use.status !== 404;
+	// Limit statuses are already surfaced by the global paywall listener; do
+	// not stack a generic billing-outage notice or retry control beside it.
+	const isLimitStatus = (status: number | null) => status === 402 || status === 429;
+	const subFailed = sub.failed && !isLimitStatus(sub.status);
+	const usageFailed = use.failed && use.status !== 404 && !isLimitStatus(use.status);
 	const signedOut = sub.status === 401 || use.status === 401;
 
 	const { plan, planUnknown } = resolveEffectivePlan(subscription);

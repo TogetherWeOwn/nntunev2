@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
-	import { ApiClient } from '#lib/api/client.js';
+	import { ApiClient, ApiError } from '#lib/api/client.js';
 	import {
 		serializePublicKeyCredential,
 		toCreationOptions,
@@ -41,9 +41,9 @@
 			);
 			status = 'created';
 			window.location.href = '/onboarding/provider';
-		} catch {
+		} catch (error) {
 			// Generic: account creation never says which step failed.
-			status = 'error';
+			status = error instanceof ApiError && error.paywall ? 'idle' : 'error';
 		}
 	}
 </script>

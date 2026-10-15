@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
-	import { ApiClient } from '#lib/api/client.js';
+	import { ApiClient, ApiError } from '#lib/api/client.js';
 	import {
 		serializePublicKeyCredential,
 		toRequestOptions,
@@ -25,8 +25,8 @@
 			await client.requestMagicLink(email.trim());
 			// Generic either way: the API never reveals which emails exist.
 			status = 'sent';
-		} catch {
-			status = 'error';
+		} catch (error) {
+			status = error instanceof ApiError && error.paywall ? 'idle' : 'error';
 		}
 	}
 
@@ -52,9 +52,9 @@
 				serializePublicKeyCredential(assertion)
 			);
 			window.location.href = '/onboarding/provider';
-		} catch {
+		} catch (error) {
 			// Generic: login errors stay non-enumerating, like the API.
-			passkeyStatus = 'error';
+			passkeyStatus = error instanceof ApiError && error.paywall ? 'idle' : 'error';
 		}
 	}
 </script>

@@ -8,6 +8,7 @@
  * sites, because all requests flow through {@link ApiClient}.
  */
 
+import { paywallFromResponse, type PaywallModel } from '../billing/planLimit.js';
 import type { ProviderForm } from '../vault-validation.js';
 
 export type FetchFn = typeof fetch;
@@ -20,12 +21,19 @@ export interface ApiClientOptions {
 export class ApiError extends Error {
 	readonly status: number;
 	readonly code: string;
+	/**
+	 * Paywall model for 402/429 plan-limit responses (already shown via the
+	 * layout listener); null for every other failure. Callers that also
+	 * render an inline error can use this to avoid duplicating the paywall.
+	 */
+	readonly paywall: PaywallModel | null;
 
-	constructor(status: number, code: string, message: string) {
+	constructor(status: number, code: string, message: string, paywall: PaywallModel | null = null) {
 		super(message);
 		this.name = 'ApiError';
 		this.status = status;
 		this.code = code;
+		this.paywall = paywall;
 	}
 }
 
@@ -145,7 +153,21 @@ export class ApiClient {
 			credentials: 'include'
 		});
 		if (!response.ok) {
-			throw new ApiError(response.status, this.errorCode(response.status), await this.message(response));
+			// 402/429 plan limits become a paywall (layout listener), not just
+			// a thrown error. Clone so message() can still read the body.
+			let body: unknown;
+			try {
+				body = await response.clone().json();
+			} catch {
+				body = undefined;
+			}
+			const paywall = paywallFromResponse({ status: response.status, headers: response.headers, body });
+			throw new ApiError(
+				response.status,
+				paywall?.code ?? this.errorCode(response.status),
+				await this.message(response),
+				paywall
+			);
 		}
 		return (await response.json()) as T;
 	}

@@ -15,6 +15,7 @@
  * helpers only. No Stripe secret ever touches this code.
  */
 
+import { paywallFromResponse, type PaywallModel } from './planLimit.js';
 import type { UsageSnapshot } from './usage';
 
 export interface PlanDTO {
@@ -48,25 +49,32 @@ export interface SubscriptionDTO {
  */
 export class BillingApiError extends Error {
 	readonly status: number;
+	readonly paywall: PaywallModel | null;
 
-	constructor(status: number, label: string, hint = '') {
+	constructor(status: number, label: string, hint = '', paywall: PaywallModel | null = null) {
 		super(`${label} failed (${status})${hint}`);
 		this.name = 'BillingApiError';
 		this.status = status;
+		this.paywall = paywall;
 	}
 }
 
 async function readJson<T>(res: Response, label: string): Promise<T> {
 	if (!res.ok) {
 		let hint = '';
+		let body: unknown;
 		try {
-			const body = await res.json();
+			body = await res.json();
 			if (body && typeof body === 'object' && 'error' in body)
 				hint = `: ${(body as { error: unknown }).error}`;
 		} catch {
 			/* non-JSON error body: keep generic */
 		}
-		throw new BillingApiError(res.status, label, hint);
+		// Client-side calls (checkout/portal) surface 402/429 as a paywall via
+		// the layout listener; with no listener (SSR loaders) this is a no-op
+		// and the typed error below drives the existing handling.
+		const paywall = paywallFromResponse({ status: res.status, headers: res.headers, body });
+		throw new BillingApiError(res.status, label, hint, paywall);
 	}
 	return (await res.json()) as T;
 }
