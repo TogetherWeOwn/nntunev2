@@ -96,9 +96,10 @@ subscriptions         id PK, user_id FK,
                       partial UNIQUE (user_id) WHERE status IN
                       ('incomplete','trialing','active','past_due','unpaid','paused')
 usage_ledger          id BIGSERIAL PK, user_id FK, period DATE (UTC day),
-                      stream_seconds BIGINT, ingest_jobs BIGINT,
+                      stream_seconds BIGINT NOT NULL DEFAULT 0 CHECK (stream_seconds >= 0),
+                      ingest_jobs BIGINT NOT NULL DEFAULT 0 CHECK (ingest_jobs >= 0),
                       UNIQUE (user_id, period) -- flows only, no cache gauge
-ingest_jobs           id PK, user_id FK, idempotency_key TEXT, created_at,
+ingest_jobs           id PK, user_id FK, idempotency_key TEXT, accepted_at,
                       status TEXT ('queued'|'running'|'done'|'failed'),
                       UNIQUE (user_id, idempotency_key)
 providers             id PK, user_id FK, label,
@@ -111,6 +112,7 @@ libraries             id PK, user_id FK, name, created_at
 artists               id PK, mbid UUID NULL (MB artist), local_key TEXT UNIQUE NULL,
                       name, partial UNIQUE (mbid) WHERE mbid IS NOT NULL
 releases              id PK, mbid UUID NULL (MB release), local_key TEXT UNIQUE NULL,
+                      release_mbid_hint UUID NULL (non-canonical reconciliation hint),
                       artist_id FK, title, release_type, year,
                       partial UNIQUE (mbid) WHERE mbid IS NOT NULL
 tracks                id PK, mbid UUID NULL INDEXED (MB recording, NOT unique),
@@ -118,12 +120,13 @@ tracks                id PK, mbid UUID NULL INDEXED (MB recording, NOT unique),
                       track_no INTEGER NOT NULL, duration_ms,
                       UNIQUE (release_id, medium_no, track_no)
 library_tracks        library_id FK, track_id FK, added_at, PK (library_id, track_id)
-track_sources         user_id FK, track_id FK, indexer_id FK NULL,
-                      nzb_ref_encrypted BYTEA + nzb_ref_* envelope fields,
-                      created_at, PK (user_id, track_id)
-track_media           user_id FK, track_id FK, content_hash FK → cache_objects,
-                      format TEXT, bitrate INTEGER, verified_at, last_served_at,
-                      PK (user_id, track_id, content_hash)
+track_sources         user_id FK, track_id FK, source_job_id FK → ingest_jobs,
+                      indexer_id FK NULL, nzb_ref_encrypted BYTEA
+                      + nzb_ref_* envelope fields, PK (user_id, track_id)
+track_media           user_id FK, track_id FK, source_job_id FK → ingest_jobs,
+                      content_hash FK → cache_objects, format TEXT, bitrate INTEGER,
+                      verified_at, last_served_at,
+                      PK (user_id, track_id, source_job_id, content_hash)
 user_cache_grants     user_id FK, content_hash FK → cache_objects,
                       provider_id UUID NOT NULL,
                       FK (user_id, provider_id) → providers(user_id, id) ON DELETE RESTRICT,
@@ -325,9 +328,11 @@ partition key as PostgreSQL requires; `UNIQUE(event_id)` alone is invalid here.
 `INSERT INTO play_events ... ON CONFLICT (event_id, played_at) DO NOTHING RETURNING
 user_id, played_at, stream_seconds` feeds a grouped daily ledger upsert. Increment
 `usage_ledger.stream_seconds` only by those **inserted/returned** rows, with
-`period=(played_at AT TIME ZONE 'UTC')::date`. Use additive `ON CONFLICT
-(user_id, period) DO UPDATE` so concurrent stream/ingest writers cannot lose one
-another's increments. Commit before acknowledging delivery. A crash before commit
+`period=(played_at AT TIME ZONE 'UTC')::date`. Both counters are `NOT NULL DEFAULT 0`;
+stream and ingest writers insert or increment only their own counter, preserving
+zero for the other. Use additive `ON CONFLICT (user_id, period) DO UPDATE` so
+concurrent stream/ingest writers cannot lose one another's increments. Commit
+before acknowledging delivery. A crash before commit
 rolls back both; a crash after commit redelivers as a zero-increment no-op. A
 missing partition or ledger error aborts both and leaves the event retryable.
 The committed event row is the durable dedupe receipt; no undefined checkpoint
@@ -341,8 +346,10 @@ Cache bytes are the live grant gauge; concurrent streams are pool-DO leases;
 library size is distinct per-user membership (ADR 0004). Analytics Engine is
 observability only. Duplicate queue delivery must not increment any flow twice.
 Acceptance must cover concurrent duplicate delivery, crash before/after commit,
-missing partitions, concurrent ingest increments, and midnight/month boundaries.
-These are required implementation tests, not executed DB tests in this docs PR.
+missing partitions, concurrent ingest increments, stream-then-ingest and
+ingest-then-stream ledger-row creation (both counters remain numeric and increment
+once), and midnight/month boundaries. These are required implementation tests, not
+executed DB tests in this docs PR.
 
 Sources: PostgreSQL [partitioned unique constraints](https://www.postgresql.org/docs/current/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE-LIMITATIONS)
 and [INSERT / ON CONFLICT / RETURNING](https://www.postgresql.org/docs/current/sql-insert.html),
@@ -360,24 +367,55 @@ not display labels such as `A1`. This distinguishes multidisc tracks and repeate
 recordings. MusicBrainz describes a track as a recording's occurrence on a
 particular release/medium ([track definition](https://musicbrainz.org/doc/Track)).
 
+The currently merged MB mirror has only one nullable `release_mbid` and nullable
+`track_no` on `mb_recording`; it does not represent per-release occurrences or
+medium positions. A NULL mirror `track_no` is unknown, never an implicit 1. Until
+the mirror follow-up supplies a per-release tracklist with `(release_mbid,
+medium_no, track_no, recording_mbid)` and an MB worker read projection, do not
+match imported files to global track occurrences using that incomplete mirror.
+Keep them under a local release/track key derived from the immutable manifest,
+retaining a known release ID as `release_mbid_hint`; match globally only when the
+mirror or accepted manifest supplies the exact occurrence position.
+
 For artists/releases, CHECK exactly one of `mbid` and `local_key` is non-NULL.
 Matched writes upsert on the partial unique MBID indexes (`ON CONFLICT (mbid)
 WHERE mbid IS NOT NULL`); unmatched writes upsert on `local_key`. The stable local
 key is a versioned length-prefixed tuple `(ingest_job_id, entity_kind,
-manifest_entry_ordinal)`, derived from the immutable accepted manifest, never a
-fresh random value on retry. For an unmatched release's tracks use `medium_no=1`
-and the manifest's 1-based entry ordinal as `track_no`. Separate unmatched jobs
-may remain distinct until explicitly matched; never merge by title/artist text.
-If the recording-to-release/medium/position association is ambiguous, keep a
-local release with NULL recording MBIDs rather than guessing a global key.
+manifest_group_first_entry_ordinal)`, derived from the immutable accepted manifest:
+entries share an artist or release only when they share that manifest's explicit
+entity-group reference, and the ordinal is the group's lowest 1-based entry ordinal.
+This makes multi-album manifests deterministic across retries without merging by
+artist/title text. For an unmatched release's tracks use `medium_no=1` and the
+manifest's 1-based file-entry ordinal as `track_no`. Separate unmatched jobs may
+remain distinct until explicitly matched. A release with a known MBID but ambiguous
+track-position association remains local and stores that ID only in
+`release_mbid_hint`; the hint is non-unique, is not a canonical MB join key, and is
+retained for later explicit reconciliation.
 
-The ingest `write` transaction upserts artist, release, then track on the keys
-above and uses their **returned local ids**, including on conflicts, for membership
-and per-user sources. Different jobs/users matching the same release position
-converge to one track; `(library_id, track_id)` makes repeated membership a no-op.
-A contradictory non-NULL recording MBID at an existing position is a match error
-for reconciliation, not permission to overwrite shared metadata or create a second
-track. Local-to-MB consolidation is separate transactional work: preserve/remap
+The ingest `write` transaction upserts artist, release, then tracks in ascending
+`(medium_no, track_no)` order; every multi-row statement orders its input rows by
+that same key. It uses their **returned local ids**, including on conflicts, for
+membership and per-user sources. Different jobs/users matching the same release
+position converge to one track; `(library_id, track_id)` makes repeated membership
+a no-op. A contradictory non-NULL recording MBID at an existing position is a
+match error for reconciliation, not permission to overwrite shared metadata or
+create a second track. Retry the entire idempotent write transaction on SQLSTATE
+`40P01` or `40001`, with a bounded maximum of three attempts and backoff; after
+exhaustion fail the job for normal retry/dead-letter handling.
+
+For a user's second import of the same shared track, `track_sources` remains one
+slot per `(user_id, track_id)`. Compare jobs by `(ingest_jobs.accepted_at,
+source_job_id)`; under the source-row conflict lock, only a newer accepted job
+may replace the encrypted source. In that same transaction, superseding the source
+makes older `track_media` rows ineligible
+for serving and removes that user's stale media mapping; remove its cache grant
+only when no other current `track_media` mapping for that user/hash needs it. Shared
+cache objects remain while any grant references them. Associate each verified media
+mapping with its `source_job_id`. Serve only mappings for the current source job
+that also have the user's grant; when several hashes exist for that job, choose
+latest `verified_at`, then ascending `content_hash` as a deterministic tie-break.
+This preserves a usable source and an unambiguous media choice after retries or
+re-imports. Local-to-MB consolidation is separate transactional work: preserve/remap
 membership, playlists and user sources before retiring a duplicate; don't mutate
 keys on conflict or discard data. An MBID is never a local track id/source FK.
 
@@ -386,9 +424,15 @@ The deferrable `(playlist_id, position)` constraint allows transactional positio
 shifts/reorders.
 
 Implementation acceptance covers concurrent cross-user and same-user/different-job
-imports of one matched release position (one global row, one library count), the
-same recording on two releases and two positions on one release (distinct tracks),
-multidisc positions, unmatched-job retry, and an ambiguous match without guessing.
+imports of one matched release position (one global row, one library count), with
+the newer accepted same-user job replacing the source and invalidating only its
+stale per-user media/grant mapping; serving selects only a current-source hash and
+uses the documented deterministic tie-break. Include opposite-order multi-track
+inputs to prove sorted upserts and bounded retries. Cover the same recording on
+two releases and two positions on one release (distinct tracks), multidisc positions,
+NULL mirror `track_no` remaining unknown/local, unmatched-job retry, deterministic
+artist/release grouping across a multi-album manifest retry, and an ambiguous match
+retaining its `release_mbid_hint` without guessing.
 
 ### 7. Existing migrations stay at their applied paths
 
@@ -424,6 +468,13 @@ work. Production DB creation/migration remains gated by the ops contract.
   explicit per-file match; ambiguous recording arrays retain NULL MBIDs/source
   manifests rather than guessing associations. Keep legacy data/read support
   until parity is verified; never use create-if-absent as a conversion.
+- **MusicBrainz mirror (merged):** the current `mb_recording` shape cannot provide
+  the per-release medium/track occurrence required by this catalog key. Revise
+  ADR 0007 and add a forward-only mirror migration for a tracklist relation keyed
+  by `(release_mbid, medium_no, track_no)`, with `recording_mbid` as its reference;
+  expose the projection through `workers/mb`. Until that follow-up ships, matching
+  uses only exact positions already present in the immutable accepted manifest;
+  otherwise retain local catalog ids and `release_mbid_hint` as specified above.
 - **Stream/Subsonic/billing:** implement the target writers, envelope/pepper
   constraints, grant checks, budgets and lifecycle with their contract tests.
   These changes are not implied by merging this document. Existing in-flight
