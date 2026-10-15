@@ -26,14 +26,25 @@ least-privilege credential.
    the canonical API. `apps/web` uses only this. Resources: `/v1/{me,library,
    artists,releases,tracks,playlists,plays,providers,indexers,search,stream}`
    plus delete entry points `DELETE /v1/account`, `DELETE
-   /v1/libraries/{id}`, `DELETE /v1/playlists/{id}` and `GET
+   /v1/libraries/{id}`, `DELETE /v1/playlists/{id}`, `POST
+   /v1/account/cancel-deletion` and `GET
    /v1/operations/{operation_id}`. Each DELETE marks `deleting_at`, persists a
    `delete_operations` row (ADR 0002 rule 3) and returns `202` with the operation
-   id; the status endpoint reports `pending`/`running`/`done`/`failed`. Writes
-   fenced by a marker return `409` with `account_deleting` or
-   `container_deleting` plus the operation id. The executor is the `delete`
-   Workflow with hourly `delete-sweep` resume, not a bare FK cascade.
-   Auth at launch: the existing session cookie. Native REST bearer keys are
+   id; a repeat DELETE returns the existing operation id with `202`. The status
+   endpoint is owner-scoped (caller must own the row) and reports
+   `pending`/`running`/`failed`, plus `done` for retained library/playlist rows;
+   an erased account's result arrives by confirmation email and its old
+   operation id is thereafter `404`. Writes fenced by a marker return `409`
+   with `account_deleting` or `container_deleting` plus the operation id. The
+   executor is the `delete` Workflow with hourly `delete-sweep` resume, not a
+   bare FK cascade. `DELETE /v1/account` additionally requires fresh step-up
+   authentication (passkey with user verification, or a magic-link challenge
+   issued within the last 15 minutes), writes an `audit_log` row, and sends a
+   confirmation email; erasure starts only after a 24-hour cancellable grace
+   window with `deleting_at` set, during which `POST
+   /v1/account/cancel-deletion` (same step-up) clears the marker and the
+   operation. Library/playlist deletes have no grace window.
+   Auth at launch otherwise: the existing session cookie. Native REST bearer keys are
    deferred to a separate scoped-credential design, not borrowed from Subsonic.
    Versioned (`/v1`); breaking changes ship `/v2` alongside, never mutate `/v1`.
 2. **Subsonic subset** (`/rest/*`, OpenSubsonic-aligned): `ping`, `getLicense`,

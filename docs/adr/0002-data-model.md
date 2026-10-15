@@ -142,14 +142,17 @@ release_art           release_id FK → releases ON DELETE CASCADE,
                         CHECK (transient_failures >= 0 AND transient_failures <= 3),
                       created_at, updated_at,
                       PK (release_id, rendition) -- durable source, nullable cache pointer
-library_tracks        library_id FK, track_id FK, added_at, PK (library_id, track_id)
+library_tracks        library_id FK, track_id FK, added_at, PK (library_id, track_id),
+                      INDEX (track_id) -- GC reference test + track-delete RI path
 track_sources         user_id FK, track_id FK, source_job_id FK → ingest_jobs,
                       indexer_id FK NULL, nzb_ref_encrypted BYTEA
-                      + nzb_ref_* envelope fields, PK (user_id, track_id)
+                      + nzb_ref_* envelope fields, PK (user_id, track_id),
+                      INDEX (track_id) -- cross-user track-delete RI path
 track_media           user_id FK, track_id FK, source_job_id FK → ingest_jobs,
                       content_hash FK → cache_objects, format TEXT, bitrate INTEGER,
                       verified_at, last_served_at,
-                      PK (user_id, track_id, source_job_id, content_hash)
+                      PK (user_id, track_id, source_job_id, content_hash),
+                      INDEX (track_id) -- GC/track-delete RI path
 user_cache_grants     user_id FK, content_hash FK → cache_objects,
                       provider_id UUID NOT NULL,
                       FK (user_id, provider_id) → providers(user_id, id) ON DELETE RESTRICT,
@@ -160,15 +163,28 @@ cache_objects         content_hash TEXT PK (sha256 hex), byte_size BIGINT,
 playlists             id PK, user_id FK, name, created_at, deleting_at NULL
 playlist_tracks       id PK, playlist_id FK, track_id FK, position INTEGER,
                       UNIQUE (playlist_id, position) DEFERRABLE INITIALLY DEFERRED,
-                      INDEX (playlist_id, track_id)
+                      INDEX (playlist_id, track_id),
+                      INDEX (track_id) -- GC reference test + track-delete RI path
 delete_operations     id UUID PK, user_id TEXT NOT NULL FK → users ON DELETE RESTRICT,
                       scope TEXT NOT NULL ('account'|'library'|'playlist'),
                       container_id UUID NULL, cursor JSONB NOT NULL DEFAULT '{}',
+                      state TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (state IN ('pending','running','failed','done')),
+                      heartbeat_at timestamptz NOT NULL DEFAULT now(),
+                      consecutive_failures SMALLINT NOT NULL DEFAULT 0
+                        CHECK (consecutive_failures >= 0),
+                      last_error TEXT NULL,
                       started_at timestamptz NOT NULL,
                       CHECK ((scope='account') = (container_id IS NULL)),
                       partial UNIQUE (user_id) WHERE scope='account',
                       partial UNIQUE (user_id, scope, container_id)
                         WHERE scope IN ('library','playlist')
+                      -- state/heartbeat/failures advance in the same transaction
+                      -- as the cursor; GET /v1/operations/{id} is owner-scoped
+                      -- (caller user_id must match) and reports pending/running/
+                      -- failed from these columns; library/playlist 'done' rows
+                      -- are retained 7 days then swept; account completion removes
+                      -- all of that user's rows and confirms by email (0006)
 play_event_outbox     event_id UUID PK, user_id FK, track_id FK,
                       played_at timestamptz NOT NULL, stream_seconds BIGINT NOT NULL,
                       cached_hit BOOLEAN, delivered_at NULL,
@@ -181,11 +197,21 @@ play_events           event_id UUID NOT NULL, user_id FK, track_id FK,
                       PARTITION BY RANGE (played_at), monthly,
                       PARTITIONED INDEX (user_id, played_at),
                       PARTITIONED INDEX (track_id)
-deleted_billing_tombstones stripe_customer_id TEXT PK, email_hash TEXT NOT NULL,
+deleted_billing_tombstones id UUID PK, stripe_customer_id TEXT NULL,
+                      UNIQUE (stripe_customer_id) WHERE stripe_customer_id IS NOT NULL,
+                      email_hmac TEXT NOT NULL, INDEX (email_hmac),
                       trial_started_at timestamptz NULL (write-once copy),
                       open_invoice_refs JSONB NOT NULL DEFAULT '[]',
                       debt_refs JSONB NOT NULL DEFAULT '[]', deleted_at timestamptz NOT NULL
-                      -- non-PII tombstone retained after account erasure; no FK to users
+                      -- no FK to users; skipped (no row) when stripe_customer_id
+                      -- IS NULL and no trial/debt history exists. email_hmac is
+                      -- HMAC-SHA256 of the normalized email (trim, lowercase,
+                      -- strip plus-tags) under the versioned billing-email
+                      -- pepper (v1 at launch, stored alongside as pepper
+                      -- version); retained 36 months for trial single-use and
+                      -- invoice/debt history, then deleted; basis recorded in
+                      -- the privacy docs. The raw email/name remain only on the
+                      -- retained remote Stripe customer, never in this table
 ```
 
 The ingest job's payload is retained by the dispatch/queue path; a durable
@@ -338,28 +364,42 @@ batch cursor. Entry points are declared in ADR 0006: `DELETE /v1/account`,
 with an operation id; `GET /v1/operations/{operation_id}` reports its state.
 The executor is the `delete` Workflow (Queues/Workflows, Containers-eligible
 batch worker): it advances the persisted cursor in bounded batches, retries a
-failed batch with backoff, alerts after three consecutive failures, and a hourly
-`delete-sweep` job resumes any operation with no heartbeat (same pattern as the
-ADR 0005 `billing-reconcile`). Starting a scoped delete atomically marks the
-relevant row and inserts its operation; the cursor records the last completed
-key and advances in the same transaction as each batch. The delete cursor keys
-on indexed access paths only: `(user_id, played_at, event_id)` for
-`play_events`/`play_event_outbox` via their `(user_id, played_at)` indexes,
-`(user_id, track_id)` for membership/media/grant batches, and `local_job_id`
-for owner-local catalog rows. A crash resumes that operation via the executor
-or the sweep, never only via a user retry. A completed library/playlist
-operation removes its operation and container in one transaction; account
-completion removes **all** of that user's `delete_operations` rows (including
-in-flight scoped operations, which the account sweep supersedes and cancels)
-and the user in one transaction, so no `ON DELETE RESTRICT` operation row can
-block the final `DELETE FROM users`.
+failed batch with backoff, alerts after three consecutive failures, and an hourly
+`delete-sweep` job resumes operations whose `heartbeat_at` is older than one
+hour (same pattern as the ADR 0005 `billing-reconcile`). Starting a scoped
+delete atomically marks the relevant row and inserts its operation; the cursor
+records the last completed key and advances in the same transaction as each
+batch, together with `state`, `heartbeat_at`, `consecutive_failures` and
+`last_error`. The delete cursor keys on indexed access paths only: `(user_id,
+played_at, event_id)` for `play_events`/`play_event_outbox` via their
+`(user_id, played_at)` indexes; `(library_id, track_id)` via
+`libraries(user_id)` for membership batches; `(playlist_id, entry id)` for
+playlist-entry batches; `(user_id, content_hash)` for grant batches; `track_id`
+via the `library_tracks(track_id)`, `playlist_tracks(track_id)`,
+`track_sources(track_id)` and `track_media(track_id)` indexes for the GC
+reference test and every `DELETE FROM tracks` RI check; and `local_job_id` for
+owner-local catalog rows. A repeat DELETE of the same account/container is
+idempotent: while its operation row exists the API returns the existing
+operation id with `202`, not a unique violation or a fence `409`. A crash
+resumes that operation via the executor or the sweep, never only via a user
+retry. A completed library/playlist operation marks its row `done` and removes
+the container in one transaction; `done` rows are retained 7 days for status
+reads, then swept. Account completion removes **all** of that user's
+`delete_operations` rows (including in-flight scoped operations, which the
+account sweep supersedes and cancels) and the user in one transaction, so no
+`ON DELETE RESTRICT` operation row can block the final `DELETE FROM users`;
+the erased account learns the result from the confirmation email (ADR 0006),
+and a later `GET /v1/operations/{id}` for it is `404`.
 
 Every writer that can create or restore user-owned state first takes
 `SELECT ... FOR SHARE` on the user's `users` row and rejects a non-NULL
 `deleting_at`; library/playlist mutations also take `FOR SHARE` on the target
 container and reject its marker. This includes ingest `write`, membership and
 playlist edits/restores, stream publication of `track_media`/grants (including
-play-event/outbox writes), and art descriptor/pointer publication. A fenced
+play-event/outbox writes), and art descriptor/pointer publication. The delete
+executor's own billing reconcile (account gate below) and its cursor/state
+writes are exempt from this fence; all other billing/subscription writers
+remain fenced once `deleting_at` is set. A fenced
 writer fails closed with native `409 Conflict` carrying
 `code: account_deleting` (or `container_deleting`), the blocking
 `operation_id`, and a `retry_after` hint; it never queues behind the delete.
@@ -384,6 +424,9 @@ container is empty before removing its marker/container; the persisted cursor is
 a resume hint, not authority to skip rechecking.
 
 Account deletion first marks `users.deleting_at` and records the operation.
+For accounts the erasure executor starts only after the 24-hour cancellable
+grace window in ADR 0006 (sessions stay valid for cancel during grace; the
+sweep deletes them only when erasure begins).
 Enumerate the user's own `ingest_jobs` and their `local_job_id` owner index
 before deleting jobs; this indexed owner path (not `local_key` parsing) drives
 local catalog cleanup, independent of current memberships/sources. In batches
@@ -393,18 +436,25 @@ referenced tracks or the user; account erasure is the first explicit exception
 to append-only event retention (rule 5). Then remove playlist entries and
 library memberships, media, grants and sources. Remove owner-local catalog rows
 and `release_art` descriptors with no remaining library/playlist references
-under the release serializer. Billing is deleted only after remote termination
-is gated: cancel the Stripe subscription through the same per-user serialized
-reconcile as ADR 0005, confirm terminal status (`canceled`/`incomplete_expired`)
-remotely and persist it locally, then copy a minimal non-PII tombstone into
-`deleted_billing_tombstones` (`stripe_customer_id`, `email_hash`,
-`trial_started_at` write-once copy, open invoice/debt refs) before deleting
-local billing operations/subscriptions/accounts. The Stripe customer is retained
-remotely for invoice/debt history, never deleted with the account; a webhook
-for an unknown or tombstoned customer resolves the tombstone, reconciles debt
-without recreating a user, and alerts. This preserves ADR 0005 trial
-single-use (`trial_started_at` survives as the tombstone copy) and the rule 4
-ban on freeing a slot while remote billing can still collect. Then remove ingest
+under the release serializer. Billing is deleted only after remote termination is gated. The gate runs under
+the same per-user serialized reconcile as ADR 0005 (exempt from the fence
+above): first resolve every unresolved `billing_operations` row for the user,
+then list ALL non-terminal remote subscriptions for the stored customer id
+(never only the locally known row), cancel each immediately — not at period
+end — with the pinned delete-cancel contract (`proration_behavior=none`,
+final invoice issued, no refund in this step; ADR 0005), and confirm every one
+reached terminal status (`canceled`/`incomplete_expired`) remotely and
+persisted locally before any billing row is deleted. Then copy a minimal
+tombstone into `deleted_billing_tombstones` (`stripe_customer_id` when
+non-NULL, `email_hmac`, `trial_started_at` write-once copy, open invoice/debt
+refs; skipped only when there is no customer id and no trial/debt history)
+before deleting local billing operations/subscriptions/accounts. The Stripe
+customer is retained remotely for invoice/debt history, never deleted with the
+account; a webhook for an unknown or tombstoned customer that still shows a
+live remote subscription cancels it immediately and alerts, otherwise it
+reconciles debt without recreating a user and alerts. This preserves ADR 0005
+trial single-use (`trial_started_at` survives as the tombstone copy) and the
+rule 4 ban on freeing a slot while remote billing can still collect. Then remove ingest
 jobs and empty library/playlist containers, providers/indexers/vaults, Subsonic
 credentials, sessions, magic-link/WebAuthn rows and other user-FK children;
 remove **all** of that user's `delete_operations` rows and, last, the account
@@ -899,10 +949,17 @@ retaining its `release_mbid_hint` without guessing. Also require:
   an account with played local tracks and pending outbox rows and assert no 23503
   on track/user deletion. Billing gate: delete a paying and a past_due account and
   assert remote cancellation is confirmed terminal before local billing rows are
-  removed, a `deleted_billing_tombstones` row retains customer id, email hash,
-  trial start and open invoice/debt refs, the Stripe customer is retained, a
-  webhook for that tombstoned customer reconciles without recreating a user, and
-  re-registering the same email hash is not trial-eligible. Include a user who
+  removed; include an account whose `billing_operations` row is still
+  `submitted`/`needs_reconcile` at deletion time and assert the gate resolves
+  it, lists all remote subscriptions, and cancels each immediately under the
+  pinned contract before deleting rows. A `deleted_billing_tombstones` row
+  retains customer id (when non-NULL), email HMAC, trial start and open
+  invoice/debt refs (no row when no customer and no history); the Stripe
+  customer is retained; a webhook for that tombstoned customer with a still-live
+  remote subscription cancels it and alerts, otherwise it reconciles without
+  recreating a user; and re-registering the same email HMAC is not
+  trial-eligible per the ADR 0005 tombstone check. Deleting an account that
+  never reached Stripe writes no tombstone and does not wedge. Include a user who
   previously removed the final local library membership and playlist reference:
   owner-keyed GC must find/delete those rows via indexed `local_job_id`, not
   memberships and never by parsing `local_key`. GC played-track case: play a
@@ -921,12 +978,23 @@ retaining its `release_mbid_hint` without guessing. Also require:
   provider/job removal, `DELETE /v1/account|/libraries/{id}|/playlists/{id}`
   return 202 with an operation id readable via `GET /v1/operations/{id}`, and
   account completion removes all of the user's operation rows including
-  in-flight scoped ones. Index case: assert `(user_id, played_at)` and
-  `(track_id)` indexes exist on `play_event_outbox` and on partitioned
-  `play_events`, the delete cursor keys on them (EXPLAIN uses the index, no
-  per-partition Seq Scan), and the local sweep queries `local_job_id`.
+  in-flight scoped ones; a repeat DELETE returns the existing operation id with
+  `202`; `GET /v1/operations/{id}` is owner-scoped and reports
+  pending/running/failed from the stored columns; library/playlist `done` rows
+  persist 7 days; the account result arrives by confirmation email. Index case:
+  assert `(user_id, played_at)` and `(track_id)` indexes exist on
+  `play_event_outbox` and on partitioned `play_events`, plus `(track_id)`
+  indexes on `library_tracks`, `playlist_tracks`, `track_sources` and
+  `track_media`, and an `email_hmac` index on `deleted_billing_tombstones`.
+  At a seeded size assert EXPLAIN uses the index (no Seq Scan, no
+  per-partition Seq Scan) for the GC reference test, a 500-track delete batch,
+  and the tombstone trial check; the delete cursor keys on those real paths and
+  the local sweep queries `local_job_id`.
   FKs remain restrictive; the two rule-5 exceptions are the only play-event
-  deletions.
+  deletions. Delete-account auth case: without fresh step-up the request is
+  rejected; with it the request returns `202`, sends the confirmation email,
+  starts erasure only after the 24-hour grace window, and honors cancel/delete
+  completion (ADR 0006).
 - Cover art: B requests A's local art by `coverart:{release_id}` or raw hash and
   receives 404/70 **before any fetch**. A's member request refills embedded art from
   an own current source; a verified-release member refills CAA art without a

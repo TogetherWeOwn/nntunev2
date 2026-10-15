@@ -23,8 +23,10 @@ billing mechanism, not a conclusion about those obligations.
    `billing_accounts` row and a `billing_operations` request with an immutable
    request id/payload. At most one unresolved billing operation per user is
    allowed. Pending setup grants no stream entitlement. Check the write-once
-   `billing_accounts.trial_started_at`: only NULL history is eligible for the
-   trial branch. Persist its proposed start/end in the immutable request payload.
+   `billing_accounts.trial_started_at` AND the `deleted_billing_tombstones`
+   email-HMAC index (normalized email under the versioned billing-email
+   pepper): only NULL history in both is eligible for the trial branch.
+   Persist its proposed start/end in the immutable request payload.
    Existing history means a paid choice with **no** `trial_end`, `trial_period_days`
    or `trial_settings`; lack of paid consent leaves setup pending, not another
    trial. A concurrent request resumes the same operation instead of rechecking
@@ -224,10 +226,15 @@ per-user operation serialization. Retain invoice/debt history; no data deletion
 or implicit refund is part of expiration. Account deletion follows the same gate
 (ADR 0002 rule 3): confirm remote terminal status through serialized reconcile
 before deleting local billing rows, retain the Stripe customer remotely, copy a
-non-PII tombstone (`stripe_customer_id`, email hash, `trial_started_at`, open
-invoice/debt refs) so trial single-use and debt survive, and handle webhooks for
-unknown or tombstoned customers by reconciling the tombstone without recreating
-a user.
+tombstone (`stripe_customer_id` when non-NULL, email HMAC per ADR 0002,
+`trial_started_at`, open invoice/debt refs; no row when there is no customer
+and no history) so trial single-use and debt survive, and handle webhooks for
+unknown or tombstoned customers by cancel-and-alert when a live remote
+subscription remains, otherwise by reconciling the tombstone without recreating
+a user. Tombstones are retained 36 months, then deleted. The account
+delete-cancel is immediate (not `cancel_at_period_end`): `proration_behavior=none`,
+final invoice issued, no refund in this step; every listed subscription must be
+confirmed terminal before local rows are deleted.
 
 ## Acceptance contract for the implementing billing PR
 
