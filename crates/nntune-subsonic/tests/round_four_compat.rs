@@ -26,14 +26,13 @@ fn body_text(app: &SubsonicApp<TestStore>, path: &str, query: &str) -> String {
     String::from_utf8(get(app, path, query)).unwrap()
 }
 
-/// Minimal configurable store. Catalogue reads come from the struct fields;
-/// user state is stubbed except for the scrobble spy, which records only
-/// known song ids (like the in-memory store).
+/// Configurable store that delegates sampling and history to the real
+/// in-memory store instead of reimplementing shuffle or play-history logic.
+/// Catalogue reads, album lists, random songs and scrobble history all come
+/// from `inner`; only lyrics stay custom and the scrobble spy counts calls.
 #[derive(Clone, Debug)]
 struct TestStore {
-    artists: Vec<Artist>,
-    albums: Vec<Album>,
-    songs: Vec<Song>,
+    inner: MemStore,
     lyrics: BTreeMap<(String, String), String>,
     scrobble_log: Rc<RefCell<Vec<(String, String)>>>,
 }
@@ -46,11 +45,10 @@ impl TestStore {
         lyrics: BTreeMap<(String, String), String>,
     ) -> (TestStore, Rc<RefCell<Vec<(String, String)>>>) {
         let log = Rc::new(RefCell::new(Vec::new()));
+        let inner = MemStore::empty_with_test_auth().with_catalogue(artists, albums, songs);
         (
             TestStore {
-                artists,
-                albums,
-                songs,
+                inner,
                 lyrics,
                 scrobble_log: Rc::clone(&log),
             },
@@ -70,6 +68,8 @@ impl TestStore {
             artist_id: "ar-1".into(),
             duration: 200,
             created: NOW.into(),
+            year: Some(2026),
+            release_date: Some("2026-01-01".into()),
         }];
         let songs = vec![Song {
             id: "so-1".into(),
@@ -110,6 +110,8 @@ impl TestStore {
                 artist_id: "ar-1".into(),
                 duration: 200,
                 created: NOW.into(),
+                year: Some(2026),
+                release_date: Some("2026-01-01".into()),
             },
             Album {
                 id: "al-b".into(),
@@ -118,6 +120,8 @@ impl TestStore {
                 artist_id: "ar-1".into(),
                 duration: 200,
                 created: NOW.into(),
+                year: Some(2026),
+                release_date: Some("2026-01-02".into()),
             },
         ];
         let songs = vec![
@@ -207,64 +211,67 @@ impl Library for TestStore {
     }
 
     fn artists(&self) -> Vec<Artist> {
-        self.artists.clone()
+        self.inner.artists()
+    }
+
+    fn artists_last_modified(&self) -> i64 {
+        self.inner.artists_last_modified()
     }
 
     fn artist(&self, id: &str) -> Option<Artist> {
-        self.artists.iter().find(|a| a.id == id).cloned()
+        self.inner.artist(id)
     }
 
     fn albums_for_artist(&self, artist_id: &str) -> Vec<Album> {
-        self.albums
-            .iter()
-            .filter(|a| a.artist_id == artist_id)
-            .cloned()
-            .collect()
+        self.inner.albums_for_artist(artist_id)
     }
 
     fn album(&self, id: &str) -> Option<Album> {
-        self.albums.iter().find(|a| a.id == id).cloned()
+        self.inner.album(id)
     }
 
     fn all_albums(&self) -> Vec<Album> {
-        self.albums.clone()
+        self.inner.all_albums()
+    }
+
+    fn album_list(&self, query: AlbumListQuery<'_>) -> Vec<Album> {
+        self.inner.album_list(query)
+    }
+
+    fn album_list2(&self, query: AlbumListQuery<'_>) -> Result<Vec<Album>, (i64, String)> {
+        self.inner.album_list2(query)
+    }
+
+    fn random_songs(&self, identity: &Identity, size: usize) -> Vec<Song> {
+        self.inner.random_songs(identity, size)
     }
 
     fn songs_for_album(&self, album_id: &str) -> Vec<Song> {
-        let mut out: Vec<Song> = self
-            .songs
-            .iter()
-            .filter(|s| s.album_id == album_id)
-            .cloned()
-            .collect();
-        out.sort_by(|a, b| a.track.cmp(&b.track).then(a.id.cmp(&b.id)));
-        out
+        self.inner.songs_for_album(album_id)
     }
 
     fn song(&self, id: &str) -> Option<Song> {
-        self.songs.iter().find(|s| s.id == id).cloned()
+        self.inner.song(id)
     }
 
     fn all_songs(&self) -> Vec<Song> {
-        let mut out = self.songs.clone();
-        out.sort_by(|a, b| a.id.cmp(&b.id));
-        out
+        self.inner.all_songs()
     }
 
     fn genres(&self) -> Vec<(String, i64, i64)> {
-        Vec::new()
+        self.inner.genres()
     }
 
     fn audio(&self, song_id: &str) -> Option<Vec<u8>> {
-        self.song(song_id).map(|_| b"audio".to_vec())
+        self.inner.audio(song_id)
     }
 
     fn cover(&self, _cover_id: &str) -> Option<Vec<u8>> {
-        None
+        self.inner.cover(_cover_id)
     }
 
     fn avatar(&self, _username: &str) -> Option<Vec<u8>> {
-        None
+        self.inner.avatar(_username)
     }
 
     fn lyrics(&self, artist: &str, title: &str) -> Option<String> {
@@ -273,78 +280,71 @@ impl Library for TestStore {
             .cloned()
     }
 
-    fn playlists(&self, _identity: &Identity) -> Vec<Playlist> {
-        Vec::new()
+    fn playlists(&self, identity: &Identity) -> Vec<Playlist> {
+        self.inner.playlists(identity)
     }
 
-    fn playlist(&self, _identity: &Identity, _id: &str) -> Option<Playlist> {
-        None
+    fn playlist(&self, identity: &Identity, id: &str) -> Option<Playlist> {
+        self.inner.playlist(identity, id)
     }
 
     fn create_playlist(&mut self, identity: &Identity, name: String) -> Playlist {
-        Playlist {
-            id: "pl-1".into(),
-            name,
-            owner: identity.username.clone(),
-            song_ids: Vec::new(),
-            created: NOW.into(),
-            changed: NOW.into(),
-        }
+        self.inner.create_playlist(identity, name)
     }
 
     fn update_playlist(
         &mut self,
-        _identity: &Identity,
-        _id: &str,
-        _name: Option<String>,
-        _add: Vec<String>,
-        _remove: Vec<usize>,
+        identity: &Identity,
+        id: &str,
+        name: Option<String>,
+        add: Vec<String>,
+        remove: Vec<usize>,
     ) -> Result<(), (i64, String)> {
-        Err((70, "The requested data was not found.".to_string()))
+        self.inner.update_playlist(identity, id, name, add, remove)
     }
 
-    fn delete_playlist(&mut self, _identity: &Identity, _id: &str) -> Result<(), (i64, String)> {
-        Err((70, "The requested data was not found.".to_string()))
+    fn delete_playlist(&mut self, identity: &Identity, id: &str) -> Result<(), (i64, String)> {
+        self.inner.delete_playlist(identity, id)
     }
 
-    fn star(&mut self, _identity: &Identity, _kind: StarKind, _id: &str) -> bool {
-        false
+    fn star(&mut self, identity: &Identity, kind: StarKind, id: &str) -> bool {
+        self.inner.star(identity, kind, id)
     }
 
-    fn unstar(&mut self, _identity: &Identity, _kind: StarKind, _id: &str) {}
-
-    fn starred(&self, _identity: &Identity, _kind: StarKind) -> Vec<String> {
-        Vec::new()
+    fn unstar(&mut self, identity: &Identity, kind: StarKind, id: &str) {
+        self.inner.unstar(identity, kind, id)
     }
 
-    fn set_rating(&mut self, _identity: &Identity, _id: &str, _rating: i64) -> bool {
-        false
+    fn starred(&self, identity: &Identity, kind: StarKind) -> Vec<String> {
+        self.inner.starred(identity, kind)
     }
 
-    fn rating(&self, _identity: &Identity, _id: &str) -> Option<i64> {
-        None
+    fn set_rating(&mut self, identity: &Identity, id: &str, rating: i64) -> bool {
+        self.inner.set_rating(identity, id, rating)
+    }
+
+    fn rating(&self, identity: &Identity, id: &str) -> Option<i64> {
+        self.inner.rating(identity, id)
     }
 
     fn scrobble(&mut self, identity: &Identity, song_id: &str) -> bool {
-        if self.song(song_id).is_none() {
+        if self.inner.song(song_id).is_none() {
             return false;
         }
         self.scrobble_log
             .borrow_mut()
             .push((identity.username.clone(), song_id.to_string()));
-        true
+        self.inner.scrobble(identity, song_id)
     }
 
-    fn queue(&self, _identity: &Identity) -> Option<PlayQueue> {
-        None
+    fn queue(&self, identity: &Identity) -> Option<PlayQueue> {
+        self.inner.queue(identity)
     }
 
-    fn save_queue(&mut self, _identity: &Identity, _queue: PlayQueue) {}
+    fn save_queue(&mut self, identity: &Identity, queue: PlayQueue) {
+        self.inner.save_queue(identity, queue)
+    }
 }
-
-// Silence dead-code warnings for the query type re-export used in docs.
-#[allow(dead_code)]
-fn _query_type(_q: AlbumListQuery<'_>) {}
 
 // --- structured lyrics (v1 ParsedLyrics) ---
 
@@ -590,8 +590,8 @@ fn album_list_reversed_by_year_is_accepted() {
         "reversed range is accepted: {text}"
     );
     assert!(text.contains("al-1"), "{text}");
-    // The catalogue list answers ok as well (never error 10 for a
-    // well-formed reversed range).
+    // The catalogue list answers ok with an empty page for a reversed range
+    // (v1 StreamableCatalogue keeps the ascending bound, so nothing matches).
     let body = get(
         &app,
         "/rest/getAlbumList2",
@@ -603,6 +603,10 @@ fn album_list_reversed_by_year_is_accepted() {
         "reversed range is accepted: {text}"
     );
     assert!(text.contains("\"status\":\"ok\""), "{text}");
+    assert!(
+        !text.contains("al-1"),
+        "reversed catalogue range is empty: {text}"
+    );
 }
 
 #[test]
@@ -627,6 +631,10 @@ fn album_list2_refuses_schema_unservable_types_with_code_zero() {
             text.contains("\"code\":0"),
             "{list_type} must refuse with 0: {text}"
         );
+        assert!(
+            text.contains(&format!("Unsupported album list type: {list_type}")),
+            "{list_type} must carry the exact refusal text: {text}"
+        );
     }
     // The legacy list still serves frequent/recent from the scrobble log.
     for list_type in ["frequent", "recent"] {
@@ -644,26 +652,12 @@ fn album_list2_refuses_schema_unservable_types_with_code_zero() {
     }
 }
 
-fn hash_order(ids: &[&str]) -> Vec<String> {
-    let mut order: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
-    order.sort_by_key(|id| {
-        id.bytes().fold(0u64, |hash, byte| {
-            hash.wrapping_mul(31).wrapping_add(u64::from(byte))
-        })
-    });
-    order
-}
-
-#[test]
-fn random_album_list_is_not_a_fixed_hash_order() {
-    // Five albums: the fixed id-hash order must not pin the random list
-    // (v1 uses inRandomOrder). A shuffle matching the hash order exactly
-    // is possible but negligible (1/120).
+fn eight_album_catalogue() -> (Vec<Artist>, Vec<Album>, Vec<Song>) {
     let artists = vec![Artist {
         id: "ar-1".into(),
         name: "Test Artist".into(),
     }];
-    let albums: Vec<Album> = (0..5)
+    let albums: Vec<Album> = (0..8)
         .map(|i| Album {
             id: format!("al-{i}"),
             name: format!("Album {i}"),
@@ -671,9 +665,11 @@ fn random_album_list_is_not_a_fixed_hash_order() {
             artist_id: "ar-1".into(),
             duration: 200,
             created: NOW.into(),
+            year: Some(2026),
+            release_date: Some("2026-01-01".into()),
         })
         .collect();
-    let songs: Vec<Song> = (0..5)
+    let songs: Vec<Song> = (0..8)
         .map(|i| Song {
             id: format!("so-{i}"),
             title: format!("Song {i}"),
@@ -693,86 +689,204 @@ fn random_album_list_is_not_a_fixed_hash_order() {
             artist_id: "ar-1".into(),
         })
         .collect();
-    let (store, _) = TestStore::new(artists, albums, songs, BTreeMap::new());
-    let app = SubsonicApp::new(store);
-    let text = body_text(
-        &app,
-        "/rest/getAlbumList2",
-        &format!("{KEY}&type=random&size=5&f=json"),
-    );
-    // Reconstruct response order from positions.
-    let mut positioned: Vec<(&str, usize)> = ["al-0", "al-1", "al-2", "al-3", "al-4"]
+    (artists, albums, songs)
+}
+
+fn album_order_in_list2(text: &str, ids: &[&str]) -> Vec<String> {
+    let mut positioned: Vec<(&str, usize)> = ids
         .iter()
-        .map(|id| (*id, text.find(&format!("\"id\":\"{id}\"")).expect(&text)))
+        .map(|id| (*id, text.find(&format!("\"id\":\"{id}\"")).expect(text)))
         .collect();
     positioned.sort_by_key(|(_, pos)| *pos);
-    let got: Vec<String> = positioned
+    positioned
         .into_iter()
         .map(|(id, _)| id.to_string())
-        .collect();
-    assert_eq!(got.len(), 5, "{text}");
-    assert_ne!(
-        got,
-        hash_order(&["al-0", "al-1", "al-2", "al-3", "al-4"]),
-        "random must not be the fixed hash order: {text}"
-    );
-    let _ = got;
+        .collect()
+}
+
+fn song_order_in_random_songs(text: &str, ids: &[&str]) -> Vec<String> {
+    album_order_in_list2(text, ids)
 }
 
 #[test]
-fn random_songs_are_not_fixed_id_order() {
-    let artists = vec![Artist {
-        id: "ar-1".into(),
-        name: "Test Artist".into(),
-    }];
-    let albums = vec![Album {
-        id: "al-1".into(),
-        name: "Test Album".into(),
-        artist: "Test Artist".into(),
-        artist_id: "ar-1".into(),
-        duration: 200,
-        created: NOW.into(),
-    }];
-    let songs: Vec<Song> = (0..5)
-        .map(|i| Song {
-            id: format!("so-{i}"),
-            title: format!("Song {i}"),
-            album: "Test Album".into(),
-            artist: "Test Artist".into(),
-            track: i as i64 + 1,
-            year: 2026,
-            genre: "Rock".into(),
-            cover_art: "al-1".into(),
-            size: 1000,
-            content_type: "audio/mpeg".into(),
-            suffix: "mp3".into(),
-            duration: 200,
-            disc: 1,
-            created: NOW.into(),
-            album_id: "al-1".into(),
-            artist_id: "ar-1".into(),
-        })
-        .collect();
-    let (store, _) = TestStore::new(artists, albums, songs, BTreeMap::new());
+fn random_album_list_is_seeded_and_successive_samples_vary() {
+    let ids = [
+        "al-0", "al-1", "al-2", "al-3", "al-4", "al-5", "al-6", "al-7",
+    ];
+    let (artists, albums, songs) = eight_album_catalogue();
+    let first = {
+        let store = MemStore::empty_with_test_auth()
+            .with_catalogue(artists.clone(), albums.clone(), songs.clone())
+            .with_random_seed(7);
+        let app = SubsonicApp::new(store);
+        let body = get(
+            &app,
+            "/rest/getAlbumList2",
+            &format!("{KEY}&type=random&size=8&f=json"),
+        );
+        String::from_utf8(body).unwrap()
+    };
+    let first_order = album_order_in_list2(&first, &ids);
+    assert_eq!(first_order.len(), 8, "{first}");
+    // Same seed and catalogue reproduce the same shuffle.
+    let (replay_artists, replay_albums, replay_songs) = eight_album_catalogue();
+    let replay_store = MemStore::empty_with_test_auth()
+        .with_catalogue(replay_artists, replay_albums, replay_songs)
+        .with_random_seed(7);
+    let replay_app = SubsonicApp::new(replay_store);
+    let replay_body = get(
+        &replay_app,
+        "/rest/getAlbumList2",
+        &format!("{KEY}&type=random&size=8&f=json"),
+    );
+    let replay_text = String::from_utf8(replay_body).unwrap();
+    assert_eq!(
+        album_order_in_list2(&replay_text, &ids),
+        first_order,
+        "same seed must reproduce the shuffle: {replay_text}"
+    );
+    // Successive samples from one store advance the sequence: across several
+    // draws at least two distinct orders appear (eight items, so a stuck
+    // shuffle would be a real bug, not chance).
+    let store = MemStore::empty_with_test_auth()
+        .with_catalogue(artists, albums, songs)
+        .with_random_seed(7);
     let app = SubsonicApp::new(store);
+    let mut orders = std::collections::HashSet::new();
+    for _ in 0..10 {
+        let body = get(
+            &app,
+            "/rest/getAlbumList2",
+            &format!("{KEY}&type=random&size=8&f=json"),
+        );
+        let text = String::from_utf8(body).unwrap();
+        let order = album_order_in_list2(&text, &ids);
+        assert_eq!(order.len(), 8, "{text}");
+        // Every sample keeps the full set; only the order varies.
+        let mut sorted = order.clone();
+        sorted.sort();
+        let mut expected: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(sorted, expected, "{text}");
+        orders.insert(order.join(","));
+    }
+    assert!(
+        orders.len() > 1,
+        "successive shuffles must advance across draws"
+    );
+    let _ = first_order;
+}
+
+#[test]
+fn random_songs_are_seeded_and_successive_samples_vary() {
+    let ids = [
+        "so-0", "so-1", "so-2", "so-3", "so-4", "so-5", "so-6", "so-7",
+    ];
+    let (artists, albums, songs) = eight_album_catalogue();
+    let first_store = MemStore::empty_with_test_auth()
+        .with_catalogue(artists.clone(), albums.clone(), songs.clone())
+        .with_random_seed(11);
+    let first_app = SubsonicApp::new(first_store);
+    let first_body = get(
+        &first_app,
+        "/rest/getRandomSongs",
+        &format!("{KEY}&size=8&f=json"),
+    );
+    let first_text = String::from_utf8(first_body).unwrap();
+    let first_order = song_order_in_random_songs(&first_text, &ids);
+    assert_eq!(first_order.len(), 8, "{first_text}");
+    let (replay_artists, replay_albums, replay_songs) = eight_album_catalogue();
+    let replay_store = MemStore::empty_with_test_auth()
+        .with_catalogue(replay_artists, replay_albums, replay_songs)
+        .with_random_seed(11);
+    let replay_app = SubsonicApp::new(replay_store);
+    let replay_body = get(
+        &replay_app,
+        "/rest/getRandomSongs",
+        &format!("{KEY}&size=8&f=json"),
+    );
+    let replay_text = String::from_utf8(replay_body).unwrap();
+    assert_eq!(
+        song_order_in_random_songs(&replay_text, &ids),
+        first_order,
+        "same seed must reproduce song sampling: {replay_text}"
+    );
+    let store = MemStore::empty_with_test_auth()
+        .with_catalogue(artists, albums, songs)
+        .with_random_seed(11);
+    let app = SubsonicApp::new(store);
+    let mut orders = std::collections::HashSet::new();
+    for _ in 0..10 {
+        let body = get(
+            &app,
+            "/rest/getRandomSongs",
+            &format!("{KEY}&size=8&f=json"),
+        );
+        let text = String::from_utf8(body).unwrap();
+        let order = song_order_in_random_songs(&text, &ids);
+        assert_eq!(order.len(), 8, "{text}");
+        orders.insert(order.join(","));
+    }
+    assert!(
+        orders.len() > 1,
+        "successive song samples must vary across draws"
+    );
+}
+
+#[test]
+fn album_list_history_is_per_user_and_recent_orders_by_recency() {
+    let (store, _) = TestStore::two_albums();
+    let app = SubsonicApp::new(store);
+    // Test plays A once and B twice; other plays only A.
+    for (key, song) in [
+        (KEY, "so-a"),
+        (KEY, "so-b"),
+        (KEY, "so-b"),
+        (OTHER_KEY, "so-a"),
+    ] {
+        let text = body_text(
+            &app,
+            "/rest/scrobble",
+            &format!("{key}&id={song}&submission=true&f=json"),
+        );
+        assert!(text.contains("\"status\":\"ok\""), "{text}");
+    }
+    // Frequent is per-user: test ranks B first (2 plays), other ranks A first.
     let text = body_text(
         &app,
-        "/rest/getRandomSongs",
-        &format!("{KEY}&size=5&f=json"),
+        "/rest/getAlbumList",
+        &format!("{KEY}&type=frequent&f=json"),
     );
-    let mut positioned: Vec<(&str, usize)> = ["so-0", "so-1", "so-2", "so-3", "so-4"]
-        .iter()
-        .map(|id| (*id, text.find(&format!("\"id\":\"{id}\"")).expect(&text)))
-        .collect();
-    positioned.sort_by_key(|(_, pos)| *pos);
-    let got: Vec<String> = positioned
-        .into_iter()
-        .map(|(id, _)| id.to_string())
-        .collect();
-    assert_ne!(
-        got,
-        vec!["so-0", "so-1", "so-2", "so-3", "so-4"],
-        "random songs must not be fixed id order: {text}"
+    let pos_a = text.find("\"id\":\"al-a\"").expect("{text}");
+    let pos_b = text.find("\"id\":\"al-b\"").expect("{text}");
+    assert!(pos_b < pos_a, "test frequent ranks B first: {text}");
+    let text = body_text(
+        &app,
+        "/rest/getAlbumList",
+        &format!("{OTHER_KEY}&type=frequent&f=json"),
+    );
+    let pos_a = text.find("\"id\":\"al-a\"").expect("{text}");
+    let pos_b = text.find("\"id\":\"al-b\"").expect("{text}");
+    assert!(pos_a < pos_b, "other frequent is isolated: {text}");
+    // Recent orders by recency for test (B last) and isolates the other user
+    // to only the album they played.
+    let text = body_text(
+        &app,
+        "/rest/getAlbumList",
+        &format!("{KEY}&type=recent&f=json"),
+    );
+    let pos_a = text.find("\"id\":\"al-a\"").expect("{text}");
+    let pos_b = text.find("\"id\":\"al-b\"").expect("{text}");
+    assert!(pos_b < pos_a, "test recent puts B first: {text}");
+    let text = body_text(
+        &app,
+        "/rest/getAlbumList",
+        &format!("{OTHER_KEY}&type=recent&f=json"),
+    );
+    assert!(text.contains("al-a"), "{text}");
+    assert!(
+        !text.contains("al-b"),
+        "recent excludes never-played albums: {text}"
     );
 }
 
@@ -870,6 +984,41 @@ fn oversized_body_answers_error_10_envelope() {
         text.contains("POST body exceeds the 10 MB limit."),
         "{text}"
     );
+}
+
+#[test]
+fn unreadable_body_answers_error_10_in_json_xml_and_jsonp() {
+    let json = nntune_subsonic::unreadable_body_response(&format!("{KEY}&f=json"));
+    assert_eq!(json.status, 200);
+    assert!(
+        json.content_type.contains("application/json"),
+        "{}",
+        json.content_type
+    );
+    let text = String::from_utf8(json.body).unwrap();
+    assert!(text.contains("\"code\":10"), "{text}");
+    assert!(text.contains("Unable to read request body."), "{text}");
+    let xml = nntune_subsonic::unreadable_body_response(KEY);
+    assert_eq!(xml.status, 200);
+    assert!(
+        xml.content_type.contains("application/xml"),
+        "{}",
+        xml.content_type
+    );
+    let text = String::from_utf8(xml.body).unwrap();
+    assert!(text.contains("code=\"10\""), "{text}");
+    assert!(text.contains("Unable to read request body."), "{text}");
+    let jsonp = nntune_subsonic::unreadable_body_response(&format!("{KEY}&f=jsonp&callback=cb"));
+    assert_eq!(jsonp.status, 200);
+    assert!(
+        jsonp.content_type.contains("text/javascript"),
+        "{}",
+        jsonp.content_type
+    );
+    let text = String::from_utf8(jsonp.body).unwrap();
+    assert!(text.starts_with("/**/cb("), "{text}");
+    assert!(text.contains("\"code\":10"), "{text}");
+    assert!(text.contains("Unable to read request body."), "{text}");
 }
 
 #[test]
