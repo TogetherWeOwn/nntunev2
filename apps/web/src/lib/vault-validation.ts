@@ -16,7 +16,7 @@ export interface ProviderForm {
 	maxConnections: number;
 }
 
-export const MAX_CONNECTIONS_LIMIT = 100;
+export const MAX_CONNECTIONS_LIMIT = 50;
 
 const HOSTNAME_LABEL = '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?';
 const HOSTNAME_PATTERN = new RegExp(`^${HOSTNAME_LABEL}(?:\\.${HOSTNAME_LABEL})+$`, 'i');
@@ -36,20 +36,29 @@ function isBlockedIpv4(host: string): boolean {
 		(a === 192 && b === 168) ||
 		(a === 169 && b === 254) ||
 		(a === 100 && b >= 64 && b <= 127) ||
-		(a === 198 && (b === 18 || b === 19)) ||
+		(a === 198 && (b === 18 || b === 19 || (b === 51 && nums[2] === 100))) ||
 		(a === 192 && b === 0) ||
-		a >= 240
+		(a === 203 && b === 0 && nums[2] === 113) ||
+		a >= 224
 	);
 }
 
 function isBlockedIpv6(host: string): boolean {
-	const lower = host.toLowerCase();
+	const lower = host.toLowerCase().replace(/^\[|\]$/g, '');
+	if (!lower.includes(':')) return false;
+	if (lower.startsWith('::')) return true;
+
+	const [firstText, secondText = ''] = lower.split(':');
+	const firstHextet = Number.parseInt(firstText ?? '', 16);
+	const secondHextet = Number.parseInt(secondText || '0', 16);
 	return (
-		lower === '::1' ||
-		lower.startsWith('fe80:') ||
-		lower.startsWith('fc') ||
-		lower.startsWith('fd') ||
-		lower.includes('::ffff:')
+		!Number.isFinite(firstHextet) ||
+		!Number.isFinite(secondHextet) ||
+		(firstHextet & 0xe000) !== 0x2000 ||
+		firstHextet === 0x2002 ||
+		(firstHextet === 0x2001 && secondHextet < 0x0200) ||
+		(firstHextet === 0x2001 && secondHextet === 0x0db8) ||
+		(firstHextet === 0x3fff && (secondHextet & 0xf000) === 0)
 	);
 }
 
@@ -93,19 +102,30 @@ export function validateProviderConfig(form: ProviderForm): string[] {
  * Validate the optional indexer URL. Returns an error string or null when
  * valid. Empty means "no indexer", which is a supported setup.
  */
-export function validateIndexerUrl(url: string): string | null {
+export function validateIndexerUrl(url: string, apiKey: string): string | null {
 	const value = url.trim();
-	if (value.length === 0) return null;
+	if (value.length === 0) {
+		return apiKey.trim().length === 0 ? null : 'Clear the indexer key or enter an indexer URL.';
+	}
 	let parsed: URL;
 	try {
 		parsed = new URL(value);
 	} catch {
 		return 'That indexer URL does not look valid.';
 	}
-	// http is a dev-only exception for the literal name `localhost`; loopback
-	// literals (127.0.0.1, ::1) stay rejected like the server rejects them.
-	const isLocalhost = parsed.hostname.toLowerCase() === 'localhost';
-	if (parsed.protocol === 'https:') return null;
-	if (parsed.protocol === 'http:' && isLocalhost) return null;
-	return 'Indexer URLs must use https (http is allowed for localhost only).';
+	if (parsed.protocol !== 'https:') {
+		return 'Indexer URLs must use https.';
+	}
+
+	const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+	if (
+		hostname === 'localhost' ||
+		hostname.endsWith('.localhost') ||
+		isBlockedIpv4(hostname) ||
+		isBlockedIpv6(hostname)
+	) {
+		return 'That indexer address is not allowed; use a public host.';
+	}
+	if (apiKey.trim().length === 0) return 'Enter your indexer API key.';
+	return null;
 }

@@ -34,10 +34,25 @@ describe('validateProviderConfig', () => {
 			'169.254.169.254',
 			'192.168.1.1',
 			'172.16.0.5',
-			'::1'
+			'224.0.0.1',
+			'198.51.100.1',
+			'203.0.113.1',
+			'::1',
+			'fc00::1',
+			'fd00::1',
+			'2001:db8::1',
+			'2002::1',
+			'3fff::1',
+			'ff02::1'
 		]) {
 			const errors = validateProviderConfig({ ...good, host });
 			expect(errors.length, `host rejected: ${host}`).toBeGreaterThan(0);
+		}
+	});
+
+	it('accepts hostnames beginning with fc or fd', () => {
+		for (const host of ['fcnews.example.com', 'fdn.example.com', 'fdfiber.net']) {
+			expect(validateProviderConfig({ ...good, host }), `host accepted: ${host}`).toEqual([]);
 		}
 	});
 
@@ -45,7 +60,8 @@ describe('validateProviderConfig', () => {
 		expect(validateProviderConfig({ ...good, port: 0 }).length).toBeGreaterThan(0);
 		expect(validateProviderConfig({ ...good, port: 65536 }).length).toBeGreaterThan(0);
 		expect(validateProviderConfig({ ...good, maxConnections: 0 }).length).toBeGreaterThan(0);
-		expect(validateProviderConfig({ ...good, maxConnections: 500 }).length).toBeGreaterThan(0);
+		expect(validateProviderConfig({ ...good, maxConnections: 50 })).toEqual([]);
+		expect(validateProviderConfig({ ...good, maxConnections: 51 }).length).toBeGreaterThan(0);
 	});
 
 	it('requires a username and a password', () => {
@@ -56,25 +72,43 @@ describe('validateProviderConfig', () => {
 
 describe('validateIndexerUrl', () => {
 	it('treats an empty URL as valid (indexer is optional)', () => {
-		expect(validateIndexerUrl('')).toBeNull();
+		expect(validateIndexerUrl('', '')).toBeNull();
+		expect(validateIndexerUrl('', 'orphaned-key')).not.toBeNull();
 	});
 
-	it('accepts an https indexer URL', () => {
-		expect(validateIndexerUrl('https://index.example.com/api')).toBeNull();
+	it('accepts an https indexer URL with an API key', () => {
+		expect(validateIndexerUrl('https://index.example.com/api', 'indexer-key')).toBeNull();
 	});
 
-	it('rejects non-https, unparsable and metadata URLs', () => {
+	it('accepts a public literal address', () => {
+		expect(validateIndexerUrl('https://8.8.8.8/api', 'indexer-key')).toBeNull();
+		expect(validateIndexerUrl('https://[2001:4860:4860::8888]/api', 'indexer-key')).toBeNull();
+	});
+
+	it('requires an API key when an indexer URL is set', () => {
+		expect(validateIndexerUrl('https://index.example.com/api', '')).not.toBeNull();
+	});
+
+	it('rejects non-https, unparsable and non-public URLs', () => {
 		for (const url of [
 			'http://169.254.169.254/latest/meta-data/',
-			'http://127.0.0.1:8080/',
+			'https://127.0.0.1:8080/',
+			'https://[::1]:8080/',
+			'https://[::]:8080/',
+			'https://[2001:db8::1]/',
+			'https://[2002::1]/',
+			'https://[3fff::1]/',
+			'https://[ff02::1]/',
+			'https://224.0.0.1/',
+			'https://198.51.100.1/',
+			'https://203.0.113.1/',
+			'https://localhost:8080/',
+			'https://localhost./api',
+			'https://service.localhost./api',
 			'ftp://index.example.com/',
 			'not-a-url'
 		]) {
-			expect(validateIndexerUrl(url), `url rejected: ${url}`).not.toBeNull();
+			expect(validateIndexerUrl(url, 'indexer-key'), `url rejected: ${url}`).not.toBeNull();
 		}
-	});
-
-	it('allows http localhost for development', () => {
-		expect(validateIndexerUrl('http://localhost:8080/api')).toBeNull();
 	});
 });

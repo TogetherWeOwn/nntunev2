@@ -1,7 +1,11 @@
 <script lang="ts">
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
-	import { ApiClient, ApiError } from '#lib/api/client.js';
-	import { decodeBase64Url } from '#lib/webauthn.js';
+	import { ApiClient } from '#lib/api/client.js';
+	import {
+		serializePublicKeyCredential,
+		toRequestOptions,
+		type AuthenticationOptionsJSON
+	} from '#lib/webauthn.js';
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
 
@@ -33,24 +37,20 @@
 		}
 		passkeyStatus = 'working';
 		try {
-			const options = await client.post<{
-				challenge: string;
-				allowCredentials: { id: string; transports?: AuthenticatorTransport[] }[];
-			}>('/v1/auth/passkey/authenticate/options', {});
+			const options = await client.post<AuthenticationOptionsJSON>(
+				'/v1/auth/passkey/authenticate/options',
+				{}
+			);
 			const assertion = await navigator.credentials.get({
-				publicKey: {
-					challenge: decodeBase64Url(options.challenge),
-					allowCredentials: options.allowCredentials.map(
-						(c): PublicKeyCredentialDescriptor => ({
-							id: decodeBase64Url(c.id),
-							type: 'public-key',
-							transports: c.transports
-						})
-					)
-				}
+				publicKey: toRequestOptions(options)
 			});
-			if (assertion === null) throw new Error('no assertion');
-			await client.post('/v1/auth/passkey/authenticate/verify', assertion);
+			if (!(assertion instanceof PublicKeyCredential)) {
+				throw new Error('no public-key credential');
+			}
+			await client.post(
+				'/v1/auth/passkey/authenticate/verify',
+				serializePublicKeyCredential(assertion)
+			);
 			window.location.href = '/onboarding/provider';
 		} catch {
 			// Generic: login errors stay non-enumerating, like the API.

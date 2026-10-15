@@ -1,7 +1,11 @@
 <script lang="ts">
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { ApiClient } from '#lib/api/client.js';
-	import { decodeBase64Url } from '#lib/webauthn.js';
+	import {
+		serializePublicKeyCredential,
+		toCreationOptions,
+		type RegistrationOptionsJSON
+	} from '#lib/webauthn.js';
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
 
@@ -21,24 +25,20 @@
 		}
 		status = 'working';
 		try {
-			const options = await client.post<{
-				challenge: string;
-				rp: { name: string; id: string };
-				user: { id: string; name: string; displayName: string };
-			}>('/v1/auth/passkey/register/options', { email: email.trim() });
+			const options = await client.post<RegistrationOptionsJSON>(
+				'/v1/auth/passkey/register/options',
+				{ email: email.trim() }
+			);
 			const credential = await navigator.credentials.create({
-				publicKey: {
-					challenge: decodeBase64Url(options.challenge),
-					rp: options.rp,
-					user: {
-						...options.user,
-						id: decodeBase64Url(options.user.id)
-					},
-					pubKeyCredParams: [{ alg: -7, type: 'public-key' }]
-				}
+				publicKey: toCreationOptions(options)
 			});
-			if (credential === null) throw new Error('no credential');
-			await client.post('/v1/auth/passkey/register/verify', credential);
+			if (!(credential instanceof PublicKeyCredential)) {
+				throw new Error('no public-key credential');
+			}
+			await client.post(
+				'/v1/auth/passkey/register/verify',
+				serializePublicKeyCredential(credential)
+			);
 			status = 'created';
 			window.location.href = '/onboarding/provider';
 		} catch {

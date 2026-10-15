@@ -8,6 +8,8 @@
  * sites, because all requests flow through {@link ApiClient}.
  */
 
+import type { ProviderForm } from '../vault-validation.js';
+
 export type FetchFn = typeof fetch;
 
 export interface ApiClientOptions {
@@ -31,15 +33,38 @@ export interface MagicLinkResult {
 	ok: true;
 }
 
+export interface IndexerConfigInput {
+	url: string;
+	api_key: string;
+}
+
+/** Wire shape used by workers/api's serde ProviderConfig and IndexerConfig. */
 export interface ProviderTestInput {
 	host: string;
 	port: number;
 	tls: boolean;
 	username: string;
 	password: string;
-	maxConnections: number;
-	indexerUrl?: string;
-	indexerApiKey?: string;
+	max_connections: number;
+	indexer?: IndexerConfigInput;
+}
+
+export function toProviderTestInput(
+	provider: ProviderForm,
+	indexerUrl: string,
+	indexerApiKey: string
+): ProviderTestInput {
+	return {
+		host: provider.host,
+		port: provider.port,
+		tls: provider.tls,
+		username: provider.username,
+		password: provider.password,
+		max_connections: provider.maxConnections,
+		...(indexerUrl.trim().length > 0
+			? { indexer: { url: indexerUrl.trim(), api_key: indexerApiKey } }
+			: {})
+	};
 }
 
 export interface ProviderTestResult {
@@ -110,7 +135,11 @@ export class ApiClient {
 		};
 		if (this.token !== null) headers['authorization'] = `Bearer ${this.token}`;
 
-		const response = await this.fetchFn(`${this.baseUrl}${path}`, { ...init, headers });
+		const response = await this.fetchFn(`${this.baseUrl}${path}`, {
+			...init,
+			headers,
+			credentials: 'include'
+		});
 		if (!response.ok) {
 			throw new ApiError(response.status, this.errorCode(response.status), await this.message(response));
 		}

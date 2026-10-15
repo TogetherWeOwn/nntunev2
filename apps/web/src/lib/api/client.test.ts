@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { ApiClient, ApiError } from './client.js';
+import { ApiClient, ApiError, toProviderTestInput } from './client.js';
 
 function jsonResponse(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {
@@ -8,6 +8,32 @@ function jsonResponse(body: unknown, status = 200): Response {
 		headers: { 'content-type': 'application/json' }
 	});
 }
+
+describe('toProviderTestInput', () => {
+	it('uses the API field names and omits an unset indexer', () => {
+		expect(
+			toProviderTestInput(
+				{
+					host: 'news.example.com',
+					port: 563,
+					tls: true,
+					username: 'alice',
+					password: 's3cret',
+					maxConnections: 4
+				},
+				'',
+				''
+			)
+		).toEqual({
+			host: 'news.example.com',
+			port: 563,
+			tls: true,
+			username: 'alice',
+			password: 's3cret',
+			max_connections: 4
+		});
+	});
+});
 
 describe('ApiClient', () => {
 	it('joins baseUrl and path without double slashes', async () => {
@@ -79,6 +105,7 @@ describe('ApiClient', () => {
 		expect(seen).toEqual([
 			expect.objectContaining({
 				method: 'POST',
+				credentials: 'include',
 				headers: expect.objectContaining({ 'content-type': 'application/json' })
 			})
 		]);
@@ -106,18 +133,32 @@ describe('ApiClient', () => {
 		}) as unknown as typeof fetch;
 		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
 
-		const result = await client.testProviderConnection({
-			host: 'news.example.com',
-			port: 563,
-			tls: true,
-			username: 'alice',
-			password: 's3cret',
-			maxConnections: 4
-		});
+		const result = await client.testProviderConnection(
+			toProviderTestInput(
+				{
+					host: 'news.example.com',
+					port: 563,
+					tls: true,
+					username: 'alice',
+					password: 's3cret',
+					maxConnections: 4
+				},
+				'https://index.example.com/api',
+				'indexer-key'
+			)
+		);
 
 		expect(result).toEqual({ ok: true, latencyMs: 120 });
 		expect(seenBodies).toEqual([
-			expect.objectContaining({ host: 'news.example.com', port: 563 })
+			{
+				host: 'news.example.com',
+				port: 563,
+				tls: true,
+				username: 'alice',
+				password: 's3cret',
+				max_connections: 4,
+				indexer: { url: 'https://index.example.com/api', api_key: 'indexer-key' }
+			}
 		]);
 	});
 
@@ -130,14 +171,20 @@ describe('ApiClient', () => {
 		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
 
 		await expect(
-			client.saveProviderConfig({
-				host: 'news.example.com',
-				port: 563,
-				tls: true,
-				username: 'alice',
-				password: 's3cret',
-				maxConnections: 4
-			})
+			client.saveProviderConfig(
+				toProviderTestInput(
+					{
+						host: 'news.example.com',
+						port: 563,
+						tls: true,
+						username: 'alice',
+						password: 's3cret',
+						maxConnections: 4
+					},
+					'',
+					''
+				)
+			)
 		).resolves.toEqual({ ok: true });
 		expect(seenUrls).toEqual(['https://api.example.com/v1/vault']);
 	});

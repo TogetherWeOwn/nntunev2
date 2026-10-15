@@ -1,6 +1,11 @@
 <script lang="ts">
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
-	import { ApiClient, ApiError, type ProviderTestResult } from '#lib/api/client.js';
+	import {
+		ApiClient,
+		ApiError,
+		toProviderTestInput,
+		type ProviderTestResult
+	} from '#lib/api/client.js';
 	import { validateIndexerUrl, validateProviderConfig } from '#lib/vault-validation.js';
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
@@ -23,9 +28,33 @@
 	let testState = $state<'idle' | 'testing' | 'ok' | 'failed'>('idle');
 	let testDetail = $state('');
 	let saveState = $state<'idle' | 'saving' | 'saved' | 'failed'>('idle');
+	let testedConfigKey = $state<string | null>(null);
+	let testRunId = 0;
 
 	function providerInput() {
 		return { host, port, tls, username, password, maxConnections };
+	}
+
+	function currentTestInput() {
+		return toProviderTestInput(providerInput(), indexerUrl, indexerApiKey);
+	}
+
+	function currentTestKey() {
+		return JSON.stringify(currentTestInput());
+	}
+
+	function invalidateTest() {
+		testRunId += 1;
+		testedConfigKey = null;
+		testState = 'idle';
+		testDetail = '';
+		saveState = 'idle';
+	}
+
+	function backTo(previousStep: 1 | 2) {
+		invalidateTest();
+		errors = [];
+		step = previousStep;
 	}
 
 	function nextFromProvider() {
@@ -36,7 +65,7 @@
 	}
 
 	function nextFromIndexer() {
-		const problem = validateIndexerUrl(indexerUrl);
+		const problem = validateIndexerUrl(indexerUrl, indexerApiKey);
 		errors = problem === null ? [] : [problem];
 		if (errors.length === 0) {
 			step = 3;
@@ -44,24 +73,26 @@
 	}
 
 	async function runTest() {
+		const input = currentTestInput();
+		const inputKey = JSON.stringify(input);
 		errors = validateProviderConfig(providerInput());
-		const indexerProblem = validateIndexerUrl(indexerUrl);
+		const indexerProblem = validateIndexerUrl(indexerUrl, indexerApiKey);
 		if (indexerProblem !== null) errors = [...errors, indexerProblem];
 		if (errors.length > 0) {
-			testState = 'idle';
+			invalidateTest();
 			return;
 		}
+
+		const runId = ++testRunId;
+		testedConfigKey = null;
 		testState = 'testing';
 		testDetail = '';
 		try {
-			const result: ProviderTestResult = await client.testProviderConnection({
-				...providerInput(),
-				...(indexerUrl.trim().length > 0
-					? { indexerUrl: indexerUrl.trim(), indexerApiKey }
-					: {})
-			});
+			const result: ProviderTestResult = await client.testProviderConnection(input);
+			if (runId !== testRunId || inputKey !== currentTestKey()) return;
 			// The response is a redacted summary: never echo credentials.
 			if (result.ok) {
+				testedConfigKey = inputKey;
 				testState = 'ok';
 				testDetail =
 					result.latencyMs !== undefined
@@ -72,6 +103,7 @@
 				testDetail = 'The server could not reach that provider.';
 			}
 		} catch (error) {
+			if (runId !== testRunId || inputKey !== currentTestKey()) return;
 			testState = 'failed';
 			testDetail =
 				error instanceof ApiError && error.status === 404
@@ -81,18 +113,20 @@
 	}
 
 	async function save() {
-		if (testState !== 'ok' || saveState === 'saving') return;
+		const input = currentTestInput();
+		const inputKey = JSON.stringify(input);
+		if (testState !== 'ok' || testedConfigKey !== inputKey || saveState === 'saving') {
+			if (testedConfigKey !== inputKey) invalidateTest();
+			return;
+		}
+
+		const runId = testRunId;
 		saveState = 'saving';
 		try {
-			await client.saveProviderConfig({
-				...providerInput(),
-				...(indexerUrl.trim().length > 0
-					? { indexerUrl: indexerUrl.trim(), indexerApiKey }
-					: {})
-			});
-			saveState = 'saved';
+			await client.saveProviderConfig(input);
+			if (runId === testRunId && inputKey === currentTestKey()) saveState = 'saved';
 		} catch {
-			saveState = 'failed';
+			if (runId === testRunId && inputKey === currentTestKey()) saveState = 'failed';
 		}
 	}
 </script>
@@ -119,6 +153,8 @@
 
 	{#if step === 1}
 		<form
+			oninput={invalidateTest}
+			onchange={invalidateTest}
 			onsubmit={(event) => {
 				event.preventDefault();
 				nextFromProvider();
@@ -134,12 +170,20 @@
 			</label>
 			<label>
 				Connections
-				<input name="maxConnections" type="number" min="1" max="100" bind:value={maxConnections} />
+				<input
+					name="maxConnections"
+					type="number"
+					min="1"
+					max="50"
+					bind:value={maxConnections}
+				/>
 			</label>
 			<button class="nt-button" type="submit">Continue</button>
 		</form>
 	{:else if step === 2}
 		<form
+			oninput={invalidateTest}
+			onchange={invalidateTest}
 			onsubmit={(event) => {
 				event.preventDefault();
 				nextFromIndexer();
@@ -151,7 +195,7 @@
 				Indexer API key
 				<input name="indexerApiKey" type="password" autocomplete="off" bind:value={indexerApiKey} />
 			</label>
-			<button class="nt-button" type="button" onclick={() => (step = 1)}>Back</button>
+			<button class="nt-button" type="button" onclick={() => backTo(1)}>Back</button>
 			<button class="nt-button" type="submit">Continue</button>
 		</form>
 	{:else}
@@ -161,7 +205,12 @@
 				We test <strong>{host || 'your provider'}</strong>
 				{indexerUrl.trim().length > 0 ? 'and your indexer ' : ''}without storing anything yet.
 			</p>
-			<button class="nt-button nt-button--ghost" type="button" onclick={() => (step = 2)}>
+			<button
+				class="nt-button nt-button--ghost"
+				type="button"
+				onclick={() => backTo(2)}
+				disabled={saveState === 'saving'}
+			>
 				Back
 			</button>
 			<button
