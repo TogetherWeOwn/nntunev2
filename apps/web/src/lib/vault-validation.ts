@@ -11,12 +11,16 @@ export interface ProviderForm {
 	host: string;
 	port: number;
 	tls: boolean;
+	allowInsecurePlaintext: boolean;
 	username: string;
 	password: string;
 	maxConnections: number;
 }
 
 export const MAX_CONNECTIONS_LIMIT = 50;
+
+/** NNTP(S) ports the API worker accepts (mirrors ALLOWED_NNTP_PORTS in vault.rs). */
+export const ALLOWED_NNTP_PORTS: readonly number[] = [119, 563];
 
 const HOSTNAME_LABEL = '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?';
 const HOSTNAME_PATTERN = new RegExp(`^${HOSTNAME_LABEL}(?:\\.${HOSTNAME_LABEL})+$`, 'i');
@@ -79,8 +83,13 @@ export function validateProviderConfig(form: ProviderForm): string[] {
 		errors.push('That hostname does not look valid.');
 	}
 
-	if (!Number.isInteger(form.port) || form.port < 1 || form.port > 65535) {
-		errors.push('Port must be between 1 and 65535.');
+	if (!Number.isInteger(form.port) || !ALLOWED_NNTP_PORTS.includes(form.port)) {
+		errors.push('Port must be 119 or 563.');
+	}
+	if (!form.tls && !form.allowInsecurePlaintext) {
+		errors.push(
+			'Disabling TLS sends your password in cleartext. Tick the acknowledgement to continue without TLS.'
+		);
 	}
 	if (form.username.trim().length === 0) {
 		errors.push('Enter your provider username.');

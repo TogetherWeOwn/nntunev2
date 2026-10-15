@@ -16,6 +16,7 @@
 	let host = $state('');
 	let port = $state(563);
 	let tls = $state(true);
+	let allowInsecurePlaintext = $state(false);
 	let username = $state('');
 	let password = $state('');
 	let maxConnections = $state(4);
@@ -31,8 +32,16 @@
 	let testedConfigKey = $state<string | null>(null);
 	let testRunId = 0;
 
+	// Keep the wire payload honest: a TLS connection never carries the
+	// plaintext opt-in, so clear a stale acknowledgement when TLS is on.
+	$effect(() => {
+		if (tls && allowInsecurePlaintext) {
+			allowInsecurePlaintext = false;
+		}
+	});
+
 	function providerInput() {
-		return { host, port, tls, username, password, maxConnections };
+		return { host, port, tls, allowInsecurePlaintext, username, password, maxConnections };
 	}
 
 	function currentTestInput() {
@@ -161,8 +170,28 @@
 			}}
 		>
 			<label>Hostname <input name="host" required autocomplete="off" bind:value={host} /></label>
-			<label>Port <input name="port" type="number" min="1" max="65535" bind:value={port} /></label>
+			<label>
+				Port
+				<select name="port" required bind:value={port}>
+					<option value={119}>119 (plaintext NNTP)</option>
+					<option value={563}>563 (TLS)</option>
+				</select>
+			</label>
 			<label><input name="tls" type="checkbox" bind:checked={tls} /> Use TLS</label>
+			{#if !tls}
+				<p role="alert">
+					Without TLS your password is sent in cleartext. Only continue without TLS if
+					your provider requires it.
+				</p>
+				<label>
+					<input
+						name="allowInsecurePlaintext"
+						type="checkbox"
+						bind:checked={allowInsecurePlaintext}
+					/>
+					I understand my password will be sent unencrypted
+				</label>
+			{/if}
 			<label>Username <input name="username" required autocomplete="username" bind:value={username} /></label>
 			<label>
 				Password

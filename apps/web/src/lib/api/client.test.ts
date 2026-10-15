@@ -17,6 +17,7 @@ describe('toProviderTestInput', () => {
 					host: ' news.example.com ',
 					port: 563,
 					tls: true,
+					allowInsecurePlaintext: false,
 					username: 'alice',
 					password: 's3cret',
 					maxConnections: 4
@@ -34,6 +35,7 @@ describe('toProviderTestInput', () => {
 					host: 'news.example.com',
 					port: 563,
 					tls: true,
+					allowInsecurePlaintext: false,
 					username: 'alice',
 					password: 's3cret',
 					maxConnections: 4
@@ -45,10 +47,34 @@ describe('toProviderTestInput', () => {
 			host: 'news.example.com',
 			port: 563,
 			tls: true,
+			allow_insecure_plaintext: false,
 			username: 'alice',
 			password: 's3cret',
 			max_connections: 4
 		});
+	});
+
+	it('only sends the plaintext opt-in with TLS disabled and acknowledged', () => {
+		const base = {
+			host: 'news.example.com',
+			port: 119,
+			username: 'alice',
+			password: 's3cret',
+			maxConnections: 4
+		};
+		expect(
+			toProviderTestInput({ ...base, tls: false, allowInsecurePlaintext: true }, '', '')
+				.allow_insecure_plaintext
+		).toBe(true);
+		expect(
+			toProviderTestInput({ ...base, tls: false, allowInsecurePlaintext: false }, '', '')
+				.allow_insecure_plaintext
+		).toBe(false);
+		// A stale acknowledgement with TLS on must never reach the server.
+		expect(
+			toProviderTestInput({ ...base, tls: true, allowInsecurePlaintext: true }, '', '')
+				.allow_insecure_plaintext
+		).toBe(false);
 	});
 });
 
@@ -156,6 +182,7 @@ describe('ApiClient', () => {
 					host: 'news.example.com',
 					port: 563,
 					tls: true,
+					allowInsecurePlaintext: false,
 					username: 'alice',
 					password: 's3cret',
 					maxConnections: 4
@@ -171,6 +198,7 @@ describe('ApiClient', () => {
 				host: 'news.example.com',
 				port: 563,
 				tls: true,
+				allow_insecure_plaintext: false,
 				username: 'alice',
 				password: 's3cret',
 				max_connections: 4,
@@ -194,6 +222,7 @@ describe('ApiClient', () => {
 						host: 'news.example.com',
 						port: 563,
 						tls: true,
+						allowInsecurePlaintext: false,
 						username: 'alice',
 						password: 's3cret',
 						maxConnections: 4

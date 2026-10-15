@@ -11,6 +11,7 @@ describe('validateProviderConfig', () => {
 		host: 'news.example.com',
 		port: 563,
 		tls: true,
+		allowInsecurePlaintext: false,
 		username: 'alice',
 		password: 's3cret',
 		maxConnections: 10
@@ -57,11 +58,31 @@ describe('validateProviderConfig', () => {
 	});
 
 	it('rejects out-of-range ports and connection counts', () => {
-		expect(validateProviderConfig({ ...good, port: 0 }).length).toBeGreaterThan(0);
-		expect(validateProviderConfig({ ...good, port: 65536 }).length).toBeGreaterThan(0);
 		expect(validateProviderConfig({ ...good, maxConnections: 0 }).length).toBeGreaterThan(0);
 		expect(validateProviderConfig({ ...good, maxConnections: 50 })).toEqual([]);
 		expect(validateProviderConfig({ ...good, maxConnections: 51 }).length).toBeGreaterThan(0);
+	});
+
+	it('only allows the NNTP ports 119 and 563', () => {
+		expect(validateProviderConfig({ ...good, port: 119 })).toEqual([]);
+		expect(validateProviderConfig({ ...good, port: 563 })).toEqual([]);
+		for (const port of [0, 80, 443, 1234, 65536]) {
+			expect(validateProviderConfig({ ...good, port }).length, `port rejected: ${port}`).toBeGreaterThan(
+				0
+			);
+		}
+	});
+
+	it('requires an explicit acknowledgement for plaintext auth', () => {
+		expect(
+			validateProviderConfig({ ...good, tls: false, allowInsecurePlaintext: false }).length
+		).toBeGreaterThan(0);
+		expect(
+			validateProviderConfig({ ...good, tls: false, allowInsecurePlaintext: true })
+		).toEqual([]);
+		expect(
+			validateProviderConfig({ ...good, tls: true, allowInsecurePlaintext: false })
+		).toEqual([]);
 	});
 
 	it('requires a username and a password', () => {

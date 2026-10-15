@@ -43,6 +43,7 @@ export interface ProviderTestInput {
 	host: string;
 	port: number;
 	tls: boolean;
+	allow_insecure_plaintext: boolean;
 	username: string;
 	password: string;
 	max_connections: number;
@@ -58,6 +59,9 @@ export function toProviderTestInput(
 		host: provider.host.trim(),
 		port: provider.port,
 		tls: provider.tls,
+		// Only send the opt-in with plaintext: with TLS it is always false so
+		// the server never records a spurious acknowledgement.
+		allow_insecure_plaintext: !provider.tls && provider.allowInsecurePlaintext,
 		username: provider.username,
 		password: provider.password,
 		max_connections: provider.maxConnections,
