@@ -1,0 +1,6 @@
+{
+  "PUBLIC_BASE_URL": "https://example.com",
+  "STREAM_CACHE_TTL_SECS": "not-a-number",
+  "READ_ONLY_MODE": "false",
+  "MAX_CONNECTIONS": "4"
+}

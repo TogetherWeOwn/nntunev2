@@ -1,0 +1,5 @@
+{
+  "STREAM_CACHE_TTL_SECS": "600",
+  "READ_ONLY_MODE": "false",
+  "MAX_CONNECTIONS": "4"
+}

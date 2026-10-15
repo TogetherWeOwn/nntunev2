@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "keys": [
+    {
+      "name": "PUBLIC_BASE_URL",
+      "kind": "string",
+      "default": null,
+      "required": true,
+      "env_overridable": true
+    },
+    {
+      "name": "STREAM_CACHE_TTL_SECS",
+      "kind": "u64",
+      "default": 300,
+      "required": false,
+      "env_overridable": true
+    },
+    {
+      "name": "READ_ONLY_MODE",
+      "kind": "bool",
+      "default": false,
+      "required": false,
+      "env_overridable": true
+    },
+    {
+      "name": "MAX_CONNECTIONS",
+      "kind": "u64",
+      "default": 4,
+      "required": false,
+      "env_overridable": false
+    }
+  ]
+}
