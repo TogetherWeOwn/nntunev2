@@ -11,9 +11,9 @@ on:
   pull_request:
     types: [opened, edited, synchronize, reopened, ready_for_review]
   # Merge queue validation (TOG-24374): `pr-lint` is a required check, so it
-  # must report on merge_group. The queue run has no PR title in its event
-  # payload, so it takes the commit-subject branch below and passes
-  # vacuously (the title was already linted on the PR itself).
+  # must report on merge_group. The queue run has no PR title and no
+  # commits array, so it takes the explicit merge_group branch in the run
+  # step and passes vacuously (the title was already linted on the PR).
   merge_group:
   push:
     branches: [main]
@@ -42,11 +42,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
           EVENT_TITLE: ${{ github.event.pull_request.title }}
           EVENT_COMMITS: ${{ toJSON(github.event.commits) }}
           INPUT_PR: ${{ inputs.pr_number }}
         run: |
           set -euo pipefail
+          # Merge queue validation runs carry no PR title and no commits
+          # array (EVENT_COMMITS is null). The title was already linted on
+          # the PR head, so pass vacuously here — an explicit branch, so a
+          # null payload can never fall through to the commit-subject path.
+          if [ "${EVENT_NAME:-}" = "merge_group" ]; then
+            echo "pr-lint: merge_group vacuous pass (title linted on PR head)"
+            exit 0
+          fi
           if [ -n "${INPUT_PR:-}" ]; then
             title="$(gh api "repos/$REPO/pulls/$INPUT_PR" --jq '.title')"
           elif [ -n "${EVENT_TITLE:-}" ]; then
@@ -65,7 +74,7 @@ jobs:
                 echo "::error::Non-conventional commit subject on main: $subject"
                 fail=1
               fi
-            done <<< "$(printf '%s' "$EVENT_COMMITS" | python3 -c 'import json,sys; print("\n".join(c["message"].split("\n")[0] for c in json.loads(sys.stdin.read() or "[]")))')"
+            done <<< "$(printf '%s' "$EVENT_COMMITS" | python3 -c 'import json,sys; print("\n".join(c["message"].split("\n")[0] for c in (json.loads(sys.stdin.read() or "[]") or [])))')"
             [ "$fail" = 0 ] && echo "pr-lint: all main-push subjects conventional"
             exit "$fail"
           fi
