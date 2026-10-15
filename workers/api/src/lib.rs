@@ -1,11 +1,12 @@
-//! NNTune v2 accounts/auth/session/vault: security-critical core
-//! (`auth`, `session`, `vault`, `webauthn`), the framework-agnostic
-//! HTTP handlers (`handlers`, native-tested against fake stores), and
-//! the Worker + Hyperdrive entry (`worker_entry`).
+//! NNTune v2 accounts/auth/session/vault/library: security-critical core
+//! (`auth`, `session`, `vault`, `webauthn`, `library`), the
+//! framework-agnostic HTTP handlers (`handlers`, native-tested against
+//! fake stores), and the Worker + Hyperdrive entry (`worker_entry`).
 
 pub mod auth;
 pub mod b64;
 pub mod handlers;
+pub mod library;
 pub mod session;
 pub mod vault;
 pub mod webauthn;

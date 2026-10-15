@@ -1,8 +1,9 @@
-# nntune-api: accounts, auth, sessions, BYOP vault
+# nntune-api: accounts, auth, sessions, BYOP vault, library
 
 Rust core + Worker HTTP entry for NNTune v2 accounts/auth (passkeys +
-email magic link), signed-cookie sessions, and the BYOP credential
-vault. Compiles to native (tests) and `wasm32` (Cloudflare Worker).
+email magic link), signed-cookie sessions, the BYOP credential
+vault, and the genre/playlist library. Compiles to native (tests)
+and `wasm32` (Cloudflare Worker).
 
 ## Layout
 
@@ -15,16 +16,17 @@ workers/api/
   src/webauthn.rs     # attestation/assertion verification (ES256 + EdDSA)
   src/handlers.rs     # framework-agnostic HTTP handlers over store traits
   src/worker_entry.rs # Hyperdrive Postgres, DoH DNS, socket dialer, mailer
-  src/encoding.rs     # base64url helpers
+  src/library.rs      # genres/playlists: opaque ids, owner-scoped authz
+  src/b64.rs          # strict base64 helpers
   tests/              # acceptance + security-regression tests
   wrangler.toml.example  # Worker config template (no secrets)
 ```
 
-`migrations/0002_auth_vault.sql` plus `0004` (challenge purpose) and `0005`
-(atomic rate-limit slots and test leases) define the Postgres schema
-(PlanetScale via Hyperdrive). All queries are parameterized; single-use claims execute
-the conditional `UPDATE ... RETURNING` prepared by the core and require
-exactly one row before any response.
+`migrations/0002_auth_vault.sql` plus `0003` (library), `0004` (challenge
+purpose) and `0005` (atomic rate-limit slots and test leases) define the
+Postgres schema (PlanetScale via Hyperdrive). All queries are parameterized;
+single-use claims execute the conditional `UPDATE ... RETURNING` prepared by
+the core and require exactly one row before any response.
 
 ## Routes (all JSON, `Cache-Control: no-store`)
 
@@ -131,6 +133,23 @@ config from secrets) is a follow-up slice.
   exact origin/challenge pinning, monotonic `sign_count` clone
   detection) must finish before authentication. The handlers enforce
   both, in that order, on every ceremony.
+- **Library (genres/playlists):** missing caller is 401 before any
+  existence check; callers see own + public rows only, invisible ids are
+  404 (no oracle), visible-but-foreign mutations are 403. Responses carry
+  only the opaque `public_id` as `id` — internal ids and `owner_user_id`
+  never serialize. All SQL is parameterized with the owner bound in WHERE;
+  SELECT lists exclude the owner column (mutation lookups return only an
+  `is_owner` boolean). Lists are keyset pages (`ORDER BY public_id COLLATE
+  "C" DESC LIMIT $2` with an opaque cursor over the public id, LIMIT clamped
+  to `MAX_PAGE_SIZE`, first page with a NULL cursor). Order is by the opaque
+  id, not newest-first: a new row sorts by its id and may land on any page.
+  The cursor is compared directly with the ordering key, so a deleted or
+  newly private boundary row cannot truncate later pages; an above-max cursor
+  replays from the top in both the in-memory pager and the SQL (harmless —
+  every row is still visibility-filtered). Playlist lists
+  omit `items`, which single reads return. UPDATE/DELETE affecting 0 rows
+  maps to 404 — the owner predicate already makes cross-owner writes
+  inexpressible.
 - **SSRF guard:** provider hosts are hostile input. Shape check (never a
   URL), resolve ALL DNS records, reject loopback/link-local/private/
   unique-local/multicast/reserved (v4+v6); literal IPs checked directly.
