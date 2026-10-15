@@ -20,8 +20,8 @@ workers/api/
   wrangler.toml.example  # Worker config template (no secrets)
 ```
 
-`migrations/0002_auth_vault.sql` is the Postgres schema (PlanetScale via
-Hyperdrive). All queries are parameterized; single-use claims execute
+`migrations/0002_auth_vault.sql` (+ `0004` challenge purpose) is the
+Postgres schema (PlanetScale via Hyperdrive). All queries are parameterized; single-use claims execute
 the conditional `UPDATE ... RETURNING` prepared by the core and require
 exactly one row before any response.
 
@@ -30,7 +30,7 @@ exactly one row before any response.
 | Route | Purpose |
 |---|---|
 | `GET /healthz` | liveness only (no config detail) |
-| `POST /v1/auth/passkey/register/start` / `finish` | passkey signup (attestation `none` or packed self-attestation) |
+| `POST /v1/auth/passkey/register/start` / `finish` | passkey signup (purpose-bound challenge + emailed-token inbox proof; attestation `none` or packed self-attestation) |
 | `POST /v1/auth/passkey/login/start` / `finish` | passkey login (assertion + sign-count clone detection) |
 | `POST /v1/auth/magic/start` / `finish` | email magic link (rate-limited per email via the shared store) |
 | `POST /v1/session/refresh` / `logout` / `revoke-all` | stored-session rotation/revocation |
@@ -46,7 +46,8 @@ Known limits of this slice: attestation `x5c` chains reject (no CA
 trust store yet); test-connection dials the vetted IP literal, so a
 provider certificate issued only for the hostname fails closed as
 `ok:false` on TLS ports; magic-link delivery needs the operator's
-`EMAIL_WEBHOOK_URL` (without it links are issued but not delivered);
+`EMAIL_WEBHOOK_URL` (without it links are issued but not delivered, and
+passkey signup cannot complete its inbox-proof step);
 test-connection is a direct bounded dial, not yet routed through the
 stream pool. Staging deploy (worker-build plumbing + per-env wrangler
 config from secrets) is a follow-up slice.

@@ -168,18 +168,20 @@ impl Store for PgStore {
         &self,
         challenge: &PasskeyChallenge,
         user_id: Option<&str>,
+        purpose: &str,
     ) -> Result<(), StoreError> {
         let client = self.connect().await?;
         client
             .execute(
-                "INSERT INTO auth_challenges (id, user_id, rp_id, origin, expires_at, consumed) \
-                 VALUES ($1, $2, $3, $4, $5, FALSE)",
+                "INSERT INTO auth_challenges (id, user_id, rp_id, origin, expires_at, consumed, purpose) \
+                 VALUES ($1, $2, $3, $4, $5, FALSE, $6)",
                 &[
                     &challenge.id,
                     &user_id,
                     &challenge.rp_id,
                     &challenge.origin,
                     &i64_of(challenge.expires_at)?,
+                    &purpose,
                 ],
             )
             .await
@@ -191,7 +193,7 @@ impl Store for PgStore {
         let client = self.connect().await?;
         let row = client
             .query_opt(
-                "SELECT id, user_id, rp_id, origin, expires_at, consumed \
+                "SELECT id, user_id, rp_id, origin, expires_at, consumed, purpose \
                  FROM auth_challenges WHERE id = $1",
                 &[&id],
             )
@@ -212,6 +214,7 @@ impl Store for PgStore {
                     consumed: r.try_get("consumed").map_err(|_| StoreError)?,
                 },
                 user_id: r.try_get("user_id").map_err(|_| StoreError)?,
+                purpose: r.try_get("purpose").map_err(|_| StoreError)?,
             })
         })
         .transpose()
@@ -804,7 +807,27 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     let body = if declared_len > handlers::MAX_BODY_BYTES {
         vec![0u8; handlers::MAX_BODY_BYTES + 1]
     } else {
-        req.bytes().await.unwrap_or_default()
+        // Stream with a hard cap: a chunked (length-less) oversized body
+        // stops buffering one byte past the limit and the handler's
+        // uniform size rejection takes it from there.
+        let mut body = Vec::new();
+        if let Ok(mut stream) = req.stream() {
+            use futures_util::StreamExt;
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(chunk) => {
+                        let room = handlers::MAX_BODY_BYTES + 1
+                            - body.len().min(handlers::MAX_BODY_BYTES + 1);
+                        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                        if body.len() > handlers::MAX_BODY_BYTES {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        body
     };
     let headers_map: HashMap<String, String> = req
         .headers()

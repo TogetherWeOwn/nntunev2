@@ -134,10 +134,19 @@ pub struct UserRecord {
     pub created_at: u64,
 }
 
+/// Challenge ceremony purposes. A challenge is redeemable only at the
+/// finish route matching its purpose — a login challenge presented at
+/// registration (which would enroll an attacker's key on the victim's
+/// account) rejects before any verification or claim.
+pub const PURPOSE_REGISTER: &str = "register";
+pub const PURPOSE_LOGIN: &str = "login";
+
 #[derive(Debug, Clone)]
 pub struct ChallengeRow {
     pub challenge: PasskeyChallenge,
     pub user_id: Option<String>,
+    /// Immutable ceremony purpose recorded at insert (migration 0004).
+    pub purpose: String,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +171,7 @@ pub trait Store {
         &self,
         challenge: &PasskeyChallenge,
         user_id: Option<&str>,
+        purpose: &str,
     ) -> impl Future<Output = Result<(), StoreError>>;
     fn challenge_by_id(
         &self,
@@ -349,6 +359,18 @@ fn random_id(bytes: usize) -> String {
     b64url_encode(&buf)
 }
 
+/// Deterministic stand-in credential id for login/start allow-lists of
+/// unknown or credential-less accounts: stable per email (keyed by the
+/// session secret), shaped like a real 18-byte credential id.
+fn fake_cred_id(cfg: &Config, email: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&cfg.session_secret);
+    hasher.update(b"|fake-cred|");
+    hasher.update(email.as_bytes());
+    b64url_encode(&hasher.finalize()[..18])
+}
+
 fn normalize_email(raw: &str) -> Option<String> {
     let email = raw.trim().to_lowercase();
     if email.len() < 3 || email.len() > 254 {
@@ -486,6 +508,10 @@ struct RegisterFinishBody {
     credential_id: String,
     attestation_object: String,
     client_data_json: String,
+    /// The magic-link token emailed at register/start: enrolling a
+    /// passkey requires proof of inbox control for the account email,
+    /// so an unregistered address cannot be claimed by a stranger.
+    magic_token: String,
     invite_code: Option<String>,
 }
 
@@ -537,13 +563,38 @@ where
         Ok(user) => user,
         Err(_) => return internal(),
     };
+    // Identical 200 shape for every outcome below (new email, abandoned
+    // signup, already-registered account): this route must not be an
+    // account-existence oracle. A taken email gets an unbound challenge
+    // whose finish fails generically, and no mail is sent for it.
+    let challenge = match auth::new_registration_challenge(&ctx.cfg.rp_id, &ctx.cfg.origin, ctx.now)
+    {
+        Ok(challenge) => challenge,
+        Err(_) => return internal(),
+    };
+    let shape = |user_id: String| {
+        json_response(
+            200,
+            serde_json::json!({
+                "challenge": challenge.id.clone(),
+                "user_id": user_id,
+                "rp_id": ctx.cfg.rp_id,
+            }),
+        )
+    };
     let user = match existing {
         Some(user) => {
-            // Resume an abandoned signup only when no credential exists
-            // yet; otherwise the account is taken (generic, no oracle).
+            // Resume an abandoned signup only when no credential exists yet.
             match ctx.store.credentials_for_user(&user.id).await {
                 Ok(creds) if creds.is_empty() => user,
-                Ok(_) => return generic_auth(),
+                Ok(_) => {
+                    let fake_user = random_id(16);
+                    let _ = ctx
+                        .store
+                        .insert_challenge(&challenge, None, PURPOSE_REGISTER)
+                        .await;
+                    return shape(fake_user);
+                }
                 Err(_) => return internal(),
             }
         }
@@ -555,32 +606,42 @@ where
             };
             match ctx.store.insert_user(&user).await {
                 Ok(()) => user,
-                // Unique-email race or store failure: stay generic.
-                Err(_) => return generic_auth(),
+                // Unique-email race: another request just claimed the row,
+                // indistinguishable from a taken account by design.
+                Err(_) => {
+                    let fake_user = random_id(16);
+                    let _ = ctx
+                        .store
+                        .insert_challenge(&challenge, None, PURPOSE_REGISTER)
+                        .await;
+                    return shape(fake_user);
+                }
             }
         }
     };
-    let challenge = match auth::new_registration_challenge(&ctx.cfg.rp_id, &ctx.cfg.origin, ctx.now)
-    {
-        Ok(challenge) => challenge,
-        Err(_) => return internal(),
-    };
     if ctx
         .store
-        .insert_challenge(&challenge, Some(&user.id))
+        .insert_challenge(&challenge, Some(&user.id), PURPOSE_REGISTER)
         .await
         .is_err()
     {
         return internal();
     }
-    json_response(
-        200,
-        serde_json::json!({
-            "challenge": challenge.id,
-            "user_id": user.id,
-            "rp_id": ctx.cfg.rp_id,
-        }),
-    )
+    // Email-ownership proof for finish: mail a single-use token bound to
+    // this user (same shared-store rate limit as magic login).
+    let since = ctx.now.saturating_sub(auth::MAGIC_LINK_TTL_SECS);
+    let issued = ctx
+        .store
+        .magic_issued_since(&email, since)
+        .await
+        .unwrap_or(u64::MAX);
+    if issued < MAGIC_LINKS_PER_WINDOW {
+        let (token, record) = auth::issue_magic_link(&user.id, &email, ctx.now);
+        if ctx.store.insert_magic(&record).await.is_ok() {
+            let _ = ctx.mailer.send_magic_link(&email, &token).await;
+        }
+    }
+    shape(user.id.clone())
 }
 
 async fn register_finish<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
@@ -604,9 +665,19 @@ where
         Ok(None) => return generic_auth(),
         Err(_) => return internal(),
     };
+    if row.purpose != PURPOSE_REGISTER {
+        return generic_auth();
+    }
     let Some(user_id) = row.user_id.clone() else {
         return generic_auth();
     };
+    // Defense in depth beside the purpose binding: registration is only
+    // for accounts with no credential yet.
+    match ctx.store.credentials_for_user(&user_id).await {
+        Ok(creds) if creds.is_empty() => {}
+        Ok(_) => return generic_auth(),
+        Err(_) => return internal(),
+    }
     let credential = match webauthn::verify_attestation(
         &attestation_object,
         &client_data_json,
@@ -629,6 +700,26 @@ where
     )
     .await
     .is_err()
+    {
+        return generic_auth();
+    }
+    // Email-ownership proof: the token mailed at register/start must be
+    // consumed atomically, bound to this same user, before enrollment.
+    if body.magic_token.is_empty() || body.magic_token.len() > 256 {
+        return generic_auth();
+    }
+    let magic = match ctx
+        .store
+        .magic_by_hash(&auth::hash_magic_token(&body.magic_token))
+        .await
+    {
+        Ok(Some(record)) if record.user_id == user_id => record,
+        Ok(_) => return generic_auth(),
+        Err(_) => return internal(),
+    };
+    if auth::consume_magic_link_atomically(magic, &body.magic_token, ctx.now, ctx.store)
+        .await
+        .is_err()
     {
         return generic_auth();
     }
@@ -684,9 +775,10 @@ where
     let Some(email) = normalize_email(&body.email) else {
         return generic_auth();
     };
-    // Always issue a challenge: an unknown email gets an unbound
-    // challenge and an empty allow-list, so this route is not an
-    // account-existence oracle (finish fails generically either way).
+    // Always issue a challenge with a non-empty allow-list shape: an
+    // unknown (or credential-less) email gets one deterministic fake
+    // credential id, indistinguishable from a one-passkey account, so
+    // this route is not an account-existence oracle.
     let user = match ctx.store.user_by_email(&email).await {
         Ok(user) => user,
         Err(_) => return internal(),
@@ -702,19 +794,18 @@ where
                 Ok(creds) => creds,
                 Err(_) => return internal(),
             };
-            (
-                Some(user.id.as_str()),
-                creds
-                    .iter()
-                    .map(|c| c.cred_id_b64url.clone())
-                    .collect::<Vec<_>>(),
-            )
+            let allow = if creds.is_empty() {
+                vec![fake_cred_id(ctx.cfg, &email)]
+            } else {
+                creds.iter().map(|c| c.cred_id_b64url.clone()).collect()
+            };
+            (Some(user.id.as_str()), allow)
         }
-        None => (None, Vec::new()),
+        None => (None, vec![fake_cred_id(ctx.cfg, &email)]),
     };
     if ctx
         .store
-        .insert_challenge(&challenge, user_id)
+        .insert_challenge(&challenge, user_id, PURPOSE_LOGIN)
         .await
         .is_err()
     {
@@ -752,6 +843,9 @@ where
         Ok(None) => return generic_auth(),
         Err(_) => return internal(),
     };
+    if row.purpose != PURPOSE_LOGIN {
+        return generic_auth();
+    }
     let Some(user_id) = row.user_id.clone() else {
         return generic_auth();
     };
@@ -1103,16 +1197,25 @@ where
         Ok(count) if count < TEST_CONNECTION_PER_MINUTE => {}
         _ => return fail(),
     }
+    // Every non-rate-limited attempt audits (including no-vault and
+    // decrypt failures), so the shared-store budget cannot be dodged by
+    // aiming at a path that never reaches the dialer.
     let row = match ctx.store.vault_by_user(&claims.user_id).await {
         Ok(Some(row)) => row,
-        _ => return fail(),
+        _ => {
+            ctx.audit(&claims.user_id, "vault.test", false).await;
+            return fail();
+        }
     };
     let payload: VaultPayload = match vault::decrypt_vault(&ctx.cfg.kek, &claims.user_id, &row.blob)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
     {
         Some(payload) => payload,
-        None => return fail(),
+        None => {
+            ctx.audit(&claims.user_id, "vault.test", false).await;
+            return fail();
+        }
     };
     // Resolve ALL records immediately before the dial and hand the
     // dialer only the vetted set; the transport must not re-resolve.
@@ -1235,12 +1338,14 @@ mod tests {
             &self,
             challenge: &PasskeyChallenge,
             user_id: Option<&str>,
+            purpose: &str,
         ) -> Result<(), StoreError> {
             self.challenges.borrow_mut().insert(
                 challenge.id.clone(),
                 ChallengeRow {
                     challenge: challenge.clone(),
                     user_id: user_id.map(str::to_string),
+                    purpose: purpose.to_string(),
                 },
             );
             Ok(())
@@ -1853,6 +1958,82 @@ mod tests {
         assert_eq!(h.dialer.seen.borrow().len(), before);
     }
 
+    // Shared synthetic-authenticator builders for the passkey tests below.
+    fn fx_head(major: u8, v: u64, out: &mut Vec<u8>) {
+        let m = major << 5;
+        if v < 24 {
+            out.push(m | v as u8);
+        } else if v <= u8::MAX as u64 {
+            out.push(m | 24);
+            out.push(v as u8);
+        } else if v <= u16::MAX as u64 {
+            out.push(m | 25);
+            out.extend_from_slice(&(v as u16).to_be_bytes());
+        } else {
+            out.push(m | 26);
+            out.extend_from_slice(&(v as u32).to_be_bytes());
+        }
+    }
+    fn fx_int(v: i64, out: &mut Vec<u8>) {
+        if v >= 0 {
+            fx_head(0, v as u64, out)
+        } else {
+            fx_head(1, (-1 - v) as u64, out)
+        }
+    }
+    fn fx_bytes(b: &[u8], out: &mut Vec<u8>) {
+        fx_head(2, b.len() as u64, out);
+        out.extend_from_slice(b);
+    }
+    fn fx_text(t: &str, out: &mut Vec<u8>) {
+        fx_head(3, t.len() as u64, out);
+        out.extend_from_slice(t.as_bytes());
+    }
+    fn fx_es256_cose(secret: u8) -> Vec<u8> {
+        use p256::ecdsa::SigningKey;
+        let sk = SigningKey::from_slice(&[secret; 32]).unwrap();
+        let point = sk.verifying_key().to_encoded_point(false);
+        let mut cose = Vec::new();
+        fx_head(5, 5, &mut cose);
+        fx_int(1, &mut cose);
+        fx_int(2, &mut cose);
+        fx_int(3, &mut cose);
+        fx_int(-7, &mut cose);
+        fx_int(-1, &mut cose);
+        fx_int(1, &mut cose);
+        fx_int(-2, &mut cose);
+        fx_bytes(point.x().unwrap(), &mut cose);
+        fx_int(-3, &mut cose);
+        fx_bytes(point.y().unwrap(), &mut cose);
+        cose
+    }
+    fn fx_none_attestation(cred_id: &[u8], cose: &[u8]) -> Vec<u8> {
+        use sha2::Digest;
+        let mut auth = Vec::new();
+        auth.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
+        auth.push(0x41);
+        auth.extend_from_slice(&1u32.to_be_bytes());
+        auth.extend_from_slice(&[0u8; 16]);
+        auth.extend_from_slice(&(cred_id.len() as u16).to_be_bytes());
+        auth.extend_from_slice(cred_id);
+        auth.extend_from_slice(cose);
+        let mut att = Vec::new();
+        fx_head(5, 3, &mut att);
+        fx_text("fmt", &mut att);
+        fx_text("none", &mut att);
+        fx_text("authData", &mut att);
+        fx_bytes(&auth, &mut att);
+        fx_text("attStmt", &mut att);
+        fx_head(5, 0, &mut att);
+        att
+    }
+    fn fx_client_json(type_: &str, challenge: &str) -> String {
+        format!(
+            r#"{{"type":"{}","challenge":"{}","origin":"{}","crossOrigin":false}}"#,
+            type_, challenge, ORIGIN
+        )
+    }
+
     #[test]
     fn passkey_register_then_login_roundtrip() {
         use p256::ecdsa::{signature::Signer, Signature as EsSignature, SigningKey};
@@ -1936,16 +2117,23 @@ mod tests {
             r#"{{"type":"webauthn.create","challenge":"{}","origin":"{}","crossOrigin":false}}"#,
             challenge, ORIGIN
         );
-        let resp = h.call(
-            "POST",
-            "/v1/auth/passkey/register/finish",
+        let finish_body = |magic_token: &str| {
             serde_json::json!({
                 "challenge": challenge,
                 "credential_id": b64url_encode(cred_id),
                 "attestation_object": b64url_encode(&att),
                 "client_data_json": b64url_encode(cd_create.as_bytes()),
+                "magic_token": magic_token,
                 "invite_code": null,
-            }),
+            })
+        };
+        // register/start mailed the inbox-proof token for this signup.
+        let magic_token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        assert_eq!(h.mailer.sent.borrow().last().unwrap().0, "new@example.com");
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/finish",
+            finish_body(&magic_token),
         );
         assert_eq!(resp.status, 200, "{}", resp.body);
         assert!(resp.set_cookie.is_some());
@@ -1982,5 +2170,137 @@ mod tests {
         // Replaying the same assertion/challenge fails generically.
         let resp = h.call("POST", "/v1/auth/passkey/login/finish", finish);
         assert_eq!(resp.status, 401);
+    }
+
+    #[test]
+    fn login_challenge_cannot_enroll_a_new_passkey() {
+        // Regression: challenges are purpose-bound. Without the binding,
+        // anyone could mint a login challenge for a victim's email and
+        // redeem it at register/finish to enroll their own passkey.
+        let h = harness();
+        seed_user(&h, "victim", "victim@example.com");
+        block_on(h.store.insert_credential(&PasskeyCredential {
+            cred_id_b64url: b64url_encode(b"victim-cred"),
+            user_id: "victim".to_string(),
+            public_key: fx_es256_cose(21),
+            sign_count: 1,
+            registered_at: NOW,
+        }))
+        .unwrap();
+
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/login/start",
+            serde_json::json!({"email": "victim@example.com"}),
+        );
+        assert_eq!(resp.status, 200);
+        let start: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let challenge = start["challenge"].as_str().unwrap().to_string();
+
+        let attacker_cred = b"attacker-cred";
+        let att = fx_none_attestation(attacker_cred, &fx_es256_cose(33));
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/finish",
+            serde_json::json!({
+                "challenge": challenge,
+                "credential_id": b64url_encode(attacker_cred),
+                "attestation_object": b64url_encode(&att),
+                "client_data_json": b64url_encode(
+                    fx_client_json("webauthn.create", start["challenge"].as_str().unwrap()).as_bytes()
+                ),
+                "magic_token": "irrelevant",
+                "invite_code": null,
+            }),
+        );
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        assert!(resp.set_cookie.is_none());
+        assert_eq!(
+            block_on(h.store.credentials_for_user("victim"))
+                .unwrap()
+                .len(),
+            1,
+            "no attacker credential may be enrolled"
+        );
+    }
+
+    #[test]
+    fn register_finish_requires_the_emailed_token() {
+        // Regression: passkey enrollment requires inbox proof, so an
+        // unregistered email cannot be claimed by a stranger.
+        let h = harness();
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "fresh@example.com"}),
+        );
+        assert_eq!(resp.status, 200);
+        let start: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let challenge = start["challenge"].as_str().unwrap().to_string();
+        let cred_id = b"fresh-cred";
+        let att = fx_none_attestation(cred_id, &fx_es256_cose(44));
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/finish",
+            serde_json::json!({
+                "challenge": challenge,
+                "credential_id": b64url_encode(cred_id),
+                "attestation_object": b64url_encode(&att),
+                "client_data_json": b64url_encode(
+                    fx_client_json("webauthn.create", start["challenge"].as_str().unwrap()).as_bytes()
+                ),
+                "magic_token": "not-the-emailed-token",
+                "invite_code": null,
+            }),
+        );
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        assert!(resp.set_cookie.is_none());
+        let user = block_on(h.store.user_by_email("fresh@example.com"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            block_on(h.store.credentials_for_user(&user.id))
+                .unwrap()
+                .is_empty(),
+            "no credential may be enrolled without inbox proof"
+        );
+    }
+
+    #[test]
+    fn auth_starts_do_not_reveal_account_existence() {
+        let h = harness();
+        seed_user(&h, "u1", "known@example.com");
+        block_on(h.store.insert_credential(&PasskeyCredential {
+            cred_id_b64url: b64url_encode(b"known-cred"),
+            user_id: "u1".to_string(),
+            public_key: fx_es256_cose(55),
+            sign_count: 0,
+            registered_at: NOW,
+        }))
+        .unwrap();
+        // register/start: same 200 shape for taken and fresh emails,
+        // and no mail is sent for the taken one.
+        for email in ["known@example.com", "fresh@example.com"] {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/passkey/register/start",
+                serde_json::json!({"email": email}),
+            );
+            assert_eq!(resp.status, 200, "{email}: {}", resp.body);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert!(body["challenge"].is_string());
+            assert!(body["user_id"].is_string());
+        }
+        assert_eq!(h.mailer.sent.borrow().len(), 1);
+        assert_eq!(h.mailer.sent.borrow()[0].0, "fresh@example.com");
+        // login/start: unknown email still returns a one-entry allow list.
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/login/start",
+            serde_json::json!({"email": "ghost@example.com"}),
+        );
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["allow_credentials"].as_array().unwrap().len(), 1);
     }
 }
