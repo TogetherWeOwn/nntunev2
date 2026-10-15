@@ -15,10 +15,11 @@ use serde::Serialize;
 use worker::{console_log, Env, Request, Response, Result, RouteContext, Router};
 
 /// Cache TTLs: lookups are immutable-ish (long TTL), search is short TTL.
-/// `LOOKUP_CACHE_TTL_S` applies to the wired DB path; the current
-/// not-wired stub below serves `no-store` so no placeholder is cached.
+/// Both apply to the wired DB path; the current not-wired stubs below
+/// serve `no-store` so no placeholder is cached.
 #[allow(dead_code)]
 const LOOKUP_CACHE_TTL_S: u32 = 86_400;
+#[allow(dead_code)]
 const SEARCH_CACHE_TTL_S: u32 = 300;
 
 /// Validate an MBID string (UUID shape `8-4-4-4-12` hex). Keeps malformed
@@ -67,6 +68,10 @@ fn headers_json() -> Result<worker::Headers> {
     Ok(headers)
 }
 
+/// Wired-path `Cache-Control` value. Unused while both stubs serve
+/// `no-store` (see `lookup`/`search`); kept so the DB slice applies the
+/// documented TTLs without re-deriving the format.
+#[allow(dead_code)]
 fn cache_control(ttl_s: u32) -> String {
     format!("public, max-age={ttl_s}")
 }
@@ -114,14 +119,19 @@ async fn search(req: &Request, _ctx: &RouteContext<()>) -> Result<Response> {
     if kind.is_none() {
         return json_error("type must be one of artist|release|recording", 400);
     }
+    // Not-wired stub: mirror `lookup` — 501 + `no-store` so neither
+    // browsers nor the edge cache an empty result list as "no match".
+    // `SEARCH_CACHE_TTL_S` applies only once real trigram rows return.
     let mut headers = headers_json()?;
-    headers.append("cache-control", &cache_control(SEARCH_CACHE_TTL_S))?;
+    headers.append("cache-control", "no-store")?;
     Ok(Response::from_json(&serde_json::json!({
         "q": q,
         "type": kind,
         "results": [],
         "status": "not_wired",
+        "hint": "DB wiring lands in the next slice; contract is trigram search over Hyperdrive with KV cache.",
     }))?
+    .with_status(501)
     .with_headers(headers))
 }
 

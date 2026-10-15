@@ -4,7 +4,8 @@ name = "nntune-mb"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
 
-# [hyperdrive]
+# [[hyperdrive]]
+# binding = "MB_DB"
 # id = "<HYPERDRIVE_ID_FOR_nntunev2-mb>"
 # localConnectionString = "<postgres://... (local dev only, never commit)>"
 

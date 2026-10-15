@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # mbdump dumps -> Postgres COPY into nntunev2-mb (idempotent, resumable).
-# Usage: DATABASE_URL=<url> ./import.sh <dump-dir>
+# Usage: DATABASE_URL=<url> [DUMP_SEQ=<n>] ./import.sh <dump-dir>
 # Never echo $DATABASE_URL; pass it only via env/secret store.
+# DUMP_SEQ (optional): replication sequence the dump corresponds to. When
+# set, mb_import_state.last_packet is updated to it after the load so the
+# hourly replicate.sh gate (PACKET_SEQ = last_packet + 1) accepts the first
+# real packet. When unset, state is left untouched and the operator must
+# seed it before replication (see README).
 #
 # Input contract (curated TSVs, NOT raw MusicBrainz dumps):
 #   <dump-dir>/mbdump-artist.tsv     mb_artist    (mbid, name, sort_name, type, country, updated_at)
@@ -53,14 +58,31 @@ for table in artist release recording; do
   echo "import: loading $table from $tsv"
   # Single psql session + single transaction: the TEMP stage table is
   # session-scoped, so create, COPY and upsert must share one connection.
+  # The WHERE guard makes reruns move rows forward only: an older dump
+  # never rolls back a row that replication (or a newer dump) moved ahead.
   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<SQL
 BEGIN;
 CREATE TEMP TABLE stage (LIKE mb_${table}) ON COMMIT DROP;
 \copy stage ($columns) FROM '$tsv' WITH (FORMAT text)
 INSERT INTO mb_${table} ($columns) SELECT $columns FROM stage
-ON CONFLICT (mbid) DO UPDATE SET $upsert;
+ON CONFLICT (mbid) DO UPDATE SET $upsert
+WHERE mb_${table}.updated_at < EXCLUDED.updated_at;
 COMMIT;
 SQL
 done
+
+# Record the dump's replication sequence so replicate.sh accepts the first
+# real packet. Unset DUMP_SEQ leaves state untouched (fresh DBs stay at the
+# migration seed 0); the operator then seeds last_packet before replication.
+if [[ -n "${DUMP_SEQ:-}" ]]; then
+  if [[ ! "$DUMP_SEQ" =~ ^[0-9]+$ ]]; then
+    echo "import: refusing non-integer DUMP_SEQ '$DUMP_SEQ'" >&2
+    exit 1
+  fi
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "UPDATE mb_import_state SET last_packet = $DUMP_SEQ, last_applied_at = now(), updated_at = now() WHERE id = 1;"
+  echo "import: seeded mb_import_state.last_packet=$DUMP_SEQ"
+else
+  echo "import: DUMP_SEQ unset; leaving mb_import_state untouched (seed last_packet before running replicate.sh)" >&2
+fi
 
 echo "import: done"

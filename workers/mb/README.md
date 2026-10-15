@@ -11,11 +11,12 @@ Decision: `docs/adr/0007-mb-mirror.md`.
 | `GET` | `/v1/mb/artist/:mbid` | Artist lookup; stub answers `501` + `no-store` until DB wiring lands, then `Cache-Control: public, max-age=86400` |
 | `GET` | `/v1/mb/release/:mbid` | Release lookup (includes `caa_url` when art is cached); same stub caching as artist |
 | `GET` | `/v1/mb/recording/:mbid` | Recording lookup; same stub caching as artist |
-| `GET` | `/v1/mb/search?q=&type=` | `type` in `artist\|release\|recording`; `q` min 2 chars; trigram (`pg_trgm`) ordered by similarity; `Cache-Control: public, max-age=300` |
+| `GET` | `/v1/mb/search?q=&type=` | `type` in `artist\|release\|recording`; `q` min 2 chars; trigram (`pg_trgm`) ordered by similarity; stub answers `501` + `no-store` until DB wiring lands, then `Cache-Control: public, max-age=300` |
 
 Errors are JSON (`{"error": "..."}`); malformed `:mbid` (must be UUID),
-unknown `type` and short queries are `400`; the pre-wiring lookup stub is
-`501` with `Cache-Control: no-store`; unknown routes are `404`.
+unknown `type` and short queries are `400`; both pre-wiring stubs (lookup
+and search) are `501` with `Cache-Control: no-store`; unknown routes are
+`404`.
 
 ## Caching
 
