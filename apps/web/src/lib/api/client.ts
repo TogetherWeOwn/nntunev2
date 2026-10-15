@@ -220,6 +220,18 @@ export class ApiClient {
 		return this.post<MagicLinkResult>('/v1/auth/magic/finish', { token });
 	}
 
+	/**
+	 * Sign out of the current session. The server revokes the session and
+	 * clears the HttpOnly cookie; the caller also drops its display-only
+	 * identity label (see `signed-in-email.ts`). Used by the `/auth/magic`
+	 * error state so a session-swapped user can sign out and redeem the
+	 * other account's link — the server's magic-finish rejection stays a
+	 * generic 401 either way.
+	 */
+	async logout(): Promise<void> {
+		await this.post<unknown>('/v1/session/logout', {});
+	}
+
 	/** Start passkey enrollment; the API also mails the inbox-proof code. */
 	async registerStart(email: string): Promise<RegisterStartResponse> {
 		return this.post<RegisterStartResponse>('/v1/auth/passkey/register/start', { email });

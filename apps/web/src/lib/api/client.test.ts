@@ -201,6 +201,19 @@ describe('ApiClient', () => {
 		expect(seenUrls).toEqual(['https://api.example.com/v1/auth/magic/start']);
 	});
 
+	it('signs out through the session endpoint so a swapped user can recover', async () => {
+		const seen: { url: unknown; init: RequestInit }[] = [];
+		const fetchFn = (async (url: unknown, init: RequestInit) => {
+			seen.push({ url, init });
+			return jsonResponse({ ok: true });
+		}) as unknown as typeof fetch;
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		await expect(client.logout()).resolves.toBeUndefined();
+		expect(seen.map(({ url }) => url)).toEqual(['https://api.example.com/v1/session/logout']);
+		expect(seen.map(({ init }) => init.method)).toEqual(['POST']);
+	});
+
 	it('nests the provider fields under the save envelope', () => {
 		expect(
 			toVaultSaveBody({
