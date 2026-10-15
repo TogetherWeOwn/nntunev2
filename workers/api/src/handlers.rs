@@ -35,7 +35,9 @@ use serde::Deserialize;
 use crate::auth::{
     self, InviteRecord, MagicLinkRecord, PasskeyChallenge, PasskeyCredential, SingleUseStore,
 };
-use crate::encoding::{b64url_decode, b64url_encode};
+// Single unpadded-base64url codec (F-HARD-01): `crate::b64` over the
+// `base64` crate. The aliased names keep wire-format call sites unchanged.
+use crate::b64::{decode as b64url_decode, encode as b64url_encode};
 use crate::session::{self, SessionClaims, SessionRecord};
 use crate::vault::{
     self, AuditEvent, DnsResolver, IndexerConfig, ProviderConfig, ValidatedTarget, VaultBlob,
@@ -47,9 +49,10 @@ use crate::webauthn;
 pub const MAX_BODY_BYTES: usize = 32 * 1024;
 /// Magic links issuable per email inside the link TTL window.
 pub const MAGIC_LINKS_PER_WINDOW: u64 = 3;
-/// Test-connection attempts per user per minute.
-pub const TEST_CONNECTION_PER_MINUTE: u64 = 10;
-/// Expired leases outlive the bounded test-connection probe by five seconds.
+// Test-connection budget lives in one place: `vault::TEST_CONNECTION_MAX_ATTEMPTS`
+// per `vault::TEST_CONNECTION_WINDOW_SECS`. No handler-level copy: the two
+// once disagreed (10 vs 5) with both test suites green.
+// Expired leases outlive the bounded test-connection probe by five seconds.
 const TEST_CONNECTION_LEASE_SECS: u64 = 20;
 const AUTH_START_WINDOW_SECS: u64 = 3600;
 
@@ -71,6 +74,10 @@ pub struct Config {
     pub kek_version: u32,
     pub session_ttl_secs: u64,
     pub invites_required: bool,
+    /// Verify-only previous session HMAC secret: `Some` only inside a
+    /// recorded rotation window, `None` in steady state. Never mints;
+    /// length-checked like the primary (a short previous fails closed).
+    pub session_previous_secret: Option<Vec<u8>>,
 }
 
 impl Config {
@@ -84,6 +91,7 @@ impl Config {
         session_ttl_secs: u64,
         invites_required: bool,
         allow_loopback_dev: bool,
+        session_previous_secret: Option<Vec<u8>>,
     ) -> Result<Self, ConfigError> {
         // Reuse the core RP/origin validator (canonical serialized origin,
         // RP == exact host), then tighten the scheme for production.
@@ -97,6 +105,11 @@ impl Config {
         if session_secret.len() < 32 || session_ttl_secs == 0 {
             return Err(ConfigError::Invalid);
         }
+        if let Some(previous) = &session_previous_secret {
+            if previous.len() < 32 {
+                return Err(ConfigError::Invalid);
+            }
+        }
         Ok(Self {
             rp_id: rp_id.to_string(),
             origin: origin.to_string(),
@@ -105,7 +118,19 @@ impl Config {
             kek_version,
             session_ttl_secs: session_ttl_secs.min(session::MAX_SESSION_SECS),
             invites_required,
+            session_previous_secret,
         })
+    }
+
+    /// Signing/verification keys for this worker: rotation (the primary
+    /// mints, both verify) only when a previous secret is configured,
+    /// otherwise single-secret steady state. See
+    /// `docs/security/session-secret-rotation.md` §4.
+    pub fn session_keys(&self) -> session::SessionKeys<'_> {
+        match &self.session_previous_secret {
+            Some(previous) => session::SessionKeys::rotation(&self.session_secret, previous),
+            None => session::SessionKeys::single(&self.session_secret),
+        }
     }
 
     fn expect<'a>(&'a self, challenge: &'a str) -> webauthn::Expect<'a> {
@@ -514,15 +539,18 @@ where
             }
         }
         let token = session_cookie_value(req).ok_or_else(generic_auth)?;
-        let claims = session::verify_session(&self.cfg.session_secret, &token, self.now)
-            .map_err(|_| generic_auth())?;
+        // Dual path first: a pre-cutover token must locate its row. The row
+        // check below still enforces revocation, counter and expiry, and
+        // minting always uses the primary.
+        let keys = self.cfg.session_keys();
+        let claims =
+            session::verify_session_dual(&keys, &token, self.now).map_err(|_| generic_auth())?;
         let record = self
             .store
             .session_by_id(&claims.session_id)
             .await
             .map_err(|_| internal())?
             .ok_or_else(generic_auth)?;
-        let keys = session::SessionKeys::single(&self.cfg.session_secret);
         let claims = session::verify_stored_session(&keys, &token, self.now, &record)
             .map_err(|_| generic_auth())?;
         Ok((claims, token))
@@ -785,6 +813,25 @@ where
         return generic_auth();
     }
     if ctx.cfg.invites_required || body.invite_code.is_some() {
+        // Atomic per-client redemption budget BEFORE the lookup: parallel
+        // guesses share one reservation (no check-then-act race), and the
+        // denial is the generic error (no throttle oracle). Keyed by
+        // source IP and account, per `auth::invite_attempt_allowed`.
+        let attempt_key = format!("invite:{}:{}", ctx.source_ip, user_id);
+        let allowed = ctx
+            .store
+            .reserve_rate_limit(
+                &attempt_key,
+                "auth.invite_redeem",
+                u64::from(auth::INVITE_REDEMPTION_MAX_ATTEMPTS),
+                ctx.now,
+                auth::INVITE_REDEMPTION_WINDOW_SECS,
+            )
+            .await
+            .unwrap_or(false);
+        if !allowed {
+            return generic_auth();
+        }
         let Some(code) = body.invite_code.as_deref() else {
             return generic_auth();
         };
@@ -1035,7 +1082,10 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
-    let keys = session::SessionKeys::single(&ctx.cfg.session_secret);
+    // Same keys as authentication: a pre-cutover token verifies through
+    // the dual path and is re-signed with the primary, migrating the
+    // session onto the new secret.
+    let keys = ctx.cfg.session_keys();
     let new_token = match session::rotate_session(&keys, &token, ctx.now, ctx.cfg.session_ttl_secs)
     {
         Ok(new_token) => new_token,
@@ -1179,6 +1229,14 @@ where
             return generic_vault();
         }
     }
+    // Repudiation-safe audit action, taken BEFORE the move below: a save
+    // carrying the explicit cleartext opt-in must not look like a normal
+    // save in the audit log (`vault::INSECURE_PLAINTEXT_AUDIT_ACTION`).
+    let audit_action = if body.provider.insecure_plaintext_acknowledged() {
+        vault::INSECURE_PLAINTEXT_AUDIT_ACTION
+    } else {
+        "vault.put"
+    };
     let indexer_configured = body.indexer.is_some();
     let payload = VaultPayload {
         provider: body.provider,
@@ -1205,7 +1263,7 @@ where
     if ctx.store.upsert_vault(&claims.user_id, &row).await.is_err() {
         return generic_vault();
     }
-    ctx.audit(&claims.user_id, "vault.put", true).await;
+    ctx.audit(&claims.user_id, audit_action, true).await;
     summary_response(Some(&row))
 }
 
@@ -1241,14 +1299,16 @@ where
     // Every failure below collapses to the same boolean (never a banner,
     // host verdict or vault-existence signal).
     let fail = || json_response(200, serde_json::json!({"ok": false}));
+    // One shared budget with the documenting module: `vault::TEST_CONNECTION_MAX_ATTEMPTS`
+    // per `vault::TEST_CONNECTION_WINDOW_SECS`, reserved atomically before any lookup or dial.
     let admitted = ctx
         .store
         .reserve_rate_limit(
             &claims.user_id,
             "vault.test",
-            TEST_CONNECTION_PER_MINUTE,
+            u64::from(vault::TEST_CONNECTION_MAX_ATTEMPTS),
             ctx.now,
-            60,
+            vault::TEST_CONNECTION_WINDOW_SECS,
         )
         .await
         .unwrap_or(false);
@@ -1372,6 +1432,7 @@ mod tests {
             3600,
             false,
             false,
+            None,
         )
         .unwrap()
     }
@@ -1798,6 +1859,7 @@ mod tests {
             60,
             false,
             false,
+            None,
         )
         .is_err());
         assert!(Config::new(
@@ -1809,6 +1871,7 @@ mod tests {
             60,
             false,
             true,
+            None,
         )
         .is_ok());
     }
@@ -2189,15 +2252,15 @@ mod tests {
             h.dialer.seen.borrow().as_slice(),
             [vec!["93.184.216.34".parse::<IpAddr>().unwrap()]]
         );
-        // Exhaust the per-minute budget: further probes answer false
-        // without reaching the dialer.
-        for _ in 1..TEST_CONNECTION_PER_MINUTE {
+        // Exhaust the per-user budget (shared with the vault module: 5 per
+        // 60s): further probes answer false without reaching the dialer.
+        for _ in 1..u64::from(vault::TEST_CONNECTION_MAX_ATTEMPTS) {
             assert!(block_on(h.store.reserve_rate_limit(
                 "u1",
                 "vault.test",
-                TEST_CONNECTION_PER_MINUTE,
+                u64::from(vault::TEST_CONNECTION_MAX_ATTEMPTS),
                 NOW,
-                60,
+                vault::TEST_CONNECTION_WINDOW_SECS,
             ))
             .unwrap());
         }
@@ -2740,7 +2803,7 @@ mod tests {
         let cookie = magic_login(&h, "a@example.com");
         put_test_vault(&h, &cookie);
 
-        for _ in 0..TEST_CONNECTION_PER_MINUTE {
+        for _ in 0..vault::TEST_CONNECTION_MAX_ATTEMPTS {
             let resp = h.call_full(
                 "POST",
                 "/v1/vault/test-connection",
@@ -2752,7 +2815,7 @@ mod tests {
         }
         assert_eq!(
             h.dialer.seen.borrow().len(),
-            TEST_CONNECTION_PER_MINUTE as usize
+            vault::TEST_CONNECTION_MAX_ATTEMPTS as usize
         );
 
         // Budget exhausted: blocked without a dial.
@@ -2766,7 +2829,7 @@ mod tests {
         assert_eq!(resp.body, r#"{"ok":false}"#);
         assert_eq!(
             h.dialer.seen.borrow().len(),
-            TEST_CONNECTION_PER_MINUTE as usize
+            vault::TEST_CONNECTION_MAX_ATTEMPTS as usize
         );
 
         // 2s later the 60s window is still closed (pins the window length).
@@ -2780,7 +2843,7 @@ mod tests {
         assert_eq!(resp.body, r#"{"ok":false}"#);
         assert_eq!(
             h.dialer.seen.borrow().len(),
-            TEST_CONNECTION_PER_MINUTE as usize
+            vault::TEST_CONNECTION_MAX_ATTEMPTS as usize
         );
 
         // After the window the same caller is admitted again and releases.
@@ -2788,11 +2851,239 @@ mod tests {
         assert_eq!(resp.body, r#"{"ok":true}"#);
         assert_eq!(
             h.dialer.seen.borrow().len(),
-            TEST_CONNECTION_PER_MINUTE as usize + 1
+            vault::TEST_CONNECTION_MAX_ATTEMPTS as usize + 1
         );
         assert!(
             h.store.test_connection_leases.borrow().is_empty(),
             "re-admitted probe must release its lease"
         );
+    }
+
+    #[test]
+    fn previous_secret_authenticates_only_inside_rotation_window() {
+        // Runbook §4: the Worker honors a staged previous secret only as
+        // part of a recorded rotation, through the dual path. A pre-cutover
+        // token authenticates and refreshes onto the primary; once the
+        // previous secret is dropped the old token fails.
+        let primary = vec![7u8; 32];
+        let previous = vec![9u8; 32];
+        let rotation_cfg = Config::new(
+            "example.com",
+            ORIGIN,
+            primary.clone(),
+            [9u8; 32],
+            1,
+            3600,
+            false,
+            false,
+            Some(previous.clone()),
+        )
+        .unwrap();
+        let steady_cfg = Config::new(
+            "example.com",
+            ORIGIN,
+            primary.clone(),
+            [9u8; 32],
+            1,
+            3600,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        // A set-but-short previous fails closed at startup, never silently
+        // narrowing the window.
+        assert!(Config::new(
+            "example.com",
+            ORIGIN,
+            primary.clone(),
+            [9u8; 32],
+            1,
+            3600,
+            false,
+            false,
+            Some(vec![1u8; 16]),
+        )
+        .is_err());
+
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        // Pre-cutover session minted under the previous secret.
+        let old_token =
+            session::issue_session(&previous, "u1", NOW, 3600).expect("issue under previous");
+        let old_claims =
+            session::verify_session(&previous, &old_token, NOW).expect("previous verifies");
+        block_on(h.store.insert_session(&SessionRecord {
+            id: old_claims.session_id.clone(),
+            user_id: "u1".to_string(),
+            created_at: old_claims.created_at,
+            expires_at: old_claims.expires_at,
+            rotation_counter: old_claims.rotation_counter,
+            revoked: false,
+        }))
+        .unwrap();
+        let cookie = format!("{}={}", session::COOKIE_NAME, old_token);
+        let authed = |cfg: &Config| {
+            let ctx = Ctx {
+                cfg,
+                store: &h.store,
+                mailer: &h.mailer,
+                dialer: &h.dialer,
+                dns: &h.dns,
+                now: NOW,
+                source_ip: "198.51.100.9".to_string(),
+            };
+            let req = Request {
+                method: "GET".to_string(),
+                path: "/v1/vault".to_string(),
+                cookie: Some(cookie.clone()),
+                origin: None,
+                body: Vec::new(),
+            };
+            block_on(handle(&ctx, &req))
+        };
+        // Inside the window the pre-cutover cookie authenticates ...
+        assert_eq!(authed(&rotation_cfg).status, 200);
+        // ... refresh migrates it onto the primary signature ...
+        let ctx = Ctx {
+            cfg: &rotation_cfg,
+            store: &h.store,
+            mailer: &h.mailer,
+            dialer: &h.dialer,
+            dns: &h.dns,
+            now: NOW,
+            source_ip: "198.51.100.9".to_string(),
+        };
+        let req = Request {
+            method: "POST".to_string(),
+            path: "/v1/session/refresh".to_string(),
+            cookie: Some(cookie.clone()),
+            origin: Some(ORIGIN.to_string()),
+            body: Vec::new(),
+        };
+        let resp = block_on(handle(&ctx, &req));
+        assert_eq!(resp.status, 200);
+        let migrated = resp.set_cookie.expect("migrated cookie");
+        let migrated_token = migrated
+            .split(';')
+            .next()
+            .unwrap()
+            .trim_start_matches(&format!("{}=", session::COOKIE_NAME));
+        assert!(session::verify_session(&primary, migrated_token, NOW).is_ok());
+        // ... and once the previous secret is dropped the old token fails.
+        assert_eq!(authed(&steady_cfg).status, 401);
+    }
+
+    #[test]
+    fn plaintext_opt_in_save_uses_insecure_audit_action() {
+        // The cleartext opt-in must be repudiation-safe in the audit log: a
+        // save with `allow_insecure_plaintext` records the insecure action,
+        // a normal save keeps the plain one.
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        put_test_vault(&h, &cookie);
+        assert_eq!(h.store.audits.borrow().last().unwrap().action, "vault.put");
+        let put_body = serde_json::json!({
+            "provider": {
+                "host": "news.example.com", "port": 119, "tls": false,
+                "username": "synthetic-user", "password": "synthetic-pass",
+                "max_connections": 4, "allow_insecure_plaintext": true
+            },
+            "indexer": null
+        });
+        let resp = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(
+            h.store.audits.borrow().last().unwrap().action,
+            vault::INSECURE_PLAINTEXT_AUDIT_ACTION
+        );
+    }
+
+    #[test]
+    fn invite_redemption_throttles_per_client_past_ten() {
+        // `auth.rs` documents the throttle as a MUST for the HTTP slice:
+        // the 11th redemption attempt inside the window denies generically,
+        // while another account from the same client still proceeds.
+        let h = harness();
+        let finish_with_code = |user_id: &str, email: &str, cred_id: &[u8], code: &str| {
+            // Fresh single-use challenge + inbox proof per attempt, without
+            // touching the register/start budget.
+            let challenge = auth::new_registration_challenge("example.com", ORIGIN, NOW).unwrap();
+            let challenge_id = challenge.id.clone();
+            block_on(
+                h.store
+                    .insert_challenge(&challenge, Some(user_id), PURPOSE_REGISTER),
+            )
+            .unwrap();
+            let (token, record) = auth::issue_magic_link(user_id, email, NOW);
+            block_on(h.store.insert_magic(&record)).unwrap();
+            let att = fx_none_attestation(cred_id, &fx_es256_cose(77));
+            h.call(
+                "POST",
+                "/v1/auth/passkey/register/finish",
+                serde_json::json!({
+                    "challenge": challenge_id,
+                    "credential_id": b64url_encode(cred_id),
+                    "attestation_object": b64url_encode(&att),
+                    "client_data_json": b64url_encode(
+                        fx_client_json("webauthn.create", &challenge_id).as_bytes()
+                    ),
+                    "magic_token": token,
+                    "invite_code": code,
+                }),
+            )
+        };
+
+        seed_user(&h, "u1", "a@example.com");
+        let good_hash = auth::hash_invite_code("correct-code-1");
+        h.store.invites.borrow_mut().insert(
+            good_hash.clone(),
+            InviteRecord {
+                code_hash: good_hash.clone(),
+                used: false,
+                created_at: NOW,
+            },
+        );
+        // Ten wrong guesses: admitted by the throttle, denied on the code.
+        for _ in 0..auth::INVITE_REDEMPTION_MAX_ATTEMPTS {
+            let resp = finish_with_code("u1", "a@example.com", b"throttle-cred", "wrong-code");
+            assert_eq!(resp.status, 401);
+            assert!(resp.set_cookie.is_none());
+        }
+        // 11th attempt carries the CORRECT code but the budget is spent.
+        let resp = finish_with_code("u1", "a@example.com", b"throttle-cred", "correct-code-1");
+        assert_eq!(resp.status, 401);
+        assert!(resp.set_cookie.is_none());
+        assert!(
+            block_on(h.store.credentials_for_user("u1"))
+                .unwrap()
+                .is_empty(),
+            "throttled attempt must not enroll a credential"
+        );
+        assert!(
+            !h.store.invites.borrow().get(&good_hash).unwrap().used,
+            "throttled attempt must not consume the invite"
+        );
+        // Same client, another account: its own budget still admits.
+        seed_user(&h, "u2", "b@example.com");
+        let good_hash_2 = auth::hash_invite_code("correct-code-2");
+        h.store.invites.borrow_mut().insert(
+            good_hash_2.clone(),
+            InviteRecord {
+                code_hash: good_hash_2,
+                used: false,
+                created_at: NOW,
+            },
+        );
+        let resp = finish_with_code("u2", "b@example.com", b"throttle-cred-2", "correct-code-2");
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(resp.set_cookie.is_some());
     }
 }

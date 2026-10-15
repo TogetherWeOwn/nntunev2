@@ -91,7 +91,9 @@ config from secrets) is a follow-up slice.
   (`INSERT/UPDATE/DELETE ... RETURNING`, including rate-limit slots and
   test-connection leases) are never cached. Deploy gate:
   `./check_hyperdrive_cache.sh --config-id <id>` asserts
-  `caching.disabled == true` (see `wrangler.toml.example`).
+  `caching.disabled == true` (see `wrangler.toml.example`). The gate
+  fails closed without Cloudflare credentials (exit 3); `--allow-skip`
+  is only for secret-less CI.
 - **Magic links:** 256-bit random tokens, SHA-256 hash at rest, 15-minute
   expiry. HTTP callers must use `consume_magic_link_atomically`, not the
   pure record-preparation helper. Magic links, passkey challenges and

@@ -47,10 +47,10 @@ fn env_string(env: &Env, name: &str) -> Option<String> {
 fn config_from_env(env: &Env) -> Option<Config> {
     let rp_id = env_string(env, "RP_ID")?;
     let origin = env_string(env, "RP_ORIGIN")?;
-    let session_secret =
-        crate::encoding::b64_decode_flexible(&env_string(env, "SESSION_SECRET_BASE64")?).ok()?;
-    let kek_bytes =
-        crate::encoding::b64_decode_flexible(&env_string(env, "VAULT_KEK_BASE64")?).ok()?;
+    // Strict unpadded base64url for both secrets (`crate::b64`, F-HARD-01):
+    // padded std-base64 input is rejected, matching the template contract.
+    let session_secret = crate::b64::decode(&env_string(env, "SESSION_SECRET_BASE64")?).ok()?;
+    let kek_bytes = crate::b64::decode(&env_string(env, "VAULT_KEK_BASE64")?).ok()?;
     let kek: [u8; 32] = kek_bytes.try_into().ok()?;
     let kek_version: u32 = env_string(env, "VAULT_KEK_VERSION")?.parse().ok()?;
     let session_ttl_secs: u64 = env_string(env, "SESSION_TTL_SECS")
@@ -62,6 +62,23 @@ fn config_from_env(env: &Env) -> Option<Config> {
             Some("1") | Some("true") | Some("TRUE")
         )
     };
+    // Rotation window ("recorded" per the runbook): the previous secret is
+    // honored only when the operator arms the rotation AND stages the
+    // previous value. A staged previous without the flag (stray secret), or
+    // an armed flag with nothing staged, fails closed at startup.
+    let rotation_armed = truthy("SESSION_SECRET_ROTATION");
+    let previous_raw = env_string(env, "SESSION_SECRET_PREVIOUS_BASE64");
+    let session_previous_secret = match (previous_raw, rotation_armed) {
+        (None, false) => None,
+        (Some(raw), true) => {
+            let bytes = crate::b64::decode(&raw).ok()?;
+            if bytes.len() < crate::session::MIN_SECRET_LEN {
+                return None;
+            }
+            Some(bytes)
+        }
+        _ => return None,
+    };
     Config::new(
         &rp_id,
         &origin,
@@ -71,6 +88,7 @@ fn config_from_env(env: &Env) -> Option<Config> {
         session_ttl_secs,
         truthy("INVITES_REQUIRED"),
         truthy("ALLOW_LOOPBACK_DEV"),
+        session_previous_secret,
     )
     .ok()
 }

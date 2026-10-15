@@ -28,7 +28,9 @@ SESSION_TTL_SECS = "86400"
 #   wrangler hyperdrive create <name> --connection-string "$DATABASE_URL" --caching-disabled
 #   wrangler hyperdrive update <id> --caching-disabled
 # Deploy gate: ./check_hyperdrive_cache.sh --config-id <id> (asserts
-# caching.disabled == true). If cached reads are wanted elsewhere, bind a
+# caching.disabled == true). The gate fails closed without Cloudflare
+# credentials (exit 3); --allow-skip is only for secret-less CI.
+# If cached reads are wanted elsewhere, bind a
 # second cache-disabled config for auth reads.
 # [[hyperdrive]]
 # binding = "HYPERDRIVE"
@@ -43,6 +45,12 @@ SESSION_TTL_SECS = "86400"
 #   SESSION_SECRET_BASE64         HMAC secret for session cookies (256-bit, unpadded base64url)
 #   SESSION_SECRET_PREVIOUS_BASE64  verify-only previous HMAC secret: set ONLY
 #                                 during a rotation window, deleted at its end.
+#                                 Honored only when SESSION_SECRET_ROTATION=1
+#                                 is also set (the recorded rotation); a staged
+#                                 previous without it, or the flag without a
+#                                 staged previous, refuses to start (fail closed).
 #                                 See docs/security/session-secret-rotation.md —
 #                                 never two live minting secrets.
+#   SESSION_SECRET_ROTATION         "1" only for the deploy(s) covering a
+#                                 recorded rotation window; unset otherwise.
 #   EMAIL_API_KEY                 transactional email provider key (magic-link delivery)
