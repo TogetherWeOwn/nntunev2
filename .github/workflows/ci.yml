@@ -89,6 +89,28 @@ jobs:
       # (native-only CI once missed a getrandom/RNG breakage there).
       - run: cargo check --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
 
+  rust-mb:
+    name: rust (workers/mb)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
+      # (2026-08-06); re-pin deliberately, never float.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo test --manifest-path workers/mb/Cargo.toml --all-targets
+      - run: cargo clippy --manifest-path workers/mb/Cargo.toml --all-targets -- -D warnings
+      - run: cargo fmt --manifest-path workers/mb/Cargo.toml -- --check
+      # The Worker deploys to wasm32: the crate must check on that target
+      # (native-only CI once missed a getrandom/RNG breakage there).
+      - run: cargo check --manifest-path workers/mb/Cargo.toml --target wasm32-unknown-unknown
+
   # E2E harness static checks: typecheck + spec discovery with no staging
   # needed, so every PR proves the harness still compiles. The live suite
   # runs in e2e-staging.yml (post-deploy). Keep this job id in ci-ok's needs.
@@ -197,7 +219,7 @@ jobs:
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, api, e2e-lint, svelte-check, vitest, web-build]
+    needs: [rust-test, rust-wasm, api, rust-mb, e2e-lint, svelte-check, vitest, web-build]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
