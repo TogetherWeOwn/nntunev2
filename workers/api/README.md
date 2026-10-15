@@ -36,7 +36,15 @@ exactly one row before any response.
 | `POST /v1/auth/magic/start` / `finish` | email magic link (atomic per-email issuance reservation shared with register inbox proof) |
 | `POST /v1/session/refresh` / `logout` / `revoke-all` | stored-session rotation/revocation |
 | `GET` / `PUT` / `DELETE /v1/vault` | booleans-only summary / encrypted upsert / delete |
-| `POST /v1/vault/test-connection` | `{"ok": bool}` only; atomically rate-limited, per-user concurrency lease, bounded pinned-address dial |
+| `POST /v1/vault/test-connection` | `{"ok": bool}` only; atomically rate-limited, per-user concurrency lease, bounded pinned-address dial; empty body tests the stored vault, a `{provider, indexer}` envelope tests a candidate without persisting it |
+
+`OPTIONS` on any listed route answers an empty 204. Credentialed CORS
+headers (`Access-Control-Allow-Origin`, never `*`) are emitted only when
+the request `Origin` exactly equals the configured origin; any other
+origin gets none, so cross-origin JSON posts die at preflight. The web
+client speaks exactly these routes and bodies, pinned by
+`workers/api/tests/fixtures/api-web-contract.json` (consumed by both the
+vitest client suite and the Rust handlers suite).
 
 Generic errors only: auth `401 {"error":"check your email and try
 again"}`, vault `400 {"error":"vault unavailable"}`, internal

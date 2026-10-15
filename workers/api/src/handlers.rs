@@ -1315,28 +1315,58 @@ where
     if !admitted {
         return fail();
     }
+    // What to dial: the stored vault by default (empty body), or a
+    // candidate envelope for test-before-save. A candidate runs the exact
+    // save-time guards (`validate` over freshly resolved records) without
+    // persisting anything, so the wizard can test a config the server has
+    // never stored. This widens no SSRF boundary: saving the same
+    // candidate then testing the stored row reaches the identical dial,
+    // and every failure below still collapses to the same boolean. A
+    // non-empty body that is not the save envelope fails closed instead
+    // of silently testing something else.
+    let (provider, indexer): (ProviderConfig, Option<IndexerConfig>) = if req.body.is_empty() {
+        let row = match ctx.store.vault_by_user(&claims.user_id).await {
+            Ok(Some(row)) => row,
+            _ => return fail(),
+        };
+        match vault::decrypt_vault(&ctx.cfg.kek, &claims.user_id, &row.blob)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<VaultPayload>(&bytes).ok())
+        {
+            Some(payload) => (payload.provider, payload.indexer),
+            None => return fail(),
+        }
+    } else {
+        match serde_json::from_slice::<VaultPutBody>(&req.body).ok() {
+            Some(envelope) => (envelope.provider, envelope.indexer),
+            None => return generic_vault(),
+        }
+    };
     // The attempt slot is reserved before any potentially slow lookup or
     // dial, so concurrent requests cannot pass a count-then-act check.
     let result = async {
-        let row = match ctx.store.vault_by_user(&claims.user_id).await {
-            Ok(Some(row)) => row,
-            _ => return false,
-        };
-        let payload: VaultPayload =
-            match vault::decrypt_vault(&ctx.cfg.kek, &claims.user_id, &row.blob)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            {
-                Some(payload) => payload,
-                None => return false,
-            };
         // Resolve all records immediately before the dial and hand the
         // dialer only the vetted, bounded address set.
-        let dns = ctx.resolve_all(&payload.provider.host).await;
-        let target: ValidatedTarget = match payload.provider.validate(&dns) {
+        let dns = ctx.resolve_all(&provider.host).await;
+        let target: ValidatedTarget = match provider.validate(&dns) {
             Ok(target) => target,
             Err(_) => return false,
         };
+        // A candidate that would not save fails the test instead of
+        // testing half a config (the stored path was validated at save).
+        if let Some(indexer) = &indexer {
+            let host = match url::Url::parse(&indexer.url)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.trim_matches(['[', ']']).to_string()))
+            {
+                Some(host) => host,
+                None => return false,
+            };
+            let indexer_dns = ctx.resolve_all(&host).await;
+            if indexer.validate(&indexer_dns).is_err() {
+                return false;
+            }
+        }
         let lease_token = random_id(16);
         let lease_acquired = ctx
             .store
@@ -1351,10 +1381,7 @@ where
         if !lease_acquired {
             return false;
         }
-        let ok = ctx
-            .dialer
-            .probe(&target, payload.provider.port, payload.provider.tls)
-            .await;
+        let ok = ctx.dialer.probe(&target, provider.port, provider.tls).await;
         let _ = ctx
             .store
             .release_test_connection_lease(&claims.user_id, &lease_token)
@@ -1367,6 +1394,39 @@ where
 }
 
 // --- Dispatch ------------------------------------------------------------------------------
+
+/// Every path the router serves. The Worker answers `OPTIONS` on exactly
+/// these paths with an empty 204 (the entry renders credentialed CORS
+/// headers only for an exact `Origin` match); anything else 404s, so a
+/// preflight never maps the API surface.
+pub fn is_known_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/healthz"
+            | "/v1/auth/passkey/register/start"
+            | "/v1/auth/passkey/register/finish"
+            | "/v1/auth/passkey/login/start"
+            | "/v1/auth/passkey/login/finish"
+            | "/v1/auth/magic/start"
+            | "/v1/auth/magic/finish"
+            | "/v1/session/refresh"
+            | "/v1/session/logout"
+            | "/v1/session/revoke-all"
+            | "/v1/vault"
+            | "/v1/vault/test-connection"
+    )
+}
+
+/// Empty 204 for a preflight against a known path. Carries no ACA headers
+/// itself: the entry appends them exactly when the request `Origin` equals
+/// the configured origin (never reflected, never `*`).
+fn preflight_response() -> Response {
+    Response {
+        status: 204,
+        body: String::new(),
+        set_cookie: None,
+    }
+}
 
 /// Route one request. Unknown routes are a plain 404; known routes map
 /// every domain failure through their surface's single generic body.
@@ -1395,6 +1455,7 @@ where
         ("PUT", "/v1/vault") => vault_put(ctx, req).await,
         ("DELETE", "/v1/vault") => vault_delete(ctx, req).await,
         ("POST", "/v1/vault/test-connection") => vault_test_connection(ctx, req).await,
+        ("OPTIONS", path) if is_known_path(path) => preflight_response(),
         _ => json_response(404, serde_json::json!({"error": "not found"})),
     }
 }
@@ -3085,5 +3146,143 @@ mod tests {
         let resp = finish_with_code("u2", "b@example.com", b"throttle-cred-2", "correct-code-2");
         assert_eq!(resp.status, 200, "{}", resp.body);
         assert!(resp.set_cookie.is_some());
+    }
+
+    #[test]
+    fn options_preflight_only_for_known_routes() {
+        let h = harness();
+        // Every served path answers the preflight with an empty 204 (the
+        // entry adds credentialed CORS headers on exact-origin match).
+        for path in [
+            "/healthz",
+            "/v1/auth/passkey/register/start",
+            "/v1/auth/passkey/register/finish",
+            "/v1/auth/passkey/login/start",
+            "/v1/auth/passkey/login/finish",
+            "/v1/auth/magic/start",
+            "/v1/auth/magic/finish",
+            "/v1/session/refresh",
+            "/v1/session/logout",
+            "/v1/session/revoke-all",
+            "/v1/vault",
+            "/v1/vault/test-connection",
+        ] {
+            assert!(is_known_path(path), "{path}");
+            let resp = h.call_full("OPTIONS", path, None, None, Some(ORIGIN));
+            assert_eq!(resp.status, 204, "{path}");
+            assert!(resp.body.is_empty(), "{path}");
+            assert!(resp.set_cookie.is_none(), "{path}");
+        }
+        // Unknown paths still 404 on preflight: no surface mapping.
+        assert!(!is_known_path("/v1/auth/magic-link"));
+        let resp = h.call_full("OPTIONS", "/v1/auth/magic-link", None, None, Some(ORIGIN));
+        assert_eq!(resp.status, 404);
+        let resp = h.call_full("OPTIONS", "/nope", None, None, Some(ORIGIN));
+        assert_eq!(resp.status, 404);
+    }
+
+    #[test]
+    fn test_connection_accepts_candidate_envelope_without_stored_vault() {
+        // Test-before-save: an authenticated caller can dial a candidate
+        // config the server has never stored, under the same budget, lease
+        // and dial guards, without creating a vault row.
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let candidate = serde_json::json!({
+            "provider": {
+                "host": "news.example.com", "port": 563, "tls": true,
+                "username": "synthetic-user", "password": "synthetic-pass",
+                "max_connections": 4
+            },
+            "indexer": null
+        });
+        let resp = h.call_full(
+            "POST",
+            "/v1/vault/test-connection",
+            Some(candidate.to_string()),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.body, r#"{"ok":true}"#);
+        assert_eq!(
+            h.dialer.seen.borrow().as_slice(),
+            [vec!["93.184.216.34".parse::<IpAddr>().unwrap()]]
+        );
+        assert!(
+            h.store.vaults.borrow().is_empty(),
+            "candidate test must not persist a vault row"
+        );
+    }
+
+    #[test]
+    fn test_connection_rejects_unparsable_body_closed() {
+        // A non-empty body that is not the save envelope fails closed
+        // instead of silently testing something else.
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let resp = h.call_full(
+            "POST",
+            "/v1/vault/test-connection",
+            Some(r#"{"provider": {"host": 7}}"#.to_string()),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 400);
+        assert!(h.dialer.seen.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_connection_candidate_with_forbidden_host_fails_boolean() {
+        // A candidate pointing at a forbidden address collapses to the
+        // same boolean as a bad stored vault (never a banner or verdict).
+        let mut h = harness();
+        h.dns.map.insert(
+            "blocked.example.com".to_string(),
+            vec!["10.0.0.5".parse().unwrap()],
+        );
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let candidate = serde_json::json!({
+            "provider": {
+                "host": "blocked.example.com", "port": 119, "tls": false,
+                "allow_insecure_plaintext": true,
+                "username": "synthetic-user", "password": "synthetic-pass",
+                "max_connections": 4
+            },
+            "indexer": null
+        });
+        let resp = h.call_full(
+            "POST",
+            "/v1/vault/test-connection",
+            Some(candidate.to_string()),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.body, r#"{"ok":false}"#);
+        assert!(h.dialer.seen.borrow().is_empty());
+    }
+
+    #[test]
+    fn api_web_contract_fixture_routes_are_served() {
+        // The canonical web/Worker contract fixture: every route the web
+        // client may call must be served (never 404), with or without a
+        // session. Unauthenticated authed routes answer 401/400, unknown
+        // challenges 401 — all non-404 by construction.
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/api-web-contract.json"))
+                .expect("contract fixture parses");
+        let routes = fixture["routes"].as_array().expect("routes array");
+        assert!(!routes.is_empty());
+        let h = harness();
+        for route in routes {
+            let method = route["method"].as_str().expect("method");
+            let path = route["path"].as_str().expect("path");
+            assert!(is_known_path(path), "{method} {path}");
+            let body = route.get("wire").map(|v| v.to_string());
+            let resp = h.call_full(method, path, body, None, Some(ORIGIN));
+            assert_ne!(resp.status, 404, "{method} {path}");
+        }
     }
 }

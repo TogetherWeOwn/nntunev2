@@ -47,8 +47,9 @@ SESSION_TTL_SECS = "86400"
 #                                 during a rotation window, deleted at its end.
 #                                 Honored only when SESSION_SECRET_ROTATION=1
 #                                 is also set (the recorded rotation); a staged
-#                                 previous without it, or the flag without a
-#                                 staged previous, refuses to start (fail closed).
+#                                 previous without it refuses to start (fail
+#                                 closed), while the flag alone is single-secret
+#                                 steady state (safe teardown order).
 #                                 See docs/security/session-secret-rotation.md —
 #                                 never two live minting secrets.
 #   SESSION_SECRET_ROTATION         "1" only for the deploy(s) covering a

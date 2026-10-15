@@ -64,20 +64,16 @@ fn config_from_env(env: &Env) -> Option<Config> {
     };
     // Rotation window ("recorded" per the runbook): the previous secret is
     // honored only when the operator arms the rotation AND stages the
-    // previous value. A staged previous without the flag (stray secret), or
-    // an armed flag with nothing staged, fails closed at startup.
+    // previous value. A staged previous without the flag (stray secret)
+    // fails closed at startup; an armed flag with nothing staged is plain
+    // single-secret steady state, so ending a rotation (delete the
+    // previous, then clear the flag) never takes a deploy down. The matrix
+    // lives in `staged_previous_secret`, natively unit-tested below.
     let rotation_armed = truthy("SESSION_SECRET_ROTATION");
     let previous_raw = env_string(env, "SESSION_SECRET_PREVIOUS_BASE64");
-    let session_previous_secret = match (previous_raw, rotation_armed) {
-        (None, false) => None,
-        (Some(raw), true) => {
-            let bytes = crate::b64::decode(&raw).ok()?;
-            if bytes.len() < crate::session::MIN_SECRET_LEN {
-                return None;
-            }
-            Some(bytes)
-        }
-        _ => return None,
+    let session_previous_secret = match staged_previous_secret(previous_raw, rotation_armed) {
+        Ok(previous) => previous,
+        Err(()) => return None,
     };
     Config::new(
         &rp_id,
@@ -91,6 +87,46 @@ fn config_from_env(env: &Env) -> Option<Config> {
         session_previous_secret,
     )
     .ok()
+}
+
+/// Pure rotation-matrix decision: the staged `SESSION_SECRET_PREVIOUS_BASE64`
+/// value plus the `SESSION_SECRET_ROTATION` flag to the verify-only previous
+/// secret (or the fail-closed refusal).
+///
+/// - `(None, _)` — nothing staged: single-secret steady state, flag or not.
+///   Clearing the flag after deleting the previous is therefore safe in any
+///   deploy order; it can never 500 the Worker.
+/// - `(Some(_), false)` — previous staged outside a recorded rotation:
+///   unexpected second secret, refuse to start (fail closed).
+/// - `(Some(raw), true)` — recorded window: strict unpadded-base64url decode
+///   plus the 32-byte minimum, else refuse to start (fail closed).
+fn staged_previous_secret(
+    previous_raw: Option<String>,
+    rotation_armed: bool,
+) -> Result<Option<Vec<u8>>, ()> {
+    match (previous_raw, rotation_armed) {
+        (None, _) => Ok(None),
+        (Some(_), false) => Err(()),
+        (Some(raw), true) => {
+            let bytes = crate::b64::decode(&raw).map_err(|_| ())?;
+            if bytes.len() < crate::session::MIN_SECRET_LEN {
+                return Err(());
+            }
+            Ok(Some(bytes))
+        }
+    }
+}
+
+/// Exact-origin CORS allow-list: the request `Origin` is echoed if and only
+/// if it equals the configured origin. Never a reflection, never `*` (the
+/// API answers credentialed requests, so a wildcard would be both invalid
+/// and unsafe). Mutations additionally require the same exact match inside
+/// the handlers' CSRF pin.
+fn allowed_cors_origin<'a>(req_origin: Option<&'a str>, cfg_origin: &str) -> Option<&'a str> {
+    match req_origin {
+        Some(origin) if origin == cfg_origin => Some(origin),
+        _ => None,
+    }
 }
 
 // --- Postgres over Hyperdrive ------------------------------------------------------------
@@ -875,13 +911,34 @@ impl Mailer for WebhookMailer {
 
 // --- Fetch dispatch ------------------------------------------------------------------------------------
 
-fn render(response: &handlers::Response) -> WorkerResult<Response> {
+fn render(response: &handlers::Response, cors_origin: Option<&str>) -> WorkerResult<Response> {
     let mut headers = Headers::new();
     headers.append("content-type", "application/json; charset=utf-8")?;
     headers.append("cache-control", "no-store")?;
     headers.append("x-content-type-options", "nosniff")?;
     if let Some(cookie) = &response.set_cookie {
         headers.append("set-cookie", cookie)?;
+    }
+    // Credentialed CORS for the configured origin only (see
+    // `allowed_cors_origin`): same-origin calls need no headers, and any
+    // other origin gets none, so cross-origin JSON posts die at preflight.
+    // A 204 here is always the known-path OPTIONS preflight, which additionally
+    // needs the method/header grant.
+    if let Some(origin) = cors_origin {
+        headers.append("access-control-allow-origin", origin)?;
+        headers.append("vary", "origin")?;
+        headers.append("access-control-allow-credentials", "true")?;
+        if response.status == 204 {
+            headers.append(
+                "access-control-allow-methods",
+                "GET, POST, PUT, DELETE, OPTIONS",
+            )?;
+            headers.append(
+                "access-control-allow-headers",
+                "content-type, authorization",
+            )?;
+            headers.append("access-control-max-age", "86400")?;
+        }
     }
     Ok(
         Response::from_body(ResponseBody::Body(response.body.clone().into_bytes()))?
@@ -891,11 +948,14 @@ fn render(response: &handlers::Response) -> WorkerResult<Response> {
 }
 
 fn internal_render() -> WorkerResult<Response> {
-    render(&handlers::Response {
-        status: 500,
-        body: r#"{"error":"internal error"}"#.to_string(),
-        set_cookie: None,
-    })
+    render(
+        &handlers::Response {
+            status: 500,
+            body: r#"{"error":"internal error"}"#.to_string(),
+            set_cookie: None,
+        },
+        None,
+    )
 }
 
 /// Worker `fetch` entry: adapts the runtime request into the handlers'
@@ -947,6 +1007,13 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         .entries()
         .map(|(k, v)| (k.to_lowercase(), v))
         .collect();
+    // Exact match only: the configured origin is the one frontend origin
+    // this Worker trusts with credentialed cross-origin calls.
+    let cors_origin = allowed_cors_origin(
+        headers_map.get("origin").map(String::as_str),
+        &config.origin,
+    )
+    .map(str::to_string);
     let request = handlers::Request {
         method: req.method().to_string(),
         path: req.path(),
@@ -969,5 +1036,84 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             .cloned()
             .unwrap_or_else(|| "unknown".to_string()),
     };
-    render(&handlers::handle(&ctx, &request).await)
+    render(
+        &handlers::handle(&ctx, &request).await,
+        cors_origin.as_deref(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn previous_43() -> String {
+        // 32 bytes as unpadded base64url (43 chars), like the template.
+        crate::b64::encode(&[7u8; 32])
+    }
+
+    #[test]
+    fn rotation_matrix_without_staged_previous_is_steady_state() {
+        // Ending a rotation (previous deleted, flag removal racing the
+        // deploy) must never fail startup.
+        assert_eq!(staged_previous_secret(None, false), Ok(None));
+        assert_eq!(staged_previous_secret(None, true), Ok(None));
+    }
+
+    #[test]
+    fn rotation_matrix_stray_previous_fails_closed() {
+        // A previous secret outside a recorded rotation is an unexpected
+        // second secret: refuse to start rather than widen signing scope.
+        assert_eq!(staged_previous_secret(Some(previous_43()), false), Err(()));
+    }
+
+    #[test]
+    fn rotation_matrix_recorded_window_accepts_strict_previous() {
+        let previous = staged_previous_secret(Some(previous_43()), true);
+        assert_eq!(previous, Ok(Some(vec![7u8; 32])));
+    }
+
+    #[test]
+    fn rotation_matrix_recorded_window_rejects_bad_previous() {
+        // Padded std-base64 is rejected like every other secret codec.
+        assert_eq!(
+            staged_previous_secret(
+                Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
+                true
+            ),
+            Err(())
+        );
+        // Short secrets can neither mint nor verify.
+        assert_eq!(
+            staged_previous_secret(Some(crate::b64::encode(&[7u8; 16])), true),
+            Err(())
+        );
+        assert_eq!(staged_previous_secret(Some(String::new()), true), Err(()));
+    }
+
+    #[test]
+    fn cors_allow_list_is_exact_match_only() {
+        let cfg = "https://app.example.com";
+        assert_eq!(
+            allowed_cors_origin(Some("https://app.example.com"), cfg),
+            Some("https://app.example.com")
+        );
+        assert_eq!(allowed_cors_origin(None, cfg), None);
+        assert_eq!(
+            allowed_cors_origin(Some("https://evil.example.com"), cfg),
+            None
+        );
+        // Trailing slash, case and scheme differences are different origins.
+        assert_eq!(
+            allowed_cors_origin(Some("https://app.example.com/"), cfg),
+            None
+        );
+        assert_eq!(
+            allowed_cors_origin(Some("HTTPS://APP.EXAMPLE.COM"), cfg),
+            None
+        );
+        assert_eq!(
+            allowed_cors_origin(Some("http://app.example.com"), cfg),
+            None
+        );
+    }
 }

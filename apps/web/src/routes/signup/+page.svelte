@@ -4,41 +4,85 @@
 	import {
 		serializePublicKeyCredential,
 		toCreationOptions,
-		type RegistrationOptionsJSON
+		toRegistrationOptions
 	} from '#lib/webauthn.js';
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
 
+	interface RegisterStartResponse {
+		challenge: string;
+		user_id: string;
+		rp_id: string;
+	}
+
 	let email = $state('');
-	let status = $state<'idle' | 'working' | 'created' | 'unsupported' | 'error'>('idle');
+	let magicCode = $state('');
+	let inviteCode = $state('');
+	let pending: RegisterStartResponse | null = $state(null);
+	let status = $state<
+		'idle' | 'working' | 'code-sent' | 'finishing' | 'created' | 'unsupported' | 'error'
+	>('idle');
 
 	const passkeysSupported =
 		typeof window !== 'undefined' &&
 		typeof window.PublicKeyCredential !== 'undefined';
 
-	async function createAccount(event: SubmitEvent) {
+	async function startAccount(event: SubmitEvent) {
 		event.preventDefault();
-		if (status === 'working' || email.trim().length === 0) return;
+		if (status === 'working' || status === 'finishing' || email.trim().length === 0) return;
 		if (!passkeysSupported) {
 			status = 'unsupported';
 			return;
 		}
 		status = 'working';
 		try {
-			const options = await client.post<RegistrationOptionsJSON>(
-				'/v1/auth/passkey/register/options',
+			// The API answers the same shape for every email (never an
+			// existence oracle) and mails an inbox-proof code when the
+			// address can still enroll.
+			pending = await client.post<RegisterStartResponse>(
+				'/v1/auth/passkey/register/start',
 				{ email: email.trim() }
 			);
+			status = 'code-sent';
+		} catch {
+			// Generic: account creation never says which step failed.
+			status = 'error';
+		}
+	}
+
+	async function finishAccount(event: SubmitEvent) {
+		event.preventDefault();
+		if (pending === null || status === 'finishing' || magicCode.trim().length === 0) return;
+		status = 'finishing';
+		try {
+			// The server returns only {challenge, user_id, rp_id}; the full
+			// creation options are assembled client-side (see
+			// toRegistrationOptions).
 			const credential = await navigator.credentials.create({
-				publicKey: toCreationOptions(options)
+				publicKey: toCreationOptions(
+					toRegistrationOptions(pending.challenge, pending.user_id, pending.rp_id, email.trim())
+				)
 			});
 			if (!(credential instanceof PublicKeyCredential)) {
 				throw new Error('no public-key credential');
 			}
-			await client.post(
-				'/v1/auth/passkey/register/verify',
-				serializePublicKeyCredential(credential)
-			);
+			const serialized = serializePublicKeyCredential(credential);
+			const response = serialized.response as Record<string, unknown>;
+			const attestationObject = response.attestationObject;
+			const clientDataJSON = response.clientDataJSON;
+			if (typeof attestationObject !== 'string' || typeof clientDataJSON !== 'string') {
+				throw new Error('credential missing attestation fields');
+			}
+			// Exact finish shape (the API rejects unknown fields): the
+			// emailed code proves inbox control before the key enrolls.
+			await client.post('/v1/auth/passkey/register/finish', {
+				challenge: pending.challenge,
+				credential_id: serialized.id,
+				attestation_object: attestationObject,
+				client_data_json: clientDataJSON,
+				magic_token: magicCode.trim(),
+				...(inviteCode.trim().length > 0 ? { invite_code: inviteCode.trim() } : {})
+			});
 			status = 'created';
 			window.location.href = '/onboarding/provider';
 		} catch {
@@ -59,22 +103,55 @@
 		Create your account with a passkey — no password to phish or leak. Then connect your own
 		Usenet provider in the next step.
 	</p>
-	<form onsubmit={createAccount}>
-		<label>
-			Email
-			<input
-				type="email"
-				name="email"
-				required
-				autocomplete="email"
-				bind:value={email}
-				disabled={status === 'working'}
-			/>
-		</label>
-		<button class="nt-button" type="submit" disabled={status === 'working'}>
-			{status === 'working' ? 'Creating…' : 'Create account with passkey'}
-		</button>
-	</form>
+	{#if status === 'code-sent' || status === 'finishing' || status === 'created'}
+		<form onsubmit={finishAccount}>
+			<p role="status">
+				We emailed a code to {email.trim()} — enter it to prove the address is yours,
+				then touch your security key when asked.
+			</p>
+			<label>
+				Email code
+				<input
+					type="text"
+					name="magic_code"
+					required
+					autocomplete="one-time-code"
+					bind:value={magicCode}
+					disabled={status === 'finishing'}
+				/>
+			</label>
+			<label>
+				Invite code (only if you were given one)
+				<input
+					type="text"
+					name="invite_code"
+					autocomplete="off"
+					bind:value={inviteCode}
+					disabled={status === 'finishing'}
+				/>
+			</label>
+			<button class="nt-button" type="submit" disabled={status === 'finishing'}>
+				{status === 'finishing' ? 'Creating…' : 'Finish creating account'}
+			</button>
+		</form>
+	{:else}
+		<form onsubmit={startAccount}>
+			<label>
+				Email
+				<input
+					type="email"
+					name="email"
+					required
+					autocomplete="email"
+					bind:value={email}
+					disabled={status === 'working'}
+				/>
+			</label>
+			<button class="nt-button" type="submit" disabled={status === 'working'}>
+				{status === 'working' ? 'Creating…' : 'Create account with passkey'}
+			</button>
+		</form>
+	{/if}
 	{#if status === 'unsupported'}
 		<p role="status">
 			This browser does not support passkeys. <a href="/login">Sign in with an email link</a>

@@ -50,6 +50,32 @@ export interface ProviderTestInput {
 	indexer?: IndexerConfigInput;
 }
 
+/**
+ * Save/test envelope the API Worker expects (`PUT /v1/vault`,
+ * `POST /v1/vault/test-connection`): the flat provider fields nested under
+ * `provider`, exactly as `workers/api` parses `VaultPutBody`. Field names
+ * are pinned by `workers/api/tests/fixtures/api-web-contract.json`, which
+ * both the vitest client suite and the Rust handlers suite consume — change
+ * both sides in the same PR, never one alone.
+ */
+export interface VaultSaveBody {
+	provider: {
+		host: string;
+		port: number;
+		tls: boolean;
+		allow_insecure_plaintext: boolean;
+		username: string;
+		password: string;
+		max_connections: number;
+	};
+	indexer?: IndexerConfigInput;
+}
+
+export function toVaultSaveBody(input: ProviderTestInput): VaultSaveBody {
+	const { indexer, ...provider } = input;
+	return indexer === undefined ? { provider } : { provider, indexer };
+}
+
 export function toProviderTestInput(
 	provider: ProviderForm,
 	indexerUrl: string,
@@ -106,12 +132,20 @@ export class ApiClient {
 		});
 	}
 
+	async put<T>(path: string, body: unknown): Promise<T> {
+		return this.request<T>(path, {
+			method: 'PUT',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+	}
+
 	/**
 	 * Request an email magic link. Always resolves the same way for unknown
 	 * and known addresses (the API never reveals which emails exist).
 	 */
 	async requestMagicLink(email: string): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>('/v1/auth/magic-link', { email });
+		return this.post<MagicLinkResult>('/v1/auth/magic/start', { email });
 	}
 
 	/**
@@ -120,7 +154,7 @@ export class ApiClient {
 	 * secrets never come back in the response.
 	 */
 	async testProviderConnection(input: ProviderTestInput): Promise<ProviderTestResult> {
-		return this.post<ProviderTestResult>('/v1/vault/test', input);
+		return this.post<ProviderTestResult>('/v1/vault/test-connection', toVaultSaveBody(input));
 	}
 
 	/**
@@ -129,7 +163,7 @@ export class ApiClient {
 	 * redacted summaries, never secret material.
 	 */
 	async saveProviderConfig(input: ProviderTestInput): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>('/v1/vault', input);
+		return this.put<MagicLinkResult>('/v1/vault', toVaultSaveBody(input));
 	}
 
 	private async request<T>(path: string, init: RequestInit): Promise<T> {
