@@ -359,17 +359,42 @@ fn random_id(bytes: usize) -> String {
     b64url_encode(&buf)
 }
 
-/// Deterministic stand-in credential id for login/start allow-lists of
-/// unknown or credential-less accounts: stable per email (keyed by the
-/// session secret), shaped like a real 18-byte credential id.
-fn fake_cred_id(cfg: &Config, email: &str) -> String {
+/// Deterministic stand-in ids for auth-start response shapes: stable
+/// per email across calls (keyed by the session secret), so probing the
+/// same address twice cannot distinguish stand-ins from real ids.
+fn fake_id(cfg: &Config, label: &str, email: &str, index: u32, bytes: usize) -> String {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(&cfg.session_secret);
-    hasher.update(b"|fake-cred|");
+    hasher.update(b"|");
+    hasher.update(label.as_bytes());
+    hasher.update(b"|");
     hasher.update(email.as_bytes());
-    b64url_encode(&hasher.finalize()[..18])
+    hasher.update(b"|");
+    hasher.update(index.to_be_bytes());
+    b64url_encode(&hasher.finalize()[..bytes])
 }
+
+/// Stand-in credential id, shaped like a real 18-byte credential id.
+fn fake_cred_id(cfg: &Config, email: &str, index: u32) -> String {
+    fake_id(cfg, "fake-cred", email, index, 18)
+}
+
+/// Stand-in user id for register/start taken-email shapes, shaped like
+/// the real 16-byte random user ids and stable per email.
+fn fake_user_id(cfg: &Config, email: &str) -> String {
+    fake_id(cfg, "fake-user", email, 0, 16)
+}
+
+/// login/start allow-lists are padded with stand-in ids to this length,
+/// so list length does not reveal how many passkeys an account holds
+/// (accounts above the pad length return their real list).
+const ALLOW_LIST_PADDED_LEN: usize = 4;
+
+/// Register/login challenge inserts allowed per account per hour,
+/// counted in the shared audit store; excess starts return the usual
+/// shape with an unstored (unredeemable) challenge.
+const AUTH_STARTS_PER_HOUR: u64 = 10;
 
 fn normalize_email(raw: &str) -> Option<String> {
     let email = raw.trim().to_lowercase();
@@ -588,12 +613,10 @@ where
             match ctx.store.credentials_for_user(&user.id).await {
                 Ok(creds) if creds.is_empty() => user,
                 Ok(_) => {
-                    let fake_user = random_id(16);
-                    let _ = ctx
-                        .store
-                        .insert_challenge(&challenge, None, PURPOSE_REGISTER)
-                        .await;
-                    return shape(fake_user);
+                    // Unstored challenge + deterministic stand-in user id:
+                    // same shape on every call, no row growth, finish
+                    // fails generically at lookup.
+                    return shape(fake_user_id(ctx.cfg, &email));
                 }
                 Err(_) => return internal(),
             }
@@ -608,17 +631,26 @@ where
                 Ok(()) => user,
                 // Unique-email race: another request just claimed the row,
                 // indistinguishable from a taken account by design.
-                Err(_) => {
-                    let fake_user = random_id(16);
-                    let _ = ctx
-                        .store
-                        .insert_challenge(&challenge, None, PURPOSE_REGISTER)
-                        .await;
-                    return shape(fake_user);
-                }
+                Err(_) => return shape(fake_user_id(ctx.cfg, &email)),
             }
         }
     };
+    // Shared-store start budget: past it the response keeps the same
+    // shape but the challenge is never stored, so finish fails
+    // generically and auth_challenges stops growing for this account.
+    let starts = ctx
+        .store
+        .audit_count_since(
+            &user.id,
+            "auth.register_start",
+            ctx.now.saturating_sub(3600),
+        )
+        .await
+        .unwrap_or(u64::MAX);
+    ctx.audit(&user.id, "auth.register_start", true).await;
+    if starts >= AUTH_STARTS_PER_HOUR {
+        return shape(user.id.clone());
+    }
     if ctx
         .store
         .insert_challenge(&challenge, Some(&user.id), PURPOSE_REGISTER)
@@ -794,15 +826,28 @@ where
                 Ok(creds) => creds,
                 Err(_) => return internal(),
             };
-            let allow = if creds.is_empty() {
-                vec![fake_cred_id(ctx.cfg, &email)]
-            } else {
-                creds.iter().map(|c| c.cred_id_b64url.clone()).collect()
-            };
-            (Some(user.id.as_str()), allow)
+            (
+                Some(user.id.as_str()),
+                creds
+                    .iter()
+                    .map(|c| c.cred_id_b64url.clone())
+                    .collect::<Vec<_>>(),
+            )
         }
-        None => (None, vec![fake_cred_id(ctx.cfg, &email)]),
+        None => (None, Vec::new()),
     };
+    // Pad with deterministic stand-ins to a fixed length so the list
+    // size does not reveal whether/how many passkeys the account holds.
+    // Authenticators ignore unknown ids, so padding is login-safe.
+    let mut allow = allow;
+    let mut pad_index = 0u32;
+    while allow.len() < ALLOW_LIST_PADDED_LEN {
+        let fake = fake_cred_id(ctx.cfg, &email, pad_index);
+        pad_index += 1;
+        if !allow.contains(&fake) {
+            allow.push(fake);
+        }
+    }
     if ctx
         .store
         .insert_challenge(&challenge, user_id, PURPOSE_LOGIN)
@@ -2279,8 +2324,15 @@ mod tests {
         }))
         .unwrap();
         // register/start: same 200 shape for taken and fresh emails,
-        // and no mail is sent for the taken one.
-        for email in ["known@example.com", "fresh@example.com"] {
+        // no mail for the taken one, and the taken email's stand-in
+        // user_id is stable across calls (a fresh random per call would
+        // itself reveal that the account is taken).
+        let mut taken_user_ids = Vec::new();
+        for email in [
+            "known@example.com",
+            "fresh@example.com",
+            "known@example.com",
+        ] {
             let resp = h.call(
                 "POST",
                 "/v1/auth/passkey/register/start",
@@ -2289,18 +2341,41 @@ mod tests {
             assert_eq!(resp.status, 200, "{email}: {}", resp.body);
             let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
             assert!(body["challenge"].is_string());
-            assert!(body["user_id"].is_string());
+            if email == "known@example.com" {
+                taken_user_ids.push(body["user_id"].clone());
+            } else {
+                assert!(body["user_id"].is_string());
+            }
         }
+        assert_eq!(taken_user_ids[0], taken_user_ids[1]);
         assert_eq!(h.mailer.sent.borrow().len(), 1);
         assert_eq!(h.mailer.sent.borrow()[0].0, "fresh@example.com");
-        // login/start: unknown email still returns a one-entry allow list.
+        // login/start: allow lists are padded to one fixed length for
+        // unknown and one-passkey accounts alike.
+        for email in ["ghost@example.com", "known@example.com"] {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/passkey/login/start",
+                serde_json::json!({"email": email}),
+            );
+            assert_eq!(resp.status, 200);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(
+                body["allow_credentials"].as_array().unwrap().len(),
+                ALLOW_LIST_PADDED_LEN,
+                "{email}"
+            );
+        }
+        // The real credential is still in its owner's list.
         let resp = h.call(
             "POST",
             "/v1/auth/passkey/login/start",
-            serde_json::json!({"email": "ghost@example.com"}),
+            serde_json::json!({"email": "known@example.com"}),
         );
-        assert_eq!(resp.status, 200);
         let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
-        assert_eq!(body["allow_credentials"].as_array().unwrap().len(), 1);
+        assert!(body["allow_credentials"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(b64url_encode(b"known-cred"))));
     }
 }
