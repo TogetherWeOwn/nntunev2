@@ -66,7 +66,7 @@ fn json_error(message: &str, status: u16) -> Result<Response> {
 }
 
 fn headers_json() -> Result<worker::Headers> {
-    let mut headers = worker::Headers::new();
+    let headers = worker::Headers::new();
     headers.append("content-type", "application/json; charset=utf-8")?;
     Ok(headers)
 }
@@ -80,7 +80,7 @@ fn service_unavailable(message: &str) -> Result<Response> {
         error: message.to_string(),
     })
     .unwrap_or_else(|_| r#"{"error":"internal"}"#.to_string());
-    let mut headers = headers_json().unwrap_or_default();
+    let headers = headers_json().unwrap_or_default();
     headers.append("retry-after", "5")?;
     Response::from_body(worker::ResponseBody::Body(body.into_bytes()))
         .map(|r| r.with_status(503).with_headers(headers))
@@ -244,7 +244,7 @@ fn queued_envelope(
         }
     }
     if !queued {
-        let mut headers = headers_json().unwrap_or_default();
+        let headers = headers_json().unwrap_or_default();
         headers.append("retry-after", "5")?;
         return Response::from_json(&body).map(|r| r.with_status(503).with_headers(headers));
     }
