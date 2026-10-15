@@ -47,11 +47,15 @@ environment-qualified art bucket, not an invented unsuffixed bucket.
 
 1. **Accept:** the API inserts an idempotent `ingest_jobs` row and increments
    the day's accepted-job count. No track id or media hash is available yet.
-2. **Ingest `write`, after `match`:** commit the resolved `tracks`,
-   `library_tracks` and per-user `track_sources` in one transaction. The source
-   contains the parsed, ordered segment list (or a durable recoverable NZB
-   manifest), not just an expiring download URL. An unmatched track gets a local
-   id with NULL MBID. Ingest does not publish audio hashes or cache grants.
+2. **Ingest `write`, after `match`:** consume the server-produced, durably
+   checkpointed accepted audio manifest (ADR 0002 rule 6); commit the resolved
+   `tracks`, `library_tracks` and per-user `track_sources` in one transaction.
+   Copy its per-audio file/track selection and ordered segments (or durable
+   recoverable NZB), not just an expiring download URL. Unmatched, conflicting or
+   unverifiable occurrences get local ids with NULL canonical MBIDs. Tenant tags
+   and positions cannot populate shared catalog rows; only mirror-verified
+   occurrences and MusicBrainz metadata can. Ingest publishes no audio hashes
+   or cache grants.
 3. **Stream publication:** fetch through the requesting user's provider,
    verify the complete object's hash, then publish `cache_objects`,
    `track_media` and `user_cache_grants` for that user. Initialize both

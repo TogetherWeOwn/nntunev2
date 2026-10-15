@@ -3,7 +3,8 @@
 - **Status:** Accepted design; implementation and independent review gates remain.
 - **Date:** 2026-10-13
 - **Revised:** 2026-10-15 — preserve merged auth; pin catalog identity, atomic
-  stream accounting, relational price mappings and bounded renewal settlement.
+  stream accounting, relational price mappings and bounded renewal settlement;
+  define the audio-manifest producer and mirror-only shared-catalog authority.
 - **Baseline inspected:** main `29140710bb5d8e0d57f1701ca1e6c3e854e9104f`.
   Auth, ingest, core, scaffold and MB work are merged, not in-flight assumptions.
 
@@ -369,39 +370,86 @@ particular release/medium ([track definition](https://musicbrainz.org/doc/Track)
 
 The currently merged MB mirror has only one nullable `release_mbid` and nullable
 `track_no` on `mb_recording`; it does not represent per-release occurrences or
-medium positions. A NULL mirror `track_no` is unknown, never an implicit 1. Until
-the mirror follow-up supplies a per-release tracklist with `(release_mbid,
-medium_no, track_no, recording_mbid)` and an MB worker read projection, do not
-match imported files to global track occurrences using that incomplete mirror.
-Keep them under a local release/track key derived from the immutable manifest,
-retaining a known release ID as `release_mbid_hint`; match globally only when the
-mirror or accepted manifest supplies the exact occurrence position.
+medium positions. A NULL mirror `track_no` is unknown, never an implicit 1.
+**Only the MB worker's trusted mirror projection may authorize a global release
+and track occurrence.** It must supply `(release_mbid, medium_no, track_no,
+recording_mbid)` and the associated MB artist/release/track metadata. File tags,
+NZBs, indexer results and manifest claims are untrusted hints, never authority to
+create a shared position. `match` must resolve an unambiguous occurrence in that
+projection and verify any claimed recording MBID against it; a release MBID alone
+is insufficient. Shared artist names, release titles and track titles/durations
+come from that MusicBrainz projection, **never tenant file tags**. Unknown MB
+metadata stays NULL where allowed; it is not filled from tenant metadata. This
+preserves MusicBrainz's distinction between a release track and its recording.
+Until both the manifest producer below and the mirror occurrence projection ship,
+all normalized catalog writes are local; the existing flat recording array is
+not an occurrence match. Keep any known release ID only as `release_mbid_hint`.
+
+**Accepted audio manifest (target contract, not present on inspected main).** Add
+a tag/fingerprint subphase at the start of Workflow `match` / `JobState::Matching`,
+after verification/repair but **before occurrence matching**. This producer writes
+`accepted_audio_manifest_v1` into an extended durable `JobCheckpoint` before any
+MB lookup. No existing `tag` step or `Tagging` state is implied. "Accepted" means
+structurally validated and frozen, not trusted catalog metadata. It contains the
+authenticated `job_id`/`user_id`, a version, and an ordered entry per selected audio
+file. Each entry carries:
+
+- `audio_ordinal`: unique, contiguous, 1-based over **selected audio files only**;
+  PAR2, NFO and other non-audio files never consume an ordinal.
+- `source_selector`: exact NZB file/ordered segments, plus archive-member/audio
+  selection where applicable, sufficient to reconstruct that audio file later.
+- Separate job-local `artist_group_ref` and `release_group_ref`, so one artist can
+  span several releases. Each release group refers to one artist group in this
+  model. These are catalog grouping references, **not NZB `<group>` newsgroups**.
+- Optional claimed artist/release/recording MBIDs, disc and track numbers, file
+  tags/fingerprint results, and the frozen local position derived below. All
+  claims remain hints even when syntactically valid.
+
+The producer orders audio selections by original NZB file order, then archive
+member path in bytewise order and audio-selection index, assigns ordinals once,
+and freezes grouping and selection with them. Within this job, equal non-NULL
+claimed artist MBIDs define an artist group; equal non-NULL claimed release MBIDs
+within that artist group define a release group. Without those associations, keep
+separate groups per audio entry rather than merge by title/name alone. These rules
+only group local hints; they do not authenticate MBIDs. `match` and `write` consume
+the checkpoint on retry, never regenerate its ordinals/groups from changed tags.
+Before `Writing`, also checkpoint per-entry match classifications and the trusted
+mirror metadata snapshot used; a write retry does not rematch against a changed
+mirror. Retain the checkpoint through job retries/replay; the `write` transaction
+copies the relevant source selection into the lifetime encrypted `track_sources`,
+not merely a checkpoint URL or expiring KV reference.
 
 For artists/releases, CHECK exactly one of `mbid` and `local_key` is non-NULL.
-Matched writes upsert on the partial unique MBID indexes (`ON CONFLICT (mbid)
-WHERE mbid IS NOT NULL`); unmatched writes upsert on `local_key`. The stable local
-key is a versioned length-prefixed tuple `(ingest_job_id, entity_kind,
-manifest_group_first_entry_ordinal)`, derived from the immutable accepted manifest:
-entries share an artist or release only when they share that manifest's explicit
-entity-group reference, and the ordinal is the group's lowest 1-based entry ordinal.
-This makes multi-album manifests deterministic across retries without merging by
-artist/title text. For an unmatched release's tracks use `medium_no=1` and the
-manifest's 1-based file-entry ordinal as `track_no`. Separate unmatched jobs may
-remain distinct until explicitly matched. A release with a known MBID but ambiguous
-track-position association remains local and stores that ID only in
-`release_mbid_hint`; the hint is non-unique, is not a canonical MB join key, and is
-retained for later explicit reconciliation.
+Mirror-verified writes upsert on the partial unique MBID indexes (`ON CONFLICT
+(mbid) WHERE mbid IS NOT NULL`); local writes upsert on `local_key`. The stable
+local key is a versioned length-prefixed tuple `(ingest_job_id, entity_kind,
+manifest_group_first_audio_ordinal)`: use the lowest `audio_ordinal` in that entry's
+artist group for an artist, or release group for a release. This makes multi-album
+retries deterministic without conflating those two groupings. For local tracks,
+use claimed `(disc, track)` only when every entry in that release group has a
+positive, unique pair; otherwise the whole group uses `(1, audio_ordinal)`. Freeze
+that choice in the manifest. These local positions **never authorize a global
+match**. Separate unmatched jobs may remain distinct until explicitly matched.
+A known but ambiguous or contradictory release claim stays only in the local
+release's `release_mbid_hint`; the hint is non-unique, is not a canonical MB join
+key, and is retained for later explicit reconciliation.
 
 The ingest `write` transaction upserts artist, release, then tracks in ascending
 `(medium_no, track_no)` order; every multi-row statement orders its input rows by
 that same key. It uses their **returned local ids**, including on conflicts, for
-membership and per-user sources. Different jobs/users matching the same release
-position converge to one track; `(library_id, track_id)` makes repeated membership
-a no-op. A contradictory non-NULL recording MBID at an existing position is a
-match error for reconciliation, not permission to overwrite shared metadata or
-create a second track. Retry the entire idempotent write transaction on SQLSTATE
-`40P01` or `40001`, with a bounded maximum of three attempts and backoff; after
-exhaustion fail the job for normal retry/dead-letter handling.
+membership and per-user sources. Different jobs/users matching the same verified
+release position converge to one track; `(library_id, track_id)` makes repeated
+membership a no-op. Tenant claims cannot overwrite shared metadata on conflict.
+If a claimed recording MBID contradicts the mirror, or an existing shared row's
+MBID contradicts the trusted occurrence, classify that entry as local: write it
+under its manifest-derived local release/track key with NULL canonical MBIDs and
+retain the release hint. Use trusted MB metadata when available, otherwise that
+user's file tags only on the local rows. Complete the import's membership/source
+writes for that local track; do not abort the import, overwrite the shared row, or
+insert a second global occurrence. Record the conflict for separate reconciliation.
+Retry the entire idempotent write transaction on SQLSTATE `40P01` or `40001`, with a
+bounded maximum of three attempts and backoff; after exhaustion fail the job for
+normal retry/dead-letter handling.
 
 For a user's second import of the same shared track, `track_sources` remains one
 slot per `(user_id, track_id)`. Compare jobs by `(ingest_jobs.accepted_at,
@@ -432,7 +480,19 @@ inputs to prove sorted upserts and bounded retries. Cover the same recording on
 two releases and two positions on one release (distinct tracks), multidisc positions,
 NULL mirror `track_no` remaining unknown/local, unmatched-job retry, deterministic
 artist/release grouping across a multi-album manifest retry, and an ambiguous match
-retaining its `release_mbid_hint` without guessing.
+retaining its `release_mbid_hint` without guessing. Also require:
+
+- Interleaved PAR2/NFO/audio and archive members produce audio-only ordinals;
+  one artist across two release groups preserves those relationships on checkpoint
+  replay. Missing/duplicate local disc/track pairs trigger the frozen whole-group
+  ordinal fallback, while valid multidisc pairs are preserved locally.
+- Without the producer or mirror occurrence projection, no normalized write mints
+  a global release/track, even with plausible manifest MBIDs and positions.
+- Tenant A claims a popular release position with a wrong recording/title/duration;
+  A's conflicting claim stays local and cannot seed shared metadata. Tenant B's
+  correct import still completes with mirror-supplied metadata. An already-existing
+  contradictory shared MBID also yields a local fallback with membership/source
+  intact, not an import failure or shared overwrite.
 
 ### 7. Existing migrations stay at their applied paths
 
@@ -468,13 +528,26 @@ work. Production DB creation/migration remains gated by the ops contract.
   explicit per-file match; ambiguous recording arrays retain NULL MBIDs/source
   manifests rather than guessing associations. Keep legacy data/read support
   until parity is verified; never use create-if-absent as a conversion.
+- **Ingest manifest producer (new alignment work):** the current parser's flat
+  `ParsedNzb.message_ids` and `LibraryWrite.recording_mbids` arrays do not contain
+  the per-file selection, grouping or occurrence data above. Preserve NZB file
+  boundaries and ordered segments through parse/repair; implement the
+  tag/fingerprint producer at the start of `match` / `Matching` before occurrence
+  lookup, persist `accepted_audio_manifest_v1` in `JobCheckpoint`, and extend
+  `JobCheckpoint` and `LibraryWrite` to carry per-entry selections and match
+  classifications into `write` / `Writing`. Do not infer
+  file associations by zipping the two legacy flat arrays. Until this producer
+  ships, every catalog association remains local; existing legacy writes are not
+  evidence that the target manifest or normalized writer already exists.
 - **MusicBrainz mirror (merged):** the current `mb_recording` shape cannot provide
   the per-release medium/track occurrence required by this catalog key. Revise
   ADR 0007 and add a forward-only mirror migration for a tracklist relation keyed
   by `(release_mbid, medium_no, track_no)`, with `recording_mbid` as its reference;
-  expose the projection through `workers/mb`. Until that follow-up ships, matching
-  uses only exact positions already present in the immutable accepted manifest;
-  otherwise retain local catalog ids and `release_mbid_hint` as specified above.
+  expose that relation and authoritative MB artist/release/track metadata through
+  `workers/mb`. Until that projection ships, **all** normalized release/track writes
+  stay local with `release_mbid_hint`, even if the manifest claims exact positions.
+  Manifest positions are not a substitute for the mirror. These are implementation
+  follow-ups, not changes to the merged mirror or pipeline in this docs-only PR.
 - **Stream/Subsonic/billing:** implement the target writers, envelope/pepper
   constraints, grant checks, budgets and lifecycle with their contract tests.
   These changes are not implied by merging this document. Existing in-flight
