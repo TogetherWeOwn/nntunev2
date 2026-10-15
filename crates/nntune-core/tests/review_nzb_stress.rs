@@ -29,7 +29,7 @@ fn build_corpus(files: usize, segments_per_file: usize) -> Vec<u8> {
         for s in 0..segments_per_file {
             let number = s + 1;
             xml.push_str(&format!(
-                "<segment bytes=\"{BYTES_PER_SEGMENT}\" number=\"{number}\">msg-{f}-{s}@stress.local</segment>"
+                "<segment bytes=\"{BYTES_PER_SEGMENT}\" number=\"{number}\">msg-{f}-{s}@stress.example.com</segment>"
             ));
         }
         xml.push_str("</segments></file>");

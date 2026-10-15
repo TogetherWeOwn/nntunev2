@@ -142,7 +142,7 @@ fn bench_nzb_parse(c: &mut Criterion) {
         for s in 0..16 {
             let number = s + 1;
             xml.push_str(&format!(
-                "<segment bytes=\"1048576\" number=\"{number}\">msg-{f}-{s}@bench.local</segment>"
+                "<segment bytes=\"1048576\" number=\"{number}\">msg-{f}-{s}@bench.example.com</segment>"
             ));
         }
         xml.push_str("</segments></file>");
