@@ -85,6 +85,43 @@ Blocked on siblings for the live half: pool-DO wire contract, `nntune-core`
 parse output, synthetic NNTP fixture server + CI E2E against it, checkpoint
 KV reads in `GET /v1/ingest/jobs/:id`, and the repair Container runtime.
 
+## Slice T2 — retry budget + DLQ (this slice)
+
+- Retry budget (`src/retry.rs`): 1 delivery + 4 redeliveries
+  (`jobs::MAX_ATTEMPTS` = 5 = `CONSUMER_MAX_RETRIES` + 1 =
+  `PAYLOAD_RETRY_ATTEMPTS` + 1, enforced by a compile-time assert).
+  Redeliveries back off 5/15/30/60 s (`retry_delay_secs`), spaced across the
+  ~60 s KV read lag instead of hot-looping. The consumer settles **per
+  message** (`decide` / `drive_batch`: ack on success, delayed retry while
+  `jobs::can_retry` allows it), so one poison job ahead of valid ones costs
+  retries, never head-of-line blocking. Permanent failures (unparseable
+  bytes) skip the budget and quarantine at once.
+- DLQ quarantine: on exhaustion the consumer sends one `DlqEntry` to
+  `nntune-ingest-dlq` (`INGEST_DLQ` binding) — the original `QueueMsg` plus
+  machine reason headers `x-ingest-error-code` / `x-ingest-attempts` — then
+  acks the original. The native dead-letter route stays configured as the
+  safety net for messages the handler never settles (panic, timeout), which
+  arrive as raw bodies with no reason envelope.
+- Poison coverage (`tests/retry_dlq.rs`): an always-failing job burns all 5
+  deliveries, lands in the DLQ with reason headers asserted, and never
+  blocks the valid jobs behind it in the same batch.
+
+## Redrive (DLQ back to queue)
+
+1. Read the DLQ (`nntune-ingest-dlq`): each entry is either a `DlqEntry`
+   (explicit quarantine, with `error_code` / `attempts` / `reason`) or a raw
+   `QueueMsg` (native dead-letter fallback).
+2. Fix the cause first (bad bytes, downed dependency) — redrive resets both
+   the attempt and the repair-round budgets, so a still-poison message just
+   burns the fresh budget and quarantines again.
+3. Re-enqueue with `retry::redrive(&entry)` (or `retry::redrive_raw(&msg)`
+   for native bodies): same job id, idempotency key and input, `attempt`
+   reset to 1, back at `Queued`. A redriven job that now succeeds acks like
+   any first delivery.
+4. No paging on DLQ depth in this slice (out of scope): poll the queue depth
+   before redriving in bulk so a systemic cause does not re-poison the queue
+   faster than it drains.
+
 ## Develop
 
 ```sh
