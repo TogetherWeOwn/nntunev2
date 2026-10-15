@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { readSignedInEmail, stashSignedInEmail } from './signed-in-email.js';
+import { clearSignedInEmail, readSignedInEmail, stashSignedInEmail } from './signed-in-email.js';
 
 function stubStorage() {
 	const map = new Map<string, string>();
 	vi.stubGlobal('sessionStorage', {
 		getItem: (key: string) => map.get(key) ?? null,
-		setItem: (key: string, value: string) => void map.set(key, value)
+		setItem: (key: string, value: string) => void map.set(key, value),
+		removeItem: (key: string) => void map.delete(key)
 	});
 	return map;
 }
@@ -26,6 +27,14 @@ describe('signed-in-email', () => {
 		expect(readSignedInEmail()).toBe('grace@example.com');
 	});
 
+	it('clears the label on sign-out', () => {
+		stubStorage();
+		stashSignedInEmail('ada@example.com');
+		expect(readSignedInEmail()).toBe('ada@example.com');
+		clearSignedInEmail();
+		expect(readSignedInEmail()).toBeNull();
+	});
+
 	it('degrades to null without throwing when storage is unavailable', () => {
 		vi.stubGlobal('sessionStorage', {
 			getItem: () => {
@@ -33,9 +42,13 @@ describe('signed-in-email', () => {
 			},
 			setItem: () => {
 				throw new Error('blocked');
+			},
+			removeItem: () => {
+				throw new Error('blocked');
 			}
 		});
 		expect(() => stashSignedInEmail('ada@example.com')).not.toThrow();
 		expect(readSignedInEmail()).toBeNull();
+		expect(() => clearSignedInEmail()).not.toThrow();
 	});
 });

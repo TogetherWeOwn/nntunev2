@@ -25,3 +25,11 @@ export function readSignedInEmail(): string | null {
 		return null;
 	}
 }
+
+export function clearSignedInEmail(): void {
+	try {
+		sessionStorage.removeItem(KEY);
+	} catch {
+		// Display only: a missing store just leaves nothing to clear.
+	}
+}
