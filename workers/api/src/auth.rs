@@ -10,7 +10,6 @@
 //! the challenge lifecycle, origin/RP binding, expiry, single-use, and
 //! credential storage shapes, all enforced and tested here.
 
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -38,7 +37,7 @@ impl std::fmt::Display for AuthError {
 
 fn random_b64url_32() -> String {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("secure randomness unavailable");
     // Shared unpadded-base64url (F-HARD-01): no per-module copies.
     crate::b64::encode(&bytes)
 }
@@ -278,7 +277,7 @@ pub fn consume_invite(
 /// enumeration is infeasible and the throttle below is defense in depth.
 pub fn generate_invite_code() -> String {
     let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("secure randomness unavailable");
     crate::b64::encode(&bytes)
 }
 
