@@ -182,26 +182,53 @@ step_up_proofs        id UUID PK, user_id TEXT NOT NULL FK → users ON DELETE C
                       session_id TEXT NOT NULL, action TEXT NOT NULL
                         ('delete-account'|'cancel-deletion'),
                       method TEXT NOT NULL ('passkey-uv'|'magic-link'),
+                      token_hash TEXT NULL, -- magic-link only: SHA-256 hex of the
+                        -- step-up link token, set at begin; NULL for passkey-uv
+                      challenge_id TEXT NULL, -- passkey-uv only: WebAuthn challenge
+                        -- id issued at begin; NULL for magic-link
+                      CHECK ((method = 'magic-link') = (token_hash IS NOT NULL)),
+                      CHECK ((method = 'passkey-uv') = (challenge_id IS NOT NULL)),
                       issued_at timestamptz NOT NULL,
                       expires_at timestamptz NOT NULL
                         CHECK (expires_at = issued_at + INTERVAL '15 minutes'),
                       verified_at timestamptz NULL, consumed_at timestamptz NULL,
                       attempts SMALLINT NOT NULL DEFAULT 0
-                        CHECK (attempts >= 0),
+                        CHECK (attempts >= 0 AND attempts <= 5),
                       partial UNIQUE (session_id, action)
                         WHERE consumed_at IS NULL
-                      -- Action-bound single-use step-up (ADR 0006): begin creates
-                      -- the row and issues the challenge/link with purpose
-                      -- 'step-up:<action>:<proof_id>'; login links (no purpose)
-                      -- never verify a proof. Complete verifies the
+                      -- Action-bound single-use step-up (ADR 0006): begin runs in
+                      -- one transaction that first retires any prior live row for
+                      -- the same (session_id, action) — UPDATE ... SET
+                      -- consumed_at = now() WHERE session_id = $s AND action = $a
+                      -- AND consumed_at IS NULL (covers expired, abandoned, and
+                      -- method-switch supersedes) — then inserts the new row, so
+                      -- an expired proof never blocks re-begin. begin is
+                      -- rate-limited to 5/hour per (session_id, action) and
+                      -- complete to 10/15min per proof id; attempts caps at 5,
+                      -- then the proof must be re-begun. The consume key is always
+                      -- the proof id returned from begin
+                      -- (WHERE id = $1 AND ... in both ADRs).
+                      -- begin issues the challenge/link with purpose
+                      -- 'step-up:<action>:<proof_id>' and stores its token_hash /
+                      -- challenge_id here; complete requires that exact hash/id
+                      -- (WHERE id = $1 AND token_hash = $t for magic-link, or
+                      -- challenge_id = $c for passkey-uv, plus the existing
+                      -- verified/unconsumed/session/action/expiry predicates) and
+                      -- marks the underlying token used / challenge consumed.
+                      -- Step-up magic links are claimed only at the dedicated
+                      -- step-up complete path, which never creates a session; the
+                      -- ADR 0008 login claim path never verifies a proof. Login
+                      -- links (no bound hash) and login challenges (no bound id)
+                      -- therefore never verify a proof. Complete verifies the
                       -- assertion/claim and sets verified_at (attempts++ per
-                      -- try, rate-limited). DELETE/cancel-deletion consumes
+                      -- try). DELETE/cancel-deletion consumes
                       -- atomically via UPDATE ... SET consumed_at=now()
                       -- WHERE id=$1 AND session_id=$session AND action=$action
                       -- AND verified_at IS NOT NULL AND consumed_at IS NULL
                       -- AND expires_at > now() RETURNING; zero rows rejects.
                       -- Existing magic_link_tokens/auth_challenges/sessions gain
-                      -- NO purpose/action column; the binding lives here.
+                      -- NO purpose/action column; the binding lives here via
+                      -- token_hash/challenge_id.
 delete_operations     id UUID PK, user_id TEXT NOT NULL FK → users ON DELETE RESTRICT,
                       scope TEXT NOT NULL ('account'|'library'|'playlist'),
                       container_id UUID NULL, cursor JSONB NOT NULL DEFAULT '{}',
@@ -470,13 +497,19 @@ container and reject its marker. This includes ingest `write`, membership and
 playlist edits/restores, stream publication of `track_media`/grants (including
 play-event/outbox writes), and art descriptor/pointer publication. The delete
 executor's own billing reconcile (account gate below) and its cursor/state
-writes are exempt from this fence, as are the auth/session writers needed to
-cancel during grace and the cancel call itself: new `sessions` login rows,
+writes are exempt from this fence. The auth/session writers needed to
+cancel during grace — new `sessions` login rows,
 `magic_link_tokens` issue/consume, `auth_challenges` challenge/assertion,
 `webauthn_credentials.sign_count` updates, the `step_up_proofs` begin/verify/
 consume writes, `audit_log` writes, session rotation, and
 `POST /v1/account/step-up/begin`, `POST /v1/account/step-up/complete`, and
-`POST /v1/account/cancel-deletion`;
+`POST /v1/account/cancel-deletion` — are exempt ONLY while the account
+operation is in `state = 'scheduled'` (the only state where cancel-deletion
+can win the compare-and-set). Once the operation is `running` (erasure
+started) those writers are fenced like any other: they take `FOR SHARE` on
+the users row, see the started operation, and fail closed with `409
+account_deleting`; no new login, step-up, or real-user audit row can be
+created after that point.
 all other billing/subscription writers and every data writer
 remain fenced once `deleting_at` is set. A fenced
 writer fails closed with native `409 Conflict` carrying
@@ -548,7 +581,10 @@ trial single-use (`trial_started_at` survives as the tombstone copy) and the
 rule 4 ban on freeing a slot while remote billing can still collect. Then remove ingest
 jobs and empty library/playlist containers, providers/indexers/vaults, Subsonic
 credentials, sessions, magic-link/WebAuthn rows and other user-FK children;
-then `DELETE FROM auth_challenges WHERE user_id=$1` (via the additive index)
+then, in the same transaction as the final `DELETE FROM users` after taking
+`SELECT ... FOR UPDATE` on the users row (auth writers hold `FOR SHARE`, so
+they serialize against it), `DELETE FROM auth_challenges WHERE user_id=$1`
+(via the additive index)
 and pseudonymize `audit_log` rows for that `user_id` to the fixed sentinels
 (`user_id='deleted'`, `source_ip='redacted'`, satisfying the migration's
 `NOT NULL` constraints — never NULL), excluding the final deletion row by id:
@@ -556,7 +592,9 @@ first insert the retained row with `user_id='deleted'`,
 `action='account_deleted:<operation_id>'`, `source_ip='redacted'`,
 `ok=TRUE`, `at=<completion time>`, then run `UPDATE audit_log SET
 user_id='deleted', source_ip='redacted' WHERE user_id=$1` (which no longer
-matches the already-sentinel final row). The final row is retained 13 months,
+matches the already-sentinel final row). A login attempt that lands during
+`running` therefore fails `409 account_deleting` before writing, and no
+real-user audit/challenge row can appear after these statements. The final row is retained 13 months,
 then swept by the daily `audit-retention-sweep` (`DELETE FROM audit_log WHERE
 action LIKE 'account_deleted:%' AND at < now-13mo`, via a partial index on
 `(action, at)` for that prefix) — no user-keyed audit/challenge row
@@ -1111,11 +1149,22 @@ retaining its `release_mbid_hint` without guessing. Also require:
   `step_up_proofs` row the request is `403 step_up_required`; a consumed proof
   replays as `403 step_up_consumed`; a proof for another purpose, session, or
   action, or past its 15-minute `expires_at`, never satisfies the atomic
-  consume. With it the request returns `202`, sends the confirmation email,
+  consume (consume key is always the proof id from begin). Step-up slot case:
+  re-begin after expiry succeeds (prior live row retired in the same
+  transaction), switching method from magic-link to passkey-uv succeeds, and
+  a 6th begin inside one hour for the same (session, action) is rate-limited;
+  a 6th complete attempt caps `attempts` at 5 and requires re-begin. Binding
+  case: presenting an ordinary login magic link (no bound `token_hash`) or a
+  login WebAuthn challenge (no bound `challenge_id`) to
+  `step-up/complete` is rejected, and claiming a step-up link through the
+  ADR 0008 login path never verifies a proof and never creates a session.
+  With it the request returns `202`, sends the confirmation email,
   creates a `scheduled` row with `erase_after=request+24h`, a sweep at +1h
   does not start erasure, cancel at the boundary versus executor start yields
   exactly one winner (loser 409/too-late), a new-device sign-in during grace
-  plus fresh step-up cancels successfully, and completion leaves no
+  plus fresh step-up cancels successfully, a login attempt once the operation
+  is `running` fails `409 account_deleting` and leaves no real-user
+  `audit_log`/`auth_challenges` row, and completion leaves no
   `auth_challenges` row and only the retained sentinel
   (`user_id='deleted'`, `action='account_deleted:<operation_id>'`) audit row
   for that user, run against the real migration schema so the `NOT NULL`

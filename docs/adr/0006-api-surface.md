@@ -44,14 +44,18 @@ least-privilege credential.
    bare FK cascade. `DELETE /v1/account` additionally requires a fresh
    action-bound single-use step-up proof, stored in the `step_up_proofs` table
    (ADR 0002) and issued through two declared endpoints: `POST
-   /v1/account/step-up/begin {action, method}` (creates the proof row and
-   issues the passkey challenge or sends the magic link with purpose
-   `step-up:<action>:<proof_id>`) and `POST /v1/account/step-up/complete
-   {proof_id, ...}` (verifies the assertion/claim and sets `verified_at`;
-   login links without a step-up purpose never verify a proof). `DELETE` (and
+   /v1/account/step-up/begin {action, method}` (in one transaction retires any prior live row for the same session and action,
+   then creates the proof row and issues the passkey challenge or sends the magic link
+   with purpose `step-up:<action>:<proof_id>`, storing its `challenge_id` /
+   `token_hash`; 5/hour per session+action) and `POST /v1/account/step-up/complete
+   {proof_id, ...}` (verifies only the bound credential — the exact `challenge_id`
+   for passkey-uv, the exact `token_hash` for magic-link — and sets `verified_at`;
+   10/15min per proof, `attempts` capped at 5, then re-begin; a login link or login
+   challenge never verifies a proof because it carries no bound hash/id, and the
+   step-up claim path never creates a session). `DELETE` (and
    cancel-deletion) consumes the proof atomically (`UPDATE ... SET
-   consumed_at=now() WHERE verified AND unconsumed AND session AND action
-   match AND expires_at > now()` — issued within the last 15 minutes for this
+   consumed_at=now() WHERE id=$1 AND verified AND unconsumed AND session AND action
+   match AND bound credential matches AND expires_at > now()` — issued within the last 15 minutes for this
    user, session and action), so an issued-but-unclaimed link, a link claimed
    for another purpose, a replayed proof, a proof from a different session, or
    a stale login-time proof never satisfies it (ADR 0008 single-use invariants
@@ -65,7 +69,9 @@ least-privilege credential.
    the operation via the compare-and-set in ADR 0002 rule 3. Cancel during
    grace needs a fresh login plus step-up when the session has lapsed (sessions
    keep the ADR 0008 one-day absolute cap); login, step-up, audit and the
-   cancel call are exempt from the `deleting_at` fence, all data writers stay
+   cancel call are exempt from the `deleting_at` fence ONLY while the account
+   operation is `scheduled` — once it is `running` they fail closed with `409
+   account_deleting` (ADR 0002 rule 3) — all data writers stay
    fenced. Account completion pseudonymizes `audit_log` and deletes
    `auth_challenges` per ADR 0002 rule 3. Library/playlist deletes have no grace window.
    Auth at launch otherwise: the existing session cookie. Native REST bearer keys are
