@@ -8,7 +8,9 @@
   add library-scoped catalog reads, same-job dedup, and text/compilation grouping;
   gate position-collapse on identity, define candidate sets with dominant-artist
   rule, unify playlist/library predicates with dormant entries, add release_art
-  cover-art path, and specify fenced account deletion, FK order and local-catalog GC.
+  cover-art path, and specify fenced account deletion, FK order and local-catalog GC;
+  align playlists with applied 0003_library.sql (evolution, not CREATE) and make
+  step-up complete lock-then-verify so failed attempts increment to the cap.
 - **Baseline inspected:** main `29140710bb5d8e0d57f1701ca1e6c3e854e9104f`.
   Auth, ingest, core, scaffold and MB work are merged, not in-flight assumptions.
 
@@ -173,8 +175,21 @@ user_cache_grants     user_id FK, content_hash FK → cache_objects,
 cache_objects         content_hash TEXT PK (sha256 hex), byte_size BIGINT,
                       r2_bucket TEXT, r2_key TEXT,
                       ref_count BIGINT (advisory), created_at, last_verified_at
-playlists             id PK, user_id FK, name, created_at, deleting_at NULL
-playlist_tracks       id PK, playlist_id FK, track_id FK, position INTEGER,
+playlists             EVOLUTION of applied migrations/0003_library.sql playlists
+                      (retained: id BIGSERIAL internal row key NEVER returned,
+                      public_id TEXT UNIQUE external handle, owner_user_id TEXT
+                      FK → users = owner, name, items JSONB legacy, is_public,
+                      created_at BIGINT); forward migration ADDS deleting_at
+                      timestamptz NULL only — never CREATEs a second playlists
+                      table (bare CREATE would collide/no-op on the existing
+                      incompatible shape). playlist_tracks.playlist_id FK →
+                      playlists(id) internal; APIs take public_id. Legacy items
+                      JSONB rows are backfilled to playlist_tracks where the
+                      opaque ref resolves, kept read-only during transition,
+                      then the column is dropped by a later migration — never
+                      dual-written. genres table from 0003 retained as-is,
+                      out of scope here; genre support needs its own ADR.
+playlist_tracks       id PK, playlist_id FK → playlists(id) ON DELETE RESTRICT,
                       UNIQUE (playlist_id, position) DEFERRABLE INITIALLY DEFERRED,
                       INDEX (playlist_id, track_id),
                       INDEX (track_id) -- GC reference test + track-delete RI path
@@ -204,8 +219,11 @@ step_up_proofs        id UUID PK, user_id TEXT NOT NULL FK → users ON DELETE C
                       -- method-switch supersedes) — then inserts the new row, so
                       -- an expired proof never blocks re-begin. begin is
                       -- rate-limited to 5/hour per (session_id, action) and
-                      -- complete to 10/15min per proof id; attempts caps at 5,
-                      -- then the proof must be re-begun. The consume key is always
+                      -- complete to 10/15min per proof id; failed complete
+                      -- tries increment attempts via the no-credential-term
+                      -- UPDATE in the canonical predicate below, attempts
+                      -- caps at 5, then the proof must be re-begun. The
+                      -- consume key is always
                       -- the proof id returned from begin
                       -- (WHERE id = $1 AND ... in both ADRs).
                       -- begin issues the challenge/link with purpose
@@ -227,14 +245,25 @@ step_up_proofs        id UUID PK, user_id TEXT NOT NULL FK → users ON DELETE C
                       -- route convention, so a route cannot erase the
                       -- distinction. sessions gains no column.
                       -- Canonical predicates (ADR 0006 references these and
-                      -- restates them nowhere else): complete is UPDATE
-                      -- step_up_proofs SET verified_at=now(),
-                      -- attempts=attempts+1 WHERE id=$1 AND
-                      -- session_id=$session AND action=$action AND
-                      -- verified_at IS NULL AND consumed_at IS NULL AND
-                      -- expires_at > now() AND ((method='magic-link' AND
-                      -- token_hash=$t) OR (method='passkey-uv' AND
-                      -- challenge_id=$c)) RETURNING, executed together with
+                      -- restates them nowhere else): complete is
+                      -- lock-then-verify in ONE transaction (a single UPDATE
+                      -- whose WHERE requires the correct credential can never
+                      -- increment attempts on a wrong guess, so the cap would
+                      -- be unimplementable). (1) SELECT ... FOR UPDATE the
+                      -- live row by id=$1 AND session_id=$session AND
+                      -- action=$action AND verified_at IS NULL AND
+                      -- consumed_at IS NULL AND expires_at > now(); zero rows
+                      -- → 403 step_up_required. (2) If attempts >= 5 → 403
+                      -- requiring re-begin (no further verify). (3)
+                      -- Constant-time compare the presented credential to the
+                      -- locked row's bound token_hash/challenge_id by method;
+                      -- on mismatch run UPDATE step_up_proofs SET
+                      -- attempts=LEAST(attempts+1,5) WHERE id=$1 (NO
+                      -- credential term, so the failure increments) and
+                      -- return 403; the 5th failure locks the proof. (4) On
+                      -- match run UPDATE step_up_proofs SET
+                      -- verified_at=now() WHERE id=$1 AND verified_at IS
+                      -- NULL AND consumed_at IS NULL RETURNING together with
                       -- UPDATE magic_link_tokens SET used=TRUE WHERE
                       -- token_hash=$t AND purpose='step-up' AND
                       -- step_up_proof_id=$1 (or the challenge consume with the
@@ -988,7 +1017,7 @@ same ingest transaction or already retained. For a local track the owner (via
 `releases.local_key` → `ingest_jobs.user_id`) must also be the caller; for a
 mirror-verified global track the own source proves the caller's import. Only
 ingest `write` creates sources, never a library edit. A `playlist_tracks` row requires all three: the caller owns the
-playlist, the track is in at least one of the caller's libraries (library
+playlist (`playlists.owner_user_id` = caller, resolved via `public_id`), the track is in at least one of the caller's libraries (library
 membership, the same predicate reads use), AND the caller holds an own
 `track_sources` row for it (source predicate). Library edits move or copy only
 tracks between the caller's own libraries; they cannot mint sources, grants, or
@@ -1186,7 +1215,9 @@ retaining its `release_mbid_hint` without guessing. Also require:
   re-begin after expiry succeeds (prior live row retired in the same
   transaction), switching method from magic-link to passkey-uv succeeds, and
   a 6th begin inside one hour for the same (session, action) is rate-limited;
-  a 6th complete attempt caps `attempts` at 5 and requires re-begin. Binding
+  five failed complete tries increment `attempts` to 5 (wrong guesses match the
+  lock by proof id, then fail the credential compare and run the no-credential
+  increment) and lock the proof so the 6th requires re-begin. Binding
   case: presenting an ordinary login magic link (`purpose='login'`) or a login
   WebAuthn challenge to `step-up/complete` matches zero rows (complete
   predicates `purpose='step-up'` plus the bound hash/id) and is rejected;
@@ -1240,8 +1271,11 @@ retaining its `release_mbid_hint` without guessing. Also require:
 
 ### 7. Existing migrations stay at their applied paths
 
-Main has `migrations/0001_mb_mirror.sql` (mirror) and
-`migrations/0002_auth_vault.sql` (app), both **top-level**, and no migration runner.
+Main has `migrations/0001_mb_mirror.sql` (mirror),
+`migrations/0002_auth_vault.sql` (app), and `migrations/0003_library.sql` (app:
+`genres` plus `playlists` with `id BIGSERIAL PK, public_id UNIQUE, owner_user_id
+FK → users, name, items JSONB, is_public, created_at BIGINT`), all **top-level**,
+and no migration runner.
 This ADR keeps those paths and withdraws the draft's `migrations/{app,mb}/` move.
 New migrations are forward-only, uniquely numbered top-level files with an
 explicit app/mirror target in the reviewed runner manifest. Never glob every SQL
@@ -1249,7 +1283,12 @@ file into both databases. The future runner must keep per-database applied-file
 checksums and reject drift; a directory name or file prefix alone is not routing.
 
 No applied migration is rewritten or moved. `CREATE TABLE IF NOT EXISTS` does
-not alter types, constraints or columns in existing tables. New app tables use
+not alter types, constraints or columns in existing tables — in particular, no
+future migration may `CREATE TABLE playlists`: it would collide with (or no-op
+on) the applied 0003 shape above. The target playlist model is implemented only
+as a forward `ALTER TABLE playlists ADD COLUMN deleting_at` plus a new
+`playlist_tracks` table FK'd to the retained internal `playlists(id)` (APIs
+continue to take `public_id`; `owner_user_id` remains the owner). New app tables use
 TEXT user FKs from the outset; no auth type conversion is required. Deploying
 a migration runner/manifest and staging upgrade tests is separate implementation
 work. Production DB creation/migration remains gated by the ops contract.
@@ -1272,6 +1311,18 @@ work. Production DB creation/migration remains gated by the ops contract.
   explicit per-file match; ambiguous recording arrays retain NULL MBIDs/source
   manifests rather than guessing associations. Keep legacy data/read support
   until parity is verified; never use create-if-absent as a conversion.
+- **Playlists/genres (0003 applied on main):** `migrations/0003_library.sql`
+  `playlists` (`id BIGSERIAL PK, public_id UNIQUE, owner_user_id, items JSONB,
+  is_public`) and `genres` are retained with all rows; the implementing PR adds
+  only `ALTER TABLE playlists ADD COLUMN deleting_at` plus the new
+  `playlist_tracks` table, backfills `items` JSONB entries to `playlist_tracks`
+  where the opaque ref resolves (unresolvable entries stay readable through the
+  legacy column during transition, never guessed into track rows), keeps
+  `public_id` as the external handle and `owner_user_id` as the owner predicate
+  in every query, and treats `genres` as out of scope (no change here). The
+  rule-3 delete executor and §6 predicates operate on the retained internal id
+  via `public_id` lookup; nothing in this docs-only PR creates, alters, or
+  migrates those tables.
 - **Ingest manifest producer (new alignment work):** the current parser's flat
   `ParsedNzb.message_ids` and `LibraryWrite.recording_mbids` arrays do not contain
   the per-file selection, grouping or occurrence data above. Preserve NZB file

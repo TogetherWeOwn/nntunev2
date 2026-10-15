@@ -42,11 +42,14 @@ docs/adr/                     # this directory
 ```
 
 This is the agreed component layout, not a claim every component is implemented.
-Main already contains `migrations/0001_mb_mirror.sql` and
-`migrations/0002_auth_vault.sql`, with no SQL migration runner. Keep their applied
-paths/history; do not invent an existing `migrations/{app,mb}/` split or apply both
-files to both databases. ADR 0002 rule 7 defines the additive runner/manifest
-requirement. Production app DB provisioning/migration remains gated separately;
+Main already contains `migrations/0001_mb_mirror.sql`,
+`migrations/0002_auth_vault.sql`, and `migrations/0003_library.sql` (app `genres`
+plus JSONB `playlists`), with no SQL migration runner. Keep their applied
+paths/history; do not invent an existing `migrations/{app,mb}/` split or apply
+every file to both databases. ADR 0002 rule 7 defines the additive runner/manifest
+requirement, and ADR 0002 specifies the playlists evolution (retain 0003 shape,
+additive `deleting_at` + new `playlist_tracks` only — never a second `CREATE
+TABLE playlists`). Production app DB provisioning/migration remains gated separately;
 the current binding alone does not establish a clean production app database.
 
 ### Alternatives considered

@@ -54,11 +54,13 @@ least-privilege credential.
    `purpose='login'`, so the login claim/assertion paths — which predicate
    `purpose='login'` — match zero rows for a step-up credential, return the
    generic failure, create no session, and leave it unconsumed) and `POST
-   /v1/account/step-up/complete {proof_id, ...}` (canonical complete predicate
-   in ADR 0002: `verified_at IS NULL AND consumed_at IS NULL` plus session,
-   action, expiry, and the exact bound `challenge_id`/`token_hash` with
-   `purpose='step-up'`; sets `verified_at`; 10/15min per proof, `attempts`
-   capped at 5, then re-begin; a login credential never verifies a proof, and
+   /v1/account/step-up/complete {proof_id, ...}` (canonical lock-then-verify
+   predicate in ADR 0002: lock the live proof by id/session/action with
+   `verified_at IS NULL AND consumed_at IS NULL` and unexpired, then compare the
+   exact bound `challenge_id`/`token_hash` with `purpose='step-up'` — mismatch
+   increments `attempts` without any credential term and returns 403, match sets
+   `verified_at`; 10/15min per proof, 5 failures lock at `attempts`=5, then
+   re-begin; a login credential never verifies a proof, and
    the step-up claim path never creates a session). `DELETE /v1/account
    {proof_id}` (and `POST /v1/account/cancel-deletion {proof_id}`) consumes the
    proof atomically under the canonical consume predicate in ADR 0002
