@@ -21,9 +21,11 @@
 //! connection back to the pool. [`PlayStream::abort`] returns the connection
 //! without caching (client went away).
 //!
-//! Failure handling: only connection-level trouble (I/O, protocol errors)
-//! quarantines the pool. A missing article or a bad segment fails that play
-//! alone — the connection is fine and goes back to the pool warm.
+//! Failure handling: only connection-level trouble (I/O, protocol errors,
+//! read timeouts) counts toward the pool circuit breaker (3-in-30s opens for
+//! 30s; the open breaker maps to `503` + `Retry-After`, see
+//! [`PlayError::http_status`]). A missing article or a bad segment fails that
+//! play alone — the connection is fine and goes back to the pool warm.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -31,7 +33,7 @@ use std::sync::{Arc, Mutex};
 use crate::cache::{ContentCache, MultipartUpload};
 use crate::grant::{self, GrantError};
 use crate::meter::{Meter, MeterEvent, MeterKind};
-use crate::nntp::{valid_message_id, NntpClient, NntpError};
+use crate::nntp::{valid_message_id, NntpClient, NntpError, UpstreamTimeouts};
 use crate::pool::{Lane, Lease, OrphanedPlay, Pool, PoolError};
 use crate::prefetch::should_prefetch;
 use crate::range::{self, RangeOutcome};
@@ -61,6 +63,44 @@ pub enum PlayError {
     Decode(YencError),
 }
 
+impl PlayError {
+    /// HTTP status for the Worker shim: an open breaker is `503` (with
+    /// [`PlayError::retry_after_header`]); an exhausted pool is also `503`
+    /// but without a `Retry-After` (capacity, not an outage); auth and range
+    /// failures keep `401`/`403`/`416`; everything upstream is `502`.
+    pub fn http_status(&self) -> u16 {
+        match self {
+            PlayError::Unauthorized(_) => 401,
+            PlayError::WrongTrack => 403,
+            PlayError::RangeUnsatisfiable => 416,
+            PlayError::PoolExhausted => 503,
+            PlayError::PoolQuarantined { .. } => 503,
+            PlayError::ArticleMissing(_)
+            | PlayError::InvalidSegment(_)
+            | PlayError::Upstream(_)
+            | PlayError::Decode(_) => 502,
+        }
+    }
+
+    /// Value for the HTTP `Retry-After` response header (whole seconds,
+    /// rounded up): `Some` only for [`PlayError::PoolQuarantined`]. The Worker
+    /// shim sends `503` + this header instead of hanging a play on a dead
+    /// upstream.
+    pub fn retry_after_header(&self) -> Option<String> {
+        match self {
+            PlayError::PoolQuarantined { retry_after_ms } => {
+                Some(retry_after_secs(*retry_after_ms).to_string())
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Whole-second `Retry-After` for a millisecond wait, rounded up.
+fn retry_after_secs(retry_after_ms: u64) -> u64 {
+    retry_after_ms.div_ceil(1000)
+}
+
 /// Everything the play path needs, by reference.
 pub struct PlayInput<'a> {
     /// Signed grant from the `api` Worker.
@@ -70,6 +110,9 @@ pub struct PlayInput<'a> {
     pub range: Option<&'a str>,
     /// Provider NNTP address (a pooled connection dials this).
     pub server_addr: SocketAddr,
+    /// Per-upstream dial/read timeouts (defaults bound a hung provider to
+    /// `connect + read + margin` per segment op; see `UpstreamTimeouts`).
+    pub timeouts: UpstreamTimeouts,
     /// Ordered segment message-IDs composing the track.
     pub segments: &'a [String],
     /// Demo cipher key (see module docs).
@@ -272,7 +315,7 @@ fn open_and_fetch_first(
     for attempt in 0..2 {
         let mut client = match warm.take() {
             Some(client) => client,
-            None => match NntpClient::connect(&input.server_addr) {
+            None => match NntpClient::connect_with_timeouts(&input.server_addr, input.timeouts) {
                 Ok(client) => {
                     pool.record_connect();
                     client
@@ -619,6 +662,7 @@ mod tests {
             track_id: "track-b",
             range: None,
             server_addr: addr,
+            timeouts: UpstreamTimeouts::default(),
             segments: &[],
             cipher_key: 0,
             now_unix: 1,
@@ -628,6 +672,27 @@ mod tests {
             play(&mut pool, &mut cache, &mut meter, secret, &input),
             Err(PlayError::WrongTrack)
         ));
+    }
+
+    #[test]
+    fn open_breaker_maps_to_503_with_retry_after() {
+        let err = PlayError::PoolQuarantined {
+            retry_after_ms: 30_000,
+        };
+        assert_eq!(err.http_status(), 503);
+        assert_eq!(err.retry_after_header().as_deref(), Some("30"));
+        // A probe-in-flight rejection (zero wait) still signals retry.
+        let probe = PlayError::PoolQuarantined { retry_after_ms: 0 };
+        assert_eq!(probe.http_status(), 503);
+        assert_eq!(probe.retry_after_header().as_deref(), Some("0"));
+        // Other failures keep their own statuses, never 503.
+        assert_eq!(
+            PlayError::Unauthorized(GrantError::Malformed).http_status(),
+            401
+        );
+        assert_eq!(PlayError::PoolExhausted.http_status(), 503);
+        assert_eq!(PlayError::PoolExhausted.retry_after_header(), None);
+        assert_eq!(PlayError::ArticleMissing("m".into()).http_status(), 502);
     }
 
     #[test]
@@ -642,6 +707,7 @@ mod tests {
             track_id: "t",
             range: None,
             server_addr: addr,
+            timeouts: UpstreamTimeouts::default(),
             segments: &[],
             cipher_key: 0,
             now_unix: 1,

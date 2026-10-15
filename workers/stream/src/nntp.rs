@@ -58,8 +58,21 @@ pub struct NntpClient {
 impl NntpClient {
     /// Open a provider connection and consume the greeting.
     pub fn connect(addr: &SocketAddr) -> Result<Self, NntpError> {
-        let stream = std::net::TcpStream::connect_timeout(addr, Duration::from_secs(5))?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        Self::connect_with_timeouts(addr, UpstreamTimeouts::default())
+    }
+
+    /// Open a provider connection with per-upstream timeouts and consume the
+    /// greeting. Both the dial and every blocking read on the connection are
+    /// bounded, so a hung upstream surfaces as [`NntpError::Io`] (a provider
+    /// failure that counts toward the pool circuit breaker) instead of
+    /// hanging the play path.
+    pub fn connect_with_timeouts(
+        addr: &SocketAddr,
+        timeouts: UpstreamTimeouts,
+    ) -> Result<Self, NntpError> {
+        let stream = std::net::TcpStream::connect_timeout(addr, timeouts.connect)?;
+        stream.set_read_timeout(Some(timeouts.read))?;
+        stream.set_write_timeout(Some(timeouts.read))?;
         let mut reader = BufReader::new(stream);
         let mut greeting = String::new();
         reader.read_line(&mut greeting)?;
@@ -126,6 +139,32 @@ pub(crate) fn unstuff(line: &[u8]) -> &[u8] {
     }
 }
 
+/// Per-upstream timeouts for the NNTP dial and every blocking read on it.
+/// Defaults (`5s` connect / `10s` read) bound the play path to
+/// `connect + read + margin` per segment op instead of hanging on a dead
+/// upstream; callers with a tighter budget (tests, low-latency providers)
+/// pass shorter values through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UpstreamTimeouts {
+    pub connect: Duration,
+    pub read: Duration,
+}
+
+impl Default for UpstreamTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(5),
+            read: Duration::from_secs(10),
+        }
+    }
+}
+
+impl UpstreamTimeouts {
+    pub fn new(connect: Duration, read: Duration) -> Self {
+        Self { connect, read }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +189,43 @@ mod tests {
         assert!(!valid_message_id("a<b@c"));
         assert!(!valid_message_id(&"a".repeat(251)));
         assert!(valid_message_id(&format!("{}@c", "a".repeat(248))));
+    }
+
+    #[test]
+    fn hung_upstream_trips_the_configured_read_timeout() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        // Greeting, then silence: the server accepts but never answers BODY.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind hung NNTP");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let _ = s.write_all(b"200 hung NNTP ready\r\n");
+                let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
+                let mut buf = [0u8; 1024];
+                use std::io::Read;
+                // Drain the BODY command, then never reply.
+                let _ = s.read(&mut buf);
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+        let timeouts =
+            UpstreamTimeouts::new(Duration::from_millis(200), Duration::from_millis(200));
+        let t0 = std::time::Instant::now();
+        let mut client =
+            NntpClient::connect_with_timeouts(&addr, timeouts).expect("greeting arrives");
+        let err = client
+            .article("<hung-seg0@synthetic.test>")
+            .expect_err("hung upstream must time out");
+        let elapsed = t0.elapsed();
+        assert!(
+            err.is_provider_failure(),
+            "a hung read indicts the provider"
+        );
+        assert!(
+            elapsed < timeouts.read + Duration::from_secs(5),
+            "play path stays within timeout + margin, took {elapsed:?}"
+        );
     }
 
     #[test]

@@ -38,10 +38,41 @@ Pool semantics (`pool.rs`):
   cap of 1 they never run). Waiter ordering across async tasks arrives with
   the Durable Object entry point; the reservation is what guarantees
   playback priority today.
-- Only connection-level failures (I/O, protocol errors) quarantine the pool
-  with 1s → 5s → 30s → 5min backoff, cleared on success. A gone article
-  (`430`/`423`) or a corrupt segment fails that one play
-  (`ArticleMissing` / `Decode`) and returns the healthy connection.
+- Only connection-level failures (I/O, protocol errors, read timeouts)
+  count toward the circuit breaker; a gone article (`430`/`423`) or a corrupt
+  segment fails that one play (`ArticleMissing` / `Decode`) and returns the
+  healthy connection. Breaker values are documented below.
+
+## Upstream timeouts and circuit breaker
+
+A dead upstream must fail fast with a `503`, never hang playback
+(`nntp.rs`, `pool.rs`, `play.rs`):
+
+| Setting | Value | Where |
+|---|---|---|
+| Dial (connect) timeout | 5 s default | `UpstreamTimeouts::default().connect` |
+| Read timeout (every blocking read) | 10 s default | `UpstreamTimeouts::default().read` |
+| Failure threshold | 3 consecutive provider failures | `pool::CIRCUIT_FAILURE_THRESHOLD` |
+| Failure window | 30 s (older failures restart the streak at 1) | `pool::CIRCUIT_WINDOW_MS` |
+| Open interval | 30 s | `pool::CIRCUIT_OPEN_MS` |
+
+- Per-upstream timeouts ride `PlayInput::timeouts` and bind at dial time
+  (a warm pooled connection keeps the timeouts it was dialed with). Worst
+  case per segment op is `connect + read + margin`; the hung-upstream
+  integration test asserts a hung play stays within `read + 5 s`.
+- The breaker opens after 3 consecutive provider failures inside the 30 s
+  window. While open, `try_acquire` fails with `PoolQuarantined` without
+  dialing out, and the play path maps it to **`503` with
+  `Retry-After: 30`** (`PlayError::http_status` /
+  `retry_after_header`). An exhausted pool (all slots leased) is also `503`
+  but carries no `Retry-After` (capacity, not an outage); auth and range
+  failures keep `401`/`403`/`416`; other upstream failures are `502`.
+- Once the 30 s open interval elapses the breaker is half-open: exactly one
+  probe acquire is admitted (a second concurrent acquire is rejected with a
+  zero `Retry-After`). Probe success closes the breaker; a provider failure
+  re-opens it for a fresh 30 s. The hung-upstream integration test trips the
+  breaker at the threshold, asserts the `503` + `Retry-After` without
+  touching the hung server, then probes recovery against the healthy server.
 
 ## TTFB targets
 

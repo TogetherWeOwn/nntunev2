@@ -42,7 +42,9 @@ mod tests {
     #[test]
     fn quarantined_pool_does_not_prefetch() {
         let mut pool = Pool::<()>::new(4);
-        pool.record_provider_error();
+        for _ in 0..crate::pool::CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
         assert!(!should_prefetch(&pool));
     }
 
