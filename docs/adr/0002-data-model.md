@@ -8,7 +8,7 @@
   add library-scoped catalog reads, same-job dedup, and text/compilation grouping;
   gate position-collapse on identity, define candidate sets with dominant-artist
   rule, unify playlist/library predicates with dormant entries, add release_art
-  cover-art path.
+  cover-art path, and specify fenced account deletion, FK order and local-catalog GC.
 - **Baseline inspected:** main `29140710bb5d8e0d57f1701ca1e6c3e854e9104f`.
   Auth, ingest, core, scaffold and MB work are merged, not in-flight assumptions.
 
@@ -61,6 +61,8 @@ and audit rows are not silently given new cascade constraints by this diagram.
 
 Unless stated otherwise, new ids are UUID, timestamps are `timestamptz`, and
 `user_id` is TEXT FK → users. Encryption field groups are expanded in rule 1.
+`users.deleting_at timestamptz NULL` is an additive column on the retained auth
+schema, not part of the already-applied auth migration.
 
 ```text
 subsonic_credentials  id PK, user_id FK, label,
@@ -113,7 +115,7 @@ providers             id PK, user_id FK, label,
 indexers              id PK, user_id TEXT FK NULL (NULL means global),
                       name, base_url, api_key_encrypted BYTEA NULL
                       + api_key_* envelope fields, enabled BOOLEAN
-libraries             id PK, user_id FK, name, created_at
+libraries             id PK, user_id FK, name, created_at, deleting_at NULL
 artists               id PK, mbid UUID NULL (MB artist), local_key TEXT UNIQUE NULL,
                       name, partial UNIQUE (mbid) WHERE mbid IS NOT NULL
 releases              id PK, mbid UUID NULL (MB release), local_key TEXT UNIQUE NULL,
@@ -149,10 +151,18 @@ user_cache_grants     user_id FK, content_hash FK → cache_objects,
 cache_objects         content_hash TEXT PK (sha256 hex), byte_size BIGINT,
                       r2_bucket TEXT, r2_key TEXT,
                       ref_count BIGINT (advisory), created_at, last_verified_at
-playlists             id PK, user_id FK, name, created_at
+playlists             id PK, user_id FK, name, created_at, deleting_at NULL
 playlist_tracks       id PK, playlist_id FK, track_id FK, position INTEGER,
                       UNIQUE (playlist_id, position) DEFERRABLE INITIALLY DEFERRED,
                       INDEX (playlist_id, track_id)
+delete_operations     id UUID PK, user_id TEXT NOT NULL FK → users ON DELETE RESTRICT,
+                      scope TEXT NOT NULL ('account'|'library'|'playlist'),
+                      container_id UUID NULL, cursor JSONB NOT NULL DEFAULT '{}',
+                      started_at timestamptz NOT NULL,
+                      CHECK ((scope='account') = (container_id IS NULL)),
+                      partial UNIQUE (user_id) WHERE scope='account',
+                      partial UNIQUE (user_id, scope, container_id)
+                        WHERE scope IN ('library','playlist')
 play_event_outbox     event_id UUID PK, user_id FK, track_id FK,
                       played_at timestamptz NOT NULL, stream_seconds BIGINT NOT NULL,
                       cached_hit BOOLEAN, delivered_at NULL,
@@ -179,7 +189,7 @@ invite_codes ──< users (invite_code_hash, logical reference)
 users ──1 billing_accounts ──< billing_operations
 users ──< subscriptions >── plans ──< plan_prices
 users ──< subsonic_credentials / providers / indexers
-users ──< usage_ledger / ingest_jobs / play_event_outbox / play_events
+users ──< usage_ledger / ingest_jobs / play_event_outbox / play_events / delete_operations
 users ──< libraries ──< library_tracks >── tracks >── releases >── artists
 users ──< track_sources >── tracks
 users ──< track_media >── tracks
@@ -304,38 +314,65 @@ advances `updated_at` only when the selection changed. A mutation that leaves
 the same selected source — for example removing one of several member tracks
 while the lowest-track-id art source remains, including via final-reference
 cleanup — leaves the pointer intact; removing/replacing the selected source
-clears it. Do not keep serving old artwork after its source is gone. Deleting a library, a playlist, or an account is an explicit
-fenced, resumable batched procedure, never a bare FK `ON DELETE CASCADE`: the
-handler marks the container `deleting` (new writes/restores/ingest `write`
-targeting it are rejected while marked), enumerates the affected `(user_id,
-track_id)` pairs and local release ids, takes serializers in the fixed order
-ascending release id, then `(user_id, track_id)`, then hash (release-then-hash
-per ADR 0003), and per batch deletes the membership rows, deletes that user's
-`track_media` rows for pairs with no remaining library membership, deletes
-`user_cache_grants` no other current mapping for that user/hash needs, runs
-the both-counts-zero source cleanup, and clears/invalidates local `release_art`
-only when the selected art source changed (rule above) in the same transaction.
-It then re-enumerates under the same serializers until empty before removing
-the container row, so a membership inserted after the first enumeration cannot
-fail the final `DELETE` with 23503; a crash mid-procedure resumes from the
-persisted `deleting` marker and batch cursor. A plain SQL `DELETE FROM
-libraries` / `playlists` that relies on cascading FKs alone must not be used;
-schema FKs use `ON DELETE RESTRICT` (or no cascade) on
-`library_tracks`/`playlist_tracks` so the procedure cannot be bypassed.
-Account deletion follows the fixed order grants → media/sources →
-memberships → providers/indexers → `ingest_jobs` (sources/media reference
-jobs; grants reference providers with `ON DELETE RESTRICT`), then local catalog
-sweep below. Local `tracks`/`releases`/`artists` rows plus their `release_art`
-descriptors are deleted once no `library_tracks` and no `playlist_tracks` row
-of any user references them (checked per batch under the release serializer);
-if `ingest_jobs` rows for the owner are already gone, derivation falls back to
-remaining membership/source evidence, never to silent retention — no ownerless
-tenant-tagged rows or art descriptors survive account deletion. A periodic
-orphan-source reconciliation step (ADR 0003 GC) deletes `track_sources` rows
-with no `library_tracks` and no `playlist_tracks` row for that `(user_id,
-track_id)`, covering crashes between batches. A retained source is recovery data,
-not read/stream authorization: dormant entries still fail the library gate.
-A live audio grant is required even when an object or track id is known.
+clears it. Do not keep serving old artwork after its source is gone.
+
+Deleting a library, playlist, or account is an explicit fenced, resumable batched
+procedure, never a bare FK cascade. The schema adds nullable `deleting_at` to
+`users`, `libraries`, and `playlists`, plus `delete_operations` with a durable
+batch cursor. Starting a scoped delete atomically marks the relevant row and
+inserts its operation; the cursor records the last completed key and advances in
+the same transaction as each batch. A crash resumes that operation. A completed
+library/playlist operation removes its operation and container in one transaction;
+account completion removes its operation and user in one transaction.
+
+Every writer that can create or restore user-owned state first takes
+`SELECT ... FOR SHARE` on the user's `users` row and rejects a non-NULL
+`deleting_at`; library/playlist mutations also take `FOR SHARE` on the target
+container and reject its marker. This includes ingest `write`, membership and
+playlist edits/restores, stream publication of `track_media`/grants, and art
+descriptor/pointer publication. Deletion sets the corresponding marker with an
+UPDATE (conflicting with writer locks), waiting for already-started writers; no
+writer can pass a marker check and commit after the marker. Publication holds
+these locks through its inserts. Stream hash serialization and the release
+serializer remain additional locks, not substitutes for the user/container
+fence. Re-enumerate memberships, grants, and media under the relevant serializers
+until empty before deleting providers or jobs; the fence prevents late
+publication from repopulating any of them. FKs on `library_tracks`/`playlist_tracks`
+remain RESTRICT/non-cascading.
+
+For library/playlist batches, enumerate affected pairs and local release ids,
+take serializers in ascending release id, then `(user_id, track_id)`, then hash
+order (release-then-hash per ADR 0003). In each transaction, delete the target
+membership/entry rows, delete `track_media` only for tracks with no remaining
+library membership, delete grants no other current mapping for that user/hash
+needs, run both-counts-zero source cleanup, and conditionally invalidate local
+`release_art` only when its selected source changes. Re-enumerate until the
+container is empty before removing its marker/container; the persisted cursor is
+a resume hint, not authority to skip rechecking.
+
+Account deletion first marks `users.deleting_at` and records the operation.
+Enumerate the user's own `ingest_jobs` and their local keys before deleting jobs;
+this is the owner index for local catalog cleanup, independent of current
+memberships/sources. In batches remove `play_event_outbox`, the user's monthly
+`play_events`, and `usage_ledger` rows before deleting referenced tracks or the
+user; account erasure is the explicit exception to append-only event retention.
+Then remove playlist entries and library memberships, media, grants and sources.
+Remove owner-local catalog rows and `release_art` descriptors with no remaining
+library/playlist references under the release serializer. Then remove ingest
+jobs and empty library/playlist containers, billing operations/subscriptions/
+accounts, providers/indexers/vaults, Subsonic credentials, sessions,
+magic-link/WebAuthn rows and other user-FK children; remove completed scoped
+delete operations and, last, the account operation and user. Honor each actual
+FK in the migration manifest's order; do not rely on cascade. The job ids and local keys remain available until
+the local sweep completes. Periodic owner-keyed local-catalog GC enumerates local
+rows through each owner's retained `ingest_jobs` and removes rows with no
+library/playlist references. This covers rows orphaned by earlier final-membership
+removal as well as interrupted account deletion, and runs before those jobs are
+eligible for cleanup. Periodic orphan-source reconciliation (ADR 0003 GC)
+removes `track_sources` with neither library nor playlist references. A retained
+source is recovery data, not read/stream authorization: dormant entries still
+fail the library gate. A live audio grant is required even when an object or
+track id is known.
 `cache_bytes` is a live SUM of object sizes across that user's unique audio grants,
 not a daily/monthly flow; artwork uses the separate lifecycle in ADR 0003.
 
@@ -379,9 +416,7 @@ is not terminal cancellation.
 
 ### 5. Flows, gauges and partitions
 
-`play_events` is append-only and monthly-partitioned. Partition maintenance
-creates future partitions and alerts if one is missing; no silent dropped writes.
-Retention/drop policy requires its own approved operation, not this ADR.
+`play_events` is append-only for normal operation and monthly-partitioned. Account deletion under rule 3 explicitly erases that user's outbox and event rows before deleting tracks/users, the sole deletion exception to append-only. Other retention/drop policy requires its own approved operation, not this ADR. Partition maintenance creates future partitions and alerts if one is missing; no silent dropped writes.
 The stream writer generates each `event_id` and its exact UTC `played_at` **once
 before dispatch**, committing the immutable event to `play_event_outbox`.
 An outbox dispatcher retries undelivered rows; it sets `delivered_at` only after
@@ -687,9 +722,7 @@ account runs the explicit batched procedure in rule 3 (enumerate affected
 `(user_id, track_id)` pairs and release ids, fixed serializer order, per-batch
 membership delete plus both-counts-zero source cleanup and art invalidation) —
 never a bare FK cascade that silently drops `library_tracks`/`playlist_tracks`
-rows without running that cleanup. Track-row deletion (consolidation only)
-remaps library/playlist references first
-and never cascades silently. Removing a track from the caller's last library, or
+rows without running that cleanup. Track-row deletion is allowed only after explicit local-catalog GC or consolidation has checked all library/playlist references and remapped references where applicable; it never cascades silently. Removing a track from the caller's last library, or
 deleting the last library holding it, does NOT delete that caller's playlist
 entries for it: the rows are retained with stable positions and counts, but
 become dormant — reads return only the entry id and position with a
@@ -800,14 +833,23 @@ retaining its `release_mbid_hint` without guessing. Also require:
   final-reference removal: no committed membership may lack its source. A playlist
   write for a track in no caller library is rejected. Schema FKs on
   `library_tracks`/`playlist_tracks` are `RESTRICT`/non-cascading so a bare
-  cascading delete cannot bypass this procedure. Deleting a library also deletes
-  that user's `track_media` rows for now-unreachable tracks and grants no other
-  current mapping needs (gauge drops immediately); deleting an account in grant
-  → media/source → membership → provider → job order leaves no local
-  `tracks`/`releases`/`artists` rows, tenant tags, or `release_art` descriptors.
-  Inserting a membership after enumeration does not fail the final container
-  delete: the handler re-enumerates until empty under the serializers, rejects
-  writes while `deleting`, and resumes after a crash from the persisted marker.
+  cascade cannot bypass the procedure. Deleting a library removes that user's
+  media for now-unreachable tracks and grants no other current mapping needs.
+  Account deletion erases the user's outbox/events/ledger before tracks/users
+  (including the `play_events` and outbox track/user FKs), then processes grants,
+  media/sources, memberships, local catalog, jobs and remaining user-FK children
+  in valid FK order; no local tracks/releases/art or tenant tags survive. Include
+  an account with played local tracks and pending outbox rows and assert no 23503
+  on track/user deletion. Include a user who previously removed the final local
+  library membership and playlist reference: owner-keyed GC must find/delete those
+  rows by ingest-job local keys, not memberships. Race each writer (ingest write,
+  library/playlist edit and restore, stream media/grant publication, art
+  descriptor/pointer publication) against setting the deleting marker; the marker
+  waits for in-flight writers and no writer commits after it. Assert schema marker
+  columns and durable `delete_operations` cursor exist, cursor+batch commit
+  atomically, crash resumes, and re-enumeration includes memberships, grants and
+  media until empty before provider/job removal. FKs remain restrictive; account
+  erasure of play events is the explicit exception to append-only retention.
 - Cover art: B requests A's local art by `coverart:{release_id}` or raw hash and
   receives 404/70 **before any fetch**. A's member request refills embedded art from
   an own current source; a verified-release member refills CAA art without a

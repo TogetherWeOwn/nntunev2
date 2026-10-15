@@ -90,10 +90,17 @@ while no library holds the track deletes the retained source. Membership changes
 playlist/library/account deletion and source cleanup serialize on `(user_id, track_id)` and
 recheck both reference sets in one transaction. Library/playlist/account deletion
 is the fenced, resumable batched procedure in ADR 0002 rule 3, never a bare FK cascade:
-mark `deleting`, enumerate affected pairs and release ids, lock in ascending release id, then
-`(user_id, track_id)`, then hash order, and per batch delete memberships, that user's
-unreachable `track_media` rows, unneeded grants, and run source cleanup plus
-conditional art invalidation.
+mark `deleting`, persist the operation cursor, enumerate affected pairs and release ids,
+lock in ascending release id, then `(user_id, track_id)`, then hash order, and per batch
+delete memberships, that user's unreachable `track_media` rows, unneeded grants, and run
+source cleanup plus conditional art invalidation. Every writer that can publish media,
+grants, art descriptors/pointers, memberships, playlist entries, restores or ingest output
+holds `users FOR SHARE` through commit and rejects a non-NULL `users.deleting_at`; scoped
+library/playlist writers also hold `FOR SHARE` on that container and reject its
+`deleting_at`. The deleting update conflicts with those locks, drains prior writers, and
+prevents a marker-check/insert race. Re-enumeration includes grants and media as well as
+memberships before provider/job deletion. The durable marker/cursor schema and account
+FK order are defined in ADR 0002 rule 3.
 For local releases, every source insert/delete/replace and every membership
 change takes the release serializer first, computes the selected art source
 before and after inside that lock, and
