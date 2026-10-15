@@ -55,7 +55,10 @@ environment-qualified art bucket, not an invented unsuffixed bucket.
    unverifiable occurrences get local ids with NULL canonical MBIDs. Tenant tags
    and positions cannot populate shared catalog rows; only mirror-verified
    occurrences and MusicBrainz metadata can. Ingest publishes no audio hashes
-   or cache grants.
+   or cache grants. The same `write` stage writes `release_art` rows (ADR 0002
+   §6): tag-embedded art for local releases, Cover Art Archive fetch for
+   mirror-verified releases, stored under the environment-qualified art bucket;
+   art bytes are served only with a per-user grant, never by bare hash.
 3. **Stream publication:** fetch through the requesting user's provider,
    verify the complete object's hash, then publish `cache_objects`,
    `track_media` and `user_cache_grants` for that user. Initialize both

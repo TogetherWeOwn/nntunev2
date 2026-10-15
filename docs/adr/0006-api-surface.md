@@ -89,10 +89,16 @@ least-privilege credential.
   through the caller's own `library_tracks` memberships. A non-member id
   returns 404 (native) or Subsonic error 70; search returns only member rows.
   Membership and playlist writes are ownership-checked per ADR 0002 §6 and cannot
-  self-assert another user's rows. `getCoverArt` maps the art id to a release
-  the caller can read and never serves by bare content hash. A new endpoint that
-  takes or returns a catalog id is denied until it declares how it applies this
-  gate.
+  self-assert another user's rows: a playlist write needs the same library
+  membership reads need plus an own track source, and entries whose track left
+  every caller library stay as dormant tombstones (stable positions/counts;
+  stream/scrobble 404/70) until re-added. `getCoverArt` takes only the opaque
+  `coverart:{release_id}` id from `getAlbum`/`getSong`/`search3`, resolves it to
+  its release and primary `release_art` row (ADR 0002 §6, ingest `write` stage;
+  tag-embedded art for local releases, Cover Art Archive for verified ones),
+  checks the caller can read that release, then serves the bytes with the grant
+  check — never by bare content hash. A new endpoint that takes or returns a
+  catalog id is denied until it declares how it applies this gate.
 - The REST OpenAPI spec is generated from code (Rust types → schema), checked
   into the repo, and CI-diffed: spec drift fails the build.
 - Subsonic responses are adapters over the same handlers, not a parallel
