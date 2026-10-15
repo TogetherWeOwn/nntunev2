@@ -79,12 +79,20 @@ least-privilege credential.
   `/rest/*` subset — never `/v1`, provider credentials, or ingest.
   Per-credential rate limits apply, and `last_used_at` anomalies (burst
   from a new IP/ASN) alert.
-- Catalog reads are library-scoped (ADR 0002 §6): every native
-  (`/v1/artists`, `/v1/releases`, `/v1/tracks`, `/v1/search`) and Subsonic
-  (`getArtist`, `getAlbum`, `getSong`, `search3`, plus directory/list/index
-  endpoints where they list catalog rows) read resolves ids only through the
-  caller's own `library_tracks` memberships. A non-member id returns 404
-  (native) or Subsonic error 70; search returns only member rows.
+- Catalog access is library-scoped by default (ADR 0002 §6): every read or
+  write that takes or returns a catalog id — native `/v1/artists`,
+  `/v1/releases`, `/v1/tracks`, `/v1/search`, `/v1/playlists` (including
+  embedded track rows), `/v1/plays`, `/v1/library`, and Subsonic `getArtist`,
+  `getAlbum`, `getSong`, `search3`, `getPlaylist(s)`, `getCoverArt`, `stream`,
+  `scrobble`, plus `getMusicDirectory`/`getAlbumList2`/`getIndexes` and any
+  directory/list/index call where it lists catalog rows — resolves ids only
+  through the caller's own `library_tracks` memberships. A non-member id
+  returns 404 (native) or Subsonic error 70; search returns only member rows.
+  Membership and playlist writes are ownership-checked per ADR 0002 §6 and cannot
+  self-assert another user's rows. `getCoverArt` maps the art id to a release
+  the caller can read and never serves by bare content hash. A new endpoint that
+  takes or returns a catalog id is denied until it declares how it applies this
+  gate.
 - The REST OpenAPI spec is generated from code (Rust types → schema), checked
   into the repo, and CI-diffed: spec drift fails the build.
 - Subsonic responses are adapters over the same handlers, not a parallel

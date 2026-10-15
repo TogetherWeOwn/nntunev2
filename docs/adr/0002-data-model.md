@@ -420,21 +420,44 @@ credits stay in the manifest/file tags — explicitly deferred, not normalized
 artist rows — until a later ADR defines them. When MBID keys are absent, group by
 normalized (album-artist text, album-title text): trim, case-fold and collapse
 internal whitespace; album-artist text means the albumartist/TPE2 tag when
-present, else the common track-artist text across the candidate set. Entries
-sharing that pair (and disc when present) form one release/artist group; only when
-both MBID and text keys are absent keep separate groups per entry. These rules
+present, else the common track-artist text across the candidate set. Disc is
+never part of any group key; it is recorded only as the track's `medium_no`
+after grouping. Entries sharing that text pair form one release/artist group.
+When album-artist text is absent (no TPE2 and no single common track-artist
+text) and the candidate set carries one normalized album-title text with at least
+three distinct normalized track-artist texts, group by that album title alone as
+an untagged compilation under the job-local Various-Artists holder, with
+per-track credits deferred as above. Only when both MBID and text keys are
+absent (no shared title meeting the compilation threshold) keep separate groups
+per entry. These rules
 only group local hints; they do not authenticate MBIDs. `match` and `write` consume
 the checkpoint on retry, never regenerate its ordinals/groups from changed tags.
 After `match` resolves each entry to an occurrence (mirror-verified or local) and
 before checkpointing classifications, collapse entries resolving to the same
-occurrence within this job: group by the resolved (release key, medium_no,
-track_no) — mirror occurrence for verified matches, manifest-derived local key for
-local matches — and keep exactly one winner per group, the lowest `audio_ordinal`
-(ordinals are unique, so no further tie-break is needed). Record losers in the
+occurrence within this job in two ordered passes. First, within each release
+group, collapse claimed-position duplicates: entries claiming the same positive
+`(disc, track)` are duplicates of one occurrence — keep the lowest
+`audio_ordinal` as winner (format preference is not a tie-break; ordinals are
+unique) and checkpoint losers as `duplicate_of`. Only then decide the frozen
+local positions for the surviving distinct occurrences (whole-group
+`(1, audio_ordinal)` fallback applies solely to missing/contradictory pairs
+among distinct occurrences, never to a group that contained a claimed duplicate).
+Second, group the survivors by the resolved (release key, medium_no, track_no) —
+mirror occurrence for verified matches, manifest-derived local key for local
+matches — and keep exactly one winner per group, the lowest `audio_ordinal`.
+Record losers in the
 checkpoint as `duplicate_of` the winner for diagnostics; they write no separate
 track, source, membership or media row. The winner's `source_selector` is the
-`track_sources` source for that occurrence. No multi-row statement in `write` may
-contain a repeated key for `tracks (release_id, medium_no, track_no)`,
+`track_sources` source for that occurrence. After `match` and before building any
+`write` statement, also collapse artist groups by resolved artist key and release
+groups by resolved release key (`mbid` for verified rows, `local_key` for local
+rows), merging colliding groups under one winner so untrusted hint variants
+(`The Beatles`/`Beatles, The`, `Abbey Road`/`Abbey Road (Remastered)`, or two
+claimed MBIDs resolving to one mirror row) cannot emit two rows with one key.
+No multi-row statement in `write` may
+contain a repeated key for `artists (mbid)` and `releases (mbid)` on their
+partial unique MBID indexes, for `artists (local_key)` and `releases (local_key)`
+on their unique local-key indexes, or for `tracks (release_id, medium_no, track_no)`,
 `track_sources (user_id, track_id)` or `library_tracks (library_id, track_id)`.
 SQLSTATE 21000 (duplicate key within one statement) is a deterministic bug, never
 retried: fix the dedup, do not add it to the retry set.
@@ -452,8 +475,10 @@ local key is a versioned length-prefixed tuple `(ingest_job_id, entity_kind,
 manifest_group_first_audio_ordinal)`: use the lowest `audio_ordinal` in that entry's
 artist group for an artist, or release group for a release. This makes multi-album
 retries deterministic without conflating those two groupings. For local tracks,
-use claimed `(disc, track)` only when every entry in that release group has a
-positive, unique pair; otherwise the whole group uses `(1, audio_ordinal)`. Freeze
+first collapse claimed-position duplicates as above, then use claimed
+`(disc, track)` for the surviving distinct occurrences only when every survivor
+in that release group has a positive, unique pair; otherwise the whole group uses
+`(1, audio_ordinal)`. Freeze
 that choice in the manifest. These local positions **never authorize a global
 match**. Separate unmatched jobs may remain distinct until explicitly matched.
 A known but ambiguous or contradictory release claim stays only in the local
@@ -493,18 +518,37 @@ re-imports. Local-to-MB consolidation is separate transactional work: preserve/r
 membership, playlists and user sources before retiring a duplicate; don't mutate
 keys on conflict or discard data. An MBID is never a local track id/source FK.
 
-Catalog reads are library-scoped. Every REST (`/v1/artists`, `/v1/releases`,
-`/v1/tracks`, `/v1/search`) and Subsonic (`getArtist`, `getAlbum`, `getSong`,
-`search3`, plus `getMusicDirectory`/`getAlbumList2`/`getIndexes` where they list
-catalog rows) read resolves ids only through the caller's own libraries:
+Catalog access is library-scoped by default. Every read or write that takes or
+returns a catalog id — native `/v1/artists`, `/v1/releases`, `/v1/tracks`,
+`/v1/search`, `/v1/playlists` (including embedded track rows), `/v1/plays`,
+`/v1/library`, and Subsonic `getArtist`, `getAlbum`, `getSong`, `search3`,
+`getPlaylist(s)`, `getCoverArt`, `stream`, `scrobble`, plus `getMusicDirectory`/
+`getAlbumList2`/`getIndexes` and any directory/list/index call where it lists
+catalog rows — resolves ids only through the caller's own libraries:
 `libraries(user_id = caller) → library_tracks → tracks → releases → artists`.
 A non-member artist/release/track id returns 404 (native) or Subsonic error 70;
-`search3`/search returns only member rows. Local-row ownership is derived, not a
+`search3`/search returns only member rows. A new endpoint that takes or returns
+a catalog id is denied until it declares how it applies this gate. Local-row
+ownership is derived, not a
 new column: parse the row's `local_key` job id → `ingest_jobs.user_id`; that user
 is the sole owner, and the library-scope rule already restricts reads to it.
 Mirror-verified global rows (when they ship) use the same membership gate: shared
 metadata is readable only for tracks in the caller's library. This covers bytes
-(grant rule) and metadata uniformly.
+(grant rule) and metadata uniformly. `getCoverArt` never serves by bare content
+hash: the art id maps to a release the caller can read through the same gate,
+and a non-member art id returns 404/error 70. Play/scrobble writes resolve the
+played track through the same memberships before accepting the event.
+
+Membership writes are ownership-checked, so membership cannot be self-asserted.
+A `library_tracks` or `playlist_tracks` row may only reference a track whose
+owner (via `releases.local_key` → `ingest_jobs.user_id`) is the caller, or which
+the caller already holds through an own `track_sources` row. For
+mirror-verified global rows, an own `track_sources` row — created only by the
+ingest `write` stage, never by a library edit — is required before any
+membership or playlist entry for that track can exist. Library edits move or copy
+only tracks between the caller's own libraries; they cannot mint sources,
+grants, or cross-user ownership. `playlist_tracks.track_id` is therefore a
+checked FK, not an unrestricted FK.
 
 Playlist entries have their own ids so the same track may occur repeatedly.
 The deferrable `(playlist_id, position)` constraint allows transactional position
@@ -523,8 +567,10 @@ retaining its `release_mbid_hint` without guessing. Also require:
 
 - Interleaved PAR2/NFO/audio and archive members produce audio-only ordinals;
   one artist across two release groups preserves those relationships on checkpoint
-  replay. Missing/duplicate local disc/track pairs trigger the frozen whole-group
-  ordinal fallback, while valid multidisc pairs are preserved locally.
+  replay. Missing pairs or contradictory pairs among distinct occurrences trigger
+  the frozen whole-group ordinal fallback, while valid multidisc pairs are
+  preserved locally; claimed-position duplicates are collapsed first and never
+  trigger the whole-group fallback by themselves.
 - Without the producer or mirror occurrence projection, no normalized write mints
   a global release/track, even with plausible manifest MBIDs and positions.
 - Tenant A claims a popular release position with a wrong recording/title/duration;
@@ -532,18 +578,33 @@ retaining its `release_mbid_hint` without guessing. Also require:
   correct import still completes with mirror-supplied metadata. An already-existing
   contradictory shared MBID also yields a local fallback with membership/source
   intact, not an import failure or shared overwrite.
-- Library-scoped reads: user B requests user A's local artist, release and track
-  ids on every catalog endpoint and gets 404 (native) or Subsonic error 70, and
-  `search3`/search never returns them; only rows reachable through the caller's own
-  `library_tracks` memberships are readable.
-- Same-job duplicates: two files in one NZB (for example FLAC and MP3 copies)
-  resolving to one occurrence complete with one track and one source (winner is the
-  lowest `audio_ordinal`; loser checkpointed as `duplicate_of`); no statement
-  carries a repeated key and no 21000 occurs.
+- Library-scoped reads and ownership-checked writes: user B requests user A's
+  local artist, release and track ids on every catalog endpoint (including
+  playlist reads, cover art, plays/scrobble, and directory/list/index calls) and
+  gets 404 (native) or Subsonic error 70, and `search3`/search never returns
+  them; only rows reachable through the caller's own `library_tracks`
+  memberships are readable. B then adds A's local track id to B's library and to
+  a B playlist, and every read endpoint — including the playlist, its entries,
+  cover art for A's release, and a scrobble for A's track — still returns 404 /
+  error 70.
+- Same-job duplicates: two files in one NZB (for example FLAC and MP3 copies
+  claiming one `(disc, track)`) resolving to one occurrence complete with one
+  track and one source (winner is the lowest `audio_ordinal`; loser checkpointed
+  as `duplicate_of`); no statement carries a repeated key and no 21000 occurs.
+  A local 12-track album plus 12 duplicate-format copies with identical tags
+  yields 12 tracks with the claimed disc and track numbers preserved.
+- Resolved-key artist/release collapse: two text groups in one job
+  (`The Beatles`/`Beatles, The` artists, `Abbey Road`/`Abbey Road (Remastered)`
+  releases) resolving to the same verified mirror artist and release complete
+  with one artist row and one release row; no statement carries a repeated
+  `mbid` or `local_key` and no 21000 occurs.
 - Text-only album (12 tracks with album/artist text but no MBIDs) forms one local
-  artist and one local release; a compilation sharing one album title (or one
-  release MBID) with distinct track artists forms one release under a
-  Various-Artists holder with per-track credits deferred to manifest tags.
+  artist and one local release; an untagged compilation (one album title, no
+  TPE2, at least three distinct track artists, no MBIDs) forms one release under
+  a Various-Artists holder with per-track credits deferred to manifest tags, as
+  does a compilation sharing one release MBID. Disc is never a group key: a
+  two-disc text-only album (disc 1/disc 2 tags, one title) yields one release
+  with `medium_no` 1 and 2.
 
 ### 7. Existing migrations stay at their applied paths
 
