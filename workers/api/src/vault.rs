@@ -25,7 +25,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -445,7 +445,7 @@ struct Dek([u8; 32]);
 
 fn random_nonce() -> [u8; 12] {
     let mut n = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut n);
+    rand::rng().fill_bytes(&mut n);
     n
 }
 
@@ -468,7 +468,7 @@ pub fn encrypt_vault(
     plaintext: &[u8],
 ) -> Result<VaultBlob, VaultError> {
     let mut dek_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut dek_bytes);
+    rand::rng().fill_bytes(&mut dek_bytes);
     let dek = Dek(dek_bytes);
     dek_bytes.zeroize();
 
