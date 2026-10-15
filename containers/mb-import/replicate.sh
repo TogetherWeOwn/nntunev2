@@ -2,10 +2,11 @@
 # Hourly replication packets -> nntunev2-mb. SLO: lag < 2 h.
 # Usage: DATABASE_URL=<url> PACKET_SEQ=<n> PACKET_URL=<url> ./replicate.sh
 # Never marks a packet applied until its deletes/upserts actually land.
-# mb_import_state (last_packet, last_applied_at, lag_seconds) is written only
-# by the future apply step, which must validate PACKET_SEQ as an integer,
-# require PACKET_SEQ = last_packet + 1, and set lag_seconds from the packet's
-# publication timestamp.
+# mb_import_state.last_packet is seeded forward-only by import.sh (DUMP_SEQ,
+# only when it advances the cursor) and advanced by the future apply step;
+# last_applied_at/lag_seconds are written only by the apply step, which must
+# validate PACKET_SEQ as an integer, require PACKET_SEQ = last_packet + 1,
+# and set lag_seconds from the packet's publication timestamp.
 set -euo pipefail
 
 : "${DATABASE_URL:?set DATABASE_URL via secret store}"

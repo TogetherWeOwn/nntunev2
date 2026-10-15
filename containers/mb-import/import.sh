@@ -3,10 +3,12 @@
 # Usage: DATABASE_URL=<url> [DUMP_SEQ=<n>] ./import.sh <dump-dir>
 # Never echo $DATABASE_URL; pass it only via env/secret store.
 # DUMP_SEQ (optional): replication sequence the dump corresponds to. When
-# set, mb_import_state.last_packet is updated to it after the load so the
-# hourly replicate.sh gate (PACKET_SEQ = last_packet + 1) accepts the first
-# real packet. When unset, state is left untouched and the operator must
-# seed it before replication (see README).
+# set, mb_import_state.last_packet is seeded forward-only (only when
+# DUMP_SEQ > current last_packet) so the hourly replicate.sh gate
+# (PACKET_SEQ = last_packet + 1) accepts the first real packet. The seed
+# never touches last_applied_at/lag_seconds (apply-step columns) and an
+# older dump never rewinds the cursor. When unset, state is left untouched
+# and the operator must seed it before replication (see README).
 #
 # Input contract (curated TSVs, NOT raw MusicBrainz dumps):
 #   <dump-dir>/mbdump-artist.tsv     mb_artist    (mbid, name, sort_name, type, country, updated_at)
@@ -72,15 +74,29 @@ SQL
 done
 
 # Record the dump's replication sequence so replicate.sh accepts the first
-# real packet. Unset DUMP_SEQ leaves state untouched (fresh DBs stay at the
-# migration seed 0); the operator then seeds last_packet before replication.
+# real packet. Forward-only seed: advances last_packet only when
+# DUMP_SEQ > current last_packet, and never touches last_applied_at /
+# lag_seconds (those are written only by the replicate apply step). An
+# older-dump rerun (DUMP_SEQ <= last_packet) warns and leaves state
+# untouched so the cursor never rewinds. Unset DUMP_SEQ leaves state
+# untouched (fresh DBs stay at the migration seed 0); the operator then
+# seeds last_packet before replication.
 if [[ -n "${DUMP_SEQ:-}" ]]; then
   if [[ ! "$DUMP_SEQ" =~ ^[0-9]+$ ]]; then
     echo "import: refusing non-integer DUMP_SEQ '$DUMP_SEQ'" >&2
     exit 1
   fi
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "UPDATE mb_import_state SET last_packet = $DUMP_SEQ, last_applied_at = now(), updated_at = now() WHERE id = 1;"
-  echo "import: seeded mb_import_state.last_packet=$DUMP_SEQ"
+  current_last_packet="$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tAX -c "SELECT last_packet FROM mb_import_state WHERE id = 1;")"
+  if [[ ! "$current_last_packet" =~ ^[0-9]+$ ]]; then
+    echo "import: unexpected last_packet '$current_last_packet' in mb_import_state" >&2
+    exit 1
+  fi
+  if (( 10#$DUMP_SEQ <= 10#$current_last_packet )); then
+    echo "import: DUMP_SEQ=$DUMP_SEQ <= current last_packet=$current_last_packet; leaving state untouched (older dump never rewinds the replication cursor)" >&2
+  else
+    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "UPDATE mb_import_state SET last_packet = $DUMP_SEQ, updated_at = now() WHERE id = 1 AND last_packet < $DUMP_SEQ;"
+    echo "import: seeded mb_import_state.last_packet=$DUMP_SEQ"
+  fi
 else
   echo "import: DUMP_SEQ unset; leaving mb_import_state untouched (seed last_packet before running replicate.sh)" >&2
 fi
