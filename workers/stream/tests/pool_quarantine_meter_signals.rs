@@ -1,7 +1,6 @@
 //! S14 acceptance: pool quarantine + warm-redial meter signals.
 //!
-//! Test-first contract for [TOG-25591](/TOG/issues/TOG-25591) (slice S14 of
-//! the roadmap on [TOG-25575](/TOG/issues/TOG-25575#document-roadmap)).
+//! Test-first contract for the S14 build slice (slice S14 of the NNTune v2 roadmap).
 //! This file is intentionally RED on the current head: the meter signals it
 //! asserts do not exist yet, so this integration target fails to build until
 //! the builder lands S14. Every other suite (`--lib`, `stream_integration`)
