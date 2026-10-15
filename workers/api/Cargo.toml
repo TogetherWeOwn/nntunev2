@@ -14,7 +14,7 @@ aes-gcm = { version = "0.10", features = ["aes"] }
 # Shared unpadded-base64url over this crate (F-HARD-01): one audited
 # implementation for vault/auth/session. Pure Rust, wasm32-compatible.
 base64 = "0.22"
-hmac = "0.12"
+hmac = "0.13"
 sha2 = "0.10"
 rand = "0.8"
 # wasm32-unknown-unknown has no OS RNG: the `js` feature routes getrandom
