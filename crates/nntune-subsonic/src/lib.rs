@@ -13,7 +13,9 @@ pub mod library;
 pub mod routes;
 pub mod value;
 
-pub use app::{oversized_body_response, HttpResponse, SubsonicApp, MAX_BODY_BYTES};
+pub use app::{
+    oversized_body_response, unreadable_body_response, HttpResponse, SubsonicApp, MAX_BODY_BYTES,
+};
 pub use auth::{AuthStore, Credentials, Identity};
 pub use endpoints::Params;
 pub use library::{Library, MemStore, UserAccount};

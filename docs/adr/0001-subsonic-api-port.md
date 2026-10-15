@@ -41,12 +41,44 @@ data, R2 for bytes.
   contract (shapes verified field-by-field against v1 source; no live v1
   capture exists yet — see the fixtures README); the Rust fixture suite
   asserts byte equality, and a dependency-free Python script validates
-  fixture shape in CI.
+  fixture shape in CI. The root workspace and standalone API commit the
+  lockfiles used for verification; their CI builds use `--locked`.
 - Two deliberate deviations from v1, both client-invisible in practice:
   envelope `type` is `nntune` (v1 inherited `koel`); per-client API keys
   (`subsonic_clients`: HMAC-peppered lookup index plus sealed legacy
   secret for `legacy_enabled` clients, with revocation) replace the
   single per-user key so keys revoke per device.
+
+## Compatibility details
+
+- The two album-list routes have different v1 backends. Legacy `getAlbumList`
+  supports all ten validated types: frequent/recent use authenticated-user
+  play history, reversed year bounds request descending order, and random
+  ignores offset. Catalogue `getAlbumList2` supports newest, random, byYear,
+  alphabeticalByName and alphabeticalByArtist; the other validated types
+  return error 0. Its reversed year bounds return an empty list, and its year
+  ordering uses album release date, then catalogue curation time (not legacy
+  row creation); nullable descending dates follow PostgreSQL NULLS FIRST.
+  Catalogue artist ordering uses its sort key rather than the display name.
+  Album years are not inferred from tracks. Favorites follow position order
+  across both starred routes and the legacy starred album list; re-starring an
+  existing item moves it to the end without duplicating its membership.
+- `Library::album_list`, `album_list2`, `random_songs` and
+  `artists_last_modified` are required store methods. Production stores must
+  implement visibility, real sampling, user history and catalogue timestamps;
+  there are no fallback rankings based on IDs or track counts. `MemStore`
+  keeps the fixture clock and a seedable, advancing shuffle sequence for
+  reproducible multi-record catalogues; its RNG is not for secrets.
+- Scrobbles with `submission=false` are now-playing notifications, not plays.
+  Structured lyrics use `lang=und`, preserve offset separately, remove known
+  metadata tags and sort trimmed timed lines. Plain lyrics have no `start`;
+  metadata-only or offset-only input returns an empty lyrics list.
+  Artist search omits unservable artwork; index buckets use v1's article and
+  uppercase-then-ASCII rules, including multi-character uppercase initials.
+- A form POST with no runtime body still dispatches its query parameters.
+  A real body read or UTF-8 failure returns an HTTP-200 error-10 envelope
+  without dispatching partial parameters. The declared and streamed 10 MiB
+  caps remain in place; only the query selects the body-error envelope format.
 
 ## Consequences
 

@@ -143,11 +143,18 @@ impl<S: Library> SubsonicApp<S> {
 /// the store. The worker shell calls this on the `Content-Length` fast path
 /// (before buffering the body); `handle` calls it on the actual byte length.
 pub fn oversized_body_response(query: &str) -> HttpResponse {
+    body_error_response(query, "POST body exceeds the 10 MB limit.")
+}
+
+/// A failed or invalid form-body read must not dispatch partial parameters.
+/// Like the size cap, use only query parameters to choose the error envelope.
+pub fn unreadable_body_response(query: &str) -> HttpResponse {
+    body_error_response(query, "Unable to read request body.")
+}
+
+fn body_error_response(query: &str, message: &str) -> HttpResponse {
     let params = Params::parse(query);
-    let doc = error_document(
-        crate::envelope::code::REQUIRED_PARAM_MISSING,
-        "POST body exceeds the 10 MB limit.",
-    );
+    let doc = error_document(crate::envelope::code::REQUIRED_PARAM_MISSING, message);
     match params.get("f") {
         Some("json") => HttpResponse::document(200, JSON_CONTENT_TYPE, render_json(&doc)),
         Some("jsonp") => {

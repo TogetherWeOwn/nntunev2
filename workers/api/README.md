@@ -84,11 +84,11 @@ This crate remains standalone (excluded from the root workspace), so use
 Run these commands from the repository root:
 
 ```sh
-cargo test --manifest-path workers/api/Cargo.toml
-cargo clippy --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path workers/api/Cargo.toml --locked
+cargo clippy --manifest-path workers/api/Cargo.toml --all-targets --locked -- -D warnings
 cargo fmt --manifest-path workers/api/Cargo.toml -- --check
-cargo check --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
-cargo test -p nntune-subsonic
+cargo check --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown --locked
+cargo test -p nntune-subsonic --locked
 python3 scripts/check-subsonic-fixtures.py
 ```
 

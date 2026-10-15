@@ -6,6 +6,7 @@
 //! are deterministic; the worker shell uses real clock values.
 
 use crate::auth::{md5_hex, AuthStore, Identity};
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 
 /// Deterministic timestamp used by `MemStore` (fixtures depend on it).
@@ -25,6 +26,14 @@ pub struct Album {
     pub artist_id: String,
     pub duration: i64,
     pub created: String,
+    /// Album/release year, never inferred from a track's year.
+    pub year: Option<i64>,
+    /// ISO release date used by the catalogue's descending byYear ordering.
+    pub release_date: Option<String>,
+    /// Canonical UTC curation timestamp, distinct from legacy row creation.
+    pub curated_at: Option<String>,
+    /// Catalogue artist sort key, which can differ from the display name.
+    pub artist_sort_name: String,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +122,9 @@ impl UserAccount {
 pub trait Library: AuthStore {
     fn user_account(&self, username: &str) -> Option<UserAccount>;
     fn artists(&self) -> Vec<Artist>;
+    /// Newest visible artist update in Unix milliseconds, or the current time
+    /// when no timestamp is available (v1 GetIndexesController).
+    fn artists_last_modified(&self) -> i64;
     fn artist(&self, id: &str) -> Option<Artist>;
     fn albums_for_artist(&self, artist_id: &str) -> Vec<Album>;
     fn album(&self, id: &str) -> Option<Album>;
@@ -149,81 +161,14 @@ pub trait Library: AuthStore {
             })
             .collect()
     }
-    fn album_list(&self, query: AlbumListQuery<'_>) -> Vec<Album> {
-        let AlbumListQuery {
-            identity,
-            list_type,
-            size,
-            offset,
-            from_year,
-            to_year,
-            genre,
-        } = query;
-        let mut albums = self.all_albums();
-        if list_type == "starred" {
-            let starred_albums: HashSet<String> = self
-                .starred(identity, StarKind::Album)
-                .into_iter()
-                .collect();
-            let via_songs: HashSet<String> = self
-                .starred(identity, StarKind::Song)
-                .into_iter()
-                .filter_map(|id| self.song(&id))
-                .map(|song| song.album_id)
-                .collect();
-            albums.retain(|album| {
-                starred_albums.contains(&album.id) || via_songs.contains(&album.id)
-            });
-        }
-        if let (Some(from), Some(to)) = (from_year, to_year) {
-            albums.retain(|album| {
-                self.songs_for_album(&album.id)
-                    .iter()
-                    .any(|song| (from..=to).contains(&song.year))
-            });
-        }
-        if let Some(genre) = genre {
-            let genre = genre.to_lowercase();
-            albums.retain(|album| {
-                self.songs_for_album(&album.id)
-                    .iter()
-                    .any(|song| song.genre.to_lowercase() == genre)
-            });
-        }
-        match list_type {
-            "alphabeticalByName" => albums.sort_by_key(|album| album.name.to_lowercase()),
-            "alphabeticalByArtist" => albums.sort_by_key(|album| album.artist.to_lowercase()),
-            "frequent" => {
-                albums.sort_by_key(|album| std::cmp::Reverse(self.songs_for_album(&album.id).len()))
-            }
-            "byYear" => albums.sort_by_key(|album| {
-                self.songs_for_album(&album.id)
-                    .iter()
-                    .map(|song| song.year)
-                    .min()
-                    .unwrap_or_default()
-            }),
-            "byGenre" => albums.sort_by_key(|album| {
-                self.songs_for_album(&album.id)
-                    .first()
-                    .map(|song| song.genre.to_lowercase())
-                    .unwrap_or_default()
-            }),
-            "highest" => albums.sort_by_key(|album| {
-                std::cmp::Reverse(self.rating(identity, &album.id).unwrap_or_default())
-            }),
-            "random" => albums.sort_by_key(|album| {
-                album.id.bytes().fold(0u64, |hash, byte| {
-                    hash.wrapping_mul(31).wrapping_add(u64::from(byte))
-                })
-            }),
-            "recent" | "newest" => {
-                albums.sort_by(|a, b| b.created.cmp(&a.created).then(a.id.cmp(&b.id)))
-            }
-            _ => albums.sort_by(|a, b| b.created.cmp(&a.created).then(a.id.cmp(&b.id))),
-        }
-        albums.into_iter().skip(offset).take(size).collect()
-    }
+    /// Legacy album repository semantics, including per-user play history.
+    /// Random ignores offset; byYear reverses order when its bounds reverse.
+    fn album_list(&self, query: AlbumListQuery<'_>) -> Vec<Album>;
+    /// Streamable catalogue semantics: five supported types, code 0 for the
+    /// other validated types; reversed byYear bounds give an empty list.
+    fn album_list2(&self, query: AlbumListQuery<'_>) -> Result<Vec<Album>, (i64, String)>;
+    /// Sample accessible, non-podcast songs for this user before limiting.
+    fn random_songs(&self, identity: &Identity, size: usize) -> Vec<Song>;
     fn genres(&self) -> Vec<(String, i64, i64)>;
     fn audio(&self, song_id: &str) -> Option<Vec<u8>>;
     fn cover(&self, cover_id: &str) -> Option<Vec<u8>>;
@@ -279,10 +224,11 @@ pub struct MemStore {
     lyrics: BTreeMap<(String, String), String>,
     playlists: BTreeMap<String, Playlist>,
     playlist_seq: u64,
-    stars: HashSet<(String, StarKind, String)>,
+    stars: Vec<(String, StarKind, String)>,
     ratings: BTreeMap<(String, String), i64>,
     scrobbles: Vec<(String, String)>,
     queues: BTreeMap<String, PlayQueue>,
+    random_state: Cell<u64>,
 }
 
 fn test_identities() -> Vec<(String, String, String, String, bool, bool)> {
@@ -330,6 +276,13 @@ fn not_authorized() -> (i64, String) {
     )
 }
 
+fn catalogue_date_desc(left: &Option<String>, right: &Option<String>) -> std::cmp::Ordering {
+    // PostgreSQL ORDER BY date DESC defaults to NULLS FIRST.
+    left.as_ref()
+        .map(std::cmp::Reverse)
+        .cmp(&right.as_ref().map(std::cmp::Reverse))
+}
+
 fn data_missing() -> (i64, String) {
     // v1 `findOrFail` misses share one text via the same renderer.
     (
@@ -339,6 +292,48 @@ fn data_missing() -> (i64, String) {
 }
 
 impl MemStore {
+    /// Replace the in-memory catalogue without enabling fixture credentials or
+    /// resetting user state. All supplied songs are shared, non-podcast tracks.
+    pub fn with_catalogue(
+        mut self,
+        artists: Vec<Artist>,
+        albums: Vec<Album>,
+        songs: Vec<Song>,
+    ) -> Self {
+        self.artists = artists;
+        self.albums = albums;
+        self.songs = songs;
+        self
+    }
+
+    /// Repeatable shuffle sequence for fixtures/local development, not secrets.
+    /// Each sample advances the sequence; a database store supplies real random
+    /// queries through the required Library methods instead of inheriting this.
+    pub fn with_random_seed(self, seed: u64) -> Self {
+        self.random_state.set(seed);
+        self
+    }
+
+    fn shuffle<T>(&self, values: &mut [T]) {
+        for end in (1..values.len()).rev() {
+            let bound = (end + 1) as u64;
+            let threshold = bound.wrapping_neg() % bound;
+            let draw = loop {
+                // SplitMix64 followed by rejection sampling avoids modulo bias.
+                let state = self.random_state.get().wrapping_add(0x9e3779b97f4a7c15);
+                self.random_state.set(state);
+                let mut value = state;
+                value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+                value ^= value >> 31;
+                if value >= threshold {
+                    break value;
+                }
+            };
+            values.swap(end, (draw % bound) as usize);
+        }
+    }
+
     /// Production-safe empty store: empty catalogue AND no credentials.
     /// The worker shell uses this, so a deployed worker rejects all auth.
     pub fn empty() -> MemStore {
@@ -368,6 +363,10 @@ impl MemStore {
             artist_id: "ar-1".into(),
             duration: 200,
             created: NOW.into(),
+            year: Some(2026),
+            release_date: Some("2026-01-01".into()),
+            curated_at: Some(NOW.into()),
+            artist_sort_name: "Test Artist".into(),
         });
         store.songs.push(Song {
             id: "so-1".into(),
@@ -457,6 +456,11 @@ impl Library for MemStore {
         self.artists.clone()
     }
 
+    fn artists_last_modified(&self) -> i64 {
+        // Fixture clock only; real stores must provide their own timestamp.
+        1_767_225_600_000
+    }
+
     fn artist(&self, id: &str) -> Option<Artist> {
         self.artists.iter().find(|a| a.id == id).cloned()
     }
@@ -475,6 +479,133 @@ impl Library for MemStore {
 
     fn all_albums(&self) -> Vec<Album> {
         self.albums.clone()
+    }
+
+    fn album_list(&self, query: AlbumListQuery<'_>) -> Vec<Album> {
+        let mut albums = self.all_albums();
+        let mut offset = query.offset;
+        match query.list_type {
+            "random" => {
+                self.shuffle(&mut albums);
+                // v1's legacy getRandom accepts a limit, not an offset.
+                offset = 0;
+            }
+            "frequent" | "recent" => {
+                let mut plays: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+                let song_albums: BTreeMap<&str, &str> = self
+                    .songs
+                    .iter()
+                    .map(|song| (song.id.as_str(), song.album_id.as_str()))
+                    .collect();
+                for (position, (username, song_id)) in self.scrobbles.iter().enumerate() {
+                    if username == &query.identity.username {
+                        if let Some(album_id) = song_albums.get(song_id.as_str()) {
+                            let entry = plays.entry(album_id).or_default();
+                            entry.0 += 1;
+                            entry.1 = position;
+                        }
+                    }
+                }
+                if query.list_type == "recent" {
+                    albums.retain(|album| plays.contains_key(album.id.as_str()));
+                    albums.sort_by_key(|album| std::cmp::Reverse(plays[album.id.as_str()].1));
+                } else {
+                    // Never-played albums remain eligible with play_count=0.
+                    albums.sort_by_key(|album| {
+                        std::cmp::Reverse(plays.get(album.id.as_str()).map_or(0, |play| play.0))
+                    });
+                }
+            }
+            "byYear" => {
+                if let (Some(from), Some(to)) = (query.from_year, query.to_year) {
+                    albums.retain(|album| {
+                        album
+                            .year
+                            .is_some_and(|year| (from.min(to)..=from.max(to)).contains(&year))
+                    });
+                    albums.sort_by(|a, b| {
+                        let years = if from > to {
+                            b.year.cmp(&a.year)
+                        } else {
+                            a.year.cmp(&b.year)
+                        };
+                        years.then(a.name.cmp(&b.name))
+                    });
+                }
+            }
+            "byGenre" => {
+                albums.retain(|album| {
+                    self.songs.iter().any(|song| {
+                        song.album_id == album.id && Some(song.genre.as_str()) == query.genre
+                    })
+                });
+                albums.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+            "highest" => {
+                albums.retain(|album| self.rating(query.identity, &album.id).is_some());
+                albums.sort_by(|a, b| {
+                    self.rating(query.identity, &b.id)
+                        .cmp(&self.rating(query.identity, &a.id))
+                        .then(a.name.cmp(&b.name))
+                });
+            }
+            "starred" => {
+                let favorites = self.starred(query.identity, StarKind::Album);
+                albums.retain(|album| favorites.contains(&album.id));
+                albums.sort_by_key(|album| favorites.iter().position(|id| id == &album.id));
+            }
+            "alphabeticalByName" => albums.sort_by(|a, b| a.name.cmp(&b.name)),
+            "alphabeticalByArtist" => {
+                albums.sort_by(|a, b| a.artist.cmp(&b.artist).then(a.name.cmp(&b.name)))
+            }
+            "newest" => albums.sort_by(|a, b| b.created.cmp(&a.created)),
+            _ => return Vec::new(), // HTTP validation rejects unknown types.
+        }
+        albums.into_iter().skip(offset).take(query.size).collect()
+    }
+
+    fn album_list2(&self, query: AlbumListQuery<'_>) -> Result<Vec<Album>, (i64, String)> {
+        let mut albums = self.all_albums();
+        // All MemStore songs are streamable. Real stores also enforce takedowns.
+        albums.retain(|album| self.songs.iter().any(|song| song.album_id == album.id));
+        match query.list_type {
+            "random" => self.shuffle(&mut albums),
+            "newest" => albums.sort_by(|a, b| catalogue_date_desc(&a.curated_at, &b.curated_at)),
+            "alphabeticalByName" => albums.sort_by(|a, b| a.name.cmp(&b.name)),
+            "alphabeticalByArtist" => albums.sort_by(|a, b| {
+                a.artist_sort_name
+                    .cmp(&b.artist_sort_name)
+                    .then(a.name.cmp(&b.name))
+            }),
+            "byYear" => {
+                if let (Some(from), Some(to)) = (query.from_year, query.to_year) {
+                    albums
+                        .retain(|album| album.year.is_some_and(|year| (from..=to).contains(&year)));
+                }
+                albums.sort_by(|a, b| {
+                    catalogue_date_desc(&a.release_date, &b.release_date)
+                        .then_with(|| catalogue_date_desc(&a.curated_at, &b.curated_at))
+                });
+            }
+            kind => {
+                return Err((
+                    crate::envelope::code::GENERIC,
+                    format!("Unsupported album list type: {kind}"),
+                ))
+            }
+        }
+        Ok(albums
+            .into_iter()
+            .skip(query.offset)
+            .take(query.size)
+            .collect())
+    }
+
+    fn random_songs(&self, _identity: &Identity, size: usize) -> Vec<Song> {
+        let mut songs = self.all_songs();
+        self.shuffle(&mut songs);
+        songs.truncate(size);
+        songs
     }
 
     fn songs_for_album(&self, album_id: &str) -> Vec<Song> {
@@ -616,26 +747,26 @@ impl Library for MemStore {
             StarKind::Song => self.song(id).is_some(),
         };
         if known {
-            self.stars
-                .insert((identity.username.clone(), kind, id.to_string()));
+            let favorite = (identity.username.clone(), kind, id.to_string());
+            // v1 upserts a fresh position even when the item is already starred.
+            self.stars.retain(|entry| entry != &favorite);
+            self.stars.push(favorite);
         }
         known
     }
 
     fn unstar(&mut self, identity: &Identity, kind: StarKind, id: &str) {
-        self.stars
-            .remove(&(identity.username.clone(), kind, id.to_string()));
+        let favorite = (identity.username.clone(), kind, id.to_string());
+        self.stars.retain(|entry| entry != &favorite);
     }
 
     fn starred(&self, identity: &Identity, kind: StarKind) -> Vec<String> {
-        let mut out: Vec<String> = self
-            .stars
+        // v1 orders all three kinds by favorites.position, not the item ID.
+        self.stars
             .iter()
             .filter(|(u, k, _)| u == &identity.username && *k == kind)
             .map(|(_, _, id)| id.clone())
-            .collect();
-        out.sort();
-        out
+            .collect()
     }
 
     fn set_rating(&mut self, identity: &Identity, id: &str, rating: i64) -> bool {

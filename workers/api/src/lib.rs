@@ -17,7 +17,9 @@ pub mod vault;
 #[cfg(target_arch = "wasm32")]
 use futures_util::StreamExt;
 #[cfg(target_arch = "wasm32")]
-use nntune_subsonic::{oversized_body_response, MemStore, SubsonicApp, MAX_BODY_BYTES};
+use nntune_subsonic::{
+    oversized_body_response, unreadable_body_response, MemStore, SubsonicApp, MAX_BODY_BYTES,
+};
 #[cfg(target_arch = "wasm32")]
 use worker::*;
 
@@ -52,16 +54,19 @@ pub async fn main(mut req: Request, _env: Env, _ctx: Context) -> Result<Response
     }
     let body = if method.eq_ignore_ascii_case("POST")
         && content_type.contains("application/x-www-form-urlencoded")
+        // Request::stream() errors on a null JS body. That is a valid empty
+        // form POST, distinct from a stream that exists but cannot be read.
+        && req.inner().body().is_some()
     {
         let mut stream = match req.stream() {
             Ok(stream) => stream,
-            Err(_) => return Response::error("Unable to read request body", 400),
+            Err(_) => return respond(&unreadable_body_response(&query)),
         };
         let mut bytes = Vec::new();
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
-                Err(_) => return Response::error("Unable to read request body", 400),
+                Err(_) => return respond(&unreadable_body_response(&query)),
             };
             if bytes.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
                 let res = oversized_body_response(&query);
@@ -71,7 +76,7 @@ pub async fn main(mut req: Request, _env: Env, _ctx: Context) -> Result<Response
         }
         match String::from_utf8(bytes) {
             Ok(body) => body,
-            Err(_) => return Response::error("Invalid UTF-8 request body", 400),
+            Err(_) => return respond(&unreadable_body_response(&query)),
         }
     } else {
         String::new()

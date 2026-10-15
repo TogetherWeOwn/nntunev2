@@ -273,28 +273,37 @@ fn search_count(
     }
 }
 
+fn list_size(params: &Params) -> Result<usize, EndpointResult> {
+    match params.get("size").unwrap_or("10").parse::<usize>() {
+        Ok(size) if (1..=500).contains(&size) => Ok(size),
+        _ => Err(missing()),
+    }
+}
+
 fn artist_index<S: Library>(store: &S) -> Vec<Value> {
     let mut groups: std::collections::BTreeMap<String, Vec<Value>> =
         std::collections::BTreeMap::new();
     for artist in store.artists() {
         let albums = store.albums_for_artist(&artist.id).len() as i64;
-        let name = artist.name.trim_start();
+        let name = artist.name.trim();
         let stripped = ["The", "El", "La", "Los", "Las", "Le", "Les"]
             .iter()
             .find_map(|article| {
                 name.get(..article.len())
                     .filter(|prefix| prefix.eq_ignore_ascii_case(article))
                     .and_then(|_| name.get(article.len()..))
-                    .filter(|suffix| suffix.chars().next().is_some_and(char::is_whitespace))
+                    .filter(|suffix| suffix.starts_with(' '))
             })
-            .map(str::trim_start)
+            .map(str::trim)
             .unwrap_or(name);
         let key = stripped
             .chars()
             .next()
             .map(|c| {
-                if c.is_alphabetic() {
-                    c.to_uppercase().to_string()
+                // v1 uppercases before byte-based ctype_alpha (e.g. ß → SS).
+                let upper = c.to_uppercase().to_string();
+                if upper.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+                    upper
                 } else {
                     "#".to_string()
                 }
@@ -361,8 +370,10 @@ pub fn handle_endpoint<S: Library>(
             EndpointResult::Doc(vec![(
                 "indexes".to_string(),
                 Value::map(vec![
-                    // Fixed to the seeded store's NOW for deterministic fixtures (Unix ms).
-                    ("lastModified", Value::int_value(1_767_225_600_000)),
+                    (
+                        "lastModified",
+                        Value::int_value(store.artists_last_modified()),
+                    ),
                     (
                         "ignoredArticles",
                         Value::str_value("The El La Los Las Le Les"),
@@ -496,12 +507,7 @@ pub fn handle_endpoint<S: Library>(
                 .take(artist_count)
                 .map(|artist| {
                     let album_count = store.albums_for_artist(&artist.id).len() as i64;
-                    Value::map(vec![
-                        ("id", Value::str_value(&artist.id)),
-                        ("name", Value::str_value(&artist.name)),
-                        ("coverArt", Value::str_value(&artist.id)),
-                        ("albumCount", Value::int_value(album_count)),
-                    ])
+                    artist_item(&artist, album_count)
                 })
                 .collect();
             let albums: Vec<Value> = store
@@ -563,7 +569,7 @@ pub fn handle_endpoint<S: Library>(
                     .ok()
                     .and_then(|year| year.parse().ok())
                 {
-                    Some(year) if Some(year) >= from_year => Some(year),
+                    Some(year) => Some(year),
                     _ => return missing(),
                 }
             } else {
@@ -577,16 +583,27 @@ pub fn handle_endpoint<S: Library>(
             } else {
                 None
             };
-            let (size, offset) = size_offset(params);
-            let albums = store.album_list(AlbumListQuery {
+            let size = ok_or_return!(list_size(params));
+            let offset = match params.get("offset").unwrap_or("0").parse::<usize>() {
+                Ok(offset) => offset,
+                Err(_) => return missing(),
+            };
+            let query = AlbumListQuery {
                 identity,
                 list_type,
-                size: size.min(500),
+                size,
                 offset,
                 from_year,
                 to_year,
                 genre,
-            });
+            };
+            let albums = if name == "getAlbumList" {
+                store.album_list(query)
+            } else {
+                ok_or_return!(store
+                    .album_list2(query)
+                    .map_err(|(code, message)| EndpointResult::Err(code, message)))
+            };
             let page: Vec<Value> = albums
                 .into_iter()
                 .map(|a| {
@@ -712,8 +729,18 @@ pub fn handle_endpoint<S: Library>(
             if ids.is_empty() {
                 return missing();
             }
-            for id in ids {
-                store.scrobble(identity, id);
+            // v1 FILTER_VALIDATE_BOOL: absent defaults true; only these
+            // case-insensitive values are true, including surrounding space.
+            let submission = params.get("submission").is_none_or(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            });
+            if submission {
+                for id in ids {
+                    store.scrobble(identity, id);
+                }
             }
             EndpointResult::Doc(vec![])
         }
@@ -774,11 +801,10 @@ pub fn handle_endpoint<S: Library>(
             EndpointResult::Doc(vec![(key.to_string(), Value::Map(entries))])
         }
         "getRandomSongs" => {
-            let (size, _) = size_offset(params);
+            let size = ok_or_return!(list_size(params));
             let songs: Vec<Value> = store
-                .all_songs()
+                .random_songs(identity, size)
                 .iter()
-                .take(size)
                 .map(|s| starred_song_entry(store, identity, s))
                 .collect();
             EndpointResult::Doc(vec![(
@@ -836,13 +862,13 @@ pub fn handle_endpoint<S: Library>(
                 None => not_found(),
             }
         }
-        // v1 `TokenInfoController` (TOG-9725): the `apiKeyAuthentication`
+        // v1 `TokenInfoController`: the `apiKeyAuthentication`
         // endpoint — reports the username the credential authenticated as.
         "tokenInfo" => EndpointResult::Doc(vec![(
             "tokenInfo".to_string(),
             Value::map(vec![("username", Value::str_value(&identity.username))]),
         )]),
-        // v1 `GetOpenSubsonicExtensionsController` (TOG-9725): exactly
+        // v1 `GetOpenSubsonicExtensionsController`: exactly
         // `apiKeyAuthentication` + `formPost`. `songLyrics` is deliberately
         // NOT claimed because `getLyrics` is a stub; `transcodeOffset` is
         // not claimed because no transcoding exists. Served without auth
@@ -1094,49 +1120,64 @@ fn star_unstar<S: Library>(
 }
 
 fn structured_lyrics(artist: &str, title: &str, text: &str) -> Value {
+    let text = text.trim();
+    if text.is_empty() {
+        return Value::List(vec![]);
+    }
     let mut offset = 0i64;
-    let mut lines = Vec::new();
-    let mut synced = false;
-    for raw_line in text.lines() {
-        let raw_line = raw_line.trim_end_matches('\r');
+    let mut timed_lines = Vec::new();
+    let mut plain_lines = Vec::new();
+    // v1 ParsedLyrics splits all three newline forms, including bare CR.
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    for raw_line in normalized.split('\n') {
         if let Some(value) = raw_line
-            .strip_prefix("[offset:")
+            .trim()
+            .strip_prefix('[')
             .and_then(|value| value.strip_suffix(']'))
-            .and_then(|value| value.parse::<i64>().ok())
+            .and_then(|tag| tag.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case("offset"))
+            .and_then(|(_, value)| value.trim().parse::<i64>().ok())
         {
             offset = value;
             continue;
         }
-        let mut content = raw_line;
+        let mut content = raw_line.trim_start();
         let mut timestamps = Vec::new();
         while let Some(rest) = content.strip_prefix('[') {
             let Some(end) = rest.find(']') else {
                 break;
             };
-            let stamp = &rest[..end];
-            let Some(start) = parse_lyric_timestamp(stamp) else {
+            let Some(start) = parse_lyric_timestamp(&rest[..end]) else {
                 break;
             };
             timestamps.push(start);
-            content = &rest[end + 1..];
+            content = rest[end + 1..].trim_start();
         }
         if timestamps.is_empty() {
-            if !content.is_empty() {
-                lines.push(Value::map(vec![
-                    ("start", Value::int_value(0)),
-                    ("value", Value::str_value(content)),
-                ]));
+            if !is_lyric_metadata(raw_line) {
+                plain_lines.push(Value::map(vec![("value", Value::str_value(raw_line))]));
             }
         } else {
-            synced = true;
             for start in timestamps {
-                lines.push(Value::map(vec![
-                    ("start", Value::int_value(start)),
-                    ("value", Value::str_value(content)),
-                ]));
+                timed_lines.push((start, content.trim().to_string()));
             }
         }
     }
+    let synced = !timed_lines.is_empty();
+    let lines = if synced {
+        timed_lines.sort_by_key(|(start, _)| *start);
+        timed_lines
+            .into_iter()
+            .map(|(start, text)| {
+                Value::map(vec![
+                    ("start", Value::int_value(start)),
+                    ("value", Value::str_value(text)),
+                ])
+            })
+            .collect()
+    } else {
+        plain_lines
+    };
     if lines.is_empty() {
         return Value::List(vec![]);
     }
@@ -1145,7 +1186,7 @@ fn structured_lyrics(artist: &str, title: &str, text: &str) -> Value {
         Value::List(vec![Value::map(vec![
             ("displayArtist", Value::str_value(artist)),
             ("displayTitle", Value::str_value(title)),
-            ("lang", Value::str_value("")),
+            ("lang", Value::str_value("und")),
             ("offset", Value::int_value(offset)),
             ("synced", Value::bool_value(synced)),
             ("line", Value::List(lines)),
@@ -1153,18 +1194,43 @@ fn structured_lyrics(artist: &str, title: &str, text: &str) -> Value {
     )])
 }
 
+fn is_lyric_metadata(line: &str) -> bool {
+    let mut rest = line.trim();
+    let mut found = false;
+    while let Some(tag) = rest.strip_prefix('[') {
+        let Some((tag, suffix)) = tag.split_once(']') else {
+            return false;
+        };
+        let Some((name, _)) = tag.split_once(':') else {
+            return false;
+        };
+        if !["ar", "ti", "al", "au", "length", "by", "offset", "re", "ve"]
+            .iter()
+            .any(|known| name.trim_end().eq_ignore_ascii_case(known))
+        {
+            return false;
+        }
+        found = true;
+        rest = suffix.trim_start();
+    }
+    found && rest.is_empty()
+}
+
 fn parse_lyric_timestamp(value: &str) -> Option<i64> {
     let (minutes, seconds) = value.split_once(':')?;
+    let (seconds, fraction) = seconds.split_once(['.', ':']).unwrap_or((seconds, ""));
+    if !(1..=2).contains(&minutes.len())
+        || seconds.len() != 2
+        || !minutes.bytes().all(|byte| byte.is_ascii_digit())
+        || !seconds.bytes().all(|byte| byte.is_ascii_digit())
+        || (!fraction.is_empty()
+            && (fraction.len() > 3 || !fraction.bytes().all(|byte| byte.is_ascii_digit())))
+        || (fraction.is_empty() && value.ends_with(['.', ':']))
+    {
+        return None;
+    }
     let minutes = minutes.parse::<i64>().ok()?;
-    let (seconds, fraction) = seconds.split_once('.').unwrap_or((seconds, "0"));
     let seconds = seconds.parse::<i64>().ok()?;
-    if !(0..60).contains(&seconds) || minutes < 0 {
-        return None;
-    }
-    if !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let fraction: String = fraction.chars().take(3).collect();
     let millis = match fraction.len() {
         0 => 0,
         1 => fraction.parse::<i64>().ok()? * 100,
