@@ -30,6 +30,8 @@ pub const DIAL_TIMEOUT_MS: u64 = 5_000;
 pub const TOTAL_TIMEOUT_MS: u64 = 15_000;
 /// Per-user concurrent `test connection` cap.
 pub const MAX_TEST_CONCURRENCY: u32 = 2;
+/// Maximum vetted DNS addresses attempted by one test-connection request.
+pub const MAX_DIAL_ADDRESSES: usize = 4;
 /// `max_connections` ceiling: the vault row value is a cap, not a target.
 pub const MAX_CONNECTIONS_CEILING: u32 = 50;
 /// Indexer fetches must never follow redirects (SSRF).
@@ -153,13 +155,16 @@ fn resolve_public_target(
     host: &str,
     dns: &impl DnsResolver,
 ) -> Result<ValidatedTarget, VaultError> {
-    let addresses = match host.parse::<IpAddr>() {
+    let mut addresses = match host.parse::<IpAddr>() {
         Ok(ip) => vec![ip],
         Err(_) => dns.resolve(host),
     };
     if addresses.is_empty() || addresses.iter().any(ip_is_forbidden) {
         return Err(VaultError::Invalid);
     }
+    // Validate every answer before retaining a bounded prefix for dialing;
+    // a later forbidden DNS answer must still reject the whole target.
+    addresses.truncate(MAX_DIAL_ADDRESSES);
     Ok(ValidatedTarget {
         host: host.to_string(),
         addresses,
@@ -167,8 +172,9 @@ fn resolve_public_target(
 }
 
 impl ProviderConfig {
-    /// Validate shape + SSRF guard and retain ALL vetted addresses for a
-    /// pinned dial. Call at save AND immediately before dial. Every failure
+    /// Validate shape + SSRF guard across ALL resolved addresses, retaining
+    /// at most [`MAX_DIAL_ADDRESSES`] for a pinned dial. Call at save AND
+    /// immediately before dial. Every failure
     /// maps to generic [`VaultError::Invalid`] (no target/existence oracle).
     pub fn validate(&self, dns: &impl DnsResolver) -> Result<ValidatedTarget, VaultError> {
         if !host_shape_ok(&self.host) {
@@ -510,6 +516,13 @@ mod tests {
         }
     }
 
+    struct ListDns(Vec<IpAddr>);
+    impl DnsResolver for ListDns {
+        fn resolve(&self, _host: &str) -> Vec<IpAddr> {
+            self.0.clone()
+        }
+    }
+
     #[test]
     fn unresolvable_host_rejected() {
         let c = ProviderConfig {
@@ -521,6 +534,36 @@ mod tests {
             max_connections: 2,
         };
         assert!(c.validate(&EmptyDns).is_err());
+    }
+
+    #[test]
+    fn validated_target_retains_only_a_bounded_address_prefix_after_checking_all() {
+        let config = ProviderConfig {
+            host: "news.example.com".into(),
+            port: 119,
+            tls: false,
+            username: "u".into(),
+            password: "p".into(),
+            max_connections: 2,
+        };
+        let public = ListDns(vec![
+            "8.8.8.8".parse().unwrap(),
+            "1.1.1.1".parse().unwrap(),
+            "9.9.9.9".parse().unwrap(),
+            "4.2.2.1".parse().unwrap(),
+            "208.67.222.222".parse().unwrap(),
+        ]);
+        let target = config.validate(&public).unwrap();
+        assert_eq!(target.addresses().len(), MAX_DIAL_ADDRESSES);
+
+        let forbidden_after_prefix = ListDns(vec![
+            "8.8.8.8".parse().unwrap(),
+            "1.1.1.1".parse().unwrap(),
+            "9.9.9.9".parse().unwrap(),
+            "4.2.2.1".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+        ]);
+        assert!(config.validate(&forbidden_after_prefix).is_err());
     }
 
     #[test]

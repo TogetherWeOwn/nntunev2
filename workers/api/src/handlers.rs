@@ -45,11 +45,13 @@ use crate::webauthn;
 /// Request bodies above this size reject before routing (not an oracle:
 /// size only, same for every route).
 pub const MAX_BODY_BYTES: usize = 32 * 1024;
-/// Magic links issuable per email inside the link TTL window. The count
-/// comes from the shared store (`magic_link_tokens`), never memory.
+/// Magic links issuable per email inside the link TTL window.
 pub const MAGIC_LINKS_PER_WINDOW: u64 = 3;
-/// Test-connection attempts per user per minute (shared-store audit count).
+/// Test-connection attempts per user per minute.
 pub const TEST_CONNECTION_PER_MINUTE: u64 = 10;
+/// Expired leases outlive the bounded test-connection probe by five seconds.
+const TEST_CONNECTION_LEASE_SECS: u64 = 20;
+const AUTH_START_WINDOW_SECS: u64 = 3600;
 
 // --- Config ---------------------------------------------------------------------
 
@@ -205,11 +207,33 @@ pub trait Store {
         &self,
         token_hash: &str,
     ) -> impl Future<Output = Result<Option<MagicLinkRecord>, StoreError>>;
-    fn magic_issued_since(
+    /// Atomically reserve one of `limit` per-key slots until `now + window_secs`.
+    /// Expired slots may be reused; concurrent calls must never exceed the cap.
+    fn reserve_rate_limit(
         &self,
-        email: &str,
-        since: u64,
-    ) -> impl Future<Output = Result<u64, StoreError>>;
+        scope_key: &str,
+        action: &str,
+        limit: u64,
+        now: u64,
+        window_secs: u64,
+    ) -> impl Future<Output = Result<bool, StoreError>>;
+    /// Remove challenges that can no longer be redeemed.
+    fn prune_expired_challenges(&self, now: u64) -> impl Future<Output = Result<(), StoreError>>;
+    /// Acquire one of the per-user test-connection leases until `expires_at`.
+    fn acquire_test_connection_lease(
+        &self,
+        user_id: &str,
+        token: &str,
+        lease_secs: u64,
+        max_concurrency: u32,
+    ) -> impl Future<Output = Result<bool, StoreError>>;
+    /// Release only the lease owned by `token`; a stale completion cannot
+    /// release a newer lease that reused the slot.
+    fn release_test_connection_lease(
+        &self,
+        user_id: &str,
+        token: &str,
+    ) -> impl Future<Output = Result<(), StoreError>>;
     fn invite_by_hash(
         &self,
         code_hash: &str,
@@ -244,12 +268,6 @@ pub trait Store {
     ) -> impl Future<Output = Result<(), StoreError>>;
     fn delete_vault(&self, user_id: &str) -> impl Future<Output = Result<(), StoreError>>;
     fn insert_audit(&self, event: &AuditEvent) -> impl Future<Output = Result<(), StoreError>>;
-    fn audit_count_since(
-        &self,
-        user_id: &str,
-        action: &str,
-        since: u64,
-    ) -> impl Future<Output = Result<u64, StoreError>>;
 }
 
 /// Magic-link delivery. The token is passed only to the mailer; it must
@@ -265,8 +283,9 @@ pub trait Mailer {
 /// Bounded outbound probe for `test connection`. Implementations dial
 /// ONLY addresses from `target` (never re-resolve `target.host()`),
 /// keep the hostname for TLS SNI/certificate checks where the runtime
-/// supports it, apply the `vault` timeout constants, follow no redirects,
-/// and return a bare boolean — banners/errors never leave the dialer.
+/// supports it, apply the per-address and total `vault` timeout constants,
+/// attempt no more than `vault::MAX_DIAL_ADDRESSES`, follow no redirects, and return a
+/// bare boolean — banners/errors never leave the dialer.
 pub trait Dialer {
     fn probe(&self, target: &ValidatedTarget, port: u16, tls: bool) -> impl Future<Output = bool>;
 }
@@ -375,9 +394,10 @@ fn fake_id(cfg: &Config, label: &str, email: &str, index: u32, bytes: usize) -> 
     b64url_encode(&hasher.finalize()[..bytes])
 }
 
-/// Stand-in credential id, shaped like a real 18-byte credential id.
-fn fake_cred_id(cfg: &Config, email: &str, index: u32) -> String {
-    fake_id(cfg, "fake-cred", email, index, 18)
+/// Opaque deterministic email scope for rate-limit rows; the address itself
+/// is not copied into the reservation table.
+fn email_rate_limit_key(cfg: &Config, email: &str) -> String {
+    fake_id(cfg, "email-rate-limit", email, 0, 32)
 }
 
 /// Stand-in user id for register/start taken-email shapes, shaped like
@@ -386,14 +406,8 @@ fn fake_user_id(cfg: &Config, email: &str) -> String {
     fake_id(cfg, "fake-user", email, 0, 16)
 }
 
-/// login/start allow-lists are padded with stand-in ids to this length,
-/// so list length does not reveal how many passkeys an account holds
-/// (accounts above the pad length return their real list).
-const ALLOW_LIST_PADDED_LEN: usize = 4;
-
-/// Register/login challenge inserts allowed per account per hour,
-/// counted in the shared audit store; excess starts return the usual
-/// shape with an unstored (unredeemable) challenge.
+/// Register/login challenge inserts allowed per account per hour.
+/// Excess starts keep the usual response shape but store no challenge.
 const AUTH_STARTS_PER_HOUR: u64 = 10;
 
 fn normalize_email(raw: &str) -> Option<String> {
@@ -418,7 +432,9 @@ fn parse_body<T: for<'de> Deserialize<'de>>(req: &Request) -> Option<T> {
 fn session_cookie_value(req: &Request) -> Option<String> {
     let header = req.cookie.as_deref()?;
     for part in header.split(';') {
-        let (name, value) = part.trim().split_once('=')?;
+        let Some((name, value)) = part.trim().split_once('=') else {
+            continue;
+        };
         if name.trim() == session::COOKIE_NAME {
             let value = value.trim();
             if !value.is_empty() {
@@ -438,9 +454,9 @@ where
 {
     async fn audit(&self, user_id: &str, action: &str, ok: bool) {
         // Best-effort: an audit-store failure must not turn a completed
-        // auth decision into a distinguishable response. Rate limiting
-        // reads the same table, so a store outage fails those closed
-        // through their own count queries.
+        // auth decision into a distinguishable response. Rate budgets and
+        // connection leases use separate atomic store operations and fail
+        // closed when those reservations fail.
         let _ = self
             .store
             .insert_audit(&vault::audit_event(
@@ -509,6 +525,28 @@ where
             session::verify_stored_session(&self.cfg.session_secret, &token, self.now, &record)
                 .map_err(|_| generic_auth())?;
         Ok((claims, token))
+    }
+
+    async fn send_magic_link_if_allowed(&self, user_id: &str, email: &str) {
+        let scope_key = email_rate_limit_key(self.cfg, email);
+        let admitted = self
+            .store
+            .reserve_rate_limit(
+                &scope_key,
+                "auth.magic_link",
+                MAGIC_LINKS_PER_WINDOW,
+                self.now,
+                auth::MAGIC_LINK_TTL_SECS,
+            )
+            .await
+            .unwrap_or(false);
+        if !admitted {
+            return;
+        }
+        let (token, record) = auth::issue_magic_link(user_id, email, self.now);
+        if self.store.insert_magic(&record).await.is_ok() {
+            let _ = self.mailer.send_magic_link(email, &token).await;
+        }
     }
 
     async fn resolve_all(&self, host: &str) -> StaticDns {
@@ -635,20 +673,21 @@ where
             }
         }
     };
-    // Shared-store start budget: past it the response keeps the same
-    // shape but the challenge is never stored, so finish fails
-    // generically and auth_challenges stops growing for this account.
-    let starts = ctx
+    // Reserve atomically before storing the challenge. The response shape
+    // stays identical when storage fails or the per-account cap is reached.
+    let admitted = ctx
         .store
-        .audit_count_since(
+        .reserve_rate_limit(
             &user.id,
             "auth.register_start",
-            ctx.now.saturating_sub(3600),
+            AUTH_STARTS_PER_HOUR,
+            ctx.now,
+            AUTH_START_WINDOW_SECS,
         )
         .await
-        .unwrap_or(u64::MAX);
-    ctx.audit(&user.id, "auth.register_start", true).await;
-    if starts >= AUTH_STARTS_PER_HOUR {
+        .unwrap_or(false);
+    ctx.audit(&user.id, "auth.register_start", admitted).await;
+    if !admitted {
         return shape(user.id.clone());
     }
     if ctx
@@ -659,20 +698,9 @@ where
     {
         return internal();
     }
-    // Email-ownership proof for finish: mail a single-use token bound to
-    // this user (same shared-store rate limit as magic login).
-    let since = ctx.now.saturating_sub(auth::MAGIC_LINK_TTL_SECS);
-    let issued = ctx
-        .store
-        .magic_issued_since(&email, since)
-        .await
-        .unwrap_or(u64::MAX);
-    if issued < MAGIC_LINKS_PER_WINDOW {
-        let (token, record) = auth::issue_magic_link(&user.id, &email, ctx.now);
-        if ctx.store.insert_magic(&record).await.is_ok() {
-            let _ = ctx.mailer.send_magic_link(&email, &token).await;
-        }
-    }
+    // Email-ownership proof and magic login share one atomic per-email
+    // issuance budget, so parallel requests cannot oversend.
+    ctx.send_magic_link_if_allowed(&user.id, &email).await;
     shape(user.id.clone())
 }
 
@@ -807,52 +835,45 @@ where
     let Some(email) = normalize_email(&body.email) else {
         return generic_auth();
     };
-    // Always issue a challenge with a non-empty allow-list shape: an
-    // unknown (or credential-less) email gets one deterministic fake
-    // credential id, indistinguishable from a one-passkey account, so
-    // this route is not an account-existence oracle.
+    if ctx.store.prune_expired_challenges(ctx.now).await.is_err() {
+        return internal();
+    }
     let user = match ctx.store.user_by_email(&email).await {
         Ok(user) => user,
         Err(_) => return internal(),
     };
+    let scope_key = user
+        .as_ref()
+        .map(|user| user.id.clone())
+        .unwrap_or_else(|| email_rate_limit_key(ctx.cfg, &email));
     let challenge = match auth::new_registration_challenge(&ctx.cfg.rp_id, &ctx.cfg.origin, ctx.now)
     {
         Ok(challenge) => challenge,
         Err(_) => return internal(),
     };
-    let (user_id, allow) = match &user {
-        Some(user) => {
-            let creds = match ctx.store.credentials_for_user(&user.id).await {
-                Ok(creds) => creds,
-                Err(_) => return internal(),
-            };
-            (
-                Some(user.id.as_str()),
-                creds
-                    .iter()
-                    .map(|c| c.cred_id_b64url.clone())
-                    .collect::<Vec<_>>(),
-            )
-        }
-        None => (None, Vec::new()),
-    };
-    // Pad with deterministic stand-ins to a fixed length so the list
-    // size does not reveal whether/how many passkeys the account holds.
-    // Authenticators ignore unknown ids, so padding is login-safe.
-    let mut allow = allow;
-    let mut pad_index = 0u32;
-    while allow.len() < ALLOW_LIST_PADDED_LEN {
-        let fake = fake_cred_id(ctx.cfg, &email, pad_index);
-        pad_index += 1;
-        if !allow.contains(&fake) {
-            allow.push(fake);
-        }
-    }
-    if ctx
+    // Use a discoverable/usernameless passkey flow: returning credential ids
+    // here leaks their variable lengths even when the list is padded.
+    let admitted = ctx
         .store
-        .insert_challenge(&challenge, user_id, PURPOSE_LOGIN)
+        .reserve_rate_limit(
+            &scope_key,
+            "auth.login_start",
+            AUTH_STARTS_PER_HOUR,
+            ctx.now,
+            AUTH_START_WINDOW_SECS,
+        )
         .await
-        .is_err()
+        .unwrap_or(false);
+    if admitted
+        && ctx
+            .store
+            .insert_challenge(
+                &challenge,
+                user.as_ref().map(|user| user.id.as_str()),
+                PURPOSE_LOGIN,
+            )
+            .await
+            .is_err()
     {
         return internal();
     }
@@ -860,7 +881,7 @@ where
         200,
         serde_json::json!({
             "challenge": challenge.id,
-            "allow_credentials": allow,
+            "allow_credentials": [],
             "rp_id": ctx.cfg.rp_id,
         }),
     )
@@ -960,21 +981,10 @@ where
     let Some(email) = normalize_email(&body.email) else {
         return generic_auth();
     };
-    // Identical response whether or not the account exists or the rate
-    // limit already fired.
+    // Identical response whether or not the account exists or the atomic
+    // per-email issuance budget has been exhausted.
     if let Ok(Some(user)) = ctx.store.user_by_email(&email).await {
-        let since = ctx.now.saturating_sub(auth::MAGIC_LINK_TTL_SECS);
-        let issued = ctx
-            .store
-            .magic_issued_since(&email, since)
-            .await
-            .unwrap_or(u64::MAX);
-        if issued < MAGIC_LINKS_PER_WINDOW {
-            let (token, record) = auth::issue_magic_link(&user.id, &email, ctx.now);
-            if ctx.store.insert_magic(&record).await.is_ok() {
-                let _ = ctx.mailer.send_magic_link(&email, &token).await;
-            }
-        }
+        ctx.send_magic_link_if_allowed(&user.id, &email).await;
     }
     json_response(200, serde_json::json!({"ok": true}))
 }
@@ -1233,51 +1243,69 @@ where
     // Every failure below collapses to the same boolean (never a banner,
     // host verdict or vault-existence signal).
     let fail = || json_response(200, serde_json::json!({"ok": false}));
-    let since = ctx.now.saturating_sub(60);
-    match ctx
+    let admitted = ctx
         .store
-        .audit_count_since(&claims.user_id, "vault.test", since)
+        .reserve_rate_limit(
+            &claims.user_id,
+            "vault.test",
+            TEST_CONNECTION_PER_MINUTE,
+            ctx.now,
+            60,
+        )
         .await
-    {
-        Ok(count) if count < TEST_CONNECTION_PER_MINUTE => {}
-        _ => return fail(),
+        .unwrap_or(false);
+    if !admitted {
+        return fail();
     }
-    // Every non-rate-limited attempt audits (including no-vault and
-    // decrypt failures), so the shared-store budget cannot be dodged by
-    // aiming at a path that never reaches the dialer.
-    let row = match ctx.store.vault_by_user(&claims.user_id).await {
-        Ok(Some(row)) => row,
-        _ => {
-            ctx.audit(&claims.user_id, "vault.test", false).await;
-            return fail();
+    // The attempt slot is reserved before any potentially slow lookup or
+    // dial, so concurrent requests cannot pass a count-then-act check.
+    let result = async {
+        let row = match ctx.store.vault_by_user(&claims.user_id).await {
+            Ok(Some(row)) => row,
+            _ => return false,
+        };
+        let payload: VaultPayload =
+            match vault::decrypt_vault(&ctx.cfg.kek, &claims.user_id, &row.blob)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            {
+                Some(payload) => payload,
+                None => return false,
+            };
+        // Resolve all records immediately before the dial and hand the
+        // dialer only the vetted, bounded address set.
+        let dns = ctx.resolve_all(&payload.provider.host).await;
+        let target: ValidatedTarget = match payload.provider.validate(&dns) {
+            Ok(target) => target,
+            Err(_) => return false,
+        };
+        let lease_token = random_id(16);
+        let lease_acquired = ctx
+            .store
+            .acquire_test_connection_lease(
+                &claims.user_id,
+                &lease_token,
+                TEST_CONNECTION_LEASE_SECS,
+                vault::MAX_TEST_CONCURRENCY,
+            )
+            .await
+            .unwrap_or(false);
+        if !lease_acquired {
+            return false;
         }
-    };
-    let payload: VaultPayload = match vault::decrypt_vault(&ctx.cfg.kek, &claims.user_id, &row.blob)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-    {
-        Some(payload) => payload,
-        None => {
-            ctx.audit(&claims.user_id, "vault.test", false).await;
-            return fail();
-        }
-    };
-    // Resolve ALL records immediately before the dial and hand the
-    // dialer only the vetted set; the transport must not re-resolve.
-    let dns = ctx.resolve_all(&payload.provider.host).await;
-    let target: ValidatedTarget = match payload.provider.validate(&dns) {
-        Ok(target) => target,
-        Err(_) => {
-            ctx.audit(&claims.user_id, "vault.test", false).await;
-            return fail();
-        }
-    };
-    let ok = ctx
-        .dialer
-        .probe(&target, payload.provider.port, payload.provider.tls)
-        .await;
-    ctx.audit(&claims.user_id, "vault.test", ok).await;
-    json_response(200, serde_json::json!({"ok": ok}))
+        let ok = ctx
+            .dialer
+            .probe(&target, payload.provider.port, payload.provider.tls)
+            .await;
+        let _ = ctx
+            .store
+            .release_test_connection_lease(&claims.user_id, &lease_token)
+            .await;
+        ok
+    }
+    .await;
+    ctx.audit(&claims.user_id, "vault.test", result).await;
+    json_response(200, serde_json::json!({"ok": result}))
 }
 
 // --- Dispatch ------------------------------------------------------------------------------
@@ -1360,6 +1388,8 @@ mod tests {
         sessions: RefCell<HashMap<String, SessionRecord>>,
         vaults: RefCell<HashMap<String, VaultRow>>,
         audits: RefCell<Vec<AuditEvent>>,
+        rate_limit_slots: RefCell<HashMap<(String, String, u32), u64>>,
+        test_connection_leases: RefCell<HashMap<(String, u32), (String, u64)>>,
     }
 
     impl Store for FakeStore {
@@ -1454,13 +1484,64 @@ mod tests {
         ) -> Result<Option<MagicLinkRecord>, StoreError> {
             Ok(self.magic.borrow().get(token_hash).cloned())
         }
-        async fn magic_issued_since(&self, email: &str, since: u64) -> Result<u64, StoreError> {
-            Ok(self
-                .magic
-                .borrow()
-                .values()
-                .filter(|r| r.email == email && r.issued_at >= since)
-                .count() as u64)
+        async fn reserve_rate_limit(
+            &self,
+            scope_key: &str,
+            action: &str,
+            limit: u64,
+            now: u64,
+            window_secs: u64,
+        ) -> Result<bool, StoreError> {
+            if limit == 0 || window_secs == 0 {
+                return Ok(false);
+            }
+            let expires_at = now.saturating_add(window_secs);
+            let mut slots = self.rate_limit_slots.borrow_mut();
+            slots.retain(|_, expires| *expires > now);
+            for slot in 0..limit {
+                let slot = u32::try_from(slot).map_err(|_| StoreError)?;
+                let key = (scope_key.to_string(), action.to_string(), slot);
+                if let std::collections::hash_map::Entry::Vacant(entry) = slots.entry(key) {
+                    entry.insert(expires_at);
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        async fn prune_expired_challenges(&self, now: u64) -> Result<(), StoreError> {
+            self.challenges
+                .borrow_mut()
+                .retain(|_, row| row.challenge.expires_at > now);
+            Ok(())
+        }
+        async fn acquire_test_connection_lease(
+            &self,
+            user_id: &str,
+            token: &str,
+            lease_secs: u64,
+            max_concurrency: u32,
+        ) -> Result<bool, StoreError> {
+            let expires_at = NOW.saturating_add(lease_secs);
+            let mut leases = self.test_connection_leases.borrow_mut();
+            leases.retain(|_, (_, expires)| *expires > NOW);
+            for slot in 0..max_concurrency {
+                let key = (user_id.to_string(), slot);
+                if let std::collections::hash_map::Entry::Vacant(entry) = leases.entry(key) {
+                    entry.insert((token.to_string(), expires_at));
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        async fn release_test_connection_lease(
+            &self,
+            user_id: &str,
+            token: &str,
+        ) -> Result<(), StoreError> {
+            self.test_connection_leases
+                .borrow_mut()
+                .retain(|(owner, _), (lease_token, _)| owner != user_id || lease_token != token);
+            Ok(())
         }
         async fn invite_by_hash(
             &self,
@@ -1524,19 +1605,6 @@ mod tests {
         async fn insert_audit(&self, event: &AuditEvent) -> Result<(), StoreError> {
             self.audits.borrow_mut().push(event.clone());
             Ok(())
-        }
-        async fn audit_count_since(
-            &self,
-            user_id: &str,
-            action: &str,
-            since: u64,
-        ) -> Result<u64, StoreError> {
-            Ok(self
-                .audits
-                .borrow()
-                .iter()
-                .filter(|a| a.user_id == user_id && a.action == action && a.at >= since)
-                .count() as u64)
         }
     }
 
@@ -1780,6 +1848,149 @@ mod tests {
     }
 
     #[test]
+    fn magic_link_reservations_are_shared_by_magic_login_and_register_proof() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        for _ in 0..2 {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/magic/start",
+                serde_json::json!({"email": "a@example.com"}),
+            );
+            assert_eq!(resp.status, 200);
+        }
+        assert_eq!(h.mailer.sent.borrow().len(), 2);
+
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "a@example.com"}),
+        );
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            h.mailer.sent.borrow().len(),
+            MAGIC_LINKS_PER_WINDOW as usize
+        );
+
+        for _ in 0..2 {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/magic/start",
+                serde_json::json!({"email": "a@example.com"}),
+            );
+            assert_eq!(resp.status, 200);
+        }
+        assert_eq!(
+            h.mailer.sent.borrow().len(),
+            MAGIC_LINKS_PER_WINDOW as usize
+        );
+        assert_eq!(
+            h.store.magic.borrow().len(),
+            MAGIC_LINKS_PER_WINDOW as usize
+        );
+    }
+
+    #[test]
+    fn login_start_is_usernameless_budgeted_and_prunes_expired_challenges() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        block_on(h.store.insert_credential(&PasskeyCredential {
+            cred_id_b64url: b64url_encode(&[0x5a; 32]),
+            user_id: "u1".to_string(),
+            public_key: fx_es256_cose(17),
+            sign_count: 1,
+            registered_at: NOW,
+        }))
+        .unwrap();
+
+        for email in ["a@example.com", "unknown@example.com"] {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/passkey/login/start",
+                serde_json::json!({"email": email}),
+            );
+            assert_eq!(resp.status, 200);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(body["allow_credentials"], serde_json::json!([]));
+        }
+
+        for _ in 0..AUTH_STARTS_PER_HOUR + 2 {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/passkey/login/start",
+                serde_json::json!({"email": "unknown@example.com"}),
+            );
+            assert_eq!(resp.status, 200);
+        }
+        let expired = PasskeyChallenge {
+            id: "expired-challenge".to_string(),
+            rp_id: "example.com".to_string(),
+            origin: ORIGIN.to_string(),
+            issued_at: NOW.saturating_sub(auth::CHALLENGE_TTL_SECS + 1),
+            expires_at: NOW.saturating_sub(1),
+            consumed: false,
+        };
+        block_on(h.store.insert_challenge(&expired, None, PURPOSE_LOGIN)).unwrap();
+        let _ = h.call(
+            "POST",
+            "/v1/auth/passkey/login/start",
+            serde_json::json!({"email": "unknown@example.com"}),
+        );
+        assert!(block_on(h.store.challenge_by_id("expired-challenge"))
+            .unwrap()
+            .is_none());
+        let unknown_challenges = h
+            .store
+            .challenges
+            .borrow()
+            .values()
+            .filter(|row| row.user_id.is_none())
+            .count();
+        assert_eq!(unknown_challenges, AUTH_STARTS_PER_HOUR as usize);
+    }
+
+    #[test]
+    fn malformed_cookie_parts_do_not_hide_the_session_cookie() {
+        let req = Request {
+            method: "GET".to_string(),
+            path: "/v1/vault".to_string(),
+            cookie: Some("nameless; nntune_session=token-value".to_string()),
+            origin: None,
+            body: Vec::new(),
+        };
+        assert_eq!(session_cookie_value(&req).as_deref(), Some("token-value"));
+    }
+
+    #[test]
+    fn test_connection_leases_enforce_cap_and_token_scoped_release() {
+        let store = FakeStore::default();
+        assert!(block_on(store.acquire_test_connection_lease("u1", "lease-a", 20, 2)).unwrap());
+        assert!(block_on(store.acquire_test_connection_lease("u1", "lease-b", 20, 2)).unwrap());
+        assert!(!block_on(store.acquire_test_connection_lease("u1", "lease-c", 20, 2)).unwrap());
+
+        block_on(store.release_test_connection_lease("u1", "lease-a")).unwrap();
+        assert!(block_on(store.acquire_test_connection_lease("u1", "lease-c", 20, 2)).unwrap());
+        // A stale token cannot release a slot that was reused by lease-c.
+        block_on(store.release_test_connection_lease("u1", "lease-a")).unwrap();
+        assert!(!block_on(store.acquire_test_connection_lease("u1", "lease-d", 20, 2)).unwrap());
+        block_on(store.release_test_connection_lease("u1", "lease-c")).unwrap();
+        assert!(block_on(store.acquire_test_connection_lease("u1", "lease-d", 20, 2)).unwrap());
+    }
+
+    #[test]
+    fn rate_limit_slots_cap_calls_and_reuse_expired_slots() {
+        let store = FakeStore::default();
+        let mut admitted = 0;
+        for _ in 0..20 {
+            if block_on(store.reserve_rate_limit("scope", "action", 10, NOW, 60)).unwrap() {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, 10);
+        assert!(block_on(store.reserve_rate_limit("scope", "action", 10, NOW + 60, 60)).unwrap());
+    }
+
+    #[test]
     fn two_concurrent_magic_finishes_cannot_both_win() {
         // Mutex store standing in for the conditional UPDATE/RETURNING:
         // the claim transition itself is the race boundary.
@@ -1982,14 +2193,15 @@ mod tests {
         );
         // Exhaust the per-minute budget: further probes answer false
         // without reaching the dialer.
-        for _ in 0..TEST_CONNECTION_PER_MINUTE {
-            let _ = block_on(h.store.insert_audit(&vault::audit_event(
+        for _ in 1..TEST_CONNECTION_PER_MINUTE {
+            assert!(block_on(h.store.reserve_rate_limit(
                 "u1",
                 "vault.test",
-                true,
-                "198.51.100.9",
+                TEST_CONNECTION_PER_MINUTE,
                 NOW,
-            )));
+                60,
+            ))
+            .unwrap());
         }
         let before = h.dialer.seen.borrow().len();
         let resp = h.call_full(
@@ -2191,7 +2403,7 @@ mod tests {
         );
         let start: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
         let challenge = start["challenge"].as_str().unwrap().to_string();
-        assert_eq!(start["allow_credentials"][0], b64url_encode(cred_id));
+        assert_eq!(start["allow_credentials"], serde_json::json!([]));
         let mut auth = Vec::new();
         auth.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
         auth.push(0x01);
@@ -2350,8 +2562,8 @@ mod tests {
         assert_eq!(taken_user_ids[0], taken_user_ids[1]);
         assert_eq!(h.mailer.sent.borrow().len(), 1);
         assert_eq!(h.mailer.sent.borrow()[0].0, "fresh@example.com");
-        // login/start: allow lists are padded to one fixed length for
-        // unknown and one-passkey accounts alike.
+        // login/start uses a usernameless flow, so neither account's
+        // variable-length credential ids are returned.
         for email in ["ghost@example.com", "known@example.com"] {
             let resp = h.call(
                 "POST",
@@ -2360,22 +2572,7 @@ mod tests {
             );
             assert_eq!(resp.status, 200);
             let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
-            assert_eq!(
-                body["allow_credentials"].as_array().unwrap().len(),
-                ALLOW_LIST_PADDED_LEN,
-                "{email}"
-            );
+            assert_eq!(body["allow_credentials"], serde_json::json!([]), "{email}");
         }
-        // The real credential is still in its owner's list.
-        let resp = h.call(
-            "POST",
-            "/v1/auth/passkey/login/start",
-            serde_json::json!({"email": "known@example.com"}),
-        );
-        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
-        assert!(body["allow_credentials"]
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!(b64url_encode(b"known-cred"))));
     }
 }

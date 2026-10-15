@@ -25,7 +25,9 @@ use crate::handlers::{
     self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, Store, StoreError, UserRecord, VaultRow,
 };
 use crate::session::SessionRecord;
-use crate::vault::{AuditEvent, ValidatedTarget, VaultBlob, DIAL_TIMEOUT_MS};
+use crate::vault::{
+    AuditEvent, ValidatedTarget, VaultBlob, DIAL_TIMEOUT_MS, MAX_DIAL_ADDRESSES, TOTAL_TIMEOUT_MS,
+};
 
 /// Hyperdrive binding name; must match `wrangler.toml.example`.
 const HYPERDRIVE_BINDING: &str = "HYPERDRIVE";
@@ -327,18 +329,6 @@ impl Store for PgStore {
         .transpose()
     }
 
-    async fn magic_issued_since(&self, email: &str, since: u64) -> Result<u64, StoreError> {
-        let client = self.connect().await?;
-        let row = client
-            .query_one(
-                "SELECT count(*) AS n FROM magic_link_tokens WHERE email = $1 AND issued_at >= $2",
-                &[&email, &i64_of(since)?],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        u64_of(row.try_get("n").map_err(|_| StoreError)?)
-    }
-
     async fn invite_by_hash(&self, code_hash: &str) -> Result<Option<InviteRecord>, StoreError> {
         let client = self.connect().await?;
         let row = client
@@ -532,21 +522,115 @@ impl Store for PgStore {
         Ok(())
     }
 
-    async fn audit_count_since(
+    async fn reserve_rate_limit(
         &self,
-        user_id: &str,
+        scope_key: &str,
         action: &str,
-        since: u64,
-    ) -> Result<u64, StoreError> {
+        limit: u64,
+        now: u64,
+        window_secs: u64,
+    ) -> Result<bool, StoreError> {
+        if limit == 0 || window_secs == 0 || limit > 100 {
+            return Ok(false);
+        }
         let client = self.connect().await?;
-        let row = client
-            .query_one(
-                "SELECT count(*) AS n FROM audit_log WHERE user_id = $1 AND action = $2 AND at >= $3",
-                &[&user_id, &action, &i64_of(since)?],
+        let expires_at = i64_of(now.saturating_add(window_secs))?;
+        let now = i64_of(now)?;
+        client
+            .execute(
+                "DELETE FROM auth_rate_limit_slots WHERE expires_at <= $1",
+                &[&now],
             )
             .await
             .map_err(|_| StoreError)?;
-        u64_of(row.try_get("n").map_err(|_| StoreError)?)
+        for slot in 0..limit {
+            let slot = i32::try_from(slot).map_err(|_| StoreError)?;
+            let rows = client
+                .query(
+                    "INSERT INTO auth_rate_limit_slots (scope_key, action, slot, expires_at) \
+                     VALUES ($1, $2, $3, $4) \
+                     ON CONFLICT (scope_key, action, slot) DO UPDATE \
+                     SET expires_at = EXCLUDED.expires_at \
+                     WHERE auth_rate_limit_slots.expires_at <= $5 \
+                     RETURNING slot",
+                    &[&scope_key, &action, &slot, &expires_at, &now],
+                )
+                .await
+                .map_err(|_| StoreError)?;
+            if !rows.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn prune_expired_challenges(&self, now: u64) -> Result<(), StoreError> {
+        let client = self.connect().await?;
+        client
+            .execute(
+                "DELETE FROM auth_challenges WHERE expires_at <= $1",
+                &[&i64_of(now)?],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        Ok(())
+    }
+
+    async fn acquire_test_connection_lease(
+        &self,
+        user_id: &str,
+        token: &str,
+        lease_secs: u64,
+        max_concurrency: u32,
+    ) -> Result<bool, StoreError> {
+        if max_concurrency == 0 || max_concurrency > 16 || lease_secs == 0 {
+            return Ok(false);
+        }
+        let lease_secs = i64_of(lease_secs)?;
+        let client = self.connect().await?;
+        client
+            .execute(
+                "DELETE FROM vault_test_leases \
+                 WHERE expires_at <= FLOOR(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT",
+                &[],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        for slot in 0..max_concurrency {
+            let slot = i16::try_from(slot).map_err(|_| StoreError)?;
+            let rows = client
+                .query(
+                    "INSERT INTO vault_test_leases (user_id, slot, token, expires_at) \
+                     VALUES ($1, $2, $3, FLOOR(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT + $4) \
+                     ON CONFLICT (user_id, slot) DO UPDATE \
+                     SET token = EXCLUDED.token, expires_at = EXCLUDED.expires_at \
+                     WHERE vault_test_leases.expires_at <= FLOOR(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT \
+                     RETURNING slot",
+                    &[&user_id, &slot, &token, &lease_secs],
+                )
+                .await
+                .map_err(|_| StoreError)?;
+            if !rows.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn release_test_connection_lease(
+        &self,
+        user_id: &str,
+        token: &str,
+    ) -> Result<(), StoreError> {
+        let client = self.connect().await?;
+        client
+            .execute(
+                "DELETE FROM vault_test_leases WHERE user_id = $1 AND token = $2",
+                &[&user_id, &token],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        Ok(())
     }
 }
 
@@ -705,12 +789,23 @@ async fn probe_one(addr: IpAddr, port: u16, tls: bool) -> bool {
 
 impl Dialer for SocketDialer {
     async fn probe(&self, target: &ValidatedTarget, port: u16, tls: bool) -> bool {
-        for addr in target.addresses() {
-            if probe_one(*addr, port, tls).await {
-                return true;
+        let mut deadline = std::pin::pin!(Delay::from(Duration::from_millis(TOTAL_TIMEOUT_MS)));
+        let mut attempts = std::pin::pin!(async {
+            for addr in target.addresses().iter().take(MAX_DIAL_ADDRESSES) {
+                if probe_one(*addr, port, tls).await {
+                    return true;
+                }
             }
-        }
-        false
+            false
+        });
+        std::future::poll_fn(|cx| {
+            use std::task::Poll;
+            if let Poll::Ready(()) = deadline.as_mut().poll(cx) {
+                return Poll::Ready(false);
+            }
+            attempts.as_mut().poll(cx)
+        })
+        .await
     }
 }
 

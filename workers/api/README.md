@@ -20,8 +20,9 @@ workers/api/
   wrangler.toml.example  # Worker config template (no secrets)
 ```
 
-`migrations/0002_auth_vault.sql` (+ `0004` challenge purpose) is the
-Postgres schema (PlanetScale via Hyperdrive). All queries are parameterized; single-use claims execute
+`migrations/0002_auth_vault.sql` plus `0004` (challenge purpose) and `0005`
+(atomic rate-limit slots and test leases) define the Postgres schema
+(PlanetScale via Hyperdrive). All queries are parameterized; single-use claims execute
 the conditional `UPDATE ... RETURNING` prepared by the core and require
 exactly one row before any response.
 
@@ -31,11 +32,11 @@ exactly one row before any response.
 |---|---|
 | `GET /healthz` | liveness only (no config detail) |
 | `POST /v1/auth/passkey/register/start` / `finish` | passkey signup (purpose-bound challenge + emailed-token inbox proof; attestation `none` or packed self-attestation) |
-| `POST /v1/auth/passkey/login/start` / `finish` | passkey login (assertion + sign-count clone detection) |
-| `POST /v1/auth/magic/start` / `finish` | email magic link (rate-limited per email via the shared store) |
+| `POST /v1/auth/passkey/login/start` / `finish` | usernameless passkey login (empty `allow_credentials`; assertion + sign-count clone detection) |
+| `POST /v1/auth/magic/start` / `finish` | email magic link (atomic per-email issuance reservation shared with register inbox proof) |
 | `POST /v1/session/refresh` / `logout` / `revoke-all` | stored-session rotation/revocation |
 | `GET` / `PUT` / `DELETE /v1/vault` | booleans-only summary / encrypted upsert / delete |
-| `POST /v1/vault/test-connection` | `{"ok": bool}` only, rate-limited, pinned-address dial |
+| `POST /v1/vault/test-connection` | `{"ok": bool}` only; atomically rate-limited, per-user concurrency lease, bounded pinned-address dial |
 
 Generic errors only: auth `401 {"error":"check your email and try
 again"}`, vault `400 {"error":"vault unavailable"}`, internal
@@ -78,6 +79,12 @@ config from secrets) is a follow-up slice.
   any session/signup response. Zero rows, multiple rows and store errors
   fail closed. Never SELECT then unconditionally persist a used flag.
   All failures return one generic message (no user-enumeration oracle).
+- **Abuse budgets:** passkey starts, magic-link issuance and test-connection
+  attempts reserve fixed slot rows through an atomic `INSERT .. ON CONFLICT`
+  before side effects; magic-link and registration inbox-proof sends share
+  one per-email window. Unknown login emails use a keyed stand-in scope,
+  expired challenges are pruned, and login options omit `allow_credentials`
+  to avoid leaking variable-length credential IDs.
 - **Passkeys:** RP ID equals the exact origin host (cross-subdomain RP
   suffixes are intentionally unsupported). Configuration must be a canonical
   serialized origin: https, or http with the host exactly `localhost`,
@@ -94,12 +101,15 @@ config from secrets) is a follow-up slice.
   IPv6 is limited to native global unicast minus transition/special-use
   space: NAT64, mapped/translated IPv4, 6to4, Teredo, site-local, discard,
   ORCHID and documentation ranges are rejected conservatively.
-  `validate` returns a `ValidatedTarget` with vetted addresses. Revalidate
+  `validate` checks every DNS answer, rejects if any is forbidden, and
+  returns at most four vetted addresses in a `ValidatedTarget`. Revalidate
   at every dial/fetch and pin the transport to that address set without
   another DNS lookup; retain the original hostname for TLS SNI/certificate
   checks and HTTP Host. Save-time validation is not a fetch authorization.
-  Indexer fetches forbid redirects; dial/total timeouts and per-user
-  concurrency caps are constants in `vault.rs`.
+  Indexer fetches forbid redirects. Test-connection attempts atomically
+  reserve shared-store rate slots, acquire one of two per-user expiring
+  leases, dial at most four addresses with a 5-second per-address timeout,
+  and stop the complete probe at 15 seconds.
 
 ## Test
 
