@@ -319,7 +319,7 @@ pub fn encrypt_vault(
     let wrap_nonce = random_nonce();
     let wrapped = kek_cipher
         .encrypt(
-            Nonce::from_slice(&wrap_nonce),
+            &Nonce::from(wrap_nonce),
             Payload {
                 msg: &dek.0,
                 aad: dek_aad(user_id, kek_version).as_bytes(),
@@ -332,7 +332,7 @@ pub fn encrypt_vault(
     let payload_nonce = random_nonce();
     let payload = dek_cipher
         .encrypt(
-            Nonce::from_slice(&payload_nonce),
+            &Nonce::from(payload_nonce),
             Payload {
                 msg: plaintext,
                 aad: payload_aad(user_id).as_bytes(),
@@ -358,14 +358,13 @@ pub fn decrypt_vault(
     blob: &VaultBlob,
 ) -> Result<Vec<u8>, VaultError> {
     let kek_cipher = Aes256Gcm::new_from_slice(kek).map_err(|_| VaultError::Crypto)?;
-    let wrap_nonce = unb64url(&blob.dek_wrapped_nonce_b64url)?;
+    let wrap_nonce: [u8; 12] = unb64url(&blob.dek_wrapped_nonce_b64url)?
+        .try_into()
+        .map_err(|_| VaultError::Invalid)?;
     let wrapped = unb64url(&blob.dek_wrapped_b64url)?;
-    if wrap_nonce.len() != 12 {
-        return Err(VaultError::Invalid);
-    }
     let mut dek_bytes = kek_cipher
         .decrypt(
-            Nonce::from_slice(&wrap_nonce),
+            &Nonce::from(wrap_nonce),
             Payload {
                 msg: &wrapped,
                 aad: dek_aad(user_id, blob.kek_version).as_bytes(),
@@ -383,14 +382,13 @@ pub fn decrypt_vault(
     let dek = Dek(arr);
 
     let dek_cipher = Aes256Gcm::new_from_slice(&dek.0).map_err(|_| VaultError::Crypto)?;
-    let payload_nonce = unb64url(&blob.payload_nonce_b64url)?;
+    let payload_nonce: [u8; 12] = unb64url(&blob.payload_nonce_b64url)?
+        .try_into()
+        .map_err(|_| VaultError::Invalid)?;
     let payload = unb64url(&blob.payload_b64url)?;
-    if payload_nonce.len() != 12 {
-        return Err(VaultError::Invalid);
-    }
     dek_cipher
         .decrypt(
-            Nonce::from_slice(&payload_nonce),
+            &Nonce::from(payload_nonce),
             Payload {
                 msg: &payload,
                 aad: payload_aad(user_id).as_bytes(),
@@ -410,14 +408,13 @@ pub fn rewrap_dek(
 ) -> Result<VaultBlob, VaultError> {
     // Unwrap with the old KEK (old AAD: old version).
     let old_cipher = Aes256Gcm::new_from_slice(old_kek).map_err(|_| VaultError::Crypto)?;
-    let wrap_nonce = unb64url(&blob.dek_wrapped_nonce_b64url)?;
+    let wrap_nonce: [u8; 12] = unb64url(&blob.dek_wrapped_nonce_b64url)?
+        .try_into()
+        .map_err(|_| VaultError::Invalid)?;
     let wrapped = unb64url(&blob.dek_wrapped_b64url)?;
-    if wrap_nonce.len() != 12 {
-        return Err(VaultError::Invalid);
-    }
     let mut dek_bytes = old_cipher
         .decrypt(
-            Nonce::from_slice(&wrap_nonce),
+            &Nonce::from(wrap_nonce),
             Payload {
                 msg: &wrapped,
                 aad: dek_aad(user_id, blob.kek_version).as_bytes(),
@@ -433,7 +430,7 @@ pub fn rewrap_dek(
     let new_cipher = Aes256Gcm::new_from_slice(new_kek).map_err(|_| VaultError::Crypto)?;
     let new_nonce = random_nonce();
     let wrap_result = new_cipher.encrypt(
-        Nonce::from_slice(&new_nonce),
+        &Nonce::from(new_nonce),
         Payload {
             msg: &dek_bytes,
             aad: dek_aad(user_id, new_version).as_bytes(),

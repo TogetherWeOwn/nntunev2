@@ -262,8 +262,8 @@ fn parse_cose_key(bytes: &[u8]) -> Result<CoseKey, WebAuthnError> {
             let y: [u8; 32] = y.try_into().map_err(|_| WebAuthnError::Invalid)?;
             // Reject points not on P-256 (also rejects the identity).
             let point = p256::EncodedPoint::from_affine_coordinates(
-                p256::FieldBytes::from_slice(&x),
-                p256::FieldBytes::from_slice(&y),
+                &p256::FieldBytes::from(x),
+                &p256::FieldBytes::from(y),
                 false,
             );
             p256::ecdsa::VerifyingKey::from_encoded_point(&point)
@@ -284,8 +284,8 @@ fn verify_signature(key: &CoseKey, message: &[u8], signature: &[u8]) -> Result<(
         CoseKey::Es256 { x, y } => {
             use p256::ecdsa::signature::Verifier;
             let point = p256::EncodedPoint::from_affine_coordinates(
-                p256::FieldBytes::from_slice(x),
-                p256::FieldBytes::from_slice(y),
+                &p256::FieldBytes::from(*x),
+                &p256::FieldBytes::from(*y),
                 false,
             );
             let verifying = p256::ecdsa::VerifyingKey::from_encoded_point(&point)
@@ -366,7 +366,7 @@ fn parse_auth_data(
         return Err(WebAuthnError::Invalid);
     }
     let rp_hash = Sha256::digest(expect.rp_id.as_bytes());
-    if bytes[..32].ct_eq(rp_hash.as_slice()).unwrap_u8() != 1 {
+    if bytes[..32].ct_eq(&rp_hash[..]).unwrap_u8() != 1 {
         return Err(WebAuthnError::Invalid);
     }
     let flags = bytes[32];
