@@ -15,15 +15,18 @@ Banned classes (rule id -> shape):
   internal-host
     Host shapes that only exist inside our walls: dotted hostnames under
     a private DNS suffix (a label, a dot, then ``internal``, ``local``,
-    ``lan``, ``intranet`` or ``corp``, followed by a port, a slash, or
-    the end of the token — see ``_INTERNAL_SUFFIX`` for the exact
-    shape), RFC-1918 IPv4, the cloud metadata IP, ``workforce``
-    control-plane hosts, and absolute instance-UI links
+    ``lan``, ``intranet`` or ``corp``, with an optional port — see
+    ``_INTERNAL_SUFFIX`` for the exact shape), RFC-1918 IPv4, the cloud
+    metadata IP, ``workforce`` control-plane hosts, and absolute
+    instance-UI links
     (``https`` + ``://`` + any host + ``/<PREFIX>/issues|agents|.../``).
-    Bare ``name.suffix`` at end-of-line still flags: it is
-    indistinguishable from a hostname, so reword or extend the
-    allowlist instead of widening the rule. Attribute access followed
-    by ``(`` or ``.`` (calls, chains) does not match.
+    The suffix rule is a negative lookahead: anything may follow the
+    host except identifier continuations (letters, digits, ``_``, ``(``,
+    ``-``) and dotted chains (``.`` + letter/digit/``_``/``(``). So a
+    sentence-ending period, ``<...>``, ``!``, ``?``, ``}`` and ``**``
+    all flag — they are the most common place for a hostname in prose.
+    Attribute access followed by ``(`` or ``.`` (calls, chains) does not
+    match; reword or extend the allowlist instead of widening the rule.
   instance-path
     Relative instance-UI paths (``/<PREFIX>/issues|agents|projects|
     approvals|runs/``). These deep-link the internal tracker even with
@@ -53,12 +56,18 @@ property, so every entry names its reason):
   * FIXTURE_EXCLUSIONS: exact test-fixture paths holding manufactured
     violations for this lint's own unit tests. No directory, extension,
     or generated-file exemptions.
-  * HOST_FIXTURE_EXCLUSIONS: exact product-test paths exempt from the
-    internal-host rule ONLY. SSRF-guard negative tests must name
+  * HOST_FIXTURE_EXCLUSIONS: exact product-test paths where ONLY the
+    private-IPv4 pattern is skipped. SSRF-guard negative tests must name
     RFC-reserved ranges (10/8, 169.254/16, IPv4-mapped embeddings) to
-    assert rejection, so any private-IP pattern makes them unmergeable.
-    Every other rule still scans these files, and gitleaks plus secret
-    scanning still apply. Exact paths, never directories.
+    assert rejection, so that one pattern would make them unmergeable.
+    The suffix, workforce-host and absolute-UI-link patterns stay active
+    on these files — a pasted hostname there must still fail. Every other
+    rule still scans these files, and gitleaks plus secret scanning still
+    apply. Exact paths, never directories.
+  * Compiled artifacts (`__pycache__/`, `*.pyc`, `*.pyo`) must never be
+    tracked: they embed absolute build paths (finding: a tracked `.pyc`
+    leaked an internal worktree path). They are reported as
+    `binary-artifact`, not scanned for content.
 
 Scope limit (by design, not a gap to widen silently): this lint scans
 tracked FILE CONTENTS only. Branch names, commit messages, and PR
@@ -99,12 +108,14 @@ HOST_FIXTURE_EXCLUSIONS = frozenset(
 
 _TOG = re.compile(r"\bTOG-\d+\b")
 
-# Hostname-looking only: one or more labels, a private suffix, then a
-# port, a slash, or the end of the token. Attribute access (`.foo(`,
-# `.foo.bar`) and bare suffix words never match.
+# Hostname-looking only: one or more labels, a private suffix, an optional
+# port, then a negative lookahead. Anything may follow except identifier
+# continuations and dotted chains, so sentence-ending punctuation flags
+# while attribute access (`.foo(`, `.foo.bar`) and bare suffix words never
+# match.
 _INTERNAL_SUFFIX = re.compile(
     r"(?<![A-Za-z0-9_.-])(?:[A-Za-z0-9-]+\.)+(?:internal|local|lan|intranet|corp)"
-    r"(?::\d+)?(?=$|[\s\"'`,;)\]:/])",
+    r"(?::\d+)?(?![A-Za-z0-9_(-]|\.[A-Za-z0-9_(])",
     re.IGNORECASE,
 )
 _WORKFORCE_HOST = re.compile(r"\bworkforce\.[A-Za-z0-9.-]+", re.IGNORECASE)
@@ -137,6 +148,20 @@ RULES = (
 _DOCKER_HOST_MASK = re.compile(r"host\.docker\.(?:internal)\b", re.IGNORECASE)
 _ENV_LOCAL_MASK = re.compile(r"\.env\.(?:local)\b", re.IGNORECASE)
 
+# Host patterns that stay active even on HOST_FIXTURE_EXCLUSIONS paths:
+# only the private-IPv4 pattern is skipped there (SSRF negative-test
+# vectors), never the hostname shapes.
+_HOST_PATTERNS_STRICT = (_INTERNAL_SUFFIX, _WORKFORCE_HOST, _ABSOLUTE_UI_LINK)
+
+# Tracked compiled artifacts: they embed absolute build paths and must
+# never be committed. Matched on path, reported as binary-artifact.
+_ARTIFACT_PATH = re.compile(r"(?:^|/)__pycache__(?:/|$)|\.py[co]$")
+
+
+def is_artifact_path(path):
+    """True when a tracked path is a compiled artifact, never public text."""
+    return bool(_ARTIFACT_PATH.search(path.replace("\\", "/")))
+
 
 def find_violations(text, path=""):
     """Return [(line_number, rule_id)] for banned shapes in text.
@@ -144,8 +169,8 @@ def find_violations(text, path=""):
     One hit per rule per line at most. Never returns matched bytes —
     callers report file:line + rule id only. There is no sentence
     exemption: a real id matches on any line, including a rule line.
-    Paths in HOST_FIXTURE_EXCLUSIONS skip the internal-host rule only;
-    every other rule still applies to them.
+    Paths in HOST_FIXTURE_EXCLUSIONS skip the private-IPv4 pattern only;
+    the other internal-host patterns and every other rule still apply.
     """
     masked = _DOCKER_HOST_MASK.sub("host.docker.example", text)
     masked = _ENV_LOCAL_MASK.sub(".env.example", masked)
@@ -154,7 +179,7 @@ def find_violations(text, path=""):
     for lineno, line in enumerate(masked.splitlines(), start=1):
         for rule_id, patterns in RULES:
             if rule_id == "internal-host" and host_exempt:
-                continue
+                patterns = _HOST_PATTERNS_STRICT
             if any(p.search(line) for p in patterns):
                 hits.append((lineno, rule_id))
     return hits
@@ -170,11 +195,14 @@ def tracked_files():
 
 
 def scan_path(path):
+    if is_artifact_path(path):
+        return [(1, "binary-artifact")]
     with open(path, "rb") as fh:
         data = fh.read()
-    if b"\0" in data:
-        return []  # binary: not public text
-    return find_violations(data.decode("utf-8", errors="replace"), path)
+    # No binary early-return: a tracked binary IS public text once merged,
+    # so the same patterns run over a lossless latin-1 decode (a tracked
+    # .pyc once leaked an internal path while NUL bytes kept CI green).
+    return find_violations(data.decode("latin-1"), path)
 
 
 def main(argv):

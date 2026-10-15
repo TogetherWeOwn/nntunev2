@@ -1,0 +1,9 @@
+/paperclip/instances/default/worktrees/e93c5542-3748-4cdc-bf8e-a690d9b7afcc/TOG-23639-nntune-v2-threat-model-security-review-gate-byop-vault-auth-public-repo/workers/api/target/wasm32-unknown-unknown/debug/deps/inout-58a7da37d3fa022d.d: /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/inout-0.1.4/src/lib.rs /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/inout-0.1.4/src/errors.rs /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/inout-0.1.4/src/inout.rs /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/inout-0.1.4/src/inout_buf.rs /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/inout-0.1.4/src/reserved.rs
+
+/paperclip/instances/default/worktrees/e93c5542-3748-4cdc-bf8e-a690d9b7afcc/TOG-23639-nntune-v2-threat-model-security-review-gate-byop-vault-auth-public-repo/workers/api/target/wasm32-unknown-unknown/debug/deps/libinout-58a7da37d3fa022d.rmeta: /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/inout-0.1.4/src/lib.rs /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/inout-0.1.4/src/errors.rs /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/inout-0.1.4/src/inout.rs /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/inout-0.1.4/src/inout_buf.rs /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/inout-0.1.4/src/reserved.rs
+
+/paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/inout-0.1.4/src/lib.rs:
+/paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/inout-0.1.4/src/errors.rs:
+/paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/inout-0.1.4/src/inout.rs:
+/paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/inout-0.1.4/src/inout_buf.rs:
+/paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/inout-0.1.4/src/reserved.rs:

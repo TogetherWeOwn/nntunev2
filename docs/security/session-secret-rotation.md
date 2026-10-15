@@ -32,7 +32,13 @@ Rules:
 - Exactly one previous secret, ever. No lists, no version chains.
 - The previous secret is verify-only: `issue_session` and
   `rotate_session` always sign with the primary. Code path:
-  `session::verify_session_dual(primary, previous, …)`.
+  `session::SessionKeys::rotation(primary, previous)` threaded through
+  `verify_session_dual`, `verify_stored_session` and `rotate_session`
+  (steady state is `SessionKeys::single(primary)`).
+- An unset previous secret is `None`, never an empty slice: every
+  signing/verification key shorter than 32 bytes (`MIN_SECRET_LEN`)
+  fails closed with `invalid session`, so a misconfigured empty secret
+  can neither mint nor verify.
 - Both failures map to the same generic `invalid session`; there is no
   oracle for which secret matched.
 - Secrets live only in Cloudflare Worker secrets (`wrangler secret put`)
@@ -79,10 +85,18 @@ bound under either secret.
 
 ## 4. What the HTTP slice MUST enforce
 
-- Verification during a window uses `verify_session_dual` and then
-  `verify_stored_session` against the current `sessions` row, unchanged.
-  Rotation of the secret never bypasses the row check, the counter, or
-  revocation.
+- Verification during a window uses
+  `verify_stored_session(&SessionKeys::rotation(primary, previous), …)`
+  against the current `sessions` row (dual-signature check first, then
+  row/counter/revocation — never signature-only). Rotation of the
+  secret never bypasses the row check, the counter, or revocation.
+- Refresh uses `rotate_session` with the same keys: it verifies through
+  the dual path and re-signs with the primary, migrating pre-cutover
+  sessions onto the new secret.
+- The Worker builds `SessionKeys` from env as: previous = `Some` ONLY
+  when `SESSION_SECRET_PREVIOUS_BASE64` is set AND a rotation is
+  recorded; unset means `SessionKeys::single(primary)`. A set-but-short
+  previous fails every verification closed (code-enforced).
 - The Worker MUST fail closed when `SESSION_SECRET_PREVIOUS_BASE64` is
   set outside a recorded rotation (unexpected second secret = alert).
 - `Set-Cookie` emission is unchanged (`__Host-nntune-session`, `Path=/`,
@@ -92,3 +106,26 @@ bound under either secret.
 
 Next review: 2027-04-14 or after the first real rotation, whichever is
 earlier. Revisit the window arithmetic if `MAX_SESSION_SECS` changes.
+
+## 6. Compromise procedure (secret exposure — NOT routine rotation)
+
+A dual-accept window does NOT contain an exposure: anyone holding the old
+secret mints valid sessions until it is removed. On suspected or confirmed
+`SESSION_SECRET*` exposure, do NOT run §§2–4 and call it contained:
+
+1. Provision a fresh primary (`openssl rand -base64 32` in the operator
+   store; `wrangler secret put SESSION_SECRET_BASE64`), one environment
+   at a time, staging first.
+2. Deploy with `SessionKeys::single(new)` — NO previous secret. A
+   compromised secret must never be dual-accepted: the window would
+   honor attacker-minted tokens.
+3. Revoke every row: `UPDATE sessions SET revoked = TRUE` (all users,
+   all environments affected). Outstanding magic links are consumed or
+   expired, never honored after this point.
+4. Delete the exposed secret from the Worker immediately
+   (`wrangler secret delete SESSION_SECRET_PREVIOUS_BASE64` if set).
+   An HMAC secret pins no data, so nothing needs it retained.
+5. Users re-authenticate via passkey or magic link (expected mass
+   re-login — announce it, not an incident on top of the incident).
+6. Audit-log entry (env, exposure→replacement, operator, date);
+   post-incident review tracks why the secret left its boundary.

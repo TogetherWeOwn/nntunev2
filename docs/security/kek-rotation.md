@@ -42,20 +42,25 @@ AAD(payload)  = "nntune-vault/v1" || user_id
 
 ## 2. Schema (PlanetScale Postgres via Hyperdrive)
 
+Merged reality (`migrations/0002_auth_vault.sql`): the table is
+`provider_vaults`, blobs are base64 `TEXT` (Worker-friendly — no binary
+column binding through Hyperdrive), and the rotation columns land in a
+follow-up migration (gate items §8):
+
 ```sql
-CREATE TABLE vault_rows (
-  user_id            TEXT PRIMARY KEY,
-  kek_version        INTEGER NOT NULL,          -- version that wraps dek_wrapped
-  dek_wrapped        BYTEA NOT NULL,            -- DEK encrypted under KEK[kek_version]
-  dek_nonce          BYTEA NOT NULL,            -- 12-byte GCM nonce for the wrap
-  payload_ciphertext BYTEA NOT NULL,            -- credentials encrypted under DEK
-  payload_nonce      BYTEA NOT NULL,            -- 12-byte GCM nonce for the payload
-  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-  rewrapped_at       TIMESTAMPTZ NULL,          -- last rotation re-wrap time
-  CONSTRAINT kek_version_positive CHECK (kek_version >= 1)
+CREATE TABLE IF NOT EXISTS provider_vaults (
+  user_id            TEXT PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
+  kek_version        INTEGER NOT NULL,   -- version that wraps dek_wrapped
+  dek_wrapped_nonce  TEXT NOT NULL,      -- base64 12-byte GCM nonce for the wrap
+  dek_wrapped        TEXT NOT NULL,      -- base64 DEK encrypted under KEK[kek_version]
+  payload_nonce      TEXT NOT NULL,      -- base64 12-byte GCM nonce for the payload
+  payload            TEXT NOT NULL,      -- base64 credentials encrypted under DEK
+  indexer_configured BOOLEAN NOT NULL DEFAULT FALSE,
+  updated_at         BIGINT NOT NULL
 );
-CREATE INDEX vault_rows_kek_version_idx ON vault_rows (kek_version);
+-- Follow-up migration (gate item): rewrapped_at + version index.
+-- ALTER TABLE provider_vaults ADD COLUMN rewrapped_at BIGINT NULL;
+-- CREATE INDEX idx_vault_kek_version ON provider_vaults (kek_version);
 ```
 
 Rules:
@@ -65,18 +70,30 @@ Rules:
 - Nonces are unique per encryption (CSPRNG). Never reused, never logged.
 - Parameterized queries only. No plaintext credential column, now or as a
   migration backfill — migrations carry ciphertext only.
+- Until the follow-up migration lands, re-wrap passes track progress in
+  `rotation_runs` (§6) and use `updated_at` as the last-touch signal;
+  `rewrapped_at` becomes authoritative once the column exists.
 
 ## 3. KEK provisioning and versioning
 
-- Each KEK version is a **separate Worker secret**: `VAULT_KEK_V1`,
-  `VAULT_KEK_V2`, … — each 32 random bytes, base64-encoded at rest
-  (`openssl rand -base64 32`, generated inside the private operator
+Slice-1 reality (`wrangler.toml.example`): one KEK per environment —
+`VAULT_KEK_BASE64` (32 random bytes, base64) plus `VAULT_KEK_VERSION`
+(the integer version stamped on every row). The rotation target below
+kicks in at the FIRST rotation; until then the single key IS version 1.
+
+- At first rotation, the current key is re-provisioned as a **separate
+  per-version Worker secret**: `VAULT_KEK_V1` (same bytes as the slice-1
+  key), then `VAULT_KEK_V2`, … — each 32 random bytes, base64-encoded at
+  rest (`openssl rand -base64 32`, generated inside the private operator
   secrets store, provisioned via `wrangler secret put` or the dashboard).
+  The legacy `VAULT_KEK_BASE64` is deleted once V1 reads green.
 - The write version is a **non-secret** config var, e.g.
-  `VAULT_KEK_CURRENT=2` (wrangler `vars`, not `secrets`).
+  `VAULT_KEK_CURRENT=2` (wrangler `vars`, not `secrets`), replacing
+  `VAULT_KEK_VERSION` at cutover.
 - The Worker build knows how to **read** every provisioned version
-  (current + retained priors, ≤3 retained) but **writes only**
-  `VAULT_KEK_CURRENT`.
+  (current + retained priors, ≤3 retained — a `kek_by_version` selector
+  over the provisioned set, so rows at mixed versions decrypt during
+  phases 1–2) but **writes only** `VAULT_KEK_CURRENT`.
 - Staging and production have **independent key sets generated
   independently** — never copy a KEK value between environments, never
   reuse a version number scheme as a shared secret. A rotation ceremony
@@ -168,8 +185,8 @@ in-memory cursors).
 
 ```sql
 -- claim a batch (cursor = last user_id, never OFFSET on a hot table)
-SELECT user_id, kek_version, dek_wrapped, dek_nonce
-  FROM vault_rows
+SELECT user_id, kek_version, dek_wrapped, dek_wrapped_nonce
+  FROM provider_vaults
  WHERE kek_version < $1 AND user_id > $2
  ORDER BY user_id LIMIT 100;
 ```
@@ -180,9 +197,10 @@ Per row:
 2. `dek_wrapped' = encrypt(KEK[current], fresh_nonce, aad_wrap(user, current), DEK)`.
 3. Conditional write (optimistic concurrency — safe under retries):
    ```sql
-   UPDATE vault_rows
-      SET kek_version = $new, dek_wrapped = $w, dek_nonce = $n,
-          rewrapped_at = now(), updated_at = now()
+   UPDATE provider_vaults
+      SET kek_version = $new, dek_wrapped = $w,
+          dek_wrapped_nonce = $n, updated_at = $now
+          -- plus rewrapped_at = $now once the follow-up migration (§2) lands
     WHERE user_id = $u AND kek_version = $old;
    ```
 4. On failure: count, continue (per-row errors never abort the pass;
@@ -215,7 +233,7 @@ back); rotation window announced.
               verify: create+read one staging vault row shows kek_version=N+1
 5. Re-wrap:   trigger Workflow pass (dry-run first on staging);
               watch rotation_runs until rows_failed=0 and
-              SELECT count(*) FROM vault_rows WHERE kek_version < N+1; → 0
+              SELECT count(*) FROM provider_vaults WHERE kek_version < N+1; → 0
               re-run once more; require 0 twice
 6. Retire:    record the retire-after date in the version table (latest
               of re-wrap-complete + one window, oldest restorable
@@ -243,23 +261,35 @@ Version table (update on every rotation):
 
 ## 8. What the vault PR must show (CISO gate checklist)
 
-- [ ] Schema has `kek_version` (+ nonces, `rewrapped_at`) from migration 1.
-- [ ] Encrypt writes current only; decrypt implements §4 version-pinned
-      decrypt with generic errors and no existence oracle.
-- [ ] Two KEK versions provisioned in staging at review time; rotation
-      phases 1–3 demonstrated (var flip + dry-run re-wrap pass).
+Slice-1 (merged: `migrations/0002_auth_vault.sql` + `workers/api` vault
+core) already shows:
+
+- [x] `kek_version` on every row from migration 1; base64 `TEXT` blobs
+      (`provider_vaults`, not `vault_rows` — see §2).
+- [x] Encrypt writes current only (`VAULT_KEK_VERSION`); decrypt is
+      version-pinned per row (`kek_version` + AAD) with generic errors
+      and no existence oracle; `rotate_kek` re-wraps DEK-only.
+- [x] Staging and prod KEK sets independently generated (operator
+      attestation, never values).
+- [x] `gitleaks` + `ci-ok` + `pr-lint` green; no secret/key/credential
+      in code, tests, fixtures, logs, or error bodies.
+
+Follow-up gate items (the vault/HTTP slice PR may not merge until the
+CISO gate verifies each at its exact head):
+
+- [ ] Follow-up migration: `rewrapped_at` + `kek_version` index (§2).
+- [ ] `kek_by_version` selector over provisioned versions so mixed-version
+      rows decrypt during phases 1–2; first rotation cuts over to
+      `VAULT_KEK_V<N>` + `VAULT_KEK_CURRENT` (§3).
 - [ ] Re-wrap job present, idempotent, resumable, with poison-row
       handling and count-only telemetry; re-wrap UPDATE binds the new
       AAD (§6 step 2).
-- [ ] Runbook §7 followed on staging; rollback rehearsed (flip-back deploy).
+- [ ] Runbook §7 followed on staging (var flip + dry-run re-wrap pass);
+      rollback rehearsed (flip-back deploy).
 - [ ] Retire-after date recorded and honored (backup/PITR-aware, §5
       invariant 3); retired material retained in the operator store.
 - [ ] Compromise path §10 implemented and drill-documented (it is a
       gate item, not a non-goal).
-- [ ] Staging and prod KEK sets independently generated (operator
-      attestation, never values).
-- [ ] `gitleaks` + `ci-ok` + `pr-lint` green; no secret/key/credential in
-      code, tests, fixtures, logs, or error bodies.
 
 ## 9. Non-goals
 

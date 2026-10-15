@@ -8,14 +8,17 @@
 # with a `# vX.Y.Z` version comment. Dependabot updates the SHA and the
 # comment together -- never replace a SHA pin with a bare tag.
 #
-# Directories are forward-looking: entries stay dormant until their
-# manifests land (`Cargo.toml` at the workspace root, `package.json`
-# under `web/` for the SvelteKit frontend).
+# One entry per manifest directory: Dependabot takes no globs, and each
+# ecosystem looks only in its configured directory. The root workspace
+# (`Cargo.toml`, members: `crates/nntune-core`) does NOT cover
+# `workers/api` or `workers/ingest` (excluded standalone crates), so they
+# get their own cargo entries. npm watches the SvelteKit app
+# (`apps/web`) and the e2e harness (`e2e`), not a top-level `web/`.
 #
-# When those manifests land, commit their lockfiles too (remove the
-# corresponding ignore lines first): without a committed lockfile the
-# dependency graph cannot see transitive versions, so the cargo/npm
-# entries above cannot do their job.
+# Lockfiles: the repo ignores `Cargo.lock` (see root `.gitignore`), so the
+# cargo entries update direct dependencies without transitive visibility.
+# Committing lockfiles for the worker crates would close that gap; that is
+# a scaffold-wide decision for the owning card, not this security PR.
 #
 # First Dependabot PR: confirm the required checks (`ci-ok`, `gitleaks`,
 # `pr-lint`, Paperclip Review) all appear on it before relying on them —
@@ -39,6 +42,8 @@ updates:
       prefix: "chore"
       include: "scope"
 
+  # Root workspace (covers crates/nntune-core; workers/* are excluded
+  # standalone crates and get their own entries below).
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
@@ -53,8 +58,51 @@ updates:
       prefix: "chore"
       include: "scope"
 
+  # Standalone worker crates (vault crypto: aes-gcm, hmac; base64).
+  - package-ecosystem: "cargo"
+    directory: "/workers/api"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  - package-ecosystem: "cargo"
+    directory: "/workers/ingest"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
   - package-ecosystem: "npm"
-    directory: "/web"
+    directory: "/apps/web"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  - package-ecosystem: "npm"
+    directory: "/e2e"
     schedule:
       interval: "weekly"
       day: "monday"

@@ -299,14 +299,26 @@ fn session_expiry_boundary_is_exclusive() {
         session::verify_session(SECRET, &token, NOW + ONE_DAY),
         Err(session::SessionError::Invalid)
     );
-    assert!(session::rotate_session(SECRET, &token, NOW + ONE_DAY, 3600).is_err());
+    assert!(session::rotate_session(
+        &session::SessionKeys::single(SECRET),
+        &token,
+        NOW + ONE_DAY,
+        3600
+    )
+    .is_err());
 }
 
 #[test]
 fn session_in_bounds_rotation_preserves_authentication_time() {
-    let token = session::issue_session(SECRET, "user-acceptance", NOW, 3600);
+    let token = session::issue_session(SECRET, "user-acceptance", NOW, 3600).expect("issue");
     let original = session::verify_session(SECRET, &token, NOW).unwrap();
-    let rotated = session::rotate_session(SECRET, &token, NOW + 60, 3600).unwrap();
+    let rotated = session::rotate_session(
+        &session::SessionKeys::single(SECRET),
+        &token,
+        NOW + 60,
+        3600,
+    )
+    .unwrap();
     let claims = session::verify_session(SECRET, &rotated, NOW + 60).unwrap();
     assert_eq!(claims.created_at, NOW);
     assert_eq!(claims.issued_at, NOW + 60);
@@ -318,8 +330,14 @@ fn session_in_bounds_rotation_preserves_authentication_time() {
 
 #[test]
 fn session_rotation_clamps_expiry_to_absolute_lifetime() {
-    let token = session::issue_session(SECRET, "user-acceptance", NOW, ONE_DAY);
-    let rotated = session::rotate_session(SECRET, &token, NOW + ONE_DAY - 120, 3600).unwrap();
+    let token = session::issue_session(SECRET, "user-acceptance", NOW, ONE_DAY).expect("issue");
+    let rotated = session::rotate_session(
+        &session::SessionKeys::single(SECRET),
+        &token,
+        NOW + ONE_DAY - 120,
+        3600,
+    )
+    .unwrap();
     let verified = session::verify_session(SECRET, &rotated, NOW + ONE_DAY - 120);
     assert!(verified.is_ok(), "rotation must not emit an over-age token");
     let claims = verified.unwrap();
@@ -329,9 +347,15 @@ fn session_rotation_clamps_expiry_to_absolute_lifetime() {
 
 #[test]
 fn session_repeated_rotations_cannot_extend_one_day_lifetime() {
-    let mut token = session::issue_session(SECRET, "user-acceptance", NOW, ONE_DAY);
+    let mut token = session::issue_session(SECRET, "user-acceptance", NOW, ONE_DAY).expect("issue");
     for (counter, offset) in [3600, 43_200, ONE_DAY - 1].into_iter().enumerate() {
-        token = session::rotate_session(SECRET, &token, NOW + offset, ONE_DAY).unwrap();
+        token = session::rotate_session(
+            &session::SessionKeys::single(SECRET),
+            &token,
+            NOW + offset,
+            ONE_DAY,
+        )
+        .unwrap();
         let verified = session::verify_session(SECRET, &token, NOW + offset);
         assert!(verified.is_ok(), "refresh must emit an in-bounds token");
         let claims = verified.unwrap();
@@ -340,11 +364,17 @@ fn session_repeated_rotations_cannot_extend_one_day_lifetime() {
         assert_eq!(claims.rotation_counter, counter as u32 + 1);
     }
     assert!(session::verify_session(SECRET, &token, NOW + ONE_DAY).is_err());
-    assert!(session::rotate_session(SECRET, &token, NOW + ONE_DAY, ONE_DAY).is_err());
+    assert!(session::rotate_session(
+        &session::SessionKeys::single(SECRET),
+        &token,
+        NOW + ONE_DAY,
+        ONE_DAY
+    )
+    .is_err());
 }
 
 fn active_session() -> (String, session::SessionRecord) {
-    let token = session::issue_session(SECRET, "user-acceptance", NOW, 3600);
+    let token = session::issue_session(SECRET, "user-acceptance", NOW, 3600).expect("issue");
     let claims = session::verify_session(SECRET, &token, NOW).unwrap();
     let row = session::SessionRecord {
         id: claims.session_id,
@@ -360,7 +390,13 @@ fn active_session() -> (String, session::SessionRecord) {
 #[test]
 fn stored_session_accepts_matching_active_row() {
     let (token, row) = active_session();
-    let claims = session::verify_stored_session(SECRET, &token, NOW + 60, &row).unwrap();
+    let claims = session::verify_stored_session(
+        &session::SessionKeys::single(SECRET),
+        &token,
+        NOW + 60,
+        &row,
+    )
+    .unwrap();
     assert_eq!(claims.user_id, "user-acceptance");
     assert_eq!(claims.expires_at, NOW + 3600);
 }
@@ -370,7 +406,12 @@ fn stored_session_rejects_stale_rotation_counter() {
     let (token, mut row) = active_session();
     row.rotation_counter = 1;
     assert_eq!(
-        session::verify_stored_session(SECRET, &token, NOW + 60, &row),
+        session::verify_stored_session(
+            &session::SessionKeys::single(SECRET),
+            &token,
+            NOW + 60,
+            &row
+        ),
         Err(session::SessionError::Invalid)
     );
 }
@@ -380,7 +421,12 @@ fn stored_session_rejects_revoked_row() {
     let (token, mut row) = active_session();
     row.revoked = true;
     assert_eq!(
-        session::verify_stored_session(SECRET, &token, NOW + 60, &row),
+        session::verify_stored_session(
+            &session::SessionKeys::single(SECRET),
+            &token,
+            NOW + 60,
+            &row
+        ),
         Err(session::SessionError::Invalid)
     );
 }
@@ -411,7 +457,12 @@ fn stored_session_rejects_mismatched_identity_and_expiry() {
         },
     ] {
         assert_eq!(
-            session::verify_stored_session(SECRET, &token, NOW + 60, &changed),
+            session::verify_stored_session(
+                &session::SessionKeys::single(SECRET),
+                &token,
+                NOW + 60,
+                &changed
+            ),
             Err(session::SessionError::Invalid),
             "mismatched authoritative row: {changed:?}"
         );
@@ -421,16 +472,39 @@ fn stored_session_rejects_mismatched_identity_and_expiry() {
 #[test]
 fn stored_session_invalidates_pre_rotation_token_after_row_advances() {
     let (token, mut row) = active_session();
-    let rotated = session::rotate_session(SECRET, &token, NOW + 60, 3600).unwrap();
+    let rotated = session::rotate_session(
+        &session::SessionKeys::single(SECRET),
+        &token,
+        NOW + 60,
+        3600,
+    )
+    .unwrap();
     row.rotation_counter = 1;
     row.expires_at = NOW + 3660;
-    assert!(session::verify_stored_session(SECRET, &rotated, NOW + 60, &row).is_ok());
+    assert!(session::verify_stored_session(
+        &session::SessionKeys::single(SECRET),
+        &rotated,
+        NOW + 60,
+        &row
+    )
+    .is_ok());
     assert_eq!(
-        session::verify_stored_session(SECRET, &token, NOW + 60, &row),
+        session::verify_stored_session(
+            &session::SessionKeys::single(SECRET),
+            &token,
+            NOW + 60,
+            &row
+        ),
         Err(session::SessionError::Invalid)
     );
     row.rotation_counter = 0;
-    assert!(session::verify_stored_session(SECRET, &rotated, NOW + 60, &row).is_err());
+    assert!(session::verify_stored_session(
+        &session::SessionKeys::single(SECRET),
+        &rotated,
+        NOW + 60,
+        &row
+    )
+    .is_err());
 }
 
 // Literal digests independently computed with SHA-256 over the UTF-8 fixtures.

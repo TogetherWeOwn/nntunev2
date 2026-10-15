@@ -17,7 +17,7 @@ fn test_secret() -> Vec<u8> {
 fn session_roundtrip_and_cookie_attributes() {
     let secret = test_secret();
     let now = 1_700_000_000u64;
-    let token = session::issue_session(&secret, "user-123", now, 3600);
+    let token = session::issue_session(&secret, "user-123", now, 3600).expect("issue");
     let claims = session::verify_session(&secret, &token, now + 60).expect("valid token");
     assert_eq!(claims.user_id, "user-123");
     assert_eq!(claims.rotation_counter, 0);
@@ -26,7 +26,7 @@ fn session_roundtrip_and_cookie_attributes() {
         !claims.session_id.is_empty(),
         "jti present for row revocation"
     );
-    let other = session::issue_session(&secret, "user-123", now, 3600);
+    let other = session::issue_session(&secret, "user-123", now, 3600).expect("issue");
     let other_claims = session::verify_session(&secret, &other, now + 60).expect("valid token");
     assert_ne!(
         claims.session_id, other_claims.session_id,
@@ -63,7 +63,7 @@ fn session_roundtrip_and_cookie_attributes() {
 fn session_tamper_rejected() {
     let secret = test_secret();
     let now = 1_700_000_000u64;
-    let mut token = session::issue_session(&secret, "user-123", now, 3600);
+    let mut token = session::issue_session(&secret, "user-123", now, 3600).expect("issue");
     token.push('A');
     assert!(session::verify_session(&secret, &token, now + 60).is_err());
 }
@@ -71,7 +71,7 @@ fn session_tamper_rejected() {
 #[test]
 fn session_wrong_secret_and_expiry_rejected() {
     let now = 1_700_000_000u64;
-    let token = session::issue_session(&test_secret(), "user-123", now, 60);
+    let token = session::issue_session(&test_secret(), "user-123", now, 60).expect("issue");
     assert!(
         session::verify_session(b"wrong-secret-00000000000000000000", &token, now + 1).is_err()
     );
@@ -82,11 +82,17 @@ fn session_wrong_secret_and_expiry_rejected() {
 fn session_rotation_bumps_counter_and_stays_valid() {
     let secret = test_secret();
     let now = 1_700_000_000u64;
-    let token = session::issue_session(&secret, "user-123", now, 3600);
+    let token = session::issue_session(&secret, "user-123", now, 3600).expect("issue");
     let old_id = session::verify_session(&secret, &token, now + 5)
         .expect("valid token")
         .session_id;
-    let rotated = session::rotate_session(&secret, &token, now + 10, 3600).expect("rotation works");
+    let rotated = session::rotate_session(
+        &session::SessionKeys::single(&secret),
+        &token,
+        now + 10,
+        3600,
+    )
+    .expect("rotation works");
     let claims = session::verify_session(&secret, &rotated, now + 20).expect("rotated valid");
     assert_eq!(claims.rotation_counter, 1);
     assert_eq!(claims.user_id, "user-123");

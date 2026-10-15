@@ -1,0 +1,10 @@
+/paperclip/instances/default/worktrees/e93c5542-3748-4cdc-bf8e-a690d9b7afcc/TOG-23639-nntune-v2-threat-model-security-review-gate-byop-vault-auth-public-repo/workers/api/target/debug/deps/cipher-76366c26f7c1618e.d: /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/lib.rs /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/block.rs /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/errors.rs /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream.rs /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream_core.rs /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream_wrapper.rs
+
+/paperclip/instances/default/worktrees/e93c5542-3748-4cdc-bf8e-a690d9b7afcc/TOG-23639-nntune-v2-threat-model-security-review-gate-byop-vault-auth-public-repo/workers/api/target/debug/deps/libcipher-76366c26f7c1618e.rmeta: /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/lib.rs /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/block.rs /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/errors.rs /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream.rs /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream_core.rs /paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream_wrapper.rs
+
+/paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/lib.rs:
+/paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/block.rs:
+/paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/errors.rs:
+/paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream.rs:
+/paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream_core.rs:
+/paperclip/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream_wrapper.rs:

@@ -62,14 +62,68 @@ impl std::fmt::Display for SessionError {
 // Unpadded-base64url lives in one place: [`crate::b64`] over the `base64`
 // crate (F-HARD-01). Decode errors map to [`SessionError::Invalid`] at each
 // call site; nothing secret or distinguishing is ever echoed.
-fn sign(secret: &[u8], payload_b64: &str) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+
+/// Minimum HMAC secret length (32 bytes / 256 bits). Every signing and
+/// verification entry point enforces it and fails closed: an unset env var
+/// that decodes to an empty slice, or any truncated secret, is
+/// [`SessionError::Invalid`] — never a working weak key.
+pub const MIN_SECRET_LEN: usize = 32;
+
+fn check_secret_len(secret: &[u8]) -> Result<(), SessionError> {
+    if secret.len() < MIN_SECRET_LEN {
+        return Err(SessionError::Invalid);
+    }
+    Ok(())
+}
+
+/// Secrets accepted for one verification call: exactly one primary plus an
+/// optional previous, never a list or version chain. The previous secret is
+/// verify-only and exists only inside a recorded rotation window; steady
+/// state is [`SessionKeys::single`]. See
+/// `docs/security/session-secret-rotation.md`.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionKeys<'a> {
+    pub primary: &'a [u8],
+    pub previous: Option<&'a [u8]>,
+}
+
+impl<'a> SessionKeys<'a> {
+    /// Steady state: one secret mints and verifies.
+    pub fn single(primary: &'a [u8]) -> Self {
+        SessionKeys {
+            primary,
+            previous: None,
+        }
+    }
+
+    /// Rotation window: the primary mints; both verify. The caller passes
+    /// `None` (via [`SessionKeys::single`]) when no rotation is recorded —
+    /// an empty or short previous secret fails closed instead of silently
+    /// widening or narrowing the window.
+    pub fn rotation(primary: &'a [u8], previous: &'a [u8]) -> Self {
+        SessionKeys {
+            primary,
+            previous: Some(previous),
+        }
+    }
+}
+
+fn sign(secret: &[u8], payload_b64: &str) -> Result<Vec<u8>, SessionError> {
+    check_secret_len(secret)?;
+    let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| SessionError::Invalid)?;
     mac.update(payload_b64.as_bytes());
-    mac.finalize().into_bytes().to_vec()
+    Ok(mac.finalize().into_bytes().to_vec())
 }
 
 /// Issue a new session token for `user_id` valid for `ttl_secs` from `now`.
-pub fn issue_session(secret: &[u8], user_id: &str, now: u64, ttl_secs: u64) -> String {
+/// Fails closed on a short secret — callers surface the error, never a
+/// token minted under a weak key.
+pub fn issue_session(
+    secret: &[u8],
+    user_id: &str,
+    now: u64,
+    ttl_secs: u64,
+) -> Result<String, SessionError> {
     let claims = SessionClaims {
         session_id: new_session_id(),
         user_id: user_id.to_string(),
@@ -80,17 +134,19 @@ pub fn issue_session(secret: &[u8], user_id: &str, now: u64, ttl_secs: u64) -> S
     };
     let payload = serde_json::to_vec(&claims).expect("claims serialize");
     let payload_b64 = crate::b64::encode(&payload);
-    let sig = sign(secret, &payload_b64);
-    format!("{}.{}", payload_b64, crate::b64::encode(&sig))
+    let sig = sign(secret, &payload_b64)?;
+    Ok(format!("{}.{}", payload_b64, crate::b64::encode(&sig)))
 }
 
 /// Verify signature and time bounds only; this does NOT authenticate a
 /// request. Use it to locate the session row, then require
 /// [`verify_stored_session`] against that current row before authorization.
+/// Short secrets fail closed (see [`MIN_SECRET_LEN`]).
 pub fn verify_session(secret: &[u8], token: &str, now: u64) -> Result<SessionClaims, SessionError> {
+    check_secret_len(secret)?;
     let (payload_b64, sig_b64) = token.split_once('.').ok_or(SessionError::Invalid)?;
     let sig = crate::b64::decode(sig_b64).map_err(|_| SessionError::Invalid)?;
-    let expected = sign(secret, payload_b64);
+    let expected = sign(secret, payload_b64)?;
     if sig.len() != expected.len() || sig.ct_eq(&expected).unwrap_u8() != 1 {
         return Err(SessionError::Invalid);
     }
@@ -117,17 +173,25 @@ pub fn verify_session(secret: &[u8], token: &str, now: u64) -> Result<SessionCla
 /// Rotation-window verification: accept tokens signed by the current
 /// `primary` secret OR the superseded `previous` secret (see
 /// `docs/security/session-secret-rotation.md`). Outside a rotation window
-/// callers pass the same secret twice or use [`verify_session`] directly —
-/// a standing second secret would needlessly broaden the signing scope.
-/// Both failures map to the same generic [`SessionError::Invalid`]; there
-/// is no oracle for which secret matched.
+/// callers pass [`SessionKeys::single`] — a standing second secret would
+/// needlessly broaden the signing scope. Both secrets are length-checked
+/// up front, so a misconfigured short `previous` fails the whole call
+/// closed instead of silently narrowing the window. Both failures map to
+/// the same generic [`SessionError::Invalid`]; there is no oracle for
+/// which secret matched.
 pub fn verify_session_dual(
-    primary: &[u8],
-    previous: &[u8],
+    keys: &SessionKeys<'_>,
     token: &str,
     now: u64,
 ) -> Result<SessionClaims, SessionError> {
-    verify_session(primary, token, now).or_else(|_| verify_session(previous, token, now))
+    check_secret_len(keys.primary)?;
+    if let Some(previous) = keys.previous {
+        check_secret_len(previous)?;
+    }
+    verify_session(keys.primary, token, now).or_else(|_| match keys.previous {
+        Some(previous) => verify_session(previous, token, now),
+        None => Err(SessionError::Invalid),
+    })
 }
 
 /// Current server-side row from `sessions`; absence of a row must reject.
@@ -144,12 +208,12 @@ pub struct SessionRecord {
 /// Request authentication: reject revocation, stale rotations, mismatched
 /// ownership and row expiry in addition to the signed-token lifetime cap.
 pub fn verify_stored_session(
-    secret: &[u8],
+    keys: &SessionKeys<'_>,
     token: &str,
     now: u64,
     record: &SessionRecord,
 ) -> Result<SessionClaims, SessionError> {
-    let claims = verify_session(secret, token, now)?;
+    let claims = verify_session_dual(keys, token, now)?;
     if record.revoked
         || claims.session_id != record.id
         || claims.user_id != record.user_id
@@ -172,12 +236,14 @@ pub fn verify_stored_session(
 /// For privilege changes, revoke the old row and use [`issue_session`] after
 /// reauthentication to create a NEW session id; never use refresh for that.
 pub fn rotate_session(
-    secret: &[u8],
+    keys: &SessionKeys<'_>,
     token: &str,
     now: u64,
     ttl_secs: u64,
 ) -> Result<String, SessionError> {
-    let claims = verify_session(secret, token, now)?;
+    // Dual path: a pre-cutover token verifies here and is re-signed below
+    // with the primary, so rotation migrates sessions onto the new secret.
+    let claims = verify_session_dual(keys, token, now)?;
     let next = SessionClaims {
         session_id: claims.session_id,
         user_id: claims.user_id,
@@ -193,7 +259,9 @@ pub fn rotate_session(
     };
     let payload = serde_json::to_vec(&next).expect("claims serialize");
     let payload_b64 = crate::b64::encode(&payload);
-    let sig = sign(secret, &payload_b64);
+    // Always re-sign with the primary: rotation migrates, never mints
+    // under the previous secret.
+    let sig = sign(keys.primary, &payload_b64)?;
     Ok(format!("{}.{}", payload_b64, crate::b64::encode(&sig)))
 }
 
@@ -230,25 +298,82 @@ mod tests {
         let primary = b"primary-secret-00000000000000000000";
         let previous = b"previous-secret-0000000000000000000";
         let now = 1_700_000_000u64;
+        let window = SessionKeys::rotation(primary, previous);
         // Token minted under the superseded secret verifies while the
         // previous secret is still configured ...
-        let old_token = issue_session(previous, "user-1", now, 3600);
+        let old_token = issue_session(previous, "user-1", now, 3600).expect("issue");
         assert!(verify_session(primary, &old_token, now + 60).is_err());
-        assert!(verify_session_dual(primary, previous, &old_token, now + 60).is_ok());
+        assert!(verify_session_dual(&window, &old_token, now + 60).is_ok());
         // ... new tokens verify under the primary alone ...
-        let new_token = issue_session(primary, "user-1", now, 3600);
-        assert!(verify_session_dual(primary, previous, &new_token, now + 60).is_ok());
+        let new_token = issue_session(primary, "user-1", now, 3600).expect("issue");
+        assert!(verify_session_dual(&window, &new_token, now + 60).is_ok());
         // ... and dropping the previous secret ends the window: old tokens
         // fail under the primary with no oracle for which secret matched.
         assert!(verify_session(primary, &old_token, now + 60).is_err());
+        let wrong = SessionKeys::rotation(
+            b"wrong-1-00000000000000000000000",
+            b"wrong-2-00000000000000000000000",
+        );
         assert_eq!(
-            verify_session_dual(
-                b"wrong-1-00000000000000000000000",
-                b"wrong-2-00000000000000000000000",
-                &new_token,
-                now + 60
-            ),
+            verify_session_dual(&wrong, &new_token, now + 60),
             Err(SessionError::Invalid)
         );
+    }
+
+    fn record_for(claims: &SessionClaims) -> SessionRecord {
+        SessionRecord {
+            id: claims.session_id.clone(),
+            user_id: claims.user_id.clone(),
+            created_at: claims.created_at,
+            expires_at: claims.expires_at,
+            rotation_counter: claims.rotation_counter,
+            revoked: false,
+        }
+    }
+
+    #[test]
+    fn rotation_window_end_to_end_through_row_check() {
+        // The documented rotation flow: a pre-cutover token authenticates
+        // through verify_stored_session, refreshes onto the primary via
+        // rotate_session, and dies when the previous secret is dropped.
+        let primary = b"primary-secret-00000000000000000000";
+        let previous = b"previous-secret-0000000000000000000";
+        let now = 1_700_000_000u64;
+        let window = SessionKeys::rotation(primary, previous);
+
+        let old_token = issue_session(previous, "user-1", now, 3600).expect("issue");
+        let record =
+            record_for(&verify_session_dual(&window, &old_token, now + 60).expect("dual verifies"));
+        // Step 3 of the runbook: the pre-cutover cookie authenticates.
+        let claims =
+            verify_stored_session(&window, &old_token, now + 60, &record).expect("row check");
+        assert_eq!(claims.rotation_counter, 0);
+        // Refresh migrates the session onto the primary signature ...
+        let rotated = rotate_session(&window, &old_token, now + 120, 3600).expect("rotate");
+        let rotated_claims =
+            verify_session(primary, &rotated, now + 180).expect("primary alone verifies");
+        assert_eq!(rotated_claims.rotation_counter, 1);
+        assert_eq!(rotated_claims.session_id, claims.session_id);
+        // ... and dropping the previous secret ends the window: the old
+        // token fails the row check under the primary alone.
+        let steady = SessionKeys::single(primary);
+        assert!(verify_stored_session(&steady, &old_token, now + 180, &record).is_err());
+    }
+
+    #[test]
+    fn short_or_empty_secrets_fail_closed() {
+        let primary = b"primary-secret-00000000000000000000";
+        let now = 1_700_000_000u64;
+        // Minting under a weak key is refused, never issued.
+        assert!(issue_session(b"", "victim", now, 3600).is_err());
+        assert!(issue_session(b"short", "victim", now, 3600).is_err());
+        assert!(verify_session(b"", "x.y", now).is_err());
+        // An unset previous secret (empty slice) fails the whole call:
+        // a token minted under the empty key never verifies.
+        let empty_prev = SessionKeys::rotation(primary, b"");
+        assert!(verify_session_dual(&empty_prev, "x.y", now).is_err());
+        // The primary itself is length-checked even when a previous exists.
+        let short_primary = SessionKeys::rotation(b"short", b"");
+        assert!(verify_session_dual(&short_primary, "x.y", now).is_err());
     }
 }

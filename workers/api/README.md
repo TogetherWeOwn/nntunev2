@@ -35,8 +35,10 @@ security-critical logic with tests.
   no `Domain=` by construction); `HttpOnly; SameSite=Lax`; immutable `created_at`
   caps the lifetime at one day even across refreshes. Secret rotation runs a
   bounded dual-accept window — see `docs/security/session-secret-rotation.md`
-  (verify-only previous secret, `created_at`-bounded window, single-secret
-  steady state). `verify_session`
+  (`SessionKeys::rotation` verifies through `verify_stored_session` and
+  re-signs with the primary; verify-only previous secret,
+  `created_at`-bounded window, single-secret steady state; keys under 32
+  bytes fail closed). `verify_session`
   checks only signatures/time and is not request authentication. Require
   `verify_stored_session` against the current `sessions` row on every
   request: owner, expiry, counter and revocation must match. Refresh must

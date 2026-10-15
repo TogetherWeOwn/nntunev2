@@ -8,6 +8,7 @@ no directory or extension exemptions.
 
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -16,6 +17,8 @@ from public_text_lint import (
     FIXTURE_EXCLUSIONS,
     HOST_FIXTURE_EXCLUSIONS,
     find_violations,
+    is_artifact_path,
+    scan_path,
 )
 
 
@@ -85,6 +88,25 @@ class TestInternalHosts(unittest.TestCase):
     def test_private_suffix_with_path_flags(self):
         self.assertIn("internal-host", rules_for("fetch db.local/rows"))
 
+    def test_sentence_end_punctuation_flags(self):
+        # The most common place for a hostname in prose docs: the end of
+        # a sentence or wrapped in markup. All of these must flag.
+        for text in [
+            "The control plane lives at ops.acme.internal.",
+            "see <ops.acme.internal> for details",
+            "is it ops.acme.internal?",
+            "watch out for ops.acme.internal!",
+            "config {host: ops.acme.internal}",
+            "point at **ops.acme.internal** today",
+            "db.internal:3000 is the default",
+        ]:
+            self.assertIn("internal-host", rules_for(text), text)
+
+    def test_chains_and_calls_still_do_not_match(self):
+        self.assertEqual([], find_violations("value = self.internal()"))
+        self.assertEqual([], find_violations("see foo.internal.bar docs"))
+        self.assertEqual([], find_violations("dash is db.internal-legacy"))
+
     def test_loopback_and_localhost_are_dev_docs(self):
         self.assertEqual([], find_violations("listen on 127.0.0.1:3000"))
         self.assertEqual([], find_violations("open http://localhost:3000"))
@@ -139,6 +161,28 @@ class TestHostFixtureExclusions(unittest.TestCase):
         for path in sorted(HOST_FIXTURE_EXCLUSIONS):
             self.assertIn("tog-id", rules_for("see TOG-23644", path))
 
+    def test_exempt_paths_still_flag_other_host_shapes(self):
+        # Only the private-IPv4 pattern is skipped on these paths: a
+        # pasted hostname, control-plane host or UI link must still fail.
+        for path in sorted(HOST_FIXTURE_EXCLUSIONS):
+            self.assertIn(
+                "internal-host",
+                rules_for("dashboard at db.internal:3000", path),
+                path,
+            )
+            self.assertIn(
+                "internal-host",
+                rules_for("see https://workforce.example.net/abc", path),
+                path,
+            )
+            self.assertIn(
+                "internal-host",
+                rules_for(
+                    "see https://tracker.example.com/NNTUNE/issues/99", path
+                ),
+                path,
+            )
+
     def test_exempt_paths_still_flag_agent_names(self):
         for path in sorted(HOST_FIXTURE_EXCLUSIONS):
             self.assertIn("agent-name", rules_for("run as paperclip-agent-7", path))
@@ -146,6 +190,32 @@ class TestHostFixtureExclusions(unittest.TestCase):
     def test_exclusions_are_files_not_directories(self):
         for path in HOST_FIXTURE_EXCLUSIONS:
             self.assertFalse(path.endswith("/"))
+
+
+class TestBinaries(unittest.TestCase):
+    # A tracked binary IS public text once merged: NUL bytes must not
+    # hide content, and compiled artifacts must never be tracked at all
+    # (a .pyc once leaked an internal worktree path with CI green).
+    NUL_FIXTURE = b"\x00\x01TOG-90000\x00\x02"
+
+    def test_nul_bytes_do_not_hide_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = os.path.join(tmp, "fixture.bin")
+            with open(fixture, "wb") as fh:
+                fh.write(self.NUL_FIXTURE)
+            self.assertIn((1, "tog-id"), scan_path(fixture))
+
+    def test_artifact_paths_are_rejected_without_reading(self):
+        self.assertTrue(is_artifact_path(".github/scripts/__pycache__/x.pyc"))
+        self.assertTrue(is_artifact_path("a/b/__pycache__/y.py"))
+        self.assertTrue(is_artifact_path("docs/note.pyc"))
+        self.assertFalse(is_artifact_path("workers/api/src/session.rs"))
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = os.path.join(tmp, "__pycache__", "lint.pyc")
+            os.makedirs(os.path.dirname(artifact))
+            with open(artifact, "wb") as fh:
+                fh.write(b"clean\x00bytes")
+            self.assertEqual([(1, "binary-artifact")], scan_path(artifact))
 
 
 class TestMechanics(unittest.TestCase):

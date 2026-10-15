@@ -57,7 +57,7 @@ stream pool (accounts/auth/vault implementation card).
 | Repudiation | "I never stored that provider" / silent credential overwrite | Audit log: vault create/update/delete + test-connection attempts (who/when/source IP/result — NEVER the secret); no log line may contain credential material |
 | Information disclosure | SQL dump, log leak, error echo, backup exposure | Envelope encryption at rest; parameterized queries only; generic errors ("vault unavailable"); `test connection` returns boolean only, never provider banners; backups inherit encryption (ciphertext only) |
 | Denial of service | Vault row hammering; KEK-fetch storms | Rate-limit vault writes + test-connection per user (shared store, not in-memory — serverless); test-connection has dial + total timeouts and per-user concurrency cap |
-| Elevation | SSRF at `test connection` AND at every pool dial: user-supplied host/port aimed at internal targets | **SSRF guard (F-VAULT-01, dial-time invariant):** the check runs on EVERY provider connect, not only at save/test time — a hostname's DNS can change after it is saved. Allowlist scheme/host shape and NNTP ports (119/563 plus documented alternates only); resolve ALL DNS records and reject loopback/link-local/private/unique-local (v4+v6); forbid redirects; dial timeout; pool Worker carries no private-network or service bindings; treat provider host as hostile input. **Accepted residual (decision):** re-resolution at connect time has a DNS-rebinding TOCTOU gap (the runtime resolves the hostname itself); contained by the per-dial private-range rejection + port allowlist, not eliminated |
+| Elevation | SSRF at `test connection` AND at every pool dial: user-supplied host/port aimed at internal targets | **SSRF guard (F-VAULT-01, dial-time invariant):** the check runs on EVERY provider connect, not only at save/test time — a hostname's DNS can change after it is saved. Allowlist scheme/host shape and NNTP ports (119/563 plus documented alternates only); resolve ALL DNS records and reject loopback/link-local/private/unique-local (v4+v6); forbid redirects; dial timeout; pool Worker carries no private-network or service bindings; treat provider host as hostile input. **Pinning is required (one position — ADR 0008, §6, `authorize_pool_dial`):** the transport dials the vetted addresses only, never a second DNS lookup, retaining the hostname for TLS SNI. **Accepted residual (decision), narrow:** ONLY transports that force hostname re-resolution (no IP-dial API) fall back to re-resolution; that DNS-rebinding TOCTOU gap is contained by the per-dial private-range rejection + port allowlist, not eliminated |
 
 Key rules: KEK rotation is designed day one (versioned keys,
 version-pinned decrypt, online re-wrap job — F-VAULT-02, normative design
@@ -102,25 +102,39 @@ Per-user NNTP pool Durable Object + streaming Worker (pool/streaming implementat
 | Elevation | Tenant escapes pool to read another tenant's vault row | Vault read path enforces owner check inside the DO call path too — defense in depth, not edge-only |
 | Elevation | Pool dials a provider host whose DNS changed after save (save-time check bypass) | The §3 SSRF guard is a dial-time invariant: enforced on every connect inside the DO (resolve all records, reject private/reserved, NNTP-port allowlist); DNS-rebinding residual accepted, see §3 |
 
-## 7. Public-repo hygiene (verified 2026-10-13)
+## 7. Public-repo hygiene (verified 2026-10-13, re-verified 2026-10-15
+after the main merge: merge-queue `TOG-*` comments removed, two-layer
+gitleaks pin negative-tested, lint covers binaries and rejects tracked
+artifacts)
 
-Verified against the scaffold at `11d1f03`:
+Verified against main post-merge (required checks report on
+`merge_group` too, so the queue cannot land an un-scanned head):
 
-- `gitleaks` full-history scan is a required check; on PRs BOTH the config
-  policy AND the ignore file come from the base branch (`--gitleaks-ignore-path`
-  pinned to a base-ref extraction, empty when the base has no ignore file),
-  so a PR-added ignore cannot silence its own scan — it takes effect only
-  after merge, and the merge required this scan to pass. A PR touching the
-  ignore file raises a warning annotation for reviewers. Inline
-  `gitleaks:allow` comments never suppress findings (`--ignore-gitleaks-allow`;
-  note: the flag stops suppression, it does not turn allows into failures —
-  an allow comment on a real leak still reports the leak). ✅
-- All three workflows declare least-privilege `permissions:` (`contents: read`,
+- `gitleaks` full-history scan is a required check; on PRs the base-branch
+  policy is enforced in TWO layers, because gitleaks reads
+  `<source>/.gitleaksignore` from the scanned checkout IN ADDITION to
+  `--gitleaks-ignore-path` (flag-pinning alone was reproduced bypassable
+  with 8.30.1: key commit + fingerprint-ignore commit exits 0). Layer 1:
+  `--gitleaks-ignore-path` points at a base-ref extraction (empty when the
+  base has no ignore file). Layer 2: the checkout's own root
+  `.gitleaksignore` is overwritten from the base ref (or deleted when the
+  base has none) before the scan — history reads git objects, so this
+  hides nothing. Negative-tested locally with the pinned 8.30.1 binary
+  and the workflow's exact flags: bypass commit exits 0 without layer 2,
+  1 with it. A PR-added ignore therefore takes effect only after merge,
+  and the merge required this scan to pass. A PR touching the ignore file
+  raises a warning annotation for reviewers. Inline `gitleaks:allow`
+  comments never suppress findings (`--ignore-gitleaks-allow`; note: the
+  flag stops suppression, it does not turn allows into failures — an
+  allow comment on a real leak still reports the leak). ✅
+- All workflows declare least-privilege `permissions:` (`contents: read`,
   plus `pull-requests: read` where the title must be read). ✅
 - No `pull_request_target` anywhere (privilege-escalation vector banned). ✅
-- `actions/checkout` pinned by SHA. ✅
+- `actions/checkout` (and all other actions) pinned by SHA. ✅
 - `.gitignore` covers `.env*` (with `!.env.example` kept), `.dev.vars`,
-  `.wrangler/`, dumps. ✅
+  `.wrangler/`, dumps, plus `__pycache__/` and `*.pyc`/`*.pyo` (bytecode
+  embeds absolute build paths — the `public-text` lint reports tracked
+  artifacts as `binary-artifact`). ✅
 - `CONTRIBUTING.md` bans internal ids/links in public text. ✅
 
 The hygiene findings below are implemented in this PR series (Dependabot
@@ -130,12 +144,18 @@ findings are normative designs the implementation PR must satisfy (§8 gate).
 
 ## 8. Vault + auth review gate (standing)
 
-No vault/auth implementation PR exists yet (checked 2026-10-13; only the CI
-probe PR is open). When the accounts/auth/vault implementation PR (or any PR touching
-`auth`, `secret`, `credential`, `vault`, `session`, `passkey`, `grant`, pool
-isolation, migrations, or workflow permissions) is ready, the CISO verdict is a
-comment-gate on that card BEFORE merge. Normal flow never waits on CISO — ONLY
-these paths do. The verdict checks, at the exact PR head:
+This PR itself carries vault/auth/session hardening (TLS gates, port
+allowlist, dual-secret rotation, `__Host-` cookie, base64 crate), so the
+gate applies to it HERE — the checks below are recorded against this PR's
+head in its body. The slice-1 vault core (`provider_vaults` + envelope
+code) merged before the gate existed; its retroactive items are the
+`kek-rotation.md` §8 follow-ups (follow-up migration, `kek_by_version`,
+re-wrap job, staging drill, retire-after, §10 drill). When any LATER PR
+touches `auth`, `secret`, `credential`, `vault`, `session`, `passkey`,
+`grant`, pool isolation, migrations, or workflow permissions, the CISO
+verdict is a comment-gate on that card BEFORE merge. Normal flow never
+waits on CISO — ONLY these paths do. The verdict checks, at the exact PR
+head:
 
 1. Threat-model §3–§6 mitigations present for every touched path.
 2. `gitleaks` + `ci-ok` + `pr-lint` green on that head; full-history scan clean.
