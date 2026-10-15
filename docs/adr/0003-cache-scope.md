@@ -89,15 +89,18 @@ own-provider fetch rebuilds media/grants. Removing the last playlist reference
 while no library holds the track deletes the retained source. Membership changes,
 playlist/library/account deletion and source cleanup serialize on `(user_id, track_id)` and
 recheck both reference sets in one transaction. Library/playlist/account deletion
-is the explicit batched procedure in ADR 0002 rule 3, never a bare FK cascade:
-enumerate affected pairs and release ids, lock in ascending release id, then
-`(user_id, track_id)`, then hash order, and delete plus clean up per batch.
-For local releases, acquire the
-release serializer first; a source insert/delete/replace or a membership change
-that alters the release's selected art source
-also clears `release_art.content_hash`, `last_served_at`, `retry_after` and
-`last_failure`, and advances `updated_at` in that transaction. Membership edits
-that keep the same selected source leave the pointer alone. This covers final
+is the fenced, resumable batched procedure in ADR 0002 rule 3, never a bare FK cascade:
+mark `deleting`, enumerate affected pairs and release ids, lock in ascending release id, then
+`(user_id, track_id)`, then hash order, and per batch delete memberships, that user's
+unreachable `track_media` rows, unneeded grants, and run source cleanup plus
+conditional art invalidation.
+For local releases, every source insert/delete/replace and every membership
+change takes the release serializer first, computes the selected art source
+before and after inside that lock, and
+also clears `release_art.content_hash`, `last_served_at`, `retry_after`,
+`last_failure`, `transient_failures`, and advances `updated_at` in that transaction
+only when the selection changed. Membership edits (including final
+playlist-reference cleanup) that keep the same selected source leave the pointer alone. This covers final
 playlist-reference cleanup as well as newer imports; it invalidates stale art
 when its source is gone instead of waiting for retention. Without either reference, recovery
 requires a new ingest, not a library edit or restore. Sources use ADR 0002's versioned,
@@ -127,10 +130,11 @@ attempt; a later authorized request may retry only once eligible.
   art refills per user; extra authorized requests coalesce onto the in-flight
   attempt or return a retryable error without opening another provider fetch.
   The tag/fingerprint subphase of `match` (ADR 0002 rule 6) extracts the indicated
-  picture while the audio bytes are already in hand and persists the validated
-  bytes (or the bounded tag-header snapshot below) with the checkpoint, so the
+  picture while the audio bytes are already in hand, stages the validated bytes
+  in the art bucket by content hash, and checkpoints only
+  `(audio_ordinal, content_hash, byte_size, mime)` deduped by hash, so the
   post-write `art` stage publishes without a second audio download in the common
-  case. Otherwise select the lowest track id among the caller's current member
+  case and without storing bytes in the checkpoint. Otherwise select the lowest track id among the caller's current member
   tracks in that release whose encrypted `track_sources` includes
   `embedded_art_selector` (tag container/picture-block ordinal/MIME type, frozen
   in the accepted manifest). Fetch only a bounded prefix: the NZB segments
@@ -140,13 +144,15 @@ attempt; a later authorized request may retry only once eligible.
   source or a tenant URL. If the selected source was removed/replaced, recompute
   from current sources; if none has art, return unavailable. Snapshot
   `source_job_id` and recheck it, membership, and entitlement before publication;
-  stale work cannot republish bytes for a superseded source. Only a source
-  replacement/removal that changes the selected art source clears
-  the local release's art pointer under the same release lock; a membership edit
-  that keeps the same selected source leaves it alone. The next refill
+  stale work cannot republish bytes for a superseded source. Every source or
+  membership mutation on a local release takes the release serializer, computes
+  the selected art source before and after inside it, and clears the art pointer
+  and negative-cache fields (including `transient_failures`) only when the
+  selection changed; otherwise the pointer survives. The next refill
   selects current sources. A playlist-only source does not authorize art reads.
   Three consecutive transient timeouts escalate to `unavailable` with the
-  one-hour negative cache, so a 30-second attempt that can never finish does not
+  one-hour negative cache (`transient_failures` 1→2→3, reset on success or
+  selected-source change), so a 30-second attempt that can never finish does not
   flap every minute.
 - **CAA/verified:** derive the front-image request from the trusted
   `releases.mbid`, not a claimed MBID or tenant URL. Use HTTPS and a fixed
@@ -161,12 +167,13 @@ attempt; a later authorized request may retry only once eligible.
   unbounded transformations. Hash the validated bytes. Serve through the
   authenticated handler with private/no-store responses, not a public R2 URL.
 - **Negative results:** under the release serializer, persist `last_failure` plus
-  a fixed `retry_after`: unavailable/CAA 404/no valid embedded art waits one hour;
-  transient fetch/timeout failure waits one minute. Until that deadline, member
-  requests return the stored 404/70 or retryable error without upstream work;
+  a fixed `retry_after` plus `transient_failures`: unavailable/CAA 404/no valid embedded art waits one hour
+  (resets the counter); transient fetch/timeout failure waits one minute and
+  increments the counter, escalating to `unavailable`/one hour when it reaches 3.
+  Until that deadline, member requests return the stored 404/70 or retryable error without upstream work;
   requests never slide the deadline. Both Workflow and serve refills obey it.
-  Successful publication clears both fields. Local source/membership changes clear
-  them with the cache pointer, so a new valid source need not wait. A failed stale
+  Successful publication clears all three fields. Local source/membership changes that clear
+  the cache pointer clear all three with it, so a new valid source need not wait (and never inherits old failures). A failed stale
   attempt cannot write a negative result after its source or lease changes.
 - **Retention:** initialize `last_served_at` at publication and refresh on each
   authorized serve. Art has a fixed **30-day idle window**, independent of plan

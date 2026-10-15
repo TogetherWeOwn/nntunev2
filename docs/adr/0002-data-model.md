@@ -130,6 +130,8 @@ release_art           release_id FK → releases ON DELETE CASCADE,
                       content_hash TEXT NULL FK → cache_objects ON DELETE RESTRICT,
                       last_served_at NULL, retry_after NULL,
                       last_failure TEXT NULL ('unavailable'|'transient'),
+                      transient_failures SMALLINT NOT NULL DEFAULT 0
+                        CHECK (transient_failures >= 0 AND transient_failures <= 3),
                       created_at, updated_at,
                       PK (release_id, rendition) -- durable source, nullable cache pointer
 library_tracks        library_id FK, track_id FK, added_at, PK (library_id, track_id)
@@ -293,27 +295,45 @@ playlist entry** references that track. Delete the source only when both counts
 are zero, including after playlist-entry/playlist deletion. Serialize membership,
 playlist and source cleanup for `(user_id, track_id)` in one transaction; a
 concurrent re-add must not lose its source. For a local release, every source
-insert/delete/replace and every membership change that alters the release's
-selected art source takes the release serialization first
-(ADR 0003) and, in that same transaction, clears its art pointer, timestamp and
-negative-cache fields and advances `updated_at`. A membership change that leaves
-the selected art source unchanged (for example removing one of several member
-tracks while the lowest-track-id art source remains) does not clear the pointer.
-This includes final-reference
-cleanup, not only a newer ingest; do not keep serving old artwork after its
-source is gone. Deleting a library, a playlist, or an account is an explicit
-batched procedure, never a bare FK `ON DELETE CASCADE`: the handler enumerates
-the affected `(user_id, track_id)` pairs and local release ids up front, takes
-serializers in the fixed order ascending release id, then `(user_id, track_id)`,
-then hash (release-then-hash per ADR 0003), and per batch deletes the membership
-rows, runs the both-counts-zero source cleanup, and clears/invalidates local
-`release_art` in the same transaction. A plain SQL `DELETE FROM libraries` /
-`playlists` that relies on cascading FKs alone must not be used; schema FKs use
-`ON DELETE RESTRICT` (or no cascade) on `library_tracks`/`playlist_tracks` so the
-procedure cannot be bypassed. A periodic orphan-source reconciliation step (ADR
-0003 GC) deletes `track_sources` rows with no `library_tracks` and no
-`playlist_tracks` row for that `(user_id, track_id)`, covering crashes between
-batches. A retained source is recovery data,
+insert/delete/replace and every membership change takes the release serializer
+first (ADR 0003), computes the selected art source (lowest track id among
+current member tracks with `embedded_art_selector`) before and after inside
+that lock, and in that same transaction clears `release_art.content_hash`,
+`last_served_at`, `retry_after`, `last_failure`, `transient_failures` and
+advances `updated_at` only when the selection changed. A mutation that leaves
+the same selected source — for example removing one of several member tracks
+while the lowest-track-id art source remains, including via final-reference
+cleanup — leaves the pointer intact; removing/replacing the selected source
+clears it. Do not keep serving old artwork after its source is gone. Deleting a library, a playlist, or an account is an explicit
+fenced, resumable batched procedure, never a bare FK `ON DELETE CASCADE`: the
+handler marks the container `deleting` (new writes/restores/ingest `write`
+targeting it are rejected while marked), enumerates the affected `(user_id,
+track_id)` pairs and local release ids, takes serializers in the fixed order
+ascending release id, then `(user_id, track_id)`, then hash (release-then-hash
+per ADR 0003), and per batch deletes the membership rows, deletes that user's
+`track_media` rows for pairs with no remaining library membership, deletes
+`user_cache_grants` no other current mapping for that user/hash needs, runs
+the both-counts-zero source cleanup, and clears/invalidates local `release_art`
+only when the selected art source changed (rule above) in the same transaction.
+It then re-enumerates under the same serializers until empty before removing
+the container row, so a membership inserted after the first enumeration cannot
+fail the final `DELETE` with 23503; a crash mid-procedure resumes from the
+persisted `deleting` marker and batch cursor. A plain SQL `DELETE FROM
+libraries` / `playlists` that relies on cascading FKs alone must not be used;
+schema FKs use `ON DELETE RESTRICT` (or no cascade) on
+`library_tracks`/`playlist_tracks` so the procedure cannot be bypassed.
+Account deletion follows the fixed order grants → media/sources →
+memberships → providers/indexers → `ingest_jobs` (sources/media reference
+jobs; grants reference providers with `ON DELETE RESTRICT`), then local catalog
+sweep below. Local `tracks`/`releases`/`artists` rows plus their `release_art`
+descriptors are deleted once no `library_tracks` and no `playlist_tracks` row
+of any user references them (checked per batch under the release serializer);
+if `ingest_jobs` rows for the owner are already gone, derivation falls back to
+remaining membership/source evidence, never to silent retention — no ownerless
+tenant-tagged rows or art descriptors survive account deletion. A periodic
+orphan-source reconciliation step (ADR 0003 GC) deletes `track_sources` rows
+with no `library_tracks` and no `playlist_tracks` row for that `(user_id,
+track_id)`, covering crashes between batches. A retained source is recovery data,
 not read/stream authorization: dormant entries still fail the library gate.
 A live audio grant is required even when an object or track id is known.
 `cache_bytes` is a live SUM of object sizes across that user's unique audio grants,
@@ -448,11 +468,19 @@ file. Each entry carries:
 - Optional `embedded_art_selector`: tag container, picture-block ordinal and
   declared MIME type within that selected audio file, frozen by the tag producer.
   While those bytes are already in hand the producer also extracts the indicated
-  picture and persists the validated bytes (or the bounded tag-header snapshot
-  per ADR 0003) with the checkpoint, so the post-write `art` stage publishes
-  without re-downloading audio in the common case. Copy it with
-  `source_selector` into the encrypted lifetime `track_sources`
-  payload. It locates bytes for later validation, never an arbitrary URL or grant.
+  picture, validates it (JPEG/PNG/WebP, at most 5 MiB and 16 megapixels per ADR
+  0003), stages the validated bytes in the environment art bucket keyed by
+  content hash (R2 PUT outside SQL; an unreferenced staged object is removed by
+  the 24-hour orphan sweep), and checkpoints only `(audio_ordinal,
+  content_hash, byte_size, mime)` per entry, deduplicated by hash so one shared
+  album cover checkpoints once. No image bytes and no tag-header snapshot are
+  stored in the `JobCheckpoint` (Workers KV 25 MiB value / 1 MiB Workflow
+  step-result limits). The producer fetches at most an 8 MiB tag-header prefix
+  per audio file and at most 32 MiB total per job for this extraction; a file
+  that cannot yield its picture within the per-file cap is recorded as
+  no-embedded-art. Copy the content hash with `source_selector` into the
+  encrypted lifetime `track_sources` payload. It locates bytes for later
+  validation, never an arbitrary URL or grant.
 - Separate job-local `artist_group_ref` and `release_group_ref`, so one artist can
   span several releases. Each release group refers to one artist group in this
   model. These are catalog grouping references, **not NZB `<group>` newsgroups**.
@@ -772,7 +800,14 @@ retaining its `release_mbid_hint` without guessing. Also require:
   final-reference removal: no committed membership may lack its source. A playlist
   write for a track in no caller library is rejected. Schema FKs on
   `library_tracks`/`playlist_tracks` are `RESTRICT`/non-cascading so a bare
-  cascading delete cannot bypass this procedure.
+  cascading delete cannot bypass this procedure. Deleting a library also deletes
+  that user's `track_media` rows for now-unreachable tracks and grants no other
+  current mapping needs (gauge drops immediately); deleting an account in grant
+  → media/source → membership → provider → job order leaves no local
+  `tracks`/`releases`/`artists` rows, tenant tags, or `release_art` descriptors.
+  Inserting a membership after enumeration does not fail the final container
+  delete: the handler re-enumerates until empty under the serializers, rejects
+  writes while `deleting`, and resumes after a crash from the persisted marker.
 - Cover art: B requests A's local art by `coverart:{release_id}` or raw hash and
   receives 404/70 **before any fetch**. A's member request refills embedded art from
   an own current source; a verified-release member refills CAA art without a
@@ -785,8 +820,17 @@ retaining its `release_mbid_hint` without guessing. Also require:
   byte object or another user's local art may be served; unavailable art is 404/70.
   Assert the post-write stage acts as the job owner, not a system principal;
   repeated negative hits do no upstream work before `retry_after`, and a source
-  change clears that wait. Final-reference cleanup invalidates local art in the
-  same transaction, and an expired refill lease cannot publish.
+  change clears that wait including `transient_failures`. Three consecutive
+  30-second transient timeouts escalate to `unavailable` with the one-hour
+  negative cache (counter `transient_failures` 1→2→3 under the release
+  serializer); a success or a selected-source change in between resets it to 0.
+  Fully removing a non-selected member track with no playlist reference leaves
+  the art pointer intact, while removing the selected art-source track clears
+  it. A 12-track album embedding the same 3 MiB cover in every file stages one
+  R2 object by hash and checkpoints only the hash tuple per entry — the
+  checkpoint stays kilobytes, never tens of megabytes. Final-reference cleanup
+  invalidates local art in the same transaction only when the selection
+  changed, and an expired refill lease cannot publish.
 
 ### 7. Existing migrations stay at their applied paths
 
