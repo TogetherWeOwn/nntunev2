@@ -1,17 +1,25 @@
-//! NNTune v2 API worker: Subsonic-compatible surface on `/rest/*`.
+//! NNTune v2 API: accounts/auth/session/vault core and Subsonic Worker shell.
 //!
-//! Transport-free dispatch lives in `nntune-subsonic` (unit + fixture tested
-//! on native); this shell only adapts the worker runtime to it. The
-//! production `Library` (PlanetScale via Hyperdrive, R2 audio/artwork via the
-//! stream worker) plugs in behind the `Library` seam — until then the worker
-//! uses `MemStore::empty()`, which holds no credentials and rejects every
-//! auth attempt, rather than serving fabricated rows. Per-client `apiKey`
-//! credentials will resolve against `subsonic_clients`
-//! (`migrations/0001_subsonic_clients.sql`).
+//! The auth, session and vault modules are native + wasm32 compatible. Their
+//! HTTP + Hyperdrive wiring remains a follow-up. The wasm32 entry adapts
+//! `/rest/*` to the transport-free `nntune-subsonic` dispatcher.
+//!
+//! The production `Library` (PlanetScale via Hyperdrive, R2 audio/artwork via
+//! the stream worker) plugs in behind the `Library` seam. Until then the
+//! Worker uses `MemStore::empty()`, which holds no credentials and rejects
+//! every auth attempt. Per-client `apiKey` credentials will resolve against
+//! `subsonic_clients` (`migrations/0001_subsonic_clients.sql`).
 
+pub mod auth;
+pub mod session;
+pub mod vault;
+
+#[cfg(target_arch = "wasm32")]
 use nntune_subsonic::{oversized_body_response, MemStore, SubsonicApp, MAX_BODY_BYTES};
+#[cfg(target_arch = "wasm32")]
 use worker::*;
 
+#[cfg(target_arch = "wasm32")]
 #[event(fetch)]
 pub async fn main(mut req: Request, _env: Env, _ctx: Context) -> Result<Response> {
     let url = req.url()?;
@@ -53,6 +61,7 @@ pub async fn main(mut req: Request, _env: Env, _ctx: Context) -> Result<Response
     respond(&res)
 }
 
+#[cfg(target_arch = "wasm32")]
 fn respond(res: &nntune_subsonic::HttpResponse) -> Result<Response> {
     let headers = Headers::new();
     headers.set("Content-Type", &res.content_type)?;

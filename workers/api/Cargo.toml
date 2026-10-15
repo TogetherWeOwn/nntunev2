@@ -2,12 +2,31 @@
 name = "nntune-api"
 version = "0.1.0"
 edition = "2021"
-description = "NNTune v2 API worker (Rust workers-rs): Subsonic-compatible surface backed by PlanetScale + stream worker"
+description = "NNTune v2 API worker: Subsonic-compatible surface, accounts/auth, sessions and BYOP credential vault (native + wasm32)"
 license = "MIT"
 
 [lib]
-crate-type = ["cdylib"]
+name = "nntune_api"
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+aes-gcm = { version = "0.10", features = ["aes"] }
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+# wasm32-unknown-unknown has no OS RNG: the `js` feature routes getrandom
+# through Web Crypto on wasm targets (native builds unaffected). Without
+# this the Worker deploy target does not build.
+getrandom = { version = "0.2", features = ["js"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = { version = "1", features = ["derive"] }
+url = "2"
+subtle = "2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
 nntune-subsonic = { path = "../../crates/nntune-subsonic" }
 worker = "0.8"
+
+[dev-dependencies]
+serde_json = "1"
