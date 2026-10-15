@@ -25,6 +25,22 @@ id-free branch names; squash-merge keeps branch names off main).
 
 Follow `.github/pull_request_template.md`: what changed, why, how tested.
 
+## Pull-request size labels (advisory)
+
+`.github/workflows/pr-size.yml` labels every pull request `size/S` (up to 100
+counted lines), `size/M` (up to 400), `size/L` (up to 1000) or `size/XL`, and
+keeps one advisory comment on pull requests over the 400-line threshold.
+Counted lines are additions + deletions excluding lockfiles, generated files
+and fixtures. The labeller lives once in the org
+[TogetherWeOwn/.github](https://github.com/TogetherWeOwn/.github) repository
+(`CI-STANDARD.md`, "Advisory PR-size labels"); the workflow here is a thin
+caller pinned to a central SHA and passes only this repo's generated paths
+(none today — the central exclusions already cover this repo's lockfiles and
+fixture/test data). This is advisory only: it is not a required check and
+never blocks a merge. A Monday run of the same workflow prints the weekly
+tally of merged pull requests per size; the labels are the durable record
+behind it.
+
 ## Merge policy
 
 - Squash-merge only; the squash commit title is the PR title.
