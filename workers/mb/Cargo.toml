@@ -9,6 +9,10 @@ license = "MIT"
 crate-type = ["cdylib"]
 
 [dependencies]
-worker = { version = "0.3", features = ["http"] }
+worker = { version = "0.3", features = ["http", "tokio-postgres"] }
+# Hyperdrive Postgres client: `connect_raw` over the Worker socket with
+# the generated connection string (workers-rs `tokio-postgres` example).
+tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
+wasm-bindgen-futures = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

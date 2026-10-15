@@ -477,7 +477,8 @@ where
             user_id,
             self.now,
             self.cfg.session_ttl_secs,
-        );
+        )
+        .map_err(|_| internal())?;
         let claims = session::verify_session(&self.cfg.session_secret, &token, self.now)
             .map_err(|_| internal())?;
         self.store
@@ -521,9 +522,9 @@ where
             .await
             .map_err(|_| internal())?
             .ok_or_else(generic_auth)?;
-        let claims =
-            session::verify_stored_session(&self.cfg.session_secret, &token, self.now, &record)
-                .map_err(|_| generic_auth())?;
+        let keys = session::SessionKeys::single(&self.cfg.session_secret);
+        let claims = session::verify_stored_session(&keys, &token, self.now, &record)
+            .map_err(|_| generic_auth())?;
         Ok((claims, token))
     }
 
@@ -1034,12 +1035,9 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
-    let new_token = match session::rotate_session(
-        &ctx.cfg.session_secret,
-        &token,
-        ctx.now,
-        ctx.cfg.session_ttl_secs,
-    ) {
+    let keys = session::SessionKeys::single(&ctx.cfg.session_secret);
+    let new_token = match session::rotate_session(&keys, &token, ctx.now, ctx.cfg.session_ttl_secs)
+    {
         Ok(new_token) => new_token,
         Err(_) => return generic_auth(),
     };
@@ -1954,7 +1952,7 @@ mod tests {
         let req = Request {
             method: "GET".to_string(),
             path: "/v1/vault".to_string(),
-            cookie: Some("nameless; nntune_session=token-value".to_string()),
+            cookie: Some(format!("nameless; {}=token-value", session::COOKIE_NAME)),
             origin: None,
             body: Vec::new(),
         };

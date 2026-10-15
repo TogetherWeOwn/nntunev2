@@ -39,24 +39,8 @@ impl std::fmt::Display for AuthError {
 fn random_b64url_32() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
-    // Reuse the session module's alphabet via a local copy to avoid coupling.
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(43);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
-        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[((n >> 6) & 63) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[(n & 63) as usize] as char);
-        }
-    }
-    out
+    // Shared unpadded-base64url (F-HARD-01): no per-module copies.
+    crate::b64::encode(&bytes)
 }
 
 fn sha256_hex(s: &str) -> String {
@@ -292,6 +276,56 @@ pub fn consume_invite(
     Ok(record)
 }
 
+// --- Invite issuance + redemption throttle (F-HARD-01 item 4) -------------------
+
+/// Invite-code entropy: 128 bits, crypto-random, unpadded-base64url
+/// (22 chars). Returns the plaintext code; callers store only
+/// [`hash_invite_code`] of it and deliver the plaintext to the inviter
+/// once. Human-guessable or sequential codes are banned: at 128 bits
+/// enumeration is infeasible and the throttle below is defense in depth.
+pub fn generate_invite_code() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    crate::b64::encode(&bytes)
+}
+
+/// Sliding window for the invite-redemption rate limit (seconds).
+pub const INVITE_REDEMPTION_WINDOW_SECS: u64 = 300;
+/// Max redemption attempts per key per [`INVITE_REDEMPTION_WINDOW_SECS`].
+/// Generous for humans retrying a pasted code, tight for scripts: 10
+/// attempts per 5 minutes per IP (or per account once authenticated).
+pub const INVITE_REDEMPTION_MAX_ATTEMPTS: u32 = 10;
+
+/// Cutoff for the sliding redemption window: attempts at or before this
+/// timestamp no longer count. The HTTP slice prunes stored attempt rows at
+/// or below it.
+pub fn invite_attempt_retention_cutoff(now_secs: u64) -> u64 {
+    now_secs.saturating_sub(INVITE_REDEMPTION_WINDOW_SECS)
+}
+
+/// Sliding-window gate for invite redemption.
+///
+/// `recent_attempt_secs` MUST come from a shared store (Postgres/KV) keyed
+/// by client IP (anonymous signup) or account — never an in-memory list:
+/// serverless isolates have no shared memory and a restart would wipe the
+/// counter. The HTTP slice MUST:
+/// - load the key's attempt timestamps,
+/// - deny with the generic [`AuthError::Invalid`] when this returns false
+///   (indistinguishable from a bad code — no throttle oracle),
+/// - otherwise persist the new attempt timestamp atomically BEFORE running
+///   the conditional invite claim (a check-then-insert race fails open
+///   under concurrency; use a conditional write / transaction).
+///
+/// Fail-closed on clock skew: timestamps in the future count against the
+/// caller.
+pub fn invite_attempt_allowed(recent_attempt_secs: &[u64], now_secs: u64) -> bool {
+    let in_window = recent_attempt_secs
+        .iter()
+        .filter(|ts| now_secs.saturating_sub(**ts) < INVITE_REDEMPTION_WINDOW_SECS)
+        .count();
+    in_window < INVITE_REDEMPTION_MAX_ATTEMPTS as usize
+}
+
 /// A validated candidate for one atomic, parameterized Postgres claim.
 /// Bind the listed parameters; never interpolate a record into SQL.
 pub enum SingleUseClaim<'a> {
@@ -417,5 +451,59 @@ mod tests {
         let spent = consume_invite(record, "INVITE-1").unwrap();
         assert!(spent.used);
         assert!(consume_invite(spent, "INVITE-1").is_err());
+    }
+
+    #[test]
+    fn invite_codes_are_128_bit_random() {
+        let a = generate_invite_code();
+        let b = generate_invite_code();
+        for code in [&a, &b] {
+            assert_eq!(code.len(), 22, "16 bytes encode to 22 unpadded chars");
+            assert!(
+                code.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+                "url-safe alphabet only: {code:?}"
+            );
+            assert_eq!(
+                crate::b64::decode(code)
+                    .expect("generated code decodes")
+                    .len(),
+                16,
+                "exactly 128 bits of entropy"
+            );
+            // Generated codes round-trip through the at-rest hash.
+            assert_eq!(hash_invite_code(code).len(), 64);
+        }
+        assert_ne!(a, b, "codes must be unique per generation");
+    }
+
+    #[test]
+    fn invite_redemption_throttle_trips() {
+        let now = 1_700_000_000u64;
+        let full: Vec<u64> = (0..10).map(|i| now - i).collect();
+        assert!(
+            !invite_attempt_allowed(&full, now),
+            "10 attempts in the window must trip the limit"
+        );
+        let nine: Vec<u64> = (0..9).map(|i| now - i).collect();
+        assert!(
+            invite_attempt_allowed(&nine, now),
+            "9 attempts in the window must pass"
+        );
+        assert!(
+            invite_attempt_allowed(&[now - 300, now - 3_600], now),
+            "attempts at/outside the window edge must age out"
+        );
+        assert!(
+            !invite_attempt_allowed(&[now - 299; 10], now),
+            "attempts just inside the window must count"
+        );
+        assert!(invite_attempt_allowed(&[], now), "first attempt must pass");
+        assert!(
+            !invite_attempt_allowed(&[now + 1_000; 10], now),
+            "future timestamps must fail closed, not bypass"
+        );
+        assert_eq!(invite_attempt_retention_cutoff(now), now - 300);
+        assert_eq!(invite_attempt_retention_cutoff(30), 0);
     }
 }

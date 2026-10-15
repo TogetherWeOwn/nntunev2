@@ -4,6 +4,7 @@
 //! the Worker + Hyperdrive entry (`worker_entry`).
 
 pub mod auth;
+pub mod b64;
 pub mod encoding;
 pub mod handlers;
 pub mod session;

@@ -37,8 +37,9 @@ Cloudflare only.
 
 ```text
 src/lib/api/      # typed API-worker client (OpenAPI codegen replaces the types, not the call sites)
+src/lib/billing/  # plan matrix, usage evaluation, checkout/portal client — display only, enforcement is server-side
 src/lib/design/   # design tokens; app-wide styles in src/app.css
 src/lib/format.ts # display formatting (durations, byte counts)
-src/routes/       # landing (/), health (/api/health), …one route per slice
+src/routes/       # landing (/), health (/api/health), pricing (/pricing), billing (/account/billing), …one route per slice
 tests/            # Playwright smoke
 ```

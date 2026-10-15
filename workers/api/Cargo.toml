@@ -11,6 +11,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 aes-gcm = { version = "0.10", features = ["aes"] }
+# Shared unpadded-base64url over this crate (F-HARD-01): one audited
+# implementation for vault/auth/session. Pure Rust, wasm32-compatible.
+base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
 rand = "0.8"
