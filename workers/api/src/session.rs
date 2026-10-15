@@ -7,7 +7,7 @@
 //! `verify_stored_session`, not signature-only verification. Secret comes
 //! from the Worker env, never code.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
