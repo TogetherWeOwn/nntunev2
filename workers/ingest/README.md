@@ -41,6 +41,40 @@ NZB upload ───────────────┘                     
   never accepted in API bodies, never logged (redacted URLs only), never
   committed. `http://` indexer URLs are refused.
 - Upload bodies are untrusted: capped, shape-checked, never logged.
+- NZB fetch-from-URL SSRF guard (`src/nzb_fetch.rs`): a server-side fetch
+  of a caller-supplied NZB URL is hostile input. The guard runs before ANY
+  transport call and on every redirect hop from scratch:
+  - `https` only (any other scheme is `nzb_fetch_bad_scheme`, 400), no
+    embedded credentials (`nzb_fetch_embedded_credentials`, 400), no
+    explicit port other than 443;
+  - host allowlist: exact, case-insensitive match against
+    `NZB_FETCH_ALLOWLIST` (comma-separated exact hostnames, e.g.
+    `nzb.example,cdn.example`; subdomains are NOT implied). The default
+    is deny-all, so a worker without the variable answers every fetch URL
+    with `nzb_fetch_host_not_allowlisted` (403);
+  - resolve ALL DNS records and reject loopback / link-local (including
+    the 169.254.169.254 cloud metadata endpoint) / private / CGNAT /
+    multicast / reserved / documentation, v4+v6 including transition
+    space (`nzb_fetch_forbidden_address`, 403) — even when the host was
+    allowlisted by mistake. IP literals are checked directly, with no DNS
+    call. Unresolvable names are refused (`nzb_fetch_unresolvable_host`,
+    400);
+  - at most 3 redirect hops (`MAX_REDIRECTS`); past the cap the fetch
+    aborts with `nzb_fetch_too_many_redirects` (400). A redirect hop to a
+    forbidden address, an `http` downgrade, or an off-allowlist host is
+    blocked under its own code and never fetched;
+  - total timeout 10000 ms (`FETCH_TIMEOUT_MS`): chunk delays accumulating
+    past it abort with `nzb_fetch_timeout` (504); partial bytes are never
+    returned. Bodies past the 2 MiB intake cap abort with
+    `nzb_fetch_too_large` (413); other upstream statuses surface as
+    `nzb_fetch_upstream_status` (502);
+  - every block is logged as host + stable code only (never the full URL:
+    it may embed credentials or an apikey).
+- Stable codes: `nzb_fetch_bad_scheme`, `nzb_fetch_malformed_url`,
+  `nzb_fetch_embedded_credentials`, `nzb_fetch_host_not_allowlisted`,
+  `nzb_fetch_forbidden_address`, `nzb_fetch_unresolvable_host`,
+  `nzb_fetch_too_many_redirects`, `nzb_fetch_timeout`, `nzb_fetch_too_large`,
+  `nzb_fetch_upstream_status`.
 
 ## E2E contract (synthetic NNTP server card)
 
