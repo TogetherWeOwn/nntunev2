@@ -70,8 +70,13 @@ export const load: PageLoad = async ({ fetch }) => {
 
 	const { plan, planUnknown } = resolveEffectivePlan(subscription);
 	const manageBillingOnly = subscription !== null && LAPSED.has(subscription.status);
-	const usageStatus: LimitStatus | null =
+	let usageStatus: LimitStatus | null =
 		!planUnknown && usage ? evaluateUsage(plan, usage) : null;
+	// Portal-only: clearing the upgrade target keeps usage scored for display
+	// while the page renders Manage billing as the sole action. A lapsed
+	// subscriber must never start a new checkout — that would double-subscribe
+	// them next to the invoice they already owe.
+	if (manageBillingOnly && usageStatus) usageStatus = { ...usageStatus, upgradeTo: null };
 
 	const notices: string[] = [];
 	if (signedOut) {
@@ -84,6 +89,14 @@ export const load: PageLoad = async ({ fetch }) => {
 		else if (planUnknown && subscription)
 			notices.push(
 				`Subscription is ${subscription.status} — manage billing to resolve; showing trial limits meanwhile.`
+			);
+		else if (manageBillingOnly && subscription)
+			// Only reachable for in-grace past_due: every other lapsed state
+			// is planUnknown, and only past_due has a grace window. The plan
+			// is confirmed so no other notice renders, yet the failed payment
+			// still needs attention before the window closes.
+			notices.push(
+				'Your last payment failed — manage billing to resolve; your plan stays active during the grace period.'
 			);
 		if (usageFailed) notices.push('Could not load usage.');
 	}

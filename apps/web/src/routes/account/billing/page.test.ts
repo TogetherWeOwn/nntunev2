@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { load } from './+page';
+import type { PageData } from './$types';
 
 function mockFetch(routes: Record<string, { status: number; body: unknown }>): typeof fetch {
 	return (async (input: unknown) => {
@@ -95,6 +96,34 @@ describe('billing loader with an unconfirmed plan', () => {
 		expect(data.planId).toBe('pro-5x');
 		expect(data.manageBillingOnly).toBe(true);
 		expect(data.usageStatus).not.toBeNull();
+		// Portal-only: usage stays scored, but no checkout target may leak
+		// through, and the failed payment gets an explicit notice.
+		expect(data.usageStatus?.upgradeTo).toBeNull();
+		expect(data.loadError).toMatch(/payment failed/i);
+	});
+
+	it('renders Manage billing as the only action for an in-grace past_due subscriber', async () => {
+		const { render } = await import('svelte/server');
+		const { default: BillingPage } = await import('./+page.svelte');
+		const fetchFn = mockFetch({
+			'/v1/me/subscription': {
+				status: 200,
+				body: {
+					planId: 'pro-5x',
+					status: 'past_due',
+					currentPeriodEnd: null,
+					trialEndsAt: null,
+					graceUntil: new Date(Date.now() + 24 * 3600 * 1000).toISOString()
+				}
+			},
+			'/v1/me/usage': { status: 200, body: USAGE_HEAVY }
+		});
+
+		const data = await loadPage(fetchFn);
+		const { body } = render(BillingPage, { props: { data: data as PageData } });
+
+		expect(body).toContain('Manage billing to resolve');
+		expect(body).not.toContain('Upgrade to');
 	});
 
 	it.each(['past_due', 'canceled', 'expired', 'incomplete'] as const)(

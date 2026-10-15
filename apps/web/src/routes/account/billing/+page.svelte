@@ -26,7 +26,10 @@
 	let busy: 'checkout' | 'portal' | null = $state(null);
 
 	async function checkout() {
-		if (!status?.upgradeTo) return;
+		// Belt and braces with the loader (which nulls upgradeTo for
+		// portal-only subscriptions): never start a checkout from here when
+		// the subscriber already holds a plan that needs the portal instead.
+		if (!status?.upgradeTo || data.manageBillingOnly) return;
 		actionError = null;
 		busy = 'checkout';
 		try {
@@ -124,12 +127,12 @@
 
 	{#if !data.signedOut}
 		<div>
-			{#if status?.upgradeTo}
+			{#if status?.upgradeTo && !data.manageBillingOnly}
 				<button disabled={busy !== null} onclick={checkout}>
 					{busy === 'checkout' ? 'Starting…' : `Upgrade to ${status.upgradeTo}`}
 				</button>
 			{/if}
-			<button disabled={busy !== null} onclick={portal} data-primary={data.manageBillingOnly}>
+			<button disabled={busy !== null} onclick={portal}>
 				{busy === 'portal'
 					? 'Opening…'
 					: data.manageBillingOnly
