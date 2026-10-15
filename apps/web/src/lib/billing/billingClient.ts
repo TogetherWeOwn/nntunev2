@@ -29,9 +29,16 @@ export interface PlanDTO {
 
 export interface SubscriptionDTO {
 	planId: string;
-	status: 'trialing' | 'active' | 'past_due' | 'canceled' | 'incomplete';
+	/**
+	 * ADR 0002 statuses (`trialing`/`active`/`past_due`/`canceled`/`expired`),
+	 * plus Stripe's `incomplete` tolerated while payment confirms — never
+	 * entitlement-granting either way.
+	 */
+	status: 'trialing' | 'active' | 'past_due' | 'canceled' | 'expired' | 'incomplete';
 	currentPeriodEnd: string | null;
 	trialEndsAt: string | null;
+	/** End of the past-due grace window (ADR 0002 rule 4); absent when the backend sends none. */
+	graceUntil?: string | null;
 }
 
 /**
@@ -96,6 +103,18 @@ export async function startCheckout(
 	const data = await readJson<{ url: string }>(res, 'Start checkout');
 	if (!data.url.startsWith('https://')) throw new Error('Invalid checkout URL');
 	return data.url;
+}
+
+/**
+ * Signup URL for a signed-out visitor whose checkout attempt failed with
+ * 401. Returns null for any other error — those stay as inline alerts.
+ * The chosen plan rides along so /signup can continue into checkout.
+ */
+export function signupUrlForCheckoutFailure(planId: string, err: unknown): string | null {
+	if (err instanceof BillingApiError && err.status === 401) {
+		return `/signup?plan=${encodeURIComponent(planId)}`;
+	}
+	return null;
 }
 
 export async function openPortal(fetchFn: typeof fetch = fetch): Promise<string> {

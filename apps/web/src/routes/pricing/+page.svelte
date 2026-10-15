@@ -1,5 +1,7 @@
 <script lang="ts">
+	import { goto } from '$app/navigation';
 	import { listPlans, formatPricePerMonth } from '#lib/billing/plans.js';
+	import { startCheckout, signupUrlForCheckoutFailure } from '#lib/billing/billingClient.js';
 
 	const plans = listPlans();
 	let checkoutError: string | null = $state(null);
@@ -9,11 +11,14 @@
 		checkoutError = null;
 		pendingPlan = planId;
 		try {
-			const { startCheckout } = await import('#lib/billing/billingClient.js');
 			const url = await startCheckout(planId);
 			window.location.href = url;
 		} catch (err) {
-			checkoutError = err instanceof Error ? err.message : 'Checkout failed';
+			// Signed-out visitors have no session cookie: send them to signup
+			// with the plan carried along instead of a raw 401 alert.
+			const signup = signupUrlForCheckoutFailure(planId, err);
+			if (signup) await goto(signup);
+			else checkoutError = err instanceof Error ? err.message : 'Checkout failed';
 		} finally {
 			pendingPlan = null;
 		}
@@ -64,13 +69,13 @@
 					<td>{plan.ingestJobsDay}</td>
 					<td>{plan.cachePriority}</td>
 					<td>
-						<button disabled={pendingPlan === plan.id} onclick={() => choose(plan.id)}>
-							{pendingPlan === plan.id
-								? 'Starting…'
-								: plan.id === 'free'
-									? 'Start trial'
-									: 'Choose'}
-						</button>
+						{#if plan.id === 'free'}
+							<a href="/signup?plan=free">Start trial</a>
+						{:else}
+							<button disabled={pendingPlan === plan.id} onclick={() => choose(plan.id)}>
+								{pendingPlan === plan.id ? 'Starting…' : 'Choose'}
+							</button>
+						{/if}
 					</td>
 				</tr>
 			{/each}

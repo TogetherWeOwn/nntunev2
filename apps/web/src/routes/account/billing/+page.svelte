@@ -8,6 +8,16 @@
 	// The loader only emits known plan ids; free is the last-resort fallback
 	// so the page can never promote an unknown state to a paid tier.
 	const plan = $derived(getPlan(data.planId) ?? getPlan('free')!);
+	// A lapsed subscriber still owns their plan: name it with its status
+	// instead of printing "Free trial" above a past_due line. The
+	// "couldn't confirm" wording is reserved for no-subscription-at-all.
+	const headingPlan = $derived(
+		!data.planUnknown || data.signedOut
+			? plan
+			: data.subscription
+				? (getPlan(data.subscription.planId) ?? plan)
+				: plan
+	);
 	// usageStatus is null unless the plan is confirmed AND usage loaded: no
 	// usage-vs-cap alert or upgrade button is rendered otherwise.
 	const status = $derived(data.usageStatus);
@@ -65,7 +75,7 @@
 	{/if}
 
 	<section aria-labelledby="plan">
-		<h2 id="plan">Current plan: {plan.name}</h2>
+		<h2 id="plan">Current plan: {headingPlan.name}</h2>
 		{#if data.subscription}
 			<p>
 				Status: {data.subscription.status}
@@ -119,8 +129,12 @@
 					{busy === 'checkout' ? 'Starting…' : `Upgrade to ${status.upgradeTo}`}
 				</button>
 			{/if}
-			<button disabled={busy !== null} onclick={portal}>
-				{busy === 'portal' ? 'Opening…' : 'Manage billing'}
+			<button disabled={busy !== null} onclick={portal} data-primary={data.manageBillingOnly}>
+				{busy === 'portal'
+					? 'Opening…'
+					: data.manageBillingOnly
+						? 'Manage billing to resolve'
+						: 'Manage billing'}
 			</button>
 		</div>
 	{/if}

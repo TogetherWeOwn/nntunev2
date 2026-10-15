@@ -43,7 +43,61 @@ describe('billing loader with an unconfirmed plan', () => {
 		expect(data.hadFetchError).toBe(true);
 	});
 
-	it.each(['past_due', 'canceled', 'incomplete'] as const)(
+	it('treats a 404 subscription as a backend failure with a retry, not a fresh account', async () => {
+		const fetchFn = mockFetch({
+			'/v1/me/subscription': { status: 404, body: { error: 'not found' } },
+			'/v1/me/usage': { status: 200, body: USAGE_HEAVY }
+		});
+
+		const data = await loadPage(fetchFn);
+
+		expect(data.planUnknown).toBe(true);
+		expect(data.usageStatus).toBeNull();
+		expect(data.hadFetchError).toBe(true);
+		expect(data.loadError).toMatch(/subscription/i);
+	});
+
+	it('treats a 404 usage as a fresh account: no failure, no retry', async () => {
+		const fetchFn = mockFetch({
+			'/v1/me/subscription': {
+				status: 200,
+				body: { planId: 'plus', status: 'active', currentPeriodEnd: null, trialEndsAt: null }
+			},
+			'/v1/me/usage': { status: 404, body: { error: 'not found' } }
+		});
+
+		const data = await loadPage(fetchFn);
+
+		expect(data.planUnknown).toBe(false);
+		expect(data.usage).toBeNull();
+		expect(data.usageStatus).toBeNull();
+		expect(data.hadFetchError).toBe(false);
+	});
+
+	it('keeps an in-grace past_due subscriber on their own plan with usage scored', async () => {
+		const fetchFn = mockFetch({
+			'/v1/me/subscription': {
+				status: 200,
+				body: {
+					planId: 'pro-5x',
+					status: 'past_due',
+					currentPeriodEnd: null,
+					trialEndsAt: null,
+					graceUntil: new Date(Date.now() + 24 * 3600 * 1000).toISOString()
+				}
+			},
+			'/v1/me/usage': { status: 200, body: USAGE_HEAVY }
+		});
+
+		const data = await loadPage(fetchFn);
+
+		expect(data.planUnknown).toBe(false);
+		expect(data.planId).toBe('pro-5x');
+		expect(data.manageBillingOnly).toBe(true);
+		expect(data.usageStatus).not.toBeNull();
+	});
+
+	it.each(['past_due', 'canceled', 'expired', 'incomplete'] as const)(
 		'sends a %s subscription to the billing portal, never to a new checkout',
 		async (status) => {
 			const fetchFn = mockFetch({

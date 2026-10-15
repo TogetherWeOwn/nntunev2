@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { openPortal, startCheckout } from './billingClient';
+import {
+	BillingApiError,
+	openPortal,
+	signupUrlForCheckoutFailure,
+	startCheckout
+} from './billingClient';
 
 function ok(body: unknown): Response {
 	return new Response(JSON.stringify(body), { status: 200 });
@@ -39,5 +44,18 @@ describe('billingClient redirects', () => {
 			async () => new Response(JSON.stringify({ error: 'no such subscription' }), { status: 404 })
 		);
 		await expect(openPortal(fetchFn as typeof fetch)).rejects.toThrow('404');
+	});
+});
+
+describe('signupUrlForCheckoutFailure', () => {
+	it('routes a 401 to signup with the chosen plan', () => {
+		expect(signupUrlForCheckoutFailure('pro-5x', new BillingApiError(401, 'Start checkout'))).toBe(
+			'/signup?plan=pro-5x'
+		);
+	});
+
+	it('returns null for non-401 failures and non-API errors', () => {
+		expect(signupUrlForCheckoutFailure('plus', new BillingApiError(500, 'Start checkout'))).toBeNull();
+		expect(signupUrlForCheckoutFailure('plus', new Error('nope'))).toBeNull();
 	});
 });
