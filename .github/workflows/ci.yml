@@ -193,11 +193,36 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
 
+  # Controlled merge_group-only ejection trap (TOG-24374 ejection proof).
+  # Passes on every event except merge_group with the marker file present.
+  # The marker is added only by the follow-up ejection-proof PR (closed, never
+  # merged); this trap PR carries no marker so its own PR and merge_group runs
+  # pass. Cleanup removes this job after the ejection receipt is captured.
+  queue-eject-trap:
+    name: queue eject trap (controlled proof)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "merge_group" ]; then
+            echo "queue-eject-trap: ${{ github.event_name }} event, marker ignored, pass"
+            exit 0
+          fi
+          if [ -e ".github/queue-eject-marker" ]; then
+            echo "::error::controlled ejection proof: marker present on merge_group, failing as designed (TOG-24374)"
+            exit 1
+          fi
+          echo "queue-eject-trap: merge_group without marker, pass"
+
   # Aggregate required check: every dependency must succeed, including
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, api, e2e-lint, svelte-check, vitest, web-build]
+    needs: [rust-test, rust-wasm, api, e2e-lint, svelte-check, vitest, web-build, queue-eject-trap]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
