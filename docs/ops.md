@@ -252,3 +252,58 @@ Binding names are chosen in Worker configs; resource names must match this table
 | App PlanetScale branch / PostgreSQL database | `nntunev2` / `main` / `nntunev2_staging` | same `main` cluster / currently `postgres`; clean launch DB deferred |
 | MB Hyperdrive variable | `HYPERDRIVE_ID_MB` (shared mirror) | `HYPERDRIVE_ID_MB` (shared mirror) |
 | Migration secret | `PLANETSCALE_MIGRATOR_URL_STAGING` | intentionally deferred to gated workflow |
+
+## Worker bindings
+
+Intended consumer bindings per environment. Resource names must match the
+tables above. Where a committed config still carries a stale name, the
+reconciliation table in the R2 section governs: align the config to this
+table, never the reverse. IDs below are non-credential binding metadata;
+no database URLs or secret values are recorded here. Non-storage bindings
+(Durable Object, Analytics Engine, Container service) are out of scope of
+this table.
+
+| Worker (config source) | Binding | Type | staging | prod | ID / variable |
+|---|---|---|---|---|---|
+| `stream` (`workers/stream/wrangler.toml`) | `AUDIO_CACHE` | R2 | `nntunev2-audio-staging` | `nntunev2-audio-prod` | name-bound, no ID |
+| `mb` (`workers/mb/wrangler.toml.example`) | `ART_CACHE` | R2 | `nntunev2-art-staging` | `nntunev2-art-prod` | name-bound, no ID |
+| `mb` | `MB_DB` | Hyperdrive | `nntunev2-mb` (shared mirror) | same | `1c6460d5112448888031973c87f671bc` / `HYPERDRIVE_ID_MB` |
+| `api` (`workers/api/wrangler.toml.example`) | `HYPERDRIVE` | Hyperdrive | `nntunev2-staging` | `nntunev2-prod` | staging `61c87403f119430bbc3a7f571df47002` / `HYPERDRIVE_ID_STAGING`; prod `d38a229748f6452bb417c6d33d277a8d` / `HYPERDRIVE_ID_PROD` |
+| `ingest` (`workers/ingest/wrangler.toml.example`) | `LIBRARY_DB` | Hyperdrive | intended app `nntunev2-staging` | intended app `nntunev2-prod` | same IDs / variables as `api`; owner confirms at activation |
+| `ingest` | `INGEST_QUEUE` (producer) | Queue | `nntunev2-ingest-staging` | `nntunev2-ingest-prod` | staging `c9e6afdea0ca487c8d20f799a052b045`; prod `2bf7e1a0edd347c9aada2afbc0c24ae5` |
+| `mb` / `ingest` (at activation) | `MB_CACHE` / `INGEST_STATE` / `INGEST_PAYLOADS` | KV | reserved `nntunev2-config-staging` | reserved `nntunev2-config-prod` | staging `1d4f21508a214ebfa8ff7b594989d6f6`; prod `9664ceed71464521bb6baae2d9374006`; assigned at activation, never by default |
+
+Known config drift (tracked in the R2 reconciliation table, fixed by the
+owning lanes, not here): the committed `workers/stream/wrangler.toml` still
+binds `AUDIO_CACHE` to `nntune-audio-cache` with no environment sections,
+and `workers/ingest/wrangler.toml.example` still names the queue
+`nntune-ingest-jobs`.
+
+## Staging promotion checklist
+
+Promotion is `main` HEAD → staging; production promotion is a later gated
+lane. Complete every box on the exact head being promoted.
+
+- [ ] Exact-head CI: `ci-ok`, `gitleaks` and `pr-lint` green on the promotion
+  SHA, plus Paperclip Review 5/5 on that head (merge policy in
+  `CONTRIBUTING.md`). A red required check is fixed in code or recorded as
+  a flake/quarantine decision with a card link, never dismissed.
+- [ ] Staging deploy evidence: the deploy workflow is green on the promotion
+  SHA and the staging hostname serves that build (the deploy owner replaces
+  the placeholder `100::` record through a Workers custom domain).
+- [ ] Staging E2E green on that SHA: `e2e-staging` synthetic smoke plus the
+  full journey pass against `STAGING_BASE_URL`. Pre-configuration skips do
+  not count as evidence once staging is configured (the workflow fails
+  closed without both Access client credentials).
+- [ ] Access intact: the `NNTune v2 staging` Access app, its owner-OTP allow
+  policy and the QA service-token policy still gate `v2-staging.nntune.com`.
+  No bypass, no shared-token rotation, and both `CF_ACCESS_CLIENT_*`
+  credentials verified available to the job through authorized injection
+  (names only, never values).
+- [ ] Data plane guarded: no production migration, no clean-launch-database
+  creation, and no resize, split, role change, or credential rotation as part
+  of promotion. Staging serves `nntunev2_staging` through its runtime roles;
+  the prod binding stays reserved.
+- [ ] Rollback pointer recorded: state the rollback target (last good staging
+  SHA redeploy, or the UNDO blocks above plus the consolidation receipt)
+  before promoting. Staging rollback is a redeploy, never a data restore.
