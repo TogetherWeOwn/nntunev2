@@ -17,6 +17,9 @@
 	// signed in and can sign out to redeem the other link.
 	let signedInEmail = $state<string | null>(null);
 	let signingOut = $state(false);
+	// Shown only when POST /v1/session/logout fails: the HttpOnly cookie
+	// (the real session) is untouched, so the recovery button must stay.
+	let signOutError = $state<string | null>(null);
 
 	onMount(() => {
 		// The Worker mails `{origin}/auth/magic?token=…` (worker_entry.rs).
@@ -59,17 +62,28 @@
 	async function signOut() {
 		if (signingOut) return;
 		signingOut = true;
+		signOutError = null;
 		try {
 			await client.logout();
 		} catch {
-			// The label is display-only: even a failed logout clears it so
-			// a stranded session can always be abandoned locally. The
-			// HttpOnly cookie itself is revoked server-side when reachable.
+			// The HttpOnly cookie is the real session and it is untouched,
+			// so a failed logout must NOT clear the label or show success:
+			// keep the button and surface the failure instead.
+			signOutError = 'Could not sign out. Try again.';
+			signingOut = false;
+			return;
 		}
 		clearSignedInEmail();
 		signedInEmail = null;
 		signingOut = false;
 		status = 'signed-out';
+	}
+
+	function retryLink() {
+		// The token is unspent (swap-guarded finishes never burn it), so
+		// after a real sign-out the same link redeems without a new email.
+		signOutError = null;
+		status = 'confirm';
 	}
 </script>
 
@@ -103,6 +117,11 @@
 			Signed out. If that link belongs to another account, open it again now — or
 			<a href="/login">request a fresh one</a>.
 		</p>
+		{#if token !== null}
+			<button class="nt-button" type="button" onclick={retryLink}>
+				Try this link again
+			</button>
+		{/if}
 	{:else}
 		<p role="alert">
 			This sign-in link didn't work — it may have expired or already been used.
@@ -110,18 +129,26 @@
 				You're still signed in as <strong>{signedInEmail}</strong>, so the link was left
 				unused: if it belongs to a different account, sign out first and then open it
 				again.
+			{:else}
+				If you are signed in to a different account, sign out first and then open it
+				again.
 			{/if}
 			<a href="/login">Request a new one</a>.
 		</p>
-		{#if signedInEmail !== null}
-			<button
-				class="nt-button nt-button--ghost"
-				type="button"
-				onclick={signOut}
-				disabled={signingOut}
-			>
-				{signingOut ? 'Signing out…' : `Sign out ${signedInEmail}`}
-			</button>
+		{#if signOutError !== null}
+			<p role="alert">{signOutError}</p>
 		{/if}
+		<button
+			class="nt-button nt-button--ghost"
+			type="button"
+			onclick={signOut}
+			disabled={signingOut}
+		>
+			{signingOut
+				? 'Signing out…'
+				: signedInEmail !== null
+					? `Sign out ${signedInEmail}`
+					: 'Sign out and try this link again'}
+		</button>
 	{/if}
 </main>
