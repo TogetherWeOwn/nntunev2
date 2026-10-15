@@ -383,13 +383,24 @@ pub fn list_genres_page(
     visible.sort_by(|a, b| b.public_id.cmp(&a.public_id));
     if let Some(cursor) = after {
         let cursor_id = parse_page_cursor(cursor)?;
-        visible.retain(|row| row.public_id < cursor_id);
+        // Fail closed on a cursor beyond the newest visible row: a forged or
+        // stale above-max cursor yields an empty page, never a replay of page
+        // one. Cursors at or below the newest row continue by direct keyset
+        // comparison, so a deleted or newly hidden boundary row cannot
+        // truncate later pages.
+        if visible.first().is_some_and(|row| cursor_id > row.public_id) {
+            visible.clear();
+        } else {
+            visible.retain(|row| row.public_id < cursor_id);
+        }
     }
     visible.truncate(limit);
     Ok(visible.iter().map(|row| genre_response(row)).collect())
 }
 
-/// One bounded playlist-summary page, newest first. See [`list_genres_page`].
+/// One bounded playlist-summary page, ordered by public id descending.
+/// See [`list_genres_page`]: the cursor is compared directly with the public
+/// ordering key so continuation does not depend on the boundary row existing.
 pub fn list_playlists_page(
     caller: Option<&str>,
     rows: &[PlaylistRow],
@@ -402,13 +413,18 @@ pub fn list_playlists_page(
         .iter()
         .filter(|row| playlist_visible(caller, row))
         .collect();
-    visible.sort_by_key(|row| std::cmp::Reverse(row.internal_id));
+    visible.sort_by(|a, b| b.public_id.cmp(&a.public_id));
     if let Some(cursor) = after {
         let cursor_id = parse_page_cursor(cursor)?;
-        if let Some(pos) = visible.iter().position(|row| row.public_id == cursor_id) {
-            visible.drain(..=pos);
-        } else {
+        // Fail closed on a cursor beyond the newest visible row: a forged or
+        // stale above-max cursor yields an empty page, never a replay of page
+        // one. Cursors at or below the newest row continue by direct keyset
+        // comparison, so a deleted or newly hidden boundary row cannot
+        // truncate later pages.
+        if visible.first().is_some_and(|row| cursor_id > row.public_id) {
             visible.clear();
+        } else {
+            visible.retain(|row| row.public_id < cursor_id);
         }
     }
     visible.truncate(limit);
@@ -926,22 +942,17 @@ mod tests {
         let first = list_playlists_page(Some("user-alice"), &rows, 10, None).unwrap();
         let cursor_id = first.last().unwrap().id.clone();
         let after = page_cursor(&cursor_id);
-        let expected: Vec<String> = (40..50)
-            .rev()
-            .map(|i| format!("p-public-{i:04}"))
-            .collect();
+        let expected: Vec<String> = (40..50).rev().map(|i| format!("p-public-{i:04}")).collect();
 
         let mut deleted = rows.clone();
         deleted.retain(|row| row.public_id != cursor_id);
-        let after_delete = list_playlists_page(
-            Some("user-alice"),
-            &deleted,
-            10,
-            Some(&after),
-        )
-        .unwrap();
+        let after_delete =
+            list_playlists_page(Some("user-alice"), &deleted, 10, Some(&after)).unwrap();
         assert_eq!(
-            after_delete.iter().map(|row| row.id.clone()).collect::<Vec<_>>(),
+            after_delete
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
             expected
         );
 
@@ -952,15 +963,13 @@ mod tests {
             .unwrap();
         boundary.is_public = false;
         boundary.owner_user_id = "user-bob".into();
-        let after_hide = list_playlists_page(
-            Some("user-alice"),
-            &hidden,
-            10,
-            Some(&after),
-        )
-        .unwrap();
+        let after_hide =
+            list_playlists_page(Some("user-alice"), &hidden, 10, Some(&after)).unwrap();
         assert_eq!(
-            after_hide.iter().map(|row| row.id.clone()).collect::<Vec<_>>(),
+            after_hide
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
             expected
         );
     }
@@ -1088,7 +1097,10 @@ mod tests {
     #[test]
     fn list_and_lookup_statements_are_bounded_and_owner_free() {
         for sql in [genre_list_statement(), playlist_list_statement()] {
-            assert!(sql.contains("ORDER BY public_id COLLATE \"C\" DESC"), "{sql}");
+            assert!(
+                sql.contains("ORDER BY public_id COLLATE \"C\" DESC"),
+                "{sql}"
+            );
             assert!(sql.contains("LIMIT $2"), "{sql}");
             // The cursor is compared directly with the public ordering key,
             // so continuation does not depend on the boundary row existing.
