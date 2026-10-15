@@ -21,6 +21,7 @@ use crate::auth::{
     self, InviteRecord, MagicLinkRecord, PasskeyChallenge, PasskeyCredential, SingleUseClaim,
     SingleUseStore,
 };
+use crate::b64::encode as b64url_encode;
 use crate::handlers::{
     self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, Store, StoreError, UserRecord, VaultRow,
 };
@@ -170,7 +171,10 @@ fn cors_headers(
 fn magic_link_payload(origin: &str, email: &str, token: &str) -> serde_json::Value {
     serde_json::json!({
         "to": email,
-        "magic_link": format!("{origin}/auth/magic?token={token}"),
+        "magic_link": format!(
+            "{origin}/auth/magic?token={token}&account={}",
+            b64url_encode(email.as_bytes())
+        ),
         "token": token,
     })
 }
@@ -1215,7 +1219,7 @@ mod tests {
         // to print the raw token as the signup inbox-proof code.
         assert_eq!(
             payload["magic_link"],
-            "https://app.example.com/auth/magic?token=fixture-token"
+            "https://app.example.com/auth/magic?token=fixture-token&account=YWRhQGV4YW1wbGUuY29t"
         );
         assert_eq!(payload["token"], "fixture-token");
     }

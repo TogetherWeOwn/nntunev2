@@ -621,6 +621,8 @@ struct LoginFinishBody {
 #[serde(deny_unknown_fields)]
 struct MagicFinishBody {
     token: String,
+    #[serde(default)]
+    email: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -797,32 +799,9 @@ where
     if auth::consume_magic_link(magic.clone(), &body.magic_token, ctx.now).is_err() {
         return generic_auth();
     }
-    // Single-use claim (conditional UPDATE, exactly one row) before any
-    // signup side effect is allowed to stand.
-    if auth::consume_challenge_atomically(
-        row.challenge,
-        &ctx.cfg.rp_id,
-        &ctx.cfg.origin,
-        ctx.now,
-        ctx.store,
-    )
-    .await
-    .is_err()
-    {
-        return generic_auth();
-    }
-    // The same proof, now consumed atomically before enrollment.
-    if auth::consume_magic_link_atomically(magic, &body.magic_token, ctx.now, ctx.store)
-        .await
-        .is_err()
-    {
-        return generic_auth();
-    }
-    if ctx.cfg.invites_required || body.invite_code.is_some() {
-        // Atomic per-client redemption budget BEFORE the lookup: parallel
-        // guesses share one reservation (no check-then-act race), and the
-        // denial is the generic error (no throttle oracle). Keyed by
-        // source IP and account, per `auth::invite_attempt_allowed`.
+    // Validate invite presence, throttle and code before spending either
+    // single-use proof. A typo must be recoverable with the same email code.
+    let invite_to_consume = if ctx.cfg.invites_required || body.invite_code.is_some() {
         let attempt_key = format!("invite:{}:{}", ctx.source_ip, user_id);
         let allowed = ctx
             .store
@@ -850,7 +829,36 @@ where
             Ok(None) => return generic_auth(),
             Err(_) => return internal(),
         };
-        if auth::consume_invite_atomically(invite, code, ctx.store)
+        if auth::consume_invite(invite.clone(), code).is_err() {
+            return generic_auth();
+        }
+        Some((invite, code.to_string()))
+    } else {
+        None
+    };
+    // Single-use claim (conditional UPDATE, exactly one row) before any
+    // signup side effect is allowed to stand.
+    if auth::consume_challenge_atomically(
+        row.challenge,
+        &ctx.cfg.rp_id,
+        &ctx.cfg.origin,
+        ctx.now,
+        ctx.store,
+    )
+    .await
+    .is_err()
+    {
+        return generic_auth();
+    }
+    // The same proof, now consumed atomically before enrollment.
+    if auth::consume_magic_link_atomically(magic, &body.magic_token, ctx.now, ctx.store)
+        .await
+        .is_err()
+    {
+        return generic_auth();
+    }
+    if let Some((invite, code)) = invite_to_consume {
+        if auth::consume_invite_atomically(invite, &code, ctx.store)
             .await
             .is_err()
         {
@@ -1065,6 +1073,13 @@ where
         Ok(None) => return generic_auth(),
         Err(_) => return internal(),
     };
+    if body
+        .email
+        .as_deref()
+        .is_some_and(|email| email != record.email)
+    {
+        return generic_auth();
+    }
     let consumed =
         match auth::consume_magic_link_atomically(record, &body.token, ctx.now, ctx.store).await {
             Ok(consumed) => consumed,
@@ -1941,6 +1956,32 @@ mod tests {
             None,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn magic_finish_rejects_mismatched_confirmation_email_without_spending_link() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": "a@example.com"}),
+        );
+        let token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let mismatch = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token, "email": "victim@example.com"}),
+        );
+        assert_eq!(mismatch.status, 401);
+        assert!(mismatch.set_cookie.is_none());
+        let matching = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token, "email": "a@example.com"}),
+        );
+        assert_eq!(matching.status, 200, "{}", matching.body);
+        assert!(matching.set_cookie.is_some());
     }
 
     #[test]
@@ -3354,7 +3395,7 @@ mod tests {
                 "register-start" | "login-start" | "magic-start" => {
                     serde_json::from_value::<EmailBody>(wire.clone()).map(|_| ())
                 }
-                "register-finish" => {
+                "register-finish" | "register-finish-with-invite" => {
                     serde_json::from_value::<RegisterFinishBody>(wire.clone()).map(|_| ())
                 }
                 "login-finish" => {
@@ -3378,6 +3419,6 @@ mod tests {
             );
             pinned += 1;
         }
-        assert_eq!(pinned, 8, "every body-bearing route is pinned");
+        assert_eq!(pinned, 9, "every body-bearing route is pinned");
     }
 }

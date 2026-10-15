@@ -361,7 +361,7 @@ describe('ApiClient', () => {
 				await client.requestMagicLink(email.email);
 			} else if (route.web === 'finishMagicLink') {
 				const token = route.input as { token: string };
-				await client.finishMagicLink(token.token);
+				await client.finishMagicLink(token.token, (route.input as { email?: string }).email);
 			} else if (route.web === 'registerStart') {
 				const email = route.input as { email: string };
 				await client.registerStart(email.email);

@@ -73,6 +73,7 @@
 				clientDataJson: clientDataJSON,
 				signature
 			});
+			sessionStorage.setItem('nntune.signed-in-email', email.trim());
 			window.location.href = '/onboarding/provider';
 		} catch {
 			// Generic: login errors stay non-enumerating, like the API.

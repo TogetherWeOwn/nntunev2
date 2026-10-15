@@ -48,6 +48,13 @@
 		}
 	}
 
+	function startOver() {
+		pending = null;
+		magicCode = '';
+		inviteCode = '';
+		status = 'idle';
+	}
+
 	async function finishAccount(event: SubmitEvent) {
 		event.preventDefault();
 		if (pending === null || status === 'finishing' || magicCode.trim().length === 0) return;
@@ -87,6 +94,7 @@
 				...(inviteCode.trim().length > 0 ? { inviteCode: inviteCode.trim() } : {})
 			});
 			status = 'created';
+			sessionStorage.setItem('nntune.signed-in-email', email.trim());
 			window.location.href = '/onboarding/provider';
 		} catch {
 			// Generic: account creation never says which step failed. Stay
@@ -118,6 +126,7 @@
 			</p>
 			{#if status === 'code-error'}
 				<p role="alert">That didn't work — re-enter the code from the email and try again.</p>
+				<button class="nt-button nt-button--ghost" type="button" onclick={startOver}>Start over</button>
 			{/if}
 			<label>
 				Email code

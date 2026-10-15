@@ -210,8 +210,11 @@ export class ApiClient {
 	}
 
 	/** Redeem an emailed magic-link token (the `/auth/magic` page). */
-	async finishMagicLink(token: string): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>('/v1/auth/magic/finish', { token });
+	async finishMagicLink(token: string, email?: string): Promise<MagicLinkResult> {
+		return this.post<MagicLinkResult>('/v1/auth/magic/finish', {
+			token,
+			...(email === undefined ? {} : { email })
+		});
 	}
 
 	/** Start passkey enrollment; the API also mails the inbox-proof code. */

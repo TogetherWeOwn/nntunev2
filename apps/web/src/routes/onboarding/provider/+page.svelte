@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import {
 		ApiClient,
@@ -11,6 +12,11 @@
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
 
 	let step = $state<1 | 2 | 3>(1);
+	let signedInEmail = $state('');
+
+	onMount(() => {
+		signedInEmail = sessionStorage.getItem('nntune.signed-in-email') ?? '';
+	});
 
 	// Step 1: provider.
 	let host = $state('');
@@ -150,6 +156,9 @@
 
 <main class="nt-wrap">
 	<h1>Connect your provider</h1>
+	{#if signedInEmail}
+			<p>Signed in as <strong>{signedInEmail}</strong>.</p>
+		{/if}
 	<p>Step {step} of 3: {step === 1 ? 'Provider' : step === 2 ? 'Indexer (optional)' : 'Test'}</p>
 
 	{#if errors.length > 0}
