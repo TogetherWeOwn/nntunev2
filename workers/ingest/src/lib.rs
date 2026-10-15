@@ -22,6 +22,7 @@ use worker::{console_log, Env, Request, Response, Result, RouteContext, Router};
 
 pub mod dispatch;
 pub mod fixtures;
+pub mod indexer_fetch;
 pub mod jobs;
 pub mod library;
 pub mod metering;

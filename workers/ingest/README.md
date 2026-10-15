@@ -41,6 +41,33 @@ NZB upload ───────────────┘                     
   never accepted in API bodies, never logged (redacted URLs only), never
   committed. `http://` indexer URLs are refused.
 - Upload bodies are untrusted: capped, shape-checked, never logged.
+- Outbound indexer fetch SSRF guard (`src/indexer_fetch.rs`, same ranges
+  as the `workers/api` vault guard — keep the two lists in sync): https
+  only, no embedded credentials, 443-only port allowlist (any other
+  explicit port is refused before any dial, so the fetch can never be
+  aimed at another port as a scan primitive). Every fetch resolves ALL
+  DNS records and rejects loopback / link-local (incl. the cloud metadata
+  endpoint) / private / unique-local / CGNAT / multicast / broadcast /
+  documentation / reserved space (v4+v6, incl. IPv6 transition space with
+  a public-looking payload); one private record poisons the whole answer.
+  DNS-pin invariant: each hop's host is resolved exactly once and the
+  transport dials only that vetted address set on 443, retaining the
+  hostname for TLS SNI / certificate checks and the Host header — the
+  transport never re-resolves, so a changed second DNS answer (rebinding)
+  is never consulted. Every redirect hop (301/302/303/307/308, absolute /
+  protocol-relative / path-absolute) is re-validated from scratch and at
+  most 3 hops are followed; the `apikey=` value is never forwarded to a
+  redirect target. Dial timeout 5000 ms per hop, total fetch timeout
+  15000 ms (the vault outbound numbers, reused); at the deadline counts
+  as expired. Guard blocks answer a stable 4xx, timeouts 504, upstream
+  failures 502, with stable codes for the shared taxonomy envelope:
+  `indexer_fetch_bad_scheme`, `indexer_fetch_malformed_url`,
+  `indexer_fetch_embedded_credentials`, `indexer_fetch_port_not_allowed`,
+  `indexer_fetch_forbidden_address`, `indexer_fetch_unresolvable_host`,
+  `indexer_fetch_too_many_redirects`, `indexer_fetch_dial_timeout`,
+  `indexer_fetch_timeout`, `indexer_fetch_upstream_status`. Decision logs
+  record host + code only (`url_host_for_log`); full URLs go through
+  `newznab::redact_api_key` before any other log line.
 
 ## E2E contract (synthetic NNTP server card)
 
