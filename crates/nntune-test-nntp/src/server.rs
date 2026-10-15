@@ -342,11 +342,30 @@ async fn handle_connection(
                 }
                 let _ = writer.write_all(b"224 Overview follows\r\n").await;
                 for a in &shared.config.articles {
+                    if !xover_in_range(&arg, a.number) {
+                        continue;
+                    }
                     let overview = format!(
                         "{}\t{}\t{}\t{}\t{}\t\t0\t0\r\n",
                         a.number, a.subject, a.from, a.date, a.message_id
                     );
-                    let _ = writer.write_all(overview.as_bytes()).await;
+                    // Abort mid-list if the server was dropped: an in-flight
+                    // XOVER must not keep serving after shutdown.
+                    let write = tokio::select! {
+                        _ = shutdown.changed() => None,
+                        res = writer.write_all(overview.as_bytes()) => Some(res),
+                    };
+                    match write {
+                        Some(Ok(())) => {}
+                        // Shutdown signalled (None) or client gone: close.
+                        _ => break,
+                    }
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                }
+                if *shutdown.borrow() {
+                    break;
                 }
                 let _ = writer.write_all(b".\r\n").await;
             }
@@ -372,7 +391,13 @@ async fn handle_connection(
                     continue;
                 }
                 if shared.config.latency_ms > 0 {
-                    tokio::time::sleep(Duration::from_millis(shared.config.latency_ms)).await;
+                    let aborted = tokio::select! {
+                        _ = shutdown.changed() => true,
+                        _ = tokio::time::sleep(Duration::from_millis(shared.config.latency_ms)) => false,
+                    };
+                    if aborted || *shutdown.borrow() {
+                        break;
+                    }
                 }
                 let code = match cmd.as_str() {
                     "ARTICLE" => 220,
@@ -399,10 +424,15 @@ async fn handle_connection(
                     continue;
                 }
                 if let Some(bps) = shared.config.slow_bytes_per_sec {
-                    write_throttled(&mut writer, payload, bps).await;
+                    if !write_throttled(&mut writer, payload, bps, &mut shutdown).await {
+                        break;
+                    }
                 } else {
                     let stuffed = dot_stuff(payload);
                     let _ = writer.write_all(&stuffed).await;
+                }
+                if *shutdown.borrow() {
+                    break;
                 }
                 let _ = writer.write_all(b".\r\n").await;
             }
@@ -499,22 +529,87 @@ fn find_crlf(data: &[u8]) -> Option<usize> {
     data.windows(2).position(|w| w == b"\r\n")
 }
 
+/// Throttled body write that aborts promptly on server shutdown.
+/// Returns true when the full body was written, false when shutdown was
+/// signalled (the caller must then close the session without a terminator).
 async fn write_throttled(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     data: &[u8],
     bytes_per_sec: u64,
-) {
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
     let bps = bytes_per_sec.max(1) as usize;
     let stuffed = dot_stuff(data);
     let mut offset = 0;
     while offset < stuffed.len() {
+        // Fast-path abort before each chunk (covers an already-signalled drop).
+        if *shutdown.borrow() {
+            return false;
+        }
         let end = (offset + bps).min(stuffed.len());
-        if writer.write_all(&stuffed[offset..end]).await.is_err() {
-            break;
+        let wrote = tokio::select! {
+            _ = shutdown.changed() => return false,
+            res = writer.write_all(&stuffed[offset..end]) => res,
+        };
+        if wrote.is_err() {
+            return false;
+        }
+        // Treat a shutdown that raced the write as an abort too: the chunk
+        // may have been partially flushed, but the session must close now.
+        if *shutdown.borrow() {
+            return false;
         }
         offset = end;
         if offset < stuffed.len() {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            let aborted = tokio::select! {
+                _ = shutdown.changed() => true,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => false,
+            };
+            if aborted || *shutdown.borrow() {
+                return false;
+            }
         }
     }
+    true
+}
+
+/// Whether `number` falls inside the requested XOVER range (RFC 3977 §6.4).
+/// Accepted forms: `n`, `n-`, `n-m` (first token only). Empty or
+/// unparseable ranges match everything to preserve the legacy list-all
+/// behavior for callers that do not pass a range.
+fn xover_in_range(arg: &str, number: u32) -> bool {
+    match parse_xover_range(arg) {
+        None => true,
+        Some((lo, hi)) => number >= lo && number <= hi,
+    }
+}
+
+fn parse_xover_range(arg: &str) -> Option<(u32, u32)> {
+    let token = arg.split_whitespace().next()?.trim();
+    if token.is_empty() {
+        return None;
+    }
+    if let Some((start_s, end_s)) = token.split_once('-') {
+        if start_s.is_empty() && end_s.is_empty() {
+            return None;
+        }
+        if start_s.is_empty() {
+            // "-m": articles 1..=m.
+            let end: u32 = end_s.parse().ok()?;
+            return Some((1, end));
+        }
+        let start: u32 = start_s.parse().ok()?;
+        if end_s.is_empty() {
+            // "n-": n..=MAX.
+            return Some((start, u32::MAX));
+        }
+        let end: u32 = end_s.parse().ok()?;
+        if start <= end {
+            return Some((start, end));
+        }
+        // Reversed range matches nothing (still a 224 with an empty list).
+        return Some((1, 0));
+    }
+    let n: u32 = token.parse().ok()?;
+    Some((n, n))
 }

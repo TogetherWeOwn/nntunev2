@@ -718,3 +718,53 @@ async fn list_reports_high_before_low() {
     assert_eq!((list_low, list_high), (low, high));
     assert!(list_high >= list_low, "LIST high/low reversed: {line:?}");
 }
+
+#[tokio::test]
+async fn server_drop_interrupts_in_flight_throttled_article() {
+    let mut config = ServerConfig::for_test();
+    config.slow_bytes_per_sec = Some(200);
+    let server = TestNntpServer::spawn(config).await;
+    let stream = TcpStream::connect(server.addr()).await.unwrap();
+    let (r, mut w) = stream.into_split();
+    let mut reader = BufReader::new(r);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    w.write_all(b"AUTHINFO USER testuser\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    w.write_all(b"AUTHINFO PASS testpass\r\n").await.unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    w.write_all(b"ARTICLE <single-yenc-001@nntune.test>\r\n")
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("220"), "got {line:?}");
+
+    drop(server);
+    let mut body = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), reader.read_to_end(&mut body))
+        .await
+        .expect("in-flight response continued after server drop")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn xover_returns_only_requested_range() {
+    let server = TestNntpServer::spawn_for_test().await;
+    let mut c = Client::connect(&server).await;
+    c.auth("testuser", "testpass").await;
+    c.cmd("GROUP alt.binaries.nntune.test").await;
+
+    let (first, block) = c.cmd_block("XOVER 3-4").await;
+    assert!(first.starts_with("224"), "got {first:?}");
+    let text = String::from_utf8_lossy(&block);
+    let rows: Vec<_> = text.lines().collect();
+    assert_eq!(rows.len(), 2, "XOVER 3-4 returned: {rows:?}");
+    let numbers: Vec<_> = rows
+        .iter()
+        .map(|row| row.split('\t').next().expect("article number"))
+        .collect();
+    assert_eq!(numbers, ["3", "4"]);
+}
