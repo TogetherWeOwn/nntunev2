@@ -252,3 +252,19 @@ Binding names are chosen in Worker configs; resource names must match this table
 | App PlanetScale branch / PostgreSQL database | `nntunev2` / `main` / `nntunev2_staging` | same `main` cluster / currently `postgres`; clean launch DB deferred |
 | MB Hyperdrive variable | `HYPERDRIVE_ID_MB` (shared mirror) | `HYPERDRIVE_ID_MB` (shared mirror) |
 | Migration secret | `PLANETSCALE_MIGRATOR_URL_STAGING` | intentionally deferred to gated workflow |
+
+## Binding parity check
+
+CI job `binding-parity` (part of `ci-ok`) diffs every
+`workers/*/wrangler.toml*` and `apps/*/wrangler.toml*` against this
+inventory for staging and prod: required bindings per Worker are mapped
+in `.github/scripts/binding_manifest.toml`, and
+`python3 .github/scripts/binding_parity.py` fails on a missing binding,
+staging/prod skew, or a resource name absent from the matrix or tables
+above, naming the Worker, environment and binding. Resource-name drift
+that predates the value-alignment work (see the reconciliation table
+near the top of this document) is recorded as exact-match
+`[[known_drift]]` manifest entries; delete each entry when its
+wrangler value is aligned — the check fails on a stale entry. Changing
+the binding values themselves, and KV key parity, are separate lanes
+and out of scope for this check.

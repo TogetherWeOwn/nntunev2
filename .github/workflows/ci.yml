@@ -87,6 +87,39 @@ jobs:
       - name: Unit-test the lint
         run: python3 .github/scripts/test_public_text_lint.py
 
+  # Wrangler binding parity: every worker config's required bindings
+  # (R2, KV, Queues, Hyperdrive, Analytics Engine, ...) must be present
+  # in both staging and prod and match the docs/ops.md inventory. The
+  # fixture pair proves the job goes red on drift: `match` must pass,
+  # `drift-missing` / `drift-skew` must fail.
+  binding-parity:
+    name: binding-parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Unit-test the parity check
+        run: python3 .github/scripts/test_binding_parity.py
+      - name: Parity check on this repo
+        run: python3 .github/scripts/binding_parity.py
+      - name: Parity check passes on the matching fixture
+        run: >-
+          python3 .github/scripts/binding_parity.py
+          --root .github/scripts/fixtures/binding-parity/match
+      - name: Parity check goes red on drift fixtures
+        run: |
+          for fixture in drift-missing drift-skew; do
+            if python3 .github/scripts/binding_parity.py \
+              --root ".github/scripts/fixtures/binding-parity/$fixture"; then
+              echo "binding-parity: $fixture fixture must fail but passed" >&2
+              exit 1
+            fi
+            echo "binding-parity: $fixture fixture correctly failed"
+          done
+
   test-nntp:
     name: test-nntp
     runs-on: ubuntu-latest
@@ -277,7 +310,7 @@ jobs:
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, test-nntp, api, rust-mb, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text]
+    needs: [rust-test, rust-wasm, test-nntp, api, rust-mb, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
