@@ -3,7 +3,8 @@
 - **Status:** Accepted design; implementation and independent review gates remain.
 - **Date:** 2026-10-13
 - **Revised:** 2026-10-15 — versioned HMAC lookup, row-bound token envelopes,
-  explicit native/compat auth scope, and implementation acceptance requirements.
+  explicit native/compat auth scope, library-scoped catalog reads,
+  and implementation acceptance requirements.
   No completed review score or client-compatibility test result is claimed.
 
 ## Context
@@ -78,6 +79,12 @@ least-privilege credential.
   `/rest/*` subset — never `/v1`, provider credentials, or ingest.
   Per-credential rate limits apply, and `last_used_at` anomalies (burst
   from a new IP/ASN) alert.
+- Catalog reads are library-scoped (ADR 0002 §6): every native
+  (`/v1/artists`, `/v1/releases`, `/v1/tracks`, `/v1/search`) and Subsonic
+  (`getArtist`, `getAlbum`, `getSong`, `search3`, plus directory/list/index
+  endpoints where they list catalog rows) read resolves ids only through the
+  caller's own `library_tracks` memberships. A non-member id returns 404
+  (native) or Subsonic error 70; search returns only member rows.
 - The REST OpenAPI spec is generated from code (Rust types → schema), checked
   into the repo, and CI-diffed: spec drift fails the build.
 - Subsonic responses are adapters over the same handlers, not a parallel

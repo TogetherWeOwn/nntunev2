@@ -4,7 +4,8 @@
 - **Date:** 2026-10-13
 - **Revised:** 2026-10-15 — preserve merged auth; pin catalog identity, atomic
   stream accounting, relational price mappings and bounded renewal settlement;
-  define the audio-manifest producer and mirror-only shared-catalog authority.
+  define the audio-manifest producer and mirror-only shared-catalog authority;
+  add library-scoped catalog reads, same-job dedup, and text/compilation grouping.
 - **Baseline inspected:** main `29140710bb5d8e0d57f1701ca1e6c3e854e9104f`.
   Auth, ingest, core, scaffold and MB work are merged, not in-flight assumptions.
 
@@ -407,13 +408,38 @@ file. Each entry carries:
 
 The producer orders audio selections by original NZB file order, then archive
 member path in bytewise order and audio-selection index, assigns ordinals once,
-and freezes grouping and selection with them. Within this job, equal non-NULL
-claimed artist MBIDs define an artist group; equal non-NULL claimed release MBIDs
-within that artist group define a release group. Without those associations, keep
-separate groups per audio entry rather than merge by title/name alone. These rules
+and freezes grouping and selection with them. Grouping is job-local only (the
+local key embeds the job id, so it cannot merge another tenant's rows); MBIDs are
+the stronger signal, normalized text is the fallback. Within this job, the artist
+group key is the claimed album-artist MBID when non-NULL, else the claimed
+track-artist MBID; the release group key is the claimed release MBID when
+non-NULL. Entries with equal non-NULL release MBIDs form one release group even
+when their artist MBIDs differ (compilation): that release group hangs under a
+single Various-Artists holder artist group for this job, and per-track artist
+credits stay in the manifest/file tags — explicitly deferred, not normalized
+artist rows — until a later ADR defines them. When MBID keys are absent, group by
+normalized (album-artist text, album-title text): trim, case-fold and collapse
+internal whitespace; album-artist text means the albumartist/TPE2 tag when
+present, else the common track-artist text across the candidate set. Entries
+sharing that pair (and disc when present) form one release/artist group; only when
+both MBID and text keys are absent keep separate groups per entry. These rules
 only group local hints; they do not authenticate MBIDs. `match` and `write` consume
 the checkpoint on retry, never regenerate its ordinals/groups from changed tags.
-Before `Writing`, also checkpoint per-entry match classifications and the trusted
+After `match` resolves each entry to an occurrence (mirror-verified or local) and
+before checkpointing classifications, collapse entries resolving to the same
+occurrence within this job: group by the resolved (release key, medium_no,
+track_no) — mirror occurrence for verified matches, manifest-derived local key for
+local matches — and keep exactly one winner per group, the lowest `audio_ordinal`
+(ordinals are unique, so no further tie-break is needed). Record losers in the
+checkpoint as `duplicate_of` the winner for diagnostics; they write no separate
+track, source, membership or media row. The winner's `source_selector` is the
+`track_sources` source for that occurrence. No multi-row statement in `write` may
+contain a repeated key for `tracks (release_id, medium_no, track_no)`,
+`track_sources (user_id, track_id)` or `library_tracks (library_id, track_id)`.
+SQLSTATE 21000 (duplicate key within one statement) is a deterministic bug, never
+retried: fix the dedup, do not add it to the retry set.
+Before `Writing`, also checkpoint per-entry match classifications (including the
+dedup winners/losers above) and the trusted
 mirror metadata snapshot used; a write retry does not rematch against a changed
 mirror. Retain the checkpoint through job retries/replay; the `write` transaction
 copies the relevant source selection into the lifetime encrypted `track_sources`,
@@ -467,6 +493,19 @@ re-imports. Local-to-MB consolidation is separate transactional work: preserve/r
 membership, playlists and user sources before retiring a duplicate; don't mutate
 keys on conflict or discard data. An MBID is never a local track id/source FK.
 
+Catalog reads are library-scoped. Every REST (`/v1/artists`, `/v1/releases`,
+`/v1/tracks`, `/v1/search`) and Subsonic (`getArtist`, `getAlbum`, `getSong`,
+`search3`, plus `getMusicDirectory`/`getAlbumList2`/`getIndexes` where they list
+catalog rows) read resolves ids only through the caller's own libraries:
+`libraries(user_id = caller) → library_tracks → tracks → releases → artists`.
+A non-member artist/release/track id returns 404 (native) or Subsonic error 70;
+`search3`/search returns only member rows. Local-row ownership is derived, not a
+new column: parse the row's `local_key` job id → `ingest_jobs.user_id`; that user
+is the sole owner, and the library-scope rule already restricts reads to it.
+Mirror-verified global rows (when they ship) use the same membership gate: shared
+metadata is readable only for tracks in the caller's library. This covers bytes
+(grant rule) and metadata uniformly.
+
 Playlist entries have their own ids so the same track may occur repeatedly.
 The deferrable `(playlist_id, position)` constraint allows transactional position
 shifts/reorders.
@@ -493,6 +532,18 @@ retaining its `release_mbid_hint` without guessing. Also require:
   correct import still completes with mirror-supplied metadata. An already-existing
   contradictory shared MBID also yields a local fallback with membership/source
   intact, not an import failure or shared overwrite.
+- Library-scoped reads: user B requests user A's local artist, release and track
+  ids on every catalog endpoint and gets 404 (native) or Subsonic error 70, and
+  `search3`/search never returns them; only rows reachable through the caller's own
+  `library_tracks` memberships are readable.
+- Same-job duplicates: two files in one NZB (for example FLAC and MP3 copies)
+  resolving to one occurrence complete with one track and one source (winner is the
+  lowest `audio_ordinal`; loser checkpointed as `duplicate_of`); no statement
+  carries a repeated key and no 21000 occurs.
+- Text-only album (12 tracks with album/artist text but no MBIDs) forms one local
+  artist and one local release; a compilation sharing one album title (or one
+  release MBID) with distinct track artists forms one release under a
+  Various-Artists holder with per-track credits deferred to manifest tags.
 
 ### 7. Existing migrations stay at their applied paths
 
