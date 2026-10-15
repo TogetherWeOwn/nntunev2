@@ -55,7 +55,7 @@ export function toProviderTestInput(
 	indexerApiKey: string
 ): ProviderTestInput {
 	return {
-		host: provider.host,
+		host: provider.host.trim(),
 		port: provider.port,
 		tls: provider.tls,
 		username: provider.username,

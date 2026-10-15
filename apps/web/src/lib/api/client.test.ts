@@ -10,6 +10,23 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe('toProviderTestInput', () => {
+	it('trims the provider host to match validation and server rules', () => {
+		expect(
+			toProviderTestInput(
+				{
+					host: ' news.example.com ',
+					port: 563,
+					tls: true,
+					username: 'alice',
+					password: 's3cret',
+					maxConnections: 4
+				},
+				'',
+				''
+			).host
+		).toBe('news.example.com');
+	});
+
 	it('uses the API field names and omits an unset indexer', () => {
 		expect(
 			toProviderTestInput(
