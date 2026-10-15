@@ -38,8 +38,10 @@ least-privilege credential.
    cancel-deletion is still possible — a fresh account deletion polls as
    `scheduled` with the 24-hour deadline through the whole grace window.
    An erased account's result arrives by confirmation email and its old
-   operation id is thereafter `404`. Writes fenced by a marker return `409`
-   with `account_deleting` or `container_deleting` plus the operation id. The
+   operation id is thereafter `404`. Authenticated writes fenced by a marker
+   return `409` with `account_deleting` or `container_deleting` plus the
+   operation id; unauthenticated auth calls on a fenced account return the
+   generic unknown-account response instead (ADR 0002 rule 3). The
    executor is the `delete` Workflow with hourly `delete-sweep` resume, not a
    bare FK cascade. `DELETE /v1/account` additionally requires a fresh
    action-bound single-use step-up proof, stored in the `step_up_proofs` table
@@ -47,21 +49,28 @@ least-privilege credential.
    /v1/account/step-up/begin {action, method}` (in one transaction retires any prior live row for the same session and action,
    then creates the proof row and issues the passkey challenge or sends the magic link
    with purpose `step-up:<action>:<proof_id>`, storing its `challenge_id` /
-   `token_hash`; 5/hour per session+action) and `POST /v1/account/step-up/complete
-   {proof_id, ...}` (verifies only the bound credential — the exact `challenge_id`
-   for passkey-uv, the exact `token_hash` for magic-link — and sets `verified_at`;
-   10/15min per proof, `attempts` capped at 5, then re-begin; a login link or login
-   challenge never verifies a proof because it carries no bound hash/id, and the
-   step-up claim path never creates a session). `DELETE` (and
-   cancel-deletion) consumes the proof atomically (`UPDATE ... SET
-   consumed_at=now() WHERE id=$1 AND verified AND unconsumed AND session AND action
-   match AND bound credential matches AND expires_at > now()` — issued within the last 15 minutes for this
-   user, session and action), so an issued-but-unclaimed link, a link claimed
-   for another purpose, a replayed proof, a proof from a different session, or
-   a stale login-time proof never satisfies it (ADR 0008 single-use invariants
-   apply). Missing, expired, unverified or mismatched proofs fail with `403`
-   and `code: step_up_required`; replaying an already-consumed proof fails
-   with `403` and `code: step_up_consumed`.
+   `token_hash`; 5/hour per session+action; the credential row is written with
+   `purpose='step-up'` plus the proof id, while login issue writes
+   `purpose='login'`, so the login claim/assertion paths — which predicate
+   `purpose='login'` — match zero rows for a step-up credential, return the
+   generic failure, create no session, and leave it unconsumed) and `POST
+   /v1/account/step-up/complete {proof_id, ...}` (canonical complete predicate
+   in ADR 0002: `verified_at IS NULL AND consumed_at IS NULL` plus session,
+   action, expiry, and the exact bound `challenge_id`/`token_hash` with
+   `purpose='step-up'`; sets `verified_at`; 10/15min per proof, `attempts`
+   capped at 5, then re-begin; a login credential never verifies a proof, and
+   the step-up claim path never creates a session). `DELETE /v1/account
+   {proof_id}` (and `POST /v1/account/cancel-deletion {proof_id}`) consumes the
+   proof atomically under the canonical consume predicate in ADR 0002
+   (`verified_at IS NOT NULL AND consumed_at IS NULL` plus id, session, action,
+   and expiry — no credential term, since complete already spent the
+   credential; issued within the last 15 minutes for this user, session and
+   action), so an issued-but-unclaimed link, a link claimed for another
+   purpose, a replayed proof, a proof from a different session, or a stale
+   login-time proof never satisfies it (ADR 0008 single-use invariants apply).
+   Missing, expired, unverified or mismatched proofs fail with `403` and
+   `code: step_up_required`; replaying an already-consumed proof fails with
+   `403` and `code: step_up_consumed`.
    The endpoint writes an `audit_log` row and sends a
    confirmation email; erasure starts only after a 24-hour cancellable grace
    window with `deleting_at` set, during which `POST
@@ -70,9 +79,10 @@ least-privilege credential.
    grace needs a fresh login plus step-up when the session has lapsed (sessions
    keep the ADR 0008 one-day absolute cap); login, step-up, audit and the
    cancel call are exempt from the `deleting_at` fence ONLY while the account
-   operation is `scheduled` — once it is `running` they fail closed with `409
-   account_deleting` (ADR 0002 rule 3) — all data writers stay
-   fenced. Account completion pseudonymizes `audit_log` and deletes
+   operation is `scheduled` — once it is `running` authenticated calls fail
+   closed with typed `409 account_deleting`, while unauthenticated magic-link
+   issue/login/challenge calls return the generic unknown-account response with
+   no link sent (ADR 0002 rule 3) — all data writers stay fenced. Account completion pseudonymizes `audit_log` and deletes
    `auth_challenges` per ADR 0002 rule 3. Library/playlist deletes have no grace window.
    Auth at launch otherwise: the existing session cookie. Native REST bearer keys are
    deferred to a separate scoped-credential design, not borrowed from Subsonic.

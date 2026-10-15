@@ -210,25 +210,46 @@ step_up_proofs        id UUID PK, user_id TEXT NOT NULL FK → users ON DELETE C
                       -- (WHERE id = $1 AND ... in both ADRs).
                       -- begin issues the challenge/link with purpose
                       -- 'step-up:<action>:<proof_id>' and stores its token_hash /
-                      -- challenge_id here; complete requires that exact hash/id
-                      -- (WHERE id = $1 AND token_hash = $t for magic-link, or
-                      -- challenge_id = $c for passkey-uv, plus the existing
-                      -- verified/unconsumed/session/action/expiry predicates) and
-                      -- marks the underlying token used / challenge consumed.
-                      -- Step-up magic links are claimed only at the dedicated
-                      -- step-up complete path, which never creates a session; the
-                      -- ADR 0008 login claim path never verifies a proof. Login
-                      -- links (no bound hash) and login challenges (no bound id)
-                      -- therefore never verify a proof. Complete verifies the
-                      -- assertion/claim and sets verified_at (attempts++ per
-                      -- try). DELETE/cancel-deletion consumes
-                      -- atomically via UPDATE ... SET consumed_at=now()
+                      -- challenge_id here. A new migration adds to both
+                      -- magic_link_tokens and auth_challenges: purpose TEXT
+                      -- NOT NULL DEFAULT 'login' CHECK (purpose IN
+                      -- ('login','step-up')) plus step_up_proof_id UUID NULL
+                      -- REFERENCES step_up_proofs(id) ON DELETE CASCADE, with
+                      -- CHECK ((purpose = 'step-up') =
+                      -- (step_up_proof_id IS NOT NULL)). Login issue paths
+                      -- write purpose='login' with NULL proof id; begin writes
+                      -- purpose='step-up' with the new proof id. The login
+                      -- claim/assertion paths predicate purpose='login', so a
+                      -- step-up token/challenge presented there matches zero
+                      -- rows, returns the generic auth failure, creates no
+                      -- session, and leaves the step-up credential unconsumed
+                      -- for its own path. This is a table predicate, not a
+                      -- route convention, so a route cannot erase the
+                      -- distinction. sessions gains no column.
+                      -- Canonical predicates (ADR 0006 references these and
+                      -- restates them nowhere else): complete is UPDATE
+                      -- step_up_proofs SET verified_at=now(),
+                      -- attempts=attempts+1 WHERE id=$1 AND
+                      -- session_id=$session AND action=$action AND
+                      -- verified_at IS NULL AND consumed_at IS NULL AND
+                      -- expires_at > now() AND ((method='magic-link' AND
+                      -- token_hash=$t) OR (method='passkey-uv' AND
+                      -- challenge_id=$c)) RETURNING, executed together with
+                      -- UPDATE magic_link_tokens SET used=TRUE WHERE
+                      -- token_hash=$t AND purpose='step-up' AND
+                      -- step_up_proof_id=$1 (or the challenge consume with the
+                      -- same purpose+proof predicates). Complete therefore
+                      -- never requires an already-set verified_at, and a login
+                      -- credential (purpose='login', no bound hash/id) never
+                      -- verifies a proof. DELETE /v1/account and POST
+                      -- /v1/account/cancel-deletion carry the proof id as
+                      -- {proof_id} in the JSON body; both consume atomically
+                      -- via UPDATE step_up_proofs SET consumed_at=now()
                       -- WHERE id=$1 AND session_id=$session AND action=$action
                       -- AND verified_at IS NOT NULL AND consumed_at IS NULL
-                      -- AND expires_at > now() RETURNING; zero rows rejects.
-                      -- Existing magic_link_tokens/auth_challenges/sessions gain
-                      -- NO purpose/action column; the binding lives here via
-                      -- token_hash/challenge_id.
+                      -- AND expires_at > now() RETURNING, with no credential
+                      -- term (the credential was already spent by complete);
+                      -- zero rows rejects.
 delete_operations     id UUID PK, user_id TEXT NOT NULL FK → users ON DELETE RESTRICT,
                       scope TEXT NOT NULL ('account'|'library'|'playlist'),
                       container_id UUID NULL, cursor JSONB NOT NULL DEFAULT '{}',
@@ -507,9 +528,17 @@ consume writes, `audit_log` writes, session rotation, and
 operation is in `state = 'scheduled'` (the only state where cancel-deletion
 can win the compare-and-set). Once the operation is `running` (erasure
 started) those writers are fenced like any other: they take `FOR SHARE` on
-the users row, see the started operation, and fail closed with `409
-account_deleting`; no new login, step-up, or real-user audit row can be
-created after that point.
+the users row and see the started operation. Authenticated calls
+(session-cookie requests: step-up begin/complete, cancel-deletion, rotation,
+and session-bound challenge/assertion writes) fail closed with the typed `409
+account_deleting` plus operation id. Unauthenticated calls (magic-link issue,
+sessionless login claim, sessionless challenge creation) on a fenced account
+return the exact generic response used for an unknown account (magic-link
+issue: the same "check your email" 200 with no link sent; claim/assertion: the
+same generic auth failure), write no token, challenge, session, or real-user
+audit row, and match the unknown-account path in status, body, and timing
+class; no new login, step-up, or real-user audit row can be created after that
+point.
 all other billing/subscription writers and every data writer
 remain fenced once `deleting_at` is set. A fenced
 writer fails closed with native `409 Conflict` carrying
@@ -592,9 +621,11 @@ first insert the retained row with `user_id='deleted'`,
 `action='account_deleted:<operation_id>'`, `source_ip='redacted'`,
 `ok=TRUE`, `at=<completion time>`, then run `UPDATE audit_log SET
 user_id='deleted', source_ip='redacted' WHERE user_id=$1` (which no longer
-matches the already-sentinel final row). A login attempt that lands during
-`running` therefore fails `409 account_deleting` before writing, and no
-real-user audit/challenge row can appear after these statements. The final row is retained 13 months,
+matches the already-sentinel final row). A session-authenticated call that
+lands during `running` therefore fails `409 account_deleting` before writing,
+while an unauthenticated magic-link issue/claim or challenge call gets the
+generic unknown-account response with nothing written, and no real-user
+audit/challenge row can appear after these statements. The final row is retained 13 months,
 then swept by the daily `audit-retention-sweep` (`DELETE FROM audit_log WHERE
 action LIKE 'account_deleted:%' AND at < now-13mo`, via a partial index on
 `(action, at)` for that prefix) — no user-keyed audit/challenge row
@@ -1112,8 +1143,10 @@ retaining its `release_mbid_hint` without guessing. Also require:
   library/playlist edit and restore, stream media/grant publication including
   play-event writes, art descriptor/pointer publication) against setting the
   deleting marker; the marker waits for in-flight writers and no writer commits
-  after it, and each fenced writer returns 409 with `account_deleting` or
-  `container_deleting` plus the blocking operation id. Assert schema marker
+  after it, and each fenced writer in this race returns 409 with
+  `account_deleting` or `container_deleting` plus the blocking operation id
+  (unauthenticated auth paths instead return the generic unknown-account
+  response per rule 3). Assert schema marker
   columns and durable `delete_operations` cursor exist, cursor+batch commit
   atomically, crash resumes via the `delete` Workflow or hourly `delete-sweep`,
   re-enumeration includes memberships, grants and media until empty before
@@ -1154,16 +1187,26 @@ retaining its `release_mbid_hint` without guessing. Also require:
   transaction), switching method from magic-link to passkey-uv succeeds, and
   a 6th begin inside one hour for the same (session, action) is rate-limited;
   a 6th complete attempt caps `attempts` at 5 and requires re-begin. Binding
-  case: presenting an ordinary login magic link (no bound `token_hash`) or a
-  login WebAuthn challenge (no bound `challenge_id`) to
-  `step-up/complete` is rejected, and claiming a step-up link through the
-  ADR 0008 login path never verifies a proof and never creates a session.
+  case: presenting an ordinary login magic link (`purpose='login'`) or a login
+  WebAuthn challenge to `step-up/complete` matches zero rows (complete
+  predicates `purpose='step-up'` plus the bound hash/id) and is rejected;
+  claiming a step-up link (`purpose='step-up'`) through the ADR 0008 login
+  path matches zero rows (login predicates `purpose='login'`), returns the
+  generic auth failure, never verifies a proof, never creates a session, and
+  leaves the step-up credential unconsumed. Complete consumes only its bound
+  credential; DELETE/cancel-deletion consume only the verified proof id
+  (`{proof_id}` in the JSON body) with no credential term. Predicate case:
+  complete with `verified_at` already set is rejected (it sets it); consume of
+  an unverified proof is rejected.
   With it the request returns `202`, sends the confirmation email,
   creates a `scheduled` row with `erase_after=request+24h`, a sweep at +1h
   does not start erasure, cancel at the boundary versus executor start yields
   exactly one winner (loser 409/too-late), a new-device sign-in during grace
-  plus fresh step-up cancels successfully, a login attempt once the operation
-  is `running` fails `409 account_deleting` and leaves no real-user
+  plus fresh step-up cancels successfully, an authenticated login attempt once
+  the operation is `running` fails `409 account_deleting` while an
+  unauthenticated magic-link issue for the erasing address returns the same
+  generic "check your email" 200 as a non-existent address (indistinguishable
+  status, body, and timing class; no link sent), both leave no real-user
   `audit_log`/`auth_challenges` row, and completion leaves no
   `auth_challenges` row and only the retained sentinel
   (`user_id='deleted'`, `action='account_deleted:<operation_id>'`) audit row
