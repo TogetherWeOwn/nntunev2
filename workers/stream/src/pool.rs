@@ -41,7 +41,10 @@ pub struct Lease {
     guard: Option<SlotGuard>,
 }
 
-/// Metering owed to a play that was dropped before `finalize` ran.
+/// Metering owed to a play that ended without `finalize` (dropped stream,
+/// `abort`, on either the miss or the hit path). The play path pushes these
+/// into pool-level shared state; the pool owner drains them via
+/// [`Pool::take_orphaned`] and emits one `BytesServed` event each.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrphanedPlay {
     pub user_id: String,
@@ -49,24 +52,11 @@ pub struct OrphanedPlay {
     pub bytes: u64,
 }
 
-impl Lease {
-    /// Stash metering for a dropped play; the pool owner drains it via
-    /// [`Pool::take_orphaned`]. No-op once the lease was released.
-    pub fn record_orphan(&self, play: OrphanedPlay) {
-        if let Some(guard) = self.guard.as_ref() {
-            guard.record_orphan(play);
-        }
-    }
-}
-
 /// Slot bookkeeping shared between the pool and outstanding leases, so a
 /// dropped lease still frees its slot.
 #[derive(Debug, Default)]
 struct SlotState {
     in_use: u32,
-    /// `BytesServed` records for dropped plays, drained by the pool owner
-    /// (which holds the meter) via [`Pool::take_orphaned`].
-    orphaned: Vec<OrphanedPlay>,
 }
 
 #[derive(Debug)]
@@ -80,14 +70,6 @@ impl SlotGuard {
     /// Disarm: the pool took the slot back, so dropping this guard is a no-op.
     fn disarm(mut self) {
         self.slots.take();
-    }
-
-    fn record_orphan(&self, play: OrphanedPlay) {
-        if let Some(slots) = self.slots.as_ref() {
-            if let Ok(mut state) = slots.lock() {
-                state.orphaned.push(play);
-            }
-        }
     }
 }
 
@@ -137,6 +119,12 @@ pub fn backoff_ms(consecutive_errors: u32) -> u64 {
 pub struct Pool<C> {
     capacity: u32,
     slots: Arc<Mutex<SlotState>>,
+    /// `BytesServed` records for plays that ended without `finalize`
+    /// (dropped streams, `abort`), on either the miss or the hit path.
+    /// Pool-level (not on the lease) so a `Cached` stream — which holds no
+    /// lease — can record its served bytes too. Drained by the pool owner
+    /// (which holds the meter) via [`Pool::take_orphaned`].
+    orphaned: Arc<Mutex<Vec<OrphanedPlay>>>,
     idle: Vec<C>,
     connects: u64,
     reuses: u64,
@@ -151,6 +139,7 @@ impl<C> Pool<C> {
         Self {
             capacity: capacity.clamp(1, HARD_MAX_CONNS),
             slots: Arc::new(Mutex::new(SlotState::default())),
+            orphaned: Arc::new(Mutex::new(Vec::new())),
             idle: Vec::new(),
             connects: 0,
             reuses: 0,
@@ -242,13 +231,29 @@ impl<C> Pool<C> {
         }
     }
 
-    /// Metering owed to plays that were dropped before `finalize` ran.
+    /// Stash metering for a play that ended without `finalize` (dropped
+    /// stream, `abort`). A lock failure (another thread panicked while
+    /// holding it) drops the record rather than panicking the caller.
+    pub fn push_orphan(&mut self, play: OrphanedPlay) {
+        if let Ok(mut orphaned) = self.orphaned.lock() {
+            orphaned.push(play);
+        }
+    }
+
+    /// Shared handle to the orphan queue, for streams that must record
+    /// metering on `Drop` without holding the pool (in particular `Cached`
+    /// streams, which hold no lease).
+    pub fn orphan_sink(&self) -> Arc<Mutex<Vec<OrphanedPlay>>> {
+        Arc::clone(&self.orphaned)
+    }
+
+    /// Metering owed to plays that ended without `finalize`.
     /// The pool owner (which holds the meter) drains these and emits
     /// `BytesServed` for each; called from `play` and `finalize`.
     pub fn take_orphaned(&mut self) -> Vec<OrphanedPlay> {
-        self.slots
+        self.orphaned
             .lock()
-            .map(|mut state| std::mem::take(&mut state.orphaned))
+            .map(|mut orphaned| std::mem::take(&mut *orphaned))
             .unwrap_or_default()
     }
 
@@ -436,6 +441,33 @@ mod tests {
                 retry_after_ms: backoff_ms(2)
             }
         );
+    }
+
+    #[test]
+    fn orphaned_plays_queue_at_pool_level_and_drain_once() {
+        let mut pool = TestPool::new(2);
+        pool.push_orphan(OrphanedPlay {
+            user_id: "u".into(),
+            track_id: "t".into(),
+            bytes: 7,
+        });
+        // Streams record through the shared sink without holding the pool
+        // (this is how `Drop` meters a lease-less cache-hit stream).
+        pool.orphan_sink()
+            .lock()
+            .expect("sink lock")
+            .push(OrphanedPlay {
+                user_id: "u".into(),
+                track_id: "t".into(),
+                bytes: 8,
+            });
+        let drained = pool.take_orphaned();
+        assert_eq!(
+            drained.iter().map(|o| o.bytes).sum::<u64>(),
+            15,
+            "both records drain together"
+        );
+        assert!(pool.take_orphaned().is_empty(), "drain is once-only");
     }
 
     #[test]

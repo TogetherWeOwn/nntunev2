@@ -579,6 +579,105 @@ fn dropping_a_stream_frees_its_slot_and_still_meters_served_bytes() {
 }
 
 #[test]
+fn aborted_miss_stream_meters_bytes_already_served() {
+    let (_plain_a, segs_a, arts_a) = fixture_track("a", 40_000, 20_000);
+    let (plain_b, segs_b, arts_b) = fixture_track("b", 20_000, 10_000);
+    let server = FakeNntp::start(merge(arts_a, arts_b));
+    let mut pool: StreamPool = Pool::new(4);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+
+    // Client disconnects mid-track via the documented path: no finalize.
+    let token = grant_for("track-a");
+    let inp = input(&token, "track-a", None, &server, &segs_a, None);
+    let resp = play(&mut pool, &mut cache, &mut meter, SECRET, &inp).expect("miss play");
+    let mut stream = resp.stream;
+    let first = stream.next().expect("first chunk");
+    let served_a = first.len() as u64;
+    assert!(served_a > 0);
+    stream.abort(&mut pool);
+    assert_eq!(pool.in_use(), 0, "abort returns the lease");
+    assert_eq!(pool.idle(), 1, "healthy connection is kept warm");
+
+    // The next play flushes the orphaned metering from the aborted stream.
+    let token_b = grant_for("track-b");
+    let inp_b = input(&token_b, "track-b", None, &server, &segs_b, None);
+    let resp_b = play(&mut pool, &mut cache, &mut meter, SECRET, &inp_b).expect("next play");
+    let (body_b, stream_b) = drain_to_vec(resp_b.stream);
+    assert_eq!(body_b, plain_b);
+    stream_b
+        .finalize(&mut pool, &mut cache, &mut meter)
+        .expect("finalize");
+    let orphaned: u64 = meter
+        .events
+        .iter()
+        .filter(|e| e.kind == MeterKind::BytesServed && e.track_id == "track-a")
+        .map(|e| e.bytes)
+        .sum();
+    assert_eq!(orphaned, served_a, "aborted play must still be metered");
+    assert!(cache.get_track("track-a").is_none(), "abort must not cache");
+}
+
+#[test]
+fn dropped_and_aborted_hit_streams_meter_served_bytes() {
+    let (plain, segments, articles) = fixture_track("a", 40_000, 20_000);
+    let server = FakeNntp::start(articles);
+    let mut pool: StreamPool = Pool::new(4);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+
+    // Seed the cache: a full miss play meters the whole track on finalize.
+    let token = grant_for("track-a");
+    let inp = input(&token, "track-a", None, &server, &segments, None);
+    let resp = play(&mut pool, &mut cache, &mut meter, SECRET, &inp).expect("seed play");
+    let (body, stream) = drain_to_vec(resp.stream);
+    assert_eq!(body, plain);
+    stream
+        .finalize(&mut pool, &mut cache, &mut meter)
+        .expect("finalize");
+    let full = plain.len() as u64;
+
+    // Hit stream dropped after one chunk: no lease, no finalize, no abort.
+    let token2 = grant_for("track-a");
+    let inp2 = input(&token2, "track-a", None, &server, &segments, None);
+    let resp2 = play(&mut pool, &mut cache, &mut meter, SECRET, &inp2).expect("hit play");
+    assert!(resp2.cache_hit);
+    let mut dropped = resp2.stream;
+    let c1 = dropped.next().expect("first hit chunk").len() as u64;
+    drop(dropped);
+
+    // Hit stream aborted after one chunk.
+    let token3 = grant_for("track-a");
+    let inp3 = input(&token3, "track-a", None, &server, &segments, None);
+    let resp3 = play(&mut pool, &mut cache, &mut meter, SECRET, &inp3).expect("hit play");
+    let mut aborted = resp3.stream;
+    let c2 = aborted.next().expect("first hit chunk").len() as u64;
+    aborted.abort(&mut pool);
+
+    // A final full hit play flushes both orphaned records.
+    let token4 = grant_for("track-a");
+    let inp4 = input(&token4, "track-a", None, &server, &segments, None);
+    let resp4 = play(&mut pool, &mut cache, &mut meter, SECRET, &inp4).expect("hit play");
+    let (body4, stream4) = drain_to_vec(resp4.stream);
+    assert_eq!(body4, plain);
+    stream4
+        .finalize(&mut pool, &mut cache, &mut meter)
+        .expect("finalize");
+    let total: u64 = meter
+        .events
+        .iter()
+        .filter(|e| e.kind == MeterKind::BytesServed && e.track_id == "track-a")
+        .map(|e| e.bytes)
+        .sum();
+    assert_eq!(
+        total,
+        full + c1 + c2 + full,
+        "seed + dropped-hit + aborted-hit + final hit must all be metered"
+    );
+    assert_eq!(pool.in_use(), 0);
+}
+
+#[test]
 fn a_gone_article_fails_that_play_but_never_quarantines_the_pool() {
     let (_, segs_gone, _) = fixture_track("gone", 20_000, 10_000);
     let (plain_ok, segs_ok, arts_ok) = fixture_track("ok", 20_000, 10_000);

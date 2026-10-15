@@ -26,7 +26,7 @@
 //! alone — the connection is fine and goes back to the pool warm.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::cache::{ContentCache, MultipartUpload};
 use crate::grant::{self, GrantError};
@@ -104,6 +104,8 @@ pub type StreamPool = Pool<NntpClient>;
 /// stream instead is still safe: the slot is freed, the half-read
 /// connection is discarded, and served bytes are metered on the next
 /// `play`/`finalize` — but the cache write is lost, so prefer `finalize`.
+/// `abort` likewise meters the bytes served so far. Either way the hit path
+/// (which holds no lease) is metered exactly like a miss.
 pub struct PlayStream {
     user_id: String,
     track_id: String,
@@ -113,18 +115,22 @@ pub struct PlayStream {
     served: u64,
     /// `None` once `finalize`/`abort` consumed the stream (or it was dropped).
     source: Option<Source>,
+    /// Pool-level orphan queue: `Drop` pushes an [`OrphanedPlay`] here when
+    /// a mid-flight stream served bytes, on either the miss or the hit path.
+    orphans: Arc<Mutex<Vec<OrphanedPlay>>>,
 }
 
 impl Drop for PlayStream {
     fn drop(&mut self) {
         // Only fires mid-flight: finalize/abort took `source` first. The
-        // guard's Drop frees the slot and the half-read client is discarded
-        // with `live` (its buffered position is untrustworthy, so it is
-        // never re-parked warm). Served bytes ride the shared slot state so
-        // the pool owner can still meter them.
-        if let Some(Source::Live(live)) = self.source.take() {
-            if self.served > 0 {
-                live.lease.record_orphan(OrphanedPlay {
+        // lease guard's Drop frees the slot and the half-read client is
+        // discarded with `live` (its buffered position is untrustworthy, so
+        // it is never re-parked warm). Served bytes ride the pool-level
+        // orphan queue so the pool owner can still meter them — for `Live`
+        // and `Cached` alike.
+        if self.source.take().is_some() && self.served > 0 {
+            if let Ok(mut orphaned) = self.orphans.lock() {
+                orphaned.push(OrphanedPlay {
                     user_id: self.user_id.clone(),
                     track_id: self.track_id.clone(),
                     bytes: self.served,
@@ -183,6 +189,7 @@ pub fn play(
             &user,
             input.track_id,
             Source::Cached(full),
+            pool.orphan_sink(),
         ));
     }
 
@@ -250,6 +257,7 @@ pub fn play(
         &user,
         input.track_id,
         Source::Live(Box::new(live)),
+        pool.orphan_sink(),
     ))
 }
 
@@ -421,6 +429,7 @@ fn respond(
     user: &str,
     track: &str,
     source: Source,
+    orphans: Arc<Mutex<Vec<OrphanedPlay>>>,
 ) -> PlayResponse {
     PlayResponse {
         status,
@@ -434,6 +443,7 @@ fn respond(
             end,
             served: 0,
             source: Some(source),
+            orphans,
         },
     }
 }
@@ -528,9 +538,21 @@ impl PlayStream {
         }
     }
 
-    /// The client went away: return the connection without caching.
+    /// The client went away: return the connection without caching. Bytes
+    /// already served are still metered: they ride the pool-level orphan
+    /// queue and are emitted as `BytesServed` on the next `play`/`finalize`
+    /// — on the hit path (which holds no lease) exactly like on a miss.
+    /// `source` is taken first so `Drop` cannot record the same bytes twice.
     pub fn abort(mut self, pool: &mut StreamPool) {
-        if let Some(Source::Live(live)) = self.source.take() {
+        let source = self.source.take();
+        if self.served > 0 {
+            pool.push_orphan(OrphanedPlay {
+                user_id: self.user_id.clone(),
+                track_id: self.track_id.clone(),
+                bytes: self.served,
+            });
+        }
+        if let Some(Source::Live(live)) = source {
             let live = *live;
             let healthy = !matches!(live.failed, Some((_, true)));
             pool.release(live.lease, healthy.then_some(live.client));
