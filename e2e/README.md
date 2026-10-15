@@ -40,7 +40,8 @@ the activation checklist is accurate:
   `apps/web/tests/smoke.spec.ts` exact-keys assertion). `health.spec.ts`
   requires `ok === true` and asserts `version` whenever the deployed app
   ships it, so the check stays green across the deploy boundary.
-- `GET /api/ready` reports readiness shape (TOG-25176):
+- `GET /api/ready` reports readiness shape:
+
   200 `{ok:true}` while the app serves traffic, 503 `{ok:false}` with
   `Retry-After` when it cannot (`apps/web/src/routes/api/ready/+server.ts`,
   shapes pinned by `apps/web/src/lib/ready.test.ts`). The smoke tolerates
@@ -50,8 +51,8 @@ the activation checklist is accurate:
   `apps/web/src/lib/contract.test.ts` plus the `smoke.spec.ts` contract
   test). The app-shell fallback to the landing's `NNTune` heading is kept
   for builds predating the hook. `/signup`'s real submission, the BYOP
-  wizard behavior (TOG-23633), ingest/library/stream/usage endpoints, and
-  usage-meter enforcement (TOG-23637) still arrive with the venture slices
+  wizard behavior, ingest/library/stream/usage endpoints, and
+  usage-meter enforcement still arrive with the venture slices
   that own them: the shells render the hooks and say what is pending, so
   the journey specs (`signup-byop`, `ingest-play-meter`) fail only on those
   real missing backends — that failure is the signal, not noise.

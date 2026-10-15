@@ -11,7 +11,7 @@ test('landing explains BYOP and links to signup and pricing', async ({ page, req
 		'href',
 		'/pricing'
 	);
-	// e2e contract hook (TOG-25176): the app-shell smoke accepts this hook
+	// e2e contract hook: the app-shell smoke accepts this hook
 	// when present and otherwise falls back to the NNTune heading.
 	await expect(page.getByTestId('app-root')).toBeVisible();
 

@@ -1,5 +1,5 @@
 <script lang="ts">
-	// NZB import shell (TOG-25176). The hooks below are the e2e contract
+	// NZB import shell. The hooks below are the e2e contract
 	// (e2e/helpers/contract.ts TESTIDS); ingest itself lands with the
 	// ingest slice. Until then selecting a file explains that honestly
 	// instead of faking a completed import.

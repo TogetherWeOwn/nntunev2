@@ -1,8 +1,8 @@
 <script lang="ts">
-	// Library shell (TOG-25176). The hooks below are the e2e contract
+	// Library shell. The hooks below are the e2e contract
 	// (e2e/helpers/contract.ts TESTIDS); listing, streaming, metering, and
 	// plan-limit enforcement land with the venture slices that own them
-	// (ingest/stream/usage, e.g. TOG-23637 for the meter). Until then the
+	// (ingest/stream/usage slices, including the usage meter). Until then the
 	// page renders the empty state honestly instead of faking tracks.
 	interface Track {
 		id: string;

@@ -1,7 +1,7 @@
 <script lang="ts">
-	// BYOP wizard shell (TOG-25176). The hooks below are the e2e contract
+	// BYOP wizard shell. The hooks below are the e2e contract
 	// (e2e/helpers/contract.ts TESTIDS); connection testing and saving land
-	// with TOG-23633, which wires this form to the real backend. Until then
+	// with the backend-wiring slice, which wires this form to the real backend. Until then
 	// both actions explain that honestly instead of faking a success.
 	let host = $state('');
 	let port = $state('563');
@@ -13,13 +13,13 @@
 	function testConnection(event: Event) {
 		event.preventDefault();
 		status =
-			'Connection testing lands with the BYOP wizard slice (TOG-23633) — settings are not saved yet.';
+			'Connection testing lands with the backend-wiring slice — settings are not saved yet.';
 	}
 
 	function save(event: Event) {
 		event.preventDefault();
 		status =
-			'Saving lands with the BYOP wizard slice (TOG-23633) — settings are not saved yet.';
+			'Saving lands with the backend-wiring slice — settings are not saved yet.';
 	}
 </script>
 
