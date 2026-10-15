@@ -1198,4 +1198,86 @@ mod tests {
             assert!(!sql.contains("OR TRUE"), "{sql}");
         }
     }
+
+    #[test]
+    fn write_statements_match_exact_text_and_owner_scope() {
+        // Exact pins: any AND->OR, FROM-swap, parameter-swap, column-drop, or
+        // SET-reorder mutant changes this text and fails here. The targeted
+        // asserts below name the failing dimension.
+        assert_eq!(
+            genre_insert_statement(),
+            "INSERT INTO genres (public_id, owner_user_id, name, is_public, created_at) VALUES ($1, $2, $3, $4, $5)",
+            "genre insert"
+        );
+        assert_eq!(
+            genre_update_statement(),
+            "UPDATE genres SET name = $3, is_public = $4 WHERE public_id = $1 AND owner_user_id = $2",
+            "genre update"
+        );
+        assert_eq!(
+            genre_delete_statement(),
+            "DELETE FROM genres WHERE public_id = $1 AND owner_user_id = $2",
+            "genre delete"
+        );
+        assert_eq!(
+            playlist_insert_statement(),
+            "INSERT INTO playlists (public_id, owner_user_id, name, items, is_public, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+            "playlist insert"
+        );
+        assert_eq!(
+            playlist_update_statement(),
+            "UPDATE playlists SET name = $3, items = $4, is_public = $5 WHERE public_id = $1 AND owner_user_id = $2",
+            "playlist update"
+        );
+        assert_eq!(
+            playlist_delete_statement(),
+            "DELETE FROM playlists WHERE public_id = $1 AND owner_user_id = $2",
+            "playlist delete"
+        );
+        // Targeted dimensions (same failure, named cause): the owner predicate
+        // must stay grouped as one `AND` unit; `OR` would wipe or rename every
+        // row of the caller plus a foreign public row.
+        for (sql, table, other_table) in [
+            (genre_update_statement(), "UPDATE genres", "playlists"),
+            (genre_delete_statement(), "DELETE FROM genres", "playlists"),
+            (playlist_update_statement(), "UPDATE playlists", "genres"),
+            (
+                playlist_delete_statement(),
+                "DELETE FROM playlists",
+                "genres",
+            ),
+        ] {
+            assert!(
+                sql.contains("WHERE public_id = $1 AND owner_user_id = $2"),
+                "{sql}"
+            );
+            assert!(!sql.contains(" OR owner_user_id"), "{sql}");
+            assert!(sql.contains(table), "{sql}");
+            assert!(!sql.contains(other_table), "{sql}");
+        }
+        // SET lists pin column order and the visibility toggle: dropping
+        // `is_public` or swapping name/items must fail here.
+        assert!(
+            genre_update_statement().contains("SET name = $3, is_public = $4"),
+            "{}",
+            genre_update_statement()
+        );
+        assert!(
+            playlist_update_statement().contains("SET name = $3, items = $4, is_public = $5"),
+            "{}",
+            playlist_update_statement()
+        );
+        // INSERT column/placeholder order: swapping $2/$3, $3/$4, or $4/$5
+        // must fail the exact pins above; the placeholders below name it.
+        assert!(
+            genre_insert_statement().contains("VALUES ($1, $2, $3, $4, $5)"),
+            "{}",
+            genre_insert_statement()
+        );
+        assert!(
+            playlist_insert_statement().contains("VALUES ($1, $2, $3, $4, $5, $6)"),
+            "{}",
+            playlist_insert_statement()
+        );
+    }
 }
