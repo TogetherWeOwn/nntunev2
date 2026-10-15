@@ -7,6 +7,11 @@ name: gitleaks
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  # Merge queue validation (TOG-24374): `gitleaks` is a required check, so it
+  # must report on merge_group. Queue runs take the merged-policy branch
+  # below (event is not pull_request), which is the correct policy for the
+  # temporary merge commit.
+  merge_group:
   push:
     branches: [main]
   workflow_dispatch:
@@ -16,7 +21,8 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  # Never cancel a queue validation run (see ci.yml).
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'merge_group' }}
 
 jobs:
   gitleaks:

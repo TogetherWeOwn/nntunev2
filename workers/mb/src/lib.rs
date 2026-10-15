@@ -87,8 +87,8 @@ fn parse_search_kind(raw: Option<String>) -> Option<&'static str> {
 /// `no-store` so neither browsers nor the edge cache the placeholder; the
 /// long `LOOKUP_CACHE_TTL_S` max-age applies only once real rows return.
 async fn lookup(kind: &str, ctx: &RouteContext<()>) -> Result<Response> {
-    let mbid = ctx.param("mbid").unwrap_or_default();
-    if !is_valid_mbid(&mbid) {
+    let mbid = ctx.param("mbid").map(String::as_str).unwrap_or("");
+    if !is_valid_mbid(mbid) {
         return json_error("invalid mbid (must be UUID)", 400);
     }
     console_log!("mb lookup kind={}", kind);
