@@ -6,6 +6,7 @@
 		toProviderTestInput,
 		type ProviderTestResult
 	} from '#lib/api/client.js';
+	import { isProviderAuthExpired, reauthPromptFor } from '#lib/provider-reauth.js';
 	import { validateIndexerUrl, validateProviderConfig } from '#lib/vault-validation.js';
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
@@ -28,6 +29,7 @@
 	let errors = $state<string[]>([]);
 	let testState = $state<'idle' | 'testing' | 'ok' | 'failed'>('idle');
 	let testDetail = $state('');
+	let reauthRequired = $state(false);
 	let saveState = $state<'idle' | 'saving' | 'saved' | 'failed'>('idle');
 	let testedConfigKey = $state<string | null>(null);
 	let testRunId = 0;
@@ -57,6 +59,7 @@
 		testedConfigKey = null;
 		testState = 'idle';
 		testDetail = '';
+		reauthRequired = false;
 		saveState = 'idle';
 	}
 
@@ -96,6 +99,7 @@
 		testedConfigKey = null;
 		testState = 'testing';
 		testDetail = '';
+		reauthRequired = false;
 		try {
 			const result: ProviderTestResult = await client.testProviderConnection(input);
 			if (runId !== testRunId || inputKey !== currentTestKey()) return;
@@ -114,10 +118,18 @@
 		} catch (error) {
 			if (runId !== testRunId || inputKey !== currentTestKey()) return;
 			testState = 'failed';
-			testDetail =
-				error instanceof ApiError && error.status === 404
-					? 'The API is not deployed yet — try again later.'
-					: 'Connection test failed. Check the details and try again.';
+			// Stale stored credential: inline re-auth prompt (S7), never a
+			// generic error page. The form stays mounted so the user re-enters
+			// the password in place; the session stays signed in.
+			if (error instanceof ApiError && isProviderAuthExpired(error)) {
+				reauthRequired = true;
+				testDetail = reauthPromptFor(error.code) ?? 'Your provider password has expired.';
+			} else {
+				testDetail =
+					error instanceof ApiError && error.status === 404
+						? 'The API is not deployed yet — try again later.'
+						: 'Connection test failed. Check the details and try again.';
+			}
 		}
 	}
 
@@ -265,7 +277,18 @@
 							: 'Save provider'}
 				</button>
 			{:else if testState === 'failed'}
-				<p role="alert">{testDetail}</p>
+				{#if reauthRequired}
+					<div role="alert" aria-labelledby="reauth-heading">
+						<h3 id="reauth-heading">Provider credentials expired</h3>
+						<p>{testDetail}</p>
+						<p>
+							Re-enter your password above and test again — your session stays
+							signed in, and the new password is verified before it is saved.
+						</p>
+					</div>
+				{:else}
+					<p role="alert">{testDetail}</p>
+				{/if}
 			{/if}
 			{#if saveState === 'saved'}
 				<p role="status">Saved. Your credentials are sealed in the encrypted vault.</p>

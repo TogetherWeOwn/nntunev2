@@ -40,6 +40,11 @@ use crate::yenc::{self, Decoded, YencError};
 /// Client chunk size for served streams.
 const CHUNK: usize = 16 * 1024;
 
+/// Documented worker/API error code for stale provider credentials (S7).
+/// The API worker returns this code (HTTP 401) and the web app renders an
+/// inline re-auth prompt on it instead of a generic error page.
+pub const PROVIDER_AUTH_EXPIRED_CODE: &str = "provider_auth_expired";
+
 /// Why a play failed.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PlayError {
@@ -47,6 +52,11 @@ pub enum PlayError {
     WrongTrack,
     RangeUnsatisfiable,
     PoolExhausted,
+    /// The provider rejected our credentials (`481`/`482` → re-auth prompt).
+    /// This never quarantines the pool: retrying with the same stale secret
+    /// cannot succeed, and a quarantine would hide the re-auth signal behind
+    /// a `PoolQuarantined` outage. Carries no credential material.
+    ProviderAuthExpired,
     PoolQuarantined {
         retry_after_ms: u64,
     },
@@ -314,10 +324,24 @@ fn fetch_segment(client: &mut NntpClient, message_id: &str) -> Result<Decoded, S
     yenc::decode_part(&raw).map_err(SegmentError::Decode)
 }
 
+impl PlayError {
+    /// Stable worker/API code for this failure. Only
+    /// [`PlayError::ProviderAuthExpired`] maps to
+    /// [`PROVIDER_AUTH_EXPIRED_CODE`]; the API worker returns it with HTTP
+    /// 401 and the web app renders the inline re-auth prompt on it.
+    pub fn code(&self) -> &'static str {
+        match self {
+            PlayError::ProviderAuthExpired => PROVIDER_AUTH_EXPIRED_CODE,
+            _ => "request_failed",
+        }
+    }
+}
+
 fn nntp_failure(e: NntpError, message_id: &str) -> Failure {
     let provider = e.is_provider_failure();
     let err = match e {
         NntpError::NoSuchArticle(_) => PlayError::ArticleMissing(message_id.to_string()),
+        NntpError::AuthExpired => PlayError::ProviderAuthExpired,
         NntpError::InvalidMessageId(id) => PlayError::InvalidSegment(id),
         other => PlayError::Upstream(format!("{other:?}")),
     };

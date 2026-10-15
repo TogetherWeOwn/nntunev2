@@ -9,6 +9,21 @@
 //! - [`redact_api_key`] scrubs the key for logs. Log the redacted URL only.
 //! - `http://` indexer URLs are refused: the key would travel in cleartext.
 
+/// Documented worker/API error code for stale provider credentials (S7).
+/// Shared verbatim with `nntune-core`, `workers/api` and `workers/stream`:
+/// the API worker returns this code with HTTP 401 and the web app renders an
+/// inline re-auth prompt on it. Safe to log and to return in error bodies.
+pub const PROVIDER_AUTH_EXPIRED_CODE: &str = "provider_auth_expired";
+
+/// True when an indexer/provider HTTP status means the stored credential is
+/// stale and the user must re-authenticate (S7). Only 401/403 map here —
+/// every other status stays a generic failure that must not trigger the
+/// re-auth prompt. The caller returns [`PROVIDER_AUTH_EXPIRED_CODE`] with
+/// HTTP 401 and MUST NOT include the key, the URL, or the upstream body.
+pub fn is_provider_auth_failure(http_status: u16) -> bool {
+    matches!(http_status, 401 | 403)
+}
+
 /// Newznab search caps for one request.
 pub const MAX_LIMIT: u32 = 100;
 /// Music-only search (`t=music`); the pipeline ingests audio releases.

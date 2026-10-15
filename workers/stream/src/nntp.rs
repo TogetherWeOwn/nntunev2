@@ -9,26 +9,50 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::time::Duration;
 
+/// Documented worker/API error code for stale provider credentials (S7).
+/// Shared verbatim with `nntune-core` and `workers/api`: the web app renders
+/// an inline re-auth prompt on this code. Safe to log and to return in error
+/// bodies: it carries no credential material.
+pub const PROVIDER_AUTH_EXPIRED_CODE: &str = "provider_auth_expired";
+
 /// What went wrong talking to the provider.
 #[derive(Debug, PartialEq, Eq)]
 pub enum NntpError {
     Io(String),
     NoSuchArticle(String),
     UnexpectedResponse(String),
+    /// The provider rejected our credentials (`481`/`482` on `BODY`).
+    /// Stale credentials are a re-auth signal, not an outage: this must not
+    /// quarantine the pool (see [`NntpError::is_provider_failure`]) and the
+    /// play path maps it to `provider_auth_expired`, never to a missing
+    /// article. Carries no credential material.
+    AuthExpired,
     /// The segment id failed RFC 5536 validation and was never sent.
     InvalidMessageId(String),
 }
 
 impl NntpError {
     /// True when the provider (or the connection to it) is unhealthy, as
-    /// opposed to one article being gone (`430`/`423`) or one id being
+    /// opposed to one article being gone (`430`/`423`), stale credentials
+    /// (`481`/`482` → re-auth prompt, not an outage), or one id being
     /// malformed, which say nothing about the provider and must not
     /// quarantine the user's pool.
     pub fn is_provider_failure(&self) -> bool {
         !matches!(
             self,
-            NntpError::NoSuchArticle(_) | NntpError::InvalidMessageId(_)
+            NntpError::NoSuchArticle(_)
+                | NntpError::AuthExpired
+                | NntpError::InvalidMessageId(_)
         )
+    }
+
+    /// Stable worker/API code for this failure. Only [`NntpError::AuthExpired`]
+    /// maps to [`PROVIDER_AUTH_EXPIRED_CODE`].
+    pub fn code(&self) -> &'static str {
+        match self {
+            NntpError::AuthExpired => PROVIDER_AUTH_EXPIRED_CODE,
+            _ => "request_failed",
+        }
     }
 }
 
@@ -106,10 +130,12 @@ impl NntpClient {
                 body.push(b'\n');
             }
             Ok(body)
-        } else if status.starts_with("430")
-            || status.starts_with("423")
-            || status.starts_with("482")
-        {
+        } else if status.starts_with("481") || status.starts_with("482") {
+            // Stale provider credentials: re-auth signal, never a missing
+            // article (a previous revision mapped 482 here). No credential
+            // material is retained: the status line is dropped.
+            Err(NntpError::AuthExpired)
+        } else if status.starts_with("430") || status.starts_with("423") {
             Err(NntpError::NoSuchArticle(message_id.to_string()))
         } else {
             Err(NntpError::UnexpectedResponse(status.trim_end().to_string()))
@@ -133,6 +159,8 @@ mod tests {
     #[test]
     fn only_a_missing_article_is_not_a_provider_failure() {
         assert!(!NntpError::NoSuchArticle("m".into()).is_provider_failure());
+        assert!(!NntpError::AuthExpired.is_provider_failure());
+        assert_eq!(NntpError::AuthExpired.code(), PROVIDER_AUTH_EXPIRED_CODE);
         assert!(!NntpError::InvalidMessageId("x".into()).is_provider_failure());
         assert!(NntpError::Io("reset".into()).is_provider_failure());
         assert!(NntpError::UnexpectedResponse("502".into()).is_provider_failure());

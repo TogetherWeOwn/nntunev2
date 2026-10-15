@@ -59,6 +59,33 @@ pub fn nntp_port_allowed(port: u16) -> bool {
     ALLOWED_NNTP_PORTS.contains(&port)
 }
 
+/// Documented worker/API error code for stale provider credentials (S7).
+/// Every worker path that observes an NNTP `481`/`482` (or an indexer HTTP
+/// 401/403) returns this code with HTTP 401; the web app renders an inline
+/// re-auth prompt on it instead of a generic error page. Safe to log and to
+/// return in error bodies: it carries no credential material.
+pub const PROVIDER_AUTH_EXPIRED_CODE: &str = "provider_auth_expired";
+
+/// Audit action for an in-place provider credential rotation (S7). Callers
+/// MUST emit this (not the plain `vault.update`) when the vault write
+/// replaces the provider secret while keeping the same user session, so the
+/// rotation is repudiation-safe and distinguishable from a first-time save.
+pub const PROVIDER_ROTATE_AUDIT_ACTION: &str = "vault.rotate";
+
+/// Audit action for a provider credential rotation. Always
+/// [`PROVIDER_ROTATE_AUDIT_ACTION`]: rotation writes are never logged as
+/// generic updates.
+pub fn provider_rotation_audit_action() -> &'static str {
+    PROVIDER_ROTATE_AUDIT_ACTION
+}
+
+/// Minimal JSON error body carrying only the documented re-auth code.
+/// No credential material, no host/user detail: safe for logs and API
+/// responses. The HTTP status for this body is always 401.
+pub fn provider_auth_expired_body() -> String {
+    serde_json::json!({ "error": PROVIDER_AUTH_EXPIRED_CODE }).to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VaultError {
     Invalid,
@@ -611,6 +638,55 @@ pub fn rewrap_dek(
         payload_nonce_b64url: blob.payload_nonce_b64url.clone(),
         payload_b64url: blob.payload_b64url.clone(),
     })
+}
+
+/// Rotate the provider credential in place without dropping the user session.
+///
+/// The session is an HMAC-signed cookie independent of the vault row, so a
+/// vault write never revokes it — but this helper makes the contract explicit
+/// and testable:
+/// - proves ownership of the old credential by decrypting `old_blob` (fails
+///   closed when the caller cannot read the row they claim to rotate);
+/// - validates `new_config` (shape + SSRF guard) so the new secret verifies
+///   via `test connection` before it is sealed;
+/// - requires the provider identity (`host`, `username`) to be unchanged —
+///   a different provider is a fresh save (`vault.update`), not a rotation;
+/// - seals the new credential with a fresh DEK under (`kek`, `kek_version`).
+///
+/// The sealed payload is the minimal provider-credential JSON
+/// (`{"username":…, "password":…}`); the full provider+indexer row shape is
+/// owned by the API worker entry, which calls this helper for the
+/// password-rotation slice. The caller MUST audit with
+/// [`provider_rotation_audit_action`] and MUST NOT touch the session row.
+///
+/// Every failure maps to generic [`VaultError::Invalid`]/[`VaultError::Crypto`]:
+/// no credential material, no host/user detail, no crypto internals.
+pub fn rotate_provider_credentials(
+    kek: &[u8; 32],
+    kek_version: u32,
+    user_id: &str,
+    old_blob: &VaultBlob,
+    old_config: &ProviderConfig,
+    new_config: &ProviderConfig,
+    dns: &impl DnsResolver,
+) -> Result<VaultBlob, VaultError> {
+    // Prove ownership of the row being rotated.
+    decrypt_vault(kek, user_id, old_blob)?;
+    // The new secret must verify before it is sealed.
+    new_config.validate(dns)?;
+    // Rotation keeps the provider identity: host + username unchanged.
+    if old_config.host != new_config.host || old_config.username != new_config.username {
+        return Err(VaultError::Invalid);
+    }
+    if new_config.password.is_empty() {
+        return Err(VaultError::Invalid);
+    }
+    let new_plaintext = serde_json::json!({
+        "username": new_config.username,
+        "password": new_config.password,
+    });
+    let bytes = serde_json::to_vec(&new_plaintext).map_err(|_| VaultError::Invalid)?;
+    encrypt_vault(kek, kek_version, user_id, &bytes)
 }
 
 // --- Redaction + audit (never secrets) --------------------------------------------

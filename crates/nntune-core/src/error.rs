@@ -2,6 +2,13 @@
 
 use std::{fmt, io};
 
+/// Documented worker/API error code for stale provider credentials (S7).
+/// Every worker path that observes an NNTP `481`/`482` (or an indexer HTTP
+/// 401/403) maps to this code; the web app renders an inline re-auth prompt
+/// on it instead of a generic error page. The code is safe to log and to
+/// return in error bodies: it carries no credential material.
+pub const PROVIDER_AUTH_EXPIRED_CODE: &str = "provider_auth_expired";
+
 /// Crate-wide result alias.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -39,12 +46,35 @@ pub enum Error {
     UnsupportedOnWasm(&'static str),
 }
 
+impl Error {
+    /// Stable worker/API code for this failure. Only authentication failures
+    /// map to [`PROVIDER_AUTH_EXPIRED_CODE`]; every other variant is a
+    /// generic protocol error that must not trigger the re-auth prompt.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Error::AuthFailed(_) => PROVIDER_AUTH_EXPIRED_CODE,
+            _ => "request_failed",
+        }
+    }
+
+    /// True when the provider rejected our credentials (`481`/`482`) or
+    /// demands auth first. The caller must surface
+    /// [`PROVIDER_AUTH_EXPIRED_CODE`] (HTTP 401) with no credential material.
+    pub fn is_auth_failure(&self) -> bool {
+        matches!(self, Error::AuthFailed(_))
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Io(e) => write!(f, "transport I/O: {e}"),
             Error::NntpReply { code, text } => write!(f, "NNTP reply {code}: {text}"),
-            Error::AuthFailed(t) => write!(f, "NNTP authentication failed: {t}"),
+            // Generic by construction (threat-model §3/§6: no credential
+            // material in logs or error bodies). The server reply text is
+            // deliberately not echoed: it is attacker-influenced and could
+            // carry reflected credential material. Log/return `code()` instead.
+            Error::AuthFailed(_) => write!(f, "NNTP authentication failed: {PROVIDER_AUTH_EXPIRED_CODE}"),
             Error::NoPermission(t) => write!(f, "NNTP permission denied: {t}"),
             Error::ArticleNotFound(id) => write!(f, "article not found: {id}"),
             Error::Malformed(r) => write!(f, "malformed input: {r}"),
