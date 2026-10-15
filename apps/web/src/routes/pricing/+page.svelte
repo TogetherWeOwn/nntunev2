@@ -1,15 +1,15 @@
 <script lang="ts">
-	import { listPlans, formatPricePerMonth } from '$lib/billing/plans';
+	import { listPlans, formatPricePerMonth } from '#lib/billing/plans.js';
 
 	const plans = listPlans();
-	let checkoutError: string | null = null;
-	let pendingPlan: string | null = null;
+	let checkoutError: string | null = $state(null);
+	let pendingPlan: string | null = $state(null);
 
 	async function choose(planId: string) {
 		checkoutError = null;
 		pendingPlan = planId;
 		try {
-			const { startCheckout } = await import('$lib/billing/billingClient');
+			const { startCheckout } = await import('#lib/billing/billingClient.js');
 			const url = await startCheckout(planId);
 			window.location.href = url;
 		} catch (err) {
@@ -64,7 +64,7 @@
 					<td>{plan.ingestJobsDay}</td>
 					<td>{plan.cachePriority}</td>
 					<td>
-						<button disabled={pendingPlan === plan.id} on:click={() => choose(plan.id)}>
+						<button disabled={pendingPlan === plan.id} onclick={() => choose(plan.id)}>
 							{pendingPlan === plan.id
 								? 'Starting…'
 								: plan.id === 'free'

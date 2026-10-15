@@ -1,37 +1,27 @@
 <script lang="ts">
-	import { getPlan } from '$lib/billing/plans';
-	import { evaluateUsage } from '$lib/billing/usage';
-	import type { SubscriptionDTO } from '$lib/billing/billingClient';
+	import { invalidateAll } from '$app/navigation';
+	import { getPlan } from '#lib/billing/plans.js';
+	import type { PageData } from './$types';
 
-	export let data: {
-		planId: string;
-		planUnknown: boolean;
-		subscription: SubscriptionDTO | null;
-		usage: {
-			period: string;
-			streamSecondsMonth: number;
-			concurrentNow: number;
-			libraryTracks: number;
-			ingestToday: number;
-		} | null;
-		loadError: string | null;
-	};
+	let { data }: { data: PageData } = $props();
 
 	// The loader only emits known plan ids; free is the last-resort fallback
 	// so the page can never promote an unknown state to a paid tier.
-	const plan = getPlan(data.planId) ?? getPlan('free')!;
-	const status = data.usage ? evaluateUsage(plan, data.usage) : null;
+	const plan = $derived(getPlan(data.planId) ?? getPlan('free')!);
+	// usageStatus is null unless the plan is confirmed AND usage loaded: no
+	// usage-vs-cap alert or upgrade button is rendered otherwise.
+	const status = $derived(data.usageStatus);
 
-	let actionError: string | null = null;
-	let busy: 'checkout' | 'portal' | null = null;
+	let actionError: string | null = $state(null);
+	let busy: 'checkout' | 'portal' | null = $state(null);
 
 	async function checkout() {
+		if (!status?.upgradeTo) return;
 		actionError = null;
 		busy = 'checkout';
 		try {
-			const { startCheckout } = await import('$lib/billing/billingClient');
-			const target = status?.upgradeTo ?? 'plus';
-			window.location.href = await startCheckout(target);
+			const { startCheckout } = await import('#lib/billing/billingClient.js');
+			window.location.href = await startCheckout(status.upgradeTo);
 		} catch (err) {
 			actionError = err instanceof Error ? err.message : 'Checkout failed';
 			busy = null;
@@ -42,7 +32,7 @@
 		actionError = null;
 		busy = 'portal';
 		try {
-			const { openPortal } = await import('$lib/billing/billingClient');
+			const { openPortal } = await import('#lib/billing/billingClient.js');
 			window.location.href = await openPortal();
 		} catch (err) {
 			actionError = err instanceof Error ? err.message : 'Portal failed';
@@ -62,8 +52,16 @@
 		<p role="alert">{data.loadError}</p>
 	{/if}
 
-	{#if data.planUnknown}
+	{#if data.planUnknown && !data.signedOut}
 		<p role="status">We couldn&apos;t confirm your plan — showing trial defaults.</p>
+	{/if}
+
+	{#if data.signedOut}
+		<p><a href="/signup">Sign in</a> to see your billing.</p>
+	{/if}
+
+	{#if data.hadFetchError}
+		<button onclick={() => invalidateAll()}>Retry</button>
 	{/if}
 
 	<section aria-labelledby="plan">
@@ -114,16 +112,18 @@
 		<p role="alert">{actionError}</p>
 	{/if}
 
-	<div>
-		{#if status?.upgradeTo}
-			<button disabled={busy !== null} on:click={checkout}>
-				{busy === 'checkout' ? 'Starting…' : `Upgrade to ${status.upgradeTo}`}
+	{#if !data.signedOut}
+		<div>
+			{#if status?.upgradeTo}
+				<button disabled={busy !== null} onclick={checkout}>
+					{busy === 'checkout' ? 'Starting…' : `Upgrade to ${status.upgradeTo}`}
+				</button>
+			{/if}
+			<button disabled={busy !== null} onclick={portal}>
+				{busy === 'portal' ? 'Opening…' : 'Manage billing'}
 			</button>
-		{/if}
-		<button disabled={busy !== null} on:click={portal}>
-			{busy === 'portal' ? 'Opening…' : 'Manage billing'}
-		</button>
-	</div>
+		</div>
+	{/if}
 
 	<p><a href="/pricing">Compare all plans</a></p>
 </main>

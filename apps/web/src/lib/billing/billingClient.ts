@@ -34,6 +34,21 @@ export interface SubscriptionDTO {
 	trialEndsAt: string | null;
 }
 
+/**
+ * Typed fetch failure carrying the HTTP status so loaders can tell a signed-out
+ * visitor (401) or a missing record (404) apart from a backend outage. The
+ * message keeps the status code so existing `toThrow('404')` assertions hold.
+ */
+export class BillingApiError extends Error {
+	readonly status: number;
+
+	constructor(status: number, label: string, hint = '') {
+		super(`${label} failed (${status})${hint}`);
+		this.name = 'BillingApiError';
+		this.status = status;
+	}
+}
+
 async function readJson<T>(res: Response, label: string): Promise<T> {
 	if (!res.ok) {
 		let hint = '';
@@ -44,7 +59,7 @@ async function readJson<T>(res: Response, label: string): Promise<T> {
 		} catch {
 			/* non-JSON error body: keep generic */
 		}
-		throw new Error(`${label} failed (${res.status})${hint}`);
+		throw new BillingApiError(res.status, label, hint);
 	}
 	return (await res.json()) as T;
 }
