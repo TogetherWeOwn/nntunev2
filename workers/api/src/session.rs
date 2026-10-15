@@ -8,7 +8,7 @@
 //! from the Worker env, never code.
 
 use hmac::{Hmac, Mac};
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -43,7 +43,7 @@ pub struct SessionClaims {
 
 fn new_session_id() -> String {
     let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     crate::b64::encode(&bytes)
 }
 
