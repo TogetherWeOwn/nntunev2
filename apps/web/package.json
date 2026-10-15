@@ -1,34 +1,31 @@
 {
-	"name": "@nntune/web",
-	"version": "0.1.0",
+	"name": "web",
 	"private": true,
-	"description": "NNTune v2 web frontend (SvelteKit on Cloudflare). Billing slice: pricing, usage meters, checkout/portal.",
+	"version": "0.0.1",
 	"type": "module",
 	"scripts": {
 		"dev": "vite dev",
 		"build": "vite build",
 		"preview": "vite preview",
-		"check": "svelte-kit sync && tsc --noEmit",
+		"prepare": "svelte-kit sync || echo ''",
+		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
 		"test": "vitest run",
-		"test:watch": "vitest",
-		"lint": "prettier --check .",
-		"format": "prettier --write ."
-	},
-	"dependencies": {
-		"@sveltejs/kit": "2.70.3",
-		"svelte": "^5.0.0"
+		"test:e2e": "playwright test"
 	},
 	"devDependencies": {
-		"@sveltejs/adapter-cloudflare": "7.2.9",
-		"@sveltejs/vite-plugin-svelte": "5.1.1",
-		"prettier": "^3.3.3",
-		"prettier-plugin-svelte": "^3.2.6",
-		"typescript": "^5.6.3",
-		"vite": "6.4.4",
-		"vitest": "4.1.11"
+		"@playwright/test": "^1.64.0",
+		"@sveltejs/adapter-cloudflare": "^8.0.0",
+		"@sveltejs/kit": "^3.0.0",
+		"@sveltejs/vite-plugin-svelte": "^7.2.0",
+		"svelte": "^5.57.1",
+		"svelte-check": "^4.6.0",
+		"typescript": "^6.0.3",
+		"vite": "^8.3.0",
+		"vitest": "^5.0.4"
 	},
-	"allowScripts": {
-		"esbuild@0.28.2": true,
-		"workerd@1.20261012.1": true
+	"imports": {
+		"#lib": "./src/lib/index.js",
+		"#lib/*": "./src/lib/*"
 	}
 }

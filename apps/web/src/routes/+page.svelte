@@ -1,26 +1,20 @@
 <svelte:head>
-	<title>NNTune v2 — BYO-Usenet music streaming</title>
+	<title>NNTune — your music, your provider</title>
+	<meta
+		name="description"
+		content="NNTune streams your music on Cloudflare. Bring your own Usenet provider; we provide search, streaming and library."
+	/>
 </svelte:head>
 
-<main>
-	<h1>NNTune v2</h1>
-	<p>Bring your own Usenet provider. We provide the music experience on top.</p>
-	<nav aria-label="Primary">
-		<a href="/pricing">Plans and pricing</a>
-		<a href="/account/billing">Account billing</a>
-	</nav>
+<main class="nt-wrap">
+	<h1>NNTune</h1>
+	<p>
+		Your music, on your terms. NNTune never bundles or resells Usenet access — you bring your
+		own provider account, and we provide the music experience on top: search, streaming,
+		library management and offline-friendly caching.
+	</p>
+	<p>
+		<a class="nt-button" href="/signup">Get started</a>
+		<a class="nt-button nt-button--ghost" href="/pricing">See plans</a>
+	</p>
 </main>
-
-<style>
-	main {
-		max-width: 44rem;
-		margin: 3rem auto;
-		padding: 0 1rem;
-		font-family: system-ui, sans-serif;
-	}
-	nav {
-		display: flex;
-		gap: 1rem;
-		margin-top: 1.5rem;
-	}
-</style>

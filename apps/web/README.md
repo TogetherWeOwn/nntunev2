@@ -1,38 +1,44 @@
-# NNTune web — billing slice
+# NNTune web app
 
-SvelteKit (`adapter-cloudflare`) frontend. This slice owns the user-visible
-billing surface: pricing table, usage meters, upgrade prompts and the
-graceful-degrade copy. Enforcement stays server-side.
+SvelteKit frontend for NNTune v2, deployed serverless on Cloudflare Workers via
+`@sveltejs/adapter-cloudflare`. The app talks **only** to `workers/api` through
+the typed client in `src/lib/api/client.ts` — never directly to NNTP providers,
+Hyperdrive, R2 or KV.
 
-## Routes
+Scaffolded with `npx sv create apps/web --template minimal --types ts --no-add-ons`.
 
-- `/` — landing with links to pricing/billing
-- `/pricing` — plan matrix (ADR 0004 tiers), checkout entry
-- `/account/billing` — subscription status, usage vs caps, upgrade + portal
+## Developing
 
-## Library
+```sh
+pnpm --dir apps/web install
+pnpm --dir apps/web dev
+```
 
-- `src/lib/billing/plans.ts` — plan matrix mirroring the `plans` table;
-  hydratable later from `GET /v1/plans` without changing components
-- `src/lib/billing/usage.ts` — display-only usage evaluation (soft at 80%,
-  hard at 100%; degrade copy, never billing)
-- `src/lib/billing/billingClient.ts` — typed `fetch` wrappers for the
-  backend contract below (session cookie, no secrets)
+## Checks
 
-## Backend contract (sibling cards implement)
+```sh
+pnpm --dir apps/web test      # vitest unit tests
+pnpm --dir apps/web check     # svelte-check typecheck
+pnpm --dir apps/web build     # Cloudflare production build
+pnpm --dir apps/web test:e2e  # Playwright smoke (builds + serves preview)
+```
 
-- `GET /v1/plans` → `{ plans: PlanDTO[] }`
-- `GET /v1/me/usage` → `{ period, streamSecondsMonth, concurrentNow, libraryTracks, ingestToday }`
-- `GET /v1/me/subscription` → `{ planId, status, currentPeriodEnd, trialEndsAt }`
-- `POST /v1/billing/checkout { planId }` → `{ url }` (https Stripe Checkout)
-- `POST /v1/billing/portal {}` → `{ url }` (https Stripe portal)
+Playwright needs a Chromium build (`playwright install chromium`) plus the
+system libraries Chromium links against; see `playwright.config.ts`.
 
-Entitlement checks read Postgres (`subscriptions` + `plans` + `usage_ledger`)
-on the hot path; Stripe is reconciled async via webhooks. Webhook signature
-verification and proration live backend-only.
+## Deploy
 
-## Commands
+Wrangler config and secrets land with the DevOps provisioning card; until then
+`pnpm preview` serves the production build locally. Never commit secrets —
+`CLOUDFLARE_*` and `HYPERDRIVE_*` values live in GitHub Actions secrets and
+Cloudflare only.
 
-- `npm install` then `npm test` (vitest), `npm run check` (tsc), `npm run build`
-- No secrets in this directory. Stripe keys live in Cloudflare Secrets /
-  GitHub Actions secrets only.
+## Structure
+
+```text
+src/lib/api/      # typed API-worker client (OpenAPI codegen replaces the types, not the call sites)
+src/lib/design/   # design tokens; app-wide styles in src/app.css
+src/lib/format.ts # display formatting (durations, byte counts)
+src/routes/       # landing (/), health (/api/health), …one route per slice
+tests/            # Playwright smoke
+```
