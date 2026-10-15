@@ -1,0 +1,13 @@
+# Fixture: stream worker with parity across envs.
+# Top-level blocks describe staging; [env.production.*] overrides prod.
+name = "nntune-stream"
+
+[[r2_buckets]]
+binding = "AUDIO_CACHE"
+bucket_name = "nntunev2-audio-staging"
+
+[env.production]
+
+[[env.production.r2_buckets]]
+binding = "AUDIO_CACHE"
+bucket_name = "nntunev2-audio-prod"

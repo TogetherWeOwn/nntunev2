@@ -1,0 +1,12 @@
+# Fixture: ingest worker with parity across envs.
+name = "nntune-ingest"
+
+[[queues.producers]]
+binding = "INGEST_QUEUE"
+queue = "nntunev2-ingest-staging"
+
+[env.production]
+
+[[env.production.queues.producers]]
+binding = "INGEST_QUEUE"
+queue = "nntunev2-ingest-prod"

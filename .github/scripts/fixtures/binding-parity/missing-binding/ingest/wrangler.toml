@@ -1,0 +1,10 @@
+# Fixture: ingest worker MISSING its staging queue producer.
+# The prod override is still declared, so the parity check must fail
+# naming worker ingest, env staging, binding INGEST_QUEUE.
+name = "nntune-ingest"
+
+[env.production]
+
+[[env.production.queues.producers]]
+binding = "INGEST_QUEUE"
+queue = "nntunev2-ingest-prod"

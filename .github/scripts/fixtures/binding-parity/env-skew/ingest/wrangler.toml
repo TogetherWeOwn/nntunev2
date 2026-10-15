@@ -1,0 +1,13 @@
+# Fixture: ingest worker with parity across envs (control for the
+# env-skew case; the drift lives in the stream worker).
+name = "nntune-ingest"
+
+[[queues.producers]]
+binding = "INGEST_QUEUE"
+queue = "nntunev2-ingest-staging"
+
+[env.production]
+
+[[env.production.queues.producers]]
+binding = "INGEST_QUEUE"
+queue = "nntunev2-ingest-prod"

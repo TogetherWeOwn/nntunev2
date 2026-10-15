@@ -1,0 +1,13 @@
+# Fixture: stream worker with parity across envs (control for the
+# missing-binding case; the drift lives in the ingest worker).
+name = "nntune-stream"
+
+[[r2_buckets]]
+binding = "AUDIO_CACHE"
+bucket_name = "nntunev2-audio-staging"
+
+[env.production]
+
+[[env.production.r2_buckets]]
+binding = "AUDIO_CACHE"
+bucket_name = "nntunev2-audio-prod"
