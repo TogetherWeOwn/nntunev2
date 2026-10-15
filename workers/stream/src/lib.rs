@@ -13,6 +13,8 @@
 //!   (the R2 shape; in-memory here).
 //! - [`yenc`]: yEnc decode for NNTP segments.
 //! - [`nntp`]: blocking NNTP `BODY` client for the miss path.
+//! - [`observability`]: per-play Analytics Engine row + structured JSON log
+//!   line (cache hit/miss, TTFT, bytes, pool error code; hashed identity).
 //! - [`play`]: miss-path orchestration (authorize → fetch → decode →
 //!   decrypt → chunked stream + writeback).
 //! - [`meter`]: Analytics Engine + usage-ledger events.
@@ -27,6 +29,7 @@ pub mod cache;
 pub mod grant;
 pub mod meter;
 pub mod nntp;
+pub mod observability;
 pub mod play;
 pub mod pool;
 pub mod prefetch;
