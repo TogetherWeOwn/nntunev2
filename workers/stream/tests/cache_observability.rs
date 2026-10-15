@@ -1,4 +1,4 @@
-//! Acceptance tests for [TOG-25178](/TOG/issues/TOG-25178) (roadmap R3):
+//! Acceptance tests (roadmap R3):
 //! cache observability with Analytics Engine and structured logs.
 //!
 //! Builder contract (implement in `workers/stream/src/observability.rs`,
@@ -36,8 +36,7 @@
 //!
 //! RED reason (2026-10-15): `nntune_stream::observability` does not exist
 //! yet, so this target fails to compile with `unresolved import`. The
-//! Builder on [TOG-25178](/TOG/issues/TOG-25178) turns it green without
-//! editing this file.
+//! implementation turns it green without editing this file.
 
 use nntune_stream::observability::{
     hash_user, CacheObserveEvent, CacheStatus, STAGING_QUERY_TEMPLATE,
