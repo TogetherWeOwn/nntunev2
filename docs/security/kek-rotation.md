@@ -206,12 +206,22 @@ Per row:
    ```sql
    UPDATE provider_vaults
       SET kek_version = $new, dek_wrapped = $w,
-          dek_wrapped_nonce = $n, updated_at = $now
-          -- plus rewrapped_at = $now once the follow-up migration (§2) lands
+          dek_wrapped_nonce = $n, updated_at = $now,
+          rewrapped_at = $now
     WHERE user_id = $u AND kek_version = $old;
    ```
 4. On failure: count, continue (per-row errors never abort the pass;
    poison rows surface in the dead-letter metric, never with key bytes).
+
+Inspect migration and re-wrap progress by KEK version with this count-only
+query; it reports no user identifiers or ciphertext:
+
+```sql
+SELECT kek_version, COUNT(*) AS row_count
+  FROM provider_vaults
+ GROUP BY kek_version
+ ORDER BY kek_version;
+```
 
 Job properties:
 
