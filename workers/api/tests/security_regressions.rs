@@ -507,6 +507,128 @@ fn stored_session_invalidates_pre_rotation_token_after_row_advances() {
     .is_err());
 }
 
+// --- Rotation drill (TOG-25182): grace-window reads ---------------------------
+// Staging-equivalent drill: the vault/session Worker has no HTTP entry yet
+// (slice-1 core only), so the ceremony runs here against the exact functions
+// the Worker will call (`vault::rewrap_dek`, `session::verify_session_dual`).
+// All keys are synthetic fills, never real secrets. Live staging replays this
+// sequence once `kek_by_version` + the re-wrap job land in the vault slice.
+
+/// Synthetic KEK fills: distinct per version, obviously not real key material.
+const KEK_V1: [u8; 32] = [0xA1; 32];
+const KEK_V2: [u8; 32] = [0xB2; 32];
+const KEK_WRONG: [u8; 32] = [0xC3; 32];
+const DRILL_USER: &str = "user-acceptance";
+const DRILL_PLAINTEXT: &[u8] = b"synthetic-credential-payload";
+
+fn generic_vault_error(err: vault::VaultError) -> String {
+    format!("{err}")
+}
+
+#[test]
+fn kek_grace_window_old_reads_succeed_until_retire() {
+    // Phase 0 (steady state v1): a row wrapped under KEK v1 decrypts with v1.
+    let v1_blob =
+        vault::encrypt_vault(&KEK_V1, 1, DRILL_USER, DRILL_PLAINTEXT).expect("encrypt under v1");
+    assert_eq!(v1_blob.kek_version, 1);
+    let recovered = vault::decrypt_vault(&KEK_V1, DRILL_USER, &v1_blob).expect("v1 reads v1");
+    assert_eq!(recovered, DRILL_PLAINTEXT);
+
+    // Phases 1-2 (pre-stage + flip writes to v2): the old row still decrypts
+    // with v1 while new rows wrap under v2 — this is the downtime-free grace.
+    let v2_blob =
+        vault::encrypt_vault(&KEK_V2, 2, DRILL_USER, DRILL_PLAINTEXT).expect("encrypt under v2");
+    assert_eq!(v2_blob.kek_version, 2);
+    let post_flip_read =
+        vault::decrypt_vault(&KEK_V2, DRILL_USER, &v2_blob).expect("v2 reads post-flip writes");
+    assert_eq!(post_flip_read, DRILL_PLAINTEXT);
+    let grace_read =
+        vault::decrypt_vault(&KEK_V1, DRILL_USER, &v1_blob).expect("old KEK reads during grace");
+    assert_eq!(grace_read, DRILL_PLAINTEXT);
+
+    // Phase 3 (re-wrap pass): DEK-only migration. The payload ciphertext is
+    // untouched; the wrap moves to v2 with fresh AAD.
+    let rewrapped =
+        vault::rewrap_dek(&KEK_V1, &KEK_V2, 2, DRILL_USER, &v1_blob).expect("re-wrap v1 -> v2");
+    assert_eq!(rewrapped.kek_version, 2);
+    assert_eq!(
+        rewrapped.payload_b64url, v1_blob.payload_b64url,
+        "re-wrap must not touch the payload ciphertext"
+    );
+    assert_eq!(
+        rewrapped.payload_nonce_b64url, v1_blob.payload_nonce_b64url,
+        "re-wrap must not touch the payload nonce"
+    );
+    let migrated =
+        vault::decrypt_vault(&KEK_V2, DRILL_USER, &rewrapped).expect("v2 reads rewrapped row");
+    assert_eq!(migrated, DRILL_PLAINTEXT);
+
+    // Version-pinned decrypt is strict both ways, and every failure carries
+    // the identical generic message — no version oracle for an attacker, and
+    // no distinguishing detail in operator-visible errors either.
+    for err in [
+        vault::decrypt_vault(&KEK_V2, DRILL_USER, &v1_blob).unwrap_err(),
+        vault::decrypt_vault(&KEK_V1, DRILL_USER, &rewrapped).unwrap_err(),
+        vault::decrypt_vault(&KEK_WRONG, DRILL_USER, &v1_blob).unwrap_err(),
+        vault::decrypt_vault(&KEK_WRONG, DRILL_USER, &rewrapped).unwrap_err(),
+    ] {
+        assert_eq!(
+            generic_vault_error(err),
+            "vault unavailable",
+            "wrong-version reads must fail generically"
+        );
+    }
+}
+
+const PREVIOUS_SECRET: &[u8] = b"synthetic-previous-secret-32-bytes!";
+
+#[test]
+fn session_rotation_window_end_old_tokens_already_dead() {
+    // Cutover at NOW: pre-cutover tokens verify through the dual path (grace),
+    // exactly as the runbook's step 3 requires.
+    let old_token =
+        session::issue_session(PREVIOUS_SECRET, DRILL_USER, NOW, 3600).expect("issue pre-cutover");
+    let window = session::SessionKeys::rotation(SECRET, PREVIOUS_SECRET);
+    let (claims, row) = {
+        let claims = session::verify_session_dual(&window, &old_token, NOW + 60)
+            .expect("pre-cutover cookie authenticates during the window");
+        let row = session::SessionRecord {
+            id: claims.session_id.clone(),
+            user_id: claims.user_id.clone(),
+            created_at: claims.created_at,
+            expires_at: claims.expires_at,
+            rotation_counter: claims.rotation_counter,
+            revoked: false,
+        };
+        (claims, row)
+    };
+    session::verify_stored_session(&window, &old_token, NOW + 60, &row)
+        .expect("row check passes during the window");
+    assert_eq!(claims.rotation_counter, 0);
+
+    // After window_end (created_at + MAX_SESSION_SECS) the old token is dead
+    // under BOTH secrets, so deleting the previous secret logs out nobody.
+    // The failure is the generic `invalid session` the HTTP layer maps to a
+    // re-login prompt — never a 500, never a reason oracle.
+    let after_window = NOW + session::MAX_SESSION_SECS + session::CLOCK_SKEW_SECS + 1;
+    for err in [
+        session::verify_session_dual(&window, &old_token, after_window).unwrap_err(),
+        session::verify_stored_session(&window, &old_token, after_window, &row).unwrap_err(),
+        session::verify_stored_session(
+            &session::SessionKeys::single(SECRET),
+            &old_token,
+            after_window,
+            &row,
+        )
+        .unwrap_err(),
+    ] {
+        assert_eq!(
+            format!("{err}"),
+            "invalid session",
+            "post-window failures must stay generic"
+        );
+    }
+}
 // Literal digests independently computed with SHA-256 over the UTF-8 fixtures.
 const MAGIC_TOKEN: &str = "acceptance-magic-token";
 const MAGIC_HASH: &str = "0b3af4fd85f42c8834c75383107f0b8cebf7e7acdce918cd1cf5b041b5ef22f6";
