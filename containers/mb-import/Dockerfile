@@ -1,6 +1,6 @@
 # mb-import: batch-only MusicBrainz dump import + replication applier.
 # Interactive traffic never touches this image (ADR 0001/0007).
-FROM postgres:16-bookworm
+FROM postgres:18-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates python3 \

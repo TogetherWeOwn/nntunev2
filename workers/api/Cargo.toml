@@ -13,7 +13,7 @@ crate-type = ["cdylib", "rlib"]
 aes-gcm = { version = "0.10", features = ["aes"] }
 # Shared unpadded-base64url over this crate (F-HARD-01): one audited
 # implementation for vault/auth/session. Pure Rust, wasm32-compatible.
-base64 = "0.22"
+base64 = "0.23"
 hmac = "0.13"
 # hmac 0.13 uses digest 0.11: sha2 must be 0.11 (same digest) or the
 # Hmac<Sha256> trait bounds fail with two digest versions in the graph.
