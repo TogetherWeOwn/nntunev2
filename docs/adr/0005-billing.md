@@ -235,13 +235,18 @@ subscription remains, otherwise by reconciling the tombstone without recreating
 a user. Tombstones are retained 36 months, then deleted. The account
 delete-cancel is immediate (not `cancel_at_period_end`): `DELETE
 /v1/subscriptions/{id}` with `prorate=false`, `invoice_now=true` (the final
-invoice), and `cancellation_details[reason]=account_deletion`; no refund in
+invoice), and `cancellation_details[comment]=account_deletion` as the
+deletion marker (`comment` is a request field on Cancel a subscription;
+`cancellation_details[reason]` is response-only and MUST NOT be sent —
+Stripe rejects unrecognised parameters with 400); no refund in
 this step (`proration_behavior=none` belongs only to the update call at the
 pinned API version). Cancelling stops automatic collection of open finalized
 invoices, so they are left uncollected and their refs recorded in the
 tombstone's `open_invoice_refs`/`debt_refs`; every listed subscription must be
 confirmed terminal before local rows are deleted. The implementing PR asserts
-these exact request parameters.
+these exact request parameters by sending the pinned request to stripe-mock
+with OpenAPI validation (or Stripe test mode) and asserting it is accepted,
+not only that the parameter names match this text.
 
 ## Acceptance contract for the implementing billing PR
 

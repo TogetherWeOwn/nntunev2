@@ -32,20 +32,32 @@ least-privilege credential.
    `delete_operations` row (ADR 0002 rule 3) and returns `202` with the operation
    id; a repeat DELETE returns the existing operation id with `202`. The status
    endpoint is owner-scoped (caller must own the row) and reports
-   `pending`/`running`/`failed`, plus `done` for retained library/playlist rows;
-   an erased account's result arrives by confirmation email and its old
+   `scheduled`/`pending`/`running`/`failed`, plus `done` for retained
+   library/playlist rows; for account (`scheduled`) rows the body also carries
+   `erase_after`, so the client can show when erasure starts and whether
+   cancel-deletion is still possible — a fresh account deletion polls as
+   `scheduled` with the 24-hour deadline through the whole grace window.
+   An erased account's result arrives by confirmation email and its old
    operation id is thereafter `404`. Writes fenced by a marker return `409`
    with `account_deleting` or `container_deleting` plus the operation id. The
    executor is the `delete` Workflow with hourly `delete-sweep` resume, not a
-   bare FK cascade. `DELETE /v1/account` additionally requires fresh step-up
-   authentication consumed for this action: either a verified passkey user-
-   verification assertion obtained for this user after the DELETE intent and
-   within the last 15 minutes, or a completed (claimed) magic-link token
-   consumed for this action within the same window — recorded against the
-   session id and the action name (`delete-account` / `cancel-deletion`) and
-   single-use, so an issued-but-unclaimed link, a link claimed for another
-   purpose, a replayed proof, a proof from a different session, or a stale
-   login-time proof never satisfies it (ADR 0008 single-use invariants apply).
+   bare FK cascade. `DELETE /v1/account` additionally requires a fresh
+   action-bound single-use step-up proof, stored in the `step_up_proofs` table
+   (ADR 0002) and issued through two declared endpoints: `POST
+   /v1/account/step-up/begin {action, method}` (creates the proof row and
+   issues the passkey challenge or sends the magic link with purpose
+   `step-up:<action>:<proof_id>`) and `POST /v1/account/step-up/complete
+   {proof_id, ...}` (verifies the assertion/claim and sets `verified_at`;
+   login links without a step-up purpose never verify a proof). `DELETE` (and
+   cancel-deletion) consumes the proof atomically (`UPDATE ... SET
+   consumed_at=now() WHERE verified AND unconsumed AND session AND action
+   match AND expires_at > now()` — issued within the last 15 minutes for this
+   user, session and action), so an issued-but-unclaimed link, a link claimed
+   for another purpose, a replayed proof, a proof from a different session, or
+   a stale login-time proof never satisfies it (ADR 0008 single-use invariants
+   apply). Missing, expired, unverified or mismatched proofs fail with `403`
+   and `code: step_up_required`; replaying an already-consumed proof fails
+   with `403` and `code: step_up_consumed`.
    The endpoint writes an `audit_log` row and sends a
    confirmation email; erasure starts only after a 24-hour cancellable grace
    window with `deleting_at` set, during which `POST

@@ -55,10 +55,14 @@ Nullability/FKs not repeated above are as defined by that migration. In
 particular, `sessions.rotation_counter` and `revoked` are not replaced by a
 `revoked_at` invention. Refresh must conditionally advance the stored counter,
 commit exactly one updated row, then send the cookie (ADR 0008). Auth challenges
-and audit rows are not silently given new cascade constraints by this diagram;
-account erasure looks them up by an additive `INDEX (user_id)` on each
-(account completion deletes `auth_challenges` rows by `user_id` and
-pseudonymizes `audit_log` rows by `user_id`, rule 3).
+and audit rows are not silently given new cascade constraints by this diagram.
+`audit_log.user_id` and `audit_log.source_ip` stay `NOT NULL` per the applied
+migration (pseudonymization uses the fixed sentinels `'deleted'` /
+`'redacted'`, never NULL — rule 3); `audit_log` lookups reuse the existing
+`idx_audit_user`, so no additive audit index is created. Only
+`auth_challenges` gains an additive `INDEX (user_id)` for account completion,
+which deletes `auth_challenges` rows by `user_id` and pseudonymizes
+`audit_log` rows by `user_id` (rule 3).
 
 ### Additive target tables — implementation work remains
 
@@ -174,6 +178,30 @@ playlist_tracks       id PK, playlist_id FK, track_id FK, position INTEGER,
                       UNIQUE (playlist_id, position) DEFERRABLE INITIALLY DEFERRED,
                       INDEX (playlist_id, track_id),
                       INDEX (track_id) -- GC reference test + track-delete RI path
+step_up_proofs        id UUID PK, user_id TEXT NOT NULL FK → users ON DELETE CASCADE,
+                      session_id TEXT NOT NULL, action TEXT NOT NULL
+                        ('delete-account'|'cancel-deletion'),
+                      method TEXT NOT NULL ('passkey-uv'|'magic-link'),
+                      issued_at timestamptz NOT NULL,
+                      expires_at timestamptz NOT NULL
+                        CHECK (expires_at = issued_at + INTERVAL '15 minutes'),
+                      verified_at timestamptz NULL, consumed_at timestamptz NULL,
+                      attempts SMALLINT NOT NULL DEFAULT 0
+                        CHECK (attempts >= 0),
+                      partial UNIQUE (session_id, action)
+                        WHERE consumed_at IS NULL
+                      -- Action-bound single-use step-up (ADR 0006): begin creates
+                      -- the row and issues the challenge/link with purpose
+                      -- 'step-up:<action>:<proof_id>'; login links (no purpose)
+                      -- never verify a proof. Complete verifies the
+                      -- assertion/claim and sets verified_at (attempts++ per
+                      -- try, rate-limited). DELETE/cancel-deletion consumes
+                      -- atomically via UPDATE ... SET consumed_at=now()
+                      -- WHERE id=$1 AND session_id=$session AND action=$action
+                      -- AND verified_at IS NOT NULL AND consumed_at IS NULL
+                      -- AND expires_at > now() RETURNING; zero rows rejects.
+                      -- Existing magic_link_tokens/auth_challenges/sessions gain
+                      -- NO purpose/action column; the binding lives here.
 delete_operations     id UUID PK, user_id TEXT NOT NULL FK → users ON DELETE RESTRICT,
                       scope TEXT NOT NULL ('account'|'library'|'playlist'),
                       container_id UUID NULL, cursor JSONB NOT NULL DEFAULT '{}',
@@ -445,8 +473,10 @@ executor's own billing reconcile (account gate below) and its cursor/state
 writes are exempt from this fence, as are the auth/session writers needed to
 cancel during grace and the cancel call itself: new `sessions` login rows,
 `magic_link_tokens` issue/consume, `auth_challenges` challenge/assertion,
-`webauthn_credentials.sign_count` updates, the step-up consumption record,
-`audit_log` writes, session rotation, and `POST /v1/account/cancel-deletion`;
+`webauthn_credentials.sign_count` updates, the `step_up_proofs` begin/verify/
+consume writes, `audit_log` writes, session rotation, and
+`POST /v1/account/step-up/begin`, `POST /v1/account/step-up/complete`, and
+`POST /v1/account/cancel-deletion`;
 all other billing/subscription writers and every data writer
 remain fenced once `deleting_at` is set. A fenced
 writer fails closed with native `409 Conflict` carrying
@@ -497,7 +527,8 @@ then list ALL non-terminal remote subscriptions for the stored customer id
 (never only the locally known row), cancel each immediately — not at period
 end — with the pinned delete-cancel contract (`DELETE
 /v1/subscriptions/{id}` with `prorate=false`, `invoice_now=true`,
-`cancellation_details[reason]=account_deletion`; no refund in this step;
+`cancellation_details[comment]=account_deletion` as the deletion marker
+(`reason` is response-only, never sent); no refund in this step;
 ADR 0005; `proration_behavior=none` belongs only to the update call).
 Cancelling stops automatic collection of open finalized invoices, so the gate
 leaves them uncollected and records their refs in the tombstone's
@@ -518,9 +549,17 @@ rule 4 ban on freeing a slot while remote billing can still collect. Then remove
 jobs and empty library/playlist containers, providers/indexers/vaults, Subsonic
 credentials, sessions, magic-link/WebAuthn rows and other user-FK children;
 then `DELETE FROM auth_challenges WHERE user_id=$1` (via the additive index)
-and pseudonymize `audit_log` rows for that `user_id` (`user_id=NULL,
-source_ip=NULL`, keeping only the final `account_deleted` row with its
-operation id for 13 months, then swept) — no user-keyed audit/challenge row
+and pseudonymize `audit_log` rows for that `user_id` to the fixed sentinels
+(`user_id='deleted'`, `source_ip='redacted'`, satisfying the migration's
+`NOT NULL` constraints — never NULL), excluding the final deletion row by id:
+first insert the retained row with `user_id='deleted'`,
+`action='account_deleted:<operation_id>'`, `source_ip='redacted'`,
+`ok=TRUE`, `at=<completion time>`, then run `UPDATE audit_log SET
+user_id='deleted', source_ip='redacted' WHERE user_id=$1` (which no longer
+matches the already-sentinel final row). The final row is retained 13 months,
+then swept by the daily `audit-retention-sweep` (`DELETE FROM audit_log WHERE
+action LIKE 'account_deleted:%' AND at < now-13mo`, via a partial index on
+`(action, at)` for that prefix) — no user-keyed audit/challenge row
 survives except that one retained deletion event; remove **all** of that
 user's `delete_operations` rows and, last, the account operation and user.
 Honor each actual FK in the migration manifest's order; do
@@ -1045,15 +1084,21 @@ retaining its `release_mbid_hint` without guessing. Also require:
   account completion removes all of the user's operation rows including
   in-flight scoped ones; a repeat DELETE returns the existing operation id with
   `202`; `GET /v1/operations/{id}` is owner-scoped and reports
-  pending/running/failed from the stored columns; library/playlist `done` rows
+  scheduled/pending/running/failed from the stored columns, with `erase_after`
+  in the body for account (`scheduled`) rows so the client can show when
+  erasure starts and whether cancel is still possible; a fresh account deletion
+  polls as `scheduled` with the 24-hour deadline. Library/playlist `done` rows
   persist 7 days; the account result arrives by confirmation email. Index case:
   assert `(user_id, played_at)` and `(track_id)` indexes exist on
   `play_event_outbox` and on partitioned `play_events`, plus `(track_id)`
   indexes on `library_tracks`, `playlist_tracks`, `track_sources` and
   `track_media`, `(source_job_id)` indexes on `track_sources`/`track_media`,
   `(content_hash)` indexes on `track_media`/`user_cache_grants` and partial
-  `release_art`, `(user_id)` indexes on `auth_challenges`/`audit_log`, and a
-  `(pepper_version, email_hmac)` index on `deleted_billing_tombstones`.
+  `release_art`, a `(user_id)` index on `auth_challenges` (`audit_log`
+  reuses the existing `idx_audit_user` — no duplicate), a partial
+  `(action, at)` index on `audit_log` for the `account_deleted:%` retention
+  sweep, and a `(pepper_version, email_hmac)` index on
+  `deleted_billing_tombstones`.
   At a seeded size assert EXPLAIN uses the index (no Seq Scan, no
   per-partition Seq Scan) for the GC reference test, a 500-track delete batch,
   an ingest_jobs delete during account erasure, the sweep step-5 mark test,
@@ -1062,14 +1107,21 @@ retaining its `release_mbid_hint` without guessing. Also require:
   Tombstone keyring case: rows under v1 and rotated v2 both match, and retiring
   v1 is refused while a v1 row remains.
   FKs remain restrictive; the two rule-5 exceptions are the only play-event
-  deletions. Delete-account auth case: without fresh step-up the request is
-  rejected; with it the request returns `202`, sends the confirmation email,
+  deletions. Delete-account auth case: without a verified unconsumed
+  `step_up_proofs` row the request is `403 step_up_required`; a consumed proof
+  replays as `403 step_up_consumed`; a proof for another purpose, session, or
+  action, or past its 15-minute `expires_at`, never satisfies the atomic
+  consume. With it the request returns `202`, sends the confirmation email,
   creates a `scheduled` row with `erase_after=request+24h`, a sweep at +1h
   does not start erasure, cancel at the boundary versus executor start yields
   exactly one winner (loser 409/too-late), a new-device sign-in during grace
   plus fresh step-up cancels successfully, and completion leaves no
-  `auth_challenges` row and only the retained pseudonymized `account_deleted`
-  audit row for that user (ADR 0006).
+  `auth_challenges` row and only the retained sentinel
+  (`user_id='deleted'`, `action='account_deleted:<operation_id>'`) audit row
+  for that user, run against the real migration schema so the `NOT NULL`
+  columns never see NULL (ADR 0006). Billing-gate case: the pinned
+  delete-cancel request is sent to stripe-mock with OpenAPI validation and
+  accepted (no `cancellation_details[reason]`).
 - Cover art: B requests A's local art by `coverart:{release_id}` or raw hash and
   receives 404/70 **before any fetch**. A's member request refills embedded art from
   an own current source; a verified-release member refills CAA art without a
