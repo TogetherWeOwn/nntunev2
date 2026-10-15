@@ -1,78 +1,93 @@
-# ADR 0004: Plan Matrix (Claude Pro/Max-style)
+# ADR 0004: Plan Matrix (Base / 5x / 20x)
 
-- **Status:** Accepted
+- **Status:** Accepted design; implementation and independent review gates remain.
 - **Date:** 2026-10-13
-- **Non-blocking note:** Metering primitives (`usage_ledger`, Analytics Engine)
-  are built to support these tiers from day one; exact numbers tune at launch.
-- **Rev 2026-10-14 (review round 3):** every capped dimension names its
-  authoritative writer (ingest/cache/concurrent included); `usage_ledger`
-  rows are daily; trial is Stripe-native with a hard post-trial paywall.
-- **Rev 2026-10-14 (review round 4, 4/5 → 5/5):** trial pinned to
-  `trial_settings.missing_payment_method = cancel` with trial-plan caps
-  while `trialing` (not the converted price's caps); provisional signup row
-  + reconciler upsert (ADR 0002 rule 4); `past_due` entitled only inside
-  `grace_until`; Known-rework list for the ingest sibling.
+- **Revised:** 2026-10-15 — concrete cache budgets, stock-versus-flow accounting,
+  and a bounded trial even when a payment method is present.
 
 ## Context
 
-Plans scale like Claude Pro/Max: a base paid tier plus 5x / 20x usage
-multipliers. Dimensions: monthly stream hours, concurrent streams, library
-size, ingest jobs/day, cache priority. NNTune never bundles Usenet access
-(BYOP) — plans meter *our* service, not provider bandwidth.
+A base paid tier and 5x / 20x stream allowances cover different usage levels.
+NNTune never bundles Usenet access (BYOP): plans cover our service, not a
+provider account. Prices are launch proposals for infrastructure cost recovery,
+not a claim of revenue or permission to activate live billing.
 
 ## Decision
 
-| Plan | Price (USD/mo) | Stream hrs/mo | Concurrent streams | Library tracks | Ingest jobs/day | Cache priority |
-|---|---|---|---|---|---|---|
-| Free (trial, 14d) | $0 | 10 | 1 | 1,000 | 5 | low |
-| Plus | $8 | 100 | 2 | 25,000 | 25 | standard |
-| Pro 5x | $30 | 500 | 4 | 100,000 | 100 | high |
-| Pro 20x | $100 | 2,000 | 8 | 500,000 | 400 | highest |
+| Plan | USD/mo | Stream hrs/mo | Concurrent streams | Library tracks | Ingest jobs/day | Cache budget (GiB) | Cache retention (days) | Cache priority |
+|---|---|---|---|---|---|---|---|---|
+| Free (trial, 14d) | $0 | 10 | 1 | 1,000 | 5 | 2 | 7 | low |
+| Plus | $8 | 100 | 2 | 25,000 | 25 | 20 | 30 | standard |
+| Pro 5x | $30 | 500 | 4 | 100,000 | 100 | 100 | 90 | high |
+| Pro 20x | $100 | 2,000 | 8 | 500,000 | 400 | 400 | 90 | highest |
 
-- **Stream hours** meter `SUM(stream_seconds)` per user per calendar month from
-  `play_events` → `usage_ledger`. Cached hits count the same (metering is
-  service usage, not egress).
-- **Ingest jobs/day** meter accepted jobs from the `ingest_jobs` table
-  (counted in the same transaction that accepts a job) → `usage_ledger`
-  daily rows. **Cache bytes** meter cache accounting → `usage_ledger`.
-  **Concurrent streams** enforce from the per-user pool Durable Object
-  (the authority for live stream count). Every capped dimension therefore
-  has an authoritative writer — none rests on Analytics Engine.
-- **Overage:** none — streams past the cap degrade gracefully (transcode to a
-  lower bitrate; artwork stays full quality) until the next period. No surprise
-  bills, ever.
-- **Free is a 14-day Stripe-native trial**, not a forever tier: signup creates
-  a `trialing` subscription on the trial plan (ADR 0002 rule 4) — the only
-  trial clock — with `trial_settings.missing_payment_method = cancel`
-  (ADR 0005): a trial ending with no payment method **cancels** (never the
-  `create_invoice` default that would leave an `active` $0 row, and never
-  `pause`). After the window with no paid subscription there is no
-  entitlement (hard paywall). While `trialing`, trial-plan caps apply (10
-  stream hrs, 1 concurrent, 1k tracks, 5 ingest/day) — not the caps of the
-  price the trial converts to. `past_due` is entitled only inside
-  `grace_until` (7d, reconciler-set); past grace the reconciler moves the
-  row to local-terminal `expired` (ADR 0002 rule 4). Trial requires a BYOP
-  provider (no bundled Usenet to abuse).
-- Prices are launch proposals; the `plans` table (ADR 0002) makes them data,
-  not code. Changing numbers needs no deploy, no ADR.
+Store `cache_bytes_budget` as an integer number of bytes: GiB means
+1,073,741,824 bytes, so the four budgets are 2,147,483,648; 21,474,836,480;
+107,374,182,400; and 429,496,729,600. `cache_retention_days` and
+`cache_priority` are separate plan columns. These are reclaimable server-side
+cache allowances, not durable storage promises.
 
-## Consequences
+### Measurement and enforcement
 
-- The API worker enforces caps from `usage_ledger` + `plans` on every stream
-  start; enforcement reads must be Hyperdrive-cached, never cold. The
-  effective plan is derived (live subscription, else nothing — hard
-  paywall) — no stored `users.plan_id` to diverge (ADR 0002 rule 4).
-- **Known rework this ADR imposes on sibling cards:** the ingest worker
-  writes `ingest_jobs` in the accepting transaction and rolls counts into
-  `usage_ledger` (rule: same-transaction counts, AE analytics-only) instead
-  of metering only through Analytics Engine events (`metering.rs` today has
-  no `ingest_jobs` table); the stream worker enforces concurrent caps from
-  the per-user pool Durable Object. Owned by the ingest and stream cards —
-  non-blocking here, but their review must show the writers.
-- `usage_ledger` (daily rows; monthly caps sum the calendar month) is the
-  metering authority for cap enforcement, fed by `play_events`
-  (`stream_seconds`), the `ingest_jobs` table (`ingest_jobs`), and cache
-  accounting (`cache_bytes`) — see ADR 0002 rule 5. Analytics Engine events
-  (`stream_start`, `ingest_job`) are analytics/observability only — sampled
-  and approximate, never used for enforcement or billing.
-- Overage/degrade behavior is user-visible copy owned by the frontend card.
+| Dimension | Authority and writer | Aggregation / enforcement |
+|---|---|---|
+| Stream hours | Stream worker `play_events` → `usage_ledger.stream_seconds` | Sum daily rows in the UTC calendar month; cached plays count equally |
+| Ingest jobs | API accept transaction inserts `ingest_jobs` and increments `usage_ledger.ingest_jobs` once per idempotency key | Current UTC day's row; queue retries do not count as new jobs |
+| Cache bytes | Live join of `user_cache_grants` with `cache_objects.byte_size`; stream publication / GC change the grants | Gauge, never a monthly sum: count each hash once per user; compare with `plans.cache_bytes_budget` |
+| Library tracks | `library_tracks` written at ingest `write` stage and on library edits | Count distinct tracks across that user's libraries |
+| Concurrent streams | Per-user pool Durable Object owns active leases | Enforce at acquisition; release on completion/disconnect and expire abandoned leases |
+
+`usage_ledger` stores **flows only** (stream seconds and accepted job counts).
+It has no `cache_bytes` field. Analytics Engine is sampled observability, never
+an enforcement or billing authority. A shared object counts in each granted
+user's gauge, but only once for that user even if several tracks reference it.
+ADR 0003 defines eviction and the grant deletion order.
+
+**Overage:** no usage-based bill. Stream-hour exhaustion uses the advertised
+lower-bitrate degraded mode until the next calendar month; it does not bypass
+concurrency, trial expiry or the payment gate. Cache pressure evicts least-recently
+served grants within the plan budget; tracks and refetch sources remain. Library
+and daily ingest limits reject new additions/jobs without deleting existing data.
+A downgrade preserves library metadata, blocks additions over the new limit, and
+makes excess cache grants eligible for eviction.
+
+### Trial and payment gate
+
+Free is a **single 14-day Stripe-native trial**, not a forever tier. ADR 0005 is
+the normative lifecycle: a real Stripe subscription id precedes entitlement;
+there is no provisional `trialing` DB row with a NULL Stripe id.
+
+- The trial subscription uses the $0 trial price, `trial_end`,
+  `trial_settings.end_behavior.missing_payment_method = cancel`, and
+  `cancel_at_period_end = true`. Its single item's period end must equal
+  `trial_end`. The scheduled cancellation applies **with or without a card**;
+  saving a payment method is not selecting a paid plan.
+- Trial caps apply only while `status='trialing' AND now() < trial_end`.
+  `active` on the free price is never entitled. A late webhook therefore
+  cannot extend free access. After expiry the result is a hard paywall.
+- A paid choice updates the **same** Stripe subscription/item and explicitly
+  ends the trial; it never creates a competing subscription while that one is
+  live. Paid caps require the selected paid price, consent and confirmed paid
+  invoice coverage (ADR 0005), not a checkout redirect or the $0 trial invoice.
+- Only failed **renewals of an already paid subscription** get seven days of
+  grace. A failed first payment grants no paid access. Grace is a local access
+  deadline, not permission to create a second billable subscription.
+- Trial requires a BYOP provider. Resubscription does not reset trial history.
+
+Prices and quotas are plan data, not code. Changes to advertised prices still
+need the normal product/billing review; data-driven configuration is not
+permission to change existing customer commitments.
+
+## Consequences and implementation alignment
+
+- Cap and entitlement decisions read fresh authoritative state via Hyperdrive;
+  connection pooling is not permission to serve stale revocations or counters.
+  The effective plan is derived, never copied to `users.plan_id` (ADR 0002).
+- Ingest is already merged: its Analytics Engine-only metering needs an additive
+  implementation follow-up for the idempotent `ingest_jobs` accept transaction
+  and daily ledger. This document does not claim that writer exists today.
+- Stream/cache follow-up implements the live gauge, retention and byte budgets;
+  frontend billing displays the same values and the trial/payment states.
+- Acceptance must cover two users sharing a hash, multiple mappings for one
+  user's hash, downgrade eviction, a month boundary (no sum of cache snapshots),
+  duplicate queue delivery, and every trial/payment case in ADR 0005.

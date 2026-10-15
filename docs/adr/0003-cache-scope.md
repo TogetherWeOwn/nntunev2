@@ -1,140 +1,134 @@
 # ADR 0003: Cache Scope + R2 Layout
 
-- **Status:** Accepted
+- **Status:** Accepted design; implementation and independent review gates remain.
 - **Date:** 2026-10-13
-- **Rev 2026-10-13:** addresses Paperclip Review on PR #2 — per-user serve
-  authorization via grants (finding 1), provisioned bucket names + mirror-DB
-  split (finding 8), GC over the new mapping tables (finding 3), no
-  client-visible hit/miss signal (hit oracle).
-- **Rev 2026-10-14 (review round 3):** bounded GC mark set (`last_served_at`
-  window) + eviction deletes grants; archive buckets reserved (scratch
-  placement open with ops owner); honest shared-vs-prefix trade-off with
-  stream/Subsonic rework listed.
-- **Rev 2026-10-14 (review round 4, 4/5 → 5/5):** both mark halves windowed
-  (`track_media.last_served_at` added, ADR 0002); `orphaned` defined;
-  per-user charging over shared objects + FK delete order
-  (grants → orphaned `track_media` → objects); refetch sources stored in
-  `track_sources` (ingest writer) so eviction is non-destructive.
+- **Revised:** 2026-10-15 — explicit byte/retention budgets, live gauge,
+  ingest/stream writer split, and FK-safe bounded reclamation.
 
 ## Context
 
-Audio and artwork fetched via users' own Usenet providers must be cached so
-repeat plays don't re-hit Usenet. Question: per-user cache namespaces, or a
-shared content-addressed store with cross-user dedupe?
-
-R2 buckets are already provisioned per environment (ops plan, provisioning
-card done): `nntunev2-{audio,art,archive}-{staging,prod}`. This ADR adopts
-those names; it does not invent new ones.
+Repeated plays should not repeatedly fetch through a user's Usenet provider.
+The choice is per-user object namespaces or shared storage deduplication with
+per-user authorization. Provisioned per-environment buckets are
+`nntunev2-{audio,art,archive}-{staging,prod}`; this ADR adopts those names.
 
 ## Decision
 
-**Shared storage dedupe with per-user serve authorization — not per-user
-namespaces, and not a globally readable cache.** Bytes are identical
-regardless of whose provider fetched them, so the storage key is
-`sha256(bytes)` and `cache_objects` (ADR 0002) is the global dedupe index.
-But the index is storage only, never a capability: the stream worker serves
-R2 bytes **only** on a matching `user_cache_grants(user_id, content_hash)`
-row, created only after that user's own provider fetched and hash-verified
-the object. Storage sharing is therefore invisible and unaddressable without
-the grant row — user A's bytes are never served on user B's grant, which
-reconciles threat-model §5 (the "namespace" is the grant set, not the key
-prefix). Likewise the track→bytes mapping is per-user (`track_media`, ADR
-0002): a global mapping would let one user's mis-matched or malicious ingest
-poison that track for everyone.
+**Shared content-addressed storage with per-user serve grants.** A global
+`cache_objects` row is a storage index, never authorization. Serving bytes
+requires both a per-user `track_media` mapping and a
+`user_cache_grants(user_id, content_hash)` row. A grant is created only after
+that user's own provider fetched and hash-verified the bytes. Knowing a hash
+or adding another user's track to a library confers no access. Per-user mappings
+also prevent one user's bad match from poisoning everyone else's track.
 
-`cached_hit` is server-side metering only — it is never returned to clients,
-and responses carry no header distinguishing hit from miss, so a timing/size
-difference can't become a cross-user fetch oracle.
+`cached_hit` is server-side telemetry only. Do not return it or hit/miss headers,
+expose hash-existence endpoints, or skip the own-provider proof because another
+user has cached an object. These rules remove direct hit oracles; timing
+resistance still needs security testing, not a claim based only on headers.
 
-### R2 layout (provisioned names + per-bucket key layout)
+### R2 layout
 
 ```text
 nntunev2-audio-{staging,prod}    # immutable audio bytes
   {sha256hex[0:2]}/{sha256hex[2:4]}/{sha256hex}
-nntunev2-art-{staging,prod}      # derived artwork renditions
+nntunev2-art-{staging,prod}      # deterministic artwork renditions
   {sha256hex[0:2]}/{sha256hex[2:4]}/{sha256hex}-{size}
-nntunev2-archive-{staging,prod}  # reserved archive capacity
-                                 # (retention-checked; no Worker binding
-                                 # by default — NOT scratch storage)
+nntunev2-archive-{staging,prod}  # retention-checked reserve, not scratch
 ```
 
-- Audio/art objects are **immutable and content-addressed**: same bytes →
-  same key. Overwrite never happens; corruption is detected by hash mismatch.
-- Ingest scratch (NZB working copies, par2 repair sets) and MB dump staging
-  placement is **open — to confirm with the ops owner** (candidates: a
-  dedicated scratch bucket, or `tmp/` in the audio bucket). This ADR does
-  not place `tmp/` and claims no lifecycle expiry on the archive buckets,
-  which the ops runbook treats as retention-checked.
-- `ref_count` in `cache_objects` is advisory (GC hint), not authoritative.
-  Collection is mark-and-sweep with a **bounded** mark set: `track_media` ∪
-  `user_cache_grants`, **each** filtered by its own `last_served_at` inside
-  the retention window (per-plan, e.g. 30d Plus / 90d Pro — `track_media`
-  carries `last_served_at` per ADR 0002, refreshed when that user's track
-  is served). Rows older than the window on either half are eviction
-  candidates, not survivors — so the window actually reclaims on both
-  halves. Eviction runs against the per-plan `cache_bytes` budget
-  (`usage_ledger`, ADR 0004) in `cache_priority` order (lower tiers first;
-  higher tiers' working sets are swept last). Charging is per-user over the
-  shared store: a user's `cache_bytes` = SUM(`byte_size`) over **that
-  user's** grants, so a shared object's bytes count toward every granted
-  user and evicting user A's grant frees A's budget while user B's grant
-  keeps the object alive. Delete order is FK-safe: eviction **deletes the
-  grant rows first, then the newly-orphaned `track_media` rows** (orphaned
-  = a `track_media` row whose `(user_id, content_hash)` has no matching
-  grant row, or whose track left the user's libraries), **then** sweepable
-  `cache_objects` (zero grants plus zero referencing `track_media` rows) —
-  the `track_media.content_hash → cache_objects` FK requires this order,
-  and a stale grant alone never makes an object sweepable while a
-  `track_media` row still points at it.
-- Per-plan **cache priority** (ADR 0004) controls eviction order and prefetch
-  depth, not visibility: higher tiers' working sets are swept last.
-- Note: ADR 0007's `nntunev2-art` reference must gain the environment suffix
-  above; owned by the MB card (non-blocking here).
+Audio/art objects are immutable and hash-verified. Archive buckets have no Worker
+binding by default. Scratch placement for ingest repair and MB dumps is not
+decided here: the ops follow-up must pin placement/retention before using it.
+No archive lifecycle expiry is assumed. The MB implementation must use the
+environment-qualified art bucket, not an invented unsuffixed bucket.
 
-### Alternatives considered
+### Writers and refetch
 
-- **Per-user prefixes (`u/{user_id}/...`):** rejected — but on a narrower
-  basis than first written. Under the grant model every user still fetches
-  bytes through their own provider before receiving a grant, so shared
-  storage saves **R2 storage only** (dedupe on overlapping libraries), not
-  Usenet egress or provider quota. The kept benefit is paid for with the
-  grant / `track_media` / GC-marking machinery, and per-user prefixes would
-  give isolation by construction. Shared-plus-grants is kept because R2
-  dedupe at our overlapping-library ratios outweighs that ops cost; if
-  grant ops cost bites in practice, per-user prefixes are the named
-  fallback (no new ADR needed to revisit, but the revisit must re-list the
-  rework below).
-- **Global mapping without grants (original draft of this ADR):** rejected on
-  review — any user could add any track to their library and read bytes
-  another user's provider fetched, redistributing BYOP content across
-  tenants and breaking the BYOP premise; plus cross-user cache poisoning.
-- **No shared cache (always re-fetch):** rejected — defeats the product's
-  offline-friendly goal and burns users' provider quotas.
+1. **Accept:** the API inserts an idempotent `ingest_jobs` row and increments
+   the day's accepted-job count. No track id or media hash is available yet.
+2. **Ingest `write`, after `match`:** commit the resolved `tracks`,
+   `library_tracks` and per-user `track_sources` in one transaction. The source
+   contains the parsed, ordered segment list (or a durable recoverable NZB
+   manifest), not just an expiring download URL. An unmatched track gets a local
+   id with NULL MBID. Ingest does not publish audio hashes or cache grants.
+3. **Stream publication:** fetch through the requesting user's provider,
+   verify the complete object's hash, then publish `cache_objects`,
+   `track_media` and `user_cache_grants` for that user. Initialize both
+   `last_served_at` columns at publication; refresh the grant and the served
+   mapping on subsequent serves. Record the fetching `provider_id` on the grant;
+   its composite FK binds it to the same user (ADR 0002). A metadata probe alone
+   is not byte proof. Retain the provider row while grants reference it; revoke
+   or evict those grants normally before deletion, never NULL out the proof.
+4. **Missing grant or missing R2 object:** use `track_sources` to fetch through
+   that user's provider again. No cross-user fallback. A missing library/source
+   is 404; upstream unavailability is a retryable fetch error, not permission to
+   borrow another user's grant. Eviction never deletes `track_sources`.
 
-## Consequences
+The source survives for the life of the user's track. Removing one library
+membership must not remove it while the track remains in another of that user's
+libraries. Removing the final membership deletes that user's source and mappings;
+a grant can be released when no other mapping for that user needs its hash.
+Sources use the versioned, row-bound encryption contract in ADR 0002.
 
-- The stream worker verifies `sha256` on ingest before indexing; mismatches are
-  quarantined, never served. Indexing writes `track_media` + `user_cache_grants`
-  for the fetching user only.
-- Serving checks the grant row on every request; missing grant → fetch via the
-  requesting user's own provider (or 404), never a cross-user byte serve. A
-  granted-but-absent object (evicted between grant check and read) takes the
-  same path: re-fetch via the requesting user's own provider (or 404) —
-  never an error that leaks another tenant's state. The refetch source is
-  stored, not improvised: `track_sources(user_id, track_id)` (ADR 0002)
-  holds the envelope-encrypted NZB ref / ordered segment message-id list
-  the stream worker's `PlayInput.segments` needs, written by the ingest
-  worker in the accepting transaction and kept for the life of the library
-  track — so budget eviction is non-destructive and a library-resident
-  track stays playable without manual re-ingest. The `(or 404)` branch is
-  reached only when no source exists (pre-ADR ingests, or the source left
-  with the library track).
-- Cache GC is a batch Workflow (Containers-eligible), never inline on play.
-- Artwork renditions are derived deterministically (`{hash}-{size}`) so they
-  dedupe too.
-- **Known rework this ADR imposes on sibling cards:** the stream worker's
-  global `track/<track_id>` pointer + signed-grant serve path and the
-  Subsonic card's cache reads must move to the per-user
-  `track_media` + `user_cache_grants` check; neither may serve on a bare
-  content hash. Owned by the stream and Subsonic compat cards —
-  non-blocking here, but their review must show the grant check.
+### Accounting and collection
+
+`plans.cache_bytes_budget` and `plans.cache_retention_days` have concrete values
+in ADR 0004. A user's `cache_bytes` is a **live gauge**:
+
+```sql
+SELECT COALESCE(SUM(o.byte_size), 0)
+FROM user_cache_grants g
+JOIN cache_objects o ON o.content_hash = g.content_hash
+WHERE g.user_id = $1;
+```
+
+The grant primary key counts each hash once per user. Sharing with another user
+saves physical R2 space but does not discount either user's allowance. The gauge
+is not in the daily `usage_ledger` and is never summed over a month.
+
+The cache-GC Workflow runs in bounded batches and follows this order:
+
+1. Identify grants outside their plan's retention window. For an over-budget
+   user, additionally select least-recently-served grants until the remaining
+   gauge fits the budget. Users without entitlement have a zero cache budget;
+   this never deletes their library metadata or sources. `cache_priority`
+   orders work under shared storage pressure (lower tiers first); it cannot
+   exempt a user from their own byte budget. An object larger than the user's
+   entire budget is streamed without persistent cache admission.
+2. Delete those grants, then orphaned `track_media` rows. Orphaned means the
+   `(user_id, content_hash)` grant is absent or the track has left all of that
+   user's libraries. Old mappings cannot independently retain objects forever:
+   both timestamps are windowed and stale mappings are prunable. A recent grant
+   still protects bytes used by another mapping for that user.
+3. Sweep a `cache_objects` row/R2 object only with **zero grants and zero
+   referencing mappings**. Serialize publication and sweep for that hash, and
+   recheck references under that serialization before deleting bytes. DB FKs
+   must not be disabled. Physical-delete failures are retried; they never
+   restore a removed authorization. `ref_count` is advisory, not the mark set.
+
+Evicting user A's grant frees A's gauge even if user B keeps the object alive.
+Never delete B's grant merely because A reached a limit. In-flight reads must
+handle a reclaimed object through the same own-provider refetch path. GC is
+batch Workflow work (Containers-eligible), not unbounded work on a play request.
+
+## Alternatives
+
+- **Per-user prefixes:** simpler isolation, rejected for now because shared
+  libraries can reduce physical R2 bytes. The grant model still requires every
+  user's first own-provider fetch: it saves storage, **not Usenet quota**. No
+  measured dedupe ratio is claimed. Revisit with measured savings/ops cost if
+  the added grant machinery is not worthwhile.
+- **Global mapping without grants:** rejected; permits cross-tenant content
+  redistribution and cache poisoning.
+- **No cache:** rejected; repeat plays unnecessarily consume provider quota.
+
+## Consequences and implementation alignment
+
+Stream and Subsonic cache readers must replace global `track/<track_id>` or bare
+hash lookups with the per-user mapping and grant checks. The merged ingest
+pipeline needs a follow-up `write` transaction for normalized library rows and
+sources, not audio publication. These are implementation acceptance requirements,
+not claims that current main already implements them. Tests must cover shared
+hashes, final versus non-final membership removal, eviction/refetch, budget and
+retention boundaries, and publication racing a sweep.

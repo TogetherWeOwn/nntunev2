@@ -1,20 +1,10 @@
 # ADR 0006: API Surface (Native REST + Subsonic Subset)
 
-- **Status:** Accepted
+- **Status:** Accepted design; implementation and independent review gates remain.
 - **Date:** 2026-10-13
-- **Rev 2026-10-13:** addresses Paperclip Review on PR #2 — Subsonic auth via
-  per-client app passwords + `apiKey` (finding 2, security), spec-valid error
-  codes (finding 7). Exact code/auth mapping is pinned by the Subsonic compat
-  card's contract tests against real clients.
-- **Rev 2026-10-14 (review round 3):** `apiKey` sent without `u` (mixed → 43),
-  hash-only lookup with reversible secret only for the `t`/`s` opt-in;
-  `p=enc:` dropped; `/rest/*` log redaction, `scope` allowlist, per-credential
-  rate limits + `last_used_at` alerting.
-- **Rev 2026-10-14 (review round 4, 4/5 → 5/5):** `api_key_hmac`
-  (HMAC-SHA256 + `SUBSONIC_INDEX_PEPPER`, ≥128-bit CSPRNG keys) replaces
-  bare SHA-256; token-form `u` defined as the per-credential generated
-  `subsonic_username` (email never accepted); Known-rework list for the
-  Subsonic sibling.
+- **Revised:** 2026-10-15 — versioned HMAC lookup, row-bound token envelopes,
+  explicit native/compat auth scope, and implementation acceptance requirements.
+  No completed review score or client-compatibility test result is claimed.
 
 ## Context
 
@@ -34,8 +24,9 @@ least-privilege credential.
 1. **Native REST (OpenAPI 3.1, `openapi.yaml` at repo root of `workers/api`):**
    the canonical API. `apps/web` uses only this. Resources: `/v1/{me,library,
    artists,releases,tracks,playlists,plays,providers,indexers,search,stream}`.
-   Auth: session cookie (web) + bearer API keys (clients). Versioned (`/v1`);
-   breaking changes ship `/v2` alongside, never by mutating `/v1`.
+   Auth at launch: the existing session cookie. Native REST bearer keys are
+   deferred to a separate scoped-credential design, not borrowed from Subsonic.
+   Versioned (`/v1`); breaking changes ship `/v2` alongside, never mutate `/v1`.
 2. **Subsonic subset** (`/rest/*`, OpenSubsonic-aligned): `ping`, `getLicense`,
    `getMusicFolders`, `getIndexes`, `getMusicDirectory`, `getAlbumList2`,
    `search3`, `getArtist`, `getAlbum`, `getSong`, `stream`, `getCoverArt`,
@@ -53,18 +44,30 @@ least-privilege credential.
   ADR 0002): random, revocable, scoped to the Subsonic surface. Two forms,
   negotiated per credential (`auth_mode`):
   - `apiKey` (default, OpenSubsonic extension): the client sends `apiKey`
-    **without** `u`; the server resolves it via `api_key_hmac`
-    (HMAC-SHA256 keyed by the `SUBSONIC_INDEX_PEPPER` Worker secret,
-    UNIQUE lookup). Keys are ≥128-bit CSPRNG (prefer 256-bit); shorter /
-    procedural keys are rejected at creation. A request carrying both `u`
-    and `apiKey` is error 43; an unknown key is error 44. Plaintext keys
-    are shown once at creation and never stored (HMAC-lookup only).
+    **without** `u`; the server resolves it via `(pepper_version, api_key_hmac)`
+    (HMAC-SHA256 keyed by the exact version in the `SUBSONIC_INDEX_PEPPER`
+    Worker-secret keyring defined in ADR 0002, composite UNIQUE lookup).
+    It computes candidates under at most
+    the current and previous pepper; an old-version match is re-HMACed to
+    the current version using the presented key, atomically and without
+    storing plaintext. ADR 0002 specifies the retirement precondition for
+    dormant credentials: stored HMACs cannot be rehashed without the key.
+    The server generates 256-bit CSPRNG keys (minimum entropy 128 bits), not
+    caller-selected passwords. A request carrying both `u` and `apiKey` is
+    error 43; an unknown key is error 44. Plaintext keys are shown once at
+    creation and never stored (HMAC-lookup only).
   - Token form (`u` + `t = md5(secret + salt)`, `s = salt`): only for
     credentials that opt in (`auth_mode` includes `token`); `u` is the
     credential's generated `subsonic_username` (non-PII UNIQUE, shown once
     with the secret — ADR 0002 rule 2), and the server looks up by it then
     unwraps exactly one envelope-encrypted secret (reversible, KEK outside
-    the DB, shown once at creation). Email is never accepted as `u`.
+    the DB, shown once at creation). Persist `token_envelope_version`,
+    `token_kek_version`, `token_dek_wrapped_nonce`, `token_dek_wrapped`,
+    `token_payload_nonce` and `token_payload_format`, alongside
+    `token_secret_encrypted`. Authenticated context binds user, credential id
+    and field as defined by ADR 0002. Copying a ciphertext
+    to another credential must fail authentication. Email is never accepted
+    as `u`.
     Reversibility exists **only** for this form, which the OpenSubsonic
     extension page tells servers to phase out.
   Plaintext `p=` (and its hex alias `p=enc:`) is **rejected** — both put
@@ -90,10 +93,13 @@ least-privilege credential.
   `apiKey`-without-`u`, error 43 on mixed `u`+`apiKey`, credential
   rotation/revocation, and redaction of auth params in emitted logs).
 - Deprecating any Subsonic endpoint needs a new ADR.
-- **Known rework this ADR imposes on sibling cards:** the Subsonic compat
-  card drops `u+p` (including `p=enc:`) entirely — legacy clients use
-  `t`/`s` with the generated `subsonic_username` as `u` — adopts the
-  `api_key_hmac` + pepper lookup, and serves cache reads only on the
-  per-user `track_media` + `user_cache_grants` check (ADR 0003), never on a
-  bare content hash. Owned by the Subsonic compat card — non-blocking here,
-  but its review must show the auth-order and grant-check changes.
+- **Implementation alignment:** the Subsonic compatibility implementation
+  drops `u+p` (including `p=enc:`), adds generated `subsonic_username` for
+  `t`/`s`, adopts versioned HMAC lookup and token envelopes, and reads cache
+  bytes only with per-user `track_media` + `user_cache_grants` (ADR 0003).
+  This is an acceptance contract, not a claim that the code has migrated.
+  Already merged changes need additive follow-up migrations; do not edit an
+  applied migration or rely on `CREATE TABLE IF NOT EXISTS` to change it.
+  Tests include dual-pepper lookup, dormant-key retirement refusal,
+  wrong-user/credential/field envelope swaps, auth-mode/scope checks, and
+  cache grants. Compatibility credentials cannot authenticate native REST.
