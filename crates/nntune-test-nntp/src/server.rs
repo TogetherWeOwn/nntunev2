@@ -193,6 +193,9 @@ async fn handle_connection(
         .await;
 
     let mut buf = String::new();
+    // Group selected by a successful GROUP (RFC 3977 s5.1): XOVER with a
+    // range requires one, otherwise the server answers 412.
+    let mut selected: Option<String> = None;
     loop {
         buf.clear();
         // Select on the shutdown signal so dropping the server closes this
@@ -315,6 +318,7 @@ async fn handle_connection(
                 let _ = writer
                     .write_all(format!("211 {count} {low} {high} {g}\r\n").as_bytes())
                     .await;
+                selected = Some(g);
             }
             "LIST" => {
                 if !check_auth(&shared.config, &authed, &mut writer).await {
@@ -340,11 +344,44 @@ async fn handle_connection(
                 if !check_auth(&shared.config, &authed, &mut writer).await {
                     continue;
                 }
-                let _ = writer.write_all(b"224 Overview follows\r\n").await;
-                for a in &shared.config.articles {
-                    if !xover_in_range(&arg, a.number) {
+                // RFC 3977 s8.3.2: collect matches first. A range that
+                // matches nothing (including a reversed range) gets 423; a
+                // range with no selected group gets 412; an unparseable
+                // range gets 501. Only then is 224 written.
+                let range = parse_xover_arg(&arg);
+                if matches!(range, XoverRange::Invalid) {
+                    let _ = writer
+                        .write_all(b"501 Syntax error in XOVER range\r\n")
+                        .await;
+                    continue;
+                }
+                let group = match (&range, &selected) {
+                    (XoverRange::All, _) => None,
+                    (_, Some(g)) => Some(g.clone()),
+                    (_, None) => {
+                        let _ = writer.write_all(b"412 No newsgroup selected\r\n").await;
                         continue;
                     }
+                };
+                let matches: Vec<_> = shared
+                    .config
+                    .articles
+                    .iter()
+                    .filter(|a| {
+                        if let Some(g) = group.as_deref() {
+                            if a.group != g {
+                                return false;
+                            }
+                        }
+                        xover_range_matches(&range, a.number)
+                    })
+                    .collect();
+                if !matches!(range, XoverRange::All) && matches.is_empty() {
+                    let _ = writer.write_all(b"423 No articles in that range\r\n").await;
+                    continue;
+                }
+                let _ = writer.write_all(b"224 Overview follows\r\n").await;
+                for a in matches {
                     let overview = format!(
                         "{}\t{}\t{}\t{}\t{}\t\t0\t0\r\n",
                         a.number, a.subject, a.from, a.date, a.message_id
@@ -573,43 +610,60 @@ async fn write_throttled(
     true
 }
 
-/// Whether `number` falls inside the requested XOVER range (RFC 3977 §6.4).
-/// Accepted forms: `n`, `n-`, `n-m` (first token only). Empty or
-/// unparseable ranges match everything to preserve the legacy list-all
-/// behavior for callers that do not pass a range.
-fn xover_in_range(arg: &str, number: u32) -> bool {
-    match parse_xover_range(arg) {
-        None => true,
-        Some((lo, hi)) => number >= lo && number <= hi,
-    }
+/// Parsed XOVER range argument (RFC 3977 §8.3). Accepted forms: `n`,
+/// `n-`, `n-m` (first token only).
+enum XoverRange {
+    /// No argument: legacy list-all for callers that pass no range.
+    All,
+    /// A parsed range. May match nothing — including a reversed range —
+    /// which the caller reports as 423.
+    Span(u32, u32),
+    /// Non-empty but unparseable: the caller reports 501 instead of
+    /// treating it as list-all.
+    Invalid,
 }
 
-fn parse_xover_range(arg: &str) -> Option<(u32, u32)> {
-    let token = arg.split_whitespace().next()?.trim();
+fn parse_xover_arg(arg: &str) -> XoverRange {
+    let Some(token) = arg.split_whitespace().next() else {
+        return XoverRange::All;
+    };
     if token.is_empty() {
-        return None;
+        return XoverRange::All;
     }
     if let Some((start_s, end_s)) = token.split_once('-') {
         if start_s.is_empty() && end_s.is_empty() {
-            return None;
+            return XoverRange::Invalid;
         }
         if start_s.is_empty() {
             // "-m": articles 1..=m.
-            let end: u32 = end_s.parse().ok()?;
-            return Some((1, end));
+            return end_s
+                .parse()
+                .map(|end| XoverRange::Span(1, end))
+                .unwrap_or(XoverRange::Invalid);
         }
-        let start: u32 = start_s.parse().ok()?;
+        let Ok(start): Result<u32, _> = start_s.parse() else {
+            return XoverRange::Invalid;
+        };
         if end_s.is_empty() {
             // "n-": n..=MAX.
-            return Some((start, u32::MAX));
+            return XoverRange::Span(start, u32::MAX);
         }
-        let end: u32 = end_s.parse().ok()?;
-        if start <= end {
-            return Some((start, end));
-        }
-        // Reversed range matches nothing (still a 224 with an empty list).
-        return Some((1, 0));
+        return end_s
+            .parse()
+            .map(|end| XoverRange::Span(start, end))
+            .unwrap_or(XoverRange::Invalid);
     }
-    let n: u32 = token.parse().ok()?;
-    Some((n, n))
+    token
+        .parse()
+        .map(|n| XoverRange::Span(n, n))
+        .unwrap_or(XoverRange::Invalid)
+}
+
+/// Whether `number` falls inside a parsed XOVER range.
+fn xover_range_matches(range: &XoverRange, number: u32) -> bool {
+    match range {
+        XoverRange::All => true,
+        XoverRange::Span(lo, hi) => number >= *lo && number <= *hi,
+        XoverRange::Invalid => false,
+    }
 }

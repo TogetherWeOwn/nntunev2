@@ -179,6 +179,9 @@ async fn xover_lists_all_articles() {
     let server = TestNntpServer::spawn_for_test().await;
     let mut c = Client::connect(&server).await;
     c.auth("testuser", "testpass").await;
+    // A ranged XOVER requires a selected group (412 otherwise).
+    let g = c.cmd("GROUP alt.binaries.nntune.test").await;
+    assert!(g.starts_with("211"), "GROUP: {g:?}");
     let (first, block) = c.cmd_block("XOVER 1-").await;
     assert!(first.starts_with("224"), "got {first:?}");
     let text = String::from_utf8_lossy(&block);
@@ -767,4 +770,46 @@ async fn xover_returns_only_requested_range() {
         .map(|row| row.split('\t').next().expect("article number"))
         .collect();
     assert_eq!(numbers, ["3", "4"]);
+}
+
+#[tokio::test]
+async fn xover_empty_and_reversed_ranges_get_423() {
+    // RFC 3977 s8.3.2: a range matching nothing in the selected group —
+    // including a reversed range — gets 423, not an empty 224 list, so a
+    // batching header scan can stop at the end of the group.
+    let server = TestNntpServer::spawn_for_test().await;
+    let mut c = Client::connect(&server).await;
+    c.auth("testuser", "testpass").await;
+    let g = c.cmd("GROUP alt.binaries.nntune.test").await;
+    assert!(g.starts_with("211"), "GROUP: {g:?}");
+    for range in ["XOVER 500-600", "XOVER 4-3", "XOVER 11"] {
+        let r = c.cmd(range).await;
+        assert!(r.starts_with("423"), "{range}: got {r:?}");
+    }
+}
+
+#[tokio::test]
+async fn xover_range_without_selected_group_gets_412() {
+    // RFC 3977 s8.3.2: a range request before any successful GROUP gets
+    // 412, so callers cannot mistake unscoped rows for group rows.
+    let server = TestNntpServer::spawn_for_test().await;
+    let mut c = Client::connect(&server).await;
+    c.auth("testuser", "testpass").await;
+    let r = c.cmd("XOVER 3-4").await;
+    assert!(r.starts_with("412"), "got {r:?}");
+}
+
+#[tokio::test]
+async fn xover_unparseable_range_gets_501() {
+    // An unparseable range must not silently degrade to list-all: a
+    // scanner typo would otherwise see the whole corpus as one batch.
+    let server = TestNntpServer::spawn_for_test().await;
+    let mut c = Client::connect(&server).await;
+    c.auth("testuser", "testpass").await;
+    let g = c.cmd("GROUP alt.binaries.nntune.test").await;
+    assert!(g.starts_with("211"), "GROUP: {g:?}");
+    for range in ["XOVER abc", "XOVER 99999999999-", "XOVER -"] {
+        let r = c.cmd(range).await;
+        assert!(r.starts_with("501"), "{range}: got {r:?}");
+    }
 }
