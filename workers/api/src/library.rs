@@ -1280,4 +1280,660 @@ mod tests {
             playlist_insert_statement()
         );
     }
+
+    fn response_genre_rows() -> Vec<GenreRow> {
+        vec![
+            GenreRow {
+                internal_id: 777,
+                public_id: "g-own-priv".into(),
+                owner_user_id: "user-alice".into(),
+                name: "Jazz".into(),
+                is_public: false,
+            },
+            GenreRow {
+                internal_id: 888,
+                public_id: "g-bob-pub".into(),
+                owner_user_id: "user-bob".into(),
+                name: "Rock".into(),
+                is_public: true,
+            },
+        ]
+    }
+
+    fn response_playlist_rows() -> Vec<PlaylistRow> {
+        vec![
+            PlaylistRow {
+                internal_id: 999,
+                public_id: "p-own-priv".into(),
+                owner_user_id: "user-alice".into(),
+                name: "Mine".into(),
+                items: vec!["track-1".into()],
+                is_public: false,
+            },
+            PlaylistRow {
+                internal_id: 111,
+                public_id: "p-bob-pub".into(),
+                owner_user_id: "user-bob".into(),
+                name: "Party".into(),
+                items: vec!["track-2".into()],
+                is_public: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn responses_carry_only_public_id_and_true_visibility() {
+        // Whole-struct asserts: mapping `id` from the internal BIGSERIAL or
+        // forcing `is_public` either way must fail here, for a private own
+        // row and a public foreign row, on every read shape.
+        let genres = response_genre_rows();
+        let own_genre = get_genre(Some("user-alice"), &genres, "g-own-priv").unwrap();
+        assert_eq!(
+            own_genre,
+            GenreResponse {
+                id: "g-own-priv".into(),
+                name: "Jazz".into(),
+                is_public: false,
+            }
+        );
+        assert_ne!(own_genre.id, genres[0].internal_id.to_string());
+        assert_eq!(
+            get_genre(Some("user-alice"), &genres, "g-bob-pub").unwrap(),
+            GenreResponse {
+                id: "g-bob-pub".into(),
+                name: "Rock".into(),
+                is_public: true,
+            }
+        );
+        assert_eq!(
+            list_genres(Some("user-alice"), &genres).unwrap(),
+            vec![
+                GenreResponse {
+                    id: "g-own-priv".into(),
+                    name: "Jazz".into(),
+                    is_public: false,
+                },
+                GenreResponse {
+                    id: "g-bob-pub".into(),
+                    name: "Rock".into(),
+                    is_public: true,
+                },
+            ]
+        );
+        // Paged order is public-id descending: "g-own-..." > "g-bob-...".
+        assert_eq!(
+            list_genres_page(Some("user-alice"), &genres, 10, None).unwrap(),
+            list_genres(Some("user-alice"), &genres).unwrap()
+        );
+
+        let playlists = response_playlist_rows();
+        let own_playlist = get_playlist(Some("user-alice"), &playlists, "p-own-priv").unwrap();
+        assert_eq!(
+            own_playlist,
+            PlaylistResponse {
+                id: "p-own-priv".into(),
+                name: "Mine".into(),
+                items: vec!["track-1".into()],
+                is_public: false,
+            }
+        );
+        assert_ne!(own_playlist.id, playlists[0].internal_id.to_string());
+        assert_eq!(
+            get_playlist(Some("user-alice"), &playlists, "p-bob-pub").unwrap(),
+            PlaylistResponse {
+                id: "p-bob-pub".into(),
+                name: "Party".into(),
+                items: vec!["track-2".into()],
+                is_public: true,
+            }
+        );
+        assert_eq!(
+            list_playlists(Some("user-alice"), &playlists).unwrap(),
+            vec![
+                PlaylistSummary {
+                    id: "p-own-priv".into(),
+                    name: "Mine".into(),
+                    is_public: false,
+                },
+                PlaylistSummary {
+                    id: "p-bob-pub".into(),
+                    name: "Party".into(),
+                    is_public: true,
+                },
+            ]
+        );
+        assert_eq!(
+            list_playlists_page(Some("user-alice"), &playlists, 10, None).unwrap(),
+            list_playlists(Some("user-alice"), &playlists).unwrap()
+        );
+        // Serialized single reads carry no internal id and no owner.
+        for json in [
+            serde_json::to_string(&own_genre).unwrap(),
+            serde_json::to_string(&own_playlist).unwrap(),
+        ] {
+            assert!(!json.contains("777"), "{json}");
+            assert!(!json.contains("999"), "{json}");
+            assert!(!json.contains("user-alice"), "{json}");
+            assert!(!json.contains("owner"), "{json}");
+        }
+    }
+
+    #[test]
+    fn insert_intents_carry_caller_visibility_timestamp_and_fresh_ids() {
+        // Whole-intent asserts for both visibilities: inverting `is_public`,
+        // emptying the owner, zeroing `created_at`, or fixing the public id
+        // must fail here. Names and items are trimmed by validation.
+        for is_public in [true, false] {
+            let genre =
+                prepare_genre_insert(Some("user-alice"), "  Jazz  ", is_public, 42).unwrap();
+            assert_eq!(
+                genre,
+                NewGenre {
+                    public_id: genre.public_id.clone(),
+                    owner_user_id: "user-alice".into(),
+                    name: "Jazz".into(),
+                    is_public,
+                    created_at: 42,
+                }
+            );
+            assert_eq!(genre.public_id.len(), 22);
+            assert!(genre
+                .public_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+
+            let playlist = prepare_playlist_insert(
+                Some("user-alice"),
+                "  Party  ",
+                vec!["  track-1  ".into()],
+                is_public,
+                7,
+            )
+            .unwrap();
+            assert_eq!(
+                playlist,
+                NewPlaylist {
+                    public_id: playlist.public_id.clone(),
+                    owner_user_id: "user-alice".into(),
+                    name: "Party".into(),
+                    items: vec!["track-1".into()],
+                    is_public,
+                    created_at: 7,
+                }
+            );
+            assert_eq!(playlist.public_id.len(), 22);
+        }
+        // Both builders call `new_public_id`: repeated inserts never reuse an
+        // id (a constant would also hit the UNIQUE constraint).
+        let genre_a = prepare_genre_insert(Some("user-alice"), "A", false, 1).unwrap();
+        let genre_b = prepare_genre_insert(Some("user-alice"), "A", false, 1).unwrap();
+        assert_ne!(genre_a.public_id, genre_b.public_id);
+        let playlist_a =
+            prepare_playlist_insert(Some("user-alice"), "A", vec![], false, 1).unwrap();
+        let playlist_b =
+            prepare_playlist_insert(Some("user-alice"), "A", vec![], false, 1).unwrap();
+        assert_ne!(playlist_a.public_id, playlist_b.public_id);
+    }
+
+    #[test]
+    fn insert_paths_validate_name_and_items_at_boundaries() {
+        // Authentication first on both builders.
+        assert_eq!(
+            prepare_genre_insert(None, "Jazz", false, 1),
+            Err(LibraryError::Unauthorized)
+        );
+        assert_eq!(
+            prepare_playlist_insert(None, "Party", vec![], false, 1),
+            Err(LibraryError::Unauthorized)
+        );
+        // Name validation on BOTH inserts (not just genre): blank and
+        // 121-char names are Invalid; exactly 120 chars is accepted, and the
+        // limit counts chars, not bytes (120 two-byte chars is fine).
+        let too_long = "x".repeat(121);
+        let max_name = "x".repeat(120);
+        let max_name_wide = "é".repeat(120);
+        assert_eq!(max_name_wide.len(), 240);
+        for bad in ["", "   ", too_long.as_str(), &"é".repeat(121)] {
+            assert_eq!(
+                prepare_genre_insert(Some("user-alice"), bad, false, 1),
+                Err(LibraryError::Invalid),
+                "genre name {bad:?}"
+            );
+            assert_eq!(
+                prepare_playlist_insert(Some("user-alice"), bad, vec![], false, 1),
+                Err(LibraryError::Invalid),
+                "playlist name {bad:?}"
+            );
+        }
+        for good in [max_name.as_str(), max_name_wide.as_str()] {
+            assert!(prepare_genre_insert(Some("user-alice"), good, false, 1).is_ok());
+            assert!(prepare_playlist_insert(Some("user-alice"), good, vec![], false, 1).is_ok());
+        }
+        // Item validation on insert: exactly 500 items and a 128-char item
+        // (also 128 two-byte chars) pass; 501 items, a 129-char item, and a
+        // blank item are Invalid.
+        let max_items: Vec<String> = (0..500).map(|i| format!("track-{i}")).collect();
+        let ok = prepare_playlist_insert(Some("user-alice"), "P", max_items, false, 1).unwrap();
+        assert_eq!(ok.items.len(), 500);
+        let too_many: Vec<String> = (0..501).map(|i| format!("track-{i}")).collect();
+        assert_eq!(
+            prepare_playlist_insert(Some("user-alice"), "P", too_many, false, 1),
+            Err(LibraryError::Invalid)
+        );
+        for bad_item in ["x".repeat(129), "é".repeat(129), "   ".to_string()] {
+            assert_eq!(
+                prepare_playlist_insert(Some("user-alice"), "P", vec![bad_item], false, 1),
+                Err(LibraryError::Invalid)
+            );
+        }
+        for good_item in ["x".repeat(128), "é".repeat(128)] {
+            assert!(
+                prepare_playlist_insert(Some("user-alice"), "P", vec![good_item], false, 1).is_ok()
+            );
+        }
+    }
+
+    fn own_genre_lookup() -> Option<MutationLookup> {
+        Some(MutationLookup {
+            public_id: "g-own-priv".into(),
+            is_owner: true,
+        })
+    }
+
+    fn own_playlist_lookup() -> Option<MutationLookup> {
+        Some(MutationLookup {
+            public_id: "p-own-priv".into(),
+            is_owner: true,
+        })
+    }
+
+    #[test]
+    fn update_and_delete_intents_carry_caller_and_visibility() {
+        // Whole-intent asserts for both visibilities on all four update
+        // authorizers (lookup-based and row-based), plus caller-as-owner on
+        // all four delete authorizers — those intents bind the
+        // `owner_user_id = $2` predicate of the pinned statements.
+        let genres = response_genre_rows();
+        let playlists = response_playlist_rows();
+        for is_public in [true, false] {
+            assert_eq!(
+                authorize_genre_update_from_lookup(
+                    Some("user-alice"),
+                    own_genre_lookup(),
+                    "  New  ",
+                    is_public,
+                )
+                .unwrap(),
+                GenreUpdate {
+                    public_id: "g-own-priv".into(),
+                    owner_user_id: "user-alice".into(),
+                    name: "New".into(),
+                    is_public,
+                }
+            );
+            assert_eq!(
+                authorize_genre_update(
+                    Some("user-alice"),
+                    &genres,
+                    "g-own-priv",
+                    "  New  ",
+                    is_public,
+                )
+                .unwrap(),
+                GenreUpdate {
+                    public_id: "g-own-priv".into(),
+                    owner_user_id: "user-alice".into(),
+                    name: "New".into(),
+                    is_public,
+                }
+            );
+            assert_eq!(
+                authorize_playlist_update_from_lookup(
+                    Some("user-alice"),
+                    own_playlist_lookup(),
+                    "  New  ",
+                    vec!["  track-9  ".into()],
+                    is_public,
+                )
+                .unwrap(),
+                PlaylistUpdate {
+                    public_id: "p-own-priv".into(),
+                    owner_user_id: "user-alice".into(),
+                    name: "New".into(),
+                    items: vec!["track-9".into()],
+                    is_public,
+                }
+            );
+            assert_eq!(
+                authorize_playlist_update(
+                    Some("user-alice"),
+                    &playlists,
+                    "p-own-priv",
+                    "  New  ",
+                    vec!["  track-9  ".into()],
+                    is_public,
+                )
+                .unwrap(),
+                PlaylistUpdate {
+                    public_id: "p-own-priv".into(),
+                    owner_user_id: "user-alice".into(),
+                    name: "New".into(),
+                    items: vec!["track-9".into()],
+                    is_public,
+                }
+            );
+        }
+        assert_eq!(
+            authorize_genre_delete_from_lookup(Some("user-alice"), own_genre_lookup()).unwrap(),
+            GenreDelete {
+                public_id: "g-own-priv".into(),
+                owner_user_id: "user-alice".into(),
+            }
+        );
+        assert_eq!(
+            authorize_genre_delete(Some("user-alice"), &genres, "g-own-priv").unwrap(),
+            GenreDelete {
+                public_id: "g-own-priv".into(),
+                owner_user_id: "user-alice".into(),
+            }
+        );
+        assert_eq!(
+            authorize_playlist_delete_from_lookup(Some("user-alice"), own_playlist_lookup())
+                .unwrap(),
+            PlaylistDelete {
+                public_id: "p-own-priv".into(),
+                owner_user_id: "user-alice".into(),
+            }
+        );
+        assert_eq!(
+            authorize_playlist_delete(Some("user-alice"), &playlists, "p-own-priv").unwrap(),
+            PlaylistDelete {
+                public_id: "p-own-priv".into(),
+                owner_user_id: "user-alice".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn every_authorizer_requires_caller_first() {
+        // A missing (or empty) caller is 401 on all eight authorizers before
+        // any existence or validation check — deleting `require_caller` from
+        // any one of them must fail here. Lookup authorizers are checked with
+        // no lookup row (where the mutant returns 404) and with an own row.
+        let genres = response_genre_rows();
+        let playlists = response_playlist_rows();
+        for caller in [None, Some("")] {
+            assert_eq!(
+                authorize_genre_update_from_lookup(caller, None, "X", true),
+                Err(LibraryError::Unauthorized)
+            );
+            assert_eq!(
+                authorize_genre_update_from_lookup(caller, own_genre_lookup(), "X", true),
+                Err(LibraryError::Unauthorized)
+            );
+            assert_eq!(
+                authorize_genre_delete_from_lookup(caller, None),
+                Err(LibraryError::Unauthorized)
+            );
+            assert_eq!(
+                authorize_genre_delete_from_lookup(caller, own_genre_lookup()),
+                Err(LibraryError::Unauthorized)
+            );
+            assert_eq!(
+                authorize_playlist_update_from_lookup(caller, None, "X", vec![], true),
+                Err(LibraryError::Unauthorized)
+            );
+            assert_eq!(
+                authorize_playlist_update_from_lookup(
+                    caller,
+                    own_playlist_lookup(),
+                    "X",
+                    vec![],
+                    true
+                ),
+                Err(LibraryError::Unauthorized)
+            );
+            assert_eq!(
+                authorize_playlist_delete_from_lookup(caller, None),
+                Err(LibraryError::Unauthorized)
+            );
+            assert_eq!(
+                authorize_playlist_delete_from_lookup(caller, own_playlist_lookup()),
+                Err(LibraryError::Unauthorized)
+            );
+            assert_eq!(
+                authorize_genre_update(caller, &genres, "g-own-priv", "X", true),
+                Err(LibraryError::Unauthorized)
+            );
+            assert_eq!(
+                authorize_genre_delete(caller, &genres, "g-own-priv"),
+                Err(LibraryError::Unauthorized)
+            );
+            assert_eq!(
+                authorize_playlist_update(caller, &playlists, "p-own-priv", "X", vec![], true),
+                Err(LibraryError::Unauthorized)
+            );
+            assert_eq!(
+                authorize_playlist_delete(caller, &playlists, "p-own-priv"),
+                Err(LibraryError::Unauthorized)
+            );
+        }
+        // 401 also beats 422: anonymous + invalid payload stays Unauthorized.
+        assert_eq!(
+            authorize_playlist_update_from_lookup(None, own_playlist_lookup(), "", vec![], true),
+            Err(LibraryError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn update_paths_validate_name_and_items_at_boundaries() {
+        // Every update path validates like insert: removing `check_name` or
+        // `check_items` from any update authorizer must fail here.
+        let genres = response_genre_rows();
+        let playlists = response_playlist_rows();
+        let too_long = "x".repeat(121);
+        for bad in ["", "   ", too_long.as_str(), &"é".repeat(121)] {
+            assert_eq!(
+                authorize_genre_update_from_lookup(
+                    Some("user-alice"),
+                    own_genre_lookup(),
+                    bad,
+                    true
+                ),
+                Err(LibraryError::Invalid),
+                "genre lookup name {bad:?}"
+            );
+            assert_eq!(
+                authorize_genre_update(Some("user-alice"), &genres, "g-own-priv", bad, true),
+                Err(LibraryError::Invalid),
+                "genre row name {bad:?}"
+            );
+            assert_eq!(
+                authorize_playlist_update_from_lookup(
+                    Some("user-alice"),
+                    own_playlist_lookup(),
+                    bad,
+                    vec![],
+                    true
+                ),
+                Err(LibraryError::Invalid),
+                "playlist lookup name {bad:?}"
+            );
+            assert_eq!(
+                authorize_playlist_update(
+                    Some("user-alice"),
+                    &playlists,
+                    "p-own-priv",
+                    bad,
+                    vec![],
+                    true
+                ),
+                Err(LibraryError::Invalid),
+                "playlist row name {bad:?}"
+            );
+        }
+        // Boundary-valid names pass on update, as chars not bytes.
+        let max_wide = "é".repeat(120);
+        assert!(authorize_genre_update_from_lookup(
+            Some("user-alice"),
+            own_genre_lookup(),
+            &max_wide,
+            true
+        )
+        .is_ok());
+        assert!(authorize_playlist_update(
+            Some("user-alice"),
+            &playlists,
+            "p-own-priv",
+            &max_wide,
+            vec![],
+            true
+        )
+        .is_ok());
+        // Playlist item limits on BOTH update authorizers: 501 items, a
+        // 129-char item, and a blank item are Invalid.
+        let too_many: Vec<String> = (0..501).map(|i| format!("track-{i}")).collect();
+        let bad_item_sets: Vec<Vec<String>> = vec![
+            too_many,
+            vec!["x".repeat(129)],
+            vec!["é".repeat(129)],
+            vec!["   ".to_string()],
+        ];
+        for items in bad_item_sets {
+            assert_eq!(
+                authorize_playlist_update_from_lookup(
+                    Some("user-alice"),
+                    own_playlist_lookup(),
+                    "P",
+                    items.clone(),
+                    true
+                ),
+                Err(LibraryError::Invalid)
+            );
+            assert_eq!(
+                authorize_playlist_update(
+                    Some("user-alice"),
+                    &playlists,
+                    "p-own-priv",
+                    "P",
+                    items,
+                    true
+                ),
+                Err(LibraryError::Invalid)
+            );
+        }
+        // Exactly 500 items and 128-char items (chars, not bytes) pass.
+        let mut max_items: Vec<String> = (0..499).map(|i| format!("track-{i}")).collect();
+        max_items.push("é".repeat(128));
+        let from_lookup = authorize_playlist_update_from_lookup(
+            Some("user-alice"),
+            own_playlist_lookup(),
+            "P",
+            max_items.clone(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(from_lookup.items.len(), 500);
+        let from_rows = authorize_playlist_update(
+            Some("user-alice"),
+            &playlists,
+            "p-own-priv",
+            "P",
+            max_items,
+            true,
+        )
+        .unwrap();
+        assert_eq!(from_rows.items.len(), 500);
+    }
+
+    #[test]
+    fn constants_and_cursor_bounds_are_pinned() {
+        // Literal pins (not in terms of the constants themselves): a bumped
+        // page cap or limit must be a deliberate, reviewed change.
+        assert_eq!(MAX_PAGE_SIZE, 50);
+        assert_eq!(MAX_NAME_LEN, 120);
+        assert_eq!(MAX_ITEMS, 500);
+        assert_eq!(MAX_ITEM_LEN, 128);
+        assert_eq!(MAX_CURSOR_PUBLIC_ID_LEN, 128);
+        assert_eq!(MAX_CURSOR_LEN, 192);
+        assert_eq!(clamp_page_size(51), 50);
+        assert_eq!(clamp_page_size(50), 50);
+        // Cursor charset is exactly the base64url id alphabet: `-` and `_`
+        // pass, anything else inside the wrapped id is Invalid.
+        assert_eq!(
+            parse_page_cursor(&page_cursor("a_b-C9")),
+            Ok("a_b-C9".to_string())
+        );
+        for bad_id in ["a.b", "a b", "a+b", "a/b", "a=b", "å"] {
+            assert_eq!(
+                parse_page_cursor(&page_cursor(bad_id)),
+                Err(LibraryError::Invalid),
+                "cursor id {bad_id:?}"
+            );
+        }
+        // A wrapped id above the public-id length cap is Invalid even though
+        // its encoding is well under the encoded-cursor cap.
+        assert_eq!(
+            parse_page_cursor(&page_cursor(&"x".repeat(129))),
+            Err(LibraryError::Invalid)
+        );
+    }
+
+    #[test]
+    fn genre_pager_chains_and_both_pagers_hide_foreign_private_rows() {
+        // Genre chaining with the same strict `<` as playlists: the boundary
+        // row of page 1 must not repeat on page 2 (`<=` would duplicate it).
+        let mut genres: Vec<GenreRow> = (0..5)
+            .map(|i| GenreRow {
+                internal_id: i as i64 + 1,
+                public_id: format!("g-chain-{i:02}"),
+                owner_user_id: "user-bob".into(),
+                name: format!("Chain {i}"),
+                is_public: true,
+            })
+            .collect();
+        // A foreign private row sorting above every public row: removing the
+        // pager's visibility filter would leak it onto page 1.
+        genres.push(GenreRow {
+            internal_id: 99,
+            public_id: "z-bob-private".into(),
+            owner_user_id: "user-bob".into(),
+            name: "Secret".into(),
+            is_public: false,
+        });
+        let first = list_genres_page(Some("user-alice"), &genres, 2, None).unwrap();
+        assert_eq!(
+            first.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["g-chain-04", "g-chain-03"]
+        );
+        let second = list_genres_page(
+            Some("user-alice"),
+            &genres,
+            2,
+            Some(&page_cursor("g-chain-03")),
+        )
+        .unwrap();
+        assert_eq!(
+            second.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["g-chain-02", "g-chain-01"]
+        );
+        let all = list_genres_page(Some("user-alice"), &genres, 50, None).unwrap();
+        assert_eq!(all.len(), 5);
+        assert!(all.iter().all(|row| row.id != "z-bob-private"));
+
+        // Same visibility pin for the playlist pager.
+        let mut playlists = many_playlist_rows(3);
+        playlists.push(PlaylistRow {
+            internal_id: 99,
+            public_id: "z-bob-private".into(),
+            owner_user_id: "user-bob".into(),
+            name: "Secret".into(),
+            items: vec!["hidden-track".into()],
+            is_public: false,
+        });
+        let page = list_playlists_page(Some("user-alice"), &playlists, 50, None).unwrap();
+        assert_eq!(page.len(), 3);
+        assert!(page.iter().all(|row| row.id != "z-bob-private"));
+        assert!(page.iter().all(|row| row.name != "Secret"));
+    }
 }
