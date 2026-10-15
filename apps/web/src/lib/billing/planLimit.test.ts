@@ -1,10 +1,9 @@
 /**
  * Failing-first acceptance tests for plan-limit 402/429 handling with upgrade CTA.
  *
- * Card: TOG-25375 (this file is owned by that card — the builder on TOG-25376
- * builds on this branch and must never edit this file).
+ * This acceptance test is frozen; change it only through its owning work item.
  *
- * Contract the builder (TOG-25376) implements in the sibling source module
+ * Contract implemented in the sibling source module
  * `src/lib/billing/planLimit.ts` (imported below as `./planLimit.js`, matching
  * this codebase's `.js`-suffix lib imports):
  *
@@ -32,19 +31,19 @@
  * These tests dynamic-import the module so they stay statically valid
  * (svelte-check clean) while failing at runtime until the builder lands the
  * implementation. Each failure below currently throws the handoff error from
- * `loadPlanLimit()`; after TOG-25376 the same assertions verify real behavior.
+ * `loadPlanLimit()`; once the module exists, the same assertions verify behavior.
  */
 
 import { describe, expect, it } from 'vitest';
 
 const NOT_IMPLEMENTED =
-	'planLimit module not implemented yet — owned by TOG-25376 (this test file is frozen by TOG-25375)';
+	'planLimit module not implemented yet (this acceptance test is intentionally failing-first)';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function loadPlanLimit(): Promise<any> {
 	// Non-literal specifier on purpose: static typecheck stays green while the
 	// module is missing (failing-first), and the runtime import throws until
-	// TOG-25376 lands planLimit.ts next to this file.
+	// the implementation lands planLimit.ts next to this file.
 	const specifier = './planLimit.js';
 	try {
 		return await import(specifier);
@@ -62,7 +61,7 @@ function limitResponse(status: number, retryAfter: string | null, code: string):
 	});
 }
 
-describe('plan-limit 402/429 handling with upgrade CTA (TOG-25375)', () => {
+describe('plan-limit 402/429 handling with upgrade CTA', () => {
 	it('mocked 402 renders a paywall with an upgrade CTA to /pricing', async () => {
 		const planLimit = await loadPlanLimit();
 		const res = limitResponse(402, null, 'plan_limit_exceeded');
