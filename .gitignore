@@ -1,5 +1,6 @@
 # Rust
 /target/
+**/target/
 # Standalone worker crates build outside the parent workspace.
 /workers/api/target/
 /workers/ingest/target/
@@ -54,6 +55,12 @@ Thumbs.db
 /coverage/
 lcov.info
 tarpaulin-report.html
+
+# Python bytecode: embeds absolute build paths, must never be tracked
+# (public repo). The public-text lint rejects these paths if committed.
+__pycache__/
+*.pyc
+*.pyo
 
 # Playwright (nntunev2 e2e harness)
 /e2e/playwright-report/

@@ -34,8 +34,14 @@ provisioned; this crate is the security-critical logic with tests.
   (`redacted_summary`); `test connection` returns a boolean, never provider
   banners; audit events carry ids/results only — there is no field for
   secret material anywhere in the API or schema.
-- **Sessions:** `HttpOnly; Secure; SameSite=Lax`; immutable `created_at`
-  caps the lifetime at one day even across refreshes. `verify_session`
+- **Sessions:** `__Host-nntune-session` (`__Host-` prefix: `Path=/`, `Secure`,
+  no `Domain=` by construction); `HttpOnly; SameSite=Lax`; immutable `created_at`
+  caps the lifetime at one day even across refreshes. Secret rotation runs a
+  bounded dual-accept window — see `docs/security/session-secret-rotation.md`
+  (`SessionKeys::rotation` verifies through `verify_stored_session` and
+  re-signs with the primary; verify-only previous secret,
+  `created_at`-bounded window, single-secret steady state; keys under 32
+  bytes fail closed). `verify_session`
   checks only signatures/time and is not request authentication. Require
   `verify_stored_session` against the current `sessions` row on every
   request: owner, expiry, counter and revocation must match. Refresh must
