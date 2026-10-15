@@ -11,11 +11,10 @@
 -- statements, which answers the 403-vs-404 question without exposing the
 -- id itself.
 --
--- Lists are keyset pages (`ORDER BY id DESC LIMIT $2` with an opaque
--- cursor over the public id): insertion order is the newest-first key,
--- immune to timestamp skew, and the primary key serves that ordering
--- directly — no extra index. The owner/visibility indexes below serve
--- the page filters.
+-- Lists are keyset pages ordered by the public id (`ORDER BY public_id
+-- COLLATE "C" DESC LIMIT $2`). The matching indexes keep the cursor
+-- comparison independent of row existence while serving the public-id order.
+-- The owner/visibility indexes below serve the page filters.
 
 CREATE TABLE IF NOT EXISTS genres (
     id              BIGSERIAL PRIMARY KEY,
@@ -27,6 +26,7 @@ CREATE TABLE IF NOT EXISTS genres (
 );
 CREATE INDEX IF NOT EXISTS idx_genres_owner ON genres (owner_user_id);
 CREATE INDEX IF NOT EXISTS idx_genres_public ON genres (is_public) WHERE is_public = TRUE;
+CREATE INDEX IF NOT EXISTS idx_genres_public_id_c ON genres (public_id COLLATE "C" DESC);
 
 CREATE TABLE IF NOT EXISTS playlists (
     id              BIGSERIAL PRIMARY KEY,
@@ -41,3 +41,4 @@ CREATE TABLE IF NOT EXISTS playlists (
 );
 CREATE INDEX IF NOT EXISTS idx_playlists_owner ON playlists (owner_user_id);
 CREATE INDEX IF NOT EXISTS idx_playlists_public ON playlists (is_public) WHERE is_public = TRUE;
+CREATE INDEX IF NOT EXISTS idx_playlists_public_id_c ON playlists (public_id COLLATE "C" DESC);

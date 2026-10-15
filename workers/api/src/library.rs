@@ -17,9 +17,10 @@
 //!   from the owner id itself, and maps 0 affected UPDATE/DELETE rows to
 //!   [`LibraryError::NotFound`] (the row vanished between lookup and write;
 //!   the owner predicate already makes cross-owner writes inexpressible).
-//! - Lists are keyset pages: `ORDER BY id DESC LIMIT $2` with an opaque
-//!   cursor over the public id, capped at [`MAX_PAGE_SIZE`]. Playlist
-//!   lists omit `items` (single reads return them).
+//! - Lists are keyset pages ordered by public id descending, capped at
+//!   [`MAX_PAGE_SIZE`]. The public-id cursor is independent of row existence,
+//!   so a deleted or newly private boundary row cannot truncate later pages.
+//!   Playlist lists omit `items` (single reads return them).
 //! - Responses carry only the opaque `public_id` as `id` plus display fields.
 //!   Internal row ids and `owner_user_id` never serialize. The authorizers
 //!   below return intents (validated parameters), never mutated rows.
@@ -282,11 +283,9 @@ fn decode_b64url_no_pad(cursor: &str) -> Result<Vec<u8>, LibraryError> {
 /// they must never parse or forge it.
 ///
 /// The cursor carries only the already-public opaque id — the same value
-/// returned as `id` in list responses, so the Worker builds the next
-/// cursor from the last returned row with no extra columns. No internal
-/// row id, no owner, no timestamps. A forged or unknown value only
-/// filters (an empty page), never leaks invisible rows: visibility still
-/// applies server-side, including inside the cursor subselect.
+/// returned as `id` in list responses. Lists compare it directly with the
+/// public-id ordering key, so paging remains stable if the boundary row is
+/// deleted or becomes private. Visibility always applies to returned rows.
 pub fn page_cursor(last_public_id: &str) -> String {
     encode_b64url_no_pad(last_public_id.as_bytes())
 }
@@ -365,12 +364,10 @@ pub fn list_playlists(
         .collect())
 }
 
-/// One bounded genre page, newest first (insertion order). `limit` is
+/// One bounded genre page, ordered by public id descending. `limit` is
 /// clamped to [`MAX_PAGE_SIZE`]; `after` continues from a [`page_cursor`]
-/// wrapping the last row's public `id`.
-/// Pages order by internal id DESC — the same insertion-order key the SQL
-/// list statement uses (`ORDER BY id DESC`), so the mirror and the
-/// database agree exactly and stay immune to timestamp skew.
+/// wrapping the last row's public `id`. The ordering key is stable even if
+/// the boundary row is deleted or becomes private.
 pub fn list_genres_page(
     caller: Option<&str>,
     rows: &[GenreRow],
@@ -383,18 +380,10 @@ pub fn list_genres_page(
         .iter()
         .filter(|row| genre_visible(caller, row))
         .collect();
-    visible.sort_by_key(|row| std::cmp::Reverse(row.internal_id));
+    visible.sort_by(|a, b| b.public_id.cmp(&a.public_id));
     if let Some(cursor) = after {
         let cursor_id = parse_page_cursor(cursor)?;
-        // Resume after the cursor's position in this visible page.
-        // Unknown or invisible ids match nothing (an empty page), never a
-        // leak — mirroring the SQL predicate, whose cursor subselect is
-        // visibility-filtered the same way.
-        if let Some(pos) = visible.iter().position(|row| row.public_id == cursor_id) {
-            visible.drain(..=pos);
-        } else {
-            visible.clear();
-        }
+        visible.retain(|row| row.public_id < cursor_id);
     }
     visible.truncate(limit);
     Ok(visible.iter().map(|row| genre_response(row)).collect())
@@ -748,18 +737,16 @@ pub fn authorize_playlist_delete(
 // owner predicate already makes cross-owner writes inexpressible, so a 0-row
 // write is never a silent foreign mutation.
 
-/// Caller-visible genre page, newest first (insertion order).
+/// Caller-visible genre page, ordered by public id descending.
 /// Parameters: owner_user_id ($1), limit clamped to [`MAX_PAGE_SIZE`]
 /// ($2), cursor public id or NULL for the first page ($3).
 ///
-/// The cursor is the last row's public `id` from the previous page (see
-/// [`page_cursor`]): the subselect maps it to its internal position
-/// without ever returning that position, and it is visibility-filtered
-/// so forged or invisible cursors match nothing instead of leaking. The
-/// Worker builds the next cursor from the last returned `public_id` —
-/// the projection already carries it, so no internal column is needed.
+/// The cursor is compared directly against the public-id ordering key, not
+/// looked up in the table. A deleted or newly private boundary row therefore
+/// cannot truncate later pages, and there is no cursor lookup that can reveal
+/// whether an invisible row exists.
 pub fn genre_list_statement() -> &'static str {
-    "SELECT public_id, name, is_public FROM genres WHERE (owner_user_id = $1 OR is_public = TRUE) AND ($3::TEXT IS NULL OR id < (SELECT id FROM genres WHERE public_id = $3 AND (owner_user_id = $1 OR is_public = TRUE))) ORDER BY id DESC LIMIT $2"
+    "SELECT public_id, name, is_public FROM genres WHERE (owner_user_id = $1 OR is_public = TRUE) AND ($3::TEXT IS NULL OR public_id COLLATE \"C\" < $3::TEXT COLLATE \"C\") ORDER BY public_id COLLATE \"C\" DESC LIMIT $2"
 }
 
 /// Parameters: public_id, owner_user_id.
@@ -792,12 +779,10 @@ pub fn genre_delete_statement() -> &'static str {
     "DELETE FROM genres WHERE public_id = $1 AND owner_user_id = $2"
 }
 
-/// Caller-visible playlist page (summaries: no `items`), newest first.
-/// Parameters: owner_user_id ($1), limit clamped to [`MAX_PAGE_SIZE`]
-/// ($2), cursor public id or NULL for the first page ($3). Cursor
-/// semantics match [`genre_list_statement`].
+/// Caller-visible playlist page (summaries: no `items`), ordered by public id.
+/// Parameters and cursor semantics match [`genre_list_statement`].
 pub fn playlist_list_statement() -> &'static str {
-    "SELECT public_id, name, is_public FROM playlists WHERE (owner_user_id = $1 OR is_public = TRUE) AND ($3::TEXT IS NULL OR id < (SELECT id FROM playlists WHERE public_id = $3 AND (owner_user_id = $1 OR is_public = TRUE))) ORDER BY id DESC LIMIT $2"
+    "SELECT public_id, name, is_public FROM playlists WHERE (owner_user_id = $1 OR is_public = TRUE) AND ($3::TEXT IS NULL OR public_id COLLATE \"C\" < $3::TEXT COLLATE \"C\") ORDER BY public_id COLLATE \"C\" DESC LIMIT $2"
 }
 
 /// Parameters: public_id, owner_user_id.
@@ -936,6 +921,51 @@ mod tests {
     }
 
     #[test]
+    fn paging_continues_when_cursor_row_is_deleted_or_hidden() {
+        let rows = many_playlist_rows(60);
+        let first = list_playlists_page(Some("user-alice"), &rows, 10, None).unwrap();
+        let cursor_id = first.last().unwrap().id.clone();
+        let after = page_cursor(&cursor_id);
+        let expected: Vec<String> = (40..50)
+            .rev()
+            .map(|i| format!("p-public-{i:04}"))
+            .collect();
+
+        let mut deleted = rows.clone();
+        deleted.retain(|row| row.public_id != cursor_id);
+        let after_delete = list_playlists_page(
+            Some("user-alice"),
+            &deleted,
+            10,
+            Some(&after),
+        )
+        .unwrap();
+        assert_eq!(
+            after_delete.iter().map(|row| row.id.clone()).collect::<Vec<_>>(),
+            expected
+        );
+
+        let mut hidden = rows;
+        let boundary = hidden
+            .iter_mut()
+            .find(|row| row.public_id == cursor_id)
+            .unwrap();
+        boundary.is_public = false;
+        boundary.owner_user_id = "user-bob".into();
+        let after_hide = list_playlists_page(
+            Some("user-alice"),
+            &hidden,
+            10,
+            Some(&after),
+        )
+        .unwrap();
+        assert_eq!(
+            after_hide.iter().map(|row| row.id.clone()).collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
     fn own_older_row_is_reachable_by_following_the_cursor() {
         // Regression for the review probe: many newer public rows by
         // another user plus one older private row by the caller. Every
@@ -1058,20 +1088,23 @@ mod tests {
     #[test]
     fn list_and_lookup_statements_are_bounded_and_owner_free() {
         for sql in [genre_list_statement(), playlist_list_statement()] {
-            assert!(sql.contains("ORDER BY id DESC"), "{sql}");
+            assert!(sql.contains("ORDER BY public_id COLLATE \"C\" DESC"), "{sql}");
             assert!(sql.contains("LIMIT $2"), "{sql}");
-            // A real keyset predicate over the public-id cursor ($3): pages
-            // beyond the first 50 are expressible in SQL, not just in the
-            // in-memory mirror.
-            assert!(sql.contains("$3"), "{sql}");
-            assert!(sql.contains("public_id = $3"), "{sql}");
-            assert!(sql.contains("id < (SELECT id FROM"), "{sql}");
-            // The cursor lookup is visibility-filtered too: forged or
-            // invisible cursors match nothing instead of leaking.
+            // The cursor is compared directly with the public ordering key,
+            // so continuation does not depend on the boundary row existing.
             assert!(
-                sql.contains("(owner_user_id = $1 OR is_public = TRUE)"),
+                sql.contains("public_id COLLATE \"C\" < $3::TEXT COLLATE \"C\""),
                 "{sql}"
             );
+            // No cursor-row lookup exists to bypass or weaken visibility;
+            // this predicate applies to every returned row.
+            assert_eq!(
+                sql.matches("(owner_user_id = $1 OR is_public = TRUE)")
+                    .count(),
+                1,
+                "{sql}"
+            );
+            assert!(!sql.contains("SELECT id FROM"), "{sql}");
         }
         // List projections return the public id the Worker builds the next
         // cursor from — never items, owner, or internal ids.
