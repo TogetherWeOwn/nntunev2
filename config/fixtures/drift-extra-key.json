@@ -1,0 +1,19 @@
+{
+  "auth.challenge_ttl_secs": 300,
+  "auth.invite_redemption_max_attempts": 10,
+  "auth.invite_redemption_window_secs": 300,
+  "auth.magic_link_ttl_secs": 900,
+  "auth.rp_id": "v2-staging.nntune.com",
+  "auth.rp_origin": "https://v2-staging.nntune.com",
+  "debug.backdoor": true,
+  "ingest.max_nzb_bytes": 2097152,
+  "ingest.payload_retry_attempts": 4,
+  "ingest.payload_ttl_secs": 2592000,
+  "mb.lookup_cache_ttl_s": 86400,
+  "mb.max_query_chars": 100,
+  "mb.search_cache_ttl_s": 300,
+  "mb.search_limit": 25,
+  "session.ttl_secs": 86400,
+  "stream.r2_min_part_bytes": 5242880,
+  "vault.indexer_allow_redirects": false
+}

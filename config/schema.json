@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "description": "Versioned schema for the NNTune v2 KV config namespaces (staging/prod). Every key carries its type, default, and env-overridability. Secret values are never declared here: Worker secrets and rotation live outside KV config. Workers read these keys only through the typed accessor (crates/nntune-config); see config/README.md for the adding-a-key procedure.",
+  "keys": {
+    "auth.challenge_ttl_secs": {
+      "type": "u64",
+      "default": 300,
+      "required": true,
+      "env_overridable": false,
+      "env_var": null,
+      "description": "Passkey challenge lifetime in seconds (workers/api auth)."
+    },
+    "auth.invite_redemption_max_attempts": {
+      "type": "u64",
+      "default": 10,
+      "required": true,
+      "env_overridable": false,
+      "env_var": null,
+      "description": "Max verification attempts inside one invite redemption window."
+    },
+    "auth.invite_redemption_window_secs": {
+      "type": "u64",
+      "default": 300,
+      "required": true,
+      "env_overridable": false,
+      "env_var": null,
+      "description": "Invite redemption attempt window in seconds."
+    },
+    "auth.magic_link_ttl_secs": {
+      "type": "u64",
+      "default": 900,
+      "required": true,
+      "env_overridable": false,
+      "env_var": null,
+      "description": "Email magic-link lifetime in seconds."
+    },
+    "auth.rp_id": {
+      "type": "string",
+      "default": null,
+      "required": true,
+      "env_overridable": true,
+      "env_var": "RP_ID",
+      "description": "Passkey relying-party id (hostname). Per-environment, so it has no default."
+    },
+    "auth.rp_origin": {
+      "type": "string",
+      "default": null,
+      "required": true,
+      "env_overridable": true,
+      "env_var": "RP_ORIGIN",
+      "description": "Passkey relying-party origin URL. Per-environment, so it has no default."
+    },
+    "ingest.max_nzb_bytes": {
+      "type": "u64",
+      "default": 2097152,
+      "required": true,
+      "env_overridable": true,
+      "env_var": "INGEST_MAX_NZB_BYTES",
+      "description": "Max accepted NZB upload body in bytes (2 MiB)."
+    },
+    "ingest.payload_retry_attempts": {
+      "type": "u64",
+      "default": 4,
+      "required": true,
+      "env_overridable": false,
+      "env_var": null,
+      "description": "Queue-consumer payload-fetch retry attempts; must cover the KV read-lag window."
+    },
+    "ingest.payload_ttl_secs": {
+      "type": "u64",
+      "default": 2592000,
+      "required": true,
+      "env_overridable": true,
+      "env_var": "INGEST_PAYLOAD_TTL_SECS",
+      "description": "Payload KV time-to-live in seconds (30 days)."
+    },
+    "mb.lookup_cache_ttl_s": {
+      "type": "u64",
+      "default": 86400,
+      "required": true,
+      "env_overridable": true,
+      "env_var": "MB_LOOKUP_CACHE_TTL_S",
+      "description": "MusicBrainz lookup success-cache TTL in seconds (immutable-ish rows)."
+    },
+    "mb.max_query_chars": {
+      "type": "u64",
+      "default": 100,
+      "required": true,
+      "env_overridable": false,
+      "env_var": null,
+      "description": "Upper bound on search query length in chars; bounds trigram work and KV keys."
+    },
+    "mb.search_cache_ttl_s": {
+      "type": "u64",
+      "default": 300,
+      "required": true,
+      "env_overridable": true,
+      "env_var": "MB_SEARCH_CACHE_TTL_S",
+      "description": "MusicBrainz search success-cache TTL in seconds."
+    },
+    "mb.search_limit": {
+      "type": "u64",
+      "default": 25,
+      "required": true,
+      "env_overridable": false,
+      "env_var": null,
+      "description": "Max search hits returned (SQL LIMIT and defensive truncation)."
+    },
+    "session.ttl_secs": {
+      "type": "u64",
+      "default": 86400,
+      "required": true,
+      "env_overridable": true,
+      "env_var": "SESSION_TTL_SECS",
+      "description": "Session cookie lifetime in seconds. The effective lifetime is min(config, the one-day authentication cap in workers/api session)."
+    },
+    "stream.r2_min_part_bytes": {
+      "type": "u64",
+      "default": 5242880,
+      "required": true,
+      "env_overridable": false,
+      "env_var": null,
+      "description": "Minimum R2 multipart part size in bytes (5 MiB)."
+    },
+    "vault.indexer_allow_redirects": {
+      "type": "bool",
+      "default": false,
+      "required": true,
+      "env_overridable": false,
+      "env_var": null,
+      "description": "Whether BYO indexer probe requests follow HTTP redirects. Fail-closed default."
+    }
+  }
+}
