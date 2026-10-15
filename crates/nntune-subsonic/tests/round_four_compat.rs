@@ -30,11 +30,14 @@ fn body_text(app: &SubsonicApp<TestStore>, path: &str, query: &str) -> String {
 /// in-memory store instead of reimplementing shuffle or play-history logic.
 /// Catalogue reads, album lists, random songs and scrobble history all come
 /// from `inner`; only lyrics stay custom and the scrobble spy counts calls.
+/// Shared scrobble-spy handle for the test store.
+type ScrobbleLog = Rc<RefCell<Vec<(String, String)>>>;
+
 #[derive(Clone, Debug)]
 struct TestStore {
     inner: MemStore,
     lyrics: BTreeMap<(String, String), String>,
-    scrobble_log: Rc<RefCell<Vec<(String, String)>>>,
+    scrobble_log: ScrobbleLog,
 }
 
 impl TestStore {
@@ -43,7 +46,7 @@ impl TestStore {
         albums: Vec<Album>,
         songs: Vec<Song>,
         lyrics: BTreeMap<(String, String), String>,
-    ) -> (TestStore, Rc<RefCell<Vec<(String, String)>>>) {
+    ) -> (TestStore, ScrobbleLog) {
         let log = Rc::new(RefCell::new(Vec::new()));
         let inner = MemStore::empty_with_test_auth().with_catalogue(artists, albums, songs);
         (
@@ -56,7 +59,7 @@ impl TestStore {
         )
     }
 
-    fn single_song_lyrics(raw: &str) -> (TestStore, Rc<RefCell<Vec<(String, String)>>>) {
+    fn single_song_lyrics(raw: &str) -> (TestStore, ScrobbleLog) {
         let artists = vec![Artist {
             id: "ar-1".into(),
             name: "Test Artist".into(),
@@ -70,6 +73,8 @@ impl TestStore {
             created: NOW.into(),
             year: Some(2026),
             release_date: Some("2026-01-01".into()),
+            curated_at: Some(NOW.into()),
+            artist_sort_name: "Test Artist".into(),
         }];
         let songs = vec![Song {
             id: "so-1".into(),
@@ -97,7 +102,7 @@ impl TestStore {
         TestStore::new(artists, albums, songs, lyrics)
     }
 
-    fn two_albums() -> (TestStore, Rc<RefCell<Vec<(String, String)>>>) {
+    fn two_albums() -> (TestStore, ScrobbleLog) {
         let artists = vec![Artist {
             id: "ar-1".into(),
             name: "Test Artist".into(),
@@ -112,6 +117,8 @@ impl TestStore {
                 created: NOW.into(),
                 year: Some(2026),
                 release_date: Some("2026-01-01".into()),
+                curated_at: Some(NOW.into()),
+                artist_sort_name: "Test Artist".into(),
             },
             Album {
                 id: "al-b".into(),
@@ -122,6 +129,8 @@ impl TestStore {
                 created: NOW.into(),
                 year: Some(2026),
                 release_date: Some("2026-01-02".into()),
+                curated_at: Some(NOW.into()),
+                artist_sort_name: "Test Artist".into(),
             },
         ];
         let songs = vec![
@@ -667,6 +676,8 @@ fn eight_album_catalogue() -> (Vec<Artist>, Vec<Album>, Vec<Song>) {
             created: NOW.into(),
             year: Some(2026),
             release_date: Some("2026-01-01".into()),
+            curated_at: Some(NOW.into()),
+            artist_sort_name: "Test Artist".into(),
         })
         .collect();
     let songs: Vec<Song> = (0..8)
@@ -1037,4 +1048,436 @@ fn other_user_key_authenticates() {
     let app = SubsonicApp::new(store);
     let text = body_text(&app, "/rest/ping", OTHER_KEY);
     assert!(text.contains("status=\"ok\""), "{text}");
+}
+
+// --- edge cases: metadata-only lyrics, starred order, catalogue sorts ---
+//
+// Source-verified against v1 (`GetLyricsBySongIdController:18-25` answers
+// `lyricsList=[]` when `ParsedLyrics.lines` is empty; starred repositories
+// order by `favorites.position`; the catalogue `newest` sorts `curated_at`
+// and `byYear` sorts `release_date DESC, curated_at DESC` with Postgres
+// `DESC NULLS FIRST`; catalogue `alphabeticalByArtist` sorts
+// `artist_sort_name` then album name while the legacy list uses the display
+// artist). Sorting and history come from the real `MemStore` via
+// `with_catalogue`; nothing here reimplements a sort or shuffle.
+
+/// Album builder with catalogue defaults; callers override the fields their
+/// case pins (`created`, `year`, `release_date`, `curated_at`,
+/// `artist_sort_name`).
+fn edge_album(id: &str, name: &str, artist: &str, artist_id: &str) -> Album {
+    Album {
+        id: id.into(),
+        name: name.into(),
+        artist: artist.into(),
+        artist_id: artist_id.into(),
+        duration: 200,
+        created: NOW.into(),
+        year: Some(2026),
+        release_date: Some("2026-01-01".into()),
+        curated_at: Some(NOW.into()),
+        artist_sort_name: artist.into(),
+    }
+}
+
+/// One streamable song per album so catalogue lists keep the album.
+fn edge_song(id: &str, album_id: &str, album_name: &str, artist_id: &str) -> Song {
+    Song {
+        id: id.into(),
+        title: format!("Song {id}"),
+        album: album_name.into(),
+        artist: "Test Artist".into(),
+        track: 1,
+        year: 2026,
+        genre: "Rock".into(),
+        cover_art: album_id.into(),
+        size: 1000,
+        content_type: "audio/mpeg".into(),
+        suffix: "mp3".into(),
+        duration: 200,
+        disc: 1,
+        created: NOW.into(),
+        album_id: album_id.into(),
+        artist_id: artist_id.into(),
+    }
+}
+
+fn id_order(text: &str, ids: &[&str]) -> Vec<String> {
+    album_order_in_list2(text, ids)
+}
+
+/// Response text for any store type (`body_text` is pinned to `TestStore`).
+fn store_text<S: Library>(app: &SubsonicApp<S>, path: &str, query: &str) -> String {
+    String::from_utf8(get(app, path, query)).unwrap()
+}
+
+#[test]
+fn lyrics_metadata_only_input_answers_empty_lyrics_list() {
+    // No lyric lines survive: tag-only and offset-only payloads must answer
+    // `lyricsList=[]`, never `structuredLyrics:[{line:[]}]`.
+    for raw in [
+        "[ar:Test Artist]\n[ti:Test Song]\n[al:Test Album]",
+        "[ar:Test Artist]",
+        "[offset:500]",
+        "[OFFSET: 500 ]",
+        "[ar:Test Artist]\n[offset:500]\n[ti:Test Song]",
+    ] {
+        let text = lyrics_body(raw);
+        assert!(text.contains("\"lyricsList\":[]"), "{raw} -> {text}");
+        assert!(!text.contains("structuredLyrics"), "{raw} -> {text}");
+        assert!(!text.contains("\"line\""), "{raw} -> {text}");
+    }
+}
+
+fn starred_catalogue() -> (Vec<Artist>, Vec<Album>, Vec<Song>) {
+    let artists = vec![
+        Artist {
+            id: "ar-1".into(),
+            name: "Artist One".into(),
+        },
+        Artist {
+            id: "ar-2".into(),
+            name: "Artist Two".into(),
+        },
+        Artist {
+            id: "ar-3".into(),
+            name: "Artist Three".into(),
+        },
+    ];
+    let albums = vec![
+        edge_album("al-1", "Album One", "Artist One", "ar-1"),
+        edge_album("al-2", "Album Two", "Artist Two", "ar-2"),
+        edge_album("al-3", "Album Three", "Artist Three", "ar-3"),
+    ];
+    let songs = vec![
+        edge_song("so-1", "al-1", "Album One", "ar-1"),
+        edge_song("so-2", "al-2", "Album Two", "ar-2"),
+        edge_song("so-3", "al-3", "Album Three", "ar-3"),
+    ];
+    (artists, albums, songs)
+}
+
+fn starred_app() -> SubsonicApp<TestStore> {
+    let (artists, albums, songs) = starred_catalogue();
+    let (store, _) = TestStore::new(artists, albums, songs, BTreeMap::new());
+    SubsonicApp::new(store)
+}
+
+#[test]
+fn starred_kinds_preserve_favorite_insertion_order() {
+    // Favorites inserted in non-id order must come back in that favorite
+    // order from both getStarred and getStarred2, for every kind. Starring
+    // through the non-`id` params (`artistId=`, `albumId=`) counts as
+    // insertion too.
+    let app = starred_app();
+    for (param, value) in [
+        ("artistId", "ar-3"),
+        ("artistId", "ar-1"),
+        ("artistId", "ar-2"),
+        ("albumId", "al-3"),
+        ("albumId", "al-1"),
+        ("albumId", "al-2"),
+        ("id", "so-3"),
+        ("id", "so-1"),
+        ("id", "so-2"),
+    ] {
+        let text = body_text(&app, "/rest/star", &format!("{KEY}&{param}={value}&f=json"));
+        assert!(
+            text.contains("\"status\":\"ok\""),
+            "{param}={value}: {text}"
+        );
+    }
+    for path in ["/rest/getStarred", "/rest/getStarred2"] {
+        let text = body_text(&app, path, &format!("{KEY}&f=json"));
+        assert_eq!(
+            id_order(&text, &["ar-3", "ar-1", "ar-2"]),
+            vec!["ar-3".to_string(), "ar-1".to_string(), "ar-2".to_string()],
+            "{path} artists: {text}"
+        );
+        assert_eq!(
+            id_order(&text, &["al-3", "al-1", "al-2"]),
+            vec!["al-3".to_string(), "al-1".to_string(), "al-2".to_string()],
+            "{path} albums: {text}"
+        );
+        assert_eq!(
+            id_order(&text, &["so-3", "so-1", "so-2"]),
+            vec!["so-3".to_string(), "so-1".to_string(), "so-2".to_string()],
+            "{path} songs: {text}"
+        );
+    }
+}
+
+#[test]
+fn legacy_starred_album_list_preserves_favorite_position() {
+    let app = starred_app();
+    for album in ["al-3", "al-1", "al-2"] {
+        let text = body_text(&app, "/rest/star", &format!("{KEY}&albumId={album}&f=json"));
+        assert!(text.contains("\"status\":\"ok\""), "{album}: {text}");
+    }
+    let text = body_text(
+        &app,
+        "/rest/getAlbumList",
+        &format!("{KEY}&type=starred&f=json"),
+    );
+    assert_eq!(
+        id_order(&text, &["al-3", "al-1", "al-2"]),
+        vec!["al-3".to_string(), "al-1".to_string(), "al-2".to_string()],
+        "legacy starred must follow favorite position: {text}"
+    );
+}
+
+#[test]
+fn restar_is_idempotent_and_unstar_restars_at_end() {
+    let app = starred_app();
+    for artist in ["ar-3", "ar-1", "ar-2"] {
+        let text = body_text(
+            &app,
+            "/rest/star",
+            &format!("{KEY}&artistId={artist}&f=json"),
+        );
+        assert!(text.contains("\"status\":\"ok\""), "{artist}: {text}");
+    }
+    // Re-starring changes nothing: no duplicate, no move.
+    let text = body_text(&app, "/rest/star", &format!("{KEY}&artistId=ar-1&f=json"));
+    assert!(text.contains("\"status\":\"ok\""), "{text}");
+    let text = body_text(&app, "/rest/getStarred2", &format!("{KEY}&f=json"));
+    assert_eq!(
+        id_order(&text, &["ar-3", "ar-1", "ar-2"]),
+        vec!["ar-3".to_string(), "ar-1".to_string(), "ar-2".to_string()],
+        "re-star must not move the favorite: {text}"
+    );
+    assert_eq!(
+        text.matches("\"id\":\"ar-1\"").count(),
+        1,
+        "re-star must not duplicate the favorite: {text}"
+    );
+    // Unstar then re-star takes a fresh position at the end.
+    let text = body_text(&app, "/rest/unstar", &format!("{KEY}&artistId=ar-3&f=json"));
+    assert!(text.contains("\"status\":\"ok\""), "{text}");
+    let text = body_text(&app, "/rest/star", &format!("{KEY}&artistId=ar-3&f=json"));
+    assert!(text.contains("\"status\":\"ok\""), "{text}");
+    let text = body_text(&app, "/rest/getStarred2", &format!("{KEY}&f=json"));
+    assert_eq!(
+        id_order(&text, &["ar-1", "ar-2", "ar-3"]),
+        vec!["ar-1".to_string(), "ar-2".to_string(), "ar-3".to_string()],
+        "re-starred favorite moves to the end: {text}"
+    );
+}
+
+#[test]
+fn starred_state_is_per_user() {
+    let app = starred_app();
+    let text = body_text(&app, "/rest/star", &format!("{KEY}&artistId=ar-1&f=json"));
+    assert!(text.contains("\"status\":\"ok\""), "{text}");
+    // The other user stars in a different order; neither side leaks.
+    for artist in ["ar-2", "ar-3"] {
+        let text = body_text(
+            &app,
+            "/rest/star",
+            &format!("{OTHER_KEY}&artistId={artist}&f=json"),
+        );
+        assert!(text.contains("\"status\":\"ok\""), "{artist}: {text}");
+    }
+    let text = body_text(&app, "/rest/getStarred2", &format!("{KEY}&f=json"));
+    assert!(text.contains("ar-1"), "{text}");
+    assert!(!text.contains("ar-2"), "{text}");
+    assert!(!text.contains("ar-3"), "{text}");
+    let text = body_text(&app, "/rest/getStarred2", &format!("{OTHER_KEY}&f=json"));
+    assert_eq!(
+        id_order(&text, &["ar-2", "ar-3"]),
+        vec!["ar-2".to_string(), "ar-3".to_string()],
+        "other user's own order is kept: {text}"
+    );
+}
+
+#[test]
+fn album_list2_newest_orders_by_curated_at_not_created() {
+    // `created` and `curated_at` disagree on purpose; the catalogue follows
+    // `curated_at` (Postgres `DESC NULLS FIRST`), the legacy list keeps
+    // following `created`.
+    let artists = vec![Artist {
+        id: "ar-1".into(),
+        name: "Test Artist".into(),
+    }];
+    let mut al_old = edge_album("al-old", "Old Created", "Test Artist", "ar-1");
+    al_old.created = "2026-03-01T00:00:00".into();
+    al_old.curated_at = Some("2026-01-01T00:00:00".into());
+    let mut al_new = edge_album("al-new", "New Created", "Test Artist", "ar-1");
+    al_new.created = "2026-01-01T00:00:00".into();
+    al_new.curated_at = Some("2026-03-01T00:00:00".into());
+    let mut al_null = edge_album("al-null", "Null Curated", "Test Artist", "ar-1");
+    al_null.created = "2026-02-01T00:00:00".into();
+    al_null.curated_at = None;
+    let albums = vec![al_old, al_new, al_null];
+    let songs = vec![
+        edge_song("so-old", "al-old", "Old Created", "ar-1"),
+        edge_song("so-new", "al-new", "New Created", "ar-1"),
+        edge_song("so-null", "al-null", "Null Curated", "ar-1"),
+    ];
+    let store = MemStore::empty_with_test_auth().with_catalogue(artists, albums, songs);
+    let app = SubsonicApp::new(store);
+    let text = store_text(
+        &app,
+        "/rest/getAlbumList2",
+        &format!("{KEY}&type=newest&f=json"),
+    );
+    assert_eq!(
+        id_order(&text, &["al-old", "al-new", "al-null"]),
+        vec![
+            "al-null".to_string(),
+            "al-new".to_string(),
+            "al-old".to_string()
+        ],
+        "List2 newest sorts curated_at, nulls first: {text}"
+    );
+    let text = store_text(
+        &app,
+        "/rest/getAlbumList",
+        &format!("{KEY}&type=newest&f=json"),
+    );
+    assert_eq!(
+        id_order(&text, &["al-old", "al-new", "al-null"]),
+        vec![
+            "al-old".to_string(),
+            "al-null".to_string(),
+            "al-new".to_string()
+        ],
+        "legacy newest keeps created order: {text}"
+    );
+}
+
+#[test]
+fn album_list2_by_year_orders_release_date_then_curated_at_nulls_first() {
+    // Every eligible album shares `year`; `release_date` decides first and
+    // `curated_at` breaks ties, both Postgres `DESC NULLS FIRST`. The 1999
+    // album stays out of the 2020-2030 window.
+    let artists = vec![Artist {
+        id: "ar-1".into(),
+        name: "Test Artist".into(),
+    }];
+    let mut al_none = edge_album("al-none", "No Release", "Test Artist", "ar-1");
+    al_none.release_date = None;
+    al_none.curated_at = None;
+    let mut al_tie_loose = edge_album("al-tie-loose", "Tie Loose", "Test Artist", "ar-1");
+    al_tie_loose.release_date = Some("2026-05-01".into());
+    al_tie_loose.curated_at = None;
+    let mut al_tie_set = edge_album("al-tie-set", "Tie Set", "Test Artist", "ar-1");
+    al_tie_set.release_date = Some("2026-05-01".into());
+    al_tie_set.curated_at = Some("2026-02-01T00:00:00".into());
+    let mut al_winter = edge_album("al-winter", "Winter", "Test Artist", "ar-1");
+    al_winter.release_date = Some("2026-01-01".into());
+    al_winter.curated_at = Some("2026-09-01T00:00:00".into());
+    let mut al_old = edge_album("al-old", "Ancient", "Test Artist", "ar-1");
+    al_old.year = Some(1999);
+    al_old.release_date = Some("1999-06-01".into());
+    al_old.curated_at = Some("2026-12-01T00:00:00".into());
+    let albums = vec![al_none, al_tie_loose, al_tie_set, al_winter, al_old];
+    let songs = vec![
+        edge_song("so-none", "al-none", "No Release", "ar-1"),
+        edge_song("so-tie-loose", "al-tie-loose", "Tie Loose", "ar-1"),
+        edge_song("so-tie-set", "al-tie-set", "Tie Set", "ar-1"),
+        edge_song("so-winter", "al-winter", "Winter", "ar-1"),
+        edge_song("so-old", "al-old", "Ancient", "ar-1"),
+    ];
+    let store = MemStore::empty_with_test_auth().with_catalogue(artists, albums, songs);
+    let app = SubsonicApp::new(store);
+    let text = store_text(
+        &app,
+        "/rest/getAlbumList2",
+        &format!("{KEY}&type=byYear&fromYear=2020&toYear=2030&f=json"),
+    );
+    assert_eq!(
+        id_order(
+            &text,
+            &["al-none", "al-tie-loose", "al-tie-set", "al-winter"]
+        ),
+        vec![
+            "al-none".to_string(),
+            "al-tie-loose".to_string(),
+            "al-tie-set".to_string(),
+            "al-winter".to_string()
+        ],
+        "byYear sorts release_date then curated_at, nulls first: {text}"
+    );
+    assert!(
+        !text.contains("al-old"),
+        "out-of-range year stays excluded: {text}"
+    );
+}
+
+#[test]
+fn album_list2_alphabetical_by_artist_uses_sort_name() {
+    // Display artists and sort names disagree on purpose: the catalogue
+    // follows `artist_sort_name` then album name, the legacy list follows
+    // the display artist then album name.
+    let artists = vec![
+        Artist {
+            id: "ar-x".into(),
+            name: "Beta".into(),
+        },
+        Artist {
+            id: "ar-y".into(),
+            name: "Alpha".into(),
+        },
+        Artist {
+            id: "ar-z".into(),
+            name: "Charlie".into(),
+        },
+        Artist {
+            id: "ar-s".into(),
+            name: "Solo".into(),
+        },
+    ];
+    let mut al_x = edge_album("al-x", "Same Name", "Beta", "ar-x");
+    al_x.artist_sort_name = "Charlie".into();
+    let mut al_y = edge_album("al-y", "Same Name", "Alpha", "ar-y");
+    al_y.artist_sort_name = "Bravo".into();
+    let mut al_z = edge_album("al-z", "Same Name", "Charlie", "ar-z");
+    al_z.artist_sort_name = "Alpha".into();
+    let mut al_t1 = edge_album("al-t1", "Second", "Solo", "ar-s");
+    al_t1.artist_sort_name = "Same".into();
+    let mut al_t2 = edge_album("al-t2", "First", "Solo", "ar-s");
+    al_t2.artist_sort_name = "Same".into();
+    let albums = vec![al_x, al_y, al_z, al_t1, al_t2];
+    let songs = vec![
+        edge_song("so-x", "al-x", "Same Name", "ar-x"),
+        edge_song("so-y", "al-y", "Same Name", "ar-y"),
+        edge_song("so-z", "al-z", "Same Name", "ar-z"),
+        edge_song("so-t1", "al-t1", "Second", "ar-s"),
+        edge_song("so-t2", "al-t2", "First", "ar-s"),
+    ];
+    let store = MemStore::empty_with_test_auth().with_catalogue(artists, albums, songs);
+    let app = SubsonicApp::new(store);
+    let ids = ["al-x", "al-y", "al-z", "al-t1", "al-t2"];
+    let text = store_text(
+        &app,
+        "/rest/getAlbumList2",
+        &format!("{KEY}&type=alphabeticalByArtist&f=json"),
+    );
+    assert_eq!(
+        id_order(&text, &ids),
+        vec![
+            "al-z".to_string(),
+            "al-y".to_string(),
+            "al-x".to_string(),
+            "al-t2".to_string(),
+            "al-t1".to_string()
+        ],
+        "List2 follows artist_sort_name then album name: {text}"
+    );
+    let text = store_text(
+        &app,
+        "/rest/getAlbumList",
+        &format!("{KEY}&type=alphabeticalByArtist&f=json"),
+    );
+    assert_eq!(
+        id_order(&text, &ids),
+        vec![
+            "al-y".to_string(),
+            "al-x".to_string(),
+            "al-z".to_string(),
+            "al-t2".to_string(),
+            "al-t1".to_string()
+        ],
+        "legacy List1 follows the display artist: {text}"
+    );
 }
