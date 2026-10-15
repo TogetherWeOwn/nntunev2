@@ -31,6 +31,12 @@ export class ApiError extends Error {
 
 export interface MagicLinkResult {
 	ok: true;
+	/**
+	 * Present on magic-link finish only: the signed-in account's own
+	 * email, echoed back so the web app can show "Signed in as …" before
+	 * any provider credential is typed (login-CSRF defense in depth).
+	 */
+	email?: string;
 }
 
 export interface IndexerConfigInput {

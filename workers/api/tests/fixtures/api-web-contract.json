@@ -40,6 +40,28 @@
       }
     },
     {
+      "id": "register-finish-invite",
+      "method": "POST",
+      "path": "/v1/auth/passkey/register/finish",
+      "web": "registerFinish",
+      "input": {
+        "challenge": "Zml4dHVyZS1yZWdpc3Rlci1jaGFsbGVuZ2U",
+        "credentialId": "Zml4dHVyZS1jcmVkZW50aWFs",
+        "attestationObject": "Zml4dHVyZS1hdHRlc3RhdGlvbg",
+        "clientDataJson": "Zml4dHVyZS1jbGllbnQtZGF0YQ",
+        "magicToken": "fixture-magic-token",
+        "inviteCode": "fixture-invite-code"
+      },
+      "wire": {
+        "challenge": "Zml4dHVyZS1yZWdpc3Rlci1jaGFsbGVuZ2U",
+        "credential_id": "Zml4dHVyZS1jcmVkZW50aWFs",
+        "attestation_object": "Zml4dHVyZS1hdHRlc3RhdGlvbg",
+        "client_data_json": "Zml4dHVyZS1jbGllbnQtZGF0YQ",
+        "magic_token": "fixture-magic-token",
+        "invite_code": "fixture-invite-code"
+      }
+    },
+    {
       "id": "login-start",
       "method": "POST",
       "path": "/v1/auth/passkey/login/start",

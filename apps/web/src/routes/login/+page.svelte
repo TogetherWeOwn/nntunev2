@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { ApiClient } from '#lib/api/client.js';
+	import { stashSignedInEmail } from '#lib/signed-in-email.js';
 	import { serializePublicKeyCredential, toRequestOptions } from '#lib/webauthn.js';
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
@@ -73,6 +74,7 @@
 				clientDataJson: clientDataJSON,
 				signature
 			});
+			stashSignedInEmail(email.trim());
 			window.location.href = '/onboarding/provider';
 		} catch {
 			// Generic: login errors stay non-enumerating, like the API.

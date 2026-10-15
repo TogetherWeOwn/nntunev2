@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { ApiClient, type RegisterStartResponse } from '#lib/api/client.js';
+	import { stashSignedInEmail } from '#lib/signed-in-email.js';
 	import {
 		serializePublicKeyCredential,
 		toCreationOptions,
@@ -48,6 +49,16 @@
 		}
 	}
 
+	function startOver() {
+		// Back to the email step with a clean slate: the recovery path
+		// when a failure after the single-use claims (expired challenge,
+		// duplicate credential) means this attempt can never succeed.
+		pending = null;
+		magicCode = '';
+		inviteCode = '';
+		status = 'idle';
+	}
+
 	async function finishAccount(event: SubmitEvent) {
 		event.preventDefault();
 		if (pending === null || status === 'finishing' || magicCode.trim().length === 0) return;
@@ -87,6 +98,7 @@
 				...(inviteCode.trim().length > 0 ? { inviteCode: inviteCode.trim() } : {})
 			});
 			status = 'created';
+			stashSignedInEmail(email.trim());
 			window.location.href = '/onboarding/provider';
 		} catch {
 			// Generic: account creation never says which step failed. Stay
@@ -117,7 +129,13 @@
 				the link for this step; it signs you in instead.)
 			</p>
 			{#if status === 'code-error'}
-				<p role="alert">That didn't work — re-enter the code from the email and try again.</p>
+				<p role="alert">
+					That didn't work — re-enter the code (and invite code, if you have one) from the
+					email and try again. If it keeps failing, start over to get a fresh code.
+				</p>
+				<button class="nt-button nt-button--ghost" type="button" onclick={startOver}>
+					Start over
+				</button>
 			{/if}
 			<label>
 				Email code
