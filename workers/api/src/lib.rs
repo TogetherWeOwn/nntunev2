@@ -6,5 +6,6 @@
 //! with unit + integration tests.
 
 pub mod auth;
+pub mod library;
 pub mod session;
 pub mod vault;
