@@ -38,12 +38,24 @@ least-privilege credential.
    with `account_deleting` or `container_deleting` plus the operation id. The
    executor is the `delete` Workflow with hourly `delete-sweep` resume, not a
    bare FK cascade. `DELETE /v1/account` additionally requires fresh step-up
-   authentication (passkey with user verification, or a magic-link challenge
-   issued within the last 15 minutes), writes an `audit_log` row, and sends a
+   authentication consumed for this action: either a verified passkey user-
+   verification assertion obtained for this user after the DELETE intent and
+   within the last 15 minutes, or a completed (claimed) magic-link token
+   consumed for this action within the same window — recorded against the
+   session id and the action name (`delete-account` / `cancel-deletion`) and
+   single-use, so an issued-but-unclaimed link, a link claimed for another
+   purpose, a replayed proof, a proof from a different session, or a stale
+   login-time proof never satisfies it (ADR 0008 single-use invariants apply).
+   The endpoint writes an `audit_log` row and sends a
    confirmation email; erasure starts only after a 24-hour cancellable grace
    window with `deleting_at` set, during which `POST
-   /v1/account/cancel-deletion` (same step-up) clears the marker and the
-   operation. Library/playlist deletes have no grace window.
+   /v1/account/cancel-deletion` (same consumed step-up) clears the marker and
+   the operation via the compare-and-set in ADR 0002 rule 3. Cancel during
+   grace needs a fresh login plus step-up when the session has lapsed (sessions
+   keep the ADR 0008 one-day absolute cap); login, step-up, audit and the
+   cancel call are exempt from the `deleting_at` fence, all data writers stay
+   fenced. Account completion pseudonymizes `audit_log` and deletes
+   `auth_challenges` per ADR 0002 rule 3. Library/playlist deletes have no grace window.
    Auth at launch otherwise: the existing session cookie. Native REST bearer keys are
    deferred to a separate scoped-credential design, not borrowed from Subsonic.
    Versioned (`/v1`); breaking changes ship `/v2` alongside, never mutate `/v1`.

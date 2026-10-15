@@ -242,7 +242,9 @@ The cache-GC Workflow runs in bounded batches and follows this order:
    batch when the deleted source was the selected art source.
 5. Sweep a `cache_objects` row/R2 object only with **zero `user_cache_grants`,
    zero `track_media` references and zero non-NULL `release_art.content_hash`
-   references**. Art is explicitly in the mark set; its FK uses RESTRICT, not a
+   references** (mark lookups use the `(content_hash)` indexes on
+   `track_media`/`user_cache_grants` and the partial `release_art` index,
+   ADR 0002). Art is explicitly in the mark set; its FK uses RESTRICT, not a
    cascading descriptor deletion. Serialize publication and sweep for that hash
    and recheck all three sets before deleting bytes from the stored bucket/key.
    DB FKs must not be disabled. Physical-delete failures are retried; they never

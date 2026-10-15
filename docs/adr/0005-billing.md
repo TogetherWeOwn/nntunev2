@@ -24,8 +24,9 @@ billing mechanism, not a conclusion about those obligations.
    request id/payload. At most one unresolved billing operation per user is
    allowed. Pending setup grants no stream entitlement. Check the write-once
    `billing_accounts.trial_started_at` AND the `deleted_billing_tombstones`
-   email-HMAC index (normalized email under the versioned billing-email
-   pepper): only NULL history in both is eligible for the trial branch.
+   `(pepper_version, email_hmac)` index (normalized email under every retained
+   `BILLING_EMAIL_PEPPER` version, ADR 0002): only NULL history in both is
+   eligible for the trial branch.
    Persist its proposed start/end in the immutable request payload.
    Existing history means a paid choice with **no** `trial_end`, `trial_period_days`
    or `trial_settings`; lack of paid consent leaves setup pending, not another
@@ -232,9 +233,15 @@ and no history) so trial single-use and debt survive, and handle webhooks for
 unknown or tombstoned customers by cancel-and-alert when a live remote
 subscription remains, otherwise by reconciling the tombstone without recreating
 a user. Tombstones are retained 36 months, then deleted. The account
-delete-cancel is immediate (not `cancel_at_period_end`): `proration_behavior=none`,
-final invoice issued, no refund in this step; every listed subscription must be
-confirmed terminal before local rows are deleted.
+delete-cancel is immediate (not `cancel_at_period_end`): `DELETE
+/v1/subscriptions/{id}` with `prorate=false`, `invoice_now=true` (the final
+invoice), and `cancellation_details[reason]=account_deletion`; no refund in
+this step (`proration_behavior=none` belongs only to the update call at the
+pinned API version). Cancelling stops automatic collection of open finalized
+invoices, so they are left uncollected and their refs recorded in the
+tombstone's `open_invoice_refs`/`debt_refs`; every listed subscription must be
+confirmed terminal before local rows are deleted. The implementing PR asserts
+these exact request parameters.
 
 ## Acceptance contract for the implementing billing PR
 
