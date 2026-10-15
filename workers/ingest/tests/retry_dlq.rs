@@ -1,4 +1,4 @@
-//! Retry-budget + DLQ acceptance (TOG-25372).
+//! Retry-budget + DLQ acceptance.
 //!
 //! An always-failing ("poison") job must burn its bounded retry budget with
 //! backoff, then land in the DLQ carrying reason headers (error code,
