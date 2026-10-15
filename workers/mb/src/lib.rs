@@ -999,6 +999,8 @@ pub async fn main(
         .await
 }
 #[cfg(test)]
+mod search_pagination_acceptance;
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
