@@ -1226,7 +1226,7 @@ fn legacy_starred_album_list_preserves_favorite_position() {
 }
 
 #[test]
-fn restar_is_idempotent_and_unstar_restars_at_end() {
+fn restar_moves_existing_favorite_to_end_and_unstar_restars_at_end() {
     let app = starred_app();
     for artist in ["ar-3", "ar-1", "ar-2"] {
         let text = body_text(
@@ -1236,14 +1236,16 @@ fn restar_is_idempotent_and_unstar_restars_at_end() {
         );
         assert!(text.contains("\"status\":\"ok\""), "{artist}: {text}");
     }
-    // Re-starring changes nothing: no duplicate, no move.
+    // v1 FavoriteService::batchFavorite assigns max(position)+1 per target and
+    // the upsert overwrites position, so re-star MOVES the existing favorite
+    // to the end while staying deduplicated: star A, star B, star A => [B, A].
     let text = body_text(&app, "/rest/star", &format!("{KEY}&artistId=ar-1&f=json"));
     assert!(text.contains("\"status\":\"ok\""), "{text}");
     let text = body_text(&app, "/rest/getStarred2", &format!("{KEY}&f=json"));
     assert_eq!(
-        id_order(&text, &["ar-3", "ar-1", "ar-2"]),
-        vec!["ar-3".to_string(), "ar-1".to_string(), "ar-2".to_string()],
-        "re-star must not move the favorite: {text}"
+        id_order(&text, &["ar-3", "ar-2", "ar-1"]),
+        vec!["ar-3".to_string(), "ar-2".to_string(), "ar-1".to_string()],
+        "re-star must move the favorite to the end: {text}"
     );
     assert_eq!(
         text.matches("\"id\":\"ar-1\"").count(),
@@ -1257,9 +1259,60 @@ fn restar_is_idempotent_and_unstar_restars_at_end() {
     assert!(text.contains("\"status\":\"ok\""), "{text}");
     let text = body_text(&app, "/rest/getStarred2", &format!("{KEY}&f=json"));
     assert_eq!(
-        id_order(&text, &["ar-1", "ar-2", "ar-3"]),
-        vec!["ar-1".to_string(), "ar-2".to_string(), "ar-3".to_string()],
+        id_order(&text, &["ar-2", "ar-1", "ar-3"]),
+        vec!["ar-2".to_string(), "ar-1".to_string(), "ar-3".to_string()],
         "re-starred favorite moves to the end: {text}"
+    );
+}
+
+#[test]
+fn restar_batch_with_existing_and_new_applies_in_request_order() {
+    // Mixed batches apply sequentially: each target takes max(position)+1, so
+    // an existing favorite moves to the end before later targets append after
+    // it. Minimal case first: star A, star B, star A => [B, A].
+    let app = starred_app();
+    for artist in ["ar-1", "ar-2"] {
+        let text = body_text(
+            &app,
+            "/rest/star",
+            &format!("{KEY}&artistId={artist}&f=json"),
+        );
+        assert!(text.contains("\"status\":\"ok\""), "{artist}: {text}");
+    }
+    let text = body_text(
+        &app,
+        "/rest/star",
+        &format!("{KEY}&artistId=ar-1&artistId=ar-3&f=json"),
+    );
+    assert!(text.contains("\"status\":\"ok\""), "{text}");
+    let text = body_text(&app, "/rest/getStarred2", &format!("{KEY}&f=json"));
+    assert_eq!(
+        id_order(&text, &["ar-2", "ar-1", "ar-3"]),
+        vec!["ar-2".to_string(), "ar-1".to_string(), "ar-3".to_string()],
+        "batch [existing, new] must move existing then append new: {text}"
+    );
+    // Reverse request order appends the new favorite before moving the
+    // existing one to the very end.
+    let app = starred_app();
+    for artist in ["ar-1", "ar-2"] {
+        let text = body_text(
+            &app,
+            "/rest/star",
+            &format!("{KEY}&artistId={artist}&f=json"),
+        );
+        assert!(text.contains("\"status\":\"ok\""), "{artist}: {text}");
+    }
+    let text = body_text(
+        &app,
+        "/rest/star",
+        &format!("{KEY}&artistId=ar-3&artistId=ar-1&f=json"),
+    );
+    assert!(text.contains("\"status\":\"ok\""), "{text}");
+    let text = body_text(&app, "/rest/getStarred2", &format!("{KEY}&f=json"));
+    assert_eq!(
+        id_order(&text, &["ar-2", "ar-3", "ar-1"]),
+        vec!["ar-2".to_string(), "ar-3".to_string(), "ar-1".to_string()],
+        "batch [new, existing] must append new then move existing: {text}"
     );
 }
 
