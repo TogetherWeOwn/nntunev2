@@ -171,9 +171,36 @@ pub fn play(
     secret: &[u8],
     input: &PlayInput<'_>,
 ) -> Result<PlayResponse, PlayError> {
-    let grant =
-        grant::verify(input.token, secret, input.now_unix).map_err(PlayError::Unauthorized)?;
+    let grant = match grant::verify(input.token, secret, input.now_unix) {
+        Ok(grant) => grant,
+        Err(err) => {
+            // Rejection meter signals (S13): expired and excessive-expiry
+            // rejections each emit one distinct, side-effect-free event
+            // before the error returns. Malformed / bad-signature
+            // rejections stay silent (out of scope). No `PlayStart`, no
+            // cache events, no dial: the pool is untouched this early.
+            let kind = match err {
+                GrantError::Expired => Some(MeterKind::GrantRejectedExpired),
+                GrantError::TtlTooLong => Some(MeterKind::GrantRejectedExcessiveExpiry),
+                GrantError::Malformed | GrantError::BadSignature => None,
+            };
+            if let Some(kind) = kind {
+                // Best-effort granted user from the validly-signed payload;
+                // empty only when undecodable. Requested track only, never
+                // secret or token material.
+                let user = grant::authenticated_user(input.token, secret).unwrap_or_default();
+                meter.emit(ev(kind, &user, input.track_id, 0));
+            }
+            return Err(PlayError::Unauthorized(err));
+        }
+    };
     if grant.track_id != input.track_id {
+        meter.emit(ev(
+            MeterKind::GrantRejectedWrongTrack,
+            &grant.user_id,
+            input.track_id,
+            0,
+        ));
         return Err(PlayError::WrongTrack);
     }
     let user = grant.user_id.clone();
@@ -609,7 +636,9 @@ mod tests {
     #[test]
     fn wrong_track_grant_is_rejected() {
         let secret = b"s";
-        let token = grant::issue("u", "track-a", 9_999_999_999, secret);
+        // Within the TTL cap (`now` is 1 below) so the test exercises track
+        // binding rather than the over-cap rejection.
+        let token = grant::issue("u", "track-a", 1 + grant::MAX_GRANT_TTL, secret);
         let mut pool = Pool::new(1);
         let mut cache = ContentCache::new();
         let mut meter = crate::meter::MemoryMeter::default();

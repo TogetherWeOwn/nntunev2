@@ -8,6 +8,24 @@
 //!
 //! Note: `user_id` and `track_id` must not contain `|` (our IDs never do);
 //! anything else that fails to parse is rejected as [`GrantError::Malformed`].
+//!
+//! Grants are short-lived: [`MAX_GRANT_TTL`] caps the lifetime at 15 minutes
+//! (900 s). The production issuer [`issue_at`] clamps longer requests to the
+//! cap, and [`verify`] rejects any grant with `exp - now` beyond
+//! `MAX_GRANT_TTL + CLOCK_SKEW_SECS` as [`GrantError::TtlTooLong`] so a
+//! captured grant stops replaying soon after issuance.
+
+/// Maximum grant lifetime: 15 minutes, in seconds.
+///
+/// Enforced at issuance (requests beyond the cap are clamped by [`issue_at`])
+/// and at verification ([`verify`] rejects over-cap grants even when the
+/// signature is valid).
+pub const MAX_GRANT_TTL: u64 = 900;
+
+/// Clock skew tolerated on top of [`MAX_GRANT_TTL`] when verifying, in
+/// seconds: an at-cap grant minted by an issuer whose clock runs ahead of
+/// the verifier's still verifies, up to 60 s over the cap.
+pub const CLOCK_SKEW_SECS: u64 = 60;
 
 /// A verified play grant.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,14 +41,41 @@ pub enum GrantError {
     Malformed,
     BadSignature,
     Expired,
+    /// The grant's remaining lifetime (`exp - now`) exceeds
+    /// `MAX_GRANT_TTL + CLOCK_SKEW_SECS`. Returned even for a validly-signed
+    /// token, so callers can tell "minted too long" apart from expiry.
+    TtlTooLong,
 }
 
 /// Issue a grant for (`user_id`, `track_id`) expiring at `exp_unix`.
+///
+/// This is the raw signer: it mints exactly the requested expiry so tests
+/// and offline tooling can construct arbitrary tokens. Production code must
+/// use [`issue_at`], which clamps the requested lifetime to
+/// [`MAX_GRANT_TTL`]; [`verify`] rejects over-cap grants regardless of
+/// which issuer minted them.
 pub fn issue(user_id: &str, track_id: &str, exp_unix: u64, secret: &[u8]) -> String {
     let payload = format!("{user_id}|{track_id}|{exp_unix}");
     let payload_b64 = base64url_encode(payload.as_bytes());
     let sig = hmac_sha256(secret, payload_b64.as_bytes());
     format!("v1.{payload_b64}.{}", base64url_encode(&sig))
+}
+
+/// Issue a grant for (`user_id`, `track_id`) with a requested lifetime of
+/// `ttl_secs` seconds from `now_unix`.
+///
+/// Requests beyond [`MAX_GRANT_TTL`] are clamped to the cap: the minted
+/// grant expires at `now_unix + min(ttl_secs, MAX_GRANT_TTL)` (saturating,
+/// so issuance near `u64::MAX` yields `u64::MAX` instead of wrapping).
+pub fn issue_at(
+    user_id: &str,
+    track_id: &str,
+    now_unix: u64,
+    ttl_secs: u64,
+    secret: &[u8],
+) -> String {
+    let exp_unix = now_unix.saturating_add(ttl_secs.min(MAX_GRANT_TTL));
+    issue(user_id, track_id, exp_unix, secret)
 }
 
 /// Verify `token` against `secret` at time `now_unix`.
@@ -56,11 +101,42 @@ pub fn verify(token: &str, secret: &[u8], now_unix: u64) -> Result<Grant, GrantE
     if now_unix >= exp_unix {
         return Err(GrantError::Expired);
     }
+    // `now_unix < exp_unix` here, so the subtraction cannot underflow;
+    // comparing the difference (rather than `now + cap + skew`) also
+    // cannot overflow near `u64::MAX`.
+    if exp_unix - now_unix > MAX_GRANT_TTL + CLOCK_SKEW_SECS {
+        return Err(GrantError::TtlTooLong);
+    }
     Ok(Grant {
         user_id: user_id.to_string(),
         track_id: track_id.to_string(),
         exp_unix,
     })
+}
+
+/// Best-effort authenticated user for metering: the `user_id` embedded in
+/// `token` when its signature verifies and its payload parses, regardless
+/// of expiry or TTL-cap state. Returns `None` for malformed tokens,
+/// bad signatures, or unparsable payloads — callers must treat that as
+/// "unknown user", never as a secret or token echo.
+pub fn authenticated_user(token: &str, secret: &[u8]) -> Option<String> {
+    let rest = token.strip_prefix("v1.")?;
+    let (payload_b64, sig_b64) = rest.split_once('.')?;
+    if payload_b64.is_empty() || sig_b64.is_empty() {
+        return None;
+    }
+    let sig = base64url_decode(sig_b64)?;
+    let expected = hmac_sha256(secret, payload_b64.as_bytes());
+    if sig.len() != expected.len() || !constant_time_eq(&sig, &expected) {
+        return None;
+    }
+    let payload = base64url_decode(payload_b64)?;
+    let payload = String::from_utf8(payload).ok()?;
+    let mut parts = payload.split('|');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(u), Some(_), Some(_), None) => Some(u.to_string()),
+        _ => None,
+    }
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
