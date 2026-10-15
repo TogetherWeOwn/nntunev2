@@ -1,14 +1,15 @@
-# nntune-api: accounts, auth, sessions, BYOP vault
+# nntune-api: Subsonic, accounts, auth, sessions, BYOP vault
 
 Rust core for NNTune v2 accounts/auth (passkey challenges + email magic
-link), signed-cookie sessions, and the BYOP credential vault. Compiles to
-native (tests) and `wasm32` (Cloudflare Worker).
+link), signed-cookie sessions, and the BYOP credential vault, with a
+Subsonic-compatible Worker entry on `/rest/*`. Compiles to native (tests)
+and `wasm32` (Cloudflare Worker).
 
 ## Layout
 
 ```text
 workers/api/
-  src/lib.rs      # crate root (native + wasm32, no Worker runtime imports)
+  src/lib.rs      # crate root; Subsonic Worker entry compiled only on wasm32
   src/session.rs  # HMAC-signed cookies: issue / verify / rotate
   src/auth.rs     # magic links, passkey challenge lifecycle, invite codes
   src/vault.rs    # envelope encryption, validation, SSRF guard, redaction
@@ -17,9 +18,19 @@ workers/api/
 ```
 
 `migrations/0002_auth_vault.sql` is the Postgres schema (PlanetScale via
-Hyperdrive). The HTTP + Hyperdrive wiring (Worker entry) lands in the
-follow-up slice once staging secrets are provisioned; this crate is the
-security-critical logic with tests.
+Hyperdrive). The auth/vault HTTP + Hyperdrive wiring lands in a follow-up
+slice once staging secrets are provisioned; those modules remain
+security-critical logic with tests, not live auth endpoints.
+
+The Subsonic Worker entry delegates to `crates/nntune-subsonic`. Its
+`MemStore::empty()` contains no credentials and refuses all authentication;
+PlanetScale `Library` and stream Worker wiring are still pending. This is
+not a deployed, usable music API yet. See
+[`docs/subsonic-client-smoke.md`](../../docs/subsonic-client-smoke.md) for
+the client verification procedure.
+
+This crate remains standalone (excluded from the root workspace), so use
+`--manifest-path workers/api/Cargo.toml` for its checks.
 
 ## Security contract (threat-model §3–§4)
 
@@ -70,10 +81,15 @@ security-critical logic with tests.
 
 ## Test
 
+Run these commands from the repository root:
+
 ```sh
-cargo test --manifest-path workers/api/Cargo.toml
-cargo clippy --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path workers/api/Cargo.toml --locked
+cargo clippy --manifest-path workers/api/Cargo.toml --all-targets --locked -- -D warnings
 cargo fmt --manifest-path workers/api/Cargo.toml -- --check
+cargo check --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown --locked
+cargo test -p nntune-subsonic --locked
+python3 scripts/check-subsonic-fixtures.py
 ```
 
 Fixtures use synthetic credentials only (`news.example.com`, `203.0.113.7`).

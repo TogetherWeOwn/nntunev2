@@ -2,7 +2,7 @@
 name = "nntune-api"
 version = "0.1.0"
 edition = "2021"
-description = "NNTune v2 accounts/auth (passkey challenges + email magic link), sessions, BYOP credential vault (Cloudflare Worker, Rust; native + wasm32)"
+description = "NNTune v2 API worker: Subsonic-compatible surface, accounts/auth, sessions and BYOP credential vault (native + wasm32)"
 license = "MIT"
 
 [lib]
@@ -23,6 +23,11 @@ serde_json = "1"
 zeroize = { version = "1", features = ["derive"] }
 url = "2"
 subtle = "2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+futures-util = "0.3"
+nntune-subsonic = { path = "../../crates/nntune-subsonic" }
+worker = "0.8"
 
 [dev-dependencies]
 serde_json = "1"

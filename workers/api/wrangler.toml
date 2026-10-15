@@ -1,0 +1,13 @@
+# nntune-api worker. Relational reads come from PlanetScale Postgres via
+# Hyperdrive and byte routes from the stream worker + R2; bindings are
+# attached by the DevOps card (no secret values ever live in this repo).
+name = "nntune-api"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+# [[hyperdrive]]  # attached at deploy time; see ops runbook.
+# binding = "PLANETSCALE"
+# id = "<hyperdrive id from Cloudflare dashboard>"

@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 Cargo.lock
+# Keep the application workspace and standalone API builds reproducible.
+!/Cargo.lock
+!/workers/api/Cargo.lock
 .cargo/
 
 # Rust wasm / workers
