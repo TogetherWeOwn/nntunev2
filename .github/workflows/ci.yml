@@ -6,6 +6,10 @@ name: ci
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  # Merge queue validation (TOG-24374): every required check must report on
+  # the queue's temporary merge commit, or the queue stalls on "Expected —
+  # waiting". merge_group runs are never cancelled (see concurrency below).
+  merge_group:
   push:
     branches: [main]
   workflow_dispatch:
@@ -15,7 +19,9 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  # merge_group refs are per-queue-entry (`gh-readonly-queue/...`) and must
+  # run to completion: cancelling a queue validation run ejects the entry.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'merge_group' }}
 
 env:
   CARGO_TERM_COLOR: always
