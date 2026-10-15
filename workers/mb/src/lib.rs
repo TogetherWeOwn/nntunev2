@@ -339,13 +339,17 @@ async fn handle_search<R: MbRepo, C: SuccessCache>(
     if let Some(body) = cache.get(&key).await {
         return success_response(body, SEARCH_CACHE_TTL_S);
     }
-    match repo.search(kind, &normalize_query(q)).await {
+    // The body echoes the normalized query, not the raw one: case and
+    // whitespace variants share this cache entry, so the first writer's
+    // raw casing must not leak into later variants' responses.
+    let normalized_q = normalize_query(q);
+    match repo.search(kind, &normalized_q).await {
         Ok(mut hits) => {
             hits.truncate(SEARCH_LIMIT);
             let results: Vec<serde_json::Value> =
                 hits.iter().map(|hit| hit.to_json(kind)).collect();
             let body = serde_json::json!({
-                "q": q,
+                "q": normalized_q,
                 "type": kind.as_str(),
                 "results": results,
             })
@@ -836,7 +840,7 @@ mod tests {
         assert_eq!(resp.cache_ttl, Some(300));
         let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
         assert_eq!(body["type"], "artist");
-        assert_eq!(body["q"], "Test");
+        assert_eq!(body["q"], "test");
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 25);
         assert_eq!(results[0]["name"], "Hit 0");
@@ -886,7 +890,7 @@ mod tests {
         let cache = FakeCache::default();
         cache.stored.borrow_mut().insert(
             search_cache_key(Kind::Artist, "test"),
-            r#"{"q":"Test","cached":true}"#.to_string(),
+            r#"{"q":"test","cached":true}"#.to_string(),
         );
         let repo = FakeRepo::default();
         let resp = block_on(handle_search(
