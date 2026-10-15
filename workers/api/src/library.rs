@@ -17,9 +17,16 @@
 //!   from the owner id itself, and maps 0 affected UPDATE/DELETE rows to
 //!   [`LibraryError::NotFound`] (the row vanished between lookup and write;
 //!   the owner predicate already makes cross-owner writes inexpressible).
-//! - Lists are keyset pages ordered by public id descending, capped at
-//!   [`MAX_PAGE_SIZE`]. The public-id cursor is independent of row existence,
-//!   so a deleted or newly private boundary row cannot truncate later pages.
+//! - Lists are keyset pages ordered by the opaque public id descending
+//!   (`ORDER BY public_id COLLATE "C" DESC`), capped at
+//!   [`MAX_PAGE_SIZE`]. The order is by the random 128-bit handle, NOT
+//!   newest-first: a newly created row sorts by its id and may land on any
+//!   page. The public-id cursor is compared directly with the ordering key
+//!   and is independent of row existence, so a deleted or newly private
+//!   boundary row cannot truncate later pages. A well-formed cursor above
+//!   every visible row replays from the top in both the in-memory pager and
+//!   the list SQL (`public_id < $3` matches everything); the replay is
+//!   harmless because visibility still filters every returned row.
 //!   Playlist lists omit `items` (single reads return them).
 //! - Responses carry only the opaque `public_id` as `id` plus display fields.
 //!   Internal row ids and `owner_user_id` never serialize. The authorizers
@@ -78,28 +85,14 @@ impl std::fmt::Display for LibraryError {
     }
 }
 
-/// Random 128-bit opaque public id (base64url, 22 chars). Never sequential,
-/// never derived from the internal row id.
+/// Random 128-bit opaque public id (base64url, 22 chars, via the shared
+/// [`crate::b64`] helper). Never sequential, never derived from the internal
+/// row id. Sorts arbitrarily: list order is by this handle, not by recency
+/// (see the list pages).
 pub fn new_public_id() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(22);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
-        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[((n >> 6) & 63) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[(n & 63) as usize] as char);
-        }
-    }
-    out
+    crate::b64::encode(&bytes)
 }
 
 fn require_caller(caller: Option<&str>) -> Result<&str, LibraryError> {
@@ -217,96 +210,34 @@ pub const MAX_CURSOR_PUBLIC_ID_LEN: usize = 128;
 /// Maximum encoded cursor length (covers a 128-byte id, base64url no-pad).
 const MAX_CURSOR_LEN: usize = 192;
 
-const B64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-fn encode_b64url_no_pad(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(B64URL[((n >> 18) & 63) as usize] as char);
-        out.push(B64URL[((n >> 12) & 63) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(B64URL[((n >> 6) & 63) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(B64URL[(n & 63) as usize] as char);
-        }
-    }
-    out
-}
-
-fn decode_b64url_no_pad(cursor: &str) -> Result<Vec<u8>, LibraryError> {
-    if cursor.is_empty() || cursor.len() > MAX_CURSOR_LEN {
-        return Err(LibraryError::Invalid);
-    }
-    if cursor.len() % 4 == 1 {
-        return Err(LibraryError::Invalid);
-    }
-    let chars: Vec<u8> = cursor.bytes().collect();
-    let mut out = Vec::with_capacity(cursor.len() / 4 * 3 + 3);
-    let mut i = 0;
-    while i < chars.len() {
-        let b0 = cursor_value(chars[i])?;
-        let b1 = if i + 1 < chars.len() {
-            cursor_value(chars[i + 1])?
-        } else {
-            return Err(LibraryError::Invalid);
-        };
-        let b2 = if i + 2 < chars.len() {
-            cursor_value(chars[i + 2])?
-        } else {
-            0
-        };
-        let b3 = if i + 3 < chars.len() {
-            cursor_value(chars[i + 3])?
-        } else {
-            0
-        };
-        let n = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
-        out.push(((n >> 16) & 0xff) as u8);
-        if i + 2 < chars.len() {
-            out.push(((n >> 8) & 0xff) as u8);
-        }
-        if i + 3 < chars.len() {
-            out.push((n & 0xff) as u8);
-        }
-        i += 4;
-    }
-    Ok(out)
-}
-
-/// Opaque keyset cursor: base64url (no padding) of the UTF-8 bytes of the
-/// last row's public `id` on the page. Clients pass it back as `after`;
-/// they must never parse or forge it.
+/// Opaque keyset cursor: base64url (no padding, via the shared
+/// [`crate::b64`] helper) of the UTF-8 bytes of the last row's public `id`
+/// on the page. Clients pass it back as `after`; they must never parse or
+/// forge it.
 ///
 /// The cursor carries only the already-public opaque id — the same value
 /// returned as `id` in list responses. Lists compare it directly with the
 /// public-id ordering key, so paging remains stable if the boundary row is
 /// deleted or becomes private. Visibility always applies to returned rows.
+/// A cursor above every visible row replays from the top in both the mirror
+/// and the SQL (`public_id < $3` matches everything); that replay is harmless
+/// because every returned row is still visibility-filtered.
 pub fn page_cursor(last_public_id: &str) -> String {
-    encode_b64url_no_pad(last_public_id.as_bytes())
-}
-
-fn cursor_value(c: u8) -> Result<u32, LibraryError> {
-    match c {
-        b'A'..=b'Z' => Ok((c - b'A') as u32),
-        b'a'..=b'z' => Ok((c - b'a' + 26) as u32),
-        b'0'..=b'9' => Ok((c - b'0' + 52) as u32),
-        b'-' => Ok(62),
-        b'_' => Ok(63),
-        _ => Err(LibraryError::Invalid),
-    }
+    crate::b64::encode(last_public_id.as_bytes())
 }
 
 /// Decode a cursor from [`page_cursor`] into the public id it wraps.
 /// Garbage is [`LibraryError::Invalid`] (a client shape error, surfaced
-/// as 422). A well-formed but unknown id simply matches no rows downstream
-/// (an empty page), never a leak.
+/// as 422). Decoding is strict via [`crate::b64::decode`]: non-canonical
+/// trailing bits are rejected, so two different strings never decode to the
+/// same id. A well-formed cursor continues by keyset comparison downstream —
+/// an above-max cursor replays from the top in both the mirror and the SQL,
+/// never a leak and never a truncation.
 pub fn parse_page_cursor(cursor: &str) -> Result<String, LibraryError> {
-    let bytes = decode_b64url_no_pad(cursor)?;
+    if cursor.is_empty() || cursor.len() > MAX_CURSOR_LEN {
+        return Err(LibraryError::Invalid);
+    }
+    let bytes = crate::b64::decode(cursor).map_err(|_| LibraryError::Invalid)?;
     let id = std::str::from_utf8(&bytes).map_err(|_| LibraryError::Invalid)?;
     if id.is_empty() || id.len() > MAX_CURSOR_PUBLIC_ID_LEN {
         return Err(LibraryError::Invalid);
@@ -364,10 +295,15 @@ pub fn list_playlists(
         .collect())
 }
 
-/// One bounded genre page, ordered by public id descending. `limit` is
-/// clamped to [`MAX_PAGE_SIZE`]; `after` continues from a [`page_cursor`]
-/// wrapping the last row's public `id`. The ordering key is stable even if
-/// the boundary row is deleted or becomes private.
+/// One bounded genre page, ordered by the opaque public id descending
+/// (arbitrary order, NOT newest-first: new rows sort by id and may land on
+/// any page). `limit` is clamped to [`MAX_PAGE_SIZE`]; `after` continues
+/// from a [`page_cursor`] wrapping the last row's public `id`. The cursor is
+/// compared directly with the ordering key — mirroring
+/// [`genre_list_statement`] (`public_id < $3`) — so it is stable even if the
+/// boundary row is deleted or becomes private. A cursor above every visible
+/// row replays from the top in both the mirror and the SQL; every returned
+/// row is still visibility-filtered.
 pub fn list_genres_page(
     caller: Option<&str>,
     rows: &[GenreRow],
@@ -383,24 +319,23 @@ pub fn list_genres_page(
     visible.sort_by(|a, b| b.public_id.cmp(&a.public_id));
     if let Some(cursor) = after {
         let cursor_id = parse_page_cursor(cursor)?;
-        // Fail closed on a cursor beyond the newest visible row: a forged or
-        // stale above-max cursor yields an empty page, never a replay of page
-        // one. Cursors at or below the newest row continue by direct keyset
-        // comparison, so a deleted or newly hidden boundary row cannot
-        // truncate later pages.
-        if visible.first().is_some_and(|row| cursor_id > row.public_id) {
-            visible.clear();
-        } else {
-            visible.retain(|row| row.public_id < cursor_id);
-        }
+        // Direct keyset comparison, mirroring the list SQL. No existence
+        // lookup: a deleted or newly hidden boundary row cannot truncate
+        // later pages. An above-max cursor matches everything and replays
+        // from the top, exactly like the SQL.
+        visible.retain(|row| row.public_id < cursor_id);
     }
     visible.truncate(limit);
     Ok(visible.iter().map(|row| genre_response(row)).collect())
 }
 
-/// One bounded playlist-summary page, ordered by public id descending.
+/// One bounded playlist-summary page, ordered by the opaque public id
+/// descending (arbitrary order, NOT newest-first).
 /// See [`list_genres_page`]: the cursor is compared directly with the public
-/// ordering key so continuation does not depend on the boundary row existing.
+/// ordering key — mirroring [`playlist_list_statement`] — so continuation
+/// does not depend on the boundary row existing. An above-max cursor replays
+/// from the top in both the mirror and the SQL; visibility still filters
+/// every returned row.
 pub fn list_playlists_page(
     caller: Option<&str>,
     rows: &[PlaylistRow],
@@ -416,16 +351,11 @@ pub fn list_playlists_page(
     visible.sort_by(|a, b| b.public_id.cmp(&a.public_id));
     if let Some(cursor) = after {
         let cursor_id = parse_page_cursor(cursor)?;
-        // Fail closed on a cursor beyond the newest visible row: a forged or
-        // stale above-max cursor yields an empty page, never a replay of page
-        // one. Cursors at or below the newest row continue by direct keyset
-        // comparison, so a deleted or newly hidden boundary row cannot
-        // truncate later pages.
-        if visible.first().is_some_and(|row| cursor_id > row.public_id) {
-            visible.clear();
-        } else {
-            visible.retain(|row| row.public_id < cursor_id);
-        }
+        // Direct keyset comparison, mirroring the list SQL. No existence
+        // lookup: a deleted or newly hidden boundary row cannot truncate
+        // later pages. An above-max cursor matches everything and replays
+        // from the top, exactly like the SQL.
+        visible.retain(|row| row.public_id < cursor_id);
     }
     visible.truncate(limit);
     Ok(visible.iter().map(|row| playlist_summary(row)).collect())
@@ -753,14 +683,18 @@ pub fn authorize_playlist_delete(
 // owner predicate already makes cross-owner writes inexpressible, so a 0-row
 // write is never a silent foreign mutation.
 
-/// Caller-visible genre page, ordered by public id descending.
+/// Caller-visible genre page, ordered by the opaque public id descending
+/// (arbitrary order, NOT newest-first).
 /// Parameters: owner_user_id ($1), limit clamped to [`MAX_PAGE_SIZE`]
 /// ($2), cursor public id or NULL for the first page ($3).
 ///
 /// The cursor is compared directly against the public-id ordering key, not
 /// looked up in the table. A deleted or newly private boundary row therefore
 /// cannot truncate later pages, and there is no cursor lookup that can reveal
-/// whether an invisible row exists.
+/// whether an invisible row exists. The `$3::TEXT IS NULL` guard makes the
+/// first page work; an above-max cursor matches every row and replays from
+/// the top (mirrored by [`list_genres_page`]); visibility still filters every
+/// returned row.
 pub fn genre_list_statement() -> &'static str {
     "SELECT public_id, name, is_public FROM genres WHERE (owner_user_id = $1 OR is_public = TRUE) AND ($3::TEXT IS NULL OR public_id COLLATE \"C\" < $3::TEXT COLLATE \"C\") ORDER BY public_id COLLATE \"C\" DESC LIMIT $2"
 }
@@ -795,8 +729,11 @@ pub fn genre_delete_statement() -> &'static str {
     "DELETE FROM genres WHERE public_id = $1 AND owner_user_id = $2"
 }
 
-/// Caller-visible playlist page (summaries: no `items`), ordered by public id.
-/// Parameters and cursor semantics match [`genre_list_statement`].
+/// Caller-visible playlist page (summaries: no `items`), ordered by the
+/// opaque public id (arbitrary order, NOT newest-first).
+/// Parameters and cursor semantics match [`genre_list_statement`]: the
+/// `$3::TEXT IS NULL` guard serves the first page, and an above-max cursor
+/// replays from the top in both the mirror and the SQL.
 pub fn playlist_list_statement() -> &'static str {
     "SELECT public_id, name, is_public FROM playlists WHERE (owner_user_id = $1 OR is_public = TRUE) AND ($3::TEXT IS NULL OR public_id COLLATE \"C\" < $3::TEXT COLLATE \"C\") ORDER BY public_id COLLATE \"C\" DESC LIMIT $2"
 }
@@ -869,6 +806,12 @@ mod tests {
             parse_page_cursor(&page_cursor("g-public-opaque-01")),
             Ok("g-public-opaque-01".to_string())
         );
+        // Strict decoding via the shared helper: non-canonical trailing bits
+        // are rejected, so distinct strings never alias to the same id.
+        assert_eq!(crate::b64::decode("Zg").unwrap(), b"f");
+        assert!(crate::b64::decode("Zh").is_err());
+        assert_eq!(parse_page_cursor("Zg"), Ok("f".to_string()));
+        assert_eq!(parse_page_cursor("Zh"), Err(LibraryError::Invalid));
         assert_eq!(parse_page_cursor(""), Err(LibraryError::Invalid));
         assert_eq!(parse_page_cursor("!!!"), Err(LibraryError::Invalid));
         assert_eq!(
@@ -879,10 +822,13 @@ mod tests {
     }
 
     fn many_playlist_rows(n: usize) -> Vec<PlaylistRow> {
+        // Deliberately NOT monotonic with internal_id: public ids run in
+        // reverse so the tests prove list order follows the public id, not
+        // insertion order or recency.
         (0..n)
             .map(|i| PlaylistRow {
                 internal_id: i as i64 + 1,
-                public_id: format!("p-public-{i:04}"),
+                public_id: format!("p-public-{:04}", n - 1 - i),
                 owner_user_id: "user-bob".into(),
                 name: format!("Public {i:04}"),
                 items: vec!["track-opaque".into()],
@@ -892,12 +838,15 @@ mod tests {
     }
 
     #[test]
-    fn pages_are_bounded_newest_first_and_chainable() {
+    fn pages_are_bounded_by_public_id_and_chainable() {
         let rows = many_playlist_rows(MAX_PAGE_SIZE + 10);
         let first = list_playlists_page(Some("user-alice"), &rows, 5000, None).unwrap();
         assert_eq!(first.len(), MAX_PAGE_SIZE);
-        // Newest (highest internal id) first, summaries carry no items.
-        assert_eq!(first[0].name, format!("Public {:04}", MAX_PAGE_SIZE + 9));
+        // Ordered by the opaque public id descending — NOT by internal id or
+        // recency. The fixture ids run opposite to internal ids, so the head
+        // is the lowest internal id: order follows the public handle.
+        assert_eq!(first[0].id, format!("p-public-{:04}", MAX_PAGE_SIZE + 9));
+        assert_eq!(first[0].name, "Public 0000");
         let json = serde_json::to_string(&first[0]).unwrap();
         assert!(!json.contains("items"), "list shapes omit items: {json}");
 
@@ -924,16 +873,18 @@ mod tests {
             list_playlists_page(Some("user-alice"), &rows, 10, Some("!!!")),
             Err(LibraryError::Invalid)
         );
-        // A well-formed but unknown cursor matches nothing (empty page),
-        // never a leak and never a restart.
-        let unknown = list_playlists_page(
+        // A well-formed cursor continues by keyset comparison in both the
+        // mirror and the SQL: an above-max cursor replays from the top
+        // (harmless — every row is still visibility-filtered), never a leak
+        // and never a truncation.
+        let replay = list_playlists_page(
             Some("user-alice"),
             &rows,
             MAX_PAGE_SIZE,
             Some(&page_cursor("p-public-9999")),
         )
         .unwrap();
-        assert!(unknown.is_empty());
+        assert_eq!(replay, first);
     }
 
     #[test]
@@ -972,14 +923,49 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
+
+        // Whole previous page vanishes before the next request: the old
+        // cursor sits above every remaining row, and the next page must still
+        // return them (mirror and SQL agree — no silent end-of-list).
+        let first_ids: Vec<String> = first.iter().map(|row| row.id.clone()).collect();
+        let mut page_gone = many_playlist_rows(60);
+        page_gone.retain(|row| !first_ids.contains(&row.public_id));
+        let after_whole_delete =
+            list_playlists_page(Some("user-alice"), &page_gone, 10, Some(&after)).unwrap();
+        assert_eq!(
+            after_whole_delete
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        let mut page_hidden = many_playlist_rows(60);
+        for row in page_hidden
+            .iter_mut()
+            .filter(|row| first_ids.contains(&row.public_id))
+        {
+            row.is_public = false;
+            row.owner_user_id = "user-bob".into();
+        }
+        let after_whole_hide =
+            list_playlists_page(Some("user-alice"), &page_hidden, 10, Some(&after)).unwrap();
+        assert_eq!(
+            after_whole_hide
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]
     fn own_older_row_is_reachable_by_following_the_cursor() {
         // Regression for the review probe: many newer public rows by
-        // another user plus one older private row by the caller. Every
-        // page must be reachable and the caller's own row must appear on
-        // the last page — never stranded past an unreachable first 50.
+        // another user plus one older private row by the caller. Order is by
+        // public id (the Bob block sorts above the Alice row by handle), so
+        // every page must be reachable and the caller's own row must appear
+        // on the last page — never stranded past an unreachable first 50.
         let mut rows: Vec<PlaylistRow> = vec![PlaylistRow {
             internal_id: 1,
             public_id: "p-alice-own".into(),
@@ -1019,10 +1005,13 @@ mod tests {
 
     #[test]
     fn genre_pages_are_bounded() {
-        let rows: Vec<GenreRow> = (0..MAX_PAGE_SIZE + 5)
+        // Ids run opposite to internal ids: order must follow the public
+        // handle, not insertion order.
+        let n = MAX_PAGE_SIZE + 5;
+        let rows: Vec<GenreRow> = (0..n)
             .map(|i| GenreRow {
                 internal_id: i as i64 + 1,
-                public_id: format!("g-public-{i:04}"),
+                public_id: format!("g-public-{:04}", n - 1 - i),
                 owner_user_id: "user-bob".into(),
                 name: format!("Genre {i:04}"),
                 is_public: true,
@@ -1030,7 +1019,8 @@ mod tests {
             .collect();
         let page = list_genres_page(Some("user-alice"), &rows, usize::MAX, None).unwrap();
         assert_eq!(page.len(), MAX_PAGE_SIZE);
-        assert_eq!(page[0].name, format!("Genre {:04}", MAX_PAGE_SIZE + 4));
+        assert_eq!(page[0].id, format!("g-public-{:04}", n - 1));
+        assert_eq!(page[0].name, "Genre 0000");
     }
 
     #[test]
@@ -1108,6 +1098,10 @@ mod tests {
                 sql.contains("public_id COLLATE \"C\" < $3::TEXT COLLATE \"C\""),
                 "{sql}"
             );
+            // First-page guard: a NULL cursor ($3) must return the first
+            // page, not zero rows (`NULL` comparison). Deleting this guard
+            // breaks every first page.
+            assert!(sql.contains("$3::TEXT IS NULL OR"), "{sql}");
             // No cursor-row lookup exists to bypass or weaken visibility;
             // this predicate applies to every returned row.
             assert_eq!(

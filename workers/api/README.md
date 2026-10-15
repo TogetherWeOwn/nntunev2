@@ -70,9 +70,14 @@ provisioned; this crate is the security-critical logic with tests.
   only the opaque `public_id` as `id` — internal ids and `owner_user_id`
   never serialize. All SQL is parameterized with the owner bound in WHERE;
   SELECT lists exclude the owner column (mutation lookups return only an
-  `is_owner` boolean). Lists are keyset pages (`ORDER BY id DESC LIMIT
-  $2` with an opaque cursor over the public id, LIMIT clamped to
-  `MAX_PAGE_SIZE`); playlist lists
+  `is_owner` boolean). Lists are keyset pages (`ORDER BY public_id COLLATE
+  "C" DESC LIMIT $2` with an opaque cursor over the public id, LIMIT clamped
+  to `MAX_PAGE_SIZE`, first page with a NULL cursor). Order is by the opaque
+  id, not newest-first: a new row sorts by its id and may land on any page.
+  The cursor is compared directly with the ordering key, so a deleted or
+  newly private boundary row cannot truncate later pages; an above-max cursor
+  replays from the top in both the in-memory pager and the SQL (harmless —
+  every row is still visibility-filtered). Playlist lists
   omit `items`, which single reads return. UPDATE/DELETE affecting 0 rows
   maps to 404 — the owner predicate already makes cross-owner writes
   inexpressible.

@@ -11,10 +11,13 @@
 -- statements, which answers the 403-vs-404 question without exposing the
 -- id itself.
 --
--- Lists are keyset pages ordered by the public id (`ORDER BY public_id
--- COLLATE "C" DESC LIMIT $2`). The matching indexes keep the cursor
+-- Lists are keyset pages ordered by the opaque public id (`ORDER BY public_id
+-- COLLATE "C" DESC LIMIT $2`, first page with a NULL cursor). Order is by the
+-- random handle, not newest-first. The matching indexes keep the cursor
 -- comparison independent of row existence while serving the public-id order.
--- The owner/visibility indexes below serve the page filters.
+-- An above-max cursor replays from the top in both the pager and the SQL;
+-- visibility still filters every row. The owner/visibility indexes below
+-- serve the page filters.
 
 CREATE TABLE IF NOT EXISTS genres (
     id              BIGSERIAL PRIMARY KEY,
