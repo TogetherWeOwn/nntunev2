@@ -1130,6 +1130,29 @@ mod tests {
         assert!(!playlist_select.contains("items"), "{playlist_select}");
         assert!(!playlist_select.contains("owner"), "{playlist_select}");
         assert!(!playlist_select.contains("internal"), "{playlist_select}");
+        // List statements hit the right table: both tables expose
+        // public_id/name/is_public, so a FROM swap still passes every other
+        // pin while returning the wrong entity kind.
+        assert!(
+            genre_list_statement().contains("FROM genres"),
+            "{}",
+            genre_list_statement()
+        );
+        assert!(
+            !genre_list_statement().contains("FROM playlists"),
+            "{}",
+            genre_list_statement()
+        );
+        assert!(
+            playlist_list_statement().contains("FROM playlists"),
+            "{}",
+            playlist_list_statement()
+        );
+        assert!(
+            !playlist_list_statement().contains("FROM genres"),
+            "{}",
+            playlist_list_statement()
+        );
         // Lookups answer ownership with a boolean; the id never leaves SQL.
         for sql in [
             genre_mutation_lookup_statement(),
@@ -1138,6 +1161,41 @@ mod tests {
             assert!(sql.contains("(owner_user_id = $2) AS is_owner"), "{sql}");
             assert!(sql.contains("public_id = $1"), "{sql}");
             assert!(sql.contains("$1"), "{sql}");
+        }
+        // Single-row reads and mutation lookups are the statements the
+        // Worker runs for every GET and every mutation authorization. Pin
+        // the full visibility predicate per statement plus the right table,
+        // so OR TRUE / OR FALSE / paren-removal / FROM-swap mutants fail.
+        // Previously only the two list statements had visibility asserts;
+        // weakening `OR is_public = TRUE` to `OR TRUE` in any of these four
+        // passed the suite while disclosing another user's private row.
+        for (sql, table, other_table) in [
+            (genre_read_statement(), "FROM genres", "FROM playlists"),
+            (
+                genre_mutation_lookup_statement(),
+                "FROM genres",
+                "FROM playlists",
+            ),
+            (playlist_read_statement(), "FROM playlists", "FROM genres"),
+            (
+                playlist_mutation_lookup_statement(),
+                "FROM playlists",
+                "FROM genres",
+            ),
+        ] {
+            assert!(
+                sql.contains("WHERE public_id = $1 AND (owner_user_id = $2 OR is_public = TRUE)"),
+                "{sql}"
+            );
+            assert_eq!(
+                sql.matches("(owner_user_id = $2 OR is_public = TRUE)")
+                    .count(),
+                1,
+                "{sql}"
+            );
+            assert!(sql.contains(table), "{sql}");
+            assert!(!sql.contains(other_table), "{sql}");
+            assert!(!sql.contains("OR TRUE"), "{sql}");
         }
     }
 }
