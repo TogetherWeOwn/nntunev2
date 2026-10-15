@@ -621,8 +621,6 @@ struct LoginFinishBody {
 #[serde(deny_unknown_fields)]
 struct MagicFinishBody {
     token: String,
-    #[serde(default)]
-    email: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -799,9 +797,18 @@ where
     if auth::consume_magic_link(magic.clone(), &body.magic_token, ctx.now).is_err() {
         return generic_auth();
     }
-    // Validate invite presence, throttle and code before spending either
-    // single-use proof. A typo must be recoverable with the same email code.
+    // Invite typo-class failures are likewise rejected BEFORE either
+    // claim: the throttle reservation, lookup and pure snapshot check run
+    // here, so a mistyped invite leaves the challenge and the emailed
+    // token intact for a corrected retry (the signup page stays on the
+    // code step). The atomic invite consume still runs after the claims
+    // below — single-use is enforced by that store claim, not this
+    // snapshot.
     let invite_to_consume = if ctx.cfg.invites_required || body.invite_code.is_some() {
+        // Atomic per-client redemption budget BEFORE the lookup: parallel
+        // guesses share one reservation (no check-then-act race), and the
+        // denial is the generic error (no throttle oracle). Keyed by
+        // source IP and account, per `auth::invite_attempt_allowed`.
         let attempt_key = format!("invite:{}:{}", ctx.source_ip, user_id);
         let allowed = ctx
             .store
@@ -817,22 +824,22 @@ where
         if !allowed {
             return generic_auth();
         }
-        let Some(code) = body.invite_code.as_deref() else {
+        let Some(code) = body.invite_code.clone() else {
             return generic_auth();
         };
         let invite = match ctx
             .store
-            .invite_by_hash(&auth::hash_invite_code(code))
+            .invite_by_hash(&auth::hash_invite_code(&code))
             .await
         {
             Ok(Some(invite)) => invite,
             Ok(None) => return generic_auth(),
             Err(_) => return internal(),
         };
-        if auth::consume_invite(invite.clone(), code).is_err() {
+        if auth::consume_invite(invite.clone(), &code).is_err() {
             return generic_auth();
         }
-        Some((invite, code.to_string()))
+        Some((invite, code))
     } else {
         None
     };
@@ -1073,13 +1080,22 @@ where
         Ok(None) => return generic_auth(),
         Err(_) => return internal(),
     };
-    if body
-        .email
-        .as_deref()
-        .is_some_and(|email| email != record.email)
-    {
-        return generic_auth();
+    // Login-CSRF guard: an emailed link must never silently REPLACE an
+    // existing session for a different account. If the request already
+    // authenticates as someone else, fail generically WITHOUT consuming
+    // the token (its owner can still redeem it after signing out). An
+    // absent or invalid session is the ordinary sign-in path. The web
+    // landing page adds the second half: no auto-redeem, an explicit
+    // confirm, and the signed-in identity shown before any credential
+    // is typed.
+    if session_cookie_value(req).is_some() {
+        if let Ok((claims, _)) = ctx.authenticate(req, false).await {
+            if claims.user_id != record.user_id {
+                return generic_auth();
+            }
+        }
     }
+    let email = record.email.clone();
     let consumed =
         match auth::consume_magic_link_atomically(record, &body.token, ctx.now, ctx.store).await {
             Ok(consumed) => consumed,
@@ -1087,7 +1103,13 @@ where
         };
     ctx.audit(&consumed.user_id, "auth.magic", true).await;
     match ctx.start_session(&consumed.user_id).await {
-        Ok(resp) => resp,
+        Ok(mut resp) => {
+            // The token holder is now signed in as this account; echoing
+            // its own email back lets the web app show "Signed in as …"
+            // before any provider credential is entered.
+            resp.body = serde_json::json!({"ok": true, "email": email}).to_string();
+            resp
+        }
         Err(resp) => resp,
     }
 }
@@ -1959,32 +1981,6 @@ mod tests {
     }
 
     #[test]
-    fn magic_finish_rejects_mismatched_confirmation_email_without_spending_link() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        h.call(
-            "POST",
-            "/v1/auth/magic/start",
-            serde_json::json!({"email": "a@example.com"}),
-        );
-        let token = h.mailer.sent.borrow().last().unwrap().1.clone();
-        let mismatch = h.call(
-            "POST",
-            "/v1/auth/magic/finish",
-            serde_json::json!({"token": token, "email": "victim@example.com"}),
-        );
-        assert_eq!(mismatch.status, 401);
-        assert!(mismatch.set_cookie.is_none());
-        let matching = h.call(
-            "POST",
-            "/v1/auth/magic/finish",
-            serde_json::json!({"token": token, "email": "a@example.com"}),
-        );
-        assert_eq!(matching.status, 200, "{}", matching.body);
-        assert!(matching.set_cookie.is_some());
-    }
-
-    #[test]
     fn magic_link_flow_issues_session_once() {
         let h = harness();
         seed_user(&h, "u1", "a@example.com");
@@ -2014,6 +2010,63 @@ mod tests {
         );
         assert_eq!(bad.status, 401);
         assert_eq!(bad.body, replay.body);
+    }
+
+    #[test]
+    fn magic_finish_never_swaps_an_existing_session_for_another_account() {
+        // Login CSRF: a signed-in victim lured into redeeming someone
+        // else's emailed link must keep their own session, and the
+        // rejected attempt must not burn the other account's token.
+        let h = harness();
+        seed_user(&h, "victim", "victim@example.com");
+        seed_user(&h, "other", "other@example.com");
+        let victim_cookie = magic_login(&h, "victim@example.com");
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": "other@example.com"}),
+        );
+        assert_eq!(resp.status, 200);
+        let other_token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let resp = h.call_full(
+            "POST",
+            "/v1/auth/magic/finish",
+            Some(serde_json::json!({"token": other_token}).to_string()),
+            Some(victim_cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 401);
+        assert_eq!(resp.body, r#"{"error":"check your email and try again"}"#);
+        assert!(resp.set_cookie.is_none(), "no swapped-session cookie");
+        // The same account redeeming its OWN fresh link mid-session works.
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": "victim@example.com"}),
+        );
+        assert_eq!(resp.status, 200);
+        let own_token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let resp = h.call_full(
+            "POST",
+            "/v1/auth/magic/finish",
+            Some(serde_json::json!({"token": own_token}).to_string()),
+            Some(victim_cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        // The other account's token survived the rejected swap, and the
+        // success body carries that account's own email for display.
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": other_token}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(
+            resp.body.contains("\"other@example.com\""),
+            "signed-in identity must be in the body: {}",
+            resp.body
+        );
     }
 
     #[test]
@@ -2733,6 +2786,69 @@ mod tests {
     }
 
     #[test]
+    fn register_finish_wrong_invite_does_not_burn_challenge_or_token() {
+        // A mistyped invite is pre-validated before either single-use
+        // claim (like a mistyped emailed code), so correcting it against
+        // the SAME challenge and token still enrolls — the signup page's
+        // stay-on-the-code-step retry must not be a dead end.
+        let h = harness();
+        let good_hash = auth::hash_invite_code("right-invite");
+        h.store.invites.borrow_mut().insert(
+            good_hash.clone(),
+            InviteRecord {
+                code_hash: good_hash.clone(),
+                used: false,
+                created_at: NOW,
+            },
+        );
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "invited@example.com"}),
+        );
+        assert_eq!(resp.status, 200);
+        let start: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let challenge = start["challenge"].as_str().unwrap().to_string();
+        let cred_id = b"invited-cred";
+        let att = fx_none_attestation(cred_id, &fx_es256_cose(46));
+        let emailed = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let finish = |invite_code: &str| {
+            serde_json::json!({
+                "challenge": challenge.clone(),
+                "credential_id": b64url_encode(cred_id),
+                "attestation_object": b64url_encode(&att),
+                "client_data_json": b64url_encode(
+                    fx_client_json("webauthn.create", &challenge).as_bytes()
+                ),
+                "magic_token": emailed.clone(),
+                "invite_code": invite_code,
+            })
+        };
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/finish",
+            finish("wrong-invite"),
+        );
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        assert!(resp.set_cookie.is_none());
+        assert!(
+            !h.store.invites.borrow().get(&good_hash).unwrap().used,
+            "rejected attempt must not consume the invite"
+        );
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/finish",
+            finish("right-invite"),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(resp.set_cookie.is_some());
+        assert!(
+            h.store.invites.borrow().get(&good_hash).unwrap().used,
+            "corrected retry consumes the invite exactly once"
+        );
+    }
+
+    #[test]
     fn auth_starts_do_not_reveal_account_existence() {
         let h = harness();
         seed_user(&h, "u1", "known@example.com");
@@ -3395,7 +3511,7 @@ mod tests {
                 "register-start" | "login-start" | "magic-start" => {
                     serde_json::from_value::<EmailBody>(wire.clone()).map(|_| ())
                 }
-                "register-finish" | "register-finish-with-invite" => {
+                "register-finish" | "register-finish-invite" => {
                     serde_json::from_value::<RegisterFinishBody>(wire.clone()).map(|_| ())
                 }
                 "login-finish" => {
@@ -3419,6 +3535,9 @@ mod tests {
             );
             pinned += 1;
         }
-        assert_eq!(pinned, 9, "every body-bearing route is pinned");
+        assert_eq!(
+            pinned, 9,
+            "every body-bearing route (incl. the invite variant) is pinned"
+        );
     }
 }

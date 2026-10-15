@@ -35,7 +35,7 @@ the core and require exactly one row before any response.
 | `GET /healthz` | liveness only (no config detail) |
 | `POST /v1/auth/passkey/register/start` / `finish` | passkey signup (purpose-bound challenge + emailed-token inbox proof; attestation `none` or packed self-attestation) |
 | `POST /v1/auth/passkey/login/start` / `finish` | usernameless passkey login (empty `allow_credentials`; assertion + sign-count clone detection) |
-| `POST /v1/auth/magic/start` / `finish` | email magic link (atomic per-email issuance reservation shared with register inbox proof) |
+| `POST /v1/auth/magic/start` / `finish` | email magic link (atomic per-email issuance reservation shared with register inbox proof; finish never replaces an existing session for a different account and echoes the signed-in account's own email for display) |
 | `POST /v1/session/refresh` / `logout` / `revoke-all` | stored-session rotation/revocation |
 | `GET` / `PUT` / `DELETE /v1/vault` | booleans-only summary / encrypted upsert / delete |
 | `POST /v1/vault/test-connection` | `{"ok": bool}` only; atomically rate-limited, per-user concurrency lease, bounded pinned-address dial; empty body tests the stored vault, a `{provider, indexer}` envelope tests a candidate without persisting it |
@@ -51,7 +51,14 @@ client builder sends, and the Rust handlers suite asserts each route is
 served and each fixture wire body deserializes into the handler's
 `deny_unknown_fields` body struct. The emailed magic link lands on the
 web app's `/auth/magic` page; the webhook payload carries both the link
-and the raw token (printed as the code the signup step asks for).
+and the raw token (printed as the code the signup step asks for). That
+page never auto-redeems (login CSRF): it scrubs the token from the URL
+and waits for an explicit confirm, `magic/finish` refuses to swap an
+existing session for a different account without burning the token,
+and the provider wizard shows "Signed in as …" before any credential
+is typed. Typo-class register failures (wrong emailed code, wrong
+invite code) are pre-validated before either single-use claim, so a
+corrected retry against the same challenge still enrolls.
 
 Generic errors only: auth `401 {"error":"check your email and try
 again"}`, vault `400 {"error":"vault unavailable"}`, internal

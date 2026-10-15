@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
+	import { readSignedInEmail } from '#lib/signed-in-email.js';
 	import {
 		ApiClient,
 		ApiError,
@@ -11,12 +12,15 @@
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
 
-	let step = $state<1 | 2 | 3>(1);
-	let signedInEmail = $state('');
-
+	// Display-only identity label (see signed-in-email.ts): the account
+	// these provider credentials will be saved to, shown before anything
+	// is typed.
+	let signedInEmail = $state<string | null>(null);
 	onMount(() => {
-		signedInEmail = sessionStorage.getItem('nntune.signed-in-email') ?? '';
+		signedInEmail = readSignedInEmail();
 	});
+
+	let step = $state<1 | 2 | 3>(1);
 
 	// Step 1: provider.
 	let host = $state('');
@@ -156,9 +160,12 @@
 
 <main class="nt-wrap">
 	<h1>Connect your provider</h1>
-	{#if signedInEmail}
-			<p>Signed in as <strong>{signedInEmail}</strong>.</p>
-		{/if}
+	{#if signedInEmail !== null}
+		<p role="status">
+			Signed in as <strong>{signedInEmail}</strong> — the provider details you save go to
+			this account. If that's not you, stop here and <a href="/login">sign in again</a>.
+		</p>
+	{/if}
 	<p>Step {step} of 3: {step === 1 ? 'Provider' : step === 2 ? 'Indexer (optional)' : 'Test'}</p>
 
 	{#if errors.length > 0}

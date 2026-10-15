@@ -40,7 +40,7 @@
       }
     },
     {
-      "id": "register-finish-with-invite",
+      "id": "register-finish-invite",
       "method": "POST",
       "path": "/v1/auth/passkey/register/finish",
       "web": "registerFinish",
@@ -111,12 +111,10 @@
       "path": "/v1/auth/magic/finish",
       "web": "finishMagicLink",
       "input": {
-        "token": "fixture-magic-token",
-        "email": "ada@example.com"
+        "token": "fixture-magic-token"
       },
       "wire": {
-        "token": "fixture-magic-token",
-        "email": "ada@example.com"
+        "token": "fixture-magic-token"
       }
     },
     {

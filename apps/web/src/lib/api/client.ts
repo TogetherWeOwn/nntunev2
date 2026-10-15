@@ -31,6 +31,12 @@ export class ApiError extends Error {
 
 export interface MagicLinkResult {
 	ok: true;
+	/**
+	 * Present on magic-link finish only: the signed-in account's own
+	 * email, echoed back so the web app can show "Signed in as …" before
+	 * any provider credential is typed (login-CSRF defense in depth).
+	 */
+	email?: string;
 }
 
 export interface IndexerConfigInput {
@@ -210,11 +216,8 @@ export class ApiClient {
 	}
 
 	/** Redeem an emailed magic-link token (the `/auth/magic` page). */
-	async finishMagicLink(token: string, email?: string): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>('/v1/auth/magic/finish', {
-			token,
-			...(email === undefined ? {} : { email })
-		});
+	async finishMagicLink(token: string): Promise<MagicLinkResult> {
+		return this.post<MagicLinkResult>('/v1/auth/magic/finish', { token });
 	}
 
 	/** Start passkey enrollment; the API also mails the inbox-proof code. */
