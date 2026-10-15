@@ -224,12 +224,16 @@ class TestMechanics(unittest.TestCase):
         self.assertEqual([(2, "tog-id")], lines)
 
     def test_emoji_before_violation_keeps_line_number(self):
-        # The ✅ glyph is bytes E2 9C 85 in UTF-8; under the scan_path
-        # latin-1 decode 0x85 becomes U+0085 (NEL), which splitlines()
-        # treats as a line break. Splitting on '\n' only must keep the
-        # violation on its real line.
-        text = "✅ ok\nx\nsee TOG-99 here\n"
-        self.assertEqual([(3, "tog-id")], find_violations(text))
+        # The ✅ glyph is bytes E2 9C 85 in UTF-8; scan_path decodes raw
+        # bytes as latin-1, so 0x85 becomes U+0085 (NEL), which
+        # str.splitlines() treats as a line break. Only the bytes ->
+        # latin-1 -> split path pins the split("\n") fix: calling
+        # find_violations on a str passes even with splitlines().
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = os.path.join(tmp, "emoji.md")
+            with open(fixture, "wb") as fh:
+                fh.write("✅ ok\nx\nsee TOG-99 here\n".encode("utf-8"))
+            self.assertEqual([(3, "tog-id")], scan_path(fixture))
 
     def test_fixture_path_is_excluded(self):
         self.assertIn(

@@ -81,10 +81,24 @@ fn check_secret_len(secret: &[u8]) -> Result<(), SessionError> {
 /// verify-only and exists only inside a recorded rotation window; steady
 /// state is [`SessionKeys::single`]. See
 /// `docs/security/session-secret-rotation.md`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct SessionKeys<'a> {
     pub primary: &'a [u8],
     pub previous: Option<&'a [u8]>,
+}
+
+// Manual Debug impl: the HMAC secrets must never appear in `{:#?}`
+// output, `dbg!`, tracing fields, or assert messages (threat-model §3:
+// no log line may contain credential material; CI logs are
+// attacker-readable). Only secret lengths and rotation presence print.
+impl<'a> std::fmt::Debug for SessionKeys<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionKeys")
+            .field("primary_len", &self.primary.len())
+            .field("has_previous", &self.previous.is_some())
+            .field("secret", &"<redacted>")
+            .finish()
+    }
 }
 
 impl<'a> SessionKeys<'a> {
@@ -375,5 +389,33 @@ mod tests {
         // The primary itself is length-checked even when a previous exists.
         let short_primary = SessionKeys::rotation(b"short", b"");
         assert!(verify_session_dual(&short_primary, "x.y", now).is_err());
+    }
+
+    #[test]
+    fn debug_redacts_session_secrets() {
+        // Threat-model §3: no log line may contain credential material.
+        // SessionKeys holds the raw session HMAC secrets; a `{:#?}`/
+        // `dbg!`/assert dump must not carry the secret bytes.
+        let primary = b"PRIMARY-SECRET-0123456789abcdef00";
+        let previous = b"PREVIOUS-SECRET-0123456789abcdef0";
+        for keys in [
+            SessionKeys::single(primary),
+            SessionKeys::rotation(primary, previous),
+        ] {
+            for dumped in [format!("{keys:?}"), format!("{keys:#?}")] {
+                assert!(
+                    !dumped.contains("PRIMARY-SECRET"),
+                    "primary secret leaked: {dumped}"
+                );
+                assert!(
+                    !dumped.contains("PREVIOUS-SECRET"),
+                    "previous secret leaked: {dumped}"
+                );
+                assert!(
+                    dumped.contains("<redacted>"),
+                    "no redaction marker: {dumped}"
+                );
+            }
+        }
     }
 }
