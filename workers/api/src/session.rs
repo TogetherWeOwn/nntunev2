@@ -27,6 +27,30 @@ pub const MAX_SESSION_SECS: u64 = 86_400;
 /// Never add `Domain=` to this cookie: browsers would reject it outright.
 pub const COOKIE_NAME: &str = "__Host-nntune-session";
 
+/// Pinned cookie scope. `__Host-` REQUIRES `Path=/` exactly: any narrower
+/// path makes browsers reject the cookie, and any `Domain=` does the same.
+/// Both header builders emit this constant and never a `Domain=`, so the
+/// cookie is host-only (exact origin host, never subdomains) by
+/// construction — scope pinning cannot drift per call site.
+pub const COOKIE_PATH: &str = "/";
+
+/// Route the Worker entry wires single-session logout to:
+/// `POST /v1/session/logout` → authenticate with [`verify_stored_session`],
+/// [`logout_session_atomically`], then send [`clear_cookie_header`].
+/// POST only: a state-changing GET logout is a cross-site request-forgery
+/// logout vector (`SameSite=Lax` still sends the cookie on top-level GET).
+pub const LOGOUT_PATH: &str = "/v1/session/logout";
+/// Route the Worker entry wires logout-everywhere to:
+/// `POST /v1/session/revoke-all` → authenticate with
+/// [`verify_stored_session`], [`logout_everywhere_atomically`], then send
+/// [`clear_cookie_header`]. POST only, same reason as [`LOGOUT_PATH`].
+pub const LOGOUT_EVERYWHERE_PATH: &str = "/v1/session/revoke-all";
+/// Audit-log action for single-session logout (ids/results only, never
+/// token material — see `vault::audit_event`).
+pub const LOGOUT_AUDIT_ACTION: &str = "session.logout";
+/// Audit-log action for logout-everywhere.
+pub const LOGOUT_EVERYWHERE_AUDIT_ACTION: &str = "session.revoke_all";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionClaims {
     /// Random per-session id (`jti`): joins the token to its server-side
@@ -279,20 +303,161 @@ pub fn rotate_session(
     Ok(format!("{}.{}", payload_b64, crate::b64::encode(&sig)))
 }
 
-/// `Set-Cookie` header value. Always HttpOnly + Secure + SameSite=Lax.
+/// `Set-Cookie` header value. Always HttpOnly + Secure + SameSite=Lax,
+/// pinned to [`COOKIE_PATH`] with no `Domain=` (the `__Host-` contract).
+/// `Max-Age` is clamped to [`MAX_SESSION_SECS`]: no caller-supplied value
+/// may mint a cookie that outlives the absolute token lifetime.
 pub fn set_cookie_header(token: &str, max_age_secs: u64) -> String {
     format!(
-        "{}={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={}",
-        COOKIE_NAME, token, max_age_secs
+        "{}={}; Path={}; HttpOnly; Secure; SameSite=Lax; Max-Age={}",
+        COOKIE_NAME,
+        token,
+        COOKIE_PATH,
+        max_age_secs.min(MAX_SESSION_SECS)
     )
 }
 
-/// Expired-cookie header for logout / revoke.
+/// Expired-cookie header for logout / revoke. Same pinned name, path and
+/// flags as [`set_cookie_header`] — a mismatched `Path` would leave the
+/// live cookie in the browser.
 pub fn clear_cookie_header() -> String {
     format!(
-        "{}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
-        COOKIE_NAME
+        "{}=; Path={}; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
+        COOKIE_NAME, COOKIE_PATH
     )
+}
+
+// --- Revocation: single-session logout + logout-everywhere -------------------
+
+/// Pure snapshot preparation for single-session logout, NOT a database
+/// revocation. Mutating an in-memory row revokes nothing server-side:
+/// HTTP callers must use [`logout_session_atomically`], which requires the
+/// committed conditional UPDATE. This helper exists for fixtures and for
+/// preparing the post-revoke row shape. Idempotent: revoking an already
+/// revoked row is a no-op, never an un-revoke.
+pub fn revoke_session(record: &mut SessionRecord) {
+    record.revoked = true;
+}
+
+/// Pure snapshot preparation for logout-everywhere, NOT a database
+/// revocation (see [`revoke_session`]). Revokes every row in `records`
+/// owned by `user_id`, returning how many rows transitioned from active
+/// to revoked. Fail closed: an empty `user_id` revokes nothing, so a bug
+/// upstream of the route can never turn into a mass revocation. Already
+/// revoked rows are left revoked and not counted again.
+pub fn revoke_all_sessions(records: &mut [SessionRecord], user_id: &str) -> usize {
+    if user_id.is_empty() {
+        return 0;
+    }
+    let mut transitioned = 0;
+    for record in records.iter_mut() {
+        if record.user_id == user_id && !record.revoked {
+            record.revoked = true;
+            transitioned += 1;
+        }
+    }
+    transitioned
+}
+
+/// A validated candidate for one atomic, parameterized Postgres revocation.
+/// Bind the listed parameters; never interpolate a record into SQL.
+pub enum SessionRevokeClaim<'a> {
+    /// Parameters: id (the verified token's `session_id`), user_id.
+    /// `user_id` is bound as well as `id` so a row can only ever be revoked
+    /// under its owner, never by presenting another user's session id.
+    Single {
+        session_id: &'a str,
+        user_id: &'a str,
+    },
+    /// Parameter: user_id (from the verified token, never the request).
+    AllForUser { user_id: &'a str },
+}
+
+impl SessionRevokeClaim<'_> {
+    /// Execute this statement once and count its returned rows. The
+    /// `revoked = FALSE` guard makes the returned count exactly the rows
+    /// this call transitioned, so concurrent logouts cannot double-count.
+    pub fn statement(&self) -> &'static str {
+        match self {
+            Self::Single { .. } => "UPDATE sessions SET revoked = TRUE WHERE id = $1 AND user_id = $2 AND revoked = FALSE RETURNING id",
+            Self::AllForUser { .. } => "UPDATE sessions SET revoked = TRUE WHERE user_id = $1 AND revoked = FALSE RETURNING id",
+        }
+    }
+}
+
+/// Worker/Hyperdrive boundary. Implementations must execute the conditional
+/// UPDATE from [`SessionRevokeClaim::statement`] and return the number of
+/// rows it returned, NOT perform SELECT + unconditional UPDATE. Return an
+/// error on storage failure. Revocation is effective only after the
+/// transaction commits; the response (including [`clear_cookie_header`])
+/// may be sent only after commit, though the clear header should still be
+/// sent when this returns an error so a failed logout never strands a live
+/// cookie in the browser. An in-memory flag is not an implementation.
+pub trait SessionRevokeStore {
+    fn revoke(
+        &self,
+        claim: SessionRevokeClaim<'_>,
+    ) -> impl std::future::Future<Output = Result<u64, SessionError>>;
+}
+
+/// Single-session logout ([`LOGOUT_PATH`]): authenticate the presented
+/// cookie against its current row, then revoke exactly that row.
+/// Zero transitioned rows (a concurrent revoke won the race), multiple
+/// rows, or a store error all fail closed with the generic error; the
+/// handler sends [`clear_cookie_header`] either way. Returns the verified
+/// claims so the handler can audit-log [`LOGOUT_AUDIT_ACTION`] under the
+/// token's `user_id` — never a request-supplied id.
+pub async fn logout_session_atomically(
+    keys: &SessionKeys<'_>,
+    token: &str,
+    now: u64,
+    record: &SessionRecord,
+    store: &impl SessionRevokeStore,
+) -> Result<SessionClaims, SessionError> {
+    let claims = verify_stored_session(keys, token, now, record)?;
+    if store
+        .revoke(SessionRevokeClaim::Single {
+            session_id: &claims.session_id,
+            user_id: &claims.user_id,
+        })
+        .await?
+        != 1
+    {
+        return Err(SessionError::Invalid);
+    }
+    Ok(claims)
+}
+
+/// Logout-everywhere ([`LOGOUT_EVERYWHERE_PATH`]): authenticate the
+/// presented cookie against its current row, then revoke EVERY session row
+/// for that token's `user_id`, including the caller's own. Afterwards all
+/// pre-existing cookies for the user fail [`verify_stored_session`]
+/// against their (now revoked) rows; a fresh login still works — this is
+/// revocation, not a ban. Returns how many rows transitioned, for the
+/// [`LOGOUT_EVERYWHERE_AUDIT_ACTION`] audit event. Zero transitioned rows
+/// fails closed: the caller's own just-verified row must transition (or a
+/// concurrent revoke already did the job, which the caller cannot
+/// distinguish from a store bug — the generic error plus a cleared cookie
+/// is the safe response). The `user_id` revoked is always the verified
+/// token's; [`verify_session`] rejects empty user ids, so this path can
+/// never mass-revoke on a missing id.
+pub async fn logout_everywhere_atomically(
+    keys: &SessionKeys<'_>,
+    token: &str,
+    now: u64,
+    record: &SessionRecord,
+    store: &impl SessionRevokeStore,
+) -> Result<u64, SessionError> {
+    let claims = verify_stored_session(keys, token, now, record)?;
+    let transitioned = store
+        .revoke(SessionRevokeClaim::AllForUser {
+            user_id: &claims.user_id,
+        })
+        .await?;
+    if transitioned == 0 {
+        return Err(SessionError::Invalid);
+    }
+    Ok(transitioned)
 }
 
 #[cfg(test)]
@@ -389,6 +554,205 @@ mod tests {
         // The primary itself is length-checked even when a previous exists.
         let short_primary = SessionKeys::rotation(b"short", b"");
         assert!(verify_session_dual(&short_primary, "x.y", now).is_err());
+    }
+
+    #[test]
+    fn cookie_headers_pin_path_and_clamp_max_age() {
+        assert_eq!(COOKIE_PATH, "/", "__Host- requires Path=/ exactly");
+        let set = set_cookie_header("tok", u64::MAX);
+        assert_eq!(
+            set,
+            format!(
+                "{COOKIE_NAME}=tok; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={MAX_SESSION_SECS}"
+            ),
+            "over-cap Max-Age clamps to the absolute lifetime"
+        );
+        assert!(set_cookie_header("tok", 60).ends_with("Max-Age=60"));
+        let cleared = clear_cookie_header();
+        assert_eq!(
+            cleared,
+            format!("{COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"),
+            "clearing header must pin the same name/path/flags"
+        );
+        for header in [&set, &cleared] {
+            assert!(!header.contains("Domain="), "never Domain=: {header}");
+            assert!(!header.contains("SameSite=None"), "never None: {header}");
+        }
+    }
+
+    // The only awaited operation is our immediately-ready in-memory store.
+    fn ready<F: std::future::Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => {
+                panic!("deterministic storage fake unexpectedly awaited external work")
+            }
+        }
+    }
+
+    struct RecordingRevokeStore {
+        outcome: Result<u64, SessionError>,
+        statements: std::cell::RefCell<Vec<&'static str>>,
+    }
+
+    impl SessionRevokeStore for RecordingRevokeStore {
+        async fn revoke(&self, claim: SessionRevokeClaim<'_>) -> Result<u64, SessionError> {
+            self.statements.borrow_mut().push(claim.statement());
+            self.outcome.clone()
+        }
+    }
+
+    #[test]
+    fn atomic_logout_requires_verified_row_and_one_transition() {
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let keys = SessionKeys::single(secret);
+        let now = 1_700_000_000u64;
+        let token = issue_session(secret, "user-1", now, 3600).expect("issue");
+        let record = record_for(&verify_session(secret, &token, now).expect("verifies"));
+
+        // Exactly one transitioned row: the single-logout claim binds both
+        // id and owner, and the verified claims come back for audit.
+        let store = RecordingRevokeStore {
+            outcome: Ok(1),
+            statements: std::cell::RefCell::new(Vec::new()),
+        };
+        let claims = ready(logout_session_atomically(
+            &keys,
+            &token,
+            now + 60,
+            &record,
+            &store,
+        ))
+        .expect("logout");
+        assert_eq!(claims.user_id, "user-1");
+        let statements = store.statements.borrow();
+        assert_eq!(statements.len(), 1);
+        assert!(
+            statements[0].contains("id = $1 AND user_id = $2 AND revoked = FALSE"),
+            "single revoke is owner-bound and transition-only: {}",
+            statements[0]
+        );
+        drop(statements);
+
+        // Zero / multiple rows / store error all fail closed.
+        for outcome in [Ok(0), Ok(2), Err(SessionError::Invalid)] {
+            let store = RecordingRevokeStore {
+                outcome: outcome.clone(),
+                statements: std::cell::RefCell::new(Vec::new()),
+            };
+            assert_eq!(
+                ready(logout_session_atomically(
+                    &keys,
+                    &token,
+                    now + 60,
+                    &record,
+                    &store
+                )),
+                Err(SessionError::Invalid),
+                "outcome {outcome:?} must fail closed"
+            );
+        }
+
+        // An already-revoked row never reaches the store: authentication
+        // rejects it first, so a replayed logout grants nothing.
+        let revoked = SessionRecord {
+            revoked: true,
+            ..record.clone()
+        };
+        let store = RecordingRevokeStore {
+            outcome: Ok(1),
+            statements: std::cell::RefCell::new(Vec::new()),
+        };
+        assert!(ready(logout_session_atomically(
+            &keys,
+            &token,
+            now + 60,
+            &revoked,
+            &store
+        ))
+        .is_err());
+        assert!(
+            store.statements.borrow().is_empty(),
+            "unauthenticated logout must not touch the store"
+        );
+    }
+
+    #[test]
+    fn atomic_logout_everywhere_revokes_by_verified_user_only() {
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let keys = SessionKeys::single(secret);
+        let now = 1_700_000_000u64;
+        let token = issue_session(secret, "user-1", now, 3600).expect("issue");
+        let record = record_for(&verify_session(secret, &token, now).expect("verifies"));
+
+        // Any positive transition count succeeds (the user's other devices
+        // are included) and is returned for the audit event.
+        let store = RecordingRevokeStore {
+            outcome: Ok(3),
+            statements: std::cell::RefCell::new(Vec::new()),
+        };
+        assert_eq!(
+            ready(logout_everywhere_atomically(
+                &keys,
+                &token,
+                now + 60,
+                &record,
+                &store
+            )),
+            Ok(3)
+        );
+        let statements = store.statements.borrow();
+        assert_eq!(statements.len(), 1);
+        assert!(
+            statements[0].contains("user_id = $1 AND revoked = FALSE")
+                && !statements[0].contains("WHERE id ="),
+            "revoke-all is scoped to the verified owner, not one row: {}",
+            statements[0]
+        );
+        drop(statements);
+
+        // Zero transitions / store error fail closed: the caller's own
+        // just-verified row must be among the revoked.
+        for outcome in [Ok(0), Err(SessionError::Invalid)] {
+            let store = RecordingRevokeStore {
+                outcome: outcome.clone(),
+                statements: std::cell::RefCell::new(Vec::new()),
+            };
+            assert_eq!(
+                ready(logout_everywhere_atomically(
+                    &keys,
+                    &token,
+                    now + 60,
+                    &record,
+                    &store
+                )),
+                Err(SessionError::Invalid),
+                "outcome {outcome:?} must fail closed"
+            );
+        }
+
+        // A token for one user presented with another user's row never
+        // reaches the store (verify_stored_session binds the pair), so
+        // nobody can revoke another user's sessions.
+        let foreign = SessionRecord {
+            user_id: "user-2".to_string(),
+            ..record.clone()
+        };
+        let store = RecordingRevokeStore {
+            outcome: Ok(9),
+            statements: std::cell::RefCell::new(Vec::new()),
+        };
+        assert!(ready(logout_everywhere_atomically(
+            &keys,
+            &token,
+            now + 60,
+            &foreign,
+            &store
+        ))
+        .is_err());
+        assert!(store.statements.borrow().is_empty());
     }
 
     #[test]
