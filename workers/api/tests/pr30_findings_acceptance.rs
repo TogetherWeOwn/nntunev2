@@ -70,6 +70,7 @@ use std::net::IpAddr;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 
+use nntune_api::handlers::Store;
 use nntune_api::{auth, b64, handlers, session, vault, webauthn};
 
 // --- Constants -----------------------------------------------------------------
@@ -1069,16 +1070,18 @@ fn plaintext_opt_in_save_audits_insecure_action() {
     let response = put_vault(&harness, &cookie, plaintext_opt_in_provider(), None);
     assert_eq!(response.status, 200, "{}", response.body);
     assert_eq!(
-        harness.audits_with(vault::INSECURE_PLAINTEXT_AUDIT_ACTION),
+        harness
+            .store
+            .audits_with(vault::INSECURE_PLAINTEXT_AUDIT_ACTION),
         1,
         "cleartext opt-in save must be repudiation-safe, not plain vault.put"
     );
-    assert_eq!(harness.audits_with("vault.put"), 0);
+    assert_eq!(harness.store.audits_with("vault.put"), 0);
 
     let cookie = magic_cookie(&harness, "tls-user", "tls@example.com");
     let response = put_vault(&harness, &cookie, public_provider(), None);
     assert_eq!(response.status, 200, "{}", response.body);
-    assert_eq!(harness.audits_with("vault.put"), 1);
+    assert_eq!(harness.store.audits_with("vault.put"), 1);
 }
 
 // --- Invite throttle (finding: late-novel-invite-redemption-unthrottled) -----------------
@@ -1210,7 +1213,7 @@ fn test_connection_enforces_shared_five_per_minute_budget() {
             response.body
         );
     }
-    assert_eq!(harness.audits_with("vault.test"), 5);
+    assert_eq!(harness.store.audits_with("vault.test"), 5);
     assert_eq!(harness.dialer.seen.borrow().len(), 5);
 
     // Sixth attempt inside the window: denied before any dial, and the
@@ -1229,7 +1232,7 @@ fn test_connection_enforces_shared_five_per_minute_budget() {
         denied.body
     );
     assert_eq!(
-        harness.audits_with("vault.test"),
+        harness.store.audits_with("vault.test"),
         5,
         "denial must not mint an audit row"
     );
