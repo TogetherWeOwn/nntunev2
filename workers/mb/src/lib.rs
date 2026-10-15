@@ -66,23 +66,28 @@ impl Kind {
 }
 
 /// Lookup statement per kind. `$1` is the validated MBID, cast in SQL so
-/// the driver only ever binds a string. Selected ids are cast to `text`
+/// the driver only ever binds a string. The parameter is typed `text`
+/// (`$1::text::uuid`): a bare `$1::uuid` would make Postgres infer the
+/// parameter as `uuid`, which tokio-postgres cannot bind from `&str`
+/// ("error serializing parameter 0", every lookup 500s). Casting through
+/// `text` keeps the `&str` binding working while the final `::uuid` cast
+/// still hits the primary-key index. Selected ids are cast to `text`
 /// to keep row decoding free of uuid/timestamp types.
 fn lookup_sql(kind: Kind) -> &'static str {
     match kind {
         Kind::Artist => {
             "SELECT mbid::text AS mbid, name, sort_name, type, country::text AS country \
-             FROM mb_artist WHERE mbid = $1::uuid"
+             FROM mb_artist WHERE mbid = $1::text::uuid"
         }
         Kind::Release => {
             "SELECT mbid::text AS mbid, artist_mbid::text AS artist_mbid, title, \
              release_type, year, caa_url \
-             FROM mb_release WHERE mbid = $1::uuid"
+             FROM mb_release WHERE mbid = $1::text::uuid"
         }
         Kind::Recording => {
             "SELECT mbid::text AS mbid, release_mbid::text AS release_mbid, title, \
              track_no, duration_ms \
-             FROM mb_recording WHERE mbid = $1::uuid"
+             FROM mb_recording WHERE mbid = $1::text::uuid"
         }
     }
 }
@@ -701,7 +706,11 @@ mod tests {
         ] {
             let sql = lookup_sql(kind);
             assert!(sql.contains(table), "{sql}");
-            assert!(sql.contains("mbid = $1::uuid"), "{sql}");
+            // `$1` must stay `text`-typed so the `&str` bind works
+            // (bare `$1::uuid` makes Postgres infer a uuid parameter,
+            // which tokio-postgres refuses from `&str`: every lookup 500s).
+            assert!(sql.contains("mbid = $1::text::uuid"), "{sql}");
+            assert!(!sql.contains("= $1::uuid"), "{sql}");
             assert!(sql.contains("mbid::text AS mbid"), "{sql}");
         }
     }
