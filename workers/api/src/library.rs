@@ -17,9 +17,9 @@
 //!   from the owner id itself, and maps 0 affected UPDATE/DELETE rows to
 //!   [`LibraryError::NotFound`] (the row vanished between lookup and write;
 //!   the owner predicate already makes cross-owner writes inexpressible).
-//! - Lists are keyset pages: `ORDER BY created_at DESC, id DESC LIMIT $2`
-//!   with an opaque cursor, capped at [`MAX_PAGE_SIZE`]. Playlist lists
-//!   omit `items` (single reads return them).
+//! - Lists are keyset pages: `ORDER BY id DESC LIMIT $2` with an opaque
+//!   cursor over the public id, capped at [`MAX_PAGE_SIZE`]. Playlist
+//!   lists omit `items` (single reads return them).
 //! - Responses carry only the opaque `public_id` as `id` plus display fields.
 //!   Internal row ids and `owner_user_id` never serialize. The authorizers
 //!   below return intents (validated parameters), never mutated rows.
@@ -211,61 +211,42 @@ fn playlist_summary(row: &PlaylistRow) -> PlaylistSummary {
     }
 }
 
-/// Opaque keyset cursor: base64url (no padding) of the big-endian internal
-/// id the page ended on. Clients pass it back as `after`; they must never
-/// parse or forge it.
-pub fn page_cursor(last_internal_id: i64) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let bytes = last_internal_id.to_be_bytes();
-    let mut out = String::with_capacity(11);
-    let mut i = 0;
-    while i < bytes.len() {
-        let b0 = bytes[i] as u32;
-        let b1 = if i + 1 < bytes.len() {
-            bytes[i + 1] as u32
-        } else {
-            0
-        };
-        let b2 = if i + 2 < bytes.len() {
-            bytes[i + 2] as u32
-        } else {
-            0
-        };
+/// Maximum public-id length accepted inside a cursor.
+pub const MAX_CURSOR_PUBLIC_ID_LEN: usize = 128;
+/// Maximum encoded cursor length (covers a 128-byte id, base64url no-pad).
+const MAX_CURSOR_LEN: usize = 192;
+
+const B64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+fn encode_b64url_no_pad(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
         let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
-        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
-        if i + 1 < bytes.len() {
-            out.push(ALPHABET[((n >> 6) & 63) as usize] as char);
+        out.push(B64URL[((n >> 18) & 63) as usize] as char);
+        out.push(B64URL[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(B64URL[((n >> 6) & 63) as usize] as char);
         }
-        if i + 2 < bytes.len() {
-            out.push(ALPHABET[(n & 63) as usize] as char);
+        if chunk.len() > 2 {
+            out.push(B64URL[(n & 63) as usize] as char);
         }
-        i += 3;
     }
     out
 }
 
-fn cursor_value(c: u8) -> Result<u32, LibraryError> {
-    match c {
-        b'A'..=b'Z' => Ok((c - b'A') as u32),
-        b'a'..=b'z' => Ok((c - b'a' + 26) as u32),
-        b'0'..=b'9' => Ok((c - b'0' + 52) as u32),
-        b'-' => Ok(62),
-        b'_' => Ok(63),
-        _ => Err(LibraryError::Invalid),
-    }
-}
-
-/// Decode a cursor from [`page_cursor`]. Garbage is [`LibraryError::Invalid`]
-/// (a client shape error, surfaced as 422).
-pub fn parse_page_cursor(cursor: &str) -> Result<i64, LibraryError> {
-    if cursor.is_empty() || cursor.len() > 11 {
+fn decode_b64url_no_pad(cursor: &str) -> Result<Vec<u8>, LibraryError> {
+    if cursor.is_empty() || cursor.len() > MAX_CURSOR_LEN {
         return Err(LibraryError::Invalid);
     }
-    let mut bytes = [0u8; 8];
+    if cursor.len() % 4 == 1 {
+        return Err(LibraryError::Invalid);
+    }
     let chars: Vec<u8> = cursor.bytes().collect();
+    let mut out = Vec::with_capacity(cursor.len() / 4 * 3 + 3);
     let mut i = 0;
-    let mut out = 0;
     while i < chars.len() {
         let b0 = cursor_value(chars[i])?;
         let b1 = if i + 1 < chars.len() {
@@ -284,24 +265,60 @@ pub fn parse_page_cursor(cursor: &str) -> Result<i64, LibraryError> {
             0
         };
         let n = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
-        if out < 8 {
-            bytes[out] = ((n >> 16) & 0xff) as u8;
-            out += 1;
+        out.push(((n >> 16) & 0xff) as u8);
+        if i + 2 < chars.len() {
+            out.push(((n >> 8) & 0xff) as u8);
         }
-        if i + 2 < chars.len() && out < 8 {
-            bytes[out] = ((n >> 8) & 0xff) as u8;
-            out += 1;
-        }
-        if i + 3 < chars.len() && out < 8 {
-            bytes[out] = (n & 0xff) as u8;
-            out += 1;
+        if i + 3 < chars.len() {
+            out.push((n & 0xff) as u8);
         }
         i += 4;
     }
-    if out != 8 {
+    Ok(out)
+}
+
+/// Opaque keyset cursor: base64url (no padding) of the UTF-8 bytes of the
+/// last row's public `id` on the page. Clients pass it back as `after`;
+/// they must never parse or forge it.
+///
+/// The cursor carries only the already-public opaque id — the same value
+/// returned as `id` in list responses, so the Worker builds the next
+/// cursor from the last returned row with no extra columns. No internal
+/// row id, no owner, no timestamps. A forged or unknown value only
+/// filters (an empty page), never leaks invisible rows: visibility still
+/// applies server-side, including inside the cursor subselect.
+pub fn page_cursor(last_public_id: &str) -> String {
+    encode_b64url_no_pad(last_public_id.as_bytes())
+}
+
+fn cursor_value(c: u8) -> Result<u32, LibraryError> {
+    match c {
+        b'A'..=b'Z' => Ok((c - b'A') as u32),
+        b'a'..=b'z' => Ok((c - b'a' + 26) as u32),
+        b'0'..=b'9' => Ok((c - b'0' + 52) as u32),
+        b'-' => Ok(62),
+        b'_' => Ok(63),
+        _ => Err(LibraryError::Invalid),
+    }
+}
+
+/// Decode a cursor from [`page_cursor`] into the public id it wraps.
+/// Garbage is [`LibraryError::Invalid`] (a client shape error, surfaced
+/// as 422). A well-formed but unknown id simply matches no rows downstream
+/// (an empty page), never a leak.
+pub fn parse_page_cursor(cursor: &str) -> Result<String, LibraryError> {
+    let bytes = decode_b64url_no_pad(cursor)?;
+    let id = std::str::from_utf8(&bytes).map_err(|_| LibraryError::Invalid)?;
+    if id.is_empty() || id.len() > MAX_CURSOR_PUBLIC_ID_LEN {
         return Err(LibraryError::Invalid);
     }
-    Ok(i64::from_be_bytes(bytes))
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(LibraryError::Invalid);
+    }
+    Ok(id.to_string())
 }
 
 fn genre_visible(caller: &str, row: &GenreRow) -> bool {
@@ -348,10 +365,12 @@ pub fn list_playlists(
         .collect())
 }
 
-/// One bounded genre page, newest first. `limit` is clamped to
-/// [`MAX_PAGE_SIZE`]; `after` continues from a [`page_cursor`].
-/// In-memory rows carry no timestamps, so pages order by internal id DESC —
-/// the stable tiebreak under the SQL `(created_at, id)` ordering.
+/// One bounded genre page, newest first (insertion order). `limit` is
+/// clamped to [`MAX_PAGE_SIZE`]; `after` continues from a [`page_cursor`]
+/// wrapping the last row's public `id`.
+/// Pages order by internal id DESC — the same insertion-order key the SQL
+/// list statement uses (`ORDER BY id DESC`), so the mirror and the
+/// database agree exactly and stay immune to timestamp skew.
 pub fn list_genres_page(
     caller: Option<&str>,
     rows: &[GenreRow],
@@ -359,17 +378,24 @@ pub fn list_genres_page(
     after: Option<&str>,
 ) -> Result<Vec<GenreResponse>, LibraryError> {
     let caller = require_caller(caller)?;
-    let after_id = match after {
-        Some(cursor) => Some(parse_page_cursor(cursor)?),
-        None => None,
-    };
     let limit = clamp_page_size(limit);
     let mut visible: Vec<&GenreRow> = rows
         .iter()
         .filter(|row| genre_visible(caller, row))
-        .filter(|row| after_id.map(|id| row.internal_id < id).unwrap_or(true))
         .collect();
     visible.sort_by_key(|row| std::cmp::Reverse(row.internal_id));
+    if let Some(cursor) = after {
+        let cursor_id = parse_page_cursor(cursor)?;
+        // Resume after the cursor's position in this visible page.
+        // Unknown or invisible ids match nothing (an empty page), never a
+        // leak — mirroring the SQL predicate, whose cursor subselect is
+        // visibility-filtered the same way.
+        if let Some(pos) = visible.iter().position(|row| row.public_id == cursor_id) {
+            visible.drain(..=pos);
+        } else {
+            visible.clear();
+        }
+    }
     visible.truncate(limit);
     Ok(visible.iter().map(|row| genre_response(row)).collect())
 }
@@ -382,17 +408,20 @@ pub fn list_playlists_page(
     after: Option<&str>,
 ) -> Result<Vec<PlaylistSummary>, LibraryError> {
     let caller = require_caller(caller)?;
-    let after_id = match after {
-        Some(cursor) => Some(parse_page_cursor(cursor)?),
-        None => None,
-    };
     let limit = clamp_page_size(limit);
     let mut visible: Vec<&PlaylistRow> = rows
         .iter()
         .filter(|row| playlist_visible(caller, row))
-        .filter(|row| after_id.map(|id| row.internal_id < id).unwrap_or(true))
         .collect();
     visible.sort_by_key(|row| std::cmp::Reverse(row.internal_id));
+    if let Some(cursor) = after {
+        let cursor_id = parse_page_cursor(cursor)?;
+        if let Some(pos) = visible.iter().position(|row| row.public_id == cursor_id) {
+            visible.drain(..=pos);
+        } else {
+            visible.clear();
+        }
+    }
     visible.truncate(limit);
     Ok(visible.iter().map(|row| playlist_summary(row)).collect())
 }
@@ -719,10 +748,18 @@ pub fn authorize_playlist_delete(
 // owner predicate already makes cross-owner writes inexpressible, so a 0-row
 // write is never a silent foreign mutation.
 
-/// First page of caller-visible genres, newest first.
-/// Parameters: owner_user_id, limit (clamped to [`MAX_PAGE_SIZE`]).
+/// Caller-visible genre page, newest first (insertion order).
+/// Parameters: owner_user_id ($1), limit clamped to [`MAX_PAGE_SIZE`]
+/// ($2), cursor public id or NULL for the first page ($3).
+///
+/// The cursor is the last row's public `id` from the previous page (see
+/// [`page_cursor`]): the subselect maps it to its internal position
+/// without ever returning that position, and it is visibility-filtered
+/// so forged or invisible cursors match nothing instead of leaking. The
+/// Worker builds the next cursor from the last returned `public_id` —
+/// the projection already carries it, so no internal column is needed.
 pub fn genre_list_statement() -> &'static str {
-    "SELECT public_id, name, is_public FROM genres WHERE owner_user_id = $1 OR is_public = TRUE ORDER BY created_at DESC, id DESC LIMIT $2"
+    "SELECT public_id, name, is_public FROM genres WHERE (owner_user_id = $1 OR is_public = TRUE) AND ($3::TEXT IS NULL OR id < (SELECT id FROM genres WHERE public_id = $3 AND (owner_user_id = $1 OR is_public = TRUE))) ORDER BY id DESC LIMIT $2"
 }
 
 /// Parameters: public_id, owner_user_id.
@@ -755,10 +792,12 @@ pub fn genre_delete_statement() -> &'static str {
     "DELETE FROM genres WHERE public_id = $1 AND owner_user_id = $2"
 }
 
-/// First page of caller-visible playlists (summaries: no `items`), newest first.
-/// Parameters: owner_user_id, limit (clamped to [`MAX_PAGE_SIZE`]).
+/// Caller-visible playlist page (summaries: no `items`), newest first.
+/// Parameters: owner_user_id ($1), limit clamped to [`MAX_PAGE_SIZE`]
+/// ($2), cursor public id or NULL for the first page ($3). Cursor
+/// semantics match [`genre_list_statement`].
 pub fn playlist_list_statement() -> &'static str {
-    "SELECT public_id, name, is_public FROM playlists WHERE owner_user_id = $1 OR is_public = TRUE ORDER BY created_at DESC, id DESC LIMIT $2"
+    "SELECT public_id, name, is_public FROM playlists WHERE (owner_user_id = $1 OR is_public = TRUE) AND ($3::TEXT IS NULL OR id < (SELECT id FROM playlists WHERE public_id = $3 AND (owner_user_id = $1 OR is_public = TRUE))) ORDER BY id DESC LIMIT $2"
 }
 
 /// Parameters: public_id, owner_user_id.
@@ -819,14 +858,20 @@ mod tests {
     }
 
     #[test]
-    fn page_cursor_round_trips() {
-        for id in [1i64, 11, 123_456_789, i64::MAX] {
-            assert_eq!(parse_page_cursor(&page_cursor(id)), Ok(id));
+    fn page_cursor_round_trips_public_ids_only() {
+        for id in ["g-public-opaque-01", "p-public-0001", &"x".repeat(128)] {
+            assert_eq!(parse_page_cursor(&page_cursor(id)), Ok(id.to_string()));
         }
+        // The cursor wraps the public id itself: decoding it yields no
+        // internal row id, only the already-public handle.
+        assert_eq!(
+            parse_page_cursor(&page_cursor("g-public-opaque-01")),
+            Ok("g-public-opaque-01".to_string())
+        );
         assert_eq!(parse_page_cursor(""), Err(LibraryError::Invalid));
         assert_eq!(parse_page_cursor("!!!"), Err(LibraryError::Invalid));
         assert_eq!(
-            parse_page_cursor(&"A".repeat(12)),
+            parse_page_cursor(&"A".repeat(193)),
             Err(LibraryError::Invalid)
         );
         assert_eq!(LibraryError::Invalid.http_status(), 422);
@@ -855,17 +900,14 @@ mod tests {
         let json = serde_json::to_string(&first[0]).unwrap();
         assert!(!json.contains("items"), "list shapes omit items: {json}");
 
+        // The Worker builds the next cursor from the last returned row —
+        // no internal id lookup needed: the cursor wraps the public id.
         let last_first_page = first[MAX_PAGE_SIZE - 1].id.clone();
-        let last_id: i64 = rows
-            .iter()
-            .find(|r| r.public_id == last_first_page)
-            .unwrap()
-            .internal_id;
         let second = list_playlists_page(
             Some("user-alice"),
             &rows,
             MAX_PAGE_SIZE,
-            Some(&page_cursor(last_id)),
+            Some(&page_cursor(&last_first_page)),
         )
         .unwrap();
         assert_eq!(second.len(), 10);
@@ -881,6 +923,59 @@ mod tests {
             list_playlists_page(Some("user-alice"), &rows, 10, Some("!!!")),
             Err(LibraryError::Invalid)
         );
+        // A well-formed but unknown cursor matches nothing (empty page),
+        // never a leak and never a restart.
+        let unknown = list_playlists_page(
+            Some("user-alice"),
+            &rows,
+            MAX_PAGE_SIZE,
+            Some(&page_cursor("p-public-9999")),
+        )
+        .unwrap();
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn own_older_row_is_reachable_by_following_the_cursor() {
+        // Regression for the review probe: many newer public rows by
+        // another user plus one older private row by the caller. Every
+        // page must be reachable and the caller's own row must appear on
+        // the last page — never stranded past an unreachable first 50.
+        let mut rows: Vec<PlaylistRow> = vec![PlaylistRow {
+            internal_id: 1,
+            public_id: "p-alice-own".into(),
+            owner_user_id: "user-alice".into(),
+            name: "Alice Own".into(),
+            items: vec![],
+            is_public: false,
+        }];
+        rows.extend((0..120).map(|i| PlaylistRow {
+            internal_id: i as i64 + 2,
+            public_id: format!("p-bob-{i:04}"),
+            owner_user_id: "user-bob".into(),
+            name: format!("Bob {i:04}"),
+            items: vec![],
+            is_public: true,
+        }));
+        let mut after: Option<String> = None;
+        let mut seen_own = false;
+        let mut pages = 0;
+        loop {
+            let page =
+                list_playlists_page(Some("user-alice"), &rows, MAX_PAGE_SIZE, after.as_deref())
+                    .unwrap();
+            pages += 1;
+            assert!(pages < 10, "paging must terminate");
+            if page.iter().any(|p| p.id == "p-alice-own") {
+                seen_own = true;
+            }
+            if page.len() < MAX_PAGE_SIZE {
+                break;
+            }
+            after = Some(page_cursor(&page.last().unwrap().id));
+        }
+        assert!(seen_own, "caller's own older row reachable via cursor");
+        assert_eq!(pages, 3, "121 rows at 50/page");
     }
 
     #[test]
@@ -963,10 +1058,30 @@ mod tests {
     #[test]
     fn list_and_lookup_statements_are_bounded_and_owner_free() {
         for sql in [genre_list_statement(), playlist_list_statement()] {
-            assert!(sql.contains("ORDER BY created_at DESC, id DESC"), "{sql}");
+            assert!(sql.contains("ORDER BY id DESC"), "{sql}");
             assert!(sql.contains("LIMIT $2"), "{sql}");
+            // A real keyset predicate over the public-id cursor ($3): pages
+            // beyond the first 50 are expressible in SQL, not just in the
+            // in-memory mirror.
+            assert!(sql.contains("$3"), "{sql}");
+            assert!(sql.contains("public_id = $3"), "{sql}");
+            assert!(sql.contains("id < (SELECT id FROM"), "{sql}");
+            // The cursor lookup is visibility-filtered too: forged or
+            // invisible cursors match nothing instead of leaking.
+            assert!(
+                sql.contains("(owner_user_id = $1 OR is_public = TRUE)"),
+                "{sql}"
+            );
         }
-        // List projections never carry items or owner/internal ids.
+        // List projections return the public id the Worker builds the next
+        // cursor from — never items, owner, or internal ids.
+        for sql in [genre_list_statement(), playlist_list_statement()] {
+            let select = sql.split(" FROM ").next().unwrap();
+            assert!(select.contains("public_id"), "{select}");
+            assert!(!select.contains("items"), "{select}");
+            assert!(!select.contains("owner"), "{select}");
+            assert!(!select.contains("internal"), "{select}");
+        }
         let playlist_select = playlist_list_statement().split(" FROM ").next().unwrap();
         assert!(!playlist_select.contains("items"), "{playlist_select}");
         assert!(!playlist_select.contains("owner"), "{playlist_select}");

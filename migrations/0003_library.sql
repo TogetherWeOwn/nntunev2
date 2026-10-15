@@ -11,8 +11,11 @@
 -- statements, which answers the 403-vs-404 question without exposing the
 -- id itself.
 --
--- Lists are keyset pages (`ORDER BY created_at DESC, id DESC LIMIT $2`):
--- the composite indexes below serve that ordering directly.
+-- Lists are keyset pages (`ORDER BY id DESC LIMIT $2` with an opaque
+-- cursor over the public id): insertion order is the newest-first key,
+-- immune to timestamp skew, and the primary key serves that ordering
+-- directly — no extra index. The owner/visibility indexes below serve
+-- the page filters.
 
 CREATE TABLE IF NOT EXISTS genres (
     id              BIGSERIAL PRIMARY KEY,
@@ -38,6 +41,3 @@ CREATE TABLE IF NOT EXISTS playlists (
 );
 CREATE INDEX IF NOT EXISTS idx_playlists_owner ON playlists (owner_user_id);
 CREATE INDEX IF NOT EXISTS idx_playlists_public ON playlists (is_public) WHERE is_public = TRUE;
--- Keyset pagination ordering for the list statements.
-CREATE INDEX IF NOT EXISTS idx_genres_created ON genres (created_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS idx_playlists_created ON playlists (created_at DESC, id DESC);
