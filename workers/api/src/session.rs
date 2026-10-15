@@ -19,6 +19,20 @@ type HmacSha256 = Hmac<Sha256>;
 pub const CLOCK_SKEW_SECS: u64 = 60;
 /// Absolute lifetime from authentication, not refreshed by rotation (one day).
 pub const MAX_SESSION_SECS: u64 = 86_400;
+/// Freshness window for privilege-gated operations (10 minutes). A session
+/// whose authentication age (`now - created_at`) exceeds this window must
+/// re-authenticate before a privilege change, even though the session itself
+/// is still valid for ordinary operations. Measured from the immutable
+/// `created_at`, never from `issued_at`: rotation must not restore freshness.
+pub const PRIVILEGE_REAUTH_WINDOW_SECS: u64 = 600;
+/// Stable, user-facing error code the HTTP layer returns (in the structured
+/// error envelope) when a privilege-gated op needs fresh authentication.
+/// Reused by every privilege gate; do not invent a second code.
+pub const REAUTH_REQUIRED_CODE: &str = "reauth_required";
+/// Stable code for a dead session (bad signature, revoked, expired, ...).
+/// Never equal to [`REAUTH_REQUIRED_CODE`]: a dead session must not be
+/// reported as merely stale.
+pub const INVALID_SESSION_CODE: &str = "invalid_session";
 /// Cookie name for the web session.
 ///
 /// The `__Host-` prefix locks out `Domain=` overrides by construction:
@@ -50,6 +64,30 @@ fn new_session_id() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
     Invalid,
+    /// The session is valid for ordinary operations but was authenticated
+    /// outside [`PRIVILEGE_REAUTH_WINDOW_SECS`]: the caller must complete a
+    /// fresh authentication proof before a privilege change. Distinct from
+    /// [`SessionError::Invalid`] so the client prompts for re-auth instead
+    /// of treating the session as dead.
+    ReauthRequired,
+}
+
+impl SessionError {
+    /// Stable code for the structured error envelope.
+    pub fn code(&self) -> &'static str {
+        match self {
+            SessionError::Invalid => INVALID_SESSION_CODE,
+            SessionError::ReauthRequired => REAUTH_REQUIRED_CODE,
+        }
+    }
+
+    /// HTTP status for the envelope (mirrors `LibraryError::http_status`).
+    pub fn http_status(&self) -> u16 {
+        match self {
+            SessionError::Invalid => 401,
+            SessionError::ReauthRequired => 401,
+        }
+    }
 }
 
 impl std::fmt::Display for SessionError {
@@ -277,6 +315,97 @@ pub fn rotate_session(
     // under the previous secret.
     let sig = sign(keys.primary, &payload_b64)?;
     Ok(format!("{}.{}", payload_b64, crate::b64::encode(&sig)))
+}
+
+/// Privilege gate: like [`verify_stored_session`], plus a freshness check
+/// on the immutable authentication time.
+///
+/// Runs the full stored-session check first (signature, row, counter,
+/// revocation, expiry) and maps ANY failure to [`SessionError::Invalid`]:
+/// an unauthenticated or revoked caller never receives the re-auth code
+/// (no oracle). Only a session that is otherwise valid but whose
+/// authentication age `now.saturating_sub(created_at)` exceeds
+/// [`PRIVILEGE_REAUTH_WINDOW_SECS`] returns
+/// [`SessionError::ReauthRequired`]. The boundary is inclusive: an age
+/// exactly equal to the window passes.
+///
+/// Privilege-gated handlers call this instead of
+/// [`verify_stored_session`]; ordinary handlers are unchanged.
+pub fn require_fresh_session(
+    keys: &SessionKeys<'_>,
+    token: &str,
+    now: u64,
+    record: &SessionRecord,
+) -> Result<SessionClaims, SessionError> {
+    let claims =
+        verify_stored_session(keys, token, now, record).map_err(|_| SessionError::Invalid)?;
+    if now.saturating_sub(claims.created_at) > PRIVILEGE_REAUTH_WINDOW_SECS {
+        return Err(SessionError::ReauthRequired);
+    }
+    Ok(claims)
+}
+
+/// Prepared replacement session from [`reauthenticate_session`]: the token
+/// and row to insert, plus the one old session id to revoke. Pure data —
+/// the caller MUST atomically INSERT `new_record` and revoke exactly the
+/// old row (`UPDATE sessions SET revoked = TRUE WHERE id =
+/// revoked_session_id`), commit, and only then send the new cookie.
+/// Single-session revoke, never a logout-everywhere.
+#[derive(Debug, Clone)]
+pub struct ReauthenticatedSession {
+    pub token: String,
+    pub new_record: SessionRecord,
+    pub revoked_session_id: String,
+}
+
+/// Mint a replacement session after a fresh authentication proof.
+///
+/// Call ONLY after the caller has completed a fresh authentication proof
+/// (passkey/magic-link ceremony is out of scope here). Verifies the old
+/// token against its row first — any failure is [`SessionError::Invalid`
+/// and nothing is minted — then mints a NEW session id under
+/// `keys.primary` only (never the rotation-window previous secret), with
+/// `created_at == issued_at == now`, `rotation_counter == 0`, and the
+/// expiry rules of [`issue_session`].
+///
+/// This is a pure prepare step, like [`rotate_session`]: the database
+/// INSERT + single-row revoke happen in the caller's transaction.
+pub fn reauthenticate_session(
+    keys: &SessionKeys<'_>,
+    old_token: &str,
+    now: u64,
+    old_record: &SessionRecord,
+    ttl_secs: u64,
+) -> Result<ReauthenticatedSession, SessionError> {
+    let old_claims = verify_stored_session(keys, old_token, now, old_record)
+        .map_err(|_| SessionError::Invalid)?;
+    let next = SessionClaims {
+        session_id: new_session_id(),
+        user_id: old_claims.user_id.clone(),
+        created_at: now,
+        issued_at: now,
+        expires_at: now.saturating_add(ttl_secs.min(MAX_SESSION_SECS)),
+        rotation_counter: 0,
+    };
+    let payload = serde_json::to_vec(&next).expect("claims serialize");
+    let payload_b64 = crate::b64::encode(&payload);
+    // Always mint under the primary: re-auth migrates off the previous
+    // secret, never mints under it.
+    let sig = sign(keys.primary, &payload_b64)?;
+    let token = format!("{}.{}", payload_b64, crate::b64::encode(&sig));
+    let new_record = SessionRecord {
+        id: next.session_id.clone(),
+        user_id: next.user_id.clone(),
+        created_at: next.created_at,
+        expires_at: next.expires_at,
+        rotation_counter: 0,
+        revoked: false,
+    };
+    Ok(ReauthenticatedSession {
+        token,
+        new_record,
+        revoked_session_id: old_record.id.clone(),
+    })
 }
 
 /// `Set-Cookie` header value. Always HttpOnly + Secure + SameSite=Lax.

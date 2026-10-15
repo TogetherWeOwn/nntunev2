@@ -48,6 +48,12 @@ provisioned; this crate is the security-critical logic with tests.
   conditionally update the matching row/counter and commit before sending
   the cookie; a superseded cookie then fails. Privilege changes require
   reauthentication, revoking the old row and issuing a new session id.
+  Privilege-gated ops enforce a freshness window of 600 seconds
+  (10 minutes) on the immutable authentication time (`created_at`, never
+  `issued_at`, so rotation cannot restore freshness): sessions
+  authenticated outside the window are rejected with the documented
+  `reauth_required` error code (401), while successful re-auth mints a
+  new session id and revokes only the old row (single-session revoke).
 - **Magic links:** 256-bit random tokens, SHA-256 hash at rest, 15-minute
   expiry. HTTP callers must use `consume_magic_link_atomically`, not the
   pure record-preparation helper. Magic links, passkey challenges and
