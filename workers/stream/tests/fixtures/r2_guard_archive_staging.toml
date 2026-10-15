@@ -1,0 +1,15 @@
+# RED fixture for the R2 manifest guard (TOG-25320).
+#
+# This manifest binds a Worker to the RESERVED staging archive bucket
+# (`nntunev2-archive-staging`, see docs/ops.md). The guard under test in
+# `workers/stream/tests/r2_eviction_manifest_guard.rs` must REJECT this file:
+# archive buckets have no Worker consumer by policy. Do not "fix" this fixture
+# to point at an audio/art bucket — its archive binding is the point.
+
+name = "nntune-stream-red-fixture"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+
+[[r2_buckets]]
+binding = "AUDIO_CACHE"
+bucket_name = "nntunev2-archive-staging"
