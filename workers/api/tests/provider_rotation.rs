@@ -43,20 +43,29 @@ fn rotation_keeps_session_and_swaps_credential() {
 
     // Old credential sealed in the vault.
     let old_config = provider_with_password("old-s3cret");
-    let old_plaintext =
-        serde_json::to_vec(&serde_json::json!({"username": old_config.username, "password": old_config.password}))
-            .unwrap();
+    let old_plaintext = serde_json::to_vec(
+        &serde_json::json!({"username": old_config.username, "password": old_config.password}),
+    )
+    .unwrap();
     let old_blob = vault::encrypt_vault(&kek, 1, user_id, &old_plaintext).expect("encrypt old");
 
     // Rotation: validate the new config, seal it, verify via test-connection
     // gates (validation + rate-limit window open).
     let new_config = provider_with_password("new-s3cret-rotated");
-    let rotated_blob =
-        vault::rotate_provider_credentials(&kek, 1, user_id, &old_blob, &old_config, &new_config, &FakeDns)
-            .expect("rotate");
-    let back: serde_json::Value =
-        serde_json::from_slice(&vault::decrypt_vault(&kek, user_id, &rotated_blob).expect("decrypt"))
-            .unwrap();
+    let rotated_blob = vault::rotate_provider_credentials(
+        &kek,
+        1,
+        user_id,
+        &old_blob,
+        &old_config,
+        &new_config,
+        &FakeDns,
+    )
+    .expect("rotate");
+    let back: serde_json::Value = serde_json::from_slice(
+        &vault::decrypt_vault(&kek, user_id, &rotated_blob).expect("decrypt"),
+    )
+    .unwrap();
     assert_eq!(back["password"], "new-s3cret-rotated");
     assert!(
         !vault::decrypt_vault(&kek, user_id, &rotated_blob)
@@ -71,14 +80,12 @@ fn rotation_keeps_session_and_swaps_credential() {
     assert!(vault::test_attempt_allowed(&[], now));
 
     // The user session survives the rotation untouched.
-    let claims = session::verify_session(&session_secret, &token, now + 60).expect("session survives");
+    let claims =
+        session::verify_session(&session_secret, &token, now + 60).expect("session survives");
     assert_eq!(claims.user_id, user_id);
 
     // Rotation is audited as a rotation, not a generic update.
-    assert_eq!(
-        vault::provider_rotation_audit_action(),
-        "vault.rotate"
-    );
+    assert_eq!(vault::provider_rotation_audit_action(), "vault.rotate");
 }
 
 #[test]

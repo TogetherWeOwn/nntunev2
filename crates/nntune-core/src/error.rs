@@ -74,7 +74,10 @@ impl fmt::Display for Error {
             // material in logs or error bodies). The server reply text is
             // deliberately not echoed: it is attacker-influenced and could
             // carry reflected credential material. Log/return `code()` instead.
-            Error::AuthFailed(_) => write!(f, "NNTP authentication failed: {PROVIDER_AUTH_EXPIRED_CODE}"),
+            Error::AuthFailed(_) => write!(
+                f,
+                "NNTP authentication failed: {PROVIDER_AUTH_EXPIRED_CODE}"
+            ),
             Error::NoPermission(t) => write!(f, "NNTP permission denied: {t}"),
             Error::ArticleNotFound(id) => write!(f, "article not found: {id}"),
             Error::Malformed(r) => write!(f, "malformed input: {r}"),

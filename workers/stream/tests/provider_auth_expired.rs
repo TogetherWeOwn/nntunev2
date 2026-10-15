@@ -32,6 +32,9 @@ fn play_error_carries_documented_code_without_secrets() {
     let secret = "s3cret-provider-password";
     let err = PlayError::ProviderAuthExpired;
     let rendered = format!("{err:?}");
-    assert!(!rendered.contains(secret), "secret in PlayError: {rendered}");
+    assert!(
+        !rendered.contains(secret),
+        "secret in PlayError: {rendered}"
+    );
     assert_eq!(err.code(), "provider_auth_expired");
 }

@@ -40,9 +40,7 @@ impl NntpError {
     pub fn is_provider_failure(&self) -> bool {
         !matches!(
             self,
-            NntpError::NoSuchArticle(_)
-                | NntpError::AuthExpired
-                | NntpError::InvalidMessageId(_)
+            NntpError::NoSuchArticle(_) | NntpError::AuthExpired | NntpError::InvalidMessageId(_)
         )
     }
 
