@@ -19,7 +19,8 @@ serverless; batch runs in Containers.
    replication bookkeeping). Full 30+ table MusicBrainz schema is out of
    scope; the mirror stores what lookup + search need.
 2. **Initial import** runs as a Cloudflare Container batch job (`mbdump`
-   dumps → Postgres `COPY`). It is idempotent and resumable by dump file.
+   dumps → Postgres `COPY`). It is idempotent and resumable by line-range
+   chunk (`mb_import_cursor`), with poison rows in `mb_import_dlq`.
 3. **Hourly replication** applies MusicBrainz replication packets via a
    scheduled Container/Workflow. SLO: **replication lag < 2 h** (packet
    applied within 2 h of publication); lag is recorded per packet.
