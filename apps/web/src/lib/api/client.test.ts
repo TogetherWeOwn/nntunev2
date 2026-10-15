@@ -66,6 +66,82 @@ describe('ApiClient', () => {
 		expect((failure as ApiError).code).toBe('unauthorized');
 	});
 
+	it('posts JSON bodies with the right content type', async () => {
+		const seen: unknown[] = [];
+		const fetchFn = (async (_url: unknown, init: unknown) => {
+			seen.push(init);
+			return jsonResponse({ ok: true });
+		}) as unknown as typeof fetch;
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		await client.post('/v1/auth/magic-link', { email: 'alice@example.com' });
+
+		expect(seen).toEqual([
+			expect.objectContaining({
+				method: 'POST',
+				headers: expect.objectContaining({ 'content-type': 'application/json' })
+			})
+		]);
+	});
+
+	it('requests a magic link without leaking which emails exist', async () => {
+		const seenUrls: unknown[] = [];
+		const fetchFn = (async (url: unknown) => {
+			seenUrls.push(url);
+			return jsonResponse({ ok: true });
+		}) as unknown as typeof fetch;
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		await expect(
+			client.requestMagicLink('alice@example.com')
+		).resolves.toEqual({ ok: true });
+		expect(seenUrls).toEqual(['https://api.example.com/v1/auth/magic-link']);
+	});
+
+	it('tests a provider connection and returns the redacted result', async () => {
+		const seenBodies: unknown[] = [];
+		const fetchFn = (async (_url: unknown, init: { body?: string } & RequestInit) => {
+			seenBodies.push(JSON.parse(String(init.body)));
+			return jsonResponse({ ok: true, latencyMs: 120 });
+		}) as unknown as typeof fetch;
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const result = await client.testProviderConnection({
+			host: 'news.example.com',
+			port: 563,
+			tls: true,
+			username: 'alice',
+			password: 's3cret',
+			maxConnections: 4
+		});
+
+		expect(result).toEqual({ ok: true, latencyMs: 120 });
+		expect(seenBodies).toEqual([
+			expect.objectContaining({ host: 'news.example.com', port: 563 })
+		]);
+	});
+
+	it('saves a tested provider config to the vault endpoint', async () => {
+		const seenUrls: unknown[] = [];
+		const fetchFn = (async (url: unknown) => {
+			seenUrls.push(url);
+			return jsonResponse({ ok: true });
+		}) as unknown as typeof fetch;
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		await expect(
+			client.saveProviderConfig({
+				host: 'news.example.com',
+				port: 563,
+				tls: true,
+				username: 'alice',
+				password: 's3cret',
+				maxConnections: 4
+			})
+		).resolves.toEqual({ ok: true });
+		expect(seenUrls).toEqual(['https://api.example.com/v1/vault']);
+	});
+
 	it('uses the global fetch without an Illegal-invocation receiver', async () => {
 		const originalFetch = globalThis.fetch;
 		// Mimic browsers/workerd: a bare global fetch throws when `this` is wrong.

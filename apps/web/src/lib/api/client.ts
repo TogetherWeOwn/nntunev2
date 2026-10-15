@@ -27,6 +27,27 @@ export class ApiError extends Error {
 	}
 }
 
+export interface MagicLinkResult {
+	ok: true;
+}
+
+export interface ProviderTestInput {
+	host: string;
+	port: number;
+	tls: boolean;
+	username: string;
+	password: string;
+	maxConnections: number;
+	indexerUrl?: string;
+	indexerApiKey?: string;
+}
+
+export interface ProviderTestResult {
+	ok: boolean;
+	latencyMs?: number;
+	error?: string;
+}
+
 export class ApiClient {
 	private readonly baseUrl: string;
 	private readonly fetchFn: FetchFn;
@@ -48,8 +69,45 @@ export class ApiClient {
 		return this.request<T>(path, { method: 'GET' });
 	}
 
+	async post<T>(path: string, body: unknown): Promise<T> {
+		return this.request<T>(path, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+	}
+
+	/**
+	 * Request an email magic link. Always resolves the same way for unknown
+	 * and known addresses (the API never reveals which emails exist).
+	 */
+	async requestMagicLink(email: string): Promise<MagicLinkResult> {
+		return this.post<MagicLinkResult>('/v1/auth/magic-link', { email });
+	}
+
+	/**
+	 * Live-test a provider (+ optional indexer) config without storing it.
+	 * The API validates (SSRF guard), dials, and returns a redacted result —
+	 * secrets never come back in the response.
+	 */
+	async testProviderConnection(input: ProviderTestInput): Promise<ProviderTestResult> {
+		return this.post<ProviderTestResult>('/v1/vault/test', input);
+	}
+
+	/**
+	 * Store a tested provider (+ optional indexer) config in the encrypted
+	 * vault. The API seals secrets with envelope encryption; responses are
+	 * redacted summaries, never secret material.
+	 */
+	async saveProviderConfig(input: ProviderTestInput): Promise<MagicLinkResult> {
+		return this.post<MagicLinkResult>('/v1/vault', input);
+	}
+
 	private async request<T>(path: string, init: RequestInit): Promise<T> {
-		const headers: Record<string, string> = { accept: 'application/json' };
+		const headers: Record<string, string> = {
+			...((init.headers as Record<string, string> | undefined) ?? {}),
+			accept: 'application/json'
+		};
 		if (this.token !== null) headers['authorization'] = `Bearer ${this.token}`;
 
 		const response = await this.fetchFn(`${this.baseUrl}${path}`, { ...init, headers });
