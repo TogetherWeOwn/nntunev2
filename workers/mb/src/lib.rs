@@ -336,6 +336,9 @@ async fn handle_search<R: MbRepo, C: SuccessCache>(
     if q_chars > MAX_QUERY_CHARS {
         return error_response("query too long (max 100 chars)", 400);
     }
+    if q.chars().any(char::is_control) {
+        return error_response("query contains control characters", 400);
+    }
     let kind = match Kind::parse(raw_kind) {
         Some(kind) => kind,
         None => return error_response("type must be one of artist|release|recording", 400),
@@ -936,6 +939,24 @@ mod tests {
         ));
         assert_eq!(resp.status, 400);
         assert_eq!(*repo.search_calls.borrow(), 0);
+        assert!(cache.puts.borrow().is_empty());
+    }
+
+    #[test]
+    fn search_rejects_control_characters_before_cache_or_repo() {
+        let repo = FakeRepo::default();
+        let cache = FakeCache::default();
+        let resp = block_on(handle_search(
+            &repo,
+            &cache,
+            Some("artist".to_string()),
+            "\0ab",
+        ));
+
+        assert_eq!(resp.status, 400);
+        assert_eq!(resp.cache_ttl, None);
+        assert_eq!(*repo.search_calls.borrow(), 0);
+        assert_eq!(*cache.gets.borrow(), 0);
         assert!(cache.puts.borrow().is_empty());
     }
 
