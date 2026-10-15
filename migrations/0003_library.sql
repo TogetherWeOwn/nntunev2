@@ -6,7 +6,13 @@
 -- Identity discipline: `id` is the internal row key and is NEVER returned
 -- to clients. `public_id` is the opaque handle exposed as `id` in API
 -- responses. `owner_user_id` filters server-side in WHERE clauses and is
--- never in a SELECT list, so responses cannot leak ownership.
+-- never in a SELECT list, so responses cannot leak ownership — except
+-- inside the `(owner_user_id = $2)` boolean of the mutation-lookup
+-- statements, which answers the 403-vs-404 question without exposing the
+-- id itself.
+--
+-- Lists are keyset pages (`ORDER BY created_at DESC, id DESC LIMIT $2`):
+-- the composite indexes below serve that ordering directly.
 
 CREATE TABLE IF NOT EXISTS genres (
     id              BIGSERIAL PRIMARY KEY,
@@ -32,3 +38,6 @@ CREATE TABLE IF NOT EXISTS playlists (
 );
 CREATE INDEX IF NOT EXISTS idx_playlists_owner ON playlists (owner_user_id);
 CREATE INDEX IF NOT EXISTS idx_playlists_public ON playlists (is_public) WHERE is_public = TRUE;
+-- Keyset pagination ordering for the list statements.
+CREATE INDEX IF NOT EXISTS idx_genres_created ON genres (created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_playlists_created ON playlists (created_at DESC, id DESC);

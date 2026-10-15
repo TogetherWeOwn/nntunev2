@@ -12,7 +12,14 @@
 //!   invisible rows return [`LibraryError::NotFound`], never Forbidden, so
 //!   private rows of other users are not enumerable.
 //! - Mutations: invisible rows are [`LibraryError::NotFound`]; visible rows
-//!   owned by someone else are [`LibraryError::Forbidden`].
+//!   owned by someone else are [`LibraryError::Forbidden`]. The Worker
+//!   decides this from [`MutationLookup`] (an `is_owner` boolean), never
+//!   from the owner id itself, and maps 0 affected UPDATE/DELETE rows to
+//!   [`LibraryError::NotFound`] (the row vanished between lookup and write;
+//!   the owner predicate already makes cross-owner writes inexpressible).
+//! - Lists are keyset pages: `ORDER BY created_at DESC, id DESC LIMIT $2`
+//!   with an opaque cursor, capped at [`MAX_PAGE_SIZE`]. Playlist lists
+//!   omit `items` (single reads return them).
 //! - Responses carry only the opaque `public_id` as `id` plus display fields.
 //!   Internal row ids and `owner_user_id` never serialize. The authorizers
 //!   below return intents (validated parameters), never mutated rows.
@@ -26,6 +33,15 @@ pub const MAX_NAME_LEN: usize = 120;
 pub const MAX_ITEMS: usize = 500;
 /// Maximum length of a single playlist item reference (chars).
 pub const MAX_ITEM_LEN: usize = 128;
+/// Maximum rows one list page returns. The Worker MUST bind a LIMIT clamped
+/// through [`clamp_page_size`]; the list statements take it as `$2` so a
+/// single response can never grow with the total public library.
+pub const MAX_PAGE_SIZE: usize = 50;
+
+/// Clamp a caller-supplied page size into `1..=MAX_PAGE_SIZE`.
+pub fn clamp_page_size(requested: usize) -> usize {
+    requested.clamp(1, MAX_PAGE_SIZE)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LibraryError {
@@ -161,6 +177,15 @@ pub struct PlaylistResponse {
     pub is_public: bool,
 }
 
+/// Playlist list shape: like [`PlaylistResponse`] but without `items`.
+/// Lists never carry track references; single reads return them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaylistSummary {
+    pub id: String,
+    pub name: String,
+    pub is_public: bool,
+}
+
 fn genre_response(row: &GenreRow) -> GenreResponse {
     GenreResponse {
         id: row.public_id.clone(),
@@ -178,6 +203,107 @@ fn playlist_response(row: &PlaylistRow) -> PlaylistResponse {
     }
 }
 
+fn playlist_summary(row: &PlaylistRow) -> PlaylistSummary {
+    PlaylistSummary {
+        id: row.public_id.clone(),
+        name: row.name.clone(),
+        is_public: row.is_public,
+    }
+}
+
+/// Opaque keyset cursor: base64url (no padding) of the big-endian internal
+/// id the page ended on. Clients pass it back as `after`; they must never
+/// parse or forge it.
+pub fn page_cursor(last_internal_id: i64) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let bytes = last_internal_id.to_be_bytes();
+    let mut out = String::with_capacity(11);
+    let mut i = 0;
+    while i < bytes.len() {
+        let b0 = bytes[i] as u32;
+        let b1 = if i + 1 < bytes.len() {
+            bytes[i + 1] as u32
+        } else {
+            0
+        };
+        let b2 = if i + 2 < bytes.len() {
+            bytes[i + 2] as u32
+        } else {
+            0
+        };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        if i + 1 < bytes.len() {
+            out.push(ALPHABET[((n >> 6) & 63) as usize] as char);
+        }
+        if i + 2 < bytes.len() {
+            out.push(ALPHABET[(n & 63) as usize] as char);
+        }
+        i += 3;
+    }
+    out
+}
+
+fn cursor_value(c: u8) -> Result<u32, LibraryError> {
+    match c {
+        b'A'..=b'Z' => Ok((c - b'A') as u32),
+        b'a'..=b'z' => Ok((c - b'a' + 26) as u32),
+        b'0'..=b'9' => Ok((c - b'0' + 52) as u32),
+        b'-' => Ok(62),
+        b'_' => Ok(63),
+        _ => Err(LibraryError::Invalid),
+    }
+}
+
+/// Decode a cursor from [`page_cursor`]. Garbage is [`LibraryError::Invalid`]
+/// (a client shape error, surfaced as 422).
+pub fn parse_page_cursor(cursor: &str) -> Result<i64, LibraryError> {
+    if cursor.is_empty() || cursor.len() > 11 {
+        return Err(LibraryError::Invalid);
+    }
+    let mut bytes = [0u8; 8];
+    let chars: Vec<u8> = cursor.bytes().collect();
+    let mut i = 0;
+    let mut out = 0;
+    while i < chars.len() {
+        let b0 = cursor_value(chars[i])?;
+        let b1 = if i + 1 < chars.len() {
+            cursor_value(chars[i + 1])?
+        } else {
+            return Err(LibraryError::Invalid);
+        };
+        let b2 = if i + 2 < chars.len() {
+            cursor_value(chars[i + 2])?
+        } else {
+            0
+        };
+        let b3 = if i + 3 < chars.len() {
+            cursor_value(chars[i + 3])?
+        } else {
+            0
+        };
+        let n = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
+        if out < 8 {
+            bytes[out] = ((n >> 16) & 0xff) as u8;
+            out += 1;
+        }
+        if i + 2 < chars.len() && out < 8 {
+            bytes[out] = ((n >> 8) & 0xff) as u8;
+            out += 1;
+        }
+        if i + 3 < chars.len() && out < 8 {
+            bytes[out] = (n & 0xff) as u8;
+            out += 1;
+        }
+        i += 4;
+    }
+    if out != 8 {
+        return Err(LibraryError::Invalid);
+    }
+    Ok(i64::from_be_bytes(bytes))
+}
+
 fn genre_visible(caller: &str, row: &GenreRow) -> bool {
     row.is_public || row.owner_user_id == caller
 }
@@ -189,6 +315,10 @@ fn playlist_visible(caller: &str, row: &PlaylistRow) -> bool {
 // --- Reads --------------------------------------------------------------------
 
 /// List caller-visible genres: own rows plus public rows.
+///
+/// In-memory mirror of the visibility rule. The Worker MUST use
+/// [`list_genres_page`] (backed by [`genre_list_statement`]) so responses
+/// stay bounded; this helper exists for rule tests over small slices.
 pub fn list_genres(
     caller: Option<&str>,
     rows: &[GenreRow],
@@ -201,17 +331,70 @@ pub fn list_genres(
         .collect())
 }
 
-/// List caller-visible playlists: own rows plus public rows.
+/// List caller-visible playlists (summaries: no `items`).
+///
+/// Mirrors [`genre_list_statement`] visibility for rule tests; the Worker
+/// MUST use [`list_playlists_page`]. Track references come only from
+/// [`get_playlist`].
 pub fn list_playlists(
     caller: Option<&str>,
     rows: &[PlaylistRow],
-) -> Result<Vec<PlaylistResponse>, LibraryError> {
+) -> Result<Vec<PlaylistSummary>, LibraryError> {
     let caller = require_caller(caller)?;
     Ok(rows
         .iter()
         .filter(|row| playlist_visible(caller, row))
-        .map(playlist_response)
+        .map(playlist_summary)
         .collect())
+}
+
+/// One bounded genre page, newest first. `limit` is clamped to
+/// [`MAX_PAGE_SIZE`]; `after` continues from a [`page_cursor`].
+/// In-memory rows carry no timestamps, so pages order by internal id DESC —
+/// the stable tiebreak under the SQL `(created_at, id)` ordering.
+pub fn list_genres_page(
+    caller: Option<&str>,
+    rows: &[GenreRow],
+    limit: usize,
+    after: Option<&str>,
+) -> Result<Vec<GenreResponse>, LibraryError> {
+    let caller = require_caller(caller)?;
+    let after_id = match after {
+        Some(cursor) => Some(parse_page_cursor(cursor)?),
+        None => None,
+    };
+    let limit = clamp_page_size(limit);
+    let mut visible: Vec<&GenreRow> = rows
+        .iter()
+        .filter(|row| genre_visible(caller, row))
+        .filter(|row| after_id.map(|id| row.internal_id < id).unwrap_or(true))
+        .collect();
+    visible.sort_by_key(|row| std::cmp::Reverse(row.internal_id));
+    visible.truncate(limit);
+    Ok(visible.iter().map(|row| genre_response(row)).collect())
+}
+
+/// One bounded playlist-summary page, newest first. See [`list_genres_page`].
+pub fn list_playlists_page(
+    caller: Option<&str>,
+    rows: &[PlaylistRow],
+    limit: usize,
+    after: Option<&str>,
+) -> Result<Vec<PlaylistSummary>, LibraryError> {
+    let caller = require_caller(caller)?;
+    let after_id = match after {
+        Some(cursor) => Some(parse_page_cursor(cursor)?),
+        None => None,
+    };
+    let limit = clamp_page_size(limit);
+    let mut visible: Vec<&PlaylistRow> = rows
+        .iter()
+        .filter(|row| playlist_visible(caller, row))
+        .filter(|row| after_id.map(|id| row.internal_id < id).unwrap_or(true))
+        .collect();
+    visible.sort_by_key(|row| std::cmp::Reverse(row.internal_id));
+    visible.truncate(limit);
+    Ok(visible.iter().map(|row| playlist_summary(row)).collect())
 }
 
 /// Read one genre. Invisible ids are NotFound (no existence oracle).
@@ -371,6 +554,92 @@ fn require_playlist_owner(caller: &str, row: &PlaylistRow) -> Result<(), Library
     }
 }
 
+/// Mutation lookup: the only owner-derived shape the Worker reads before a
+/// mutation. `is_owner` answers the 403-vs-404 question while the owner id
+/// itself never leaves SQL (see [`genre_mutation_lookup_statement`]).
+/// `None` means the lookup returned no row: the id is invisible to the
+/// caller ([`LibraryError::NotFound`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationLookup {
+    pub public_id: String,
+    pub is_owner: bool,
+}
+
+fn require_lookup_owner(lookup: Option<MutationLookup>) -> Result<String, LibraryError> {
+    let lookup = lookup.ok_or(LibraryError::NotFound)?;
+    if lookup.is_owner {
+        Ok(lookup.public_id)
+    } else {
+        Err(LibraryError::Forbidden)
+    }
+}
+
+/// Authorize a genre update from a [`genre_mutation_lookup_statement`] row.
+/// The Worker MUST fetch the lookup for the target id first; authentication
+/// still runs before the existence check.
+pub fn authorize_genre_update_from_lookup(
+    caller: Option<&str>,
+    lookup: Option<MutationLookup>,
+    name: &str,
+    is_public: bool,
+) -> Result<GenreUpdate, LibraryError> {
+    let caller = require_caller(caller)?;
+    let public_id = require_lookup_owner(lookup)?;
+    Ok(GenreUpdate {
+        public_id,
+        owner_user_id: caller.to_string(),
+        name: check_name(name)?,
+        is_public,
+    })
+}
+
+/// Authorize a genre delete from a [`genre_mutation_lookup_statement`] row.
+pub fn authorize_genre_delete_from_lookup(
+    caller: Option<&str>,
+    lookup: Option<MutationLookup>,
+) -> Result<GenreDelete, LibraryError> {
+    let caller = require_caller(caller)?;
+    let public_id = require_lookup_owner(lookup)?;
+    Ok(GenreDelete {
+        public_id,
+        owner_user_id: caller.to_string(),
+    })
+}
+
+/// Authorize a playlist update from a [`playlist_mutation_lookup_statement`]
+/// row.
+pub fn authorize_playlist_update_from_lookup(
+    caller: Option<&str>,
+    lookup: Option<MutationLookup>,
+    name: &str,
+    items: Vec<String>,
+    is_public: bool,
+) -> Result<PlaylistUpdate, LibraryError> {
+    let caller = require_caller(caller)?;
+    let public_id = require_lookup_owner(lookup)?;
+    Ok(PlaylistUpdate {
+        public_id,
+        owner_user_id: caller.to_string(),
+        name: check_name(name)?,
+        items: check_items(items)?,
+        is_public,
+    })
+}
+
+/// Authorize a playlist delete from a [`playlist_mutation_lookup_statement`]
+/// row.
+pub fn authorize_playlist_delete_from_lookup(
+    caller: Option<&str>,
+    lookup: Option<MutationLookup>,
+) -> Result<PlaylistDelete, LibraryError> {
+    let caller = require_caller(caller)?;
+    let public_id = require_lookup_owner(lookup)?;
+    Ok(PlaylistDelete {
+        public_id,
+        owner_user_id: caller.to_string(),
+    })
+}
+
 pub fn authorize_genre_update(
     caller: Option<&str>,
     rows: &[GenreRow],
@@ -441,16 +710,32 @@ pub fn authorize_playlist_delete(
 //
 // The Worker binds intent fields positionally ($1..$n); never interpolates a
 // value into SQL. SELECT lists enumerate display columns only: `owner_user_id`
-// filters server-side in WHERE and is never returned.
+// filters server-side in WHERE and is never returned — except inside the
+// `(owner_user_id = $2)` boolean of the mutation lookups, which answers the
+// 403-vs-404 question without exposing the id itself.
+//
+// Mutation statements affect 0 rows when the row vanished between lookup and
+// write (or never existed): the Worker maps that to NotFound (404). The
+// owner predicate already makes cross-owner writes inexpressible, so a 0-row
+// write is never a silent foreign mutation.
 
-/// Parameters: owner_user_id.
+/// First page of caller-visible genres, newest first.
+/// Parameters: owner_user_id, limit (clamped to [`MAX_PAGE_SIZE`]).
 pub fn genre_list_statement() -> &'static str {
-    "SELECT public_id, name, is_public FROM genres WHERE owner_user_id = $1 OR is_public = TRUE"
+    "SELECT public_id, name, is_public FROM genres WHERE owner_user_id = $1 OR is_public = TRUE ORDER BY created_at DESC, id DESC LIMIT $2"
 }
 
 /// Parameters: public_id, owner_user_id.
 pub fn genre_read_statement() -> &'static str {
     "SELECT public_id, name, is_public FROM genres WHERE public_id = $1 AND (owner_user_id = $2 OR is_public = TRUE)"
+}
+
+/// Mutation lookup for one genre: visibility-filtered read returning only an
+/// ownership boolean. Feeds [`authorize_genre_update_from_lookup`] /
+/// [`authorize_genre_delete_from_lookup`].
+/// Parameters: public_id, owner_user_id.
+pub fn genre_mutation_lookup_statement() -> &'static str {
+    "SELECT public_id, (owner_user_id = $2) AS is_owner FROM genres WHERE public_id = $1 AND (owner_user_id = $2 OR is_public = TRUE)"
 }
 
 /// Parameters: public_id, owner_user_id, name, is_public, created_at.
@@ -459,23 +744,34 @@ pub fn genre_insert_statement() -> &'static str {
 }
 
 /// Parameters: public_id, owner_user_id, name, is_public.
+/// 0 affected rows maps to NotFound (404).
 pub fn genre_update_statement() -> &'static str {
     "UPDATE genres SET name = $3, is_public = $4 WHERE public_id = $1 AND owner_user_id = $2"
 }
 
 /// Parameters: public_id, owner_user_id.
+/// 0 affected rows maps to NotFound (404).
 pub fn genre_delete_statement() -> &'static str {
     "DELETE FROM genres WHERE public_id = $1 AND owner_user_id = $2"
 }
 
-/// Parameters: owner_user_id.
+/// First page of caller-visible playlists (summaries: no `items`), newest first.
+/// Parameters: owner_user_id, limit (clamped to [`MAX_PAGE_SIZE`]).
 pub fn playlist_list_statement() -> &'static str {
-    "SELECT public_id, name, items, is_public FROM playlists WHERE owner_user_id = $1 OR is_public = TRUE"
+    "SELECT public_id, name, is_public FROM playlists WHERE owner_user_id = $1 OR is_public = TRUE ORDER BY created_at DESC, id DESC LIMIT $2"
 }
 
 /// Parameters: public_id, owner_user_id.
 pub fn playlist_read_statement() -> &'static str {
     "SELECT public_id, name, items, is_public FROM playlists WHERE public_id = $1 AND (owner_user_id = $2 OR is_public = TRUE)"
+}
+
+/// Mutation lookup for one playlist: visibility-filtered read returning only
+/// an ownership boolean. Feeds [`authorize_playlist_update_from_lookup`] /
+/// [`authorize_playlist_delete_from_lookup`].
+/// Parameters: public_id, owner_user_id.
+pub fn playlist_mutation_lookup_statement() -> &'static str {
+    "SELECT public_id, (owner_user_id = $2) AS is_owner FROM playlists WHERE public_id = $1 AND (owner_user_id = $2 OR is_public = TRUE)"
 }
 
 /// Parameters: public_id, owner_user_id, name, items, is_public, created_at.
@@ -484,11 +780,13 @@ pub fn playlist_insert_statement() -> &'static str {
 }
 
 /// Parameters: public_id, owner_user_id, name, items, is_public.
+/// 0 affected rows maps to NotFound (404).
 pub fn playlist_update_statement() -> &'static str {
     "UPDATE playlists SET name = $3, items = $4, is_public = $5 WHERE public_id = $1 AND owner_user_id = $2"
 }
 
 /// Parameters: public_id, owner_user_id.
+/// 0 affected rows maps to NotFound (404).
 pub fn playlist_delete_statement() -> &'static str {
     "DELETE FROM playlists WHERE public_id = $1 AND owner_user_id = $2"
 }
@@ -509,5 +807,178 @@ mod tests {
         assert!(id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+    }
+
+    #[test]
+    fn page_size_is_clamped() {
+        assert_eq!(clamp_page_size(0), 1);
+        assert_eq!(clamp_page_size(10), 10);
+        assert_eq!(clamp_page_size(MAX_PAGE_SIZE), MAX_PAGE_SIZE);
+        assert_eq!(clamp_page_size(MAX_PAGE_SIZE + 1), MAX_PAGE_SIZE);
+        assert_eq!(clamp_page_size(usize::MAX), MAX_PAGE_SIZE);
+    }
+
+    #[test]
+    fn page_cursor_round_trips() {
+        for id in [1i64, 11, 123_456_789, i64::MAX] {
+            assert_eq!(parse_page_cursor(&page_cursor(id)), Ok(id));
+        }
+        assert_eq!(parse_page_cursor(""), Err(LibraryError::Invalid));
+        assert_eq!(parse_page_cursor("!!!"), Err(LibraryError::Invalid));
+        assert_eq!(
+            parse_page_cursor(&"A".repeat(12)),
+            Err(LibraryError::Invalid)
+        );
+        assert_eq!(LibraryError::Invalid.http_status(), 422);
+    }
+
+    fn many_playlist_rows(n: usize) -> Vec<PlaylistRow> {
+        (0..n)
+            .map(|i| PlaylistRow {
+                internal_id: i as i64 + 1,
+                public_id: format!("p-public-{i:04}"),
+                owner_user_id: "user-bob".into(),
+                name: format!("Public {i:04}"),
+                items: vec!["track-opaque".into()],
+                is_public: true,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pages_are_bounded_newest_first_and_chainable() {
+        let rows = many_playlist_rows(MAX_PAGE_SIZE + 10);
+        let first = list_playlists_page(Some("user-alice"), &rows, 5000, None).unwrap();
+        assert_eq!(first.len(), MAX_PAGE_SIZE);
+        // Newest (highest internal id) first, summaries carry no items.
+        assert_eq!(first[0].name, format!("Public {:04}", MAX_PAGE_SIZE + 9));
+        let json = serde_json::to_string(&first[0]).unwrap();
+        assert!(!json.contains("items"), "list shapes omit items: {json}");
+
+        let last_first_page = first[MAX_PAGE_SIZE - 1].id.clone();
+        let last_id: i64 = rows
+            .iter()
+            .find(|r| r.public_id == last_first_page)
+            .unwrap()
+            .internal_id;
+        let second = list_playlists_page(
+            Some("user-alice"),
+            &rows,
+            MAX_PAGE_SIZE,
+            Some(&page_cursor(last_id)),
+        )
+        .unwrap();
+        assert_eq!(second.len(), 10);
+        assert!(second.iter().all(|p| p.id != last_first_page));
+
+        // Auth still runs before paging: anonymous callers get 401, and a
+        // garbage cursor is 422, not a silent restart.
+        assert_eq!(
+            list_playlists_page(None, &rows, 10, None),
+            Err(LibraryError::Unauthorized)
+        );
+        assert_eq!(
+            list_playlists_page(Some("user-alice"), &rows, 10, Some("!!!")),
+            Err(LibraryError::Invalid)
+        );
+    }
+
+    #[test]
+    fn genre_pages_are_bounded() {
+        let rows: Vec<GenreRow> = (0..MAX_PAGE_SIZE + 5)
+            .map(|i| GenreRow {
+                internal_id: i as i64 + 1,
+                public_id: format!("g-public-{i:04}"),
+                owner_user_id: "user-bob".into(),
+                name: format!("Genre {i:04}"),
+                is_public: true,
+            })
+            .collect();
+        let page = list_genres_page(Some("user-alice"), &rows, usize::MAX, None).unwrap();
+        assert_eq!(page.len(), MAX_PAGE_SIZE);
+        assert_eq!(page[0].name, format!("Genre {:04}", MAX_PAGE_SIZE + 4));
+    }
+
+    #[test]
+    fn lookup_authorizers_drive_403_404_from_statement_output() {
+        // Simulate exactly what the lookup statements return: the target id
+        // plus an ownership boolean, never the owner id.
+        let own = Some(MutationLookup {
+            public_id: "g-alice-public-opaque-02".into(),
+            is_owner: true,
+        });
+        let update =
+            authorize_genre_update_from_lookup(Some("user-alice"), own, "Renamed", true).unwrap();
+        assert_eq!(update.owner_user_id, "user-alice");
+        assert_eq!(update.public_id, "g-alice-public-opaque-02");
+
+        let foreign = Some(MutationLookup {
+            public_id: "g-bob-public-opaque-04".into(),
+            is_owner: false,
+        });
+        assert_eq!(
+            authorize_genre_update_from_lookup(Some("user-alice"), foreign.clone(), "X", true),
+            Err(LibraryError::Forbidden)
+        );
+        assert_eq!(
+            authorize_genre_delete_from_lookup(Some("user-alice"), foreign),
+            Err(LibraryError::Forbidden)
+        );
+        // No lookup row: invisible id, 404 — never 403.
+        assert_eq!(
+            authorize_genre_delete_from_lookup(Some("user-alice"), None),
+            Err(LibraryError::NotFound)
+        );
+        assert_eq!(
+            authorize_playlist_delete_from_lookup(Some("user-alice"), None),
+            Err(LibraryError::NotFound)
+        );
+        // Auth first, even with a valid lookup in hand.
+        assert_eq!(
+            authorize_genre_update_from_lookup(
+                None,
+                Some(MutationLookup {
+                    public_id: "g-alice-public-opaque-02".into(),
+                    is_owner: true,
+                }),
+                "Renamed",
+                true
+            ),
+            Err(LibraryError::Unauthorized)
+        );
+        let playlist_update = authorize_playlist_update_from_lookup(
+            Some("user-alice"),
+            Some(MutationLookup {
+                public_id: "p-alice-public-opaque-12".into(),
+                is_owner: true,
+            }),
+            "Party",
+            vec!["track-opaque".into()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(playlist_update.owner_user_id, "user-alice");
+    }
+
+    #[test]
+    fn list_and_lookup_statements_are_bounded_and_owner_free() {
+        for sql in [genre_list_statement(), playlist_list_statement()] {
+            assert!(sql.contains("ORDER BY created_at DESC, id DESC"), "{sql}");
+            assert!(sql.contains("LIMIT $2"), "{sql}");
+        }
+        // List projections never carry items or owner/internal ids.
+        let playlist_select = playlist_list_statement().split(" FROM ").next().unwrap();
+        assert!(!playlist_select.contains("items"), "{playlist_select}");
+        assert!(!playlist_select.contains("owner"), "{playlist_select}");
+        assert!(!playlist_select.contains("internal"), "{playlist_select}");
+        // Lookups answer ownership with a boolean; the id never leaves SQL.
+        for sql in [
+            genre_mutation_lookup_statement(),
+            playlist_mutation_lookup_statement(),
+        ] {
+            assert!(sql.contains("(owner_user_id = $2) AS is_owner"), "{sql}");
+            assert!(sql.contains("public_id = $1"), "{sql}");
+            assert!(sql.contains("$1"), "{sql}");
+        }
     }
 }

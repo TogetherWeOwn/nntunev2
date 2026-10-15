@@ -63,7 +63,12 @@ provisioned; this crate is the security-critical logic with tests.
   404 (no oracle), visible-but-foreign mutations are 403. Responses carry
   only the opaque `public_id` as `id` — internal ids and `owner_user_id`
   never serialize. All SQL is parameterized with the owner bound in WHERE;
-  SELECT lists exclude the owner column.
+  SELECT lists exclude the owner column (mutation lookups return only an
+  `is_owner` boolean). Lists are keyset pages (`ORDER BY created_at DESC,
+  id DESC LIMIT $2`, LIMIT clamped to `MAX_PAGE_SIZE`); playlist lists
+  omit `items`, which single reads return. UPDATE/DELETE affecting 0 rows
+  maps to 404 — the owner predicate already makes cross-owner writes
+  inexpressible.
 - **SSRF guard:** provider hosts are hostile input. Shape check (never a
   URL), resolve ALL DNS records, reject loopback/link-local/private/
   unique-local/multicast/reserved (v4+v6); literal IPs checked directly.
