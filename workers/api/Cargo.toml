@@ -16,7 +16,7 @@ aes-gcm = { version = "0.10", features = ["aes"] }
 base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
-rand = "0.8"
+rand = "0.10"
 # wasm32-unknown-unknown has no OS RNG: the `js` feature routes getrandom
 # through Web Crypto on wasm targets (native builds unaffected). Without
 # this the Worker deploy target does not build.
