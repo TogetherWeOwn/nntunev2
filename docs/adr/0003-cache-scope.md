@@ -252,6 +252,9 @@ Evicting user A's grant frees A's gauge even if user B keeps the object alive.
 Never delete B's grant merely because A reached a limit. In-flight reads must
 handle a reclaimed object through the same own-provider refetch path. GC is
 batch Workflow work (Containers-eligible), not unbounded work on a play request.
+Cache GC never deletes tracks or play events; those belong to the owner-keyed
+local-catalog GC in ADR 0002 rule 3 with its per-track event-erasure exception
+and indexed `(user_id, played_at)` / `(track_id)` access paths.
 
 ## Alternatives
 

@@ -24,7 +24,15 @@ least-privilege credential.
 
 1. **Native REST (OpenAPI 3.1, `openapi.yaml` at repo root of `workers/api`):**
    the canonical API. `apps/web` uses only this. Resources: `/v1/{me,library,
-   artists,releases,tracks,playlists,plays,providers,indexers,search,stream}`.
+   artists,releases,tracks,playlists,plays,providers,indexers,search,stream}`
+   plus delete entry points `DELETE /v1/account`, `DELETE
+   /v1/libraries/{id}`, `DELETE /v1/playlists/{id}` and `GET
+   /v1/operations/{operation_id}`. Each DELETE marks `deleting_at`, persists a
+   `delete_operations` row (ADR 0002 rule 3) and returns `202` with the operation
+   id; the status endpoint reports `pending`/`running`/`done`/`failed`. Writes
+   fenced by a marker return `409` with `account_deleting` or
+   `container_deleting` plus the operation id. The executor is the `delete`
+   Workflow with hourly `delete-sweep` resume, not a bare FK cascade.
    Auth at launch: the existing session cookie. Native REST bearer keys are
    deferred to a separate scoped-credential design, not borrowed from Subsonic.
    Versioned (`/v1`); breaking changes ship `/v2` alongside, never mutate `/v1`.

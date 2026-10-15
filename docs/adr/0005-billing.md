@@ -221,7 +221,13 @@ persist terminal status before releasing its slot. Stripe failure leaves the
 nonterminal slot reserved and setup pending, with an alert/retry, not a duplicate
 bill. Fresh authenticated purchases and cancellation reconciliation use the same
 per-user operation serialization. Retain invoice/debt history; no data deletion
-or implicit refund is part of expiration.
+or implicit refund is part of expiration. Account deletion follows the same gate
+(ADR 0002 rule 3): confirm remote terminal status through serialized reconcile
+before deleting local billing rows, retain the Stripe customer remotely, copy a
+non-PII tombstone (`stripe_customer_id`, email hash, `trial_started_at`, open
+invoice/debt refs) so trial single-use and debt survive, and handle webhooks for
+unknown or tombstoned customers by reconciling the tombstone without recreating
+a user.
 
 ## Acceptance contract for the implementing billing PR
 
