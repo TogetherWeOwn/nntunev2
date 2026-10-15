@@ -8,14 +8,89 @@
 //!
 //! [`ContentCache`] is the in-memory stand-in; production swaps it for R2
 //! calls with identical semantics (see `wrangler.toml` bindings).
+//!
+//! Freshness ([`CACHE_FRESH_TTL_SECS`]) and stale-while-revalidate
+//! ([`CACHE_SWR_WINDOW_SECS`]): timed entries written with
+//! [`ContentCache::put_track_at`] serve fresh as `HIT`, then stale as `STALE`
+//! while the worker revalidates in the background (see
+//! [`CacheServe::needs_revalidate`); past both windows the entry is a `MISS`
+//! and the play path re-fetches upstream. Untimed [`ContentCache::put_track`]
+//! entries never go stale (legacy callers).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::grant::sha256;
 
+/// Fresh window in seconds: a timed entry at most this old serves as `HIT`
+/// with no revalidation. Documented in `workers/stream/README.md`.
+pub const CACHE_FRESH_TTL_SECS: u64 = 300;
+
+/// Stale-while-revalidate window in seconds past the fresh TTL: the entry
+/// still serves immediately (as `STALE`, flagging background revalidation)
+/// instead of blocking on upstream. Documented in `workers/stream/README.md`.
+pub const CACHE_SWR_WINDOW_SECS: u64 = 3_600;
+
+/// How a cached entry served a read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheServe {
+    /// Within the fresh TTL: serve, no revalidation owed.
+    Fresh { age_secs: u64 },
+    /// Past the fresh TTL but inside the SWR window: serve immediately and
+    /// revalidate in the background.
+    Stale { age_secs: u64 },
+}
+
+impl CacheServe {
+    /// Seconds since the entry was written.
+    pub fn age_secs(&self) -> u64 {
+        match *self {
+            CacheServe::Fresh { age_secs } | CacheServe::Stale { age_secs } => age_secs,
+        }
+    }
+
+    /// Whether serving this entry owes a background revalidation.
+    pub fn needs_revalidate(&self) -> bool {
+        matches!(*self, CacheServe::Stale { .. })
+    }
+
+    /// The `Cache-Status` value for this serve.
+    pub fn cache_status(&self) -> CacheStatus {
+        match *self {
+            CacheServe::Fresh { .. } => CacheStatus::Hit,
+            CacheServe::Stale { .. } => CacheStatus::Stale,
+        }
+    }
+}
+
+/// Value for the `Cache-Status` response header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheStatus {
+    Hit,
+    Miss,
+    Stale,
+}
+
+impl CacheStatus {
+    /// The wire value pinned by `cache_status_header_values_pin_the_wire_contract`.
+    pub fn header_value(self) -> &'static str {
+        match self {
+            CacheStatus::Hit => "HIT",
+            CacheStatus::Miss => "MISS",
+            CacheStatus::Stale => "STALE",
+        }
+    }
+}
+
+struct BlobEntry {
+    data: Arc<[u8]>,
+    /// `None` for untimed [`ContentCache::put_track`] writes, which never go
+    /// stale.
+    stored_at_secs: Option<u64>,
+}
+
 pub struct ContentCache {
-    blobs: HashMap<String, Arc<[u8]>>,
+    blobs: HashMap<String, BlobEntry>,
     index: HashMap<String, String>,
 }
 
@@ -30,9 +105,29 @@ impl ContentCache {
     /// Store `plaintext` for `track_id`; returns the blob hash hex.
     pub fn put_track(&mut self, track_id: &str, plaintext: Vec<u8>) -> String {
         let hash = Self::hex_hash(&plaintext);
-        self.blobs
-            .entry(hash.clone())
-            .or_insert_with(|| Arc::from(plaintext));
+        self.blobs.entry(hash.clone()).or_insert_with(|| BlobEntry {
+            data: Arc::from(plaintext),
+            stored_at_secs: None,
+        });
+        self.index.insert(track_id.to_string(), hash.clone());
+        hash
+    }
+
+    /// Store `plaintext` for `track_id` at time `now_secs` (unix seconds);
+    /// returns the blob hash hex. Rewriting a track repoints it and restarts
+    /// its freshness clock — this is also how a background revalidation
+    /// refreshes a stale entry.
+    pub fn put_track_at(&mut self, track_id: &str, plaintext: Vec<u8>, now_secs: u64) -> String {
+        let hash = Self::hex_hash(&plaintext);
+        // A revalidation may race a content change: always restamp, so the
+        // entry's age counts from the latest write.
+        self.blobs.insert(
+            hash.clone(),
+            BlobEntry {
+                data: Arc::from(plaintext),
+                stored_at_secs: Some(now_secs),
+            },
+        );
         self.index.insert(track_id.to_string(), hash.clone());
         hash
     }
@@ -43,7 +138,30 @@ impl ContentCache {
         self.index
             .get(track_id)
             .and_then(|h| self.blobs.get(h))
-            .cloned()
+            .map(|e| Arc::clone(&e.data))
+    }
+
+    /// Fetch the cached plaintext for `track_id` at time `now_secs` (unix
+    /// seconds) with its freshness. Fresh entries serve as-is; stale entries
+    /// serve immediately while owing a background revalidation (see
+    /// [`CacheServe`]); expired entries (past fresh + SWR) and unknown
+    /// tracks return `None` so the caller re-fetches upstream.
+    pub fn get_track_at(&self, track_id: &str, now_secs: u64) -> Option<(Arc<[u8]>, CacheServe)> {
+        let entry = self.index.get(track_id).and_then(|h| self.blobs.get(h))?;
+        let data = Arc::clone(&entry.data);
+        match entry.stored_at_secs {
+            None => Some((data, CacheServe::Fresh { age_secs: 0 })),
+            Some(stored) => {
+                let age = now_secs.saturating_sub(stored);
+                if age <= CACHE_FRESH_TTL_SECS {
+                    Some((data, CacheServe::Fresh { age_secs: age }))
+                } else if age <= CACHE_FRESH_TTL_SECS + CACHE_SWR_WINDOW_SECS {
+                    Some((data, CacheServe::Stale { age_secs: age }))
+                } else {
+                    None
+                }
+            }
+        }
     }
 
     /// Distinct blobs held (dedup probe).
@@ -151,6 +269,129 @@ mod tests {
         assert_eq!(up.bytes_staged(), 5);
         assert!(up.flushed_part_sizes().is_empty());
         assert_eq!(up.complete(), b"hello");
+    }
+
+    #[test]
+    fn swr_windows_are_the_documented_values() {
+        assert_eq!(
+            CACHE_FRESH_TTL_SECS, 300,
+            "worker README documents this value; change both together"
+        );
+        assert_eq!(
+            CACHE_SWR_WINDOW_SECS, 3_600,
+            "worker README documents this value; change both together"
+        );
+    }
+
+    #[test]
+    fn cache_status_header_values_pin_the_wire_contract() {
+        assert_eq!(CacheStatus::Hit.header_value(), "HIT");
+        assert_eq!(CacheStatus::Miss.header_value(), "MISS");
+        assert_eq!(CacheStatus::Stale.header_value(), "STALE");
+    }
+
+    #[test]
+    fn fresh_entry_serves_hit_without_revalidation() {
+        let mut cache = ContentCache::new();
+        cache.put_track_at("t1", b"audio-bytes".to_vec(), 1_000);
+        let (data, serve) = cache
+            .get_track_at("t1", 1_000 + CACHE_FRESH_TTL_SECS - 1)
+            .expect("fresh entry serves");
+        assert_eq!(data.as_ref(), b"audio-bytes");
+        assert_eq!(
+            serve,
+            CacheServe::Fresh {
+                age_secs: CACHE_FRESH_TTL_SECS - 1
+            }
+        );
+        assert!(!serve.needs_revalidate());
+        assert_eq!(serve.cache_status(), CacheStatus::Hit);
+    }
+
+    #[test]
+    fn stale_entry_serves_data_while_flagging_revalidation() {
+        let mut cache = ContentCache::new();
+        cache.put_track_at("t1", b"audio-bytes".to_vec(), 1_000);
+        let (data, serve) = cache
+            .get_track_at("t1", 1_000 + CACHE_FRESH_TTL_SECS + 10)
+            .expect("stale entry still serves immediately");
+        assert_eq!(data.as_ref(), b"audio-bytes");
+        assert_eq!(
+            serve,
+            CacheServe::Stale {
+                age_secs: CACHE_FRESH_TTL_SECS + 10
+            }
+        );
+        assert!(serve.needs_revalidate());
+        assert_eq!(serve.cache_status(), CacheStatus::Stale);
+    }
+
+    #[test]
+    fn expired_entry_is_a_miss() {
+        let mut cache = ContentCache::new();
+        cache.put_track_at("t1", b"audio-bytes".to_vec(), 1_000);
+        assert!(
+            cache
+                .get_track_at(
+                    "t1",
+                    1_000 + CACHE_FRESH_TTL_SECS + CACHE_SWR_WINDOW_SECS + 1
+                )
+                .is_none(),
+            "past fresh + SWR the entry must re-fetch upstream"
+        );
+        assert!(
+            cache.get_track_at("missing", 1_000).is_none(),
+            "unknown tracks miss too"
+        );
+    }
+
+    #[test]
+    fn swr_boundaries_are_fresh_then_stale_then_miss() {
+        let mut cache = ContentCache::new();
+        cache.put_track_at("t1", b"v".to_vec(), 1_000);
+        assert!(
+            matches!(
+                cache
+                    .get_track_at("t1", 1_000 + CACHE_FRESH_TTL_SECS)
+                    .map(|(_, s)| s),
+                Some(CacheServe::Fresh { .. })
+            ),
+            "exactly at the fresh TTL the entry is still fresh"
+        );
+        assert!(
+            matches!(
+                cache
+                    .get_track_at("t1", 1_000 + CACHE_FRESH_TTL_SECS + CACHE_SWR_WINDOW_SECS)
+                    .map(|(_, s)| s),
+                Some(CacheServe::Stale { .. })
+            ),
+            "exactly at the end of the SWR window the entry still serves stale"
+        );
+    }
+
+    #[test]
+    fn untimed_puts_stay_fresh_for_legacy_callers() {
+        let mut cache = ContentCache::new();
+        cache.put_track("t1", b"audio-bytes".to_vec());
+        let (data, serve) = cache
+            .get_track_at("t1", 9_999_999_999)
+            .expect("untimed entries never go stale");
+        assert_eq!(data.as_ref(), b"audio-bytes");
+        assert_eq!(serve, CacheServe::Fresh { age_secs: 0 });
+    }
+
+    #[test]
+    fn revalidation_refreshes_a_stale_entry_back_to_fresh() {
+        let mut cache = ContentCache::new();
+        cache.put_track_at("t1", b"v1".to_vec(), 1_000);
+        let now = 1_000 + CACHE_FRESH_TTL_SECS + 10;
+        let (_, serve) = cache.get_track_at("t1", now).expect("stale serves");
+        assert!(serve.needs_revalidate());
+        // The background refresh completes: the entry is rewritten at `now`.
+        cache.put_track_at("t1", b"v2".to_vec(), now);
+        let (data, serve) = cache.get_track_at("t1", now).expect("refreshed serves");
+        assert_eq!(data.as_ref(), b"v2");
+        assert_eq!(serve, CacheServe::Fresh { age_secs: 0 });
     }
 
     #[test]

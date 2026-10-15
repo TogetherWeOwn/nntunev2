@@ -17,6 +17,8 @@
 //!   decrypt → chunked stream + writeback).
 //! - [`meter`]: Analytics Engine + usage-ledger events.
 //! - [`prefetch`]: next-track prefetch on spare pool capacity (never the last connection).
+//! - [`stampede`]: singleflight stampede guard (one upstream fetch per
+//!   concurrent identical segment + range) with waiter-timeout fallback.
 //!
 //! Cloudflare bindings (DO storage, R2, Analytics Engine) are wired in
 //! `workers/stream/wrangler.toml`; this crate stays dependency-free so
@@ -31,4 +33,5 @@ pub mod play;
 pub mod pool;
 pub mod prefetch;
 pub mod range;
+pub mod stampede;
 pub mod yenc;

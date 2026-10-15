@@ -43,6 +43,34 @@ Pool semantics (`pool.rs`):
   (`430`/`423`) or a corrupt segment fails that one play
   (`ArticleMissing` / `Decode`) and returns the healthy connection.
 
+## Stampede guard (singleflight + stale-while-revalidate)
+
+Concurrent identical Range fetches (seek storms, shared links) coalesce:
+`src/stampede.rs` holds one in-flight upstream fetch per
+`flight_key(segment message-id + raw Range header)` — the other 49 of 50
+concurrent waiters share the leader's bytes instead of dialing. Sharing is
+in-flight only: a finished flight never serves later calls (freshness is
+the cache's job, below).
+
+- Waiter timeout: `SINGLEFLIGHT_WAIT_TIMEOUT_MS = 5_000`. A waiter parked
+  longer than 5 s falls back to its own queued fetch instead of hanging.
+  5 s sits under the 10 s NNTP read timeout, so a stalled leader never
+  wedges the edge past the provider's own deadline. A panicking leader
+  removes its key, so later calls start a fresh flight.
+- SWR windows (`src/cache.rs`): `CACHE_FRESH_TTL_SECS = 300` serves `HIT`
+  with no revalidation; the next `CACHE_SWR_WINDOW_SECS = 3_600` serves
+  `STALE` immediately while flagging `needs_revalidate`, so the Worker
+  re-fetches in the background while the client already has its bytes.
+  Past both windows the entry is a `MISS` and the play path re-fetches
+  upstream. Cache writes are stamped with the play time on `finalize`, so
+  the SWR clock runs from when the bytes were fetched.
+- Headers: every play carries `Cache-Status: HIT|MISS|STALE` and
+  `Age: <seconds-since-write>` (see `PlayResponse::cache_headers`).
+- Split of duties: the portable core owns the primitive, the key shape and
+  the SWR clock; the Worker / pool Durable Object entry point (deploy
+  slice) holds one `Singleflight` group per isolate and performs the
+  background revalidation flagged by `needs_revalidate`.
+
 ## TTFB targets
 
 First-byte latency is measured by `tests/stream_integration.rs`
