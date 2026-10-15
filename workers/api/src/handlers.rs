@@ -1,0 +1,1986 @@
+//! Framework-agnostic HTTP handlers for the accounts/auth/vault API.
+//!
+//! The Worker entry (`worker_entry`) adapts `worker::Request` into
+//! [`Request`] and renders [`Response`]; all security decisions live here
+//! and are native-tested against fake stores.
+//!
+//! Contracts enforced here (threat model + CISO conditions):
+//! - One generic error body per surface: auth failures are always
+//!   `401 {"error":"check your email and try again"}`, vault failures
+//!   always `400 {"error":"vault unavailable"}`, store failures
+//!   `500 {"error":"internal error"}`. No credential, host, banner or
+//!   existence detail ever reaches a body.
+//! - Every authenticated request goes through
+//!   [`session::verify_stored_session`] against the current server row
+//!   (revoked/missing/stale-counter/mismatched rows reject), and cookie-
+//!   authenticated mutations require an exact `Origin` match (CSRF).
+//! - Vault reads/writes are keyed ONLY by the session's `user_id` — there
+//!   is no handler parameter naming a vault, so a non-owner cannot even
+//!   address another vault (no existence oracle).
+//! - Magic links, challenges and invites are consumed only through the
+//!   `*_atomically` helpers (conditional UPDATE/RETURNING, exactly one
+//!   row, committed before any response). Session refresh advances the
+//!   server row with a conditional counter update before `Set-Cookie`.
+//! - Outbound test-connection dials resolve ALL records immediately
+//!   before dialing, validate into a [`vault::ValidatedTarget`], and the
+//!   [`Dialer`] receives only that vetted address set.
+
+use std::future::Future;
+use std::net::IpAddr;
+use std::pin::Pin;
+
+use rand::RngCore;
+use serde::Deserialize;
+
+use crate::auth::{
+    self, InviteRecord, MagicLinkRecord, PasskeyChallenge, PasskeyCredential, SingleUseStore,
+};
+use crate::encoding::{b64url_decode, b64url_encode};
+use crate::session::{self, SessionClaims, SessionRecord};
+use crate::vault::{
+    self, AuditEvent, DnsResolver, IndexerConfig, ProviderConfig, ValidatedTarget, VaultBlob,
+};
+use crate::webauthn;
+
+/// Request bodies above this size reject before routing (not an oracle:
+/// size only, same for every route).
+pub const MAX_BODY_BYTES: usize = 32 * 1024;
+/// Magic links issuable per email inside the link TTL window. The count
+/// comes from the shared store (`magic_link_tokens`), never memory.
+pub const MAGIC_LINKS_PER_WINDOW: u64 = 3;
+/// Test-connection attempts per user per minute (shared-store audit count).
+pub const TEST_CONNECTION_PER_MINUTE: u64 = 10;
+
+// --- Config ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigError {
+    Invalid,
+}
+
+/// Worker configuration, validated once at startup. Production origins are
+/// https-only; an exact loopback http origin is accepted only when the
+/// operator explicitly opts in for local development.
+pub struct Config {
+    pub rp_id: String,
+    pub origin: String,
+    pub session_secret: Vec<u8>,
+    pub kek: [u8; 32],
+    pub kek_version: u32,
+    pub session_ttl_secs: u64,
+    pub invites_required: bool,
+}
+
+impl Config {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        rp_id: &str,
+        origin: &str,
+        session_secret: Vec<u8>,
+        kek: [u8; 32],
+        kek_version: u32,
+        session_ttl_secs: u64,
+        invites_required: bool,
+        allow_loopback_dev: bool,
+    ) -> Result<Self, ConfigError> {
+        // Reuse the core RP/origin validator (canonical serialized origin,
+        // RP == exact host), then tighten the scheme for production.
+        auth::new_registration_challenge(rp_id, origin, 0).map_err(|_| ConfigError::Invalid)?;
+        let loopback_http = ["http://localhost", "http://127.0.0.1", "http://[::1]"]
+            .iter()
+            .any(|prefix| origin.starts_with(prefix));
+        if !(origin.starts_with("https://") || (allow_loopback_dev && loopback_http)) {
+            return Err(ConfigError::Invalid);
+        }
+        if session_secret.len() < 32 || session_ttl_secs == 0 {
+            return Err(ConfigError::Invalid);
+        }
+        Ok(Self {
+            rp_id: rp_id.to_string(),
+            origin: origin.to_string(),
+            session_secret,
+            kek,
+            kek_version,
+            session_ttl_secs: session_ttl_secs.min(session::MAX_SESSION_SECS),
+            invites_required,
+        })
+    }
+
+    fn expect<'a>(&'a self, challenge: &'a str) -> webauthn::Expect<'a> {
+        webauthn::Expect {
+            rp_id: &self.rp_id,
+            origin: &self.origin,
+            challenge,
+        }
+    }
+}
+
+// --- Store traits -----------------------------------------------------------------
+
+/// Opaque storage failure: detail stays server-side.
+#[derive(Debug, Clone, Copy)]
+pub struct StoreError;
+
+impl From<auth::AuthError> for StoreError {
+    fn from(_: auth::AuthError) -> Self {
+        StoreError
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserRecord {
+    pub id: String,
+    pub email: String,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChallengeRow {
+    pub challenge: PasskeyChallenge,
+    pub user_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VaultRow {
+    pub blob: VaultBlob,
+    pub indexer_configured: bool,
+    pub updated_at: u64,
+}
+
+/// Persistence over migration-0002 tables. Implementations must use
+/// parameterized statements only, and conditional single-row updates for
+/// the rotation/sign-count advances. `Store` implementors also implement
+/// [`SingleUseStore`] with the `auth::SingleUseClaim::statement` SQL.
+#[allow(clippy::too_many_arguments)]
+pub trait Store {
+    fn user_by_email(
+        &self,
+        email: &str,
+    ) -> impl Future<Output = Result<Option<UserRecord>, StoreError>>;
+    fn insert_user(&self, user: &UserRecord) -> impl Future<Output = Result<(), StoreError>>;
+    fn insert_challenge(
+        &self,
+        challenge: &PasskeyChallenge,
+        user_id: Option<&str>,
+    ) -> impl Future<Output = Result<(), StoreError>>;
+    fn challenge_by_id(
+        &self,
+        id: &str,
+    ) -> impl Future<Output = Result<Option<ChallengeRow>, StoreError>>;
+    fn insert_credential(
+        &self,
+        credential: &PasskeyCredential,
+    ) -> impl Future<Output = Result<(), StoreError>>;
+    fn credential_by_id(
+        &self,
+        cred_id_b64url: &str,
+    ) -> impl Future<Output = Result<Option<PasskeyCredential>, StoreError>>;
+    fn credentials_for_user(
+        &self,
+        user_id: &str,
+    ) -> impl Future<Output = Result<Vec<PasskeyCredential>, StoreError>>;
+    /// Conditional `UPDATE ... WHERE cred_id AND sign_count = expected`:
+    /// true iff exactly one row advanced.
+    fn advance_sign_count(
+        &self,
+        cred_id_b64url: &str,
+        expected: u32,
+        new: u32,
+    ) -> impl Future<Output = Result<bool, StoreError>>;
+    fn insert_magic(
+        &self,
+        record: &MagicLinkRecord,
+    ) -> impl Future<Output = Result<(), StoreError>>;
+    fn magic_by_hash(
+        &self,
+        token_hash: &str,
+    ) -> impl Future<Output = Result<Option<MagicLinkRecord>, StoreError>>;
+    fn magic_issued_since(
+        &self,
+        email: &str,
+        since: u64,
+    ) -> impl Future<Output = Result<u64, StoreError>>;
+    fn invite_by_hash(
+        &self,
+        code_hash: &str,
+    ) -> impl Future<Output = Result<Option<InviteRecord>, StoreError>>;
+    fn insert_session(
+        &self,
+        record: &SessionRecord,
+    ) -> impl Future<Output = Result<(), StoreError>>;
+    fn session_by_id(
+        &self,
+        id: &str,
+    ) -> impl Future<Output = Result<Option<SessionRecord>, StoreError>>;
+    /// Conditional `UPDATE ... WHERE id AND rotation_counter = expected
+    /// AND revoked = FALSE`: true iff exactly one row rotated.
+    fn rotate_session_row(
+        &self,
+        id: &str,
+        expected_counter: u32,
+        new_counter: u32,
+        new_expires_at: u64,
+    ) -> impl Future<Output = Result<bool, StoreError>>;
+    fn revoke_session(&self, id: &str) -> impl Future<Output = Result<(), StoreError>>;
+    fn revoke_all_sessions(&self, user_id: &str) -> impl Future<Output = Result<(), StoreError>>;
+    fn vault_by_user(
+        &self,
+        user_id: &str,
+    ) -> impl Future<Output = Result<Option<VaultRow>, StoreError>>;
+    fn upsert_vault(
+        &self,
+        user_id: &str,
+        row: &VaultRow,
+    ) -> impl Future<Output = Result<(), StoreError>>;
+    fn delete_vault(&self, user_id: &str) -> impl Future<Output = Result<(), StoreError>>;
+    fn insert_audit(&self, event: &AuditEvent) -> impl Future<Output = Result<(), StoreError>>;
+    fn audit_count_since(
+        &self,
+        user_id: &str,
+        action: &str,
+        since: u64,
+    ) -> impl Future<Output = Result<u64, StoreError>>;
+}
+
+/// Magic-link delivery. The token is passed only to the mailer; it must
+/// never be logged by implementations.
+pub trait Mailer {
+    fn send_magic_link(
+        &self,
+        email: &str,
+        token: &str,
+    ) -> impl Future<Output = Result<(), StoreError>>;
+}
+
+/// Bounded outbound probe for `test connection`. Implementations dial
+/// ONLY addresses from `target` (never re-resolve `target.host()`),
+/// keep the hostname for TLS SNI/certificate checks where the runtime
+/// supports it, apply the `vault` timeout constants, follow no redirects,
+/// and return a bare boolean — banners/errors never leave the dialer.
+pub trait Dialer {
+    fn probe(&self, target: &ValidatedTarget, port: u16, tls: bool) -> impl Future<Output = bool>;
+}
+
+/// Async DNS for handler-time resolution (the sync core guard consumes
+/// the result via a static adapter, so exactly the resolved set is what
+/// gets vetted and dialed).
+pub trait AsyncDns {
+    fn resolve<'a>(&'a self, host: &'a str) -> Pin<Box<dyn Future<Output = Vec<IpAddr>> + 'a>>;
+}
+
+struct StaticDns {
+    addresses: Vec<IpAddr>,
+}
+
+impl DnsResolver for StaticDns {
+    fn resolve(&self, _host: &str) -> Vec<IpAddr> {
+        self.addresses.clone()
+    }
+}
+
+// --- HTTP shapes --------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct Request {
+    pub method: String,
+    pub path: String,
+    /// Raw `Cookie` header value, if any.
+    pub cookie: Option<String>,
+    /// Raw `Origin` header value, if any.
+    pub origin: Option<String>,
+    pub body: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Response {
+    pub status: u16,
+    pub body: String,
+    pub set_cookie: Option<String>,
+}
+
+fn json_response(status: u16, body: serde_json::Value) -> Response {
+    Response {
+        status,
+        body: body.to_string(),
+        set_cookie: None,
+    }
+}
+
+fn generic_auth() -> Response {
+    json_response(
+        401,
+        serde_json::json!({"error": "check your email and try again"}),
+    )
+}
+
+fn generic_vault() -> Response {
+    json_response(400, serde_json::json!({"error": "vault unavailable"}))
+}
+
+fn internal() -> Response {
+    json_response(500, serde_json::json!({"error": "internal error"}))
+}
+
+fn invalid_request() -> Response {
+    json_response(400, serde_json::json!({"error": "invalid request"}))
+}
+
+pub struct Ctx<'a, S, M, D, N>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    pub cfg: &'a Config,
+    pub store: &'a S,
+    pub mailer: &'a M,
+    pub dialer: &'a D,
+    pub dns: &'a N,
+    pub now: u64,
+    pub source_ip: String,
+}
+
+// --- Helpers ---------------------------------------------------------------------------
+
+fn random_id(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    rand::thread_rng().fill_bytes(&mut buf);
+    b64url_encode(&buf)
+}
+
+fn normalize_email(raw: &str) -> Option<String> {
+    let email = raw.trim().to_lowercase();
+    if email.len() < 3 || email.len() > 254 {
+        return None;
+    }
+    if email.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    let (local, domain) = email.split_once('@')?;
+    if local.is_empty() || domain.is_empty() || domain.contains('@') || !domain.contains('.') {
+        return None;
+    }
+    Some(email)
+}
+
+fn parse_body<T: for<'de> Deserialize<'de>>(req: &Request) -> Option<T> {
+    serde_json::from_slice(&req.body).ok()
+}
+
+fn session_cookie_value(req: &Request) -> Option<String> {
+    let header = req.cookie.as_deref()?;
+    for part in header.split(';') {
+        let (name, value) = part.trim().split_once('=')?;
+        if name.trim() == session::COOKIE_NAME {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+impl<'a, S, M, D, N> Ctx<'a, S, M, D, N>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    async fn audit(&self, user_id: &str, action: &str, ok: bool) {
+        // Best-effort: an audit-store failure must not turn a completed
+        // auth decision into a distinguishable response. Rate limiting
+        // reads the same table, so a store outage fails those closed
+        // through their own count queries.
+        let _ = self
+            .store
+            .insert_audit(&vault::audit_event(
+                user_id,
+                action,
+                ok,
+                &self.source_ip,
+                self.now,
+            ))
+            .await;
+    }
+
+    /// Issue + persist a new session row; the cookie is only returned
+    /// after the row insert succeeds.
+    async fn start_session(&self, user_id: &str) -> Result<Response, Response> {
+        let token = session::issue_session(
+            &self.cfg.session_secret,
+            user_id,
+            self.now,
+            self.cfg.session_ttl_secs,
+        );
+        let claims = session::verify_session(&self.cfg.session_secret, &token, self.now)
+            .map_err(|_| internal())?;
+        self.store
+            .insert_session(&SessionRecord {
+                id: claims.session_id.clone(),
+                user_id: claims.user_id.clone(),
+                created_at: claims.created_at,
+                expires_at: claims.expires_at,
+                rotation_counter: claims.rotation_counter,
+                revoked: false,
+            })
+            .await
+            .map_err(|_| internal())?;
+        let mut resp = json_response(200, serde_json::json!({"ok": true}));
+        resp.set_cookie = Some(session::set_cookie_header(
+            &token,
+            claims.expires_at.saturating_sub(self.now),
+        ));
+        Ok(resp)
+    }
+
+    /// Full request authentication: signed token + current server row via
+    /// `verify_stored_session`, plus the CSRF origin pin for mutations.
+    async fn authenticate(
+        &self,
+        req: &Request,
+        mutation: bool,
+    ) -> Result<(SessionClaims, String), Response> {
+        if mutation {
+            match req.origin.as_deref() {
+                Some(origin) if origin == self.cfg.origin => {}
+                _ => return Err(generic_auth()),
+            }
+        }
+        let token = session_cookie_value(req).ok_or_else(generic_auth)?;
+        let claims = session::verify_session(&self.cfg.session_secret, &token, self.now)
+            .map_err(|_| generic_auth())?;
+        let record = self
+            .store
+            .session_by_id(&claims.session_id)
+            .await
+            .map_err(|_| internal())?
+            .ok_or_else(generic_auth)?;
+        let claims =
+            session::verify_stored_session(&self.cfg.session_secret, &token, self.now, &record)
+                .map_err(|_| generic_auth())?;
+        Ok((claims, token))
+    }
+
+    async fn resolve_all(&self, host: &str) -> StaticDns {
+        StaticDns {
+            addresses: self.dns.resolve(host).await,
+        }
+    }
+}
+
+// --- Request bodies ----------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmailBody {
+    email: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterFinishBody {
+    challenge: String,
+    credential_id: String,
+    attestation_object: String,
+    client_data_json: String,
+    invite_code: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginFinishBody {
+    challenge: String,
+    credential_id: String,
+    authenticator_data: String,
+    client_data_json: String,
+    signature: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MagicFinishBody {
+    token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VaultPutBody {
+    provider: ProviderConfig,
+    indexer: Option<IndexerConfig>,
+}
+
+#[derive(serde::Serialize, Deserialize)]
+struct VaultPayload {
+    provider: ProviderConfig,
+    indexer: Option<IndexerConfig>,
+}
+
+// --- Route handlers ------------------------------------------------------------------------
+
+async fn register_start<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let Some(body) = parse_body::<EmailBody>(req) else {
+        return generic_auth();
+    };
+    let Some(email) = normalize_email(&body.email) else {
+        return generic_auth();
+    };
+    let existing = match ctx.store.user_by_email(&email).await {
+        Ok(user) => user,
+        Err(_) => return internal(),
+    };
+    let user = match existing {
+        Some(user) => {
+            // Resume an abandoned signup only when no credential exists
+            // yet; otherwise the account is taken (generic, no oracle).
+            match ctx.store.credentials_for_user(&user.id).await {
+                Ok(creds) if creds.is_empty() => user,
+                Ok(_) => return generic_auth(),
+                Err(_) => return internal(),
+            }
+        }
+        None => {
+            let user = UserRecord {
+                id: random_id(16),
+                email: email.clone(),
+                created_at: ctx.now,
+            };
+            match ctx.store.insert_user(&user).await {
+                Ok(()) => user,
+                // Unique-email race or store failure: stay generic.
+                Err(_) => return generic_auth(),
+            }
+        }
+    };
+    let challenge = match auth::new_registration_challenge(&ctx.cfg.rp_id, &ctx.cfg.origin, ctx.now)
+    {
+        Ok(challenge) => challenge,
+        Err(_) => return internal(),
+    };
+    if ctx
+        .store
+        .insert_challenge(&challenge, Some(&user.id))
+        .await
+        .is_err()
+    {
+        return internal();
+    }
+    json_response(
+        200,
+        serde_json::json!({
+            "challenge": challenge.id,
+            "user_id": user.id,
+            "rp_id": ctx.cfg.rp_id,
+        }),
+    )
+}
+
+async fn register_finish<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let Some(body) = parse_body::<RegisterFinishBody>(req) else {
+        return generic_auth();
+    };
+    let (Ok(attestation_object), Ok(client_data_json)) = (
+        b64url_decode(&body.attestation_object),
+        b64url_decode(&body.client_data_json),
+    ) else {
+        return generic_auth();
+    };
+    let row = match ctx.store.challenge_by_id(&body.challenge).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return generic_auth(),
+        Err(_) => return internal(),
+    };
+    let Some(user_id) = row.user_id.clone() else {
+        return generic_auth();
+    };
+    let credential = match webauthn::verify_attestation(
+        &attestation_object,
+        &client_data_json,
+        &ctx.cfg.expect(&row.challenge.id),
+    ) {
+        Ok(credential) => credential,
+        Err(_) => return generic_auth(),
+    };
+    if b64url_encode(&credential.cred_id) != body.credential_id {
+        return generic_auth();
+    }
+    // Single-use claim (conditional UPDATE, exactly one row) before any
+    // signup side effect is allowed to stand.
+    if auth::consume_challenge_atomically(
+        row.challenge,
+        &ctx.cfg.rp_id,
+        &ctx.cfg.origin,
+        ctx.now,
+        ctx.store,
+    )
+    .await
+    .is_err()
+    {
+        return generic_auth();
+    }
+    if ctx.cfg.invites_required || body.invite_code.is_some() {
+        let Some(code) = body.invite_code.as_deref() else {
+            return generic_auth();
+        };
+        let invite = match ctx
+            .store
+            .invite_by_hash(&auth::hash_invite_code(code))
+            .await
+        {
+            Ok(Some(invite)) => invite,
+            Ok(None) => return generic_auth(),
+            Err(_) => return internal(),
+        };
+        if auth::consume_invite_atomically(invite, code, ctx.store)
+            .await
+            .is_err()
+        {
+            return generic_auth();
+        }
+    }
+    let stored = PasskeyCredential {
+        cred_id_b64url: body.credential_id.clone(),
+        user_id: user_id.clone(),
+        public_key: credential.public_key_cose.clone(),
+        sign_count: credential.sign_count,
+        registered_at: ctx.now,
+    };
+    match ctx.store.insert_credential(&stored).await {
+        Ok(()) => {}
+        // Duplicate credential id (replay under a fresh challenge) stays generic.
+        Err(_) => return generic_auth(),
+    }
+    ctx.audit(&user_id, "auth.register", true).await;
+    match ctx.start_session(&user_id).await {
+        Ok(resp) => resp,
+        Err(resp) => resp,
+    }
+}
+
+async fn login_start<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let Some(body) = parse_body::<EmailBody>(req) else {
+        return generic_auth();
+    };
+    let Some(email) = normalize_email(&body.email) else {
+        return generic_auth();
+    };
+    // Always issue a challenge: an unknown email gets an unbound
+    // challenge and an empty allow-list, so this route is not an
+    // account-existence oracle (finish fails generically either way).
+    let user = match ctx.store.user_by_email(&email).await {
+        Ok(user) => user,
+        Err(_) => return internal(),
+    };
+    let challenge = match auth::new_registration_challenge(&ctx.cfg.rp_id, &ctx.cfg.origin, ctx.now)
+    {
+        Ok(challenge) => challenge,
+        Err(_) => return internal(),
+    };
+    let (user_id, allow) = match &user {
+        Some(user) => {
+            let creds = match ctx.store.credentials_for_user(&user.id).await {
+                Ok(creds) => creds,
+                Err(_) => return internal(),
+            };
+            (
+                Some(user.id.as_str()),
+                creds
+                    .iter()
+                    .map(|c| c.cred_id_b64url.clone())
+                    .collect::<Vec<_>>(),
+            )
+        }
+        None => (None, Vec::new()),
+    };
+    if ctx
+        .store
+        .insert_challenge(&challenge, user_id)
+        .await
+        .is_err()
+    {
+        return internal();
+    }
+    json_response(
+        200,
+        serde_json::json!({
+            "challenge": challenge.id,
+            "allow_credentials": allow,
+            "rp_id": ctx.cfg.rp_id,
+        }),
+    )
+}
+
+async fn login_finish<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let Some(body) = parse_body::<LoginFinishBody>(req) else {
+        return generic_auth();
+    };
+    let (Ok(authenticator_data), Ok(client_data_json), Ok(signature)) = (
+        b64url_decode(&body.authenticator_data),
+        b64url_decode(&body.client_data_json),
+        b64url_decode(&body.signature),
+    ) else {
+        return generic_auth();
+    };
+    let row = match ctx.store.challenge_by_id(&body.challenge).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return generic_auth(),
+        Err(_) => return internal(),
+    };
+    let Some(user_id) = row.user_id.clone() else {
+        return generic_auth();
+    };
+    let credential = match ctx.store.credential_by_id(&body.credential_id).await {
+        Ok(Some(credential)) => credential,
+        Ok(None) => return generic_auth(),
+        Err(_) => return internal(),
+    };
+    if credential.user_id != user_id {
+        return generic_auth();
+    }
+    let new_sign_count = match webauthn::verify_assertion(
+        &credential.public_key,
+        credential.sign_count,
+        &authenticator_data,
+        &client_data_json,
+        &signature,
+        &ctx.cfg.expect(&row.challenge.id),
+    ) {
+        Ok(count) => count,
+        Err(_) => return generic_auth(),
+    };
+    if auth::consume_challenge_atomically(
+        row.challenge,
+        &ctx.cfg.rp_id,
+        &ctx.cfg.origin,
+        ctx.now,
+        ctx.store,
+    )
+    .await
+    .is_err()
+    {
+        return generic_auth();
+    }
+    // Conditional counter advance: a concurrent assertion replay that
+    // already moved the counter loses here even if both snapshots passed.
+    match ctx
+        .store
+        .advance_sign_count(
+            &credential.cred_id_b64url,
+            credential.sign_count,
+            new_sign_count,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return generic_auth(),
+        Err(_) => return internal(),
+    }
+    ctx.audit(&user_id, "auth.login", true).await;
+    match ctx.start_session(&user_id).await {
+        Ok(resp) => resp,
+        Err(resp) => resp,
+    }
+}
+
+async fn magic_start<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let Some(body) = parse_body::<EmailBody>(req) else {
+        return generic_auth();
+    };
+    let Some(email) = normalize_email(&body.email) else {
+        return generic_auth();
+    };
+    // Identical response whether or not the account exists or the rate
+    // limit already fired.
+    if let Ok(Some(user)) = ctx.store.user_by_email(&email).await {
+        let since = ctx.now.saturating_sub(auth::MAGIC_LINK_TTL_SECS);
+        let issued = ctx
+            .store
+            .magic_issued_since(&email, since)
+            .await
+            .unwrap_or(u64::MAX);
+        if issued < MAGIC_LINKS_PER_WINDOW {
+            let (token, record) = auth::issue_magic_link(&user.id, &email, ctx.now);
+            if ctx.store.insert_magic(&record).await.is_ok() {
+                let _ = ctx.mailer.send_magic_link(&email, &token).await;
+            }
+        }
+    }
+    json_response(200, serde_json::json!({"ok": true}))
+}
+
+async fn magic_finish<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let Some(body) = parse_body::<MagicFinishBody>(req) else {
+        return generic_auth();
+    };
+    if body.token.is_empty() || body.token.len() > 256 {
+        return generic_auth();
+    }
+    let record = match ctx
+        .store
+        .magic_by_hash(&auth::hash_magic_token(&body.token))
+        .await
+    {
+        Ok(Some(record)) => record,
+        Ok(None) => return generic_auth(),
+        Err(_) => return internal(),
+    };
+    let consumed =
+        match auth::consume_magic_link_atomically(record, &body.token, ctx.now, ctx.store).await {
+            Ok(consumed) => consumed,
+            Err(_) => return generic_auth(),
+        };
+    ctx.audit(&consumed.user_id, "auth.magic", true).await;
+    match ctx.start_session(&consumed.user_id).await {
+        Ok(resp) => resp,
+        Err(resp) => resp,
+    }
+}
+
+async fn session_refresh<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, token) = match ctx.authenticate(req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let new_token = match session::rotate_session(
+        &ctx.cfg.session_secret,
+        &token,
+        ctx.now,
+        ctx.cfg.session_ttl_secs,
+    ) {
+        Ok(new_token) => new_token,
+        Err(_) => return generic_auth(),
+    };
+    let new_claims = match session::verify_session(&ctx.cfg.session_secret, &new_token, ctx.now) {
+        Ok(new_claims) => new_claims,
+        Err(_) => return internal(),
+    };
+    // Row first (conditional counter update), cookie only after commit:
+    // the previous token stops verifying against the advanced row.
+    match ctx
+        .store
+        .rotate_session_row(
+            &claims.session_id,
+            claims.rotation_counter,
+            new_claims.rotation_counter,
+            new_claims.expires_at,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return generic_auth(),
+        Err(_) => return internal(),
+    }
+    let mut resp = json_response(200, serde_json::json!({"ok": true}));
+    resp.set_cookie = Some(session::set_cookie_header(
+        &new_token,
+        new_claims.expires_at.saturating_sub(ctx.now),
+    ));
+    resp
+}
+
+async fn session_logout<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match ctx.authenticate(req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    if ctx.store.revoke_session(&claims.session_id).await.is_err() {
+        return internal();
+    }
+    let mut resp = json_response(200, serde_json::json!({"ok": true}));
+    resp.set_cookie = Some(session::clear_cookie_header());
+    resp
+}
+
+async fn session_revoke_all<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match ctx.authenticate(req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    if ctx
+        .store
+        .revoke_all_sessions(&claims.user_id)
+        .await
+        .is_err()
+    {
+        return internal();
+    }
+    ctx.audit(&claims.user_id, "session.revoke_all", true).await;
+    let mut resp = json_response(200, serde_json::json!({"ok": true}));
+    resp.set_cookie = Some(session::clear_cookie_header());
+    resp
+}
+
+fn summary_response(row: Option<&VaultRow>) -> Response {
+    let (provider_configured, indexer_configured, updated_at) = match row {
+        Some(row) => (true, row.indexer_configured, row.updated_at),
+        None => (false, false, 0),
+    };
+    let summary = vault::redacted_summary(provider_configured, indexer_configured, updated_at);
+    json_response(
+        200,
+        serde_json::json!({
+            "provider_configured": summary.provider_configured,
+            "indexer_configured": summary.indexer_configured,
+            "updated_at": summary.updated_at,
+        }),
+    )
+}
+
+async fn vault_get<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match ctx.authenticate(req, false).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    match ctx.store.vault_by_user(&claims.user_id).await {
+        Ok(row) => summary_response(row.as_ref()),
+        Err(_) => generic_vault(),
+    }
+}
+
+async fn vault_put<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match ctx.authenticate(req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let Some(body) = parse_body::<VaultPutBody>(req) else {
+        return generic_vault();
+    };
+    // Save-time SSRF validation over freshly resolved records (this does
+    // not authorize any later fetch; dial time revalidates).
+    let provider_dns = ctx.resolve_all(&body.provider.host).await;
+    if body.provider.validate(&provider_dns).is_err() {
+        return generic_vault();
+    }
+    if let Some(indexer) = &body.indexer {
+        let host = match url::Url::parse(&indexer.url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.trim_matches(['[', ']']).to_string()))
+        {
+            Some(host) => host,
+            None => return generic_vault(),
+        };
+        let indexer_dns = ctx.resolve_all(&host).await;
+        if indexer.validate(&indexer_dns).is_err() {
+            return generic_vault();
+        }
+    }
+    let indexer_configured = body.indexer.is_some();
+    let payload = VaultPayload {
+        provider: body.provider,
+        indexer: body.indexer,
+    };
+    let plaintext = match serde_json::to_vec(&payload) {
+        Ok(bytes) => bytes,
+        Err(_) => return generic_vault(),
+    };
+    let blob = match vault::encrypt_vault(
+        &ctx.cfg.kek,
+        ctx.cfg.kek_version,
+        &claims.user_id,
+        &plaintext,
+    ) {
+        Ok(blob) => blob,
+        Err(_) => return generic_vault(),
+    };
+    let row = VaultRow {
+        blob,
+        indexer_configured,
+        updated_at: ctx.now,
+    };
+    if ctx.store.upsert_vault(&claims.user_id, &row).await.is_err() {
+        return generic_vault();
+    }
+    ctx.audit(&claims.user_id, "vault.put", true).await;
+    summary_response(Some(&row))
+}
+
+async fn vault_delete<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match ctx.authenticate(req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    if ctx.store.delete_vault(&claims.user_id).await.is_err() {
+        return generic_vault();
+    }
+    ctx.audit(&claims.user_id, "vault.delete", true).await;
+    summary_response(None)
+}
+
+async fn vault_test_connection<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match ctx.authenticate(req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    // Every failure below collapses to the same boolean (never a banner,
+    // host verdict or vault-existence signal).
+    let fail = || json_response(200, serde_json::json!({"ok": false}));
+    let since = ctx.now.saturating_sub(60);
+    match ctx
+        .store
+        .audit_count_since(&claims.user_id, "vault.test", since)
+        .await
+    {
+        Ok(count) if count < TEST_CONNECTION_PER_MINUTE => {}
+        _ => return fail(),
+    }
+    let row = match ctx.store.vault_by_user(&claims.user_id).await {
+        Ok(Some(row)) => row,
+        _ => return fail(),
+    };
+    let payload: VaultPayload = match vault::decrypt_vault(&ctx.cfg.kek, &claims.user_id, &row.blob)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    {
+        Some(payload) => payload,
+        None => return fail(),
+    };
+    // Resolve ALL records immediately before the dial and hand the
+    // dialer only the vetted set; the transport must not re-resolve.
+    let dns = ctx.resolve_all(&payload.provider.host).await;
+    let target: ValidatedTarget = match payload.provider.validate(&dns) {
+        Ok(target) => target,
+        Err(_) => {
+            ctx.audit(&claims.user_id, "vault.test", false).await;
+            return fail();
+        }
+    };
+    let ok = ctx
+        .dialer
+        .probe(&target, payload.provider.port, payload.provider.tls)
+        .await;
+    ctx.audit(&claims.user_id, "vault.test", ok).await;
+    json_response(200, serde_json::json!({"ok": ok}))
+}
+
+// --- Dispatch ------------------------------------------------------------------------------
+
+/// Route one request. Unknown routes are a plain 404; known routes map
+/// every domain failure through their surface's single generic body.
+pub async fn handle<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if req.body.len() > MAX_BODY_BYTES {
+        return invalid_request();
+    }
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/healthz") => json_response(200, serde_json::json!({"ok": true})),
+        ("POST", "/v1/auth/passkey/register/start") => register_start(ctx, req).await,
+        ("POST", "/v1/auth/passkey/register/finish") => register_finish(ctx, req).await,
+        ("POST", "/v1/auth/passkey/login/start") => login_start(ctx, req).await,
+        ("POST", "/v1/auth/passkey/login/finish") => login_finish(ctx, req).await,
+        ("POST", "/v1/auth/magic/start") => magic_start(ctx, req).await,
+        ("POST", "/v1/auth/magic/finish") => magic_finish(ctx, req).await,
+        ("POST", "/v1/session/refresh") => session_refresh(ctx, req).await,
+        ("POST", "/v1/session/logout") => session_logout(ctx, req).await,
+        ("POST", "/v1/session/revoke-all") => session_revoke_all(ctx, req).await,
+        ("GET", "/v1/vault") => vault_get(ctx, req).await,
+        ("PUT", "/v1/vault") => vault_put(ctx, req).await,
+        ("DELETE", "/v1/vault") => vault_delete(ctx, req).await,
+        ("POST", "/v1/vault/test-connection") => vault_test_connection(ctx, req).await,
+        _ => json_response(404, serde_json::json!({"error": "not found"})),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context as TaskContext, Poll, Waker};
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let waker = Waker::noop();
+        let mut cx = TaskContext::from_waker(waker);
+        let mut future = Box::pin(future);
+        for _ in 0..1_000 {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return value;
+            }
+        }
+        panic!("future did not complete");
+    }
+
+    const NOW: u64 = 1_700_000_000;
+    const ORIGIN: &str = "https://example.com";
+
+    fn cfg() -> Config {
+        Config::new(
+            "example.com",
+            ORIGIN,
+            b"test-session-secret-32-bytes-long!!".to_vec(),
+            [9u8; 32],
+            1,
+            3600,
+            false,
+            false,
+        )
+        .unwrap()
+    }
+
+    #[derive(Default)]
+    struct FakeStore {
+        users: RefCell<HashMap<String, UserRecord>>,
+        challenges: RefCell<HashMap<String, ChallengeRow>>,
+        credentials: RefCell<HashMap<String, PasskeyCredential>>,
+        magic: RefCell<HashMap<String, MagicLinkRecord>>,
+        invites: RefCell<HashMap<String, InviteRecord>>,
+        sessions: RefCell<HashMap<String, SessionRecord>>,
+        vaults: RefCell<HashMap<String, VaultRow>>,
+        audits: RefCell<Vec<AuditEvent>>,
+    }
+
+    impl Store for FakeStore {
+        async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
+            Ok(self
+                .users
+                .borrow()
+                .values()
+                .find(|u| u.email == email)
+                .cloned())
+        }
+        async fn insert_user(&self, user: &UserRecord) -> Result<(), StoreError> {
+            let mut users = self.users.borrow_mut();
+            if users.values().any(|u| u.email == user.email) {
+                return Err(StoreError);
+            }
+            users.insert(user.id.clone(), user.clone());
+            Ok(())
+        }
+        async fn insert_challenge(
+            &self,
+            challenge: &PasskeyChallenge,
+            user_id: Option<&str>,
+        ) -> Result<(), StoreError> {
+            self.challenges.borrow_mut().insert(
+                challenge.id.clone(),
+                ChallengeRow {
+                    challenge: challenge.clone(),
+                    user_id: user_id.map(str::to_string),
+                },
+            );
+            Ok(())
+        }
+        async fn challenge_by_id(&self, id: &str) -> Result<Option<ChallengeRow>, StoreError> {
+            Ok(self.challenges.borrow().get(id).cloned())
+        }
+        async fn insert_credential(
+            &self,
+            credential: &PasskeyCredential,
+        ) -> Result<(), StoreError> {
+            let mut creds = self.credentials.borrow_mut();
+            if creds.contains_key(&credential.cred_id_b64url) {
+                return Err(StoreError);
+            }
+            creds.insert(credential.cred_id_b64url.clone(), credential.clone());
+            Ok(())
+        }
+        async fn credential_by_id(
+            &self,
+            cred_id_b64url: &str,
+        ) -> Result<Option<PasskeyCredential>, StoreError> {
+            Ok(self.credentials.borrow().get(cred_id_b64url).cloned())
+        }
+        async fn credentials_for_user(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<PasskeyCredential>, StoreError> {
+            Ok(self
+                .credentials
+                .borrow()
+                .values()
+                .filter(|c| c.user_id == user_id)
+                .cloned()
+                .collect())
+        }
+        async fn advance_sign_count(
+            &self,
+            cred_id_b64url: &str,
+            expected: u32,
+            new: u32,
+        ) -> Result<bool, StoreError> {
+            let mut creds = self.credentials.borrow_mut();
+            match creds.get_mut(cred_id_b64url) {
+                Some(cred) if cred.sign_count == expected => {
+                    cred.sign_count = new;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
+        async fn insert_magic(&self, record: &MagicLinkRecord) -> Result<(), StoreError> {
+            self.magic
+                .borrow_mut()
+                .insert(record.token_hash.clone(), record.clone());
+            Ok(())
+        }
+        async fn magic_by_hash(
+            &self,
+            token_hash: &str,
+        ) -> Result<Option<MagicLinkRecord>, StoreError> {
+            Ok(self.magic.borrow().get(token_hash).cloned())
+        }
+        async fn magic_issued_since(&self, email: &str, since: u64) -> Result<u64, StoreError> {
+            Ok(self
+                .magic
+                .borrow()
+                .values()
+                .filter(|r| r.email == email && r.issued_at >= since)
+                .count() as u64)
+        }
+        async fn invite_by_hash(
+            &self,
+            code_hash: &str,
+        ) -> Result<Option<InviteRecord>, StoreError> {
+            Ok(self.invites.borrow().get(code_hash).cloned())
+        }
+        async fn insert_session(&self, record: &SessionRecord) -> Result<(), StoreError> {
+            self.sessions
+                .borrow_mut()
+                .insert(record.id.clone(), record.clone());
+            Ok(())
+        }
+        async fn session_by_id(&self, id: &str) -> Result<Option<SessionRecord>, StoreError> {
+            Ok(self.sessions.borrow().get(id).cloned())
+        }
+        async fn rotate_session_row(
+            &self,
+            id: &str,
+            expected_counter: u32,
+            new_counter: u32,
+            new_expires_at: u64,
+        ) -> Result<bool, StoreError> {
+            let mut sessions = self.sessions.borrow_mut();
+            match sessions.get_mut(id) {
+                Some(row) if row.rotation_counter == expected_counter && !row.revoked => {
+                    row.rotation_counter = new_counter;
+                    row.expires_at = new_expires_at;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
+        async fn revoke_session(&self, id: &str) -> Result<(), StoreError> {
+            if let Some(row) = self.sessions.borrow_mut().get_mut(id) {
+                row.revoked = true;
+            }
+            Ok(())
+        }
+        async fn revoke_all_sessions(&self, user_id: &str) -> Result<(), StoreError> {
+            for row in self.sessions.borrow_mut().values_mut() {
+                if row.user_id == user_id {
+                    row.revoked = true;
+                }
+            }
+            Ok(())
+        }
+        async fn vault_by_user(&self, user_id: &str) -> Result<Option<VaultRow>, StoreError> {
+            Ok(self.vaults.borrow().get(user_id).cloned())
+        }
+        async fn upsert_vault(&self, user_id: &str, row: &VaultRow) -> Result<(), StoreError> {
+            self.vaults
+                .borrow_mut()
+                .insert(user_id.to_string(), row.clone());
+            Ok(())
+        }
+        async fn delete_vault(&self, user_id: &str) -> Result<(), StoreError> {
+            self.vaults.borrow_mut().remove(user_id);
+            Ok(())
+        }
+        async fn insert_audit(&self, event: &AuditEvent) -> Result<(), StoreError> {
+            self.audits.borrow_mut().push(event.clone());
+            Ok(())
+        }
+        async fn audit_count_since(
+            &self,
+            user_id: &str,
+            action: &str,
+            since: u64,
+        ) -> Result<u64, StoreError> {
+            Ok(self
+                .audits
+                .borrow()
+                .iter()
+                .filter(|a| a.user_id == user_id && a.action == action && a.at >= since)
+                .count() as u64)
+        }
+    }
+
+    /// Mirrors the conditional UPDATE/RETURNING semantics: one winner.
+    impl SingleUseStore for FakeStore {
+        async fn claim(&self, candidate: auth::SingleUseClaim<'_>) -> Result<u64, auth::AuthError> {
+            match candidate {
+                auth::SingleUseClaim::MagicLink { record, now } => {
+                    let mut magic = self.magic.borrow_mut();
+                    match magic.get_mut(&record.token_hash) {
+                        Some(row)
+                            if row.user_id == record.user_id
+                                && row.email == record.email
+                                && row.expires_at == record.expires_at
+                                && row.expires_at > now
+                                && !row.used =>
+                        {
+                            row.used = true;
+                            Ok(1)
+                        }
+                        _ => Ok(0),
+                    }
+                }
+                auth::SingleUseClaim::Challenge { record, now } => {
+                    let mut challenges = self.challenges.borrow_mut();
+                    match challenges.get_mut(&record.id) {
+                        Some(row)
+                            if row.challenge.rp_id == record.rp_id
+                                && row.challenge.origin == record.origin
+                                && row.challenge.expires_at == record.expires_at
+                                && row.challenge.expires_at > now
+                                && !row.challenge.consumed =>
+                        {
+                            row.challenge.consumed = true;
+                            Ok(1)
+                        }
+                        _ => Ok(0),
+                    }
+                }
+                auth::SingleUseClaim::Invite { record } => {
+                    let mut invites = self.invites.borrow_mut();
+                    match invites.get_mut(&record.code_hash) {
+                        Some(row) if !row.used => {
+                            row.used = true;
+                            Ok(1)
+                        }
+                        _ => Ok(0),
+                    }
+                }
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeMailer {
+        sent: RefCell<Vec<(String, String)>>,
+    }
+
+    impl Mailer for FakeMailer {
+        async fn send_magic_link(&self, email: &str, token: &str) -> Result<(), StoreError> {
+            self.sent
+                .borrow_mut()
+                .push((email.to_string(), token.to_string()));
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeDialer {
+        ok: bool,
+        seen: RefCell<Vec<Vec<IpAddr>>>,
+    }
+
+    impl Dialer for FakeDialer {
+        async fn probe(&self, target: &ValidatedTarget, _port: u16, _tls: bool) -> bool {
+            self.seen.borrow_mut().push(target.addresses().to_vec());
+            self.ok
+        }
+    }
+
+    struct FakeDns {
+        map: HashMap<String, Vec<IpAddr>>,
+    }
+
+    impl AsyncDns for FakeDns {
+        fn resolve<'a>(&'a self, host: &'a str) -> Pin<Box<dyn Future<Output = Vec<IpAddr>> + 'a>> {
+            let addrs = self.map.get(host).cloned().unwrap_or_default();
+            Box::pin(async move { addrs })
+        }
+    }
+
+    struct Harness {
+        config: Config,
+        store: FakeStore,
+        mailer: FakeMailer,
+        dialer: FakeDialer,
+        dns: FakeDns,
+    }
+
+    fn harness() -> Harness {
+        Harness {
+            config: cfg(),
+            store: FakeStore::default(),
+            mailer: FakeMailer::default(),
+            dialer: FakeDialer {
+                ok: true,
+                seen: RefCell::new(Vec::new()),
+            },
+            dns: FakeDns {
+                map: HashMap::from([(
+                    "news.example.com".to_string(),
+                    vec!["93.184.216.34".parse().unwrap()],
+                )]),
+            },
+        }
+    }
+
+    impl Harness {
+        fn ctx(&self) -> Ctx<'_, FakeStore, FakeMailer, FakeDialer, FakeDns> {
+            Ctx {
+                cfg: &self.config,
+                store: &self.store,
+                mailer: &self.mailer,
+                dialer: &self.dialer,
+                dns: &self.dns,
+                now: NOW,
+                source_ip: "198.51.100.9".to_string(),
+            }
+        }
+
+        fn call(&self, method: &str, path: &str, body: serde_json::Value) -> Response {
+            self.call_full(method, path, Some(body.to_string()), None, Some(ORIGIN))
+        }
+
+        fn call_full(
+            &self,
+            method: &str,
+            path: &str,
+            body: Option<String>,
+            cookie: Option<String>,
+            origin: Option<&str>,
+        ) -> Response {
+            let req = Request {
+                method: method.to_string(),
+                path: path.to_string(),
+                cookie,
+                origin: origin.map(str::to_string),
+                body: body.map(|b| b.into_bytes()).unwrap_or_default(),
+            };
+            block_on(handle(&self.ctx(), &req))
+        }
+    }
+
+    fn cookie_of(resp: &Response) -> String {
+        let header = resp.set_cookie.clone().expect("set-cookie");
+        header.split(';').next().unwrap().to_string()
+    }
+
+    fn seed_user(h: &Harness, id: &str, email: &str) {
+        block_on(h.store.insert_user(&UserRecord {
+            id: id.to_string(),
+            email: email.to_string(),
+            created_at: NOW,
+        }))
+        .unwrap();
+    }
+
+    fn magic_login(h: &Harness, email: &str) -> String {
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": email}),
+        );
+        assert_eq!(resp.status, 200);
+        let token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        cookie_of(&resp)
+    }
+
+    #[test]
+    fn config_rejects_http_origin_in_production_mode() {
+        assert!(Config::new(
+            "example.com",
+            "http://example.com",
+            vec![1u8; 32],
+            [0u8; 32],
+            1,
+            60,
+            false,
+            false,
+        )
+        .is_err());
+        assert!(Config::new(
+            "localhost",
+            "http://localhost",
+            vec![1u8; 32],
+            [0u8; 32],
+            1,
+            60,
+            false,
+            true,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn magic_link_flow_issues_session_once() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        // Unknown email: same 200, nothing mailed.
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": "ghost@example.com"}),
+        );
+        assert_eq!(resp.status, 200);
+        assert!(h.mailer.sent.borrow().is_empty());
+        // Real flow + replay rejection.
+        let _cookie = magic_login(&h, "a@example.com");
+        let token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let replay = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(replay.status, 401);
+        assert_eq!(replay.body, r#"{"error":"check your email and try again"}"#);
+        // Bad token is indistinguishable.
+        let bad = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": "nope"}),
+        );
+        assert_eq!(bad.status, 401);
+        assert_eq!(bad.body, replay.body);
+    }
+
+    #[test]
+    fn two_concurrent_magic_finishes_cannot_both_win() {
+        // Mutex store standing in for the conditional UPDATE/RETURNING:
+        // the claim transition itself is the race boundary.
+        struct ClaimStore {
+            claimed: Mutex<HashSet<String>>,
+        }
+        impl SingleUseStore for ClaimStore {
+            async fn claim(
+                &self,
+                candidate: auth::SingleUseClaim<'_>,
+            ) -> Result<u64, auth::AuthError> {
+                let key = match candidate {
+                    auth::SingleUseClaim::MagicLink { record, .. } => record.token_hash.clone(),
+                    _ => return Ok(0),
+                };
+                let mut set = self.claimed.lock().unwrap();
+                Ok(if set.insert(key) { 1 } else { 0 })
+            }
+        }
+        let (token, record) = auth::issue_magic_link("u1", "a@example.com", NOW);
+        let store = Arc::new(ClaimStore {
+            claimed: Mutex::new(HashSet::new()),
+        });
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            let store = store.clone();
+            let record = record.clone();
+            let token = token.clone();
+            joins.push(std::thread::spawn(move || {
+                block_on(auth::consume_magic_link_atomically(
+                    record,
+                    &token,
+                    NOW,
+                    store.as_ref(),
+                ))
+                .is_ok()
+            }));
+        }
+        let wins = joins
+            .into_iter()
+            .map(|j| j.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(wins, 1);
+    }
+
+    #[test]
+    fn refresh_rotates_server_row_and_revoke_all_kills_sessions() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let resp = h.call_full(
+            "POST",
+            "/v1/session/refresh",
+            None,
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200);
+        let cookie2 = cookie_of(&resp);
+        assert_ne!(cookie, cookie2);
+        // The pre-rotation cookie is now stale against the row.
+        let stale = h.call_full(
+            "POST",
+            "/v1/session/refresh",
+            None,
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(stale.status, 401);
+        // Revoke-all kills the rotated cookie too.
+        let resp = h.call_full(
+            "POST",
+            "/v1/session/revoke-all",
+            None,
+            Some(cookie2.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200);
+        let dead = h.call_full("GET", "/v1/vault", None, Some(cookie2), None);
+        assert_eq!(dead.status, 401);
+    }
+
+    #[test]
+    fn vault_crud_is_booleans_only_and_owner_scoped() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        seed_user(&h, "u2", "b@example.com");
+        let cookie_a = magic_login(&h, "a@example.com");
+        let cookie_b = magic_login(&h, "b@example.com");
+        let put_body = serde_json::json!({
+            "provider": {
+                "host": "news.example.com", "port": 563, "tls": true,
+                "username": "synthetic-user", "password": "synthetic-pass",
+                "max_connections": 4
+            },
+            "indexer": null
+        });
+        let resp = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie_a.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(
+            resp.body.contains("\"provider_configured\":true"),
+            "{}",
+            resp.body
+        );
+        for leak in ["news.example.com", "synthetic-user", "synthetic-pass"] {
+            assert!(!resp.body.contains(leak), "leaked {leak}");
+        }
+        // Another user sees an empty vault, never the owner's existence.
+        let resp = h.call_full("GET", "/v1/vault", None, Some(cookie_b), None);
+        assert!(
+            resp.body.contains("\"provider_configured\":false"),
+            "{}",
+            resp.body
+        );
+        // Unauthenticated and CSRF-origin mismatch both reject generically.
+        let resp = h.call_full("GET", "/v1/vault", None, None, None);
+        assert_eq!(resp.status, 401);
+        let resp = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie_a.clone()),
+            Some("https://evil.example.com"),
+        );
+        assert_eq!(resp.status, 401);
+        // Private targets collapse to the one generic vault error.
+        let mut dns_map = HashMap::new();
+        dns_map.insert(
+            "news.example.com".to_string(),
+            vec!["10.0.0.5".parse().unwrap()],
+        );
+        let h2_dns = FakeDns { map: dns_map };
+        let ctx = Ctx {
+            cfg: &h.config,
+            store: &h.store,
+            mailer: &h.mailer,
+            dialer: &h.dialer,
+            dns: &h2_dns,
+            now: NOW,
+            source_ip: "198.51.100.9".to_string(),
+        };
+        let req = Request {
+            method: "PUT".to_string(),
+            path: "/v1/vault".to_string(),
+            cookie: Some(cookie_a.clone()),
+            origin: Some(ORIGIN.to_string()),
+            body: put_body.to_string().into_bytes(),
+        };
+        let resp = block_on(handle(&ctx, &req));
+        assert_eq!(resp.status, 400);
+        assert_eq!(resp.body, r#"{"error":"vault unavailable"}"#);
+        // Delete returns to booleans-false.
+        let resp = h.call_full("DELETE", "/v1/vault", None, Some(cookie_a), Some(ORIGIN));
+        assert!(
+            resp.body.contains("\"provider_configured\":false"),
+            "{}",
+            resp.body
+        );
+    }
+
+    #[test]
+    fn test_connection_dials_only_vetted_addresses_and_rate_limits() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let put_body = serde_json::json!({
+            "provider": {
+                "host": "news.example.com", "port": 563, "tls": true,
+                "username": "synthetic-user", "password": "synthetic-pass",
+                "max_connections": 4
+            },
+            "indexer": null
+        });
+        let resp = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200);
+        let resp = h.call_full(
+            "POST",
+            "/v1/vault/test-connection",
+            None,
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.body, r#"{"ok":true}"#);
+        assert_eq!(
+            h.dialer.seen.borrow().as_slice(),
+            [vec!["93.184.216.34".parse::<IpAddr>().unwrap()]]
+        );
+        // Exhaust the per-minute budget: further probes answer false
+        // without reaching the dialer.
+        for _ in 0..TEST_CONNECTION_PER_MINUTE {
+            let _ = block_on(h.store.insert_audit(&vault::audit_event(
+                "u1",
+                "vault.test",
+                true,
+                "198.51.100.9",
+                NOW,
+            )));
+        }
+        let before = h.dialer.seen.borrow().len();
+        let resp = h.call_full(
+            "POST",
+            "/v1/vault/test-connection",
+            None,
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.body, r#"{"ok":false}"#);
+        assert_eq!(h.dialer.seen.borrow().len(), before);
+    }
+
+    #[test]
+    fn passkey_register_then_login_roundtrip() {
+        use p256::ecdsa::{signature::Signer, Signature as EsSignature, SigningKey};
+        use sha2::Digest;
+
+        // Fixture builders (synthetic authenticator).
+        fn head(major: u8, v: u64, out: &mut Vec<u8>) {
+            let m = major << 5;
+            if v < 24 {
+                out.push(m | v as u8);
+            } else if v <= u8::MAX as u64 {
+                out.push(m | 24);
+                out.push(v as u8);
+            } else if v <= u16::MAX as u64 {
+                out.push(m | 25);
+                out.extend_from_slice(&(v as u16).to_be_bytes());
+            } else {
+                out.push(m | 26);
+                out.extend_from_slice(&(v as u32).to_be_bytes());
+            }
+        }
+        fn eint(v: i64, out: &mut Vec<u8>) {
+            if v >= 0 {
+                head(0, v as u64, out)
+            } else {
+                head(1, (-1 - v) as u64, out)
+            }
+        }
+        fn ebytes(b: &[u8], out: &mut Vec<u8>) {
+            head(2, b.len() as u64, out);
+            out.extend_from_slice(b);
+        }
+        fn etext(t: &str, out: &mut Vec<u8>) {
+            head(3, t.len() as u64, out);
+            out.extend_from_slice(t.as_bytes());
+        }
+
+        let h = harness();
+        let sk = SigningKey::from_slice(&[11u8; 32]).unwrap();
+        let point = sk.verifying_key().to_encoded_point(false);
+        let mut cose = Vec::new();
+        head(5, 5, &mut cose);
+        eint(1, &mut cose);
+        eint(2, &mut cose);
+        eint(3, &mut cose);
+        eint(-7, &mut cose);
+        eint(-1, &mut cose);
+        eint(1, &mut cose);
+        eint(-2, &mut cose);
+        ebytes(point.x().unwrap(), &mut cose);
+        eint(-3, &mut cose);
+        ebytes(point.y().unwrap(), &mut cose);
+
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "new@example.com"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let start: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let challenge = start["challenge"].as_str().unwrap().to_string();
+
+        let cred_id = b"synthetic-cred";
+        let mut auth = Vec::new();
+        auth.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
+        auth.push(0x41);
+        auth.extend_from_slice(&1u32.to_be_bytes());
+        auth.extend_from_slice(&[0u8; 16]);
+        auth.extend_from_slice(&(cred_id.len() as u16).to_be_bytes());
+        auth.extend_from_slice(cred_id);
+        auth.extend_from_slice(&cose);
+        let mut att = Vec::new();
+        head(5, 3, &mut att);
+        etext("fmt", &mut att);
+        etext("none", &mut att);
+        etext("authData", &mut att);
+        ebytes(&auth, &mut att);
+        etext("attStmt", &mut att);
+        head(5, 0, &mut att);
+        let cd_create = format!(
+            r#"{{"type":"webauthn.create","challenge":"{}","origin":"{}","crossOrigin":false}}"#,
+            challenge, ORIGIN
+        );
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/finish",
+            serde_json::json!({
+                "challenge": challenge,
+                "credential_id": b64url_encode(cred_id),
+                "attestation_object": b64url_encode(&att),
+                "client_data_json": b64url_encode(cd_create.as_bytes()),
+                "invite_code": null,
+            }),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(resp.set_cookie.is_some());
+
+        // Login with an assertion (sign_count 2 > stored 1).
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/login/start",
+            serde_json::json!({"email": "new@example.com"}),
+        );
+        let start: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let challenge = start["challenge"].as_str().unwrap().to_string();
+        assert_eq!(start["allow_credentials"][0], b64url_encode(cred_id));
+        let mut auth = Vec::new();
+        auth.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
+        auth.push(0x01);
+        auth.extend_from_slice(&2u32.to_be_bytes());
+        let cd_get = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"{}","crossOrigin":false}}"#,
+            challenge, ORIGIN
+        );
+        let mut msg = auth.clone();
+        msg.extend_from_slice(&sha2::Sha256::digest(cd_get.as_bytes()));
+        let sig: EsSignature = sk.sign(&msg);
+        let finish = serde_json::json!({
+            "challenge": challenge,
+            "credential_id": b64url_encode(cred_id),
+            "authenticator_data": b64url_encode(&auth),
+            "client_data_json": b64url_encode(cd_get.as_bytes()),
+            "signature": b64url_encode(sig.to_der().as_bytes()),
+        });
+        let resp = h.call("POST", "/v1/auth/passkey/login/finish", finish.clone());
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        // Replaying the same assertion/challenge fails generically.
+        let resp = h.call("POST", "/v1/auth/passkey/login/finish", finish);
+        assert_eq!(resp.status, 401);
+    }
+}

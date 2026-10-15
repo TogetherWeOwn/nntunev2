@@ -4,13 +4,22 @@ name = "nntune-api"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
 
+[build]
+command = "cargo install -q worker-build --locked && worker-build --release"
+
 [vars]
-# Public, non-secret config only.
+# Public, non-secret config only. RP_ORIGIN must be the canonical
+# serialized https origin whose host is exactly RP_ID (the Worker
+# refuses to start otherwise). http loopback needs ALLOW_LOOPBACK_DEV.
 RP_ID = "example.com"
 RP_ORIGIN = "https://example.com"
 SESSION_TTL_SECS = "86400"
+# INVITES_REQUIRED = "true"
+# ALLOW_LOOPBACK_DEV = "true"          # local dev only, never staging/prod
+# EMAIL_WEBHOOK_URL = "https://<mail-provider-webhook>"  # magic-link delivery
 
 # Hyperdrive binding for PlanetScale Postgres (ID filled per environment).
+# The binding name must stay HYPERDRIVE (see src/worker_entry.rs).
 # [[hyperdrive]]
 # binding = "HYPERDRIVE"
 # id = "<fill in staging/prod id>"
@@ -18,5 +27,5 @@ SESSION_TTL_SECS = "86400"
 # Secrets (set with `wrangler secret put`, never here):
 #   VAULT_KEK_BASE64        32-byte KEK, base64 (versioned; rotate via rewrap job)
 #   VAULT_KEK_VERSION       integer version matching the KEK
-#   SESSION_SECRET_BASE64   HMAC secret for session cookies
-#   EMAIL_API_KEY           transactional email provider key (magic-link delivery)
+#   SESSION_SECRET_BASE64   >=32-byte HMAC secret for session cookies, base64
+#   EMAIL_API_KEY           bearer key for EMAIL_WEBHOOK_URL (optional)

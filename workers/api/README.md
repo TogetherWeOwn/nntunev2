@@ -1,25 +1,55 @@
 # nntune-api: accounts, auth, sessions, BYOP vault
 
-Rust core for NNTune v2 accounts/auth (passkey challenges + email magic
-link), signed-cookie sessions, and the BYOP credential vault. Compiles to
-native (tests) and `wasm32` (Cloudflare Worker).
+Rust core + Worker HTTP entry for NNTune v2 accounts/auth (passkeys +
+email magic link), signed-cookie sessions, and the BYOP credential
+vault. Compiles to native (tests) and `wasm32` (Cloudflare Worker).
 
 ## Layout
 
 ```text
 workers/api/
-  src/lib.rs      # crate root (native + wasm32, no Worker runtime imports)
-  src/session.rs  # HMAC-signed cookies: issue / verify / rotate
-  src/auth.rs     # magic links, passkey challenge lifecycle, invite codes
-  src/vault.rs    # envelope encryption, validation, SSRF guard, redaction
-  tests/api_tests.rs  # acceptance tests (TDD)
+  src/lib.rs          # crate root + Worker fetch event
+  src/session.rs      # HMAC-signed cookies: issue / verify / rotate
+  src/auth.rs         # magic links, passkey challenge lifecycle, invite codes
+  src/vault.rs        # envelope encryption, validation, SSRF guard, redaction
+  src/webauthn.rs     # attestation/assertion verification (ES256 + EdDSA)
+  src/handlers.rs     # framework-agnostic HTTP handlers over store traits
+  src/worker_entry.rs # Hyperdrive Postgres, DoH DNS, socket dialer, mailer
+  src/encoding.rs     # base64url helpers
+  tests/              # acceptance + security-regression tests
   wrangler.toml.example  # Worker config template (no secrets)
 ```
 
 `migrations/0002_auth_vault.sql` is the Postgres schema (PlanetScale via
-Hyperdrive). The HTTP + Hyperdrive wiring (Worker entry) lands in the
-follow-up slice once staging secrets are provisioned; this crate is the
-security-critical logic with tests.
+Hyperdrive). All queries are parameterized; single-use claims execute
+the conditional `UPDATE ... RETURNING` prepared by the core and require
+exactly one row before any response.
+
+## Routes (all JSON, `Cache-Control: no-store`)
+
+| Route | Purpose |
+|---|---|
+| `GET /healthz` | liveness only (no config detail) |
+| `POST /v1/auth/passkey/register/start` / `finish` | passkey signup (attestation `none` or packed self-attestation) |
+| `POST /v1/auth/passkey/login/start` / `finish` | passkey login (assertion + sign-count clone detection) |
+| `POST /v1/auth/magic/start` / `finish` | email magic link (rate-limited per email via the shared store) |
+| `POST /v1/session/refresh` / `logout` / `revoke-all` | stored-session rotation/revocation |
+| `GET` / `PUT` / `DELETE /v1/vault` | booleans-only summary / encrypted upsert / delete |
+| `POST /v1/vault/test-connection` | `{"ok": bool}` only, rate-limited, pinned-address dial |
+
+Generic errors only: auth `401 {"error":"check your email and try
+again"}`, vault `400 {"error":"vault unavailable"}`, internal
+`500 {"error":"internal error"}`. Cookie-authenticated mutations also
+require an exact `Origin` header match.
+
+Known limits of this slice: attestation `x5c` chains reject (no CA
+trust store yet); test-connection dials the vetted IP literal, so a
+provider certificate issued only for the hostname fails closed as
+`ok:false` on TLS ports; magic-link delivery needs the operator's
+`EMAIL_WEBHOOK_URL` (without it links are issued but not delivered);
+test-connection is a direct bounded dial, not yet routed through the
+stream pool. Staging deploy (worker-build plumbing + per-env wrangler
+config from secrets) is a follow-up slice.
 
 ## Security contract (threat-model §3–§4)
 
@@ -52,9 +82,11 @@ security-critical logic with tests.
   serialized origin: https, or http with the host exactly `localhost`,
   `127.0.0.1` or `::1` for development, no userinfo/path/query/fragment.
   Five-minute challenges must be consumed through
-  `consume_challenge_atomically`; signature verification still must finish
-  before authentication. Monotonic `sign_count` storage and full WebAuthn
-  attestation/assertion verification wire to the follow-up Worker slice.
+  `consume_challenge_atomically`, and `webauthn.rs` signature verification
+  (attestation `none`/packed-self, assertion ES256/EdDSA, RP-hash and
+  exact origin/challenge pinning, monotonic `sign_count` clone
+  detection) must finish before authentication. The handlers enforce
+  both, in that order, on every ceremony.
 - **SSRF guard:** provider hosts are hostile input. Shape check (never a
   URL), resolve ALL DNS records, reject loopback/link-local/private/
   unique-local/multicast/reserved (v4+v6); literal IPs checked directly.
