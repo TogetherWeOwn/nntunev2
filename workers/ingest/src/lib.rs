@@ -34,7 +34,10 @@ pub mod rate_limit;
 pub mod repair;
 
 use dispatch::validate_user_id;
-use jobs::validate_job_id;
+use jobs::{validate_job_id, JobSource};
+use metering::{
+    emit_meter, MeterOutcome, MeterSink, MeterWriteError, METER_DATASET, METER_DATASET_BINDING,
+};
 use newznab::{MAX_CATEGORIES, MAX_LIMIT, MAX_PAGE};
 use nzb_intake::{estimate_nzb, IntakeRejection};
 use queue::{validate_indexer_ref, NzbUploadRequest, QueueMsg, SearchRequest};
@@ -216,6 +219,91 @@ async fn try_enqueue(env: &Env, msg: &QueueMsg) -> bool {
     }
 }
 
+/// Entry workflow stage metered at enqueue, by job source.
+///
+/// Search jobs enter at `search`; upload jobs skip search and enter at
+/// `parse` (see `jobs::advance` from `Queued`). Both are in
+/// `queue::WORKFLOW_STEPS`, so the meter write never hits `UnknownStage` here.
+fn meter_entry_stage(source: JobSource) -> &'static str {
+    match source {
+        JobSource::IndexerSearch => "search",
+        JobSource::NzbUpload => "parse",
+    }
+}
+
+/// [`MeterSink`] backed by the `INGEST_METER` Analytics Engine binding.
+///
+/// A native binding success maps to 200; a binding call failure maps to
+/// `Err` (transport failure before any status existed). The event shape stays
+/// owned by `metering.rs`: the full [`meter_write_body`] JSON rides in blob1,
+/// with the stage as the single index and the attempt as double1 for queries.
+struct EdgeMeterSink<'a> {
+    dataset: &'a worker::AnalyticsEngineDataset,
+}
+
+impl MeterSink for EdgeMeterSink<'_> {
+    fn send(&mut self, dataset: &str, body: serde_json::Value) -> Result<u16, String> {
+        debug_assert_eq!(dataset, METER_DATASET);
+        let stage = body.get("stage").and_then(|v| v.as_str()).unwrap_or("");
+        let attempt = body.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0) as f64;
+        let job_id = body.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+        let user_id = body.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
+        let outcome = body.get("outcome").and_then(|v| v.as_str()).unwrap_or("");
+        let event_json = body.to_string();
+        let point = worker::AnalyticsEngineDataPointBuilder::new()
+            .indexes([stage])
+            .blobs([event_json.as_str(), job_id, user_id, outcome])
+            .doubles([attempt])
+            .build();
+        match self.dataset.write_data_point(&point) {
+            Ok(()) => Ok(200),
+            Err(e) => Err(format!("{e:?}")),
+        }
+    }
+}
+
+/// Write one stage-transition meter event through the `INGEST_METER` binding.
+///
+/// A missing binding or a failing write returns a retryable
+/// [`MeterWriteError`] (the route answers 503 + `Retry-After`, never
+/// 202-and-dropped). An unknown stage is returned before the binding is
+/// touched. The unused `_body_hint` keeps the shape-ownership link explicit:
+/// the wire body is always [`meter_write_body`], via [`emit_meter`].
+fn try_meter(
+    env: &Env,
+    msg: &QueueMsg,
+    stage: &str,
+    outcome: MeterOutcome,
+) -> Result<(), MeterWriteError> {
+    let dataset = match env.analytics_engine(METER_DATASET_BINDING) {
+        Ok(dataset) => dataset,
+        Err(e) => {
+            console_log!("ingest meter binding missing: {:?}", e);
+            return Err(MeterWriteError::Transport(format!(
+                "meter binding {METER_DATASET_BINDING} missing: {e:?}"
+            )));
+        }
+    };
+    let mut sink = EdgeMeterSink { dataset: &dataset };
+    match emit_meter(&mut sink, msg, stage, outcome) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            console_log!("ingest meter write failed: {}", e);
+            Err(e)
+        }
+    }
+}
+
+/// Answer a meter-write failure. Retryable failures (missing/failing binding)
+/// surface 503 + `Retry-After`, never 202-and-dropped; an unknown stage is a
+/// caller bug and surfaces 400.
+fn meter_failure_response(err: &MeterWriteError) -> Result<Response> {
+    if err.is_retryable() {
+        return service_unavailable("meter unavailable; nothing was accepted, retry shortly");
+    }
+    json_error("unknown meter stage", 400)
+}
+
 /// Answer an enqueue result. Success is 202 `queued`; a missing or failing
 /// Queue binding is 503 with `Retry-After` — never 202 — so clients, proxies,
 /// and retry middleware do not mistake a lost job for an accepted one.
@@ -316,6 +404,16 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
         Err(message) => return json_error(message, 400),
     };
     console_log!("ingest search q_len={} job={}", q.len(), msg.job_id);
+    // Stage-transition meter at enqueue, fail-closed: a missing/failing
+    // INGEST_METER binding surfaces 503 + Retry-After, never 202-and-dropped.
+    if let Err(e) = try_meter(
+        &ctx.env,
+        &msg,
+        meter_entry_stage(msg.source),
+        MeterOutcome::Ok,
+    ) {
+        return meter_failure_response(&e);
+    }
     let queued = try_enqueue(&ctx.env, &msg).await;
     queued_envelope(&msg, "indexer_search", queued, serde_json::json!({}))
 }
@@ -359,6 +457,19 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Respons
                 est.segment_count,
                 msg.job_id
             );
+            // Stage-transition meter at enqueue, fail-closed: a missing/failing
+            // INGEST_METER binding surfaces 503 + Retry-After, never
+            // 202-and-dropped. Runs after the payload store (bytes are
+            // TTL-expired on failure) and before the Queue send (no orphan job
+            // without its meter).
+            if let Err(e) = try_meter(
+                &ctx.env,
+                &msg,
+                meter_entry_stage(msg.source),
+                MeterOutcome::Ok,
+            ) {
+                return meter_failure_response(&e);
+            }
             let queued = try_enqueue(&ctx.env, &msg).await;
             queued_envelope(
                 &msg,
