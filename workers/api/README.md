@@ -42,9 +42,14 @@ exactly one row before any response.
 headers (`Access-Control-Allow-Origin`, never `*`) are emitted only when
 the request `Origin` exactly equals the configured origin; any other
 origin gets none, so cross-origin JSON posts die at preflight. The web
-client speaks exactly these routes and bodies, pinned by
-`workers/api/tests/fixtures/api-web-contract.json` (consumed by both the
-vitest client suite and the Rust handlers suite).
+client speaks exactly these routes and bodies: every body-bearing route
+is pinned by `workers/api/tests/fixtures/api-web-contract.json` from
+both sides — the vitest client suite asserts the exact wire body each
+client builder sends, and the Rust handlers suite asserts each route is
+served and each fixture wire body deserializes into the handler's
+`deny_unknown_fields` body struct. The emailed magic link lands on the
+web app's `/auth/magic` page; the webhook payload carries both the link
+and the raw token (printed as the code the signup step asks for).
 
 Generic errors only: auth `401 {"error":"check your email and try
 again"}`, vault `400 {"error":"vault unavailable"}`, internal

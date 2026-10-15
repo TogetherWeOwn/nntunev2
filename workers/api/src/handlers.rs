@@ -778,6 +778,25 @@ where
     if b64url_encode(&credential.cred_id) != body.credential_id {
         return generic_auth();
     }
+    // Email-ownership proof, pre-validated BEFORE either single-use claim:
+    // a mistyped emailed code must not burn the ceremony challenge, so the
+    // user can simply re-enter the code (the pure snapshot check grants
+    // nothing — both atomic claims below still gate enrollment).
+    if body.magic_token.is_empty() || body.magic_token.len() > 256 {
+        return generic_auth();
+    }
+    let magic = match ctx
+        .store
+        .magic_by_hash(&auth::hash_magic_token(&body.magic_token))
+        .await
+    {
+        Ok(Some(record)) if record.user_id == user_id => record,
+        Ok(_) => return generic_auth(),
+        Err(_) => return internal(),
+    };
+    if auth::consume_magic_link(magic.clone(), &body.magic_token, ctx.now).is_err() {
+        return generic_auth();
+    }
     // Single-use claim (conditional UPDATE, exactly one row) before any
     // signup side effect is allowed to stand.
     if auth::consume_challenge_atomically(
@@ -792,20 +811,7 @@ where
     {
         return generic_auth();
     }
-    // Email-ownership proof: the token mailed at register/start must be
-    // consumed atomically, bound to this same user, before enrollment.
-    if body.magic_token.is_empty() || body.magic_token.len() > 256 {
-        return generic_auth();
-    }
-    let magic = match ctx
-        .store
-        .magic_by_hash(&auth::hash_magic_token(&body.magic_token))
-        .await
-    {
-        Ok(Some(record)) if record.user_id == user_id => record,
-        Ok(_) => return generic_auth(),
-        Err(_) => return internal(),
-    };
+    // The same proof, now consumed atomically before enrollment.
     if auth::consume_magic_link_atomically(magic, &body.magic_token, ctx.now, ctx.store)
         .await
         .is_err()
@@ -2646,6 +2652,46 @@ mod tests {
     }
 
     #[test]
+    fn register_finish_typoed_code_does_not_burn_the_challenge() {
+        // A mistyped emailed code is rejected before either single-use
+        // claim, so re-entering the correct code against the SAME
+        // challenge still enrolls — no second register/start email needed.
+        let h = harness();
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "typo@example.com"}),
+        );
+        assert_eq!(resp.status, 200);
+        let start: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let challenge = start["challenge"].as_str().unwrap().to_string();
+        let cred_id = b"typo-cred";
+        let att = fx_none_attestation(cred_id, &fx_es256_cose(45));
+        let finish = |magic_token: String| {
+            serde_json::json!({
+                "challenge": challenge.clone(),
+                "credential_id": b64url_encode(cred_id),
+                "attestation_object": b64url_encode(&att),
+                "client_data_json": b64url_encode(
+                    fx_client_json("webauthn.create", &challenge).as_bytes()
+                ),
+                "magic_token": magic_token,
+                "invite_code": null,
+            })
+        };
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/finish",
+            finish("typoed-code".to_string()),
+        );
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        let emailed = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let resp = h.call("POST", "/v1/auth/passkey/register/finish", finish(emailed));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(resp.set_cookie.is_some());
+    }
+
+    #[test]
     fn auth_starts_do_not_reveal_account_existence() {
         let h = harness();
         seed_user(&h, "u1", "known@example.com");
@@ -3284,5 +3330,54 @@ mod tests {
             let resp = h.call_full(method, path, body, None, Some(ORIGIN));
             assert_ne!(resp.status, 404, "{method} {path}");
         }
+    }
+
+    #[test]
+    fn api_web_contract_fixture_bodies_parse_as_handler_bodies() {
+        // Route-served is not enough: every fixture wire body must
+        // deserialize into the exact `deny_unknown_fields` body struct its
+        // handler parses, so a renamed wire key (in the fixture, the web
+        // builders, or the structs) fails here instead of in production.
+        // A wire-bearing route id with no mapping below also fails, so a
+        // new body-bearing route cannot be added unpinned.
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/api-web-contract.json"))
+                .expect("contract fixture parses");
+        let routes = fixture["routes"].as_array().expect("routes array");
+        let mut pinned = 0;
+        for route in routes {
+            let Some(wire) = route.get("wire") else {
+                continue;
+            };
+            let id = route["id"].as_str().expect("route id");
+            let parsed: Result<(), String> = (match id {
+                "register-start" | "login-start" | "magic-start" => {
+                    serde_json::from_value::<EmailBody>(wire.clone()).map(|_| ())
+                }
+                "register-finish" => {
+                    serde_json::from_value::<RegisterFinishBody>(wire.clone()).map(|_| ())
+                }
+                "login-finish" => {
+                    serde_json::from_value::<LoginFinishBody>(wire.clone()).map(|_| ())
+                }
+                "magic-finish" => {
+                    serde_json::from_value::<MagicFinishBody>(wire.clone()).map(|_| ())
+                }
+                "vault-save" | "vault-test-connection" => {
+                    serde_json::from_value::<VaultPutBody>(wire.clone()).map(|_| ())
+                }
+                other => panic!("no handler body mapping for route {other}"),
+            })
+            .map_err(|e| e.to_string());
+            assert!(parsed.is_ok(), "route {id}: {parsed:?}");
+            // Every body-bearing route must also be pinned from the web
+            // side (a `web` builder entry the vitest suite drives).
+            assert!(
+                route.get("web").is_some(),
+                "route {id} has a wire body but no web builder entry"
+            );
+            pinned += 1;
+        }
+        assert_eq!(pinned, 8, "every body-bearing route is pinned");
     }
 }

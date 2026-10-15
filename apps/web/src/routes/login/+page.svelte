@@ -5,12 +5,6 @@
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
 
-	interface LoginStartResponse {
-		challenge: string;
-		allow_credentials: unknown[];
-		rp_id: string;
-	}
-
 	let email = $state('');
 	let status = $state<'idle' | 'sending' | 'sent' | 'error'>('idle');
 	let passkeyStatus = $state<'idle' | 'working' | 'unsupported' | 'error'>('idle');
@@ -46,10 +40,7 @@
 			// Email-first login: the API answers the same shape for known
 			// and unknown addresses (never an oracle) with an empty
 			// allow-list, and the browser offers any local credential.
-			const options = await client.post<LoginStartResponse>(
-				'/v1/auth/passkey/login/start',
-				{ email: email.trim() }
-			);
+			const options = await client.loginStart(email.trim());
 			const assertion = await navigator.credentials.get({
 				publicKey: toRequestOptions({
 					challenge: options.challenge,
@@ -65,19 +56,21 @@
 			const authenticatorData = response.authenticatorData;
 			const clientDataJSON = response.clientDataJSON;
 			const signature = response.signature;
+			const credentialId = serialized.id;
 			if (
 				typeof authenticatorData !== 'string' ||
 				typeof clientDataJSON !== 'string' ||
-				typeof signature !== 'string'
+				typeof signature !== 'string' ||
+				typeof credentialId !== 'string'
 			) {
 				throw new Error('credential missing assertion fields');
 			}
 			// Exact finish shape (the API rejects unknown fields).
-			await client.post('/v1/auth/passkey/login/finish', {
+			await client.loginFinish({
 				challenge: options.challenge,
-				credential_id: serialized.id,
-				authenticator_data: authenticatorData,
-				client_data_json: clientDataJSON,
+				credentialId,
+				authenticatorData,
+				clientDataJson: clientDataJSON,
 				signature
 			});
 			window.location.href = '/onboarding/provider';

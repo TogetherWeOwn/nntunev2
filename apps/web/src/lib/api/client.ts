@@ -103,6 +103,67 @@ export interface ProviderTestResult {
 	error?: string;
 }
 
+/** `POST /v1/auth/passkey/register/start` response (fixed shape, never an oracle). */
+export interface RegisterStartResponse {
+	challenge: string;
+	user_id: string;
+	rp_id: string;
+}
+
+/** `POST /v1/auth/passkey/login/start` response (empty allow-list by design). */
+export interface LoginStartResponse {
+	challenge: string;
+	allow_credentials: unknown[];
+	rp_id: string;
+}
+
+/**
+ * Inputs for the passkey finish calls. Pages pass camelCase fields and the
+ * builders below emit the snake_case wire body the Worker parses
+ * (`deny_unknown_fields`), so a renamed field fails type-checking in the
+ * page and the fixture test in the client — never silently in production.
+ * Wire shapes are pinned by `api-web-contract.json`.
+ */
+export interface RegisterFinishInput {
+	challenge: string;
+	credentialId: string;
+	attestationObject: string;
+	clientDataJson: string;
+	magicToken: string;
+	inviteCode?: string;
+}
+
+export interface LoginFinishInput {
+	challenge: string;
+	credentialId: string;
+	authenticatorData: string;
+	clientDataJson: string;
+	signature: string;
+}
+
+export function toRegisterFinishBody(input: RegisterFinishInput): Record<string, string> {
+	return {
+		challenge: input.challenge,
+		credential_id: input.credentialId,
+		attestation_object: input.attestationObject,
+		client_data_json: input.clientDataJson,
+		magic_token: input.magicToken,
+		...(input.inviteCode !== undefined && input.inviteCode.length > 0
+			? { invite_code: input.inviteCode }
+			: {})
+	};
+}
+
+export function toLoginFinishBody(input: LoginFinishInput): Record<string, string> {
+	return {
+		challenge: input.challenge,
+		credential_id: input.credentialId,
+		authenticator_data: input.authenticatorData,
+		client_data_json: input.clientDataJson,
+		signature: input.signature
+	};
+}
+
 export class ApiClient {
 	private readonly baseUrl: string;
 	private readonly fetchFn: FetchFn;
@@ -146,6 +207,37 @@ export class ApiClient {
 	 */
 	async requestMagicLink(email: string): Promise<MagicLinkResult> {
 		return this.post<MagicLinkResult>('/v1/auth/magic/start', { email });
+	}
+
+	/** Redeem an emailed magic-link token (the `/auth/magic` page). */
+	async finishMagicLink(token: string): Promise<MagicLinkResult> {
+		return this.post<MagicLinkResult>('/v1/auth/magic/finish', { token });
+	}
+
+	/** Start passkey enrollment; the API also mails the inbox-proof code. */
+	async registerStart(email: string): Promise<RegisterStartResponse> {
+		return this.post<RegisterStartResponse>('/v1/auth/passkey/register/start', { email });
+	}
+
+	/** Finish passkey enrollment with the attestation + emailed code. */
+	async registerFinish(input: RegisterFinishInput): Promise<MagicLinkResult> {
+		return this.post<MagicLinkResult>(
+			'/v1/auth/passkey/register/finish',
+			toRegisterFinishBody(input)
+		);
+	}
+
+	/** Start passkey login for an email (empty allow-list response). */
+	async loginStart(email: string): Promise<LoginStartResponse> {
+		return this.post<LoginStartResponse>('/v1/auth/passkey/login/start', { email });
+	}
+
+	/** Finish passkey login with the assertion. */
+	async loginFinish(input: LoginFinishInput): Promise<MagicLinkResult> {
+		return this.post<MagicLinkResult>(
+			'/v1/auth/passkey/login/finish',
+			toLoginFinishBody(input)
+		);
 	}
 
 	/**

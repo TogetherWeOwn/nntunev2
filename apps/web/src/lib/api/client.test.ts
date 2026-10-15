@@ -339,6 +339,13 @@ describe('ApiClient', () => {
 		// `web` entry pins the exact method, path and wire body the client
 		// must send. Drift in either direction fails here.
 		expect(contract.version).toBe(1);
+		// Every body-bearing route must be pinned from the web side; a route
+		// with a wire body but no `web` builder can drift silently.
+		for (const route of contract.routes) {
+			if (route.wire !== undefined) {
+				expect(route.web, `${route.id} has a wire body but no web builder`).toBeDefined();
+			}
+		}
 		for (const route of contract.routes) {
 			if (route.web === undefined || route.input === undefined || route.wire === undefined) {
 				continue;
@@ -352,6 +359,23 @@ describe('ApiClient', () => {
 			if (route.web === 'requestMagicLink') {
 				const email = route.input as { email: string };
 				await client.requestMagicLink(email.email);
+			} else if (route.web === 'finishMagicLink') {
+				const token = route.input as { token: string };
+				await client.finishMagicLink(token.token);
+			} else if (route.web === 'registerStart') {
+				const email = route.input as { email: string };
+				await client.registerStart(email.email);
+			} else if (route.web === 'loginStart') {
+				const email = route.input as { email: string };
+				await client.loginStart(email.email);
+			} else if (route.web === 'registerFinish') {
+				await client.registerFinish(
+					route.input as unknown as Parameters<typeof client.registerFinish>[0]
+				);
+			} else if (route.web === 'loginFinish') {
+				await client.loginFinish(
+					route.input as unknown as Parameters<typeof client.loginFinish>[0]
+				);
 			} else if (route.web === 'testProviderConnection') {
 				await client.testProviderConnection(
 					route.input as unknown as Parameters<

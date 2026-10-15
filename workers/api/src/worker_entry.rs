@@ -129,6 +129,52 @@ fn allowed_cors_origin<'a>(req_origin: Option<&'a str>, cfg_origin: &str) -> Opt
     }
 }
 
+/// The full credentialed-CORS header set for one response, decided purely
+/// from the request `Origin` and the configured origin: `render` appends
+/// exactly this list, so the trust decision is unit-testable off-wasm.
+/// No match (or no `Origin`) yields no headers at all — never a reflection,
+/// never `*`. A 204 is always the known-path OPTIONS preflight, which
+/// additionally needs the method/header grant.
+fn cors_headers(
+    status: u16,
+    req_origin: Option<&str>,
+    cfg_origin: &str,
+) -> Vec<(&'static str, String)> {
+    let Some(origin) = allowed_cors_origin(req_origin, cfg_origin) else {
+        return Vec::new();
+    };
+    let mut headers = vec![
+        ("access-control-allow-origin", origin.to_string()),
+        ("vary", "origin".to_string()),
+        ("access-control-allow-credentials", "true".to_string()),
+    ];
+    if status == 204 {
+        headers.push((
+            "access-control-allow-methods",
+            "GET, POST, PUT, DELETE, OPTIONS".to_string(),
+        ));
+        headers.push((
+            "access-control-allow-headers",
+            "content-type, authorization".to_string(),
+        ));
+        headers.push(("access-control-max-age", "86400".to_string()));
+    }
+    headers
+}
+
+/// Webhook payload for one magic-link email. The `magic_link` lands on the
+/// web app's `/auth/magic` page (which redeems it via
+/// `POST /v1/auth/magic/finish`); the raw `token` is included so the mail
+/// template can also print it as the copy-paste code the passkey-signup
+/// inbox-proof step asks for. Pure so the link shape is unit-testable.
+fn magic_link_payload(origin: &str, email: &str, token: &str) -> serde_json::Value {
+    serde_json::json!({
+        "to": email,
+        "magic_link": format!("{origin}/auth/magic?token={token}"),
+        "token": token,
+    })
+}
+
 // --- Postgres over Hyperdrive ------------------------------------------------------------
 
 fn i64_of(v: u64) -> Result<i64, StoreError> {
@@ -878,11 +924,7 @@ impl Mailer for WebhookMailer {
         if !url.starts_with("https://") {
             return Err(StoreError);
         }
-        let body = serde_json::json!({
-            "to": email,
-            "magic_link": format!("{}/auth/magic?token={}", self.origin, token),
-        })
-        .to_string();
+        let body = magic_link_payload(&self.origin, email, token).to_string();
         let mut headers = Headers::new();
         headers
             .set("content-type", "application/json")
@@ -911,7 +953,10 @@ impl Mailer for WebhookMailer {
 
 // --- Fetch dispatch ------------------------------------------------------------------------------------
 
-fn render(response: &handlers::Response, cors_origin: Option<&str>) -> WorkerResult<Response> {
+fn render(
+    response: &handlers::Response,
+    cors: &[(&'static str, String)],
+) -> WorkerResult<Response> {
     let mut headers = Headers::new();
     headers.append("content-type", "application/json; charset=utf-8")?;
     headers.append("cache-control", "no-store")?;
@@ -919,26 +964,11 @@ fn render(response: &handlers::Response, cors_origin: Option<&str>) -> WorkerRes
     if let Some(cookie) = &response.set_cookie {
         headers.append("set-cookie", cookie)?;
     }
-    // Credentialed CORS for the configured origin only (see
-    // `allowed_cors_origin`): same-origin calls need no headers, and any
-    // other origin gets none, so cross-origin JSON posts die at preflight.
-    // A 204 here is always the known-path OPTIONS preflight, which additionally
-    // needs the method/header grant.
-    if let Some(origin) = cors_origin {
-        headers.append("access-control-allow-origin", origin)?;
-        headers.append("vary", "origin")?;
-        headers.append("access-control-allow-credentials", "true")?;
-        if response.status == 204 {
-            headers.append(
-                "access-control-allow-methods",
-                "GET, POST, PUT, DELETE, OPTIONS",
-            )?;
-            headers.append(
-                "access-control-allow-headers",
-                "content-type, authorization",
-            )?;
-            headers.append("access-control-max-age", "86400")?;
-        }
+    // Credentialed CORS for the configured origin only: the exact header
+    // set is decided by the unit-tested `cors_headers`; render only
+    // appends it.
+    for (name, value) in cors {
+        headers.append(name, value)?;
     }
     Ok(
         Response::from_body(ResponseBody::Body(response.body.clone().into_bytes()))?
@@ -954,7 +984,7 @@ fn internal_render() -> WorkerResult<Response> {
             body: r#"{"error":"internal error"}"#.to_string(),
             set_cookie: None,
         },
-        None,
+        &[],
     )
 }
 
@@ -1007,13 +1037,6 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         .entries()
         .map(|(k, v)| (k.to_lowercase(), v))
         .collect();
-    // Exact match only: the configured origin is the one frontend origin
-    // this Worker trusts with credentialed cross-origin calls.
-    let cors_origin = allowed_cors_origin(
-        headers_map.get("origin").map(String::as_str),
-        &config.origin,
-    )
-    .map(str::to_string);
     let request = handlers::Request {
         method: req.method().to_string(),
         path: req.path(),
@@ -1036,10 +1059,17 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             .cloned()
             .unwrap_or_else(|| "unknown".to_string()),
     };
-    render(
-        &handlers::handle(&ctx, &request).await,
-        cors_origin.as_deref(),
-    )
+    let response = handlers::handle(&ctx, &request).await;
+    // Exact match only: the configured origin is the one frontend origin
+    // this Worker trusts with credentialed cross-origin calls. The raw
+    // request Origin goes into the tested `cors_headers` decision — never
+    // echoed directly.
+    let cors = cors_headers(
+        response.status,
+        headers_map.get("origin").map(String::as_str),
+        &config.origin,
+    );
+    render(&response, &cors)
 }
 
 #[cfg(test)]
@@ -1115,5 +1145,78 @@ mod tests {
             allowed_cors_origin(Some("http://app.example.com"), cfg),
             None
         );
+    }
+
+    #[test]
+    fn cors_headers_exact_match_grants_credentialed_headers() {
+        let cfg = "https://app.example.com";
+        let headers = cors_headers(200, Some("https://app.example.com"), cfg);
+        assert_eq!(
+            headers,
+            vec![
+                (
+                    "access-control-allow-origin",
+                    "https://app.example.com".to_string()
+                ),
+                ("vary", "origin".to_string()),
+                ("access-control-allow-credentials", "true".to_string()),
+            ]
+        );
+        assert!(headers.iter().all(|(_, v)| v != "*"));
+    }
+
+    #[test]
+    fn cors_headers_preflight_adds_method_and_header_grants() {
+        let cfg = "https://app.example.com";
+        let headers = cors_headers(204, Some("https://app.example.com"), cfg);
+        assert_eq!(headers.len(), 6);
+        assert!(headers.contains(&(
+            "access-control-allow-methods",
+            "GET, POST, PUT, DELETE, OPTIONS".to_string()
+        )));
+        assert!(headers.contains(&(
+            "access-control-allow-headers",
+            "content-type, authorization".to_string()
+        )));
+        assert!(headers.contains(&("access-control-max-age", "86400".to_string())));
+        // Non-preflight statuses never carry the preflight grants.
+        let headers = cors_headers(401, Some("https://app.example.com"), cfg);
+        assert!(headers
+            .iter()
+            .all(|(name, _)| *name != "access-control-allow-methods"));
+    }
+
+    #[test]
+    fn cors_headers_untrusted_origins_get_nothing() {
+        let cfg = "https://app.example.com";
+        for origin in [
+            None,
+            Some("https://evil.example.com"),
+            Some("https://app.example.com/"),
+            Some("HTTPS://APP.EXAMPLE.COM"),
+            Some("http://app.example.com"),
+            Some("*"),
+        ] {
+            assert!(cors_headers(200, origin, cfg).is_empty(), "{origin:?}");
+            assert!(cors_headers(204, origin, cfg).is_empty(), "{origin:?}");
+        }
+    }
+
+    #[test]
+    fn magic_link_payload_links_the_web_route_and_carries_the_code() {
+        let payload = magic_link_payload(
+            "https://app.example.com",
+            "ada@example.com",
+            "fixture-token",
+        );
+        assert_eq!(payload["to"], "ada@example.com");
+        // The link must land on the page that redeems it
+        // (apps/web/src/routes/auth/magic) and the template must be able
+        // to print the raw token as the signup inbox-proof code.
+        assert_eq!(
+            payload["magic_link"],
+            "https://app.example.com/auth/magic?token=fixture-token"
+        );
+        assert_eq!(payload["token"], "fixture-token");
     }
 }

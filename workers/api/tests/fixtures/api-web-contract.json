@@ -11,6 +11,10 @@
       "id": "register-start",
       "method": "POST",
       "path": "/v1/auth/passkey/register/start",
+      "web": "registerStart",
+      "input": {
+        "email": "ada@example.com"
+      },
       "wire": {
         "email": "ada@example.com"
       }
@@ -19,6 +23,14 @@
       "id": "register-finish",
       "method": "POST",
       "path": "/v1/auth/passkey/register/finish",
+      "web": "registerFinish",
+      "input": {
+        "challenge": "Zml4dHVyZS1yZWdpc3Rlci1jaGFsbGVuZ2U",
+        "credentialId": "Zml4dHVyZS1jcmVkZW50aWFs",
+        "attestationObject": "Zml4dHVyZS1hdHRlc3RhdGlvbg",
+        "clientDataJson": "Zml4dHVyZS1jbGllbnQtZGF0YQ",
+        "magicToken": "fixture-magic-token"
+      },
       "wire": {
         "challenge": "Zml4dHVyZS1yZWdpc3Rlci1jaGFsbGVuZ2U",
         "credential_id": "Zml4dHVyZS1jcmVkZW50aWFs",
@@ -31,6 +43,10 @@
       "id": "login-start",
       "method": "POST",
       "path": "/v1/auth/passkey/login/start",
+      "web": "loginStart",
+      "input": {
+        "email": "ada@example.com"
+      },
       "wire": {
         "email": "ada@example.com"
       }
@@ -39,6 +55,14 @@
       "id": "login-finish",
       "method": "POST",
       "path": "/v1/auth/passkey/login/finish",
+      "web": "loginFinish",
+      "input": {
+        "challenge": "Zml4dHVyZS1sb2dpbi1jaGFsbGVuZ2U",
+        "credentialId": "Zml4dHVyZS1jcmVkZW50aWFs",
+        "authenticatorData": "fixture-authenticator-data",
+        "clientDataJson": "Zml4dHVyZS1jbGllbnQtZGF0YQ",
+        "signature": "Zml4dHVyZS1zaWduYXR1cmU"
+      },
       "wire": {
         "challenge": "Zml4dHVyZS1sb2dpbi1jaGFsbGVuZ2U",
         "credential_id": "Zml4dHVyZS1jcmVkZW50aWFs",
@@ -63,6 +87,10 @@
       "id": "magic-finish",
       "method": "POST",
       "path": "/v1/auth/magic/finish",
+      "web": "finishMagicLink",
+      "input": {
+        "token": "fixture-magic-token"
+      },
       "wire": {
         "token": "fixture-magic-token"
       }

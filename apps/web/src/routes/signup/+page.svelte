@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
-	import { ApiClient } from '#lib/api/client.js';
+	import { ApiClient, type RegisterStartResponse } from '#lib/api/client.js';
 	import {
 		serializePublicKeyCredential,
 		toCreationOptions,
@@ -9,18 +9,19 @@
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
 
-	interface RegisterStartResponse {
-		challenge: string;
-		user_id: string;
-		rp_id: string;
-	}
-
 	let email = $state('');
 	let magicCode = $state('');
 	let inviteCode = $state('');
 	let pending: RegisterStartResponse | null = $state(null);
 	let status = $state<
-		'idle' | 'working' | 'code-sent' | 'finishing' | 'created' | 'unsupported' | 'error'
+		| 'idle'
+		| 'working'
+		| 'code-sent'
+		| 'finishing'
+		| 'code-error'
+		| 'created'
+		| 'unsupported'
+		| 'error'
 	>('idle');
 
 	const passkeysSupported =
@@ -39,10 +40,7 @@
 			// The API answers the same shape for every email (never an
 			// existence oracle) and mails an inbox-proof code when the
 			// address can still enroll.
-			pending = await client.post<RegisterStartResponse>(
-				'/v1/auth/passkey/register/start',
-				{ email: email.trim() }
-			);
+			pending = await client.registerStart(email.trim());
 			status = 'code-sent';
 		} catch {
 			// Generic: account creation never says which step failed.
@@ -70,24 +68,32 @@
 			const response = serialized.response as Record<string, unknown>;
 			const attestationObject = response.attestationObject;
 			const clientDataJSON = response.clientDataJSON;
-			if (typeof attestationObject !== 'string' || typeof clientDataJSON !== 'string') {
+			const credentialId = serialized.id;
+			if (
+				typeof attestationObject !== 'string' ||
+				typeof clientDataJSON !== 'string' ||
+				typeof credentialId !== 'string'
+			) {
 				throw new Error('credential missing attestation fields');
 			}
 			// Exact finish shape (the API rejects unknown fields): the
 			// emailed code proves inbox control before the key enrolls.
-			await client.post('/v1/auth/passkey/register/finish', {
+			await client.registerFinish({
 				challenge: pending.challenge,
-				credential_id: serialized.id,
-				attestation_object: attestationObject,
-				client_data_json: clientDataJSON,
-				magic_token: magicCode.trim(),
-				...(inviteCode.trim().length > 0 ? { invite_code: inviteCode.trim() } : {})
+				credentialId,
+				attestationObject,
+				clientDataJson: clientDataJSON,
+				magicToken: magicCode.trim(),
+				...(inviteCode.trim().length > 0 ? { inviteCode: inviteCode.trim() } : {})
 			});
 			status = 'created';
 			window.location.href = '/onboarding/provider';
 		} catch {
-			// Generic: account creation never says which step failed.
-			status = 'error';
+			// Generic: account creation never says which step failed. Stay
+			// on the code step: a mistyped code is rejected before the
+			// challenge is spent, so the same emailed code can simply be
+			// re-entered without asking for another email.
+			status = 'code-error';
 		}
 	}
 </script>
@@ -103,12 +109,16 @@
 		Create your account with a passkey — no password to phish or leak. Then connect your own
 		Usenet provider in the next step.
 	</p>
-	{#if status === 'code-sent' || status === 'finishing' || status === 'created'}
+	{#if status === 'code-sent' || status === 'finishing' || status === 'code-error' || status === 'created'}
 		<form onsubmit={finishAccount}>
 			<p role="status">
-				We emailed a code to {email.trim()} — enter it to prove the address is yours,
-				then touch your security key when asked.
+				We emailed a sign-in link and a code to {email.trim()} — enter the code here to
+				prove the address is yours, then touch your security key when asked. (Don't use
+				the link for this step; it signs you in instead.)
 			</p>
+			{#if status === 'code-error'}
+				<p role="alert">That didn't work — re-enter the code from the email and try again.</p>
+			{/if}
 			<label>
 				Email code
 				<input
