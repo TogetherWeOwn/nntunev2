@@ -258,16 +258,23 @@ impl<C> Pool<C> {
     }
 
     /// A provider call failed: count it and (re)start quarantine backoff.
-    pub fn record_provider_error(&mut self) {
+    /// Returns the backoff (ms) just applied, for metering.
+    pub fn record_provider_error(&mut self) -> u64 {
         self.consecutive_errors = self.consecutive_errors.saturating_add(1);
         let backoff = backoff_ms(self.consecutive_errors);
         self.quarantined_until_ms = Some(self.now_ms.saturating_add(backoff));
+        backoff
     }
 
-    /// A provider call succeeded: clear errors and quarantine.
-    pub fn record_success(&mut self) {
+    /// A provider call succeeded: clear errors and quarantine. Returns
+    /// whether a quarantine was pending (its deadline had not yet been
+    /// cleared, even if it had already elapsed), for metering — so the
+    /// caller emits exactly one exit event per clearing.
+    pub fn record_success(&mut self) -> bool {
+        let cleared = self.quarantined_until_ms.is_some() || self.consecutive_errors > 0;
         self.consecutive_errors = 0;
         self.quarantined_until_ms = None;
+        cleared
     }
 
     /// Advance the virtual clock (test seam; the DO uses wall-clock time).
@@ -473,11 +480,28 @@ mod tests {
     #[test]
     fn success_clears_quarantine() {
         let mut pool = TestPool::new(2);
-        pool.record_provider_error();
+        assert_eq!(pool.record_provider_error(), backoff_ms(1));
         assert!(pool.quarantined());
-        pool.record_success();
+        assert!(pool.record_success(), "clearing call reports the exit");
         assert!(!pool.quarantined());
+        assert!(
+            !pool.record_success(),
+            "a second success has nothing to clear"
+        );
         pool.try_acquire(Lane::Playback)
             .expect("acquire after reset");
+    }
+
+    #[test]
+    fn success_after_backoff_elapsed_still_reports_the_clearing() {
+        let mut pool = TestPool::new(2);
+        pool.record_provider_error();
+        pool.advance(backoff_ms(1));
+        assert!(!pool.quarantined(), "deadline passed");
+        assert!(
+            pool.record_success(),
+            "pending quarantine clears on the first success"
+        );
+        assert!(!pool.record_success());
     }
 }

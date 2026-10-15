@@ -207,7 +207,7 @@ pub fn play(
         PoolError::Exhausted => PlayError::PoolExhausted,
     })?;
 
-    let (client, first) = match open_and_fetch_first(pool, input) {
+    let (client, first) = match open_and_fetch_first(pool, meter, &user, lease.lane, input) {
         Ok(pair) => pair,
         Err((client, failure)) => {
             return Err(settle(
@@ -221,7 +221,15 @@ pub fn play(
             ))
         }
     };
-    pool.record_success();
+    if pool.record_success() {
+        meter.emit(ev_pool(
+            MeterKind::QuarantineExited,
+            &user,
+            input.track_id,
+            lease.lane,
+            0,
+        ));
+    }
     let mut live = Live {
         client,
         lease,
@@ -265,6 +273,9 @@ pub fn play(
 /// connection the provider silently closed is redialed once.
 fn open_and_fetch_first(
     pool: &mut StreamPool,
+    meter: &mut dyn Meter,
+    user: &str,
+    lane: Lane,
     input: &PlayInput<'_>,
 ) -> Result<(NntpClient, Decoded), (Option<NntpClient>, Failure)> {
     let mut warm = pool.take_idle();
@@ -283,7 +294,15 @@ fn open_and_fetch_first(
         match fetch_segment(&mut client, &input.segments[0]) {
             Ok(decoded) => return Ok((client, decoded)),
             Err(SegmentError::Nntp(e)) if was_warm && attempt == 0 && e.is_provider_failure() => {
-                // Stale pooled connection: drop it and redial once.
+                // Stale pooled connection: drop it and redial once. Metered
+                // as a redial, not an outage: no quarantine, no provider error.
+                meter.emit(ev_pool(
+                    MeterKind::WarmRedial,
+                    user,
+                    input.track_id,
+                    lane,
+                    0,
+                ));
                 continue;
             }
             Err(SegmentError::Nntp(e)) => {
@@ -335,10 +354,18 @@ fn settle(
     user: &str,
     track: &str,
 ) -> PlayError {
+    let lane = lease.lane;
     pool.release(lease, if provider { None } else { client });
     if provider {
-        pool.record_provider_error();
+        let backoff_ms = pool.record_provider_error();
         meter.emit(ev(MeterKind::ProviderError, user, track, 0));
+        meter.emit(ev_pool(
+            MeterKind::QuarantineEntered,
+            user,
+            track,
+            lane,
+            backoff_ms,
+        ));
     }
     err
 }
@@ -454,6 +481,18 @@ fn ev(kind: MeterKind, user: &str, track: &str, bytes: u64) -> MeterEvent {
         user_id: user.to_string(),
         track_id: track.to_string(),
         bytes,
+        lane: None,
+        backoff_ms: 0,
+    }
+}
+
+/// A pool-health event (quarantine entry/exit, warm redial): carries the
+/// lane of the call it belongs to and, for quarantine entry, the backoff.
+fn ev_pool(kind: MeterKind, user: &str, track: &str, lane: Lane, backoff_ms: u64) -> MeterEvent {
+    MeterEvent {
+        lane: Some(lane),
+        backoff_ms,
+        ..ev(kind, user, track, 0)
     }
 }
 
@@ -517,8 +556,19 @@ impl PlayStream {
                     upload,
                     ..
                 } = *live;
+                let lane = lease.lane;
                 pool.release(lease, Some(client));
-                pool.record_success();
+                // Normally already cleared by `play` (no second exit), but a
+                // quarantine recorded by an interleaved play can clear here.
+                if pool.record_success() {
+                    meter.emit(ev_pool(
+                        MeterKind::QuarantineExited,
+                        &self.user_id,
+                        &self.track_id,
+                        lane,
+                        0,
+                    ));
+                }
                 cache.put_track(&self.track_id, upload.complete());
                 Ok(())
             }
