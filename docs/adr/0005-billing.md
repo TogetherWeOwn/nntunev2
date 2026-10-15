@@ -2,8 +2,8 @@
 
 - **Status:** Accepted design; implementation and independent review gates remain.
 - **Date:** 2026-10-13
-- **Revised:** 2026-10-15 — real-id creation, one nonterminal subscription,
-  card-present trial cutoff, complete status mapping and scheduled reconciliation.
+- **Revised:** 2026-10-15 — bounded renewal settlement, payment-conditional trial
+  conversion/expiry and authoritative per-environment price mappings.
 
 ## Decision
 
@@ -87,21 +87,70 @@ trial's cancellation or change its price outside the paid-choice flow below.
 ## Trial → paid and subsequent purchases
 
 A user explicitly chooses a paid price and consents to the displayed charge.
+Use `collection_method=charge_automatically` with a supported card payment method
+for this flow. Collect/attach it in a setup flow before conversion; do not silently
+fall back to a payment behavior that forfeits the trial.
+
 While the trial is nonterminal, **update that subscription's existing item**:
-`items[0][id]` identifies it, `items[0][price]` selects the paid monthly price,
-`trial_end=now`, `cancel_at_period_end=false`, `proration_behavior=none`, and
-`payment_behavior=default_incomplete`. This ends the trial immediately and
-requires payment confirmation; the UI completes the invoice PaymentIntent flow
-(including authentication) before claiming success. Do not use Checkout
-`mode=subscription` to create a second subscription beside the trial. A setup
-flow may collect a payment method without creating a subscription.
+`items[0][id]` identifies it, `items[0][price]` selects the mapped paid monthly
+price, `trial_end=now`, `cancel_at_period_end=false`, `proration_behavior=none`,
+and **`payment_behavior=pending_if_incomplete`**. Submit the invoice-generating
+change as one pending update, not a separate early trial end/cancellation change.
+The trial ends and the paid selection applies **only on successful payment**;
+a decline or abandoned authentication leaves the original trial and scheduled
+cancellation in effect. The UI completes the invoice PaymentIntent action flow
+before claiming success. Do not use Checkout `mode=subscription` to create a
+second subscription beside the trial.
+
+Persist the pending invoice id and Stripe's `pending_update.expires_at` on the
+same `billing_operations` row; keep it unresolved until confirmed paid/applied
+or voided/expired. Stripe sets that deadline to the earlier trial/item period end
+when within 23 hours, otherwise 23 hours after the update. Retries resume payment
+of **that invoice**, never resubmit a new update to extend the deadline. No pending
+conversion extends the original trial entitlement. On expiry Stripe voids the
+invoice and discards the update; the hourly `billing-reconcile` job retrieves
+remote state, confirms that result and resolves the operation. If expiry has
+elapsed but the update/invoice remains open, it voids that still-unpaid pending
+invoice and re-reads state before resolving. A payment winning that race is
+reconciled as paid, never treated as a failed conversion or refunded implicitly.
+Stripe failure keeps the operation unresolved with an alert/retry. Before the
+original trial end the user retains free caps and can make a fresh explicit
+choice after confirmed cleanup; at the original end there is no entitlement and
+remote cancellation must be confirmed before a new paid subscription. Trial
+history is never reset. No permanent `past_due` first-payment row is invented.
 
 `plan_id` is the last confirmed entitlement plan (`free` until the first paid
-invoice), whereas `stripe_price_id` is the currently selected Stripe price.
-Only reconciliation of the matching paid service invoice advances `plan_id` and
-`paid_through_at`. The $0 trial invoice, a redirect, `active` by itself, or an
-unpaid upgrade cannot grant paid caps. Paid upgrades likewise retain the last
-paid plan until the upgrade invoice settles; downgrades apply at renewal.
+invoice), whereas `stripe_price_id` is the **applied** Stripe item price (the
+pending choice stays in the operation payload until applied). Only reconciliation
+of the matching paid service invoice advances `plan_id` and `paid_through_at`.
+The $0 trial invoice, a redirect, `active` by itself, or an unpaid upgrade cannot
+grant paid caps. Paid upgrades use the same pending-update/payment gate, retaining
+the last paid plan until settlement; downgrades apply at renewal.
+
+### Price identity is authoritative relational data
+
+`plan_prices` (ADR 0002) maps exact Stripe price ids to `plans.id` in each
+environment's application DB. Seed four selectable mappings: the $0 monthly
+trial price → `free`, and the $8/$30/$100 USD monthly licensed prices →
+`plus`/`pro-5x`/`pro-20x`. The reviewed environment-specific seed verifies the
+configured Stripe account, `livemode`, currency, amount, interval and usage type;
+it does not invent ids or copy test ids into live. A missing mapping disables
+that purchase option. KV, a client parameter and Stripe metadata are not mapping
+authority. Keep historical mappings immutable and nonselectable after a price
+replacement so old invoices/subscriptions still reconcile; never repoint a price
+to a different plan. At most one selectable price per plan is allowed, matching
+the advertised `plans.price_cents`.
+
+Resolve paid service invoice lines through that table, bound to the known
+customer, subscription and `stripe_subscription_item_id`. Require the applied
+or recorded pending operation's price and corresponding service period; unrelated
+one-off/credit lines and the free price confer no paid caps. Read the full invoice,
+not only its first line. Advance coverage monotonically under the per-user lock;
+duplicated/older invoices cannot regress a later confirmed plan/period. An unknown
+price or wrong mode/account fails closed: record observed remote state, do **not**
+advance `plan_id`/`paid_through_at`, disable new purchases for it and alert for
+reconciliation. Existing previously confirmed coverage/allowances retain only
+their original deadlines; an unknown price grants no new or higher paid caps.
 
 Once the previous subscription is confirmed Stripe-terminal, a new paid
 subscription may be created with a new operation id and **no new trial**.
@@ -121,7 +170,7 @@ provider statuses fail closed and require reconciliation, not a guessed mapping.
 | Stripe status | Access | Slot |
 |---|---|---|
 | `trialing` | Free caps only before `trial_end` | Reserved |
-| `active` | Last confirmed paid plan only when `plan_id != 'free'` and `paid_through_at > now()` | Reserved |
+| `active` | Last confirmed paid plan (`plan_id != 'free'`) while `paid_through_at > now()`, or for the fixed 3-hour renewal-settlement allowance below | Reserved |
 | `past_due` | Last confirmed paid plan while `paid_through_at > now()`, or during an eligible renewal's `grace_until > now()` | Reserved |
 | `incomplete`, `unpaid`, `paused` | None | Reserved; resolve/cancel existing subscription before replacement |
 | `canceled`, `incomplete_expired` | None, even with an old future period end | Released |
@@ -130,9 +179,23 @@ For a paid-through end-of-period cancellation, Stripe remains `active` with
 `cancel_at_period_end=true`; this is not the terminal `canceled` case.
 `current_period_end` alone is not proof of payment: it can advance on an unpaid
 renewal. `paid_through_at` comes from confirmed paid service invoice coverage.
-A failed mid-period upgrade must not erase still-paid lower-tier access: if it
-puts the subscription in `past_due`, that coverage remains until `paid_through_at`
-without inventing grace or granting the unpaid higher tier.
+Stripe normally keeps a renewal invoice in draft for about one hour before
+charging. To avoid a recurring access gap, `RENEWAL_SETTLEMENT_ALLOWANCE` is
+**3 hours from the last confirmed `paid_through_at`**. For `active` paid rows
+with `cancel_at_period_end=false`, non-NULL paid coverage and
+`now() < paid_through_at + interval '3 hours'`, retain the last confirmed plan,
+including its cache budget. No synthetic advance of paid coverage, first-payment
+allowance, sliding deadline or allowance after scheduled cancellation. This is
+our bounded service policy, not a promise that Stripe always settles in 3 hours:
+longer draft/webhook outages alert and cut access at the bound unless confirmed
+payment or eligible renewal-failure grace is reconciled. Stream, ingest and
+cache GC all use the same effective-plan predicate from ADR 0002, including this
+allowance; GC must not independently zero a renewing user's budget at period end.
+
+A failed mid-period upgrade must not erase still-paid lower-tier access. Pending
+updates normally preserve the applied subscription; if a separately failed
+renewal puts it in `past_due`, paid coverage remains until `paid_through_at`
+without granting the unpaid higher tier.
 
 Only the first failed **renewal after a paid period** sets `grace_until` to that
 paid period's end plus seven days. Invoice retries/duplicate events do not extend
@@ -142,10 +205,14 @@ trial. Successful recovery reconciles the paid invoice and clears grace.
 ### Expiry has a real executor
 
 The API worker's scheduled **`billing-reconcile` job runs hourly**, processing
-bounded batches of pending operations, expired trials, past-grace rows and
-stale nonterminal subscriptions. It also runs for one user inline before any
-new-subscription attempt. No Stripe webhook is expected when a local grace clock
-elapses. Access is cut off by the timestamp predicate immediately, independent
+bounded batches of unresolved operations (including pending-update expiry),
+expired trials, paid rows at/past `paid_through_at`, and past-grace rows. It also
+runs for one user inline before any new-subscription attempt. Poll pending
+operations every run; do not require a webhook or a non-NULL `grace_until` to
+clean up an abandoned first payment. Read remote pending-update/expiry state if
+a crash left its local invoice id/deadline unset. No Stripe webhook is expected
+when a local grace clock elapses. Access is cut off by the full effective-plan
+timestamp predicate, including the bounded settlement allowance, independently
 of the job.
 
 For past-grace rows, retrieve current Stripe/invoice state first. Recover a
@@ -164,14 +231,29 @@ or implicit refund is part of expiration.
 - Advance a Stripe test clock through day 14 with no card, and with a saved card
   but no paid choice: both end with no free entitlement. Delayed/duplicated
   events cannot resurrect it. No charge occurs just for saving a card.
-- Trial-to-paid keeps the same subscription id and item id. Cover paid success,
-  decline, authentication required, interrupted confirmation, and repeated
-  upgrade clicks. No first-payment grace or unpaid higher-tier entitlement.
+- Trial-to-paid keeps the same subscription id and item id. Success applies the
+  paid change; decline/abandoned authentication leaves the original trial end and
+  scheduled cancellation intact, with free caps only until that end. Resume the
+  same invoice on repeated clicks. Advance past `pending_update.expires_at`
+  **without a webhook**: the invoice is void, the pending change disappears and
+  reconciliation resolves the operation without consuming remaining trial time
+  or leaving an immortal first-payment slot. Test expiry/payment races, a lost
+  API response, and conversion within 23 hours of trial end. Validate these
+  pending fields on the pinned Stripe API version before enabling conversion;
+  unsupported behavior fails setup, never falls back to `default_incomplete`.
+- Cross a paid renewal boundary: during Stripe's draft hour and delayed paid
+  webhook, streaming and cache budgets stay on the last paid plan. Payment moves
+  confirmed coverage forward. No payment/event by T+3h denies access exactly at
+  that bound; repeated events cannot extend it. Scheduled cancellation stops at
+  T with no allowance. Payment failure inside the allowance transitions to
+  fixed renewal grace without an intermediate access/cache-budget loss.
 - Advance beyond a renewal's grace with **no new webhook**. The local read denies
   access; hourly and inline reconciliation settle or cancel the old subscription
   before replacement. Test every status in the table and an out-of-order old id.
-- Verify plan downgrade/upgrade invoice coverage and idempotent daily usage
-  independently; no metered price or usage report is created.
+- Verify all four per-environment price mappings, an unknown price, wrong mode,
+  retired-but-known price, unrelated invoice lines and duplicate/out-of-order
+  invoices. No unknown price advances paid caps/coverage. Verify plan changes and
+  idempotent daily usage independently; no metered usage report is created.
 
 ## Sources and verification boundary
 
@@ -179,6 +261,8 @@ Official documentation checked on 2026-10-15:
 
 - [Subscription free trials and missing-payment behavior](https://docs.stripe.com/billing/subscriptions/trials/free-trials)
 - [Update Subscription: item id, price, trial_end and payment_behavior](https://docs.stripe.com/api/subscriptions/update)
+- [Pending updates: supported fields, payment failure and expiry](https://docs.stripe.com/billing/subscriptions/pending-updates)
+- [Subscription renewal invoices: draft then finalize/charge](https://docs.stripe.com/billing/invoices/subscription)
 - [Scheduled cancellation and undo before period end](https://docs.stripe.com/billing/subscriptions/cancel)
 - [Idempotent request retention](https://docs.stripe.com/api/idempotent_requests)
 

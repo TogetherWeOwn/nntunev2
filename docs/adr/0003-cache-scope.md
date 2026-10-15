@@ -3,7 +3,7 @@
 - **Status:** Accepted design; implementation and independent review gates remain.
 - **Date:** 2026-10-13
 - **Revised:** 2026-10-15 — explicit byte/retention budgets, live gauge,
-  ingest/stream writer split, and FK-safe bounded reclamation.
+  FK-safe reclamation and renewal-settlement-aware effective-plan lookup.
 
 ## Context
 
@@ -91,8 +91,11 @@ The cache-GC Workflow runs in bounded batches and follows this order:
 
 1. Identify grants outside their plan's retention window. For an over-budget
    user, additionally select least-recently-served grants until the remaining
-   gauge fits the budget. Users without entitlement have a zero cache budget;
-   this never deletes their library metadata or sources. `cache_priority`
+   gauge fits the budget. Resolve the effective plan with **ADR 0002 rule 4**,
+   including its fixed 3-hour active-paid renewal-settlement allowance and
+   eligible renewal-failure grace. Paid period end alone is **not** a zero-budget
+   signal. Only users without entitlement under that same predicate have a zero
+   cache budget; this never deletes library metadata or sources. `cache_priority`
    orders work under shared storage pressure (lower tiers first); it cannot
    exempt a user from their own byte budget. An object larger than the user's
    entire budget is streamed without persistent cache admission.

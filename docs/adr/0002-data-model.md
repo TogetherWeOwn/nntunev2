@@ -2,8 +2,8 @@
 
 - **Status:** Accepted design; implementation and independent review gates remain.
 - **Date:** 2026-10-13
-- **Revised:** 2026-10-15 — preserve merged auth, specify additive app tables,
-  version encrypted fields, separate ingest/stream writers and pin billing slots.
+- **Revised:** 2026-10-15 — preserve merged auth; pin catalog identity, atomic
+  stream accounting, relational price mappings and bounded renewal settlement.
 - **Baseline inspected:** main `29140710bb5d8e0d57f1701ca1e6c3e854e9104f`.
   Auth, ingest, core, scaffold and MB work are merged, not in-flight assumptions.
 
@@ -69,17 +69,25 @@ plans                 id TEXT PK ('free','plus','pro-5x','pro-20x'), price_cents
                       stream_hours_month, max_concurrent_streams, max_library_tracks,
                       ingest_jobs_day, cache_priority,
                       cache_bytes_budget BIGINT, cache_retention_days INTEGER
+plan_prices           stripe_price_id TEXT PK, plan_id FK → plans NOT NULL,
+                      currency TEXT NOT NULL, price_cents INTEGER NOT NULL,
+                      billing_interval TEXT NOT NULL, livemode BOOLEAN NOT NULL,
+                      selectable BOOLEAN NOT NULL DEFAULT FALSE,
+                      partial UNIQUE (plan_id) WHERE selectable
 billing_accounts      user_id TEXT PK/FK, stripe_customer_id TEXT UNIQUE NULL,
                       trial_started_at NULL (write-once after confirmed trial creation)
 billing_operations    id PK, user_id FK, kind TEXT, state TEXT,
                       request_key TEXT UNIQUE, request_payload JSONB,
-                      stripe_subscription_id TEXT NULL, created_at, updated_at,
+                      stripe_subscription_id TEXT NULL, stripe_invoice_id TEXT NULL,
+                      pending_update_expires_at NULL, created_at, updated_at,
                       partial UNIQUE (user_id) WHERE state IN
                       ('pending','submitted','needs_reconcile')
 billing_webhook_events stripe_event_id TEXT PK, received_at, processed_at NULL
 subscriptions         id PK, user_id FK,
                       stripe_subscription_id TEXT UNIQUE NOT NULL,
-                      stripe_customer_id TEXT NOT NULL, stripe_price_id TEXT NOT NULL,
+                      stripe_customer_id TEXT NOT NULL,
+                      stripe_subscription_item_id TEXT NOT NULL,
+                      stripe_price_id TEXT NOT NULL (observed provider state),
                       plan_id FK → plans (last confirmed entitlement plan),
                       status TEXT (Stripe status, rule 4), current_period_end,
                       cancel_at_period_end BOOLEAN DEFAULT FALSE,
@@ -100,11 +108,15 @@ indexers              id PK, user_id TEXT FK NULL (NULL means global),
                       name, base_url, api_key_encrypted BYTEA NULL
                       + api_key_* envelope fields, enabled BOOLEAN
 libraries             id PK, user_id FK, name, created_at
-artists               id PK, mbid UUID NULL INDEXED, name
-releases              id PK, mbid UUID NULL INDEXED, artist_id FK,
-                      title, release_type, year
-tracks                id PK, mbid UUID NULL INDEXED, release_id FK,
-                      title, track_no, duration_ms
+artists               id PK, mbid UUID NULL (MB artist), local_key TEXT UNIQUE NULL,
+                      name, partial UNIQUE (mbid) WHERE mbid IS NOT NULL
+releases              id PK, mbid UUID NULL (MB release), local_key TEXT UNIQUE NULL,
+                      artist_id FK, title, release_type, year,
+                      partial UNIQUE (mbid) WHERE mbid IS NOT NULL
+tracks                id PK, mbid UUID NULL INDEXED (MB recording, NOT unique),
+                      release_id FK NOT NULL, title, medium_no INTEGER NOT NULL,
+                      track_no INTEGER NOT NULL, duration_ms,
+                      UNIQUE (release_id, medium_no, track_no)
 library_tracks        library_id FK, track_id FK, added_at, PK (library_id, track_id)
 track_sources         user_id FK, track_id FK, indexer_id FK NULL,
                       nzb_ref_encrypted BYTEA + nzb_ref_* envelope fields,
@@ -122,8 +134,15 @@ playlists             id PK, user_id FK, name, created_at
 playlist_tracks       id PK, playlist_id FK, track_id FK, position INTEGER,
                       UNIQUE (playlist_id, position) DEFERRABLE INITIALLY DEFERRED,
                       INDEX (playlist_id, track_id)
-play_events           user_id FK, track_id FK, played_at, stream_seconds BIGINT,
-                      cached_hit BOOLEAN, PARTITION BY RANGE (played_at), monthly
+play_event_outbox     event_id UUID PK, user_id FK, track_id FK,
+                      played_at timestamptz NOT NULL, stream_seconds BIGINT NOT NULL,
+                      cached_hit BOOLEAN, delivered_at NULL,
+                      CHECK (stream_seconds >= 0)
+play_events           event_id UUID NOT NULL, user_id FK, track_id FK,
+                      played_at timestamptz NOT NULL, stream_seconds BIGINT NOT NULL,
+                      cached_hit BOOLEAN, PK (event_id, played_at),
+                      CHECK (stream_seconds >= 0),
+                      PARTITION BY RANGE (played_at), monthly
 ```
 
 The ingest job's payload is retained by the dispatch/queue path; a durable
@@ -139,9 +158,9 @@ users ──1 provider_vaults (existing, retained)
 users ──< auth_challenges / audit_log (logical ownership)
 invite_codes ──< users (invite_code_hash, logical reference)
 users ──1 billing_accounts ──< billing_operations
-users ──< subscriptions >── plans
+users ──< subscriptions >── plans ──< plan_prices
 users ──< subsonic_credentials / providers / indexers
-users ──< usage_ledger / ingest_jobs / play_events
+users ──< usage_ledger / ingest_jobs / play_event_outbox / play_events
 users ──< libraries ──< library_tracks >── tracks >── releases >── artists
 users ──< track_sources >── tracks
 users ──< track_media >── tracks
@@ -266,8 +285,13 @@ a slot while a remote subscription can still bill.
 Entitlement is derived from the single row:
 
 - `trialing AND trial_end > now()` → free caps.
-- `active AND plan_id != 'free' AND paid_through_at > now()` → the confirmed
-  paid plan. An `active` free subscription has no entitlement.
+- `active AND plan_id != 'free'` → the confirmed paid plan while
+  `paid_through_at > now()`, **or** while `cancel_at_period_end=false` and
+  `now() < paid_through_at + interval '3 hours'`. The latter is the fixed
+  `RENEWAL_SETTLEMENT_ALLOWANCE`, covering Stripe's normal draft/charge window
+  and webhook delay, not evidence of payment. It requires a non-NULL previously
+  paid end, never advances it and cannot slide on a retry. An `active` free
+  subscription has no entitlement. Scheduled cancellation gets no allowance.
 - `past_due` with a previous paid plan → that plan while `paid_through_at > now()`
   (including a failed mid-period upgrade), or with `grace_until > now()` during
   the fixed seven-day **renewal-only** grace. No grace for first payment.
@@ -287,20 +311,84 @@ is not terminal cancellation.
 `play_events` is append-only and monthly-partitioned. Partition maintenance
 creates future partitions and alerts if one is missing; no silent dropped writes.
 Retention/drop policy requires its own approved operation, not this ADR.
-Stream seconds roll into daily UTC `usage_ledger` rows exactly once; the
-implementing writer must persist a stable event/batch dedupe identity and commit
-its rollup checkpoint with the increment. Ingest counts increment at acceptance.
-Only stream seconds sum across days for a monthly cap; ingest uses today's row.
+The stream writer generates each `event_id` and its exact UTC `played_at` **once
+before dispatch**, committing the immutable event to `play_event_outbox`.
+An outbox dispatcher retries undelivered rows; it sets `delivered_at` only after
+the event/ledger transaction commits. Queue/Worker retries reuse both and the
+same payload; never regenerate
+`played_at=now()` on delivery. Each event carries an **incremental**, non-overlapping
+number of seconds, not a cumulative playback total. Split events at UTC midnight
+so each belongs to one daily/monthly cap period. The composite PK includes the
+partition key as PostgreSQL requires; `UNIQUE(event_id)` alone is invalid here.
+
+**No asynchronous rollup or independent checkpoint.** In one DB transaction,
+`INSERT INTO play_events ... ON CONFLICT (event_id, played_at) DO NOTHING RETURNING
+user_id, played_at, stream_seconds` feeds a grouped daily ledger upsert. Increment
+`usage_ledger.stream_seconds` only by those **inserted/returned** rows, with
+`period=(played_at AT TIME ZONE 'UTC')::date`. Use additive `ON CONFLICT
+(user_id, period) DO UPDATE` so concurrent stream/ingest writers cannot lose one
+another's increments. Commit before acknowledging delivery. A crash before commit
+rolls back both; a crash after commit redelivers as a zero-increment no-op. A
+missing partition or ledger error aborts both and leaves the event retryable.
+The committed event row is the durable dedupe receipt; no undefined checkpoint
+table is needed. Producers must reject attempts to reuse an identity for a changed
+payload. Retention must preserve receipts through the approved replay horizon;
+do not replay dropped partitions into the live ledger without a separate rebuild.
+
+Ingest counts increment at acceptance. Only stream seconds sum across days for a
+monthly cap; ingest uses today's row.
 Cache bytes are the live grant gauge; concurrent streams are pool-DO leases;
 library size is distinct per-user membership (ADR 0004). Analytics Engine is
 observability only. Duplicate queue delivery must not increment any flow twice.
+Acceptance must cover concurrent duplicate delivery, crash before/after commit,
+missing partitions, concurrent ingest increments, and midnight/month boundaries.
+These are required implementation tests, not executed DB tests in this docs PR.
 
-### 6. Playlist identity and metadata
+Sources: PostgreSQL [partitioned unique constraints](https://www.postgresql.org/docs/current/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE-LIMITATIONS)
+and [INSERT / ON CONFLICT / RETURNING](https://www.postgresql.org/docs/current/sql-insert.html),
+checked 2026-10-15. `RETURNING` includes only successfully inserted/updated rows.
+
+### 6. Catalog identity and playlist entries
+
+The global catalog represents release-track occurrences, **not** one row per
+recording. `artists.mbid` is an MB **artist** id; `releases.mbid` is an MB
+**release** id, not release-group id; `tracks.mbid` is an MB **recording** id.
+A recording may occur on multiple releases or twice on one release, so its MBID
+is deliberately not unique. A track's canonical key is
+`(release_id, medium_no, track_no)`: both integers are 1-based ordinal positions,
+not display labels such as `A1`. This distinguishes multidisc tracks and repeated
+recordings. MusicBrainz describes a track as a recording's occurrence on a
+particular release/medium ([track definition](https://musicbrainz.org/doc/Track)).
+
+For artists/releases, CHECK exactly one of `mbid` and `local_key` is non-NULL.
+Matched writes upsert on the partial unique MBID indexes (`ON CONFLICT (mbid)
+WHERE mbid IS NOT NULL`); unmatched writes upsert on `local_key`. The stable local
+key is a versioned length-prefixed tuple `(ingest_job_id, entity_kind,
+manifest_entry_ordinal)`, derived from the immutable accepted manifest, never a
+fresh random value on retry. For an unmatched release's tracks use `medium_no=1`
+and the manifest's 1-based entry ordinal as `track_no`. Separate unmatched jobs
+may remain distinct until explicitly matched; never merge by title/artist text.
+If the recording-to-release/medium/position association is ambiguous, keep a
+local release with NULL recording MBIDs rather than guessing a global key.
+
+The ingest `write` transaction upserts artist, release, then track on the keys
+above and uses their **returned local ids**, including on conflicts, for membership
+and per-user sources. Different jobs/users matching the same release position
+converge to one track; `(library_id, track_id)` makes repeated membership a no-op.
+A contradictory non-NULL recording MBID at an existing position is a match error
+for reconciliation, not permission to overwrite shared metadata or create a second
+track. Local-to-MB consolidation is separate transactional work: preserve/remap
+membership, playlists and user sources before retiring a duplicate; don't mutate
+keys on conflict or discard data. An MBID is never a local track id/source FK.
 
 Playlist entries have their own ids so the same track may occur repeatedly.
 The deferrable `(playlist_id, position)` constraint allows transactional position
-shifts/reorders. Nullable, indexed MBIDs permit local/unmatched imports; an MBID
-is not a local track id and must not be substituted for it in source/cache FKs.
+shifts/reorders.
+
+Implementation acceptance covers concurrent cross-user and same-user/different-job
+imports of one matched release position (one global row, one library count), the
+same recording on two releases and two positions on one release (distinct tracks),
+multidisc positions, unmatched-job retry, and an ambiguous match without guessing.
 
 ### 7. Existing migrations stay at their applied paths
 

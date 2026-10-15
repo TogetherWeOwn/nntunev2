@@ -2,8 +2,8 @@
 
 - **Status:** Accepted design; implementation and independent review gates remain.
 - **Date:** 2026-10-13
-- **Revised:** 2026-10-15 — concrete cache budgets, stock-versus-flow accounting,
-  and a bounded trial even when a payment method is present.
+- **Revised:** 2026-10-15 — concrete cache budgets, atomic stream accounting,
+  payment-conditional trial conversion and bounded renewal settlement.
 
 ## Context
 
@@ -31,7 +31,7 @@ cache allowances, not durable storage promises.
 
 | Dimension | Authority and writer | Aggregation / enforcement |
 |---|---|---|
-| Stream hours | Stream worker `play_events` → `usage_ledger.stream_seconds` | Sum daily rows in the UTC calendar month; cached plays count equally |
+| Stream hours | Stream worker inserts immutable `(event_id, played_at)` events and increments `usage_ledger.stream_seconds` from inserted rows in the **same transaction** (ADR 0002) | Sum daily rows in the UTC calendar month; cached plays count equally; duplicate delivery adds zero |
 | Ingest jobs | API accept transaction inserts `ingest_jobs` and increments `usage_ledger.ingest_jobs` once per idempotency key | Current UTC day's row; queue retries do not count as new jobs |
 | Cache bytes | Live join of `user_cache_grants` with `cache_objects.byte_size`; stream publication / GC change the grants | Gauge, never a monthly sum: count each hash once per user; compare with `plans.cache_bytes_budget` |
 | Library tracks | `library_tracks` written at ingest `write` stage and on library edits | Count distinct tracks across that user's libraries |
@@ -65,13 +65,18 @@ there is no provisional `trialing` DB row with a NULL Stripe id.
 - Trial caps apply only while `status='trialing' AND now() < trial_end`.
   `active` on the free price is never entitled. A late webhook therefore
   cannot extend free access. After expiry the result is a hard paywall.
-- A paid choice updates the **same** Stripe subscription/item and explicitly
-  ends the trial; it never creates a competing subscription while that one is
-  live. Paid caps require the selected paid price, consent and confirmed paid
-  invoice coverage (ADR 0005), not a checkout redirect or the $0 trial invoice.
-- Only failed **renewals of an already paid subscription** get seven days of
-  grace. A failed first payment grants no paid access. Grace is a local access
-  deadline, not permission to create a second billable subscription.
+- A paid choice submits a `pending_if_incomplete` update of the **same** Stripe
+  subscription/item, ending the trial only on successful payment. Unpaid or
+  abandoned confirmation preserves the original trial deadline/cancellation;
+  the pending invoice expires within Stripe's bounded window (ADR 0005). It
+  never creates a competing subscription. Paid caps require consent, a price
+  resolved through the environment's relational `plan_prices` mapping, and
+  confirmed paid invoice coverage, not a redirect or the $0 trial invoice.
+- Active paid renewals retain the last confirmed plan/cache budget for the fixed
+  **3-hour settlement allowance** in ADR 0002, excluding scheduled cancellation.
+  Only failed **renewals of an already paid subscription** get seven days of
+  grace. No first-payment allowance or paid access. Neither deadline slides on
+  retries or permits a second billable subscription.
 - Trial requires a BYOP provider. Resubscription does not reset trial history.
 
 Prices and quotas are plan data, not code. Changes to advertised prices still
