@@ -79,6 +79,35 @@ cargo fmt --all --check
 No network, no Cloudflare account, no secrets: the synthetic NNTP server
 lives in `tests/stream_integration.rs` and serves canned yEnc multipart articles.
 
+## Metering reconciliation (deduped usage ledger)
+
+Complete-play metering converges at the usage ledger, never in the meter.
+The meter (`meter.rs`) stays an append-only fact log: every `BytesServed`
+emission is recorded verbatim, so a redelivered play still shows up twice
+in the raw events. The ledger is the dedup point.
+
+- Idempotency key: `derive_play_idempotency_key(user_id, track_id,
+  play_id)` returns `play:{user}:{track}:{play}` and rejects any field
+  that is empty or contains `:` or NUL. Redelivery derives the same
+  idempotency key; a genuine second listen carries a different `play_id`
+  and bills separately.
+- Dedup rule: `UsageLedger::record` converges redeliveries to one entry —
+  first write wins, mismatch is flagged, never silently adjusted. A
+  duplicate never appends, sums into, or overwrites the existing entry,
+  even when its byte count disagrees. Production keys the Hyperdrive
+  usage-ledger table `UNIQUE(idempotency_key)`, converging
+  `ON CONFLICT (idempotency_key)` like the ingest upsert.
+- Reconcile pass: `reconcile(plays, ledger, meter)` checks each distinct
+  play (first occurrence authoritative) against the ledger. A play whose
+  ledger entry is missing, or whose metered bytes differ from the entry's
+  bytes, emits exactly one `ReconcileMismatch` meter event (carrying the
+  metered byte count) under the Analytics Engine metric
+  `play_reconcile_mismatch`, plus a single-line structured log
+  (`event=play_reconcile_mismatch idempotency_key=… user_id=…
+  track_id=… metered_bytes=… ledger_bytes=…`, with
+  `ledger_bytes=missing` when there is no entry). The pass takes
+  `&UsageLedger` and never adjusts, backfills, or drops an entry.
+
 ## Production notes
 
 - Deploy bindings: `wrangler.toml` (`NntpPool` DO, `AUDIO_CACHE` R2,
