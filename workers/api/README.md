@@ -56,9 +56,12 @@ page never auto-redeems (login CSRF): it scrubs the token from the URL
 and waits for an explicit confirm, `magic/finish` refuses to swap an
 existing session for a different account without burning the token,
 and the provider wizard shows "Signed in as …" before any credential
-is typed. A swap-guarded failure names the still-signed-in account on
-the page and offers sign-out (`POST /v1/session/logout`), after which
-the unspent link redeems. Typo-class register failures (wrong emailed code, wrong
+is typed. A swap-guarded failure always offers sign-out
+(`POST /v1/session/logout`), after which the unspent link redeems; it
+names the still-signed-in account only when this browser tab knows it
+(the display-only sessionStorage label), otherwise it says to sign out
+first when signed in elsewhere. A failed sign-out keeps the button and
+shows "Could not sign out. Try again." instead of success. Typo-class register failures (wrong emailed code, wrong
 invite code) are pre-validated before either single-use claim, so a
 corrected retry against the same challenge still enrolls.
 
