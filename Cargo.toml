@@ -1,3 +1,6 @@
 [workspace]
-members = ["workers/stream"]
+members = ["crates/nntune-core", "workers/stream"]
+# workers/api and workers/ingest are standalone crates (no [workspace] table):
+# exclude them so this parent workspace never swallows them.
+exclude = ["workers/api", "workers/ingest"]
 resolver = "2"
