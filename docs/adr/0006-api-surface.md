@@ -92,13 +92,19 @@ least-privilege credential.
   self-assert another user's rows: a playlist write needs the same library
   membership reads need plus an own track source, and entries whose track left
   every caller library stay as dormant tombstones (stable positions/counts;
-  stream/scrobble 404/70) until re-added. `getCoverArt` takes only the opaque
-  `coverart:{release_id}` id from `getAlbum`/`getSong`/`search3`, resolves it to
-  its release and primary `release_art` row (ADR 0002 §6, ingest `write` stage;
-  tag-embedded art for local releases, Cover Art Archive for verified ones),
-  checks the caller can read that release, then serves the bytes with the grant
-  check — never by bare content hash. A new endpoint that takes or returns a
-  catalog id is denied until it declares how it applies this gate.
+  stream/scrobble 404/70). Retain their encrypted own source while any own playlist
+  entry survives; re-adding the same track restores membership, then an own-provider
+  fetch recreates evicted audio media/grants (ADR 0002 rule 3). Neither a dormant
+  entry nor its retained source authorizes a read. `getCoverArt` takes only the
+  opaque `coverart:{release_id}` id from `getAlbum`/`getSong`/`search3` and checks
+  release membership **before** resolving `release_art`, reading bytes or refilling.
+  The primary is the sole launch rendition, `original`. Art uses membership alone,
+  **no audio grant**: the post-write `art` stage/refill uses embedded selectors from
+  the local owner's current member-track sources, or CAA from a verified release
+  MBID (ADR 0003). Expired/missing art pointers or objects use that same bounded
+  refill; unavailable art returns 404/70, temporary upstream failure a retryable
+  error. Serve privately, never by raw hash or public R2 URL. A new endpoint that
+  takes or returns a catalog id is denied until it declares how it applies this gate.
 - The REST OpenAPI spec is generated from code (Rust types → schema), checked
   into the repo, and CI-diffed: spec drift fails the build.
 - Subsonic responses are adapters over the same handlers, not a parallel

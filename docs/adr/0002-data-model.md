@@ -124,11 +124,14 @@ tracks                id PK, mbid UUID NULL INDEXED (MB recording, NOT unique),
                       release_id FK NOT NULL, title, medium_no INTEGER NOT NULL,
                       track_no INTEGER NOT NULL, duration_ms,
                       UNIQUE (release_id, medium_no, track_no)
-release_art         release_id FK → releases ON DELETE CASCADE,
-                      content_hash FK → cache_objects, source_job_id FK → ingest_jobs,
+release_art           release_id FK → releases ON DELETE CASCADE,
                       rendition TEXT NOT NULL DEFAULT 'original',
-                      is_primary BOOLEAN NOT NULL DEFAULT FALSE,
-                      created_at, PK (release_id, content_hash, rendition)
+                      source_kind TEXT NOT NULL ('embedded'|'caa'),
+                      content_hash TEXT NULL FK → cache_objects ON DELETE RESTRICT,
+                      last_served_at NULL, retry_after NULL,
+                      last_failure TEXT NULL ('unavailable'|'transient'),
+                      created_at, updated_at,
+                      PK (release_id, rendition) -- durable source, nullable cache pointer
 library_tracks        library_id FK, track_id FK, added_at, PK (library_id, track_id)
 track_sources         user_id FK, track_id FK, source_job_id FK → ingest_jobs,
                       indexer_id FK NULL, nzb_ref_encrypted BYTEA
@@ -141,7 +144,8 @@ user_cache_grants     user_id FK, content_hash FK → cache_objects,
                       provider_id UUID NOT NULL,
                       FK (user_id, provider_id) → providers(user_id, id) ON DELETE RESTRICT,
                       verified_at, last_served_at, PK (user_id, content_hash)
-cache_objects         content_hash TEXT PK (sha256 hex), byte_size BIGINT, r2_key TEXT,
+cache_objects         content_hash TEXT PK (sha256 hex), byte_size BIGINT,
+                      r2_bucket TEXT, r2_key TEXT,
                       ref_count BIGINT (advisory), created_at, last_verified_at
 playlists             id PK, user_id FK, name, created_at
 playlist_tracks       id PK, playlist_id FK, track_id FK, position INTEGER,
@@ -271,16 +275,33 @@ native REST (ADR 0006).
   encrypted `track_sources` in one transaction. Preserve an ordered per-track
   segment manifest or recoverable NZB with file/track selection. A short-lived
   URL or the existing 30-day `INGEST_PAYLOADS` KV entry is not a lifetime source.
-  Unmatched tracks have local ids and NULL MBIDs. This stage writes no media hash.
+  Unmatched tracks have local ids and NULL MBIDs. This stage writes no media hash;
+  it also inserts idempotent `release_art` source descriptors with NULL cache
+  pointers, then checkpoints a continuation to the post-write art stage (ADR 0003).
+- **Post-write `art` stage / cover-art cache refill:** acquire/validate art and put
+  R2 bytes outside SQL, then publish the cache pointer in a short transaction
+  (ADR 0003). Art is authorized by library membership, not audio grants.
 - **Stream worker, after full own-provider fetch and hash verification:**
   `cache_objects`, per-user `track_media`, and `user_cache_grants`. Initialize
   both `last_served_at` columns and refresh the grant/served mapping on serve.
 
-Eviction removes grants, then orphaned mappings, then unreferenced objects (ADR
-0003); it never removes sources. Final removal from all of a user's libraries
-removes that user's source/mappings, not other users' copies. A live grant is
-required even when an object or track id is known. `cache_bytes` is a live
-SUM of object sizes across that user's unique grants, not a daily/monthly flow.
+Audio eviction removes grants, then orphaned mappings, then unreferenced objects
+(ADR 0003); it never removes sources. Final removal from all of a user's libraries
+removes that user's media mappings and unneeded grants, not other users' copies.
+Retain the encrypted `track_sources` while **any own library membership OR own
+playlist entry** references that track. Delete the source only when both counts
+are zero, including after playlist-entry/playlist deletion. Serialize membership,
+playlist and source cleanup for `(user_id, track_id)` in one transaction; a
+concurrent re-add must not lose its source. For a local release, **every** source
+insert/delete/replace and membership change takes the release serialization first
+(ADR 0003) and, in that same transaction, clears its art pointer, timestamp and
+negative-cache fields and advances `updated_at`. This includes final-reference
+cleanup, not only a newer ingest; do not keep serving old artwork until TTL expiry.
+A retained source is recovery data,
+not read/stream authorization: dormant entries still fail the library gate.
+A live audio grant is required even when an object or track id is known.
+`cache_bytes` is a live SUM of object sizes across that user's unique audio grants,
+not a daily/monthly flow; artwork uses the separate lifecycle in ADR 0003.
 
 ### 4. Subscription slots are not the same as entitlement
 
@@ -408,6 +429,10 @@ file. Each entry carries:
   PAR2, NFO and other non-audio files never consume an ordinal.
 - `source_selector`: exact NZB file/ordered segments, plus archive-member/audio
   selection where applicable, sufficient to reconstruct that audio file later.
+- Optional `embedded_art_selector`: tag container, picture-block ordinal and
+  declared MIME type within that selected audio file, frozen by the tag producer.
+  Copy it with `source_selector` into the encrypted lifetime `track_sources`
+  payload. It locates bytes for later validation, never an arbitrary URL or grant.
 - Separate job-local `artist_group_ref` and `release_group_ref`, so one artist can
   span several releases. Each release group refers to one artist group in this
   model. These are catalog grouping references, **not NZB `<group>` newsgroups**.
@@ -419,45 +444,50 @@ The producer orders audio selections by original NZB file order, then archive
 member path in bytewise order and audio-selection index, assigns ordinals once,
 and freezes grouping and selection with them. Grouping is job-local only (the
 local key embeds the job id, so it cannot merge another tenant's rows); MBIDs are
-the stronger signal, normalized text is the fallback. **Candidate set** means the
-set of accepted manifest entries sharing one normalized album-title text within
-this `(user_id, job_id)`. A multi-album NZB is partitioned by normalized
-album-title text first; each title partition groups independently, so album X by
-A and album Y by B never merge. Normalization is trim, case-fold and collapse
-internal whitespace throughout. Within this job, the artist group key is the
-claimed album-artist MBID when non-NULL, else the claimed track-artist MBID;
-the release group key is the claimed release MBID when non-NULL. Entries with
-equal non-NULL release MBIDs form one release group even when their artist MBIDs
-differ (compilation): that release group hangs under a single Various-Artists
-holder artist group for this job, and per-track artist credits stay in the
-manifest/file tags — explicitly deferred, not normalized artist rows — until a
-later ADR defines them. When MBID keys are absent, group by normalized
-(album-artist text, album-title text); album-artist text means the
-albumartist/TPE2 tag when present, else the single common track-artist text
-across that title partition. Disc is never part of any group key; it is recorded
-only as the track's `medium_no` after grouping. Entries sharing that text pair
-form one release/artist group. When album-artist text is absent for a title
-partition (no TPE2 and no single common track-artist text), strip featuring
-suffixes from each track-artist text (case-insensitive trailing ` feat. X`,
-` ft. X`, ` featuring X`, ` with X`) and count stripped texts: if one stripped
-artist text covers at least two-thirds of the partition's entries, group the
-whole partition as one release under that dominant artist (per-track credits
-still deferred to manifest tags); otherwise group the whole partition by album
-title alone as an untagged compilation under the job-local Various-Artists
-holder, with per-track credits deferred as above. There is no minimum distinct
-artist count: a two-artist split, a duet, or an 11-plus-1 `feat.` album without
-TPE2 all form one release, never one release per track. Only when a title
-partition carries no shared normalized album-title text at all keep separate
-groups per entry. These rules only group local hints; they do not authenticate
-MBIDs. `match` and `write` consume the checkpoint on retry, never regenerate its
-ordinals/groups from changed tags.
+the stronger signal, normalized text is the fallback. Apply grouping in this order:
+
+1. Across the **whole job**, entries with the same syntactically valid non-NULL
+   claimed release MBID form one release group, regardless of differing or absent
+   album-title tags. Different release MBIDs never merge just because titles match.
+   The artist group key is the claimed album-artist MBID when present, else the
+   claimed track-artist MBID. If those artist keys differ within a release-MBID
+   group, put that release under the job-local Various-Artists holder; per-track
+   credits remain in the manifest tags, not normalized artist rows. Missing artist
+   keys use the text/dominant-artist rule below within that release group, without
+   splitting the release. A release MBID is still only a local grouping hint until
+   the trusted mirror resolves an occurrence.
+2. Only entries **without a release MBID** enter text grouping. Here **candidate
+   set** means entries sharing one nonempty normalized album-title text within
+   `(user_id, job_id)`. Partition those entries by title, so album X by A and album
+   Y by B group independently. Never attach a missing-MBID entry to an MBID group
+   by title alone. Normalization is trim, case-fold and collapse internal whitespace.
+   Group by normalized (album-artist text, album-title text); album-artist text
+   means albumartist/TPE2 when present, else a single common track-artist text
+   across that candidate set. Equal text pairs form one release/artist group.
+   Without TPE2 or a single common track artist, strip case-insensitive trailing
+   ` feat. X`, ` ft. X`, ` featuring X`, ` with X` suffixes and count stripped
+   texts. A nonempty artist covering at least two-thirds of the set holds the
+   release; otherwise use the job-local Various-Artists holder. Per-track credits
+   stay in the manifest. There is no minimum distinct artist count: a two-artist
+   split, duet or 11-plus-1 `feat.` album without TPE2 forms one release.
+3. Only when **both release MBID and nonempty album-title text are absent** use
+   separate release groups per entry. An artist MBID alone does not identify an album.
+
+Disc is never a group key; it determines `medium_no` only after grouping. These
+rules group local hints, not authenticated MBIDs. `match` and `write` consume the
+checkpoint on retry, never regenerate its ordinals/groups from changed tags.
 After `match` resolves each entry to an occurrence (mirror-verified or local) and
 before checkpointing classifications, collapse entries resolving to the same
-occurrence within this job in two ordered passes. A claimed `(disc, track)` pair
-alone never collapses anything: it is an untrusted hint. An absent disc (or an
-absent track number) is a missing pair, never an implicit 1; only a positive
-claimed pair participates in duplicate detection. First, within each release
-group, consider entries claiming the same positive `(disc, track)`: collapse
+occurrence within this job in two ordered passes. First derive an **effective
+disc** per release group: if no entry carries a disc tag, use disc 1 for all its
+entries (ordinary single-disc rips). If any entry carries a disc tag, each entry
+needs its own positive disc value; absent, malformed or nonpositive values remain
+missing. An absent/invalid track number is always missing. Freeze effective discs
+in the manifest before dedup; all references to claimed pairs below use this
+normalization. It never supplies a missing **mirror** position or authorizes a
+global match. A positive `(disc, track)` pair alone never collapses anything:
+it remains an untrusted hint. First, within each release group, consider entries
+with the same positive effective `(disc, track)`: collapse
 them only when identity also agrees — for mirror-verified entries only when
 `match` resolved both to the same occurrence key, for local entries only when
 the claimed pair is equal AND (normalized titles agree AND durations agree
@@ -566,29 +596,34 @@ ownership is derived, not a
 new column: parse the row's `local_key` job id → `ingest_jobs.user_id`; that user
 is the sole owner, and the library-scope rule already restricts reads to it.
 Mirror-verified global rows (when they ship) use the same membership gate: shared
-metadata is readable only for tracks in the caller's library. This covers bytes
-(grant rule) and metadata uniformly. Cover art data path: `release_art`
-links a release to its art objects (`content_hash` → `cache_objects`, written
-by the ingest `write` stage — tag-embedded art for local releases, MusicBrainz
-Cover Art Archive fetch for mirror-verified releases — with the art bytes stored
-under the environment-qualified `nntunev2-art-{staging,prod}` bucket per ADR
-0003 and served only with a `user_cache_grants` row for that hash). The
-`coverArt` id handed to clients inside `getAlbum`, `getSong` and `search3`
-entries is the opaque release-derived id `coverart:{release_id}`, never the raw
-content hash. `getCoverArt` resolves that id to its release, checks the caller
-can read the release through the same library gate, then serves the primary
-`release_art` row (`is_primary`, latest `created_at` tie-break) with the grant
-check; a non-member art id, an unknown id, or a raw-hash request returns 404
-(native) or Subsonic error 70. Play/scrobble writes resolve the played track
+metadata is readable only for tracks in the caller's library. Audio additionally
+requires its own-provider grant. **Artwork is membership-authorized metadata:**
+there are no art grants and art never contributes to `cache_bytes`. `release_art`
+holds a durable source descriptor and a nullable cache pointer; ingest `write`
+records the descriptor, then a separate idempotent **post-write `art` stage**
+acquires and caches bytes (ADR 0003). Local releases use tag-embedded art selected
+from an own current `track_sources` payload; verified global releases use only
+Cover Art Archive via the trusted release MBID, never tenant artwork. The schema
+has one row per `(release_id, rendition)`; launch supports only `original`, which
+is therefore the primary. Other sizes/renditions are deferred, not extra rows or
+unbounded transforms. `content_hash=NULL` means uncached, not unrecoverable;
+ADR 0003 defines refill and FK-safe expiry.
+
+The `coverArt` id in `getAlbum`, `getSong` and `search3` is the opaque
+`coverart:{release_id}`, never the raw hash. `getCoverArt` checks release membership
+**before** resolving the art descriptor, reading R2 or scheduling a refill. It
+serves the original from `nntunev2-art-{staging,prod}`, or takes the art-specific
+refetch path. A non-member, unknown id, unavailable artwork or raw-hash request
+returns 404 (native) / Subsonic error 70; temporary upstream failures are retryable
+errors, not a cross-user fallback. Play/scrobble writes resolve the played track
 through the same memberships before accepting the event.
 
 Membership writes are ownership-checked, so membership cannot be self-asserted.
-A `library_tracks` row may only reference a track whose owner (via
-`releases.local_key` → `ingest_jobs.user_id`) is the caller, or which the
-caller already holds through an own `track_sources` row. For mirror-verified
-global rows, an own `track_sources` row — created only by the ingest `write`
-stage, never by a library edit — is required before any membership for that
-track can exist. A `playlist_tracks` row requires both: the caller owns the
+A `library_tracks` row requires an own `track_sources` row, inserted in the
+same ingest transaction or already retained. For a local track the owner (via
+`releases.local_key` → `ingest_jobs.user_id`) must also be the caller; for a
+mirror-verified global track the own source proves the caller's import. Only
+ingest `write` creates sources, never a library edit. A `playlist_tracks` row requires all three: the caller owns the
 playlist, the track is in at least one of the caller's libraries (library
 membership, the same predicate reads use), AND the caller holds an own
 `track_sources` row for it (source predicate). Library edits move or copy only
@@ -607,8 +642,13 @@ entries for it: the rows are retained with stable positions and counts, but
 become dormant — reads return the entry id and position with a
 `dormant: track not in any library` tombstone instead of track metadata, and
 `stream`/`scrobble` for a dormant entry return 404 (native) or Subsonic error
-70. Re-adding the track to any of the caller's libraries re-activates the
-entries without reordering.
+70. The retained own `track_sources` row (rule 3) permits re-adding that same
+local or verified track to an own library; this re-activates the entries without
+reordering. Deleted media/grants are rebuilt by a full own-provider fetch before
+streaming. If neither library nor playlist references remained and the source was
+deleted, a library edit cannot restore playable content: require a new ingest.
+Ownership of a local id alone must not create a source-less membership; existing
+track re-adds also require the retained own source. Dormancy does not bypass caps.
 
 Implementation acceptance covers concurrent cross-user and same-user/different-job
 imports of one matched release position (one global row, one library count), with
@@ -649,13 +689,18 @@ retaining its `release_mbid_hint` without guessing. Also require:
   `audio_ordinal`; loser checkpointed as `duplicate_of` and listed in the job
   result); no statement carries a repeated key and no 21000 occurs. A local
   12-track album plus 12 duplicate-format copies with identical tags yields 12
-  tracks with the claimed disc and track numbers preserved.
+  tracks with the claimed disc and track numbers preserved. With track tags 1–12
+  and **no disc tag on any file**, 12 FLAC + 12 MP3 copies still yield 12 tracks
+  at effective disc 1 / claimed tracks 1–12, not 24 ordinal tracks.
 - Distinct identities sharing a claimed position are never dropped: 12 singles
   sharing one album title with distinct artists and every file tagged track 1/1
   import as 12 tracks (identity disagreement forces the whole-group
   `(1, audio_ordinal)` fallback); two entries claiming one position but resolved
-  by the mirror to different occurrences both write. An absent disc tag is a
-  missing pair (whole-group fallback), never an implicit disc 1.
+  by the mirror to different occurrences both write. In a **mixed tagged/untagged
+  disc group**, an absent disc remains missing and triggers the local whole-group
+  fallback. A malformed/zero disc does not qualify as the all-tags-absent case;
+  missing/invalid track tags still trigger fallback. Mirror NULL positions remain
+  unknown regardless of the local effective-disc rule.
 - Resolved-key artist/release collapse: two text groups in one job
   (`The Beatles`/`Beatles, The` artists, `Abbey Road`/`Abbey Road (Remastered)`
   releases) resolving to the same verified mirror artist and release complete
@@ -671,17 +716,34 @@ retaining its `release_mbid_hint` without guessing. Also require:
   release MBID hangs under the Various-Artists holder with per-track credits
   deferred to manifest tags. Disc is never a group key: a two-disc text-only
   album (disc 1/disc 2 tags, one title) yields one release with `medium_no` 1
-  and 2.
-- Playlist/library consistency: adding track T to library L and playlist P, then
-  removing T from every caller library, leaves P's rows with stable positions
-  and counts but dormant entries (tombstone, no metadata; stream/scrobble
-  404/70); re-adding T re-activates them in place. Deleting a library holding
-  playlist tracks behaves the same; playlist rows survive, memberships cascade.
-  A playlist write for a track in no caller library is rejected.
-- Cover art: B requests A's local release art by its `coverart:{release_id}` id
-  and by the raw content hash and gets 404 (native) or Subsonic error 70 in both
-  cases; the owner resolving the same id through an own library gets the bytes
-  with the grant check.
+  and 2. Twenty-four files with one release MBID and titles `X [CD1]` / `X [CD2]`
+  form **one** release with media 1 and 2, even before the mirror projection ships;
+  a shared release MBID with no album titles also forms one local release. Distinct
+  MBIDs with equal titles stay separate, and no-MBID title-only groups still work.
+- Playlist/library consistency: for both a local and a mirror-verified track T,
+  remove T from its last library while P references it. Assert stable P entry ids,
+  positions and counts, tombstones/no metadata and stream/scrobble 404/70; the own
+  source survives but audio mappings/unneeded grants do not. Re-add the **same T**
+  and assert entries re-activate in place and own-provider fetch makes streaming
+  work. Deleting the last playlist entry (or playlist) with no library membership
+  deletes the source; subsequent library-only re-add is rejected for both track
+  types. A non-final membership removal retains the source. Race re-add against
+  final-reference removal: no committed membership may lack its source. A playlist
+  write for a track in no caller library is rejected.
+- Cover art: B requests A's local art by `coverart:{release_id}` or raw hash and
+  receives 404/70 **before any fetch**. A's member request refills embedded art from
+  an own current source; a verified-release member refills CAA art without a
+  provider id. Neither creates an audio grant nor changes the cache-bytes gauge.
+  Expire the art pointer after 30 idle days, then sweep: no FK failure, descriptor
+  retained, authorized refetch works. A missing R2 object uses the same refill.
+  Test post-write retry, crashes before/after pointer publication, two authorized
+  concurrent refills, GC racing publication, source replacement during embedded
+  fetch, and membership removal before publication/serve. No stale source, missing
+  byte object or another user's local art may be served; unavailable art is 404/70.
+  Assert the post-write stage acts as the job owner, not a system principal;
+  repeated negative hits do no upstream work before `retry_after`, and a source
+  change clears that wait. Final-reference cleanup invalidates local art in the
+  same transaction, and an expired refill lease cannot publish.
 
 ### 7. Existing migrations stay at their applied paths
 
@@ -728,6 +790,11 @@ work. Production DB creation/migration remains gated by the ops contract.
   file associations by zipping the two legacy flat arrays. Until this producer
   ships, every catalog association remains local; existing legacy writes are not
   evidence that the target manifest or normalized writer already exists.
+- **Artwork (new alignment work):** add the manifest's embedded-art selector,
+  durable `release_art` descriptor/cache fields, the post-write `art` stage and
+  authenticated refill, source-change invalidation, negative caching and the
+  three-reference-set GC contract in ADR 0003. Existing `write` remains SQL-only;
+  no current Worker is claimed to implement this lifecycle.
 - **MusicBrainz mirror (merged):** the current `mb_recording` shape cannot provide
   the per-release medium/track occurrence required by this catalog key. Revise
   ADR 0007 and add a forward-only mirror migration for a tracklist relation keyed

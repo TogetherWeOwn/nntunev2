@@ -14,13 +14,18 @@ per-user authorization. Provisioned per-environment buckets are
 
 ## Decision
 
-**Shared content-addressed storage with per-user serve grants.** A global
-`cache_objects` row is a storage index, never authorization. Serving bytes
+**Shared content-addressed storage with per-user audio serve grants.** A global
+`cache_objects` row is a storage index, never authorization. Serving **audio**
 requires both a per-user `track_media` mapping and a
 `user_cache_grants(user_id, content_hash)` row. A grant is created only after
 that user's own provider fetched and hash-verified the bytes. Knowing a hash
 or adding another user's track to a library confers no access. Per-user mappings
 also prevent one user's bad match from poisoning everyone else's track.
+
+**Artwork is library-scoped metadata, not audio.** It uses `release_art` and the
+membership gate in ADR 0002 §6, never `track_media` or `user_cache_grants`.
+No art grant exists, no provider id is fabricated for an HTTP fetch, and art
+is excluded from the per-user `cache_bytes` gauge. Audio's grant rule is unchanged.
 
 `cached_hit` is server-side telemetry only. Do not return it or hit/miss headers,
 expose hash-existence endpoints, or skip the own-provider proof because another
@@ -32,8 +37,8 @@ resistance still needs security testing, not a claim based only on headers.
 ```text
 nntunev2-audio-{staging,prod}    # immutable audio bytes
   {sha256hex[0:2]}/{sha256hex[2:4]}/{sha256hex}
-nntunev2-art-{staging,prod}      # deterministic artwork renditions
-  {sha256hex[0:2]}/{sha256hex[2:4]}/{sha256hex}-{size}
+nntunev2-art-{staging,prod}      # validated artwork, original only at launch
+  {sha256hex[0:2]}/{sha256hex[2:4]}/{sha256hex}
 nntunev2-archive-{staging,prod}  # retention-checked reserve, not scratch
 ```
 
@@ -54,11 +59,13 @@ environment-qualified art bucket, not an invented unsuffixed bucket.
    recoverable NZB), not just an expiring download URL. Unmatched, conflicting or
    unverifiable occurrences get local ids with NULL canonical MBIDs. Tenant tags
    and positions cannot populate shared catalog rows; only mirror-verified
-   occurrences and MusicBrainz metadata can. Ingest publishes no audio hashes
-   or cache grants. The same `write` stage writes `release_art` rows (ADR 0002
-   §6): tag-embedded art for local releases, Cover Art Archive fetch for
-   mirror-verified releases, stored under the environment-qualified art bucket;
-   art bytes are served only with a per-user grant, never by bare hash.
+   occurrences and MusicBrainz metadata can. This transaction publishes no hashes
+   or cache grants. It inserts `release_art(release_id, rendition='original',
+   source_kind, content_hash=NULL)` descriptors idempotently, without clearing an
+   existing cache pointer on replay. `embedded` is valid only for a local release;
+   `caa` only for a mirror-verified release. The Workflow durably checkpoints the
+   resulting release ids and then advances to the separate `art` stage below;
+   a crash before checkpointing replays the idempotent `write`, not a new import.
 3. **Stream publication:** fetch through the requesting user's provider,
    verify the complete object's hash, then publish `cache_objects`,
    `track_media` and `user_cache_grants` for that user. Initialize both
@@ -72,11 +79,89 @@ environment-qualified art bucket, not an invented unsuffixed bucket.
    is 404; upstream unavailability is a retryable fetch error, not permission to
    borrow another user's grant. Eviction never deletes `track_sources`.
 
-The source survives for the life of the user's track. Removing one library
-membership must not remove it while the track remains in another of that user's
-libraries. Removing the final membership deletes that user's source and mappings;
-a grant can be released when no other mapping for that user needs its hash.
-Sources use the versioned, row-bound encryption contract in ADR 0002.
+Retain the encrypted source while any of the user's libraries **or playlist
+entries** references the track (ADR 0002 rule 3). Final library removal deletes
+that user's media mappings and grants not needed by other current mappings, but
+preserves the source for dormant playlist entries. They cannot read/stream until
+an own-library re-add passes the same source and cap checks; then a full
+own-provider fetch rebuilds media/grants. Removing the last playlist reference
+while no library holds the track deletes the retained source. Membership changes,
+playlist deletion and source cleanup serialize on `(user_id, track_id)` and
+recheck both reference sets in one transaction. For local releases, acquire the
+release serializer first; every source insert/delete/replace or membership change
+also clears `release_art.content_hash`, `last_served_at`, `retry_after` and
+`last_failure`, and advances `updated_at` in that transaction. This covers final
+playlist-reference cleanup as well as newer imports; it invalidates stale art
+immediately instead of waiting for retention. Without either reference, recovery
+requires a new ingest, not a library edit. Sources use ADR 0002's versioned,
+row-bound encryption; retained sources do not retain cached bytes.
+
+### Artwork acquisition, expiry and refill
+
+The new idempotent Workflow **`art` stage runs after `write` commits**, before
+job completion. Its principal is `ingest_jobs.user_id`, verified against the
+checkpoint's job id; it has **no system bypass** of ownership, membership or
+provider checks. It and an authenticated cover-art request use the same refill.
+A per-release application-level serializer (not a SQL transaction) spans the
+**entire refill**, including fetch/validation/PUT; source edits and pointer clears
+use it too. Each attempt has a 30-second end-to-end timeout; a lost serialization
+lease aborts publication, never continues as a stale writer. Network fetch, image
+validation and R2 PUT happen **outside** SQL; a short publication transaction
+upserts `cache_objects` and the nullable `release_art.content_hash` pointer. Store
+both `r2_bucket` and `r2_key` (ADR 0002). Replays reuse the content-addressed object
+and descriptor, not another release/art row. Optional art failure never rolls back
+an imported library: at most three attempts, obeying the retry-after rule below,
+then record unavailable art in the job result. A serve request makes at most one
+attempt; a later authorized request may retry only once eligible.
+
+- **Embedded/local:** require the caller's library membership and local ownership.
+  Select the lowest track id among the caller's current member tracks in that
+  release whose encrypted `track_sources` includes `embedded_art_selector` (tag
+  container/picture-block ordinal/MIME type, frozen in the accepted manifest).
+  Fetch that selected audio via the caller's provider using its lifetime
+  `source_selector`, then extract the indicated picture. Never use another user's
+  source or a tenant URL. If the selected source was removed/replaced, recompute
+  from current sources; if none has art, return unavailable. Snapshot
+  `source_job_id` and recheck it plus membership before publication; stale work
+  cannot republish bytes for a superseded source. Source replacement/removal clears
+  the local release's art pointer under the same release lock; the next refill
+  selects current sources. A playlist-only source does not authorize art reads.
+- **CAA/verified:** derive the front-image request from the trusted
+  `releases.mbid`, not a claimed MBID or tenant URL. Use HTTPS and a fixed
+  Cover Art Archive/image-host allowlist, validating redirects under the same
+  network policy. No provider/grant is required. Tenant embedded art can never
+  overwrite a verified release's art. Recheck the trusted release identity and
+  the requesting user's membership before publication/serve.
+- **Bounds:** accept only fully validated JPEG/PNG/WebP, at most 5 MiB and 16
+  megapixels; reject other types, including SVG, and never trust the declared
+  MIME alone. Launch stores only `original`; other sizes use that image, not
+  unbounded transformations. Hash the validated bytes. Serve through the
+  authenticated handler with private/no-store responses, not a public R2 URL.
+- **Negative results:** under the release serializer, persist `last_failure` plus
+  a fixed `retry_after`: unavailable/CAA 404/no valid embedded art waits one hour;
+  transient fetch/timeout failure waits one minute. Until that deadline, member
+  requests return the stored 404/70 or retryable error without upstream work;
+  requests never slide the deadline. Both Workflow and serve refills obey it.
+  Successful publication clears both fields. Local source/membership changes clear
+  them with the cache pointer, so a new valid source need not wait. A failed stale
+  attempt cannot write a negative result after its source or lease changes.
+- **Retention:** initialize `last_served_at` at publication and refresh on each
+  authorized serve. Art has a fixed **30-day idle window**, independent of plan
+  audio budgets. GC clears stale `content_hash` pointers (and their timestamp)
+  under the same release lock, but retains `source_kind`/release descriptors.
+  A missing pointer **or missing R2 object** triggers the refill above after the
+  membership check. CAA 404/no embedded image yields 404 / Subsonic 70; transport
+  failures yield retryable errors. Never fall back to another user's local art.
+
+Publication, reference clearing and sweep also share the per-hash serialization
+used for audio. Acquire locks in release-then-hash order; a hash-only sweep never
+acquires a release lock. Hold the hash serialization from R2 PUT through pointer
+publication; recheck R2 existence before committing. This closes the PUT/GC gap
+without doing HTTP inside SQL. A crash after PUT but before DB commit leaves an
+unreferenced object: the bucket orphan sweep removes it only after 24 hours and a
+serialized recheck of **all three** reference sets below. A crash after DB commit
+is an idempotent replay. These are required implementation tests, not executed
+runtime tests in this ADR.
 
 ### Accounting and collection
 
@@ -111,10 +196,14 @@ The cache-GC Workflow runs in bounded batches and follows this order:
    user's libraries. Old mappings cannot independently retain objects forever:
    both timestamps are windowed and stale mappings are prunable. A recent grant
    still protects bytes used by another mapping for that user.
-3. Sweep a `cache_objects` row/R2 object only with **zero grants and zero
-   referencing mappings**. Serialize publication and sweep for that hash, and
-   recheck references under that serialization before deleting bytes. DB FKs
-   must not be disabled. Physical-delete failures are retried; they never
+3. Clear expired artwork pointers using the separate 30-day rule above; do not
+   delete their durable descriptors. Audio budget/grant eviction never clears art.
+4. Sweep a `cache_objects` row/R2 object only with **zero `user_cache_grants`,
+   zero `track_media` references and zero non-NULL `release_art.content_hash`
+   references**. Art is explicitly in the mark set; its FK uses RESTRICT, not a
+   cascading descriptor deletion. Serialize publication and sweep for that hash
+   and recheck all three sets before deleting bytes from the stored bucket/key.
+   DB FKs must not be disabled. Physical-delete failures are retried; they never
    restore a removed authorization. `ref_count` is advisory, not the mark set.
 
 Evicting user A's grant frees A's gauge even if user B keeps the object alive.
