@@ -4,6 +4,7 @@
 </svelte:head>
 
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import Artwork from '#lib/player/Artwork.svelte';
 	import { SeekController } from '#lib/player/seekController.js';
 
@@ -24,8 +25,7 @@
 		const attempts = Array.from({ length: 10 }, (_, i) =>
 			controller.seek(i * 1000, i * 1000 + 99)
 		);
-		const outcomes = await Promise.allSettled(attempts);
-		const fulfilled = outcomes.filter((o) => o.status === 'fulfilled');
+		await Promise.allSettled(attempts);
 		// The player must never wedge: one more seek works after the storm.
 		const after = await controller.seek(0, 99);
 		status = 'ready';
@@ -39,8 +39,8 @@
 		};
 	}
 
-	// Smoke-test hook for `page.evaluate`.
-	$effect(() => {
+	// Smoke-test hook for `page.evaluate`, registered on client mount.
+	onMount(() => {
 		(window as unknown as { __seekStorm?: typeof seekStorm }).__seekStorm = seekStorm;
 	});
 </script>

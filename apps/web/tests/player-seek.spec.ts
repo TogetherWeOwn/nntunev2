@@ -1,21 +1,30 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type APIResponse } from '@playwright/test';
+
+/**
+ * `APIResponse` (from the `request` fixture) has no `headerValue` — that
+ * exists only on page `Response`. Read headers via `headersArray`.
+ */
+async function responseHeader(response: APIResponse, name: string): Promise<string> {
+	const headers = await response.headersArray();
+	return headers.find((h) => h.name.toLowerCase() === name.toLowerCase())?.value ?? '';
+}
 
 test('audio is private-cached and artwork is public-immutable', async ({ request }) => {
 	const audio = await request.get('/api/demo/audio');
 	expect(audio.ok()).toBe(true);
-	const audioControl = await audio.headerValue('cache-control');
+	const audioControl = await responseHeader(audio, 'cache-control');
 	expect(audioControl).toMatch(/^private/);
 	expect(audioControl).not.toContain('immutable');
 
 	const artwork = await request.get('/api/demo/artwork');
 	expect(artwork.ok()).toBe(true);
-	const artworkControl = await artwork.headerValue('cache-control');
+	const artworkControl = await responseHeader(artwork, 'cache-control');
 	expect(artworkControl).toMatch(/^public/);
 	expect(artworkControl).toContain('immutable');
 
 	const range = await request.get('/api/demo/audio', { headers: { range: 'bytes=0-99' } });
 	expect(range.status()).toBe(206);
-	expect(await range.headerValue('content-range')).toBe('bytes 0-99/262144');
+	expect(await responseHeader(range, 'content-range')).toBe('bytes 0-99/262144');
 	expect((await range.body()).length).toBe(100);
 });
 
@@ -33,6 +42,11 @@ test('missing artwork falls back to the placeholder with alt text', async ({ pag
 
 test('10x rapid seeks never wedge the player', async ({ page }) => {
 	await page.goto('/demo/player');
+
+	// The hook is registered on client mount; wait for hydration instead of racing it.
+	await page.waitForFunction(
+		() => typeof (window as unknown as { __seekStorm?: unknown }).__seekStorm === 'function'
+	);
 
 	const result = await page.evaluate(async () => {
 		const storm = window.__seekStorm;
