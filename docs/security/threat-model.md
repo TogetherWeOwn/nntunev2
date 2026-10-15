@@ -1,7 +1,7 @@
 # NNTune v2 Threat Model (STRIDE)
 
 Owner: CISO · Status: living document (finding IDs map to Paperclip child cards; card identifiers are never pasted into this public repo) —
-update it when the vault, session, grant, or pool designs change, and re-request
+update it when the vault, session, grant, pool, or ingest-fetch designs change, and re-request
 CISO review on the changing PR.
 
 ## 1. Scope and assumptions
@@ -58,22 +58,29 @@ stream pool (accounts/auth/vault implementation card).
 | Information disclosure | SQL dump, log leak, error echo, backup exposure | Envelope encryption at rest; parameterized queries only; generic errors ("vault unavailable"); `test connection` returns boolean only, never provider banners; backups inherit encryption (ciphertext only) |
 | Denial of service | Vault row hammering; KEK-fetch storms | Rate-limit vault writes + test-connection per user (shared store, not in-memory — serverless); test-connection has dial + total timeouts and per-user concurrency cap |
 | Elevation | SSRF at `test connection` AND at every pool dial: user-supplied host/port aimed at internal targets | **SSRF guard (F-VAULT-01, dial-time invariant):** the check runs on EVERY provider connect, not only at save/test time — a hostname's DNS can change after it is saved. Allowlist scheme/host shape and NNTP ports (119/563 plus documented alternates only); resolve ALL DNS records and reject loopback/link-local/private/unique-local (v4+v6); forbid redirects; dial timeout; pool Worker carries no private-network or service bindings; treat provider host as hostile input. **Pinning is required (one position — ADR 0008, §6, `authorize_pool_dial`):** the transport dials the vetted addresses only, never a second DNS lookup, retaining the hostname for TLS SNI. **Accepted residual (decision), narrow:** ONLY transports that force hostname re-resolution (no IP-dial API) fall back to re-resolution; that DNS-rebinding TOCTOU gap is contained by the per-dial private-range rejection + port allowlist, not eliminated |
+| Elevation | SSRF at Newznab indexer fetch: a user-supplied indexer base URL fetched server-side (same attacker shape as the vault guard, third surface) | **Indexer fetch guard (F-INGEST-01):** https-only, no embedded credentials, 443-only port allowlist (any other explicit port is refused before any dial, so the fetch can never be aimed at another port as a scan primitive); resolve ALL DNS records and reject loopback/link-local (incl. the cloud metadata endpoint)/private/unique-local/CGNAT/multicast/reserved (v4+v6, incl. IPv6 transition space); one private record poisons the whole answer. **DNS-pin invariant per hop:** each hop's host is resolved exactly once and the transport dials only that vetted address set on 443, retaining the hostname for TLS SNI/certificate checks and the Host header — the transport never re-resolves. Every redirect hop is re-validated from scratch (at most 3 hops; the API key is never forwarded to a redirect target). Dial timeout 5000 ms per hop, total fetch timeout 15000 ms; guard blocks answer a stable 4xx, decision logs carry host + code only (full URLs pass through key redaction first) |
+| Elevation | SSRF at NZB fetch-from-URL: a caller-supplied NZB URL fetched server-side | **NZB fetch guard (F-INGEST-02):** https-only, no embedded credentials, no explicit port other than 443; exact-match host allowlist with a deny-all default (a worker without the list refuses every fetch URL); resolve ALL DNS records and reject loopback/link-local (incl. the cloud metadata endpoint)/private/CGNAT/multicast/reserved/documentation (v4+v6, incl. transition space) even for allowlisted hosts — IP literals are checked directly with no DNS call; at most 3 redirect hops, each re-validated from scratch (a forbidden, downgraded, or off-allowlist target is blocked under its own code, never fetched); total timeout 10000 ms with partial bytes never returned; bodies past the 2 MiB intake cap abort; stable 4xx codes; every block is logged as host + code only, never the full URL |
 
 Key rules: KEK rotation is designed day one (versioned keys,
 version-pinned decrypt, online re-wrap job — F-VAULT-02, normative design
 in `kek-rotation.md`); DEK per user, never hard-coded; no credential in
-Analytics Engine, KV, R2, Queues payloads, or error bodies.
+Analytics Engine, KV, R2, Queues payloads, or error bodies. The KEK
+re-wrap follow-up migration (F-VAULT-03, normative design in
+`kek-rotation.md` §§2, 6, 8) adds `rewrapped_at` + a `kek_version`
+index: re-wrap passes stamp `rewrapped_at` per row (until the migration
+lands, progress is tracked in `rotation_runs` with `updated_at` as the
+last-touch signal) and per-version counts drive the retire gate.
 
 ## 4. Sessions, passkeys, magic links (STRIDE)
 
 | Threat | Attack | Mitigation (required) |
 |---|---|---|
-| Spoofing | Session theft / fixation; WebAuthn registration hijack | Signed cookies (`httpOnly`, `Secure`, `SameSite=Lax` minimum), server-side session row, rotation on privilege change; WebAuthn RP ID pinned to the real origin; challenge single-use + short expiry |
+| Spoofing | Session theft / fixation; WebAuthn registration hijack | Signed cookies (`httpOnly`, `Secure`, `SameSite=Lax` minimum), server-side session row, freshness-gated privilege changes (re-auth + new session id — see Elevation row); WebAuthn RP ID pinned to the real origin; challenge single-use + short expiry |
 | Tampering | Cookie editing; magic-link reuse | Cookies are signed (secret from env, never code); magic-link tokens are cryptographic-random (≥128-bit), hashed at rest, single-use, ≤15-min expiry |
 | Repudiation | Disputed logins | Audit log: login/register/magic-link issue+consume/session revoke/account-email change (who/when/result) |
 | Information disclosure | Session/token leak via logs or error pages | No token material in logs or error bodies; login errors are generic ("check your email") — no user-enumeration oracle |
 | Denial of service | Magic-link email bombing; auth-endpoint hammering | Strict rate limits on auth endpoints (shared store), email-send cooldown per address; invite-code gate if abuse appears |
-| Elevation | Fixed/forever sessions; leaked logout; account-email takeover (there are no passwords — whoever controls the account email controls the account via magic link, so changing it is the main takeover/persistence path) | Bounded `maxAge`, rotation, explicit revoke-all on passkey add/remove; every endpoint re-checks authz, not just auth. **Email change requires** fresh passkey authentication (or confirmation via the OLD address), notification to the old address with a revert link, and revocation of ALL sessions plus outstanding magic links; the change is audit-logged (see Repudiation row) |
+| Elevation | Fixed/forever sessions; leaked logout; stale session used for a privilege change; account-email takeover (there are no passwords — whoever controls the account email controls the account via magic link, so changing it is the main takeover/persistence path) | Bounded `maxAge`, rotation, explicit revoke-all on passkey add/remove; every endpoint re-checks authz, not just auth. **Email change requires** fresh passkey authentication (or confirmation via the OLD address), notification to the old address with a revert link, and revocation of ALL sessions plus outstanding magic links; the change is audit-logged (see Repudiation row). **Privilege-gated operations require fresh authentication (F-SESS-01):** the immutable authentication age (`now - created_at` — rotation preserves `created_at`, so refresh cannot restore freshness) must be within 600 s; an older-but-otherwise-valid session is rejected with the stable `reauth_required` code, and successful re-auth mints a NEW session id while revoking only the old row (single-session revoke, never logout-everywhere). Dead sessions (bad signature, revoked, expired) return `invalid_session`, never the re-auth code — no oracle |
 
 ## 5. Signed stream grants (STRIDE)
 
@@ -81,7 +88,7 @@ Stream Worker serves Range requests with R2 cache; grants authorize fetches.
 
 | Threat | Attack | Mitigation (required) |
 |---|---|---|
-| Spoofing | Forged or replayed grant | Grants are MAC-signed (server key), short TTL (minutes), bound to `user_id` + content id; `nbf`/`exp` enforced with clock-skew cap |
+| Spoofing | Forged or replayed grant | Grants are MAC-signed (server key), max 15-minute lifetime (`MAX_GRANT_TTL` = 900 s) enforced at issue AND verify (F-GRANT-01): issuance clamps longer requests to the cap, and verification rejects a validly-signed, unexpired grant whose remaining lifetime (`exp - now`) exceeds the cap plus a 60 s skew allowance as `TtlTooLong` — distinct from `Expired`/`BadSignature`, so "minted too long" is distinguishable in logs and callers; `now >= exp` stays expired (skew never resurrects a grant). Bound to `user_id` + content id |
 | Tampering | Grant edited to another track/user | MAC covers ALL grant fields; any field change invalidates |
 | Repudiation | Disputed fetches for metering | Metering events keyed to authenticated grant (Analytics Engine carries ids, never secrets) |
 | Information disclosure | Grant URL leaks (logs, Referer) | Grants travel in `Authorization` header or POST body, never query strings; cache keys namespaced per user — NEVER serve user A's bytes for user B's grant (cache-poisoning = cross-user disclosure). **Browser media elements** (plain GET + Range, no custom headers): playback auth uses EITHER a fetch/MSE player sending the `Authorization` header, OR a path-scoped, short-TTL, `HttpOnly`/`Secure`/`SameSite=Lax` grant cookie minted alongside the signed grant — never a signed query-string grant; `Referrer-Policy: no-referrer`; logs scrub grant bytes |
@@ -166,7 +173,10 @@ head:
    migration output).
 6. Workflow changes keep least-privilege permissions and no `pull_request_target`.
 7. Auth changes implement the §4 email-change rule (fresh auth, old-address
-   notice + revert, revoke-all); media playback uses a §5 transport (header
+   notice + revert, revoke-all) and the §4 privilege-freshness gate (stale
+   sessions rejected with `reauth_required`; re-auth mints a new id with a
+   single-row revoke); grant mint/verify honors the §5 TTL cap (clamp at
+   issue, `TtlTooLong` at verify); media playback uses a §5 transport (header
    player or grant cookie, never signed query strings).
 8. KEK retire honors backup/PITR retention (`kek-rotation.md` §5, retire-after
    date); a KEK-exposure response follows the §10 compromise path, never
@@ -178,6 +188,11 @@ head:
 |---|---|---|
 | F-VAULT-01 | `test connection` SSRF guard for user-supplied provider host/port | Paperclip child card (mapping in the threat-model card thread, never pasted here) |
 | F-VAULT-02 | KEK rotation + versioning designed day one (re-wrap job) | Normative design: `kek-rotation.md`; tracking on the Paperclip child card (see above) |
+| F-VAULT-03 | KEK rewrap follow-up migration: `rewrapped_at` + `kek_version` index; per-version progress counts | Normative design: `kek-rotation.md` §§2, 6, 8; tracking on the Paperclip child card (see above) |
+| F-SESS-01 | Privilege-change re-auth: 600 s freshness on the immutable auth age, `reauth_required` code, new session id with single-row revoke | Paperclip child card (see above) |
+| F-GRANT-01 | Play-grant TTL cap: 15-min max lifetime clamped at issue, over-cap grants rejected at verify (`TtlTooLong`), 60 s skew bound | Paperclip child card (see above) |
+| F-INGEST-01 | Newznab indexer fetch SSRF guard: https/443-only, resolve-ALL + private-range rejection, per-hop DNS pin, ≤3 re-validated redirects, timeouts | Paperclip child card (see above) |
+| F-INGEST-02 | NZB fetch-from-URL SSRF guard: exact-match host allowlist (deny-all default), resolve-ALL + private-range rejection, ≤3 re-validated redirects, timeout + 2 MiB body cap | Paperclip child card (see above) |
 | F-HYG-01 | Dependabot updates config (alerts ≠ updates) | Paperclip child card (see above) |
 | F-HYG-02 | CI lint banning internal ids/hosts/agent names in public text | Paperclip child card (see above) |
 | F-HYG-03 | PR-template secrets affirmation checkbox | Paperclip child card (see above) |
