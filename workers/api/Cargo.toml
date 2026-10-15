@@ -26,6 +26,18 @@ serde_json = "1"
 zeroize = { version = "1", features = ["derive"] }
 url = "2"
 subtle = "2"
+# WebAuthn signature verification (pure-Rust, wasm32-compatible):
+# ES256 (COSE alg -7) and EdDSA (COSE alg -8) credential public keys.
+p256 = { version = "0.13", default-features = false, features = ["alloc", "arithmetic", "ecdsa"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+# Worker HTTP + Hyperdrive entry (same versions as workers/mb). These
+# compile natively so `cargo test` keeps covering the core handlers;
+# the runtime-only paths live in `worker_entry`.
+worker = { version = "0.3", features = ["http", "tokio-postgres"] }
+tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
+wasm-bindgen-futures = "0.4"
+# Only for the capped request-body stream read in the Worker entry.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 serde_json = "1"

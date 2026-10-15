@@ -36,6 +36,8 @@ pub const DIAL_TIMEOUT_MS: u64 = 5_000;
 pub const TOTAL_TIMEOUT_MS: u64 = 15_000;
 /// Per-user concurrent `test connection` cap.
 pub const MAX_TEST_CONCURRENCY: u32 = 2;
+/// Maximum vetted DNS addresses attempted by one test-connection request.
+pub const MAX_DIAL_ADDRESSES: usize = 4;
 /// Sliding window for the per-user `test connection` rate limit (seconds).
 pub const TEST_CONNECTION_WINDOW_SECS: u64 = 60;
 /// Max `test connection` attempts per user per [`TEST_CONNECTION_WINDOW_SECS`].
@@ -230,13 +232,16 @@ fn resolve_public_target(
     port: u16,
     dns: &impl DnsResolver,
 ) -> Result<ValidatedTarget, VaultError> {
-    let addresses = match host.parse::<IpAddr>() {
+    let mut addresses = match host.parse::<IpAddr>() {
         Ok(ip) => vec![ip],
         Err(_) => dns.resolve(host),
     };
     if addresses.is_empty() || addresses.iter().any(ip_is_forbidden) {
         return Err(VaultError::Invalid);
     }
+    // Validate every answer before retaining a bounded prefix for dialing;
+    // a later forbidden DNS answer must still reject the whole target.
+    addresses.truncate(MAX_DIAL_ADDRESSES);
     Ok(ValidatedTarget {
         host: host.to_string(),
         port,
@@ -274,8 +279,9 @@ pub fn authorize_pool_dial(
 }
 
 impl ProviderConfig {
-    /// Validate shape + SSRF guard and retain ALL vetted addresses for a
-    /// pinned dial. Call at save AND immediately before dial. Every failure
+    /// Validate shape + SSRF guard across ALL resolved addresses, retaining
+    /// at most [`MAX_DIAL_ADDRESSES`] for a pinned dial. Call at save AND
+    /// immediately before dial. Every failure
     /// maps to generic [`VaultError::Invalid`] (no target/existence oracle).
     ///
     /// Transport confidentiality (threat-model §2 "TLS-everywhere"):
@@ -477,7 +483,7 @@ pub fn encrypt_vault(
     let wrap_nonce = random_nonce();
     let wrapped = kek_cipher
         .encrypt(
-            Nonce::from_slice(&wrap_nonce),
+            &Nonce::from(wrap_nonce),
             Payload {
                 msg: &dek.0,
                 aad: dek_aad(user_id, kek_version).as_bytes(),
@@ -490,7 +496,7 @@ pub fn encrypt_vault(
     let payload_nonce = random_nonce();
     let payload = dek_cipher
         .encrypt(
-            Nonce::from_slice(&payload_nonce),
+            &Nonce::from(payload_nonce),
             Payload {
                 msg: plaintext,
                 aad: payload_aad(user_id).as_bytes(),
@@ -516,15 +522,14 @@ pub fn decrypt_vault(
     blob: &VaultBlob,
 ) -> Result<Vec<u8>, VaultError> {
     let kek_cipher = Aes256Gcm::new_from_slice(kek).map_err(|_| VaultError::Crypto)?;
-    let wrap_nonce =
-        crate::b64::decode(&blob.dek_wrapped_nonce_b64url).map_err(|_| VaultError::Invalid)?;
+    let wrap_nonce: [u8; 12] = crate::b64::decode(&blob.dek_wrapped_nonce_b64url)
+        .map_err(|_| VaultError::Invalid)?
+        .try_into()
+        .map_err(|_| VaultError::Invalid)?;
     let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url).map_err(|_| VaultError::Invalid)?;
-    if wrap_nonce.len() != 12 {
-        return Err(VaultError::Invalid);
-    }
     let mut dek_bytes = kek_cipher
         .decrypt(
-            Nonce::from_slice(&wrap_nonce),
+            &Nonce::from(wrap_nonce),
             Payload {
                 msg: &wrapped,
                 aad: dek_aad(user_id, blob.kek_version).as_bytes(),
@@ -542,15 +547,14 @@ pub fn decrypt_vault(
     let dek = Dek(arr);
 
     let dek_cipher = Aes256Gcm::new_from_slice(&dek.0).map_err(|_| VaultError::Crypto)?;
-    let payload_nonce =
-        crate::b64::decode(&blob.payload_nonce_b64url).map_err(|_| VaultError::Invalid)?;
+    let payload_nonce: [u8; 12] = crate::b64::decode(&blob.payload_nonce_b64url)
+        .map_err(|_| VaultError::Invalid)?
+        .try_into()
+        .map_err(|_| VaultError::Invalid)?;
     let payload = crate::b64::decode(&blob.payload_b64url).map_err(|_| VaultError::Invalid)?;
-    if payload_nonce.len() != 12 {
-        return Err(VaultError::Invalid);
-    }
     dek_cipher
         .decrypt(
-            Nonce::from_slice(&payload_nonce),
+            &Nonce::from(payload_nonce),
             Payload {
                 msg: &payload,
                 aad: payload_aad(user_id).as_bytes(),
@@ -570,15 +574,14 @@ pub fn rewrap_dek(
 ) -> Result<VaultBlob, VaultError> {
     // Unwrap with the old KEK (old AAD: old version).
     let old_cipher = Aes256Gcm::new_from_slice(old_kek).map_err(|_| VaultError::Crypto)?;
-    let wrap_nonce =
-        crate::b64::decode(&blob.dek_wrapped_nonce_b64url).map_err(|_| VaultError::Invalid)?;
+    let wrap_nonce: [u8; 12] = crate::b64::decode(&blob.dek_wrapped_nonce_b64url)
+        .map_err(|_| VaultError::Invalid)?
+        .try_into()
+        .map_err(|_| VaultError::Invalid)?;
     let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url).map_err(|_| VaultError::Invalid)?;
-    if wrap_nonce.len() != 12 {
-        return Err(VaultError::Invalid);
-    }
     let mut dek_bytes = old_cipher
         .decrypt(
-            Nonce::from_slice(&wrap_nonce),
+            &Nonce::from(wrap_nonce),
             Payload {
                 msg: &wrapped,
                 aad: dek_aad(user_id, blob.kek_version).as_bytes(),
@@ -594,7 +597,7 @@ pub fn rewrap_dek(
     let new_cipher = Aes256Gcm::new_from_slice(new_kek).map_err(|_| VaultError::Crypto)?;
     let new_nonce = random_nonce();
     let wrap_result = new_cipher.encrypt(
-        Nonce::from_slice(&new_nonce),
+        &Nonce::from(new_nonce),
         Payload {
             msg: &dek_bytes,
             aad: dek_aad(user_id, new_version).as_bytes(),
@@ -674,6 +677,13 @@ mod tests {
         }
     }
 
+    struct ListDns(Vec<IpAddr>);
+    impl DnsResolver for ListDns {
+        fn resolve(&self, _host: &str) -> Vec<IpAddr> {
+            self.0.clone()
+        }
+    }
+
     #[test]
     fn unresolvable_host_rejected() {
         let c = ProviderConfig {
@@ -687,6 +697,38 @@ mod tests {
             allow_insecure_plaintext: true,
         };
         assert!(c.validate(&EmptyDns).is_err());
+    }
+
+    #[test]
+    fn validated_target_retains_only_a_bounded_address_prefix_after_checking_all() {
+        let config = ProviderConfig {
+            host: "news.example.com".into(),
+            port: 119,
+            tls: false,
+            username: "u".into(),
+            password: "p".into(),
+            max_connections: 2,
+            // Opt in so this test exercises the DNS guard, not the TLS gate.
+            allow_insecure_plaintext: true,
+        };
+        let public = ListDns(vec![
+            "8.8.8.8".parse().unwrap(),
+            "1.1.1.1".parse().unwrap(),
+            "9.9.9.9".parse().unwrap(),
+            "4.2.2.1".parse().unwrap(),
+            "208.67.222.222".parse().unwrap(),
+        ]);
+        let target = config.validate(&public).unwrap();
+        assert_eq!(target.addresses().len(), MAX_DIAL_ADDRESSES);
+
+        let forbidden_after_prefix = ListDns(vec![
+            "8.8.8.8".parse().unwrap(),
+            "1.1.1.1".parse().unwrap(),
+            "9.9.9.9".parse().unwrap(),
+            "4.2.2.1".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+        ]);
+        assert!(config.validate(&forbidden_after_prefix).is_err());
     }
 
     #[test]

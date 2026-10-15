@@ -228,6 +228,21 @@ budget and cache freshness against the actual origin limits. Database CONNECT
 isolation does not isolate CPU, connections, storage/I/O, maintenance, or outages, and the
 app single-node allocation must not be described as highly available.
 
+App auth reads require cache-disabled Hyperdrive: the API reads sessions,
+credentials, users, challenges and vaults with plain `SELECT`s through the
+`HYPERDRIVE` binding (`workers/api/src/worker_entry.rs`), which Hyperdrive
+caches by default (60s + 15s stale-while-revalidate, never invalidated by
+writes). The staging/prod app configs (`HYPERDRIVE_ID_STAGING`,
+`HYPERDRIVE_ID_PROD`) MUST be updated with
+`wrangler hyperdrive update <id> --caching-disabled` before the API serves
+traffic; the MB mirror config may stay cached. Deploy checklist (with
+`CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID` exported):
+`workers/api/check_hyperdrive_cache.sh --config-id $HYPERDRIVE_ID_STAGING`
+(and prod) must report `caching.disabled=true`. The gate fails closed
+(exit 3) without credentials; `--allow-skip` is only for secret-less CI.
+Template and contract:
+`workers/api/wrangler.toml.example`, `workers/api/README.md`.
+
 UNDO: consolidation is not reversed by reusing the deleted branch's URLs or by
 blindly restoring the old PS-40 resize command. The authorized host executor's
 consolidation receipt records per-step rollback; consult it with current data,

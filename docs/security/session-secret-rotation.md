@@ -97,7 +97,10 @@ bound under either secret.
 - The Worker builds `SessionKeys` from env as: previous = `Some` ONLY
   when `SESSION_SECRET_PREVIOUS_BASE64` is set AND a rotation is
   recorded; unset means `SessionKeys::single(primary)`. A set-but-short
-  previous fails every verification closed (code-enforced).
+  previous fails every verification closed (code-enforced). Recorded
+  means `SESSION_SECRET_ROTATION=1` is set for the window alongside the
+  staged previous; any other combination (stray previous without the
+  flag, or the flag with nothing staged) refuses to start.
 - The Worker MUST fail closed when `SESSION_SECRET_PREVIOUS_BASE64` is
   set outside a recorded rotation (unexpected second secret = alert).
 - `Set-Cookie` emission is unchanged (`__Host-nntune-session`, `Path=/`,
