@@ -46,12 +46,21 @@ then these fixtures pin the port's v1-derived contract, not v1 bytes.
 - 49 supported endpoints: the v1 authenticated table plus `tokenInfo`
   (reports the caller's username); `getOpenSubsonicExtensions` is public
   (no credentials needed) and claims exactly `apiKeyAuthentication` v1 +
-  `formPost` v1 — `songLyrics` is not claimed because `getLyrics` is a
-  stub, per v1.
+  `formPost` v1; `songLyrics` is not claimed because the legacy `getLyrics`
+  endpoint is still a text-only compatibility stub, per v1.
 - `getUser` roles are v1 `UserResource` exactly (`settingsRole` true,
   `uploadRole`/`coverArtRole` for admin-or-manager, `commentRole` false,
   no `folder`); song entries never emit `bitRate`/`path`/`playCount` and
   always emit empty `transcodedContentType`/`transcodedSuffix`.
+- `getArtists` and `getIndexes` include `ignoredArticles`; index letters strip
+  those articles and place non-alphabetic names under `#`. `getIndexes` uses
+  the v1 `indexes` wrapper and includes `lastModified`.
+- `search3` returns `artist`, `album` and `song` legs, honors per-leg counts,
+  and an empty query pages the whole library by `size`/`offset`.
+- Album lists validate the v1 type set, require year bounds for `byYear` and
+  a genre for `byGenre`, and cap page size at 500.
+- `getLyricsBySongId` returns `lyricsList.structuredLyrics`; missing lyric data
+  yields an empty collection, while an unknown song id remains error 70.
 - Empty-library fixtures assert v1 behaviour with no rows: empty collections
   serialize to self-closed elements (`<artists/>`), never to 404.
 
@@ -66,8 +75,9 @@ then these fixtures pin the port's v1-derived contract, not v1 bytes.
   `43` apiKey mixed with `u`/`p`/`t`/`s`;
   `44` invalid API key; `50` is always
   `User is not authorized for the given operation.`;
-  `70` is always `The requested data was not found.` (v1
-  `SubsonicAwareErrorRenderer`/`findOrFail` texts).
+  `70` uses the `SubsonicAwareErrorRenderer` generic text for `findOrFail`
+  paths; data-not-found controllers preserve their endpoint-specific v1 text
+  (for example `Song not found.` and `Album not found.`).
   `hls.m3u8` is not a Subsonic document: plain HTTP 410 (as in v1,
   matching Navidrome).
 - `p=enc:<hex>` passwords hex-decode as in v1; query decoding is byte-based

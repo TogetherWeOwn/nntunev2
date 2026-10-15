@@ -67,6 +67,17 @@ pub struct PlayQueue {
     pub changed_by: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct AlbumListQuery<'a> {
+    pub identity: &'a Identity,
+    pub list_type: &'a str,
+    pub size: usize,
+    pub offset: usize,
+    pub from_year: Option<i64>,
+    pub to_year: Option<i64>,
+    pub genre: Option<&'a str>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum StarKind {
     Artist,
@@ -109,6 +120,110 @@ pub trait Library: AuthStore {
     fn songs_for_album(&self, album_id: &str) -> Vec<Song>;
     fn song(&self, id: &str) -> Option<Song>;
     fn all_songs(&self) -> Vec<Song>;
+    fn search_artists(&self, query: &str) -> Vec<Artist> {
+        self.artists()
+            .into_iter()
+            .filter(|artist| {
+                query.is_empty() || artist.name.to_lowercase().contains(&query.to_lowercase())
+            })
+            .collect()
+    }
+    fn search_albums(&self, query: &str) -> Vec<Album> {
+        self.all_albums()
+            .into_iter()
+            .filter(|album| {
+                query.is_empty()
+                    || album.name.to_lowercase().contains(&query.to_lowercase())
+                    || album.artist.to_lowercase().contains(&query.to_lowercase())
+            })
+            .collect()
+    }
+    fn search_songs(&self, query: &str) -> Vec<Song> {
+        self.all_songs()
+            .into_iter()
+            .filter(|song| {
+                query.is_empty()
+                    || song.title.to_lowercase().contains(&query.to_lowercase())
+                    || song.album.to_lowercase().contains(&query.to_lowercase())
+                    || song.artist.to_lowercase().contains(&query.to_lowercase())
+            })
+            .collect()
+    }
+    fn album_list(&self, query: AlbumListQuery<'_>) -> Vec<Album> {
+        let AlbumListQuery {
+            identity,
+            list_type,
+            size,
+            offset,
+            from_year,
+            to_year,
+            genre,
+        } = query;
+        let mut albums = self.all_albums();
+        if list_type == "starred" {
+            let starred_albums: HashSet<String> = self
+                .starred(identity, StarKind::Album)
+                .into_iter()
+                .collect();
+            let via_songs: HashSet<String> = self
+                .starred(identity, StarKind::Song)
+                .into_iter()
+                .filter_map(|id| self.song(&id))
+                .map(|song| song.album_id)
+                .collect();
+            albums.retain(|album| {
+                starred_albums.contains(&album.id) || via_songs.contains(&album.id)
+            });
+        }
+        if let (Some(from), Some(to)) = (from_year, to_year) {
+            albums.retain(|album| {
+                self.songs_for_album(&album.id)
+                    .iter()
+                    .any(|song| (from..=to).contains(&song.year))
+            });
+        }
+        if let Some(genre) = genre {
+            let genre = genre.to_lowercase();
+            albums.retain(|album| {
+                self.songs_for_album(&album.id)
+                    .iter()
+                    .any(|song| song.genre.to_lowercase() == genre)
+            });
+        }
+        match list_type {
+            "alphabeticalByName" => albums.sort_by_key(|album| album.name.to_lowercase()),
+            "alphabeticalByArtist" => albums.sort_by_key(|album| album.artist.to_lowercase()),
+            "frequent" => {
+                albums.sort_by_key(|album| std::cmp::Reverse(self.songs_for_album(&album.id).len()))
+            }
+            "byYear" => albums.sort_by_key(|album| {
+                self.songs_for_album(&album.id)
+                    .iter()
+                    .map(|song| song.year)
+                    .min()
+                    .unwrap_or_default()
+            }),
+            "byGenre" => albums.sort_by_key(|album| {
+                self.songs_for_album(&album.id)
+                    .first()
+                    .map(|song| song.genre.to_lowercase())
+                    .unwrap_or_default()
+            }),
+            "highest" => albums.sort_by_key(|album| {
+                std::cmp::Reverse(self.rating(identity, &album.id).unwrap_or_default())
+            }),
+            "random" => albums.sort_by_key(|album| {
+                album.id.bytes().fold(0u64, |hash, byte| {
+                    hash.wrapping_mul(31).wrapping_add(u64::from(byte))
+                })
+            }),
+            "recent" | "newest" => {
+                albums.sort_by(|a, b| b.created.cmp(&a.created).then(a.id.cmp(&b.id)))
+            }
+            _ => albums.sort_by(|a, b| b.created.cmp(&a.created).then(a.id.cmp(&b.id))),
+        }
+        albums.into_iter().skip(offset).take(size).collect()
+    }
     fn genres(&self) -> Vec<(String, i64, i64)>;
     fn audio(&self, song_id: &str) -> Option<Vec<u8>>;
     fn cover(&self, cover_id: &str) -> Option<Vec<u8>>;

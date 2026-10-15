@@ -15,6 +15,8 @@ pub mod session;
 pub mod vault;
 
 #[cfg(target_arch = "wasm32")]
+use futures_util::StreamExt;
+#[cfg(target_arch = "wasm32")]
 use nntune_subsonic::{oversized_body_response, MemStore, SubsonicApp, MAX_BODY_BYTES};
 #[cfg(target_arch = "wasm32")]
 use worker::*;
@@ -51,7 +53,26 @@ pub async fn main(mut req: Request, _env: Env, _ctx: Context) -> Result<Response
     let body = if method.eq_ignore_ascii_case("POST")
         && content_type.contains("application/x-www-form-urlencoded")
     {
-        req.text().await.unwrap_or_default()
+        let mut stream = match req.stream() {
+            Ok(stream) => stream,
+            Err(_) => return Response::error("Unable to read request body", 400),
+        };
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(_) => return Response::error("Unable to read request body", 400),
+            };
+            if bytes.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
+                let res = oversized_body_response(&query);
+                return respond(&res);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        match String::from_utf8(bytes) {
+            Ok(body) => body,
+            Err(_) => return Response::error("Invalid UTF-8 request body", 400),
+        }
     } else {
         String::new()
     };

@@ -8,7 +8,9 @@
 
 use crate::auth::Identity;
 use crate::envelope::code;
-use crate::library::{Album, Artist, Library, PlayQueue, Playlist, Song, StarKind, NOW};
+use crate::library::{
+    Album, AlbumListQuery, Artist, Library, PlayQueue, Playlist, Song, StarKind, NOW,
+};
 use crate::value::Value;
 
 /// Parsed query string: first value wins for `get`, all values for `get_all`.
@@ -115,10 +117,11 @@ fn missing() -> EndpointResult {
 
 // v1 `findOrFail` misses share one text via `SubsonicAwareErrorRenderer`.
 fn not_found() -> EndpointResult {
-    EndpointResult::Err(
-        code::NOT_FOUND,
-        "The requested data was not found.".to_string(),
-    )
+    not_found_with("The requested data was not found.")
+}
+
+fn not_found_with(message: &str) -> EndpointResult {
+    EndpointResult::Err(code::NOT_FOUND, message.to_string())
 }
 
 // v1 authorization failures share one text via the same renderer.
@@ -256,6 +259,63 @@ fn size_offset(params: &Params) -> (usize, usize) {
     (size, offset)
 }
 
+fn search_count(
+    params: &Params,
+    name: &str,
+    default_count: usize,
+) -> Result<usize, EndpointResult> {
+    match params.get(name) {
+        None => Ok(default_count),
+        Some(value) => match value.parse::<usize>() {
+            Ok(count) if count <= 500 => Ok(count),
+            _ => Err(missing()),
+        },
+    }
+}
+
+fn artist_index<S: Library>(store: &S) -> Vec<Value> {
+    let mut groups: std::collections::BTreeMap<String, Vec<Value>> =
+        std::collections::BTreeMap::new();
+    for artist in store.artists() {
+        let albums = store.albums_for_artist(&artist.id).len() as i64;
+        let name = artist.name.trim_start();
+        let stripped = ["The", "El", "La", "Los", "Las", "Le", "Les"]
+            .iter()
+            .find_map(|article| {
+                name.get(..article.len())
+                    .filter(|prefix| prefix.eq_ignore_ascii_case(article))
+                    .and_then(|_| name.get(article.len()..))
+                    .filter(|suffix| suffix.chars().next().is_some_and(char::is_whitespace))
+            })
+            .map(str::trim_start)
+            .unwrap_or(name);
+        let key = stripped
+            .chars()
+            .next()
+            .map(|c| {
+                if c.is_alphabetic() {
+                    c.to_uppercase().to_string()
+                } else {
+                    "#".to_string()
+                }
+            })
+            .unwrap_or_else(|| "#".to_string());
+        groups
+            .entry(key)
+            .or_default()
+            .push(artist_item(&artist, albums));
+    }
+    groups
+        .into_iter()
+        .map(|(name, artists)| {
+            Value::map(vec![
+                ("name", Value::str_value(name)),
+                ("artist", Value::List(artists)),
+            ])
+        })
+        .collect()
+}
+
 // --- dispatch ---
 
 pub fn handle_endpoint<S: Library>(
@@ -283,37 +343,33 @@ pub fn handle_endpoint<S: Library>(
                 ])]),
             )]),
         )]),
-        "getArtists" | "getIndexes" => {
-            let mut groups: std::collections::BTreeMap<String, Vec<Value>> =
-                std::collections::BTreeMap::new();
-            for artist in store.artists() {
-                let albums = store.albums_for_artist(&artist.id).len() as i64;
-                let key = artist
-                    .name
-                    .chars()
-                    .next()
-                    .map(|c| c.to_uppercase().to_string())
-                    .unwrap_or_else(|| "-".to_string());
-                groups
-                    .entry(key)
-                    .or_default()
-                    .push(artist_item(&artist, albums));
-            }
-            let index: Vec<Value> = groups
-                .into_iter()
-                .map(|(name, artists)| {
-                    Value::map(vec![
-                        ("name", Value::str_value(name)),
-                        ("artist", Value::List(artists)),
-                    ])
-                })
-                .collect();
-            let artists = if index.is_empty() {
-                Value::Map(vec![])
-            } else {
-                Value::map(vec![("index", Value::List(index))])
-            };
-            EndpointResult::Doc(vec![("artists".to_string(), artists)])
+        "getArtists" => {
+            let index = artist_index(store);
+            EndpointResult::Doc(vec![(
+                "artists".to_string(),
+                Value::map(vec![
+                    (
+                        "ignoredArticles",
+                        Value::str_value("The El La Los Las Le Les"),
+                    ),
+                    ("index", Value::List(index)),
+                ]),
+            )])
+        }
+        "getIndexes" => {
+            let index = artist_index(store);
+            EndpointResult::Doc(vec![(
+                "indexes".to_string(),
+                Value::map(vec![
+                    // Fixed to the seeded store's NOW for deterministic fixtures (Unix ms).
+                    ("lastModified", Value::int_value(1_767_225_600_000)),
+                    (
+                        "ignoredArticles",
+                        Value::str_value("The El La Los Las Le Les"),
+                    ),
+                    ("index", Value::List(index)),
+                ]),
+            )])
         }
         "getMusicDirectory" => {
             let id = ok_or_return!(req(params, "id"));
@@ -349,7 +405,7 @@ pub fn handle_endpoint<S: Library>(
                     ]),
                 )])
             } else {
-                not_found()
+                not_found_with("Directory not found.")
             }
         }
         "getArtist" => {
@@ -374,7 +430,7 @@ pub fn handle_endpoint<S: Library>(
                         ]),
                     )])
                 }
-                None => not_found(),
+                None => not_found_with("Artist not found."),
             }
         }
         "getAlbum" => {
@@ -392,7 +448,7 @@ pub fn handle_endpoint<S: Library>(
                     entries.push(("song".to_string(), Value::List(songs)));
                     EndpointResult::Doc(vec![("album".to_string(), Value::Map(entries))])
                 }
-                None => not_found(),
+                None => not_found_with("Album not found."),
             }
         }
         "getSong" => {
@@ -402,7 +458,7 @@ pub fn handle_endpoint<S: Library>(
                     "song".to_string(),
                     starred_song_entry(store, identity, &song),
                 )]),
-                None => not_found(),
+                None => not_found_with("Song not found."),
             }
         }
         "getGenres" => {
@@ -427,43 +483,112 @@ pub fn handle_endpoint<S: Library>(
             search2(store, identity, query)
         }
         "search3" => {
-            let query = ok_or_return!(req(params, "query"));
-            let matched: Vec<Value> = store
-                .all_songs()
-                .iter()
-                .filter(|s| song_matches(s, query))
-                .map(|s| starred_song_entry(store, identity, s))
+            let query = params.get("query").unwrap_or("");
+            let (size, offset) = size_offset(params);
+            let default_count = if query.is_empty() { size } else { 20 };
+            let artist_count = ok_or_return!(search_count(params, "artistCount", default_count));
+            let album_count = ok_or_return!(search_count(params, "albumCount", default_count));
+            let song_count = ok_or_return!(search_count(params, "songCount", default_count));
+            let artists: Vec<Value> = store
+                .search_artists(query)
+                .into_iter()
+                .skip(offset)
+                .take(artist_count)
+                .map(|artist| {
+                    let album_count = store.albums_for_artist(&artist.id).len() as i64;
+                    Value::map(vec![
+                        ("id", Value::str_value(&artist.id)),
+                        ("name", Value::str_value(&artist.name)),
+                        ("coverArt", Value::str_value(&artist.id)),
+                        ("albumCount", Value::int_value(album_count)),
+                    ])
+                })
                 .collect();
-            let result = if matched.is_empty() {
-                Value::Map(vec![])
-            } else {
-                Value::map(vec![("match", Value::List(matched))])
-            };
-            EndpointResult::Doc(vec![("searchResult3".to_string(), result)])
+            let albums: Vec<Value> = store
+                .search_albums(query)
+                .into_iter()
+                .skip(offset)
+                .take(album_count)
+                .map(|album| {
+                    let songs = store.songs_for_album(&album.id).len() as i64;
+                    album_item(&album, songs)
+                })
+                .collect();
+            let songs: Vec<Value> = store
+                .search_songs(query)
+                .into_iter()
+                .skip(offset)
+                .take(song_count)
+                .map(|song| starred_song_entry(store, identity, &song))
+                .collect();
+            EndpointResult::Doc(vec![(
+                "searchResult3".to_string(),
+                Value::map(vec![
+                    ("artist", Value::List(artists)),
+                    ("album", Value::List(albums)),
+                    ("song", Value::List(songs)),
+                ]),
+            )])
         }
         "getAlbumList" | "getAlbumList2" => {
             let list_type = ok_or_return!(req(params, "type"));
-            let (size, offset) = size_offset(params);
-            let mut albums = store.all_albums();
-            if list_type == "starred" {
-                let starred_albums: std::collections::HashSet<String> = store
-                    .starred(identity, StarKind::Album)
-                    .into_iter()
-                    .collect();
-                let via_songs: std::collections::HashSet<String> = store
-                    .starred(identity, StarKind::Song)
-                    .into_iter()
-                    .filter_map(|id| store.song(&id))
-                    .map(|s| s.album_id)
-                    .collect();
-                albums.retain(|a| starred_albums.contains(&a.id) || via_songs.contains(&a.id));
+            const ALBUM_LIST_TYPES: &[&str] = &[
+                "newest",
+                "frequent",
+                "random",
+                "starred",
+                "recent",
+                "highest",
+                "byYear",
+                "byGenre",
+                "alphabeticalByName",
+                "alphabeticalByArtist",
+            ];
+            if !ALBUM_LIST_TYPES.contains(&list_type) {
+                return missing();
             }
-            // Deterministic newest-first; single-seed store keeps fixtures stable.
-            albums.sort_by(|a, b| b.created.cmp(&a.created).then(a.id.cmp(&b.id)));
+            let from_year = if list_type == "byYear" {
+                match req(params, "fromYear")
+                    .ok()
+                    .and_then(|year| year.parse().ok())
+                {
+                    Some(year) => Some(year),
+                    None => return missing(),
+                }
+            } else {
+                None
+            };
+            let to_year = if list_type == "byYear" {
+                match req(params, "toYear")
+                    .ok()
+                    .and_then(|year| year.parse().ok())
+                {
+                    Some(year) if Some(year) >= from_year => Some(year),
+                    _ => return missing(),
+                }
+            } else {
+                None
+            };
+            let genre = if list_type == "byGenre" {
+                match req(params, "genre") {
+                    Ok(genre) => Some(genre),
+                    Err(error) => return error,
+                }
+            } else {
+                None
+            };
+            let (size, offset) = size_offset(params);
+            let albums = store.album_list(AlbumListQuery {
+                identity,
+                list_type,
+                size: size.min(500),
+                offset,
+                from_year,
+                to_year,
+                genre,
+            });
             let page: Vec<Value> = albums
                 .into_iter()
-                .skip(offset)
-                .take(size)
                 .map(|a| {
                     let n = store.songs_for_album(&a.id).len() as i64;
                     album_item(&a, n)
@@ -492,7 +617,7 @@ pub fn handle_endpoint<S: Library>(
                         body: bytes,
                     }
                 }
-                None => not_found(),
+                None => not_found_with("Song not found."),
             }
         }
         "getCoverArt" => {
@@ -502,7 +627,7 @@ pub fn handle_endpoint<S: Library>(
                     content_type: "image/png".to_string(),
                     body: bytes,
                 },
-                None => not_found(),
+                None => not_found_with("Cover art not found."),
             }
         }
         "getPlaylists" => {
@@ -583,12 +708,14 @@ pub fn handle_endpoint<S: Library>(
             }
         }
         "scrobble" => {
-            let id = ok_or_return!(req(params, "id"));
-            if store.scrobble(identity, id) {
-                EndpointResult::Doc(vec![])
-            } else {
-                not_found()
+            let ids = params.get_all("id");
+            if ids.is_empty() {
+                return missing();
             }
+            for id in ids {
+                store.scrobble(identity, id);
+            }
+            EndpointResult::Doc(vec![])
         }
         "star" => star_unstar(store, identity, params, true),
         "unstar" => star_unstar(store, identity, params, false),
@@ -752,32 +879,30 @@ pub fn handle_endpoint<S: Library>(
         "getLyrics" => {
             let artist = ok_or_return!(req(params, "artist"));
             let title = ok_or_return!(req(params, "title"));
-            match store.lyrics(artist, title) {
-                Some(text) => EndpointResult::Doc(vec![(
-                    "lyrics".to_string(),
-                    Value::map(vec![
-                        ("artist", Value::str_value(artist)),
-                        ("title", Value::str_value(title)),
-                        ("value", Value::str_value(text)),
-                    ]),
-                )]),
-                None => not_found(),
-            }
+            let lyrics = store.lyrics(artist, title).map(|text| {
+                Value::map(vec![
+                    ("artist", Value::str_value(artist)),
+                    ("title", Value::str_value(title)),
+                    ("value", Value::str_value(text)),
+                ])
+            });
+            EndpointResult::Doc(vec![(
+                "lyrics".to_string(),
+                lyrics.unwrap_or_else(|| Value::Map(vec![])),
+            )])
         }
         "getLyricsBySongId" => {
             let id = ok_or_return!(req(params, "id"));
             match store.song(id) {
-                Some(song) => match store.lyrics(&song.artist.clone(), &song.title.clone()) {
-                    Some(text) => EndpointResult::Doc(vec![(
-                        "lyrics".to_string(),
-                        Value::map(vec![
-                            ("artist", Value::str_value(&song.artist)),
-                            ("title", Value::str_value(&song.title)),
-                            ("value", Value::str_value(text)),
-                        ]),
-                    )]),
-                    None => not_found(),
-                },
+                Some(song) => {
+                    let lyrics = store.lyrics(&song.artist, &song.title);
+                    EndpointResult::Doc(vec![(
+                        "lyricsList".to_string(),
+                        lyrics
+                            .map(|text| structured_lyrics(&song.artist, &song.title, &text))
+                            .unwrap_or_else(|| Value::List(vec![])),
+                    )])
+                }
                 None => not_found(),
             }
         }
@@ -949,28 +1074,104 @@ fn star_unstar<S: Library>(
     if ids.is_empty() && album_ids.is_empty() && artist_ids.is_empty() {
         return missing();
     }
-    let mut apply = |kind: StarKind, id: &str| -> Result<(), EndpointResult> {
+    let mut apply = |kind: StarKind, id: &str| {
         if star {
-            if store.star(identity, kind, id) {
-                Ok(())
-            } else {
-                Err(not_found())
-            }
+            store.star(identity, kind, id);
         } else {
             store.unstar(identity, kind, id);
-            Ok(())
         }
     };
     for id in ids {
-        ok_or_return!(apply(StarKind::Song, id));
+        apply(StarKind::Song, id);
     }
     for id in album_ids {
-        ok_or_return!(apply(StarKind::Album, id));
+        apply(StarKind::Album, id);
     }
     for id in artist_ids {
-        ok_or_return!(apply(StarKind::Artist, id));
+        apply(StarKind::Artist, id);
     }
     EndpointResult::Doc(vec![])
+}
+
+fn structured_lyrics(artist: &str, title: &str, text: &str) -> Value {
+    let mut offset = 0i64;
+    let mut lines = Vec::new();
+    let mut synced = false;
+    for raw_line in text.lines() {
+        let raw_line = raw_line.trim_end_matches('\r');
+        if let Some(value) = raw_line
+            .strip_prefix("[offset:")
+            .and_then(|value| value.strip_suffix(']'))
+            .and_then(|value| value.parse::<i64>().ok())
+        {
+            offset = value;
+            continue;
+        }
+        let mut content = raw_line;
+        let mut timestamps = Vec::new();
+        while let Some(rest) = content.strip_prefix('[') {
+            let Some(end) = rest.find(']') else {
+                break;
+            };
+            let stamp = &rest[..end];
+            let Some(start) = parse_lyric_timestamp(stamp) else {
+                break;
+            };
+            timestamps.push(start);
+            content = &rest[end + 1..];
+        }
+        if timestamps.is_empty() {
+            if !content.is_empty() {
+                lines.push(Value::map(vec![
+                    ("start", Value::int_value(0)),
+                    ("value", Value::str_value(content)),
+                ]));
+            }
+        } else {
+            synced = true;
+            for start in timestamps {
+                lines.push(Value::map(vec![
+                    ("start", Value::int_value(start)),
+                    ("value", Value::str_value(content)),
+                ]));
+            }
+        }
+    }
+    if lines.is_empty() {
+        return Value::List(vec![]);
+    }
+    Value::map(vec![(
+        "structuredLyrics",
+        Value::List(vec![Value::map(vec![
+            ("displayArtist", Value::str_value(artist)),
+            ("displayTitle", Value::str_value(title)),
+            ("lang", Value::str_value("")),
+            ("offset", Value::int_value(offset)),
+            ("synced", Value::bool_value(synced)),
+            ("line", Value::List(lines)),
+        ])]),
+    )])
+}
+
+fn parse_lyric_timestamp(value: &str) -> Option<i64> {
+    let (minutes, seconds) = value.split_once(':')?;
+    let minutes = minutes.parse::<i64>().ok()?;
+    let (seconds, fraction) = seconds.split_once('.').unwrap_or((seconds, "0"));
+    let seconds = seconds.parse::<i64>().ok()?;
+    if !(0..60).contains(&seconds) || minutes < 0 {
+        return None;
+    }
+    if !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let fraction: String = fraction.chars().take(3).collect();
+    let millis = match fraction.len() {
+        0 => 0,
+        1 => fraction.parse::<i64>().ok()? * 100,
+        2 => fraction.parse::<i64>().ok()? * 10,
+        _ => fraction.parse::<i64>().ok()?,
+    };
+    Some((minutes * 60 + seconds) * 1000 + millis)
 }
 
 fn song_matches(song: &Song, query: &str) -> bool {

@@ -25,6 +25,7 @@ url = "2"
 subtle = "2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+futures-util = "0.3"
 nntune-subsonic = { path = "../../crates/nntune-subsonic" }
 worker = "0.8"
 

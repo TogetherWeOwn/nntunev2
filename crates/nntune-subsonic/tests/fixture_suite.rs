@@ -123,7 +123,15 @@ fn missing_and_unknown_ids_match_goldens() {
     assert_eq!(status, 200);
     assert_eq!(body, fixture("error-missing-param.xml"));
     let (_, _, body) = get(&app, "/rest/stream", &format!("{KEY}&id=nope&f=json"));
-    assert_eq!(body, fixture("error-not-found.json"));
+    assert_eq!(body, fixture("stream-not-found.json"));
+    for (path, fixture_name) in [
+        ("/rest/getSong", "getSong-not-found.json"),
+        ("/rest/getAlbum", "getAlbum-not-found.json"),
+        ("/rest/getArtist", "getArtist-not-found.json"),
+    ] {
+        let (_, _, body) = get(&app, path, &format!("{KEY}&id=missing&f=json"));
+        assert_eq!(body, fixture(fixture_name), "{path}");
+    }
 }
 
 #[test]
@@ -291,6 +299,8 @@ fn catalogue_endpoints_match_goldens() {
     assert_eq!(body, fixture("getArtists-seeded.xml"));
     let (_, _, body) = get(&app, "/rest/getArtists", &format!("{KEY}&f=json"));
     assert_eq!(body, fixture("getArtists-seeded.json"));
+    let (_, _, body) = get(&app, "/rest/getIndexes", &format!("{KEY}&f=json"));
+    assert_eq!(body, fixture("getIndexes-seeded.json"));
     let (_, _, body) = get(&app, "/rest/getSong", &format!("{KEY}&id=so-1&f=json"));
     assert_eq!(body, fixture("getSong.json"));
     let (_, _, body) = get(&app, "/rest/getAlbum", &format!("{KEY}&id=al-1&f=json"));
@@ -327,6 +337,18 @@ fn catalogue_endpoints_match_goldens() {
         &format!("{KEY}&artist=Test+Artist&title=Test+Song&f=json"),
     );
     assert_eq!(body, fixture("getLyrics.json"));
+    let (_, _, body) = get(
+        &app,
+        "/rest/getLyricsBySongId",
+        &format!("{KEY}&id=so-1&f=json"),
+    );
+    assert_eq!(body, fixture("getLyricsBySongId.json"));
+    let (_, _, body) = get(
+        &app,
+        "/rest/getLyrics",
+        &format!("{KEY}&artist=Missing&title=Missing&f=json"),
+    );
+    assert!(String::from_utf8(body).unwrap().contains("\"lyrics\":{}"));
 }
 
 #[test]
@@ -347,10 +369,46 @@ fn search_and_album_lists_match_goldens() {
     assert_eq!(body, fixture("search3-match.json"));
     let (_, _, body) = get(
         &app,
+        "/rest/search3",
+        &format!("{KEY}&query=&size=10&offset=0&f=json"),
+    );
+    assert_eq!(body, fixture("search3-empty-query.json"));
+    let (_, _, body) = get(
+        &app,
+        "/rest/search3",
+        &format!("{KEY}&query=Test&artistCount=0&f=json"),
+    );
+    assert!(String::from_utf8(body).unwrap().contains("\"artist\":[]"));
+    let (_, _, body) = get(
+        &app,
         "/rest/getAlbumList2",
         &format!("{KEY}&type=newest&f=json"),
     );
     assert_eq!(body, fixture("getAlbumList2-newest.json"));
+    let (_, _, body) = get(
+        &app,
+        "/rest/getAlbumList2",
+        &format!("{KEY}&type=alphabeticalByName&f=json"),
+    );
+    assert_eq!(body, fixture("getAlbumList2-alphabetical.json"));
+    let (_, _, body) = get(
+        &app,
+        "/rest/getAlbumList2",
+        &format!("{KEY}&type=byYear&fromYear=2020&toYear=2030&f=json"),
+    );
+    assert_eq!(body, fixture("getAlbumList2-byYear.json"));
+    let (_, _, body) = get(
+        &app,
+        "/rest/getAlbumList2",
+        &format!("{KEY}&type=byYear&f=json"),
+    );
+    assert!(String::from_utf8(body).unwrap().contains("\"code\":10"));
+    let (_, _, body) = get(
+        &app,
+        "/rest/getAlbumList2",
+        &format!("{KEY}&type=invalid&f=json"),
+    );
+    assert!(String::from_utf8(body).unwrap().contains("\"code\":10"));
 }
 
 #[test]
@@ -388,6 +446,12 @@ fn star_flow_matches_goldens() {
     assert_eq!(body, fixture("ping.xml"));
     let (_, _, body) = get(&app, "/rest/getStarred2", KEY);
     assert_eq!(body, fixture("starred2-empty.xml"));
+    let (_, _, body) = get(&app, "/rest/star", &format!("{KEY}&id=gone&id=so-1"));
+    assert_eq!(body, fixture("ping.xml"));
+    let (_, _, body) = get(&app, "/rest/getStarred2", &format!("{KEY}&f=json"));
+    assert_eq!(body, fixture("starred2-after-star.json"));
+    let (_, _, body) = get(&app, "/rest/scrobble", &format!("{KEY}&id=gone&id=so-1"));
+    assert_eq!(body, fixture("ping.xml"));
 }
 
 #[test]
