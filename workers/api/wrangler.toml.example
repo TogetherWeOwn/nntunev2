@@ -20,6 +20,16 @@ SESSION_TTL_SECS = "86400"
 
 # Hyperdrive binding for PlanetScale Postgres (ID filled per environment).
 # The binding name must stay HYPERDRIVE (see src/worker_entry.rs).
+# Auth reads (sessions, credentials, users, challenges, vaults) are plain
+# SELECTs: Hyperdrive caches non-mutating queries by default (~60s + 15s
+# stale-while-revalidate, never invalidated by writes), which would delay
+# logout/revoke-all, break refresh rotation, and serve stale sign_counts.
+# The HYPERDRIVE config MUST be created/updated with query caching disabled:
+#   wrangler hyperdrive create <name> --connection-string "$DATABASE_URL" --caching-disabled
+#   wrangler hyperdrive update <id> --caching-disabled
+# Deploy gate: ./check_hyperdrive_cache.sh --config-id <id> (asserts
+# caching.disabled == true). If cached reads are wanted elsewhere, bind a
+# second cache-disabled config for auth reads.
 # [[hyperdrive]]
 # binding = "HYPERDRIVE"
 # id = "<fill in staging/prod id>"

@@ -71,6 +71,21 @@ config from secrets) is a follow-up slice.
   conditionally update the matching row/counter and commit before sending
   the cookie; a superseded cookie then fails. Privilege changes require
   reauthentication, revoking the old row and issuing a new session id.
+- **Hyperdrive query caching:** the `HYPERDRIVE` binding MUST point to a
+  Hyperdrive config with query caching disabled (`--caching-disabled`).
+  Session, credential, user, challenge and vault reads are plain
+  parameterized `SELECT`s; Hyperdrive caches such reads by default
+  (`max_age` 60s + 15s `stale_while_revalidate`, never invalidated by
+  writes) and names sessions/authentication as the case needing a
+  separate cache-disabled config. With caching on, `logout`/`revoke-all`
+  (`UPDATE sessions SET revoked = TRUE`) is invisible for up to ~75s, a
+  refreshed cookie fails against the cached `rotation_counter`, a second
+  hardware-key login fails the conditional `sign_count` advance on stale
+  data, and a repeated `register/start` can see a cached user miss. Writes
+  (`INSERT/UPDATE/DELETE ... RETURNING`, including rate-limit slots and
+  test-connection leases) are never cached. Deploy gate:
+  `./check_hyperdrive_cache.sh --config-id <id>` asserts
+  `caching.disabled == true` (see `wrangler.toml.example`).
 - **Magic links:** 256-bit random tokens, SHA-256 hash at rest, 15-minute
   expiry. HTTP callers must use `consume_magic_link_atomically`, not the
   pure record-preparation helper. Magic links, passkey challenges and

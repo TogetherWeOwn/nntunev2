@@ -2575,4 +2575,226 @@ mod tests {
             assert_eq!(body["allow_credentials"], serde_json::json!([]), "{email}");
         }
     }
+
+    fn put_test_vault(h: &Harness, cookie: &str) {
+        let put_body = serde_json::json!({
+            "provider": {
+                "host": "news.example.com", "port": 563, "tls": true,
+                "username": "synthetic-user", "password": "synthetic-pass",
+                "max_connections": 4
+            },
+            "indexer": null
+        });
+        let resp = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie.to_string()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+    }
+
+    fn call_at(h: &Harness, now: u64, method: &str, path: &str, cookie: String) -> Response {
+        let ctx = Ctx {
+            cfg: &h.config,
+            store: &h.store,
+            mailer: &h.mailer,
+            dialer: &h.dialer,
+            dns: &h.dns,
+            now,
+            source_ip: "198.51.100.9".to_string(),
+        };
+        let req = Request {
+            method: method.to_string(),
+            path: path.to_string(),
+            cookie: Some(cookie),
+            origin: Some(ORIGIN.to_string()),
+            body: Vec::new(),
+        };
+        block_on(handle(&ctx, &req))
+    }
+
+    #[test]
+    fn vault_test_connection_lease_cap_and_release_are_handler_enforced() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        put_test_vault(&h, &cookie);
+
+        // A normal probe succeeds and releases its lease afterwards.
+        let resp = h.call_full(
+            "POST",
+            "/v1/vault/test-connection",
+            None,
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.body, r#"{"ok":true}"#);
+        assert_eq!(h.dialer.seen.borrow().len(), 1);
+        assert!(
+            h.store.test_connection_leases.borrow().is_empty(),
+            "successful probe must release its lease"
+        );
+
+        // Fill the per-user lease cap directly (MAX_TEST_CONCURRENCY slots).
+        assert!(block_on(h.store.acquire_test_connection_lease(
+            "u1",
+            "lease-a",
+            20,
+            vault::MAX_TEST_CONCURRENCY
+        ))
+        .unwrap());
+        assert!(block_on(h.store.acquire_test_connection_lease(
+            "u1",
+            "lease-b",
+            20,
+            vault::MAX_TEST_CONCURRENCY
+        ))
+        .unwrap());
+
+        // The handler must refuse without reaching the dialer.
+        let before = h.dialer.seen.borrow().len();
+        let resp = h.call_full(
+            "POST",
+            "/v1/vault/test-connection",
+            None,
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.body, r#"{"ok":false}"#);
+        assert_eq!(
+            h.dialer.seen.borrow().len(),
+            before,
+            "capped probe must not dial"
+        );
+        assert_eq!(h.store.test_connection_leases.borrow().len(), 2);
+
+        // Free both slots: the next probe is admitted and releases again.
+        block_on(h.store.release_test_connection_lease("u1", "lease-a")).unwrap();
+        block_on(h.store.release_test_connection_lease("u1", "lease-b")).unwrap();
+        let resp = h.call_full(
+            "POST",
+            "/v1/vault/test-connection",
+            None,
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.body, r#"{"ok":true}"#);
+        assert_eq!(h.dialer.seen.borrow().len(), before + 1);
+        assert!(
+            h.store.test_connection_leases.borrow().is_empty(),
+            "probe must release its lease"
+        );
+    }
+
+    #[test]
+    fn register_start_budget_stores_no_challenge_past_cap() {
+        let h = harness();
+        let email = "budget@example.com";
+        let mut user_id = String::new();
+        for i in 0..AUTH_STARTS_PER_HOUR {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/passkey/register/start",
+                serde_json::json!({"email": email}),
+            );
+            assert_eq!(resp.status, 200, "{}", resp.body);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            let got = body["user_id"].as_str().unwrap().to_string();
+            if i == 0 {
+                user_id = got;
+            } else {
+                assert_eq!(got, user_id, "abandoned signup keeps one user id");
+            }
+        }
+        assert_eq!(
+            h.store.challenges.borrow().len(),
+            AUTH_STARTS_PER_HOUR as usize
+        );
+        let mails_before = h.mailer.sent.borrow().len();
+
+        // The 11th start keeps the 200 shape but stores nothing and mails nothing.
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": email}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["user_id"].as_str().unwrap(), user_id);
+        assert_eq!(
+            h.store.challenges.borrow().len(),
+            AUTH_STARTS_PER_HOUR as usize,
+            "over-budget register/start must not store a challenge"
+        );
+        assert_eq!(
+            h.mailer.sent.borrow().len(),
+            mails_before,
+            "over-budget register/start must not send mail"
+        );
+    }
+
+    #[test]
+    fn vault_test_connection_window_reopens_after_60s_at_handler() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        put_test_vault(&h, &cookie);
+
+        for _ in 0..TEST_CONNECTION_PER_MINUTE {
+            let resp = h.call_full(
+                "POST",
+                "/v1/vault/test-connection",
+                None,
+                Some(cookie.clone()),
+                Some(ORIGIN),
+            );
+            assert_eq!(resp.body, r#"{"ok":true}"#);
+        }
+        assert_eq!(
+            h.dialer.seen.borrow().len(),
+            TEST_CONNECTION_PER_MINUTE as usize
+        );
+
+        // Budget exhausted: blocked without a dial.
+        let resp = h.call_full(
+            "POST",
+            "/v1/vault/test-connection",
+            None,
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.body, r#"{"ok":false}"#);
+        assert_eq!(
+            h.dialer.seen.borrow().len(),
+            TEST_CONNECTION_PER_MINUTE as usize
+        );
+
+        // 2s later the 60s window is still closed (pins the window length).
+        let resp = call_at(
+            &h,
+            NOW + 2,
+            "POST",
+            "/v1/vault/test-connection",
+            cookie.clone(),
+        );
+        assert_eq!(resp.body, r#"{"ok":false}"#);
+        assert_eq!(
+            h.dialer.seen.borrow().len(),
+            TEST_CONNECTION_PER_MINUTE as usize
+        );
+
+        // After the window the same caller is admitted again and releases.
+        let resp = call_at(&h, NOW + 61, "POST", "/v1/vault/test-connection", cookie);
+        assert_eq!(resp.body, r#"{"ok":true}"#);
+        assert_eq!(
+            h.dialer.seen.borrow().len(),
+            TEST_CONNECTION_PER_MINUTE as usize + 1
+        );
+        assert!(
+            h.store.test_connection_leases.borrow().is_empty(),
+            "re-admitted probe must release its lease"
+        );
+    }
 }
