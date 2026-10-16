@@ -3,23 +3,21 @@
 # Usage: DATABASE_URL=<url> [DUMP_SEQ=<n>] [MB_IMPORT_CHUNK_LINES=<n>] ./import.sh <dump-dir>
 # Never echo $DATABASE_URL; pass it only via env/secret store.
 #
-# Kill-safe chunking: each dump file is applied in line-range chunks
-# (default 2000 lines), one transaction per chunk. The committed line
-# number is recorded in mb_import_cursor, so kill -9 mid-import resumes
-# after the last committed chunk instead of restarting the file. Rerunning
-# over the same dump inserts zero dupes: chunks at or below the cursor are
-# skipped, and the upsert carries the forward-only updated_at guard (an
-# older dump never rolls back a row replication moved ahead).
-#
+# Kill-safe chunking: each content-addressed dump file is applied in
+# line-range chunks (default 2000 lines), one transaction per chunk. The
+# committed line number is recorded per (table, dump hash), so kill -9
+# resumes the same dump while a newer dump starts at line 0. The upsert
+# carries a forward-only updated_at guard (older dumps never roll a row back).
+
 # Poison rows never abort the import: the mb-validate pre-pass checks every
 # line against the typed upsert contract (uuid/int/timestamp shapes, COPY
 # escapes, canonical dump layout) and poison lines land in mb_import_dlq
-# with reason + raw line for the operator. A duplicate MBID inside one
-# chunk is fatal (the dump contradicts itself); the same MBID in two
-# chunks is fatal too, so a mid-file edit between runs can never silently
-# double-apply. FK order is artist -> release -> recording: every chunk of
-# a later table only references rows an earlier table already committed,
-# and immediate FK checks never see a half-chunk (a failed chunk rolls
+# with reason + raw line for the operator. Duplicate valid MBIDs within a
+# dump are rejected before import; the same MBID across distinct dumps is
+# expected and is handled by the forward-only upsert. FK order is
+# artist -> release -> recording: every chunk of a later table only
+# references rows an earlier table already committed, and immediate FK
+# checks never see a half-chunk (a failed chunk rolls
 # back whole).
 #
 # DUMP_SEQ (optional): replication sequence the dump corresponds to. When
@@ -103,7 +101,17 @@ for table in artist release recording; do
   # awk NR counts a trailing partial line; the validator counts the same
   # way, so cursor line numbers and sed ranges agree on every file shape.
   total="$(awk 'END { print NR+0 }' "$tsv")"
-  completed="$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tAX -c "SELECT lines_done FROM mb_import_cursor WHERE table_name = '$table';")"
+  dump_id="$(sha256sum "$tsv" | cut -d ' ' -f 1)"
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "INSERT INTO mb_import_cursor (table_name, dump_id, lines_done) VALUES ('$table', '$dump_id', 0) ON CONFLICT (table_name, dump_id) DO NOTHING;" >/dev/null
+  awk -F '\t' '$1 ~ /^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$/ { print tolower($1) }' "$tsv" \
+    | sort -T "$work" >"$work/mbids.sorted"
+  uniq -d "$work/mbids.sorted" >"$work/mbids.duplicates"
+  if [[ -s "$work/mbids.duplicates" ]]; then
+    echo "import: duplicate MBID(s) in $tsv (dump contradicts itself):" >&2
+    head -n 5 "$work/mbids.duplicates" >&2
+    exit 1
+  fi
+  completed="$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tAX -c "SELECT lines_done FROM mb_import_cursor WHERE table_name = '$table' AND dump_id = '$dump_id';")"
   if [[ ! "$completed" =~ ^[0-9]+$ ]]; then
     echo "import: unexpected lines_done '$completed' for $table in mb_import_cursor (migration 0003 missing?)" >&2
     exit 1
@@ -118,7 +126,7 @@ for table in artist release recording; do
   fi
   echo "import: loading $table from $tsv (resuming at line $((10#$completed + 1)) of $total)"
   while true; do
-    completed="$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tAX -c "SELECT lines_done FROM mb_import_cursor WHERE table_name = '$table';")"
+    completed="$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tAX -c "SELECT lines_done FROM mb_import_cursor WHERE table_name = '$table' AND dump_id = '$dump_id';")"
     if (( 10#$completed >= 10#$total )); then
       break
     fi
@@ -149,29 +157,6 @@ for table in artist release recording; do
       echo "$dupes" >&2
       exit 1
     fi
-    # A repeated MBID in an EARLIER chunk would upsert onto the already
-    # loaded row, so the chunk's line count and row count legitimately
-    # differ. Refuse up front with the offending keys instead of letting
-    # the post-commit row-count check fail on committed data: the dump
-    # must carry each MBID once (official extracts do), and a repeated key
-    # means the dump was regenerated or hand-edited mid-run.
-    if (( 10#$valid_n > 0 )); then
-      awk -F'\t' '{ print $1 }' "$work/valid.tsv" >"$work/mbids.tsv"
-      # No explicit transaction here, so no ON COMMIT DROP: each statement
-      # autocommits, which would drop the temp table before COPY runs. The
-      # table dies with the session instead.
-      overlap="$(psql "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -tAX <<SQL
-CREATE TEMP TABLE want (mbid uuid);
-\copy want FROM '$work/mbids.tsv' WITH (FORMAT text)
-SELECT CASE WHEN count(*) = 0 THEN '' ELSE count(*) || ' already loaded, e.g. ' || string_agg(mbid::text, ', ') END
-FROM (SELECT w.mbid FROM want w JOIN mb_${table} t USING (mbid) LIMIT 5) s;
-SQL
-)"
-      if [[ -n "$overlap" ]]; then
-        echo "import: $table chunk lines $range repeats MBID(s) from earlier lines ($overlap); fix the dump, cursor stays at $completed" >&2
-        exit 1
-      fi
-    fi
     # Single psql session + single transaction: the TEMP stage tables are
     # session-scoped, so create, COPY, upsert, DLQ load and cursor advance
     # must share one connection. The WHERE guard makes reruns move rows
@@ -182,7 +167,7 @@ SQL
     # applying. DLQ inserts ignore conflicts so a replayed chunk (kill
     # between COMMIT and cursor read) never double-logs poison.
     # -q keeps stdout to just the RETURNING value: without it every command
-    # tag (BEGIN/COPY/INSERT/...) lands in the capture and the comparison
+    # tag (BEGIN/COPY/INSERT/...) lands in the capture and the cursor check
     # below misfires.
     advanced="$(psql "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -tAX <<SQL
 BEGIN;
@@ -193,22 +178,17 @@ ON CONFLICT (mbid) DO UPDATE SET $upsert
 WHERE mb_${table}.updated_at < EXCLUDED.updated_at;
 CREATE TEMP TABLE poison (reason text, line_no bigint, raw text) ON COMMIT DROP;
 \copy poison FROM '$work/poison.tsv' WITH (FORMAT text)
-INSERT INTO mb_import_dlq (table_name, line_no, reason, raw_line)
-SELECT '$table', line_no, reason, raw FROM poison
-ON CONFLICT (table_name, line_no) DO NOTHING;
+INSERT INTO mb_import_dlq (table_name, dump_id, line_no, reason, raw_line)
+SELECT '$table', '$dump_id', line_no, reason, raw FROM poison
+ON CONFLICT (table_name, dump_id, line_no) DO NOTHING;
 UPDATE mb_import_cursor SET lines_done = $end, updated_at = now()
-WHERE table_name = '$table' AND lines_done = $completed
+WHERE table_name = '$table' AND dump_id = '$dump_id' AND lines_done = $completed
 RETURNING lines_done;
 COMMIT;
 SQL
 )"
     if [[ "$advanced" != "$end" ]]; then
       echo "import: cursor for $table moved under this run (expected $end, got '$advanced'); stopping without damage" >&2
-      exit 1
-    fi
-    committed="$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tAX -c "SELECT count(*) FROM mb_${table} WHERE line_no BETWEEN $start AND $end;")"
-    if [[ "$committed" != "$valid_n" ]]; then
-      echo "import: chunk $table lines $range committed $committed rows, validator passed $valid_n; stopping (cursor is at $end, rerun replays safely)" >&2
       exit 1
     fi
     echo "import: $table lines $start-$end committed ($valid_n rows, $poison_n poison)"

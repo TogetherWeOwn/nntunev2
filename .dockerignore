@@ -10,5 +10,7 @@ containers/*/
 crates/*/
 !crates/mb-import-validate/
 !crates/nntune-core/
-workers/
+!crates/nntune-test-nntp/
+workers/*
+!workers/stream/
 *.md

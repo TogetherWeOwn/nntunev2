@@ -1,18 +1,15 @@
 # mb-import: batch-only MusicBrainz dump import + replication applier.
 # Interactive traffic never touches this image (ADR 0001/0007).
 #
-# Build from the REPOSITORY ROOT (the validator stage needs the workspace):
+# Build from the REPOSITORY ROOT:
 #   docker build -f containers/mb-import/Dockerfile .
 FROM rust:1-bookworm AS validator
 WORKDIR /src
-# Workspace metadata first so `cargo build -p` resolves without the full tree.
-COPY Cargo.toml ./Cargo.toml
-COPY Cargo.lock ./Cargo.lock
-COPY crates/nntune-core/Cargo.toml ./crates/nntune-core/Cargo.toml
-COPY workers/stream/Cargo.toml ./workers/stream/Cargo.toml
-COPY crates/mb-import-validate/Cargo.toml ./crates/mb-import-validate/Cargo.toml
-COPY crates/mb-import-validate/src ./crates/mb-import-validate/src
-RUN cargo build --release --offline -p mb-import-validate
+# Cargo.lock is intentionally not tracked for this workspace. Copy the full
+# (dockerignored) workspace so Cargo can resolve all member manifests on a
+# clean checkout, then build the single validator package online.
+COPY . .
+RUN cargo build --release -p mb-import-validate
 
 FROM postgres:18-bookworm
 

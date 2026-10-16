@@ -328,19 +328,25 @@ fn split_zone(value: &str) -> Option<String> {
             return Some(value.to_string());
         }
         let zone = &value[i - 1..];
-        let digits: String = zone[1..].chars().filter(|c| *c != ':').collect();
-        if digits.len() == 2 || digits.len() == 4 {
-            if let Ok(hh) = zone[1..3].parse::<u32>() {
-                let mm = if digits.len() == 4 {
-                    zone[4..].parse::<u32>().unwrap_or(99)
-                } else {
-                    0
-                };
-                if hh <= 23 && mm <= 59 {
-                    return Some(bare.to_string());
-                }
+        let digits = match zone.len() {
+            3 if zone[1..].bytes().all(|b| b.is_ascii_digit()) => zone[1..].to_string(),
+            5 if zone[1..].bytes().all(|b| b.is_ascii_digit()) => zone[1..].to_string(),
+            6 if zone.as_bytes()[3] == b':'
+                && zone[1..3].bytes().all(|b| b.is_ascii_digit())
+                && zone[4..6].bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                format!("{}{}", &zone[1..3], &zone[4..6])
             }
-            return None;
+            _ => return None,
+        };
+        let hh = digits[..2].parse::<u32>().ok()?;
+        let mm = if digits.len() == 4 {
+            digits[2..].parse::<u32>().ok()?
+        } else {
+            0
+        };
+        if hh <= 23 && mm <= 59 {
+            return Some(bare.to_string());
         }
         return None;
     }
@@ -398,7 +404,10 @@ fn is_time(time: &str) -> bool {
         if sec.len() != 2 {
             return false;
         }
-        if sec.parse::<u32>().is_ok_and(|s| s > 60) {
+        let Ok(sec) = sec.parse::<u32>() else {
+            return false;
+        };
+        if sec > 60 {
             return false;
         }
         if let Some(f) = frac {
@@ -520,6 +529,8 @@ mod tests {
         for ts in [
             "2024-05-01",
             "2024-05-01 12:00:00+00",
+            "2024-05-01T12:00:00+0530",
+            "2024-05-01T12:00:00+05:30",
             "2024-05-01T12:00:00.123456Z",
             "2024-02-29T00:00:00Z", // 2024 is a leap year
         ] {
@@ -533,6 +544,10 @@ mod tests {
             "2024-13-01",
             "2024-05-01T25:00:00Z",
             "2024-05-01 12:00",
+            "2024-05-01T12:00:ABZ",
+            "2024-05-01T12:00:00+0560",
+            "2024-05-01T12:00:00+05:60",
+            "2024-05-01T12:00:00+05::30",
         ] {
             assert!(
                 validate_line(Table::Artist, 1, &artist_line(MBID, ts)).is_err(),

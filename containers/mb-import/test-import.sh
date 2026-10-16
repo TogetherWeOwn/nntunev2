@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Integration test for import.sh: chunked import, kill-resume, dupe-rerun,
-# DLQ query, and the refusal guards. Needs psql, python3 and mb-validate
+# Integration test for import.sh: chunked import, kill-resume, same-dump
+# rerun, newer-dump upsert, DLQ query, and refusal guards. Needs psql,
+# python3 and mb-validate
 # on PATH (or MB_VALIDATE_BIN), plus DATABASE_URL to a SCRATCH database.
 # DESTRUCTIVE: truncates mb_artist/mb_release/mb_recording/mb_import_dlq and
 # resets mb_import_cursor/mb_import_state, so it refuses to run unless
@@ -27,6 +28,8 @@ export MB_IMPORT_CHUNK_LINES=25
 
 db() { psql "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -tAX "$@"; }
 db_show() { psql "$DATABASE_URL" -v ON_ERROR_STOP=1 "$@"; }
+dump_id() { sha256sum "$1" | cut -d ' ' -f 1; }
+cursor() { db -c "SELECT lines_done FROM mb_import_cursor WHERE table_name='$1' AND dump_id='$(dump_id "$2")';"; }
 
 fail=0
 check() {
@@ -76,9 +79,9 @@ bash "$SELF_DIR/import.sh" "$FIX" >/dev/null
 check "artists loaded" "120" "$(db -c 'SELECT count(*) FROM mb_artist;')"
 check "releases loaded" "60" "$(db -c 'SELECT count(*) FROM mb_release;')"
 check "recordings loaded" "60" "$(db -c 'SELECT count(*) FROM mb_recording;')"
-check "artist cursor" "123" "$(db -c "SELECT lines_done FROM mb_import_cursor WHERE table_name='artist';")"
-check "release cursor" "61" "$(db -c "SELECT lines_done FROM mb_import_cursor WHERE table_name='release';")"
-check "recording cursor" "60" "$(db -c "SELECT lines_done FROM mb_import_cursor WHERE table_name='recording';")"
+check "artist cursor" "123" "$(cursor artist "$FIX/mbdump-artist.tsv")"
+check "release cursor" "61" "$(cursor release "$FIX/mbdump-release.tsv")"
+check "recording cursor" "60" "$(cursor recording "$FIX/mbdump-recording.tsv")"
 check "dlq rows" "4" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
 check "dlq reasons" "bad_uuid,bad_timestamp,column_count,bad_uuid" \
   "$(db -c "SELECT string_agg(reason, ',' ORDER BY table_name, line_no) FROM mb_import_dlq;")"
@@ -98,14 +101,38 @@ bash "$SELF_DIR/import.sh" "$FIX" >/dev/null
 after="$(db -c 'SELECT (SELECT count(*) FROM mb_artist), (SELECT count(*) FROM mb_release), (SELECT count(*) FROM mb_recording), (SELECT count(*) FROM mb_import_dlq), (SELECT sum(lines_done) FROM mb_import_cursor);')"
 check "rerun changes nothing" "$before" "$after"
 
-echo "=== 3. kill -9 mid-import resumes from cursor ==="
+echo "=== 3. same-sized newer dump upserts rows and isolates cursor/DLQ ==="
+NEWER="$FIX-newer"
+rm -rf "$NEWER"
+cp -R "$FIX" "$NEWER"
+python3 - "$NEWER/mbdump-artist.tsv" <<'EOF'
+import sys
+from pathlib import Path
+p = Path(sys.argv[1])
+lines = p.read_text().splitlines()
+fields = lines[0].split('\t')
+fields[1] = 'Band 9'
+fields[5] = '2025-05-01T12:00:00Z'
+lines[0] = '\t'.join(fields)
+p.write_text('\n'.join(lines) + '\n')
+EOF
+[[ "$(wc -c <"$FIX/mbdump-artist.tsv")" == "$(wc -c <"$NEWER/mbdump-artist.tsv")" ]]
+bash "$SELF_DIR/import.sh" "$NEWER" >/dev/null
+check "new dump updates existing artist" "Band 9|2025-05-01 12:00:00+00"   "$(db -c "SELECT name || '|' || updated_at FROM mb_artist WHERE mbid='00000000-0000-0000-0000-000000000001';")"
+check "new dump preserves table row counts" "120|60|60"   "$(db -c 'SELECT (SELECT count(*) FROM mb_artist) || chr(124) || (SELECT count(*) FROM mb_release) || chr(124) || (SELECT count(*) FROM mb_recording);')"
+check "new dump starts an independent cursor" "123" "$(cursor artist "$NEWER/mbdump-artist.tsv")"
+check "DLQ retains poison from both dumps" "7" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
+check "same line poison is keyed by dump" "2" \
+  "$(db -c "SELECT count(DISTINCT dump_id) FROM mb_import_dlq WHERE table_name='artist' AND line_no=121;")"
+
+echo "=== 4. kill -9 mid-import resumes from cursor ==="
 reset_db
 bash "$SELF_DIR/import.sh" "$FIX" >/dev/null 2>&1 &
 imp=$!
 killed_at=""
 for _ in $(seq 1 300); do
   sleep 0.2
-  cur="$(db -c "SELECT lines_done FROM mb_import_cursor WHERE table_name='artist';")"
+  cur="$(cursor artist "$FIX/mbdump-artist.tsv")"
   if [[ "$cur" =~ ^[0-9]+$ ]] && (( 10#$cur >= 25 )); then
     killed_at="$cur"
     break
@@ -127,10 +154,10 @@ else
   check "resume: artist dupes" "0" "$(db -c 'SELECT count(*) FROM (SELECT mbid FROM mb_artist GROUP BY mbid HAVING count(*)>1) d;')"
   check "resume: release dupes" "0" "$(db -c 'SELECT count(*) FROM (SELECT mbid FROM mb_release GROUP BY mbid HAVING count(*)>1) d;')"
   check "resume: recording dupes" "0" "$(db -c 'SELECT count(*) FROM (SELECT mbid FROM mb_recording GROUP BY mbid HAVING count(*)>1) d;')"
-  check "resume: artist cursor" "123" "$(db -c "SELECT lines_done FROM mb_import_cursor WHERE table_name='artist';")"
+  check "resume: artist cursor" "123" "$(cursor artist "$FIX/mbdump-artist.tsv")"
 fi
 
-echo "=== 4. cross-chunk duplicate MBID is refused, cursor pinned ==="
+echo "=== 5. duplicate MBID anywhere in one dump is refused ==="
 reset_db
 DUPE="$FIX-dupe"
 rm -rf "$DUPE"
@@ -151,34 +178,33 @@ if MB_IMPORT_CHUNK_LINES=10 bash "$SELF_DIR/import.sh" "$DUPE" >/dev/null 2>&1; 
 else
   echo "ok: dupe dump refused"
 fi
-check "dupe: cursor pinned before bad chunk" "20" \
-  "$(db -c "SELECT lines_done FROM mb_import_cursor WHERE table_name='artist';")"
-check "dupe: only clean rows loaded" "20" "$(db -c 'SELECT count(*) FROM mb_artist;')"
+check "dupe: cursor remains at zero" "0" "$(cursor artist "$DUPE/mbdump-artist.tsv")"
+check "dupe: no rows loaded" "0" "$(db -c 'SELECT count(*) FROM mb_artist;')"
 
-echo "=== 5. cursor ahead of dump is refused ==="
+echo "=== 6. cursor ahead of dump is refused ==="
 reset_db
 bash "$SELF_DIR/import.sh" "$FIX" >/dev/null
-db -c "UPDATE mb_import_cursor SET lines_done = 9999 WHERE table_name='artist';" >/dev/null
+db -c "UPDATE mb_import_cursor SET lines_done = 9999 WHERE table_name='artist' AND dump_id='$(dump_id "$FIX/mbdump-artist.tsv")';" >/dev/null
 if bash "$SELF_DIR/import.sh" "$FIX" >/dev/null 2>&1; then
   echo "FAIL: shrunken dump imported without error" >&2
   fail=1
 else
   echo "ok: shrunken dump refused"
 fi
-db -c "UPDATE mb_import_cursor SET lines_done = 123 WHERE table_name='artist';" >/dev/null
+db -c "UPDATE mb_import_cursor SET lines_done = 123 WHERE table_name='artist' AND dump_id='$(dump_id "$FIX/mbdump-artist.tsv")';" >/dev/null
 
-echo "=== 6. DUMP_SEQ seeds forward only ==="
+echo "=== 7. DUMP_SEQ seeds forward only ==="
 db -c "UPDATE mb_import_state SET last_packet = 0;" >/dev/null
 DUMP_SEQ=7 bash "$SELF_DIR/import.sh" "$FIX" >/dev/null
 check "seed advances" "7" "$(db -c 'SELECT last_packet FROM mb_import_state WHERE id = 1;')"
 DUMP_SEQ=5 bash "$SELF_DIR/import.sh" "$FIX" >/dev/null
 check "older seed never rewinds" "7" "$(db -c 'SELECT last_packet FROM mb_import_state WHERE id = 1;')"
 
-rm -rf "$FIX" "$DUPE"
+rm -rf "$FIX" "$DUPE" "$NEWER"
 if (( fail != 0 )); then
   echo "test-import: FAILED" >&2
   exit 1
 fi
 echo "test-import: all checks passed"
-db_show -c "SELECT table_name, lines_done FROM mb_import_cursor ORDER BY 1;" \
+db_show -c "SELECT table_name, dump_id, lines_done FROM mb_import_cursor ORDER BY 1, 2;" \
   -c "SELECT table_name, reason, count(*) FROM mb_import_dlq GROUP BY 1, 2 ORDER BY 1, 2;"
