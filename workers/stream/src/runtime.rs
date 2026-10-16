@@ -1,0 +1,134 @@
+//! Workers runtime entry (wasm32 only): the per-user `NntpPool` Durable
+//! Object and its probe route.
+//!
+//! - `POST /probe` on the Durable Object runs one ingest probe batch
+//!   ([`crate::probe`]). There is no public route to it: callers reach the
+//!   object through a Durable Object binding (`NNTP_POOL`, cross-script from
+//!   the ingest Worker), addressed by `id_from_name(user_id)`, and the object
+//!   refuses envelopes naming any other user.
+//! - The Worker's own `fetch` answers `404` until the play routes land.
+//!
+//! I/O objects belong to the Durable Object rather than to one request, so a
+//! warm provider connection parked in the pool is reused by later requests.
+
+use std::cell::{OnceCell, RefCell};
+
+use futures_util::StreamExt;
+use nntune_core::nntp::NntpClient;
+use nntune_core::transports::WorkerTransport;
+use worker::{
+    durable_object, event, Context, Date, DurableObject, Env, Headers, Method, Request, Response,
+    Result, State,
+};
+
+use crate::pool::Pool;
+use crate::probe::{
+    parse_request, run_probe, PoolProvider, ProbeError, ProbeReply, WallClock, MAX_PROBE_BODY_BYTES,
+};
+
+/// Durable Object route for one probe batch.
+pub const PROBE_PATH: &str = "/probe";
+
+#[event(fetch)]
+async fn fetch(_req: Request, _env: Env, _ctx: Context) -> Result<Response> {
+    Response::error("not found", 404)
+}
+
+#[durable_object(fetch)]
+pub struct NntpPool {
+    state: State,
+    /// Built on the first probe with the provider's cap; a changed cap
+    /// applies when the runtime next evicts this instance.
+    pool: OnceCell<RefCell<Pool<NntpClient<WorkerTransport>>>>,
+    clock: WallClock,
+}
+
+impl DurableObject for NntpPool {
+    fn new(state: State, _env: Env) -> Self {
+        Self {
+            state,
+            pool: OnceCell::new(),
+            clock: WallClock::default(),
+        }
+    }
+
+    async fn fetch(&self, mut req: Request) -> Result<Response> {
+        if req.method() != Method::Post || req.path() != PROBE_PATH {
+            return Response::error("not found", 404);
+        }
+        respond(self.probe(&mut req).await)
+    }
+}
+
+impl NntpPool {
+    async fn probe(&self, req: &mut Request) -> ProbeReply {
+        // The id came from `id_from_name(user_id)`; without the name there is
+        // no owner to check the envelope against, so refuse.
+        let Some(pool_user) = self.state.id().name() else {
+            return ProbeReply::from(Err(ProbeError::BadRequest("pool has no owner")));
+        };
+        let body = match read_capped(req, MAX_PROBE_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(e) => return ProbeReply::from(Err(e)),
+        };
+        let probe = match parse_request(&body, &pool_user) {
+            Ok(probe) => probe,
+            Err(e) => return ProbeReply::from(Err(e)),
+        };
+        let provider = match self.provider(&pool_user).await {
+            Ok(provider) => provider,
+            Err(e) => return ProbeReply::from(Err(e)),
+        };
+        let pool = self
+            .pool
+            .get_or_init(|| RefCell::new(Pool::new(provider.capacity)));
+        self.clock
+            .sync(&mut pool.borrow_mut(), Date::now().as_millis());
+        let config = provider.config;
+        let dial = || {
+            let config = config.clone();
+            async move {
+                let transport = WorkerTransport::connect(&config)
+                    .map_err(|e| nntune_core::Error::Io(std::io::Error::other(e.to_string())))?;
+                NntpClient::connect(transport, &config).await
+            }
+        };
+        ProbeReply::from(run_probe(pool, dial, &probe).await)
+    }
+
+    /// The user's provider settings and connection cap.
+    ///
+    /// Not connected yet: the encrypted provider row lives in the account
+    /// vault, and reading it here (Hyperdrive, key-encryption key, and the
+    /// SSRF guard on every connect) is the vault-read slice. Until then every
+    /// probe answers `503 provider_unavailable`, which ingest retries.
+    async fn provider(&self, _user_id: &str) -> core::result::Result<PoolProvider, ProbeError> {
+        Err(ProbeError::ProviderUnavailable)
+    }
+}
+
+/// Read the body without ever buffering more than `cap` bytes.
+async fn read_capped(req: &mut Request, cap: usize) -> core::result::Result<Vec<u8>, ProbeError> {
+    let unreadable = ProbeError::BadRequest("unreadable body");
+    let mut stream = Box::pin(req.stream().map_err(|_| unreadable)?);
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| unreadable)?;
+        if buf.len().saturating_add(chunk.len()) > cap {
+            return Err(ProbeError::TooLarge);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+fn respond(reply: ProbeReply) -> Result<Response> {
+    let headers = Headers::new();
+    headers.set("content-type", "application/json")?;
+    if let Some(secs) = reply.retry_after_secs {
+        headers.set("retry-after", &secs.to_string())?;
+    }
+    Ok(Response::ok(reply.body)?
+        .with_status(reply.status)
+        .with_headers(headers))
+}
