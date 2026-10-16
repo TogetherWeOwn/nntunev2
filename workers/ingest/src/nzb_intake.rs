@@ -175,6 +175,19 @@ fn find_bytes(bytes: &[u8], needle: &[u8], from: usize) -> Option<usize> {
         .map(|offset| from + offset)
 }
 
+/// Skip a terminated XML construct without allowing its closing delimiter to
+/// overlap the opening delimiter.
+fn skip_terminated(
+    bytes: &[u8],
+    start: usize,
+    opener_len: usize,
+    terminator: &[u8],
+) -> Option<usize> {
+    let content_start = start.checked_add(opener_len)?;
+    let terminator_start = find_bytes(bytes, terminator, content_start)?;
+    terminator_start.checked_add(terminator.len())
+}
+
 /// Skip an XML declaration, including a DOCTYPE internal subset.
 fn skip_declaration(bytes: &[u8], start: usize) -> Option<usize> {
     let mut i = start + 2;
@@ -203,7 +216,7 @@ fn skip_declaration(bytes: &[u8], start: usize) -> Option<usize> {
 /// Return the next opening XML tag, skipping comments, CDATA, processing
 /// instructions, declarations, and closing tags. The returned end offset is
 /// past `>` so subsequent scans never revisit the tag or its attributes.
-fn next_open_tag(body: &str, mut i: usize) -> Option<OpenTag> {
+fn next_open_tag(body: &str, mut i: usize) -> Result<Option<OpenTag>, ()> {
     let bytes = body.as_bytes();
     while i < bytes.len() {
         if bytes[i] != b'<' {
@@ -211,29 +224,29 @@ fn next_open_tag(body: &str, mut i: usize) -> Option<OpenTag> {
             continue;
         }
         if bytes[i..].starts_with(b"<!--") {
-            i = find_bytes(bytes, b"-->", i + 4)? + 3;
+            i = skip_terminated(bytes, i, 4, b"-->").ok_or(())?;
             continue;
         }
         if bytes[i..].starts_with(b"<![CDATA[") {
-            i = find_bytes(bytes, b"]]>", i + 9)? + 3;
+            i = skip_terminated(bytes, i, 9, b"]]>").ok_or(())?;
             continue;
         }
         if bytes[i..].starts_with(b"<?") {
-            i = find_bytes(bytes, b"?>", i + 2)? + 2;
+            i = skip_terminated(bytes, i, 2, b"?>").ok_or(())?;
             continue;
         }
         if bytes[i..].starts_with(b"<!") {
-            i = skip_declaration(bytes, i)?;
+            i = skip_declaration(bytes, i).ok_or(())?;
             continue;
         }
         if bytes[i..].starts_with(b"</") {
-            i = find_bytes(bytes, b">", i + 2)? + 1;
+            i = find_bytes(bytes, b">", i + 2).ok_or(())? + 1;
             continue;
         }
 
         let start = i;
         let name_start = i + 1;
-        let name_end = read_name(bytes, name_start)?;
+        let name_end = read_name(bytes, name_start).ok_or(())?;
         let mut j = name_end;
         let mut quote = None;
         while j < bytes.len() {
@@ -250,24 +263,24 @@ fn next_open_tag(body: &str, mut i: usize) -> Option<OpenTag> {
             j += 1;
         }
         if j >= bytes.len() {
-            return None;
+            return Err(());
         }
-        return Some(OpenTag {
+        return Ok(Some(OpenTag {
             start,
             name_end,
             end: j + 1,
-        });
+        }));
     }
-    None
+    Ok(None)
 }
 
 /// Count opening elements with local name `name`, stopping once `over` is
 /// exceeded. Prefixes are ignored so this agrees with nntune-core's
 /// namespace-aware local-name dispatch.
-fn count_elements(body: &str, name: &str, over: usize) -> usize {
+fn count_elements(body: &str, name: &str, over: usize) -> Result<usize, ()> {
     let mut count = 0;
     let mut offset = 0;
-    while let Some(tag) = next_open_tag(body, offset) {
+    while let Some(tag) = next_open_tag(body, offset)? {
         let qualified_name = &body[tag.start + 1..tag.name_end];
         if qualified_name.rsplit(':').next() == Some(name) {
             count += 1;
@@ -277,7 +290,7 @@ fn count_elements(body: &str, name: &str, over: usize) -> usize {
         }
         offset = tag.end;
     }
-    count
+    Ok(count)
 }
 
 /// Skip ASCII whitespace, returning the new offset.
@@ -342,18 +355,18 @@ fn check_well_formed(body: &str) -> bool {
         }
         let rest = &body[i..];
         if rest.starts_with("<!--") {
-            match body[i..].find("-->") {
-                Some(k) => i += k + 3,
+            match skip_terminated(bytes, i, 4, b"-->") {
+                Some(end) => i = end,
                 None => return false,
             }
         } else if rest.starts_with("<?") {
-            match body[i..].find("?>") {
-                Some(k) => i += k + 2,
+            match skip_terminated(bytes, i, 2, b"?>") {
+                Some(end) => i = end,
                 None => return false,
             }
         } else if rest.starts_with("<![CDATA[") {
-            match body[i..].find("]]>") {
-                Some(k) => i += k + 3,
+            match skip_terminated(bytes, i, 9, b"]]>") {
+                Some(end) => i = end,
                 None => return false,
             }
         } else if rest.starts_with("<!") {
@@ -437,7 +450,7 @@ fn check_well_formed(body: &str) -> bool {
 fn sum_segment_bytes(body: &str) -> Result<u64, ()> {
     let mut total: u64 = 0;
     let mut offset = 0;
-    while let Some(open) = next_open_tag(body, offset) {
+    while let Some(open) = next_open_tag(body, offset)? {
         let qualified_name = &body[open.start + 1..open.name_end];
         if qualified_name.rsplit(':').next() != Some("segment") {
             offset = open.end;
@@ -518,14 +531,16 @@ pub fn estimate_nzb_with_limits(
     if !check_well_formed(body) {
         return Err(IntakeRejection::Malformed);
     }
-    let file_count = count_elements(body, "file", limits.max_files);
+    let file_count =
+        count_elements(body, "file", limits.max_files).map_err(|_| IntakeRejection::Malformed)?;
     if file_count > limits.max_files {
         return Err(IntakeRejection::TooManyFiles {
             count: file_count,
             max: limits.max_files,
         });
     }
-    let segment_count = count_elements(body, "segment", limits.max_segments);
+    let segment_count = count_elements(body, "segment", limits.max_segments)
+        .map_err(|_| IntakeRejection::Malformed)?;
     if segment_count > limits.max_segments {
         return Err(IntakeRejection::TooManySegments {
             count: segment_count,
@@ -836,6 +851,25 @@ mod tests {
         assert_eq!(estimate.file_count, 1);
         assert_eq!(estimate.segment_count, 1);
         assert_eq!(estimate.declared_bytes, 100);
+    }
+
+    #[test]
+    fn overlapping_construct_terminators_are_rejected_and_fail_closed() {
+        for construct in ["<!-->", "<!--->", "<??>"] {
+            let doc = format!(
+                "<?xml?><nzb>{construct}<segment bytes=\"99999999999\">x@y</segment></nzb>"
+            );
+            assert_eq!(
+                estimate_nzb(&doc),
+                Err(IntakeRejection::Malformed),
+                "{construct}"
+            );
+            let construct_start = doc.find(construct).unwrap();
+            assert!(
+                matches!(next_open_tag(&doc, construct_start), Err(())),
+                "cap tokenizer must not truncate at {construct}"
+            );
+        }
     }
 
     #[test]
