@@ -73,6 +73,7 @@ fn new_session_id() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
     Invalid,
+    Misconfigured,
     /// The revoke did not commit (storage failure). The handler must NOT
     /// clear the session cookie: return a retryable 5xx so the caller keeps
     /// the only credential that can authenticate a retry. Carries the
@@ -84,9 +85,10 @@ pub enum SessionError {
 
 impl std::fmt::Display for SessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Generic: never leak why verification failed.
         match self {
-            // Generic: never leak why verification failed.
             Self::Invalid => write!(f, "invalid session"),
+            Self::Misconfigured => write!(f, "session service unavailable"),
             // Distinct from Invalid so the handler can return a retryable
             // 5xx without clearing the cookie; carries no secret material.
             Self::Storage { .. } => write!(f, "session store unavailable"),
@@ -101,12 +103,12 @@ impl std::fmt::Display for SessionError {
 /// Minimum HMAC secret length (32 bytes / 256 bits). Every signing and
 /// verification entry point enforces it and fails closed: an unset env var
 /// that decodes to an empty slice, or any truncated secret, is
-/// [`SessionError::Invalid`] — never a working weak key.
+/// [`SessionError::Misconfigured`] — never a working weak key.
 pub const MIN_SECRET_LEN: usize = 32;
 
 fn check_secret_len(secret: &[u8]) -> Result<(), SessionError> {
     if secret.len() < MIN_SECRET_LEN {
-        return Err(SessionError::Invalid);
+        return Err(SessionError::Misconfigured);
     }
     Ok(())
 }
@@ -225,9 +227,9 @@ pub fn verify_session(secret: &[u8], token: &str, now: u64) -> Result<SessionCla
 /// callers pass [`SessionKeys::single`] — a standing second secret would
 /// needlessly broaden the signing scope. Both secrets are length-checked
 /// up front, so a misconfigured short `previous` fails the whole call
-/// closed instead of silently narrowing the window. Both failures map to
-/// the same generic [`SessionError::Invalid`]; there is no oracle for
-/// which secret matched.
+/// closed instead of silently narrowing the window. A bad token maps to
+/// [`SessionError::Invalid`]; a short configured secret maps to
+/// [`SessionError::Misconfigured`] before token verification.
 pub fn verify_session_dual(
     keys: &SessionKeys<'_>,
     token: &str,
@@ -531,8 +533,8 @@ mod tests {
         // fail under the primary with no oracle for which secret matched.
         assert!(verify_session(primary, &old_token, now + 60).is_err());
         let wrong = SessionKeys::rotation(
-            b"wrong-1-00000000000000000000000",
-            b"wrong-2-00000000000000000000000",
+            b"wrong-1-000000000000000000000000",
+            b"wrong-2-000000000000000000000000",
         );
         assert_eq!(
             verify_session_dual(&wrong, &new_token, now + 60),
@@ -585,16 +587,31 @@ mod tests {
         let primary = b"primary-secret-00000000000000000000";
         let now = 1_700_000_000u64;
         // Minting under a weak key is refused, never issued.
-        assert!(issue_session(b"", "victim", now, 3600).is_err());
-        assert!(issue_session(b"short", "victim", now, 3600).is_err());
-        assert!(verify_session(b"", "x.y", now).is_err());
-        // An unset previous secret (empty slice) fails the whole call:
-        // a token minted under the empty key never verifies.
+        assert_eq!(
+            issue_session(b"", "victim", now, 3600),
+            Err(SessionError::Misconfigured)
+        );
+        assert_eq!(
+            issue_session(b"short", "victim", now, 3600),
+            Err(SessionError::Misconfigured)
+        );
+        assert_eq!(
+            verify_session(b"", "x.y", now),
+            Err(SessionError::Misconfigured)
+        );
+        // An unset previous secret (empty slice) fails the whole call
+        // before token verification.
         let empty_prev = SessionKeys::rotation(primary, b"");
-        assert!(verify_session_dual(&empty_prev, "x.y", now).is_err());
+        assert_eq!(
+            verify_session_dual(&empty_prev, "x.y", now),
+            Err(SessionError::Misconfigured)
+        );
         // The primary itself is length-checked even when a previous exists.
         let short_primary = SessionKeys::rotation(b"short", b"");
-        assert!(verify_session_dual(&short_primary, "x.y", now).is_err());
+        assert_eq!(
+            verify_session_dual(&short_primary, "x.y", now),
+            Err(SessionError::Misconfigured)
+        );
     }
 
     #[test]
