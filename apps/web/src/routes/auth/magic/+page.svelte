@@ -50,7 +50,13 @@
 				stashSignedInEmail(result.email);
 			}
 			window.location.href = '/onboarding/provider';
-		} catch {
+		} catch (error) {
+			if (error instanceof ApiError && error.paywall) {
+				// The token remains available; keep the explicit confirmation
+				// action so the user can retry once the global paywall clears.
+				status = 'confirm';
+				return;
+			}
 			// Generic: expired, already used, unknown and swap-guarded
 			// tokens all read the same, like the API. The token is left
 			// unspent, so its owner can still redeem it after signing out.

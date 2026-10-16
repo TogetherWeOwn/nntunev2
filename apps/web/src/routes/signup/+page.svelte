@@ -43,7 +43,11 @@
 			// address can still enroll.
 			pending = await client.registerStart(email.trim());
 			status = 'code-sent';
-		} catch {
+		} catch (error) {
+			if (error instanceof ApiError && error.paywall) {
+				status = 'idle';
+				return;
+			}
 			// Generic: account creation never says which step failed.
 			status = 'error';
 		}
@@ -102,7 +106,8 @@
 			window.location.href = '/onboarding/byop';
 		} catch (error) {
 			if (error instanceof ApiError && error.paywall) {
-				status = 'idle';
+				// Keep the retryable code form and single-use challenge available.
+				status = 'code-sent';
 				return;
 			}
 			// Generic: account creation never says which step failed. Stay
