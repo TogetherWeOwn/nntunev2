@@ -13,7 +13,7 @@ pub const GRACE_SECONDS: i64 = 86_400;
 ///
 /// `$1` is the TEXT user id. The operation's 24-hour deadline is based on the
 /// database clock, and a retry returns the existing operation id without
-/// extending its deadline.
+/// extending its deadline. A zero-row result means the user does not exist.
 pub const SCHEDULE_ACCOUNT_DELETION_SQL: &str = r#"
 WITH fenced_user AS (
     UPDATE users
@@ -32,12 +32,23 @@ DO UPDATE SET id = delete_operations.id
 RETURNING id
 "#;
 
+/// Take a transaction-scoped lock on the account owner row before cancellation.
+///
+/// `$1` is the TEXT user id. The caller must keep this lock while executing the
+/// cancellation statement, so schedule and cancel acquire user before operation.
+pub const LOCK_ACCOUNT_DELETION_USER_SQL: &str = r#"
+SELECT id FROM users WHERE id = $1 FOR UPDATE
+"#;
+
 /// Cancel only the owner's still-scheduled operation and clear its user fence.
 ///
-/// `$1` is the operation UUID and `$2` is the TEXT user id. Deleting the
-/// scheduled row is the cancellation compare-and-set; if executor start has
-/// changed its state to `running`, this statement returns no row and leaves the
-/// fence in place (ADR 0002 rule 3).
+/// `$1` is the operation UUID and `$2` is the TEXT user id. The caller must first
+/// execute `LOCK_ACCOUNT_DELETION_USER_SQL` for `$2` in the same transaction,
+/// then verify the operation exists and belongs to that user before mapping a
+/// zero-row result. Deleting the scheduled row is the cancellation compare-and-set;
+/// if executor start has changed its state to `running`, this statement returns
+/// no row and leaves the fence in place (ADR 0002 rule 3). With that prior
+/// owner-scoped check, zero rows means the ADR's 409 outcome.
 pub const CANCEL_ACCOUNT_DELETION_SQL: &str = r#"
 WITH cancelled AS (
     DELETE FROM delete_operations
