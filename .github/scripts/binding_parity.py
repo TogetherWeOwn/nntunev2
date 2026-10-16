@@ -125,7 +125,9 @@ _KNOWN_TABLES = frozenset(
 
 # Wrangler binding tables whose binding name is spelled ``name`` rather than
 # ``binding``. Keep this list explicit: arbitrary config tables also use name.
-_NAME_KEYED_BINDING_TABLES = frozenset({"send_email", "unsafe.bindings", "ratelimits"})
+_NAME_KEYED_BINDING_TABLES = frozenset(
+    {"send_email", "unsafe.bindings", "ratelimits", "logfwdr.bindings"}
+)
 
 
 def extract_bindings(data):
@@ -192,6 +194,9 @@ def extract_bindings(data):
     unsafe = data.get("unsafe")
     if isinstance(unsafe, dict) and "bindings" in unsafe:
         unknown_tables.append(("unsafe.bindings", unsafe["bindings"]))
+    logfwdr = data.get("logfwdr")
+    if isinstance(logfwdr, dict) and "bindings" in logfwdr:
+        unknown_tables.append(("logfwdr.bindings", logfwdr["bindings"]))
     for key, value in unknown_tables:
         candidates = value if isinstance(value, list) else [value]
         name_keyed = key in _NAME_KEYED_BINDING_TABLES

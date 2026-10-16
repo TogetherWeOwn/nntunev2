@@ -604,6 +604,11 @@ reason = "fixture: value fix owned elsewhere"
                 'namespace_id = "1234"\n',
                 "RL",
             ),
+            "logfwdr.bindings": (
+                '\n[[env.staging.logfwdr.bindings]]\nname = "LOG"\n'
+                'destination = "syslog"\n',
+                "LOG",
+            ),
         }
         for table, (addition, binding) in configs.items():
             with self.subTest(table=table), tempfile.TemporaryDirectory() as tmp:
