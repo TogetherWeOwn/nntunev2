@@ -58,7 +58,10 @@ impl KeySpec {
     /// with a stray space must fail where it is used, not be silently fixed
     /// here). Bools accept only `true`/`false` (case-insensitive).
     fn parse(&self, raw: &str) -> Result<Value, ConfigError> {
-        let invalid = || ConfigError::InvalidType { key: self.name, expected: self.ty };
+        let invalid = || ConfigError::InvalidType {
+            key: self.name,
+            expected: self.ty,
+        };
         match self.ty {
             ConfigType::U64 => {
                 let trimmed = raw.trim();
@@ -237,7 +240,10 @@ impl fmt::Display for ConfigError {
         match self {
             ConfigError::MissingRequired(key) => write!(f, "missing required config key: {key}"),
             ConfigError::InvalidType { key, expected } => {
-                write!(f, "config key {key} has the wrong type (expected {expected})")
+                write!(
+                    f,
+                    "config key {key} has the wrong type (expected {expected})"
+                )
             }
             ConfigError::UnknownKey(key) => write!(f, "undeclared config key: {key}"),
         }
@@ -321,7 +327,10 @@ mod tests {
     use super::*;
 
     fn kv(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(key, value)| ((*key).to_string(), (*value).to_string())).collect()
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
     }
 
     /// Minimal valid KV: the two identity keys, which have no defaults.
@@ -342,7 +351,10 @@ mod tests {
         assert_eq!(config.get_u64("mb.search_cache_ttl_s"), Some(300));
         assert_eq!(config.get_u64("mb.search_limit"), Some(25));
         assert_eq!(config.get_u64("ingest.payload_ttl_secs"), Some(2592000));
-        assert_eq!(config.get_bool("vault.indexer_allow_redirects"), Some(false));
+        assert_eq!(
+            config.get_bool("vault.indexer_allow_redirects"),
+            Some(false)
+        );
         assert_eq!(config.get_str("auth.rp_id"), Some("v2-staging.nntune.com"));
     }
 
@@ -350,7 +362,10 @@ mod tests {
     fn explicit_kv_values_win_over_defaults() {
         let mut raw = identity();
         raw.insert("session.ttl_secs".to_string(), "3600".to_string());
-        raw.insert("vault.indexer_allow_redirects".to_string(), "true".to_string());
+        raw.insert(
+            "vault.indexer_allow_redirects".to_string(),
+            "true".to_string(),
+        );
         let config = Config::load(&raw).expect("explicit values load");
         assert_eq!(config.get_u64("session.ttl_secs"), Some(3600));
         assert_eq!(config.get_bool("vault.indexer_allow_redirects"), Some(true));
@@ -360,8 +375,14 @@ mod tests {
     fn missing_required_key_without_default_fails() {
         let mut raw = identity();
         raw.remove("auth.rp_id");
-        assert_eq!(Config::load(&raw), Err(ConfigError::MissingRequired("auth.rp_id")));
-        assert_eq!(Config::load(&HashMap::new()), Err(ConfigError::MissingRequired("auth.rp_id")));
+        assert_eq!(
+            Config::load(&raw),
+            Err(ConfigError::MissingRequired("auth.rp_id"))
+        );
+        assert_eq!(
+            Config::load(&HashMap::new()),
+            Err(ConfigError::MissingRequired("auth.rp_id"))
+        );
     }
 
     #[test]
@@ -381,7 +402,10 @@ mod tests {
         }
         // Bool keys reject anything outside true/false.
         let mut raw = identity();
-        raw.insert("vault.indexer_allow_redirects".to_string(), "perhaps".to_string());
+        raw.insert(
+            "vault.indexer_allow_redirects".to_string(),
+            "perhaps".to_string(),
+        );
         assert_eq!(
             Config::load(&raw),
             Err(ConfigError::InvalidType {
@@ -395,14 +419,20 @@ mod tests {
     fn bool_parsing_is_strict_but_case_insensitive() {
         for good in ["true", "TRUE", " True "] {
             let mut raw = identity();
-            raw.insert("vault.indexer_allow_redirects".to_string(), good.to_string());
+            raw.insert(
+                "vault.indexer_allow_redirects".to_string(),
+                good.to_string(),
+            );
             let config = Config::load(&raw).expect("bool spelling loads");
             assert_eq!(config.get_bool("vault.indexer_allow_redirects"), Some(true));
         }
         for bad in ["yes", "1", "on", ""] {
             let mut raw = identity();
             raw.insert("vault.indexer_allow_redirects".to_string(), bad.to_string());
-            assert!(Config::load(&raw).is_err(), "bool spelling {bad:?} must fail");
+            assert!(
+                Config::load(&raw).is_err(),
+                "bool spelling {bad:?} must fail"
+            );
         }
     }
 
@@ -458,10 +488,11 @@ mod tests {
     fn schema_file_matches_code_table() {
         let path = format!("{}/../../config/schema.json", env!("CARGO_MANIFEST_DIR"));
         let text = std::fs::read_to_string(&path).expect("schema.json readable");
-        let schema: serde_json::Value =
-            serde_json::from_str(&text).expect("schema.json parses");
+        let schema: serde_json::Value = serde_json::from_str(&text).expect("schema.json parses");
         assert_eq!(
-            schema.get("schema_version").and_then(serde_json::Value::as_u64),
+            schema
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64),
             Some(u64::from(SCHEMA_VERSION)),
             "schema_version drift"
         );
@@ -486,7 +517,9 @@ mod tests {
                 spec.name
             );
             assert_eq!(
-                entry.get("env_overridable").and_then(serde_json::Value::as_bool),
+                entry
+                    .get("env_overridable")
+                    .and_then(serde_json::Value::as_bool),
                 Some(spec.env_overridable),
                 "env_overridable drift for {}",
                 spec.name
@@ -498,12 +531,9 @@ mod tests {
                     "env_var drift for {}",
                     spec.name
                 ),
-                Some(serde_json::Value::Null) | None => assert_eq!(
-                    None,
-                    spec.env_var,
-                    "env_var drift for {}",
-                    spec.name
-                ),
+                Some(serde_json::Value::Null) | None => {
+                    assert_eq!(None, spec.env_var, "env_var drift for {}", spec.name)
+                }
                 other => panic!("bad env_var shape for {}: {other:?}", spec.name),
             }
             // The declared default must re-parse through the same typed
@@ -514,9 +544,9 @@ mod tests {
                     let expected = match spec.ty {
                         ConfigType::U64 => json_default.as_u64().map(|n| n.to_string()),
                         ConfigType::Bool => json_default.as_bool().map(|b| b.to_string()),
-                        ConfigType::Str => json_default
-                            .as_str()
-                            .map(std::string::ToString::to_string),
+                        ConfigType::Str => {
+                            json_default.as_str().map(std::string::ToString::to_string)
+                        }
                     }
                     .unwrap_or_else(|| {
                         panic!("schema default has wrong JSON type for {}", spec.name)
