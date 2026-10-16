@@ -10,9 +10,14 @@
   rule, unify playlist/library predicates with dormant entries, add release_art
   cover-art path, and specify fenced account deletion, FK order and local-catalog GC;
   align playlists with applied 0003_library.sql (evolution, not CREATE) and make
-  step-up complete lock-then-verify so failed attempts increment to the cap.
-- **Baseline inspected:** main `29140710bb5d8e0d57f1701ca1e6c3e854e9104f`.
-  Auth, ingest, core, scaffold and MB work are merged, not in-flight assumptions.
+  step-up complete lock-then-verify so failed attempts increment to the cap;
+  fix delete-ops container typing, public-playlist metadata rule, merged playlist
+  SQL rework list, and passkey-uv assertion verification.
+- **Baseline inspected:** main `553902652cc8f5bea149c3a1bfbc55725ce5f757`
+  (includes `migrations/0001_mb_mirror.sql`, `0002_auth_vault.sql` and
+  `0003_library.sql` via #28 plus `workers/api/src/library.rs` playlist
+  statements). Auth, ingest, core, scaffold and MB work are merged,
+  not in-flight assumptions.
 
 ## Context and compatibility boundary
 
@@ -124,7 +129,7 @@ providers             id PK, user_id FK, label,
 indexers              id PK, user_id TEXT FK NULL (NULL means global),
                       name, base_url, api_key_encrypted BYTEA NULL
                       + api_key_* envelope fields, enabled BOOLEAN
-libraries             id PK, user_id FK, name, created_at, deleting_at NULL
+libraries             id UUID PK, user_id FK, name, created_at, deleting_at NULL
 artists               id PK, mbid UUID NULL (MB artist), local_key TEXT UNIQUE NULL,
                       local_job_id UUID NULL FK → ingest_jobs (indexed owner path;
                       NOT NULL when local_key present),
@@ -177,19 +182,32 @@ cache_objects         content_hash TEXT PK (sha256 hex), byte_size BIGINT,
                       ref_count BIGINT (advisory), created_at, last_verified_at
 playlists             EVOLUTION of applied migrations/0003_library.sql playlists
                       (retained: id BIGSERIAL internal row key NEVER returned,
-                      public_id TEXT UNIQUE external handle, owner_user_id TEXT
+                      public_id TEXT UNIQUE external handle (22-char base64url
+                      from `new_public_id`), owner_user_id TEXT
                       FK → users = owner, name, items JSONB legacy, is_public,
                       created_at BIGINT); forward migration ADDS deleting_at
                       timestamptz NULL only — never CREATEs a second playlists
                       table (bare CREATE would collide/no-op on the existing
-                      incompatible shape). playlist_tracks.playlist_id FK →
-                      playlists(id) internal; APIs take public_id. Legacy items
-                      JSONB rows are backfilled to playlist_tracks where the
-                      opaque ref resolves, kept read-only during transition,
-                      then the column is dropped by a later migration — never
-                      dual-written. genres table from 0003 retained as-is,
+                      incompatible shape). playlist_tracks.playlist_id BIGINT
+                      FK → playlists(id) internal; APIs take public_id TEXT.
+                      Legacy items JSONB rows are backfilled to playlist_tracks
+                      where the opaque ref resolves, kept read-only during
+                      transition and readable by the owner only (never returned
+                      to a non-owner, §6), then the column is dropped by a later
+                      migration — never dual-written. `is_public` is retained
+                      for list visibility, but non-owner reads of a public
+                      playlist return metadata only (name, entry count — no
+                      track rows, catalog ids, tags, or legacy items, §6).
+                      genres table from 0003 retained as-is,
                       out of scope here; genre support needs its own ADR.
-playlist_tracks       id PK, playlist_id FK → playlists(id) ON DELETE RESTRICT,
+playlist_tracks       id UUID PK (opaque entry handle, returned as {entry_id}
+                      in URLs/tombstones/cursors; never sequential),
+                      playlist_id BIGINT NOT NULL FK → playlists(id)
+                      ON DELETE RESTRICT,
+                      track_id UUID NULL FK → tracks(id) ON DELETE RESTRICT
+                      (NULL only for dormant entries whose track left every
+                      caller library, §6),
+                      position INTEGER NOT NULL,
                       UNIQUE (playlist_id, position) DEFERRABLE INITIALLY DEFERRED,
                       INDEX (playlist_id, track_id),
                       INDEX (track_id) -- GC reference test + track-delete RI path
@@ -254,14 +272,32 @@ step_up_proofs        id UUID PK, user_id TEXT NOT NULL FK → users ON DELETE C
                       -- action=$action AND verified_at IS NULL AND
                       -- consumed_at IS NULL AND expires_at > now(); zero rows
                       -- → 403 step_up_required. (2) If attempts >= 5 → 403
-                      -- requiring re-begin (no further verify). (3)
-                      -- Constant-time compare the presented credential to the
-                      -- locked row's bound token_hash/challenge_id by method;
-                      -- on mismatch run UPDATE step_up_proofs SET
-                      -- attempts=LEAST(attempts+1,5) WHERE id=$1 (NO
-                      -- credential term, so the failure increments) and
-                      -- return 403; the 5th failure locks the proof. (4) On
-                      -- match run UPDATE step_up_proofs SET
+                      -- requiring re-begin (no further verify). (3) Verify by
+                      -- method, inside the same locked transaction (a bare
+                      -- challenge-id or token-hash equality alone never sets
+                      -- verified_at for passkey-uv): for method='magic-link',
+                      -- constant-time compare SHA-256 hex of the presented
+                      -- token to the locked row's bound token_hash; for
+                      -- method='passkey-uv', require ALL of: the assertion's
+                      -- challenge equals the locked row's bound challenge_id,
+                      -- rp_id and origin match the expected values, the
+                      -- assertion signature verifies against a
+                      -- webauthn_credentials.public_key row of the same user,
+                      -- the user-verification (UV) flag is set, and
+                      -- sign_count advances (UPDATE
+                      -- webauthn_credentials SET sign_count=<new> WHERE
+                      -- cred_id=$c AND user_id=$u AND
+                      -- sign_count<old>). This follows main
+                      -- workers/api/src/auth.rs, where
+                      -- verify_and_consume_challenge is documented as a
+                      -- lifecycle gate only and callers must still complete
+                      -- credential signature verification — the Worker must
+                      -- not treat a passing lifecycle gate alone as WebAuthn
+                      -- authentication. On ANY verification failure run UPDATE
+                      -- step_up_proofs SET attempts=LEAST(attempts+1,5) WHERE
+                      -- id=$1 (NO credential term, so the failure increments)
+                      -- and return 403; the 5th failure locks the proof.
+                      -- (4) On match run UPDATE step_up_proofs SET
                       -- verified_at=now() WHERE id=$1 AND verified_at IS
                       -- NULL AND consumed_at IS NULL RETURNING together with
                       -- UPDATE magic_link_tokens SET used=TRUE WHERE
@@ -281,7 +317,13 @@ step_up_proofs        id UUID PK, user_id TEXT NOT NULL FK → users ON DELETE C
                       -- zero rows rejects.
 delete_operations     id UUID PK, user_id TEXT NOT NULL FK → users ON DELETE RESTRICT,
                       scope TEXT NOT NULL ('account'|'library'|'playlist'),
-                      container_id UUID NULL, cursor JSONB NOT NULL DEFAULT '{}',
+                      container_id TEXT NULL, -- library scope: libraries.id
+                        -- UUID as text; playlist scope: playlists.public_id
+                        -- TEXT (22-char base64url); account scope: NULL.
+                        -- TEXT because neither key is UUID-typed in the
+                        -- retained 0003 shape (playlists.id is BIGSERIAL
+                        -- internal, public_id is TEXT).
+                      cursor JSONB NOT NULL DEFAULT '{}',
                       state TEXT NOT NULL DEFAULT 'pending'
                         CHECK (state IN ('scheduled','pending','running','failed','done')),
                       erase_after timestamptz NULL
@@ -518,8 +560,8 @@ batch, together with `state`, `heartbeat_at`, `consecutive_failures` and
 `last_error`. The delete cursor keys on indexed access paths only: `(user_id,
 played_at, event_id)` for `play_events`/`play_event_outbox` via their
 `(user_id, played_at)` indexes; `(library_id, track_id)` via
-`libraries(user_id)` for membership batches; `(playlist_id, entry id)` for
-playlist-entry batches; `(user_id, content_hash)` for grant batches; `track_id`
+`libraries(user_id)` for membership batches; `(playlist_id, entry_id UUID)`
+for playlist-entry batches; `(user_id, content_hash)` for grant batches; `track_id`
 via the `library_tracks(track_id)`, `playlist_tracks(track_id)`,
 `track_sources(track_id)` and `track_media(track_id)` indexes for the GC
 reference test and every `DELETE FROM tracks` RI check;
@@ -983,7 +1025,22 @@ catalog rows — resolves ids only through the caller's own libraries:
 `libraries(user_id = caller) → library_tracks → tracks → releases → artists`.
 A non-member artist/release/track id returns 404 (native) or Subsonic error 70;
 `search3`/search returns only member rows. A new endpoint that takes or returns
-a catalog id is denied until it declares how it applies this gate. Local-row ownership is derived via the indexed `local_job_id` →
+a catalog id is denied until it declares how it applies this gate.
+Public playlists (`playlists.is_public=TRUE`, retained from 0003) are the one
+visibility exception, and they are metadata-only for non-owners: a non-owner
+read of a public playlist returns only `public_id`, `name`, `is_public` and the
+entry count — never embedded track rows, catalog ids, file tags, `coverart:`
+ids, or the legacy `items` JSONB. The merged
+`playlist_read_statement`/`playlist_list_statement` shape
+(`WHERE public_id=$1 AND (owner_user_id=$2 OR is_public=TRUE)` returning
+`items` to any caller) is therefore narrowed: list/single reads keep the
+owner-or-public predicate for the metadata row, but the `items` column and any
+backfilled `playlist_tracks` rows are projected only when
+`owner_user_id=caller`; non-owner projections return an empty items/entry set
+with the count. The legacy `items` column is readable by the playlist owner
+only during transition (opaque refs, never guessed into track rows), never by a
+non-owner. An owner read resolves embedded rows through the owner's own
+memberships exactly like any other playlist read. Local-row ownership is derived via the indexed `local_job_id` →
 `ingest_jobs.user_id`; that user is the sole owner, and the library-scope rule
 already restricts reads to it. `local_key` parsing is legacy backfill only,
 never a runtime access path.
@@ -1268,6 +1325,33 @@ retaining its `release_mbid_hint` without guessing. Also require:
   checkpoint stays kilobytes, never tens of megabytes. Final-reference cleanup
   invalidates local art in the same transaction only when the selection
   changed, and an expired refill lease cannot publish.
+- Delete-ops container typing: `DELETE /v1/playlists/{public_id}` creates a
+  `delete_operations` row with `scope='playlist'` and `container_id` set to
+  that `public_id` TEXT (library scope stores `libraries.id` UUID as TEXT;
+  account scope stores NULL) — inserting the 22-char base64url handle and the
+  `SELECT id FROM playlists` BIGINT into a UUID column is the 22P02/type
+  failure this replaces. A repeat DELETE while the row exists returns the same
+  operation id with 202, never a unique violation. `playlist_tracks.id` is the
+  opaque UUID `{entry_id}` in URLs, tombstones and cursors (never a sequential
+  internal key).
+- Public-playlist metadata rule: a non-owner read of a public playlist that
+  contains an owner-local track returns only name/entry-count metadata — no
+  embedded track rows, catalog ids, file tags, `coverart:` ids, or legacy
+  `items`. The legacy `items` column is never returned to a non-owner, even
+  for unresolvable refs. Owner reads resolve embedded rows through the owner's
+  own memberships.
+- Step-up method split: an unsigned or wrong-key passkey assertion, and a
+  valid-signature assertion without the UV flag, both leave `verified_at` NULL
+  and increment `attempts` (no-credential-term UPDATE); only a
+  challenge-matching, origin/rp-bound, signature-verified, UV-set assertion
+  with an advancing `sign_count` sets `verified_at`. A bare challenge-id match
+  never verifies.
+- Merged playlist SQL rework: the implementing PR replaces
+  `playlist_delete_statement` with the fenced rule-3 delete, freezes `items`
+  writes, narrows the read/list projections per §6, and maps or retires
+  `/api/playlists` onto `/v1/playlists`; the merged
+  `library_single_row_visibility.rs` / `library_tests.rs` pins are updated in
+  the same PR.
 
 ### 7. Existing migrations stay at their applied paths
 
@@ -1311,18 +1395,41 @@ work. Production DB creation/migration remains gated by the ops contract.
   explicit per-file match; ambiguous recording arrays retain NULL MBIDs/source
   manifests rather than guessing associations. Keep legacy data/read support
   until parity is verified; never use create-if-absent as a conversion.
-- **Playlists/genres (0003 applied on main):** `migrations/0003_library.sql`
+- **Playlists/genres (0003 applied on main via #28):** `migrations/0003_library.sql`
   `playlists` (`id BIGSERIAL PK, public_id UNIQUE, owner_user_id, items JSONB,
   is_public`) and `genres` are retained with all rows; the implementing PR adds
   only `ALTER TABLE playlists ADD COLUMN deleting_at` plus the new
   `playlist_tracks` table, backfills `items` JSONB entries to `playlist_tracks`
-  where the opaque ref resolves (unresolvable entries stay readable through the
-  legacy column during transition, never guessed into track rows), keeps
-  `public_id` as the external handle and `owner_user_id` as the owner predicate
-  in every query, and treats `genres` as out of scope (no change here). The
+  where the opaque ref resolves (unresolvable entries stay readable by the
+  owner through the legacy column during transition, never to a non-owner and
+  never guessed into track rows), keeps `public_id` as the external handle,
+  and treats `genres` as out of scope (no change here). Reads keep the merged
+  owner-or-public metadata predicate but project `items`/entries owner-only
+  per §6; mutations keep `owner_user_id` as the owner predicate. The
   rule-3 delete executor and §6 predicates operate on the retained internal id
   via `public_id` lookup; nothing in this docs-only PR creates, alters, or
-  migrates those tables.
+  migrates those tables. The implementing PR must also rework the merged
+  statements in `workers/api/src/library.rs`, which this ADR otherwise leaves
+  untouched: replace the bare `playlist_delete_statement`
+  (`DELETE FROM playlists WHERE public_id=$1 AND owner_user_id=$2` — fails
+  23503 once a `playlist_tracks.playlist_id ... ON DELETE RESTRICT` row exists
+  and bypasses `delete_operations`, the `deleting_at` fence and rule-3
+  source/art cleanup) with the fenced rule-3 procedure (FOR SHARE on the users
+  row and the playlist row resolved via `public_id`, reject non-NULL
+  `deleting_at`, delete only through `delete_operations` + the batched
+  executor); freeze writes to `items` (`playlist_insert_statement` /
+  `playlist_update_statement` must stop writing `items` — 422 on items input
+  or route it into `playlist_tracks` — because the column is read-only in
+  transition and merged handlers would otherwise mint playlists that never
+  reach `playlist_tracks`); narrow `playlist_read_statement` /
+  `playlist_list_statement` to the §6 metadata-only projection for non-owners;
+  and map or retire the merged `/api/playlists` routes onto the declared
+  `/v1/playlists` surface (ADR 0006 declares only `/v1`; no parallel
+  `/api/playlists` contract survives). The same PR updates the merged
+  `library_single_row_visibility.rs` / `library_tests.rs` pins (public-items
+  visibility, mutation-lookup shape, delete path) in lockstep — the narrowed
+  projection and fenced delete are breaking changes against those tests, not
+  silent drift.
 - **Ingest manifest producer (new alignment work):** the current parser's flat
   `ParsedNzb.message_ids` and `LibraryWrite.recording_mbids` arrays do not contain
   the per-file selection, grouping or occurrence data above. Preserve NZB file

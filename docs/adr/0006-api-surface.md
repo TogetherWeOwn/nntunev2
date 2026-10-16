@@ -2,9 +2,10 @@
 
 - **Status:** Accepted design; implementation and independent review gates remain.
 - **Date:** 2026-10-13
-- **Revised:** 2026-10-15 — versioned HMAC lookup, row-bound token envelopes,
+- **Revised:** 2026-10-16 — versioned HMAC lookup, row-bound token envelopes,
   explicit native/compat auth scope, library-scoped catalog reads,
-  and implementation acceptance requirements.
+  implementation acceptance requirements, public-playlist metadata-only rule,
+  playlist public_id delete handle, and method-split step-up verification.
   No completed review score or client-compatibility test result is claimed.
 
 ## Context
@@ -26,7 +27,9 @@ least-privilege credential.
    the canonical API. `apps/web` uses only this. Resources: `/v1/{me,library,
    artists,releases,tracks,playlists,plays,providers,indexers,search,stream}`
    plus delete entry points `DELETE /v1/account`, `DELETE
-   /v1/libraries/{id}`, `DELETE /v1/playlists/{id}`, `POST
+   /v1/libraries/{id}` (`libraries.id` UUID), `DELETE /v1/playlists/{public_id}`
+   (playlist `public_id` TEXT; the `delete_operations.container_id` TEXT holds
+   that handle, ADR 0002), `POST
    /v1/account/cancel-deletion` and `GET
    /v1/operations/{operation_id}`. Each DELETE marks `deleting_at`, persists a
    `delete_operations` row (ADR 0002 rule 3) and returns `202` with the operation
@@ -56,11 +59,18 @@ least-privilege credential.
    generic failure, create no session, and leave it unconsumed) and `POST
    /v1/account/step-up/complete {proof_id, ...}` (canonical lock-then-verify
    predicate in ADR 0002: lock the live proof by id/session/action with
-   `verified_at IS NULL AND consumed_at IS NULL` and unexpired, then compare the
-   exact bound `challenge_id`/`token_hash` with `purpose='step-up'` — mismatch
-   increments `attempts` without any credential term and returns 403, match sets
-   `verified_at`; 10/15min per proof, 5 failures lock at `attempts`=5, then
-   re-begin; a login credential never verifies a proof, and
+   `verified_at IS NULL AND consumed_at IS NULL` and unexpired, then verify by
+   method with `purpose='step-up'` — magic-link: constant-time compare SHA-256
+   of the presented token to the bound `token_hash`; passkey-uv: the
+   assertion's challenge must equal the bound `challenge_id` AND rp_id/origin
+   must match AND the signature must verify against a
+   `webauthn_credentials.public_key` row of the same user AND the UV flag must
+   be set AND `sign_count` must advance (a bare challenge-id match never sets
+   `verified_at`, per main `workers/api/src/auth.rs` where
+   `verify_and_consume_challenge` is a lifecycle gate only) — any failure
+   increments `attempts` without any credential term and returns 403, a pass
+   sets `verified_at`; 10/15min per proof, 5 failures lock at `attempts`=5,
+   then re-begin; a login credential never verifies a proof, and
    the step-up claim path never creates a session). `DELETE /v1/account
    {proof_id}` (and `POST /v1/account/cancel-deletion {proof_id}`) consumes the
    proof atomically under the canonical consume predicate in ADR 0002
@@ -149,6 +159,13 @@ least-privilege credential.
   directory/list/index call where it lists catalog rows — resolves ids only
   through the caller's own `library_tracks` memberships. A non-member id
   returns 404 (native) or Subsonic error 70; search returns only member rows.
+  Public playlists (`is_public=TRUE`) are metadata-only for non-owners: name
+  and entry count only, never embedded track rows, catalog ids, tags,
+  `coverart:` ids, or legacy `items` (ADR 0002 §6 narrows the merged
+  `playlist_read_statement`/`playlist_list_statement`, which returned `items`
+  to any caller). The merged `/api/playlists` routes are mapped onto
+  `/v1/playlists` (or retired with the statements above) — no parallel
+  `/api/playlists` contract survives this ADR.
   Membership and playlist writes are ownership-checked per ADR 0002 §6 and cannot
   self-assert another user's rows: a playlist write needs the same library
   membership reads need plus an own track source, and entries whose track left
