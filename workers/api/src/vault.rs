@@ -647,17 +647,26 @@ pub fn rewrap_dek(
 /// and testable:
 /// - proves ownership of the old credential by decrypting `old_blob` (fails
 ///   closed when the caller cannot read the row they claim to rotate);
-/// - validates `new_config` (shape + SSRF guard) so the new secret verifies
-///   via `test connection` before it is sealed;
-/// - requires the provider identity (`host`, `username`) to be unchanged —
-///   a different provider is a fresh save (`vault.update`), not a rotation;
-/// - seals the new credential with a fresh DEK under (`kek`, `kek_version`).
+/// - binds the provider identity (`host`, `username`) to the *decrypted
+///   stored row*, never to a caller-supplied "old" config: a `new_config`
+///   naming a different host or username is rejected — a different provider
+///   is a fresh save (`vault.update`), not a rotation;
+/// - validates `new_config` shape + SSRF guard ([`ProviderConfig::validate`]).
+///   This does NOT dial the provider: the caller MUST first verify the new
+///   secret with a real `test connection` (enforcing
+///   [`test_attempt_allowed`]/[`concurrent_test_allowed`] and
+///   [`TestConnectionBudget`]) — a wrong new password otherwise seals happily;
+/// - seals the **full stored row** with only the provider password replaced,
+///   under a fresh DEK: indexer secrets and every other provider/indexer
+///   field in the decrypted payload are preserved verbatim. A stored payload
+///   that is not a JSON object (or carries no bindable provider identity)
+///   fails closed rather than being replaced by a partial row.
 ///
-/// The sealed payload is the minimal provider-credential JSON
-/// (`{"username":…, "password":…}`); the full provider+indexer row shape is
-/// owned by the API worker entry, which calls this helper for the
-/// password-rotation slice. The caller MUST audit with
-/// [`provider_rotation_audit_action`] and MUST NOT touch the session row.
+/// The stored payload is the serialized provider+indexer row
+/// ([`encrypt_vault`]); the provider object is `payload["provider"]` when
+/// that is an object, otherwise the top-level object itself. The caller MUST
+/// audit with [`provider_rotation_audit_action`] and MUST NOT touch the
+/// session row.
 ///
 /// Every failure maps to generic [`VaultError::Invalid`]/[`VaultError::Crypto`]:
 /// no credential material, no host/user detail, no crypto internals.
@@ -666,26 +675,56 @@ pub fn rotate_provider_credentials(
     kek_version: u32,
     user_id: &str,
     old_blob: &VaultBlob,
-    old_config: &ProviderConfig,
     new_config: &ProviderConfig,
     dns: &impl DnsResolver,
 ) -> Result<VaultBlob, VaultError> {
-    // Prove ownership of the row being rotated.
-    decrypt_vault(kek, user_id, old_blob)?;
-    // The new secret must verify before it is sealed.
-    new_config.validate(dns)?;
-    // Rotation keeps the provider identity: host + username unchanged.
-    if old_config.host != new_config.host || old_config.username != new_config.username {
-        return Err(VaultError::Invalid);
-    }
     if new_config.password.is_empty() {
         return Err(VaultError::Invalid);
     }
-    let new_plaintext = serde_json::json!({
-        "username": new_config.username,
-        "password": new_config.password,
-    });
-    let bytes = serde_json::to_vec(&new_plaintext).map_err(|_| VaultError::Invalid)?;
+    // Prove ownership of the row being rotated and load the full stored row.
+    let mut plaintext = decrypt_vault(kek, user_id, old_blob)?;
+    let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&plaintext);
+    plaintext.zeroize();
+    let mut row = parsed.map_err(|_| VaultError::Invalid)?;
+    let row_obj = row.as_object_mut().ok_or(VaultError::Invalid)?;
+    // The provider object: `provider` sub-object when present, else the
+    // top-level object (legacy flat rows).
+    let provider = match row_obj.get_mut("provider") {
+        Some(serde_json::Value::Object(_)) => row_obj["provider"]
+            .as_object_mut()
+            .ok_or(VaultError::Invalid)?,
+        Some(_) => return Err(VaultError::Invalid),
+        None => row_obj,
+    };
+    // Bind identity to the stored row: every stored host/username present
+    // must match the new config, and at least one must be present to bind to.
+    let mut bound = false;
+    for (field, expected) in [
+        ("host", new_config.host.as_str()),
+        ("username", new_config.username.as_str()),
+    ] {
+        match provider.get(field) {
+            Some(serde_json::Value::String(stored)) => {
+                bound = true;
+                if stored != expected {
+                    return Err(VaultError::Invalid);
+                }
+            }
+            Some(_) => return Err(VaultError::Invalid),
+            None => {}
+        }
+    }
+    if !bound {
+        return Err(VaultError::Invalid);
+    }
+    // Shape + SSRF guard only — no dial (see caller obligations above).
+    new_config.validate(dns)?;
+    // Replace only the password; preserve the rest of the row verbatim.
+    provider.insert(
+        "password".to_string(),
+        serde_json::Value::String(new_config.password.clone()),
+    );
+    let bytes = serde_json::to_vec(&row).map_err(|_| VaultError::Invalid)?;
     encrypt_vault(kek, kek_version, user_id, &bytes)
 }
 

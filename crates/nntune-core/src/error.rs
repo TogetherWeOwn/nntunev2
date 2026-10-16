@@ -14,7 +14,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Every failure this crate can report. Transport I/O surfaces as
 /// [`Error::Io`]; NNTP protocol failures carry their numeric reply code.
-#[derive(Debug)]
+///
+/// `Debug` is manual, not derived: the [`Error::AuthFailed`] payload is
+/// attacker-influenced server reply text that may carry reflected
+/// credential material, so `{:?}` must redact it exactly like `Display`
+/// does (threat-model §3/§6; precedent: redacted `Debug` for credential
+/// configs in `workers/api/src/vault.rs`).
 pub enum Error {
     /// Underlying transport I/O failure (includes timeouts, which each
     /// transport implementation enforces and reports as [`io::ErrorKind::TimedOut`]).
@@ -44,6 +49,46 @@ pub enum Error {
     Par2Unhealthy { filename: String, detail: String },
     /// Operation needs a native target (e.g. spawning the `par2` repair binary).
     UnsupportedOnWasm(&'static str),
+}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Io(e) => f.debug_tuple("Io").field(e).finish(),
+            Error::NntpReply { code, text } => f
+                .debug_struct("NntpReply")
+                .field("code", code)
+                .field("text", text)
+                .finish(),
+            // Redacted: never print the server reply text (see enum docs).
+            Error::AuthFailed(_) => f.debug_tuple("AuthFailed").field(&"<redacted>").finish(),
+            Error::NoPermission(t) => f.debug_tuple("NoPermission").field(t).finish(),
+            Error::ArticleNotFound(id) => f.debug_tuple("ArticleNotFound").field(id).finish(),
+            Error::Malformed(r) => f.debug_tuple("Malformed").field(r).finish(),
+            Error::CrcMismatch {
+                message_id,
+                want,
+                got,
+            } => f
+                .debug_struct("CrcMismatch")
+                .field("message_id", message_id)
+                .field("want", want)
+                .field("got", got)
+                .finish(),
+            Error::Bounds { bound, limit } => f
+                .debug_struct("Bounds")
+                .field("bound", bound)
+                .field("limit", limit)
+                .finish(),
+            Error::Decrypt(r) => f.debug_tuple("Decrypt").field(r).finish(),
+            Error::Par2Unhealthy { filename, detail } => f
+                .debug_struct("Par2Unhealthy")
+                .field("filename", filename)
+                .field("detail", detail)
+                .finish(),
+            Error::UnsupportedOnWasm(op) => f.debug_tuple("UnsupportedOnWasm").field(op).finish(),
+        }
+    }
 }
 
 impl Error {

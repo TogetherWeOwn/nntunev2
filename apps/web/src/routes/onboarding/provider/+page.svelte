@@ -119,7 +119,8 @@
 			if (runId !== testRunId || inputKey !== currentTestKey()) return;
 			testState = 'failed';
 			// Stale stored credential: inline re-auth prompt (S7), never a
-			// generic error page. The form stays mounted so the user re-enters
+			// generic error page. The step-3 prompt renders its own password
+			// field (the step-1 form is unmounted by now) so the user re-enters
 			// the password in place; the session stays signed in.
 			if (error instanceof ApiError && isProviderAuthExpired(error)) {
 				reauthRequired = true;
@@ -282,9 +283,26 @@
 						<h3 id="reauth-heading">Provider credentials expired</h3>
 						<p>{testDetail}</p>
 						<p>
-							Re-enter your password above and test again — your session stays
-							signed in, and the new password is verified before it is saved.
+							Re-enter your password below and test again — your session stays
+							signed in, and the new password is tested before it is saved.
 						</p>
+						<label>
+							Password
+							<input
+								name="reauthPassword"
+								type="password"
+								required
+								autocomplete="current-password"
+								bind:value={password}
+								oninput={() => {
+									// A changed password voids any earlier test result,
+									// but typing must not dismiss this prompt.
+									testedConfigKey = null;
+									saveState = 'idle';
+								}}
+							/>
+						</label>
+						<button class="nt-button" type="button" onclick={runTest}>Test again</button>
 					</div>
 				{:else}
 					<p role="alert">{testDetail}</p>
