@@ -98,6 +98,44 @@ test('auth transition invalidates a previously authenticated tab snapshot', asyn
 	await otherTab.close();
 });
 
+test('auth transition discards an in-flight response body from the previous session', async ({ page }) => {
+	await seedSnapshot(page);
+	await page.addInitScript((items) => {
+		const originalFetch = window.fetch.bind(window);
+		window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+			if (String(input).endsWith('/api/library')) {
+				return Promise.resolve({
+					ok: true,
+					status: 200,
+					json: () =>
+						new Promise((resolve) => {
+							Object.assign(window, { __releaseLibraryBody: () => resolve(items) });
+						})
+				} as Response);
+			}
+			return originalFetch(input, init);
+		}) as typeof fetch;
+	}, SEEDED.items);
+
+	await page.goto('/library');
+	await expect
+		.poll(() => page.evaluate(() => typeof Reflect.get(window, '__releaseLibraryBody')))
+		.toBe('function');
+
+	const otherTab = await page.context().newPage();
+	await otherTab.goto('/login');
+	await otherTab.evaluate((key) => {
+		window.localStorage.setItem(key, 'test-auth-transition');
+		window.localStorage.removeItem(key);
+	}, 'nntune.library.auth-transition.v1');
+
+	await expect(page.getByRole('alert')).toContainText(/session changed/i);
+	await page.evaluate(() => Reflect.get(window, '__releaseLibraryBody')());
+	await expect(page.getByTestId('library-list')).toHaveCount(0);
+	expect(await readSnapshot(page)).toBeNull();
+	await otherTab.close();
+});
+
 test('non-empty payload with no valid rows preserves the last-good snapshot', async ({ page }) => {
 	await seedSnapshot(page);
 	let invalid = false;
@@ -263,6 +301,28 @@ test('blocked storage still renders a fresh library list', async ({ page }) => {
 
 	await expect(page.getByTestId('library-list')).toContainText('Seeded Song One');
 	await expect(page.getByTestId('library-item')).toHaveCount(2);
+	await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
+test('blocked storage retains a fresh list as stale after a failed refresh', async ({ page }) => {
+	await blockStorage(page);
+	let failNext = false;
+	await page.route('**/api/library', (route) => {
+		if (failNext) return route.abort('failed');
+		failNext = true;
+		return route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify(SEEDED.items)
+		});
+	});
+
+	await page.goto('/library');
+	await expect(page.getByTestId('library-list')).toContainText('Seeded Song One');
+	await page.getByRole('button', { name: 'Refresh' }).click();
+
+	await expect(page.getByTestId('library-list')).toContainText('Seeded Song One');
+	await expect(page.getByTestId('library-stale-badge')).toBeVisible();
 	await expect(page.getByRole('alert')).toHaveCount(0);
 });
 

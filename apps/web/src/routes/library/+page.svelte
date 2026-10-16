@@ -17,6 +17,7 @@
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
 	let authenticatedThisLoad = false;
+	let inMemorySnapshot: ReturnType<typeof saveSnapshot> | null = null;
 	let activeRequest: AbortController | null = null;
 	let requestGeneration = 0;
 
@@ -60,8 +61,10 @@
 				fetchFn('/api/library', { credentials: 'include', signal: controller.signal }),
 				timeout
 			]);
+			if (generation !== requestGeneration) return;
 			if (response.status === 401 || response.status === 403) {
 				authenticatedThisLoad = false;
+				inMemorySnapshot = null;
 				invalidateLibraryCache();
 				items = [];
 				staleAt = null;
@@ -70,16 +73,19 @@
 			}
 			if (!response.ok) throw new Error(`library request failed (${response.status})`);
 			const payload = await Promise.race([response.json(), timeout]);
+			if (generation !== requestGeneration) return;
 			const fresh = toLibraryItems(payload);
 			if (fresh === null) throw new Error('library response has an invalid shape');
 			authenticatedThisLoad = true;
 			items = fresh;
 			staleAt = null;
-			saveSnapshot(browserStorage('session'), fresh);
+			inMemorySnapshot = saveSnapshot(browserStorage('session'), fresh);
 		} catch {
 			if (generation !== requestGeneration) return;
 			// Do not trust a tab's snapshot until this page has verified its session.
-			const snapshot = authenticatedThisLoad ? loadSnapshot(browserStorage('session')) : null;
+			const snapshot = authenticatedThisLoad
+				? (inMemorySnapshot ?? loadSnapshot(browserStorage('session')))
+				: null;
 			if (snapshot) {
 				items = snapshot.items;
 				staleAt = snapshot.savedAt;
@@ -103,6 +109,7 @@
 		activeRequest?.abort();
 		activeRequest = null;
 		authenticatedThisLoad = false;
+		inMemorySnapshot = null;
 		clearSnapshot(browserStorage('session'));
 		items = [];
 		staleAt = null;
