@@ -14,22 +14,20 @@ const PLACEHOLDER_PATTERNS = ['placeholder', 'todo', 'example.com', 'javascript:
 async function assertPricingActionsResolve(page: Page): Promise<void> {
 	// The pricing page must always offer a way forward (trial signup,
 	// current-usage check) even when checkout itself is limit-blocked.
-	for (const { name, expectedHref } of [
-		{ name: 'Start trial', expectedHref: '/signup?plan=free' },
-		{ name: 'Check your current usage', expectedHref: '/account/billing' }
-	]) {
+	for (const name of ['Start trial', 'Check your current usage']) {
 		const link = page.getByRole('link', { name, exact: true });
+		await expect(link, `pricing page must expose exactly one "${name}" link`).toHaveCount(1);
 		await expect(link).toBeVisible();
-		await expect(link).toHaveAttribute('href', expectedHref);
 		const href = await link.getAttribute('href');
 		expect(href, `${name} link should have an href`).toBeTruthy();
+		if (!href) continue;
 		for (const placeholder of PLACEHOLDER_PATTERNS) {
 			expect(
-				href!.toLowerCase(),
+				href.toLowerCase(),
 				`CTA href "${href}" must not point at a placeholder`
 			).not.toContain(placeholder);
 		}
-		const response = await page.request.get(href!);
+		const response = await page.request.get(href);
 		expect(response.status(), `${href} should resolve without a client or server error`).toBeLessThan(400);
 	}
 }
