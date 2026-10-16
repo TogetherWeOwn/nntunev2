@@ -11,7 +11,7 @@ use nntune_core::nntp::{NntpClient, NntpConfig};
 use nntune_core::transports::{connect_native, NativeTlsTransport};
 use nntune_stream::pool::{Lane, Pool};
 use nntune_stream::probe::{
-    run_probe, serve_probe, ProbeError, ProbeOutcome, ProbeRequest, LANE_FULL_RETRY_MS,
+    run_probe, serve_probe, ProbeError, ProbeOutcome, ProbeRequest, WallClock, LANE_FULL_RETRY_MS,
 };
 use nntune_test_nntp::{default_corpus, TestNntpServer};
 
@@ -62,6 +62,17 @@ fn request(user: &str, batch_index: usize, ids: &[String]) -> ProbeRequest {
     }
 }
 
+/// The pool's virtual clock stays where it is; these tests do not move time.
+fn no_tick(_: &mut Pool<Client>) {}
+
+/// A dial that takes 1.5 s of wall-clock time and then fails.
+async fn slow_failing_dial(now: &Cell<u64>) -> nntune_core::Result<Client> {
+    now.set(now.get() + 1_500);
+    Err(nntune_core::Error::Io(std::io::Error::other(
+        "provider timed out",
+    )))
+}
+
 #[tokio::test]
 async fn stat_partitions_present_and_missing_and_echoes_the_batch() {
     let server = TestNntpServer::spawn_for_test().await;
@@ -73,9 +84,14 @@ async fn stat_partitions_present_and_missing_and_echoes_the_batch() {
     let mut ids = vec![posted[0].clone(), MISSING.to_string()];
     ids.push(posted[1].clone());
     ids.push(UNKNOWN.to_string());
-    let outcome = run_probe(&pool, || dial(cfg.clone(), &dials), &request("u1", 7, &ids))
-        .await
-        .expect("probe succeeds");
+    let outcome = run_probe(
+        &pool,
+        || dial(cfg.clone(), &dials),
+        no_tick,
+        &request("u1", 7, &ids),
+    )
+    .await
+    .expect("probe succeeds");
 
     assert_eq!(
         outcome,
@@ -104,6 +120,7 @@ async fn warm_connection_serves_the_next_batch_without_a_dial() {
         run_probe(
             &pool,
             || dial(cfg.clone(), &dials),
+            no_tick,
             &request("u1", batch, &ids),
         )
         .await
@@ -123,7 +140,7 @@ async fn warm_connection_closed_while_idle_is_redialed_once() {
     let ids = posted_ids();
     let dial_target = || dial(target.borrow().clone(), &dials);
 
-    run_probe(&pool, dial_target, &request("u1", 0, &ids))
+    run_probe(&pool, dial_target, no_tick, &request("u1", 0, &ids))
         .await
         .expect("first probe");
     assert_eq!(pool.borrow().idle(), 1);
@@ -135,7 +152,7 @@ async fn warm_connection_closed_while_idle_is_redialed_once() {
     let second = TestNntpServer::spawn_for_test().await;
     *target.borrow_mut() = config(second.addr(), "testpass");
 
-    let outcome = run_probe(&pool, dial_target, &request("u1", 1, &ids))
+    let outcome = run_probe(&pool, dial_target, no_tick, &request("u1", 1, &ids))
         .await
         .expect("stale warm connection is replaced, not reported");
     assert_eq!(outcome.present, ids);
@@ -151,7 +168,7 @@ async fn provider_failure_is_generic_and_quarantines_the_pool() {
     let pool: RefCell<Pool<Client>> = RefCell::new(Pool::new(4));
     let req = request("u1", 0, &posted_ids());
 
-    let err = run_probe(&pool, || dial(cfg.clone(), &dials), &req)
+    let err = run_probe(&pool, || dial(cfg.clone(), &dials), no_tick, &req)
         .await
         .expect_err("bad credentials fail the batch");
     assert_eq!(err, ProbeError::Provider);
@@ -159,7 +176,7 @@ async fn provider_failure_is_generic_and_quarantines_the_pool() {
     assert_eq!(pool.borrow().idle(), 0, "the failed connection is dropped");
 
     // Quarantined: the next batch backs off without touching the provider.
-    let err = run_probe(&pool, || dial(cfg.clone(), &dials), &req)
+    let err = run_probe(&pool, || dial(cfg.clone(), &dials), no_tick, &req)
         .await
         .expect_err("quarantined");
     assert_eq!(
@@ -172,6 +189,37 @@ async fn provider_failure_is_generic_and_quarantines_the_pool() {
 }
 
 #[tokio::test]
+async fn quarantine_backoff_counts_from_the_failure_not_the_request_start() {
+    // The dial fails 1.5 s after the request began, longer than the 1 s first
+    // backoff step. Stamped from the request start the step would already be
+    // over when recorded and the next probe would redial at once.
+    let now = Cell::new(10_000);
+    let clock = WallClock::default();
+    let tick = |pool: &mut Pool<Client>| clock.sync(pool, now.get());
+    let pool: RefCell<Pool<Client>> = RefCell::new(Pool::new(4));
+    let req = request("u1", 0, &posted_ids());
+
+    let err = run_probe(&pool, || slow_failing_dial(&now), tick, &req)
+        .await
+        .expect_err("the dial fails");
+    assert_eq!(err, ProbeError::Provider);
+    assert_eq!(now.get(), 11_500);
+
+    // 100 ms after the failure, 900 ms of the 1 s step remain; no dial.
+    now.set(11_600);
+    let err = run_probe(&pool, || slow_failing_dial(&now), tick, &req)
+        .await
+        .expect_err("still quarantined");
+    assert_eq!(
+        err,
+        ProbeError::Busy {
+            retry_after_ms: 900
+        }
+    );
+    assert_eq!(now.get(), 11_600, "a quarantined probe never dials");
+}
+
+#[tokio::test]
 async fn ingest_lane_never_takes_the_playback_slot() {
     let server = TestNntpServer::spawn_for_test().await;
     let cfg = config(server.addr(), "testpass");
@@ -180,7 +228,7 @@ async fn ingest_lane_never_takes_the_playback_slot() {
 
     // Cap 1: the only connection is playback's.
     let pool: RefCell<Pool<Client>> = RefCell::new(Pool::new(1));
-    let err = run_probe(&pool, || dial(cfg.clone(), &dials), &req)
+    let err = run_probe(&pool, || dial(cfg.clone(), &dials), no_tick, &req)
         .await
         .expect_err("lane full");
     assert_eq!(
@@ -194,11 +242,11 @@ async fn ingest_lane_never_takes_the_playback_slot() {
     let pool: RefCell<Pool<Client>> = RefCell::new(Pool::new(2));
     let play = pool.borrow_mut().try_acquire(Lane::Playback).expect("play");
     assert!(matches!(
-        run_probe(&pool, || dial(cfg.clone(), &dials), &req).await,
+        run_probe(&pool, || dial(cfg.clone(), &dials), no_tick, &req).await,
         Err(ProbeError::Busy { .. })
     ));
     pool.borrow_mut().release(play, None);
-    run_probe(&pool, || dial(cfg.clone(), &dials), &req)
+    run_probe(&pool, || dial(cfg.clone(), &dials), no_tick, &req)
         .await
         .expect("lane free once the play ends");
     assert_eq!(dials.get(), 1, "refused probes never dial");
@@ -216,8 +264,8 @@ async fn concurrent_probes_share_the_pool_without_holding_a_borrow() {
     let (a, b) = (request("u1", 0, &ids), request("u1", 1, &ids));
 
     let (ra, rb) = tokio::join!(
-        run_probe(&pool, || dial(cfg.clone(), &dials), &a),
-        run_probe(&pool, || dial(cfg.clone(), &dials), &b),
+        run_probe(&pool, || dial(cfg.clone(), &dials), no_tick, &a),
+        run_probe(&pool, || dial(cfg.clone(), &dials), no_tick, &b),
     );
     assert_eq!(ra.expect("a").batch_index, 0);
     assert_eq!(rb.expect("b").batch_index, 1);
@@ -243,7 +291,14 @@ async fn serve_probe_answers_the_ingest_envelope_as_json() {
         "segment_bytes": [739, null],
     })
     .to_string();
-    let reply = serve_probe(&pool, "u1", body.as_bytes(), || dial(cfg.clone(), &dials)).await;
+    let reply = serve_probe(
+        &pool,
+        "u1",
+        body.as_bytes(),
+        || dial(cfg.clone(), &dials),
+        no_tick,
+    )
+    .await;
     assert_eq!(reply.status, 200);
     let outcome: ProbeOutcome = serde_json::from_str(&reply.body).expect("outcome JSON");
     assert_eq!(outcome.batch_index, 4);
@@ -251,7 +306,14 @@ async fn serve_probe_answers_the_ingest_envelope_as_json() {
     assert_eq!(outcome.missing, vec![MISSING.to_string()]);
 
     // Routed to another user's pool: refused before any dial.
-    let reply = serve_probe(&pool, "u2", body.as_bytes(), || dial(cfg.clone(), &dials)).await;
+    let reply = serve_probe(
+        &pool,
+        "u2",
+        body.as_bytes(),
+        || dial(cfg.clone(), &dials),
+        no_tick,
+    )
+    .await;
     assert_eq!(reply.status, 400);
     assert_eq!(reply.body, r#"{"error":"bad_request"}"#);
     assert_eq!(dials.get(), 1);

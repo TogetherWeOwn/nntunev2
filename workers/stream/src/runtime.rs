@@ -89,8 +89,6 @@ impl NntpPool {
         let pool = self
             .pool
             .get_or_init(|| RefCell::new(Pool::new(provider.capacity)));
-        self.clock
-            .sync(&mut pool.borrow_mut(), Date::now().as_millis());
         let config = provider.config;
         let dial = || {
             let config = config.clone();
@@ -100,7 +98,11 @@ impl NntpPool {
                 NntpClient::connect(transport, &config).await
             }
         };
-        ProbeReply::from(run_probe(pool, dial, &probe).await)
+        let clock = &self.clock;
+        let tick = |pool: &mut Pool<NntpClient<WorkerTransport>>| {
+            clock.sync(pool, Date::now().as_millis());
+        };
+        ProbeReply::from(run_probe(pool, dial, tick, &probe).await)
     }
 
     /// The user's provider settings and connection cap.
@@ -109,6 +111,12 @@ impl NntpPool {
     /// vault, and reading it here (Hyperdrive, key-encryption key, and the
     /// SSRF guard on every connect) is the vault-read slice. Until then every
     /// probe answers `503 provider_unavailable`, which ingest retries.
+    ///
+    /// When it returns real settings, key the pool (or flush its idle
+    /// connections) on a provider fingerprint: the pool is built once with the
+    /// first provider's cap and parked connections carry no provider identity,
+    /// so a changed host or credential would keep answering from the old
+    /// connection until the instance is evicted.
     async fn provider(&self, _user_id: &str) -> core::result::Result<PoolProvider, ProbeError> {
         Err(ProbeError::ProviderUnavailable)
     }

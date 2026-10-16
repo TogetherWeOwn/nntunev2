@@ -228,18 +228,27 @@ pub async fn stat_batch<T: Transport>(
 /// Run one validated probe on `pool`'s ingest lane. `dial` opens and
 /// authenticates a fresh provider connection; it is called at most once per
 /// probe (none when a warm connection answers).
-pub async fn run_probe<T, D, F>(
+///
+/// `tick` brings the pool's clock up to date (the Durable Object passes
+/// [`WallClock::sync`] over `Date.now()`). It runs before the lane is leased
+/// and again right before a provider failure is recorded, so quarantine
+/// backoff counts from the failure, not from the start of a slow dial or
+/// batch.
+pub async fn run_probe<T, D, F, S>(
     pool: &RefCell<Pool<NntpClient<T>>>,
     mut dial: D,
+    tick: S,
     req: &ProbeRequest,
 ) -> Result<ProbeOutcome, ProbeError>
 where
     T: Transport,
     D: FnMut() -> F,
     F: Future<Output = nntune_core::Result<NntpClient<T>>>,
+    S: Fn(&mut Pool<NntpClient<T>>),
 {
     let (lease, warm) = {
         let mut pool = pool.borrow_mut();
+        tick(&mut pool);
         let lease = pool.try_acquire(Lane::Ingest).map_err(|e| match e {
             PoolError::Quarantined { retry_after_ms } => ProbeError::Busy { retry_after_ms },
             PoolError::Exhausted => ProbeError::Busy {
@@ -260,13 +269,13 @@ where
             }
             // Closed while idle: drop it and redial once below.
             Err(nntune_core::Error::Io(_)) => {}
-            Err(_) => return Err(provider_failed(pool, lease)),
+            Err(_) => return Err(provider_failed(pool, &tick, lease)),
         }
     }
 
     let mut client = match dial().await {
         Ok(client) => client,
-        Err(_) => return Err(provider_failed(pool, lease)),
+        Err(_) => return Err(provider_failed(pool, &tick, lease)),
     };
     pool.borrow_mut().record_connect();
     match stat_batch(&mut client, &req.segment_ids).await {
@@ -276,7 +285,7 @@ where
             pool.release(lease, Some(client));
             Ok(outcome(req, found))
         }
-        Err(_) => Err(provider_failed(pool, lease)),
+        Err(_) => Err(provider_failed(pool, &tick, lease)),
     }
 }
 
@@ -290,32 +299,36 @@ fn outcome(req: &ProbeRequest, (present, missing): (Vec<String>, Vec<String>)) -
 }
 
 /// Quarantines the pool, drops the leased connection and returns the generic
-/// provider error.
+/// provider error. The clock is ticked first so the backoff starts now.
 fn provider_failed<T: Transport>(
     pool: &RefCell<Pool<NntpClient<T>>>,
+    tick: &impl Fn(&mut Pool<NntpClient<T>>),
     lease: crate::pool::Lease,
 ) -> ProbeError {
     let mut pool = pool.borrow_mut();
+    tick(&mut pool);
     pool.record_provider_error();
     pool.release(lease, None);
     ProbeError::Provider
 }
 
 /// Serve one probe call end to end: validate `body` for `pool_user`'s pool,
-/// then run it.
-pub async fn serve_probe<T, D, F>(
+/// then run it (`dial` and `tick` as for [`run_probe`]).
+pub async fn serve_probe<T, D, F, S>(
     pool: &RefCell<Pool<NntpClient<T>>>,
     pool_user: &str,
     body: &[u8],
     dial: D,
+    tick: S,
 ) -> ProbeReply
 where
     T: Transport,
     D: FnMut() -> F,
     F: Future<Output = nntune_core::Result<NntpClient<T>>>,
+    S: Fn(&mut Pool<NntpClient<T>>),
 {
     let result = match parse_request(body, pool_user) {
-        Ok(req) => run_probe(pool, dial, &req).await,
+        Ok(req) => run_probe(pool, dial, tick, &req).await,
         Err(e) => Err(e),
     };
     ProbeReply::from(result)
