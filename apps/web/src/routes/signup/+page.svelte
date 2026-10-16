@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
+	import { invalidateLibraryCache } from '#lib/library/cache.js';
 	import { ApiClient, type RegisterStartResponse } from '#lib/api/client.js';
 	import { stashSignedInEmail } from '#lib/signed-in-email.js';
 	import {
@@ -97,6 +98,7 @@
 				magicToken: magicCode.trim(),
 				...(inviteCode.trim().length > 0 ? { inviteCode: inviteCode.trim() } : {})
 			});
+			invalidateLibraryCache();
 			status = 'created';
 			stashSignedInEmail(email.trim());
 			window.location.href = '/onboarding/byop';
