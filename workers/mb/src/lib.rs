@@ -10,9 +10,11 @@
 //! binding `MB_DB`; successful responses are cached in KV (`MB_CACHE`) and
 //! at the edge via the Cache API / `Cache-Control`. Failures (400/404/500)
 //! are `no-store` and are never written to either cache. Interactive reads
-//! never call musicbrainz.org. Cover art bytes live in the `nntunev2-art`
-//! R2 bucket; this worker serves cacheable URLs, never secrets. See
-//! `README.md` and `migrations/0001_mb_mirror.sql`.
+//! never call musicbrainz.org. Cover art bytes live in the per-environment
+//! R2 art buckets (`nntunev2-art-staging` / `nntunev2-art-prod`, see
+//! `docs/ops.md`); this worker serves env-correct cacheable URLs built by
+//! [`caa_url_for_art`], never secrets. See `README.md` and
+//! `migrations/0001_mb_mirror.sql`.
 //!
 //! Structure: [`handle_lookup`] / [`handle_search`] are the testable core
 //! over the [`MbRepo`] and [`SuccessCache`] traits. The HTTP layer at the bottom wires them to a per-request
@@ -35,6 +37,66 @@ const MAX_QUERY_CHARS: usize = 100;
 /// Hyperdrive / KV binding names: must match `wrangler.toml.example`.
 const MB_DB_BINDING: &str = "MB_DB";
 const MB_CACHE_BINDING: &str = "MB_CACHE";
+
+/// R2 cover-art buckets per `docs/ops.md` ("R2 buckets", "Environments
+/// matrix"): one bucket per concern per environment. There is no shared
+/// unsuffixed art bucket; always use one of the two names below.
+pub const ART_BUCKET_STAGING: &str = "nntunev2-art-staging";
+pub const ART_BUCKET_PROD: &str = "nntunev2-art-prod";
+
+/// Resolve the cover-art bucket for an environment name: `"staging"` maps
+/// to the staging bucket; `"prod"` and `"production"` (the wrangler env
+/// name) map to the prod bucket. Anything else falls back to prod, so a
+/// missing or misspelled `ENVIRONMENT` var can never point the live
+/// release lookup at staging art.
+pub fn art_bucket_for_env(env: &str) -> &'static str {
+    match env {
+        "staging" => ART_BUCKET_STAGING,
+        "prod" | "production" => ART_BUCKET_PROD,
+        _ => ART_BUCKET_PROD,
+    }
+}
+
+/// Build the cacheable cover-art URL for an art key (for example
+/// `art/ab/cd/<sha>-500`, ADR 0003) in the given bucket. The returned URL
+/// always embeds both the bucket name and the key; the release lookup
+/// serves this value as `caa_url`. The virtual-hosted shape is the
+/// convention until the public host stabilizes with binding activation
+/// (TOG-23680); KV/edge cache key schemes are unaffected.
+pub fn caa_url_for_art(bucket: &str, key: &str) -> String {
+    let key = key.trim_start_matches('/');
+    format!("https://{bucket}.r2.cloudflarestorage.com/{key}")
+}
+
+/// Normalize a stored release `caa_url` to the env-correct bucket. The
+/// mirror is shared across envs (`HYPERDRIVE_ID_MB` in `docs/ops.md`), so
+/// the same stored value must serve both staging and prod:
+/// - `None`/empty stays `None` (the release has no cached art);
+/// - a bare art key (`art/...`, no scheme) is built into this env's URL
+///   via [`caa_url_for_art`];
+/// - a URL already naming this env's bucket passes through;
+/// - a URL in our shape naming the *other* env's bucket is swapped to
+///   this env (same key, correct bucket);
+/// - any other URL (e.g. an upstream CAA link) passes through untouched:
+///   never break external links.
+fn normalize_caa_url(raw: Option<String>, bucket: &str) -> Option<String> {
+    let raw = raw.filter(|s| !s.is_empty())?;
+    if !raw.contains("://") {
+        return Some(caa_url_for_art(bucket, &raw));
+    }
+    if raw.contains(bucket) {
+        return Some(raw);
+    }
+    let other = if bucket == ART_BUCKET_STAGING {
+        ART_BUCKET_PROD
+    } else {
+        ART_BUCKET_STAGING
+    };
+    if raw.contains(other) {
+        return Some(raw.replace(other, bucket));
+    }
+    Some(raw)
+}
 
 /// Entity selector. The only route into SQL: each variant maps to a
 /// static, parameterized statement (see [`lookup_sql`]/[`search_sql`]), so
@@ -414,11 +476,23 @@ mod http_layer {
         }
     }
 
+    /// Resolve the art bucket from the Worker's `ENVIRONMENT` var
+    /// (`staging` vs `production`, see `wrangler.toml.example`). Falls back
+    /// to the prod bucket when unset, matching [`art_bucket_for_env`].
+    fn art_bucket_from_env(env: &Env) -> &'static str {
+        let name = env
+            .var("ENVIRONMENT")
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        art_bucket_for_env(&name)
+    }
+
     /// [`MbRepo`] over Hyperdrive. Lazy: the Postgres connection is opened
     /// per query (Hyperdrive pools underneath), so a KV/edge cache hit
     /// never connects.
     struct PgRepo {
         env: Env,
+        art_bucket: &'static str,
     }
 
     impl PgRepo {
@@ -454,7 +528,8 @@ mod http_layer {
                 .query_opt(lookup_sql(kind), &[&mbid])
                 .await
                 .map_err(|_| RepoError)?;
-            row.map(|row| entity_from_row(kind, &row)).transpose()
+            row.map(|row| entity_from_row(kind, &row, self.art_bucket))
+                .transpose()
         }
 
         async fn search(
@@ -471,7 +546,11 @@ mod http_layer {
         }
     }
 
-    fn entity_from_row(kind: Kind, row: &tokio_postgres::Row) -> Result<Entity, RepoError> {
+    fn entity_from_row(
+        kind: Kind,
+        row: &tokio_postgres::Row,
+        art_bucket: &str,
+    ) -> Result<Entity, RepoError> {
         // Column names/types are fixed by `lookup_sql`; a mismatch is a
         // server-side schema bug, reported as an opaque read failure.
         let entity = match kind {
@@ -488,7 +567,10 @@ mod http_layer {
                 title: row.try_get("title").map_err(|_| RepoError)?,
                 release_type: row.try_get("release_type").map_err(|_| RepoError)?,
                 year: row.try_get("year").map_err(|_| RepoError)?,
-                caa_url: row.try_get("caa_url").map_err(|_| RepoError)?,
+                caa_url: normalize_caa_url(
+                    row.try_get("caa_url").map_err(|_| RepoError)?,
+                    art_bucket,
+                ),
             }),
             Kind::Recording => Entity::Recording(Recording {
                 mbid: row.try_get("mbid").map_err(|_| RepoError)?,
@@ -555,6 +637,7 @@ mod http_layer {
         let mbid = ctx.param("mbid").map(String::as_str).unwrap_or("");
         let repo = PgRepo {
             env: ctx.env.clone(),
+            art_bucket: art_bucket_from_env(&ctx.env),
         };
         let cache = EdgeCache::from_env(&ctx.env);
         let api = handle_lookup(&repo, &cache, kind, mbid).await;
@@ -570,6 +653,7 @@ mod http_layer {
             url.query_pairs().into_owned().collect();
         let repo = PgRepo {
             env: ctx.env.clone(),
+            art_bucket: art_bucket_from_env(&ctx.env),
         };
         let cache = EdgeCache::from_env(&ctx.env);
         let api = handle_search(
@@ -799,6 +883,71 @@ mod tests {
         assert_eq!(body["year"], 1983);
         assert!(body["caa_url"].is_null());
         assert!(body["artist_mbid"].is_null());
+    }
+
+    #[test]
+    fn art_bucket_env_matrix_matches_ops_inventory() {
+        assert_eq!(ART_BUCKET_STAGING, "nntunev2-art-staging");
+        assert_eq!(ART_BUCKET_PROD, "nntunev2-art-prod");
+        assert_ne!(ART_BUCKET_STAGING, ART_BUCKET_PROD);
+        assert_eq!(art_bucket_for_env("staging"), ART_BUCKET_STAGING);
+        assert_eq!(art_bucket_for_env("prod"), ART_BUCKET_PROD);
+        assert_eq!(art_bucket_for_env("production"), ART_BUCKET_PROD);
+        // Unknown or missing env never resolves staging art.
+        assert_eq!(art_bucket_for_env(""), ART_BUCKET_PROD);
+        assert_eq!(art_bucket_for_env("dev"), ART_BUCKET_PROD);
+    }
+
+    #[test]
+    fn caa_url_builder_embeds_bucket_and_key() {
+        let url = caa_url_for_art(ART_BUCKET_STAGING, "art/ab/cd/0123456789abcdef-500");
+        assert!(url.contains(ART_BUCKET_STAGING), "{url}");
+        assert!(url.contains("art/ab/cd/0123456789abcdef-500"), "{url}");
+        assert!(!url.contains(ART_BUCKET_PROD), "{url}");
+        // Leading slashes do not produce an empty path segment.
+        let slashed = caa_url_for_art(ART_BUCKET_PROD, "/art/ab/cd/key-250");
+        assert!(!slashed.contains(".com//"), "{slashed}");
+        assert!(slashed.contains(ART_BUCKET_PROD), "{slashed}");
+    }
+
+    #[test]
+    fn normalize_caa_url_serves_env_correct_bucket() {
+        let key = "art/ab/cd/0123456789abcdef-500".to_string();
+        // Bare art keys are built into the requesting env's bucket.
+        assert_eq!(
+            normalize_caa_url(Some(key.clone()), ART_BUCKET_STAGING),
+            Some(caa_url_for_art(ART_BUCKET_STAGING, &key))
+        );
+        assert_eq!(
+            normalize_caa_url(Some(key.clone()), ART_BUCKET_PROD),
+            Some(caa_url_for_art(ART_BUCKET_PROD, &key))
+        );
+        // Same-env URLs pass through; other-env URLs in our shape swap.
+        let staging_url = caa_url_for_art(ART_BUCKET_STAGING, &key);
+        let prod_url = caa_url_for_art(ART_BUCKET_PROD, &key);
+        assert_eq!(
+            normalize_caa_url(Some(staging_url.clone()), ART_BUCKET_STAGING),
+            Some(staging_url.clone())
+        );
+        assert_eq!(
+            normalize_caa_url(Some(staging_url.clone()), ART_BUCKET_PROD),
+            Some(prod_url.clone())
+        );
+        assert_eq!(
+            normalize_caa_url(Some(prod_url.clone()), ART_BUCKET_STAGING),
+            Some(staging_url.clone())
+        );
+        // Missing art stays missing; upstream links are never rewritten.
+        assert_eq!(normalize_caa_url(None, ART_BUCKET_PROD), None);
+        assert_eq!(
+            normalize_caa_url(Some(String::new()), ART_BUCKET_PROD),
+            None
+        );
+        let upstream = "https://coverartarchive.org/release/abc/front-500".to_string();
+        assert_eq!(
+            normalize_caa_url(Some(upstream.clone()), ART_BUCKET_STAGING),
+            Some(upstream)
+        );
     }
 
     #[test]

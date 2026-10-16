@@ -13,6 +13,18 @@ compatibility_date = "2026-10-01"
 # binding = "MB_CACHE"
 # id = "<KV_NAMESPACE_ID>"
 
-# [[r2_buckets]]
+# Artwork cache: one R2 bucket per environment (docs/ops.md inventory).
+# Binding activation stays with TOG-23680; uncomment when activating.
+# Staging (`wrangler deploy --env staging`):
+# [env.staging.vars]
+# ENVIRONMENT = "staging"
+# [[env.staging.r2_buckets]]
 # binding = "ART_CACHE"
-# bucket_name = "nntunev2-art"
+# bucket_name = "nntunev2-art-staging"
+#
+# Prod (`wrangler deploy --env production`):
+# [env.production.vars]
+# ENVIRONMENT = "production"
+# [[env.production.r2_buckets]]
+# binding = "ART_CACHE"
+# bucket_name = "nntunev2-art-prod"

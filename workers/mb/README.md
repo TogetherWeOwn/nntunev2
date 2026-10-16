@@ -32,8 +32,12 @@ search success is `{"q", "type", "results": [{"mbid", "name"|"title",
   400/404/500 responses are `no-store` and written to neither cache.
   KV failures degrade to plain DB reads; a missing `MB_CACHE` binding
   disables KV, a missing/unreachable `MB_DB` yields the generic `500`.
-- Cover art bytes live in R2 `nntunev2-art` (`art/{hh}/{hh}/{sha}-{size}`,
-  ADR 0003); this worker returns URLs, never proxies full images inline.
+- Cover art bytes live in the per-environment R2 art buckets
+  (`nntunev2-art-staging` / `nntunev2-art-prod`, `docs/ops.md` inventory;
+  keys `art/{hh}/{hh}/{sha}-{size}`, ADR 0003). Release `caa_url` is
+  served env-correct via `caa_url_for_art` (`art_bucket_for_env` on the
+  `ENVIRONMENT` var); KV/edge cache key schemes are unchanged. This
+  worker returns URLs, never proxies full images inline.
 
 ## p95 methodology (acceptance input)
 
