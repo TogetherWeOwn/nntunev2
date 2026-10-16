@@ -7,6 +7,10 @@
 //! gone article fails one play without quarantining the pool, while a
 //! provider outage does quarantine and recovers; TTFB is measured on both
 //! paths (targets documented in `workers/stream/README.md`).
+//!
+//! S10: a mid-track seek on a cold cache with per-segment byte ranges fetches
+//! only the covering segment (a single BODY); without ranges the prefix walk
+//! is preserved, and both paths serve byte-identical output.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -230,6 +234,7 @@ fn input<'a>(
         range,
         server_addr: server.addr,
         segments,
+        segment_ranges: None,
         cipher_key: CIPHER_KEY,
         now_unix: NOW_UNIX,
         up_next,
@@ -238,6 +243,49 @@ fn input<'a>(
 
 fn grant_for(track: &str) -> String {
     grant::issue("user-1", track, EXP_UNIX, SECRET)
+}
+
+/// Per-segment plaintext byte ranges for a [`fixture_track`] of `len` bytes
+/// in `seg_len`-byte articles: `[(0, seg_len), (seg_len, 2*seg_len), ...]`
+/// with the last end clamped to `len`. This is the S9 NZB-metadata shape the
+/// S10 play path consumes (injected via fixture; wire-up to the real S9
+/// envelope is a later slice).
+fn segment_ranges_for(len: usize, seg_len: usize) -> Vec<(u64, u64)> {
+    let mut ranges = Vec::new();
+    let mut start = 0u64;
+    while (start as usize) < len {
+        let end = ((start as usize) + seg_len).min(len) as u64;
+        ranges.push((start, end));
+        start = end;
+    }
+    ranges
+}
+
+/// Like [`input`], but carries the S10 per-segment byte ranges: each
+/// `(start, end_exclusive)` plaintext offset in `segments` order and length.
+/// `None` means ranges are unknown and the play path must keep the current
+/// prefix-walk fallback.
+#[allow(clippy::too_many_arguments)]
+fn input_with_ranges<'a>(
+    token: &'a str,
+    track_id: &'a str,
+    range: Option<&'a str>,
+    server: &FakeNntp,
+    segments: &'a [String],
+    segment_ranges: Option<&'a [(u64, u64)]>,
+    up_next: Option<&'a str>,
+) -> PlayInput<'a> {
+    PlayInput {
+        token,
+        track_id,
+        range,
+        server_addr: server.addr,
+        segments,
+        segment_ranges,
+        cipher_key: CIPHER_KEY,
+        now_unix: NOW_UNIX,
+        up_next,
+    }
 }
 
 #[test]
@@ -416,9 +464,10 @@ fn range_on_a_hit_returns_206_and_unsatisfiable_is_416() {
 
 #[test]
 fn seek_on_a_cold_cache_fetches_the_prefix_before_the_first_byte() {
-    // Known limitation (see README TTFB notes): without NZB segment sizes
+    // Prefix-walk fallback (see README TTFB notes): without NZB byte ranges
     // the play path cannot know which article covers a mid-track offset, so
-    // it walks segments in order. A seek's TTFB costs the whole prefix.
+    // it walks segments in order. A seek's TTFB costs the whole prefix. S10
+    // preserves this fallback when ranges are absent.
     let (plain, segments, articles) = fixture_track("a", 60_000, 20_000);
     let server = FakeNntp::start(articles);
     let mut pool: StreamPool = Pool::new(4);
@@ -814,4 +863,140 @@ fn provider_outage_quarantines_then_recovers() {
         .finalize(&mut pool, &mut cache, &mut meter)
         .expect("finalize");
     assert!(!pool.quarantined(), "success clears the quarantine");
+}
+
+#[test]
+fn seek_with_ranges_fetches_only_the_covering_segment() {
+    // S10 covering-segment fetch: byte ranges address the covering article
+    // directly, so a mid-track seek costs one BODY instead of the prefix.
+    let (plain, segments, articles) = fixture_track("a", 60_000, 20_000);
+    let ranges = segment_ranges_for(60_000, 20_000);
+    assert_eq!(
+        ranges,
+        [(0u64, 20_000u64), (20_000, 40_000), (40_000, 60_000)]
+    );
+    let server = FakeNntp::start(articles);
+    let mut pool: StreamPool = Pool::new(4);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+
+    let token = grant_for("track-a");
+    let inp = input_with_ranges(
+        &token,
+        "track-a",
+        Some("bytes=45000-45099"),
+        &server,
+        &segments,
+        Some(&ranges),
+        None,
+    );
+    let resp = play(&mut pool, &mut cache, &mut meter, SECRET, &inp).expect("seek with ranges");
+    assert_eq!(resp.status, 206);
+    assert_eq!(
+        resp.content_range.as_deref(),
+        Some(format!("bytes 45000-45099/{}", plain.len()).as_str())
+    );
+    let mut stream = resp.stream;
+    let first = stream.next().expect("first chunk");
+    assert_eq!(
+        server.bodies(),
+        1,
+        "covering segment 2 addressed directly: no prefix walk"
+    );
+    let mut body = first;
+    for chunk in stream.by_ref() {
+        body.extend_from_slice(&chunk);
+    }
+    assert_eq!(body, &plain[45_000..45_100]);
+    stream
+        .finalize(&mut pool, &mut cache, &mut meter)
+        .expect("finalize");
+    assert_eq!(
+        cache.get_track("track-a").as_deref(),
+        Some(plain.as_slice()),
+        "covering fetch still caches the whole track"
+    );
+}
+
+#[test]
+fn seek_with_and_without_ranges_yields_byte_identical_output() {
+    // S10 parity: the covering fetch and the prefix-walk fallback serve the
+    // same bytes; only the BODY count differs (1 vs the whole prefix).
+    let (plain, segments, articles) = fixture_track("a", 60_000, 20_000);
+    let ranges = segment_ranges_for(60_000, 20_000);
+    let covering_server = FakeNntp::start(articles.clone());
+    let fallback_server = FakeNntp::start(articles);
+
+    // Covering path: ranges present.
+    let mut pool_c: StreamPool = Pool::new(4);
+    let mut cache_c = ContentCache::new();
+    let mut meter_c = MemoryMeter::default();
+    let token_c = grant_for("track-a");
+    let inp_c = input_with_ranges(
+        &token_c,
+        "track-a",
+        Some("bytes=45000-45099"),
+        &covering_server,
+        &segments,
+        Some(&ranges),
+        None,
+    );
+    let resp_c =
+        play(&mut pool_c, &mut cache_c, &mut meter_c, SECRET, &inp_c).expect("covering seek");
+    assert_eq!(resp_c.status, 206);
+    let mut stream_c = resp_c.stream;
+    let first_c = stream_c.next().expect("first covering chunk");
+    assert_eq!(
+        covering_server.bodies(),
+        1,
+        "ranges present: only the covering segment is fetched"
+    );
+    let mut covering = first_c;
+    for chunk in stream_c.by_ref() {
+        covering.extend_from_slice(&chunk);
+    }
+    stream_c
+        .finalize(&mut pool_c, &mut cache_c, &mut meter_c)
+        .expect("covering finalize");
+
+    // Fallback path: the same seek with ranges absent.
+    let mut pool_f: StreamPool = Pool::new(4);
+    let mut cache_f = ContentCache::new();
+    let mut meter_f = MemoryMeter::default();
+    let token_f = grant_for("track-a");
+    let inp_f = input(
+        &token_f,
+        "track-a",
+        Some("bytes=45000-45099"),
+        &fallback_server,
+        &segments,
+        None,
+    );
+    let resp_f =
+        play(&mut pool_f, &mut cache_f, &mut meter_f, SECRET, &inp_f).expect("fallback seek");
+    assert_eq!(resp_f.status, 206);
+    let mut stream_f = resp_f.stream;
+    let first_f = stream_f.next().expect("first fallback chunk");
+    assert_eq!(
+        fallback_server.bodies(),
+        3,
+        "ranges absent: the prefix walk is preserved"
+    );
+    let mut fallback = first_f;
+    for chunk in stream_f.by_ref() {
+        fallback.extend_from_slice(&chunk);
+    }
+    stream_f
+        .finalize(&mut pool_f, &mut cache_f, &mut meter_f)
+        .expect("fallback finalize");
+
+    assert_eq!(
+        resp_c.content_range, resp_f.content_range,
+        "both paths answer the same range"
+    );
+    assert_eq!(
+        covering, fallback,
+        "covering fetch and prefix walk serve identical bytes"
+    );
+    assert_eq!(covering, &plain[45_000..45_100]);
 }
