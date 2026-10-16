@@ -112,11 +112,13 @@ KV reads in `GET /v1/ingest/jobs/:id`, and the repair Container runtime.
 
 ## Redrive (DLQ back to queue)
 
-1. The Cloudflare DLQ defaults to **4 days retention**; unconsumed entries
-   are deleted at expiry. Configure the maximum 14-day window on the queue with
+1. On **Workers Paid**, the Cloudflare DLQ defaults to **4 days retention**;
+   configure up to 14 days with
    `npx wrangler queues update nntune-ingest-dlq --message-retention-period-secs 1209600`
-   (Cloudflare permits 60–1,209,600 seconds). Treat the configured period as
-   the redrive deadline; this queue is not a permanent archive.
+   (60–1,209,600 seconds). On **Workers Free**, retention is fixed at 24 hours
+   and cannot be configured. Unconsumed entries are deleted at expiry on either
+   plan, so treat the applicable retention period as the redrive deadline; this
+   queue is not a permanent archive.
 2. Read the DLQ: each entry is either a `DlqEntry` (explicit quarantine, with
    `error_code` / `attempts` / redacted, bounded `reason`) or a raw `QueueMsg`
    (native dead-letter fallback). Fix the cause first.

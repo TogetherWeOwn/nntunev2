@@ -320,7 +320,12 @@ where
     }
     let mut report = BatchReport::default();
     for (msg, checkpoint) in msgs.iter().zip(checkpoints) {
-        let disposition = decide_checkpoint(msg, checkpoint, run(msg))
+        let result = if is_terminal(checkpoint.state) {
+            Ok(())
+        } else {
+            run(msg)
+        };
+        let disposition = decide_checkpoint(msg, checkpoint, result)
             .expect("checkpoint pairing was validated before batch processing");
         match disposition {
             Disposition::Ack => report.acked += 1,
@@ -559,6 +564,29 @@ mod tests {
             .unwrap()
             .quarantined
             .is_empty());
+    }
+
+    #[test]
+    fn drive_batch_skips_job_step_for_done_and_failed_checkpoints() {
+        let msgs = vec![msg_at(1), msg_at(1)];
+        let mut checkpoints: Vec<_> = msgs.iter().map(checkpoint_for).collect();
+        checkpoints[0].state = JobState::Done;
+        checkpoints[1].state = JobState::Failed;
+        checkpoints[1].failure_code = Some(ERR_PROBE_FAILED.to_string());
+        checkpoints[1].failure_reason = Some("previous failure".to_string());
+        let mut run_calls = 0;
+
+        let report = drive_batch(&msgs, &mut checkpoints, |_| {
+            run_calls += 1;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(run_calls, 0);
+        assert_eq!(report.acked, 1);
+        assert_eq!(report.retried, 0);
+        assert_eq!(report.quarantined.len(), 1);
+        assert_eq!(report.quarantined[0].error_code, ERR_PROBE_FAILED);
     }
 
     #[test]
