@@ -1884,6 +1884,8 @@ mod tests {
         audits: RefCell<Vec<AuditEvent>>,
         rate_limit_slots: RefCell<HashMap<(String, String, u32), u64>>,
         test_connection_leases: RefCell<HashMap<(String, u32), (String, u64)>>,
+        delete_user_before_next_challenge: RefCell<Option<String>>,
+        challenge_reads: RefCell<usize>,
     }
 
     impl Store for FakeStore {
@@ -1909,6 +1911,9 @@ mod tests {
             user_id: Option<&str>,
             purpose: &str,
         ) -> Result<(), StoreError> {
+            if let Some(id) = self.delete_user_before_next_challenge.borrow_mut().take() {
+                self.users.borrow_mut().remove(&id);
+            }
             // Mirror migration 0006 FK (`auth_challenges.user_id ->
             // users(id)`): bound challenges fail when the user is gone, so a
             // concurrent reap surfaces here instead of orphaning the row.
@@ -1928,6 +1933,7 @@ mod tests {
             Ok(())
         }
         async fn challenge_by_id(&self, id: &str) -> Result<Option<ChallengeRow>, StoreError> {
+            *self.challenge_reads.borrow_mut() += 1;
             Ok(self.challenges.borrow().get(id).cloned())
         }
         async fn insert_credential(
@@ -3811,27 +3817,32 @@ mod tests {
 
     #[test]
     fn reap_sql_pins_register_purpose_and_activity_exemptions() {
-        // Destructive-statement pin: mutating the purpose literal
-        // `'register'` -> `'login'` (or dropping an exemption) must fail
-        // this test even though all FakeStore-driven tests stay green.
+        // Pin the destructive SQL predicates themselves: the FakeStore
+        // exercises an independent mirror and cannot establish Pg semantics.
         let sql = reap_unverified_users_sql();
+        let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            sql.contains(&format!("'{PURPOSE_REGISTER}'")),
-            "reap must filter on PURPOSE_REGISTER"
+            sql.contains("created_at <= $1"),
+            "reap must enforce the TTL"
         );
         assert!(
-            !sql.contains("'login'"),
-            "reap must never filter on the login purpose"
+            sql.contains("users.id <> $2"),
+            "reap must preserve the current user"
         );
-        for table in [
-            "webauthn_credentials",
-            "auth_challenges",
-            "provider_vaults",
-            "sessions",
-            "magic_link_tokens",
+        assert!(sql.contains("auth_challenges.purpose = 'register'"));
+        assert!(sql.contains("auth_challenges.expires_at > $3"));
+        assert!(sql.contains("magic_link_tokens.expires_at > $3"));
+        for predicate in [
+            "NOT EXISTS (SELECT 1 FROM webauthn_credentials",
+            "NOT EXISTS (SELECT 1 FROM auth_challenges",
+            "NOT EXISTS (SELECT 1 FROM provider_vaults",
+            "NOT EXISTS (SELECT 1 FROM sessions",
+            "NOT EXISTS (SELECT 1 FROM magic_link_tokens",
         ] {
-            assert!(sql.contains(table), "reap must exempt {table}");
+            assert!(sql.contains(predicate), "reap must include `{predicate}`");
         }
+        assert!(!sql.contains("auth_challenges.expires_at <= $3"));
+        assert!(!sql.contains("magic_link_tokens.expires_at <= $3"));
     }
 
     #[test]
@@ -3938,13 +3949,9 @@ mod tests {
 
     #[test]
     fn register_start_heals_concurrently_reaped_resumed_signup() {
-        // Concurrency pin: a stale credential-less user holds no unexpired
-        // register challenge precisely because it is resuming, so a
-        // concurrent `register_start` for another email reaps it between
-        // this request's `user_by_email` and `insert_challenge`. Simulate
-        // the interleaving at the store layer (lookup, concurrent reap,
-        // insert with FK failure, heal-and-retry) and assert the resumed
-        // signup survives under the same id.
+        // Delete the resumed user at the handler's challenge insert to model
+        // another register_start reaping it after lookup; the handler must
+        // recreate the row and retry the challenge insert.
         let h = harness();
         let stale_at = NOW.saturating_sub(UNVERIFIED_USER_TTL_SECS + 1);
         block_on(h.store.insert_user(&UserRecord {
@@ -3953,45 +3960,31 @@ mod tests {
             created_at: stale_at,
         }))
         .unwrap();
-        let existing = block_on(h.store.user_by_email("race@example.com"))
+        *h.store.delete_user_before_next_challenge.borrow_mut() = Some("resumed-race".to_string());
+
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "race@example.com"}),
+        );
+
+        assert!(
+            h.store.delete_user_before_next_challenge.borrow().is_none(),
+            "race hook must fire during register_start"
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let user = block_on(h.store.user_by_email("race@example.com"))
             .unwrap()
-            .unwrap();
-        block_on(
-            h.store
-                .reap_unverified_users(NOW, UNVERIFIED_USER_TTL_SECS, Some("other")),
-        )
-        .unwrap();
-        assert!(
-            block_on(h.store.user_by_email("race@example.com"))
-                .unwrap()
-                .is_none(),
-            "concurrent reap deletes the resuming user"
+            .expect("handler heals the user deleted during challenge insert");
+        assert_eq!(
+            user.id, "resumed-race",
+            "healing retains the original user id"
         );
-        let challenge = auth::new_registration_challenge("example.com", ORIGIN, NOW).unwrap();
         assert!(
-            block_on(
-                h.store
-                    .insert_challenge(&challenge, Some(&existing.id), PURPOSE_REGISTER)
-            )
-            .is_err(),
-            "FK failure surfaces the concurrent delete"
-        );
-        let healed = UserRecord {
-            id: existing.id.clone(),
-            email: "race@example.com".to_string(),
-            created_at: NOW,
-        };
-        block_on(h.store.insert_user(&healed)).unwrap();
-        block_on(
-            h.store
-                .insert_challenge(&challenge, Some(&existing.id), PURPOSE_REGISTER),
-        )
-        .unwrap();
-        assert!(
-            block_on(h.store.user_by_email("race@example.com"))
-                .unwrap()
-                .is_some(),
-            "healed resumed signup survives under the same id"
+            h.store.challenges.borrow().values().any(|row| {
+                row.user_id.as_deref() == Some("resumed-race") && row.purpose == PURPOSE_REGISTER
+            }),
+            "handler retries and stores the registration challenge"
         );
     }
 
@@ -4052,12 +4045,13 @@ mod tests {
 
     #[test]
     fn login_finish_lookup_budget_bounds_rotating_ids_before_db() {
-        // Same per-IP pre-read bound on the login finish: exhaust the
-        // `auth.login_finish_ip` pool, then even a well-formed unknown
-        // challenge id is rejected without reaching the per-challenge
-        // budget or verification. Removing the pre-lookup reservation
-        // would leave rotating ids unbound (one Pg SELECT each).
+        // Exhaust the per-IP lookup budget while providing a real stored
+        // challenge. Rejection must happen before challenge_by_id, rather
+        // than passing vacuously because a bogus challenge misses lookup.
         let h = harness();
+        let challenge = auth::new_registration_challenge("example.com", ORIGIN, NOW).unwrap();
+        let challenge_id = challenge.id.clone();
+        block_on(h.store.insert_challenge(&challenge, None, PURPOSE_LOGIN)).unwrap();
         for _ in 0..FINISH_LOOKUP_ATTEMPTS_PER_IP {
             assert!(block_on(h.store.reserve_rate_limit(
                 "198.51.100.9",
@@ -4068,12 +4062,11 @@ mod tests {
             ))
             .unwrap());
         }
-        let bogus = "A".repeat(43);
         let resp = h.call(
             "POST",
             "/v1/auth/passkey/login/finish",
             serde_json::json!({
-                "challenge": bogus,
+                "challenge": challenge_id.clone(),
                 "credential_id": b64url_encode(b"nope"),
                 "authenticator_data": b64url_encode(b"nope"),
                 "client_data_json": b64url_encode(b"nope"),
@@ -4082,6 +4075,12 @@ mod tests {
         );
         assert_eq!(resp.status, 401, "{}", resp.body);
         assert!(resp.set_cookie.is_none());
+        assert_eq!(
+            *h.store.challenge_reads.borrow(),
+            0,
+            "budget denial must precede challenge lookup"
+        );
+        assert!(h.store.challenges.borrow().contains_key(&challenge_id));
     }
 
     #[test]

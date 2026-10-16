@@ -23,8 +23,9 @@ workers/api/
 ```
 
 `migrations/0002_auth_vault.sql` plus `0003` (library), `0004` (challenge
-purpose) and `0005` (atomic rate-limit slots and test leases) define the
-Postgres schema (PlanetScale via Hyperdrive). All queries are parameterized;
+purpose), `0005` (atomic rate-limit slots and test leases), and `0006`
+(registration-challenge user foreign key) define the Postgres schema
+(PlanetScale via Hyperdrive). All queries are parameterized;
 single-use claims execute the conditional `UPDATE ... RETURNING` prepared by
 the core and require exactly one row before any response.
 
@@ -142,9 +143,12 @@ config from secrets) is a follow-up slice.
   and every mail send reserves a per-IP (30/hour) plus global (100/5 min)
   issuance slot in front of the per-email window — distinct-email loops
   and victim-list email-bombing from one IP stop with unchanged response
-  shapes. `register_start` also reaps never-completed signups (no
-  credential and no vault/session/unexpired magic after 24 h) and prunes
-  expired challenges. Passkey finishes reserve 100 lookups per client IP
+  shapes. `register_start` also reaps never-completed signups older than
+  24 h only when they have no credential, vault, session, unexpired magic
+  link, or unexpired registration challenge. In-flight registration
+  challenges (including consumed challenges awaiting finish) protect the
+  signup until expiry; expired challenges are pruned. Passkey finishes
+  reserve 100 lookups per client IP
   BEFORE any DB read plus 10 attempts per challenge before verification
   (and magic finishes 10 per client IP, after the exact-Origin pin) per
   5-minute window, so rotating unknown challenge ids cannot fund unbounded
