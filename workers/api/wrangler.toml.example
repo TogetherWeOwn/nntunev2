@@ -4,13 +4,34 @@ name = "nntune-api"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
 
+[build]
+command = "cargo install -q worker-build --locked && worker-build --release"
+
 [vars]
-# Public, non-secret config only.
+# Public, non-secret config only. RP_ORIGIN must be the canonical
+# serialized https origin whose host is exactly RP_ID (the Worker
+# refuses to start otherwise). http loopback needs ALLOW_LOOPBACK_DEV.
 RP_ID = "example.com"
 RP_ORIGIN = "https://example.com"
 SESSION_TTL_SECS = "86400"
+# INVITES_REQUIRED = "true"
+# ALLOW_LOOPBACK_DEV = "true"          # local dev only, never staging/prod
+# EMAIL_WEBHOOK_URL = "https://<mail-provider-webhook>"  # magic-link delivery
 
 # Hyperdrive binding for PlanetScale Postgres (ID filled per environment).
+# The binding name must stay HYPERDRIVE (see src/worker_entry.rs).
+# Auth reads (sessions, credentials, users, challenges, vaults) are plain
+# SELECTs: Hyperdrive caches non-mutating queries by default (~60s + 15s
+# stale-while-revalidate, never invalidated by writes), which would delay
+# logout/revoke-all, break refresh rotation, and serve stale sign_counts.
+# The HYPERDRIVE config MUST be created/updated with query caching disabled:
+#   wrangler hyperdrive create <name> --connection-string "$DATABASE_URL" --caching-disabled
+#   wrangler hyperdrive update <id> --caching-disabled
+# Deploy gate: ./check_hyperdrive_cache.sh --config-id <id> (asserts
+# caching.disabled == true). The gate fails closed without Cloudflare
+# credentials (exit 3); --allow-skip is only for secret-less CI.
+# If cached reads are wanted elsewhere, bind a
+# second cache-disabled config for auth reads.
 # [[hyperdrive]]
 # binding = "HYPERDRIVE"
 # id = "<fill in staging/prod id>"
@@ -24,6 +45,13 @@ SESSION_TTL_SECS = "86400"
 #   SESSION_SECRET_BASE64         HMAC secret for session cookies (256-bit, unpadded base64url)
 #   SESSION_SECRET_PREVIOUS_BASE64  verify-only previous HMAC secret: set ONLY
 #                                 during a rotation window, deleted at its end.
+#                                 Honored only when SESSION_SECRET_ROTATION=1
+#                                 is also set (the recorded rotation); a staged
+#                                 previous without it refuses to start (fail
+#                                 closed), while the flag alone is single-secret
+#                                 steady state (safe teardown order).
 #                                 See docs/security/session-secret-rotation.md —
 #                                 never two live minting secrets.
+#   SESSION_SECRET_ROTATION         "1" only for the deploy(s) covering a
+#                                 recorded rotation window; unset otherwise.
 #   EMAIL_API_KEY                 transactional email provider key (magic-link delivery)

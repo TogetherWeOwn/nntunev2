@@ -144,16 +144,8 @@ reason = "pre-existing value drift; alignment owned elsewhere (docs/ops.md recon
 
 [[known_drift]]
 worker = "mb"
-env = "staging"
-binding = "ART_CACHE"
-actual = "nntunev2-art"
-expected = "nntunev2-art-staging"
-reason = "pre-existing value drift; alignment owned elsewhere (docs/ops.md reconciliation table)"
-
-[[known_drift]]
-worker = "mb"
 env = "prod"
 binding = "ART_CACHE"
-actual = "nntunev2-art"
+actual = "nntunev2-art-staging"
 expected = "nntunev2-art-prod"
-reason = "pre-existing value drift; alignment owned elsewhere (docs/ops.md reconciliation table)"
+reason = "prod template override is pending; alignment owned elsewhere (docs/ops.md reconciliation table)"

@@ -10,9 +10,10 @@
 //! binding `MB_DB`; successful responses are cached in KV (`MB_CACHE`) and
 //! at the edge via the Cache API / `Cache-Control`. Failures (400/404/500)
 //! are `no-store` and are never written to either cache. Interactive reads
-//! never call musicbrainz.org. Cover art bytes live in the `nntunev2-art`
-//! R2 bucket; this worker serves cacheable URLs, never secrets. See
-//! `README.md` and `migrations/0001_mb_mirror.sql`.
+//! never call musicbrainz.org. Cover art bytes live in the per-environment
+//! R2 art buckets (`nntunev2-art-staging` / `nntunev2-art-prod`); this
+//! worker serves cacheable URLs, never secrets. See `README.md` and
+//! `migrations/0001_mb_mirror.sql`.
 //!
 //! Structure: [`handle_lookup`] / [`handle_search`] are the testable core
 //! over the [`MbRepo`] and [`SuccessCache`] traits. The HTTP layer at the bottom wires them to a per-request
@@ -510,7 +511,7 @@ mod http_layer {
     }
 
     fn json_headers(cache_ttl: Option<u32>) -> WorkerResult<Headers> {
-        let mut headers = Headers::new();
+        let headers = Headers::new();
         headers.append("content-type", "application/json; charset=utf-8")?;
         match cache_ttl {
             Some(ttl) => headers.append("cache-control", &cache_control(ttl))?,
