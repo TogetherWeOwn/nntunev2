@@ -52,7 +52,11 @@ fn column_info(db: &Connection, name: &str) -> (String, bool) {
         .expect("inspect provider_vaults columns");
     let columns = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?))
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
         })
         .expect("query provider_vaults columns");
     for column in columns {
@@ -114,9 +118,15 @@ fn rewrap_records_timestamp_and_mixed_versions_test_only_kek_by_versions() {
         "INSERT INTO users (id, email, created_at)
          VALUES (?1, ?2, ?3), (?4, ?5, ?6), (?7, ?8, ?9)",
         params![
-            "legacy-user", "legacy@example.test", 10,
-            "retained-user", "retained@example.test", 11,
-            "current-user", "current@example.test", 12,
+            "legacy-user",
+            "legacy@example.test",
+            10,
+            "retained-user",
+            "retained@example.test",
+            11,
+            "current-user",
+            "current@example.test",
+            12,
         ],
     )
     .expect("seed users");
@@ -156,8 +166,14 @@ fn rewrap_records_timestamp_and_mixed_versions_test_only_kek_by_versions() {
         .expect("seed encrypted vault row");
     }
 
-    let rewrapped = rewrap_dek(&old_kek, &current_kek, CURRENT_VERSION, "legacy-user", &legacy)
-        .expect("re-wrap legacy DEK");
+    let rewrapped = rewrap_dek(
+        &old_kek,
+        &current_kek,
+        CURRENT_VERSION,
+        "legacy-user",
+        &legacy,
+    )
+    .expect("re-wrap legacy DEK");
     assert_eq!(rewrapped.payload_nonce_b64url, legacy.payload_nonce_b64url);
     assert_eq!(rewrapped.payload_b64url, legacy.payload_b64url);
     // Distinct values catch writing the rotation marker into the wrong column.
