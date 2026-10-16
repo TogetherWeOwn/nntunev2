@@ -13,9 +13,10 @@
 //!   emit, and silently dropping it here would hide double-emission
 //!   bugs instead of converging at the ledger (positive control: this
 //!   passes today and must keep passing).
-//! - The Analytics Engine sink the metric rides on (`METER` binding,
-//!   `nntune_meter` dataset in `wrangler.toml`) must stay wired
-//!   (positive control).
+//! - The `METER` binding to the `nntune_meter` dataset in `wrangler.toml`
+//!   is the intended future Analytics Engine sink for the reconcile
+//!   metric. This change emits nothing to Analytics Engine; the binding
+//!   must stay declared (positive control).
 //!
 //! The API for idempotency-key derivation, the deduped ledger, and the
 //! reconcile pass is covered in
@@ -36,9 +37,10 @@ fn manifest_file(name: &str) -> String {
 #[test]
 fn readme_documents_the_reconcile_method_and_metric_name() {
     let readme = manifest_file("README.md");
-    // The reconcile pass (method) and the Analytics Engine metric it
-    // emits on mismatch: an operator must be able to go from a firing
-    // alert to the code and the ledger semantics without reading source.
+    // The reconcile pass (method) and the `play_reconcile_mismatch` name
+    // it carries on mismatch: an operator must be able to go from a
+    // firing alert to the code and the ledger semantics without reading
+    // source. Nothing is emitted to Analytics Engine by this change.
     for needle in [
         "reconcile",
         "play_reconcile_mismatch",
@@ -107,8 +109,9 @@ fn meter_event_order_and_kinds_are_unchanged_by_the_new_variant() {
 
 #[test]
 fn analytics_engine_meter_dataset_stays_bound() {
-    // The reconcile metric rides the existing Analytics Engine sink:
-    // `wrangler.toml` must keep the `METER` binding to `nntune_meter`.
+    // `nntune_meter` is the intended future Analytics Engine dataset for
+    // the reconcile metric; nothing is emitted to it yet. `wrangler.toml`
+    // must keep the `METER` binding so that wiring has a target.
     let wrangler = manifest_file("wrangler.toml");
     assert!(wrangler.contains("METER"), "METER binding is required");
     assert!(
