@@ -150,8 +150,10 @@ fn schedule_sql_sets_fence_and_idempotently_returns_existing_operation() {
     assert!(sql.contains("'scheduled'"), "{sql}");
     assert!(sql.contains("now()+interval'24hours'"), "{sql}");
     assert!(
-        sql.contains("onconflict") && sql.contains("returningid"),
-        "repeat scheduling returns the existing operation id: {sql}"
+        sql.contains(
+            "onconflict(user_id)wherescope='account'doupdatesetid=delete_operations.idreturningid"
+        ),
+        "repeat scheduling must preserve the existing account operation and deadline: {sql}"
     );
 }
 
@@ -159,8 +161,8 @@ fn schedule_sql_sets_fence_and_idempotently_returns_existing_operation() {
 fn cancel_sql_is_owner_scoped_compare_and_set_and_clears_fence() {
     let sql = normalize(CANCEL_ACCOUNT_DELETION_SQL);
     assert!(
-        sql.contains("whereid=$1anduser_id=$2andstate='scheduled'"),
-        "cancellation must win only for this owner's scheduled operation: {sql}"
+        sql.contains("whereid=$1anduser_id=$2andstate='scheduled'andscope='account'"),
+        "cancellation must win only for this owner's scheduled account operation: {sql}"
     );
     assert!(sql.contains("updateusers"), "{sql}");
     assert!(sql.contains("setdeleting_at=null"), "{sql}");
@@ -170,8 +172,8 @@ fn cancel_sql_is_owner_scoped_compare_and_set_and_clears_fence() {
 fn erasure_start_sql_is_deadline_guarded_compare_and_set() {
     let sql = normalize(START_ACCOUNT_ERASURE_SQL);
     assert!(
-        sql.contains("state='scheduled'anderase_after<=now()"),
-        "a scheduled operation starts only after its deadline: {sql}"
+        sql.contains("whereid=$1andscope='account'andstate='scheduled'anderase_after<=now()"),
+        "only a scheduled account operation past its deadline can start: {sql}"
     );
     assert!(sql.contains("setstate='running'"), "{sql}");
 }
@@ -180,8 +182,8 @@ fn erasure_start_sql_is_deadline_guarded_compare_and_set() {
 fn operation_status_sql_is_owner_scoped() {
     let sql = normalize(OPERATION_STATUS_SQL);
     assert!(
-        sql.contains("user_id=$2"),
-        "status lookup must bind the owner: {sql}"
+        sql.contains("whereid=$1anduser_id=$2"),
+        "status lookup must bind both the operation id and owning user: {sql}"
     );
 }
 
