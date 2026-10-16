@@ -6,10 +6,10 @@
 //! group shared across threads coalesces whoever arrives while a fetch for
 //! the same key is in flight. Waiters that out-wait the leader re-run leader
 //! election instead of fetching in parallel: exactly one of them becomes the
-//! replacement leader and the rest join its flight, and a replacement flight
-//! is never itself replaced for slowness — so one stalled fetch costs at
-//! most two concurrent upstream fetches per key, however many waiters pile
-//! up (see [`SINGLEFLIGHT_WAIT_TIMEOUT_MS`]).
+//! replacement leader and the rest join its flight. A replacement is never
+//! itself replaced for slowness, and no flight is led beside a superseded
+//! leader that is still fetching, so a stalled key runs at most two upstream
+//! fetches at once (see [`SINGLEFLIGHT_WAIT_TIMEOUT_MS`]).
 //!
 //! Scope, honestly: this module is the primitive only. Nothing in the play
 //! path calls it yet — wiring arrives with the Worker / pool Durable Object
@@ -20,22 +20,19 @@
 //! with the same key shape and timeout semantics.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
-/// How long a waiter rides one flight before re-running leader election.
-/// Documented in `workers/stream/README.md`. On timeout the waiters do not
+/// How long a waiter parks on one flight before re-running leader election.
+/// Documented in `workers/stream/README.md`. On timeout a waiter does not
 /// fetch in parallel: one replaces the flight and leads, the rest join the
-/// replacement — and the replacement is never itself replaced for slowness
-/// (its waiters keep waiting in timeout-sized chunks, checking the original
-/// flight each chunk), so a stalled leader costs at most one extra upstream
-/// fetch, never a fan-out and never a chain of generations. 5 s is below
-/// the NNTP client's 10 s timeout, but that timeout is per socket *read*
+/// replacement. A replacement is never replaced in turn, so a stalled leader
+/// costs at most two concurrent upstream fetches per key. 5 s is below the
+/// NNTP client's 10 s timeout, but that timeout is per socket *read*
 /// (`nntp.rs`), not per article, so a slow-but-healthy leader can still be
-/// replaced once and briefly overlap its replacement (its waiters then take
-/// whichever of the two results lands first); that bounded overlap is the
-/// price of never hanging a waiter behind a wedged leader. Only a
-/// *panicking* leader frees a further successor flight.
+/// replaced once and briefly overlap its replacement; the waiters then take
+/// whichever result lands first. That bounded overlap is the price of never
+/// parking a waiter behind a wedged leader.
 pub const SINGLEFLIGHT_WAIT_TIMEOUT_MS: u64 = 5_000;
 
 /// Singleflight key for a segment fetch: the NZB segment message-id,
@@ -63,11 +60,10 @@ struct FlightState<T, E> {
 struct Flight<T, E> {
     state: Mutex<FlightState<T, E>>,
     ready: Condvar,
-    /// True when this flight replaced a timed-out one (or was elected by a
-    /// caller that had already timed out once). A replacement flight is
-    /// never itself replaced for slowness — that is what bounds a stalled
-    /// key at two concurrent upstream fetches instead of one new flight per
-    /// timeout generation.
+    /// True when this flight is a replacement: elected by a caller that had
+    /// already timed out, or led while a superseded leader was still fetching.
+    /// Such a flight is never replaced for slowness, which is what bounds a key
+    /// at two concurrent fetches.
     is_replacement: bool,
 }
 
@@ -85,24 +81,35 @@ impl<T, E> Flight<T, E> {
     }
 }
 
+/// One key's registry entry. `current` is the flight new callers join;
+/// `outstanding` counts the leaders inside `fetch` for this key, including a
+/// superseded leader still fetching behind its replacement.
+struct Slot<T, E> {
+    current: Option<Arc<Flight<T, E>>>,
+    outstanding: usize,
+}
+
+type Registry<T, E> = HashMap<String, Slot<T, E>>;
+
 /// Coalesces concurrent identical fetches. The first caller for a key becomes
 /// the leader and runs its `fetch`; callers that arrive while it is in flight
 /// wait for its result instead of fetching. A waiter that out-waits
-/// [`SINGLEFLIGHT_WAIT_TIMEOUT_MS`] re-runs leader election under the map
-/// lock: if the timed-out flight is still the registered one, that waiter
-/// replaces it and leads the next flight while the other waiters join the
-/// replacement (never a parallel fan-out); if a newer flight is already
-/// registered, it joins that one. A replacement flight is never replaced
-/// for slowness in turn — its waiters re-wait in timeout chunks, taking the
-/// original flight's result if it lands — so slow leaders cost at most two
-/// concurrent fetches per key. Sharing is in-flight only: once a flight
-/// completes, the next call fetches again — freshness is the cache's job,
-/// not this group's.
+/// [`SINGLEFLIGHT_WAIT_TIMEOUT_MS`] re-runs leader election under the registry
+/// lock: if the timed-out flight is still registered, that waiter replaces it
+/// and leads the next flight while the other waiters join the replacement; if
+/// a newer flight is registered, it joins that one. A replacement is never
+/// replaced for slowness, and no flight is led while a superseded leader is
+/// still fetching unless it is itself a replacement, so a stalled key runs at
+/// most two upstream fetches at once. When a leader settles, its outcome goes
+/// to its own waiters and to the replacement it was superseded by, so the
+/// first result the chain produces is the one every waiter takes. Sharing is
+/// in-flight only: once the registered flight's leader returns, the next call
+/// fetches again — freshness is the cache's job, not this group's.
 ///
 /// `T`/`E` need `Clone` so every waiter gets its own copy of the leader's
 /// outcome, and `Send` so one group can be shared across threads.
 pub struct Singleflight<T, E> {
-    inner: Mutex<HashMap<String, Arc<Flight<T, E>>>>,
+    inner: Mutex<Registry<T, E>>,
     timeout: Duration,
 }
 
@@ -129,153 +136,119 @@ where
     /// the air.
     pub fn call(&self, key: &str, fetch: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
         let mut fetch = Some(fetch);
-        // A newer flight a timed-out waiter was told to join, if any.
+        // A flight a timed-out waiter was told to join, if any.
         let mut joined: Option<Arc<Flight<T, E>>> = None;
-        // The flight this caller last timed out on before joining a newer
-        // one: a slow-but-healthy original leader may still land first, and
-        // its result is as good as the replacement's.
-        let mut previous: Option<Arc<Flight<T, E>>> = None;
-        // Whether this caller has already timed out once. A flight it goes
-        // on to lead is then a replacement (never replaced for slowness in
-        // turn), even when elected fresh after a leader panic.
+        // Whether this caller has already timed out once. A flight it goes on
+        // to lead is then a replacement, even when elected fresh after a
+        // leader panic.
         let mut has_timed_out = false;
         loop {
-            let (flight, is_leader) = match joined.take() {
-                Some(flight) => (flight, false),
+            let flight = match joined.take() {
+                Some(flight) => flight,
                 None => {
-                    let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                    match map.get(key) {
-                        Some(flight) => (Arc::clone(flight), false),
-                        None => {
-                            let flight = Arc::new(Flight::new(has_timed_out));
-                            map.insert(key.to_string(), Arc::clone(&flight));
-                            (flight, true)
-                        }
+                    let mut registry = self.registry();
+                    let slot = registry.entry(key.to_string()).or_insert_with(|| Slot {
+                        current: None,
+                        outstanding: 0,
+                    });
+                    if let Some(flight) = slot.current.clone() {
+                        flight
+                    } else {
+                        let is_replacement = has_timed_out || slot.outstanding > 0;
+                        let flight = Arc::new(Flight::new(is_replacement));
+                        slot.current = Some(Arc::clone(&flight));
+                        slot.outstanding += 1;
+                        drop(registry);
+                        let fetch = fetch.take().expect("fetch is consumed only by a leader");
+                        return self.lead(key, flight, fetch);
                     }
                 }
             };
-
-            if is_leader {
-                let fetch = fetch.take().expect("fetch is consumed only by a leader");
-                return self.lead(key, flight, fetch);
-            }
 
             if let Some(result) = Self::wait(&flight, self.timeout) {
                 return result;
             }
 
-            // Timed out on `flight`. Either leader may have finished in the
-            // gap between the wait expiring and this check; never replace a
-            // completed flight, and take the original's result if it landed.
+            // Timed out on `flight`. Checks run under the registry lock, so a
+            // leader that settles in the gap is seen as completed here.
             has_timed_out = true;
+            let mut registry = self.registry();
             if let Some(result) = Self::completed(&flight) {
                 return result;
             }
-            if let Some(result) = previous.as_deref().and_then(Self::completed) {
-                return result;
-            }
             if let Some(successor) = Self::successor(&flight) {
-                // The replacement can finish and unregister before this
-                // staggered waiter reaches the map lock. Follow the durable
-                // link from the flight it joined instead of electing a third
-                // fetch after the replacement has disappeared from the map.
-                previous = Some(Arc::clone(&flight));
                 joined = Some(successor);
                 continue;
             }
-
-            // Re-run leader election. Invariant: a leader marks its flight
-            // done only while holding the map lock, after removing its own
-            // entry (see `lead`), so a flight still registered here is
-            // guaranteed unfinished.
-            let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            match map.get(key) {
-                Some(current) if Arc::ptr_eq(current, &flight) => {
+            let current = registry.get(key).and_then(|slot| slot.current.clone());
+            match current {
+                Some(current) if Arc::ptr_eq(&current, &flight) => {
                     if flight.is_replacement {
-                        // Already the replacement flight: a slow leader gets
-                        // exactly one understudy, not a chain of them. Keep
-                        // waiting on it in timeout chunks (the checks above
-                        // still catch the original flight landing). Only a
-                        // panic takes us out of this branch, via the `None`
-                        // arm below on a later pass.
-                        joined = Some(Arc::clone(&flight));
+                        joined = Some(flight);
                         continue;
                     }
-                    // The flight we waited on is still registered and still
-                    // unfinished after a full timeout: replace it and become
-                    // the one replacement leader. The old leader may yet
-                    // finish (or panic), but its completion path only removes
-                    // the map entry if it is still its own (`Arc::ptr_eq`),
-                    // so it cannot evict this new flight.
                     let replacement = Arc::new(Flight::new(true));
                     flight
                         .state
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .successor = Some(Arc::clone(&replacement));
-                    map.insert(key.to_string(), Arc::clone(&replacement));
-                    drop(map);
+                    let slot = registry
+                        .get_mut(key)
+                        .expect("a registered flight has a slot");
+                    slot.current = Some(Arc::clone(&replacement));
+                    slot.outstanding += 1;
+                    drop(registry);
                     let fetch = fetch.take().expect("fetch is consumed only by a leader");
                     return self.lead(key, replacement, fetch);
                 }
-                Some(current) => {
-                    // Another waiter already replaced the flight: join the
-                    // newer one instead of fetching, remembering this one in
-                    // case its (slow, healthy) leader lands first.
-                    previous = Some(Arc::clone(&flight));
-                    joined = Some(Arc::clone(current));
-                }
-                None => {
-                    // The flight ended and was removed: either it completed
-                    // in the gap above, or its leader panicked (entry
-                    // removed, never marked done). Recheck completion, then
-                    // loop to elect a fresh flight.
-                    drop(map);
-                    if let Some(result) = Self::completed(&flight) {
-                        return result;
-                    }
-                    if let Some(result) = previous.as_deref().and_then(Self::completed) {
-                        return result;
-                    }
-                    if let Some(successor) = Self::successor(&flight) {
-                        joined = Some(successor);
-                    }
-                }
+                Some(current) => joined = Some(current),
+                // The flight's leader panicked and released the key; elect afresh.
+                None => {}
             }
         }
     }
 
-    /// Run `fetch` as the leader of `flight`, publish its outcome to the
-    /// flight's waiters, and unregister — without evicting a replacement
-    /// flight a timed-out waiter may have installed in the meantime.
+    /// Run `fetch` as the leader of `flight`, then settle: the outcome goes to
+    /// the flight and to the replacement it was superseded by (if still
+    /// pending), and the leader's slot is released. A panicking `fetch`
+    /// releases the slot without a result; its waiters recover via timeout.
     fn lead(
         &self,
         key: &str,
         flight: Arc<Flight<T, E>>,
         fetch: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, E> {
-        // A panic in `fetch` must not wedge `key` forever, so the entry is
-        // removed unless we complete it below.
-        let mut guard = RemoveOnPanic {
-            inner: &self.inner,
+        let mut unsettled = Unsettled {
+            registry: &self.inner,
             key,
-            flight: Arc::clone(&flight),
-            defused: false,
+            flight: &flight,
+            armed: true,
         };
         let result = fetch();
-        guard.defused = true;
-        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if map
-            .get(key)
-            .is_some_and(|current| Arc::ptr_eq(current, &flight))
-        {
-            map.remove(key);
+        unsettled.armed = false;
+        let mut registry = self.registry();
+        Self::publish(&flight, result.clone());
+        if let Some(successor) = Self::successor(&flight) {
+            Self::publish(&successor, result.clone());
         }
-        let mut state = flight.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.result = Some(result.clone());
-        state.done = true;
-        flight.ready.notify_all();
+        release(&mut registry, key, &flight);
         result
+    }
+
+    fn registry(&self) -> MutexGuard<'_, Registry<T, E>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Set a flight's outcome for its waiters. A flight already settled keeps
+    /// its first result.
+    fn publish(flight: &Flight<T, E>, result: Result<T, E>) {
+        let mut state = flight.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.done {
+            state.result = Some(result);
+            state.done = true;
+            flight.ready.notify_all();
+        }
     }
 
     /// Wait for the leader's outcome; `None` on timeout signals that the
@@ -326,30 +299,41 @@ where
     }
 }
 
-/// Removes a leader's map entry if its `fetch` panics, so later calls for
-/// the key start a fresh flight instead of joining a corpse. Waiters already
-/// parked on the old flight still recover via their own timeout (no hang).
-/// Only removes the entry if it is still this leader's flight: a panicking
-/// leader that timed-out waiters already replaced must not evict theirs.
-struct RemoveOnPanic<'a, T, E> {
-    inner: &'a Mutex<HashMap<String, Arc<Flight<T, E>>>>,
+/// Unregisters a leader's slot when its `fetch` panics. Disarmed on the
+/// normal path, where `lead` settles the flight under the same lock.
+struct Unsettled<'a, T, E> {
+    registry: &'a Mutex<Registry<T, E>>,
     key: &'a str,
-    flight: Arc<Flight<T, E>>,
-    defused: bool,
+    flight: &'a Arc<Flight<T, E>>,
+    armed: bool,
 }
 
-impl<T, E> Drop for RemoveOnPanic<'_, T, E> {
+impl<T, E> Drop for Unsettled<'_, T, E> {
     fn drop(&mut self) {
-        if !self.defused {
-            if let Ok(mut map) = self.inner.lock() {
-                if map
-                    .get(self.key)
-                    .is_some_and(|current| Arc::ptr_eq(current, &self.flight))
-                {
-                    map.remove(self.key);
-                }
-            }
+        if self.armed {
+            let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            release(&mut registry, self.key, self.flight);
         }
+    }
+}
+
+/// Ends one leader's claim on `key`. The registered flight is cleared only if
+/// it is still this leader's, so a superseded leader never evicts its
+/// replacement; the slot goes away once no leader and no flight remain.
+fn release<T, E>(registry: &mut Registry<T, E>, key: &str, flight: &Arc<Flight<T, E>>) {
+    let Some(slot) = registry.get_mut(key) else {
+        return;
+    };
+    slot.outstanding -= 1;
+    if slot
+        .current
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, flight))
+    {
+        slot.current = None;
+    }
+    if slot.outstanding == 0 && slot.current.is_none() {
+        registry.remove(key);
     }
 }
 
@@ -363,6 +347,19 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{flight_key, Singleflight, SINGLEFLIGHT_WAIT_TIMEOUT_MS};
+
+    fn tracked_fetch(
+        inflight: &AtomicUsize,
+        peak: &AtomicUsize,
+        hold: Duration,
+        body: &str,
+    ) -> Result<Vec<u8>, String> {
+        let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(now, Ordering::SeqCst);
+        thread::sleep(hold);
+        inflight.fetch_sub(1, Ordering::SeqCst);
+        Ok(body.as_bytes().to_vec())
+    }
 
     #[test]
     fn flight_key_is_the_normalized_segment_id_only() {
@@ -692,16 +689,16 @@ mod tests {
                 b"leader-bytes"
             );
 
-            // A caller arriving now must join the replacement flight, not
-            // start a third fetch — the old leader's completion must not
-            // have evicted it from the map.
+            // A caller arriving now joins the live replacement flight rather
+            // than starting a third fetch, and takes the first result the
+            // chain produced: the old leader's, which landed mid-replacement.
             let got = group
                 .call(&key, || {
                     upstream_calls.fetch_add(1, Ordering::SeqCst);
                     Ok::<_, String>(b"third-fetch".to_vec())
                 })
                 .expect("join replacement flight");
-            assert_eq!(got, b"replacement-bytes");
+            assert_eq!(got, b"leader-bytes");
             assert_eq!(
                 waiter.join().expect("waiter thread").unwrap(),
                 b"replacement-bytes"
@@ -709,6 +706,133 @@ mod tests {
         });
 
         assert_eq!(upstream_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn original_result_releases_waiters_parked_on_the_replacement() {
+        let group = Arc::new(Singleflight::<Vec<u8>, String>::with_timeout(
+            Duration::from_millis(100),
+        ));
+        let upstream_calls = Arc::new(AtomicUsize::new(0));
+        let leader_registered = Arc::new(AtomicBool::new(false));
+        let key = flight_key("<slow-seg@synthetic.test>");
+
+        thread::scope(|s| {
+            let (group_l, calls_l, registered_l) = (
+                Arc::clone(&group),
+                Arc::clone(&upstream_calls),
+                Arc::clone(&leader_registered),
+            );
+            let key_l = key.clone();
+            let leader = s.spawn(move || {
+                group_l.call(&key_l, || {
+                    calls_l.fetch_add(1, Ordering::SeqCst);
+                    registered_l.store(true, Ordering::SeqCst);
+                    // Lands at ~200 ms, while the waiter is parked on the
+                    // replacement, which fails at ~230 ms.
+                    thread::sleep(Duration::from_millis(200));
+                    Ok::<_, String>(b"leader-bytes".to_vec())
+                })
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !leader_registered.load(Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "leader never registered");
+                thread::yield_now();
+            }
+
+            // Times out on the leader at ~100 ms, becomes the replacement.
+            let (group_r, calls_r) = (Arc::clone(&group), Arc::clone(&upstream_calls));
+            let key_r = key.clone();
+            let replacement = s.spawn(move || {
+                group_r.call(&key_r, || {
+                    calls_r.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(130));
+                    Err::<Vec<u8>, _>("replacement-failed".to_string())
+                })
+            });
+
+            thread::sleep(Duration::from_millis(50));
+            let (group_w, calls_w) = (Arc::clone(&group), Arc::clone(&upstream_calls));
+            let key_w = key.clone();
+            let staggered = s.spawn(move || {
+                // Joins the original, times out, and parks on the replacement.
+                group_w.call(&key_w, || {
+                    calls_w.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, String>(b"third-fetch".to_vec())
+                })
+            });
+
+            assert_eq!(
+                staggered.join().expect("staggered waiter thread"),
+                Ok(b"leader-bytes".to_vec()),
+                "a waiter parked on the replacement takes the original's result when it lands first"
+            );
+            assert_eq!(
+                leader.join().expect("leader thread"),
+                Ok(b"leader-bytes".to_vec())
+            );
+            assert!(replacement.join().expect("replacement thread").is_err());
+        });
+
+        assert_eq!(upstream_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn no_third_concurrent_fetch_beside_a_superseded_leader() {
+        let group = Singleflight::<Vec<u8>, String>::with_timeout(Duration::from_millis(50));
+        let inflight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let leader_registered = AtomicBool::new(false);
+        let key = flight_key("<stall-seg@synthetic.test>");
+
+        thread::scope(|s| {
+            let stalled = s.spawn(|| {
+                group.call(&key, || {
+                    leader_registered.store(true, Ordering::SeqCst);
+                    tracked_fetch(&inflight, &peak, Duration::from_millis(1_000), "stalled")
+                })
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !leader_registered.load(Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "leader never registered");
+                thread::yield_now();
+            }
+
+            // Times out on the stalled leader, replaces it, and finishes while
+            // the stalled leader is still fetching.
+            let replaced = group.call(&key, || {
+                tracked_fetch(&inflight, &peak, Duration::from_millis(20), "replacement")
+            });
+            assert_eq!(replaced, Ok(b"replacement".to_vec()));
+
+            // A fresh caller leads beside the stalled leader; a second caller
+            // times out on that fresh flight. Neither may replace it.
+            let fresh = s.spawn(|| {
+                group.call(&key, || {
+                    tracked_fetch(&inflight, &peak, Duration::from_millis(400), "fresh")
+                })
+            });
+            thread::sleep(Duration::from_millis(10));
+            let late = s.spawn(|| {
+                group.call(&key, || {
+                    tracked_fetch(&inflight, &peak, Duration::from_millis(400), "late")
+                })
+            });
+
+            assert_eq!(fresh.join().expect("fresh thread"), Ok(b"fresh".to_vec()));
+            assert_eq!(late.join().expect("late thread"), Ok(b"fresh".to_vec()));
+            assert_eq!(
+                stalled.join().expect("stalled thread"),
+                Ok(b"stalled".to_vec())
+            );
+        });
+
+        assert!(
+            peak.load(Ordering::SeqCst) <= 2,
+            "at most two concurrent upstream fetches per key, saw {}",
+            peak.load(Ordering::SeqCst)
+        );
     }
 
     #[test]

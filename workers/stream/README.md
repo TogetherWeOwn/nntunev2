@@ -61,20 +61,22 @@ behaviour.
   `BODY` that ignores the client's `Range` header (`Range`/`206` is resolved
   against the fetched bytes), so seek storms asking for different ranges of
   one segment are the same fetch and share one flight. Sharing is in-flight
-  only: a finished flight never serves later calls (freshness is the
-  cache's job, below).
+  only: once a flight's leader returns, later calls fetch again (freshness is
+  the cache's job, below).
 - Waiter timeout: `SINGLEFLIGHT_WAIT_TIMEOUT_MS = 5_000`. A waiter parked
   longer than 5 s re-runs leader election instead of fetching on its own:
   exactly one timed-out waiter replaces the flight and leads, the rest join
-  the replacement — and a replacement flight is never itself replaced for
-  slowness (its waiters keep waiting in 5 s chunks, taking the original
-  flight's result if it lands first). So a stalled leader costs at most one
-  extra upstream fetch per key: never a fan-out, never a chain of
-  generations, and no waiter hangs behind a wedged leader. (The NNTP
-  client's 10 s timeout is per socket *read*, so a slow-but-healthy leader
-  can be replaced once and briefly overlap its replacement; that bounded
-  overlap is the documented trade-off.) A panicking leader removes its
-  key, so later calls start a fresh flight.
+  the replacement. A replacement is never replaced for slowness (its waiters
+  keep waiting in 5 s chunks), and no flight is led while a superseded leader
+  is still fetching unless it is itself a replacement. So a stalled key runs
+  at most **two upstream fetches at once**, however many callers pile up,
+  and no waiter hangs behind a wedged leader. When the original leader lands
+  first, its result goes to the replacement's waiters too: the first result
+  of the chain is the one every waiter takes. (The NNTP client's 10 s
+  timeout is per socket *read*, so a slow-but-healthy leader can be replaced
+  once and briefly overlap its replacement; that bounded overlap is the
+  documented trade-off.) A panicking leader releases its key, so later calls
+  start a fresh flight; its waiters recover through their own timeout.
 - Native only: the primitive parks waiters on a `Condvar`, which traps on
   `wasm32-unknown-unknown`, so the module is `#[cfg(not(target_arch =
   "wasm32"))]` and CI checks this crate on wasm32 to keep that fence

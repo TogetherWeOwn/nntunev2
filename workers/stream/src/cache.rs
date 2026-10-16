@@ -13,7 +13,7 @@
 //! ([`CACHE_SWR_WINDOW_SECS`]): timed entries written with
 //! [`ContentCache::put_track_at`] serve fresh as `HIT`, then stale as `STALE`
 //! while the worker revalidates in the background (see
-//! [`CacheServe::needs_revalidate`); past both windows the entry is a `MISS`
+//! [`CacheServe::needs_revalidate`]); past both windows the entry is a `MISS`
 //! and the play path re-fetches upstream. Untimed [`ContentCache::put_track`]
 //! entries never go stale (legacy callers). Freshness is tracked per track,
 //! not per deduplicated blob, so restamping one track never changes another
