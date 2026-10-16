@@ -38,6 +38,18 @@ pub enum MeterKind {
     BytesServed,
     PrefetchEnqueued,
     ProviderError,
+    /// A play was rejected because its grant had expired
+    /// (`GrantError::Expired`). Carries the requested track and the granted
+    /// user only; never secret or token material.
+    GrantRejectedExpired,
+    /// A play was rejected because its grant's remaining lifetime exceeded
+    /// `MAX_GRANT_TTL + CLOCK_SKEW_SECS` (`GrantError::TtlTooLong`).
+    /// Same payload shape as the other rejection events.
+    GrantRejectedExcessiveExpiry,
+    /// A play was rejected because a valid grant was presented for the
+    /// wrong track (`PlayError::WrongTrack`). `track_id` is the requested
+    /// track, not the granted one.
+    GrantRejectedWrongTrack,
     /// A provider-level failure quarantined the pool; the event carries the
     /// failed call's lane and the backoff just applied.
     QuarantineEntered,
