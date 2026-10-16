@@ -225,6 +225,20 @@ fn ranges_disagreeing_with_the_covering_article_fall_back_and_serve() {
 }
 
 #[test]
+fn wrong_interior_boundary_in_ranges_still_serves() {
+    // Total and the covering segment agree with the hint, but the interior
+    // boundary lies (hint splits 20k/10k/30k, articles are 20k/20k/20k).
+    // Placement is proven by chaining article offsets, not the hint, so
+    // the whole remainder serves and caches exactly.
+    let (plain, segments, server) = fixture_track("a", 60_000, 20_000);
+    let lying = [(0u64, 20_000u64), (20_000, 30_000), (30_000, 60_000)];
+    let (status, body, cached) = run(&server, &segments, "bytes=5000-", &lying);
+    assert_eq!(status, 206);
+    assert_eq!(body, &plain[5_000..]);
+    assert_eq!(cached, plain);
+}
+
+#[test]
 fn covering_seek_running_to_end_of_track_serves_every_byte() {
     // Open-ended seek from segment 1 of 4: serving advances past the
     // covering segment, which first backfills segment 0 so the covering

@@ -169,19 +169,18 @@ struct Live {
     client: NntpClient,
     lease: Lease,
     segments: Vec<String>,
-    /// Validated per-segment ranges, when the covering fetch is in play.
-    ranges: Option<Vec<(u64, u64)>>,
     /// Next segment to fetch for the *client* (serving cursor). Starts at
     /// the covering segment; `finalize` separately fetches whatever
     /// `seg_done` still lacks (e.g. a skipped prefix).
     next_seg: usize,
     seg_done: Vec<bool>,
+    /// `(offset, len)` each fetched article declared for itself, once
+    /// placed. Placement is proven by chaining these together (see
+    /// `ingest`), never by the NZB ranges hint.
+    seg_placed: Vec<Option<(u64, u64)>>,
     cipher_key: u8,
     /// File size declared by the first fetched segment.
     total: u64,
-    /// Bytes decoded so far, in fetch order (placement check on the
-    /// prefix-walk path, where fetch order is file order).
-    decoded: u64,
     /// The most recently decoded segment, shared with `pending` (no copy).
     buf: Arc<[u8]>,
     buf_start: u64,
@@ -272,40 +271,37 @@ pub fn play(
         let agrees = first.file_size == r[r.len() - 1].1
             && first.offset == r[first_seg].0
             && first.data.len() as u64 == r[first_seg].1 - r[first_seg].0;
-        if !agrees {
-            ranges = None;
-            if first_seg != 0 {
-                // The hint lied about the covering article: discard it and
-                // restart as a prefix walk on the same connection.
-                match fetch_segment(&mut client, &input.segments[0]) {
-                    Ok(decoded) => {
-                        first = decoded;
-                        first_seg = 0;
-                    }
-                    Err(SegmentError::Nntp(e)) => {
-                        let failure = nntp_failure(e, &input.segments[0]);
-                        let keep = if failure.1 { None } else { Some(client) };
-                        return Err(settle(
-                            pool,
-                            meter,
-                            lease,
-                            keep,
-                            failure,
-                            &user,
-                            input.track_id,
-                        ));
-                    }
-                    Err(SegmentError::Decode(e)) => {
-                        return Err(settle(
-                            pool,
-                            meter,
-                            lease,
-                            Some(client),
-                            (PlayError::Decode(e), false),
-                            &user,
-                            input.track_id,
-                        ));
-                    }
+        if !agrees && first_seg != 0 {
+            // The hint lied about the covering article: discard it and
+            // restart as a prefix walk on the same connection.
+            match fetch_segment(&mut client, &input.segments[0]) {
+                Ok(decoded) => {
+                    first = decoded;
+                    first_seg = 0;
+                }
+                Err(SegmentError::Nntp(e)) => {
+                    let failure = nntp_failure(e, &input.segments[0]);
+                    let keep = if failure.1 { None } else { Some(client) };
+                    return Err(settle(
+                        pool,
+                        meter,
+                        lease,
+                        keep,
+                        failure,
+                        &user,
+                        input.track_id,
+                    ));
+                }
+                Err(SegmentError::Decode(e)) => {
+                    return Err(settle(
+                        pool,
+                        meter,
+                        lease,
+                        Some(client),
+                        (PlayError::Decode(e), false),
+                        &user,
+                        input.track_id,
+                    ));
                 }
             }
         }
@@ -315,12 +311,11 @@ pub fn play(
         client,
         lease,
         segments: input.segments.to_vec(),
-        ranges: ranges.map(<[(u64, u64)]>::to_vec),
+        seg_placed: vec![None; input.segments.len()],
         next_seg: first_seg,
         seg_done: vec![false; input.segments.len()],
         cipher_key: input.cipher_key,
         total: first.file_size,
-        decoded: 0,
         buf: Arc::from([]),
         buf_start: 0,
         pending: BTreeMap::new(),
@@ -466,23 +461,29 @@ fn settle(
 impl Live {
     /// Take one decoded segment: check its placement, decrypt, stage it
     /// (flushing the contiguous prefix into the upload) and make it the
-    /// current buffer. Placement is cross-checked against the segment's
-    /// declared range when ranges are in play, else against the running
-    /// decode cursor (fetch order is file order on the prefix walk).
+    /// current buffer. Placement is proven from the articles themselves,
+    /// in any fetch order: the first segment anchors at 0, the last ends
+    /// at the declared file size, and every segment must chain exactly
+    /// onto any already-placed neighbour. The NZB ranges hint plays no
+    /// part here (it only chose the covering segment in `play`, where the
+    /// covering article is cross-checked against it), so wrong interior
+    /// boundaries in the hint can never fail a playable track.
     fn ingest(&mut self, idx: usize, mut d: Decoded) -> Result<(), Failure> {
         let multi_segment = self.segments.len() > 1;
-        let expected = match &self.ranges {
-            Some(ranges) => ranges[idx].0,
-            None => self.decoded,
-        };
-        let ranges_mismatch = self.ranges.as_ref().is_some_and(|ranges| {
-            ranges[ranges.len() - 1].1 != self.total
-                || d.data.len() as u64 != ranges[idx].1 - ranges[idx].0
-        });
-        let misplaced = d.offset != expected
-            || d.file_size != self.total
-            || ranges_mismatch
-            || (multi_segment && !d.multipart);
+        let len = d.data.len() as u64;
+        let prev_end = idx
+            .checked_sub(1)
+            .and_then(|p| self.seg_placed[p].map(|(off, l)| off + l));
+        let next_start = self
+            .seg_placed
+            .get(idx + 1)
+            .and_then(|next| next.map(|(off, _)| off));
+        let unchained = (idx == 0 && d.offset != 0)
+            || (idx + 1 == self.segments.len() && d.offset + len != self.total)
+            || prev_end.is_some_and(|end| d.offset != end)
+            || next_start.is_some_and(|start| d.offset + len != start)
+            || d.offset + len > self.total;
+        let misplaced = unchained || d.file_size != self.total || (multi_segment && !d.multipart);
         if misplaced {
             return Err((PlayError::Decode(YencError::BadPart), false));
         }
@@ -492,7 +493,7 @@ impl Live {
             *b ^= self.cipher_key;
         }
         self.buf_start = d.offset;
-        self.decoded += d.data.len() as u64;
+        self.seg_placed[idx] = Some((d.offset, len));
         let data: Arc<[u8]> = Arc::from(d.data);
         self.buf = Arc::clone(&data);
         self.seg_done[idx] = true;
