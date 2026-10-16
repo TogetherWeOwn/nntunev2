@@ -5,8 +5,8 @@
 //! belongs in the API module and a forward-only migration.
 
 use nntune_api::account_deletion::{
-    self, CancelOutcome, CANCEL_ACCOUNT_DELETION_SQL, OPERATION_STATUS_SQL,
-    SCHEDULE_ACCOUNT_DELETION_SQL, START_ACCOUNT_ERASURE_SQL,
+    self, CancelOutcome, CANCEL_ACCOUNT_DELETION_SQL, LOCK_ACCOUNT_DELETION_USER_SQL,
+    OPERATION_STATUS_SQL, SCHEDULE_ACCOUNT_DELETION_SQL, START_ACCOUNT_ERASURE_SQL,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -166,6 +166,17 @@ fn cancel_sql_is_owner_scoped_compare_and_set_and_clears_fence() {
     );
     assert!(sql.contains("updateusers"), "{sql}");
     assert!(sql.contains("setdeleting_at=null"), "{sql}");
+    assert!(sql.contains("fromcancelled"), "{sql}");
+    assert!(sql.contains("whereusers.id=cancelled.user_id"), "{sql}");
+}
+
+#[test]
+fn user_lock_sql_locks_the_user_before_operation_cancellation() {
+    let sql = normalize(LOCK_ACCOUNT_DELETION_USER_SQL);
+    assert!(
+        sql.contains("selectidfromuserswhereid=$1forupdate"),
+        "cancellation must lock the user row before the operation row: {sql}"
+    );
 }
 
 #[test]
