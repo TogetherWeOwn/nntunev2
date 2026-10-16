@@ -32,37 +32,125 @@ pub struct IntakeEstimate {
     pub segment_count: usize,
 }
 
-/// True for bytes that can continue an XML element name: anything after
-/// `<{name}` in this set means this is a longer name (`<segments>`,
-/// `<segmentx>`), not the element we count.
+/// True for bytes that can continue an XML element name.
 fn is_name_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':')
 }
 
-/// Count `<{name}` element starts, stopping once `over` is exceeded.
-///
-/// An occurrence only counts when the byte after the name is *not* a name
-/// character, so whitespace of any kind (` `, `\t`, `\r`, `\n`), `>` and
-/// `/` (self-closing) all count, while the `<segments>` container and
-/// longer names (`<segmentx>`) do not. Operates on bytes so it cannot miss
-/// a spelling the XML spec allows.
-fn count_elements(haystack: &str, name: &str, over: usize) -> usize {
-    let needle = format!("<{name}");
-    let mut n = 0;
-    let mut rest = haystack;
-    while let Some(i) = rest.find(needle.as_str()) {
-        let after = rest.as_bytes().get(i + needle.len()).copied();
-        // A truncated tail (`<segment` at the very end) counts: it is still
-        // attacker-controlled shape the parser would have to deal with.
-        if after.is_none() || !is_name_char(after.unwrap_or(0)) {
-            n += 1;
-            if n > over {
-                break;
+fn starts_with_at(bytes: &[u8], at: usize, marker: &[u8]) -> bool {
+    bytes.get(at..at.saturating_add(marker.len())) == Some(marker)
+}
+
+/// Skip an XML declaration, respecting quotes and an internal subset.
+fn skip_declaration(bytes: &[u8], mut at: usize) -> usize {
+    let mut quote = None;
+    let mut subset_depth = 0usize;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if let Some(q) = quote {
+            if byte == q {
+                quote = None;
+            }
+        } else {
+            match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'[' => subset_depth += 1,
+                b']' => subset_depth = subset_depth.saturating_sub(1),
+                b'>' if subset_depth == 0 => return at + 1,
+                _ => {}
             }
         }
-        rest = &rest[i + needle.len()..];
+        at += 1;
     }
-    n
+    at
+}
+
+/// Skip an element tag's attributes, so tag-like text in attribute values is
+/// never counted as a nested element.
+fn skip_tag(bytes: &[u8], mut at: usize) -> usize {
+    let mut quote = None;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if let Some(q) = quote {
+            if byte == q {
+                quote = None;
+            }
+        } else {
+            match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'>' => return at + 1,
+                _ => {}
+            }
+        }
+        at += 1;
+    }
+    at
+}
+
+/// Count actual XML start tags with the requested local name, stopping once
+/// `over` is exceeded. Comments, CDATA, processing instructions, declarations,
+/// closing tags, and tag-like text in attributes are skipped.
+fn count_elements(haystack: &str, name: &str, over: usize) -> usize {
+    let bytes = haystack.as_bytes();
+    let mut at = 0;
+    let mut count = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'<' {
+            at += 1;
+            continue;
+        }
+        if starts_with_at(bytes, at, b"<!--") {
+            at = bytes[at + 4..]
+                .windows(3)
+                .position(|w| w == b"-->")
+                .map_or(bytes.len(), |i| at + 4 + i + 3);
+            continue;
+        }
+        if starts_with_at(bytes, at, b"<![CDATA[") {
+            at = bytes[at + 9..]
+                .windows(3)
+                .position(|w| w == b"]]>")
+                .map_or(bytes.len(), |i| at + 9 + i + 3);
+            continue;
+        }
+        if starts_with_at(bytes, at, b"<?") {
+            at = bytes[at + 2..]
+                .windows(2)
+                .position(|w| w == b"?>")
+                .map_or(bytes.len(), |i| at + 2 + i + 2);
+            continue;
+        }
+        if starts_with_at(bytes, at, b"<!") {
+            at = skip_declaration(bytes, at + 2);
+            continue;
+        }
+
+        let mut name_start = at + 1;
+        let closing = bytes.get(name_start) == Some(&b'/');
+        if closing {
+            name_start += 1;
+        }
+        let mut name_end = name_start;
+        while name_end < bytes.len() && is_name_char(bytes[name_end]) {
+            name_end += 1;
+        }
+        if name_end == name_start {
+            at += 1;
+            continue;
+        }
+        if !closing {
+            let qname = &bytes[name_start..name_end];
+            let local_name = qname.rsplit(|b| *b == b':').next().unwrap_or(qname);
+            if local_name == name.as_bytes() {
+                count += 1;
+                if count > over {
+                    return count;
+                }
+            }
+        }
+        at = skip_tag(bytes, name_end);
+    }
+    count
 }
 
 /// Validate an upload body and estimate its shape.
@@ -159,6 +247,23 @@ mod tests {
         assert_eq!(estimate_nzb(doc).unwrap().segment_count, 1);
         let doc = "<?xml?><nzb><segmentx>y</segmentx></nzb>";
         assert_eq!(estimate_nzb(doc).unwrap().segment_count, 0);
+    }
+
+    #[test]
+    fn ignores_tag_like_text_in_comments_cdata_and_attributes() {
+        let xml = r#"<?xml?><nzb note="<segment>"><!-- <segment> --><![CDATA[<segment>]]><segment>x</segment></nzb>"#;
+        assert_eq!(estimate_nzb(xml).unwrap().segment_count, 1);
+    }
+
+    #[test]
+    fn comment_tag_text_cannot_trigger_segment_cap() {
+        let mut xml = String::from("<?xml?><nzb><!--");
+        for _ in 0..=MAX_SEGMENTS {
+            xml.push_str("<segment>");
+        }
+        xml.push_str("--></nzb>");
+        assert!(xml.len() < MAX_NZB_BYTES);
+        assert_eq!(estimate_nzb(&xml).unwrap().segment_count, 0);
     }
 
     #[test]

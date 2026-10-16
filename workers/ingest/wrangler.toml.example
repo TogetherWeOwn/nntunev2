@@ -5,29 +5,29 @@ name = "nntune-ingest"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
 
-# Slice 2: Queue producer (code: src/dispatch.rs, src/queue.rs). The routes
-# only produce; nothing consumes yet (see below), so every accepted enqueue
-# waits in the queue until the consumer ships.
+# Queue producer (code: src/dispatch.rs, src/queue.rs). The routes produce
+# jobs; consumer configuration remains disabled below until every runtime
+# boundary required to finish a job is executable.
 [[queues.producers]]
 binding = "INGEST_QUEUE"
 queue = "nntune-ingest-jobs"
 
-# Consumer: NOT YET. This crate has only `event(fetch)` — no `event(queue)`
-# handler — so declaring this worker a consumer would deliver every message
-# to a handler that does not exist (retried `max_retries` times, then
-# dropped, while callers saw 202 queued). Uncomment together with the Queue
-# handler and a dead-letter queue, e.g.:
+# Consumer: intentionally disabled. `src/queue_consumer.rs` has per-message
+# validation, ack/retry, terminal replay, checkpoint, and upload-parse handling,
+# but indexer, pool-probe, and repair runtime calls are not executable yet.
+# Enabling this before those interfaces land would make valid jobs fail rather
+# than complete. Uncomment only after those runtime blockers are resolved.
 #
 # [[queues.consumers]]
 # queue = "nntune-ingest-jobs"
 # max_batch_size = 10
-# Keep max_retries = PAYLOAD_RETRY_ATTEMPTS (4) in src/dispatch.rs: the
-# payload-fetch backoff (5/15/30/60 s, 110 s cumulative) needs all four
-# retries to cover the ~60 s KV lag plus the edge-cached negative-lookup
-# window (consumer reads with cacheTtl 30).
 # max_retries = 4
 # [[queues.consumers.dead_letter_queue]]
 # queue = "nntune-ingest-dlq"
+#
+# `max_retries` must match PAYLOAD_RETRY_ATTEMPTS (4) in src/dispatch.rs:
+# payload reads retry at 5/15/30/60 seconds (110 seconds cumulative), covering
+# the ~60 second KV visibility lag and the 60-second edge-cached miss window.
 
 # Workflows: NOT YET. workers-rs 0.3 has no Workflow client and this crate
 # exports no Workflow class, and `[[workflows]]` requires a `class_name`, so

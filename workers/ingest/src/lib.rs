@@ -3,23 +3,26 @@
 //! Routes (all JSON):
 //! - `POST /v1/ingest/search` — Newznab search with the user's own indexer
 //!   (`indexer_ref` vault handle; raw keys are never accepted here).
-//! - `POST /v1/ingest/nzb` — NZB upload; guarded by intake caps, then
-//!   parsed by `nntune-core` in the next slice.
+//! - `POST /v1/ingest/nzb` — NZB upload; guarded by intake caps, parsed with
+//!   the bounded `nntune-core` parser, and cross-checked before enqueue.
 //! - `GET /v1/ingest/jobs/:id` — job checkpoint status (idempotent resume).
 //!
 //! Pipeline: search/upload → parse (`nntune-core`) → segment availability
 //! probe through the user's pool DO → par2 verify (Container batch repair
 //! when needed) → tag/fingerprint + MusicBrainz match (`workers/mb`) →
 //! library rows. Routes validate the contract, persist upload bytes to the
-//! payload KV, and enqueue to `nntune-ingest-jobs`; the Queue consumer
-//! (Workflow steps in `queue::WORKFLOW_STEPS`) runs parse → probe → verify →
-//! repair → match → write once its handler lands (the consumer/workflow
-//! entries stay commented out in `wrangler.toml.example` until then).
+//! payload KV, and enqueue to `nntune-ingest-jobs`. The `event(queue)` handler
+//! persists checkpoints and parses uploads, but retries work at provider-search,
+//! pool-probe, and repair boundaries that are not executable yet; consumer
+//! configuration therefore stays commented out in `wrangler.toml.example`.
+//! Workflow steps in `queue::WORKFLOW_STEPS` describe the intended parse → probe
+//! → verify → repair → match → write path.
 //! See `README.md`.
 
 use futures_util::StreamExt;
 use worker::{console_log, Env, Request, Response, Result, RouteContext, Router};
 
+pub mod checkpoint;
 pub mod dispatch;
 pub mod fixtures;
 pub mod jobs;
@@ -30,6 +33,7 @@ pub mod nzb_intake;
 pub mod parse;
 pub mod probe;
 pub mod queue;
+pub mod queue_consumer;
 pub mod rate_limit;
 pub mod repair;
 
@@ -66,7 +70,7 @@ fn json_error(message: &str, status: u16) -> Result<Response> {
 }
 
 fn headers_json() -> Result<worker::Headers> {
-    let headers = worker::Headers::new();
+    let mut headers = worker::Headers::new();
     headers.append("content-type", "application/json; charset=utf-8")?;
     Ok(headers)
 }
@@ -80,7 +84,7 @@ fn service_unavailable(message: &str) -> Result<Response> {
         error: message.to_string(),
     })
     .unwrap_or_else(|_| r#"{"error":"internal"}"#.to_string());
-    let headers = headers_json().unwrap_or_default();
+    let mut headers = headers_json().unwrap_or_default();
     headers.append("retry-after", "5")?;
     Response::from_body(worker::ResponseBody::Body(body.into_bytes()))
         .map(|r| r.with_status(503).with_headers(headers))
@@ -244,7 +248,7 @@ fn queued_envelope(
         }
     }
     if !queued {
-        let headers = headers_json().unwrap_or_default();
+        let mut headers = headers_json().unwrap_or_default();
         headers.append("retry-after", "5")?;
         return Response::from_json(&body).map(|r| r.with_status(503).with_headers(headers));
     }
@@ -341,6 +345,13 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Respons
         Err(IntakeRejection::TooManyFiles) => json_error("nzb has too many files", 413),
         Err(IntakeRejection::TooManySegments) => json_error("nzb has too many segments", 413),
         Ok(est) => {
+            match parse::parse_upload(parsed.nzb_xml.as_bytes(), &est) {
+                Ok(_) => {}
+                Err(parse::ParseRejection::Invalid(message)) => return json_error(message, 400),
+                Err(parse::ParseRejection::TooLarge) => {
+                    return json_error("nzb exceeds shared parser limits", 413)
+                }
+            }
             let msg = match dispatch::build_upload_dispatch(&parsed.user_id, &parsed.nzb_xml) {
                 Ok(msg) => msg,
                 Err(message) => return json_error(message, 400),
@@ -373,17 +384,17 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Respons
     }
 }
 
-/// Job checkpoint status: validates the id shape before DB wiring lands.
+/// Read the durable checkpoint written by the Queue consumer.
 async fn job_status(_req: &Request, ctx: &RouteContext<()>) -> Result<Response> {
     let id = ctx.param("id").cloned().unwrap_or_default();
     if !validate_job_id(&id) {
         return json_error("unknown job id", 404);
     }
-    Response::from_json(&serde_json::json!({
-        "job_id": id,
-        "status": "not_wired",
-        "hint": "Checkpoint reads land with the Queue consumer; enqueue is live.",
-    }))
+    match checkpoint::get(&ctx.env, &id).await {
+        Ok(Some(checkpoint)) => Response::from_json(&checkpoint),
+        Ok(None) => json_error("unknown job id", 404),
+        Err(_) => service_unavailable("checkpoint store unavailable"),
+    }
 }
 
 #[cfg(test)]

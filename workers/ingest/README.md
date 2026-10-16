@@ -32,8 +32,12 @@ NZB upload ───────────────┘                     
   ≤16 categories, paged window), `POST /v1/ingest/nzb` (wire cap accounting
   for JSON escaping, then the 2 MiB / 5k / 60k intake guard) — malformed JSON
   is 400, over-cap is 413, busy store/queue is 503; success is 202 + enqueue
-  with job id + idempotency key. `GET /v1/ingest/jobs/:id` (checkpoint reads
-  land with the consumer).
+  with job id + idempotency key. NZB uploads are parsed by the shared bounded
+  `nntune-core` parser and cross-checked against the intake scan before enqueue.
+  `GET /v1/ingest/jobs/:id` reads a durable checkpoint from `INGEST_STATE`;
+  `src/queue_consumer.rs` writes replay-safe checkpoints and parses stored
+  uploads with `nntune-core`, then retries because execution boundaries remain
+  incomplete.
 
 ## Security rules
 
@@ -42,17 +46,14 @@ NZB upload ───────────────┘                     
   committed. `http://` indexer URLs are refused.
 - Upload bodies are untrusted: capped, shape-checked, never logged.
 
-## E2E contract (synthetic NNTP server card)
+## Synthetic NNTP CI coverage
 
-End-to-end acceptance runs against the synthetic server in CI (no real
-Usenet in CI). Ingest needs from that card:
-
-1. Fixture articles: yEnc single/multi-part, obfuscated subjects, one
-   intentionally gapped set (430s) + matching par2 set for the repair path.
-2. Newznab stub: `t=music` search returning a GUID whose NZB references
-   fixture message-ids.
-3. Connection caps per credential + slow-link/mid-disconnect modes for the
-   resume test (kill mid-`Probing`, redeliver, expect one library row).
+`tests/synthetic_nntp.rs` runs the shared `nntune-core` NZB parser and NNTP
+client against the merged `nntune-test-nntp` fixture server, fetches the parsed
+Message-ID, and verifies shared yEnc decoding. The `rust-ingest` CI job runs it
+with `cargo test --all-targets`; it uses no live Usenet. This validates parser
+and server interoperability, not the unavailable Worker bindings, Newznab
+provider, pool DO, repair Container, or end-to-end library write path.
 
 ## Slice 2 (this slice)
 
@@ -63,9 +64,9 @@ Usenet in CI). Ingest needs from that card:
   feature; bindings in `wrangler.toml.example`). Search keys bind query +
   indexer + categories + limit + page, so no request is silently dropped.
   Success is 202 `queued`; a missing/failing binding or payload store is 503
-  with `Retry-After` (never 202). The consumer/workflow entries stay
-  commented out in `wrangler.toml.example` until the Queue handler (with DLQ)
-  and the Workflow class ship — declaring them now would drop every message.
+  with `Retry-After` (never 202). The Queue handler and DLQ example are
+  present, but the consumer remains disabled until its runtime dependencies
+  are executable. workers-rs 0.3 still has no Workflow client or class.
 - Request bodies carry self-asserted `user_id` (1..=128 chars) until the
   accounts card authenticates callers; the key format already binds the
   user, so keys stay valid when auth lands.
@@ -81,14 +82,20 @@ Usenet in CI). Ingest needs from that card:
   (`src/fixtures.rs`), pipeline E2E (`tests/pipeline_e2e.rs`): happy path
   reaches `Done` with one library row; the gapped set repairs then finishes.
 
-Blocked on siblings for the live half: pool-DO wire contract, `nntune-core`
-parse output, synthetic NNTP fixture server + CI E2E against it, checkpoint
-KV reads in `GET /v1/ingest/jobs/:id`, and the repair Container runtime.
+The Queue `event(queue)` handler is implemented with per-message validation,
+ack/retry, a configured-but-disabled DLQ example, terminal replay handling,
+`INGEST_STATE` checkpoint writes, and shared-parser upload validation. Consumer
+configuration remains disabled: there is no executable provider-search or
+pool-probe endpoint, and the repair Container is still a placeholder. Library
+and metering helpers also remain unconnected, so no live provider, pool, repair,
+library, or metering invocation is claimed here. The synthetic-server test
+covers shared parser/client interoperability only; do not enable the consumer
+until the missing runtime interfaces are executable.
 
 ## Develop
 
 ```sh
-cargo test -p nntune-ingest
+cargo test --manifest-path workers/ingest/Cargo.toml --all-targets
 ```
 
 Pure modules carry inline unit tests; handlers stay thin so the contract

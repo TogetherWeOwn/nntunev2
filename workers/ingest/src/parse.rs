@@ -1,19 +1,16 @@
-//! Parse glue: the parsed shape the checkpoint stores.
+//! Parse glue: project bounded parser output into probe envelopes.
 //!
-//! Full NZB parsing (subject decoding, yEnc segment maps) is owned by the
-//! nntune-core card; this module owns the ingest side: the [`ParsedNzb`]
-//! shape the `Parsing` step must produce, the cross-check that keeps a parse
-//! disagreeing with the intake guard from spending provider connections, and
-//! the batching into probe-sized envelopes.
+//! NZB parsing is delegated to `nntune-core`; this module owns the ingest
+//! projection, the cross-check that keeps a parse disagreeing with the intake
+//! guard from spending provider connections, and batching into probe envelopes.
 
 use serde::{Deserialize, Serialize};
 
 use crate::nzb_intake::IntakeEstimate;
 use crate::probe::{validate_message_id, MAX_PROBE_SEGMENTS};
 
-/// What the `Parsing` step stores in the checkpoint: the segment map the
-/// pool probe walks. Produced by `nntune-core` once that card lands; until
-/// then tests and the synthetic E2E construct it from fixtures.
+/// Ingest-side projection of a parsed NZB. The parser's richer metadata is
+/// discarded here; only validated segment ids cross the provider boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedNzb {
     pub file_count: usize,
@@ -21,11 +18,41 @@ pub struct ParsedNzb {
     pub message_ids: Vec<String>,
 }
 
-/// Cross-check a parse against the intake guard's estimate. Any disagreement
-/// fails the job before a single provider connection is spent.
+/// Why an uploaded NZB failed the shared-parser validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseRejection {
+    Invalid(&'static str),
+    TooLarge,
+}
+
+/// Parse uploaded NZB bytes with the shared bounded parser, then verify its
+/// counts and identifiers against the conservative intake scan.
+pub fn parse_upload(xml: &[u8], estimate: &IntakeEstimate) -> Result<ParsedNzb, ParseRejection> {
+    let document = nntune_core::nzb::parse(xml).map_err(|error| match error {
+        nntune_core::Error::Bounds { .. } => ParseRejection::TooLarge,
+        _ => ParseRejection::Invalid("nntune-core rejected NZB"),
+    })?;
+    let file_count = document.files.len();
+    let message_ids = document
+        .files
+        .into_iter()
+        .flat_map(|file| file.segments.into_iter().map(|segment| segment.message_id))
+        .collect::<Vec<_>>();
+    let parsed = ParsedNzb {
+        file_count,
+        segment_count: message_ids.len(),
+        message_ids,
+    };
+    check_parsed(estimate, &parsed).map_err(ParseRejection::Invalid)?;
+    Ok(parsed)
+}
+
+/// Cross-check parser counts and identifiers against the intake scan. The
+/// cheap scan is deliberately conservative and can count tag-like text in
+/// comments or attributes, so parsed counts may be lower but never higher.
 pub fn check_parsed(estimate: &IntakeEstimate, parsed: &ParsedNzb) -> Result<(), &'static str> {
-    if parsed.file_count != estimate.file_count || parsed.segment_count != estimate.segment_count {
-        return Err("parse disagrees with the intake guard");
+    if parsed.file_count > estimate.file_count || parsed.segment_count > estimate.segment_count {
+        return Err("parse exceeds the intake estimate");
     }
     if parsed.message_ids.len() != parsed.segment_count {
         return Err("message-id count must match the segment count");
@@ -60,6 +87,42 @@ mod tests {
             segment_count: 2,
             message_ids: SMALL_NZB_SEGMENTS.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn upload_parse_uses_core_document_and_matches_intake() {
+        let est = estimate_nzb(SMALL_NZB).unwrap();
+        let parsed = parse_upload(SMALL_NZB.as_bytes(), &est).unwrap();
+        assert_eq!(parsed, parsed_small());
+    }
+
+    #[test]
+    fn tag_like_comment_text_does_not_fail_the_parser_cross_check() {
+        let xml = SMALL_NZB.replace(
+            "</nzb>",
+            "<!-- retry <segment bytes=\"1\" number=\"9\">note</segment> -->\n</nzb>",
+        );
+        let est = estimate_nzb(&xml).unwrap();
+        assert_eq!(est.segment_count, 2);
+        assert_eq!(parse_upload(xml.as_bytes(), &est).unwrap(), parsed_small());
+    }
+
+    #[test]
+    fn shared_parser_bounds_are_reported_as_too_large() {
+        let mut xml = String::from(
+            "<nzb><file poster=\"p\" date=\"0\" subject=\"x\"><groups><group>x</group></groups><segments>",
+        );
+        for number in 1..=4097 {
+            xml.push_str(&format!(
+                "<segment bytes=\"1\" number=\"{number}\">s{number}@example.invalid</segment>"
+            ));
+        }
+        xml.push_str("</segments></file></nzb>");
+        let est = estimate_nzb(&xml).unwrap();
+        assert_eq!(
+            parse_upload(xml.as_bytes(), &est),
+            Err(ParseRejection::TooLarge)
+        );
     }
 
     #[test]
