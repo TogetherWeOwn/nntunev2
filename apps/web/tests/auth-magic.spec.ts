@@ -31,7 +31,7 @@ test('magic-link landing waits for confirm, redeems once, then names the account
 	expect(finishPosts).toBe(0);
 
 	await confirm.click();
-	await page.waitForURL('/onboarding/provider');
+	await page.waitForURL('/onboarding/byop');
 	expect(finishPosts).toBe(1);
 
 	// The wizard names the account before any credential field.
@@ -102,7 +102,7 @@ test('swap-guarded link offers sign-out with no label and redeems after sign-out
 	const retry = page.getByRole('button', { name: /sign in with this link/i });
 	await expect(retry).toBeVisible();
 	await retry.click();
-	await page.waitForURL('/onboarding/provider');
+	await page.waitForURL('/onboarding/byop');
 	expect(finishPosts).toBe(2);
 	await expect(page.getByText(/signed in as/i)).toContainText('bob@example.com');
 });
