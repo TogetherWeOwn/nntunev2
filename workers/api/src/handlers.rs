@@ -70,24 +70,15 @@ const REGISTER_FINISH_ATTEMPTS_PER_CHALLENGE: u64 = 10;
 const LOGIN_FINISH_ATTEMPTS_PER_CHALLENGE: u64 = 10;
 const MAGIC_FINISH_ATTEMPTS_PER_IP: u64 = 10;
 const FINISH_ATTEMPT_WINDOW_SECS: u64 = crate::auth::CHALLENGE_TTL_SECS;
-/// Auth-start abuse budgets (CISO follow-up): per-email/per-account caps
-/// never bind across fresh addresses — each new email mints a fresh user
-/// id — so every start route also reserves one per-IP slot and one global
-/// slot BEFORE creating any user/challenge row or queuing mail. Denial
-/// keeps the route's usual response shape (no throttle oracle). 30/hour
-/// per IP admits legitimate multi-user NAT while cutting distinct-email
-/// loops; 100 per 5 minutes globally bounds fleet-wide mail/DB pressure
-/// within the atomic slot-table guard (`reserve_rate_limit` fails closed
-/// above 100 slots, so the global window is short instead of wide).
+/// Per-IP auth-start admission: 30/hour admits legitimate multi-user NAT
+/// while cutting distinct-email loops. Global capacity is reserved only for
+/// outbound mail, so exhaustion cannot block auth challenge issuance.
 const AUTH_STARTS_PER_IP_PER_HOUR: u64 = 30;
-const AUTH_START_GLOBAL_PER_WINDOW: u64 = 100;
-const AUTH_START_GLOBAL_WINDOW_SECS: u64 = 300;
 /// Outbound mail abuse cap: register/start and magic/start share one
 /// per-IP plus one global issuance budget in front of the per-email budget,
 /// so one IP cannot email-bomb unlimited distinct victims (3 mails/15 min
 /// per victim, unlimited victims). Any denial sends nothing and stores no
-/// magic row. Same sizing as the start budgets: 30/hour per IP, 100 per
-/// 5 minutes globally.
+/// magic row. The global cap is 100 per 5 minutes.
 const MAIL_PER_IP_PER_HOUR: u64 = 30;
 const MAIL_GLOBAL_PER_WINDOW: u64 = 100;
 const MAIL_GLOBAL_WINDOW_SECS: u64 = 300;
@@ -287,18 +278,18 @@ pub trait Store {
     ) -> impl Future<Output = Result<bool, StoreError>>;
     /// Remove challenges that can no longer be redeemed.
     fn prune_expired_challenges(&self, now: u64) -> impl Future<Output = Result<(), StoreError>>;
-    /// Best-effort reaping of never-completed signups: delete user rows
-    /// older than `ttl_secs` that still hold no credential. Cascade removes
-    /// their magic/session/vault rows. Default no-op so out-of-tree `Store`
-    /// impls keep compiling; the production Postgres store and the handler
-    /// test fake override it.
+    /// Reap abandoned signups while preserving the current/resumed user and
+    /// users with unexpired registration challenges, including in-flight
+    /// finishes. Default no-op so out-of-tree `Store` impls keep compiling;
+    /// production and the test fake override it.
     fn reap_unverified_users(
         &self,
         now: u64,
         ttl_secs: u64,
+        protected_user_id: Option<&str>,
     ) -> impl Future<Output = Result<(), StoreError>> {
         async move {
-            let _ = (now, ttl_secs);
+            let _ = (now, ttl_secs, protected_user_id);
             Ok(())
         }
     }
@@ -485,6 +476,13 @@ fn email_rate_limit_key(cfg: &Config, email: &str) -> String {
 
 /// Stand-in user id for register/start taken-email shapes, shaped like
 /// the real 16-byte random user ids and stable per email.
+fn valid_challenge_id(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
 fn fake_user_id(cfg: &Config, email: &str) -> String {
     fake_id(cfg, "fake-user", email, 0, 16)
 }
@@ -614,35 +612,17 @@ where
         Ok((claims, token))
     }
 
-    /// Per-IP plus global auth-start budget shared by the register, login
-    /// and magic start routes. Reserves one slot in each scope BEFORE any
-    /// user/challenge row or mail; denial or store error admits nothing
-    /// (fail-closed). Callers keep their usual response shape, so throttled
-    /// and ordinary starts are indistinguishable. (A denial after the IP
-    /// slot was taken wastes that one IP slot; acceptable for an abuse
-    /// budget and bounded by the same window.)
+    /// Per-IP admission shared by register, login and magic start routes.
+    /// The global budget is reserved only for outbound mail, so exhaustion
+    /// cannot prevent users from obtaining an authentication challenge.
     async fn admit_auth_start(&self) -> bool {
-        let ip_ok = self
-            .store
+        self.store
             .reserve_rate_limit(
                 &self.source_ip,
                 "auth.start_ip",
                 AUTH_STARTS_PER_IP_PER_HOUR,
                 self.now,
                 AUTH_START_WINDOW_SECS,
-            )
-            .await
-            .unwrap_or(false);
-        if !ip_ok {
-            return false;
-        }
-        self.store
-            .reserve_rate_limit(
-                GLOBAL_SCOPE_KEY,
-                "auth.start_global",
-                AUTH_START_GLOBAL_PER_WINDOW,
-                self.now,
-                AUTH_START_GLOBAL_WINDOW_SECS,
             )
             .await
             .unwrap_or(false)
@@ -678,6 +658,10 @@ where
             .await
             .unwrap_or(false);
         if !mail_global_ok {
+            // Alert without including request/user data; this signals fleet-wide
+            // outbound-mail pressure while keeping auth starts available.
+            #[cfg(target_arch = "wasm32")]
+            worker::console_log!("api global mail budget exhausted");
             return;
         }
         let scope_key = email_rate_limit_key(self.cfg, email);
@@ -774,10 +758,6 @@ where
     let Some(email) = normalize_email(&body.email) else {
         return generic_auth();
     };
-    let existing = match ctx.store.user_by_email(&email).await {
-        Ok(user) => user,
-        Err(_) => return internal(),
-    };
     // Identical 200 shape for every outcome below (new email, abandoned
     // signup, already-registered account): this route must not be an
     // account-existence oracle. A taken email gets an unbound challenge
@@ -797,13 +777,24 @@ where
             }),
         )
     };
-    // Bound table growth first: reap never-completed signups and prune
-    // expired challenges (best-effort retention; failures fail closed like
-    // `login_start`, never silently skipping cleanup). Runs before the
-    // budget gate so cleanup never depends on budget.
+    // Per-IP admission before user lookup or maintenance. The global budget
+    // applies to outbound mail only, never to auth challenge issuance.
+    if !ctx.admit_auth_start().await {
+        return shape(fake_user_id(ctx.cfg, &email));
+    }
+    let existing = match ctx.store.user_by_email(&email).await {
+        Ok(user) => user,
+        Err(_) => return internal(),
+    };
+    // Preserve a resumed signup through this cleanup pass. Other active
+    // registration attempts are protected by their unexpired challenges.
     if ctx
         .store
-        .reap_unverified_users(ctx.now, UNVERIFIED_USER_TTL_SECS)
+        .reap_unverified_users(
+            ctx.now,
+            UNVERIFIED_USER_TTL_SECS,
+            existing.as_ref().map(|user| user.id.as_str()),
+        )
         .await
         .is_err()
     {
@@ -811,13 +802,6 @@ where
     }
     if ctx.store.prune_expired_challenges(ctx.now).await.is_err() {
         return internal();
-    }
-    // Per-IP/global budget BEFORE any user row or mail: each new email
-    // would otherwise mint a fresh user id the per-account cap never binds
-    // on. Denial keeps the identical 200 shape (the taken-account stand-in
-    // id), so throttled and taken starts are indistinguishable.
-    if !ctx.admit_auth_start().await {
-        return shape(fake_user_id(ctx.cfg, &email));
     }
     let user = match existing {
         Some(user) => {
@@ -888,6 +872,14 @@ where
     let Some(body) = parse_body::<RegisterFinishBody>(req) else {
         return generic_auth();
     };
+    if !valid_challenge_id(&body.challenge) {
+        return generic_auth();
+    }
+    let row = match ctx.store.challenge_by_id(&body.challenge).await {
+        Ok(Some(row)) if row.purpose == PURPOSE_REGISTER => row,
+        Ok(_) => return generic_auth(),
+        Err(_) => return internal(),
+    };
     let (Ok(attestation_object), Ok(client_data_json)) = (
         b64url_decode(&body.attestation_object),
         b64url_decode(&body.client_data_json),
@@ -910,14 +902,6 @@ where
         .await
         .unwrap_or(false);
     if !admitted {
-        return generic_auth();
-    }
-    let row = match ctx.store.challenge_by_id(&body.challenge).await {
-        Ok(Some(row)) => row,
-        Ok(None) => return generic_auth(),
-        Err(_) => return internal(),
-    };
-    if row.purpose != PURPOSE_REGISTER {
         return generic_auth();
     }
     let Some(user_id) = row.user_id.clone() else {
@@ -1067,18 +1051,14 @@ where
     let Some(email) = normalize_email(&body.email) else {
         return generic_auth();
     };
-    if ctx.store.prune_expired_challenges(ctx.now).await.is_err() {
-        return internal();
-    }
     let challenge = match auth::new_registration_challenge(&ctx.cfg.rp_id, &ctx.cfg.origin, ctx.now)
     {
         Ok(challenge) => challenge,
         Err(_) => return internal(),
     };
-    // Per-IP/global budget BEFORE any lookup or challenge row: unknown
-    // emails would otherwise mint unbounded unbound challenge rows. Denial
-    // returns the same fixed-shape 200 with an unstored challenge, so
-    // throttled and ordinary starts are indistinguishable.
+    // Per-IP admission before maintenance or lookup: unknown emails would
+    // otherwise mint unbounded unbound challenge rows. Denial returns the
+    // same fixed-shape 200 with an unstored challenge.
     if !ctx.admit_auth_start().await {
         return json_response(
             200,
@@ -1088,6 +1068,9 @@ where
                 "rp_id": ctx.cfg.rp_id,
             }),
         );
+    }
+    if ctx.store.prune_expired_challenges(ctx.now).await.is_err() {
+        return internal();
     }
     let user = match ctx.store.user_by_email(&email).await {
         Ok(user) => user,
@@ -1143,6 +1126,14 @@ where
     let Some(body) = parse_body::<LoginFinishBody>(req) else {
         return generic_auth();
     };
+    if !valid_challenge_id(&body.challenge) {
+        return generic_auth();
+    }
+    let row = match ctx.store.challenge_by_id(&body.challenge).await {
+        Ok(Some(row)) if row.purpose == PURPOSE_LOGIN => row,
+        Ok(_) => return generic_auth(),
+        Err(_) => return internal(),
+    };
     let (Ok(authenticator_data), Ok(client_data_json), Ok(signature)) = (
         b64url_decode(&body.authenticator_data),
         b64url_decode(&body.client_data_json),
@@ -1164,14 +1155,6 @@ where
         .await
         .unwrap_or(false);
     if !admitted {
-        return generic_auth();
-    }
-    let row = match ctx.store.challenge_by_id(&body.challenge).await {
-        Ok(Some(row)) => row,
-        Ok(None) => return generic_auth(),
-        Err(_) => return internal(),
-    };
-    if row.purpose != PURPOSE_LOGIN {
         return generic_auth();
     }
     let Some(user_id) = row.user_id.clone() else {
@@ -1907,7 +1890,12 @@ mod tests {
                 .retain(|_, row| row.challenge.expires_at > now);
             Ok(())
         }
-        async fn reap_unverified_users(&self, now: u64, ttl_secs: u64) -> Result<(), StoreError> {
+        async fn reap_unverified_users(
+            &self,
+            now: u64,
+            ttl_secs: u64,
+            protected_user_id: Option<&str>,
+        ) -> Result<(), StoreError> {
             let cutoff = now.saturating_sub(ttl_secs);
             let credentialed: HashSet<String> = self
                 .credentials
@@ -1915,9 +1903,21 @@ mod tests {
                 .values()
                 .map(|cred| cred.user_id.clone())
                 .collect();
-            self.users
-                .borrow_mut()
-                .retain(|_, user| user.created_at > cutoff || credentialed.contains(&user.id));
+            let active_registrations: HashSet<String> = self
+                .challenges
+                .borrow()
+                .values()
+                .filter(|row| {
+                    row.purpose == PURPOSE_REGISTER && row.challenge.expires_at > now
+                })
+                .filter_map(|row| row.user_id.clone())
+                .collect();
+            self.users.borrow_mut().retain(|_, user| {
+                user.created_at > cutoff
+                    || credentialed.contains(&user.id)
+                    || active_registrations.contains(&user.id)
+                    || protected_user_id == Some(user.id.as_str())
+            });
             Ok(())
         }
         async fn acquire_test_connection_lease(
@@ -3401,6 +3401,32 @@ mod tests {
     }
 
     #[test]
+    fn global_mail_budget_exhaustion_does_not_block_registration_challenge() {
+        let h = harness();
+        for _ in 0..MAIL_GLOBAL_PER_WINDOW {
+            assert!(block_on(h.store.reserve_rate_limit(
+                GLOBAL_SCOPE_KEY,
+                "auth.mail_global",
+                MAIL_GLOBAL_PER_WINDOW,
+                NOW,
+                MAIL_GLOBAL_WINDOW_SECS,
+            ))
+            .unwrap());
+        }
+
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "budget-global@example.com"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert!(body["challenge"].is_string());
+        assert_eq!(h.store.challenges.borrow().len(), 1);
+        assert!(h.mailer.sent.borrow().is_empty());
+    }
+
+    #[test]
     fn register_start_distinct_email_loop_bounded_by_ip_budget() {
         // Distinct-email loop from one IP: per-account caps never bind on
         // fresh addresses, so the shared per-IP budget must cut the loop
@@ -3554,6 +3580,51 @@ mod tests {
             "the current signup still proceeds"
         );
         assert!(block_on(h.store.challenge_by_id("expired-challenge"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn register_start_reaper_preserves_resumed_and_active_signups() {
+        let h = harness();
+        let stale_at = NOW.saturating_sub(UNVERIFIED_USER_TTL_SECS + 1);
+        for (id, email) in [
+            ("resumed", "resume@example.com"),
+            ("active", "active@example.com"),
+            ("abandoned", "abandoned@example.com"),
+        ] {
+            block_on(h.store.insert_user(&UserRecord {
+                id: id.to_string(),
+                email: email.to_string(),
+                created_at: stale_at,
+            }))
+            .unwrap();
+        }
+        let mut finishing_challenge =
+            auth::new_registration_challenge("example.com", ORIGIN, NOW).unwrap();
+        // Finish consumes the challenge before credential insertion; cleanup
+        // must still protect the user during that in-flight interval.
+        finishing_challenge.consumed = true;
+        block_on(h.store.insert_challenge(
+            &finishing_challenge,
+            Some("active"),
+            PURPOSE_REGISTER,
+        ))
+        .unwrap();
+
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "resume@example.com"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(block_on(h.store.user_by_email("resume@example.com"))
+            .unwrap()
+            .is_some());
+        assert!(block_on(h.store.user_by_email("active@example.com"))
+            .unwrap()
+            .is_some());
+        assert!(block_on(h.store.user_by_email("abandoned@example.com"))
             .unwrap()
             .is_none());
     }

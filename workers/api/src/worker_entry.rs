@@ -698,20 +698,29 @@ impl Store for PgStore {
         Ok(())
     }
 
-    async fn reap_unverified_users(&self, now: u64, ttl_secs: u64) -> Result<(), StoreError> {
-        // Never-completed signups only: rows past the TTL that still hold no
-        // credential (any user with a credential, session, or vault finished
-        // registration, because enrollment precedes all of those). Cascade
-        // removes their magic-link/session rows; their challenges expire
-        // within minutes and fall to the prune above.
+    async fn reap_unverified_users(
+        &self,
+        now: u64,
+        ttl_secs: u64,
+        protected_user_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        // Delete abandoned signups only: preserve credentialed accounts,
+        // the account currently being resumed, and users with an unexpired
+        // registration challenge (including one consumed by an in-flight finish).
         let cutoff = i64_of(now.saturating_sub(ttl_secs))?;
+        let now = i64_of(now)?;
         let client = self.connect().await?;
         client
             .execute(
                 "DELETE FROM users WHERE created_at <= $1 \
+                 AND ($2::TEXT IS NULL OR users.id <> $2) \
                  AND NOT EXISTS (SELECT 1 FROM webauthn_credentials \
-                                 WHERE webauthn_credentials.user_id = users.id)",
-                &[&cutoff],
+                                 WHERE webauthn_credentials.user_id = users.id) \
+                 AND NOT EXISTS (SELECT 1 FROM auth_challenges \
+                                 WHERE auth_challenges.user_id = users.id \
+                                   AND auth_challenges.purpose = 'register' \
+                                   AND auth_challenges.expires_at > $3)",
+                &[&cutoff, &protected_user_id, &now],
             )
             .await
             .map_err(|_| StoreError)?;
