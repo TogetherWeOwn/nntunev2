@@ -46,13 +46,15 @@ pub const ART_BUCKET_PROD: &str = "nntunev2-art-prod";
 
 /// Resolve the cover-art bucket for an environment name: `"staging"` maps
 /// to the staging bucket; `"prod"` and `"production"` (the wrangler env
-/// name) map to the prod bucket. Anything else defaults to prod. Release
-/// responses do not use this mapping until a public host is configured.
-pub fn art_bucket_for_env(env: &str) -> &'static str {
+/// name) map to the prod bucket. Anything else (including empty) resolves
+/// to `None` so a missing or mistyped env can never silently target prod
+/// art. Release responses do not use this mapping until a public host is
+/// configured.
+pub fn art_bucket_for_env(env: &str) -> Option<&'static str> {
     match env {
-        "staging" => ART_BUCKET_STAGING,
-        "prod" | "production" => ART_BUCKET_PROD,
-        _ => ART_BUCKET_PROD,
+        "staging" => Some(ART_BUCKET_STAGING),
+        "prod" | "production" => Some(ART_BUCKET_PROD),
+        _ => None,
     }
 }
 
@@ -835,12 +837,12 @@ mod tests {
         assert_eq!(ART_BUCKET_STAGING, "nntunev2-art-staging");
         assert_eq!(ART_BUCKET_PROD, "nntunev2-art-prod");
         assert_ne!(ART_BUCKET_STAGING, ART_BUCKET_PROD);
-        assert_eq!(art_bucket_for_env("staging"), ART_BUCKET_STAGING);
-        assert_eq!(art_bucket_for_env("prod"), ART_BUCKET_PROD);
-        assert_eq!(art_bucket_for_env("production"), ART_BUCKET_PROD);
-        // Unknown or missing env never resolves staging art.
-        assert_eq!(art_bucket_for_env(""), ART_BUCKET_PROD);
-        assert_eq!(art_bucket_for_env("dev"), ART_BUCKET_PROD);
+        assert_eq!(art_bucket_for_env("staging"), Some(ART_BUCKET_STAGING));
+        assert_eq!(art_bucket_for_env("prod"), Some(ART_BUCKET_PROD));
+        assert_eq!(art_bucket_for_env("production"), Some(ART_BUCKET_PROD));
+        // Unknown or missing env resolves to nothing: never silently prod.
+        assert_eq!(art_bucket_for_env(""), None);
+        assert_eq!(art_bucket_for_env("dev"), None);
     }
 
     #[test]
