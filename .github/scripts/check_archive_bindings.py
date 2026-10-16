@@ -69,10 +69,9 @@ def _is_unsupported_json_candidate(path: Path) -> bool:
 
 def _has_toml_r2_marker(text: str) -> bool:
     """Detect an R2 key/table in malformed TOML, excluding comments and values."""
-    key = re.compile(
-        r'''(?:^|\.)(?:"r2_buckets"|'r2_buckets'|r2_buckets)(?=\s*(?:\]|$))'''
-    )
-    assignment = re.compile(r'''^\s*(?:"r2_buckets"|'r2_buckets'|r2_buckets)\s*=''')
+    key = r'''(?:"r2_buckets"|'r2_buckets'|r2_buckets)'''
+    header_key = re.compile(rf'''(?<![\w-]){key}(?![\w-])''')
+    assignment = re.compile(rf'''(?:^|[.{{,\s]){key}\s*=''')
     for line in text.splitlines():
         quote = ""
         escaped = False
@@ -94,9 +93,9 @@ def _has_toml_r2_marker(text: str) -> bool:
             else:
                 visible.append(char)
         statement = "".join(visible).strip()
-        if assignment.match(statement):
+        if assignment.search(statement):
             return True
-        if statement.startswith("[") and key.search(statement[1:]):
+        if statement.startswith("[") and header_key.search(statement.lstrip("[ \\t")):
             return True
     return False
 

@@ -63,14 +63,14 @@ fails when either bucket name contains
 guard is name-based on purpose: renaming a bucket to dodge it breaks the
 exact names in `docs/ops.md` first.
 
-## Header-consistency deltas (verified 2026-10-15)
+## Header-consistency deltas (verified 2026-10-16)
 
 - MusicBrainz JSON headers match this table exactly (lookup 86400,
   search 300, errors `no-store`); no delta.
 - Stream audio edge `Cache-Control` is **prescribed but not yet wired**:
-  `workers/stream` currently ships the portable cache/orchestration core
-  only — no Worker entry point exists to set response headers, and the
-  deploy-config slice owns that file. Audio plays are grant-authorized
+  a Worker fetch entry point exists, but no play route exists yet to set
+  response headers; the deploy-config slice owns that implementation.
+  Audio plays are grant-authorized
   per user and metered per request, so the prescription is `no-store`:
   browser replay must not skip grant-expiry checks, logout handling, or
   usage metering. The deploy-config slice applies it; this table is the

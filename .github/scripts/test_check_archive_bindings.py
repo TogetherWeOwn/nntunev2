@@ -145,6 +145,58 @@ def test_malformed_custom_toml_with_binding_table_fails_closed():
     _assert_rejected(repo, "cannot parse TOML config")
 
 
+def test_malformed_custom_toml_top_level_array_table_fails_closed():
+    repo = _repo_with(
+        {
+            "workers/stream/wrangler.toml": CLEAN_MANIFEST,
+            "infra/malformed-binding.toml": (
+                '[[r2_buckets]]\nbucket_name = "nntunev2-archive-prod"\n'
+                "invalid = [TOML"
+            ),
+        }
+    )
+    _assert_rejected(repo, "cannot parse TOML config")
+
+
+def test_malformed_custom_toml_spaced_array_table_fails_closed():
+    repo = _repo_with(
+        {
+            "workers/stream/wrangler.toml": CLEAN_MANIFEST,
+            "infra/malformed-binding.toml": (
+                '[[ r2_buckets ]]\nbucket_name = "nntunev2-archive-prod"\n'
+                "invalid = [TOML"
+            ),
+        }
+    )
+    _assert_rejected(repo, "cannot parse TOML config")
+
+
+def test_malformed_custom_toml_dotted_assignment_fails_closed():
+    repo = _repo_with(
+        {
+            "workers/stream/wrangler.toml": CLEAN_MANIFEST,
+            "infra/malformed-binding.toml": (
+                'env.production.r2_buckets = [{ bucket_name = "nntunev2-archive-prod" }]\n'
+                "invalid = [TOML"
+            ),
+        }
+    )
+    _assert_rejected(repo, "cannot parse TOML config")
+
+
+def test_malformed_custom_toml_inline_environment_table_fails_closed():
+    repo = _repo_with(
+        {
+            "workers/stream/wrangler.toml": CLEAN_MANIFEST,
+            "infra/malformed-binding.toml": (
+                'env = { production = { r2_buckets = [{ bucket_name = '
+                '"nntunev2-archive-prod" }] } }\ninvalid = [TOML'
+            ),
+        }
+    )
+    _assert_rejected(repo, "cannot parse TOML config")
+
+
 def test_uppercase_toml_extension_is_scanned():
     repo = _repo_with({"workers/stream/wrangler.TOML": ARCHIVE_MANIFEST})
     hits = archive_bindings(repo)
@@ -344,6 +396,10 @@ if __name__ == "__main__":
     test_custom_json_path_with_archive_binding_is_rejected()
     test_non_worker_toml_without_r2_binding_is_ignored()
     test_malformed_custom_toml_with_binding_table_fails_closed()
+    test_malformed_custom_toml_top_level_array_table_fails_closed()
+    test_malformed_custom_toml_spaced_array_table_fails_closed()
+    test_malformed_custom_toml_dotted_assignment_fails_closed()
+    test_malformed_custom_toml_inline_environment_table_fails_closed()
     test_uppercase_toml_extension_is_scanned()
     test_manifest_outside_scan_roots_fails()
     test_nested_manifest_outside_scan_roots_fails()
