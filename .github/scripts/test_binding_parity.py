@@ -400,6 +400,20 @@ class TestDriftCases(unittest.TestCase):
             self.assertIn("worker=demo env=- binding=SURPRISE_TOP", joined)
             self.assertIn("top-level binding is not in the manifest", joined)
 
+    def test_top_level_resource_is_checked_against_prod_manifest(self):
+        # Default wrangler deploy uses the root-level config, which is the
+        # production target even when [env.production] is also configured.
+        wrangler = MATCHING_WRANGLER + (
+            '\n[[r2_buckets]]\nbinding = "AUDIO_CACHE"\n'
+            'bucket_name = "fx-audio-staging"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            drifts, _, _ = run_check(make_repo(tmp, wrangler=wrangler))
+            joined = "\n".join(drifts)
+            self.assertIn("worker=demo env=prod binding=AUDIO_CACHE", joined)
+            self.assertIn("fx-audio-staging", joined)
+            self.assertIn("ops inventory 'fx-audio-prod'", joined)
+
     def test_unmapped_config_file_is_drift(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_repo(tmp)

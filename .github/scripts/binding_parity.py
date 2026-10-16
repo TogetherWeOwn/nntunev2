@@ -42,8 +42,9 @@ reconciliation table in ``docs/ops.md``) is recorded in the manifest as
 is fixed the entry goes stale and this check fails until it is removed.
 Known-drift entries are rejected for id-typed bindings (KV, Hyperdrive).
 
-This script checks binding *presence, shape and inventory membership* —
-not binding values beyond the inventory names above, and not KV keys.
+This script checks binding *presence, shape, resource values and inventory
+membership*, and not KV keys. For real configs, top-level bindings are also
+checked against production because a default ``wrangler deploy`` uses them.
 Drift output names the worker, environment and binding; for id-typed
 bindings it never prints the actual or expected id, so no credential-like
 value reaches a (public) CI log.
@@ -642,6 +643,59 @@ def check(root, manifest_path, ops_path):
                 _fmt(name, raw_env, "-", "-", "unrecognized environment section")
             )
         required = {(b["type"], b["binding"]): b for b in worker["bindings"]}
+
+        def check_resource(binding, env, item):
+            type_name, binding_name = binding["type"], binding["binding"]
+            resource = item["resource"]
+            expected = binding["expected"][env]
+            if is_placeholder(resource):
+                if not is_example:
+                    drifts.append(
+                        _fmt(
+                            name, env, binding_name, type_name,
+                            "resource is a placeholder in a real wrangler.toml",
+                        )
+                    )
+                return
+            if expected is None:
+                return
+            if resource == expected:
+                return
+            drift_key = (name, env, binding_name, resource, expected)
+            known = next(
+                (
+                    d
+                    for d in known_drift
+                    if (d["worker"], d["env"], d["binding"], d.get("actual"), d.get("expected"))
+                    == drift_key
+                ),
+                None,
+            )
+            if known is not None:
+                used_known_drift.add(drift_key)
+                warnings.append(
+                    "known drift "
+                    + _fmt(
+                        name, env, binding_name, type_name,
+                        f"resource {resource!r} != ops inventory {expected!r} "
+                        f"({known['reason']})",
+                    )
+                )
+            elif type_name in ID_TYPES:
+                drifts.append(
+                    _fmt(
+                        name, env, binding_name, type_name,
+                        "resource id does not match the ops inventory",
+                    )
+                )
+            else:
+                drifts.append(
+                    _fmt(
+                        name, env, binding_name, type_name,
+                        f"resource {resource!r} != ops inventory {expected!r}",
+                    )
+                )
+
         if not is_example:
             for key, item in sorted(top_level.items()):
                 if key not in required and item["type"] != "assets":
@@ -651,6 +705,10 @@ def check(root, manifest_path, ops_path):
                             "top-level binding is not in the manifest",
                         )
                     )
+                elif key in required and item["type"] != "assets":
+                    # A default wrangler deploy uses the top-level production
+                    # bindings, independently of [env.production].
+                    check_resource(required[key], "prod", item)
 
         for binding in worker["bindings"]:
             for env in ENVS:
@@ -685,53 +743,7 @@ def check(root, manifest_path, ops_path):
                         _fmt(name, env, binding_name, type_name, "missing required binding")
                     )
                     continue
-                resource = actual["resource"]
-                if is_placeholder(resource):
-                    if not is_example:
-                        drifts.append(
-                            _fmt(
-                                name, env, binding_name, type_name,
-                                "resource is a placeholder in a real wrangler.toml",
-                            )
-                        )
-                    continue
-                expected = binding["expected"][env]
-                if expected is None or resource == expected:
-                    continue
-                drift_key = (name, env, binding_name, resource, expected)
-                known = next(
-                    (
-                        d
-                        for d in known_drift
-                        if (d["worker"], d["env"], d["binding"], d.get("actual"), d.get("expected"))
-                        == drift_key
-                    ),
-                    None,
-                )
-                if known is not None:
-                    used_known_drift.add(drift_key)
-                    warnings.append(
-                        "known drift "
-                        + _fmt(
-                            name, env, binding_name, type_name,
-                            f"resource {resource!r} != ops inventory {expected!r} "
-                            f"({known['reason']})",
-                        )
-                    )
-                elif type_name in ID_TYPES:
-                    drifts.append(
-                        _fmt(
-                            name, env, binding_name, type_name,
-                            "resource id does not match the ops inventory",
-                        )
-                    )
-                else:
-                    drifts.append(
-                        _fmt(
-                            name, env, binding_name, type_name,
-                            f"resource {resource!r} != ops inventory {expected!r}",
-                        )
-                    )
+                check_resource(binding, env, actual)
             for key, item in sorted(present.items()):
                 if key not in required and not item["declared"]:
                     drifts.append(
