@@ -65,6 +65,8 @@ fn meter_stays_an_append_only_fact_log_under_redelivery() {
         user_id: "user-1".to_string(),
         track_id: "track-9".to_string(),
         bytes: 40_000,
+        lane: None,
+        backoff_ms: 0,
     };
     meter.emit(play.clone());
     meter.emit(play);
@@ -91,6 +93,8 @@ fn meter_event_order_and_kinds_are_unchanged_by_the_new_variant() {
             user_id: "user-1".to_string(),
             track_id: "track-9".to_string(),
             bytes: 7,
+            lane: None,
+            backoff_ms: 0,
         });
     }
     let kinds: Vec<MeterKind> = meter.events.iter().map(|e| e.kind).collect();
