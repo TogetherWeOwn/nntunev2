@@ -21,8 +21,9 @@
 //!   event name for a mismatch. Production Analytics Engine emission is
 //!   not wired.
 //! - `MeterKind::ReconcileMismatch` — the `MeterEvent` kind emitted for
-//!   a mismatch, with the play's `user_id`, `track_id` and
-//!   `bytes` = the metered byte count.
+//!   a mismatch, with the play's `user_id` and `track_id` and
+//!   `bytes = 0` (non-serving). The metered and ledger byte counts stay
+//!   on the `ReconcileMismatch` record.
 //! - `pub fn derive_play_idempotency_key(user_id, track_id, play_id)
 //!   -> Result<String, &'static str>` — returns
 //!   `"play:{user_id}:{track_id}:{play_id}"`. Each key field is rejected
@@ -35,11 +36,14 @@
 //!   the Hyperdrive usage-ledger table, which in production must key
 //!   `UNIQUE(idempotency_key)` exactly as the ingest library upsert
 //!   converges `ON CONFLICT (idempotency_key)`:
-//!   - `record(&mut self, play: &CompletePlay) -> RecordOutcome`
-//!     (`Recorded` for a new key, `Duplicate` for a redelivery).
-//!     First write wins: a duplicate never appends, sums into, or
-//!     overwrites the existing entry — even if its byte count
-//!     disagrees (that disagreement is reconcile's job to flag).
+//!   - `record(&mut self, play: &CompletePlay) -> RecordOutcome`:
+//!     `Recorded` for a new key; `Duplicate` for an exact redelivery
+//!     (same user, track and bytes); `Conflict` for a redelivery whose
+//!     user, track or bytes disagree with the entry, or a play whose key
+//!     does not bind its identity (the key must be exactly
+//!     `play:{user_id}:{track_id}:{play_id}` with valid fields). First
+//!     write wins: a `Conflict` never appends, sums into, or overwrites
+//!     the existing entry (reconcile's job is to flag the disagreement).
 //!   - `entries(&self) -> &[LedgerEntry]` in first-record order,
 //!     `get(&self, idempotency_key) -> Option<&LedgerEntry>`,
 //!     `len()`, `is_empty()`.
@@ -50,12 +54,16 @@
 //!     `PartialEq`, `Eq`). `RecordOutcome` is `Debug`, `PartialEq`, `Eq`.
 //! - `pub fn reconcile(plays: &[CompletePlay], ledger: &UsageLedger,
 //!   meter: &mut dyn Meter) -> ReconcileReport` — compares each
-//!   distinct play (by idempotency key, first occurrence authoritative,
-//!   redeliveries checked once) against the ledger:
+//!   distinct play (by idempotency key, first occurrence authoritative)
+//!   against the ledger:
 //!   - a play whose ledger entry is missing, or whose user, track, or
 //!     byte count differs from the entry, is a mismatch;
+//!   - a later occurrence of an already-seen key whose user, track, or
+//!     bytes disagree with its first occurrence is flagged as its own
+//!     mismatch; agreeing redeliveries are checked once and not counted
+//!     as distinct plays;
 //!   - every mismatch emits exactly one `ReconcileMismatch` meter
-//!     event and produces one `ReconcileMismatch` record whose
+//!     event (`bytes = 0`) and produces one `ReconcileMismatch` record whose
 //!     `log_line()` is a single-line structured log with fields
 //!     `event=play_reconcile_mismatch`, `idempotency_key=…`,
 //!     `user_id=…`, `track_id=…`, `metered_bytes=…` and
@@ -197,10 +205,11 @@ fn redelivery_with_disagreeing_bytes_never_rewrites_the_entry() {
     let mut ledger = UsageLedger::default();
     ledger.record(&play("user-1", "track-9", "play-7", 40_000));
     // Same play, redelivered with a different byte count (truncated or
-    // corrupted replay): first write wins; reconcile flags the drift.
+    // corrupted replay): reported as a conflict; first write wins and
+    // reconcile flags the drift.
     assert_eq!(
         ledger.record(&play("user-1", "track-9", "play-7", 41_500)),
-        RecordOutcome::Duplicate
+        RecordOutcome::Conflict
     );
     assert_eq!(ledger.len(), 1);
     assert_eq!(
@@ -327,13 +336,14 @@ fn byte_mismatch_is_flagged_with_metric_and_log_and_never_adjusted() {
     assert_eq!(m.metered_bytes, 39_999);
     assert_eq!(m.ledger_bytes, Some(40_000));
 
-    // Exactly one metric event, carrying the metered byte count.
+    // Exactly one metric event: non-serving, so bytes = 0; the metered
+    // count stays on the record.
     assert_eq!(mismatch_events(&meter), 1);
     let ev = &meter.events[0];
     assert_eq!(ev.kind, MeterKind::ReconcileMismatch);
     assert_eq!(ev.user_id, "user-1");
     assert_eq!(ev.track_id, "track-9");
-    assert_eq!(ev.bytes, 39_999);
+    assert_eq!(ev.bytes, 0);
 
     // Structured log: one line, named event, both byte counts, the key.
     let line = m.log_line();
@@ -395,16 +405,17 @@ fn reconcile_is_per_play_not_per_aggregate() {
 
 #[test]
 fn reconcile_checks_each_redelivery_once_in_input_order() {
-    // The metered input itself can contain redeliveries: each play is
-    // checked (and, on mismatch, reported) exactly once, in
-    // first-occurrence order; the first occurrence's bytes are the
-    // authoritative metered value.
+    // The metered input itself can contain redeliveries. Each distinct
+    // play is checked once, in first-occurrence order, and the first
+    // occurrence's bytes are the authoritative metered value. A later
+    // redelivery that disagrees with its first occurrence is flagged as
+    // its own mismatch; it is not a new distinct play.
     let metered = [
         play("user-1", "track-b", "play-2", 200), // missing from ledger
         play("user-1", "track-a", "play-1", 100), // matches
-        play("user-1", "track-b", "play-2", 999), // redelivery, ignored
+        play("user-1", "track-b", "play-2", 999), // redelivery conflicts: flagged
         play("user-1", "track-c", "play-3", 300), // byte mismatch
-        play("user-1", "track-a", "play-1", 555), // redelivery, ignored
+        play("user-1", "track-a", "play-1", 555), // redelivery conflicts: flagged
     ];
     let ledger = ledger_with(&[
         play("user-1", "track-a", "play-1", 100),
@@ -414,18 +425,28 @@ fn reconcile_checks_each_redelivery_once_in_input_order() {
     let mut meter = MemoryMeter::default();
     let report = reconcile(&metered, &ledger, &mut meter);
     assert_eq!(report.checked, 3, "distinct play keys, not input rows");
-    let flagged: Vec<&str> = report
+    let flagged: Vec<(&str, u64)> = report
         .mismatches
         .iter()
-        .map(|m| m.idempotency_key.as_str())
+        .map(|m| (m.idempotency_key.as_str(), m.metered_bytes))
         .collect();
     assert_eq!(
         flagged,
-        ["play:user-1:track-b:play-2", "play:user-1:track-c:play-3"],
-        "one record per mismatched play, first-occurrence order"
+        [
+            ("play:user-1:track-b:play-2", 200),
+            ("play:user-1:track-b:play-2", 999),
+            ("play:user-1:track-c:play-3", 300),
+            ("play:user-1:track-a:play-1", 555),
+        ],
+        "one record per mismatch, first-occurrence input order"
     );
-    assert_eq!(report.mismatches[0].metered_bytes, 200);
-    assert_eq!(mismatch_events(&meter), 2, "one metric per mismatched play");
+    let ledger_bytes: Vec<Option<u64>> = report.mismatches.iter().map(|m| m.ledger_bytes).collect();
+    assert_eq!(ledger_bytes, [None, None, Some(301), Some(100)]);
+    assert_eq!(mismatch_events(&meter), 4, "one metric per mismatch record");
+    assert!(
+        meter.events.iter().all(|e| e.bytes == 0),
+        "mismatch events are non-serving"
+    );
     assert_eq!(ledger.len(), 3, "ledger untouched, extra entry included");
 }
 
