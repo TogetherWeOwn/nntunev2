@@ -972,3 +972,250 @@ fn provider_outage_quarantines_then_recovers() {
         .expect("finalize");
     assert!(!pool.quarantined(), "success clears the quarantine");
 }
+
+#[test]
+fn corrupt_first_segment_fails_without_quarantine_and_keeps_connection_warm() {
+    use nntune_stream::pool::{CircuitState, CIRCUIT_FAILURE_THRESHOLD};
+
+    let (_, segments, mut articles) = fixture_track("corrupt-first", 20_000, 10_000);
+    let (plain_ok, segs_ok, arts_ok) = fixture_track("ok", 20_000, 10_000);
+    articles.insert(segments[0].clone(), b"this is not yEnc\r\n".to_vec());
+    let mut both = arts_ok;
+    both.extend(articles);
+    let server = FakeNntp::start(both);
+    let mut pool: StreamPool = Pool::new(4);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+    let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+    // Two provider failures first: a corrupt segment must not become the third.
+    for _ in 0..(CIRCUIT_FAILURE_THRESHOLD - 1) {
+        let token = grant_for("track-corrupt-first");
+        let mut inp = input(
+            &token,
+            "track-corrupt-first",
+            None,
+            &server,
+            &segments,
+            None,
+        );
+        inp.server_addr = dead;
+        assert!(matches!(
+            play(&mut pool, &mut cache, &mut meter, SECRET, &inp),
+            Err(PlayError::Upstream(_))
+        ));
+    }
+    assert!(!pool.quarantined());
+
+    let token = grant_for("track-corrupt-first");
+    let inp = input(
+        &token,
+        "track-corrupt-first",
+        None,
+        &server,
+        &segments,
+        None,
+    );
+    assert!(
+        matches!(
+            play(&mut pool, &mut cache, &mut meter, SECRET, &inp),
+            Err(PlayError::Decode(_))
+        ),
+        "a corrupt first segment is a Decode, not an outage"
+    );
+    assert!(
+        !pool.quarantined(),
+        "a corrupt segment must not count toward the breaker"
+    );
+    assert_eq!(pool.circuit_state(), CircuitState::Closed);
+    assert_eq!(
+        (pool.in_use(), pool.idle()),
+        (0, 1),
+        "the healthy connection is kept warm after a Decode"
+    );
+
+    // The warm connection serves the next healthy track without redial.
+    let token_ok = grant_for("track-ok");
+    let inp_ok = input(&token_ok, "track-ok", None, &server, &segs_ok, None);
+    let resp_ok = play(&mut pool, &mut cache, &mut meter, SECRET, &inp_ok).expect("healthy play");
+    let (body_ok, stream_ok) = drain_to_vec(resp_ok.stream);
+    assert_eq!(body_ok, plain_ok);
+    stream_ok
+        .finalize(&mut pool, &mut cache, &mut meter)
+        .expect("finalize");
+    assert_eq!(server.connects(), 1, "Decode kept the connection warm");
+    assert_eq!((pool.connects(), pool.reuses()), (1, 1));
+}
+
+#[test]
+fn corrupt_first_segment_as_half_open_probe_closes_the_breaker() {
+    use nntune_stream::pool::{CircuitState, CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_OPEN_MS};
+
+    let (_, segments, mut articles) = fixture_track("corrupt-probe", 20_000, 10_000);
+    articles.insert(segments[0].clone(), b"corrupt\r\n".to_vec());
+    let server = FakeNntp::start(articles);
+    let mut pool: StreamPool = Pool::new(4);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+    let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+    for _ in 0..CIRCUIT_FAILURE_THRESHOLD {
+        let token = grant_for("track-probe");
+        let mut inp = input(&token, "track-probe", None, &server, &segments, None);
+        inp.server_addr = dead;
+        assert!(matches!(
+            play(&mut pool, &mut cache, &mut meter, SECRET, &inp),
+            Err(PlayError::Upstream(_))
+        ));
+    }
+    assert!(pool.quarantined());
+    pool.advance(CIRCUIT_OPEN_MS);
+    assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+
+    // A provider response — even a corrupt article — proves liveness and must
+    // close a half-open probe instead of re-opening it.
+    let token = grant_for("track-probe");
+    let inp = input(&token, "track-probe", None, &server, &segments, None);
+    assert!(matches!(
+        play(&mut pool, &mut cache, &mut meter, SECRET, &inp),
+        Err(PlayError::Decode(_))
+    ));
+    assert_eq!(
+        pool.circuit_state(),
+        CircuitState::Closed,
+        "a Decode probe response closes the breaker"
+    );
+    assert!(!pool.quarantined());
+    assert_eq!(pool.idle(), 1, "probe connection kept warm");
+
+    // Closed again: the next corrupt play is admitted (Decode, not 503).
+    let token2 = grant_for("track-probe");
+    let inp2 = input(&token2, "track-probe", None, &server, &segments, None);
+    assert!(matches!(
+        play(&mut pool, &mut cache, &mut meter, SECRET, &inp2),
+        Err(PlayError::Decode(_))
+    ));
+}
+
+#[test]
+fn corrupt_later_segment_fails_the_stream_without_quarantine() {
+    use nntune_stream::pool::CIRCUIT_FAILURE_THRESHOLD;
+
+    let (_, segments, mut articles) = fixture_track("corrupt-later", 30_000, 10_000);
+    assert_eq!(segments.len(), 3);
+    articles.insert(segments[1].clone(), b"garbage\r\n".to_vec());
+    let server = FakeNntp::start(articles);
+    let mut pool: StreamPool = Pool::new(4);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+    let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+    for _ in 0..(CIRCUIT_FAILURE_THRESHOLD - 1) {
+        let token = grant_for("track-corrupt-later");
+        let mut inp = input(
+            &token,
+            "track-corrupt-later",
+            None,
+            &server,
+            &segments,
+            None,
+        );
+        inp.server_addr = dead;
+        assert!(matches!(
+            play(&mut pool, &mut cache, &mut meter, SECRET, &inp),
+            Err(PlayError::Upstream(_))
+        ));
+    }
+
+    let token = grant_for("track-corrupt-later");
+    let inp = input(
+        &token,
+        "track-corrupt-later",
+        None,
+        &server,
+        &segments,
+        None,
+    );
+    let resp = play(&mut pool, &mut cache, &mut meter, SECRET, &inp).expect("first segment ok");
+    let (partial, stream) = drain_to_vec(resp.stream);
+    assert_eq!(partial.len(), 10_000, "only segment 0 was served");
+    assert!(
+        matches!(stream.error(), Some(PlayError::Decode(_))),
+        "a corrupt later segment is a Decode"
+    );
+    assert!(matches!(
+        stream.finalize(&mut pool, &mut cache, &mut meter),
+        Err(PlayError::Decode(_))
+    ));
+    assert!(
+        !pool.quarantined(),
+        "a corrupt later segment must not count toward the breaker"
+    );
+    assert_eq!(
+        (pool.in_use(), pool.idle()),
+        (0, 1),
+        "the healthy connection is kept warm after a later Decode"
+    );
+    assert!(
+        cache.get_track("track-corrupt-later").is_none(),
+        "no partial cache entry"
+    );
+}
+
+#[test]
+fn first_segment_success_clears_the_streak_before_abort() {
+    use nntune_stream::pool::{CircuitState, CIRCUIT_FAILURE_THRESHOLD};
+
+    let (_, segments, articles) = fixture_track("abort-clear", 20_000, 10_000);
+    let server = FakeNntp::start(articles);
+    let mut pool: StreamPool = Pool::new(4);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+    let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+    for _ in 0..(CIRCUIT_FAILURE_THRESHOLD - 1) {
+        let token = grant_for("track-abort");
+        let mut inp = input(&token, "track-abort", None, &server, &segments, None);
+        inp.server_addr = dead;
+        assert!(matches!(
+            play(&mut pool, &mut cache, &mut meter, SECRET, &inp),
+            Err(PlayError::Upstream(_))
+        ));
+    }
+    assert!(!pool.quarantined());
+
+    // First-segment success records success before the stream exists, so an
+    // abort (which records neither success nor failure) still leaves a clear
+    // streak.
+    let token = grant_for("track-abort");
+    let inp = input(&token, "track-abort", None, &server, &segments, None);
+    let resp = play(&mut pool, &mut cache, &mut meter, SECRET, &inp).expect("first segment ok");
+    let mut stream = resp.stream;
+    let first = stream.next().expect("first chunk");
+    assert!(!first.is_empty());
+    stream.abort(&mut pool);
+    assert_eq!(
+        pool.circuit_state(),
+        CircuitState::Closed,
+        "first-segment success must clear the streak before abort"
+    );
+    assert_eq!((pool.in_use(), pool.idle()), (0, 1));
+    assert!(
+        cache.get_track("track-abort").is_none(),
+        "abort must not cache"
+    );
+
+    // One more provider failure is only the first of a fresh streak.
+    let token2 = grant_for("track-abort");
+    let mut inp2 = input(&token2, "track-abort", None, &server, &segments, None);
+    inp2.server_addr = dead;
+    assert!(matches!(
+        play(&mut pool, &mut cache, &mut meter, SECRET, &inp2),
+        Err(PlayError::Upstream(_))
+    ));
+    assert!(
+        !pool.quarantined(),
+        "2 failures + success/abort + 1 failure must not open the breaker"
+    );
+    assert_eq!(pool.circuit_state(), CircuitState::Closed);
+}

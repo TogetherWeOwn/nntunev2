@@ -423,6 +423,58 @@ mod tests {
     }
 
     #[test]
+    fn delayed_greeting_then_silent_respects_shared_connect_plus_read_deadline() {
+        use std::io::{BufRead, Write};
+        use std::net::TcpListener;
+
+        // Shared first-segment budget: connect + read. The greeting delay
+        // consumes most of it, so the silent article that follows must time
+        // out on the *remaining* budget, not a fresh read timeout. This pins
+        // the `read_timeout.min(remaining)` socket bound: with a plain
+        // `read_timeout` a single blocking read overruns the budget.
+        let timeouts =
+            UpstreamTimeouts::new(Duration::from_millis(200), Duration::from_millis(800));
+        let budget = timeouts.connect.saturating_add(timeouts.read);
+        let greeting_delay = Duration::from_millis(700);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind delayed NNTP");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            std::thread::sleep(greeting_delay);
+            if stream.write_all(b"200 delayed NNTP ready\r\n").is_err() {
+                return;
+            }
+            let _ = stream.flush();
+            // Read the BODY command, then go silent: hold the connection open
+            // so the client's deadline (not EOF) ends the op. Detached like
+            // the hung test: no join, the 5 s hold outlives the assertion.
+            let mut command = Vec::new();
+            let _ =
+                BufReader::new(stream.try_clone().expect("clone")).read_until(b'\n', &mut command);
+            std::thread::sleep(Duration::from_secs(5));
+        });
+
+        let deadline = NntpDeadline::new(budget);
+        let t0 = std::time::Instant::now();
+        let mut client = NntpClient::connect_with_deadline(&addr, timeouts, &deadline)
+            .expect("greeting still arrives within budget");
+        let err = client
+            .article_with_deadline("<delayed-seg0@synthetic.test>", &deadline)
+            .expect_err("silent article after a delayed greeting must time out");
+        let elapsed = t0.elapsed();
+
+        assert!(
+            err.is_provider_failure(),
+            "deadline is a provider failure: {err:?}"
+        );
+        assert!(
+            elapsed < budget + Duration::from_millis(400),
+            "a single blocking read must not overrun the shared connect+read budget ({budget:?}), took {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn unstuff_strips_exactly_one_dot() {
         assert_eq!(unstuff(b"..stuffed"), &b".stuffed"[..]);
         assert_eq!(unstuff(b"...double"), &b"..double"[..]);
