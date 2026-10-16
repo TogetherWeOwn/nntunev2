@@ -71,7 +71,9 @@ fn is_valid_key_field(field: &str, max_bytes: usize) -> bool {
         && field.len() <= max_bytes
         && !field.contains(':')
         && !field.contains('=')
-        && !field.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+        && !field
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
 }
 
 /// Derive the idempotency key for one play: `play:{user}:{track}:{play}`.
