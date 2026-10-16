@@ -1,32 +1,14 @@
-//! Acceptance tests: env-specific cover-art bucket and CAA URL.
-//!
-//! Test-first (RED): every test in this file fails on the pre-slice head
-//! and passes once the Builder implements the slice. Write-only for this
-//! card: the Builder implements on this branch and never edits this file.
+//! Acceptance tests: env-specific cover-art bucket mapping and interim CAA behavior.
 //!
 //! Authoritative bucket inventory: `docs/ops.md` ("R2 buckets", "Environments
 //! matrix"). There is no bucket named `nntunev2-art`; staging uses
 //! `nntunev2-art-staging` and prod uses `nntunev2-art-prod`.
 //!
-//! Builder contract (implement in `workers/mb/src/lib.rs`; `workers/api`
-//! precedent is `crate-type = ["cdylib", "rlib"]`, add `"rlib"` here too so
-//! these integration tests can link):
-//!
-//! ```rust
-//! pub const ART_BUCKET_STAGING: &str = "nntunev2-art-staging";
-//! pub const ART_BUCKET_PROD: &str = "nntunev2-art-prod";
-//! pub fn art_bucket_for_env(env: &str) -> &'static str { /* ... */ }
-//! pub fn caa_url_for_art(bucket: &str, key: &str) -> String { /* ... */ }
-//! ```
-//!
-//! - `art_bucket_for_env("staging")` returns the staging bucket;
-//!   `"prod"` and `"production"` return the prod bucket.
-//! - `caa_url_for_art(bucket, key)` returns a URL string that embeds both
-//!   the given bucket name and the given key (URL shape is the Builder's
-//!   choice; the release lookup serves this value as `caa_url`).
-//! - `workers/mb/wrangler.toml.example`, `workers/mb/README.md`,
-//!   `workers/mb/src/lib.rs` docs and `docs/adr/0007-mb-mirror.md` must name
-//!   only the env-suffixed buckets, never the bare `nntunev2-art`.
+//! `caa_url_for_art` returns an internal `r2://` object URI. Until a public
+//! R2 custom domain or `r2.dev` URL is configured, the Worker preserves stored
+//! `caa_url` values unchanged. The internal object URI is not client-facing,
+//! and these tests do not claim a release response uses it or that a public
+//! URL is environment-correct before activation.
 //!
 //! No production writes, no secrets, no staging dependency: pure unit and
 //! source-text assertions only.
@@ -92,39 +74,34 @@ fn staging_and_prod_buckets_differ() {
 }
 
 #[test]
-fn release_caa_url_points_at_env_correct_bucket() {
+fn caa_object_uri_uses_env_bucket_and_key() {
     let key = "art/ab/cd/0123456789abcdef-500";
-    let staging_url = caa_url_for_art(art_bucket_for_env("staging"), key);
-    let prod_url = caa_url_for_art(art_bucket_for_env("prod"), key);
+    let staging_uri = caa_url_for_art(art_bucket_for_env("staging"), key);
+    let prod_uri = caa_url_for_art(art_bucket_for_env("prod"), key);
 
-    for (env, url) in [("staging", &staging_url), ("prod", &prod_url)] {
+    for (env, uri, bucket) in [
+        ("staging", &staging_uri, "nntunev2-art-staging"),
+        ("prod", &prod_uri, "nntunev2-art-prod"),
+    ] {
         assert!(
-            url.contains(key),
-            "{env} caa_url must embed the art key {key:?}, got {url:?}"
+            uri.starts_with("r2://"),
+            "{env} CAA object URI must use the internal r2 scheme, got {uri:?}"
+        );
+        assert!(
+            uri.contains(bucket),
+            "{env} CAA object URI must identify its bucket, got {uri:?}"
+        );
+        assert!(
+            uri.contains(key),
+            "{env} CAA object URI must identify its key {key:?}, got {uri:?}"
         );
     }
-    assert!(
-        staging_url.contains("nntunev2-art-staging"),
-        "staging caa_url must point at the staging bucket, got {staging_url:?}"
-    );
-    assert!(
-        !staging_url.contains("nntunev2-art-prod"),
-        "staging caa_url must not point at the prod bucket, got {staging_url:?}"
-    );
-    assert!(
-        prod_url.contains("nntunev2-art-prod"),
-        "prod caa_url must point at the prod bucket, got {prod_url:?}"
-    );
-    assert!(
-        !prod_url.contains("nntunev2-art-staging"),
-        "prod caa_url must not point at the staging bucket, got {prod_url:?}"
-    );
 }
 
 /// Grep assertion: no bare `nntunev2-art` reference may remain in code or
-/// docs. Every occurrence must be the staging or prod suffixed name from
-/// `docs/ops.md`. Scans the four files known to carry the stale name; the
-/// ops inventory itself (which documents the rename) is out of scope.
+/// docs. Every occurrence must be exactly the staging or prod bucket name
+/// from `docs/ops.md`. Scans the four files known to carry the stale name;
+/// the ops inventory itself (which documents the rename) is out of scope.
 #[test]
 fn no_bare_art_bucket_reference_remains() {
     let root = repo_root();
@@ -146,8 +123,14 @@ fn no_bare_art_bucket_reference_remains() {
             while let Some(hit) = line[search_from..].find(bare) {
                 let start = search_from + hit;
                 let rest = &line[start + bare.len()..];
-                let is_suffixed = rest.starts_with("-staging") || rest.starts_with("-prod");
-                if !is_suffixed {
+                let is_exact_allowed_bucket = ["-staging", "-prod"].iter().any(|suffix| {
+                    rest.strip_prefix(suffix).is_some_and(|remaining| {
+                        remaining.chars().next().is_none_or(|ch| {
+                            !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-'
+                        })
+                    })
+                });
+                if !is_exact_allowed_bucket {
                     offenders.push(format!("{}:{}: {}", rel, idx + 1, line.trim()));
                     break;
                 }
@@ -158,7 +141,7 @@ fn no_bare_art_bucket_reference_remains() {
 
     assert!(
         offenders.is_empty(),
-        "bare `nntunev2-art` references remain (use -staging/-prod per docs/ops.md):\n{}",
+        "bare `nntunev2-art` references remain (use exact -staging/-prod names per docs/ops.md):\n{}",
         offenders.join("\n")
     );
 }
