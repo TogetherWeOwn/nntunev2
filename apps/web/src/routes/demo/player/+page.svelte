@@ -7,13 +7,75 @@
 	import { onMount } from 'svelte';
 	import Artwork from '#lib/player/Artwork.svelte';
 	import { SeekController } from '#lib/player/seekController.js';
+	import { applyMediaSession } from '#lib/player/mediaSession.js';
+	import {
+		addTrack,
+		clearQueue,
+		createQueue,
+		currentTrack,
+		DEMO_TRACKS,
+		moveTrack,
+		nextTrack,
+		previousTrack,
+		restoreQueue,
+		selectTrack,
+		serializeQueue,
+		type QueueState
+	} from '#lib/player/queue.js';
 
 	const AUDIO_URL = '/api/demo/audio';
+	const QUEUE_STORAGE_KEY = 'nntune:demo-queue:v1';
 
 	let status = $state('idle');
 	let completedSeeks = $state(0);
 	let abortedSeeks = $state(0);
 	let lastBytes = $state(0);
+
+	let queue: QueueState = $state(createQueue(DEMO_TRACKS));
+	let restored = $state(false);
+	let audioEl: HTMLAudioElement | undefined = $state();
+
+	const current = $derived(currentTrack(queue));
+	const inQueue = $derived(new Set(queue.tracks.map((t) => t.id)));
+
+	function tryPlay(): void {
+		// Synthetic demo bytes may not decode in every engine; a rejected
+		// play() must never break queue navigation.
+		audioEl?.play().catch(() => {});
+	}
+
+	function goNext(): void {
+		const advanced = nextTrack(queue);
+		if (advanced === queue) {
+			status = 'ended';
+			return;
+		}
+		queue = advanced;
+		tryPlay();
+	}
+
+	function goPrevious(): void {
+		queue = previousTrack(queue);
+		tryPlay();
+	}
+
+	// MediaSession follows the current track; queue order + current track
+	// persist for the tab session (sessionStorage, restored on mount).
+	$effect(() => {
+		applyMediaSession(current, {
+			onNext: goNext,
+			onPrevious: goPrevious,
+			onPlay: tryPlay,
+			onPause: () => audioEl?.pause()
+		});
+		if (restored) {
+			try {
+				sessionStorage.setItem(QUEUE_STORAGE_KEY, serializeQueue(queue));
+			} catch {
+				// Storage can be unavailable (private mode); queue still works.
+			}
+		}
+	});
 
 	/**
 	 * Run by the smoke test: fire 10 rapid Range seeks through one
@@ -42,6 +104,12 @@
 	// Smoke-test hook for `page.evaluate`, registered on client mount.
 	onMount(() => {
 		(window as unknown as { __seekStorm?: typeof seekStorm }).__seekStorm = seekStorm;
+		try {
+			queue = restoreQueue(sessionStorage.getItem(QUEUE_STORAGE_KEY), DEMO_TRACKS);
+		} catch {
+			// Keep the fixture queue when storage is unavailable.
+		}
+		restored = true;
 	});
 </script>
 
@@ -49,10 +117,98 @@
 	<h1>Player resilience demo</h1>
 	<p data-testid="player-status">Status: {status}</p>
 
-	<!-- Missing R2 art (null) must render the placeholder with alt text. -->
-	<Artwork src={null} alt="Demo track artwork" />
+	<!-- Artwork reuse: the shared Artwork component's placeholder fallback
+	     renders for the current track when its art is missing (track 1). -->
+	<Artwork src={current?.artworkUrl ?? null} alt={current ? `${current.title} artwork` : 'Track artwork'} />
 
-	<audio data-testid="demo-audio" src={AUDIO_URL} preload="metadata" controls></audio>
+	<p data-testid="now-playing">
+		{#if current}
+			Now playing: {current.title} — {current.artist}
+		{:else}
+			Queue is empty
+		{/if}
+	</p>
+
+	<audio
+		bind:this={audioEl}
+		data-testid="demo-audio"
+		src={current?.streamUrl}
+		preload="metadata"
+		controls
+		onended={goNext}
+	></audio>
+
+	<div>
+		<button type="button" data-testid="player-prev" onclick={goPrevious} disabled={!current}>
+			Previous
+		</button>
+		<button type="button" data-testid="player-next" onclick={goNext} disabled={!current}>
+			Next
+		</button>
+	</div>
+
+	<section data-testid="queue-panel" aria-label="Playback queue">
+		<h2>Queue</h2>
+		<ol>
+			{#each queue.tracks as track, i (track.id)}
+				<li data-testid="queue-item" data-track-id={track.id}>
+					<button
+						type="button"
+						data-testid="queue-select-{track.id}"
+						aria-current={i === queue.currentIndex ? 'true' : undefined}
+						onclick={() => {
+							queue = selectTrack(queue, i);
+							tryPlay();
+						}}
+					>
+						{track.title} — {track.artist}{i === queue.currentIndex ? ' (playing)' : ''}
+					</button>
+					<button
+						type="button"
+						data-testid="queue-move-up-{track.id}"
+						aria-label="Move {track.title} up"
+						disabled={i === 0}
+						onclick={() => (queue = moveTrack(queue, i, i - 1))}
+					>
+						Up
+					</button>
+					<button
+						type="button"
+						data-testid="queue-move-down-{track.id}"
+						aria-label="Move {track.title} down"
+						disabled={i === queue.tracks.length - 1}
+						onclick={() => (queue = moveTrack(queue, i, i + 1))}
+					>
+						Down
+					</button>
+				</li>
+			{/each}
+		</ol>
+		<button
+			type="button"
+			data-testid="queue-clear"
+			disabled={queue.tracks.length === 0}
+			onclick={() => (queue = clearQueue(queue))}
+		>
+			Clear queue
+		</button>
+
+		<h3>Add to queue</h3>
+		<ul>
+			{#each DEMO_TRACKS as track (track.id)}
+				<li>
+					<button
+						type="button"
+						data-testid="queue-add-{track.id}"
+						disabled={inQueue.has(track.id)}
+						onclick={() => (queue = addTrack(queue, track))}
+					>
+						Add {track.title}
+					</button>
+				</li>
+			{/each}
+		</ul>
+	</section>
 
 	<button type="button" data-testid="seek-storm" onclick={() => void seekStorm()}>
 		Run 10x seek storm
