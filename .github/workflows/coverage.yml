@@ -46,16 +46,24 @@ jobs:
           printf '| --- | ---: | ---: | ---: |\n' >> "$GITHUB_STEP_SUMMARY"
           for crate in root api ingest mb; do
             report="coverage-${crate}.lcov"
+            if [[ ! -s "$report" ]]; then
+              echo "Coverage report for ${crate} is missing or empty: ${report}" >&2
+              exit 1
+            fi
             read -r found hit < <(awk -F: '
               /^LF:/ { found += $2 }
               /^LH:/ { hit += $2 }
               END { printf "%d %d\n", found, hit }
             ' "$report")
-            if (( found == 0 )); then
-              percent='n/a'
-            else
-              percent=$(awk -v hit="$hit" -v found="$found" 'BEGIN { printf "%.1f%%", 100 * hit / found }')
+            if (( found <= 0 )); then
+              echo "Coverage report for ${crate} contains no instrumented lines: ${report}" >&2
+              exit 1
             fi
+            if (( hit < 0 || hit > found )); then
+              echo "Coverage report for ${crate} has invalid hit count ${hit} for ${found} lines: ${report}" >&2
+              exit 1
+            fi
+            percent=$(awk -v hit="$hit" -v found="$found" 'BEGIN { printf "%.1f%%", 100 * hit / found }')
             printf '| `%s` | %s | %s | %s |\n' "$crate" "$found" "$hit" "$percent" >> "$GITHUB_STEP_SUMMARY"
           done
 
