@@ -70,9 +70,11 @@ behaviour.
   keep waiting in 5 s chunks), and no flight is led while a superseded leader
   is still fetching unless it is itself a replacement. So a stalled key runs
   at most **two upstream fetches at once**, however many callers pile up,
-  and no waiter hangs behind a wedged leader. When the original leader lands
-  first, its result goes to the replacement's waiters too: the first result
-  of the chain is the one every waiter takes. (The NNTP client's 10 s
+  and no waiter hangs behind a wedged leader. When the original leader
+  succeeds first, its result goes to the replacement's waiters too: the first
+  success of the chain is the one every waiter takes. An error stays with the
+  flight that produced it, so the original's failure never fails callers
+  parked on a replacement that is still fetching. (The NNTP client's 10 s
   timeout is per socket *read*, so a slow-but-healthy leader can be replaced
   once and briefly overlap its replacement; that bounded overlap is the
   documented trade-off.) A panicking leader releases its key, so later calls

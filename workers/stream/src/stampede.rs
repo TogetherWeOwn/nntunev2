@@ -31,7 +31,7 @@ use std::time::Duration;
 /// NNTP client's 10 s timeout, but that timeout is per socket *read*
 /// (`nntp.rs`), not per article, so a slow-but-healthy leader can still be
 /// replaced once and briefly overlap its replacement; the waiters then take
-/// whichever result lands first. That bounded overlap is the price of never
+/// whichever success lands first. That bounded overlap is the price of never
 /// parking a waiter behind a wedged leader.
 pub const SINGLEFLIGHT_WAIT_TIMEOUT_MS: u64 = 5_000;
 
@@ -101,8 +101,10 @@ type Registry<T, E> = HashMap<String, Slot<T, E>>;
 /// replaced for slowness, and no flight is led while a superseded leader is
 /// still fetching unless it is itself a replacement, so a stalled key runs at
 /// most two upstream fetches at once. When a leader settles, its outcome goes
-/// to its own waiters and to the replacement it was superseded by, so the
-/// first result the chain produces is the one every waiter takes. Sharing is
+/// to its own waiters. A success also goes to the replacement it was superseded
+/// by, so the first success the chain produces is the one every waiter still
+/// parked takes. An error never crosses into the replacement: its waiters keep
+/// waiting for the replacement's own outcome. Sharing is
 /// in-flight only: once the registered flight's leader returns, the next call
 /// fetches again — freshness is the cache's job, not this group's.
 ///
@@ -229,7 +231,9 @@ where
         unsettled.armed = false;
         let mut registry = self.registry();
         Self::publish(&flight, result.clone());
-        if let Some(successor) = Self::successor(&flight) {
+        if let (Some(successor), Ok(_)) = (Self::successor(&flight), &result) {
+            // An error stays with the flight that produced it: the replacement's
+            // own fetch decides its waiters' outcome.
             Self::publish(&successor, result.clone());
         }
         release(&mut registry, key, &flight);
@@ -773,6 +777,79 @@ mod tests {
                 Ok(b"leader-bytes".to_vec())
             );
             assert!(replacement.join().expect("replacement thread").is_err());
+        });
+
+        assert_eq!(upstream_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn original_error_does_not_fail_waiters_parked_on_a_successful_replacement() {
+        let group = Arc::new(Singleflight::<Vec<u8>, String>::with_timeout(
+            Duration::from_millis(100),
+        ));
+        let upstream_calls = Arc::new(AtomicUsize::new(0));
+        let leader_registered = Arc::new(AtomicBool::new(false));
+        let key = flight_key("<slow-seg@synthetic.test>");
+
+        thread::scope(|s| {
+            let (group_l, calls_l, registered_l) = (
+                Arc::clone(&group),
+                Arc::clone(&upstream_calls),
+                Arc::clone(&leader_registered),
+            );
+            let key_l = key.clone();
+            let leader = s.spawn(move || {
+                group_l.call(&key_l, || {
+                    calls_l.fetch_add(1, Ordering::SeqCst);
+                    registered_l.store(true, Ordering::SeqCst);
+                    // Fails at ~200 ms, while the waiter is parked on the
+                    // replacement, which succeeds at ~260 ms.
+                    thread::sleep(Duration::from_millis(200));
+                    Err::<Vec<u8>, _>("original-failed".to_string())
+                })
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !leader_registered.load(Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "leader never registered");
+                thread::yield_now();
+            }
+
+            // Times out on the original at ~100 ms, becomes the replacement.
+            let (group_r, calls_r) = (Arc::clone(&group), Arc::clone(&upstream_calls));
+            let key_r = key.clone();
+            let replacement = s.spawn(move || {
+                group_r.call(&key_r, || {
+                    calls_r.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(160));
+                    Ok::<_, String>(b"replacement-bytes".to_vec())
+                })
+            });
+
+            thread::sleep(Duration::from_millis(50));
+            let (group_w, calls_w) = (Arc::clone(&group), Arc::clone(&upstream_calls));
+            let key_w = key.clone();
+            let staggered = s.spawn(move || {
+                // Joins the original, times out, and parks on the replacement.
+                group_w.call(&key_w, || {
+                    calls_w.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, String>(b"third-fetch".to_vec())
+                })
+            });
+
+            assert_eq!(
+                staggered.join().expect("staggered waiter thread"),
+                Ok(b"replacement-bytes".to_vec()),
+                "a parked replacement waiter takes the replacement's success, not the original's error"
+            );
+            assert_eq!(
+                replacement.join().expect("replacement thread"),
+                Ok(b"replacement-bytes".to_vec())
+            );
+            assert_eq!(
+                leader.join().expect("leader thread"),
+                Err("original-failed".to_string())
+            );
         });
 
         assert_eq!(upstream_calls.load(Ordering::SeqCst), 2);
