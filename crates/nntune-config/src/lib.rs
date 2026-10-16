@@ -271,11 +271,15 @@ impl Config {
         let mut values = HashMap::with_capacity(KEYS.len());
         for spec in KEYS {
             match kv.get(spec.name) {
-                Some(raw) => values.insert(spec.name.to_owned(), spec.parse(raw)?),
+                Some(raw) => {
+                    values.insert(spec.name.to_owned(), spec.parse(raw)?);
+                }
                 None => match spec.default {
-                    Some(default) => values.insert(spec.name.to_owned(), spec.parse(default)?),
+                    Some(default) => {
+                        values.insert(spec.name.to_owned(), spec.parse(default)?);
+                    }
                     None if spec.required => return Err(ConfigError::MissingRequired(spec.name)),
-                    None => None,
+                    None => {}
                 },
             }
         }
