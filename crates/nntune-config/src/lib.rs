@@ -56,7 +56,10 @@ impl KeySpec {
     /// Parse one raw KV text value into the declared type. Numbers and bools
     /// tolerate surrounding whitespace; strings are kept exact (a hostname
     /// with a stray space must fail where it is used, not be silently fixed
-    /// here). Bools accept only `true`/`false` (case-insensitive).
+    /// here) but empty/whitespace-only strings are rejected, matching the CI
+    /// parity checker (`config_parity_check.py`), which rejects empty
+    /// required strings. Bools accept only `true`/`false`
+    /// (case-insensitive).
     fn parse(&self, raw: &str) -> Result<Value, ConfigError> {
         let invalid = || ConfigError::InvalidType {
             key: self.name,
@@ -72,7 +75,12 @@ impl KeySpec {
                 "false" => Ok(Value::Bool(false)),
                 _ => Err(invalid()),
             },
-            ConfigType::Str => Ok(Value::Str(raw.to_string())),
+            ConfigType::Str => {
+                if raw.trim().is_empty() {
+                    return Err(invalid());
+                }
+                Ok(Value::Str(raw.to_string()))
+            }
         }
     }
 }
@@ -290,13 +298,20 @@ impl Config {
     /// `env_overridable` are consulted, and only through their documented
     /// `env_var` name; every other entry in `env` is ignored. Precedence is
     /// KV first, environment second (local dev and `wrangler [vars]` win).
+    /// The overlay is atomic: every override is parsed first and the config
+    /// is only mutated when all of them are valid, so a failing overlay
+    /// leaves the previous values untouched (fail-closed).
     pub fn apply_env(&mut self, env: &HashMap<String, String>) -> Result<(), ConfigError> {
+        let mut staged = Vec::new();
         for spec in KEYS.iter().filter(|spec| spec.env_overridable) {
             if let Some(var) = spec.env_var {
                 if let Some(raw) = env.get(var) {
-                    self.values.insert(spec.name.to_owned(), spec.parse(raw)?);
+                    staged.push((spec.name.to_owned(), spec.parse(raw)?));
                 }
             }
+        }
+        for (name, value) in staged {
+            self.values.insert(name, value);
         }
         Ok(())
     }
@@ -478,6 +493,69 @@ mod tests {
         );
         // The failed overlay leaves the previous value in place.
         assert_eq!(config.get_u64("session.ttl_secs"), Some(86400));
+    }
+
+    #[test]
+    fn env_overlay_is_atomic_across_vars() {
+        // One good override plus one bad override: the whole overlay fails
+        // and NONE of the values change (no partial application).
+        let mut config = Config::load(&identity()).expect("identity loads");
+        let env = kv(&[("RP_ID", "evil"), ("SESSION_TTL_SECS", "soon")]);
+        assert_eq!(
+            config.apply_env(&env),
+            Err(ConfigError::InvalidType {
+                key: "session.ttl_secs",
+                expected: ConfigType::U64,
+            }),
+        );
+        assert_eq!(
+            config.get_str("auth.rp_id"),
+            Some("v2-staging.nntune.com"),
+            "rp_id must not be mutated by a failed overlay"
+        );
+        assert_eq!(config.get_u64("session.ttl_secs"), Some(86400));
+    }
+
+    #[test]
+    fn empty_and_blank_strings_rejected() {
+        // The CI parity checker rejects empty required strings; the typed
+        // accessor must agree so a blank KV value cannot load at runtime.
+        for bad in ["", "   ", "\t\n "] {
+            let mut raw = identity();
+            raw.insert("auth.rp_id".to_string(), bad.to_string());
+            assert_eq!(
+                Config::load(&raw),
+                Err(ConfigError::InvalidType {
+                    key: "auth.rp_id",
+                    expected: ConfigType::Str,
+                }),
+                "blank rp_id {bad:?} must fail"
+            );
+            let mut raw = identity();
+            raw.insert("auth.rp_origin".to_string(), bad.to_string());
+            assert_eq!(
+                Config::load(&raw),
+                Err(ConfigError::InvalidType {
+                    key: "auth.rp_origin",
+                    expected: ConfigType::Str,
+                }),
+                "blank rp_origin {bad:?} must fail"
+            );
+        }
+        // Blank env overrides fail closed too, without mutating anything.
+        let mut config = Config::load(&identity()).expect("identity loads");
+        let env = kv(&[("RP_ID", "   ")]);
+        assert_eq!(
+            config.apply_env(&env),
+            Err(ConfigError::InvalidType {
+                key: "auth.rp_id",
+                expected: ConfigType::Str,
+            }),
+        );
+        assert_eq!(
+            config.get_str("auth.rp_id"),
+            Some("v2-staging.nntune.com")
+        );
     }
 
     #[test]

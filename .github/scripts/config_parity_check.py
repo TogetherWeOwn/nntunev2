@@ -2,15 +2,16 @@
 """Staging/prod KV config parity check against the versioned schema.
 
 Loads the staging and prod key sets and validates both against
-``config/schema.json``. Exits 1 on drift (a missing required key, a type
-mismatch, an undeclared key, or a staging/prod key-set asymmetry) and 0
-when both sides validate with identical key sets. Per-environment VALUES
-may differ (hostnames, TTLs); only keys and types must match, so changing
-a value never fails this check but adding a key without updating the
-schema always does.
+``config/schema.json``. Exits 1 on drift (an invalid schema, a missing
+required key, a type mismatch, an undeclared key, or a staging/prod
+key-set asymmetry) and 0 when both sides validate with identical key
+sets. Per-environment VALUES may differ (hostnames, TTLs); only keys and
+types must match, so changing a value never fails this check but adding
+a key without updating the schema always does.
 
-Exit codes mirror the repo's parity-script convention: 1 = drift found,
-2 = unusable input (missing file, bad JSON, invalid schema).
+Exit codes: 0 = parity holds; 1 = drift found (including an invalid
+schema); 2 = unusable input (missing file, bad JSON: the check itself
+never ran).
 
 Usage:
   python3 .github/scripts/config_parity_check.py \
