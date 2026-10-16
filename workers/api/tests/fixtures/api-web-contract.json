@@ -1,0 +1,203 @@
+{
+  "$comment": "Canonical v1 web/Worker contract. The web client (apps/web) and the API Worker (workers/api) MUST agree on every entry here: the vitest client suite asserts the wire bodies it sends, and the Rust handlers suite asserts each route is served. Change both sides in the same PR, never one alone. All values are synthetic fixtures (example.com, documentation ports); nothing here is a credential.",
+  "version": 1,
+  "routes": [
+    {
+      "id": "health",
+      "method": "GET",
+      "path": "/healthz"
+    },
+    {
+      "id": "register-start",
+      "method": "POST",
+      "path": "/v1/auth/passkey/register/start",
+      "web": "registerStart",
+      "input": {
+        "email": "ada@example.com"
+      },
+      "wire": {
+        "email": "ada@example.com"
+      }
+    },
+    {
+      "id": "register-finish",
+      "method": "POST",
+      "path": "/v1/auth/passkey/register/finish",
+      "web": "registerFinish",
+      "input": {
+        "challenge": "Zml4dHVyZS1yZWdpc3Rlci1jaGFsbGVuZ2U",
+        "credentialId": "Zml4dHVyZS1jcmVkZW50aWFs",
+        "attestationObject": "Zml4dHVyZS1hdHRlc3RhdGlvbg",
+        "clientDataJson": "Zml4dHVyZS1jbGllbnQtZGF0YQ",
+        "magicToken": "fixture-magic-token"
+      },
+      "wire": {
+        "challenge": "Zml4dHVyZS1yZWdpc3Rlci1jaGFsbGVuZ2U",
+        "credential_id": "Zml4dHVyZS1jcmVkZW50aWFs",
+        "attestation_object": "Zml4dHVyZS1hdHRlc3RhdGlvbg",
+        "client_data_json": "Zml4dHVyZS1jbGllbnQtZGF0YQ",
+        "magic_token": "fixture-magic-token"
+      }
+    },
+    {
+      "id": "register-finish-invite",
+      "method": "POST",
+      "path": "/v1/auth/passkey/register/finish",
+      "web": "registerFinish",
+      "input": {
+        "challenge": "Zml4dHVyZS1yZWdpc3Rlci1jaGFsbGVuZ2U",
+        "credentialId": "Zml4dHVyZS1jcmVkZW50aWFs",
+        "attestationObject": "Zml4dHVyZS1hdHRlc3RhdGlvbg",
+        "clientDataJson": "Zml4dHVyZS1jbGllbnQtZGF0YQ",
+        "magicToken": "fixture-magic-token",
+        "inviteCode": "fixture-invite-code"
+      },
+      "wire": {
+        "challenge": "Zml4dHVyZS1yZWdpc3Rlci1jaGFsbGVuZ2U",
+        "credential_id": "Zml4dHVyZS1jcmVkZW50aWFs",
+        "attestation_object": "Zml4dHVyZS1hdHRlc3RhdGlvbg",
+        "client_data_json": "Zml4dHVyZS1jbGllbnQtZGF0YQ",
+        "magic_token": "fixture-magic-token",
+        "invite_code": "fixture-invite-code"
+      }
+    },
+    {
+      "id": "login-start",
+      "method": "POST",
+      "path": "/v1/auth/passkey/login/start",
+      "web": "loginStart",
+      "input": {
+        "email": "ada@example.com"
+      },
+      "wire": {
+        "email": "ada@example.com"
+      }
+    },
+    {
+      "id": "login-finish",
+      "method": "POST",
+      "path": "/v1/auth/passkey/login/finish",
+      "web": "loginFinish",
+      "input": {
+        "challenge": "Zml4dHVyZS1sb2dpbi1jaGFsbGVuZ2U",
+        "credentialId": "Zml4dHVyZS1jcmVkZW50aWFs",
+        "authenticatorData": "fixture-authenticator-data",
+        "clientDataJson": "Zml4dHVyZS1jbGllbnQtZGF0YQ",
+        "signature": "Zml4dHVyZS1zaWduYXR1cmU"
+      },
+      "wire": {
+        "challenge": "Zml4dHVyZS1sb2dpbi1jaGFsbGVuZ2U",
+        "credential_id": "Zml4dHVyZS1jcmVkZW50aWFs",
+        "authenticator_data": "fixture-authenticator-data",
+        "client_data_json": "Zml4dHVyZS1jbGllbnQtZGF0YQ",
+        "signature": "Zml4dHVyZS1zaWduYXR1cmU"
+      }
+    },
+    {
+      "id": "magic-start",
+      "method": "POST",
+      "path": "/v1/auth/magic/start",
+      "web": "requestMagicLink",
+      "input": {
+        "email": "ada@example.com"
+      },
+      "wire": {
+        "email": "ada@example.com"
+      }
+    },
+    {
+      "id": "magic-finish",
+      "method": "POST",
+      "path": "/v1/auth/magic/finish",
+      "web": "finishMagicLink",
+      "input": {
+        "token": "fixture-magic-token"
+      },
+      "wire": {
+        "token": "fixture-magic-token"
+      }
+    },
+    {
+      "id": "session-refresh",
+      "method": "POST",
+      "path": "/v1/session/refresh"
+    },
+    {
+      "id": "session-logout",
+      "method": "POST",
+      "path": "/v1/session/logout"
+    },
+    {
+      "id": "session-revoke-all",
+      "method": "POST",
+      "path": "/v1/session/revoke-all"
+    },
+    {
+      "id": "vault-get",
+      "method": "GET",
+      "path": "/v1/vault"
+    },
+    {
+      "id": "vault-save",
+      "method": "PUT",
+      "path": "/v1/vault",
+      "web": "saveProviderConfig",
+      "input": {
+        "host": "news.example.com",
+        "port": 563,
+        "tls": true,
+        "allow_insecure_plaintext": false,
+        "username": "synthetic-user",
+        "password": "synthetic-pass",
+        "max_connections": 4
+      },
+      "wire": {
+        "provider": {
+          "host": "news.example.com",
+          "port": 563,
+          "tls": true,
+          "allow_insecure_plaintext": false,
+          "username": "synthetic-user",
+          "password": "synthetic-pass",
+          "max_connections": 4
+        }
+      }
+    },
+    {
+      "id": "vault-delete",
+      "method": "DELETE",
+      "path": "/v1/vault"
+    },
+    {
+      "id": "vault-test",
+      "method": "POST",
+      "path": "/v1/vault/test",
+      "web": "testProviderConnection",
+      "input": {
+        "host": "news.example.com",
+        "port": 563,
+        "tls": true,
+        "allow_insecure_plaintext": false,
+        "username": "synthetic-user",
+        "password": "synthetic-pass",
+        "max_connections": 4
+      },
+      "wire": {
+        "provider": {
+          "host": "news.example.com",
+          "port": 563,
+          "tls": true,
+          "allow_insecure_plaintext": false,
+          "username": "synthetic-user",
+          "password": "synthetic-pass",
+          "max_connections": 4
+        }
+      }
+    },
+    {
+      "id": "vault-test-connection-legacy",
+      "method": "POST",
+      "path": "/v1/vault/test-connection"
+    }
+  ]
+}

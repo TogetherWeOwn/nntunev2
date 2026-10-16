@@ -1,5 +1,7 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
+	import { readSignedInEmail } from '#lib/signed-in-email.js';
 	import {
 		ApiClient,
 		ApiError,
@@ -9,6 +11,14 @@
 	import { validateIndexerUrl, validateProviderConfig } from '#lib/vault-validation.js';
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
+
+	// Display-only identity label (see signed-in-email.ts): the account
+	// these provider credentials will be saved to, shown before anything
+	// is typed.
+	let signedInEmail = $state<string | null>(null);
+	onMount(() => {
+		signedInEmail = readSignedInEmail();
+	});
 
 	let step = $state<1 | 2 | 3>(1);
 
@@ -153,6 +163,12 @@
 
 <main class="nt-wrap">
 	<h1>Connect your provider</h1>
+	{#if signedInEmail !== null}
+		<p role="status">
+			Signed in as <strong>{signedInEmail}</strong> — the provider details you save go to
+			this account. If that's not you, stop here and <a href="/login">sign in again</a>.
+		</p>
+	{/if}
 	<p>Step {step} of 3: {step === 1 ? 'Provider' : step === 2 ? 'Indexer (optional)' : 'Test'}</p>
 
 	{#if errors.length > 0}
