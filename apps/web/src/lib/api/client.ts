@@ -70,11 +70,11 @@ export function toProviderTestInput(
 		// Only send the opt-in with plaintext: with TLS it is always false so
 		// the server never records a spurious acknowledgement.
 		allow_insecure_plaintext: !provider.tls && provider.allowInsecurePlaintext,
-		username: provider.username,
+		username: provider.username.trim(),
 		password: provider.password,
 		max_connections: provider.maxConnections,
 		...(indexerUrl.trim().length > 0
-			? { indexer: { url: indexerUrl.trim(), api_key: indexerApiKey } }
+			? { indexer: { url: indexerUrl.trim(), api_key: indexerApiKey.trim() } }
 			: {})
 	};
 }
