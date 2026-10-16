@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { ApiClient, ApiError } from '#lib/api/client.js';
+	import { broadcastAuthTransition, clearSnapshot } from '#lib/library/cache.js';
 	import {
 		clearSignedInEmail,
 		readSignedInEmail,
@@ -44,6 +45,9 @@
 		status = 'working';
 		try {
 			const result = await client.finishMagicLink(token);
+			clearSnapshot(window.sessionStorage);
+			clearSnapshot(window.localStorage);
+			broadcastAuthTransition(window.localStorage);
 			// Show which account this is on the next screen, before any
 			// provider credential is typed.
 			if (typeof result.email === 'string' && result.email.length > 0) {
@@ -76,6 +80,9 @@
 			}
 			// A generic 401 means there is no live session to revoke.
 		}
+		clearSnapshot(window.sessionStorage);
+		clearSnapshot(window.localStorage);
+		broadcastAuthTransition(window.localStorage);
 		clearSignedInEmail();
 		signedInEmail = null;
 		signingOut = false;

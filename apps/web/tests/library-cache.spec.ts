@@ -176,3 +176,61 @@ test('fresh library success replaces the snapshot and hides the badge', async ({
 		'track-fresh-1'
 	]);
 });
+
+test('magic-link redemption invalidates another tab library snapshot', async ({ page }) => {
+	await page.route('**/api/library', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify(SEEDED.items)
+		})
+	);
+	await page.goto('/library');
+	await expect(page.getByTestId('library-list')).toContainText('Seeded Song One');
+
+	const magicTab = await page.context().newPage();
+	await magicTab.route('**/v1/auth/magic/finish', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ ok: true, email: 'new-account@example.test' })
+		})
+	);
+	await magicTab.goto('/auth/magic?token=test-token');
+	await magicTab.getByRole('button', { name: 'Sign in with this link' }).click();
+
+	await expect(page.getByRole('alert')).toContainText(/session changed/i);
+	await expect(page.getByTestId('library-list')).toHaveCount(0);
+	expect(await readSnapshot(page)).toBeNull();
+	await magicTab.close();
+});
+
+test('magic-link sign-out invalidates another tab library snapshot', async ({ page }) => {
+	await page.route('**/api/library', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify(SEEDED.items)
+		})
+	);
+	await page.goto('/library');
+	await expect(page.getByTestId('library-list')).toContainText('Seeded Song One');
+
+	const magicTab = await page.context().newPage();
+	await magicTab.route('**/v1/auth/magic/finish', (route) =>
+		route.fulfill({ status: 401, contentType: 'application/json', body: JSON.stringify({}) })
+	);
+	await magicTab.route('**/v1/session/logout', (route) =>
+		route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({}) })
+	);
+	await magicTab.goto('/auth/magic?token=test-token');
+	await magicTab.getByRole('button', { name: 'Sign in with this link' }).click();
+	await magicTab.getByRole('alert').waitFor();
+	await magicTab.getByRole('button', { name: /sign out and try this link again/i }).click();
+
+	await expect(magicTab.getByRole('status')).toContainText('Signed out');
+	await expect(page.getByRole('alert')).toContainText(/session changed/i);
+	await expect(page.getByTestId('library-list')).toHaveCount(0);
+	expect(await readSnapshot(page)).toBeNull();
+	await magicTab.close();
+});
