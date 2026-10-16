@@ -483,13 +483,17 @@ pub fn fetch_nzb(
 /// URL's host and the rejection code, NEVER the full URL (it may embed
 /// credentials or an apikey) and never the path or query. Unparseable
 /// input yields the `invalid` placeholder, which contains no part of the
-/// input.
+/// input. Any whitespace or control character anywhere in the input also
+/// yields `invalid`, so a smuggled newline can never become a log line.
 pub fn url_host_for_log(url: &str) -> String {
     const PLACEHOLDER: &str = "invalid";
     parse_log_host(url).unwrap_or_else(|| PLACEHOLDER.to_string())
 }
 
 fn parse_log_host(url: &str) -> Option<String> {
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
     let (scheme, rest) = url.split_once("://")?;
     if scheme.is_empty() {
         return None;
@@ -639,6 +643,32 @@ mod tests {
         assert_eq!(
             resolve_location("2606:4700::1111", "/x.nzb"),
             Ok("https://[2606:4700::1111]/x.nzb".to_string())
+        );
+    }
+
+    #[test]
+    fn log_host_rejects_whitespace_and_control() {
+        // A smuggled newline/control char must never become a log line:
+        // the sanitizer yields the placeholder, echoing no input bytes.
+        for evil in [
+            "https://nzb.example\n.evil.example/x.nzb",
+            "https://nzb.example\r\n.evil.example/x.nzb",
+            "https://nzb.example\tevil/x.nzb",
+            "https://nzb.example evil/x.nzb",
+            "https://nzb.example\x00/x.nzb",
+            "https://nzb.example\x7f/x.nzb",
+            "https://user:pass@nzb.example\x01/x.nzb",
+        ] {
+            assert_eq!(url_host_for_log(evil), "invalid", "input: {evil:?}");
+        }
+        // Sane inputs are unchanged.
+        assert_eq!(
+            url_host_for_log("https://nzb.example/get/abc.nzb"),
+            "nzb.example"
+        );
+        assert_eq!(
+            url_host_for_log("https://user:SECRET@nzb.example/x"),
+            "nzb.example"
         );
     }
 }
