@@ -35,21 +35,26 @@ checked against its real contract for the first time. The smoke stays green
 on the current app; the items below are future contract, documented here so
 the activation checklist is accurate:
 
-- `GET /api/health` returns exactly `{ok:true}`
+- `GET /api/health` returns `{ok:true, version:<pkg>}`
   (`apps/web/src/routes/api/health/+server.ts`, pinned by
-  `apps/web/tests/smoke.spec.ts` `toEqual({ok:true})`). `health.spec.ts`
-  requires `ok === true` and asserts `version` only when the app ships it.
-- `GET /api/ready` does not exist yet (staging answers 404). The smoke
-  tolerates 404 as "not yet implemented" and pins the 200/503 + Retry-After
-  shape once the route lands.
-- `apps/web/src` has no `data-testid` hooks yet. The app-shell smoke accepts
-  `data-testid="app-root"` when present and otherwise falls back to the
-  landing's `NNTune` heading; signup/BYOP/library/player/meter hooks
-  (`helpers/contract.ts` `TESTIDS`) and `/signup`'s real form, the BYOP
-  wizard, ingest/library/stream/usage endpoints arrive with the venture
-  slices that own them. The journey specs (`signup-byop`, `ingest-play-meter`)
-  therefore remain red until those slices land — that failure is the signal,
-  not noise.
+  `apps/web/tests/smoke.spec.ts` exact-keys assertion). `health.spec.ts`
+  requires `ok === true` and asserts `version` whenever the deployed app
+  ships it, so the check stays green across the deploy boundary.
+- `GET /api/ready` reports readiness shape (TOG-25176):
+  200 `{ok:true}` while the app serves traffic, 503 `{ok:false}` with
+  `Retry-After` when it cannot (`apps/web/src/routes/api/ready/+server.ts`,
+  shapes pinned by `apps/web/src/lib/ready.test.ts`). The smoke tolerates
+  404 for builds predating the route; any other status must match the shape.
+- `apps/web/src` renders every `data-testid` hook in
+  `helpers/contract.ts` `TESTIDS` (pinned by
+  `apps/web/src/lib/contract.test.ts` plus the `smoke.spec.ts` contract
+  test). The app-shell fallback to the landing's `NNTune` heading is kept
+  for builds predating the hook. `/signup`'s real submission, the BYOP
+  wizard behavior (TOG-23633), ingest/library/stream/usage endpoints, and
+  usage-meter enforcement (TOG-23637) still arrive with the venture slices
+  that own them: the shells render the hooks and say what is pending, so
+  the journey specs (`signup-byop`, `ingest-play-meter`) fail only on those
+  real missing backends — that failure is the signal, not noise.
 
 ## Run locally
 
