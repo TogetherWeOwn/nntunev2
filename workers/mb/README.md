@@ -9,7 +9,7 @@ Decision: `docs/adr/0007-mb-mirror.md`.
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/v1/mb/artist/:mbid` | Artist lookup over Hyperdrive (`MB_DB`); success `Cache-Control: public, max-age=86400` |
-| `GET` | `/v1/mb/release/:mbid` | Release lookup (includes `caa_url` when art is cached); same caching as artist |
+| `GET` | `/v1/mb/release/:mbid` | Release lookup (includes the stored `caa_url`); same caching as artist |
 | `GET` | `/v1/mb/recording/:mbid` | Recording lookup; same caching as artist |
 | `GET` | `/v1/mb/search?q=&type=` | `type` in `artist\|release\|recording`; `q` 2-100 chars; trigram (`pg_trgm`) ordered by similarity, `LIMIT 25`; success `Cache-Control: public, max-age=300` |
 

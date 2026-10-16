@@ -60,8 +60,9 @@ pub fn art_bucket_for_env(env: &str) -> Option<&'static str> {
 
 /// Build an internal object URI for an art key (for example
 /// `art/ab/cd/<sha>-500`, ADR 0003) in the given bucket. This `r2://` URI
-/// is not a public HTTP URL and must not be sent to clients; public CAA
-/// URLs remain unchanged until a custom domain or r2.dev host is configured.
+/// is not a public HTTP URL and must not be sent to clients. This helper is
+/// not used by runtime response handling; release reads pass the stored
+/// `caa_url` through unchanged until a custom domain or r2.dev host is configured.
 pub fn caa_url_for_art(bucket: &str, key: &str) -> String {
     let key = key.trim_start_matches('/');
     format!("r2://{bucket}/{key}")

@@ -19,6 +19,12 @@ compatibility_date = "2026-10-01"
 # docs/ops.md); the KV namespace and R2 bucket are per env. `ENVIRONMENT` is
 # informational only: the worker does not read it yet, and the per-env
 # ART_CACHE binding is what selects the bucket.
+# Keep this top-level commented binding for the binding-parity check, which
+# recognizes commented known tables but not env-scoped table headers.
+# [[r2_buckets]]
+# binding = "ART_CACHE"
+# bucket_name = "nntunev2-art-staging"
+#
 # Staging (`wrangler deploy --env staging`); bindings do not inherit:
 # [[env.staging.hyperdrive]]
 # binding = "MB_DB"
