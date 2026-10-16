@@ -16,6 +16,7 @@
 	let staleAt: string | null = $state(null);
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
+	let libraryUnavailable = $state(false);
 	let authenticatedThisLoad = false;
 	let inMemorySnapshot: ReturnType<typeof saveSnapshot> | null = null;
 	let activeRequest: AbortController | null = null;
@@ -46,6 +47,7 @@
 		const generation = ++requestGeneration;
 		loading = true;
 		loadError = null;
+		libraryUnavailable = false;
 		const controller = new AbortController();
 		activeRequest = controller;
 		let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -62,6 +64,16 @@
 				timeout
 			]);
 			if (generation !== requestGeneration) return;
+			if (response.status === 404) {
+				// The list endpoint has not landed yet. Do not treat a 404 as
+				// session verification or expose a previously saved snapshot.
+				authenticatedThisLoad = false;
+				inMemorySnapshot = null;
+				items = [];
+				staleAt = null;
+				libraryUnavailable = true;
+				return;
+			}
 			if (response.status === 401 || response.status === 403) {
 				authenticatedThisLoad = false;
 				inMemorySnapshot = null;
@@ -79,7 +91,8 @@
 			authenticatedThisLoad = true;
 			items = fresh;
 			staleAt = null;
-			inMemorySnapshot = saveSnapshot(browserStorage('session'), fresh);
+			const persistedSnapshot = saveSnapshot(browserStorage('session'), fresh);
+			inMemorySnapshot = { ...persistedSnapshot, items: fresh };
 		} catch {
 			if (generation !== requestGeneration) return;
 			// Do not trust a tab's snapshot until this page has verified its session.
@@ -148,8 +161,11 @@
 			<p data-testid="library-stale-badge" role="status">{staleLabel(staleAt)}</p>
 		{/if}
 
-		{#if items.length === 0}
-			<p role="status">Your library is empty.</p>
+		{#if libraryUnavailable}
+			<p role="status">Library listing is not available yet.</p>
+			<p><a href="/library/import">Import an NZB</a></p>
+		{:else if items.length === 0}
+			<p role="status">Your library is empty. <a href="/library/import">Import an NZB</a> to get started.</p>
 		{:else}
 			<ul data-testid="library-list">
 				{#each items as track (track.id)}
@@ -160,7 +176,7 @@
 						{/if}
 					</li>
 				{/each}
-			</ul>
+				</ul>
 		{/if}
 
 		<button class="nt-button nt-button--ghost" type="button" onclick={() => void refresh()}>

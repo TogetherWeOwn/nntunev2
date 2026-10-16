@@ -98,7 +98,9 @@ test('auth transition invalidates a previously authenticated tab snapshot', asyn
 	await otherTab.close();
 });
 
-test('auth transition discards an in-flight response body from the previous session', async ({ page }) => {
+test('auth transition discards an in-flight response body from the previous session', async ({
+	page
+}) => {
 	await seedSnapshot(page);
 	await page.addInitScript((items) => {
 		const originalFetch = window.fetch.bind(window);
@@ -180,6 +182,36 @@ test('offline load without session verification does not render a prior account 
 	await expect(page.getByTestId('library-stale-badge')).toHaveCount(0);
 });
 
+test('missing library endpoint stays neutral and does not expose a cached snapshot', async ({
+	page
+}) => {
+	await seedSnapshot(page);
+	await page.route('**/api/library', (route) =>
+		route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({}) })
+	);
+
+	await page.goto('/library');
+
+	await expect(page.getByRole('status')).toContainText(/listing is not available yet/i);
+	await expect(page.getByRole('alert')).toHaveCount(0);
+	await expect(page.getByTestId('library-list')).toHaveCount(0);
+	await expect(page.getByTestId('library-stale-badge')).toHaveCount(0);
+});
+
+test('empty library keeps the NZB import link', async ({ page }) => {
+	await page.route('**/api/library', (route) =>
+		route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([]) })
+	);
+
+	await page.goto('/library');
+
+	await expect(page.getByRole('status')).toContainText(/library is empty/i);
+	await expect(page.getByRole('link', { name: 'Import an NZB' })).toHaveAttribute(
+		'href',
+		'/library/import'
+	);
+});
+
 test('a never-settling library request times out and exits loading state', async ({ page }) => {
 	await page.route('**/api/library', async () => new Promise(() => {}));
 
@@ -187,6 +219,34 @@ test('a never-settling library request times out and exits loading state', async
 
 	await expect(page.getByRole('alert')).toContainText(/not reachable/i, { timeout: 12_000 });
 	await expect(page.getByRole('status')).toHaveCount(0);
+});
+
+test('stale retry keeps every freshly loaded item beyond the persisted cache cap', async ({
+	page
+}) => {
+	const fresh = Array.from({ length: 250 }, (_, index) => ({
+		id: `track-${index}`,
+		title: `Song ${index}`
+	}));
+	let failNext = false;
+	await page.route('**/api/library', (route) => {
+		if (failNext) return route.abort('failed');
+		failNext = true;
+		return route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify(fresh)
+		});
+	});
+
+	await page.goto('/library');
+	await expect(page.getByTestId('library-item')).toHaveCount(250);
+	await page.getByRole('button', { name: 'Refresh' }).click();
+
+	await expect(page.getByTestId('library-stale-badge')).toBeVisible();
+	await expect(page.getByTestId('library-item')).toHaveCount(250);
+	const stored = await readSnapshot(page);
+	expect(JSON.parse(stored as string).items).toHaveLength(200);
 });
 
 test('fresh library success replaces the snapshot and hides the badge', async ({ page }) => {
@@ -234,7 +294,7 @@ test('magic-link redemption invalidates another tab library snapshot', async ({ 
 			body: JSON.stringify({ ok: true, email: 'new-account@example.test' })
 		})
 	);
-	await magicTab.goto('/auth/magic?token=test-token');
+	await magicTab.goto('/auth/magic?token=test-magic-token');
 	await magicTab.getByRole('button', { name: 'Sign in with this link' }).click();
 
 	await expect(page.getByRole('alert')).toContainText(/session changed/i);
@@ -261,7 +321,7 @@ test('magic-link sign-out invalidates another tab library snapshot', async ({ pa
 	await magicTab.route('**/v1/session/logout', (route) =>
 		route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({}) })
 	);
-	await magicTab.goto('/auth/magic?token=test-token');
+	await magicTab.goto('/auth/magic?token=test-magic-token');
 	await magicTab.getByRole('button', { name: 'Sign in with this link' }).click();
 	await magicTab.getByRole('alert').waitFor();
 	await magicTab.getByRole('button', { name: /sign out and try this link again/i }).click();
@@ -354,7 +414,7 @@ test('blocked storage does not turn a successful magic-link sign-in into a failu
 		})
 	);
 
-	await page.goto('/auth/magic?token=fixture-magic-token');
+	await page.goto('/auth/magic?token=test-magic-token');
 	await page.getByRole('button', { name: /sign in with this link/i }).click();
 
 	// Cleanup after a successful redemption must not land in the error branch.
