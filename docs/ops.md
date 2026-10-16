@@ -37,7 +37,7 @@ integration prerequisites on sibling branches are:
 | [#2](https://github.com/TogetherWeOwn/nntunev2/pull/2), cache ADR | Physical audio/art buckets are separate per environment; prefixes live inside them. |
 | [#14](https://github.com/TogetherWeOwn/nntunev2/pull/14), scaffold | Replace placeholders only when activating the correct consumer bindings. |
 | [#8](https://github.com/TogetherWeOwn/nntunev2/pull/8), stream | `workers/stream/wrangler.toml` uses `nntune-audio-cache` without environment sections; bind `AUDIO_CACHE` to `nntunev2-audio-staging` / `nntunev2-audio-prod`. |
-| [#10](https://github.com/TogetherWeOwn/nntunev2/pull/10), ingest | Producer and consumer use `nntune-ingest-jobs`, and the commented DLQ example uses `nntune-ingest-dlq`; use the per-environment queue names below. Do not uncomment the example with its shared unsuffixed DLQ name. |
+| [#10](https://github.com/TogetherWeOwn/nntunev2/pull/10), ingest | Producer and consumer still use `nntune-ingest-jobs`; the commented DLQ field is valid but staging-specific (`nntunev2-ingest-dlq-staging`). Use `nntunev2-ingest-dlq-prod` in prod, and align producer/consumer queue names with the per-environment inventory below. |
 | [#11](https://github.com/TogetherWeOwn/nntunev2/pull/11), E2E | Supply the two pending Access client secrets before enabling the staging URL; see the Access section. |
 
 Their owners must coordinate these fixes at the next permitted review round and
@@ -85,8 +85,10 @@ and IDs against Cloudflare before configuring dead-letter routing.
 The reported inventory lists these DLQ queues as provisioned and not connected
 to a consumer; live existence is unverified as noted above. Configure the
 consumer's dead-letter handling only when the ingest consumer is enabled.
-Cloudflare deletes messages delivered to a DLQ without an active consumer after
-four days ([DLQ documentation](https://developers.cloudflare.com/queues/configuration/dead-letter-queues/)).
+Cloudflare's default retention for DLQ messages is four days when there is no
+active consumer ([DLQ documentation](https://developers.cloudflare.com/queues/configuration/dead-letter-queues/)). Queue message retention can be
+customized from 60 seconds to 14 days ([retention-period announcement](https://developers.cloudflare.com/changelog/post/2025-02-14-customize-queue-retention-period/)).
+The actual retention configured on these reported queues is unverified.
 Enable dead-letter routing only with a plan to process each DLQ.
 
 UNDO: API `DELETE /accounts/<acct>/queues/<queue_id>` after authorized
@@ -285,7 +287,7 @@ Binding names are chosen in Worker configs; resource names must match this table
 | R2 archive / reserved, no consumer | `nntunev2-archive-staging` | `nntunev2-archive-prod` |
 | Ingest scratch (reported; names and 7-day lifecycle unverified) | `nntunev2-ingest-scratch-staging` (`ingest-scratch/`; intended 7 days) | `nntunev2-ingest-scratch-prod` (`ingest-scratch/`; intended 7 days) |
 | Ingest Queue | `nntunev2-ingest-staging` | `nntunev2-ingest-prod` |
-| Ingest DLQ / no active consumer (reported names/IDs; live existence unverified) | `nntunev2-ingest-dlq-staging` (4-day expiry if active) | `nntunev2-ingest-dlq-prod` (4-day expiry if active) |
+| Ingest DLQ / no active consumer (reported names/IDs; live existence and retention unverified) | `nntunev2-ingest-dlq-staging` (default 4-day retention while no active consumer) | `nntunev2-ingest-dlq-prod` (default 4-day retention while no active consumer) |
 | Config KV | `nntunev2-config-staging` | `nntunev2-config-prod` |
 | Hostname | `v2-staging.nntune.com` (+ Access; deployment pending) | TBD at launch |
 | App Hyperdrive variable | `HYPERDRIVE_ID_STAGING` | `HYPERDRIVE_ID_PROD` |
@@ -317,10 +319,12 @@ Known config drift (tracked in the R2 reconciliation table, fixed by the
 owning lanes, not here): the committed `workers/stream/wrangler.toml` still
 binds `AUDIO_CACHE` to `nntune-audio-cache` with no environment sections,
 and `workers/ingest/wrangler.toml.example` still names `nntune-ingest-jobs`
-for the producer/consumer and `nntune-ingest-dlq` for the commented DLQ
-example. Align each with the per-environment names above before enabling it;
-otherwise the DLQ example can create or share an unsuffixed queue across
-staging and prod.
+for the producer/consumer. Its commented DLQ example now uses the valid
+`dead_letter_queue` field inside `[[queues.consumers]]`, but remains staging-
+specific; prod must use `nntunev2-ingest-dlq-prod`. Align all names with the
+per-environment inventory before enabling the configs. Do not add a nested
+`[[queues.consumers.dead_letter_queue]]` table: Wrangler rejects that shape,
+so it will not configure dead-letter routing.
 
 ## Staging promotion checklist
 

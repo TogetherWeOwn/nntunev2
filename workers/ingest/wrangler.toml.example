@@ -26,8 +26,7 @@ queue = "nntune-ingest-jobs"
 # retries to cover the ~60 s KV lag plus the edge-cached negative-lookup
 # window (consumer reads with cacheTtl 30).
 # max_retries = 4
-# [[queues.consumers.dead_letter_queue]]
-# queue = "nntune-ingest-dlq"
+# dead_letter_queue = "nntunev2-ingest-dlq-staging"
 
 # Workflows: NOT YET. workers-rs 0.3 has no Workflow client and this crate
 # exports no Workflow class, and `[[workflows]]` requires a `class_name`, so
