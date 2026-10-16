@@ -123,6 +123,9 @@ jobs:
       # The Worker deploys to wasm32: the crate must check on that target
       # (native-only CI once missed a getrandom/RNG breakage there).
       - run: cargo check --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
+      # The Hyperdrive cache gate fails closed without credentials; pin its
+      # exit codes with the built-in shim self-test (no network, no secrets).
+      - run: bash workers/api/check_hyperdrive_cache.sh --self-test
 
   rust-mb:
     name: rust (workers/mb)
