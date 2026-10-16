@@ -53,7 +53,7 @@ use nntune_stream::yenc::{self, PartSpec};
 
 const SECRET: &[u8] = b"stream-quarantine-acceptance-secret";
 const NOW_UNIX: u64 = 1_700_000_000;
-const EXP_UNIX: u64 = 9_999_999_999;
+const EXP_UNIX: u64 = NOW_UNIX + 900;
 const CIPHER_KEY: u8 = 0x5A;
 
 type Fixture = (Vec<u8>, Vec<String>, HashMap<String, Vec<u8>>);
