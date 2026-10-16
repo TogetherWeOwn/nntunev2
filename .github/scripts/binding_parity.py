@@ -123,6 +123,10 @@ _KNOWN_TABLES = frozenset(
     }
 )
 
+# Wrangler binding tables whose binding name is spelled ``name`` rather than
+# ``binding``. Keep this list explicit: arbitrary config tables also use name.
+_NAME_KEYED_BINDING_TABLES = frozenset({"send_email", "unsafe.bindings"})
+
 
 def extract_bindings(data):
     """Return {(type, binding): entry} for one wrangler table level."""
@@ -180,25 +184,36 @@ def extract_bindings(data):
     # Fail closed on binding-shaped tables this script does not model
     # (a new Cloudflare binding kind): surface them as unknown types so
     # the unexpected-binding check flags them instead of ignoring them.
-    for key, value in data.items():
-        if key in _KNOWN_TABLES:
-            continue
+    unknown_tables = [
+        (key, value)
+        for key, value in data.items()
+        if key not in _KNOWN_TABLES
+    ]
+    unsafe = data.get("unsafe")
+    if isinstance(unsafe, dict) and "bindings" in unsafe:
+        unknown_tables.append(("unsafe.bindings", unsafe["bindings"]))
+    for key, value in unknown_tables:
         candidates = value if isinstance(value, list) else [value]
+        name_keyed = key in _NAME_KEYED_BINDING_TABLES
         for item in candidates:
-            if isinstance(item, dict) and "binding" in item:
-                binding = item["binding"]
-                if not isinstance(binding, str) or not binding:
-                    raise ParityError(
-                        f"{key}: 'binding' must be a non-empty string (unknown:{key})"
-                    )
-                add(
-                    {
-                        "type": f"unknown:{key}",
-                        "binding": binding,
-                        "resource": None,
-                        "declared": False,
-                    }
+            if not isinstance(item, dict):
+                continue
+            binding_key = "binding" if "binding" in item else "name" if name_keyed else None
+            if binding_key is None:
+                continue
+            binding = item[binding_key]
+            if not isinstance(binding, str) or not binding:
+                raise ParityError(
+                    f"{key}: {binding_key!r} must be a non-empty string (unknown:{key})"
                 )
+            add(
+                {
+                    "type": f"unknown:{key}",
+                    "binding": binding,
+                    "resource": None,
+                    "declared": False,
+                }
+            )
     return out
 
 

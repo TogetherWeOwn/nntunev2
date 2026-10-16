@@ -536,6 +536,20 @@ reason = "fixture: value fix owned elsewhere"
             self.assertEqual([], drifts)
             self.assertEqual(2, len(warnings))
 
+        # A suppression is bound to the exact actual value as well as the
+        # worker, env, binding and expected value.
+        different_actual = manifest.replace(
+            'actual = "fx-old-bucket"', 'actual = "fx-another-bucket"', 1
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            drifts, warnings, _ = run_check(
+                make_repo(tmp, wrangler=wrangler, manifest=different_actual)
+            )
+            joined = "\n".join(drifts)
+            self.assertIn("resource 'fx-old-bucket' != ops inventory", joined)
+            self.assertIn("stale known-drift entry", joined)
+            self.assertEqual(1, len(warnings))
+
     def test_stale_known_drift_fails(self):
         # Config now matches the inventory, so the known-drift entries
         # suppress nothing and must be removed.
@@ -572,6 +586,27 @@ reason = "fixture: value fix owned elsewhere"
             joined = "\n".join(drifts)
             self.assertIn("binding=SEARCH", joined)
             self.assertIn("unknown:vectorize", joined)
+
+    def test_name_keyed_unknown_binding_tables_are_flagged(self):
+        configs = {
+            "send_email": (
+                '\n[[env.staging.send_email]]\nname = "EMAIL"\n'
+                'allowed_sender_addresses = ["noreply@example.com"]\n'
+            ),
+            "unsafe.bindings": (
+                '\n[[env.staging.unsafe.bindings]]\nname = "LEGACY"\n'
+                'type = "text_blob"\n'
+            ),
+        }
+        for table, addition in configs.items():
+            with self.subTest(table=table), tempfile.TemporaryDirectory() as tmp:
+                drifts, _, _ = run_check(
+                    make_repo(tmp, wrangler=MATCHING_WRANGLER + addition)
+                )
+                joined = "\n".join(drifts)
+                self.assertIn("binding=" + ("EMAIL" if table == "send_email" else "LEGACY"), joined)
+                self.assertIn("unknown:" + table, joined)
+                self.assertIn("staging/prod skew", joined)
 
     def test_manifest_key_typo_fails_closed(self):
         manifest = MANIFEST.replace('staging = "fx-audio-staging"',
