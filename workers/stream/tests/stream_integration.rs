@@ -88,12 +88,29 @@ struct FakeNntp {
 
 impl FakeNntp {
     fn start(articles: HashMap<String, Vec<u8>>) -> Self {
-        Self::start_closing_after(articles, usize::MAX)
+        Self::start_with_options(articles, usize::MAX, None)
+    }
+
+    /// Start with one BODY ordinal receiving an NNTP status instead of an article.
+    fn start_rejecting_body(
+        articles: HashMap<String, Vec<u8>>,
+        body_ordinal: usize,
+        reply: &'static str,
+    ) -> Self {
+        Self::start_with_options(articles, usize::MAX, Some((body_ordinal, reply)))
     }
 
     /// Like `start`, but the server hangs up after `close_after` BODY
     /// commands on a connection (a provider reaping idle/busy sessions).
     fn start_closing_after(articles: HashMap<String, Vec<u8>>, close_after: usize) -> Self {
+        Self::start_with_options(articles, close_after, None)
+    }
+
+    fn start_with_options(
+        articles: HashMap<String, Vec<u8>>,
+        close_after: usize,
+        reject_body: Option<(usize, &'static str)>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake NNTP");
         let addr = listener.local_addr().expect("local addr");
         listener.set_nonblocking(true).expect("nonblocking");
@@ -116,7 +133,7 @@ impl FakeNntp {
                     Err(_) => break,
                 };
                 connects_c.fetch_add(1, Ordering::SeqCst);
-                Self::serve(stream, &articles, close_after, &bodies_c);
+                Self::serve(stream, &articles, close_after, reject_body, &bodies_c);
             }
         });
         Self {
@@ -132,6 +149,7 @@ impl FakeNntp {
         stream: TcpStream,
         articles: &HashMap<String, Vec<u8>>,
         close_after: usize,
+        reject_body: Option<(usize, &'static str)>,
         bodies: &AtomicUsize,
     ) {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -159,7 +177,13 @@ impl FakeNntp {
                 .map(|s| s.trim().trim_matches(|c| c == '<' || c == '>'))
             {
                 served += 1;
-                bodies.fetch_add(1, Ordering::SeqCst);
+                let body_ordinal = bodies.fetch_add(1, Ordering::SeqCst) + 1;
+                if let Some((reject_ordinal, reply)) = reject_body {
+                    if body_ordinal == reject_ordinal {
+                        let _ = writer.write_all(reply.as_bytes());
+                        continue;
+                    }
+                }
                 let full_mid = format!("<{mid}>");
                 match articles.get(&full_mid) {
                     Some(article) => {
@@ -286,6 +310,89 @@ fn input_with_ranges<'a>(
         now_unix: NOW_UNIX,
         up_next,
     }
+}
+
+#[test]
+fn stale_auth_midstream_is_dropped_on_finalize_and_abort() {
+    let (_, segments, articles) = fixture_track("auth-midstream", 40_000, 20_000);
+    let server = FakeNntp::start_rejecting_body(articles, 2, "481 authentication rejected\r\n");
+    let mut pool: StreamPool = Pool::new(4);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+    let token = grant_for("track-auth-finalize");
+    let inp = input(
+        &token,
+        "track-auth-finalize",
+        None,
+        &server,
+        &segments,
+        None,
+    );
+    let response = play(&mut pool, &mut cache, &mut meter, SECRET, &inp).expect("first segment");
+    assert_eq!(
+        response.stream.finalize(&mut pool, &mut cache, &mut meter),
+        Err(PlayError::ProviderAuthExpired)
+    );
+    assert_eq!((pool.idle(), pool.in_use()), (0, 0));
+    assert!(!pool.quarantined());
+
+    drop(server);
+    let (_, abort_segments, abort_articles) = fixture_track("auth-abort", 40_000, 20_000);
+    let abort_server =
+        FakeNntp::start_rejecting_body(abort_articles, 2, "481 authentication rejected\r\n");
+    let token = grant_for("track-auth-abort");
+    let input = input(
+        &token,
+        "track-auth-abort",
+        None,
+        &abort_server,
+        &abort_segments,
+        None,
+    );
+    let response = play(&mut pool, &mut cache, &mut meter, SECRET, &input).expect("first segment");
+    let mut stream = response.stream;
+    assert!(stream.next().is_some());
+    while stream.next().is_some() {}
+    assert_eq!(
+        abort_server.bodies(),
+        2,
+        "second BODY must fail with stale auth"
+    );
+    stream.abort(&mut pool);
+    assert_eq!((pool.idle(), pool.in_use()), (0, 0));
+    assert!(!pool.quarantined());
+}
+
+#[test]
+fn stale_auth_on_warm_connection_redials_before_next_play() {
+    let (plain, segments, articles) = fixture_track("auth-redial", 20_000, 20_000);
+    let server = FakeNntp::start_rejecting_body(articles, 2, "480 authentication required\r\n");
+    let mut pool: StreamPool = Pool::new(4);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+
+    let token = grant_for("track-first");
+    let first_input = input(&token, "track-first", None, &server, &segments, None);
+    let response =
+        play(&mut pool, &mut cache, &mut meter, SECRET, &first_input).expect("first play");
+    let (body, stream) = drain_to_vec(response.stream);
+    assert_eq!(body, plain);
+    stream
+        .finalize(&mut pool, &mut cache, &mut meter)
+        .expect("first finalize");
+    assert_eq!(pool.idle(), 1);
+
+    let token = grant_for("track-second");
+    let input = input(&token, "track-second", None, &server, &segments, None);
+    let response = play(&mut pool, &mut cache, &mut meter, SECRET, &input).expect("warm retry");
+    let (body, stream) = drain_to_vec(response.stream);
+    assert_eq!(body, plain);
+    stream
+        .finalize(&mut pool, &mut cache, &mut meter)
+        .expect("retry finalize");
+    assert_eq!(server.connects(), 2);
+    assert_eq!(pool.idle(), 1);
+    assert!(!pool.quarantined());
 }
 
 #[test]

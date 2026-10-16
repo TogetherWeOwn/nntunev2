@@ -17,23 +17,25 @@ use futures_util::StreamExt;
 use nntune_core::nntp::NntpClient;
 use nntune_core::transports::WorkerTransport;
 use worker::{
-    durable_object, event, Context, Date, DurableObject, Env, Headers, Method, Request, Response,
-    Result, State,
+    durable_object, event, Context, Date, DurableObject, Env, Headers, Request, Response, Result,
+    State,
 };
 
 use crate::pool::Pool;
 use crate::probe::{
     parse_request, run_probe, PoolProvider, ProbeError, ProbeReply, WallClock, MAX_PROBE_BODY_BYTES,
 };
+use crate::routes::{self, ProbeDecision};
 
 /// Durable Object route for one probe batch.
-pub const PROBE_PATH: &str = "/probe";
+pub const PROBE_PATH: &str = routes::PROBE_PATH;
 
 /// The Worker's own route: only the Durable Object serves probes, so every
 /// request here is a 404 until the play routes land.
 #[event(fetch)]
 async fn fetch(_req: Request, _env: Env, _ctx: Context) -> Result<Response> {
-    Response::error("not found", 404)
+    let (status, body) = routes::decide_public_fetch();
+    Response::error(body, status)
 }
 
 #[durable_object(fetch)]
@@ -59,10 +61,16 @@ impl DurableObject for NntpPool {
 
     /// Serves `POST /probe`; any other method or path is a 404.
     async fn fetch(&self, mut req: Request) -> Result<Response> {
-        if req.method() != Method::Post || req.path() != PROBE_PATH {
-            return Response::error("not found", 404);
-        }
-        respond(self.probe(&mut req).await)
+        let has_owner_name = self.state.id().name().is_some();
+        routes::dispatch_probe(
+            routes::decide_probe_action(req.method().as_ref(), &req.path(), has_owner_name),
+            |decision| match decision {
+                ProbeDecision::NotFound => Response::error(decision.body(), decision.status()),
+                _ => respond(route_reply(decision)),
+            },
+            || async { respond(self.probe(&mut req).await) },
+        )
+        .await
     }
 }
 
@@ -72,7 +80,7 @@ impl NntpPool {
         // The id came from `id_from_name(user_id)`; without the name there is
         // no owner to check the envelope against, so refuse.
         let Some(pool_user) = self.state.id().name() else {
-            return ProbeReply::from(Err(ProbeError::BadRequest("pool has no owner")));
+            return route_reply(ProbeDecision::OwnerMissing);
         };
         let body = match read_capped(req, MAX_PROBE_BODY_BYTES).await {
             Ok(body) => body,
@@ -84,6 +92,13 @@ impl NntpPool {
         };
         let provider = match self.provider(&pool_user).await {
             Ok(provider) => provider,
+            Err(ProbeError::ProviderUnavailable) => {
+                return route_reply(routes::decide_probe(
+                    routes::PROBE_METHOD,
+                    routes::PROBE_PATH,
+                    true,
+                ));
+            }
             Err(e) => return ProbeReply::from(Err(e)),
         };
         let pool = self
@@ -119,6 +134,15 @@ impl NntpPool {
     /// connection until the instance is evicted.
     async fn provider(&self, _user_id: &str) -> core::result::Result<PoolProvider, ProbeError> {
         Err(ProbeError::ProviderUnavailable)
+    }
+}
+
+/// Convert the portable routing decision into the reply rendered by the adapter.
+fn route_reply(decision: ProbeDecision) -> ProbeReply {
+    ProbeReply {
+        status: decision.status(),
+        body: decision.body().to_string(),
+        retry_after_secs: None,
     }
 }
 
