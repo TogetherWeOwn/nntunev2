@@ -56,13 +56,19 @@ First-byte latency is measured by `tests/stream_integration.rs`
 Miss TTFB for a range starting at byte 0 is dial (skipped on a warm pool) +
 **one** article fetch + decode, independent of track length: the integration
 test asserts the server has received exactly one `BODY` when the first chunk
-arrives on a three-segment track. A mid-track seek on a cold cache instead
-walks every earlier segment first (TTFB grows with the seek position):
-`PlayInput` carries only message-ids, so without NZB segment sizes the play
-path cannot know which article covers an offset — covering-segment fetch is
-a follow-up once ingest exposes per-segment byte ranges. An integration test
-pins the current prefix cost. Staging p95 numbers are owned by Analytics
-Engine monitoring (`PlayStart` → first-byte events) once deployed.
+arrives on a three-segment track. A mid-track seek on a cold cache gets the
+same one-`BODY` TTFB when `PlayInput::segment_ranges` carries the NZB
+per-segment byte ranges: the article covering the range start is fetched
+first, the skipped prefix is backfilled by `finalize` in file order (the
+multipart staging still only ever receives the contiguous prefix, so the
+5 MiB part coalescing and the one-part-plus-one-segment memory bound are
+unchanged), and the whole track still lands in cache. Without ranges — or
+with ranges that fail validation (wrong arity, gaps, non-zero start) — the
+play path keeps the prefix walk: it walks every earlier segment first and
+TTFB grows with the seek position. Integration tests pin both costs (one
+`BODY` vs the whole prefix) and byte-identical output. Staging p95 numbers
+are owned by Analytics Engine monitoring (`PlayStart` → first-byte events)
+once deployed.
 
 CI (`.github/workflows/ci.yml`, job `rust`, required through `ci-ok`) runs
 fmt, clippy `-D warnings` and every test; the integration test asserts the

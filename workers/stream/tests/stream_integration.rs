@@ -232,6 +232,7 @@ fn input<'a>(
         range,
         server_addr: server.addr,
         segments,
+        segment_ranges: None,
         cipher_key: CIPHER_KEY,
         now_unix: NOW_UNIX,
         up_next,
