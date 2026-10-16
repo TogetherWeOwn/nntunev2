@@ -72,8 +72,11 @@ behaviour.
   keep waiting in 5 s chunks), and no flight is led while a superseded leader
   is still fetching unless it is itself a replacement. So a stalled key runs
   at most **two upstream fetches at once**, however many callers pile up,
-  and no waiter hangs behind a wedged leader. When the original leader
-  succeeds first, its result goes to the replacement's waiters too: the first
+  and no waiter hangs behind a single wedged leader. If the replacement also
+  stalls, its waiters can wait indefinitely in 5 s chunks (there is no overall
+  deadline) until either fetch settles; callers needing a hard bound must add
+  their own. When the original leader succeeds first, its result goes to the
+  replacement's waiters too: the first
   success of the chain is the one every waiter takes. An error stays with the
   flight that produced it, so the original's failure never fails callers
   parked on a replacement that is still fetching. (The NNTP client's 10 s
@@ -89,9 +92,11 @@ behaviour.
 - SWR windows (`src/cache.rs`): `CACHE_FRESH_TTL_SECS = 300` serves `HIT`
   with no revalidation; the next `CACHE_SWR_WINDOW_SECS = 3_600` serves
   `STALE` immediately while flagging `needs_revalidate` — to exactly one
-  reader per stale entry, via `try_begin_revalidate` (the claim releases
-  when the rewrite lands, or via `finish_revalidate` after a failed
-  attempt). Freshness is stamped per track, so deduplicated blobs never
+  reader per stale entry, via `try_begin_revalidate` (an abandoned claim
+  expires after `REVALIDATE_CLAIM_TTL_SECS = 300`; retain the acquisition
+  timestamp when calling `finish_revalidate` so a late owner cannot release a
+  newer claim). The claim also releases when the rewrite lands. Freshness is
+  stamped per track, so deduplicated blobs never
   restamp a peer track. Past both windows the entry is a `MISS` and the
   play path re-fetches upstream. Cache writes are stamped with the play
   time on `finalize`, so the SWR clock runs from when the bytes were
