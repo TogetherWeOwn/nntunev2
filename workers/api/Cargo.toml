@@ -29,7 +29,7 @@ url = "2"
 subtle = "2"
 # WebAuthn signature verification (pure-Rust, wasm32-compatible):
 # ES256 (COSE alg -7) and EdDSA (COSE alg -8) credential public keys.
-p256 = { version = "0.13", default-features = false, features = ["alloc", "arithmetic", "ecdsa"] }
+p256 = { version = "0.14", default-features = false, features = ["alloc", "arithmetic", "ecdsa"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
 # Worker HTTP + Hyperdrive entry (same versions as workers/mb). These
 # compile natively so `cargo test` keeps covering the core handlers;
