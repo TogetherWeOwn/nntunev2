@@ -1,6 +1,9 @@
 # Rust
 /target/
 **/target/
+# Standalone worker crates build outside the parent workspace.
+/workers/api/target/
+/workers/ingest/target/
 **/*.rs.bk
 Cargo.lock
 .cargo/
