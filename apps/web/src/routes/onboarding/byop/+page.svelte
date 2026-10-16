@@ -175,7 +175,10 @@
 			<label>Hostname <input data-testid="byop-host" name="host" required autocomplete="off" bind:value={host} /></label>
 			<label>
 				Port
-				<input data-testid="byop-port" name="port" type="number" min="1" max="65535" required bind:value={port} />
+				<select data-testid="byop-port" name="port" required bind:value={port}>
+					<option value={119}>119 (plaintext NNTP)</option>
+					<option value={563}>563 (TLS)</option>
+				</select>
 			</label>
 			<label><input data-testid="byop-tls" name="tls" type="checkbox" bind:checked={tls} /> Use TLS</label>
 			{#if !tls}
