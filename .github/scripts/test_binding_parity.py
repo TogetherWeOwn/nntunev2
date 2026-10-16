@@ -615,6 +615,40 @@ reason = "fixture: value fix owned elsewhere"
             self.assertIn("::error::binding-parity:", output.getvalue())
             self.assertNotIn("Traceback", output.getvalue())
 
+    def assert_wrangler_fails_closed_with_exit_two(self, wrangler):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp, wrangler=wrangler)
+            with self.assertRaises(ParityError):
+                run_check(root)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(2, main(["--root", str(root)]))
+            self.assertIn("::error::binding-parity:", output.getvalue())
+            self.assertNotIn("Traceback", output.getvalue())
+
+    def test_present_assets_or_unknown_binding_must_be_non_empty_string(self):
+        for binding_value in ('""', "0"):
+            with self.subTest(table="assets", binding_value=binding_value):
+                self.assert_wrangler_fails_closed_with_exit_two(
+                    MATCHING_WRANGLER
+                    + f"\n[assets]\nbinding = {binding_value}\n"
+                )
+            with self.subTest(table="unknown", binding_value=binding_value):
+                self.assert_wrangler_fails_closed_with_exit_two(
+                    MATCHING_WRANGLER
+                    + "\n[[env.staging.vectorize]]\n"
+                    + f"binding = {binding_value}\nindex_name = \"fx-index\"\n"
+                )
+
+    def test_bindingless_assets_and_unknown_table_remain_ignored(self):
+        wrangler = MATCHING_WRANGLER + (
+            '\n[assets]\ndirectory = "./public"\n'
+            '\n[[env.staging.vectorize]]\nindex_name = "fx-index"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            drifts, _, _ = run_check(make_repo(tmp, wrangler=wrangler))
+        self.assertEqual([], drifts)
+
     def test_non_string_queue_consumer_fails_closed_with_exit_two(self):
         wrangler = MATCHING_WRANGLER + (
             '\n[env.staging.queues]\n'

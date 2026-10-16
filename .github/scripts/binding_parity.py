@@ -175,7 +175,7 @@ def extract_bindings(data):
     for item in durable_objects.get("bindings", []):
         add(_entry("durable_objects.bindings", item, "durable_object", "name"))
     assets = data.get("assets")
-    if isinstance(assets, dict) and assets.get("binding"):
+    if isinstance(assets, dict) and "binding" in assets:
         add(_entry("assets", assets, "assets", "binding"))
     # Fail closed on binding-shaped tables this script does not model
     # (a new Cloudflare binding kind): surface them as unknown types so
@@ -185,15 +185,16 @@ def extract_bindings(data):
             continue
         candidates = value if isinstance(value, list) else [value]
         for item in candidates:
-            if isinstance(item, dict) and item.get("binding"):
-                if not isinstance(item["binding"], str):
+            if isinstance(item, dict) and "binding" in item:
+                binding = item["binding"]
+                if not isinstance(binding, str) or not binding:
                     raise ParityError(
-                        f"{key}: 'binding' must be a string (unknown:{key})"
+                        f"{key}: 'binding' must be a non-empty string (unknown:{key})"
                     )
                 add(
                     {
                         "type": f"unknown:{key}",
-                        "binding": item["binding"],
+                        "binding": binding,
                         "resource": None,
                         "declared": False,
                     }
