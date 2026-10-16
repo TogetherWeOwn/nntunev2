@@ -61,8 +61,8 @@ jobs:
       # (2026-08-06); re-pin deliberately, never float.
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
-          targets: wasm32-unknown-unknown
           components: clippy
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Scalar core (no transport features) and the Workers transport build.
       - run: cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
@@ -71,8 +71,9 @@ jobs:
       # Wasm SIMD; the deploy enables it via this RUSTFLAGS).
       - run: RUSTFLAGS="-C target-feature=+simd128" cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
       # The stream Worker entry (NntpPool Durable Object) only compiles on
-      # wasm32: lint it on the target it deploys to. This also verifies the
-      # native-only stampede guard remains cfg'd out on the Worker target.
+      # wasm32: check and lint it on the target it deploys to. This also
+      # verifies the native-only stampede guard remains cfg'd out.
+      - run: cargo check -p nntune-stream --target wasm32-unknown-unknown
       - run: cargo clippy -p nntune-stream --target wasm32-unknown-unknown -- -D warnings
 
   # Public-repo hygiene: fail on internal tracker ids (TOG-<digits>),

@@ -26,11 +26,12 @@
 //! - `stampede` (native only, compiled out on wasm32): singleflight
 //!   stampede-guard primitive (one upstream fetch per concurrent segment)
 //!   with waiter-timeout re-election. Not yet wired into the play path.
+//! - [`routes`]: fail-closed public fetch and probe routing decisions, natively
+//!   tested and rendered by the wasm32 [`runtime`] adapter.
 //!
 //! Cloudflare bindings (DO storage, R2, Analytics Engine) are wired in
-//! `workers/stream/wrangler.toml`. The Workers entry (`runtime`, wasm32
-//! only) exports the `NntpPool` Durable Object with its probe route; the
-//! play-path routes arrive with the runtime adapter slice. Native builds
+//! `workers/stream/wrangler.toml`. The Workers entry (`runtime`, wasm32 only)
+//! exports the `NntpPool` Durable Object with its probe route. Native builds
 //! and `cargo test` never link the Workers runtime.
 
 pub mod cache;
@@ -43,6 +44,9 @@ pub mod pool;
 pub mod prefetch;
 pub mod probe;
 pub mod range;
+pub mod routes;
+pub mod yenc;
+
 // Native only: the Mutex/Condvar waiter path traps on wasm32-unknown-unknown
 // (and a single-threaded isolate cannot park a waiter anyway). The Worker
 // entry point gets an async shared-future equivalent; see the module docs.
@@ -50,4 +54,3 @@ pub mod range;
 pub mod runtime;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod stampede;
-pub mod yenc;
