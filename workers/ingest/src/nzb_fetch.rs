@@ -483,8 +483,10 @@ pub fn fetch_nzb(
 /// URL's host and the rejection code, NEVER the full URL (it may embed
 /// credentials or an apikey) and never the path or query. Unparseable
 /// input yields the `invalid` placeholder, which contains no part of the
-/// input. Any whitespace or control character anywhere in the input also
-/// yields `invalid`, so a smuggled newline can never become a log line.
+/// input. Any whitespace or control character anywhere in the input, or a
+/// literal `@` in the path, query, or fragment, also yields `invalid`. This
+/// prevents malformed userinfo from being mistaken for a host and smuggled
+/// newlines from logging.
 pub fn url_host_for_log(url: &str) -> String {
     const PLACEHOLDER: &str = "invalid";
     parse_log_host(url).unwrap_or_else(|| PLACEHOLDER.to_string())
@@ -683,6 +685,12 @@ mod tests {
             "https://APIKEY:secret#x@evil.example/path",
             "https://user:SECRET@nzb.example:invalid/x",
             "https://user:SECRET@[2001:db8::1]:+443/x",
+            "https://user:12345/ss@nzb.example/x",
+            "https://apikey/ss@nzb.example/x",
+            "https://apikey:12345/ss@nzb.example/x",
+            "https://apikey/ss@",
+            "https://nzb.example/get?email=a@b",
+            "https://nzb.example/x#section@2",
         ] {
             assert_eq!(
                 url_host_for_log(malformed),
@@ -702,6 +710,16 @@ mod tests {
         assert_eq!(
             url_host_for_log("https://user:SECRET@[2001:db8::1]:443/x"),
             "2001:db8::1"
+        );
+        assert_eq!(
+            url_host_for_log("https://nzb.example/get?email=a%40b"),
+            "nzb.example"
+        );
+        // Fail closed for a legitimate path containing '@'; it must not be
+        // confused with userinfo outside the authority when extracting logs.
+        assert_eq!(
+            url_host_for_log("https://nzb.example/@user/x.nzb"),
+            "invalid"
         );
     }
 }
