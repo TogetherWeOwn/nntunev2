@@ -11,6 +11,7 @@
 /** Every code in the `docs/api-errors.md` registry. */
 export const KNOWN_ERROR_CODES = new Set([
 	'unauthorized',
+	'reauth_required',
 	'provider_auth_expired',
 	'plan_limit_exceeded',
 	'forbidden',
