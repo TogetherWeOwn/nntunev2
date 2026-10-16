@@ -328,13 +328,24 @@ impl<C> Pool<C> {
     /// previous failures are older than [`CIRCUIT_WINDOW_MS`]) and open the
     /// breaker for [`CIRCUIT_OPEN_MS`] once the streak reaches
     /// [`CIRCUIT_FAILURE_THRESHOLD`]. A failure in half-open re-opens for a
-    /// fresh interval without resetting the streak.
+    /// fresh interval without resetting the streak. A failure while open is
+    /// held: the breaker already knows the provider is down, so the streak
+    /// and the window are left alone and the original open interval still
+    /// half-opens for exactly one probe instead of silently closing (a
+    /// window reset here would drop the count to 1 and report Closed).
     pub fn record_provider_error(&mut self) {
-        if self.circuit_state() == CircuitState::HalfOpen {
-            self.reopen_after_probe();
-            return;
+        match self.circuit_state() {
+            CircuitState::HalfOpen => {
+                self.reopen_after_probe();
+            }
+            CircuitState::Open => {
+                // Late failure from a pre-outage lease: hold the open
+                // interval, leave `consecutive_errors`/`window_start_ms` alone.
+            }
+            CircuitState::Closed => {
+                self.record_failure_in_window();
+            }
         }
-        self.record_failure_in_window();
     }
 
     /// Record a provider failure associated with a lease. When that lease is
@@ -415,6 +426,20 @@ impl<C> Pool<C> {
         } else if self.quarantined_until_ms.is_none() {
             self.consecutive_errors = 0;
             self.window_start_ms = None;
+        }
+    }
+
+    /// A first-segment success on `lease_id`: settles only the admitted
+    /// half-open probe (closing the breaker, so recovery still works) and
+    /// leaves a closed-state streak untouched. Mid-track provider failures
+    /// are then counted against the streak the first segment did not erase,
+    /// so a provider that serves segment 0 and dies afterwards still trips
+    /// the breaker. The closed-state streak is cleared only when the play
+    /// completes cleanly (`finalize` success or an `abort` with no failure,
+    /// via [`Pool::record_success_for`]).
+    pub fn record_probe_success_for(&mut self, lease_id: u64) {
+        if self.probe_in_flight() == Some(lease_id) {
+            self.record_success();
         }
     }
 
@@ -852,5 +877,73 @@ mod tests {
             !pool.quarantined(),
             "a closed-state success restarts the streak"
         );
+    }
+
+    #[test]
+    fn late_failure_while_open_holds_the_breaker_for_its_probe() {
+        use super::{CircuitState, PoolError, CIRCUIT_OPEN_MS};
+        let mut pool = TestPool::new(4);
+        // A play that took its lease before the outage fails late, after
+        // the breaker already opened.
+        let stale = pool.try_acquire(Lane::Playback).expect("pre-outage lease");
+        pool.record_provider_error();
+        pool.advance(10_000);
+        pool.record_provider_error();
+        pool.advance(10_000);
+        pool.record_provider_error();
+        assert_eq!(pool.circuit_state(), CircuitState::Open);
+        pool.advance(CIRCUIT_OPEN_MS - 5_000);
+        pool.record_provider_error_for(stale.id);
+        pool.release(stale, None);
+        // The original open interval still half-opens for exactly one probe:
+        // without the Open hold the window reset would drop the streak to 1
+        // and report Closed here, admitting every play to the dead upstream.
+        pool.advance(5_000);
+        assert!(!pool.quarantined());
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+        let probe = pool.try_acquire(Lane::Playback).expect("probe admitted");
+        assert!(
+            matches!(
+                pool.try_acquire(Lane::Playback),
+                Err(PoolError::Quarantined { .. })
+            ),
+            "half-open still admits only one probe"
+        );
+        pool.record_success_for(probe.id);
+        assert_eq!(pool.circuit_state(), CircuitState::Closed);
+        pool.release(probe, None);
+    }
+
+    #[test]
+    fn first_segment_probe_success_only_settles_the_probe() {
+        use super::{CircuitState, CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_OPEN_MS};
+        let mut pool = TestPool::new(4);
+        // Two provider failures on the streak, then a play whose first
+        // segment serves fine: the streak must survive the first segment so
+        // a later mid-track failure still reaches the threshold.
+        pool.record_provider_error();
+        pool.record_provider_error();
+        let lease = pool.try_acquire(Lane::Playback).expect("lease");
+        pool.record_probe_success_for(lease.id);
+        assert_eq!(pool.circuit_state(), CircuitState::Closed);
+        pool.release(lease, None);
+        pool.record_provider_error();
+        assert!(
+            pool.quarantined(),
+            "2 failures + mid-track failure must open the breaker"
+        );
+        assert_eq!(
+            pool.circuit_state(),
+            CircuitState::Open,
+            "streak reaches the threshold"
+        );
+        assert_eq!(CIRCUIT_FAILURE_THRESHOLD, 3);
+        // And a probe's own first segment still closes the breaker.
+        pool.advance(CIRCUIT_OPEN_MS);
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+        let probe = pool.try_acquire(Lane::Playback).expect("probe admitted");
+        pool.record_probe_success_for(probe.id);
+        assert_eq!(pool.circuit_state(), CircuitState::Closed);
+        pool.release(probe, None);
     }
 }

@@ -288,7 +288,12 @@ pub fn play_with_timeouts(
             ))
         }
     };
-    pool.record_success_for(lease.id);
+    // The first segment proves the provider answered, but it must not wipe
+    // the closed-state streak: only the admitted half-open probe closes the
+    // breaker here, so repeated mid-track provider failures still reach the
+    // threshold. The streak clears when the play completes cleanly
+    // (`finalize` success or an `abort` with no failure).
+    pool.record_probe_success_for(lease.id);
     let mut live = Live {
         client,
         lease,
@@ -661,6 +666,13 @@ impl PlayStream {
                 pool.record_provider_error_for(lease.id);
             } else if non_provider_result {
                 pool.record_non_provider_result_for(lease.id);
+            } else {
+                // Clean abort: the first segment served fine and nothing
+                // failed afterwards, so this play completed without
+                // indicting the provider. Clear a closed-state streak (a
+                // stale lease still can never close an open breaker or
+                // release another play's probe).
+                pool.record_success_for(lease.id);
             }
             pool.release(lease, (!provider_failure).then_some(client));
         }

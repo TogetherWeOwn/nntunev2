@@ -1163,7 +1163,7 @@ fn corrupt_later_segment_fails_the_stream_without_quarantine() {
 }
 
 #[test]
-fn first_segment_success_clears_the_streak_before_abort() {
+fn clean_abort_clears_the_streak_after_first_segment() {
     use nntune_stream::pool::{CircuitState, CIRCUIT_FAILURE_THRESHOLD};
 
     let (_, segments, articles) = fixture_track("abort-clear", 20_000, 10_000);
@@ -1184,9 +1184,9 @@ fn first_segment_success_clears_the_streak_before_abort() {
     }
     assert!(!pool.quarantined());
 
-    // First-segment success records success before the stream exists, so an
-    // abort (which records neither success nor failure) still leaves a clear
-    // streak.
+    // The first segment settles only a half-open probe, so it leaves the
+    // closed-state streak alone; the clean abort (no failure recorded) is
+    // what clears the streak.
     let token = grant_for("track-abort");
     let inp = input(&token, "track-abort", None, &server, &segments, None);
     let resp = play(&mut pool, &mut cache, &mut meter, SECRET, &inp).expect("first segment ok");
@@ -1197,7 +1197,7 @@ fn first_segment_success_clears_the_streak_before_abort() {
     assert_eq!(
         pool.circuit_state(),
         CircuitState::Closed,
-        "first-segment success must clear the streak before abort"
+        "a clean abort must clear the streak after the first segment"
     );
     assert_eq!((pool.in_use(), pool.idle()), (0, 1));
     assert!(
@@ -1222,7 +1222,7 @@ fn first_segment_success_clears_the_streak_before_abort() {
 
 #[test]
 fn abort_after_a_failed_segment_records_the_provider_failure() {
-    use nntune_stream::pool::CIRCUIT_FAILURE_THRESHOLD;
+    use nntune_stream::pool::{CircuitState, CIRCUIT_FAILURE_THRESHOLD};
 
     let (_, segments, articles) = fixture_track("abort-fail", 30_000, 10_000);
     assert_eq!(segments.len(), 3);
@@ -1254,26 +1254,68 @@ fn abort_after_a_failed_segment_records_the_provider_failure() {
         "the dropped connection is a provider failure"
     );
     stream.abort(&mut pool);
-    // The first-segment success cleared the pre-seeded streak, so the aborted
-    // failure is streak 1 of a fresh streak: two more provider failures must
-    // open the breaker. Without abort settlement the streak would sit at 2.
-    assert!(!pool.quarantined());
-    for _ in 0..(CIRCUIT_FAILURE_THRESHOLD - 1) {
-        let token = grant_for("track-abort-fail");
-        let mut inp = input(&token, "track-abort-fail", None, &server, &segments, None);
-        inp.server_addr = dead;
-        assert!(matches!(
-            play(&mut pool, &mut cache, &mut meter, SECRET, &inp),
-            Err(PlayError::Upstream(_))
-        ));
-    }
+    // The first segment no longer clears the pre-seeded streak, so the
+    // aborted mid-track failure is the third consecutive provider failure
+    // and opens the breaker immediately.
     assert!(
         pool.quarantined(),
         "aborting after a provider failure must count toward the breaker"
     );
+    assert_eq!(pool.circuit_state(), CircuitState::Open);
+    // Further plays fail fast without dialing the dead upstream.
+    let token = grant_for("track-abort-fail");
+    let mut inp = input(&token, "track-abort-fail", None, &server, &segments, None);
+    inp.server_addr = dead;
+    assert!(matches!(
+        play(&mut pool, &mut cache, &mut meter, SECRET, &inp),
+        Err(PlayError::PoolQuarantined { .. })
+    ));
     assert_eq!((pool.in_use(), pool.idle()), (0, 0));
     assert!(
         cache.get_track("track-abort-fail").is_none(),
         "abort must not cache"
+    );
+}
+
+#[test]
+fn repeated_mid_track_failures_open_the_breaker() {
+    use nntune_stream::pool::{CircuitState, CIRCUIT_FAILURE_THRESHOLD};
+
+    let (_, segments, articles) = fixture_track("mid-track", 30_000, 10_000);
+    assert_eq!(segments.len(), 3);
+    // The provider serves the first segment, then hangs up mid-track.
+    let server = FakeNntp::start_closing_after(articles, 1);
+    let mut pool: StreamPool = Pool::new(4);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+
+    for i in 1..=CIRCUIT_FAILURE_THRESHOLD {
+        let token = grant_for("track-mid");
+        let inp = input(&token, "track-mid", None, &server, &segments, None);
+        let resp = play(&mut pool, &mut cache, &mut meter, SECRET, &inp)
+            .expect("segment 0 serves before the mid-track failure");
+        let (partial, stream) = drain_to_vec(resp.stream);
+        assert!(!partial.is_empty(), "segment 0 streams before the failure");
+        assert!(
+            matches!(stream.error(), Some(PlayError::Upstream(_))),
+            "the dropped connection is a provider failure"
+        );
+        assert!(
+            matches!(
+                stream.finalize(&mut pool, &mut cache, &mut meter),
+                Err(PlayError::Upstream(_))
+            ),
+            "mid-track provider failure surfaces on finalize"
+        );
+        assert_eq!(
+            pool.quarantined(),
+            i == CIRCUIT_FAILURE_THRESHOLD,
+            "the breaker opens exactly at the threshold of mid-track failures"
+        );
+    }
+    assert_eq!(pool.circuit_state(), CircuitState::Open);
+    assert!(
+        cache.get_track("track-mid").is_none(),
+        "failed plays must not cache"
     );
 }
