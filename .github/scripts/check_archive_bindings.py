@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Archive reservation guard: no Worker may bind an archive R2 bucket.
 
-Parses Wrangler TOML manifests under ``workers/`` and ``apps/`` and fails
+Parses Wrangler TOML manifests repo-wide and fails
 if any R2 binding (top-level or a per-environment override) points at an
 archive bucket. Wrangler manifests with unsupported formats are rejected
 until the guard can parse them. Archive buckets are reserved capacity with
@@ -30,33 +30,37 @@ class ManifestError(Exception):
 def archive_bindings(repo_root: Path) -> list[tuple[Path, str]]:
     """Return ``(manifest, bucket_name)`` pairs targeting archive buckets."""
     hits: list[tuple[Path, str]] = []
-    manifest_count = 0
     for root in SCAN_ROOTS:
         base = repo_root / root
         if not base.is_dir():
             raise ManifestError(f"required scan root is missing: {base}")
-        candidates = sorted(path for path in base.rglob("wrangler*") if path.is_file())
-        manifests = [
-            path
-            for path in candidates
-            if path.name.endswith(SUPPORTED_MANIFEST_SUFFIXES)
-        ]
-        unsupported = [path for path in candidates if path not in manifests]
-        if unsupported:
-            paths = ", ".join(str(path) for path in unsupported)
-            raise ManifestError(
-                f"unsupported Wrangler manifest(s): {paths}; "
-                "use a TOML manifest until this format is supported"
-            )
-        manifest_count += len(manifests)
-        for manifest in manifests:
-            hits.extend(
-                (manifest, bucket)
-                for bucket in _bucket_names(manifest)
-                if "archive" in bucket.lower()
-            )
-    if not manifest_count:
+    # Scan repo-wide so an effective manifest outside the expected roots
+    # (e.g. repo-root or crates/x wrangler.toml) cannot bypass the guard.
+    candidates = sorted(
+        path
+        for path in repo_root.rglob("wrangler*")
+        if path.is_file() and ".git/" not in path.as_posix()
+    )
+    manifests = [
+        path
+        for path in candidates
+        if path.name.endswith(SUPPORTED_MANIFEST_SUFFIXES)
+    ]
+    unsupported = [path for path in candidates if path not in manifests]
+    if unsupported:
+        paths = ", ".join(str(path) for path in unsupported)
+        raise ManifestError(
+            f"unsupported Wrangler manifest(s): {paths}; "
+            "use a TOML manifest until this format is supported"
+        )
+    if not manifests:
         raise ManifestError("no Wrangler TOML manifests were scanned")
+    for manifest in manifests:
+        hits.extend(
+            (manifest, bucket)
+            for bucket in _bucket_names(manifest)
+            if "archive" in bucket.lower()
+        )
     return hits
 
 
