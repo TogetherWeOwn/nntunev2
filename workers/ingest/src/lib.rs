@@ -554,8 +554,14 @@ mod tests {
         );
         let (_, too_many_files_body) =
             intake_rejection_parts(&estimate_nzb(&file_bomb).unwrap_err());
-        assert_eq!(too_many_files_body["file_count"].as_u64().unwrap(), (MAX_FILES + 1) as u64);
-        assert_eq!(too_many_files_body["max_files"].as_u64().unwrap(), MAX_FILES as u64);
+        assert_eq!(
+            too_many_files_body["file_count"].as_u64().unwrap(),
+            (MAX_FILES + 1) as u64
+        );
+        assert_eq!(
+            too_many_files_body["max_files"].as_u64().unwrap(),
+            MAX_FILES as u64
+        );
         // A valid NZB has no rejection at all: it queues.
         assert!(estimate_nzb(crate::fixtures::SMALL_NZB).is_ok());
     }
