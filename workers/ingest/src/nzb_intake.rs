@@ -769,7 +769,10 @@ mod tests {
 
     #[test]
     fn unterminated_doctype_subset_is_malformed_before_counting_elements() {
-        let mut doc = String::from("<?xml?><!DOCTYPE nzb [>");
+        // The `<nzb>` root keeps the NotNzb pre-filter from firing first, so
+        // this pins the well-formedness gate: an unterminated internal subset
+        // must be `Malformed`, never an element count that hides the decoys.
+        let mut doc = String::from("<?xml?><!DOCTYPE nzb [><nzb>");
         for _ in 0..(MAX_SEGMENTS + 1) {
             doc.push_str("<segment>");
         }
