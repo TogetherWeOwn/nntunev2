@@ -54,6 +54,23 @@ struct ApiError {
     error: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct HealthResponse {
+    status: u16,
+    body: &'static str,
+    content_type: &'static str,
+    cache_control: &'static str,
+}
+
+fn health_response() -> HealthResponse {
+    HealthResponse {
+        status: 200,
+        body: r#"{"ok":true}"#,
+        content_type: "application/json",
+        cache_control: "no-store",
+    }
+}
+
 fn json_error(message: &str, status: u16) -> Result<Response> {
     let body = serde_json::to_string(&ApiError {
         error: message.to_string(),
@@ -373,6 +390,15 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Respons
     }
 }
 
+fn healthz() -> Result<Response> {
+    let health = health_response();
+    let headers = worker::Headers::new();
+    headers.append("content-type", health.content_type)?;
+    headers.append("cache-control", health.cache_control)?;
+    Response::from_body(worker::ResponseBody::Body(health.body.as_bytes().to_vec()))
+        .map(|response| response.with_status(health.status).with_headers(headers))
+}
+
 /// Job checkpoint status: validates the id shape before DB wiring lands.
 async fn job_status(_req: &Request, ctx: &RouteContext<()>) -> Result<Response> {
     let id = ctx.param("id").cloned().unwrap_or_default();
@@ -407,6 +433,19 @@ mod tests {
             "page": page,
         })
         .to_string()
+    }
+
+    #[test]
+    fn health_response_is_uncached_json_without_dependencies() {
+        assert_eq!(
+            health_response(),
+            HealthResponse {
+                status: 200,
+                body: r#"{"ok":true}"#,
+                content_type: "application/json",
+                cache_control: "no-store",
+            }
+        );
     }
 
     #[test]
@@ -485,6 +524,7 @@ mod tests {
 #[worker::event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Response> {
     Router::new()
+        .get_async("/healthz", |_, _| async { healthz() })
         .post_async("/v1/ingest/search", |mut req, ctx| async move {
             search(&mut req, &ctx).await
         })

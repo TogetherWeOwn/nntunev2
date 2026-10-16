@@ -294,6 +294,23 @@ fn success_response(body: String, ttl_s: u32) -> ApiResponse {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct HealthResponse {
+    status: u16,
+    body: &'static str,
+    content_type: &'static str,
+    cache_control: &'static str,
+}
+
+fn health_response() -> HealthResponse {
+    HealthResponse {
+        status: 200,
+        body: r#"{"ok":true}"#,
+        content_type: "application/json",
+        cache_control: "no-store",
+    }
+}
+
 /// Lookup core: validate → KV → DB. Only a found row is written to the
 /// cache; missing rows (404) and read failures (500) never are.
 async fn handle_lookup<R: MbRepo, C: SuccessCache>(
@@ -562,6 +579,18 @@ mod http_layer {
         serve(req.url()?.to_string(), api).await
     }
 
+    pub fn healthz_route() -> WorkerResult<Response> {
+        let health = health_response();
+        let headers = Headers::new();
+        headers.append("content-type", health.content_type)?;
+        headers.append("cache-control", health.cache_control)?;
+        Ok(
+            Response::from_body(ResponseBody::Body(health.body.as_bytes().to_vec()))?
+                .with_status(health.status)
+                .with_headers(headers),
+        )
+    }
+
     pub async fn search_route(req: &Request, ctx: &RouteContext<()>) -> WorkerResult<Response> {
         if let Some(hit) = edge_hit(req).await {
             return Ok(hit);
@@ -595,6 +624,7 @@ pub async fn main(
     _ctx: worker::Context,
 ) -> worker::Result<worker::Response> {
     worker::Router::new()
+        .get_async("/healthz", |_, _| async { http_layer::healthz_route() })
         .get_async("/v1/mb/artist/:mbid", |req, ctx| async move {
             http_layer::lookup_route(Kind::Artist, &req, &ctx).await
         })
@@ -699,6 +729,19 @@ mod tests {
             label: format!("Hit {n}"),
             score: 1.0 - (n as f32 / 100.0),
         }
+    }
+
+    #[test]
+    fn health_response_is_uncached_json_without_dependencies() {
+        assert_eq!(
+            health_response(),
+            HealthResponse {
+                status: 200,
+                body: r#"{"ok":true}"#,
+                content_type: "application/json",
+                cache_control: "no-store",
+            }
+        );
     }
 
     #[test]
