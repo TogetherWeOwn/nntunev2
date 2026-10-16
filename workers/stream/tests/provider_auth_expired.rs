@@ -1,4 +1,4 @@
-//! S7 RED: forced NNTP 481/482 on the miss path must surface the
+//! S7 RED: forced NNTP 480/481 on the miss path must surface the
 //! documented `provider_auth_expired` code as an inline re-auth signal,
 //! never a quarantined outage and never credential material.
 
@@ -118,13 +118,16 @@ impl Drop for AuthRejectingNntp {
 }
 
 #[test]
-fn fake_481_482_replies_drive_play_to_provider_auth_expired_without_quarantine() {
-    // Mutant-killing: real 481/482 status lines travel through
+fn fake_480_481_replies_drive_play_to_provider_auth_expired_without_quarantine() {
+    // Mutant-killing: real 480/481 status lines travel through
     // NntpClient::article -> play. Mapping either code to any other
-    // NntpError/PlayError (or quarantining on it) fails this test.
+    // NntpError/PlayError, quarantining on it, or parking the stale
+    // connection warm (idle != 0 / reused on the second play) fails here.
+    // 480 is the standard BODY reply for a no-longer-authenticated
+    // session; 482 on BODY is out-of-sequence and is covered separately.
     for reply in [
+        "480 authentication required\r\n",
         "481 authentication rejected\r\n",
-        "482 authentication required\r\n",
     ] {
         let server = AuthRejectingNntp::start(reply);
         let mut pool: StreamPool = Pool::new(4);
@@ -142,25 +145,44 @@ fn fake_481_482_replies_drive_play_to_provider_auth_expired_without_quarantine()
             now_unix: 1_700_000_000,
             up_next: None,
         };
-        // PlayResponse is not Debug, so no expect_err here.
-        let err = match play(&mut pool, &mut cache, &mut meter, SECRET, &input) {
-            Ok(_) => panic!("stale credentials must fail the play"),
-            Err(e) => e,
-        };
-        assert_eq!(
-            err,
-            PlayError::ProviderAuthExpired,
-            "reply {reply:?} must surface as the re-auth signal"
-        );
-        assert_eq!(err.code(), "provider_auth_expired");
-        assert!(
-            !pool.quarantined(),
-            "reply {reply:?}: stale creds are not a provider outage"
-        );
-        assert!(
-            !meter.has_kind(MeterKind::ProviderError),
-            "reply {reply:?}: no provider-error metering on the re-auth path"
-        );
-        assert_eq!(pool.in_use(), 0, "the lease is returned after settle");
+        // Two plays against the same pool: the stale connection must be
+        // dropped, never parked warm and reused.
+        for play_no in 1..=2 {
+            // PlayResponse is not Debug, so no expect_err here.
+            let err = match play(&mut pool, &mut cache, &mut meter, SECRET, &input) {
+                Ok(_) => panic!("stale credentials must fail the play"),
+                Err(e) => e,
+            };
+            assert_eq!(
+                err,
+                PlayError::ProviderAuthExpired,
+                "reply {reply:?} play {play_no} must surface as the re-auth signal"
+            );
+            assert_eq!(err.code(), "provider_auth_expired");
+            assert!(
+                !pool.quarantined(),
+                "reply {reply:?} play {play_no}: stale creds are not a provider outage"
+            );
+            assert!(
+                !meter.has_kind(MeterKind::ProviderError),
+                "reply {reply:?} play {play_no}: no provider-error metering on the re-auth path"
+            );
+            assert_eq!(pool.in_use(), 0, "the lease is returned after settle");
+            assert_eq!(
+                pool.idle(),
+                0,
+                "reply {reply:?} play {play_no}: the stale connection must be dropped, not parked warm"
+            );
+            assert_eq!(
+                pool.connects(),
+                play_no,
+                "reply {reply:?}: every play dials a fresh connection"
+            );
+            assert_eq!(
+                pool.reuses(),
+                0,
+                "reply {reply:?}: no warm reuse of a stale session"
+            );
+        }
     }
 }

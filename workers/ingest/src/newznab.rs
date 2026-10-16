@@ -9,19 +9,24 @@
 //! - [`redact_api_key`] scrubs the key for logs. Log the redacted URL only.
 //! - `http://` indexer URLs are refused: the key would travel in cleartext.
 
-/// Documented worker/API error code for stale provider credentials (S7).
-/// Shared verbatim with `nntune-core`, `workers/api` and `workers/stream`:
-/// the API worker returns this code with HTTP 401 and the web app renders an
-/// inline re-auth prompt on it. Safe to log and to return in error bodies.
-pub const PROVIDER_AUTH_EXPIRED_CODE: &str = "provider_auth_expired";
+/// Documented worker/API error code for a stale *indexer* API key (S7).
+/// Deliberately distinct from the NNTP provider's `provider_auth_expired`
+/// (`nntune-core`, `workers/api`, `workers/stream`): the two secrets are
+/// fixed through different prompts, and provider rotation preserves the
+/// indexer key verbatim. The web app answers this code with copy asking
+/// for the indexer API key, never the provider password. Safe to log and
+/// to return in error bodies.
+pub const INDEXER_AUTH_EXPIRED_CODE: &str = "indexer_auth_expired";
 
-/// True when an indexer/provider HTTP status means the stored credential is
-/// stale and the user must re-authenticate (S7). Only 401/403 map here —
-/// every other status stays a generic failure that must not trigger the
-/// re-auth prompt. The caller returns [`PROVIDER_AUTH_EXPIRED_CODE`] with
-/// HTTP 401 and MUST NOT include the key, the URL, or the upstream body.
-pub fn is_provider_auth_failure(http_status: u16) -> bool {
-    matches!(http_status, 401 | 403)
+/// True when an indexer HTTP status means the stored API key was rejected
+/// and the user must re-enter it (S7). Only 401 maps here: 403 from an
+/// indexer is routinely a rate limit, WAF, or blocked account rather than
+/// a bad key, so it must not trigger a credential prompt. Every other
+/// status stays a generic failure. The caller returns
+/// [`INDEXER_AUTH_EXPIRED_CODE`] and MUST NOT include the key, the URL, or
+/// the upstream body.
+pub fn is_indexer_auth_failure(http_status: u16) -> bool {
+    http_status == 401
 }
 
 /// Newznab search caps for one request.

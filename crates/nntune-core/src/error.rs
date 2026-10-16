@@ -3,8 +3,8 @@
 use std::{fmt, io};
 
 /// Documented worker/API error code for stale provider credentials (S7).
-/// Every worker path that observes an NNTP `481`/`482` (or an indexer HTTP
-/// 401/403) maps to this code; the web app renders an inline re-auth prompt
+/// Every NNTP path that observes `480`/`481` (or `482` on `AUTHINFO`) maps
+/// to this code; the web app renders an inline re-auth prompt
 /// on it instead of a generic error page. The code is safe to log and to
 /// return in error bodies: it carries no credential material.
 pub const PROVIDER_AUTH_EXPIRED_CODE: &str = "provider_auth_expired";
@@ -15,8 +15,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Every failure this crate can report. Transport I/O surfaces as
 /// [`Error::Io`]; NNTP protocol failures carry their numeric reply code.
 ///
-/// `Debug` is manual, not derived: the [`Error::AuthFailed`] payload is
-/// attacker-influenced server reply text that may carry reflected
+/// `Debug` is manual, not derived: the [`Error::AuthFailed`] and
+/// [`Error::NoPermission`] payloads are attacker-influenced server reply
+/// text from the auth exchange that may carry reflected
 /// credential material, so `{:?}` must redact it exactly like `Display`
 /// does (threat-model §3/§6; precedent: redacted `Debug` for credential
 /// configs in `workers/api/src/vault.rs`).
@@ -26,9 +27,12 @@ pub enum Error {
     Io(io::Error),
     /// Unexpected NNTP reply: (numeric code, human-readable text).
     NntpReply { code: u16, text: String },
-    /// Server rejected our credentials (`481`/`482`) or demands auth first.
+    /// Server rejected our credentials (`480`/`481`, `482` on `AUTHINFO`)
+    /// or demands auth first.
     AuthFailed(String),
     /// Server refused the command (`502`: no permission / access denied).
+    /// Deliberately NOT an auth-failure signal: `502` also covers service
+    /// unavailability, so it must not trigger the re-auth prompt.
     NoPermission(String),
     /// Article does not exist (`430`).
     ArticleNotFound(String),
@@ -62,7 +66,9 @@ impl fmt::Debug for Error {
                 .finish(),
             // Redacted: never print the server reply text (see enum docs).
             Error::AuthFailed(_) => f.debug_tuple("AuthFailed").field(&"<redacted>").finish(),
-            Error::NoPermission(t) => f.debug_tuple("NoPermission").field(t).finish(),
+            // Redacted like AuthFailed: 502 replies inside the auth
+            // exchange are the same attacker-influenced reply text.
+            Error::NoPermission(_) => f.debug_tuple("NoPermission").field(&"<redacted>").finish(),
             Error::ArticleNotFound(id) => f.debug_tuple("ArticleNotFound").field(id).finish(),
             Error::Malformed(r) => f.debug_tuple("Malformed").field(r).finish(),
             Error::CrcMismatch {
@@ -102,8 +108,8 @@ impl Error {
         }
     }
 
-    /// True when the provider rejected our credentials (`481`/`482`) or
-    /// demands auth first. The caller must surface
+    /// True when the provider rejected our credentials (`480`/`481`, or
+    /// `482` on `AUTHINFO`) or demands auth first. The caller must surface
     /// [`PROVIDER_AUTH_EXPIRED_CODE`] (HTTP 401) with no credential material.
     pub fn is_auth_failure(&self) -> bool {
         matches!(self, Error::AuthFailed(_))
@@ -123,7 +129,7 @@ impl fmt::Display for Error {
                 f,
                 "NNTP authentication failed: {PROVIDER_AUTH_EXPIRED_CODE}"
             ),
-            Error::NoPermission(t) => write!(f, "NNTP permission denied: {t}"),
+            Error::NoPermission(_) => write!(f, "NNTP permission denied: <redacted>"),
             Error::ArticleNotFound(id) => write!(f, "article not found: {id}"),
             Error::Malformed(r) => write!(f, "malformed input: {r}"),
             Error::CrcMismatch {

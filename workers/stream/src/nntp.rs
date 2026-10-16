@@ -21,11 +21,15 @@ pub enum NntpError {
     Io(String),
     NoSuchArticle(String),
     UnexpectedResponse(String),
-    /// The provider rejected our credentials (`481`/`482` on `BODY`).
+    /// The provider rejected our credentials, or the session is no longer
+    /// authenticated (`480`/`481` on `BODY`; RFC 4643 reserves `481`/`482`
+    /// for `AUTHINFO`, and a `482` on `BODY` is out-of-sequence — a generic
+    /// protocol error, deliberately not mapped here).
     /// Stale credentials are a re-auth signal, not an outage: this must not
     /// quarantine the pool (see [`NntpError::is_provider_failure`]) and the
     /// play path maps it to `provider_auth_expired`, never to a missing
-    /// article. Carries no credential material.
+    /// article — but the connection itself is stale and is dropped, never
+    /// parked warm for reuse. Carries no credential material.
     AuthExpired,
     /// The segment id failed RFC 5536 validation and was never sent.
     InvalidMessageId(String),
@@ -34,7 +38,7 @@ pub enum NntpError {
 impl NntpError {
     /// True when the provider (or the connection to it) is unhealthy, as
     /// opposed to one article being gone (`430`/`423`), stale credentials
-    /// (`481`/`482` → re-auth prompt, not an outage), or one id being
+    /// (`480`/`481` → re-auth prompt, not an outage), or one id being
     /// malformed, which say nothing about the provider and must not
     /// quarantine the user's pool.
     pub fn is_provider_failure(&self) -> bool {
@@ -128,10 +132,12 @@ impl NntpClient {
                 body.push(b'\n');
             }
             Ok(body)
-        } else if status.starts_with("481") || status.starts_with("482") {
-            // Stale provider credentials: re-auth signal, never a missing
-            // article (a previous revision mapped 482 here). No credential
-            // material is retained: the status line is dropped.
+        } else if status.starts_with("480") || status.starts_with("481") {
+            // Session no longer authenticated (480, the standard BODY
+            // reply) or credentials rejected (481): re-auth signal, never
+            // a missing article. 482 here is out-of-sequence and stays a
+            // generic protocol error below. No credential material is
+            // retained: the status line is dropped.
             Err(NntpError::AuthExpired)
         } else if status.starts_with("430") || status.starts_with("423") {
             Err(NntpError::NoSuchArticle(message_id.to_string()))

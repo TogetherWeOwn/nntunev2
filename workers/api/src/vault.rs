@@ -640,17 +640,24 @@ pub fn rewrap_dek(
     })
 }
 
-/// Rotate the provider credential in place without dropping the user session.
+/// Rotate the provider credential in place. Helper only in this slice:
+/// no Worker entry route calls this yet (`workers/api/src/lib.rs` — the
+/// HTTP wiring is a follow-up). This function never reads or writes
+/// session state: the user session is an HMAC-signed cookie independent of
+/// the vault row, so a vault write cannot revoke it.
 ///
-/// The session is an HMAC-signed cookie independent of the vault row, so a
-/// vault write never revokes it — but this helper makes the contract explicit
-/// and testable:
+/// The contract:
 /// - proves ownership of the old credential by decrypting `old_blob` (fails
 ///   closed when the caller cannot read the row they claim to rotate);
-/// - binds the provider identity (`host`, `username`) to the *decrypted
-///   stored row*, never to a caller-supplied "old" config: a `new_config`
-///   naming a different host or username is rejected — a different provider
-///   is a fresh save (`vault.update`), not a rotation;
+/// - binds the full retained endpoint — `host`, `username`, and every
+///   retained transport field (`port`, `tls`, `max_connections`,
+///   `allow_insecure_plaintext`) — to the *decrypted stored row*, never to
+///   a caller-supplied "old" config: a `new_config` differing in any of
+///   them is rejected, so the endpoint a caller test-connects is provably
+///   the endpoint that gets sealed. A different endpoint is a fresh save
+///   (`vault.update`), not a rotation. Fields absent from a legacy flat
+///   row retain nothing, except `allow_insecure_plaintext` whose serde
+///   default (`false`) is its retained value;
 /// - validates `new_config` shape + SSRF guard ([`ProviderConfig::validate`]).
 ///   This does NOT dial the provider: the caller MUST first verify the new
 ///   secret with a real `test connection` (enforcing
@@ -717,7 +724,35 @@ pub fn rotate_provider_credentials(
     if !bound {
         return Err(VaultError::Invalid);
     }
+    // Bind the retained transport fields, so the validated/tested
+    // `new_config` can never diverge from the row actually sealed (a
+    // stored port 80, or a stored 563/TLS row behind a plaintext-tested
+    // new_config, both fail here or in `validate` below).
+    let retained_matches = [
+        provider
+            .get("port")
+            .map(|v| v.as_u64() == Some(u64::from(new_config.port))),
+        provider
+            .get("tls")
+            .map(|v| v.as_bool() == Some(new_config.tls)),
+        provider
+            .get("max_connections")
+            .map(|v| v.as_u64() == Some(u64::from(new_config.max_connections))),
+    ];
+    // Present but divergent (or wrong JSON type): reject. A field absent
+    // from a legacy flat row retains nothing to diverge from.
+    if retained_matches.contains(&Some(false)) {
+        return Err(VaultError::Invalid);
+    }
+    match provider.get("allow_insecure_plaintext") {
+        // Absent means the serde default `false` is retained.
+        Some(v) if v.as_bool() == Some(new_config.allow_insecure_plaintext) => {}
+        None if !new_config.allow_insecure_plaintext => {}
+        _ => return Err(VaultError::Invalid),
+    }
     // Shape + SSRF guard only — no dial (see caller obligations above).
+    // The binding above makes this a validation of the retained row, not
+    // of a throwaway config.
     new_config.validate(dns)?;
     // Replace only the password; preserve the rest of the row verbatim.
     provider.insert(

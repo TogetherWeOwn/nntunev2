@@ -1,14 +1,14 @@
-//! S7 RED: rotation writes the new secret without dropping the user
-//! session; the old credential stops working; the full stored row
-//! (provider fields + indexer secret) survives rotation with only the
-//! password replaced; identity is bound to the decrypted stored row;
+//! S7 RED: rotation writes the new secret; the old credential stops
+//! working; the full stored row (provider fields + indexer secret)
+//! survives rotation with only the password replaced; identity and the
+//! retained transport fields are bound to the decrypted stored row;
 //! no credential material in error bodies.
 //!
 //! `rotate_provider_credentials` performs shape + SSRF validation only —
 //! it does not dial. Verifying the new secret with a real test-connection
 //! (rate-limit + budget gates) is the API entry's job before it calls rotate.
 
-use nntune_api::{session, vault};
+use nntune_api::vault;
 use std::net::IpAddr;
 
 struct FakeDns;
@@ -66,14 +66,10 @@ fn seal(plaintext: &[u8]) -> vault::VaultBlob {
 }
 
 #[test]
-fn rotation_keeps_session_swaps_credential_and_preserves_full_row() {
+fn rotation_swaps_credential_and_preserves_full_row() {
     let kek = test_kek();
     let user_id = "user-1";
-    let session_secret = b"test-session-secret-that-is-32-bytes!!".to_vec();
     let now = 1_700_000_000u64;
-
-    // Live session before rotation.
-    let token = session::issue_session(&session_secret, user_id, now, 3600).expect("issue");
 
     // Old credential sealed in the vault as a full provider+indexer row.
     let old_blob = seal(&full_row_plaintext("old-s3cret"));
@@ -111,10 +107,8 @@ fn rotation_keeps_session_swaps_credential_and_preserves_full_row() {
     assert!(new_config.validate(&FakeDns).is_ok());
     assert!(vault::test_attempt_allowed(&[], now));
 
-    // The user session survives the rotation untouched.
-    let claims =
-        session::verify_session(&session_secret, &token, now + 60).expect("session survives");
-    assert_eq!(claims.user_id, user_id);
+    // (The helper takes no session input and returns no session output;
+    // session independence is by signature, not asserted here.)
 
     // Rotation is audited as a rotation, not a generic update.
     assert_eq!(vault::provider_rotation_audit_action(), "vault.rotate");
@@ -244,6 +238,73 @@ fn rotation_preserves_flat_row_extra_fields() {
         back["indexer_api_key"], "flat-indexer-s3cret",
         "flat-row extra fields must survive rotation"
     );
+}
+
+#[test]
+fn rotation_rejects_stored_disallowed_port_even_when_new_config_is_valid() {
+    // Stored row carries port 80 (outside the [119, 563] allowlist); the
+    // new config at 563 validates cleanly. Rotation must still refuse to
+    // reseal the unchecked retained port.
+    let mut row = serde_json::from_slice::<serde_json::Value>(&full_row_plaintext("old-s3cret"))
+        .expect("row json");
+    row["provider"]["port"] = serde_json::json!(80);
+    let old_blob = seal(&serde_json::to_vec(&row).unwrap());
+    let new_config = provider_with_password("new-s3cret-rotated");
+    assert!(
+        new_config.validate(&FakeDns).is_ok(),
+        "the new config alone is valid — only the retained-row binding may reject"
+    );
+    assert!(
+        vault::rotate_provider_credentials(
+            &test_kek(),
+            1,
+            "user-1",
+            &old_blob,
+            &new_config,
+            &FakeDns
+        )
+        .is_err(),
+        "rotation must reject a retained stored port outside the allowlist"
+    );
+}
+
+#[test]
+fn rotation_rejects_transport_divergence_from_stored_row() {
+    // The test-connection a caller runs must target the endpoint that gets
+    // sealed: any port/tls/max_connections/plaintext divergence between
+    // new_config and the stored row is rejected, even when new_config
+    // validates on its own.
+    let old_blob = seal(&full_row_plaintext("old-s3cret"));
+
+    let mut by_port = provider_with_password("new-s3cret-rotated");
+    by_port.port = 119;
+    by_port.tls = false;
+    by_port.allow_insecure_plaintext = true;
+    assert!(
+        by_port.validate(&FakeDns).is_ok(),
+        "divergent endpoint is itself valid — only the binding may reject"
+    );
+    assert!(vault::rotate_provider_credentials(
+        &test_kek(),
+        1,
+        "user-1",
+        &old_blob,
+        &by_port,
+        &FakeDns
+    )
+    .is_err());
+
+    let mut by_max = provider_with_password("new-s3cret-rotated");
+    by_max.max_connections = 8;
+    assert!(vault::rotate_provider_credentials(
+        &test_kek(),
+        1,
+        "user-1",
+        &old_blob,
+        &by_max,
+        &FakeDns
+    )
+    .is_err());
 }
 
 #[test]

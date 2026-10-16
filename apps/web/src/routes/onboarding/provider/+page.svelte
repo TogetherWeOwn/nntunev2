@@ -6,7 +6,11 @@
 		toProviderTestInput,
 		type ProviderTestResult
 	} from '#lib/api/client.js';
-	import { isProviderAuthExpired, reauthPromptFor } from '#lib/provider-reauth.js';
+	import {
+		isIndexerAuthExpired,
+		isProviderAuthExpired,
+		reauthPromptFor
+	} from '#lib/provider-reauth.js';
 	import { validateIndexerUrl, validateProviderConfig } from '#lib/vault-validation.js';
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
@@ -122,7 +126,13 @@
 			// generic error page. The step-3 prompt renders its own password
 			// field (the step-1 form is unmounted by now) so the user re-enters
 			// the password in place; the session stays signed in.
-			if (error instanceof ApiError && isProviderAuthExpired(error)) {
+			if (error instanceof ApiError && isIndexerAuthExpired(error)) {
+				// Wrong secret for the password prompt: name the API key and
+				// point at the indexer step; never mount the password field.
+				testDetail =
+					reauthPromptFor(error.code) ??
+					'Your indexer rejected its API key. Go back to the indexer step and re-enter it.';
+			} else if (error instanceof ApiError && isProviderAuthExpired(error)) {
 				reauthRequired = true;
 				testDetail = reauthPromptFor(error.code) ?? 'Your provider password has expired.';
 			} else {
