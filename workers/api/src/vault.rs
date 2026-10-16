@@ -761,9 +761,13 @@ mod tests {
                 Err(VaultError::Invalid),
                 "decrypt accepted a wrapped nonce of length {len}"
             );
-            assert_eq!(
-                rewrap_dek(&kek, &new_kek, 2, "user-1", &bad_wrap_nonce),
-                Err(VaultError::Invalid),
+            // `VaultBlob` has no `PartialEq`, so match on the error instead
+            // of comparing the whole `Result` with `assert_eq!`.
+            assert!(
+                matches!(
+                    rewrap_dek(&kek, &new_kek, 2, "user-1", &bad_wrap_nonce),
+                    Err(VaultError::Invalid)
+                ),
                 "rewrap accepted a wrapped nonce of length {len}"
             );
 
