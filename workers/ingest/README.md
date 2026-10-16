@@ -53,7 +53,7 @@ NZB upload ───────────────┘                     
     is deny-all, so a worker without the variable answers every fetch URL
     with `nzb_fetch_host_not_allowlisted` (403);
   - resolve ALL DNS records and reject loopback / link-local (including
-    the 169.254.169.254 cloud metadata endpoint) / private / CGNAT /
+    the cloud metadata endpoint) / private / CGNAT /
     multicast / reserved / documentation, v4+v6 including transition
     space (`nzb_fetch_forbidden_address`, 403) — even when the host was
     allowlisted by mistake. IP literals are checked directly, with no DNS

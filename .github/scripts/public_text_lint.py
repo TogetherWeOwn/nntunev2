@@ -106,6 +106,8 @@ HOST_FIXTURE_EXCLUSIONS = frozenset(
         # SSRF negative-test vectors (web vault validation): private IPv4
         # and metadata IP asserted rejected client-side.
         "apps/web/src/lib/vault-validation.test.ts",
+        # Ingest SSRF tests assert link-local and RFC-1918 addresses rejected.
+        "workers/ingest/tests/nzb_fetch_ssrf_guard.rs",
     }
 )
 

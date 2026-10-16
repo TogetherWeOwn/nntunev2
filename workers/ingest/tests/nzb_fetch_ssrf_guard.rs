@@ -83,7 +83,7 @@
 //!
 //! /// Pre-fetch guard: https only, no embedded credentials, host on the
 //! /// allowlist, and every resolved address public (reject loopback,
-//! /// link-local incl. 169.254.169.254, private, CGNAT, multicast,
+//! /// link-local (including the cloud metadata endpoint), private, CGNAT, multicast,
 //! /// reserved/documentation, IPv6 non-global). A forbidden address is
 //! /// rejected even when the host was allowlisted by mistake. IP-literal
 //! /// hosts are checked directly without DNS.

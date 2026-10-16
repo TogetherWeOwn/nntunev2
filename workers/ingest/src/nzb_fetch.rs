@@ -13,7 +13,7 @@
 //! - the host must be on the operator-configured allowlist (exact,
 //!   case-insensitive match — subdomains are NOT implied);
 //! - resolve ALL DNS records and reject loopback / link-local (including
-//!   the 169.254.169.254 cloud metadata endpoint) / private / CGNAT /
+//!   the cloud metadata endpoint) / private / CGNAT /
 //!   multicast / reserved / documentation (v4+v6, including transition
 //!   space). A forbidden address is rejected even when its host was
 //!   allowlisted by mistake. IP-literal hosts are checked directly, with
