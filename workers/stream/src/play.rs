@@ -90,7 +90,7 @@ impl PlayError {
             PlayError::WrongTrack => ApiError::forbidden(),
             PlayError::RangeUnsatisfiable => ApiError::range_not_satisfiable(),
             PlayError::PoolExhausted => ApiError::rate_limited(),
-            PlayError::PoolQuarantined { .. } => ApiError::upstream_unavailable(),
+            PlayError::PoolQuarantined { .. } => ApiError::upstream_circuit_open(),
             PlayError::ArticleMissing(_) => ApiError::not_found(),
             PlayError::InvalidSegment(_) => ApiError::invalid_request(),
             PlayError::Upstream(_) => ApiError::upstream_unavailable(),
@@ -111,19 +111,19 @@ impl PlayError {
     }
 
     /// HTTP status for the Worker shim: an open breaker is `503` (with
-    /// [`PlayError::retry_after_header`]); an exhausted pool is also `503`
-    /// but without a `Retry-After` (capacity, not an outage); auth and range
-    /// failures keep `401`/`403`/`416`; everything upstream is `502`.
+    /// [`PlayError::retry_after_header`]); an exhausted pool is `429`
+    /// (`rate_limited`); auth, range, missing-article, and invalid-segment
+    /// failures use their shared-envelope statuses; provider failures are `502`.
     pub fn http_status(&self) -> u16 {
         match self {
             PlayError::Unauthorized(_) | PlayError::ProviderAuthExpired => 401,
             PlayError::WrongTrack => 403,
             PlayError::RangeUnsatisfiable => 416,
-            PlayError::PoolExhausted | PlayError::PoolQuarantined { .. } => 503,
-            PlayError::ArticleMissing(_)
-            | PlayError::InvalidSegment(_)
-            | PlayError::Upstream(_)
-            | PlayError::Decode(_) => 502,
+            PlayError::PoolExhausted => 429,
+            PlayError::PoolQuarantined { .. } => 503,
+            PlayError::ArticleMissing(_) => 404,
+            PlayError::InvalidSegment(_) => 400,
+            PlayError::Upstream(_) | PlayError::Decode(_) => 502,
         }
     }
 
@@ -1192,8 +1192,8 @@ mod tests {
             (PlayError::PoolExhausted, "rate_limited", 429, true),
             (
                 PlayError::PoolQuarantined { retry_after_ms: 5 },
-                "upstream_unavailable",
-                502,
+                "upstream_circuit_open",
+                503,
                 true,
             ),
             (
@@ -1228,6 +1228,7 @@ mod tests {
                 (code, status, retryable),
                 "{err:?}"
             );
+            assert_eq!(err.http_status(), api.status, "status drift for {err:?}");
             assert!(!api.body_json().contains("seg@news"), "{err:?}");
             assert!(!api.body_json().contains("provider detail"), "{err:?}");
         }
@@ -1384,9 +1385,9 @@ mod tests {
             PlayError::Unauthorized(GrantError::Malformed).http_status(),
             401
         );
-        assert_eq!(PlayError::PoolExhausted.http_status(), 503);
+        assert_eq!(PlayError::PoolExhausted.http_status(), 429);
         assert_eq!(PlayError::PoolExhausted.retry_after_header(), None);
-        assert_eq!(PlayError::ArticleMissing("m".into()).http_status(), 502);
+        assert_eq!(PlayError::ArticleMissing("m".into()).http_status(), 404);
     }
 
     #[test]

@@ -721,6 +721,34 @@ mod tests {
     }
 
     #[test]
+    fn ingest_half_open_probe_may_use_playback_reserved_slot() {
+        use super::{CIRCUIT_OPEN_MS, HALF_OPEN_PROBE_RETRY_MS};
+
+        let mut pool = TestPool::new(2);
+        let playback = pool.try_acquire(Lane::Playback).expect("playback lease");
+        for _ in 0..super::CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        pool.advance(CIRCUIT_OPEN_MS);
+
+        assert!(pool.can_acquire(Lane::Ingest));
+        let probe = pool
+            .try_acquire(Lane::Ingest)
+            .expect("ingest probe uses reserved slot");
+        assert!(!pool.can_acquire(Lane::Prefetch));
+        assert_eq!(
+            pool.try_acquire(Lane::Playback)
+                .expect_err("one probe at a time"),
+            PoolError::Quarantined {
+                retry_after_ms: HALF_OPEN_PROBE_RETRY_MS
+            }
+        );
+
+        pool.release(probe, None);
+        pool.release(playback, None);
+    }
+
+    #[test]
     fn half_open_probe_waits_for_capacity_with_a_retry_hint() {
         use super::{CIRCUIT_OPEN_MS, HALF_OPEN_PROBE_RETRY_MS};
 

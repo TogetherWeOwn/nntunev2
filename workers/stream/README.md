@@ -73,9 +73,10 @@ A dead upstream must fail fast with a `503`, never hang playback
   window. While open, `try_acquire` fails with `PoolQuarantined` without
   dialing out, and the play path maps it to **`503` with
   `Retry-After: 30`** (`PlayError::http_status` /
-  `retry_after_header`). An exhausted pool (all slots leased) is also `503`
-  but carries no `Retry-After` (capacity, not an outage); auth and range
-  failures keep `401`/`403`/`416`; other upstream failures are `502`.
+  `retry_after_header`) with the `upstream_circuit_open` envelope code. An exhausted
+  pool (all slots leased) is `429` (`rate_limited`), not an outage. Auth,
+  permission, range, missing-article and invalid-segment failures use their
+  envelope statuses (`401`/`403`/`416`/`404`/`400`); provider failures are `502`.
 - Once the 30 s open interval elapses the breaker is half-open: exactly one
   `Playback` or `Ingest` probe acquire is admitted, tracked independently of
   other live leases. `Prefetch` cannot consume it; an ingest probe may use the

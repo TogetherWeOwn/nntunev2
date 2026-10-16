@@ -30,7 +30,7 @@ use nntune_core::nntp::{NntpClient, NntpConfig};
 use nntune_core::transport::Transport;
 use serde::{Deserialize, Serialize};
 
-use crate::pool::{Lane, Pool, PoolError};
+use crate::pool::{CircuitState, Lane, Pool, PoolError};
 
 /// The user's provider as the pool dials it: connection settings (vetted by
 /// the dial-time SSRF guard) and the effective connection cap
@@ -213,12 +213,40 @@ pub async fn stat_batch<T: Transport>(
     client: &mut NntpClient<T>,
     ids: &[String],
 ) -> nntune_core::Result<(Vec<String>, Vec<String>)> {
+    stat_batch_with_response(client, ids, || {}).await
+}
+
+/// Run the first-response callback as soon as one STAT proves the provider is
+/// answering. Half-open probes use this to release the breaker probe slot
+/// before walking the rest of a potentially large batch.
+async fn stat_batch_with_response<T, F>(
+    client: &mut NntpClient<T>,
+    ids: &[String],
+    mut on_response: F,
+) -> nntune_core::Result<(Vec<String>, Vec<String>)>
+where
+    T: Transport,
+    F: FnMut(),
+{
     let mut present = Vec::new();
     let mut missing = Vec::new();
+    let mut response_seen = false;
     for id in ids {
         match client.stat(id).await {
-            Ok(_) => present.push(id.clone()),
-            Err(nntune_core::Error::ArticleNotFound(_)) => missing.push(id.clone()),
+            Ok(_) => {
+                present.push(id.clone());
+                if !response_seen {
+                    response_seen = true;
+                    on_response();
+                }
+            }
+            Err(nntune_core::Error::ArticleNotFound(_)) => {
+                missing.push(id.clone());
+                if !response_seen {
+                    response_seen = true;
+                    on_response();
+                }
+            }
             Err(e) => return Err(e),
         }
     }
@@ -246,7 +274,7 @@ where
     F: Future<Output = nntune_core::Result<NntpClient<T>>>,
     S: Fn(&mut Pool<NntpClient<T>>),
 {
-    let (lease, warm, success_epoch) = {
+    let (lease, warm, success_epoch, is_probe) = {
         let mut pool = pool.borrow_mut();
         tick(&mut pool);
         let lease = pool.try_acquire(Lane::Ingest).map_err(|e| match e {
@@ -256,11 +284,26 @@ where
             },
         })?;
         let warm = pool.take_idle();
-        (lease, warm, pool.provider_error_epoch())
+        (
+            lease,
+            warm,
+            pool.provider_error_epoch(),
+            pool.circuit_state() == CircuitState::HalfOpen,
+        )
     };
 
     if let Some(mut client) = warm {
-        match stat_batch(&mut client, &req.segment_ids).await {
+        let pool_ref = pool;
+        let lease_id = lease.id;
+        match stat_batch_with_response(&mut client, &req.segment_ids, || {
+            if is_probe {
+                pool_ref
+                    .borrow_mut()
+                    .record_success_for_if_epoch_matches(lease_id, success_epoch);
+            }
+        })
+        .await
+        {
             Ok(found) => {
                 let mut pool = pool.borrow_mut();
                 pool.record_reuse();
@@ -279,7 +322,17 @@ where
         Err(_) => return Err(provider_failed(pool, &tick, lease)),
     };
     pool.borrow_mut().record_connect();
-    match stat_batch(&mut client, &req.segment_ids).await {
+    let pool_ref = pool;
+    let lease_id = lease.id;
+    match stat_batch_with_response(&mut client, &req.segment_ids, || {
+        if is_probe {
+            pool_ref
+                .borrow_mut()
+                .record_success_for_if_epoch_matches(lease_id, success_epoch);
+        }
+    })
+    .await
+    {
         Ok(found) => {
             let mut pool = pool.borrow_mut();
             pool.record_success_for_if_epoch_matches(lease.id, success_epoch);
