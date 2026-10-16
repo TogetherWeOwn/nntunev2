@@ -45,6 +45,7 @@
 	let testDetail = $state('');
 	let reauthRequired = $state(false);
 	let reauthPasswordInput = $state<HTMLInputElement | null>(null);
+	let saveReauthRequired = $state(false);
 	let saveState = $state<'idle' | 'saving' | 'saved' | 'failed'>('idle');
 	let testedConfigKey = $state<string | null>(null);
 	let testRunId = 0;
@@ -79,6 +80,7 @@
 		testState = 'idle';
 		testDetail = '';
 		reauthRequired = false;
+		saveReauthRequired = false;
 		saveState = 'idle';
 	}
 
@@ -168,6 +170,7 @@
 		}
 
 		const runId = testRunId;
+		saveReauthRequired = false;
 		saveState = 'saving';
 		try {
 			await client.saveProviderConfig(input);
@@ -175,8 +178,11 @@
 				saveState = 'saved';
 				window.location.href = '/library';
 			}
-		} catch {
-			if (runId === testRunId && inputKey === currentTestKey()) saveState = 'failed';
+		} catch (error) {
+			if (runId === testRunId && inputKey === currentTestKey()) {
+				saveReauthRequired = error instanceof ApiError && error.code === 'reauth_required';
+				saveState = 'failed';
+			}
 		}
 	}
 </script>
@@ -347,6 +353,11 @@
 			{/if}
 			{#if saveState === 'saved'}
 				<p role="status">Saved. Your credentials are sealed in the encrypted vault.</p>
+			{:else if saveState === 'failed' && saveReauthRequired}
+				<p role="alert">
+					Your session is too old to save provider details. <a href="/login">Sign in again</a>,
+					then enter your provider details and test the connection before saving.
+				</p>
 			{:else if saveState === 'failed'}
 				<p role="alert">Could not save. Your details were not stored — try again.</p>
 			{/if}

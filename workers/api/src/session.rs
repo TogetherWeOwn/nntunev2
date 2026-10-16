@@ -340,8 +340,9 @@ pub fn verify_stored_session(
 /// WHERE id/user_id/counter match AND revoked = FALSE, persisting the next
 /// counter and expiry. Require exactly one row and commit before Set-Cookie.
 /// Once committed, the previous token fails [`verify_stored_session`].
-/// For privilege changes, revoke the old row and use [`issue_session`] after
-/// reauthentication to create a NEW session id; never use refresh for that.
+/// For privilege changes, use [`reauthenticate_session`] after a fresh proof
+/// to prepare a NEW session id and conditional old-row revoke; never use
+/// refresh for that.
 pub fn rotate_session(
     keys: &SessionKeys<'_>,
     token: &str,
