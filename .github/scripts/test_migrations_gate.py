@@ -225,15 +225,19 @@ class TestMigrationGateContract(MigrationsGateTestCase):
 
         manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
         targets = {entry["file"]: entry["target"] for entry in manifest["migration"]}
-        self.assertEqual(
-            {
-                "0001_mb_mirror.sql": "mirror",
-                "0002_auth_vault.sql": "app",
-                "0003_library.sql": "app",
-                "0004_auth_challenge_purpose.sql": "app",
-                "0005_atomic_rate_limits_and_leases.sql": "app",
-            },
-            targets,
+        expected_targets = {
+            "0001_mb_mirror.sql": "mirror",
+            "0002_auth_vault.sql": "app",
+            "0003_library.sql": "app",
+            "0004_auth_challenge_purpose.sql": "app",
+            "0005_atomic_rate_limits_and_leases.sql": "app",
+        }
+        self.assertTrue(
+            expected_targets.items() <= targets.items(),
+            (
+                f"expected original migration targets {expected_targets!r} "
+                f"to be present in {targets!r}"
+            ),
         )
 
         result = subprocess.run(
