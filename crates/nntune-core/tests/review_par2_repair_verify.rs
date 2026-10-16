@@ -1,13 +1,18 @@
-//! Corrupt-segment repair through the native container path.
+//! Verify failure modes and native repair-binary wiring.
 //!
 //! A synthetic recovery set (Main + FileDesc + IFSC, built in-test) guards a
-//! small data file. One byte is corrupted, [`RecoverySet::verify`] rejects
-//! the damage, the file is repaired via [`repair_with_binary`] — the same
-//! native subprocess path the container batch job uses, with a fake provider
-//! binary that restores the pristine bytes and prints the real binary's
-//! terminal summary line — and the repaired file verifies byte-identical.
-//! No network, no provider binary, no real Reed-Solomon: the fixture pins
-//! the wiring (verify rejects, repair runs contained, bytes round-trip).
+//! small data file. Two verify failures are pinned by their exact error
+//! detail: a flipped data byte fails the whole-file MD5 check, and a wrong
+//! IFSC block CRC (with the data untouched, so the MD5 still matches) fails
+//! the per-block CRC32 check. A third case runs [`repair_with_binary`] —
+//! the same native subprocess path the container batch job uses — against a
+//! fake provider binary that copies staged pristine bytes over the target
+//! and prints the real binary's terminal summary line.
+//!
+//! That fake is a `cp`, so the byte-identical assertions after it pin only
+//! the wiring (verify rejects, the subprocess runs contained in the scratch
+//! dir, its output bytes verify) — never Reed-Solomon repair correctness,
+//! which needs the real provider binary. No network, no real binary.
 #![cfg(target_os = "linux")]
 
 use std::fs;
@@ -18,6 +23,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use nntune_core::par2::repair::repair_with_binary;
 use nntune_core::par2::RecoverySet;
+use nntune_core::Error;
 
 const BLOCK_SIZE: u64 = 1024;
 const FILE_LEN: usize = 8192;
@@ -130,6 +136,13 @@ fn ptype(suffix: &[u8]) -> [u8; 16] {
 }
 
 fn recovery_set_bytes(data: &[u8]) -> Vec<u8> {
+    recovery_set_bytes_with_bad_crc(data, None)
+}
+
+/// Builds the synthetic set; with `bad_crc_block = Some(n)` the IFSC entry
+/// for block `n` carries a wrong CRC32 while the FileDesc whole-file MD5
+/// stays correct for `data`, so verification reaches the per-block loop.
+fn recovery_set_bytes_with_bad_crc(data: &[u8], bad_crc_block: Option<usize>) -> Vec<u8> {
     let whole_md5 = md5::compute(data).0;
     let first16k = md5::compute(&data[..data.len().min(16 * 1024)]).0;
     let mut seed = Vec::new();
@@ -156,7 +169,12 @@ fn recovery_set_bytes(data: &[u8]) -> Vec<u8> {
 
     let mut ifsc_body = Vec::new();
     ifsc_body.extend_from_slice(&file_id);
-    for crc in block_crcs(data) {
+    for (i, crc) in block_crcs(data).into_iter().enumerate() {
+        let crc = if bad_crc_block == Some(i) {
+            crc ^ 0xffff_ffff
+        } else {
+            crc
+        };
         ifsc_body.extend_from_slice(&[0u8; 16]);
         ifsc_body.extend_from_slice(&crc.to_le_bytes());
     }
@@ -168,8 +186,35 @@ fn recovery_set_bytes(data: &[u8]) -> Vec<u8> {
     set_bytes
 }
 
+/// Pins a verify failure to the exact check that fired, so disabling any
+/// single compare in `verify_file` (whole-file MD5 or per-block CRC32)
+/// fails the case that names it instead of passing on the other check.
+fn assert_unhealthy(err: Error, want_detail: &str) {
+    match err {
+        Error::Par2Unhealthy { filename, detail } => {
+            assert_eq!(filename, FILENAME);
+            assert_eq!(detail, want_detail);
+        }
+        other => panic!("expected Par2Unhealthy({want_detail:?}), got {other:?}"),
+    }
+}
+
 #[test]
-fn corrupt_segment_repairs_via_native_path_byte_identical() {
+fn wrong_block_crc_fails_per_block_check_with_whole_file_md5_intact() {
+    let pristine = pristine_bytes();
+    // The data is untouched, so the whole-file MD5 check passes; only the
+    // IFSC CRC for block 4 is wrong, which must fail the per-block loop.
+    let set_bytes = recovery_set_bytes_with_bad_crc(&pristine, Some(4));
+    let set = RecoverySet::parse(&set_bytes).expect("synthetic set parses");
+    assert_unhealthy(
+        set.verify(FILENAME, &pristine)
+            .expect_err("a wrong block CRC must fail verification"),
+        "block 4 CRC32 mismatch",
+    );
+}
+
+#[test]
+fn damaged_fixture_fails_whole_file_md5_and_repair_wiring_restores_bytes() {
     let pristine = pristine_bytes();
     let set_bytes = recovery_set_bytes(&pristine);
     let set = RecoverySet::parse(&set_bytes).expect("synthetic set parses");
@@ -185,12 +230,17 @@ fn corrupt_segment_repairs_via_native_path_byte_identical() {
     fs::write(job.scratch.join("set.par2"), &set_bytes).unwrap();
 
     // Corrupt one byte in the middle block: the segment-level damage the
-    // ingest pipeline would hand to repair.
+    // ingest pipeline would hand to repair. The whole-file MD5 check runs
+    // before the per-block CRC32 loop, so this case pins the MD5 detail;
+    // the per-block detail is pinned separately above.
     let mut damaged = pristine.clone();
     damaged[FILE_LEN / 2] ^= 0x01;
     fs::write(job.scratch.join("track.bin"), &damaged).unwrap();
-    set.verify(FILENAME, &damaged)
-        .expect_err("corrupted fixture must fail verification");
+    assert_unhealthy(
+        set.verify(FILENAME, &damaged)
+            .expect_err("corrupted fixture must fail verification"),
+        "whole-file MD5 mismatch",
+    );
 
     let report = repair_with_binary(&job.binary, &job.scratch, &[Path::new("set.par2")])
         .expect("native repair path runs");
@@ -201,10 +251,14 @@ fn corrupt_segment_repairs_via_native_path_byte_identical() {
     assert_eq!(report.repaired_blocks, -1);
     assert!(report.tail.contains("Repair complete."));
 
+    // Wiring assertions only: the fake binary is a `cp` of the staged
+    // pristine bytes, so equality here proves the subprocess ran in the
+    // scratch dir and its output round-trips through verify — not that a
+    // real binary could reconstruct the block.
     let repaired = fs::read(job.scratch.join("track.bin")).unwrap();
     assert_eq!(
         repaired, pristine,
-        "repaired bytes differ from the pristine fixture"
+        "bytes written by the repair binary differ from the pristine fixture"
     );
     assert_eq!(md5::compute(&repaired).0, md5::compute(&pristine).0);
     set.verify(FILENAME, &repaired)
