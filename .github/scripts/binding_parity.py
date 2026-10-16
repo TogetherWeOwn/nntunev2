@@ -54,7 +54,7 @@ Usage:
   Paths are resolved relative to --root (default: repo root, i.e. the
   current directory). Exit 0 = parity (known-drift warnings may print),
   1 = drift found, 2 = a manifest, inventory or config file could not
-  be parsed (fail closed).
+  be parsed or has a wrongly typed field (fail closed, no traceback).
 """
 
 import argparse
@@ -469,6 +469,24 @@ def parse_ops_inventory(text, source="docs/ops.md"):
     return inventory, ids
 
 
+def _manifest_str(path, where, table, key, required=True):
+    """Return table[key], which must be a non-empty string (or absent if optional)."""
+    value = table.get(key)
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ParityError(f"{path}: {where}: {key} must be a non-empty string")
+    return value
+
+
+def _manifest_tables(path, container, key, where):
+    """Return container[key], which must be an array of tables (or absent)."""
+    value = container.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(t, dict) for t in value):
+        raise ParityError(f"{path}: {where} must be an array of tables")
+    return value
+
+
 def load_manifest(path):
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -479,46 +497,41 @@ def load_manifest(path):
         raise ParityError(f"{path}: manifest has unknown top-level keys {sorted(extra)}")
     workers = []
     seen_workers = set()
-    for worker in data.get("worker", []):
-        if not isinstance(worker, dict):
-            raise ParityError(f"{path}: [[worker]] is not a table")
+    for worker in _manifest_tables(path, data, "worker", "[[worker]]"):
         extra = set(worker) - {"name", "config", "binding"}
         if extra:
             raise ParityError(f"{path}: [[worker]] has unknown keys {sorted(extra)}")
-        name, config = worker.get("name"), worker.get("config")
-        if not name or not config:
-            raise ParityError(f"{path}: [[worker]] needs name and config")
+        name = _manifest_str(path, "[[worker]]", worker, "name")
+        config = _manifest_str(path, f"worker {name}", worker, "config")
         if name in seen_workers:
             raise ParityError(f"{path}: duplicate worker {name!r}")
         seen_workers.add(name)
         bindings = []
         seen_bindings = set()
-        for binding in worker.get("binding", []):
-            if not isinstance(binding, dict):
-                raise ParityError(f"{path}: worker {name}: binding is not a table")
+        for binding in _manifest_tables(
+            path, worker, "binding", f"worker {name}: [[worker.binding]]"
+        ):
+            where = f"worker {name}: binding"
             extra = set(binding) - {"binding", "type", *ENVS}
             if extra:
-                raise ParityError(
-                    f"{path}: worker {name}: binding has unknown keys {sorted(extra)}"
-                )
-            type_name, binding_name = binding.get("type"), binding.get("binding")
-            if (
-                type_name not in RESOURCE_KEY
-                or not isinstance(binding_name, str)
-                or not binding_name
-            ):
-                raise ParityError(
-                    f"{path}: worker {name}: binding needs a known type and a name"
-                )
+                raise ParityError(f"{path}: {where} has unknown keys {sorted(extra)}")
+            type_name = _manifest_str(path, where, binding, "type")
+            binding_name = _manifest_str(path, where, binding, "binding")
+            if type_name not in RESOURCE_KEY:
+                raise ParityError(f"{path}: {where} has an unknown type")
             key = (type_name, binding_name)
             if key in seen_bindings:
                 raise ParityError(f"{path}: worker {name}: duplicate binding {key}")
             seen_bindings.add(key)
+            where = f"worker {name}: binding {binding_name}"
             bindings.append(
                 {
                     "type": type_name,
                     "binding": binding_name,
-                    "expected": {env: binding.get(env) for env in ENVS},
+                    "expected": {
+                        env: _manifest_str(path, where, binding, env, required=False)
+                        for env in ENVS
+                    },
                 }
             )
         workers.append({"name": name, "config": config, "bindings": bindings})
@@ -526,23 +539,28 @@ def load_manifest(path):
         raise ParityError(f"{path}: manifest maps no workers")
     by_worker = {w["name"]: w for w in workers}
     known_drift = []
-    for drift in data.get("known_drift", []):
-        if not isinstance(drift, dict):
-            raise ParityError(f"{path}: [[known_drift]] is not a table")
+    for drift in _manifest_tables(path, data, "known_drift", "[[known_drift]]"):
         extra = set(drift) - {"worker", "env", "binding", "actual", "expected", "reason"}
         if extra:
             raise ParityError(f"{path}: [[known_drift]] has unknown keys {sorted(extra)}")
-        worker = by_worker.get(drift.get("worker", ""))
+        where = "[[known_drift]]"
+        worker_name = _manifest_str(path, where, drift, "worker")
+        binding_name = _manifest_str(path, where, drift, "binding")
+        env = _manifest_str(path, where, drift, "env")
+        _manifest_str(path, where, drift, "actual")
+        _manifest_str(path, where, drift, "expected")
+        _manifest_str(path, where, drift, "reason")
+        worker = by_worker.get(worker_name)
         if worker is None:
             raise ParityError(f"{path}: known_drift names an unmapped worker")
-        entries = [b for b in worker["bindings"] if b["binding"] == drift.get("binding")]
+        entries = [b for b in worker["bindings"] if b["binding"] == binding_name]
         if not entries:
             raise ParityError(f"{path}: known_drift names an unmapped binding")
         if entries[0]["type"] in ID_TYPES:
             raise ParityError(f"{path}: known_drift is not allowed for id-typed bindings")
-        if drift.get("env") not in ENVS or not drift.get("reason"):
-            raise ParityError(f"{path}: known_drift needs env and a reason")
-        if drift.get("expected") != entries[0]["expected"][drift["env"]]:
+        if env not in ENVS:
+            raise ParityError(f"{path}: known_drift env must be one of {list(ENVS)}")
+        if drift["expected"] != entries[0]["expected"][env]:
             raise ParityError(
                 f"{path}: known_drift expected value disagrees with the binding map"
             )

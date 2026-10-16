@@ -632,6 +632,109 @@ prod = "fx-jobs"
             self.assertIn("::error::binding-parity:", output.getvalue())
             self.assertNotIn("Traceback", output.getvalue())
 
+    def assert_manifest_fails_closed(self, manifest, pattern):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp, manifest=manifest)
+            with self.assertRaisesRegex(ParityError, pattern):
+                run_check(root)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(2, main(["--root", str(root)]))
+            self.assertIn("::error::binding-parity:", output.getvalue())
+            self.assertNotIn("Traceback", output.getvalue())
+
+    def test_manifest_non_string_binding_name_fails_closed_with_exit_two(self):
+        self.assert_manifest_fails_closed(
+            MANIFEST.replace('binding = "AUDIO_CACHE"', "binding = 123"),
+            "binding must be a non-empty string",
+        )
+
+    def test_manifest_malformed_binding_fields_fail_closed_with_exit_two(self):
+        cases = {
+            "type is an array": (
+                'type = "r2"', 'type = ["r2"]', "type must be a non-empty string"
+            ),
+            "type is an int": (
+                'type = "r2"', "type = 7", "type must be a non-empty string"
+            ),
+            "type is unknown": (
+                'type = "r2"', 'type = "nope"', "unknown type"
+            ),
+            "staging is an array": (
+                'staging = "fx-audio-staging"', 'staging = ["fx-audio-staging"]',
+                "staging must be a non-empty string",
+            ),
+            "prod is an int": (
+                'prod = "fx-audio-prod"', "prod = 5",
+                "prod must be a non-empty string",
+            ),
+            "config is an int": (
+                'config = "workers/demo/wrangler.toml"', "config = 123",
+                "config must be a non-empty string",
+            ),
+            "worker name is an array": (
+                'name = "demo"', 'name = ["demo"]', "name must be a non-empty string"
+            ),
+        }
+        for label, (old, new, pattern) in cases.items():
+            with self.subTest(label):
+                self.assert_manifest_fails_closed(MANIFEST.replace(old, new, 1), pattern)
+
+    def test_manifest_non_table_arrays_fail_closed_with_exit_two(self):
+        self.assert_manifest_fails_closed(
+            'worker = "demo"\n', r"\[\[worker\]\] must be an array of tables"
+        )
+        self.assert_manifest_fails_closed(
+            '[[worker]]\nname = "demo"\nconfig = "workers/demo/wrangler.toml"\n'
+            '[worker.binding]\nbinding = "AUDIO_CACHE"\ntype = "r2"\n',
+            r"\[\[worker.binding\]\] must be an array of tables",
+        )
+        self.assert_manifest_fails_closed(
+            'known_drift = "x"\n' + MANIFEST,
+            r"\[\[known_drift\]\] must be an array of tables",
+        )
+
+    def test_manifest_malformed_known_drift_fields_fail_closed_with_exit_two(self):
+        base = {
+            "worker": '"demo"',
+            "env": '"staging"',
+            "binding": '"AUDIO_CACHE"',
+            "actual": '"fx-old-bucket"',
+            "expected": '"fx-audio-staging"',
+            "reason": '"fixture: value fix owned elsewhere"',
+        }
+        cases = {
+            "worker": "123",
+            "env": '["staging"]',
+            "binding": "[1]",
+            "actual": '["fx-old-bucket"]',
+            "expected": "5",
+            "reason": "true",
+        }
+        for key, bad in cases.items():
+            with self.subTest(key):
+                fields = dict(base, **{key: bad})
+                manifest = MANIFEST + "\n[[known_drift]]\n" + "".join(
+                    f"{k} = {v}\n" for k, v in fields.items()
+                )
+                self.assert_manifest_fails_closed(
+                    manifest, f"{key} must be a non-empty string"
+                )
+        with self.subTest("missing actual"):
+            fields = {k: v for k, v in base.items() if k != "actual"}
+            manifest = MANIFEST + "\n[[known_drift]]\n" + "".join(
+                f"{k} = {v}\n" for k, v in fields.items()
+            )
+            self.assert_manifest_fails_closed(
+                manifest, "actual must be a non-empty string"
+            )
+        with self.subTest("unknown env"):
+            fields = dict(base, env='"qa"')
+            manifest = MANIFEST + "\n[[known_drift]]\n" + "".join(
+                f"{k} = {v}\n" for k, v in fields.items()
+            )
+            self.assert_manifest_fails_closed(manifest, "env must be one of")
+
     def test_unparsable_config_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_repo(tmp, wrangler="name = [not toml")
