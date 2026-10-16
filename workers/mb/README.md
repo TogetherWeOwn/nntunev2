@@ -55,8 +55,25 @@ staging Hyperdrive + KV:
 - `search p95 < 600 ms` (trigram, `LIMIT 25`)
 
 Numbers are recorded here once staging exists; this slice defines the
-method, not the measurements. Replication SLO: **lag < 2 h**
-(`mb_import_state.lag_seconds`).
+method, not the measurements.
+
+### Replication SLO
+
+The **p95 source** for replication lag is the `lag_secs` value of each
+applied packet in `mb_replication_packet`, not the aggregate
+`mb_import_state` snapshot. Compute p95 over the observed packet records in
+the reporting window; the SLO is p95 lag **under 2 hours**. A **breach
+definition** is any packet with `lag_secs > 7200` seconds (exactly 7200
+passes), or any missing sequence between the lowest observed packet and the
+reported latest packet sequence. Missing packets cannot be dropped from the
+accounting: each is returned as a `missing_sequence` breach.
+
+`ReplicationSloProbe` returns a JSON structured event named
+`mb_replication_slo_breach` for every evaluation, including `breach_count`
+and its breach details. When the count is non-zero, increment the documented
+counter metric `mb_replication_slo_breach_total` by that count. The durable
+ledger schema is `migrations/0004_mb_replication_packet_ledger.sql`; packet
+application remains the separate replication-applier responsibility.
 
 ## Terms
 
