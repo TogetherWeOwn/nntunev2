@@ -70,6 +70,7 @@ fn stale_serve_projects_to_a_stale_observability_row_not_hit() {
         cipher_key: 0,
         now_unix: stale_now,
         up_next: None,
+        segment_ranges: None,
     };
     let resp = play(&mut pool, &mut cache, &mut meter, SECRET, &input).expect("stale serves");
     assert_eq!(

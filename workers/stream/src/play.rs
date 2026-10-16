@@ -8,23 +8,35 @@
 //! sibling card). The byte flow — fetch, decode, decrypt, fan out to client
 //! chunks *and* the multipart upload — is the production shape.
 //!
-//! Miss-path streaming: [`play`] fetches only the first segment (its yEnc
-//! `=ybegin size=` reveals the file size, so `Range`/`206` resolves before a
-//! byte is sent); later segments are fetched lazily as the client pulls
-//! [`PlayStream`] chunks. A mid-track `Range` still walks every earlier
-//! segment first — segment sizes live in NZB metadata this slice does not
-//! own yet, so the covering article cannot be addressed directly (see the
-//! README TTFB notes). Memory is one decoded segment at a time (plus the
-//! staged write, which R2 holds in production). [`PlayStream::finalize`]
-//! drains any segments the client's range did not need so the cache still
-//! gets the whole track, then completes the upload and hands the healthy
-//! connection back to the pool. [`PlayStream::abort`] returns the connection
-//! without caching (client went away).
+//! Miss-path streaming: [`play`] fetches only one segment up front (its
+//! yEnc `=ybegin size=` reveals the file size, so `Range`/`206` resolves
+//! before a byte is sent); later segments are fetched lazily as the client
+//! pulls [`PlayStream`] chunks. Which segment comes first depends on
+//! [`PlayInput::segment_ranges`]: with per-segment byte ranges (NZB
+//! metadata) a mid-track `Range` fetches the *covering* article directly —
+//! one `BODY` to first byte — while without them the play path keeps the
+//! prefix walk from segment 0, since the covering article cannot be
+//! addressed (see the README TTFB notes). Ranges are a verified hint: a
+//! ranges-only `416`, ranges that fail validation, or a covering article
+//! that disagrees with its declared range all drop the hint and fall back
+//! to the prefix walk, so wrong NZB metadata cannot make a playable track
+//! unplayable. Memory is the staged write (which R2 holds in production)
+//! plus one decoded segment at a time: the covering segment is the only
+//! one ever held out of order, because the skipped prefix is backfilled
+//! in file order before serving advances past it — staging only ever
+//! receives the contiguous prefix, flushed into multipart parts as it
+//! grows.
+//! [`PlayStream::finalize`] drains any segments the client's range did not
+//! need — including a skipped prefix — so the cache still gets the whole
+//! track, then completes the upload and hands the healthy connection back
+//! to the pool. [`PlayStream::abort`] returns the connection without
+//! caching (client went away).
 //!
 //! Failure handling: only connection-level trouble (I/O, protocol errors)
 //! quarantines the pool. A missing article or a bad segment fails that play
 //! alone — the connection is fine and goes back to the pool warm.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -120,6 +132,12 @@ pub struct PlayInput<'a> {
     pub server_addr: SocketAddr,
     /// Ordered segment message-IDs composing the track.
     pub segments: &'a [String],
+    /// Per-segment plaintext byte ranges, `(start, end_exclusive)` in
+    /// `segments` order, when NZB metadata carries them. `Some` (and valid:
+    /// one range per segment, contiguous from 0) lets a mid-track `Range`
+    /// fetch its covering segment first; `None` or invalid keeps the
+    /// prefix-walk fallback from segment 0.
+    pub segment_ranges: Option<&'a [(u64, u64)]>,
     /// Demo cipher key (see module docs).
     pub cipher_key: u8,
     /// Current time, unix seconds (grant expiry check).
@@ -241,17 +259,30 @@ struct Live {
     client: NntpClient,
     lease: Lease,
     segments: Vec<String>,
+    /// Next segment to fetch for the *client* (serving cursor). Starts at
+    /// the covering segment; `finalize` separately fetches whatever
+    /// `seg_done` still lacks (e.g. a skipped prefix).
     next_seg: usize,
+    seg_done: Vec<bool>,
+    /// `(offset, len)` each fetched article declared for itself, once
+    /// placed. Placement is proven by chaining these together (see
+    /// `ingest`), never by the NZB ranges hint.
+    seg_placed: Vec<Option<(u64, u64)>>,
     cipher_key: u8,
     /// `PlayInput::now_unix` at play time: the cache write stamped on
     /// `finalize`, so the SWR clock runs from when the bytes were fetched.
     started_at: u64,
-    /// File size declared by the first segment.
+    /// File size declared by the first fetched segment.
     total: u64,
-    /// Bytes decoded so far (end offset of `buf`).
-    fetched: u64,
-    buf: Vec<u8>,
+    /// The most recently decoded segment, shared with `pending` (no copy).
+    buf: Arc<[u8]>,
     buf_start: u64,
+    /// Decoded segments not yet staged: `upload` only ever receives the
+    /// contiguous prefix (`staged_seg..`), so a covering segment fetched
+    /// ahead of its prefix waits here until `load_next` or `finalize` fills the gap.
+    pending: BTreeMap<usize, Arc<[u8]>>,
+    staged_seg: usize,
+    staged_bytes: u64,
     upload: MultipartUpload,
     failed: Option<Failure>,
     provider_error_epoch: Arc<AtomicU64>,
@@ -391,12 +422,27 @@ fn play_authorized(
     if let Some(bad) = input.segments.iter().find(|s| !valid_segment_id(s)) {
         return Err(PlayError::InvalidSegment(bad.clone()));
     }
+    // Covering-segment plan: ranges are a *hint*, never trusted blindly.
+    // Valid-shape ranges tentatively resolve the range so the first fetch
+    // is the article covering its start — but a ranges-only 416, or a
+    // covering article that disagrees with its declared range (checked
+    // below), drops the hint and keeps the prefix walk, so wrong NZB
+    // metadata can never make a playable track unplayable. Absent/invalid
+    // ranges plan nothing and the prefix walk behaves exactly as before.
+    let mut ranges = valid_ranges(input.segment_ranges, input.segments.len());
+    let mut first_seg = 0;
+    if let Some(r) = ranges {
+        match resolve_range(r[r.len() - 1].1, input.range) {
+            Ok((_, _, start, _)) => first_seg = covering_segment(r, start),
+            Err(_) => ranges = None,
+        }
+    }
     let lease = pool.try_acquire(Lane::Playback).map_err(|e| match e {
         PoolError::Quarantined { retry_after_ms } => PlayError::PoolQuarantined { retry_after_ms },
         PoolError::Exhausted => PlayError::PoolExhausted,
     })?;
 
-    let (client, first, redialed) = match open_and_fetch_first(pool, input) {
+    let (mut client, mut first, redialed) = match open_and_fetch(pool, input, first_seg) {
         Ok(result) => result,
         Err((client, failure)) => {
             return Err(settle(
@@ -410,6 +456,49 @@ fn play_authorized(
             ))
         }
     };
+    if let Some(r) = ranges {
+        let agrees = first.file_size == r[r.len() - 1].1
+            && first.offset == r[first_seg].0
+            && first.data.len() as u64 == r[first_seg].1 - r[first_seg].0;
+        if !agrees && first_seg != 0 {
+            // The hint lied about the covering article: discard it and
+            // restart as a prefix walk on the same connection.
+            match fetch_segment(&mut client, &input.segments[0]) {
+                Ok(decoded) => {
+                    first = decoded;
+                    first_seg = 0;
+                }
+                Err(SegmentError::Nntp(e)) => {
+                    let failure = nntp_failure(e, &input.segments[0]);
+                    let keep = if failure.1 == Conn::KeepWarm {
+                        Some(client)
+                    } else {
+                        None
+                    };
+                    return Err(settle(
+                        pool,
+                        meter,
+                        lease,
+                        keep,
+                        failure,
+                        user,
+                        input.track_id,
+                    ));
+                }
+                Err(SegmentError::Decode(e)) => {
+                    return Err(settle(
+                        pool,
+                        meter,
+                        lease,
+                        Some(client),
+                        (PlayError::Decode(e), Conn::KeepWarm),
+                        user,
+                        input.track_id,
+                    ));
+                }
+            }
+        }
+    }
     if redialed {
         meter.emit(ev_pool(
             MeterKind::WarmRedial,
@@ -432,21 +521,26 @@ fn play_authorized(
         client,
         lease,
         segments: input.segments.to_vec(),
-        next_seg: 0,
+        seg_placed: vec![None; input.segments.len()],
+        next_seg: first_seg,
+        seg_done: vec![false; input.segments.len()],
         cipher_key: input.cipher_key,
         started_at: input.now_unix,
         total: first.file_size,
-        fetched: 0,
-        buf: Vec::new(),
+        buf: Arc::from([]),
         buf_start: 0,
+        pending: BTreeMap::new(),
+        staged_seg: 0,
+        staged_bytes: 0,
         upload: MultipartUpload::begin(input.track_id),
         failed: None,
         provider_error_epoch: pool.provider_error_epoch_source(),
         last_success_epoch: None,
     };
-    if let Err(failure) = live.ingest(first) {
+    if let Err(failure) = live.ingest(first_seg, first) {
         return Err(live.settle(pool, meter, Some(failure), user, input.track_id));
     }
+    live.next_seg = first_seg + 1;
     let window = match resolve_range(live.total, input.range) {
         Ok(window) => window,
         Err(e) => {
@@ -472,12 +566,37 @@ fn play_authorized(
     ))
 }
 
-/// Dial or reuse a connection and fetch + decode segment 0. A warm
-/// connection the provider silently closed is redialed once.
-fn open_and_fetch_first(
+/// Accept `segment_ranges` only in the exact shape the covering fetch can
+/// trust: one non-empty range per segment, contiguous from byte 0.
+/// Anything else returns `None` and the caller keeps the prefix walk —
+/// suspect NZB metadata must never make a playable track unplayable.
+fn valid_ranges(ranges: Option<&[(u64, u64)]>, segments: usize) -> Option<&[(u64, u64)]> {
+    let ranges = ranges?;
+    if ranges.len() != segments || ranges.first().map(|r| r.0) != Some(0) {
+        return None;
+    }
+    if ranges.iter().any(|(start, end)| end <= start) || ranges.windows(2).any(|w| w[0].1 != w[1].0)
+    {
+        return None;
+    }
+    Some(ranges)
+}
+
+/// Index of the segment whose range covers `start` (`start` < file size,
+/// as resolved ranges guarantee).
+fn covering_segment(ranges: &[(u64, u64)], start: u64) -> usize {
+    ranges.partition_point(|&(_, end)| end <= start)
+}
+
+/// Dial or reuse a connection and fetch + decode segment `idx` (segment 0
+/// on the prefix walk, the covering segment when ranges are present). A
+/// warm connection the provider silently closed is redialed once.
+fn open_and_fetch(
     pool: &mut StreamPool,
     input: &PlayInput<'_>,
+    idx: usize,
 ) -> Result<(NntpClient, Decoded, bool), (Option<NntpClient>, Failure)> {
+    let mid = &input.segments[idx];
     let mut warm = pool.take_idle();
     let was_warm = warm.is_some();
     let mut redialed = false;
@@ -489,10 +608,10 @@ fn open_and_fetch_first(
                     pool.record_connect();
                     client
                 }
-                Err(e) => return Err((None, nntp_failure(e, &input.segments[0]))),
+                Err(e) => return Err((None, nntp_failure(e, mid))),
             },
         };
-        match fetch_segment(&mut client, &input.segments[0]) {
+        match fetch_segment(&mut client, mid) {
             Ok(decoded) => return Ok((client, decoded, redialed)),
             Err(SegmentError::Nntp(e))
                 if was_warm
@@ -506,7 +625,7 @@ fn open_and_fetch_first(
                 continue;
             }
             Err(SegmentError::Nntp(e)) => {
-                let failure = nntp_failure(e, &input.segments[0]);
+                let failure = nntp_failure(e, mid);
                 let keep = if failure.1 == Conn::KeepWarm {
                     Some(client)
                 } else {
@@ -596,13 +715,31 @@ fn settle(
 }
 
 impl Live {
-    /// Take one decoded segment: check its placement, decrypt, stage the
-    /// upload part and make it the current buffer.
-    fn ingest(&mut self, mut d: Decoded) -> Result<(), Failure> {
+    /// Take one decoded segment: check its placement, decrypt, stage it
+    /// (flushing the contiguous prefix into the upload) and make it the
+    /// current buffer. Placement is proven from the articles themselves,
+    /// in any fetch order: the first segment anchors at 0, the last ends
+    /// at the declared file size, and every segment must chain exactly
+    /// onto any already-placed neighbour. The NZB ranges hint plays no
+    /// part here (it only chose the covering segment in `play`, where the
+    /// covering article is cross-checked against it), so wrong interior
+    /// boundaries in the hint can never fail a playable track.
+    fn ingest(&mut self, idx: usize, mut d: Decoded) -> Result<(), Failure> {
         let multi_segment = self.segments.len() > 1;
-        let misplaced = d.offset != self.fetched
-            || d.file_size != self.total
-            || (multi_segment && !d.multipart);
+        let len = d.data.len() as u64;
+        let prev_end = idx
+            .checked_sub(1)
+            .and_then(|p| self.seg_placed[p].map(|(off, l)| off + l));
+        let next_start = self
+            .seg_placed
+            .get(idx + 1)
+            .and_then(|next| next.map(|(off, _)| off));
+        let unchained = (idx == 0 && d.offset != 0)
+            || (idx + 1 == self.segments.len() && d.offset + len != self.total)
+            || prev_end.is_some_and(|end| d.offset != end)
+            || next_start.is_some_and(|start| d.offset + len != start)
+            || d.offset + len > self.total;
+        let misplaced = unchained || d.file_size != self.total || (multi_segment && !d.multipart);
         if misplaced {
             return Err((PlayError::Decode(YencError::BadPart), Conn::KeepWarm));
         }
@@ -611,16 +748,22 @@ impl Live {
         for b in d.data.iter_mut() {
             *b ^= self.cipher_key;
         }
-        self.upload.part(&d.data);
-        self.buf_start = self.fetched;
-        self.fetched += d.data.len() as u64;
-        self.buf = d.data;
-        self.next_seg += 1;
-        if self.next_seg == self.segments.len() && self.fetched != self.total {
+        self.buf_start = d.offset;
+        self.seg_placed[idx] = Some((d.offset, len));
+        let data: Arc<[u8]> = Arc::from(d.data);
+        self.buf = Arc::clone(&data);
+        self.seg_done[idx] = true;
+        self.pending.insert(idx, data);
+        while let Some(data) = self.pending.remove(&self.staged_seg) {
+            self.upload.part(&data);
+            self.staged_bytes += data.len() as u64;
+            self.staged_seg += 1;
+        }
+        if self.staged_seg == self.segments.len() && self.staged_bytes != self.total {
             return Err((
                 PlayError::Decode(YencError::SizeMismatch {
                     expected: self.total,
-                    actual: self.fetched as usize,
+                    actual: self.staged_bytes as usize,
                 }),
                 Conn::KeepWarm,
             ));
@@ -628,18 +771,39 @@ impl Live {
         Ok(())
     }
 
-    fn load_next(&mut self) -> Result<(), Failure> {
-        let mid = self.segments[self.next_seg].clone();
+    /// Fetch + ingest segment `idx`, wherever it sits in the file.
+    fn load(&mut self, idx: usize) -> Result<(), Failure> {
+        let mid = self.segments[idx].clone();
         let fetch_epoch = self.provider_error_epoch.load(Ordering::Acquire);
         match fetch_segment(&mut self.client, &mid) {
             Ok(decoded) => {
-                self.ingest(decoded)?;
+                self.ingest(idx, decoded)?;
                 self.last_success_epoch = Some(fetch_epoch);
                 Ok(())
             }
             Err(SegmentError::Nntp(e)) => Err(nntp_failure(e, &mid)),
             Err(SegmentError::Decode(e)) => Err((PlayError::Decode(e), Conn::KeepWarm)),
         }
+    }
+
+    /// Fetch + ingest the next segment the client needs. A covering fetch
+    /// first backfills the prefix it skipped, in file order: the covering
+    /// segment then flushes out of `pending` into the staged upload, so at
+    /// most one segment ever waits out of order (the staged 5 MiB part plus
+    /// one segment bound holds however long the client's range runs). On
+    /// the prefix walk every earlier segment is already done and this is a
+    /// plain sequential fetch. `finalize` backfills the same way when the
+    /// client's range ends inside the covering segment.
+    fn load_next(&mut self) -> Result<(), Failure> {
+        for idx in 0..self.next_seg {
+            if !self.seg_done[idx] {
+                self.load(idx)?;
+            }
+        }
+        let idx = self.next_seg;
+        self.load(idx)?;
+        self.next_seg += 1;
+        Ok(())
     }
 
     /// Release the lease for good, returning how the play ended.
@@ -821,10 +985,17 @@ impl PlayStream {
             Some(Source::Live(live)) => live,
             _ => return Ok(()),
         };
-        while live.failed.is_none() && live.next_seg < live.segments.len() {
-            if let Err(failure) = live.load_next() {
-                live.failed = Some(failure);
+        // Fetch whatever serving skipped — segments past the client's
+        // range, plus the prefix a covering fetch jumped over — in file
+        // order, so staging flushes the whole track into the upload.
+        let mut idx = 0;
+        while live.failed.is_none() && idx < live.segments.len() {
+            if !live.seg_done[idx] {
+                if let Err(failure) = live.load(idx) {
+                    live.failed = Some(failure);
+                }
             }
+            idx += 1;
         }
         if live.failed.is_none()
             && live.last_success_epoch == Some(pool.provider_error_epoch())
@@ -1046,6 +1217,7 @@ mod tests {
             range: None,
             server_addr: address,
             segments,
+            segment_ranges: None,
             cipher_key: 0,
             now_unix: 1,
             up_next: None,
@@ -1144,6 +1316,7 @@ mod tests {
             range: None,
             server_addr: addr,
             segments: &[],
+            segment_ranges: None,
             cipher_key: 0,
             now_unix: 1,
             up_next: None,
@@ -1152,6 +1325,29 @@ mod tests {
             play(&mut pool, &mut cache, &mut meter, secret, &input),
             Err(PlayError::WrongTrack)
         ));
+    }
+
+    #[test]
+    fn ranges_validate_only_in_covering_shape() {
+        let good = [(0, 10), (10, 25), (25, 30)];
+        assert_eq!(valid_ranges(Some(&good), 3), Some(&good[..]));
+        // Absent, wrong arity, non-zero start, a gap, an empty segment:
+        // all fall back to the prefix walk instead of failing the play.
+        assert_eq!(valid_ranges(None, 3), None);
+        assert_eq!(valid_ranges(Some(&good), 2), None);
+        assert_eq!(valid_ranges(Some(&[(1, 10)]), 1), None);
+        assert_eq!(valid_ranges(Some(&[(0, 10), (11, 20)]), 2), None);
+        assert_eq!(valid_ranges(Some(&[(0, 10), (10, 10)]), 2), None);
+        assert_eq!(valid_ranges(Some(&[]), 0), None);
+    }
+
+    #[test]
+    fn covering_segment_addresses_the_range_start() {
+        let ranges = [(0, 10), (10, 25), (25, 30)];
+        assert_eq!(covering_segment(&ranges, 0), 0);
+        assert_eq!(covering_segment(&ranges, 9), 0);
+        assert_eq!(covering_segment(&ranges, 10), 1);
+        assert_eq!(covering_segment(&ranges, 29), 2);
     }
 
     #[test]
@@ -1175,6 +1371,7 @@ mod tests {
             range: None,
             server_addr: addr,
             segments: &[],
+            segment_ranges: None,
             cipher_key: 0,
             now_unix: stale_now,
             up_next: None,
@@ -1226,6 +1423,7 @@ mod tests {
             range: Some("bytes=2-5"),
             server_addr: addr,
             segments: &[],
+            segment_ranges: None,
             cipher_key: 0,
             now_unix,
             up_next: None,
@@ -1263,6 +1461,7 @@ mod tests {
             range: None,
             server_addr: addr,
             segments: &[],
+            segment_ranges: None,
             cipher_key: 0,
             now_unix,
             up_next: None,
@@ -1307,6 +1506,7 @@ mod tests {
             range: None,
             server_addr: addr,
             segments: &[],
+            segment_ranges: None,
             cipher_key: 0,
             now_unix: 1_010,
             up_next: None,
@@ -1345,6 +1545,7 @@ mod tests {
             range: None,
             server_addr: addr,
             segments: &[],
+            segment_ranges: None,
             cipher_key: 0,
             now_unix,
             up_next: None,
@@ -1420,6 +1621,7 @@ mod tests {
             range: None,
             server_addr: addr,
             segments: &segments,
+            segment_ranges: None,
             cipher_key: 0,
             now_unix: 5_000,
             up_next: None,
@@ -1479,6 +1681,7 @@ mod tests {
                 range: None,
                 server_addr: addr,
                 segments: &[],
+                segment_ranges: None,
                 cipher_key: 0,
                 now_unix: 1,
                 up_next: None,
@@ -1791,6 +1994,7 @@ mod tests {
             range: None,
             server_addr: addr,
             segments: &[],
+            segment_ranges: None,
             cipher_key: 0,
             now_unix: 1,
             up_next: None,
@@ -1835,6 +2039,7 @@ mod tests {
             cipher_key: 0,
             now_unix: stale_now,
             up_next: None,
+            segment_ranges: None,
         };
         let mut response = play(&mut pool, &mut cache, &mut meter, secret, &input).unwrap();
         assert!(response.cache_hit, "stale is still served from cache");
@@ -1875,6 +2080,7 @@ mod tests {
             range: None,
             server_addr: addr,
             segments: &segments,
+            segment_ranges: None,
             cipher_key: 0,
             now_unix: 1,
             up_next: None,
