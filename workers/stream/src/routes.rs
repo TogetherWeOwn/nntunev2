@@ -88,6 +88,10 @@ pub fn decide_public_fetch() -> (u16, &'static str) {
 mod tests {
     use super::*;
 
+    fn has_line(text: &str, line: &str) -> bool {
+        text.lines().any(|candidate| candidate.trim() == line)
+    }
+
     #[test]
     fn public_fetch_stays_not_found() {
         assert_eq!(decide_public_fetch(), (404, "not found"));
@@ -149,12 +153,12 @@ mod tests {
         let wrangler =
             std::fs::read_to_string(dir.join("wrangler.toml")).expect("read wrangler.toml");
         assert!(
-            wrangler.contains("class_name = \"NntpPool\""),
+            has_line(&wrangler, r#"class_name = "NntpPool""#),
             "wrangler.toml must bind class_name \"NntpPool\":\n{wrangler}"
         );
         assert!(
-            wrangler.contains("\"NntpPool\""),
-            "wrangler.toml migrations must list \"NntpPool\":\n{wrangler}"
+            has_line(&wrangler, r#"new_sqlite_classes = ["NntpPool"]"#),
+            "wrangler.toml must migrate \"NntpPool\" as a SQLite class:\n{wrangler}"
         );
         let runtime =
             std::fs::read_to_string(dir.join("src/runtime.rs")).expect("read src/runtime.rs");

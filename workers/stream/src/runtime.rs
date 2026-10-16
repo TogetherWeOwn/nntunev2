@@ -38,21 +38,16 @@ impl DurableObject for NntpPool {
         // Durable Objects must be addressed with id_from_name(user_id). Refuse
         // unnamed instances rather than serving an ownerless pool.
         let has_owner_name = self.state.id().name().is_some();
-        match routes::decide_probe(method.as_ref(), &req.path(), has_owner_name) {
-            ProbeDecision::NotFound => {
-                Response::error(routes::NOT_FOUND_BODY, routes::NOT_FOUND_STATUS)
-            }
-            ProbeDecision::OwnerMissing => {
-                Response::error(routes::OWNER_MISSING_BODY, routes::OWNER_MISSING_STATUS)
-            }
+        let decision = routes::decide_probe(method.as_ref(), &req.path(), has_owner_name);
+        let response = Response::error(decision.body(), decision.status())?;
+        match decision {
             ProbeDecision::ProviderUnavailable => {
                 let headers = worker::Headers::new();
                 headers.set("content-type", "application/json")?;
                 headers.set("retry-after", "5")?;
-                Ok(Response::ok(routes::PROVIDER_UNAVAILABLE_BODY)?
-                    .with_status(routes::PROVIDER_UNAVAILABLE_STATUS)
-                    .with_headers(headers))
+                Ok(response.with_headers(headers))
             }
+            ProbeDecision::NotFound | ProbeDecision::OwnerMissing => Ok(response),
         }
     }
 }
