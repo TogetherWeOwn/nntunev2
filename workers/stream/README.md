@@ -101,6 +101,24 @@ cargo fmt --all --check
 No network, no Cloudflare account, no secrets: the synthetic NNTP server
 lives in `tests/stream_integration.rs` and serves canned yEnc multipart articles.
 
+## Worker build and current runtime boundary
+
+The crate builds the deployable Worker module with:
+
+```sh
+cargo build --manifest-path workers/stream/Cargo.toml --release --target wasm32-unknown-unknown
+```
+
+This emits `target/wasm32-unknown-unknown/release/nntune_stream.wasm` as well
+as the Rust library artifact. Wrangler's build command runs `worker-build
+--release` to generate the `build/worker/shim.mjs` entry configured below.
+The wasm32-only `runtime` exports the `NntpPool` Durable Object. Its probe
+route currently fails closed with `503 provider_unavailable` until provider
+configuration is wired from the account vault; the Worker's public fetch path
+remains `404` until the play path is connected to Cloudflare's R2 and metering
+adapters. This is a buildable runtime entrypoint, not a production playback
+deployment.
+
 ## Production notes
 
 - Deploy bindings: `wrangler.toml` (`NntpPool` DO, `AUDIO_CACHE` R2,

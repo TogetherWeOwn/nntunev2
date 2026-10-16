@@ -18,10 +18,9 @@
 //! - [`meter`]: Analytics Engine + usage-ledger events.
 //! - [`prefetch`]: next-track prefetch on spare pool capacity (never the last connection).
 //!
-//! Cloudflare bindings (DO storage, R2, Analytics Engine) are wired in
-//! `workers/stream/wrangler.toml`; this crate stays dependency-free so
-//! `cargo test` runs anywhere. The `worker`/DO entry points that embed this
-//! core arrive with the deploy-config slice.
+//! Cloudflare bindings (DO storage, R2, Analytics Engine) are declared in
+//! `workers/stream/wrangler.toml`. The runtime adapter is compiled only for
+//! wasm32 so native `cargo test` continues to exercise the portable core.
 
 pub mod cache;
 pub mod grant;
@@ -32,3 +31,6 @@ pub mod pool;
 pub mod prefetch;
 pub mod range;
 pub mod yenc;
+
+#[cfg(target_arch = "wasm32")]
+pub mod runtime;

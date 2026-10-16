@@ -8,3 +8,9 @@ license = "MIT"
 [lib]
 name = "nntune_stream"
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+worker = "0.8"
+# The Durable Object macro expands to #[wasm_bindgen] items resolved by name.
+wasm-bindgen = "0.2.129"
