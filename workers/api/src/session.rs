@@ -521,6 +521,49 @@ mod tests {
     }
 
     #[test]
+    fn reauthenticate_session_caps_ttl_at_absolute_lifetime() {
+        // Pins the `ttl_secs.min(MAX_SESSION_SECS)` cap in
+        // `reauthenticate_session`: uncapped, a ttl > MAX_SESSION_SECS
+        // mints a token `verify_session` rejects
+        // (`expires_at > created_at + MAX`) while the old row is already
+        // slated for revoke — a dead replacement and a lockout.
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let keys = SessionKeys::single(secret);
+        let now = 1_700_000_000u64;
+        // Stale for privilege ops, but the session itself is still valid.
+        let reauth_at = now + 1200;
+        let old_token = issue_session(secret, "user-1", now, 3600).expect("issue");
+        let old_record = record_for(&verify_session(secret, &old_token, now).expect("verify"));
+
+        let reauthed = reauthenticate_session(
+            &keys,
+            &old_token,
+            reauth_at,
+            &old_record,
+            MAX_SESSION_SECS * 3,
+        )
+        .expect("re-auth mints a capped replacement");
+        assert_eq!(reauthed.revoked_session_id, old_record.id);
+        assert_eq!(
+            reauthed.new_record.expires_at,
+            reauth_at.saturating_add(MAX_SESSION_SECS),
+            "re-auth TTL is capped at the absolute session lifetime"
+        );
+        let claims =
+            verify_session(secret, &reauthed.token, reauth_at).expect("capped token verifies");
+        assert_eq!(claims.expires_at, reauth_at + MAX_SESSION_SECS);
+        assert_eq!(claims.created_at, reauth_at);
+        assert_eq!(reauthed.new_record.expires_at, claims.expires_at);
+        // The replacement is live and fresh at the privilege gate.
+        assert!(
+            verify_stored_session(&keys, &reauthed.token, reauth_at, &reauthed.new_record).is_ok()
+        );
+        assert!(
+            require_fresh_session(&keys, &reauthed.token, reauth_at, &reauthed.new_record).is_ok()
+        );
+    }
+
+    #[test]
     fn debug_redacts_session_secrets() {
         // Threat-model §3: no log line may contain credential material.
         // SessionKeys holds the raw session HMAC secrets; a `{:#?}`/
