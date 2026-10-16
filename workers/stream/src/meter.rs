@@ -11,8 +11,9 @@
 //! - [`MeterEvent`] with [`MeterEvent::seconds`]: stream seconds attributed to
 //!   the play at the nominal rate [`STREAM_BYTES_PER_SEC`]. The authoritative
 //!   ledger row (PlanetScale via Hyperdrive, owned by the api worker) derives
-//!   its seconds from the same byte count with the same rate, so the fast
-//!   signal and the billing truth agree by construction.
+//!   its seconds from the folded byte total ([`served_bytes`]) with the same
+//!   rate. Per-event seconds each round up and are not additive: reconcile
+//!   from bytes, never by summing event seconds.
 
 /// Analytics Engine binding name: must match `[analytics_engine_datasets]`
 /// in `workers/stream/wrangler.toml`.

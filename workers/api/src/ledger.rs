@@ -10,8 +10,9 @@
 //! - One [`LedgerRow`] per billed service window: (`user_id`, `track_id`,
 //!   `idempotency_key`, `bytes_served`, `stream_seconds`, `recorded_at`).
 //!   Seconds MUST equal `ceil(bytes / STREAM_BYTES_PER_SEC)` — the same rate
-//!   the stream worker attributes with — so the fast signal and the ledger
-//!   agree by construction; mismatched seconds are rejected.
+//!   the stream worker attributes with — derived from the window's folded
+//!   byte total, never by summing per-event seconds (each event rounds up,
+//!   so per-event seconds are not additive); mismatched seconds are rejected.
 //! - `period_month` (`YYYY-MM`, UTC) derives deterministically from
 //!   `recorded_at`; monthly usage is `SUM` over (`user_id`, `period_month`).
 //! - Replay safety: the insert is `ON CONFLICT (idempotency_key) DO NOTHING`,
@@ -61,7 +62,9 @@ impl std::fmt::Display for LedgerError {
 }
 
 /// Fresh 128-bit idempotency key (base64url, 22 chars, via the shared
-/// [`crate::b64`] helper). Never sequential; every finalize mints one.
+/// [`crate::b64`] helper). Never sequential. Mint once per billed service
+/// window and reuse the returned key for every finalize retry, so
+/// `ON CONFLICT (idempotency_key) DO NOTHING` can deduplicate retries.
 pub fn new_idempotency_key() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -203,9 +206,11 @@ pub fn ledger_insert_statement() -> &'static str {
 }
 
 /// Parameters: user_id, period_month. One row; zeros when the user has no
-/// usage in the period (COALESCE, never NULL).
+/// usage in the period (COALESCE, never NULL). Both sums are cast to BIGINT
+/// (`SUM` over BIGINT returns NUMERIC in Postgres) so callers can always
+/// decode them as integers.
 pub fn ledger_monthly_total_statement() -> &'static str {
-    "SELECT COALESCE(SUM(stream_seconds), 0) AS stream_seconds, COALESCE(SUM(bytes_served), 0) AS bytes_served FROM usage_ledger WHERE user_id = $1 AND period_month = $2"
+    "SELECT COALESCE(SUM(stream_seconds), 0)::BIGINT AS stream_seconds, COALESCE(SUM(bytes_served), 0)::BIGINT AS bytes_served FROM usage_ledger WHERE user_id = $1 AND period_month = $2"
 }
 
 #[cfg(test)]
@@ -300,7 +305,7 @@ mod tests {
         );
         assert_eq!(
             ledger_monthly_total_statement(),
-            "SELECT COALESCE(SUM(stream_seconds), 0) AS stream_seconds, COALESCE(SUM(bytes_served), 0) AS bytes_served FROM usage_ledger WHERE user_id = $1 AND period_month = $2",
+            "SELECT COALESCE(SUM(stream_seconds), 0)::BIGINT AS stream_seconds, COALESCE(SUM(bytes_served), 0)::BIGINT AS bytes_served FROM usage_ledger WHERE user_id = $1 AND period_month = $2",
             "monthly total"
         );
     }

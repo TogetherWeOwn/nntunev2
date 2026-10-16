@@ -92,5 +92,6 @@ lives in `tests/stream_integration.rs` and serves canned yEnc multipart articles
   `[bytes, seconds]`) + the Hyperdrive usage-ledger table
   (`migrations/0004_usage_ledger.sql`; row intents and statements owned by
   the api worker's `src/ledger.rs`). Every event carries stream seconds at
-  the nominal 48 000 bytes/s rate, so the fast signal and the ledger row
-  derived from the same bytes agree by construction.
+  the nominal 48 000 bytes/s rate. Reconciliation must fold bytes first
+  (`served_bytes`) and derive seconds from that total: per-event seconds
+  each round up, so summing them overcounts split windows.
