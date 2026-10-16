@@ -46,9 +46,9 @@ AAD(payload)  = "v1|vault|<user_id>"              (payload_aad)
 ## 2. Schema (PlanetScale Postgres via Hyperdrive)
 
 Merged reality (`migrations/0002_auth_vault.sql` +
-`migrations/0004_kek_rotation.sql`): the table is `provider_vaults`,
+`migrations/0007_kek_rotation.sql`): the table is `provider_vaults`,
 blobs are base64 `TEXT` (Worker-friendly — no binary column binding
-through Hyperdrive), and migration 0004 adds the rotation marker and
+through Hyperdrive), and migration 0007 adds the rotation marker and
 version index:
 
 ```sql
@@ -61,9 +61,9 @@ CREATE TABLE IF NOT EXISTS provider_vaults (
   payload            TEXT NOT NULL,      -- base64 credentials encrypted under DEK
   indexer_configured BOOLEAN NOT NULL DEFAULT FALSE,
   updated_at         BIGINT NOT NULL,
-  rewrapped_at       BIGINT NULL       -- migration 0004: NULL = never re-wrapped
+  rewrapped_at       BIGINT NULL       -- migration 0007: NULL = never re-wrapped
 );
--- Migration 0004 (landed): rewrapped_at + version index.
+-- Migration 0007 (landed): rewrapped_at + version index.
 -- ALTER TABLE provider_vaults ADD COLUMN rewrapped_at BIGINT NULL;
 -- CREATE INDEX IF NOT EXISTS idx_vault_kek_version ON provider_vaults (kek_version);
 ```
@@ -75,7 +75,7 @@ Rules:
 - Nonces are unique per encryption (CSPRNG). Never reused, never logged.
 - Parameterized queries only. No plaintext credential column, now or as a
   migration backfill — migrations carry ciphertext only.
-- Since migration 0004, `rewrapped_at` is the authoritative re-wrap
+- Since migration 0007, `rewrapped_at` is the authoritative re-wrap
   marker: the §6 conditional UPDATE sets it (with `updated_at`) on every
   re-wrap, and `NULL` means the row has never been re-wrapped. Re-wrap
   passes still track pass-level progress in `rotation_runs` (§6);
@@ -299,7 +299,7 @@ Follow-up gate items (the vault/HTTP slice PR may not merge until the
 CISO gate verifies each at its exact head):
 
 - [x] Follow-up migration: `rewrapped_at` + `kek_version` index (§2)
-      — `migrations/0004_kek_rotation.sql`; the §6 re-wrap UPDATE sets
+      — `migrations/0007_kek_rotation.sql`; the §6 re-wrap UPDATE sets
       `rewrapped_at`, and per-version progress counts are documented
       in §6.
 - [ ] `kek_by_version` selector over provisioned versions so mixed-version

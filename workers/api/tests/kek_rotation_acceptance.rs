@@ -39,7 +39,7 @@ fn fixture_db() -> Connection {
     db.execute_batch(&initial)
         .expect("apply initial vault migration");
 
-    let follow_up = std::fs::read_to_string(migration_path("0004_kek_rotation.sql"))
+    let follow_up = std::fs::read_to_string(migration_path("0007_kek_rotation.sql"))
         .expect("read KEK rotation follow-up migration");
     db.execute_batch(&follow_up)
         .expect("apply KEK rotation follow-up migration");
