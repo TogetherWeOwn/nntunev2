@@ -28,7 +28,7 @@ use crate::probe::{
 use crate::routes::{self, ProbeDecision};
 
 /// Durable Object route for one probe batch.
-pub const PROBE_PATH: &str = "/probe";
+pub const PROBE_PATH: &str = routes::PROBE_PATH;
 
 /// The Worker's own route: only the Durable Object serves probes, so every
 /// request here is a 404 until the play routes land.
@@ -64,7 +64,8 @@ impl DurableObject for NntpPool {
         let has_owner_name = self.state.id().name().is_some();
         let decision = routes::decide_probe(req.method().as_ref(), &req.path(), has_owner_name);
         match decision {
-            ProbeDecision::NotFound | ProbeDecision::OwnerMissing => respond(route_reply(decision)),
+            ProbeDecision::NotFound => Response::error(decision.body(), decision.status()),
+            ProbeDecision::OwnerMissing => respond(route_reply(decision)),
             ProbeDecision::ProviderUnavailable => respond(self.probe(&mut req).await),
         }
     }
@@ -89,7 +90,11 @@ impl NntpPool {
         let provider = match self.provider(&pool_user).await {
             Ok(provider) => provider,
             Err(ProbeError::ProviderUnavailable) => {
-                return route_reply(routes::decide_probe("POST", PROBE_PATH, true));
+                return route_reply(routes::decide_probe(
+                    routes::PROBE_METHOD,
+                    routes::PROBE_PATH,
+                    true,
+                ));
             }
             Err(e) => return ProbeReply::from(Err(e)),
         };
@@ -134,7 +139,7 @@ fn route_reply(decision: ProbeDecision) -> ProbeReply {
     ProbeReply {
         status: decision.status(),
         body: decision.body().to_string(),
-        retry_after_secs: (decision == ProbeDecision::ProviderUnavailable).then_some(5),
+        retry_after_secs: None,
     }
 }
 

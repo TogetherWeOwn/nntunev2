@@ -30,7 +30,7 @@ pub const NOT_FOUND_BODY: &str = "not found";
 /// Probe on an instance without an owner name (`id_from_name(user_id)`).
 pub const OWNER_MISSING_STATUS: u16 = 400;
 /// Probe on an instance without an owner name (`id_from_name(user_id)`).
-pub const OWNER_MISSING_BODY: &str = "pool owner unavailable";
+pub const OWNER_MISSING_BODY: &str = r#"{"error":"bad_request"}"#;
 /// Probe on a named instance before provider wiring lands (retryable).
 pub const PROVIDER_UNAVAILABLE_STATUS: u16 = 503;
 /// Probe on a named instance before provider wiring lands (retryable).
@@ -125,7 +125,7 @@ mod tests {
         let decision = decide_probe("POST", "/probe", false);
         assert_eq!(decision, ProbeDecision::OwnerMissing);
         assert_eq!(decision.status(), 400);
-        assert_eq!(decision.body(), "pool owner unavailable");
+        assert_eq!(decision.body(), r#"{"error":"bad_request"}"#);
     }
 
     #[test]
