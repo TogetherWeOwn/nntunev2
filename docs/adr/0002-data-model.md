@@ -284,10 +284,19 @@ step_up_proofs        id UUID PK, user_id TEXT NOT NULL FK → users ON DELETE C
                       -- assertion signature verifies against a
                       -- webauthn_credentials.public_key row of the same user,
                       -- the user-verification (UV) flag is set, and
-                      -- sign_count advances (UPDATE
-                      -- webauthn_credentials SET sign_count=<new> WHERE
-                      -- cred_id=$c AND user_id=$u AND
-                      -- sign_count<old>). This follows main
+                      -- the presented counter passes the pinned compare-and-set
+                      -- (no angle-bracket placeholders anywhere in this predicate):
+                      -- accept iff the presented counter is strictly greater than
+                      -- the stored counter (UPDATE webauthn_credentials SET
+                      -- sign_count=$presented WHERE cred_id=$c AND user_id=$u
+                      -- AND sign_count < $presented), OR the synced-credential
+                      -- case stored=0 AND presented=0 (main
+                      -- migrations/0002_auth_vault.sql:22 DEFAULT 0; some synced
+                      -- passkeys never increment, so a stored 0 with a presented
+                      -- 0 verifies WITHOUT advancing and without incrementing
+                      -- attempts). Stored>0 with presented=0, or
+                      -- presented<stored otherwise, fails verification and only
+                      -- increments attempts. This follows main
                       -- workers/api/src/auth.rs, where
                       -- verify_and_consume_challenge is documented as a
                       -- lifecycle gate only and callers must still complete
@@ -1030,14 +1039,27 @@ Public playlists (`playlists.is_public=TRUE`, retained from 0003) are the one
 visibility exception, and they are metadata-only for non-owners: a non-owner
 read of a public playlist returns only `public_id`, `name`, `is_public` and the
 entry count — never embedded track rows, catalog ids, file tags, `coverart:`
-ids, or the legacy `items` JSONB. The merged
-`playlist_read_statement`/`playlist_list_statement` shape
-(`WHERE public_id=$1 AND (owner_user_id=$2 OR is_public=TRUE)` returning
-`items` to any caller) is therefore narrowed: list/single reads keep the
-owner-or-public predicate for the metadata row, but the `items` column and any
-backfilled `playlist_tracks` rows are projected only when
-`owner_user_id=caller`; non-owner projections return an empty items/entry set
-with the count. The legacy `items` column is readable by the playlist owner
+ids, or the legacy `items` JSONB. The merged shapes are distinct and are
+narrowed separately (verified against main `workers/api/src/library.rs`):
+`playlist_read_statement` (`SELECT public_id, name, items, is_public ...
+WHERE public_id=$1 AND (owner_user_id=$2 OR is_public=TRUE)`) is the one
+that returns `items` to any caller, while `playlist_list_statement` already
+selects only `public_id, name, is_public` under `WHERE (owner_user_id=$1 OR
+is_public=TRUE)` with cursor paging — it takes no `public_id` and never
+returned `items`. The read keeps the owner-or-public predicate for the
+metadata row, but the `items` column and any backfilled `playlist_tracks`
+rows are projected only when `owner_user_id=caller`; non-owner
+projections return an empty items/entry set with the count. The list keeps
+its metadata-only shape and gains only the entry count column. The
+non-owner entry count has exactly one source per phase with no mixed
+window: before the implementing-PR cutover it is
+`jsonb_array_length(items)`; the freeze, the where-resolves backfill, and
+the narrowed projection land atomically in that one PR, so after cutover it
+is `COUNT(*) FROM playlist_tracks WHERE playlist_id=$pid` — never
+a sum or max of the two. Unresolved legacy entries (opaque refs that never
+resolve) stay owner-only and are excluded from the non-owner count by
+design; the implementing PR's acceptance asserts post-backfill count equals
+the pre-freeze `items` length for fully-resolvable playlists. The legacy `items` column is readable by the playlist owner
 only during transition (opaque refs, never guessed into track rows), never by a
 non-owner. An owner read resolves embedded rows through the owner's own
 memberships exactly like any other playlist read. Local-row ownership is derived via the indexed `local_job_id` →
@@ -1340,15 +1362,19 @@ retaining its `release_mbid_hint` without guessing. Also require:
   `items`. The legacy `items` column is never returned to a non-owner, even
   for unresolvable refs. Owner reads resolve embedded rows through the owner's
   own memberships.
-- Step-up method split: an unsigned or wrong-key passkey assertion, and a
-  valid-signature assertion without the UV flag, both leave `verified_at` NULL
-  and increment `attempts` (no-credential-term UPDATE); only a
-  challenge-matching, origin/rp-bound, signature-verified, UV-set assertion
-  with an advancing `sign_count` sets `verified_at`. A bare challenge-id match
-  never verifies.
+- Step-up method split: an unsigned or wrong-key passkey assertion, a
+  valid-signature assertion without the UV flag, and a valid UV assertion
+  whose presented counter goes backwards (stored>0 with presented=0, or
+  presented<stored) all leave `verified_at` NULL and increment `attempts`
+  (no-credential-term UPDATE); only a challenge-matching, origin/rp-bound,
+  signature-verified, UV-set assertion whose counter passes the pinned
+  compare-and-set sets `verified_at` — presented>stored advances it, and the
+  synced-credential stored=0/presented=0 case verifies without advancing. A
+  bare challenge-id match never verifies.
 - Merged playlist SQL rework: the implementing PR replaces
   `playlist_delete_statement` with the fenced rule-3 delete, freezes `items`
-  writes, narrows the read/list projections per §6, and maps or retires
+  writes, narrows the read projection for non-owners and adds the entry
+  count to the already-metadata-only list per §6, and maps or retires
   `/api/playlists` onto `/v1/playlists`; the merged
   `library_single_row_visibility.rs` / `library_tests.rs` pins are updated in
   the same PR.
@@ -1421,8 +1447,12 @@ work. Production DB creation/migration remains gated by the ops contract.
   `playlist_update_statement` must stop writing `items` — 422 on items input
   or route it into `playlist_tracks` — because the column is read-only in
   transition and merged handlers would otherwise mint playlists that never
-  reach `playlist_tracks`); narrow `playlist_read_statement` /
-  `playlist_list_statement` to the §6 metadata-only projection for non-owners;
+  reach `playlist_tracks`); narrow `playlist_read_statement` to the §6
+  metadata-only projection for non-owners (drop `items` for non-owners) and
+  extend the already-metadata-only `playlist_list_statement` with only the
+  §6 entry-count column (`COUNT(*) FROM playlist_tracks`, cut over
+  atomically with the backfill per §6 — the list was never an `items`
+  carrier, so there is no "narrow the list" step);
   and map or retire the merged `/api/playlists` routes onto the declared
   `/v1/playlists` surface (ADR 0006 declares only `/v1`; no parallel
   `/api/playlists` contract survives). The same PR updates the merged

@@ -65,8 +65,11 @@ least-privilege credential.
    assertion's challenge must equal the bound `challenge_id` AND rp_id/origin
    must match AND the signature must verify against a
    `webauthn_credentials.public_key` row of the same user AND the UV flag must
-   be set AND `sign_count` must advance (a bare challenge-id match never sets
-   `verified_at`, per main `workers/api/src/auth.rs` where
+   be set AND the presented counter must pass the pinned compare-and-set in
+   ADR 0002 (presented strictly greater than stored advances it; stored=0
+   with presented=0 verifies without advancing, per main
+   `migrations/0002_auth_vault.sql:22` DEFAULT 0 — a bare challenge-id match
+   never sets `verified_at`, per main `workers/api/src/auth.rs` where
    `verify_and_consume_challenge` is a lifecycle gate only) — any failure
    increments `attempts` without any credential term and returns 403, a pass
    sets `verified_at`; 10/15min per proof, 5 failures lock at `attempts`=5,
@@ -162,8 +165,10 @@ least-privilege credential.
   Public playlists (`is_public=TRUE`) are metadata-only for non-owners: name
   and entry count only, never embedded track rows, catalog ids, tags,
   `coverart:` ids, or legacy `items` (ADR 0002 §6 narrows the merged
-  `playlist_read_statement`/`playlist_list_statement`, which returned `items`
-  to any caller). The merged `/api/playlists` routes are mapped onto
+  `playlist_read_statement`, which returned `items` to any caller under
+  `WHERE public_id=$1 AND (owner_user_id=$2 OR is_public=TRUE)`; the
+  `playlist_list_statement` never returned `items` — it already selects only
+  `public_id, name, is_public` — and gains only the entry count). The merged `/api/playlists` routes are mapped onto
   `/v1/playlists` (or retired with the statements above) — no parallel
   `/api/playlists` contract survives this ADR.
   Membership and playlist writes are ownership-checked per ADR 0002 §6 and cannot
