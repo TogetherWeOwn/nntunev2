@@ -15,10 +15,14 @@ compatibility_date = "2026-10-01"
 
 # Artwork cache: one R2 bucket per environment (docs/ops.md inventory).
 # Binding activation is a separate follow-up; uncomment when activating.
+# The MB mirror Hyperdrive is shared across envs (one `nntunev2-mb` config,
+# docs/ops.md); the KV namespace and R2 bucket are per env. `ENVIRONMENT` is
+# informational only: the worker does not read it yet, and the per-env
+# ART_CACHE binding is what selects the bucket.
 # Staging (`wrangler deploy --env staging`); bindings do not inherit:
 # [[env.staging.hyperdrive]]
 # binding = "MB_DB"
-# id = "<STAGING_HYPERDRIVE_ID_FOR_nntunev2-mb>"
+# id = "<HYPERDRIVE_ID_MB>"
 # [[env.staging.kv_namespaces]]
 # binding = "MB_CACHE"
 # id = "<STAGING_KV_NAMESPACE_ID>"
@@ -31,7 +35,7 @@ compatibility_date = "2026-10-01"
 # Prod (`wrangler deploy --env production`); bindings do not inherit:
 # [[env.production.hyperdrive]]
 # binding = "MB_DB"
-# id = "<PRODUCTION_HYPERDRIVE_ID_FOR_nntunev2-mb>"
+# id = "<HYPERDRIVE_ID_MB>"
 # [[env.production.kv_namespaces]]
 # binding = "MB_CACHE"
 # id = "<PRODUCTION_KV_NAMESPACE_ID>"
