@@ -22,6 +22,8 @@ use nntune_stream::yenc::{self, PartSpec};
 
 const SECRET: &[u8] = b"covering-fallback-secret";
 const NOW_UNIX: u64 = 1_700_000_000;
+// Play-path grants must sit within the TTL cap (`MAX_GRANT_TTL` = 900 s).
+const EXP_UNIX: u64 = NOW_UNIX + 900;
 const CIPHER_KEY: u8 = 0x5A;
 
 fn fixture_track(tag: &str, len: usize, seg_len: usize) -> (Vec<u8>, Vec<String>, Server) {
@@ -166,7 +168,7 @@ fn run(
     let mut pool: StreamPool = Pool::new(4);
     let mut cache = ContentCache::new();
     let mut meter = MemoryMeter::default();
-    let token = grant::issue("user-1", "track-a", 9_999_999_999, SECRET);
+    let token = grant::issue("user-1", "track-a", EXP_UNIX, SECRET);
     let inp = PlayInput {
         token: &token,
         track_id: "track-a",
@@ -226,7 +228,7 @@ fn covering_seek_backfills_prefix_before_serving_past_the_covering_segment() {
     let mut pool: StreamPool = Pool::new(4);
     let mut cache = ContentCache::new();
     let mut meter = MemoryMeter::default();
-    let token = grant::issue("user-1", "track-a", 9_999_999_999, SECRET);
+    let token = grant::issue("user-1", "track-a", EXP_UNIX, SECRET);
     let inp = PlayInput {
         token: &token,
         track_id: "track-a",
