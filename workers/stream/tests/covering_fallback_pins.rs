@@ -16,7 +16,7 @@ use std::time::Duration;
 use nntune_stream::cache::ContentCache;
 use nntune_stream::grant;
 use nntune_stream::meter::MemoryMeter;
-use nntune_stream::play::{play, PlayInput, PlayStream, StreamPool};
+use nntune_stream::play::{play, PlayError, PlayInput, PlayStream, StreamPool};
 use nntune_stream::pool::Pool;
 use nntune_stream::yenc::{self, PartSpec};
 
@@ -257,4 +257,108 @@ fn covering_seek_backfills_prefix_before_serving_past_the_covering_segment() {
     stream
         .finalize(&mut pool, &mut cache, &mut meter)
         .expect("finalize");
+}
+
+#[test]
+fn duplicate_interior_article_is_rejected_on_prefix_and_covering_paths() {
+    let ranges = [
+        (0u64, 20_000u64),
+        (20_000, 40_000),
+        (40_000, 60_000),
+        (60_000, 80_000),
+    ];
+
+    // Prefix walk: after segment 0 is placed, segment 1 incorrectly names
+    // that same article again. Its offset must not be accepted as segment 1.
+    let (_plain, mut segments, server) = fixture_track("prefix-duplicate", 80_000, 20_000);
+    segments[1] = segments[0].clone();
+    let mut pool: StreamPool = Pool::new(4);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+    let token = grant::issue("user-1", "track-a", EXP_UNIX, SECRET);
+    let inp = PlayInput {
+        token: &token,
+        track_id: "track-a",
+        range: Some("bytes=20000-20099"),
+        server_addr: server.addr,
+        segments: &segments,
+        segment_ranges: None,
+        cipher_key: CIPHER_KEY,
+        now_unix: NOW_UNIX,
+        up_next: None,
+    };
+    let resp = play(&mut pool, &mut cache, &mut meter, SECRET, &inp).expect("prefix play");
+    let mut stream: PlayStream = resp.stream;
+    assert!(stream.next().is_none());
+    let prefix_stream_bad_part = matches!(
+        stream.error(),
+        Some(PlayError::Decode(yenc::YencError::BadPart))
+    );
+    let prefix_finalize_bad_part = matches!(
+        stream.finalize(&mut pool, &mut cache, &mut meter),
+        Err(PlayError::Decode(yenc::YencError::BadPart))
+    );
+    let prefix_cache_empty = cache.get_track("track-a").is_none();
+
+    // Covering path: start at segment 2, then force load_next to backfill the
+    // skipped prefix. The duplicate interior article must fail before it can
+    // be staged behind the covering segment.
+    let (_plain, mut segments, server) = fixture_track("cover-duplicate", 80_000, 20_000);
+    segments[1] = segments[0].clone();
+    let mut pool: StreamPool = Pool::new(4);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+    let token = grant::issue("user-1", "track-a", EXP_UNIX, SECRET);
+    let inp = PlayInput {
+        token: &token,
+        track_id: "track-a",
+        range: Some("bytes=45000-"),
+        server_addr: server.addr,
+        segments: &segments,
+        segment_ranges: Some(&ranges),
+        cipher_key: CIPHER_KEY,
+        now_unix: NOW_UNIX,
+        up_next: None,
+    };
+    let resp = play(&mut pool, &mut cache, &mut meter, SECRET, &inp).expect("covering play");
+    let mut stream: PlayStream = resp.stream;
+    assert!(
+        stream.next().is_some(),
+        "covering article serves initial bytes"
+    );
+    while stream.next().is_some() {}
+    let covering_stream_bad_part = matches!(
+        stream.error(),
+        Some(PlayError::Decode(yenc::YencError::BadPart))
+    );
+    let covering_finalize_bad_part = matches!(
+        stream.finalize(&mut pool, &mut cache, &mut meter),
+        Err(PlayError::Decode(yenc::YencError::BadPart))
+    );
+    let covering_cache_empty = cache.get_track("track-a").is_none();
+
+    assert!(
+        prefix_stream_bad_part,
+        "prefix walk must reject the duplicate"
+    );
+    assert!(
+        prefix_finalize_bad_part,
+        "prefix failure must survive finalize"
+    );
+    assert!(
+        prefix_cache_empty,
+        "prefix failure must not cache the track"
+    );
+    assert!(
+        covering_stream_bad_part,
+        "covering backfill must reject the duplicate"
+    );
+    assert!(
+        covering_finalize_bad_part,
+        "covering failure must survive finalize"
+    );
+    assert!(
+        covering_cache_empty,
+        "covering failure must not cache the track"
+    );
 }
