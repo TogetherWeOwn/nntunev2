@@ -320,9 +320,10 @@ fn meter_failure_response(err: &MeterWriteError) -> Result<Response> {
 /// never be the authority behind the idempotency: the ledger below is.
 ///
 /// Protocol per admission (`drive_metered_admission`):
-/// 1. `record_stage_once` inserts (`job_id`, `stage`) as `pending`, or
-///    returns the existing mark. A storage failure answers 503
-///    (fail-closed): nothing was queued or metered.
+/// 1. `record_stage_once` atomically claims (`job_id`, `stage`) and inserts
+///    `pending`, or returns the existing mark. A competing claimant gets
+///    `Busy` and answers 503 + Retry-After without queue/meter side effects.
+///    A storage failure also answers 503 (fail-closed).
 /// 2. An existing `queued` mark means a previous attempt finished the
 ///    whole outbox (Queue accepted AND meter written): replay 202 without
 ///    re-queueing or re-metering. This is the idempotency that closes the
@@ -347,11 +348,12 @@ fn meter_failure_response(err: &MeterWriteError) -> Result<Response> {
 ///    recovery re-drives `pending` (at most a duplicate `Ok` in that
 ///    narrow window, never a silent drop — this slice forbids drops).
 ///
-/// Production backing is the `metered_admission` table in the existing
-/// `LIBRARY_DB` Hyperdrive database (`migrations/0004_*`): `PRIMARY KEY
-/// (job_id, stage)` makes concurrent `record_stage_once` inserts converge
-/// (one row wins; every loser reads the same mark), which a process-local
-/// set or an eventually consistent marker cannot do.
+/// Production uses the `metered_admission` table in the existing
+/// `LIBRARY_DB` Hyperdrive database (`migrations/0004_*`) for durable marks,
+/// and a Postgres session advisory lock keyed by (`job_id`, `stage`) as the
+/// cross-isolate atomic claim. The lock stays on the request's dedicated DB
+/// connection until commit or retryable failure; process loss drops the
+/// session and releases it.
 ///
 /// Outbox mark for one (`job_id`, `stage`) admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -360,6 +362,8 @@ enum AdmissionMark {
     /// Intent recorded; the Queue has not observably accepted the job and
     /// no `Ok` meter event is owed yet.
     Pending,
+    /// Another request currently owns the admission attempt; not persisted.
+    Busy,
     /// Queue accepted AND the entry `Ok` meter event was written: the
     /// admission is complete and replays as 202 with no further writes.
     Queued,
@@ -367,26 +371,34 @@ enum AdmissionMark {
 
 /// Authoritative durable ledger keyed by (`job_id`, `stage`).
 ///
-/// Production: [`PgAdmissionLedger`] over Hyperdrive Postgres, where the
-/// primary key is the concurrency authority. Tests drive the same seam
-/// with in-memory and file-backed doubles (see `mod tests`).
+/// Production: [`PgAdmissionLedger`] over Hyperdrive Postgres, using a
+/// session advisory lock for atomic ownership and the table primary key for
+/// durable identity. Tests drive the same seam with in-memory and file-backed
+/// doubles (see `mod tests`).
 trait AdmissionLedger {
-    /// Insert (`job_id`, `stage`) as `pending`, or return the existing
-    /// mark when a previous attempt already recorded it. A storage
-    /// failure maps to a retryable [`MeterWriteError`] (fail-closed).
+    /// Atomically claim (`job_id`, `stage`) before reading or creating the
+    /// durable mark. A competing request returns `Busy` without side effects.
     async fn record_stage_once(
         &mut self,
         job_id: &str,
         stage: &str,
     ) -> Result<AdmissionMark, MeterWriteError>;
     /// Commit a `pending` admission to `queued` after the Queue send was
-    /// accepted and the `Ok` meter event was written.
+    /// accepted and the `Ok` meter event was written, then release its claim.
     async fn mark_queued(&mut self, job_id: &str, stage: &str) -> Result<(), MeterWriteError>;
+    /// Release the claim after a failed attempt; a process loss also releases
+    /// the production session-level advisory lock.
+    async fn release_claim(&mut self) {}
 }
 
 /// Parameterized statements owned here (execution lives with the ledger
 /// impls); see `migrations/0004_metered_admission.sql` for the table.
-/// `$1` is the job id, `$2` is the stage, everywhere.
+/// Ledger statements use `$1` for job id and `$2` for stage; claim SQL uses
+/// `$1` for their combined lock key.
+fn admission_claim_sql() -> &'static str {
+    "SELECT pg_try_advisory_lock(hashtextextended($1, 0))"
+}
+
 fn admission_record_sql() -> &'static str {
     "INSERT INTO metered_admission (job_id, stage, state) VALUES ($1, $2, 'pending') \
      ON CONFLICT (job_id, stage) DO NOTHING"
@@ -402,18 +414,21 @@ fn admission_mark_queued_sql() -> &'static str {
 
 /// [`AdmissionLedger`] over the `LIBRARY_DB` Hyperdrive database.
 ///
-/// A fresh connection per statement (Hyperdrive pools underneath): one
-/// statement never shares a client across awaits, so a pooled-route
-/// hiccup fails that statement (fail-closed 503), never the isolate.
-/// Connection detail never reaches logs or errors: every failure maps to
-/// a retryable transport error with no host/role strings.
+/// A dedicated connection is held for the full admission attempt so the
+/// session-level advisory lock remains owned across queue/meter awaits.
+/// Hyperdrive pools underneath; a connection hiccup fails closed as 503,
+/// never the isolate. Connection detail never reaches logs or errors.
 struct PgAdmissionLedger {
     env: Env,
+    claim: Option<tokio_postgres::Client>,
 }
 
 impl PgAdmissionLedger {
     fn from_env(env: &Env) -> Self {
-        Self { env: env.clone() }
+        Self {
+            env: env.clone(),
+            claim: None,
+        }
     }
 
     async fn client(&self) -> Result<tokio_postgres::Client, MeterWriteError> {
@@ -464,20 +479,28 @@ impl AdmissionLedger for PgAdmissionLedger {
     ) -> Result<AdmissionMark, MeterWriteError> {
         let unavailable = || MeterWriteError::Transport("admission ledger unavailable".to_string());
         let client = self.client().await?;
+        // A session advisory lock is the atomic claim. Keep this dedicated
+        // connection alive across queue/meter awaits; concurrent requests
+        // fail fast rather than both driving the same pending row.
+        let lock_key = format!("{job_id}:{stage}");
+        let locked: bool = client
+            .query_one(admission_claim_sql(), &[&lock_key])
+            .await
+            .map_err(|_| unavailable())?
+            .get(0);
+        if !locked {
+            return Ok(AdmissionMark::Busy);
+        }
+        self.claim = Some(client);
+        let client = self.claim.as_ref().expect("claim just stored");
         client
             .execute(admission_record_sql(), &[&job_id, &stage])
             .await
-            .map_err(|e| {
-                console_log!("admission ledger record failed: {:?}", e);
-                unavailable()
-            })?;
+            .map_err(|_| unavailable())?;
         let row = client
             .query_opt(admission_read_mark_sql(), &[&job_id, &stage])
             .await
-            .map_err(|e| {
-                console_log!("admission ledger read failed: {:?}", e);
-                unavailable()
-            })?;
+            .map_err(|_| unavailable())?;
         match row {
             Some(row) => {
                 let state: String = row.get(0);
@@ -488,7 +511,10 @@ impl AdmissionLedger for PgAdmissionLedger {
     }
 
     async fn mark_queued(&mut self, job_id: &str, stage: &str) -> Result<(), MeterWriteError> {
-        let client = self.client().await?;
+        let client = self
+            .claim
+            .as_ref()
+            .ok_or_else(|| MeterWriteError::Transport("admission claim missing".to_string()))?;
         client
             .execute(admission_mark_queued_sql(), &[&job_id, &stage])
             .await
@@ -496,7 +522,14 @@ impl AdmissionLedger for PgAdmissionLedger {
                 console_log!("admission ledger commit failed: {:?}", e);
                 MeterWriteError::Transport("admission ledger unavailable".to_string())
             })?;
+        self.release_claim().await;
         Ok(())
+    }
+
+    async fn release_claim(&mut self) {
+        // Dropping the session releases the advisory lock even if explicit
+        // unlock fails; never reuse a claim after an incomplete attempt.
+        self.claim.take();
     }
 }
 
@@ -507,6 +540,8 @@ impl AdmissionLedger for PgAdmissionLedger {
 enum AdmissionDecision {
     /// Ledger already `queued`: replay 202 with no queue/meter writes.
     AlreadyQueued,
+    /// Another request owns the durable admission claim; retry shortly.
+    Busy,
     /// Queue accepted, `Ok` metered, ledger committed: answer 202.
     Admitted,
     /// Queue unavailable: nothing queued or metered, ledger `pending`.
@@ -542,18 +577,28 @@ where
     }
     let mark = match ledger.record_stage_once(&msg.job_id, stage).await {
         Ok(mark) => mark,
-        Err(e) => return AdmissionDecision::MeterUnavailable(e),
+        Err(e) => {
+            ledger.release_claim().await;
+            return AdmissionDecision::MeterUnavailable(e);
+        }
     };
     if mark == AdmissionMark::Queued {
+        ledger.release_claim().await;
         return AdmissionDecision::AlreadyQueued;
     }
+    if mark == AdmissionMark::Busy {
+        return AdmissionDecision::Busy;
+    }
     if !queue_send().await {
+        ledger.release_claim().await;
         return AdmissionDecision::QueueUnavailable;
     }
     if let Err(e) = meter_emit(MeterOutcome::Ok).await {
+        ledger.release_claim().await;
         return AdmissionDecision::MeterUnavailable(e);
     }
     if let Err(e) = ledger.mark_queued(&msg.job_id, stage).await {
+        ledger.release_claim().await;
         return AdmissionDecision::MeterUnavailable(e);
     }
     AdmissionDecision::Admitted
@@ -583,6 +628,7 @@ async fn admit_metered_job(
         AdmissionDecision::AlreadyQueued | AdmissionDecision::Admitted => {
             queued_envelope(msg, source, true, extra)
         }
+        AdmissionDecision::Busy => service_unavailable("admission is in progress; retry shortly"),
         AdmissionDecision::QueueUnavailable => queued_envelope(msg, source, false, extra),
         AdmissionDecision::MeterUnavailable(e) => meter_failure_response(&e),
     }
@@ -874,14 +920,13 @@ mod tests {
 
     // --- Durable metered admission seam ---------------------------------
     //
-    // The production ledger is Postgres (`PgAdmissionLedger`, primary key
-    // as the concurrency authority). These doubles prove the admission
-    // state machine drives the `AdmissionLedger` seam correctly under
-    // reload, concurrency, and failure — no Worker runtime needed.
+    // Production uses a Postgres session advisory lock for the concurrent
+    // claim and the primary key for durable marks. These doubles prove the
+    // admission state machine at the `AdmissionLedger` seam under reload,
+    // concurrency, and failure — no Worker runtime needed.
 
-    /// In-memory ledger double: the `Mutex` (or sole ownership) around it
-    /// stands in for the Postgres primary key in production. Injected
-    /// `fail_*` flags model ledger commit failures.
+    /// In-memory ledger double for durable marks. Injected `fail_*` flags
+    /// model ledger commit failures; `ConcurrentLedger` models claim races.
     struct MemLedger {
         marks: std::collections::BTreeMap<(String, String), AdmissionMark>,
         fail_record: bool,
@@ -1109,9 +1154,11 @@ mod tests {
                 "ledger statements are keyed by (job_id, stage): {sql}"
             );
         }
+        assert!(admission_claim_sql().contains("pg_try_advisory_lock"));
+        assert!(admission_claim_sql().contains("hashtextextended"));
         assert!(
             admission_record_sql().contains("ON CONFLICT (job_id, stage) DO NOTHING"),
-            "concurrent records must converge on one row"
+            "retries must converge on one durable row"
         );
         assert!(admission_record_sql().contains("pending"));
         assert!(admission_mark_queued_sql().contains("queued"));
@@ -1341,33 +1388,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    struct ConcurrentLedger {
+        shared: std::sync::Arc<std::sync::Mutex<(AdmissionMark, bool)>>,
+    }
+
+    impl AdmissionLedger for ConcurrentLedger {
+        async fn record_stage_once(
+            &mut self,
+            _job_id: &str,
+            _stage: &str,
+        ) -> Result<AdmissionMark, MeterWriteError> {
+            let mut state = self.shared.lock().expect("state lock");
+            if state.0 == AdmissionMark::Queued {
+                return Ok(AdmissionMark::Queued);
+            }
+            if state.1 {
+                return Ok(AdmissionMark::Busy);
+            }
+            state.1 = true;
+            Ok(AdmissionMark::Pending)
+        }
+
+        async fn mark_queued(
+            &mut self,
+            _job_id: &str,
+            _stage: &str,
+        ) -> Result<(), MeterWriteError> {
+            let mut state = self.shared.lock().expect("state lock");
+            state.0 = AdmissionMark::Queued;
+            state.1 = false;
+            Ok(())
+        }
+
+        async fn release_claim(&mut self) {
+            self.shared.lock().expect("state lock").1 = false;
+        }
+    }
+
     #[test]
-    fn admission_competing_inserts_converge_on_one_meter_write() {
-        // Eight concurrent admissions for the same job: the ledger serializes
-        // the intent (production: the primary key), so exactly one attempt
-        // meters and the rest replay without side effects.
+    fn admission_competing_requests_claim_before_queue_or_meter() {
+        // Each request has its own ledger handle, just like production. The
+        // queue delay lets competitors interleave after the first claim.
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc, Mutex,
+            Arc, Barrier, Mutex,
         };
-        let ledger = Arc::new(Mutex::new(MemLedger::new()));
+        let shared = Arc::new(Mutex::new((AdmissionMark::Pending, false)));
+        let start = Arc::new(Barrier::new(8));
         let meter_calls = Arc::new(AtomicUsize::new(0));
-        let admitted = Arc::new(AtomicUsize::new(0));
+        let queued_calls = Arc::new(AtomicUsize::new(0));
         let msg = admission_msg();
         let handles: Vec<_> = (0..8)
             .map(|_| {
-                let ledger = Arc::clone(&ledger);
+                let shared = Arc::clone(&shared);
+                let start = Arc::clone(&start);
                 let meter_calls = Arc::clone(&meter_calls);
-                let admitted = Arc::clone(&admitted);
+                let queued_calls = Arc::clone(&queued_calls);
                 let msg = msg.clone();
                 std::thread::spawn(move || {
                     use futures_util::future::FutureExt as _;
-                    let mut guard = ledger.lock().expect("ledger lock");
-                    let decision = drive_metered_admission(
-                        &mut *guard,
+                    let mut ledger = ConcurrentLedger { shared };
+                    start.wait();
+                    drive_metered_admission(
+                        &mut ledger,
                         &msg,
                         "parse",
-                        || async move { true },
+                        || {
+                            queued_calls.fetch_add(1, Ordering::SeqCst);
+                            async {
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                                true
+                            }
+                        },
                         |outcome| {
                             assert_eq!(outcome, MeterOutcome::Ok);
                             meter_calls.fetch_add(1, Ordering::SeqCst);
@@ -1375,23 +1467,31 @@ mod tests {
                         },
                     )
                     .now_or_never()
-                    .expect("scripted admission resolves without yielding");
-                    if decision == AdmissionDecision::Admitted {
-                        admitted.fetch_add(1, Ordering::SeqCst);
-                    }
-                    decision
+                    .expect("scripted admission resolves without yielding")
                 })
             })
             .collect();
-        for handle in handles {
-            let decision = handle.join().expect("admission thread");
-            assert!(matches!(
-                decision,
-                AdmissionDecision::Admitted | AdmissionDecision::AlreadyQueued
-            ));
-        }
+        let decisions: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("admission thread"))
+            .collect();
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|d| **d == AdmissionDecision::Admitted)
+                .count(),
+            1
+        );
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|d| **d == AdmissionDecision::Busy)
+                .count(),
+            7
+        );
+        assert_eq!(queued_calls.load(Ordering::SeqCst), 1);
         assert_eq!(meter_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(admitted.load(Ordering::SeqCst), 1);
+        assert_eq!(shared.lock().expect("state lock").0, AdmissionMark::Queued);
     }
 }
 
