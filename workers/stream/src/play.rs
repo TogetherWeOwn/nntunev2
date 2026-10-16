@@ -102,6 +102,11 @@ fn retry_after_secs(retry_after_ms: u64) -> u64 {
 }
 
 /// Everything the play path needs, by reference.
+///
+/// `UpstreamTimeouts` stay out of this struct on purpose: adding a required
+/// field here breaks every existing `PlayInput` literal (including grant-TTL
+/// acceptance helpers on `main`). Per-play timeouts go through
+/// [`play_with_timeouts`]; [`play`] uses `UpstreamTimeouts::default()`.
 pub struct PlayInput<'a> {
     /// Signed grant from the `api` Worker.
     pub token: &'a str,
@@ -110,9 +115,6 @@ pub struct PlayInput<'a> {
     pub range: Option<&'a str>,
     /// Provider NNTP address (a pooled connection dials this).
     pub server_addr: SocketAddr,
-    /// Per-upstream dial/read timeouts (defaults bound a hung provider to
-    /// `connect + read + margin` per segment op; see `UpstreamTimeouts`).
-    pub timeouts: UpstreamTimeouts,
     /// Ordered segment message-IDs composing the track.
     pub segments: &'a [String],
     /// Demo cipher key (see module docs).
@@ -206,13 +208,35 @@ struct Live {
     failed: Option<Failure>,
 }
 
-/// Serve `track_id` to its granted owner.
+/// Serve `track_id` to its granted owner (default upstream timeouts).
 pub fn play(
     pool: &mut StreamPool,
     cache: &mut ContentCache,
     meter: &mut dyn Meter,
     secret: &[u8],
     input: &PlayInput<'_>,
+) -> Result<PlayResponse, PlayError> {
+    play_with_timeouts(
+        pool,
+        cache,
+        meter,
+        secret,
+        input,
+        UpstreamTimeouts::default(),
+    )
+}
+
+/// Serve `track_id` with explicit per-upstream dial/read timeouts.
+///
+/// `connect` bounds a new dial and `read` bounds each article op (idle-read
+/// limit plus total status-plus-body deadline); see `UpstreamTimeouts`.
+pub fn play_with_timeouts(
+    pool: &mut StreamPool,
+    cache: &mut ContentCache,
+    meter: &mut dyn Meter,
+    secret: &[u8],
+    input: &PlayInput<'_>,
+    timeouts: UpstreamTimeouts,
 ) -> Result<PlayResponse, PlayError> {
     let grant =
         grant::verify(input.token, secret, input.now_unix).map_err(PlayError::Unauthorized)?;
@@ -250,7 +274,7 @@ pub fn play(
         PoolError::Exhausted => PlayError::PoolExhausted,
     })?;
 
-    let (client, first) = match open_and_fetch_first(pool, input) {
+    let (client, first) = match open_and_fetch_first(pool, input, timeouts) {
         Ok(pair) => pair,
         Err((client, failure)) => {
             return Err(settle(
@@ -309,12 +333,13 @@ pub fn play(
 fn open_and_fetch_first(
     pool: &mut StreamPool,
     input: &PlayInput<'_>,
+    timeouts: UpstreamTimeouts,
 ) -> Result<(NntpClient, Decoded), (Option<NntpClient>, Failure)> {
-    let deadline = NntpDeadline::new(input.timeouts.connect.saturating_add(input.timeouts.read));
+    let deadline = NntpDeadline::new(timeouts.connect.saturating_add(timeouts.read));
     let mut warm = pool.take_idle();
     if let Some(client) = warm.as_mut() {
         if !client
-            .prepare_for_reuse(&input.server_addr, input.timeouts.read)
+            .prepare_for_reuse(&input.server_addr, timeouts.read)
             .unwrap_or(false)
         {
             warm = None;
@@ -324,17 +349,15 @@ fn open_and_fetch_first(
     for attempt in 0..2 {
         let mut client = match warm.take() {
             Some(client) => client,
-            None => match NntpClient::connect_with_deadline(
-                &input.server_addr,
-                input.timeouts,
-                &deadline,
-            ) {
-                Ok(client) => {
-                    pool.record_connect();
-                    client
+            None => {
+                match NntpClient::connect_with_deadline(&input.server_addr, timeouts, &deadline) {
+                    Ok(client) => {
+                        pool.record_connect();
+                        client
+                    }
+                    Err(e) => return Err((None, nntp_failure(e, &input.segments[0]))),
                 }
-                Err(e) => return Err((None, nntp_failure(e, &input.segments[0]))),
-            },
+            }
         };
         match fetch_segment_with_deadline(&mut client, &input.segments[0], &deadline) {
             Ok(decoded) => {
@@ -693,7 +716,6 @@ mod tests {
             track_id: "track-b",
             range: None,
             server_addr: addr,
-            timeouts: UpstreamTimeouts::default(),
             segments: &[],
             cipher_key: 0,
             now_unix: 1,
@@ -749,14 +771,13 @@ mod tests {
             track_id: "track",
             range: None,
             server_addr: current_addr,
-            timeouts,
             segments: &segments,
             cipher_key: 0,
             now_unix: 0,
             up_next: None,
         };
 
-        let (client, failure) = match open_and_fetch_first(&mut pool, &input) {
+        let (client, failure) = match open_and_fetch_first(&mut pool, &input, timeouts) {
             Err(result) => result,
             Ok(_) => panic!("missing article response"),
         };
@@ -837,7 +858,6 @@ mod tests {
             track_id: "t",
             range: None,
             server_addr: addr,
-            timeouts: UpstreamTimeouts::default(),
             segments: &[],
             cipher_key: 0,
             now_unix: 1,

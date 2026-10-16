@@ -56,9 +56,11 @@ A dead upstream must fail fast with a `503`, never hang playback
 | Failure window | 30 s (older failures restart the streak at 1) | `pool::CIRCUIT_WINDOW_MS` |
 | Open interval | 30 s | `pool::CIRCUIT_OPEN_MS` |
 
-- Per-upstream timeouts ride `PlayInput::timeouts`: `connect` bounds a new
-  dial, and the current `read` timeout is applied when reusing a warm
-  connection. A warm connection is reused only when its peer matches the
+- Per-upstream timeouts ride `play_with_timeouts` (`play` uses
+  `UpstreamTimeouts::default()`): `connect` bounds a new dial, and the
+  current `read` timeout is applied when reusing a warm connection. They stay
+  out of `PlayInput` on purpose so existing `PlayInput` literals keep
+  compiling. A warm connection is reused only when its peer matches the
   current `server_addr`. `read` is both the idle-read limit and the total
   status-plus-body deadline for one
   article, so a trickling response cannot extend playback indefinitely. The

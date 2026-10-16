@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use nntune_stream::cache::ContentCache;
 use nntune_stream::grant;
 use nntune_stream::meter::{MemoryMeter, MeterKind};
-use nntune_stream::play::{play, PlayError, PlayInput, PlayStream, StreamPool};
+use nntune_stream::play::{play, play_with_timeouts, PlayError, PlayInput, PlayStream, StreamPool};
 use nntune_stream::pool::Pool;
 use nntune_stream::yenc::{self, PartSpec};
 
@@ -293,7 +293,6 @@ fn input<'a>(
         track_id,
         range,
         server_addr: server.addr,
-        timeouts: nntune_stream::nntp::UpstreamTimeouts::default(),
         segments,
         cipher_key: CIPHER_KEY,
         now_unix: NOW_UNIX,
@@ -856,12 +855,11 @@ fn hung_upstream_trips_the_breaker_and_serves_503_then_recovers() {
     // the breaker without opening it before the threshold.
     for i in 1..=CIRCUIT_FAILURE_THRESHOLD {
         let token = grant_for("track-a");
-        let mut inp = input(&token, "track-a", None, &hung, &segments, None);
-        inp.timeouts = quick;
+        let inp = input(&token, "track-a", None, &hung, &segments, None);
         let t0 = Instant::now();
         assert!(
             matches!(
-                play(&mut pool, &mut cache, &mut meter, SECRET, &inp),
+                play_with_timeouts(&mut pool, &mut cache, &mut meter, SECRET, &inp, quick),
                 Err(PlayError::Upstream(_))
             ),
             "hung play {i} must surface as an upstream failure"
@@ -885,10 +883,9 @@ fn hung_upstream_trips_the_breaker_and_serves_503_then_recovers() {
     // 503 with a Retry-After for the Worker shim.
     let hung_bodies = hung.bodies();
     let token = grant_for("track-a");
-    let mut inp = input(&token, "track-a", None, &hung, &segments, None);
-    inp.timeouts = quick;
+    let inp = input(&token, "track-a", None, &hung, &segments, None);
     let t0 = Instant::now();
-    let err = match play(&mut pool, &mut cache, &mut meter, SECRET, &inp) {
+    let err = match play_with_timeouts(&mut pool, &mut cache, &mut meter, SECRET, &inp, quick) {
         Err(e) => e,
         Ok(_) => panic!("open breaker must reject"),
     };
