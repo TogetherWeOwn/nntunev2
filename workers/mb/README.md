@@ -62,10 +62,7 @@ method, not the measurements.
 The **p95 source** for replication lag is the `lag_secs` value of each
 applied packet in `mb_replication_packet`, not the aggregate
 `mb_import_state` snapshot. Compute p95 over the observed packet records in
-the reporting window; the SLO is p95 lag **under 2 hours**. A **breach
-definition** is any packet with `lag_secs > 7200` seconds (exactly 7200
-passes), or any missing sequence between the lowest observed packet and the
-reported latest packet sequence. Missing packets cannot be dropped from the
+the reporting window; the SLO is p95 lag **under 2 hours**. The **breach definition** is any packet with `lag_secs > 7200` seconds (exactly 7200 passes), or any missing sequence between the lowest observed packet and the reported latest packet sequence. Missing packets cannot be dropped from the
 accounting: each is returned as a `missing_sequence` breach.
 
 `ReplicationSloProbe` returns a JSON structured event named
