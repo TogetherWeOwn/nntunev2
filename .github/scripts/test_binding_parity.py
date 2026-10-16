@@ -616,6 +616,22 @@ prod = "fx-jobs"
             self.assertIn("::error::binding-parity:", output.getvalue())
             self.assertNotIn("Traceback", output.getvalue())
 
+    def test_non_string_binding_fails_closed_with_exit_two(self):
+        wrangler = MATCHING_WRANGLER.replace(
+            "[[env.staging.hyperdrive]]",
+            '[[env.staging.r2_buckets]]\nbinding = 123\n'
+            'bucket_name = "fx-extra"\n[[env.staging.hyperdrive]]',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp, wrangler=wrangler)
+            with self.assertRaisesRegex(ParityError, "must be a string"):
+                run_check(root)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(2, main(["--root", str(root)]))
+            self.assertIn("::error::binding-parity:", output.getvalue())
+            self.assertNotIn("Traceback", output.getvalue())
+
     def test_unparsable_config_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_repo(tmp, wrangler="name = [not toml")

@@ -98,8 +98,10 @@ def _entry(table, item, type_name, binding_key):
     if not isinstance(item, dict):
         raise ParityError(f"{table}: entry is not a table ({type_name})")
     binding = item.get(binding_key)
-    if not binding:
-        raise ParityError(f"{table}: entry without {binding_key!r} ({type_name})")
+    if not isinstance(binding, str) or not binding:
+        raise ParityError(
+            f"{table}: {binding_key!r} must be a string ({type_name})"
+        )
     resource = item.get(RESOURCE_KEY[type_name])
     if not isinstance(resource, str):
         raise ParityError(
@@ -184,6 +186,10 @@ def extract_bindings(data):
         candidates = value if isinstance(value, list) else [value]
         for item in candidates:
             if isinstance(item, dict) and item.get("binding"):
+                if not isinstance(item["binding"], str):
+                    raise ParityError(
+                        f"{key}: 'binding' must be a string (unknown:{key})"
+                    )
                 add(
                     {
                         "type": f"unknown:{key}",
@@ -496,7 +502,11 @@ def load_manifest(path):
                     f"{path}: worker {name}: binding has unknown keys {sorted(extra)}"
                 )
             type_name, binding_name = binding.get("type"), binding.get("binding")
-            if type_name not in RESOURCE_KEY or not binding_name:
+            if (
+                type_name not in RESOURCE_KEY
+                or not isinstance(binding_name, str)
+                or not binding_name
+            ):
                 raise ParityError(
                     f"{path}: worker {name}: binding needs a known type and a name"
                 )
