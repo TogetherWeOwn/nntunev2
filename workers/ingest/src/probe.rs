@@ -1,10 +1,11 @@
 //! Segment probe: availability checks through the user's pool DO.
 //!
-//! The wire contract (pool routes, auth, per-credential caps) is owned by
-//! the pool-DO card; this module owns the ingest side: the probe envelope
-//! and how its outcome moves the checkpoint. Live calls stay behind the
-//! checkpoint resume: a crash mid-`Probing` redelivers the same envelope,
-//! and the mapping below converges on one `Verifying` entry.
+//! The stream Worker's `NntpPool` Durable Object serves the probe
+//! (`workers/stream/src/probe.rs`: `STAT` on the pool's ingest lane);
+//! [`crate::pool_probe`] makes the call. This module owns the ingest side:
+//! the probe envelope and how its outcome moves the checkpoint. Live calls
+//! stay behind the checkpoint resume: a crash mid-`Probing` redelivers the
+//! same envelope, and the mapping below converges on one `Verifying` entry.
 
 use std::collections::BTreeMap;
 

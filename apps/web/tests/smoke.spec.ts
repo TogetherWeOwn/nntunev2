@@ -101,6 +101,25 @@ test('login offers passkey and email-link sign-in', async ({ page }) => {
 	await expect(page.locator('input[type="email"]')).toBeVisible();
 });
 
+test('magic-link landing route exists and fails generically without a token', async ({
+	page,
+	request
+}) => {
+	// The API Worker mails `{origin}/auth/magic?token=…`; the landing route
+	// must exist (never a 404) and must not redeem anything tokenless.
+	const response = await request.get('/auth/magic');
+	expect(response.status(), '/auth/magic should not 404').not.toBe(404);
+	expect(response.ok()).toBe(true);
+
+	await page.goto('/auth/magic');
+	await expect(page.getByRole('heading', { level: 1 })).toContainText('Sign in');
+	await expect(page.getByRole('alert')).toContainText(/didn't work/i);
+	await expect(page.getByRole('link', { name: /request a new one/i })).toHaveAttribute(
+		'href',
+		'/login'
+	);
+});
+
 test('provider wizard walks provider, indexer and test steps', async ({ page, request }) => {
 	for (const href of ['/login', '/signup', '/onboarding/provider']) {
 		const response = await request.get(href);

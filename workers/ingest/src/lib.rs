@@ -28,6 +28,7 @@ pub mod metering;
 pub mod newznab;
 pub mod nzb_intake;
 pub mod parse;
+pub mod pool_probe;
 pub mod probe;
 pub mod queue;
 pub mod rate_limit;

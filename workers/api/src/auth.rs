@@ -5,10 +5,10 @@
 //! generic (no user-enumeration oracle); challenges are single-use with
 //! short expiry and RP/origin pinning.
 //!
-//! Full WebAuthn attestation/assertion signature verification wires to a
-//! WebAuthn library in the follow-up slice (child card): this module owns
-//! the challenge lifecycle, origin/RP binding, expiry, single-use, and
-//! credential storage shapes, all enforced and tested here.
+//! WebAuthn attestation/assertion signature verification lives in
+//! `crate::webauthn`; this module owns the challenge lifecycle,
+//! origin/RP binding, expiry, single-use claims, and credential
+//! storage shapes, all enforced and tested here.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -63,6 +63,13 @@ pub struct MagicLinkRecord {
     pub issued_at: u64,
     pub expires_at: u64,
     pub used: bool,
+}
+
+/// SHA-256 hex of a presented magic-link token, for record lookup by hash.
+/// The HTTP layer looks the record up with this, then still requires
+/// [`consume_magic_link_atomically`] — a hash lookup is not authentication.
+pub fn hash_magic_token(token: &str) -> String {
+    sha256_hex(token)
 }
 
 /// Issue a magic link: returns `(plaintext_token, stored_record)`.
