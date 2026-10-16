@@ -150,3 +150,41 @@ test('failed logout keeps the sign-out action and reports the failure', async ({
 	await expect(page.getByText(/signed out\. if that link/i)).toHaveCount(0);
 	await expect(page.getByRole('button', { name: /sign out/i })).toBeEnabled();
 });
+
+test('401 logout clears a stale account label and leaves the link retryable', async ({ page }) => {
+	let finishPosts = 0;
+	let logoutPosts = 0;
+	await page.route('**/v1/auth/magic/finish', async (route) => {
+		finishPosts += 1;
+		await route.fulfill({
+			status: 401,
+			contentType: 'application/json',
+			body: JSON.stringify({ error: 'check your email and try again' })
+		});
+	});
+	await page.route('**/v1/session/logout', async (route) => {
+		logoutPosts += 1;
+		await route.fulfill({
+			status: 401,
+			contentType: 'application/json',
+			body: JSON.stringify({ error: 'check your email and try again' })
+		});
+	});
+
+	await page.goto('/');
+	await page.evaluate(() => sessionStorage.setItem('nntune:signed-in-email', 'stale@example.com'));
+	await page.goto('/auth/magic?token=fixture-expired-token');
+	await page.getByRole('button', { name: /sign in with this link/i }).click();
+	await expect(page.getByRole('alert').first()).toContainText('stale@example.com');
+
+	await page.getByRole('button', { name: /sign out stale@example.com/i }).click();
+	expect(logoutPosts).toBe(1);
+	await expect(page.getByText(/signed out\. if that link/i)).toBeVisible();
+	await page.getByRole('button', { name: /try this link again/i }).click();
+	await page.getByRole('button', { name: /sign in with this link/i }).click();
+
+	await expect(page.getByRole('alert').first()).toContainText(/didn't work/i);
+	await expect(page.getByRole('alert').first()).not.toContainText('stale@example.com');
+	await expect(page.getByText(/could not sign out/i)).toHaveCount(0);
+	expect(finishPosts).toBe(2);
+});

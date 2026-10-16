@@ -58,7 +58,7 @@ export interface ProviderTestInput {
 
 /**
  * Save/test envelope the API Worker expects (`PUT /v1/vault`,
- * `POST /v1/vault/test-connection`): the flat provider fields nested under
+ * `POST /v1/vault/test`): the flat provider fields nested under
  * `provider`, exactly as `workers/api` parses `VaultPutBody`. Field names
  * are pinned by `workers/api/tests/fixtures/api-web-contract.json`, which
  * both the vitest client suite and the Rust handlers suite consume — change
@@ -264,7 +264,7 @@ export class ApiClient {
 	 * secrets never come back in the response.
 	 */
 	async testProviderConnection(input: ProviderTestInput): Promise<ProviderTestResult> {
-		return this.post<ProviderTestResult>('/v1/vault/test-connection', toVaultSaveBody(input));
+		return this.post<ProviderTestResult>('/v1/vault/test', toVaultSaveBody(input));
 	}
 
 	/**

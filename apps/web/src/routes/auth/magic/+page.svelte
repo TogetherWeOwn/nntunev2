@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
-	import { ApiClient } from '#lib/api/client.js';
+	import { ApiClient, ApiError } from '#lib/api/client.js';
 	import {
 		clearSignedInEmail,
 		readSignedInEmail,
@@ -65,13 +65,16 @@
 		signOutError = null;
 		try {
 			await client.logout();
-		} catch {
-			// The HttpOnly cookie is the real session and it is untouched,
-			// so a failed logout must NOT clear the label or show success:
-			// keep the button and surface the failure instead.
-			signOutError = 'Could not sign out. Try again.';
-			signingOut = false;
-			return;
+		} catch (error) {
+			if (!(error instanceof ApiError && error.status === 401)) {
+				// The HttpOnly cookie is the real session and it is untouched,
+				// so a failed logout must NOT clear the label or show success:
+				// keep the button and surface the failure instead.
+				signOutError = 'Could not sign out. Try again.';
+				signingOut = false;
+				return;
+			}
+			// A generic 401 means there is no live session to revoke.
 		}
 		clearSignedInEmail();
 		signedInEmail = null;

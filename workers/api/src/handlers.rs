@@ -29,7 +29,6 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
 
-use rand::RngCore;
 use serde::Deserialize;
 
 use crate::auth::{
@@ -399,7 +398,7 @@ where
 
 fn random_id(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
-    rand::thread_rng().fill_bytes(&mut buf);
+    getrandom::fill(&mut buf).expect("secure randomness unavailable");
     b64url_encode(&buf)
 }
 
@@ -1456,6 +1455,7 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/session/logout"
             | "/v1/session/revoke-all"
             | "/v1/vault"
+            | "/v1/vault/test"
             | "/v1/vault/test-connection"
     )
 }
@@ -1497,7 +1497,9 @@ where
         ("GET", "/v1/vault") => vault_get(ctx, req).await,
         ("PUT", "/v1/vault") => vault_put(ctx, req).await,
         ("DELETE", "/v1/vault") => vault_delete(ctx, req).await,
-        ("POST", "/v1/vault/test-connection") => vault_test_connection(ctx, req).await,
+        ("POST", "/v1/vault/test") | ("POST", "/v1/vault/test-connection") => {
+            vault_test_connection(ctx, req).await
+        },
         ("OPTIONS", path) if is_known_path(path) => preflight_response(),
         _ => json_response(404, serde_json::json!({"error": "not found"})),
     }
@@ -3520,7 +3522,7 @@ mod tests {
                 "magic-finish" => {
                     serde_json::from_value::<MagicFinishBody>(wire.clone()).map(|_| ())
                 }
-                "vault-save" | "vault-test-connection" => {
+                "vault-save" | "vault-test" => {
                     serde_json::from_value::<VaultPutBody>(wire.clone()).map(|_| ())
                 }
                 other => panic!("no handler body mapping for route {other}"),
