@@ -38,10 +38,10 @@ fn probe_reports_over_two_hour_lag_and_missing_packet_sequences() {
             && breach.sequence == Some(7)
             && breach.lag_secs == Some(TWO_HOURS_SECS + 1)
     }));
-    assert!(report.breaches.iter().any(|breach| {
-        breach.kind == "missing_sequence"
-            && breach.sequence == Some(8)
-    }));
+    assert!(report
+        .breaches
+        .iter()
+        .any(|breach| breach.kind == "missing_sequence" && breach.sequence == Some(8)));
 }
 
 #[test]
@@ -61,7 +61,16 @@ fn breach_emits_structured_log_and_metric_instead_of_silent_skip() {
 #[test]
 fn readme_documents_p95_source_and_breach_definition() {
     let readme = include_str!("../README.md").to_ascii_lowercase();
-    assert!(readme.contains("p95 source"), "document the source population for p95");
-    assert!(readme.contains("breach definition"), "document exactly when a breach occurs");
-    assert!(readme.contains("mb_replication_slo_breach"), "document the emitted metric name");
+    assert!(
+        readme.contains("p95 source"),
+        "document the source population for p95"
+    );
+    assert!(
+        readme.contains("breach definition"),
+        "document exactly when a breach occurs"
+    );
+    assert!(
+        readme.contains("mb_replication_slo_breach"),
+        "document the emitted metric name"
+    );
 }
