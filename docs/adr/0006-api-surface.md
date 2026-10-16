@@ -145,7 +145,8 @@ least-privilege credential.
     as `u`.
     Reversibility exists **only** for this form, which the OpenSubsonic
     extension page tells servers to phase out.
-  Plaintext `p=` (and its hex alias `p=enc:`) is **rejected** — both put
+  Plaintext `p=` (and its hex alias `p=enc:`) is **rejected with Subsonic
+  error 42** ("Provided authentication mechanism not supported") — both put
   long-lived secrets in query strings (logs, threat-model §5); legacy
   clients use `t`/`s`. `/rest/*` logging MUST redact `u`, `p`, `t`, `s`
   and `apiKey` before any sink (access logs, error reports, traces).
@@ -175,7 +176,9 @@ least-privilege credential.
   self-assert another user's rows: a playlist write needs the same library
   membership reads need plus an own track source, and entries whose track left
   every caller library stay as dormant tombstones (stable positions/counts;
-  stream/scrobble 404/70). Retain their encrypted own source while any own playlist
+  `playlist_tracks.track_id` remains non-NULL; dormancy means no caller
+  `library_tracks` membership; stream/scrobble 404/70). Retain their encrypted
+  own source while any own playlist
   entry survives; the entry-keyed restore `POST
   /v1/playlists/{playlist_id}/entries/{entry_id}/restore` with body
   `{library_id}` restores membership — it resolves playlist, entry, and library
@@ -207,8 +210,9 @@ least-privilege credential.
   features (BYOP management, ingest jobs) are REST-only.
 - Fuzz/contract tests cover the Subsonic subset against known client quirks
   (case sensitivity, `c=` client param, token/salt and `apiKey` vectors,
-  `apiKey`-without-`u`, error 43 on mixed `u`+`apiKey`, credential
-  rotation/revocation, and redaction of auth params in emitted logs).
+  `apiKey`-without-`u`, error 43 on mixed `u`+`apiKey`, error 42 on `p=` or
+  `p=enc:`, credential rotation/revocation, and redaction of auth params in
+  emitted logs).
 - Deprecating any Subsonic endpoint needs a new ADR.
 - **Implementation alignment:** the Subsonic compatibility implementation
   drops `u+p` (including `p=enc:`), adds generated `subsonic_username` for

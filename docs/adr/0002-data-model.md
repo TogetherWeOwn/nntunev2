@@ -204,9 +204,9 @@ playlist_tracks       id UUID PK (opaque entry handle, returned as {entry_id}
                       in URLs/tombstones/cursors; never sequential),
                       playlist_id BIGINT NOT NULL FK → playlists(id)
                       ON DELETE RESTRICT,
-                      track_id UUID NULL FK → tracks(id) ON DELETE RESTRICT
-                      (NULL only for dormant entries whose track left every
-                      caller library, §6),
+                      track_id UUID NOT NULL FK → tracks(id) ON DELETE RESTRICT
+                      (retained for dormant entries; dormancy means the track
+                      has no caller library membership, §6),
                       position INTEGER NOT NULL,
                       UNIQUE (playlist_id, position) DEFERRABLE INITIALLY DEFERRED,
                       INDEX (playlist_id, track_id),
@@ -1112,10 +1112,11 @@ membership delete plus both-counts-zero source cleanup and art invalidation) —
 never a bare FK cascade that silently drops `library_tracks`/`playlist_tracks`
 rows without running that cleanup. Track-row deletion is allowed only after explicit local-catalog GC or consolidation has checked all library/playlist references and remapped references where applicable; it never cascades silently. Removing a track from the caller's last library, or
 deleting the last library holding it, does NOT delete that caller's playlist
-entries for it: the rows are retained with stable positions and counts, but
-become dormant — reads return only the entry id and position with a
-`dormant: track not in any library` tombstone instead of track metadata (the
-tombstone exposes no track id; none is needed for the restore below), and
+entries for it: the rows (including their non-NULL `track_id`) are retained
+with stable positions and counts, but become dormant — dormancy is determined
+by the absence of that caller's `library_tracks` membership. Reads return only
+the entry id and position with a `dormant: track not in any library` tombstone
+instead of track metadata (the tombstone exposes no track id), and
 `stream`/`scrobble` for a dormant entry return 404 (native) or Subsonic error
 70. The retained own `track_sources` row (rule 3) permits restoring that same
 local or verified track to an own library **only** through the entry-keyed
@@ -1203,8 +1204,10 @@ retaining its `release_mbid_hint` without guessing. Also require:
   MBIDs with equal titles stay separate, and no-MBID title-only groups still work.
 - Playlist/library consistency: for both a local and a mirror-verified track T,
   remove T from its last library while P references it. Assert stable P entry ids,
-  positions and counts, tombstones/no metadata and stream/scrobble 404/70; the own
-  source survives but audio mappings/unneeded grants do not. Restore via the public
+  positions and counts, unchanged non-NULL `playlist_tracks.track_id`, tombstones/no
+  metadata and stream/scrobble 404/70; GC retains the source by the
+  `(user_id, track_id)` playlist reference while audio mappings/unneeded grants do
+  not. Restore via the public
   entry-keyed operation `POST /v1/playlists/{playlist_id}/entries/{entry_id}/restore`
   with an own `{library_id}` and assert entries re-activate in place and
   own-provider fetch makes streaming work; a plain `POST /v1/library` with the
