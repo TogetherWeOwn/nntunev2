@@ -68,8 +68,8 @@ exact names in `docs/ops.md` first.
 - MusicBrainz JSON headers match this table exactly (lookup 86400,
   search 300, errors `no-store`); no delta.
 - Stream audio edge `Cache-Control` is **prescribed but not yet wired**:
-  a Worker fetch entry point exists, but no play route exists yet to set
-  response headers; the deploy-config slice owns that implementation.
+  no Worker entry point or play route exists yet to set response headers;
+  the deploy-config slice owns that implementation.
   Audio plays are grant-authorized
   per user and metered per request, so the prescription is `no-store`:
   browser replay must not skip grant-expiry checks, logout handling, or

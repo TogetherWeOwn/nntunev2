@@ -202,7 +202,7 @@ def _bucket_names(manifest: Path) -> list[str] | None:
     except tomllib.TOMLDecodeError as exc:
         if not manifest.name.lower().startswith("wrangler"):
             try:
-                text = manifest.read_text(encoding="utf-8")
+                text = manifest.read_text(encoding="utf-8-sig")
             except (OSError, UnicodeError) as read_exc:
                 raise ManifestError(
                     f"cannot inspect TOML config {manifest}: {read_exc}"

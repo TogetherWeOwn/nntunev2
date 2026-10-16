@@ -158,6 +158,19 @@ def test_malformed_custom_toml_top_level_array_table_fails_closed():
     _assert_rejected(repo, "cannot parse TOML config")
 
 
+def test_bom_malformed_custom_toml_top_level_array_table_fails_closed():
+    repo = _repo_with(
+        {
+            "workers/stream/wrangler.toml": CLEAN_MANIFEST,
+            "infra/malformed-binding.toml": (
+                '﻿[[r2_buckets]]\nbucket_name = "nntunev2-archive-prod"\n'
+                "invalid = [TOML"
+            ),
+        }
+    )
+    _assert_rejected(repo, "cannot parse TOML config")
+
+
 def test_malformed_custom_toml_spaced_array_table_fails_closed():
     repo = _repo_with(
         {
@@ -397,6 +410,7 @@ if __name__ == "__main__":
     test_non_worker_toml_without_r2_binding_is_ignored()
     test_malformed_custom_toml_with_binding_table_fails_closed()
     test_malformed_custom_toml_top_level_array_table_fails_closed()
+    test_bom_malformed_custom_toml_top_level_array_table_fails_closed()
     test_malformed_custom_toml_spaced_array_table_fails_closed()
     test_malformed_custom_toml_dotted_assignment_fails_closed()
     test_malformed_custom_toml_inline_environment_table_fails_closed()
