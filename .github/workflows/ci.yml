@@ -391,8 +391,17 @@ jobs:
           cache: pnpm
           cache-dependency-path: apps/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
-      - run: pnpm exec playwright install --with-deps chromium
-      - run: pnpm test:e2e
+      - name: Install Playwright chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Run apps/web Playwright suite
+        run: pnpm test:e2e
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: web-e2e-report
+          path: apps/web/test-results/
+          retention-days: 7
 
   # Aggregate required check: every dependency must succeed, including
   # when a required job fails, is cancelled, or is skipped.

@@ -12,6 +12,7 @@ async function responseHeader(response: APIResponse, name: string): Promise<stri
 test('audio is private-cached and artwork is public-immutable', async ({ request }) => {
 	const audio = await request.get('/api/demo/audio');
 	expect(audio.ok()).toBe(true);
+	expect(await responseHeader(audio, 'content-type')).toBe('audio/wav');
 	const audioControl = await responseHeader(audio, 'cache-control');
 	expect(audioControl).toMatch(/^private/);
 	expect(audioControl).not.toContain('immutable');
@@ -25,7 +26,10 @@ test('audio is private-cached and artwork is public-immutable', async ({ request
 	const range = await request.get('/api/demo/audio', { headers: { range: 'bytes=0-99' } });
 	expect(range.status()).toBe(206);
 	expect(await responseHeader(range, 'content-range')).toBe('bytes 0-99/262144');
-	expect((await range.body()).length).toBe(100);
+	const rangeBody = await range.body();
+	expect(rangeBody.length).toBe(100);
+	expect(rangeBody.toString('ascii', 0, 4)).toBe('RIFF');
+	expect(rangeBody.toString('ascii', 8, 12)).toBe('WAVE');
 });
 
 test('missing artwork falls back to the placeholder with alt text', async ({ page }) => {
@@ -47,6 +51,33 @@ test('artwork that fails to load swaps to the placeholder once', async ({ page }
 	await expect(art).toHaveAttribute('data-fallback', 'true');
 	await expect(art).toHaveAttribute('src', /placeholder-artwork/);
 	await expect.poll(async () => art.evaluate((img: HTMLImageElement) => img.naturalWidth)).toBeGreaterThan(0);
+});
+
+test('a failed artwork fallback renders alt content instead of a broken image', async ({ page }) => {
+	await page.goto('/demo/player');
+
+	const fallback = page.getByTestId('fallback-failure-artwork');
+	await expect(fallback.getByTestId('track-artwork-fallback')).toBeVisible();
+	await expect(fallback.getByTestId('track-artwork')).toHaveCount(0);
+	await expect(fallback.getByRole('img')).toHaveAccessibleName('Fallback failure artwork');
+});
+
+test('valid artwork renders after a failed placeholder and track change', async ({ page }) => {
+	await page.route('**/placeholder-artwork.svg', (route) => route.fulfill({ status: 404 }));
+	await page.route('**/api/demo/artwork', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'image/svg+xml',
+			body: '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1" />'
+		})
+	);
+	await page.goto('/demo/player');
+
+	const artwork = page.getByTestId('current-artwork');
+	await expect(artwork.getByTestId('track-artwork-fallback')).toBeVisible();
+	await page.getByTestId('player-next').click();
+	await expect(artwork.getByTestId('track-artwork')).toBeVisible();
+	await expect(artwork.getByTestId('track-artwork')).toHaveAttribute('src', '/api/demo/artwork');
 });
 
 test('10x rapid seeks never wedge the player', async ({ page }) => {
