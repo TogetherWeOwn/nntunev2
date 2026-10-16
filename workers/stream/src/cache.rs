@@ -15,9 +15,13 @@
 //! while the worker revalidates in the background (see
 //! [`CacheServe::needs_revalidate`); past both windows the entry is a `MISS`
 //! and the play path re-fetches upstream. Untimed [`ContentCache::put_track`]
-//! entries never go stale (legacy callers).
+//! entries never go stale (legacy callers). Freshness is tracked per track,
+//! not per deduplicated blob, so restamping one track never changes another
+//! track's serve. Revalidation itself is claimed per track via
+//! [`ContentCache::try_begin_revalidate`], so concurrent stale reads trigger
+//! one background refresh, not one per reader.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::grant::sha256;
@@ -84,6 +88,10 @@ impl CacheStatus {
 
 struct BlobEntry {
     data: Arc<[u8]>,
+}
+
+struct TrackEntry {
+    hash: String,
     /// `None` for untimed [`ContentCache::put_track`] writes, which never go
     /// stale.
     stored_at_secs: Option<u64>,
@@ -91,7 +99,10 @@ struct BlobEntry {
 
 pub struct ContentCache {
     blobs: HashMap<String, BlobEntry>,
-    index: HashMap<String, String>,
+    index: HashMap<String, TrackEntry>,
+    /// Tracks with a background revalidation already claimed (see
+    /// [`ContentCache::try_begin_revalidate`]).
+    revalidating: HashSet<String>,
 }
 
 impl ContentCache {
@@ -99,6 +110,7 @@ impl ContentCache {
         Self {
             blobs: HashMap::new(),
             index: HashMap::new(),
+            revalidating: HashSet::new(),
         }
     }
 
@@ -107,9 +119,15 @@ impl ContentCache {
         let hash = Self::hex_hash(&plaintext);
         self.blobs.entry(hash.clone()).or_insert_with(|| BlobEntry {
             data: Arc::from(plaintext),
-            stored_at_secs: None,
         });
-        self.index.insert(track_id.to_string(), hash.clone());
+        self.index.insert(
+            track_id.to_string(),
+            TrackEntry {
+                hash: hash.clone(),
+                stored_at_secs: None,
+            },
+        );
+        self.revalidating.remove(track_id);
         hash
     }
 
@@ -119,17 +137,40 @@ impl ContentCache {
     /// refreshes a stale entry.
     pub fn put_track_at(&mut self, track_id: &str, plaintext: Vec<u8>, now_secs: u64) -> String {
         let hash = Self::hex_hash(&plaintext);
-        // A revalidation may race a content change: always restamp, so the
-        // entry's age counts from the latest write.
-        self.blobs.insert(
-            hash.clone(),
-            BlobEntry {
-                data: Arc::from(plaintext),
+        // A revalidation may race a content change: always restamp this
+        // track, so its age counts from the latest write without affecting
+        // other tracks that share the deduplicated blob.
+        self.blobs.entry(hash.clone()).or_insert_with(|| BlobEntry {
+            data: Arc::from(plaintext),
+        });
+        self.index.insert(
+            track_id.to_string(),
+            TrackEntry {
+                hash: hash.clone(),
                 stored_at_secs: Some(now_secs),
             },
         );
-        self.index.insert(track_id.to_string(), hash.clone());
+        // The rewrite *is* the revalidation landing: release the claim so a
+        // later stale serve can claim the next one.
+        self.revalidating.remove(track_id);
         hash
+    }
+
+    /// Claim the background revalidation for `track_id`: returns `true` to
+    /// exactly one caller until the claim is released — by the rewrite
+    /// landing ([`ContentCache::put_track_at`]) or by
+    /// [`ContentCache::finish_revalidate`] after a failed attempt. This is
+    /// what dedupes revalidation when many readers serve the same stale
+    /// entry at once: only the claimant is told to re-fetch.
+    pub fn try_begin_revalidate(&mut self, track_id: &str) -> bool {
+        self.revalidating.insert(track_id.to_string())
+    }
+
+    /// Release a revalidation claim without a rewrite (the background
+    /// re-fetch failed or was abandoned), so a later stale serve can claim
+    /// it again and retry.
+    pub fn finish_revalidate(&mut self, track_id: &str) {
+        self.revalidating.remove(track_id);
     }
 
     /// Fetch the cached plaintext for `track_id`, if any. Shared, not
@@ -137,7 +178,7 @@ impl ContentCache {
     pub fn get_track(&self, track_id: &str) -> Option<Arc<[u8]>> {
         self.index
             .get(track_id)
-            .and_then(|h| self.blobs.get(h))
+            .and_then(|entry| self.blobs.get(&entry.hash))
             .map(|e| Arc::clone(&e.data))
     }
 
@@ -147,9 +188,10 @@ impl ContentCache {
     /// [`CacheServe`]); expired entries (past fresh + SWR) and unknown
     /// tracks return `None` so the caller re-fetches upstream.
     pub fn get_track_at(&self, track_id: &str, now_secs: u64) -> Option<(Arc<[u8]>, CacheServe)> {
-        let entry = self.index.get(track_id).and_then(|h| self.blobs.get(h))?;
-        let data = Arc::clone(&entry.data);
-        match entry.stored_at_secs {
+        let track = self.index.get(track_id)?;
+        let blob = self.blobs.get(&track.hash)?;
+        let data = Arc::clone(&blob.data);
+        match track.stored_at_secs {
             None => Some((data, CacheServe::Fresh { age_secs: 0 })),
             Some(stored) => {
                 let age = now_secs.saturating_sub(stored);
@@ -378,6 +420,70 @@ mod tests {
             .expect("untimed entries never go stale");
         assert_eq!(data.as_ref(), b"audio-bytes");
         assert_eq!(serve, CacheServe::Fresh { age_secs: 0 });
+    }
+
+    #[test]
+    fn shared_blob_freshness_is_tracked_per_track() {
+        let mut cache = ContentCache::new();
+        let t1_hash = cache.put_track_at("t1", b"shared-bytes".to_vec(), 1_000);
+        let t2_hash = cache.put_track("t2", b"shared-bytes".to_vec());
+        assert_eq!(t1_hash, t2_hash);
+
+        let old = 1_000 + CACHE_FRESH_TTL_SECS + 1;
+        assert!(matches!(
+            cache.get_track_at("t1", old).map(|(_, serve)| serve),
+            Some(CacheServe::Stale { .. })
+        ));
+        assert_eq!(
+            cache.get_track_at("t2", old).map(|(_, serve)| serve),
+            Some(CacheServe::Fresh { age_secs: 0 }),
+            "a timed write for one track must not make an untimed dedup peer stale"
+        );
+
+        cache.put_track_at("t2", b"shared-bytes".to_vec(), old);
+        // t1 was stamped at 1_000 and is read at 1_000 + 2*(FRESH+1): its
+        // age counts from its own write. Had t2's restamp refreshed the
+        // shared blob, t1 would read Fresh/at a younger age instead.
+        assert_eq!(
+            cache
+                .get_track_at("t1", old + CACHE_FRESH_TTL_SECS + 1)
+                .map(|(_, serve)| serve),
+            Some(CacheServe::Stale {
+                age_secs: 2 * (CACHE_FRESH_TTL_SECS + 1)
+            }),
+            "restamping a deduplicated peer must not refresh the other track"
+        );
+        assert_eq!(
+            cache.get_track_at("t2", old).map(|(_, serve)| serve),
+            Some(CacheServe::Fresh { age_secs: 0 })
+        );
+    }
+
+    #[test]
+    fn revalidation_is_claimed_once_per_track_until_it_resolves() {
+        let mut cache = ContentCache::new();
+        cache.put_track_at("t1", b"bytes".to_vec(), 1_000);
+
+        assert!(
+            cache.try_begin_revalidate("t1"),
+            "first stale reader claims"
+        );
+        assert!(
+            !cache.try_begin_revalidate("t1"),
+            "concurrent stale readers must not each start a revalidation"
+        );
+        assert!(
+            cache.try_begin_revalidate("t2"),
+            "claims are per track, not global"
+        );
+
+        // A failed attempt releases the claim so a later reader retries.
+        cache.finish_revalidate("t1");
+        assert!(cache.try_begin_revalidate("t1"));
+
+        // The rewrite landing also releases it (and refreshes the entry).
+        cache.put_track_at("t1", b"bytes".to_vec(), 2_000);
+        assert!(cache.try_begin_revalidate("t1"));
     }
 
     #[test]

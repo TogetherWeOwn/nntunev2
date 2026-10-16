@@ -94,9 +94,13 @@ pub struct PlayResponse {
     pub cache_status: CacheStatus,
     /// Seconds since the serving entry was written (0 on a miss).
     pub age_secs: u64,
-    /// True when a stale entry served immediately: the worker entry point
-    /// must revalidate (re-fetch upstream and rewrite the entry) in the
-    /// background while the client already has its bytes.
+    /// True when a stale entry served immediately *and* this response
+    /// claimed the track's one background revalidation (see
+    /// `ContentCache::try_begin_revalidate`): the worker entry point must
+    /// re-fetch upstream and rewrite the entry while the client already has
+    /// its bytes, or release the claim with `finish_revalidate` if that
+    /// re-fetch fails. Concurrent stale readers get `false` — one refresh
+    /// per stale entry, not one per reader.
     pub needs_revalidate: bool,
     pub stream: PlayStream,
 }
@@ -211,10 +215,17 @@ pub fn play(
     if let Some((full, serve)) = cache.get_track_at(input.track_id, input.now_unix) {
         meter.emit(ev(MeterKind::CacheHit, &user, input.track_id, 0));
         let window = resolve_range(full.len() as u64, input.range)?;
+        // A stale serve owes one background revalidation per entry, not one
+        // per reader: only the response that claims it reports
+        // `needs_revalidate`. Claimed only once the serve is known-good, so
+        // a failed range never strands the claim with no one told to act.
+        let needs_revalidate =
+            serve.needs_revalidate() && cache.try_begin_revalidate(input.track_id);
         return Ok(respond(
             window,
             true,
             Some(serve),
+            needs_revalidate,
             &user,
             input.track_id,
             Source::Cached(full),
@@ -285,6 +296,7 @@ pub fn play(
         window,
         false,
         None,
+        false,
         &user,
         input.track_id,
         Source::Live(Box::new(live)),
@@ -456,22 +468,23 @@ fn resolve_range(len: u64, range: Option<&str>) -> Result<Window, PlayError> {
 
 /// `serve` pins the `Cache-Status`/`Age` headers: `Some` serve (fresh or
 /// stale) for cache hits, `None` for a miss (fetched upstream).
+/// `needs_revalidate` is the caller's already-claimed revalidation flag
+/// (see [`play`]); it is *not* derived from `serve` here, so concurrent
+/// stale serves cannot each demand a refresh.
+#[allow(clippy::too_many_arguments)]
 fn respond(
     (status, content_range, start, end): Window,
     cache_hit: bool,
     serve: Option<CacheServe>,
+    needs_revalidate: bool,
     user: &str,
     track: &str,
     source: Source,
     orphans: Arc<Mutex<Vec<OrphanedPlay>>>,
 ) -> PlayResponse {
-    let (cache_status, age_secs, needs_revalidate) = match serve {
-        Some(serve) => (
-            serve.cache_status(),
-            serve.age_secs(),
-            serve.needs_revalidate(),
-        ),
-        None => (CacheStatus::Miss, 0, false),
+    let (cache_status, age_secs) = match serve {
+        Some(serve) => (serve.cache_status(), serve.age_secs()),
+        None => (CacheStatus::Miss, 0),
     };
     PlayResponse {
         status,
@@ -760,6 +773,49 @@ mod tests {
             body.extend_from_slice(&chunk);
         }
         assert_eq!(body, b"2345");
+    }
+
+    #[test]
+    fn only_the_first_stale_serve_claims_the_revalidation() {
+        use crate::cache::{CacheStatus, CACHE_FRESH_TTL_SECS};
+
+        let secret = b"s";
+        let token = grant::issue("u", "track-swr", 9_999_999_999, secret);
+        let mut pool = Pool::new(1);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+        cache.put_track_at("track-swr", b"0123456789".to_vec(), 1_000);
+
+        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+        let input = PlayInput {
+            token: &token,
+            track_id: "track-swr",
+            range: None,
+            server_addr: addr,
+            segments: &[],
+            cipher_key: 0,
+            now_unix: 1_000 + CACHE_FRESH_TTL_SECS + 1,
+            up_next: None,
+        };
+        let first = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("stale serves");
+        assert_eq!(first.cache_status, CacheStatus::Stale);
+        assert!(
+            first.needs_revalidate,
+            "the first stale reader claims the one background revalidation"
+        );
+        let second = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("stale serves");
+        assert_eq!(second.cache_status, CacheStatus::Stale);
+        assert!(
+            !second.needs_revalidate,
+            "later stale readers must not each trigger a refresh"
+        );
+
+        // The revalidation rewrite landing releases the claim and the entry
+        // serves fresh again.
+        cache.put_track_at("track-swr", b"0123456789".to_vec(), input.now_unix);
+        let third = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("fresh serves");
+        assert_eq!(third.cache_status, CacheStatus::Hit);
+        assert!(!third.needs_revalidate);
     }
 
     #[test]

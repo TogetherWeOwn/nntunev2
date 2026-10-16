@@ -69,6 +69,10 @@ jobs:
       # The simd128 yEnc fast path must keep compiling (Workers run V8 with
       # Wasm SIMD; the deploy enables it via this RUSTFLAGS).
       - run: RUSTFLAGS="-C target-feature=+simd128" cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
+      # The stream crate must also check on wasm32: its stampede guard is
+      # native-only and cfg'd out there, and this keeps that fence honest so
+      # a future wiring change cannot silently trap in the Worker.
+      - run: cargo check -p nntune-stream --target wasm32-unknown-unknown
 
   # Public-repo hygiene: fail on internal tracker ids (TOG-<digits>),
   # internal hostnames, instance-UI paths and agent names in tracked text.

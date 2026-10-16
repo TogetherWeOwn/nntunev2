@@ -17,8 +17,10 @@
 //!   decrypt → chunked stream + writeback).
 //! - [`meter`]: Analytics Engine + usage-ledger events.
 //! - [`prefetch`]: next-track prefetch on spare pool capacity (never the last connection).
-//! - [`stampede`]: singleflight stampede guard (one upstream fetch per
-//!   concurrent identical segment + range) with waiter-timeout fallback.
+//! - `stampede` (native only, compiled out on wasm32): singleflight
+//!   stampede-guard primitive (one upstream fetch per concurrent segment)
+//!   with waiter-timeout re-election. Not yet wired into the play path;
+//!   wiring arrives with the Worker entry point.
 //!
 //! Cloudflare bindings (DO storage, R2, Analytics Engine) are wired in
 //! `workers/stream/wrangler.toml`; this crate stays dependency-free so
@@ -33,5 +35,9 @@ pub mod play;
 pub mod pool;
 pub mod prefetch;
 pub mod range;
+// Native only: the Mutex/Condvar waiter path traps on wasm32-unknown-unknown
+// (and a single-threaded isolate cannot park a waiter anyway). The Worker
+// entry point gets an async shared-future equivalent; see the module docs.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod stampede;
 pub mod yenc;
