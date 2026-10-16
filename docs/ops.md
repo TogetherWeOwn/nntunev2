@@ -314,10 +314,13 @@ lane. Complete every box on the exact head being promoted.
   the prod binding stays reserved.
 - [ ] Rollback pointer recorded: record the last good staging SHA and its
   successful push-triggered `deploy.yml` run, with `staging-web` conclusion
-  `success` (not `skipped`), before promoting. To roll back
-  `apps/web`, open that Actions run and choose **Re-run all jobs**; do not use
-  `workflow_dispatch` on the old SHA because `staging-web` is push-only and
-  will be skipped. Verify the rerun and staging health. This workflow does not
+  `success` (not `skipped`), before promoting. To accept rollback evidence,
+  also require the rollback rerun's `staging-web` job conclusion to be `success`
+  (not `skipped`); overall workflow success and staging health alone are
+  insufficient. To roll back `apps/web`, open that Actions run and choose
+  **Re-run all jobs**; do not use `workflow_dispatch` on the old SHA because
+  `staging-web` is push-only and will be skipped. Verify the rerun's
+  `staging-web` success and staging health. This workflow does not
   deploy Workers, which need their own rollback evidence. Staging rollback is
   a redeploy, never a data restore; retain the UNDO blocks and consolidation
   receipt for infrastructure-specific rollback.
