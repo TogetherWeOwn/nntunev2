@@ -17,11 +17,14 @@
 //!   decrypt → chunked stream + writeback).
 //! - [`meter`]: Analytics Engine + usage-ledger events.
 //! - [`prefetch`]: next-track prefetch on spare pool capacity (never the last connection).
+//! - [`probe`]: ingest segment-availability probe (`STAT` on the ingest
+//!   lane), served by the `NntpPool` Durable Object.
 //!
 //! Cloudflare bindings (DO storage, R2, Analytics Engine) are wired in
-//! `workers/stream/wrangler.toml`; this crate stays dependency-free so
-//! `cargo test` runs anywhere. The `worker`/DO entry points that embed this
-//! core arrive with the deploy-config slice.
+//! `workers/stream/wrangler.toml`. The Workers entry (`runtime`, wasm32
+//! only) exports the `NntpPool` Durable Object with its probe route; the
+//! play-path routes arrive with the runtime adapter slice. Native builds
+//! and `cargo test` never link the Workers runtime.
 
 pub mod cache;
 pub mod grant;
@@ -30,5 +33,8 @@ pub mod nntp;
 pub mod play;
 pub mod pool;
 pub mod prefetch;
+pub mod probe;
 pub mod range;
+#[cfg(target_arch = "wasm32")]
+pub mod runtime;
 pub mod yenc;
