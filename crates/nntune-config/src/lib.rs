@@ -552,10 +552,7 @@ mod tests {
                 expected: ConfigType::Str,
             }),
         );
-        assert_eq!(
-            config.get_str("auth.rp_id"),
-            Some("v2-staging.nntune.com")
-        );
+        assert_eq!(config.get_str("auth.rp_id"), Some("v2-staging.nntune.com"));
     }
 
     #[test]
