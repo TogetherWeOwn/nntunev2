@@ -43,7 +43,7 @@ describe('billing loader with an unconfirmed plan', () => {
 		const seen: PaywallModel[] = [];
 		const unsubscribe = onPaywall((model) => seen.push(model));
 
-		expect(data.hadFetchError).toBe(false);
+		expect(data.hadFetchError).toBe(status === 429);
 		expect(data.loadError).toBeNull();
 		expect(data.planUnknown).toBe(true);
 		expect(seen).toHaveLength(1);
@@ -70,7 +70,7 @@ describe('billing loader with an unconfirmed plan', () => {
 		const seen: PaywallModel[] = [];
 		const unsubscribe = onPaywall((model) => seen.push(model));
 
-		expect(data.hadFetchError).toBe(false);
+		expect(data.hadFetchError).toBe(status === 429);
 		expect(data.loadError).toBeNull();
 		expect(seen).toHaveLength(1);
 		expect(seen[0]?.status).toBe(status);

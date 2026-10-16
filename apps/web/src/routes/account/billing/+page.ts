@@ -65,8 +65,10 @@ export const load: PageLoad = async ({ fetch }) => {
 	const subscription: SubscriptionDTO | null = sub.value;
 	const usage: UsageDTO | null = use.status === 404 ? null : use.value;
 	// Limit statuses are already surfaced by the global paywall listener; do
-	// not stack a generic billing-outage notice or retry control beside it.
+	// not stack a generic billing-outage notice beside it. A 429 still needs
+	// the page Retry control once its countdown allows another attempt.
 	const isLimitStatus = (status: number | null) => status === 402 || status === 429;
+	const retryableLimit = sub.status === 429 || use.status === 429;
 	const subFailed = sub.failed && !isLimitStatus(sub.status);
 	const usageFailed = use.failed && use.status !== 404 && !isLimitStatus(use.status);
 	const signedOut = sub.status === 401 || use.status === 401;
@@ -108,7 +110,7 @@ export const load: PageLoad = async ({ fetch }) => {
 		planId: plan.id,
 		planUnknown,
 		signedOut,
-		hadFetchError: !signedOut && (subFailed || usageFailed),
+		hadFetchError: !signedOut && (subFailed || usageFailed || retryableLimit),
 		manageBillingOnly,
 		subscription,
 		usage,
