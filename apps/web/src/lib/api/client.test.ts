@@ -126,6 +126,42 @@ describe('ApiClient', () => {
 		expect((failure as ApiError).status).toBe(500);
 	});
 
+	it('reads code, message, and retryable from the error envelope', async () => {
+		const fetchFn = vi.fn(async () =>
+			jsonResponse({ code: 'rate_limited', message: 'too many requests', retryable: true }, 429)
+		);
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/me').catch((error: unknown) => error);
+		expect(failure).toBeInstanceOf(ApiError);
+		expect((failure as ApiError).code).toBe('rate_limited');
+		expect((failure as ApiError).message).toBe('too many requests');
+		expect((failure as ApiError).retryable).toBe(true);
+	});
+
+	it('exposes the 402 plan-limit envelope as non-retryable', async () => {
+		const fetchFn = vi.fn(async () =>
+			jsonResponse({ code: 'plan_limit_exceeded', message: 'plan limit reached', retryable: false }, 402)
+		);
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/me').catch((error: unknown) => error);
+		expect((failure as ApiError).code).toBe('plan_limit_exceeded');
+		expect((failure as ApiError).retryable).toBe(false);
+	});
+
+	it('falls back to the generic code for an unregistered envelope code', async () => {
+		const fetchFn = vi.fn(async () =>
+			jsonResponse({ code: 'future_code', message: 'from a newer server', retryable: false }, 500)
+		);
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/me').catch((error: unknown) => error);
+		expect((failure as ApiError).code).toBe('request_failed');
+		expect((failure as ApiError).message).toBe('from a newer server');
+		expect((failure as ApiError).retryable).toBe(true);
+	});
+
 	it('maps 401 to the unauthorized code', async () => {
 		const fetchFn = vi.fn(async () => jsonResponse({ error: 'nope' }, 401));
 		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });

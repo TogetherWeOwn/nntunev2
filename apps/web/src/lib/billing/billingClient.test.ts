@@ -39,6 +39,21 @@ describe('billingClient redirects', () => {
 		);
 	});
 
+	it('carries envelope code and retryable on billing failures', async () => {
+		const fetchFn = vi.fn(
+			async () =>
+				new Response(
+					JSON.stringify({ code: 'plan_limit_exceeded', message: 'plan limit reached', retryable: false }),
+					{ status: 402 }
+				)
+		);
+		const failure = await openPortal(fetchFn as typeof fetch).catch((e: unknown) => e);
+		expect(failure).toBeInstanceOf(BillingApiError);
+		expect((failure as BillingApiError).code).toBe('plan_limit_exceeded');
+		expect((failure as BillingApiError).retryable).toBe(false);
+		expect((failure as BillingApiError).status).toBe(402);
+	});
+
 	it('surfaces server errors without leaking bodies', async () => {
 		const fetchFn = vi.fn(
 			async () => new Response(JSON.stringify({ error: 'no such subscription' }), { status: 404 })

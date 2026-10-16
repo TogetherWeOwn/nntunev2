@@ -20,6 +20,7 @@
 use futures_util::StreamExt;
 use worker::{console_log, Env, Request, Response, Result, RouteContext, Router};
 
+pub mod api_error;
 pub mod dispatch;
 pub mod fixtures;
 pub mod jobs;
@@ -33,10 +34,11 @@ pub mod queue;
 pub mod rate_limit;
 pub mod repair;
 
+use api_error::ApiError;
 use dispatch::validate_user_id;
 use jobs::validate_job_id;
 use newznab::{MAX_CATEGORIES, MAX_LIMIT, MAX_PAGE};
-use nzb_intake::{estimate_nzb, IntakeRejection};
+use nzb_intake::estimate_nzb;
 use queue::{validate_indexer_ref, NzbUploadRequest, QueueMsg, SearchRequest};
 
 /// Largest accepted `POST /v1/ingest/search` body: the request is a query plus
@@ -49,17 +51,9 @@ pub const MAX_SEARCH_BODY_BYTES: usize = 16 * 1024;
 /// the wire, so the wire cap accounts for that before buffering.
 pub const MAX_UPLOAD_BODY_BYTES: usize = 13 * 1024 * 1024;
 
-#[derive(Debug, serde::Serialize)]
-struct ApiError {
-    error: String,
-}
-
-fn json_error(message: &str, status: u16) -> Result<Response> {
-    let body = serde_json::to_string(&ApiError {
-        error: message.to_string(),
-    })
-    .unwrap_or_else(|_| r#"{"error":"internal"}"#.to_string());
-    Response::from_body(worker::ResponseBody::Body(body.into_bytes())).map(|r| {
+fn json_error(err: ApiError) -> Result<Response> {
+    let status = err.status;
+    Response::from_body(worker::ResponseBody::Body(err.body_json().into_bytes())).map(|r| {
         r.with_status(status)
             .with_headers(headers_json().unwrap_or_default())
     })
@@ -76,12 +70,9 @@ fn accepted(body: serde_json::Value) -> Result<Response> {
 }
 
 fn service_unavailable(message: &str) -> Result<Response> {
-    let body = serde_json::to_string(&ApiError {
-        error: message.to_string(),
-    })
-    .unwrap_or_else(|_| r#"{"error":"internal"}"#.to_string());
     let headers = headers_json().unwrap_or_default();
     headers.append("retry-after", "5")?;
+    let body = ApiError::service_unavailable(message).body_json();
     Response::from_body(worker::ResponseBody::Body(body.into_bytes()))
         .map(|r| r.with_status(503).with_headers(headers))
 }
@@ -132,23 +123,20 @@ fn push_chunk(
 /// unauthenticated route. This reads through `Request::stream()` and bails
 /// with 413 on the chunk that would cross the cap; non-UTF-8 bodies are a
 /// 400, as is an unreadable stream.
-async fn read_capped_text(
-    req: &mut Request,
-    cap: usize,
-) -> core::result::Result<String, (String, u16)> {
+async fn read_capped_text(req: &mut Request, cap: usize) -> core::result::Result<String, ApiError> {
     if let Err(message) = check_declared_len(content_length(req), cap) {
-        return Err((message.to_string(), 413));
+        return Err(ApiError::payload_too_large(message));
     }
     let stream = req
         .stream()
-        .map_err(|_| ("failed to read request body".to_string(), 400))?;
+        .map_err(|_| ApiError::invalid_request("failed to read request body"))?;
     let mut stream = Box::pin(stream);
     let mut buf = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| ("failed to read request body".to_string(), 400))?;
-        push_chunk(&mut buf, &chunk, cap).map_err(|m| (m.to_string(), 413))?;
+        let chunk = chunk.map_err(|_| ApiError::invalid_request("failed to read request body"))?;
+        push_chunk(&mut buf, &chunk, cap).map_err(ApiError::payload_too_large)?;
     }
-    String::from_utf8(buf).map_err(|_| ("request body must be UTF-8".to_string(), 400))
+    String::from_utf8(buf).map_err(|_| ApiError::invalid_request("request body must be UTF-8"))
 }
 
 /// Parse a search body: malformed JSON is a client error (400), never a 500.
@@ -234,9 +222,15 @@ fn queued_envelope(
         "idempotency_key": msg.idempotency_key,
     });
     if !queued {
-        body["hint"] = serde_json::Value::String(
+        // Error path: the shared envelope fields ride alongside the job
+        // correlation fields above (extra fields are allowed, see
+        // docs/api-errors.md).
+        body["code"] = serde_json::Value::String("service_unavailable".into());
+        body["message"] = serde_json::Value::String(
             "Queue unavailable; nothing was accepted, retry shortly.".into(),
         );
+        body["retryable"] = serde_json::Value::Bool(true);
+        body["hint"] = body["message"].clone();
     }
     if let serde_json::Value::Object(map) = extra {
         if let serde_json::Value::Object(ref mut body_map) = body {
@@ -294,14 +288,14 @@ async fn store_upload_payload(env: &Env, payload_ref: &str, nzb_xml: &str) -> bo
 async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
     let text = match read_capped_text(req, MAX_SEARCH_BODY_BYTES).await {
         Ok(text) => text,
-        Err((message, status)) => return json_error(&message, status),
+        Err(err) => return json_error(err),
     };
     let parsed = match parse_search(&text) {
         Ok(parsed) => parsed,
-        Err(message) => return json_error(message, 400),
+        Err(message) => return json_error(ApiError::invalid_request(message)),
     };
     if let Err(message) = check_search(&parsed) {
-        return json_error(message, 400);
+        return json_error(ApiError::invalid_request(message));
     }
     let q = parsed.query.trim().to_string();
     let msg = match dispatch::build_search_dispatch(
@@ -313,7 +307,7 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
         parsed.page,
     ) {
         Ok(msg) => msg,
-        Err(message) => return json_error(message, 400),
+        Err(message) => return json_error(ApiError::invalid_request(message)),
     };
     console_log!("ingest search q_len={} job={}", q.len(), msg.job_id);
     let queued = try_enqueue(&ctx.env, &msg).await;
@@ -325,25 +319,21 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
 async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
     let text = match read_capped_text(req, MAX_UPLOAD_BODY_BYTES).await {
         Ok(text) => text,
-        Err((message, status)) => return json_error(&message, status),
+        Err(err) => return json_error(err),
     };
     let parsed = match parse_upload(&text) {
         Ok(parsed) => parsed,
-        Err(message) => return json_error(message, 400),
+        Err(message) => return json_error(ApiError::invalid_request(message)),
     };
     if let Err(message) = check_upload(&parsed) {
-        return json_error(message, 400);
+        return json_error(ApiError::invalid_request(message));
     }
     match estimate_nzb(&parsed.nzb_xml) {
-        Err(IntakeRejection::Empty) => json_error("nzb_xml must not be empty", 400),
-        Err(IntakeRejection::TooLarge) => json_error("nzb_xml exceeds 2 MiB", 413),
-        Err(IntakeRejection::NotNzb) => json_error("nzb_xml is not an NZB document", 400),
-        Err(IntakeRejection::TooManyFiles) => json_error("nzb has too many files", 413),
-        Err(IntakeRejection::TooManySegments) => json_error("nzb has too many segments", 413),
+        Err(rejection) => json_error(ApiError::from(rejection)),
         Ok(est) => {
             let msg = match dispatch::build_upload_dispatch(&parsed.user_id, &parsed.nzb_xml) {
                 Ok(msg) => msg,
-                Err(message) => return json_error(message, 400),
+                Err(message) => return json_error(ApiError::invalid_request(message)),
             };
             // The bytes must be durably stored before the job exists: an
             // enqueued job without retrievable bytes can never run.
@@ -377,7 +367,7 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Respons
 async fn job_status(_req: &Request, ctx: &RouteContext<()>) -> Result<Response> {
     let id = ctx.param("id").cloned().unwrap_or_default();
     if !validate_job_id(&id) {
-        return json_error("unknown job id", 404);
+        return json_error(ApiError::not_found("unknown job id"));
     }
     Response::from_json(&serde_json::json!({
         "job_id": id,
@@ -494,7 +484,9 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
         .get_async("/v1/ingest/jobs/:id", |req, ctx| async move {
             job_status(&req, &ctx).await
         })
-        .or_else_any_method_async("/*catchall", |_, _| async { json_error("not found", 404) })
+        .or_else_any_method_async("/*catchall", |_, _| async {
+            json_error(ApiError::not_found("not found"))
+        })
         .run(req, env)
         .await
 }

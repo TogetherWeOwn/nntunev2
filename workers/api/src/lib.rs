@@ -5,6 +5,7 @@
 //! secrets are provisioned). This crate holds the security-critical logic
 //! with unit + integration tests.
 
+pub mod api_error;
 pub mod auth;
 pub mod b64;
 pub mod library;

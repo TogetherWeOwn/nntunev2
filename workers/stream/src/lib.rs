@@ -23,6 +23,7 @@
 //! `cargo test` runs anywhere. The `worker`/DO entry points that embed this
 //! core arrive with the deploy-config slice.
 
+pub mod api_error;
 pub mod cache;
 pub mod grant;
 pub mod meter;

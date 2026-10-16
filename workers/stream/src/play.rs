@@ -28,6 +28,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use crate::api_error::ApiError;
 use crate::cache::{ContentCache, MultipartUpload};
 use crate::grant::{self, GrantError};
 use crate::meter::{Meter, MeterEvent, MeterKind};
@@ -59,6 +60,26 @@ pub enum PlayError {
     Upstream(String),
     /// A segment could not be decoded (corrupt or mis-placed yEnc part).
     Decode(YencError),
+}
+
+impl PlayError {
+    /// The shared user-facing envelope for this failure (see
+    /// `docs/api-errors.md`). Variant payloads (provider replies,
+    /// message-ids, decode detail) deliberately never reach the wire:
+    /// every message here is static per code.
+    pub fn api_error(&self) -> ApiError {
+        match self {
+            PlayError::Unauthorized(_) => ApiError::unauthorized(),
+            PlayError::WrongTrack => ApiError::forbidden(),
+            PlayError::RangeUnsatisfiable => ApiError::range_not_satisfiable(),
+            PlayError::PoolExhausted => ApiError::rate_limited(),
+            PlayError::PoolQuarantined { .. } => ApiError::upstream_unavailable(),
+            PlayError::ArticleMissing(_) => ApiError::not_found(),
+            PlayError::InvalidSegment(_) => ApiError::invalid_request(),
+            PlayError::Upstream(_) => ApiError::upstream_unavailable(),
+            PlayError::Decode(_) => ApiError::corrupt_content(),
+        }
+    }
 }
 
 /// Everything the play path needs, by reference.
@@ -605,6 +626,72 @@ impl Iterator for PlayStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn play_errors_map_to_the_shared_envelope() {
+        // Representative play failures across auth, range, limits, and
+        // upstream paths; payloads must not leak into the wire message.
+        let cases: Vec<(PlayError, &'static str, u16, bool)> = vec![
+            (
+                PlayError::Unauthorized(GrantError::Expired),
+                "unauthorized",
+                401,
+                false,
+            ),
+            (PlayError::WrongTrack, "forbidden", 403, false),
+            (
+                PlayError::RangeUnsatisfiable,
+                "range_not_satisfiable",
+                416,
+                false,
+            ),
+            (PlayError::PoolExhausted, "rate_limited", 429, true),
+            (
+                PlayError::PoolQuarantined { retry_after_ms: 5 },
+                "upstream_unavailable",
+                502,
+                true,
+            ),
+            (
+                PlayError::ArticleMissing("seg@news.example".into()),
+                "not_found",
+                404,
+                false,
+            ),
+            (
+                PlayError::InvalidSegment("bad id".into()),
+                "invalid_request",
+                400,
+                false,
+            ),
+            (
+                PlayError::Upstream("502 provider detail".into()),
+                "upstream_unavailable",
+                502,
+                true,
+            ),
+            (
+                PlayError::Decode(YencError::Truncated),
+                "corrupt_content",
+                502,
+                false,
+            ),
+        ];
+        for (err, code, status, retryable) in cases {
+            let api = err.api_error();
+            assert_eq!(
+                (api.code, api.status, api.retryable),
+                (code, status, retryable),
+                "{err:?}"
+            );
+            assert!(!api.body_json().contains("seg@news"), "{err:?}");
+            assert!(!api.body_json().contains("provider detail"), "{err:?}");
+        }
+        assert_eq!(
+            PlayError::WrongTrack.api_error().body_json(),
+            r#"{"code":"forbidden","message":"not the owner","retryable":false}"#
+        );
+    }
 
     #[test]
     fn wrong_track_grant_is_rejected() {

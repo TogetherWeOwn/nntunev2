@@ -20,6 +20,9 @@
 
 use serde::Serialize;
 
+mod api_error;
+use api_error::ApiError;
+
 /// Cache TTLs: lookups are immutable-ish (long TTL), search is short TTL.
 /// They apply to successful responses only; failures serve `no-store`.
 const LOOKUP_CACHE_TTL_S: u32 = 86_400;
@@ -276,11 +279,10 @@ struct ApiResponse {
     cache_ttl: Option<u32>,
 }
 
-fn error_response(message: &str, status: u16) -> ApiResponse {
-    let body = serde_json::json!({ "error": message }).to_string();
+fn error_response(err: ApiError) -> ApiResponse {
     ApiResponse {
-        status,
-        body,
+        status: err.status,
+        body: err.body_json(),
         cache_ttl: None,
     }
 }
@@ -302,7 +304,7 @@ async fn handle_lookup<R: MbRepo, C: SuccessCache>(
     mbid: &str,
 ) -> ApiResponse {
     if !is_valid_mbid(mbid) {
-        return error_response("invalid mbid (must be UUID)", 400);
+        return error_response(ApiError::invalid_request("invalid mbid (must be UUID)"));
     }
     let key = lookup_cache_key(kind, mbid);
     if let Some(body) = cache.get(&key).await {
@@ -314,8 +316,8 @@ async fn handle_lookup<R: MbRepo, C: SuccessCache>(
             cache.put(&key, &body, LOOKUP_CACHE_TTL_S).await;
             success_response(body, LOOKUP_CACHE_TTL_S)
         }
-        Ok(None) => error_response("not found", 404),
-        Err(_) => error_response("internal error", 500),
+        Ok(None) => error_response(ApiError::not_found("not found")),
+        Err(_) => error_response(ApiError::internal_error()),
     }
 }
 
@@ -331,17 +333,23 @@ async fn handle_search<R: MbRepo, C: SuccessCache>(
     let q = raw_q.trim();
     let q_chars = q.chars().count();
     if q_chars < 2 {
-        return error_response("query too short (min 2 chars)", 400);
+        return error_response(ApiError::invalid_request("query too short (min 2 chars)"));
     }
     if q_chars > MAX_QUERY_CHARS {
-        return error_response("query too long (max 100 chars)", 400);
+        return error_response(ApiError::invalid_request("query too long (max 100 chars)"));
     }
     if q.chars().any(char::is_control) {
-        return error_response("query contains control characters", 400);
+        return error_response(ApiError::invalid_request(
+            "query contains control characters",
+        ));
     }
     let kind = match Kind::parse(raw_kind) {
         Some(kind) => kind,
-        None => return error_response("type must be one of artist|release|recording", 400),
+        None => {
+            return error_response(ApiError::invalid_request(
+                "type must be one of artist|release|recording",
+            ))
+        }
     };
     let key = search_cache_key(kind, q);
     if let Some(body) = cache.get(&key).await {
@@ -365,7 +373,7 @@ async fn handle_search<R: MbRepo, C: SuccessCache>(
             cache.put(&key, &body, SEARCH_CACHE_TTL_S).await;
             success_response(body, SEARCH_CACHE_TTL_S)
         }
-        Err(_) => error_response("internal error", 500),
+        Err(_) => error_response(ApiError::internal_error()),
     }
 }
 
@@ -583,7 +591,7 @@ mod http_layer {
     }
 
     pub async fn not_found() -> WorkerResult<Response> {
-        render(&error_response("not found", 404))
+        render(&error_response(ApiError::not_found("not found")))
     }
 }
 
@@ -802,6 +810,35 @@ mod tests {
     }
 
     #[test]
+    fn error_routes_return_the_shared_envelope() {
+        // Representative error routes: validation (400), missing (404), and
+        // repository failure (500) all carry {code, message, retryable}.
+        let repo = FakeRepo::default();
+        let cache = FakeCache::default();
+        let bad = block_on(handle_lookup(&repo, &cache, Kind::Artist, "nope"));
+        let body: serde_json::Value = serde_json::from_str(&bad.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"code":"invalid_request","message":"invalid mbid (must be UUID)","retryable":false})
+        );
+        let missing = block_on(handle_lookup(&repo, &cache, Kind::Artist, MBID));
+        let body: serde_json::Value = serde_json::from_str(&missing.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"code":"not_found","message":"not found","retryable":false})
+        );
+        let short_q = block_on(handle_search(
+            &repo,
+            &cache,
+            Some("artist".to_string()),
+            "x",
+        ));
+        let body: serde_json::Value = serde_json::from_str(&short_q.body).unwrap();
+        assert_eq!(body["code"], "invalid_request");
+        assert_eq!(body["retryable"], false);
+    }
+
+    #[test]
     fn lookup_missing_is_404_and_not_cached() {
         let repo = FakeRepo::default();
         let cache = FakeCache::default();
@@ -820,7 +857,10 @@ mod tests {
         let cache = FakeCache::default();
         let resp = block_on(handle_lookup(&repo, &cache, Kind::Artist, MBID));
         assert_eq!(resp.status, 500);
-        assert_eq!(resp.body, r#"{"error":"internal error"}"#);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"internal_error","message":"internal error","retryable":true}"#
+        );
         assert_eq!(resp.cache_ttl, None);
         assert!(cache.puts.borrow().is_empty());
     }
