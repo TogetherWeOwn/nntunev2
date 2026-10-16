@@ -154,8 +154,15 @@ fn rotation_rejects_host_mismatch_against_stored_row() {
         "mismatched host is itself valid — only the identity guard may reject"
     );
     assert!(
-        vault::rotate_provider_credentials(&test_kek(), 1, "user-1", &old_blob, &new_config, &FakeDns)
-            .is_err(),
+        vault::rotate_provider_credentials(
+            &test_kek(),
+            1,
+            "user-1",
+            &old_blob,
+            &new_config,
+            &FakeDns
+        )
+        .is_err(),
         "rotation must reject a host change (that is a fresh save)"
     );
 }
@@ -166,8 +173,15 @@ fn rotation_rejects_username_mismatch_against_stored_row() {
     let mut new_config = provider_with_password("new-s3cret-rotated");
     new_config.username = "mallory".into();
     assert!(
-        vault::rotate_provider_credentials(&test_kek(), 1, "user-1", &old_blob, &new_config, &FakeDns)
-            .is_err(),
+        vault::rotate_provider_credentials(
+            &test_kek(),
+            1,
+            "user-1",
+            &old_blob,
+            &new_config,
+            &FakeDns
+        )
+        .is_err(),
         "rotation must reject a username change (that is a fresh save)"
     );
 }
@@ -178,24 +192,27 @@ fn rotation_rejects_stored_row_without_bindable_identity() {
     // fail closed instead of sealing a caller-asserted identity.
     let old_blob = seal(br#"{"password":"old-s3cret"}"#);
     let new_config = provider_with_password("new-s3cret-rotated");
-    assert!(
-        vault::rotate_provider_credentials(&test_kek(), 1, "user-1", &old_blob, &new_config, &FakeDns)
-            .is_err()
-    );
+    assert!(vault::rotate_provider_credentials(
+        &test_kek(),
+        1,
+        "user-1",
+        &old_blob,
+        &new_config,
+        &FakeDns
+    )
+    .is_err());
     // A non-JSON payload likewise fails closed rather than being replaced
     // by a partial {"username","password"} row.
     let opaque_blob = seal(b"not-json");
-    assert!(
-        vault::rotate_provider_credentials(
-            &test_kek(),
-            1,
-            "user-1",
-            &opaque_blob,
-            &new_config,
-            &FakeDns,
-        )
-        .is_err()
-    );
+    assert!(vault::rotate_provider_credentials(
+        &test_kek(),
+        1,
+        "user-1",
+        &opaque_blob,
+        &new_config,
+        &FakeDns,
+    )
+    .is_err());
 }
 
 #[test]
@@ -210,9 +227,15 @@ fn rotation_preserves_flat_row_extra_fields() {
     .unwrap();
     let old_blob = seal(&flat);
     let new_config = provider_with_password("new-s3cret-rotated");
-    let rotated =
-        vault::rotate_provider_credentials(&test_kek(), 1, "user-1", &old_blob, &new_config, &FakeDns)
-            .expect("rotate flat row");
+    let rotated = vault::rotate_provider_credentials(
+        &test_kek(),
+        1,
+        "user-1",
+        &old_blob,
+        &new_config,
+        &FakeDns,
+    )
+    .expect("rotate flat row");
     let back: serde_json::Value =
         serde_json::from_slice(&vault::decrypt_vault(&test_kek(), "user-1", &rotated).unwrap())
             .unwrap();
