@@ -19,7 +19,9 @@ workers/api/
   wrangler.toml.example  # Worker config template (no secrets)
 ```
 
-`migrations/0002_auth_vault.sql` + `migrations/0003_library.sql` are the
+`migrations/0002_auth_vault.sql` + `migrations/0003_library.sql` +
+`migrations/0004_kek_rotation.sql` (vault `rewrapped_at` marker +
+`kek_version` index, see `docs/security/kek-rotation.md` §2) are the
 Postgres schema (PlanetScale via Hyperdrive). The HTTP + Hyperdrive wiring
 (Worker entry) lands in the follow-up slice once staging secrets are
 provisioned; this crate is the security-critical logic with tests.

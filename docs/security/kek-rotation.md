@@ -45,10 +45,11 @@ AAD(payload)  = "v1|vault|<user_id>"              (payload_aad)
 
 ## 2. Schema (PlanetScale Postgres via Hyperdrive)
 
-Merged reality (`migrations/0002_auth_vault.sql`): the table is
-`provider_vaults`, blobs are base64 `TEXT` (Worker-friendly — no binary
-column binding through Hyperdrive), and the rotation columns land in a
-follow-up migration (gate items §8):
+Merged reality (`migrations/0002_auth_vault.sql` +
+`migrations/0004_kek_rotation.sql`): the table is `provider_vaults`,
+blobs are base64 `TEXT` (Worker-friendly — no binary column binding
+through Hyperdrive), and migration 0004 adds the rotation marker and
+version index:
 
 ```sql
 CREATE TABLE IF NOT EXISTS provider_vaults (
@@ -59,11 +60,12 @@ CREATE TABLE IF NOT EXISTS provider_vaults (
   payload_nonce      TEXT NOT NULL,      -- base64 12-byte GCM nonce for the payload
   payload            TEXT NOT NULL,      -- base64 credentials encrypted under DEK
   indexer_configured BOOLEAN NOT NULL DEFAULT FALSE,
-  updated_at         BIGINT NOT NULL
+  updated_at         BIGINT NOT NULL,
+  rewrapped_at       BIGINT NULL       -- migration 0004: NULL = never re-wrapped
 );
--- Follow-up migration (gate item): rewrapped_at + version index.
+-- Migration 0004 (landed): rewrapped_at + version index.
 -- ALTER TABLE provider_vaults ADD COLUMN rewrapped_at BIGINT NULL;
--- CREATE INDEX idx_vault_kek_version ON provider_vaults (kek_version);
+-- CREATE INDEX IF NOT EXISTS idx_vault_kek_version ON provider_vaults (kek_version);
 ```
 
 Rules:
@@ -73,9 +75,11 @@ Rules:
 - Nonces are unique per encryption (CSPRNG). Never reused, never logged.
 - Parameterized queries only. No plaintext credential column, now or as a
   migration backfill — migrations carry ciphertext only.
-- Until the follow-up migration lands, re-wrap passes track progress in
-  `rotation_runs` (§6) and use `updated_at` as the last-touch signal;
-  `rewrapped_at` becomes authoritative once the column exists.
+- Since migration 0004, `rewrapped_at` is the authoritative re-wrap
+  marker: the §6 conditional UPDATE sets it (with `updated_at`) on every
+  re-wrap, and `NULL` means the row has never been re-wrapped. Re-wrap
+  passes still track pass-level progress in `rotation_runs` (§6);
+  `updated_at` alone is no longer used as the re-wrap signal.
 
 ## 3. KEK provisioning and versioning
 
@@ -294,7 +298,10 @@ core) already shows:
 Follow-up gate items (the vault/HTTP slice PR may not merge until the
 CISO gate verifies each at its exact head):
 
-- [ ] Follow-up migration: `rewrapped_at` + `kek_version` index (§2).
+- [x] Follow-up migration: `rewrapped_at` + `kek_version` index (§2)
+      — `migrations/0004_kek_rotation.sql`; the §6 re-wrap UPDATE sets
+      `rewrapped_at`, and per-version progress counts are documented
+      in §6.
 - [ ] `kek_by_version` selector over provisioned versions so mixed-version
       rows decrypt during phases 1–2; first rotation cuts over to
       `VAULT_KEK_V<N>` + `VAULT_KEK_CURRENT` (§3).
