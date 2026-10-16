@@ -23,13 +23,12 @@ The provisioned layout is **one bucket per concern per environment**, not one
 shared bucket. Object key prefixes describe cache scope *within* those buckets;
 they do not replace the environment boundary. Worker configs and cache/MusicBrainz
 ADRs must use the exact names below. There is no bucket named `nntunev2-art`.
-Alignment is **not yet complete** on the sibling branches. Known integration
-prerequisites identified across the provisioning review rounds:
+The MB documentation/example references are reconciled here; remaining
+integration prerequisites on sibling branches are:
 
 | Owning PR | Required reconciliation |
 |---|---|
 | [#2](https://github.com/TogetherWeOwn/nntunev2/pull/2), cache ADR | Physical audio/art buckets are separate per environment; prefixes live inside them. |
-| [#4](https://github.com/TogetherWeOwn/nntunev2/pull/4), MB docs/example | Replace nonexistent `nntunev2-art` with the appropriate art bucket below. |
 | [#14](https://github.com/TogetherWeOwn/nntunev2/pull/14), scaffold | Replace placeholders only when activating the correct consumer bindings. |
 | [#8](https://github.com/TogetherWeOwn/nntunev2/pull/8), stream | `workers/stream/wrangler.toml` uses `nntune-audio-cache` without environment sections; bind `AUDIO_CACHE` to `nntunev2-audio-staging` / `nntunev2-audio-prod`. |
 | [#10](https://github.com/TogetherWeOwn/nntunev2/pull/10), ingest | Both producer and consumer in `workers/ingest/wrangler.toml.example` use `nntune-ingest-jobs`; use `nntunev2-ingest-staging` / `nntunev2-ingest-prod`. |
@@ -288,13 +287,21 @@ lane. Complete every box on the exact head being promoted.
   SHA, plus Paperclip Review 5/5 on that head (merge policy in
   `CONTRIBUTING.md`). A red required check is fixed in code or recorded as
   a flake/quarantine decision with a card link, never dismissed.
-- [ ] Staging deploy evidence: the deploy workflow is green on the promotion
-  SHA and the staging hostname serves that build (the deploy owner replaces
-  the placeholder `100::` record through a Workers custom domain).
-- [ ] Staging E2E green on that SHA: `e2e-staging` synthetic smoke plus the
-  full journey pass against `STAGING_BASE_URL`. Pre-configuration skips do
-  not count as evidence once staging is configured (the workflow fails
-  closed without both Access client credentials).
+- [ ] Staging deploy evidence: record the successful push-triggered
+  `deploy.yml` run for the promotion SHA and verify staging health. This
+  workflow deploys `apps/web` only; it does not deploy stream, MB, API or
+  ingest Workers. The current `/api/health` returns only `{ok:true}`, with no
+  build identity, so neither a green deploy run nor a health response proves
+  which SHA is serving. Do not claim same-build evidence until a deployed-build
+  identity is exposed and compared with the promotion SHA. The deploy owner
+  replaces the placeholder `100::` record through a Workers custom domain.
+- [ ] Staging E2E: after `staging-web` completes, run `e2e-staging` by
+  `workflow_dispatch` or use a scheduled run that starts afterward; the
+  push-triggered E2E run can race the independent deploy. Record its run and
+  result, and do not call it same-build evidence until the staging build
+  identity is verified against the deploy SHA. Pre-configuration skips do
+  not count once staging is configured; the workflow fails closed without
+  both Access client credentials.
 - [ ] Access intact: the `NNTune v2 staging` Access app, its owner-OTP allow
   policy and the QA service-token policy still gate `v2-staging.nntune.com`.
   No bypass, no shared-token rotation, and both `CF_ACCESS_CLIENT_*`
@@ -304,6 +311,11 @@ lane. Complete every box on the exact head being promoted.
   creation, and no resize, split, role change, or credential rotation as part
   of promotion. Staging serves `nntunev2_staging` through its runtime roles;
   the prod binding stays reserved.
-- [ ] Rollback pointer recorded: state the rollback target (last good staging
-  SHA redeploy, or the UNDO blocks above plus the consolidation receipt)
-  before promoting. Staging rollback is a redeploy, never a data restore.
+- [ ] Rollback pointer recorded: record the last good staging SHA and its
+  successful push-triggered `deploy.yml` run before promoting. To roll back
+  `apps/web`, open that Actions run and choose **Re-run all jobs**; do not use
+  `workflow_dispatch` on the old SHA because `staging-web` is push-only and
+  will be skipped. Verify the rerun and staging health. This workflow does not
+  deploy Workers, which need their own rollback evidence. Staging rollback is
+  a redeploy, never a data restore; retain the UNDO blocks and consolidation
+  receipt for infrastructure-specific rollback.
