@@ -1,7 +1,11 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { listPlans, formatPricePerMonth } from '#lib/billing/plans.js';
-	import { startCheckout, signupUrlForCheckoutFailure } from '#lib/billing/billingClient.js';
+	import {
+		BillingApiError,
+		startCheckout,
+		signupUrlForCheckoutFailure
+	} from '#lib/billing/billingClient.js';
 
 	const plans = listPlans();
 	let checkoutError: string | null = $state(null);
@@ -18,7 +22,8 @@
 			// with the plan carried along instead of a raw 401 alert.
 			const signup = signupUrlForCheckoutFailure(planId, err);
 			if (signup) await goto(signup);
-			else checkoutError = err instanceof Error ? err.message : 'Checkout failed';
+			else if (!(err instanceof BillingApiError && err.paywall))
+				checkoutError = err instanceof Error ? err.message : 'Checkout failed';
 		} finally {
 			pendingPlan = null;
 		}

@@ -138,6 +138,13 @@
 			}
 		} catch (error) {
 			if (runId !== testRunId || inputKey !== currentTestKey()) return;
+			if (error instanceof ApiError && error.paywall) {
+				// The global paywall owns the limit response; avoid a duplicate
+				// inline failure state beneath the modal.
+				testState = 'idle';
+				testDetail = '';
+				return;
+			}
 			testState = 'failed';
 			// Stale stored credential: inline re-auth prompt (S7), never a
 			// generic error page. The step-3 prompt renders its own password
@@ -179,10 +186,13 @@
 				window.location.href = '/library';
 			}
 		} catch (error) {
-			if (runId === testRunId && inputKey === currentTestKey()) {
-				saveReauthRequired = error instanceof ApiError && error.code === 'reauth_required';
-				saveState = 'failed';
+			if (runId !== testRunId || inputKey !== currentTestKey()) return;
+			if (error instanceof ApiError && error.paywall) {
+				saveState = 'idle';
+				return;
 			}
+			saveReauthRequired = error instanceof ApiError && error.code === 'reauth_required';
+			saveState = 'failed';
 		}
 	}
 </script>

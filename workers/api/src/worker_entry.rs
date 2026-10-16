@@ -1,7 +1,9 @@
 //! Worker runtime wiring: env config, Hyperdrive Postgres store,
 //! DNS-over-HTTPS resolution, pinned-address socket probing, and the
-//! magic-link mailer webhook. Everything here adapts `handlers` traits
-//! to Cloudflare bindings; no security decisions live in this module.
+//! magic-link mailer webhook. Request security decisions live in
+//! `handlers`; startup fail-closed gates (env config plus the Hyperdrive
+//! caching-disabled attestation below) live here and refuse to serve
+//! traffic when the operator has not attested a cache-disabled config.
 //!
 //! Failures are opaque by construction: driver/DB errors map to
 //! [`handlers::StoreError`] without detail, and nothing in this module
@@ -45,6 +47,17 @@ fn env_string(env: &Env, name: &str) -> Option<String> {
 }
 
 fn config_from_env(env: &Env) -> Option<Config> {
+    // Runtime fail-closed gate for the Hyperdrive caching finding: auth
+    // reads are plain SELECTs through the HYPERDRIVE binding, so a
+    // caching-enabled config would serve stale sessions/credentials for
+    // up to ~75s. The Worker cannot inspect the Hyperdrive config at
+    // runtime, so the operator attests `HYPERDRIVE_CACHING_DISABLED=1`
+    // (set only after `check_hyperdrive_cache.sh` passes for that env).
+    // Without the attestation the Worker answers the same generic 500 as
+    // any other misconfiguration and serves no auth traffic.
+    if !hyperdrive_caching_disabled_attested(env_string(env, "HYPERDRIVE_CACHING_DISABLED")) {
+        return None;
+    }
     let rp_id = env_string(env, "RP_ID")?;
     let origin = env_string(env, "RP_ORIGIN")?;
     // Strict unpadded base64url for both secrets (`crate::b64`, F-HARD-01):
@@ -87,6 +100,15 @@ fn config_from_env(env: &Env) -> Option<Config> {
         session_previous_secret,
     )
     .ok()
+}
+
+/// Pure Hyperdrive caching attestation decision: `Some("1"/"true"/"TRUE")`
+/// in `HYPERDRIVE_CACHING_DISABLED` means the operator verified that env's
+/// Hyperdrive config has query caching disabled; anything else (missing,
+/// empty, any other value) refuses to start. Unit-tested below; the same
+/// truthy spelling as the other feature flags.
+fn hyperdrive_caching_disabled_attested(raw: Option<String>) -> bool {
+    matches!(raw.as_deref(), Some("1") | Some("true") | Some("TRUE"))
 }
 
 /// Pure rotation-matrix decision: the staged `SESSION_SECRET_PREVIOUS_BASE64`
@@ -643,6 +665,24 @@ impl Store for PgStore {
             )
             .await
             .map_err(|_| StoreError)?;
+        // O(1) fast-fail on the exhausted path (single source of truth:
+        // `handlers::RATE_LIMIT_EXHAUSTED_SQL`, pinned by statement-shape
+        // test): without this guard every denied request pays one DELETE
+        // plus `limit` conflicting upserts (~101 statements with 100 row
+        // locks for the 100-slot finish lookup budget). The slot loop below
+        // still claims atomically, so a concurrent race that passes this
+        // snapshot simply fails closed there.
+        let exhausted = client
+            .query_one(
+                handlers::RATE_LIMIT_EXHAUSTED_SQL,
+                &[&scope_key, &action, &now],
+            )
+            .await
+            .map_err(|_| StoreError)?
+            .get::<_, i64>(0);
+        if exhausted >= i64::try_from(limit).map_err(|_| StoreError)? {
+            return Ok(false);
+        }
         for slot in 0..limit {
             let slot = i32::try_from(slot).map_err(|_| StoreError)?;
             let rows = client
@@ -670,6 +710,29 @@ impl Store for PgStore {
             .execute(
                 "DELETE FROM auth_challenges WHERE expires_at <= $1",
                 &[&i64_of(now)?],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        Ok(())
+    }
+
+    async fn reap_unverified_users(
+        &self,
+        now: u64,
+        ttl_secs: u64,
+        protected_user_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        // Single source of truth lives in `handlers` (statement-shape test
+        // pins the purpose literal and the vault/session/magic exemptions):
+        // magic-only accounts and vault owners are never reaped, so a vault
+        // saved under a magic session cannot cascade-delete 24h later.
+        let cutoff = i64_of(now.saturating_sub(ttl_secs))?;
+        let now = i64_of(now)?;
+        let client = self.connect().await?;
+        client
+            .execute(
+                &handlers::reap_unverified_users_sql(),
+                &[&cutoff, &protected_user_id, &now],
             )
             .await
             .map_err(|_| StoreError)?;
@@ -1079,6 +1142,28 @@ mod tests {
     fn previous_43() -> String {
         // 32 bytes as unpadded base64url (43 chars), like the template.
         crate::b64::encode(&[7u8; 32])
+    }
+
+    #[test]
+    fn hyperdrive_attestation_fails_closed_without_explicit_opt_in() {
+        // The Worker must not serve auth reads unless the operator
+        // attested a cache-disabled Hyperdrive config for that env.
+        assert!(hyperdrive_caching_disabled_attested(Some("1".to_string())));
+        assert!(hyperdrive_caching_disabled_attested(Some(
+            "true".to_string()
+        )));
+        assert!(hyperdrive_caching_disabled_attested(Some(
+            "TRUE".to_string()
+        )));
+        for raw in [
+            None,
+            Some(String::new()),
+            Some("0".to_string()),
+            Some("false".to_string()),
+            Some("yes".to_string()),
+        ] {
+            assert!(!hyperdrive_caching_disabled_attested(raw));
+        }
     }
 
     #[test]

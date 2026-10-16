@@ -28,6 +28,7 @@ pub mod jobs;
 pub mod library;
 pub mod metering;
 pub mod newznab;
+pub mod nzb_fetch;
 pub mod nzb_intake;
 pub mod parse;
 pub mod pool_probe;

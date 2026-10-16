@@ -13,7 +13,8 @@ client ── play(token, range?) ──▶ stream Worker
   2. R2 hit: serve 200 / 206 straight from the shared cached blob
      (audio/<sha256>; cache.rs, range.rs) — no copy of the track
   3. R2 miss: lease a pool slot (Playback lane), take a warm connection
-     (or dial one), BODY the FIRST segment, yEnc-decode it (multipart
+     (or dial one), BODY the first segment (or, for a mid-track seek with
+     NZB segment ranges, the segment covering the range start), yEnc-decode it (multipart
      =ybegin/=ypart/=yend, pcrc32) and read the file size from =ybegin so
      Range/206 resolves before byte one. Later segments are fetched
      lazily as the client pulls 16 KiB chunks: decode → decrypt → client
@@ -72,8 +73,11 @@ behaviour.
   keep waiting in 5 s chunks), and no flight is led while a superseded leader
   is still fetching unless it is itself a replacement. So a stalled key runs
   at most **two upstream fetches at once**, however many callers pile up,
-  and no waiter hangs behind a wedged leader. When the original leader
-  succeeds first, its result goes to the replacement's waiters too: the first
+  and no waiter hangs behind a single wedged leader. If the replacement also
+  stalls, its waiters can wait indefinitely in 5 s chunks (there is no overall
+  deadline) until either fetch settles; callers needing a hard bound must add
+  their own. When the original leader succeeds first, its result goes to the
+  replacement's waiters too: the first
   success of the chain is the one every waiter takes. An error stays with the
   flight that produced it, so the original's failure never fails callers
   parked on a replacement that is still fetching. (The NNTP client's 10 s
@@ -89,9 +93,11 @@ behaviour.
 - SWR windows (`src/cache.rs`): `CACHE_FRESH_TTL_SECS = 300` serves `HIT`
   with no revalidation; the next `CACHE_SWR_WINDOW_SECS = 3_600` serves
   `STALE` immediately while flagging `needs_revalidate` — to exactly one
-  reader per stale entry, via `try_begin_revalidate` (the claim releases
-  when the rewrite lands, or via `finish_revalidate` after a failed
-  attempt). Freshness is stamped per track, so deduplicated blobs never
+  reader per stale entry, via `try_begin_revalidate` (an abandoned claim
+  expires after `REVALIDATE_CLAIM_TTL_SECS = 300`; retain the acquisition
+  timestamp when calling `finish_revalidate` so a late owner cannot release a
+  newer claim). The claim also releases when the rewrite lands. Freshness is
+  stamped per track, so deduplicated blobs never
   restamp a peer track. Past both windows the entry is a `MISS` and the
   play path re-fetches upstream. Cache writes are stamped with the play
   time on `finalize`, so the SWR clock runs from when the bytes were
@@ -150,13 +156,23 @@ First-byte latency is measured by `tests/stream_integration.rs`
 Miss TTFB for a range starting at byte 0 is dial (skipped on a warm pool) +
 **one** article fetch + decode, independent of track length: the integration
 test asserts the server has received exactly one `BODY` when the first chunk
-arrives on a three-segment track. A mid-track seek on a cold cache instead
-walks every earlier segment first (TTFB grows with the seek position):
-`PlayInput` carries only message-ids, so without NZB segment sizes the play
-path cannot know which article covers an offset — covering-segment fetch is
-a follow-up once ingest exposes per-segment byte ranges. An integration test
-pins the current prefix cost. Staging p95 numbers are owned by Analytics
-Engine monitoring (`PlayStart` → first-byte events) once deployed.
+arrives on a three-segment track. A mid-track seek on a cold cache gets the
+same one-`BODY` TTFB when `PlayInput::segment_ranges` carries the NZB
+per-segment byte ranges: the article covering the range start is fetched
+first, and the skipped prefix is backfilled in file order before serving
+advances past the covering segment (or by `finalize` when the range ends
+inside it), so multipart staging still only ever receives the contiguous
+prefix — 5 MiB part coalescing is unchanged and at most the covering
+segment is ever held out of order beyond the staged part. The whole track
+still lands in cache. Ranges are a verified hint, never trusted blindly:
+without ranges, with ranges that fail validation (wrong arity, gaps,
+non-zero start), with a ranges-only `416`, or when the covering article
+disagrees with its declared range, the play path keeps (or falls back to)
+the prefix walk: it walks every earlier segment first and TTFB grows with
+the seek position. Integration tests pin both costs (one
+`BODY` vs the whole prefix) and byte-identical output. Staging p95 numbers
+are owned by Analytics Engine monitoring (`PlayStart` → first-byte events)
+once deployed.
 
 CI (`.github/workflows/ci.yml`, job `rust`, required through `ci-ok`) runs
 fmt, clippy `-D warnings` and every test; the integration test asserts the

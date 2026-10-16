@@ -8,8 +8,9 @@
  * sites, because all requests flow through {@link ApiClient}.
  */
 
+import { paywallFromResponse, type PaywallModel } from '../billing/planLimit.js';
 import type { ProviderForm } from '../vault-validation.js';
-import { parseErrorResponse } from './errors.js';
+import { parseErrorBody } from './errors.js';
 
 export type FetchFn = typeof fetch;
 
@@ -22,14 +23,27 @@ export class ApiError extends Error {
 	readonly status: number;
 	/** Registry code from the error envelope (`docs/api-errors.md`). */
 	readonly code: string;
+	/**
+	 * Paywall model for 402/429 plan-limit responses (already shown via the
+	 * layout listener); null for every other failure. Callers that also
+	 * render an inline error can use this to avoid duplicating the paywall.
+	 */
+	readonly paywall: PaywallModel | null;
 	/** Whether retrying the same request may succeed (envelope flag). */
 	readonly retryable: boolean;
 
-	constructor(status: number, code: string, message: string, retryable = false) {
+	constructor(
+		status: number,
+		code: string,
+		message: string,
+		paywall: PaywallModel | null = null,
+		retryable = false
+	) {
 		super(message);
 		this.name = 'ApiError';
 		this.status = status;
 		this.code = code;
+		this.paywall = paywall;
 		this.retryable = retryable;
 	}
 }
@@ -301,8 +315,16 @@ export class ApiClient {
 			credentials: 'include'
 		});
 		if (!response.ok) {
-			const { code, message, retryable } = await parseErrorResponse(response);
-			throw new ApiError(response.status, code, message, retryable);
+			// Read once so the paywall and typed error share the structured contract.
+			let body: unknown = null;
+			try {
+				body = await response.json();
+			} catch {
+				/* non-JSON error body: use status-based defaults */
+			}
+			const parsed = parseErrorBody(body, response.status);
+			const paywall = paywallFromResponse({ status: response.status, headers: response.headers, body });
+			throw new ApiError(response.status, parsed.code, parsed.message, paywall, parsed.retryable);
 		}
 		return (await response.json()) as T;
 	}
