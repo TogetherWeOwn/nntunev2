@@ -1,4 +1,4 @@
-//! Acceptance tests for TOG-25583: env-specific cover-art bucket and CAA URL.
+//! Acceptance tests: env-specific cover-art bucket and CAA URL.
 //!
 //! Test-first (RED): every test in this file fails on the pre-slice head
 //! and passes once the Builder implements the slice. Write-only for this
