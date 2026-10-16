@@ -95,7 +95,7 @@ def _has_toml_r2_marker(text: str) -> bool:
         statement = "".join(visible).strip()
         if assignment.search(statement):
             return True
-        if statement.startswith("[") and header_key.search(statement.lstrip("[ \\t")):
+        if statement.startswith("[") and header_key.search(statement.lstrip("[ \t")):
             return True
     return False
 

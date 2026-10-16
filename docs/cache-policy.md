@@ -21,7 +21,8 @@ which buckets a Worker may never consume.
 
 No object-expiry lifecycle rule is configured: stored objects live until
 explicitly deleted. Cloudflare currently has a default lifecycle rule on
-all six buckets that aborts incomplete multipart uploads after 7 days; it
+all buckets (including the two ingest-scratch buckets) that aborts
+incomplete multipart uploads after 7 days; it
 does not expire completed objects. The TTL column therefore governs
 **downstream copies only** (edge Cache API, KV, browser/CDN via
 `Cache-Control`), never completed R2 objects. Deleting or overwriting an
@@ -80,9 +81,7 @@ exact names in `docs/ops.md` first.
   exists yet. Art objects are immutable content-addressed blobs, so the
   prescription is `public, max-age=86400, immutable` wherever serving
   lands. Same conformance-target status as stream.
-- Name-alignment deltas (owned by the binding-alignment slices, not
-  this policy): `workers/stream/wrangler.toml` still binds the legacy
-  `nntune-audio-cache` name without environment sections, and
-  `workers/mb/wrangler.toml.example` references a commented-out
-  nonexistent `nntunev2-art` name. Neither targets an archive bucket, so
-  the guard passes; the names must still be aligned to this table.
+- Name-alignment deltas: none remaining. `workers/stream/wrangler.toml`
+  binds the exact per-environment audio names and
+  `workers/mb/wrangler.toml.example` references the suffixed art names.
+  Neither targets an archive bucket, so the guard passes.
