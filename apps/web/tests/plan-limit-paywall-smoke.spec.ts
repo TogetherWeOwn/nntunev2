@@ -48,31 +48,47 @@ async function choosePlus(page: Page): Promise<void> {
 }
 
 test('mocked 402 checkout keeps pricing actions reachable', async ({ page }) => {
-	await page.route('**/v1/billing/checkout', (route) =>
-		route.fulfill({
+	let checkoutRequests = 0;
+	await page.route('**/v1/billing/checkout', (route) => {
+		checkoutRequests += 1;
+		return route.fulfill({
 			status: 402,
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ error: 'plan_limit_exceeded' })
-		})
-	);
+		});
+	});
 
 	await choosePlus(page);
 
-	await expect(page.getByRole('alert')).toBeVisible();
+	const alert = page.getByRole('alert');
+	await expect(alert).toBeVisible();
+	// Status-blind `toBeVisible()` lets 500/418 or an unmocked 404 pass.
+	// billingClient surfaces `${status}` + backend `error` in the message,
+	// so pin both to prove the 402 path rendered.
+	await expect(alert).toContainText('402');
+	await expect(alert).toContainText('plan_limit_exceeded');
+	expect(checkoutRequests, 'checkout mock must intercept the request').toBeGreaterThan(0);
 	await assertPricingActionsResolve(page);
 });
 
 test('mocked 429 checkout keeps pricing actions reachable', async ({ page }) => {
-	await page.route('**/v1/billing/checkout', (route) =>
-		route.fulfill({
+	let checkoutRequests = 0;
+	await page.route('**/v1/billing/checkout', (route) => {
+		checkoutRequests += 1;
+		return route.fulfill({
 			status: 429,
-			headers: { 'content-type': 'application/json', 'Retry-After': '45' },
+			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ error: 'rate_limited' })
-		})
-	);
+		});
+	});
 
 	await choosePlus(page);
 
-	await expect(page.getByRole('alert')).toBeVisible();
+	const alert = page.getByRole('alert');
+	await expect(alert).toBeVisible();
+	// Same status-blindness guard as the 402 case: pin status + error code.
+	await expect(alert).toContainText('429');
+	await expect(alert).toContainText('rate_limited');
+	expect(checkoutRequests, 'checkout mock must intercept the request').toBeGreaterThan(0);
 	await assertPricingActionsResolve(page);
 });
