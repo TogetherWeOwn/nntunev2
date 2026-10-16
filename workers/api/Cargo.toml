@@ -10,14 +10,17 @@ name = "nntune_api"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-aes-gcm = { version = "0.10", features = ["aes"] }
+# Keys and nonces use getrandom below, not aead's optional OsRng backend.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 # Shared unpadded-base64url over this crate (F-HARD-01): one audited
 # implementation for vault/auth/session. Pure Rust, wasm32-compatible.
-base64 = "0.22"
-hmac = "0.12"
-sha2 = "0.10"
-rand = "0.8"
-# wasm32-unknown-unknown has no OS RNG: route getrandom through Web Crypto.
+base64 = "0.23"
+hmac = "0.13"
+# hmac 0.13 uses digest 0.11: sha2 must be 0.11 (same digest) or the
+# Hmac<Sha256> trait bounds fail with two digest versions in the graph.
+sha2 = "0.11"
+# wasm32-unknown-unknown has no OS RNG: the `wasm_js` feature routes
+# getrandom through Web Crypto (native builds keep the OS backend).
 getrandom = { version = "0.4", features = ["wasm_js"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
