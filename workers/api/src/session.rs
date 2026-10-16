@@ -74,12 +74,24 @@ fn new_session_id() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
     Invalid,
+    /// The revoke did not commit (storage failure). The handler must NOT
+    /// clear the session cookie: return a retryable 5xx so the caller keeps
+    /// the only credential that can authenticate a retry. Carries the
+    /// verified `user_id` so the failed revoke can be audited.
+    Storage {
+        user_id: String,
+    },
 }
 
 impl std::fmt::Display for SessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Generic: never leak why verification failed.
-        write!(f, "invalid session")
+        match self {
+            // Generic: never leak why verification failed.
+            Self::Invalid => write!(f, "invalid session"),
+            // Distinct from Invalid so the handler can return a retryable
+            // 5xx without clearing the cookie; carries no secret material.
+            Self::Storage { .. } => write!(f, "session store unavailable"),
+        }
     }
 }
 
@@ -383,16 +395,33 @@ impl SessionRevokeClaim<'_> {
             Self::AllForUser { .. } => "UPDATE sessions SET revoked = TRUE WHERE user_id = $1 AND revoked = FALSE RETURNING id",
         }
     }
+
+    /// Values to bind, in `$1, $2` order. The Worker adapter binds from this
+    /// method so the statement text and the bound values cannot drift apart;
+    /// tests assert these values with a `session_id` that differs from the
+    /// `user_id` so a swapped bind fails.
+    pub fn params(&self) -> Vec<&str> {
+        match self {
+            Self::Single {
+                session_id,
+                user_id,
+            } => vec![*session_id, *user_id],
+            Self::AllForUser { user_id } => vec![*user_id],
+        }
+    }
 }
 
 /// Worker/Hyperdrive boundary. Implementations must execute the conditional
-/// UPDATE from [`SessionRevokeClaim::statement`] and return the number of
-/// rows it returned, NOT perform SELECT + unconditional UPDATE. Return an
-/// error on storage failure. Revocation is effective only after the
-/// transaction commits; the response (including [`clear_cookie_header`])
-/// may be sent only after commit, though the clear header should still be
-/// sent when this returns an error so a failed logout never strands a live
-/// cookie in the browser. An in-memory flag is not an implementation.
+/// UPDATE from [`SessionRevokeClaim::statement`], binding
+/// [`SessionRevokeClaim::params`] in order, and return the number of rows it
+/// returned, NOT perform SELECT + unconditional UPDATE. Return
+/// [`SessionError::Storage`] (with the claim's `user_id`) on storage
+/// failure. Revocation is effective only after the transaction commits; the
+/// response (including [`clear_cookie_header`]) may be sent only after
+/// commit. On storage failure the handler must NOT clear the cookie — the
+/// other sessions are still live and the caller needs its cookie to retry —
+/// so it returns a retryable 5xx instead. An in-memory flag is not an
+/// implementation.
 pub trait SessionRevokeStore {
     fn revoke(
         &self,
@@ -402,11 +431,15 @@ pub trait SessionRevokeStore {
 
 /// Single-session logout ([`LOGOUT_PATH`]): authenticate the presented
 /// cookie against its current row, then revoke exactly that row.
-/// Zero transitioned rows (a concurrent revoke won the race), multiple
-/// rows, or a store error all fail closed with the generic error; the
-/// handler sends [`clear_cookie_header`] either way. Returns the verified
-/// claims so the handler can audit-log [`LOGOUT_AUDIT_ACTION`] under the
-/// token's `user_id` — never a request-supplied id.
+/// Zero transitioned rows (a concurrent revoke won the race) or multiple
+/// rows fail closed with [`SessionError::Invalid`]; the cookie is already
+/// dead server-side (or the token was invalid), so the handler still sends
+/// [`clear_cookie_header`]. A store failure returns
+/// [`SessionError::Storage`] with the verified `user_id` instead: the revoke
+/// did not commit, so the handler must NOT clear the cookie and must return
+/// a retryable 5xx. Returns the verified claims so the handler can
+/// audit-log [`LOGOUT_AUDIT_ACTION`] under the token's `user_id` — never a
+/// request-supplied id.
 pub async fn logout_session_atomically(
     keys: &SessionKeys<'_>,
     token: &str,
@@ -415,14 +448,16 @@ pub async fn logout_session_atomically(
     store: &impl SessionRevokeStore,
 ) -> Result<SessionClaims, SessionError> {
     let claims = verify_stored_session(keys, token, now, record)?;
-    if store
+    let transitioned = store
         .revoke(SessionRevokeClaim::Single {
             session_id: &claims.session_id,
             user_id: &claims.user_id,
         })
-        .await?
-        != 1
-    {
+        .await
+        .map_err(|_| SessionError::Storage {
+            user_id: claims.user_id.clone(),
+        })?;
+    if transitioned != 1 {
         return Err(SessionError::Invalid);
     }
     Ok(claims)
@@ -435,12 +470,16 @@ pub async fn logout_session_atomically(
 /// against their (now revoked) rows; a fresh login still works — this is
 /// revocation, not a ban. Returns how many rows transitioned, for the
 /// [`LOGOUT_EVERYWHERE_AUDIT_ACTION`] audit event. Zero transitioned rows
-/// fails closed: the caller's own just-verified row must transition (or a
-/// concurrent revoke already did the job, which the caller cannot
-/// distinguish from a store bug — the generic error plus a cleared cookie
-/// is the safe response). The `user_id` revoked is always the verified
-/// token's; [`verify_session`] rejects empty user ids, so this path can
-/// never mass-revoke on a missing id.
+/// fails closed with [`SessionError::Invalid`]: the caller's own
+/// just-verified row must transition, so zero means a concurrent revoke
+/// already did the job — every cookie for the user is dead server-side, and
+/// the handler still sends [`clear_cookie_header`]. A store failure returns
+/// [`SessionError::Storage`] with the verified `user_id` instead: nothing
+/// was revoked, so the handler must NOT clear the caller's cookie and must
+/// return a retryable 5xx (the caller needs its cookie to retry, and the
+/// failure is audited under the returned `user_id`). The `user_id` revoked
+/// is always the verified token's; [`verify_session`] rejects empty user
+/// ids, so this path can never mass-revoke on a missing id.
 pub async fn logout_everywhere_atomically(
     keys: &SessionKeys<'_>,
     token: &str,
@@ -453,7 +492,10 @@ pub async fn logout_everywhere_atomically(
         .revoke(SessionRevokeClaim::AllForUser {
             user_id: &claims.user_id,
         })
-        .await?;
+        .await
+        .map_err(|_| SessionError::Storage {
+            user_id: claims.user_id.clone(),
+        })?;
     if transitioned == 0 {
         return Err(SessionError::Invalid);
     }
@@ -594,12 +636,15 @@ mod tests {
 
     struct RecordingRevokeStore {
         outcome: Result<u64, SessionError>,
-        statements: std::cell::RefCell<Vec<&'static str>>,
+        calls: std::cell::RefCell<Vec<(&'static str, Vec<String>)>>,
     }
 
     impl SessionRevokeStore for RecordingRevokeStore {
         async fn revoke(&self, claim: SessionRevokeClaim<'_>) -> Result<u64, SessionError> {
-            self.statements.borrow_mut().push(claim.statement());
+            self.calls.borrow_mut().push((
+                claim.statement(),
+                claim.params().into_iter().map(str::to_owned).collect(),
+            ));
             self.outcome.clone()
         }
     }
@@ -616,7 +661,7 @@ mod tests {
         // id and owner, and the verified claims come back for audit.
         let store = RecordingRevokeStore {
             outcome: Ok(1),
-            statements: std::cell::RefCell::new(Vec::new()),
+            calls: std::cell::RefCell::new(Vec::new()),
         };
         let claims = ready(logout_session_atomically(
             &keys,
@@ -627,20 +672,31 @@ mod tests {
         ))
         .expect("logout");
         assert_eq!(claims.user_id, "user-1");
-        let statements = store.statements.borrow();
-        assert_eq!(statements.len(), 1);
-        assert!(
-            statements[0].contains("id = $1 AND user_id = $2 AND revoked = FALSE"),
-            "single revoke is owner-bound and transition-only: {}",
-            statements[0]
+        assert_ne!(
+            claims.session_id, claims.user_id,
+            "fixture ids must differ so a swapped bind is visible"
         );
-        drop(statements);
+        let calls = store.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0]
+                .0
+                .contains("id = $1 AND user_id = $2 AND revoked = FALSE"),
+            "single revoke is owner-bound and transition-only: {}",
+            calls[0].0
+        );
+        assert_eq!(
+            calls[0].1,
+            vec![claims.session_id.clone(), claims.user_id.clone()],
+            "single revoke must bind the verified session_id then user_id"
+        );
+        drop(calls);
 
-        // Zero / multiple rows / store error all fail closed.
-        for outcome in [Ok(0), Ok(2), Err(SessionError::Invalid)] {
+        // Zero / multiple rows fail closed with the generic error ...
+        for outcome in [Ok(0), Ok(2)] {
             let store = RecordingRevokeStore {
                 outcome: outcome.clone(),
-                statements: std::cell::RefCell::new(Vec::new()),
+                calls: std::cell::RefCell::new(Vec::new()),
             };
             assert_eq!(
                 ready(logout_session_atomically(
@@ -654,6 +710,27 @@ mod tests {
                 "outcome {outcome:?} must fail closed"
             );
         }
+        // ... while a store failure keeps the verified user for audit and
+        // must not be mistaken for an invalid session.
+        let store = RecordingRevokeStore {
+            outcome: Err(SessionError::Storage {
+                user_id: "user-1".to_string(),
+            }),
+            calls: std::cell::RefCell::new(Vec::new()),
+        };
+        assert_eq!(
+            ready(logout_session_atomically(
+                &keys,
+                &token,
+                now + 60,
+                &record,
+                &store
+            )),
+            Err(SessionError::Storage {
+                user_id: "user-1".to_string()
+            }),
+            "store failure must surface Storage with the verified user"
+        );
 
         // An already-revoked row never reaches the store: authentication
         // rejects it first, so a replayed logout grants nothing.
@@ -663,7 +740,7 @@ mod tests {
         };
         let store = RecordingRevokeStore {
             outcome: Ok(1),
-            statements: std::cell::RefCell::new(Vec::new()),
+            calls: std::cell::RefCell::new(Vec::new()),
         };
         assert!(ready(logout_session_atomically(
             &keys,
@@ -674,7 +751,7 @@ mod tests {
         ))
         .is_err());
         assert!(
-            store.statements.borrow().is_empty(),
+            store.calls.borrow().is_empty(),
             "unauthenticated logout must not touch the store"
         );
     }
@@ -691,7 +768,7 @@ mod tests {
         // are included) and is returned for the audit event.
         let store = RecordingRevokeStore {
             outcome: Ok(3),
-            statements: std::cell::RefCell::new(Vec::new()),
+            calls: std::cell::RefCell::new(Vec::new()),
         };
         assert_eq!(
             ready(logout_everywhere_atomically(
@@ -703,22 +780,27 @@ mod tests {
             )),
             Ok(3)
         );
-        let statements = store.statements.borrow();
-        assert_eq!(statements.len(), 1);
+        let calls = store.calls.borrow();
+        assert_eq!(calls.len(), 1);
         assert!(
-            statements[0].contains("user_id = $1 AND revoked = FALSE")
-                && !statements[0].contains("WHERE id ="),
+            calls[0].0.contains("user_id = $1 AND revoked = FALSE")
+                && !calls[0].0.contains("WHERE id ="),
             "revoke-all is scoped to the verified owner, not one row: {}",
-            statements[0]
+            calls[0].0
         );
-        drop(statements);
+        assert_eq!(
+            calls[0].1,
+            vec![record.user_id.clone()],
+            "revoke-all must bind the verified token's user_id"
+        );
+        drop(calls);
 
-        // Zero transitions / store error fail closed: the caller's own
-        // just-verified row must be among the revoked.
-        for outcome in [Ok(0), Err(SessionError::Invalid)] {
+        // Zero transitions fail closed: the caller's own just-verified row
+        // must be among the revoked.
+        {
             let store = RecordingRevokeStore {
-                outcome: outcome.clone(),
-                statements: std::cell::RefCell::new(Vec::new()),
+                outcome: Ok(0),
+                calls: std::cell::RefCell::new(Vec::new()),
             };
             assert_eq!(
                 ready(logout_everywhere_atomically(
@@ -729,9 +811,30 @@ mod tests {
                     &store
                 )),
                 Err(SessionError::Invalid),
-                "outcome {outcome:?} must fail closed"
+                "zero transitions must fail closed"
             );
         }
+        // A store failure keeps the verified user for audit (retryable 5xx
+        // without clearing the cookie), never the generic error.
+        let store = RecordingRevokeStore {
+            outcome: Err(SessionError::Storage {
+                user_id: "user-1".to_string(),
+            }),
+            calls: std::cell::RefCell::new(Vec::new()),
+        };
+        assert_eq!(
+            ready(logout_everywhere_atomically(
+                &keys,
+                &token,
+                now + 60,
+                &record,
+                &store
+            )),
+            Err(SessionError::Storage {
+                user_id: "user-1".to_string()
+            }),
+            "store failure must surface Storage with the verified user"
+        );
 
         // A token for one user presented with another user's row never
         // reaches the store (verify_stored_session binds the pair), so
@@ -742,7 +845,7 @@ mod tests {
         };
         let store = RecordingRevokeStore {
             outcome: Ok(9),
-            statements: std::cell::RefCell::new(Vec::new()),
+            calls: std::cell::RefCell::new(Vec::new()),
         };
         assert!(ready(logout_everywhere_atomically(
             &keys,
@@ -752,7 +855,7 @@ mod tests {
             &store
         ))
         .is_err());
-        assert!(store.statements.borrow().is_empty());
+        assert!(store.calls.borrow().is_empty());
     }
 
     #[test]

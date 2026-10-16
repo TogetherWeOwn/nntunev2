@@ -40,7 +40,9 @@ security-critical logic with tests.
   (`/v1/session/revoke-all`) revokes every row for the verified token's user
   — both authenticate via `verify_stored_session` first, then require the
   committed conditional `SessionRevokeStore` UPDATE (owner-bound,
-  transition-counted; zero rows and store errors fail closed). The pure
+  transition-counted; zero rows fail closed with `Invalid`, store failures
+  surface `Storage` with the verified user so the handler returns a
+  retryable 5xx without clearing the cookie). The pure
   `revoke_session` / `revoke_all_sessions` helpers only prepare snapshots;
   they revoke nothing server-side. Secret rotation runs a
   bounded dual-accept window — see `docs/security/session-secret-rotation.md`
