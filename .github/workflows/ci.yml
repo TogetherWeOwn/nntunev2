@@ -61,14 +61,20 @@ jobs:
       # (2026-08-06); re-pin deliberately, never float.
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
+          components: clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Scalar core (no transport features) and the Workers transport build.
       - run: cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
       - run: cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features --features worker-transport
+      - run: cargo check -p nntune-config --target wasm32-unknown-unknown
       # The simd128 yEnc fast path must keep compiling (Workers run V8 with
       # Wasm SIMD; the deploy enables it via this RUSTFLAGS).
       - run: RUSTFLAGS="-C target-feature=+simd128" cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
+      # The stream Worker entry (NntpPool Durable Object) only compiles on
+      # wasm32: check and lint it on the target it deploys to.
+      - run: cargo check -p nntune-stream --target wasm32-unknown-unknown
+      - run: cargo clippy -p nntune-stream --target wasm32-unknown-unknown -- -D warnings
 
   # Public-repo hygiene: fail on internal tracker ids (TOG-<digits>),
   # internal hostnames, instance-UI paths and agent names in tracked text.
@@ -169,6 +175,23 @@ jobs:
       # The Worker deploys to wasm32: the crate must check on that target
       # (native-only CI once missed a getrandom/RNG breakage there).
       - run: cargo check --manifest-path workers/mb/Cargo.toml --target wasm32-unknown-unknown
+
+  # KV config staging/prod parity: both env fixtures must validate against
+  # config/schema.json with identical key sets (values may differ). Also runs
+  # the checker's self-tests over matching + drifted fixtures. Keep this job
+  # id in ci-ok's needs.
+  config-parity:
+    name: config-parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check staging/prod parity against schema
+        run: python3 .github/scripts/config_parity_check.py --schema config/schema.json --staging config/staging.json --prod config/prod.json
+      - name: Parity checker self-tests (matching + drifted fixtures)
+        run: python3 .github/scripts/test_config_parity_check.py
 
   rust-ingest:
     name: rust (workers/ingest)
@@ -324,7 +347,7 @@ jobs:
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, test-nntp, api, rust-mb, rust-ingest, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, migrations-gate]
+    needs: [rust-test, rust-wasm, test-nntp, api, rust-mb, rust-ingest, config-parity, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, migrations-gate]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
