@@ -256,6 +256,8 @@ export async function completeByopWizard(page: Page, baseURL: string): Promise<v
       if (!checked) await tls.check().catch(() => {});
     }
   }
+  await page.getByRole('button', { name: 'Continue' }).click();
+  await page.getByRole('button', { name: 'Continue' }).click();
   await page.getByTestId(TESTIDS.byopTest).click();
   const status = page.getByTestId(TESTIDS.byopStatus);
   await expect(status, 'BYOP test-connection gave no status').toBeVisible({ timeout: 60_000 });

@@ -40,7 +40,7 @@
 				serializePublicKeyCredential(credential)
 			);
 			status = 'created';
-			window.location.href = '/onboarding/provider';
+			window.location.href = '/onboarding/byop';
 		} catch {
 			// Generic: account creation never says which step failed.
 			status = 'error';

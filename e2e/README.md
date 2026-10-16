@@ -40,21 +40,20 @@ the activation checklist is accurate:
   `apps/web/tests/smoke.spec.ts` exact-keys assertion). `health.spec.ts`
   requires `ok === true` and asserts `version` whenever the deployed app
   ships it, so the check stays green across the deploy boundary.
-- `GET /api/ready` reports readiness shape (TOG-25176):
-  200 `{ok:true}` while the app serves traffic, 503 `{ok:false}` with
-  `Retry-After` when it cannot (`apps/web/src/routes/api/ready/+server.ts`,
-  shapes pinned by `apps/web/src/lib/ready.test.ts`). The smoke tolerates
-  404 for builds predating the route; any other status must match the shape.
-- `apps/web/src` renders every `data-testid` hook in
-  `helpers/contract.ts` `TESTIDS` (pinned by
-  `apps/web/src/lib/contract.test.ts` plus the `smoke.spec.ts` contract
-  test). The app-shell fallback to the landing's `NNTune` heading is kept
-  for builds predating the hook. `/signup`'s real submission, the BYOP
-  wizard behavior (TOG-23633), ingest/library/stream/usage endpoints, and
-  usage-meter enforcement (TOG-23637) still arrive with the venture slices
-  that own them: the shells render the hooks and say what is pending, so
-  the journey specs (`signup-byop`, `ingest-play-meter`) fail only on those
-  real missing backends — that failure is the signal, not noise.
+- `GET /api/ready` currently returns 200 `{ok:true}` while the stateless app
+  can serve traffic (`apps/web/src/routes/api/ready/+server.ts`). The 503
+  `{ok:false}` plus `Retry-After` shape in `apps/web/src/lib/ready.ts` is
+  reserved for a future downstream dependency check; the current endpoint
+  does not emit it. The smoke tolerates 404 for builds predating the route and
+  otherwise requires the current 200 shape.
+- `apps/web/src/lib/contract.test.ts` checks that each hook in
+  `helpers/contract.ts` `TESTIDS` is declared in its expected route file.
+  This is a source-level route contract, not proof that conditional markup is
+  reachable or visible at runtime; the smoke separately checks selected hooks
+  in rendered pages. `/signup`'s real submission, the BYOP wizard's backend
+  behavior, ingest/library/stream/usage endpoints, and usage-meter enforcement
+  still depend on their venture slices; the journey specs expose those missing
+  backend behaviors directly.
 
 ## Run locally
 

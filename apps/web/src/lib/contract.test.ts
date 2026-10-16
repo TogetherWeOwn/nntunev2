@@ -12,14 +12,36 @@ const sources = import.meta.glob('../routes/**/*.svelte', {
 	eager: true
 }) as Record<string, string>;
 
-describe('e2e contract hooks', () => {
-	const haystack = Object.values(sources).join('\n');
+const routeForTestId: Record<keyof typeof TESTIDS, string> = {
+	appRoot: '../routes/+page.svelte',
+	signupEmail: '../routes/signup/+page.svelte',
+	signupSubmit: '../routes/signup/+page.svelte',
+	signupError: '../routes/signup/+page.svelte',
+	byopHost: '../routes/onboarding/byop/+page.svelte',
+	byopPort: '../routes/onboarding/byop/+page.svelte',
+	byopUser: '../routes/onboarding/byop/+page.svelte',
+	byopPass: '../routes/onboarding/byop/+page.svelte',
+	byopTls: '../routes/onboarding/byop/+page.svelte',
+	byopTest: '../routes/onboarding/byop/+page.svelte',
+	byopSave: '../routes/onboarding/byop/+page.svelte',
+	byopStatus: '../routes/onboarding/byop/+page.svelte',
+	importFile: '../routes/library/import/+page.svelte',
+	importStatus: '../routes/library/import/+page.svelte',
+	libraryItem: '../routes/library/+page.svelte',
+	audioPlayer: '../routes/library/+page.svelte',
+	usageMeter: '../routes/library/+page.svelte',
+	planLimitNotice: '../routes/library/+page.svelte'
+};
 
-	for (const [key, testid] of Object.entries(TESTIDS)) {
-		it(`renders data-testid="${testid}" (${key})`, () => {
+describe('e2e contract hooks', () => {
+	for (const [key, testid] of Object.entries(TESTIDS) as [keyof typeof TESTIDS, string][]) {
+		it(`declares data-testid="${testid}" in its route markup (${key})`, () => {
+			const route = routeForTestId[key];
+			const source = sources[route];
+			expect(source, `contract key "${key}": expected route source "${route}"`).toBeDefined();
 			expect(
-				haystack,
-				`contract key "${key}": no route renders data-testid="${testid}" — ` +
+				source,
+				`contract key "${key}": expected route source "${route}" to declare data-testid="${testid}" — ` +
 					'update app + e2e/helpers/contract.ts together (see e2e/README.md).'
 			).toContain(`data-testid="${testid}"`);
 		});
