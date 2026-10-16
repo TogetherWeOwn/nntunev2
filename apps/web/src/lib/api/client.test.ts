@@ -287,7 +287,7 @@ describe('ApiClient', () => {
 
 		expect(result).toEqual({ ok: true, latencyMs: 120 });
 		expect(seen.map(({ url }) => url)).toEqual([
-			'https://api.example.com/v1/vault/test-connection'
+			'https://api.example.com/v1/vault/test'
 		]);
 		expect(seen.map(({ init }) => JSON.parse(String(init.body)))).toEqual([
 			{

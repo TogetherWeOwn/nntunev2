@@ -58,7 +58,7 @@ export interface ProviderTestInput {
 
 /**
  * Save/test envelope the API Worker expects (`PUT /v1/vault`,
- * `POST /v1/vault/test-connection`): the flat provider fields nested under
+ * `POST /v1/vault/test`): the flat provider fields nested under
  * `provider`, exactly as `workers/api` parses `VaultPutBody`. Field names
  * are pinned by `workers/api/tests/fixtures/api-web-contract.json`, which
  * both the vitest client suite and the Rust handlers suite consume — change
@@ -94,11 +94,11 @@ export function toProviderTestInput(
 		// Only send the opt-in with plaintext: with TLS it is always false so
 		// the server never records a spurious acknowledgement.
 		allow_insecure_plaintext: !provider.tls && provider.allowInsecurePlaintext,
-		username: provider.username,
+		username: provider.username.trim(),
 		password: provider.password,
 		max_connections: provider.maxConnections,
 		...(indexerUrl.trim().length > 0
-			? { indexer: { url: indexerUrl.trim(), api_key: indexerApiKey } }
+			? { indexer: { url: indexerUrl.trim(), api_key: indexerApiKey.trim() } }
 			: {})
 	};
 }
@@ -264,7 +264,7 @@ export class ApiClient {
 	 * secrets never come back in the response.
 	 */
 	async testProviderConnection(input: ProviderTestInput): Promise<ProviderTestResult> {
-		return this.post<ProviderTestResult>('/v1/vault/test-connection', toVaultSaveBody(input));
+		return this.post<ProviderTestResult>('/v1/vault/test', toVaultSaveBody(input));
 	}
 
 	/**
