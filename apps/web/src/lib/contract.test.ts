@@ -28,6 +28,8 @@ const routeForTestId: Record<keyof typeof TESTIDS, string> = {
 	importFile: '../routes/library/import/+page.svelte',
 	importStatus: '../routes/library/import/+page.svelte',
 	libraryItem: '../routes/library/+page.svelte',
+	libraryList: '../routes/library/+page.svelte',
+	libraryStaleBadge: '../routes/library/+page.svelte',
 	audioPlayer: '../routes/library/+page.svelte',
 	usageMeter: '../routes/library/+page.svelte',
 	planLimitNotice: '../routes/library/+page.svelte'
