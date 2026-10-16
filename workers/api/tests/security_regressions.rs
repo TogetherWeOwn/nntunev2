@@ -890,7 +890,7 @@ fn origins_reject_noncanonical_forms_and_nonexact_rp_bindings() {
     ] {
         assert_eq!(
             auth::new_registration_challenge(rp, origin, NOW).unwrap_err(),
-            auth::AuthError::Invalid,
+            auth::AuthError::Misconfigured,
             "noncanonical origin/RP accepted: {rp:?}, {origin:?}"
         );
         // Present hostile origins/RP IDs against a valid, origin-bound

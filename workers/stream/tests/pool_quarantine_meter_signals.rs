@@ -251,6 +251,7 @@ fn input<'a>(
         range,
         server_addr: server.addr,
         segments,
+        segment_ranges: None,
         cipher_key: CIPHER_KEY,
         now_unix: NOW_UNIX,
         up_next,
@@ -266,7 +267,7 @@ fn events_of(meter: &MemoryMeter, kind: MeterKind) -> Vec<&MeterEvent> {
 }
 
 #[test]
-fn quarantine_entry_emits_lane_and_backoff_ladder() {
+fn quarantine_entry_emits_lane_and_open_interval() {
     let (_, segments, _) = fixture_track("a", 20_000, 10_000);
     // Live server only to prove a quarantined pool never dials out.
     let server = FakeNntp::start(HashMap::new());
@@ -275,13 +276,11 @@ fn quarantine_entry_emits_lane_and_backoff_ladder() {
     let mut meter = MemoryMeter::default();
     let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
 
-    // Five consecutive provider outages. Each can only be recorded once the
-    // previous backoff has elapsed, so the ladder must read
-    // 1s / 5s / 30s / 5min / 5min(capped).
-    let expected_backoffs = [1_000u64, 5_000, 30_000, 300_000, 300_000];
-    for (n, want) in expected_backoffs.iter().enumerate() {
-        if n > 0 {
-            pool.advance(expected_backoffs[n - 1]);
+    // Three consecutive failures open the breaker; later failed half-open
+    // probes reopen it for the fixed 30-second interval.
+    for n in 0usize..5 {
+        if n >= 3 {
+            pool.advance(nntune_stream::pool::CIRCUIT_OPEN_MS);
         }
         let token = grant_for("track-a");
         let mut inp = input(&token, "track-a", None, &server, &segments, None);
@@ -293,26 +292,18 @@ fn quarantine_entry_emits_lane_and_backoff_ladder() {
             ),
             "outage {n} must fail as an upstream provider error"
         );
-        assert!(pool.quarantined(), "outage {n} must quarantine the pool");
+        assert_eq!(pool.quarantined(), n >= 2, "outage {n} breaker state");
         let entered = events_of(&meter, MeterKind::QuarantineEntered);
-        assert_eq!(entered.len(), n + 1, "one entry event per outage");
-        assert_eq!(
-            entered[n].lane,
-            Some(Lane::Playback),
-            "entry carries the lane"
-        );
-        assert_eq!(
-            entered[n].backoff_ms, *want,
-            "entry carries the ladder backoff"
-        );
-        assert_eq!(entered[n].user_id, "user-1");
-        assert_eq!(entered[n].track_id, "track-a");
+        let expected_entries = n.saturating_sub(1);
+        assert_eq!(entered.len(), expected_entries, "breaker entry count");
+        if let Some(event) = entered.last() {
+            assert_eq!(event.lane, Some(Lane::Playback));
+            assert_eq!(event.backoff_ms, nntune_stream::pool::CIRCUIT_OPEN_MS);
+            assert_eq!(event.user_id, "user-1");
+            assert_eq!(event.track_id, "track-a");
+        }
     }
-    assert_eq!(
-        events_of(&meter, MeterKind::ProviderError).len(),
-        5,
-        "one provider-error per outage, alongside the entry events"
-    );
+    assert_eq!(events_of(&meter, MeterKind::ProviderError).len(), 5);
 
     // Still quarantined: the next play is rejected without dialing out and
     // without emitting another quarantine entry.
@@ -325,7 +316,7 @@ fn quarantine_entry_emits_lane_and_backoff_ladder() {
     assert_eq!(server.connects(), 0, "quarantined pool must not dial out");
     assert_eq!(
         events_of(&meter, MeterKind::QuarantineEntered).len(),
-        5,
+        3,
         "a quarantined rejection emits no new entry event"
     );
     assert_eq!(
@@ -343,20 +334,22 @@ fn successful_call_clearing_quarantine_emits_single_exit_without_noise() {
     let mut cache = ContentCache::new();
     let mut meter = MemoryMeter::default();
 
-    // One outage against a dead port: entry with the first-ladder backoff.
+    // Three failures against a dead port open the breaker.
     let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
     let token = grant_for("track-a");
     let mut inp = input(&token, "track-a", None, &server, &segments, None);
     inp.server_addr = dead;
-    assert!(matches!(
-        play(&mut pool, &mut cache, &mut meter, SECRET, &inp),
-        Err(PlayError::Upstream(_))
-    ));
+    for _ in 0..nntune_stream::pool::CIRCUIT_FAILURE_THRESHOLD {
+        assert!(matches!(
+            play(&mut pool, &mut cache, &mut meter, SECRET, &inp),
+            Err(PlayError::Upstream(_))
+        ));
+    }
     assert!(pool.quarantined());
     assert_eq!(events_of(&meter, MeterKind::QuarantineEntered).len(), 1);
 
-    // Backoff elapses; the pool recovers on the next successful call.
-    pool.advance(300_000);
+    // The open interval elapses; the pool recovers on the next successful call.
+    pool.advance(nntune_stream::pool::CIRCUIT_OPEN_MS);
     let token2 = grant_for("track-a");
     let inp2 = input(&token2, "track-a", None, &server, &segments, None);
     let resp = play(&mut pool, &mut cache, &mut meter, SECRET, &inp2).expect("recovered play");
@@ -385,7 +378,7 @@ fn successful_call_clearing_quarantine_emits_single_exit_without_noise() {
     );
     assert_eq!(
         events_of(&meter, MeterKind::ProviderError).len(),
-        1,
+        nntune_stream::pool::CIRCUIT_FAILURE_THRESHOLD as usize,
         "recovery emits no extra provider error"
     );
     assert!(

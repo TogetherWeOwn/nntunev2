@@ -29,6 +29,11 @@ target = "app"
 sha256 = "6d222588102fbff8bd5096a42e669722262ba84014fc5865bfbf3b8c19894245"
 
 [[migration]]
-file = "0007_mb_import_resume_dlq.sql"
+file = "0007_auth_challenge_user_fk.sql"
+target = "app"
+sha256 = "ce0350f7d08a251bbfab9a817d1c4c3dc72a7484cb2379869c5e6c11a0fb6791"
+
+[[migration]]
+file = "0008_mb_import_resume_dlq.sql"
 target = "mirror"
-sha256 = "fa9b6f0b365bf26b3a862154a26c1a95cde4e0e75653a565d1e6ffefd29c1b3c"
+sha256 = "d32bc0dd0e48d7c1e5f710d706788fd40e65d83a2ab07d49a2b44158927d47f0"

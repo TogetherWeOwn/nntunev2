@@ -15,7 +15,10 @@
 #
 # Fails closed when credentials are absent (exit 3): a gate that cannot run
 # must not report success. Secret-less CI passes --allow-skip explicitly to
-# skip instead. Fails when caching is enabled or the config cannot be read
+# skip instead; real staging/prod deploys MUST provide credentials and MUST
+# NOT pass --allow-skip (the Worker additionally refuses to serve traffic
+# without HYPERDRIVE_CACHING_DISABLED=1, set only after this gate passes).
+# Fails when caching is enabled or the config cannot be read
 # with credentials present.
 set -euo pipefail
 
