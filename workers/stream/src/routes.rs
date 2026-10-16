@@ -222,14 +222,134 @@ mod tests {
         );
     }
 
+    fn tokens<T: quote::ToTokens>(value: &T) -> String {
+        value.to_token_stream().to_string()
+    }
+
     #[test]
     fn wasm_adapter_uses_dispatch_and_preserves_worker_status_rendering() {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let runtime = std::fs::read_to_string(dir.join("src/runtime.rs")).expect("read runtime.rs");
-        assert!(runtime.contains("routes::dispatch_probe("));
-        assert!(runtime.contains("|| async { respond(self.probe(&mut req).await) }"));
-        assert!(runtime.contains("Response::error(decision.body(), decision.status())"));
-        assert!(runtime.contains(".with_status(reply.status)"));
+        let parsed = syn::parse_file(&runtime).expect("parse runtime.rs");
+
+        let public_fetch = parsed
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(function) if function.sig.ident == "fetch" => Some(function),
+                _ => None,
+            })
+            .expect("public fetch handler");
+        let expected_public_fetch = syn::parse_str::<syn::ItemFn>(
+            "async fn fetch(_req: Request, _env: Env, _ctx: Context) -> Result<Response> {\n                let (status, body) = routes::decide_public_fetch();\n                Response::error(body, status)\n            }",
+        )
+        .expect("parse expected public fetch handler");
+        assert_eq!(
+            tokens(&public_fetch.sig),
+            tokens(&expected_public_fetch.sig)
+        );
+        assert_eq!(
+            tokens(&public_fetch.block),
+            tokens(&expected_public_fetch.block)
+        );
+        let event_attribute: syn::Attribute = syn::parse_quote!(#[event(fetch)]);
+        assert!(
+            public_fetch
+                .attrs
+                .iter()
+                .any(|attribute| tokens(attribute) == tokens(&event_attribute)),
+            "public fetch must retain its Worker event binding"
+        );
+
+        let durable_object_fetch = parsed
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Impl(implementation)
+                    if implementation.trait_.as_ref().is_some_and(|(_, path, _)| {
+                        path.segments
+                            .last()
+                            .is_some_and(|s| s.ident == "DurableObject")
+                    }) =>
+                {
+                    implementation.items.iter().find_map(|item| match item {
+                        syn::ImplItem::Fn(function) if function.sig.ident == "fetch" => {
+                            Some(function)
+                        }
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .expect("NntpPool Durable Object fetch handler");
+        let expected_durable_object_fetch = syn::parse_str::<syn::ImplItemFn>(
+            "async fn fetch(&self, mut req: Request) -> Result<Response> {\n                let has_owner_name = self.state.id().name().is_some();\n                routes::dispatch_probe(\n                    routes::decide_probe_action(req.method().as_ref(), &req.path(), has_owner_name),\n                    |decision| match decision {\n                        ProbeDecision::NotFound => Response::error(decision.body(), decision.status()),\n                        _ => respond(route_reply(decision)),\n                    },\n                    || async { respond(self.probe(&mut req).await) },\n                )\n                .await\n            }",
+        )
+        .expect("parse expected Durable Object handler");
+        assert_eq!(
+            tokens(&durable_object_fetch.sig),
+            tokens(&expected_durable_object_fetch.sig)
+        );
+        assert_eq!(
+            tokens(&durable_object_fetch.block),
+            tokens(&expected_durable_object_fetch.block),
+            "Durable Object fetch must keep each decision on its intended response path"
+        );
+
+        let durable_object = parsed
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Struct(item) if item.ident == "NntpPool" => Some(item),
+                _ => None,
+            })
+            .expect("NntpPool Durable Object");
+        let fetch_attribute: syn::Attribute = syn::parse_quote!(#[durable_object(fetch)]);
+        assert!(
+            durable_object
+                .attrs
+                .iter()
+                .any(|attribute| tokens(attribute) == tokens(&fetch_attribute)),
+            "NntpPool must retain its Durable Object fetch binding"
+        );
+
+        let route_reply = parsed
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(function) if function.sig.ident == "route_reply" => Some(function),
+                _ => None,
+            })
+            .expect("route_reply function");
+        let expected_route_reply = syn::parse_str::<syn::ItemFn>(
+            "fn route_reply(decision: ProbeDecision) -> ProbeReply {\n                ProbeReply {\n                    status: decision.status(),\n                    body: decision.body().to_string(),\n                    retry_after_secs: None,\n                }\n            }",
+        )
+        .expect("parse expected route_reply");
+        assert_eq!(tokens(&route_reply.sig), tokens(&expected_route_reply.sig));
+        assert_eq!(
+            tokens(&route_reply.block),
+            tokens(&expected_route_reply.block),
+            "route_reply must preserve portable status and body"
+        );
+
+        let respond = parsed
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(function) if function.sig.ident == "respond" => Some(function),
+                _ => None,
+            })
+            .expect("respond function");
+        let expected_respond = syn::parse_str::<syn::ItemFn>(
+            "fn respond(reply: ProbeReply) -> Result<Response> {\n                let headers = Headers::new();\n                headers.set(\"content-type\", \"application/json\")?;\n                if let Some(secs) = reply.retry_after_secs {\n                    headers.set(\"retry-after\", &secs.to_string())?;\n                }\n                Ok(Response::ok(reply.body)?\n                    .with_status(reply.status)\n                    .with_headers(headers))\n            }",
+        )
+        .expect("parse expected respond");
+        assert_eq!(tokens(&respond.sig), tokens(&expected_respond.sig));
+        assert_eq!(
+            tokens(&respond.block),
+            tokens(&expected_respond.block),
+            "respond must preserve its reply status and retry metadata"
+        );
     }
 
     #[test]
