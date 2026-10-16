@@ -930,6 +930,50 @@ fn a_connection_the_provider_closed_is_redialed_transparently() {
 }
 
 #[test]
+fn ten_sequential_range_seeks_abort_without_wedging_the_pool() {
+    let (plain, segments, articles) = fixture_track("a", 40_000, 10_000);
+    let server = FakeNntp::start(articles);
+    let mut pool: StreamPool = Pool::new(4);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+
+    // Uncached track: each seek is a live miss holding a pool lease. A cache
+    // hit holds no lease, so it could not prove that abort releases one.
+    // Ten rapid seeks: each reads one chunk, then aborts (the client
+    // seeking again). No seek may wedge the pool or the track.
+    for i in 0..10 {
+        let start = (i * 1000) as u64;
+        let range = format!("bytes={}-{}", start, start + 99);
+        let token = grant_for("track-a");
+        let inp = input(&token, "track-a", Some(&range), &server, &segments, None);
+        let resp = play(&mut pool, &mut cache, &mut meter, SECRET, &inp).expect("seek play");
+        assert_eq!(resp.status, 206);
+        assert!(!resp.cache_hit, "seek {i}: must be a live miss");
+        let mut stream = resp.stream;
+        let chunk = stream.next().expect("first seek chunk");
+        assert_eq!(chunk.len(), 100);
+        assert_eq!(pool.in_use(), 1, "seek {i}: live seek holds one lease");
+        stream.abort(&mut pool);
+        assert_eq!(pool.in_use(), 0, "seek {i}: abort must free the pool");
+    }
+    assert!(
+        cache.get_track("track-a").is_none(),
+        "aborted seeks must not cache"
+    );
+
+    // The player still serves after the storm.
+    let token = grant_for("track-a");
+    let inp = input(&token, "track-a", None, &server, &segments, None);
+    let resp = play(&mut pool, &mut cache, &mut meter, SECRET, &inp).expect("post-storm play");
+    let (body, stream) = drain_to_vec(resp.stream);
+    assert_eq!(body, plain);
+    stream
+        .finalize(&mut pool, &mut cache, &mut meter)
+        .expect("finalize");
+    assert_eq!(pool.in_use(), 0);
+}
+
+#[test]
 fn provider_outage_quarantines_then_recovers() {
     let (plain, segments, articles) = fixture_track("a", 40_000, 20_000);
     let server = FakeNntp::start(articles);

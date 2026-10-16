@@ -41,7 +41,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::cache::{ContentCache, MultipartUpload};
+use crate::cache::{CacheServe, CacheStatus, ContentCache, MultipartUpload};
 use crate::grant::{self, GrantError};
 use crate::meter::{Meter, MeterEvent, MeterKind};
 use crate::nntp::{valid_message_id, NntpClient, NntpError};
@@ -135,7 +135,33 @@ pub struct PlayResponse {
     /// Bytes this response will serve.
     pub body_len: u64,
     pub cache_hit: bool,
+    /// `Cache-Status` value pinning how the cache served this play (`HIT`
+    /// fresh, `STALE` served-while-revalidating, `MISS` fetched upstream).
+    pub cache_status: CacheStatus,
+    /// Seconds since the serving entry was written (0 on a miss).
+    pub age_secs: u64,
+    /// True when a stale entry served immediately *and* this response
+    /// claimed the track's one background revalidation (see
+    /// `ContentCache::try_begin_revalidate`): the worker entry point must
+    /// re-fetch upstream and rewrite the entry while the client already has
+    /// its bytes, or release the claim with `finish_revalidate` if that
+    /// re-fetch fails. Concurrent stale readers get `false` — one refresh
+    /// per stale entry, not one per reader.
+    pub needs_revalidate: bool,
     pub stream: PlayStream,
+}
+
+impl PlayResponse {
+    /// `Cache-Status` + `Age` response headers for this play.
+    pub fn cache_headers(&self) -> [(String, String); 2] {
+        [
+            (
+                "Cache-Status".to_string(),
+                self.cache_status.header_value().to_string(),
+            ),
+            ("Age".to_string(), self.age_secs.to_string()),
+        ]
+    }
 }
 
 /// What settle does with the connection behind a failed play: only a
@@ -218,6 +244,9 @@ struct Live {
     /// `ingest`), never by the NZB ranges hint.
     seg_placed: Vec<Option<(u64, u64)>>,
     cipher_key: u8,
+    /// `PlayInput::now_unix` at play time: the cache write stamped on
+    /// `finalize`, so the SWR clock runs from when the bytes were fetched.
+    started_at: u64,
     /// File size declared by the first fetched segment.
     total: u64,
     /// The most recently decoded segment, shared with `pending` (no copy).
@@ -306,12 +335,23 @@ fn play_authorized(
     flush_orphaned(pool, meter);
     meter.emit(ev(MeterKind::PlayStart, user, input.track_id, 0));
 
-    if let Some(full) = cache.get_track(input.track_id) {
+    // Fresh entries serve as-is; stale entries serve immediately while owing
+    // a background revalidation (see `needs_revalidate`). Expired entries
+    // read as `None` and fall through to the miss path below.
+    if let Some((full, serve)) = cache.get_track_at(input.track_id, input.now_unix) {
         meter.emit(ev(MeterKind::CacheHit, user, input.track_id, 0));
         let window = resolve_range(full.len() as u64, input.range)?;
+        // A stale serve owes one background revalidation per entry, not one
+        // per reader: only the response that claims it reports
+        // `needs_revalidate`. Claimed only once the serve is known-good, so
+        // a failed range never strands the claim with no one told to act.
+        let needs_revalidate =
+            serve.needs_revalidate() && cache.try_begin_revalidate(input.track_id);
         return Ok(respond(
             window,
             true,
+            Some(serve),
+            needs_revalidate,
             user,
             input.track_id,
             Source::Cached(full),
@@ -431,6 +471,7 @@ fn play_authorized(
         next_seg: first_seg,
         seg_done: vec![false; input.segments.len()],
         cipher_key: input.cipher_key,
+        started_at: input.now_unix,
         total: first.file_size,
         buf: Arc::from([]),
         buf_start: 0,
@@ -461,6 +502,8 @@ fn play_authorized(
     }
     Ok(respond(
         window,
+        false,
+        None,
         false,
         user,
         input.track_id,
@@ -748,19 +791,34 @@ fn resolve_range(len: u64, range: Option<&str>) -> Result<Window, PlayError> {
     }
 }
 
+/// `serve` pins the `Cache-Status`/`Age` headers: `Some` serve (fresh or
+/// stale) for cache hits, `None` for a miss (fetched upstream).
+/// `needs_revalidate` is the caller's already-claimed revalidation flag
+/// (see [`play`]); it is *not* derived from `serve` here, so concurrent
+/// stale serves cannot each demand a refresh.
+#[allow(clippy::too_many_arguments)]
 fn respond(
     (status, content_range, start, end): Window,
     cache_hit: bool,
+    serve: Option<CacheServe>,
+    needs_revalidate: bool,
     user: &str,
     track: &str,
     source: Source,
     orphans: Arc<Mutex<Vec<OrphanedPlay>>>,
 ) -> PlayResponse {
+    let (cache_status, age_secs) = match serve {
+        Some(serve) => (serve.cache_status(), serve.age_secs()),
+        None => (CacheStatus::Miss, 0),
+    };
     PlayResponse {
         status,
         content_range,
         body_len: end - start,
         cache_hit,
+        cache_status,
+        age_secs,
+        needs_revalidate,
         stream: PlayStream {
             user_id: user.to_string(),
             track_id: track.to_string(),
@@ -895,10 +953,11 @@ impl PlayStream {
                     client,
                     lease,
                     upload,
+                    started_at,
                     ..
                 } = *live;
                 pool.release(lease, Some(client));
-                cache.put_track(&self.track_id, upload.complete());
+                cache.put_track_at(&self.track_id, upload.complete(), started_at);
                 Ok(())
             }
             Some(failure) => {
@@ -1151,6 +1210,316 @@ mod tests {
         assert_eq!(covering_segment(&ranges, 9), 0);
         assert_eq!(covering_segment(&ranges, 10), 1);
         assert_eq!(covering_segment(&ranges, 29), 2);
+    }
+
+    #[test]
+    fn stale_cache_entry_serves_immediately_with_swr_headers() {
+        use crate::cache::{CacheStatus, CACHE_FRESH_TTL_SECS};
+        use crate::play::PlayInput;
+
+        let secret = b"s";
+        let stale_now = 1_000 + CACHE_FRESH_TTL_SECS + 10;
+        // Within the TTL cap so the test exercises the cache path.
+        let token = grant::issue("u", "track-swr", stale_now + 60, secret);
+        let mut pool = Pool::new(1);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+        cache.put_track_at("track-swr", b"0123456789".to_vec(), 1_000);
+
+        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+        let input = PlayInput {
+            token: &token,
+            track_id: "track-swr",
+            range: None,
+            server_addr: addr,
+            segments: &[],
+            segment_ranges: None,
+            cipher_key: 0,
+            now_unix: stale_now,
+            up_next: None,
+        };
+        let resp = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("stale serves");
+        assert_eq!(resp.status, 200);
+        assert!(resp.cache_hit, "stale is still served from cache");
+        assert_eq!(resp.cache_status, CacheStatus::Stale);
+        assert_eq!(resp.age_secs, CACHE_FRESH_TTL_SECS + 10);
+        assert!(
+            resp.needs_revalidate,
+            "stale serve owes background revalidation"
+        );
+        assert_eq!(
+            resp.cache_headers(),
+            [
+                ("Cache-Status".to_string(), "STALE".to_string()),
+                ("Age".to_string(), (CACHE_FRESH_TTL_SECS + 10).to_string()),
+            ]
+        );
+        let mut body = Vec::new();
+        let mut stream = resp.stream;
+        for chunk in stream.by_ref() {
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, b"0123456789");
+        stream
+            .finalize(&mut pool, &mut cache, &mut meter)
+            .expect("hit finalize");
+    }
+
+    #[test]
+    fn stale_range_serve_is_206_with_swr_headers() {
+        use crate::cache::{CacheStatus, CACHE_FRESH_TTL_SECS};
+
+        let secret = b"s";
+        let now_unix = 1_000 + CACHE_FRESH_TTL_SECS + 1;
+        // Within the TTL cap so the test exercises the cache path.
+        let token = grant::issue("u", "track-swr", now_unix + 60, secret);
+        let mut pool = Pool::new(1);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+        cache.put_track_at("track-swr", b"0123456789".to_vec(), 1_000);
+
+        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+        let input = PlayInput {
+            token: &token,
+            track_id: "track-swr",
+            range: Some("bytes=2-5"),
+            server_addr: addr,
+            segments: &[],
+            segment_ranges: None,
+            cipher_key: 0,
+            now_unix,
+            up_next: None,
+        };
+        let resp = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("stale serves");
+        assert_eq!(resp.status, 206);
+        assert_eq!(resp.content_range.as_deref(), Some("bytes 2-5/10"));
+        assert_eq!(resp.cache_status, CacheStatus::Stale);
+        assert!(resp.needs_revalidate);
+        let mut body = Vec::new();
+        let mut stream = resp.stream;
+        for chunk in stream.by_ref() {
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, b"2345");
+    }
+
+    #[test]
+    fn only_the_first_stale_serve_claims_the_revalidation() {
+        use crate::cache::{CacheStatus, CACHE_FRESH_TTL_SECS};
+
+        let secret = b"s";
+        let now_unix = 1_000 + CACHE_FRESH_TTL_SECS + 1;
+        // Within the TTL cap so the test exercises the cache path.
+        let token = grant::issue("u", "track-swr", now_unix + 60, secret);
+        let mut pool = Pool::new(1);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+        cache.put_track_at("track-swr", b"0123456789".to_vec(), 1_000);
+
+        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+        let input = PlayInput {
+            token: &token,
+            track_id: "track-swr",
+            range: None,
+            server_addr: addr,
+            segments: &[],
+            segment_ranges: None,
+            cipher_key: 0,
+            now_unix,
+            up_next: None,
+        };
+        let first = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("stale serves");
+        assert_eq!(first.cache_status, CacheStatus::Stale);
+        assert!(
+            first.needs_revalidate,
+            "the first stale reader claims the one background revalidation"
+        );
+        let second = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("stale serves");
+        assert_eq!(second.cache_status, CacheStatus::Stale);
+        assert!(
+            !second.needs_revalidate,
+            "later stale readers must not each trigger a refresh"
+        );
+
+        // The revalidation rewrite landing releases the claim and the entry
+        // serves fresh again.
+        cache.put_track_at("track-swr", b"0123456789".to_vec(), input.now_unix);
+        let third = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("fresh serves");
+        assert_eq!(third.cache_status, CacheStatus::Hit);
+        assert!(!third.needs_revalidate);
+    }
+
+    #[test]
+    fn fresh_cache_entry_serves_hit_headers_without_revalidation() {
+        use crate::cache::CacheStatus;
+
+        let secret = b"s";
+        // Within the TTL cap so the test exercises the cache path.
+        let token = grant::issue("u", "track-swr", 1_010 + 60, secret);
+        let mut pool = Pool::new(1);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+        cache.put_track_at("track-swr", b"0123456789".to_vec(), 1_000);
+
+        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+        let input = PlayInput {
+            token: &token,
+            track_id: "track-swr",
+            range: None,
+            server_addr: addr,
+            segments: &[],
+            segment_ranges: None,
+            cipher_key: 0,
+            now_unix: 1_010,
+            up_next: None,
+        };
+        let resp = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("fresh serves");
+        assert!(resp.cache_hit);
+        assert_eq!(resp.cache_status, CacheStatus::Hit);
+        assert_eq!(resp.age_secs, 10);
+        assert!(!resp.needs_revalidate);
+        assert_eq!(
+            resp.cache_headers(),
+            [
+                ("Cache-Status".to_string(), "HIT".to_string()),
+                ("Age".to_string(), "10".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn expired_cache_entry_falls_through_to_the_miss_path() {
+        use crate::cache::{CACHE_FRESH_TTL_SECS, CACHE_SWR_WINDOW_SECS};
+
+        let secret = b"s";
+        let now_unix = 1_000 + CACHE_FRESH_TTL_SECS + CACHE_SWR_WINDOW_SECS + 1;
+        // Within the TTL cap so the test exercises the cache path.
+        let token = grant::issue("u", "track-swr", now_unix + 60, secret);
+        let mut pool = Pool::new(1);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+        cache.put_track_at("track-swr", b"0123456789".to_vec(), 1_000);
+
+        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+        let input = PlayInput {
+            token: &token,
+            track_id: "track-swr",
+            range: None,
+            server_addr: addr,
+            segments: &[],
+            segment_ranges: None,
+            cipher_key: 0,
+            now_unix,
+            up_next: None,
+        };
+        // Empty segments fail on the miss path: proof the expired entry did
+        // not serve.
+        assert!(matches!(
+            play(&mut pool, &mut cache, &mut meter, secret, &input),
+            Err(PlayError::Upstream(_))
+        ));
+    }
+
+    #[test]
+    fn miss_finalize_stamps_the_cache_write_with_play_time() {
+        use crate::cache::{CacheStatus, CACHE_FRESH_TTL_SECS};
+        use crate::yenc::{self, PartSpec};
+        use std::io::{BufRead, BufReader, Write as _};
+        use std::net::TcpListener;
+        use std::thread;
+
+        // One-segment track, identity cipher (key 0 is a no-op xor).
+        let plain = b"stamp-me".to_vec();
+        let mid = "t1-seg0@unit.test".to_string();
+        let article = yenc::encode_part(
+            &plain,
+            "t1.flac",
+            PartSpec {
+                file_size: plain.len() as u64,
+                part: 1,
+                total: 1,
+                offset: 0,
+                file_crc: Some(yenc::crc32(&plain)),
+            },
+        );
+        // Minimal single-article NNTP stub (mirrors the integration fake's
+        // dot-stuffing so `decode_part` sees the exact encoded bytes).
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub NNTP");
+        let addr = listener.local_addr().expect("stub addr");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("one play connection");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stub"));
+            let mut writer = stream;
+            writer
+                .write_all(b"200 stub NNTP ready\r\n")
+                .expect("greeting");
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("BODY line");
+            assert!(line.starts_with("BODY"), "stub only serves BODY");
+            writer
+                .write_all(format!("222 0 <{mid}> follows\r\n").as_bytes())
+                .expect("222");
+            for raw_line in article.split(|&b| b == b'\n') {
+                let text_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+                if text_line.first() == Some(&b'.') {
+                    writer.write_all(b".").expect("dot-stuff");
+                }
+                writer.write_all(text_line).expect("article line");
+                writer.write_all(b"\r\n").expect("crlf");
+            }
+            writer.write_all(b".\r\n").expect("terminator");
+        });
+
+        let secret = b"s";
+        // Within the TTL cap so the test exercises the miss path.
+        let token = grant::issue("u", "track-t1", 5_000 + 60, secret);
+        let mut pool = Pool::new(1);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+        let segments = ["t1-seg0@unit.test".to_string()];
+        let input = PlayInput {
+            token: &token,
+            track_id: "track-t1",
+            range: None,
+            server_addr: addr,
+            segments: &segments,
+            segment_ranges: None,
+            cipher_key: 0,
+            now_unix: 5_000,
+            up_next: None,
+        };
+        let resp = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("miss play");
+        assert!(!resp.cache_hit);
+        assert_eq!(resp.cache_status, CacheStatus::Miss);
+        assert_eq!(resp.age_secs, 0);
+        assert!(!resp.needs_revalidate);
+        assert_eq!(
+            resp.cache_headers(),
+            [
+                ("Cache-Status".to_string(), "MISS".to_string()),
+                ("Age".to_string(), "0".to_string()),
+            ]
+        );
+        let mut body = Vec::new();
+        let mut stream = resp.stream;
+        for chunk in stream.by_ref() {
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, plain);
+        stream
+            .finalize(&mut pool, &mut cache, &mut meter)
+            .expect("finalize");
+        server.join().expect("stub served one article");
+
+        // The write is stamped with the play time, so the SWR clock runs.
+        let (_, serve) = cache
+            .get_track_at("track-t1", 5_000)
+            .expect("just-written entry serves");
+        assert_eq!(serve, crate::cache::CacheServe::Fresh { age_secs: 0 });
+        let (_, serve) = cache
+            .get_track_at("track-t1", 5_000 + CACHE_FRESH_TTL_SECS + 1)
+            .expect("entry goes stale on schedule");
+        assert!(serve.needs_revalidate());
     }
 
     #[test]
