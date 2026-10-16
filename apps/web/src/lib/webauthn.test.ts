@@ -61,7 +61,8 @@ describe('WebAuthn options', () => {
 		expect(options.excludeCredentials?.[0]?.transports).toEqual(['internal']);
 		expect(options.authenticatorSelection).toEqual({
 			residentKey: 'required',
-			requireResidentKey: true
+			requireResidentKey: true,
+			userVerification: 'required'
 		});
 		expect(options.timeout).toBe(60_000);
 	});
@@ -111,7 +112,8 @@ describe('WebAuthn options', () => {
 		expect(Array.from(new Uint8Array(browser.user.id as ArrayBuffer))).toEqual([4, 5, 6]);
 		expect(browser.authenticatorSelection).toEqual({
 			residentKey: 'required',
-			requireResidentKey: true
+			requireResidentKey: true,
+			userVerification: 'required'
 		});
 	});
 });
@@ -175,4 +177,26 @@ describe('serializePublicKeyCredential', () => {
 			clientExtensionResults: {}
 		});
 	});
+});
+
+it('requires user verification for creation and request options', () => {
+	const registration = toRegistrationOptions('AQID', 'BAUG', 'example.com', 'ada@example.com');
+	expect(registration.authenticatorSelection?.userVerification).toBe('required');
+
+	const weakenedCreation = toCreationOptions({
+		...registration,
+		authenticatorSelection: {
+			...registration.authenticatorSelection,
+			userVerification: 'discouraged'
+		}
+	});
+	expect(weakenedCreation.authenticatorSelection?.userVerification).toBe('required');
+
+	expect(toRequestOptions({ challenge: 'AQID' }).userVerification).toBe('required');
+
+	const weakenedRequest = toRequestOptions({
+		challenge: 'AQID',
+		userVerification: 'discouraged'
+	});
+	expect(weakenedRequest.userVerification).toBe('required');
 });
