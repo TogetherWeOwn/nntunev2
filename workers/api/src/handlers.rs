@@ -14,6 +14,10 @@
 //!   [`session::verify_stored_session`] against the current server row
 //!   (revoked/missing/stale-counter/mismatched rows reject), and cookie-
 //!   authenticated mutations require an exact `Origin` match (CSRF).
+//!   `POST /v1/auth/magic/finish` mints a cookie from a pure bearer token,
+//!   so it requires the same exact `Origin` match even when unauthenticated
+//!   (login-CSRF session planting): browsers always send `Origin` on this
+//!   fetch POST, and API-only clients must send `Origin: <configured origin>`.
 //! - Vault reads/writes are keyed ONLY by the session's `user_id` — there
 //!   is no handler parameter naming a vault, so a non-owner cannot even
 //!   address another vault (no existence oracle).
@@ -1064,6 +1068,17 @@ where
     D: Dialer,
     N: AsyncDns,
 {
+    // Login-CSRF session-planting pin: this route mints a cookie from a pure
+    // bearer token, so a cross-site POST would plant the attacker's session
+    // in the victim's browser — response `Set-Cookie` is not stopped by
+    // `SameSite=Lax`, and CORS alone does not stop form/nav POSTs. Require
+    // the same exact-`Origin` match as cookie-authenticated mutations,
+    // BEFORE any token lookup or consume (so a rejected cross-origin
+    // attempt leaves the token unspent). Browsers always send `Origin` on
+    // this fetch POST; API-only clients must send `Origin: <configured origin>`.
+    if req.origin.as_deref() != Some(ctx.cfg.origin.as_str()) {
+        return generic_auth();
+    }
     let Some(body) = parse_body::<MagicFinishBody>(req) else {
         return generic_auth();
     };
@@ -1079,14 +1094,14 @@ where
         Ok(None) => return generic_auth(),
         Err(_) => return internal(),
     };
-    // Login-CSRF guard: an emailed link must never silently REPLACE an
-    // existing session for a different account. If the request already
-    // authenticates as someone else, fail generically WITHOUT consuming
-    // the token (its owner can still redeem it after signing out). An
-    // absent or invalid session is the ordinary sign-in path. The web
-    // landing page adds the second half: no auto-redeem, an explicit
-    // confirm, and the signed-in identity shown before any credential
-    // is typed.
+    // Login-CSRF guard (second layer after the exact-`Origin` pin above):
+    // an emailed link must never silently REPLACE an existing session for
+    // a different account. If the request already authenticates as someone
+    // else, fail generically WITHOUT consuming the token (its owner can
+    // still redeem it after signing out). An absent or invalid session is
+    // the ordinary sign-in path. The web landing page adds the third layer:
+    // no auto-redeem, an explicit confirm, and the signed-in identity shown
+    // before any credential is typed.
     if session_cookie_value(req).is_some() {
         if let Ok((claims, _)) = ctx.authenticate(req, false).await {
             if claims.user_id != record.user_id {
@@ -2066,6 +2081,52 @@ mod tests {
             "signed-in identity must be in the body: {}",
             resp.body
         );
+    }
+
+    #[test]
+    fn magic_finish_requires_exact_origin_and_leaves_token_unspent() {
+        // Login-CSRF session planting: an unauthenticated cross-origin POST
+        // carrying the attacker's token must not mint a cookie (response
+        // `Set-Cookie` is not stopped by `SameSite=Lax`), and the rejected
+        // attempt must not spend the token — the same-origin explicit-confirm
+        // flow still redeems afterwards.
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": "a@example.com"}),
+        );
+        assert_eq!(resp.status, 200);
+        let token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        // Cross-origin: no cookie, generic body, token survives.
+        for origin in [Some("https://evil.test"), None] {
+            let resp = h.call_full(
+                "POST",
+                "/v1/auth/magic/finish",
+                Some(serde_json::json!({"token": token}).to_string()),
+                None,
+                origin,
+            );
+            assert_eq!(resp.status, 401, "origin={origin:?}: {}", resp.body);
+            assert_eq!(resp.body, r#"{"error":"check your email and try again"}"#);
+            assert!(resp.set_cookie.is_none(), "no planted cookie for {origin:?}");
+        }
+        // Same-origin explicit confirm still redeems and spends the token.
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(resp.set_cookie.is_some(), "same-origin must set a cookie");
+        let replay = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(replay.status, 401);
+        assert!(replay.set_cookie.is_none());
     }
 
     #[test]
