@@ -29,8 +29,9 @@
 //!
 //! ## Allowlist config
 //!
-//! The worker loads the allowlist from the `NZB_FETCH_ALLOWLIST`
-//! environment variable: a comma-separated list of exact hostnames
+//! Not wired yet: no route calls [`fetch_nzb`] and nothing reads the
+//! variable below. The wiring follow-up loads the allowlist from the
+//! `NZB_FETCH_ALLOWLIST` environment variable: a comma-separated list of exact hostnames
 //! (e.g. `nzb.example,cdn.example`). Matching is exact and
 //! case-insensitive; `sub.nzb.example` is NOT covered by `nzb.example`.
 //! The default ([`FetchConfig::default`]) allows nothing (deny-all), so a
@@ -395,13 +396,24 @@ fn resolve_location(current_host: &str, location: &str) -> Result<String, FetchR
         }
         return Ok(format!("https:{location}"));
     }
+    if location.starts_with('/') {
+        return Ok(format!(
+            "https://{}{location}",
+            bracket_ipv6_host(current_host)
+        ));
+    }
     if location.contains("://") {
         return Ok(location.to_string());
     }
-    if location.starts_with('/') {
-        return Ok(format!("https://{current_host}{location}"));
-    }
     Err(FetchRejection::MalformedUrl)
+}
+
+fn bracket_ipv6_host(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
 }
 
 fn is_redirect(status: u16) -> bool {
@@ -428,20 +440,22 @@ pub fn fetch_nzb(
 ) -> Result<Vec<u8>, FetchRejection> {
     let mut current = url.to_string();
     let mut followed: u32 = 0;
+    let mut elapsed: u64 = 0;
     loop {
         // The guard runs before EVERY transport call, including the first:
         // a blocked URL is rejected before any fetch happens.
         let target = validate_fetch_url(&current, config, dns)?;
         let response = transport.get(&current)?;
-        let mut elapsed: u64 = 0;
+        for chunk in &response.chunks {
+            elapsed = elapsed.saturating_add(chunk.delay_ms);
+            if elapsed >= config.timeout_ms {
+                return Err(FetchRejection::Timeout);
+            }
+        }
         match response.status {
             200..=299 => {
                 let mut body = Vec::new();
                 for chunk in &response.chunks {
-                    elapsed = elapsed.saturating_add(chunk.delay_ms);
-                    if elapsed >= config.timeout_ms {
-                        return Err(FetchRejection::Timeout);
-                    }
                     body.extend_from_slice(&chunk.bytes);
                     if body.len() > config.max_bytes {
                         return Err(FetchRejection::TooLarge);
@@ -549,6 +563,81 @@ mod tests {
         assert_eq!(
             validate_fetch_url("https://nzb.example:65536/x.nzb", &cfg, &NoDns),
             Err(FetchRejection::MalformedUrl)
+        );
+    }
+
+    struct PublicDns;
+    impl DnsResolver for PublicDns {
+        fn resolve(&self, _host: &str) -> Vec<IpAddr> {
+            vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]
+        }
+    }
+
+    struct ScriptedTransport {
+        responses: Vec<RawResponse>,
+    }
+    impl FetchTransport for ScriptedTransport {
+        fn get(&mut self, _url: &str) -> Result<RawResponse, FetchRejection> {
+            Ok(self.responses.remove(0))
+        }
+    }
+
+    fn delayed(status: u16, location: Option<&str>, delay_ms: u64, bytes: &[u8]) -> RawResponse {
+        RawResponse {
+            status,
+            location: location.map(str::to_string),
+            chunks: vec![BodyChunk {
+                delay_ms,
+                bytes: bytes.to_vec(),
+            }],
+        }
+    }
+
+    #[test]
+    fn total_timeout_spans_redirect_hops() {
+        let cfg = FetchConfig {
+            allowed_hosts: vec!["nzb.example".to_string()],
+            timeout_ms: 1_000,
+            ..FetchConfig::default()
+        };
+        let url = "https://nzb.example/a.nzb";
+
+        let mut transport = ScriptedTransport {
+            responses: vec![
+                delayed(302, Some("https://nzb.example/final.nzb"), 900, b""),
+                delayed(200, None, 900, b"<nzb/>"),
+            ],
+        };
+        assert_eq!(
+            fetch_nzb(url, &cfg, &PublicDns, &mut transport),
+            Err(FetchRejection::Timeout)
+        );
+
+        let mut transport = ScriptedTransport {
+            responses: vec![
+                delayed(302, Some("https://nzb.example/final.nzb"), 400, b""),
+                delayed(200, None, 400, b"<nzb/>"),
+            ],
+        };
+        assert_eq!(
+            fetch_nzb(url, &cfg, &PublicDns, &mut transport),
+            Ok(b"<nzb/>".to_vec())
+        );
+    }
+
+    #[test]
+    fn path_absolute_location_with_url_in_query_stays_on_current_host() {
+        assert_eq!(
+            resolve_location("nzb.example", "/dl?src=https://cdn.example/x"),
+            Ok("https://nzb.example/dl?src=https://cdn.example/x".to_string())
+        );
+    }
+
+    #[test]
+    fn path_absolute_location_rebrackets_ipv6_host() {
+        assert_eq!(
+            resolve_location("2606:4700::1111", "/x.nzb"),
+            Ok("https://[2606:4700::1111]/x.nzb".to_string())
         );
     }
 }
