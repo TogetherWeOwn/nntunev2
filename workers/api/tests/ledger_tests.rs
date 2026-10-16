@@ -325,3 +325,45 @@ fn statements_are_parameterized_replay_safe_and_month_scoped() {
     // Exactly one predicate group: no OR that could widen the scope.
     assert!(!monthly.contains(" OR "), "no scope widening: {monthly}");
 }
+
+#[test]
+fn migration_pins_rate_and_persisted_caps() {
+    // The migration is the persisted half of the prepare gate: if its rate
+    // literal drifts (e.g. 48000 -> 4800) every prepare-valid row fails at
+    // the DB, or corrupt rows are accepted. Dropping the CHECK has the same
+    // effect. This test reads the migration file so either mutant fails the
+    // suite.
+    const MIGRATION: &str = include_str!("../../../migrations/0006_usage_ledger.sql");
+    let rate = ledger::STREAM_BYTES_PER_SEC.to_string();
+    assert!(
+        MIGRATION.contains(&format!("bytes_served / {rate}")),
+        "migration must divide by STREAM_BYTES_PER_SEC ({rate})"
+    );
+    assert!(
+        MIGRATION.contains(&format!("bytes_served % {rate}")),
+        "migration must modulo by STREAM_BYTES_PER_SEC ({rate})"
+    );
+    // Literal pin: the rate re-bills history, so drift is deliberate only.
+    assert_eq!(ledger::STREAM_BYTES_PER_SEC, 48_000);
+    // Persisted caps mirror the prepare bounds: without them a row that
+    // satisfies the rate CHECK can still exceed the per-row / time-domain
+    // limits prepare enforces (LedgerRow fields alone do not enforce them).
+    assert!(
+        MIGRATION.contains(&format!(
+            "stream_seconds <= {}",
+            ledger::MAX_STREAM_SECONDS_PER_ROW
+        )),
+        "migration must cap stream_seconds at MAX_STREAM_SECONDS_PER_ROW"
+    );
+    assert!(
+        MIGRATION.contains(&format!("bytes_served <= {}", ledger::MAX_BYTES_PER_ROW)),
+        "migration must cap bytes_served at MAX_BYTES_PER_ROW"
+    );
+    assert!(
+        MIGRATION.contains(&format!("recorded_at <= {}", ledger::MAX_RECORDED_AT)),
+        "migration must cap recorded_at at MAX_RECORDED_AT"
+    );
+    assert_eq!(ledger::MAX_STREAM_SECONDS_PER_ROW, 86_400);
+    assert_eq!(ledger::MAX_BYTES_PER_ROW, 4_147_200_000);
+    assert_eq!(ledger::MAX_RECORDED_AT, 253_402_300_799);
+}
