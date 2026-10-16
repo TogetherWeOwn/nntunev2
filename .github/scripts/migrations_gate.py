@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import os
 import re
 import subprocess
 import sys
@@ -143,7 +144,11 @@ def check_drift(root, base_ref):
             raise
         base_commit = git(root, "rev-parse", "--verify", "origin/main^{commit}").strip()
 
-    base_files = git(root, "ls-tree", "-r", "--name-only", base_commit, "--", "migrations").splitlines()
+    base_files = [
+        os.fsdecode(path)
+        for path in git(root, "ls-tree", "-r", "-z", "--name-only", base_commit, "--", "migrations", text=False).split(b"\0")
+        if path
+    ]
     base_sql = {
         path: path
         for path in base_files
@@ -177,12 +182,16 @@ def check_drift(root, base_ref):
         base_manifest = {entry["file"]: entry for entry in base_entries}
 
     violations = 0
-    for filename, entry in current_entries.items():
-        if filename not in base_flat_files:
-            match = NUMBER_PREFIX.match(filename)
-            if match and int(match.group(1)) <= base_max:
-                report("out-of-order", filename, f"new migration number must exceed base maximum {base_max:04d}")
-                violations += 1
+    new_numbers = sorted(
+        (int(match.group(1)), filename)
+        for filename in current_entries
+        if filename not in base_flat_files and (match := NUMBER_PREFIX.match(filename))
+    )
+    for offset, (number, filename) in enumerate(new_numbers, start=1):
+        expected = base_max + offset
+        if number != expected:
+            report("out-of-order", filename, f"new migration number must be {expected:04d}")
+            violations += 1
 
     for path in sorted(base_sql):
         filename = Path(path).name

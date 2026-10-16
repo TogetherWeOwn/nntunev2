@@ -75,6 +75,22 @@ class MigrationGateRegressionTests(unittest.TestCase):
                     self.assertEqual(1, result.returncode, result.stdout + result.stderr)
                     self.assertIn(f"migrations-gate: out-of-order: {added}: ", result.stdout)
 
+    def test_new_number_must_be_next_after_base_maximum(self):
+        base_ref = self.make_base(["0001_first.sql", "0003_third.sql"])
+        self.write_migration("0005_gap.sql")
+        self.write_manifest(
+            [
+                ("0001_first.sql", "app"),
+                ("0003_third.sql", "app"),
+                ("0005_gap.sql", "app"),
+            ]
+        )
+
+        result = self.run_gate("--base-ref", base_ref)
+
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn("migrations-gate: out-of-order: 0005_gap.sql: new migration number must be 0004", result.stdout)
+
     def test_applied_manifest_target_change_is_reported(self):
         base_ref = self.make_base(["0001_first.sql"])
         self.write_manifest([("0001_first.sql", "mirror")])
@@ -99,6 +115,17 @@ class MigrationGateRegressionTests(unittest.TestCase):
 
         self.assertEqual(2, result.returncode, result.stdout + result.stderr)
         self.assertIn("cannot parse base migrations/manifest.toml", result.stderr)
+
+    def test_non_ascii_base_migration_drift_is_detected(self):
+        filename = "0001_café.sql"
+        base_ref = self.make_base([filename])
+        self.write_migration(filename, "DROP TABLE users;\n")
+        self.write_manifest([(filename, "app")])
+
+        result = self.run_gate("--base-ref", base_ref)
+
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn("migrations-gate: applied-edited: 0001_café.sql: ", result.stdout)
 
     def test_missing_base_manifest_is_tolerated(self):
         self.git("init", "-q")
@@ -156,13 +183,13 @@ class MigrationGateRegressionTests(unittest.TestCase):
         self.git("add", "migrations")
         self.git("commit", "-qm", "base migrations")
         base_ref = self.git("rev-parse", "HEAD").stdout.strip()
-        self.write_migration("0010_next.sql")
-        self.write_manifest([("0001_first.sql", "app"), ("0010_next.sql", "app")])
+        self.write_migration("0002_next.sql")
+        self.write_manifest([("0001_first.sql", "app"), ("0002_next.sql", "app")])
 
         result = self.run_gate("--base-ref", base_ref)
 
         self.assertEqual(1, result.returncode, result.stdout + result.stderr)
-        self.assertNotIn("out-of-order: 0010_next.sql", result.stdout)
+        self.assertNotIn("out-of-order: 0002_next.sql", result.stdout)
 
     def test_unlisted_base_file_in_empty_manifest_has_no_manifest_drift_noise(self):
         self.git("init", "-q")
