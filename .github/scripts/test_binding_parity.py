@@ -154,6 +154,22 @@ class TestOpsInventoryParsing(unittest.TestCase):
         self.assertNotIn("fx-hd-prod", ids["staging"]["hyperdrive"])
         self.assertIn("fx-hd-prod", ids["prod"]["hyperdrive"])
 
+    def test_matrix_columns_follow_reordered_header(self):
+        ops = OPS_MD.replace(
+            "| Concern | staging | prod |", "| Concern | prod | staging |"
+        ).replace(
+            "| R2 audio | `fx-audio-staging` | `fx-audio-prod` |",
+            "| R2 audio | `fx-audio-prod` | `fx-audio-staging` |",
+        )
+        inventory, _ = parse_ops_inventory(ops)
+        self.assertEqual({"fx-audio-staging"}, inventory["staging"])
+        self.assertEqual({"fx-audio-prod"}, inventory["prod"])
+
+    def test_matrix_missing_environment_column_fails_closed(self):
+        ops = OPS_MD.replace("| Concern | staging | prod |", "| Concern | staging | live |")
+        with self.assertRaisesRegex(ParityError, "lacks staging/prod columns"):
+            parse_ops_inventory(ops)
+
     def test_missing_matrix_fails_closed(self):
         with self.assertRaises(ParityError):
             parse_ops_inventory("# ops\n\nno matrix here\n")
@@ -563,6 +579,20 @@ reason = "fixture: value fix owned elsewhere"
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(ParityError):
                 run_check(make_repo(tmp, manifest=manifest))
+
+    def test_non_string_resource_fails_closed_with_exit_two(self):
+        wrangler = MATCHING_WRANGLER.replace(
+            'bucket_name = "fx-audio-staging"', "bucket_name = 123"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp, wrangler=wrangler)
+            with self.assertRaisesRegex(ParityError, "bucket_name must be a string"):
+                run_check(root)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(2, main(["--root", str(root)]))
+            self.assertIn("::error::binding-parity:", output.getvalue())
+            self.assertNotIn("Traceback", output.getvalue())
 
     def test_unparsable_config_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:

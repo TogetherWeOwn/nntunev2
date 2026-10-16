@@ -100,10 +100,15 @@ def _entry(table, item, type_name, binding_key):
     binding = item.get(binding_key)
     if not binding:
         raise ParityError(f"{table}: entry without {binding_key!r} ({type_name})")
+    resource = item.get(RESOURCE_KEY[type_name])
+    if not isinstance(resource, str):
+        raise ParityError(
+            f"{table}: {RESOURCE_KEY[type_name]} must be a string ({type_name})"
+        )
     return {
         "type": type_name,
         "binding": binding,
-        "resource": item.get(RESOURCE_KEY[type_name]),
+        "resource": resource,
         "declared": False,
     }
 
@@ -310,12 +315,41 @@ def parse_ops_inventory(text, source="docs/ops.md"):
     if next_heading:
         section = section[: next_heading.start()]
     inventory = {env: set() for env in ENVS}
-    for line in section.split("\n"):
-        cells = line.split("|")
-        if len(cells) < 5:  # | concern | staging | prod |
+    env_indexes = None
+    header_line = None
+    for line in section.splitlines():
+        if not line.lstrip().startswith("|"):
             continue
-        for env, cell in zip(ENVS, cells[2:4]):
-            inventory[env].update(re.findall(r"`([^`]+)`", cell))
+        cells = [cell.strip().lower() for cell in line.split("|")]
+        aliases = [
+            {alias for alias, env in ENV_ALIASES.items() if env == target}
+            for target in ENVS
+        ]
+        indexes = {
+            env: [index for index, cell in enumerate(cells) if cell in aliases[pos]]
+            for pos, env in enumerate(ENVS)
+        }
+        if all(len(indexes[env]) == 1 for env in ENVS):
+            env_indexes = {env: indexes[env][0] for env in ENVS}
+            header_line = line
+            break
+    if env_indexes is None:
+        raise ParityError(f"{source}: Environments matrix lacks staging/prod columns")
+    for line in section.splitlines():
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = line.split("|")
+        if all(
+            not cell.strip() or re.fullmatch(r":?-{3,}:?", cell.strip())
+            for cell in cells
+        ):
+            continue
+        if len(cells) <= max(env_indexes.values()):
+            raise ParityError(f"{source}: malformed Environments matrix row")
+        if line == header_line:
+            continue
+        for env, index in env_indexes.items():
+            inventory[env].update(re.findall(r"`([^`]+)`", cells[index]))
     if not any(inventory.values()):
         raise ParityError(f"{source}: Environments matrix has no resources")
 
