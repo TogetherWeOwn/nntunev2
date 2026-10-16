@@ -199,3 +199,25 @@ describe('serializePublicKeyCredential', () => {
 		});
 	});
 });
+
+it('requires user verification for creation and request options', () => {
+	const registration = toRegistrationOptions('AQID', 'BAUG', 'example.com', 'ada@example.com');
+	expect(registration.authenticatorSelection?.userVerification).toBe('required');
+
+	const weakenedCreation = toCreationOptions({
+		...registration,
+		authenticatorSelection: {
+			...registration.authenticatorSelection,
+			userVerification: 'discouraged'
+		}
+	});
+	expect(weakenedCreation.authenticatorSelection?.userVerification).toBe('required');
+
+	expect(toRequestOptions({ challenge: 'AQID' }).userVerification).toBe('required');
+
+	const weakenedRequest = toRequestOptions({
+		challenge: 'AQID',
+		userVerification: 'discouraged'
+	});
+	expect(weakenedRequest.userVerification).toBe('required');
+});
