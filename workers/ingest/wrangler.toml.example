@@ -26,8 +26,7 @@ queue = "nntune-ingest-jobs"
 # retries to cover the ~60 s KV lag plus the edge-cached negative-lookup
 # window (consumer reads with cacheTtl 30).
 # max_retries = 4
-# [[queues.consumers.dead_letter_queue]]
-# queue = "nntune-ingest-dlq"
+# dead_letter_queue = "nntunev2-ingest-dlq-staging"
 
 # Workflows: NOT YET. workers-rs 0.3 has no Workflow client and this crate
 # exports no Workflow class, and `[[workflows]]` requires a `class_name`, so
@@ -53,6 +52,15 @@ id = "<KV_NAMESPACE_ID>"
 [[kv_namespaces]]
 binding = "INGEST_PAYLOADS"
 id = "<KV_NAMESPACE_ID_FOR_PAYLOADS>"
+
+# Segment probe (code: src/pool_probe.rs). Cross-script binding to the stream
+# Worker's per-user `NntpPool` Durable Object, addressed by
+# `id_from_name(user_id)`; the object has no public route. Deploy the stream
+# Worker (which declares the class) before this one.
+[[durable_objects.bindings]]
+name = "NNTP_POOL"
+class_name = "NntpPool"
+script_name = "nntune-stream"
 
 # Slice 2: usage metering (code: src/metering.rs).
 [[analytics_engine_datasets]]

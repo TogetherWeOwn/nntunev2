@@ -2,8 +2,7 @@ import { expect, test, type Page } from '@playwright/test';
 
 /**
  * Queue fixture: all stream responses are mocked, so play-through is
- * driven by transport buttons and synthetic `ended` events (the fake
- * bytes never decode to real audio). MediaSession action handlers are
+ * driven by transport buttons and synthetic `ended` events. MediaSession action handlers are
  * captured before page scripts run, then invoked exactly as the OS
  * would, proving the wiring instead of trusting it.
  */
@@ -11,7 +10,7 @@ async function openPlayer(page: Page): Promise<void> {
 	await page.route('**/api/demo/audio**', (route) =>
 		route.fulfill({
 			status: 200,
-			contentType: 'audio/mpeg',
+			contentType: 'audio/wav',
 			headers: { 'accept-ranges': 'bytes' },
 			body: Buffer.alloc(2048, 7)
 		})

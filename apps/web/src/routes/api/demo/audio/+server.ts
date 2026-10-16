@@ -3,9 +3,8 @@ import { audioCacheHeaders } from '#lib/player/cacheHeaders.js';
 import { syntheticBody } from '#lib/player/demoMedia.js';
 
 /**
- * Synthetic media for player smoke tests: deterministic pseudo-audio
- * with `Range`/`206` support. No provider, no R2, no auth. `?track=<id>`
- * selects a distinct body for queue tracks.
+ * Deterministic WAV media for player smoke tests. No provider, no R2, no auth.
+ * `?track=<id>` selects distinct samples; byte ranges preserve WAV playback.
  */
 
 type ParsedRange = { start: number; end: number } | { unsatisfiable: true };
@@ -36,7 +35,7 @@ export const GET: RequestHandler = ({ request, url }) => {
 	const body = syntheticBody(url.searchParams.get('track'));
 	const headers = new Headers({
 		...audioCacheHeaders(),
-		'content-type': 'audio/mpeg',
+		'content-type': 'audio/wav',
 		'accept-ranges': 'bytes',
 		'content-length': String(body.length)
 	});
