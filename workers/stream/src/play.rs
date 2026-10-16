@@ -83,7 +83,8 @@ impl PlayError {
     /// every message here is static per code.
     pub fn api_error(&self) -> ApiError {
         match self {
-            PlayError::Unauthorized(_) | PlayError::ProviderAuthExpired => ApiError::unauthorized(),
+            PlayError::Unauthorized(_) => ApiError::unauthorized(),
+            PlayError::ProviderAuthExpired => ApiError::provider_auth_expired(),
             PlayError::WrongTrack => ApiError::forbidden(),
             PlayError::RangeUnsatisfiable => ApiError::range_not_satisfiable(),
             PlayError::PoolExhausted => ApiError::rate_limited(),
@@ -1020,7 +1021,12 @@ mod tests {
                 401,
                 false,
             ),
-            (PlayError::ProviderAuthExpired, "unauthorized", 401, false),
+            (
+                PlayError::ProviderAuthExpired,
+                "provider_auth_expired",
+                401,
+                false,
+            ),
             (PlayError::WrongTrack, "forbidden", 403, false),
             (
                 PlayError::RangeUnsatisfiable,
@@ -1070,6 +1076,10 @@ mod tests {
             assert!(!api.body_json().contains("seg@news"), "{err:?}");
             assert!(!api.body_json().contains("provider detail"), "{err:?}");
         }
+        assert_eq!(
+            PlayError::ProviderAuthExpired.api_error().body_json(),
+            r#"{"code":"provider_auth_expired","message":"provider credentials expired","retryable":false}"#
+        );
         assert_eq!(
             PlayError::WrongTrack.api_error().body_json(),
             r#"{"code":"forbidden","message":"not the owner","retryable":false}"#

@@ -45,12 +45,11 @@ with HTTP status 500. The worker implementations seal 5xx messages to fixed publ
 (pre-taxonomy) derive their code from unambiguous HTTP statuses (400, 401,
 402, 403, 404, 413, 416, 422, 429, 503); all other statuses use
 `request_failed`. The web client continues to support these legacy bodies
-during migration, with two explicit re-auth exceptions: `provider_auth_expired`
-and `indexer_auth_expired` may appear in a legacy `error` field (or a `code`
-field from the provider re-auth route). The web client preserves these signals
-to show the provider re-auth UI; they are not members of this shared registry.
-Do not emit them as structured-envelope codes without first adding registry
-rows and worker mappings.
+during migration. `provider_auth_expired` is also a registered structured code
+so the stream worker can preserve its inline credential-refresh signal in the
+shared `{code, message, retryable}` envelope. The separate
+`indexer_auth_expired` legacy signal remains outside this registry and is
+preserved for the indexer re-key flow.
 
 ## Registry
 
@@ -60,6 +59,7 @@ emit the code.
 | code | HTTP status | retryable | owning worker | meaning |
 | --- | --- | --- | --- | --- |
 | `unauthorized` | 401 | false | api, stream | Missing, invalid, or expired credentials/session/grant. Deliberately generic: never says which check failed. |
+| `provider_auth_expired` | 401 | false | api, stream | Provider credentials expired; prompts inline credential refresh rather than signing the user out. |
 | `plan_limit_exceeded` | 402 | false | api, ingest, stream | The plan quota (streams, library, ingest jobs) is exhausted; upgrade or wait for the period reset. Defined ahead of server-side enforcement so clients can build the upgrade path now. |
 | `forbidden` | 403 | false | api, stream | Authenticated, but the resource belongs to someone else (or the grant names a different track). |
 | `not_found` | 404 | false | api, ingest, mb, stream | No such (visible) resource. Invisible private rows are 404, never 403. |

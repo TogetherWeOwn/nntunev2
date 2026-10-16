@@ -28,6 +28,11 @@ pub const REGISTRY: &[CodeSpec] = &[
         retryable: false,
     },
     CodeSpec {
+        code: "provider_auth_expired",
+        status: 401,
+        retryable: false,
+    },
+    CodeSpec {
         code: "plan_limit_exceeded",
         status: 402,
         retryable: false,
@@ -121,6 +126,9 @@ impl ApiError {
 
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self::by_code("unauthorized", message)
+    }
+    pub fn provider_auth_expired(message: impl Into<String>) -> Self {
+        Self::by_code("provider_auth_expired", message)
     }
     pub fn plan_limit_exceeded(message: impl Into<String>) -> Self {
         Self::by_code("plan_limit_exceeded", message)
@@ -286,6 +294,16 @@ mod tests {
         );
         let unavailable = ApiError::service_unavailable("binding token");
         assert_eq!(unavailable.message, "service unavailable");
+    }
+
+    #[test]
+    fn provider_auth_expired_uses_its_registered_reauth_code() {
+        let err = ApiError::provider_auth_expired("provider credentials expired");
+        assert_eq!(
+            (err.code, err.status, err.retryable),
+            ("provider_auth_expired", 401, false)
+        );
+        assert_eq!(err.message, "provider credentials expired");
     }
 
     #[test]

@@ -22,6 +22,11 @@ pub const REGISTRY: &[CodeSpec] = &[
         retryable: false,
     },
     CodeSpec {
+        code: "provider_auth_expired",
+        status: 401,
+        retryable: false,
+    },
+    CodeSpec {
         code: "plan_limit_exceeded",
         status: 402,
         retryable: false,
@@ -125,6 +130,9 @@ impl ApiError {
     pub fn unauthorized() -> Self {
         Self::by_code("unauthorized", "authentication required")
     }
+    pub fn provider_auth_expired() -> Self {
+        Self::by_code("provider_auth_expired", "provider credentials expired")
+    }
     pub fn plan_limit_exceeded() -> Self {
         Self::by_code("plan_limit_exceeded", "plan limit reached")
     }
@@ -205,6 +213,19 @@ mod tests {
         );
         let rate = ApiError::rate_limited();
         assert_eq!((rate.status, rate.retryable), (429, true));
+    }
+
+    #[test]
+    fn provider_auth_expired_has_a_distinct_401_envelope() {
+        let err = ApiError::provider_auth_expired();
+        assert_eq!(
+            (err.code, err.status, err.retryable),
+            ("provider_auth_expired", 401, false)
+        );
+        assert_eq!(
+            err.body_json(),
+            r#"{"code":"provider_auth_expired","message":"provider credentials expired","retryable":false}"#
+        );
     }
 
     #[test]
