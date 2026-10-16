@@ -1907,9 +1907,7 @@ mod tests {
                 .challenges
                 .borrow()
                 .values()
-                .filter(|row| {
-                    row.purpose == PURPOSE_REGISTER && row.challenge.expires_at > now
-                })
+                .filter(|row| row.purpose == PURPOSE_REGISTER && row.challenge.expires_at > now)
                 .filter_map(|row| row.user_id.clone())
                 .collect();
             self.users.borrow_mut().retain(|_, user| {
@@ -3605,11 +3603,10 @@ mod tests {
         // Finish consumes the challenge before credential insertion; cleanup
         // must still protect the user during that in-flight interval.
         finishing_challenge.consumed = true;
-        block_on(h.store.insert_challenge(
-            &finishing_challenge,
-            Some("active"),
-            PURPOSE_REGISTER,
-        ))
+        block_on(
+            h.store
+                .insert_challenge(&finishing_challenge, Some("active"), PURPOSE_REGISTER),
+        )
         .unwrap();
 
         let resp = h.call(
