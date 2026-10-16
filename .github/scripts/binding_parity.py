@@ -125,7 +125,7 @@ _KNOWN_TABLES = frozenset(
 
 # Wrangler binding tables whose binding name is spelled ``name`` rather than
 # ``binding``. Keep this list explicit: arbitrary config tables also use name.
-_NAME_KEYED_BINDING_TABLES = frozenset({"send_email", "unsafe.bindings"})
+_NAME_KEYED_BINDING_TABLES = frozenset({"send_email", "unsafe.bindings", "ratelimits"})
 
 
 def extract_bindings(data):
@@ -201,7 +201,7 @@ def extract_bindings(data):
             binding_key = "binding" if "binding" in item else "name" if name_keyed else None
             if binding_key is None:
                 continue
-            binding = item[binding_key]
+            binding = item.get(binding_key)
             if not isinstance(binding, str) or not binding:
                 raise ParityError(
                     f"{key}: {binding_key!r} must be a non-empty string (unknown:{key})"

@@ -591,22 +591,33 @@ reason = "fixture: value fix owned elsewhere"
         configs = {
             "send_email": (
                 '\n[[env.staging.send_email]]\nname = "EMAIL"\n'
-                'allowed_sender_addresses = ["noreply@example.com"]\n'
+                'allowed_sender_addresses = ["noreply@example.com"]\n',
+                "EMAIL",
             ),
             "unsafe.bindings": (
                 '\n[[env.staging.unsafe.bindings]]\nname = "LEGACY"\n'
-                'type = "text_blob"\n'
+                'type = "text_blob"\n',
+                "LEGACY",
+            ),
+            "ratelimits": (
+                '\n[[env.staging.ratelimits]]\nname = "RL"\n'
+                'namespace_id = "1234"\n',
+                "RL",
             ),
         }
-        for table, addition in configs.items():
+        for table, (addition, binding) in configs.items():
             with self.subTest(table=table), tempfile.TemporaryDirectory() as tmp:
                 drifts, _, _ = run_check(
                     make_repo(tmp, wrangler=MATCHING_WRANGLER + addition)
                 )
                 joined = "\n".join(drifts)
-                self.assertIn("binding=" + ("EMAIL" if table == "send_email" else "LEGACY"), joined)
+                self.assertIn("binding=" + binding, joined)
                 self.assertIn("unknown:" + table, joined)
                 self.assertIn("staging/prod skew", joined)
+
+    def test_name_keyed_unknown_binding_without_name_fails_with_exit_two(self):
+        wrangler = MATCHING_WRANGLER + "\n[[env.staging.send_email]]\n"
+        self.assert_wrangler_fails_closed_with_exit_two(wrangler)
 
     def test_manifest_key_typo_fails_closed(self):
         manifest = MANIFEST.replace('staging = "fx-audio-staging"',
