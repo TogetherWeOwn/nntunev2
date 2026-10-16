@@ -1,13 +1,18 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { onPaywall, type PaywallModel } from '#lib/billing/planLimit.js';
 import { load } from './+page';
 import type { PageData } from './$types';
 
-function mockFetch(routes: Record<string, { status: number; body: unknown }>): typeof fetch {
+afterEach(() => vi.unstubAllGlobals());
+
+function mockFetch(
+	routes: Record<string, { status: number; body: unknown; headers?: HeadersInit }>
+): typeof fetch {
 	return (async (input: unknown) => {
 		const url = typeof input === 'string' ? input : (input as URL).toString();
 		const route = routes[url];
 		if (!route) return new Response('not found', { status: 404 });
-		return new Response(JSON.stringify(route.body), { status: route.status });
+		return new Response(JSON.stringify(route.body), { status: route.status, headers: route.headers });
 	}) as typeof fetch;
 }
 
@@ -27,6 +32,75 @@ async function loadPage(fetchFn: typeof fetch) {
 }
 
 describe('billing loader with an unconfirmed plan', () => {
+	it.each([402, 429])('delivers a cold-load %s limit to the late layout subscriber', async (status) => {
+		vi.stubGlobal('window', {});
+		const fetchFn = mockFetch({
+			'/v1/me/subscription': { status, body: { code: 'plan_limit_exceeded' } },
+			'/v1/me/usage': { status: 200, body: USAGE_HEAVY }
+		});
+
+		const data = await loadPage(fetchFn);
+		const seen: PaywallModel[] = [];
+		const unsubscribe = onPaywall((model) => seen.push(model));
+
+		expect(data.hadFetchError).toBe(status === 429);
+		expect(data.loadError).toBeNull();
+		expect(data.planUnknown).toBe(true);
+		expect(seen).toHaveLength(1);
+		expect(seen[0]?.status).toBe(status);
+		expect(seen[0]?.ctaHref).toBe('/pricing');
+		unsubscribe();
+	});
+
+	it.each([402, 429])('delivers a usage-endpoint %s limit to the late layout subscriber', async (status) => {
+		vi.stubGlobal('window', {});
+		const fetchFn = mockFetch({
+			'/v1/me/subscription': {
+				status: 200,
+				body: { planId: 'plus', status: 'active', currentPeriodEnd: null, trialEndsAt: null }
+			},
+			'/v1/me/usage': {
+				status,
+				body: { code: 'plan_limit_exceeded' },
+				headers: status === 429 ? { 'Retry-After': '45' } : undefined
+			}
+		});
+
+		const data = await loadPage(fetchFn);
+		const seen: PaywallModel[] = [];
+		const unsubscribe = onPaywall((model) => seen.push(model));
+
+		expect(data.hadFetchError).toBe(status === 429);
+		expect(data.loadError).toBeNull();
+		expect(seen).toHaveLength(1);
+		expect(seen[0]?.status).toBe(status);
+		expect(seen[0]?.ctaHref).toBe('/pricing');
+		if (status === 429) expect(seen[0]?.retryAfterSeconds).toBe(45);
+		unsubscribe();
+	});
+
+	it('replays only the latest limit when both requests fail before layout subscription', async () => {
+		vi.stubGlobal('window', {});
+		const fetchFn = mockFetch({
+			'/v1/me/subscription': { status: 402, body: { code: 'subscription_limit' } },
+			'/v1/me/usage': {
+				status: 429,
+				body: { code: 'rate_limited' },
+				headers: { 'Retry-After': '45' }
+			}
+		});
+
+		await loadPage(fetchFn);
+		const seen: PaywallModel[] = [];
+		const unsubscribe = onPaywall((model) => seen.push(model));
+
+		expect(seen).toHaveLength(1);
+		expect(seen[0]?.status).toBe(429);
+		expect(seen[0]?.code).toBe('rate_limited');
+		expect(seen[0]?.retryAfterSeconds).toBe(45);
+		unsubscribe();
+	});
+
 	it('scores no usage and offers no upgrade when only the subscription call fails', async () => {
 		const fetchFn = mockFetch({
 			'/v1/me/subscription': { status: 500, body: { error: 'boom' } },
