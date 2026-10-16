@@ -669,6 +669,10 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::thread::{self, JoinHandle};
 
+    /// Grant expiry for these fixtures: `test_input` verifies at `now_unix`
+    /// = 1, so a 900 s lifetime stays inside the 15-minute grant TTL cap.
+    const GRANT_EXP_UNIX: u64 = 901;
+
     fn serve_article(
         listener: TcpListener,
         article: Vec<u8>,
@@ -834,7 +838,7 @@ mod tests {
         let (plain, article) = test_article();
         let server = serve_article(listener, article, true);
         let segment = vec!["track-seg@synthetic.test".to_string()];
-        let token = grant::issue("u", "track-a", 9_999_999_999, b"s");
+        let token = grant::issue("u", "track-a", GRANT_EXP_UNIX, b"s");
         let mut pool = Pool::new(2);
         let mut cache = ContentCache::new();
         let mut meter = crate::meter::MemoryMeter::default();
@@ -851,7 +855,7 @@ mod tests {
             .finalize(&mut pool, &mut cache, &mut meter)
             .expect("first finalize");
 
-        let token = grant::issue("u", "track-b", 9_999_999_999, b"s");
+        let token = grant::issue("u", "track-b", GRANT_EXP_UNIX, b"s");
         let input = test_input(&token, "track-b", address, &segment);
         assert!(matches!(
             play(&mut pool, &mut cache, &mut meter, b"s", &input),
@@ -879,7 +883,7 @@ mod tests {
         let (plain, article) = test_article();
         let server = serve_article(listener, article, false);
         let segment = vec!["track-seg@synthetic.test".to_string()];
-        let token = grant::issue("u", "track-a", 9_999_999_999, b"s");
+        let token = grant::issue("u", "track-a", GRANT_EXP_UNIX, b"s");
         let mut pool = Pool::new(2);
         let mut cache = ContentCache::new();
         let mut meter = crate::meter::MemoryMeter::default();
@@ -891,7 +895,7 @@ mod tests {
         assert_eq!(body, plain);
         server.join().expect("server thread");
 
-        let token = grant::issue("u", "track-b", 9_999_999_999, b"s");
+        let token = grant::issue("u", "track-b", GRANT_EXP_UNIX, b"s");
         let dead = closed_address();
         let other_segment = vec!["other-seg@synthetic.test".to_string()];
         let input = test_input(&token, "track-b", dead, &other_segment);
@@ -925,7 +929,7 @@ mod tests {
             "track-seg0@synthetic.test".to_string(),
             "track-seg1@synthetic.test".to_string(),
         ];
-        let token = grant::issue("u", "track-a", 9_999_999_999, b"s");
+        let token = grant::issue("u", "track-a", GRANT_EXP_UNIX, b"s");
         let mut pool = Pool::new(2);
         let mut cache = ContentCache::new();
         let mut meter = crate::meter::MemoryMeter::default();
@@ -933,7 +937,7 @@ mod tests {
         let input = test_input(&token, "track-a", address, &segments);
         let response = play(&mut pool, &mut cache, &mut meter, b"s", &input).expect("play");
         let mut stream = response.stream;
-        let token = grant::issue("u", "track-b", 9_999_999_999, b"s");
+        let token = grant::issue("u", "track-b", GRANT_EXP_UNIX, b"s");
         let dead = closed_address();
         let other_segment = vec!["other-seg@synthetic.test".to_string()];
         let input = test_input(&token, "track-b", dead, &other_segment);
@@ -964,7 +968,7 @@ mod tests {
             "track-seg0@synthetic.test".to_string(),
             "track-seg1@synthetic.test".to_string(),
         ];
-        let token = grant::issue("u", "track-a", 9_999_999_999, b"s");
+        let token = grant::issue("u", "track-a", GRANT_EXP_UNIX, b"s");
         let mut pool = Pool::new(2);
         let mut cache = ContentCache::new();
         let mut meter = crate::meter::MemoryMeter::default();
@@ -972,7 +976,7 @@ mod tests {
         let input = test_input(&token, "track-a", address, &segments);
         let response = play(&mut pool, &mut cache, &mut meter, b"s", &input).expect("play");
         let mut stream = response.stream;
-        let token = grant::issue("u", "track-b", 9_999_999_999, b"s");
+        let token = grant::issue("u", "track-b", GRANT_EXP_UNIX, b"s");
         let dead = closed_address();
         let other_segment = vec!["other-seg@synthetic.test".to_string()];
         let input = test_input(&token, "track-b", dead, &other_segment);
@@ -1009,7 +1013,7 @@ mod tests {
             "track-seg0@synthetic.test".to_string(),
             "track-seg1@synthetic.test".to_string(),
         ];
-        let token = grant::issue("u", "track-a", 9_999_999_999, b"s");
+        let token = grant::issue("u", "track-a", GRANT_EXP_UNIX, b"s");
         let mut pool = Pool::new(2);
         let mut cache = ContentCache::new();
         let mut meter = crate::meter::MemoryMeter::default();
@@ -1017,7 +1021,7 @@ mod tests {
         let input = test_input(&token, "track-a", address, &segments);
         let response = play(&mut pool, &mut cache, &mut meter, b"s", &input).expect("play");
         let mut stream = response.stream;
-        let token = grant::issue("u", "track-b", 9_999_999_999, b"s");
+        let token = grant::issue("u", "track-b", GRANT_EXP_UNIX, b"s");
         let dead = closed_address();
         let other_segment = vec!["other-seg@synthetic.test".to_string()];
         let input = test_input(&token, "track-b", dead, &other_segment);
@@ -1032,7 +1036,7 @@ mod tests {
         server.join().expect("server thread");
 
         pool.advance(1_000);
-        let token = grant::issue("u", "track-c", 9_999_999_999, b"s");
+        let token = grant::issue("u", "track-c", GRANT_EXP_UNIX, b"s");
         let input = test_input(&token, "track-c", closed_address(), &other_segment);
         assert!(matches!(
             play(&mut pool, &mut cache, &mut meter, b"s", &input),
