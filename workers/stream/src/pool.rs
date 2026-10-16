@@ -20,6 +20,7 @@
 //! stream's connection is discarded, because its read position is unknown
 //! and re-parking it could attribute one article's bytes to another play.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Priority lane. Ordering is priority order: `Playback < Prefetch < Ingest`.
@@ -130,6 +131,8 @@ pub struct Pool<C> {
     reuses: u64,
     next_id: u64,
     consecutive_errors: u32,
+    /// Shared with active streams so a deferred success cannot clear a later error.
+    provider_error_epoch: Arc<AtomicU64>,
     quarantined_until_ms: Option<u64>,
     now_ms: u64,
 }
@@ -145,6 +148,7 @@ impl<C> Pool<C> {
             reuses: 0,
             next_id: 0,
             consecutive_errors: 0,
+            provider_error_epoch: Arc::new(AtomicU64::new(0)),
             quarantined_until_ms: None,
             now_ms: 0,
         }
@@ -260,6 +264,19 @@ impl<C> Pool<C> {
     /// A provider call failed: count it and (re)start quarantine backoff.
     /// Returns the backoff (ms) just applied, for metering.
     pub fn record_provider_error(&mut self) -> u64 {
+        let mut epoch = self.provider_error_epoch.load(Ordering::Relaxed);
+        loop {
+            let next = epoch.saturating_add(1);
+            match self.provider_error_epoch.compare_exchange_weak(
+                epoch,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => epoch = current,
+            }
+        }
         self.consecutive_errors = self.consecutive_errors.saturating_add(1);
         let backoff = backoff_ms(self.consecutive_errors);
         self.quarantined_until_ms = Some(self.now_ms.saturating_add(backoff));
@@ -275,6 +292,14 @@ impl<C> Pool<C> {
         self.consecutive_errors = 0;
         self.quarantined_until_ms = None;
         cleared
+    }
+
+    pub(crate) fn provider_error_epoch_source(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.provider_error_epoch)
+    }
+
+    pub(crate) fn provider_error_epoch(&self) -> u64 {
+        self.provider_error_epoch.load(Ordering::Acquire)
     }
 
     /// Advance the virtual clock (test seam; the DO uses wall-clock time).
