@@ -17,7 +17,13 @@ An authorized executor must satisfy the applicable approval/retention gates firs
 - Workers Paid + R2 Paid entitlements: confirmed by the host executor on
   2026-10-13; not independently billing-verified by the operator MCP token.
 
-### R2 buckets (created 2026-10-13)
+### R2 buckets (core buckets created 2026-10-13; scratch details unverified)
+
+The scratch-bucket names, seven-day lifecycle rule, provisioning status, and
+creation date are unverified by this documentation update; the repository has
+no independent provisioning receipt for them. Treat these details as reported
+inventory, not GET-verified Cloudflare state, until an authorized executor
+checks the bucket and lifecycle metadata.
 
 The provisioned layout is **one bucket per concern per environment**, not one
 shared bucket. Object key prefixes describe cache scope *within* those buckets;
@@ -31,15 +37,16 @@ integration prerequisites on sibling branches are:
 | [#2](https://github.com/TogetherWeOwn/nntunev2/pull/2), cache ADR | Physical audio/art buckets are separate per environment; prefixes live inside them. |
 | [#14](https://github.com/TogetherWeOwn/nntunev2/pull/14), scaffold | Replace placeholders only when activating the correct consumer bindings. |
 | [#8](https://github.com/TogetherWeOwn/nntunev2/pull/8), stream | `workers/stream/wrangler.toml` uses `nntune-audio-cache` without environment sections; bind `AUDIO_CACHE` to `nntunev2-audio-staging` / `nntunev2-audio-prod`. |
-| [#10](https://github.com/TogetherWeOwn/nntunev2/pull/10), ingest | Both producer and consumer in `workers/ingest/wrangler.toml.example` use `nntune-ingest-jobs`; use `nntunev2-ingest-staging` / `nntunev2-ingest-prod`. |
+| [#10](https://github.com/TogetherWeOwn/nntunev2/pull/10), ingest | Producer and consumer use `nntune-ingest-jobs`, and the commented DLQ example uses `nntune-ingest-dlq`; use the per-environment queue names below. Do not uncomment the example with its shared unsuffixed DLQ name. |
 | [#11](https://github.com/TogetherWeOwn/nntunev2/pull/11), E2E | Supply the two pending Access client secrets before enabling the staging URL; see the Access section. |
 
 Their owners must coordinate these fixes at the next permitted review round and
 recheck actual bindings before deployment. This runbook does not change those
-branches or certify a deploy. Scratch storage is now provisioned separately
-from archive buckets. The ingest scratch buckets are isolated by environment
-and expire objects under `ingest-scratch/` after seven days; do not use archive
-buckets as scratch storage.
+branches or certify a deploy. Scratch storage is intended to be separate from archive buckets. The reported
+ingest scratch buckets are isolated by environment and are intended to expire
+objects under `ingest-scratch/` after seven days; do not use archive buckets as
+scratch storage. Provisioning and lifecycle settings are unverified as noted
+above.
 
 | Bucket | Env | Intended consumer |
 |---|---|---|
@@ -49,8 +56,8 @@ buckets as scratch storage.
 | `nntunev2-art-prod` | prod | MusicBrainz Worker artwork cache |
 | `nntunev2-archive-staging` | staging | reserved archive capacity; no Worker consumer configured |
 | `nntunev2-archive-prod` | prod | reserved archive capacity; no Worker consumer configured |
-| `nntunev2-ingest-scratch-staging` | staging | ingest repair scratch data; `ingest-scratch/` objects expire after 7 days |
-| `nntunev2-ingest-scratch-prod` | prod | ingest repair scratch data; `ingest-scratch/` objects expire after 7 days |
+| `nntunev2-ingest-scratch-staging` | staging | reported ingest repair scratch; `ingest-scratch/` 7-day expiry intended, unverified |
+| `nntunev2-ingest-scratch-prod` | prod | reported ingest repair scratch; `ingest-scratch/` 7-day expiry intended, unverified |
 
 The archive buckets were requested at provisioning time. They are not evidence
 of an implemented archival pipeline and must not be bound to a Worker by default.
@@ -62,7 +69,11 @@ UNDO (decommissioning reference, not an instruction to execute):
 consumer removal and data-retention checks. Never delete cached/archive data as
 part of a documentation fix.
 
-### Queues (created 2026-10-13)
+### Queues (baseline ingest queues created 2026-10-13; DLQ details unverified)
+
+The DLQ queue names and IDs below are reported inventory; their creation date and
+live existence are unverified by this documentation update. Confirm the names
+and IDs against Cloudflare before configuring dead-letter routing.
 
 | Queue | ID | Env |
 |---|---|---|
@@ -71,8 +82,9 @@ part of a documentation fix.
 | `nntunev2-ingest-dlq-staging` | `e7ab1d4b284f44f094c5fe62f9bf96a5` | staging DLQ |
 | `nntunev2-ingest-dlq-prod` | `e9d0a9f5549249df9eebaa5c00951328` | prod DLQ |
 
-The DLQ queues are provisioned but are not connected to a consumer. Configure
-the consumer's dead-letter handling only when the ingest consumer is enabled.
+The reported inventory lists these DLQ queues as provisioned and not connected
+to a consumer; live existence is unverified as noted above. Configure the
+consumer's dead-letter handling only when the ingest consumer is enabled.
 Cloudflare deletes messages delivered to a DLQ without an active consumer after
 four days ([DLQ documentation](https://developers.cloudflare.com/queues/configuration/dead-letter-queues/)).
 Enable dead-letter routing only with a plan to process each DLQ.
@@ -271,9 +283,9 @@ Binding names are chosen in Worker configs; resource names must match this table
 | R2 audio / stream Worker | `nntunev2-audio-staging` | `nntunev2-audio-prod` |
 | R2 artwork / MB Worker | `nntunev2-art-staging` | `nntunev2-art-prod` |
 | R2 archive / reserved, no consumer | `nntunev2-archive-staging` | `nntunev2-archive-prod` |
-| Ingest scratch | `nntunev2-ingest-scratch-staging` (`ingest-scratch/`, 7 days) | `nntunev2-ingest-scratch-prod` (`ingest-scratch/`, 7 days) |
+| Ingest scratch (reported; names and 7-day lifecycle unverified) | `nntunev2-ingest-scratch-staging` (`ingest-scratch/`; intended 7 days) | `nntunev2-ingest-scratch-prod` (`ingest-scratch/`; intended 7 days) |
 | Ingest Queue | `nntunev2-ingest-staging` | `nntunev2-ingest-prod` |
-| Ingest DLQ / no active consumer | `nntunev2-ingest-dlq-staging` (4-day expiry) | `nntunev2-ingest-dlq-prod` (4-day expiry) |
+| Ingest DLQ / no active consumer (reported names/IDs; live existence unverified) | `nntunev2-ingest-dlq-staging` (4-day expiry if active) | `nntunev2-ingest-dlq-prod` (4-day expiry if active) |
 | Config KV | `nntunev2-config-staging` | `nntunev2-config-prod` |
 | Hostname | `v2-staging.nntune.com` (+ Access; deployment pending) | TBD at launch |
 | App Hyperdrive variable | `HYPERDRIVE_ID_STAGING` | `HYPERDRIVE_ID_PROD` |
@@ -304,8 +316,11 @@ this table.
 Known config drift (tracked in the R2 reconciliation table, fixed by the
 owning lanes, not here): the committed `workers/stream/wrangler.toml` still
 binds `AUDIO_CACHE` to `nntune-audio-cache` with no environment sections,
-and `workers/ingest/wrangler.toml.example` still names the queue
-`nntune-ingest-jobs`.
+and `workers/ingest/wrangler.toml.example` still names `nntune-ingest-jobs`
+for the producer/consumer and `nntune-ingest-dlq` for the commented DLQ
+example. Align each with the per-environment names above before enabling it;
+otherwise the DLQ example can create or share an unsuffixed queue across
+staging and prod.
 
 ## Staging promotion checklist
 
