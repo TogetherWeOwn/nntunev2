@@ -789,6 +789,72 @@ mod tests {
         );
     }
 
+    fn unwrap_dek(kek: &[u8; 32], user_id: &str, blob: &VaultBlob) -> Vec<u8> {
+        let cipher = Aes256Gcm::new_from_slice(kek).expect("kek cipher");
+        let wrap_nonce = crate::b64::decode(&blob.dek_wrapped_nonce_b64url).expect("wrap nonce");
+        let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url).expect("wrapped dek");
+        cipher
+            .decrypt(
+                Nonce::from_slice(&wrap_nonce),
+                Payload {
+                    msg: &wrapped,
+                    aad: dek_aad(user_id, blob.kek_version).as_bytes(),
+                },
+            )
+            .expect("unwrap dek")
+    }
+
+    #[test]
+    fn encrypt_vault_randomness_differs_per_call() {
+        // Pin the secure-randomness fills: a dropped fill would leave a
+        // zero DEK and constant AES-GCM nonces (catastrophic nonce reuse)
+        // while round-trip tests stayed green.
+        let kek = [0x11u8; 32];
+        let a = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+        let b = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+        assert_ne!(
+            a.dek_wrapped_nonce_b64url, b.dek_wrapped_nonce_b64url,
+            "wrap nonce must be fresh per call"
+        );
+        assert_ne!(
+            a.payload_nonce_b64url, b.payload_nonce_b64url,
+            "payload nonce must be fresh per call"
+        );
+        assert_ne!(
+            a.dek_wrapped_b64url, b.dek_wrapped_b64url,
+            "wrapped DEK must differ per call"
+        );
+        let zero_nonce = crate::b64::encode(&[0u8; 12]);
+        for blob in [&a, &b] {
+            assert_ne!(blob.dek_wrapped_nonce_b64url, zero_nonce);
+            assert_ne!(blob.payload_nonce_b64url, zero_nonce);
+        }
+        // The wrapped DEKs differing could come from the wrap nonce alone;
+        // unwrap both so a zero-filled DEK itself is pinned too.
+        let dek_a = unwrap_dek(&kek, "user-1", &a);
+        let dek_b = unwrap_dek(&kek, "user-1", &b);
+        assert_ne!(dek_a, [0u8; 32], "DEK must not be the zero buffer");
+        assert_ne!(dek_b, [0u8; 32], "DEK must not be the zero buffer");
+        assert_ne!(dek_a, dek_b, "DEK must be fresh per call");
+    }
+
+    #[test]
+    fn rewrap_dek_uses_fresh_wrap_nonce() {
+        let old_kek = [0x11u8; 32];
+        let new_kek = [0x33u8; 32];
+        let blob = encrypt_vault(&old_kek, 1, "user-1", b"secret").expect("encrypt");
+        let rotated = rewrap_dek(&old_kek, &new_kek, 2, "user-1", &blob).expect("rewrap");
+        assert_ne!(
+            rotated.dek_wrapped_nonce_b64url, blob.dek_wrapped_nonce_b64url,
+            "re-wrap must use a fresh nonce, never reuse the old one"
+        );
+        assert_ne!(
+            rotated.dek_wrapped_nonce_b64url,
+            crate::b64::encode(&[0u8; 12])
+        );
+        assert_ne!(rotated.dek_wrapped_b64url, blob.dek_wrapped_b64url);
+    }
+
     #[test]
     fn http_indexer_url_rejected_for_public_host() {
         // F-TRANS-01 Gap 1: `http://` would send the API key in cleartext.

@@ -91,11 +91,18 @@ export function validateProviderConfig(form: ProviderForm): string[] {
 			'Disabling TLS sends your password in cleartext. Tick the acknowledgement to continue without TLS.'
 		);
 	}
-	if (form.username.trim().length === 0) {
+	// Rust String.len() counts UTF-8 bytes, not JavaScript UTF-16 code units.
+	const encoder = new TextEncoder();
+	const username = form.username.trim();
+	if (username.length === 0) {
 		errors.push('Enter your provider username.');
+	} else if (encoder.encode(username).byteLength > 255) {
+		errors.push('Provider username must be at most 255 UTF-8 bytes.');
 	}
 	if (form.password.length === 0) {
 		errors.push('Enter your provider password.');
+	} else if (encoder.encode(form.password).byteLength > 1024) {
+		errors.push('Provider password must be at most 1024 UTF-8 bytes.');
 	}
 	if (
 		!Number.isInteger(form.maxConnections) ||
@@ -135,6 +142,10 @@ export function validateIndexerUrl(url: string, apiKey: string): string | null {
 	) {
 		return 'That indexer address is not allowed; use a public host.';
 	}
-	if (apiKey.trim().length === 0) return 'Enter your indexer API key.';
+	const key = apiKey.trim();
+	if (key.length === 0) return 'Enter your indexer API key.';
+	if (new TextEncoder().encode(key).byteLength > 1024) {
+		return 'Indexer API key must be at most 1024 UTF-8 bytes.';
+	}
 	return null;
 }
