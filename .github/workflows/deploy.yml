@@ -18,6 +18,9 @@ name: deploy
 #   workers/api/check_hyperdrive_cache.sh --config-id $HYPERDRIVE_ID_STAGING
 #   (and prod) with CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID set and fail
 #   the deploy on non-zero exit (auth reads require a cache-disabled config).
+#   Real deploys MUST NOT pass --allow-skip (CI-only); the Worker also
+#   refuses to serve traffic without HYPERDRIVE_CACHING_DISABLED=1, set only
+#   after the gate passes for that env's Hyperdrive config.
 # - Public-repo note: fork PRs get no secrets, so preview skips there too.
 
 on:

@@ -120,7 +120,11 @@ config from secrets) is a follow-up slice.
   `./check_hyperdrive_cache.sh --config-id <id>` asserts
   `caching.disabled == true` (see `wrangler.toml.example`). The gate
   fails closed without Cloudflare credentials (exit 3); `--allow-skip`
-  is only for secret-less CI.
+  is only for secret-less CI and MUST NOT be used in real deploys.
+  Runtime attestation: the Worker refuses to serve traffic (generic 500,
+  same as any misconfiguration) unless `HYPERDRIVE_CACHING_DISABLED=1`
+  is set for that env — set it only after the gate passes for that
+  Hyperdrive config.
 - **Magic links:** 256-bit random tokens, SHA-256 hash at rest, 15-minute
   expiry. HTTP callers must use `consume_magic_link_atomically`, not the
   pure record-preparation helper. Magic links, passkey challenges and
@@ -132,9 +136,13 @@ config from secrets) is a follow-up slice.
 - **Abuse budgets:** passkey starts, magic-link issuance and test-connection
   attempts reserve fixed slot rows through an atomic `INSERT .. ON CONFLICT`
   before side effects; magic-link and registration inbox-proof sends share
-  one per-email window. Unknown login emails use a keyed stand-in scope,
-  expired challenges are pruned, and login options omit `allow_credentials`
-  to avoid leaking variable-length credential IDs.
+  one per-email window. Passkey finishes reserve 10 attempts per challenge
+  (and magic finishes 10 per client IP, after the exact-Origin pin) per
+  5-minute window BEFORE any DB read or ECDSA verification, so forged
+  assertions cannot burn unlimited CPU on one challenge; legitimate single
+  attempts and typo retries are unaffected. Unknown login emails use a
+  keyed stand-in scope, expired challenges are pruned, and login options
+  omit `allow_credentials` to avoid leaking variable-length credential IDs.
 - **Passkeys:** RP ID equals the exact origin host (cross-subdomain RP
   suffixes are intentionally unsupported). Configuration must be a canonical
   serialized origin: https, or http with the host exactly `localhost`,

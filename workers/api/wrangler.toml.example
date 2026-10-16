@@ -29,9 +29,13 @@ SESSION_TTL_SECS = "86400"
 #   wrangler hyperdrive update <id> --caching-disabled
 # Deploy gate: ./check_hyperdrive_cache.sh --config-id <id> (asserts
 # caching.disabled == true). The gate fails closed without Cloudflare
-# credentials (exit 3); --allow-skip is only for secret-less CI.
+# credentials (exit 3); --allow-skip is only for secret-less CI and MUST
+# NOT be used in real deploys. Runtime attestation: the Worker refuses to
+# serve traffic unless HYPERDRIVE_CACHING_DISABLED=1 is set for that env —
+# set it only after the gate passes for that Hyperdrive config id.
 # If cached reads are wanted elsewhere, bind a
 # second cache-disabled config for auth reads.
+HYPERDRIVE_CACHING_DISABLED = "1"
 # [[hyperdrive]]
 # binding = "HYPERDRIVE"
 # id = "<fill in staging/prod id>"

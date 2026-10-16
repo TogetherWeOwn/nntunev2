@@ -58,6 +58,18 @@ pub const MAGIC_LINKS_PER_WINDOW: u64 = 3;
 // Expired leases outlive the bounded test-connection probe by five seconds.
 const TEST_CONNECTION_LEASE_SECS: u64 = 20;
 const AUTH_START_WINDOW_SECS: u64 = 3600;
+/// Finish-route attempt budgets (CISO follow-up): each forged assertion
+/// costs P-256 ECDSA verify + SHA-256 plus DB reads, while a failed verify
+/// does not burn the challenge — so one challenge id would otherwise allow
+/// unlimited CPU-heavy attempts. Reserve one slot per challenge (passkey
+/// finishes) or per client IP (magic finish) BEFORE any verification or
+/// lookup; excess attempts answer the same generic auth error as any other
+/// failure. Ten per challenge TTL admits legitimate single attempts and
+/// typo retries while cutting off bombardment.
+const REGISTER_FINISH_ATTEMPTS_PER_CHALLENGE: u64 = 10;
+const LOGIN_FINISH_ATTEMPTS_PER_CHALLENGE: u64 = 10;
+const MAGIC_FINISH_ATTEMPTS_PER_IP: u64 = 10;
+const FINISH_ATTEMPT_WINDOW_SECS: u64 = crate::auth::CHALLENGE_TTL_SECS;
 
 // --- Config ---------------------------------------------------------------------
 
@@ -752,6 +764,24 @@ where
     ) else {
         return generic_auth();
     };
+    // Attempt budget BEFORE any DB read or CPU-heavy verification: a failed
+    // attestation verify must not grant unlimited retries on one challenge.
+    // Same atomic slot pattern as register/start; denial is the generic
+    // error so throttled and invalid attempts are indistinguishable.
+    let admitted = ctx
+        .store
+        .reserve_rate_limit(
+            &body.challenge,
+            "auth.register_finish",
+            REGISTER_FINISH_ATTEMPTS_PER_CHALLENGE,
+            ctx.now,
+            FINISH_ATTEMPT_WINDOW_SECS,
+        )
+        .await
+        .unwrap_or(false);
+    if !admitted {
+        return generic_auth();
+    }
     let row = match ctx.store.challenge_by_id(&body.challenge).await {
         Ok(Some(row)) => row,
         Ok(None) => return generic_auth(),
@@ -976,6 +1006,22 @@ where
     ) else {
         return generic_auth();
     };
+    // Attempt budget BEFORE any DB read or CPU-heavy verification, same as
+    // register/finish: one challenge id cannot fund unlimited assertions.
+    let admitted = ctx
+        .store
+        .reserve_rate_limit(
+            &body.challenge,
+            "auth.login_finish",
+            LOGIN_FINISH_ATTEMPTS_PER_CHALLENGE,
+            ctx.now,
+            FINISH_ATTEMPT_WINDOW_SECS,
+        )
+        .await
+        .unwrap_or(false);
+    if !admitted {
+        return generic_auth();
+    }
     let row = match ctx.store.challenge_by_id(&body.challenge).await {
         Ok(Some(row)) => row,
         Ok(None) => return generic_auth(),
@@ -1083,6 +1129,24 @@ where
         return generic_auth();
     };
     if body.token.is_empty() || body.token.len() > 256 {
+        return generic_auth();
+    }
+    // Attempt budget AFTER the exact-Origin pin and BEFORE the hash lookup:
+    // rotating tokens must share one per-client budget, or bogus finishes
+    // are an unbounded DB read. Cross-origin rejects above never reach this
+    // reservation, so an attacker cannot burn a victim IP's budget.
+    let admitted = ctx
+        .store
+        .reserve_rate_limit(
+            &ctx.source_ip,
+            "auth.magic_finish",
+            MAGIC_FINISH_ATTEMPTS_PER_IP,
+            ctx.now,
+            FINISH_ATTEMPT_WINDOW_SECS,
+        )
+        .await
+        .unwrap_or(false);
+    if !admitted {
         return generic_auth();
     }
     let record = match ctx
@@ -2110,7 +2174,10 @@ mod tests {
             );
             assert_eq!(resp.status, 401, "origin={origin:?}: {}", resp.body);
             assert_eq!(resp.body, r#"{"error":"check your email and try again"}"#);
-            assert!(resp.set_cookie.is_none(), "no planted cookie for {origin:?}");
+            assert!(
+                resp.set_cookie.is_none(),
+                "no planted cookie for {origin:?}"
+            );
         }
         // Same-origin explicit confirm still redeems and spends the token.
         let resp = h.call(
@@ -3460,6 +3527,187 @@ mod tests {
         let resp = finish_with_code("u2", "b@example.com", b"throttle-cred-2", "correct-code-2");
         assert_eq!(resp.status, 200, "{}", resp.body);
         assert!(resp.set_cookie.is_some());
+    }
+
+    #[test]
+    fn register_finish_attempt_budget_cuts_off_forged_attestations() {
+        // One challenge id funds at most 10 finish attempts: 10 forged
+        // attestations exhaust it, and the 11th attempt with a VALID
+        // attestation + inbox proof still fails generically without
+        // enrolling. A fresh challenge is unaffected (proves the budget is
+        // per-challenge, and legitimate single attempts still pass).
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let challenge = auth::new_registration_challenge("example.com", ORIGIN, NOW).unwrap();
+        let challenge_id = challenge.id.clone();
+        block_on(
+            h.store
+                .insert_challenge(&challenge, Some("u1"), PURPOSE_REGISTER),
+        )
+        .unwrap();
+        let (token, record) = auth::issue_magic_link("u1", "a@example.com", NOW);
+        block_on(h.store.insert_magic(&record)).unwrap();
+        let cred_id = b"budget-cred";
+        let att = fx_none_attestation(cred_id, &fx_es256_cose(61));
+        let client_json = fx_client_json("webauthn.create", &challenge_id);
+        let forged = serde_json::json!({
+            "challenge": challenge_id.clone(),
+            "credential_id": b64url_encode(cred_id),
+            "attestation_object": b64url_encode(b"forged-attestation"),
+            "client_data_json": b64url_encode(client_json.as_bytes()),
+            "magic_token": token.clone(),
+            "invite_code": null,
+        });
+        for _ in 0..REGISTER_FINISH_ATTEMPTS_PER_CHALLENGE {
+            let resp = h.call("POST", "/v1/auth/passkey/register/finish", forged.clone());
+            assert_eq!(resp.status, 401);
+            assert!(resp.set_cookie.is_none());
+        }
+        // Valid assertion on the spent challenge is now cut off by budget.
+        let valid = serde_json::json!({
+            "challenge": challenge_id.clone(),
+            "credential_id": b64url_encode(cred_id),
+            "attestation_object": b64url_encode(&att),
+            "client_data_json": b64url_encode(client_json.as_bytes()),
+            "magic_token": token.clone(),
+            "invite_code": null,
+        });
+        let resp = h.call("POST", "/v1/auth/passkey/register/finish", valid);
+        assert_eq!(resp.status, 401);
+        assert!(resp.set_cookie.is_none());
+        assert!(
+            block_on(h.store.credentials_for_user("u1"))
+                .unwrap()
+                .is_empty(),
+            "budget-cutoff attempt must not enroll"
+        );
+        // A fresh challenge for the same account still admits one attempt
+        // shape (fails only on the forged bytes, not the budget).
+        let challenge2 = auth::new_registration_challenge("example.com", ORIGIN, NOW).unwrap();
+        let challenge_id2 = challenge2.id.clone();
+        block_on(
+            h.store
+                .insert_challenge(&challenge2, Some("u1"), PURPOSE_REGISTER),
+        )
+        .unwrap();
+        let (token2, record2) = auth::issue_magic_link("u1", "a@example.com", NOW);
+        block_on(h.store.insert_magic(&record2)).unwrap();
+        let client_json2 = fx_client_json("webauthn.create", &challenge_id2);
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/finish",
+            serde_json::json!({
+                "challenge": challenge_id2,
+                "credential_id": b64url_encode(cred_id),
+                "attestation_object": b64url_encode(b"forged-attestation"),
+                "client_data_json": b64url_encode(client_json2.as_bytes()),
+                "magic_token": token2,
+                "invite_code": null,
+            }),
+        );
+        assert_eq!(resp.status, 401);
+    }
+
+    #[test]
+    fn login_finish_attempt_budget_cuts_off_forged_assertions() {
+        // Same per-challenge budget on the login finish: 10 forged
+        // assertions exhaust the challenge, and the 11th valid assertion
+        // still fails without a session.
+        use p256::ecdsa::{signature::Signer, Signature as EsSignature, SigningKey};
+        use sha2::Digest;
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let sk = SigningKey::from_slice(&[62u8; 32]).unwrap();
+        let point = sk.verifying_key().to_encoded_point(false);
+        let mut cose = Vec::new();
+        fx_head(5, 5, &mut cose);
+        fx_int(1, &mut cose);
+        fx_int(2, &mut cose);
+        fx_int(3, &mut cose);
+        fx_int(-7, &mut cose);
+        fx_int(-1, &mut cose);
+        fx_int(1, &mut cose);
+        fx_int(-2, &mut cose);
+        fx_bytes(point.x().unwrap(), &mut cose);
+        fx_int(-3, &mut cose);
+        fx_bytes(point.y().unwrap(), &mut cose);
+        let cred_id = b"budget-login-cred";
+        block_on(h.store.insert_credential(&PasskeyCredential {
+            cred_id_b64url: b64url_encode(cred_id),
+            user_id: "u1".to_string(),
+            public_key: cose,
+            sign_count: 1,
+            registered_at: NOW,
+        }))
+        .unwrap();
+        let challenge = auth::new_registration_challenge("example.com", ORIGIN, NOW).unwrap();
+        let challenge_id = challenge.id.clone();
+        block_on(
+            h.store
+                .insert_challenge(&challenge, Some("u1"), PURPOSE_LOGIN),
+        )
+        .unwrap();
+        let forged = serde_json::json!({
+            "challenge": challenge_id.clone(),
+            "credential_id": b64url_encode(cred_id),
+            "authenticator_data": b64url_encode(b"forged-auth"),
+            "client_data_json": b64url_encode(b"forged-client"),
+            "signature": b64url_encode(b"forged-sig"),
+        });
+        for _ in 0..LOGIN_FINISH_ATTEMPTS_PER_CHALLENGE {
+            let resp = h.call("POST", "/v1/auth/passkey/login/finish", forged.clone());
+            assert_eq!(resp.status, 401);
+            assert!(resp.set_cookie.is_none());
+        }
+        // Build the valid assertion (sign_count 2 > stored 1) — still cut off.
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
+        auth_data.push(0x01);
+        auth_data.extend_from_slice(&2u32.to_be_bytes());
+        let cd_get = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"{}","crossOrigin":false}}"#,
+            challenge_id, ORIGIN
+        );
+        let mut msg = auth_data.clone();
+        msg.extend_from_slice(&sha2::Sha256::digest(cd_get.as_bytes()));
+        let sig: EsSignature = sk.sign(&msg);
+        let valid = serde_json::json!({
+            "challenge": challenge_id,
+            "credential_id": b64url_encode(cred_id),
+            "authenticator_data": b64url_encode(&auth_data),
+            "client_data_json": b64url_encode(cd_get.as_bytes()),
+            "signature": b64url_encode(sig.to_der().as_bytes()),
+        });
+        let resp = h.call("POST", "/v1/auth/passkey/login/finish", valid);
+        assert_eq!(resp.status, 401);
+        assert!(resp.set_cookie.is_none());
+    }
+
+    #[test]
+    fn magic_finish_attempt_budget_cuts_off_per_ip() {
+        // Rotating tokens must share one per-client budget: 10 bogus
+        // finishes exhaust the IP, and the valid token is then cut off
+        // without a session. All calls carry the exact Origin (required by
+        // the login-CSRF pin) so rejections prove the budget, not the pin.
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let (token, record) = auth::issue_magic_link("u1", "a@example.com", NOW);
+        block_on(h.store.insert_magic(&record)).unwrap();
+        for i in 0..MAGIC_FINISH_ATTEMPTS_PER_IP {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/magic/finish",
+                serde_json::json!({"token": format!("bogus-token-{i}")}),
+            );
+            assert_eq!(resp.status, 401, "{i}");
+        }
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(resp.status, 401);
+        assert!(resp.set_cookie.is_none());
     }
 
     #[test]

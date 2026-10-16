@@ -1,7 +1,9 @@
 //! Worker runtime wiring: env config, Hyperdrive Postgres store,
 //! DNS-over-HTTPS resolution, pinned-address socket probing, and the
-//! magic-link mailer webhook. Everything here adapts `handlers` traits
-//! to Cloudflare bindings; no security decisions live in this module.
+//! magic-link mailer webhook. Request security decisions live in
+//! `handlers`; startup fail-closed gates (env config plus the Hyperdrive
+//! caching-disabled attestation below) live here and refuse to serve
+//! traffic when the operator has not attested a cache-disabled config.
 //!
 //! Failures are opaque by construction: driver/DB errors map to
 //! [`handlers::StoreError`] without detail, and nothing in this module
@@ -45,6 +47,17 @@ fn env_string(env: &Env, name: &str) -> Option<String> {
 }
 
 fn config_from_env(env: &Env) -> Option<Config> {
+    // Runtime fail-closed gate for the Hyperdrive caching finding: auth
+    // reads are plain SELECTs through the HYPERDRIVE binding, so a
+    // caching-enabled config would serve stale sessions/credentials for
+    // up to ~75s. The Worker cannot inspect the Hyperdrive config at
+    // runtime, so the operator attests `HYPERDRIVE_CACHING_DISABLED=1`
+    // (set only after `check_hyperdrive_cache.sh` passes for that env).
+    // Without the attestation the Worker answers the same generic 500 as
+    // any other misconfiguration and serves no auth traffic.
+    if !hyperdrive_caching_disabled_attested(env_string(env, "HYPERDRIVE_CACHING_DISABLED")) {
+        return None;
+    }
     let rp_id = env_string(env, "RP_ID")?;
     let origin = env_string(env, "RP_ORIGIN")?;
     // Strict unpadded base64url for both secrets (`crate::b64`, F-HARD-01):
@@ -87,6 +100,15 @@ fn config_from_env(env: &Env) -> Option<Config> {
         session_previous_secret,
     )
     .ok()
+}
+
+/// Pure Hyperdrive caching attestation decision: `Some("1"/"true"/"TRUE")`
+/// in `HYPERDRIVE_CACHING_DISABLED` means the operator verified that env's
+/// Hyperdrive config has query caching disabled; anything else (missing,
+/// empty, any other value) refuses to start. Unit-tested below; the same
+/// truthy spelling as the other feature flags.
+fn hyperdrive_caching_disabled_attested(raw: Option<String>) -> bool {
+    matches!(raw.as_deref(), Some("1") | Some("true") | Some("TRUE"))
 }
 
 /// Pure rotation-matrix decision: the staged `SESSION_SECRET_PREVIOUS_BASE64`
@@ -1079,6 +1101,28 @@ mod tests {
     fn previous_43() -> String {
         // 32 bytes as unpadded base64url (43 chars), like the template.
         crate::b64::encode(&[7u8; 32])
+    }
+
+    #[test]
+    fn hyperdrive_attestation_fails_closed_without_explicit_opt_in() {
+        // The Worker must not serve auth reads unless the operator
+        // attested a cache-disabled Hyperdrive config for that env.
+        assert!(hyperdrive_caching_disabled_attested(Some("1".to_string())));
+        assert!(hyperdrive_caching_disabled_attested(Some(
+            "true".to_string()
+        )));
+        assert!(hyperdrive_caching_disabled_attested(Some(
+            "TRUE".to_string()
+        )));
+        for raw in [
+            None,
+            Some(String::new()),
+            Some("0".to_string()),
+            Some("false".to_string()),
+            Some("yes".to_string()),
+        ] {
+            assert!(!hyperdrive_caching_disabled_attested(raw));
+        }
     }
 
     #[test]
