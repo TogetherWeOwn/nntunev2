@@ -62,12 +62,15 @@ impl DurableObject for NntpPool {
     /// Serves `POST /probe`; any other method or path is a 404.
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         let has_owner_name = self.state.id().name().is_some();
-        let decision = routes::decide_probe(req.method().as_ref(), &req.path(), has_owner_name);
-        match decision {
-            ProbeDecision::NotFound => Response::error(decision.body(), decision.status()),
-            ProbeDecision::OwnerMissing => respond(route_reply(decision)),
-            ProbeDecision::ProviderUnavailable => respond(self.probe(&mut req).await),
-        }
+        routes::dispatch_probe(
+            routes::decide_probe_action(req.method().as_ref(), &req.path(), has_owner_name),
+            |decision| match decision {
+                ProbeDecision::NotFound => Response::error(decision.body(), decision.status()),
+                _ => respond(route_reply(decision)),
+            },
+            || async { respond(self.probe(&mut req).await) },
+        )
+        .await
     }
 }
 

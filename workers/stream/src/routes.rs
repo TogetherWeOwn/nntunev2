@@ -36,6 +36,15 @@ pub const PROVIDER_UNAVAILABLE_STATUS: u16 = 503;
 /// Probe on a named instance before provider wiring lands (retryable).
 pub const PROVIDER_UNAVAILABLE_BODY: &str = r#"{"error":"provider_unavailable"}"#;
 
+/// Adapter action for one Durable Object request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeAction {
+    /// Return the supplied portable route decision without running a probe.
+    Respond(ProbeDecision),
+    /// Run request validation and probe execution.
+    RunProbe,
+}
+
 /// Pool probe outcome for one request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeDecision {
@@ -64,6 +73,31 @@ impl ProbeDecision {
             ProbeDecision::OwnerMissing => OWNER_MISSING_BODY,
             ProbeDecision::ProviderUnavailable => PROVIDER_UNAVAILABLE_BODY,
         }
+    }
+}
+
+/// Decide whether the adapter returns a route response or executes a probe.
+pub fn decide_probe_action(method: &str, path: &str, has_owner_name: bool) -> ProbeAction {
+    match decide_probe(method, path, has_owner_name) {
+        ProbeDecision::NotFound => ProbeAction::Respond(ProbeDecision::NotFound),
+        ProbeDecision::OwnerMissing => ProbeAction::Respond(ProbeDecision::OwnerMissing),
+        ProbeDecision::ProviderUnavailable => ProbeAction::RunProbe,
+    }
+}
+
+/// Dispatch the portable route action through the adapter's response or probe handler.
+pub async fn dispatch_probe<T, F, Fut>(
+    action: ProbeAction,
+    respond: impl FnOnce(ProbeDecision) -> T,
+    run_probe: F,
+) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    match action {
+        ProbeAction::Respond(decision) => respond(decision),
+        ProbeAction::RunProbe => run_probe().await,
     }
 }
 
@@ -141,6 +175,61 @@ mod tests {
             "provider wiring is absent: never 200"
         );
         assert_eq!(decision.body(), r#"{"error":"provider_unavailable"}"#);
+    }
+
+    #[test]
+    fn probe_dispatch_distinguishes_rejection_from_probe_execution() {
+        assert_eq!(
+            decide_probe_action("GET", "/probe", true),
+            ProbeAction::Respond(ProbeDecision::NotFound)
+        );
+        assert_eq!(
+            decide_probe_action("POST", "/probe", false),
+            ProbeAction::Respond(ProbeDecision::OwnerMissing)
+        );
+        assert_eq!(
+            decide_probe_action("POST", "/probe", true),
+            ProbeAction::RunProbe
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_runs_the_selected_response_or_probe_handler() {
+        let render = |decision: ProbeDecision| (decision.status(), decision.body());
+        let run_probe = || async { (200, "probe ran") };
+
+        assert_eq!(
+            dispatch_probe(
+                ProbeAction::Respond(ProbeDecision::NotFound),
+                render,
+                run_probe
+            )
+            .await,
+            (404, "not found")
+        );
+        assert_eq!(
+            dispatch_probe(
+                ProbeAction::Respond(ProbeDecision::OwnerMissing),
+                render,
+                run_probe
+            )
+            .await,
+            (400, r#"{"error":"bad_request"}"#)
+        );
+        assert_eq!(
+            dispatch_probe(ProbeAction::RunProbe, render, run_probe).await,
+            (200, "probe ran")
+        );
+    }
+
+    #[test]
+    fn wasm_adapter_uses_dispatch_and_preserves_worker_status_rendering() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let runtime = std::fs::read_to_string(dir.join("src/runtime.rs")).expect("read runtime.rs");
+        assert!(runtime.contains("routes::dispatch_probe("));
+        assert!(runtime.contains("|| async { respond(self.probe(&mut req).await) }"));
+        assert!(runtime.contains("Response::error(decision.body(), decision.status())"));
+        assert!(runtime.contains(".with_status(reply.status)"));
     }
 
     #[test]
