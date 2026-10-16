@@ -32,6 +32,8 @@ pub const STREAM_BYTES_PER_SEC: u64 = 48_000;
 pub const MAX_STREAM_SECONDS_PER_ROW: u64 = 86_400;
 /// Maximum bytes one row may carry: exactly 24 h at the nominal rate.
 pub const MAX_BYTES_PER_ROW: u64 = 4_147_200_000;
+/// Last Unix second representable by the persisted four-digit `YYYY-MM` month.
+pub const MAX_RECORDED_AT: u64 = 253_402_300_799;
 /// Maximum length of user, track and idempotency-key handles (chars).
 pub const MAX_ID_LEN: usize = 128;
 
@@ -71,8 +73,9 @@ pub fn new_idempotency_key() -> String {
 }
 
 /// Calendar month (`YYYY-MM`, UTC) containing Unix timestamp `recorded_at`.
-/// Dependency-free civil-date conversion (Hinnant's algorithm); valid for the
-/// full `u64` timestamp range.
+/// Dependency-free civil-date conversion (Hinnant's algorithm). Persisted
+/// timestamps are bounded by [`MAX_RECORDED_AT`] so the resulting year fits the
+/// migration's four-digit `period_month` constraint.
 pub fn period_month_for_timestamp(recorded_at: u64) -> String {
     let (year, month, _) = civil_from_days((recorded_at / 86_400) as i64);
     format!("{year:04}-{month:02}")
@@ -144,6 +147,9 @@ pub fn prepare_ledger_row(
         return Err(LedgerError::Invalid);
     }
     if stream_seconds != bytes_served.div_ceil(STREAM_BYTES_PER_SEC) {
+        return Err(LedgerError::Invalid);
+    }
+    if recorded_at > MAX_RECORDED_AT {
         return Err(LedgerError::Invalid);
     }
     Ok(LedgerRow {
@@ -253,6 +259,34 @@ mod tests {
         assert_eq!(period_month_for_timestamp(1_709_251_200), "2024-03");
         // 2100-01-01T00:00:00Z.
         assert_eq!(period_month_for_timestamp(4_102_444_800), "2100-01");
+    }
+
+    #[test]
+    fn recorded_at_fits_bigint_and_four_digit_month() {
+        let row = prepare_ledger_row(
+            "user-alice",
+            "track-1",
+            &new_idempotency_key(),
+            1,
+            1,
+            MAX_RECORDED_AT,
+        )
+        .unwrap();
+        assert_eq!(row.period_month, "9999-12");
+        for recorded_at in [MAX_RECORDED_AT + 1, i64::MAX as u64, u64::MAX] {
+            assert_eq!(
+                prepare_ledger_row(
+                    "user-alice",
+                    "track-1",
+                    &new_idempotency_key(),
+                    1,
+                    1,
+                    recorded_at,
+                ),
+                Err(LedgerError::Invalid),
+                "recorded_at {recorded_at} must fit the database month domain"
+            );
+        }
     }
 
     #[test]

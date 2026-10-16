@@ -240,8 +240,9 @@ mod tests {
                 kind: MeterKind::PlayStart,
                 user_id: "u".to_string(),
                 track_id: "t".to_string(),
-                bytes: 0,
-                seconds: 0,
+                // Deliberately non-zero to make kind-filtering observable.
+                bytes: 1,
+                seconds: 1,
             },
             MeterEvent {
                 kind: MeterKind::BytesServed,
