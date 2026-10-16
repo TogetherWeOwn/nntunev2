@@ -66,6 +66,8 @@ export function parseErrorBody(body: unknown, status: number): ParsedApiError {
 			: typeof record.error === 'string' && record.error.length > 0
 				? record.error
 				: fallback.message;
+	// Preserve the separate provider re-auth signals; unlike registry codes,
+	// these select an inline credential-refresh flow in the web client.
 	for (const candidate of [record.code, record.error]) {
 		if (candidate === 'provider_auth_expired' || candidate === 'indexer_auth_expired') {
 			return {

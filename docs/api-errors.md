@@ -45,7 +45,12 @@ with HTTP status 500. The worker implementations seal 5xx messages to fixed publ
 (pre-taxonomy) derive their code from unambiguous HTTP statuses (400, 401,
 402, 403, 404, 413, 416, 422, 429, 503); all other statuses use
 `request_failed`. The web client continues to support these legacy bodies
-during migration.
+during migration, with two explicit re-auth exceptions: `provider_auth_expired`
+and `indexer_auth_expired` may appear in a legacy `error` field (or a `code`
+field from the provider re-auth route). The web client preserves these signals
+to show the provider re-auth UI; they are not members of this shared registry.
+Do not emit them as structured-envelope codes without first adding registry
+rows and worker mappings.
 
 ## Registry
 
