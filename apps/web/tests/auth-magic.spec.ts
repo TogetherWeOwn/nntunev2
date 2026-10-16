@@ -186,7 +186,7 @@ test('magic-link paywall preserves the token for a successful retry', async ({ p
 	await dialog.getByRole('button', { name: 'Not now' }).click();
 	await expect(dialog).toBeHidden();
 	await page.getByRole('button', { name: /sign in with this link/i }).click();
-	await page.waitForURL('/onboarding/provider');
+	await page.waitForURL('/onboarding/byop');
 	expect(finishPosts).toBe(2);
 });
 
