@@ -508,9 +508,9 @@ fn admission_claim_lease_secs() -> u64 {
 }
 
 /// Parameterized statements owned here (execution lives with the ledger
-/// impls); see `migrations/0004_metered_admission.sql`,
-/// `migrations/0005_metered_admission_claim.sql`, and
-/// `migrations/0006_metered_admission_claim_epoch.sql` for the table.
+/// impls); see `migrations/0007_metered_admission.sql`,
+/// `migrations/0008_metered_admission_claim.sql`, and
+/// `migrations/0009_metered_admission_claim_epoch.sql` for the table.
 /// Every statement is single-transaction autocommit with `$1` = job id and
 /// `$2` = stage: no `BEGIN`, no session lock, no temp state, so each one is
 /// safe under Hyperdrive transaction-mode pooling.

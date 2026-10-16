@@ -1,6 +1,6 @@
--- NNTune v2 migration 0005: lease-based metered admission claim.
+-- NNTune v2 migration 0008: lease-based metered admission claim.
 --
--- Replaces the session advisory-lock claim (0004) which Hyperdrive cannot
+-- Replaces the earlier session advisory-lock claim, which Hyperdrive cannot
 -- honor: Hyperdrive pools in transaction mode (one origin connection per
 -- transaction), so a `pg_try_advisory_lock` held across queue/meter awaits
 -- either never serializes concurrent isolates or fails every claim to 503.

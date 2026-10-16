@@ -27,3 +27,18 @@ sha256 = "fb61dd289c72b159299e56d0b5a3bfb3734dc5516665a9225c0cce0ffd64bbce"
 file = "0006_account_deletion.sql"
 target = "app"
 sha256 = "6d222588102fbff8bd5096a42e669722262ba84014fc5865bfbf3b8c19894245"
+
+[[migration]]
+file = "0007_metered_admission.sql"
+target = "app"
+sha256 = "efefaf50947415d60ee8898689aa3a6ce6aebcd34f99170ef67fd0c6ec7df0fe"
+
+[[migration]]
+file = "0008_metered_admission_claim.sql"
+target = "app"
+sha256 = "444b967fa312637eb1b3c6b0175a7b52e00e5a4f557aa953ec91c4bac345505c"
+
+[[migration]]
+file = "0009_metered_admission_claim_epoch.sql"
+target = "app"
+sha256 = "4075fe12e3658a4b5312460b7839aeb3f42bbf6b7b1a4215115e8a7ac2c40c83"

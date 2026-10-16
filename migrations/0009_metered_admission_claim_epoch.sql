@@ -1,4 +1,4 @@
--- NNTune v2 migration 0006: fence lease owners across admission retries.
+-- NNTune v2 migration 0009: fence lease owners across admission retries.
 --
 -- A lease expiry permits a new request to claim a stalled row, but does not
 -- stop the old isolate from resuming. The monotonically increasing epoch lets
