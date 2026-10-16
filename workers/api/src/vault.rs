@@ -60,6 +60,37 @@ pub fn nntp_port_allowed(port: u16) -> bool {
     ALLOWED_NNTP_PORTS.contains(&port)
 }
 
+/// Documented provider-reauth code (S7). Core and stream NNTP handling
+/// classify `480`/`481` and `482` on `AUTHINFO` replies as this code;
+/// `482` elsewhere is out-of-sequence, not a re-auth signal. When surfaced
+/// as an API error it uses HTTP 401, which the web app recognizes for its
+/// inline provider-password prompt. This does not claim every worker/API
+/// path is wired to emit the code. Indexer HTTP 401 uses the distinct
+/// `indexer_auth_expired` code; 403 remains generic (see
+/// `workers/ingest/src/newznab.rs`). Safe to log and return in error bodies:
+/// it carries no credential material.
+pub const PROVIDER_AUTH_EXPIRED_CODE: &str = "provider_auth_expired";
+
+/// Audit action for an in-place provider credential rotation (S7). Callers
+/// MUST emit this (not the plain `vault.update`) when the vault write
+/// replaces the provider secret while keeping the same user session, so the
+/// rotation is repudiation-safe and distinguishable from a first-time save.
+pub const PROVIDER_ROTATE_AUDIT_ACTION: &str = "vault.rotate";
+
+/// Audit action for a provider credential rotation. Always
+/// [`PROVIDER_ROTATE_AUDIT_ACTION`]: rotation writes are never logged as
+/// generic updates.
+pub fn provider_rotation_audit_action() -> &'static str {
+    PROVIDER_ROTATE_AUDIT_ACTION
+}
+
+/// Minimal JSON error body carrying only the documented re-auth code.
+/// No credential material, no host/user detail: safe for logs and API
+/// responses. The HTTP status for this body is always 401.
+pub fn provider_auth_expired_body() -> String {
+    serde_json::json!({ "error": PROVIDER_AUTH_EXPIRED_CODE }).to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VaultError {
     Invalid,
@@ -615,6 +646,129 @@ pub fn rewrap_dek(
     })
 }
 
+/// Rotate the provider credential in place. Helper only in this slice:
+/// no Worker entry route calls this yet (`workers/api/src/lib.rs` — the
+/// HTTP wiring is a follow-up). This function never reads or writes
+/// session state: the user session is an HMAC-signed cookie independent of
+/// the vault row, so a vault write cannot revoke it.
+///
+/// The contract:
+/// - proves ownership of the old credential by decrypting `old_blob` (fails
+///   closed when the caller cannot read the row they claim to rotate);
+/// - binds the full retained endpoint — `host`, `username`, and every
+///   retained transport field (`port`, `tls`, `max_connections`,
+///   `allow_insecure_plaintext`) — to the *decrypted stored row*, never to
+///   a caller-supplied "old" config: a `new_config` differing in any of
+///   them is rejected, so the endpoint a caller test-connects is provably
+///   the endpoint that gets sealed. A different endpoint is a fresh save
+///   (`vault.update`), not a rotation. Fields absent from a legacy flat
+///   row retain nothing, except `allow_insecure_plaintext` whose serde
+///   default (`false`) is its retained value;
+/// - validates `new_config` shape + SSRF guard ([`ProviderConfig::validate`]).
+///   This does NOT dial the provider: the caller MUST first verify the new
+///   secret with a real `test connection` (enforcing
+///   [`test_attempt_allowed`]/[`concurrent_test_allowed`] and
+///   [`TestConnectionBudget`]) — a wrong new password otherwise seals happily;
+/// - seals the **full stored row** with only the provider password replaced,
+///   under a fresh DEK: indexer secrets and every other provider/indexer
+///   field in the decrypted payload are preserved verbatim. A stored payload
+///   that is not a JSON object (or carries no bindable provider identity)
+///   fails closed rather than being replaced by a partial row.
+///
+/// The stored payload is the serialized provider+indexer row
+/// ([`encrypt_vault`]); the provider object is `payload["provider"]` when
+/// that is an object, otherwise the top-level object itself. The caller MUST
+/// audit with [`provider_rotation_audit_action`] and MUST NOT touch the
+/// session row.
+///
+/// Every failure maps to generic [`VaultError::Invalid`]/[`VaultError::Crypto`]:
+/// no credential material, no host/user detail, no crypto internals.
+pub fn rotate_provider_credentials(
+    kek: &[u8; 32],
+    kek_version: u32,
+    user_id: &str,
+    old_blob: &VaultBlob,
+    new_config: &ProviderConfig,
+    dns: &impl DnsResolver,
+) -> Result<VaultBlob, VaultError> {
+    if new_config.password.is_empty() {
+        return Err(VaultError::Invalid);
+    }
+    // Prove ownership of the row being rotated and load the full stored row.
+    let mut plaintext = decrypt_vault(kek, user_id, old_blob)?;
+    let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&plaintext);
+    plaintext.zeroize();
+    let mut row = parsed.map_err(|_| VaultError::Invalid)?;
+    let row_obj = row.as_object_mut().ok_or(VaultError::Invalid)?;
+    // The provider object: `provider` sub-object when present, else the
+    // top-level object (legacy flat rows).
+    let provider = match row_obj.get_mut("provider") {
+        Some(serde_json::Value::Object(_)) => row_obj["provider"]
+            .as_object_mut()
+            .ok_or(VaultError::Invalid)?,
+        Some(_) => return Err(VaultError::Invalid),
+        None => row_obj,
+    };
+    // Bind identity to the stored row: every stored host/username present
+    // must match the new config, and at least one must be present to bind to.
+    let mut bound = false;
+    for (field, expected) in [
+        ("host", new_config.host.as_str()),
+        ("username", new_config.username.as_str()),
+    ] {
+        match provider.get(field) {
+            Some(serde_json::Value::String(stored)) => {
+                bound = true;
+                if stored != expected {
+                    return Err(VaultError::Invalid);
+                }
+            }
+            Some(_) => return Err(VaultError::Invalid),
+            None => {}
+        }
+    }
+    if !bound {
+        return Err(VaultError::Invalid);
+    }
+    // Bind the retained transport fields, so the validated/tested
+    // `new_config` can never diverge from the row actually sealed (a
+    // stored port 80, or a stored 563/TLS row behind a plaintext-tested
+    // new_config, both fail here or in `validate` below).
+    let retained_matches = [
+        provider
+            .get("port")
+            .map(|v| v.as_u64() == Some(u64::from(new_config.port))),
+        provider
+            .get("tls")
+            .map(|v| v.as_bool() == Some(new_config.tls)),
+        provider
+            .get("max_connections")
+            .map(|v| v.as_u64() == Some(u64::from(new_config.max_connections))),
+    ];
+    // Present but divergent (or wrong JSON type): reject. A field absent
+    // from a legacy flat row retains nothing to diverge from.
+    if retained_matches.contains(&Some(false)) {
+        return Err(VaultError::Invalid);
+    }
+    match provider.get("allow_insecure_plaintext") {
+        // Absent means the serde default `false` is retained.
+        Some(v) if v.as_bool() == Some(new_config.allow_insecure_plaintext) => {}
+        None if !new_config.allow_insecure_plaintext => {}
+        _ => return Err(VaultError::Invalid),
+    }
+    // Shape + SSRF guard only — no dial (see caller obligations above).
+    // The binding above makes this a validation of the retained row, not
+    // of a throwaway config.
+    new_config.validate(dns)?;
+    // Replace only the password; preserve the rest of the row verbatim.
+    provider.insert(
+        "password".to_string(),
+        serde_json::Value::String(new_config.password.clone()),
+    );
+    let bytes = serde_json::to_vec(&row).map_err(|_| VaultError::Invalid)?;
+    encrypt_vault(kek, kek_version, user_id, &bytes)
+}
+
 // --- Redaction + audit (never secrets) --------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -789,6 +943,42 @@ mod tests {
         };
         assert!(tls.validate(&PublicDns).is_ok());
         assert!(!tls.insecure_plaintext_acknowledged());
+    }
+
+    #[test]
+    fn malformed_nonce_lengths_are_rejected() {
+        let kek = [0x11u8; 32];
+        let new_kek = [0x22u8; 32];
+        let blob = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+
+        for len in [0, 1, 11, 13, 16, 24] {
+            let nonce = crate::b64::encode(&vec![7u8; len]);
+
+            let mut bad_wrap_nonce = blob.clone();
+            bad_wrap_nonce.dek_wrapped_nonce_b64url = nonce.clone();
+            assert_eq!(
+                decrypt_vault(&kek, "user-1", &bad_wrap_nonce),
+                Err(VaultError::Invalid),
+                "decrypt accepted a wrapped nonce of length {len}"
+            );
+            // `VaultBlob` has no `PartialEq`, so match on the error instead
+            // of comparing the whole `Result` with `assert_eq!`.
+            assert!(
+                matches!(
+                    rewrap_dek(&kek, &new_kek, 2, "user-1", &bad_wrap_nonce),
+                    Err(VaultError::Invalid)
+                ),
+                "rewrap accepted a wrapped nonce of length {len}"
+            );
+
+            let mut bad_payload_nonce = blob.clone();
+            bad_payload_nonce.payload_nonce_b64url = nonce;
+            assert_eq!(
+                decrypt_vault(&kek, "user-1", &bad_payload_nonce),
+                Err(VaultError::Invalid),
+                "decrypt accepted a payload nonce of length {len}"
+            );
+        }
     }
 
     #[test]

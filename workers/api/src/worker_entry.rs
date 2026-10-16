@@ -860,7 +860,7 @@ async fn doh_query(host: &str, rrtype: &str) -> Vec<IpAddr> {
     url.query_pairs_mut()
         .append_pair("name", host)
         .append_pair("type", rrtype);
-    let mut headers = Headers::new();
+    let headers = Headers::new();
     if headers.set("accept", "application/dns-json").is_err() {
         return Vec::new();
     }
@@ -988,7 +988,7 @@ impl Mailer for WebhookMailer {
             return Err(StoreError);
         }
         let body = magic_link_payload(&self.origin, email, token).to_string();
-        let mut headers = Headers::new();
+        let headers = Headers::new();
         headers
             .set("content-type", "application/json")
             .map_err(|_| StoreError)?;
@@ -1020,7 +1020,7 @@ fn render(
     response: &handlers::Response,
     cors: &[(&'static str, String)],
 ) -> WorkerResult<Response> {
-    let mut headers = Headers::new();
+    let headers = Headers::new();
     headers.append("content-type", "application/json; charset=utf-8")?;
     headers.append("cache-control", "no-store")?;
     headers.append("x-content-type-options", "nosniff")?;
