@@ -1,25 +1,11 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { listPlans, formatPricePerMonth } from '#lib/billing/plans.js';
-	import {
-		BillingApiError,
-		startCheckout,
-		signupUrlForCheckoutFailure
-	} from '#lib/billing/billingClient.js';
+	import { startCheckout, signupUrlForCheckoutFailure } from '#lib/billing/billingClient.js';
 
 	const plans = listPlans();
 	let checkoutError: string | null = $state(null);
 	let pendingPlan: string | null = $state(null);
-
-	function checkoutErrorMessage(err: unknown): string {
-		if (err instanceof BillingApiError) {
-			if (err.status === 402)
-				return 'This plan is unavailable because of a usage limit. Review your usage or choose another plan.';
-			if (err.status === 429)
-				return 'Checkout is temporarily busy. Please wait a moment and try again.';
-		}
-		return 'Checkout could not be started. Please try again.';
-	}
 
 	async function choose(planId: string) {
 		checkoutError = null;
@@ -32,7 +18,7 @@
 			// with the plan carried along instead of a raw 401 alert.
 			const signup = signupUrlForCheckoutFailure(planId, err);
 			if (signup) await goto(signup);
-			else checkoutError = checkoutErrorMessage(err);
+			else checkoutError = err instanceof Error ? err.message : 'Checkout failed';
 		} finally {
 			pendingPlan = null;
 		}
