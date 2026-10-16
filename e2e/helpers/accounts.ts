@@ -246,7 +246,7 @@ export async function completeByopWizard(page: Page, baseURL: string): Promise<v
   });
   await expect(page.getByTestId(TESTIDS.byopHost)).toBeVisible({ timeout: 15_000 });
   await page.getByTestId(TESTIDS.byopHost).fill(endpoint.host);
-  await page.getByTestId(TESTIDS.byopPort).fill(String(endpoint.port));
+  await page.getByTestId(TESTIDS.byopPort).selectOption(String(endpoint.port));
   await page.getByTestId(TESTIDS.byopUser).fill(endpoint.user);
   await page.getByTestId(TESTIDS.byopPass).fill(password);
   if (endpoint.tls) {
@@ -256,6 +256,8 @@ export async function completeByopWizard(page: Page, baseURL: string): Promise<v
       if (!checked) await tls.check().catch(() => {});
     }
   }
+  await page.getByRole('button', { name: 'Continue' }).click();
+  await page.getByRole('button', { name: 'Continue' }).click();
   await page.getByTestId(TESTIDS.byopTest).click();
   const status = page.getByTestId(TESTIDS.byopStatus);
   await expect(status, 'BYOP test-connection gave no status').toBeVisible({ timeout: 60_000 });
