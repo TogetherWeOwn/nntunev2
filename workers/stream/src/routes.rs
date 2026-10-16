@@ -126,6 +126,14 @@ mod tests {
         text.lines().any(|candidate| candidate.trim() == line)
     }
 
+    fn non_doc_attributes(attrs: &[syn::Attribute]) -> Vec<String> {
+        attrs
+            .iter()
+            .filter(|attribute| !attribute.path().is_ident("doc"))
+            .map(tokens)
+            .collect()
+    }
+
     #[test]
     fn public_fetch_stays_not_found() {
         assert_eq!(decide_public_fetch(), (404, "not found"));
@@ -253,12 +261,10 @@ mod tests {
             tokens(&expected_public_fetch.block)
         );
         let event_attribute: syn::Attribute = syn::parse_quote!(#[event(fetch)]);
-        assert!(
-            public_fetch
-                .attrs
-                .iter()
-                .any(|attribute| tokens(attribute) == tokens(&event_attribute)),
-            "public fetch must retain its Worker event binding"
+        assert_eq!(
+            non_doc_attributes(&public_fetch.attrs),
+            vec![tokens(&event_attribute)],
+            "public fetch must have exactly its Worker event binding and no cfg/other attributes"
         );
 
         let durable_object_fetch = parsed
@@ -282,6 +288,10 @@ mod tests {
                 _ => None,
             })
             .expect("NntpPool Durable Object fetch handler");
+        assert!(
+            non_doc_attributes(&durable_object_fetch.attrs).is_empty(),
+            "Durable Object fetch handler must not carry cfg/other attributes"
+        );
         let expected_durable_object_fetch = syn::parse_str::<syn::ImplItemFn>(
             "async fn fetch(&self, mut req: Request) -> Result<Response> {\n                let has_owner_name = self.state.id().name().is_some();\n                routes::dispatch_probe(\n                    routes::decide_probe_action(req.method().as_ref(), &req.path(), has_owner_name),\n                    |decision| match decision {\n                        ProbeDecision::NotFound => Response::error(decision.body(), decision.status()),\n                        _ => respond(route_reply(decision)),\n                    },\n                    || async { respond(self.probe(&mut req).await) },\n                )\n                .await\n            }",
         )
@@ -305,12 +315,10 @@ mod tests {
             })
             .expect("NntpPool Durable Object");
         let fetch_attribute: syn::Attribute = syn::parse_quote!(#[durable_object(fetch)]);
-        assert!(
-            durable_object
-                .attrs
-                .iter()
-                .any(|attribute| tokens(attribute) == tokens(&fetch_attribute)),
-            "NntpPool must retain its Durable Object fetch binding"
+        assert_eq!(
+            non_doc_attributes(&durable_object.attrs),
+            vec![tokens(&fetch_attribute)],
+            "NntpPool must have exactly its Durable Object fetch binding"
         );
 
         let route_reply = parsed
@@ -321,6 +329,10 @@ mod tests {
                 _ => None,
             })
             .expect("route_reply function");
+        assert!(
+            non_doc_attributes(&route_reply.attrs).is_empty(),
+            "route_reply must not carry cfg/other attributes"
+        );
         let expected_route_reply = syn::parse_str::<syn::ItemFn>(
             "fn route_reply(decision: ProbeDecision) -> ProbeReply {\n                ProbeReply {\n                    status: decision.status(),\n                    body: decision.body().to_string(),\n                    retry_after_secs: None,\n                }\n            }",
         )
@@ -340,6 +352,10 @@ mod tests {
                 _ => None,
             })
             .expect("respond function");
+        assert!(
+            non_doc_attributes(&respond.attrs).is_empty(),
+            "respond must not carry cfg/other attributes"
+        );
         let expected_respond = syn::parse_str::<syn::ItemFn>(
             "fn respond(reply: ProbeReply) -> Result<Response> {\n                let headers = Headers::new();\n                headers.set(\"content-type\", \"application/json\")?;\n                if let Some(secs) = reply.retry_after_secs {\n                    headers.set(\"retry-after\", &secs.to_string())?;\n                }\n                Ok(Response::ok(reply.body)?\n                    .with_status(reply.status)\n                    .with_headers(headers))\n            }",
         )
