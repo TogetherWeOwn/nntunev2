@@ -34,6 +34,13 @@ export class ApiError extends Error {
 	}
 }
 
+/** Documented re-auth code (S7): stale provider credential. */
+export const PROVIDER_AUTH_EXPIRED_CODE = 'provider_auth_expired';
+
+/** Documented re-key code (S7): stale indexer API key. Distinct from the
+ * provider code: the web app names the API key (never the password) for it. */
+export const INDEXER_AUTH_EXPIRED_CODE = 'indexer_auth_expired';
+
 export interface MagicLinkResult {
 	ok: true;
 	/**
@@ -299,6 +306,4 @@ export class ApiClient {
 		}
 		return (await response.json()) as T;
 	}
-
-
 }

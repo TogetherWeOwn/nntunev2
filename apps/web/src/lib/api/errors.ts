@@ -66,6 +66,15 @@ export function parseErrorBody(body: unknown, status: number): ParsedApiError {
 			: typeof record.error === 'string' && record.error.length > 0
 				? record.error
 				: fallback.message;
+	for (const candidate of [record.code, record.error]) {
+		if (candidate === 'provider_auth_expired' || candidate === 'indexer_auth_expired') {
+			return {
+				code: candidate,
+				message,
+				retryable: typeof record.retryable === 'boolean' ? record.retryable : fallback.retryable
+			};
+		}
+	}
 	if (typeof record.code === 'string' && KNOWN_ERROR_CODES.has(record.code)) {
 		return {
 			code: record.code,
