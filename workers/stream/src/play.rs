@@ -221,11 +221,14 @@ pub fn play_with_observe_event(
     };
     let result = play_authorized(pool, cache, meter, input, &user);
     let error_event = result.as_ref().err().and_then(|error| {
-        error.pool_error_code().map(|_| {
-            CacheObserveEvent::from_play(request_id, &user, false, 0, 0, Some(error))
-        })
+        error
+            .pool_error_code()
+            .map(|_| CacheObserveEvent::from_play(request_id, &user, false, 0, 0, Some(error)))
     });
-    ObservedPlayAttempt { result, error_event }
+    ObservedPlayAttempt {
+        result,
+        error_event,
+    }
 }
 
 fn authorized_user(secret: &[u8], input: &PlayInput<'_>) -> Result<String, PlayError> {
@@ -822,7 +825,9 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.pool_error_code(), Some(expected_code));
-        let event = attempt.error_event.expect("early pool errors need an event");
+        let event = attempt
+            .error_event
+            .expect("early pool errors need an event");
         assert_eq!(event.cache_status, CacheStatus::Miss);
         assert_eq!(event.request_id, "req-pool-error");
         assert_eq!(event.user_hash, hash_user("u"));
