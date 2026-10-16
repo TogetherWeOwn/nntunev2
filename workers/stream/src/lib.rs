@@ -17,6 +17,8 @@
 //!   decrypt → chunked stream + writeback).
 //! - [`meter`]: Analytics Engine + usage-ledger events.
 //! - [`prefetch`]: next-track prefetch on spare pool capacity (never the last connection).
+//! - [`routes`]: fail-closed HTTP routing decisions (public fetch + pool probe
+//!   statuses), natively tested; the wasm32 [`runtime`] adapter renders them.
 //!
 //! Cloudflare bindings (DO storage, R2, Analytics Engine) are declared in
 //! `workers/stream/wrangler.toml`. The runtime adapter is compiled only for
@@ -30,6 +32,7 @@ pub mod play;
 pub mod pool;
 pub mod prefetch;
 pub mod range;
+pub mod routes;
 pub mod yenc;
 
 #[cfg(target_arch = "wasm32")]

@@ -61,6 +61,7 @@ jobs:
       # (2026-08-06); re-pin deliberately, never float.
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
+          components: clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Scalar core (no transport features) and the Workers transport build.
@@ -69,6 +70,11 @@ jobs:
       # The simd128 yEnc fast path must keep compiling (Workers run V8 with
       # Wasm SIMD; the deploy enables it via this RUSTFLAGS).
       - run: RUSTFLAGS="-C target-feature=+simd128" cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
+      # The stream Worker entrypoint (`runtime.rs`, wasm32-only) is compiled
+      # by no native job: check + clippy it here so a type/behavior break in
+      # the entrypoint fails the gate before deploy.
+      - run: cargo check -p nntune-stream --target wasm32-unknown-unknown
+      - run: cargo clippy -p nntune-stream --target wasm32-unknown-unknown -- -D warnings
 
   # Public-repo hygiene: fail on internal tracker ids (TOG-<digits>),
   # internal hostnames, instance-UI paths and agent names in tracked text.

@@ -5,15 +5,21 @@
 //! fail closed with a retryable `503`; no public route can dial an arbitrary
 //! provider. The Worker's fetch handler is a not-found response until the play
 //! route is connected to the authorization, R2, and metering adapters.
+//!
+//! Route/status decisions live in [`crate::routes`] (portable, natively
+//! tested); this module only adapts them to `worker` responses.
 
 use worker::{
-    durable_object, event, Context, DurableObject, Env, Method, Request, Response, Result, State,
+    durable_object, event, Context, DurableObject, Env, Request, Response, Result, State,
 };
+
+use crate::routes::{self, ProbeDecision};
 
 /// The Worker has no public HTTP routes until the play adapters are wired.
 #[event(fetch)]
 async fn fetch(_req: Request, _env: Env, _ctx: Context) -> Result<Response> {
-    Response::error("not found", 404)
+    let (status, body) = routes::decide_public_fetch();
+    Response::error(body, status)
 }
 
 /// Per-user Durable Object entrypoint for NNTP pool operations.
@@ -28,21 +34,25 @@ impl DurableObject for NntpPool {
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
-        if req.method() != Method::Post || req.path() != "/probe" {
-            return Response::error("not found", 404);
-        }
-
+        let method = req.method();
         // Durable Objects must be addressed with id_from_name(user_id). Refuse
         // unnamed instances rather than serving an ownerless pool.
-        if self.state.id().name().is_none() {
-            return Response::error("pool owner unavailable", 400);
+        let has_owner_name = self.state.id().name().is_some();
+        match routes::decide_probe(method.as_ref(), &req.path(), has_owner_name) {
+            ProbeDecision::NotFound => {
+                Response::error(routes::NOT_FOUND_BODY, routes::NOT_FOUND_STATUS)
+            }
+            ProbeDecision::OwnerMissing => {
+                Response::error(routes::OWNER_MISSING_BODY, routes::OWNER_MISSING_STATUS)
+            }
+            ProbeDecision::ProviderUnavailable => {
+                let headers = worker::Headers::new();
+                headers.set("content-type", "application/json")?;
+                headers.set("retry-after", "5")?;
+                Ok(Response::ok(routes::PROVIDER_UNAVAILABLE_BODY)?
+                    .with_status(routes::PROVIDER_UNAVAILABLE_STATUS)
+                    .with_headers(headers))
+            }
         }
-
-        let headers = worker::Headers::new();
-        headers.set("content-type", "application/json")?;
-        headers.set("retry-after", "5")?;
-        Ok(Response::ok(r#"{"error":"provider_unavailable"}"#)?
-            .with_status(503)
-            .with_headers(headers))
     }
 }

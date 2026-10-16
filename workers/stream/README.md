@@ -1,7 +1,9 @@
 # `stream` Worker + per-user NNTP pool
 
-Portable Rust core (`nntune-stream`, zero dependencies) of the NNTune v2
-stream Worker and its per-user NNTP pool Durable Object.
+Portable Rust core (`nntune-stream`) of the NNTune v2 stream Worker and
+its per-user NNTP pool Durable Object. The portable core itself has zero
+dependencies; the wasm32-only runtime adapter adds the `worker` and
+`wasm-bindgen` dependencies.
 
 ## Play path
 
