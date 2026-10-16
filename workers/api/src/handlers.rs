@@ -124,6 +124,17 @@ pub fn reap_unverified_users_sql() -> String {
     )
 }
 
+/// Canonical rate-limit exhausted fast-fail statement shape: the single
+/// source of truth for the `PgStore::reserve_rate_limit` O(1) guard
+/// (called from `worker_entry`) and the statement-shape test below. The
+/// production guard must stay a single `SELECT COUNT(*)` over the live
+/// window; without it every denied request pays one DELETE plus `limit`
+/// conflicting upserts (~101 statements with 100 row locks for the
+/// 100-slot finish-lookup budget). The `FakeStore` mirror exercises the
+/// same exhausted-decision behavior and counts slot probes.
+pub const RATE_LIMIT_EXHAUSTED_SQL: &str = "SELECT COUNT(*) FROM auth_rate_limit_slots \
+     WHERE scope_key = $1 AND action = $2 AND expires_at > $3";
+
 // --- Config ---------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2391,6 +2402,32 @@ mod tests {
             self.call_full(method, path, Some(body.to_string()), None, Some(ORIGIN))
         }
 
+        fn call_with_ip(
+            &self,
+            source_ip: &str,
+            method: &str,
+            path: &str,
+            body: serde_json::Value,
+        ) -> Response {
+            let ctx = Ctx {
+                cfg: &self.config,
+                store: &self.store,
+                mailer: &self.mailer,
+                dialer: &self.dialer,
+                dns: &self.dns,
+                now: NOW,
+                source_ip: source_ip.to_string(),
+            };
+            let req = Request {
+                method: method.to_string(),
+                path: path.to_string(),
+                cookie: None,
+                origin: Some(ORIGIN.to_string()),
+                body: body.to_string().into_bytes(),
+            };
+            block_on(handle(&ctx, &req))
+        }
+
         fn call_full(
             &self,
             method: &str,
@@ -3777,8 +3814,8 @@ mod tests {
     fn rate_limit_exhausted_path_skips_slot_scan() {
         // DoS-amplification pin: an exhausted 100-slot finish-lookup budget
         // must fast-fail without scanning every slot (production runs one
-        // `SELECT count(*)` then returns; the fake mirrors it and counts slot
-        // probes). Removing the guard drives 100 probes here.
+        // `RATE_LIMIT_EXHAUSTED_SQL` count then returns; the fake mirrors it
+        // and counts slot probes). Removing the guard drives 100 probes here.
         let store = FakeStore::default();
         for _ in 0..FINISH_LOOKUP_ATTEMPTS_PER_IP {
             assert!(block_on(store.reserve_rate_limit(
@@ -3803,6 +3840,47 @@ mod tests {
             *store.rate_limit_slot_probes.borrow(),
             0,
             "exhausted budget must fast-fail without scanning slots"
+        );
+    }
+
+    #[test]
+    fn rate_limit_exhausted_sql_pins_production_fast_fail() {
+        // Pin the production `PgStore::reserve_rate_limit` fast-fail itself:
+        // the guard must stay a single `SELECT COUNT(*)` over the live
+        // window (`worker_entry` executes this shared constant). Deleting or
+        // retargeting the Pg guard leaves the fake-mirror probe test green,
+        // so this shape test observes the production path directly.
+        let sql = RATE_LIMIT_EXHAUSTED_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            sql.starts_with("SELECT COUNT(*) FROM auth_rate_limit_slots"),
+            "fast-fail must count live slots in one statement, got: {sql}"
+        );
+        for predicate in ["scope_key = $1", "action = $2", "expires_at > $3"] {
+            assert!(
+                sql.contains(predicate),
+                "fast-fail must include `{predicate}`"
+            );
+        }
+        assert!(
+            !sql.contains("expires_at <= $3"),
+            "fast-fail must count live slots, never expired ones"
+        );
+        // Wiring pin: production must execute this shared constant, not a
+        // divergent literal or no guard at all. Deleting the Pg fast-fail
+        // block (or inlining a hand-written literal) leaves the FakeStore
+        // probe test green, so this assertion observes the production path
+        // directly at compile time.
+        let entry = include_str!("worker_entry.rs");
+        assert!(
+            entry.contains("RATE_LIMIT_EXHAUSTED_SQL"),
+            "Pg reserve_rate_limit must execute the shared exhausted SQL"
+        );
+        assert!(
+            !entry.contains("SELECT COUNT(*) FROM auth_rate_limit_slots"),
+            "Pg must not carry a divergent fast-fail literal"
         );
     }
 
@@ -3844,6 +3922,67 @@ mod tests {
             ))
             .unwrap(),
             "same /64 must share one budget"
+        );
+    }
+
+    #[test]
+    fn register_start_ipv6_slash64_shares_handler_budget() {
+        // Handler wiring pin: two IPv6 addresses in one /64 share one
+        // `admit_auth_start` budget through the real `register_start`
+        // handler — not just the `rate_limit_ip_key` unit above (which
+        // pre-keys via the function itself) and not the IPv4-only harness
+        // default. Reverting `admit_auth_start` to the raw `source_ip`
+        // leaves every other test green but fails here: the second address
+        // would get a fresh budget instead of the shared refusal.
+        let h = harness();
+        let ip_a = "2001:db8:abcd:12::1";
+        let ip_b = "2001:db8:abcd:12::9";
+        let ip_other = "2001:db8:abcd:13::1";
+        let from_a = AUTH_STARTS_PER_IP_PER_HOUR - 10;
+        for i in 0..from_a {
+            let resp = h.call_with_ip(
+                ip_a,
+                "POST",
+                "/v1/auth/passkey/register/start",
+                serde_json::json!({"email": format!("v6a{i}@example.com")}),
+            );
+            assert_eq!(resp.status, 200, "ip_a iteration {i}: {}", resp.body);
+        }
+        for i in 0..10 {
+            let resp = h.call_with_ip(
+                ip_b,
+                "POST",
+                "/v1/auth/passkey/register/start",
+                serde_json::json!({"email": format!("v6b{i}@example.com")}),
+            );
+            assert_eq!(
+                resp.status, 200,
+                "ip_b iteration {i} must share the remaining /64 budget: {}",
+                resp.body
+            );
+        }
+        let denied = h.call_with_ip(
+            ip_b,
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "v6b-final@example.com"}),
+        );
+        assert_eq!(
+            denied.status, 429,
+            "second address in the same /64 must hit the shared budget: {}",
+            denied.body
+        );
+        assert_eq!(denied.body, r#"{"error":"rate_limited"}"#);
+        let other = h.call_with_ip(
+            ip_other,
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "v6other@example.com"}),
+        );
+        assert_eq!(
+            other.status, 200,
+            "a different /64 must keep its own budget: {}",
+            other.body
         );
     }
 

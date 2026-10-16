@@ -665,15 +665,16 @@ impl Store for PgStore {
             )
             .await
             .map_err(|_| StoreError)?;
-        // O(1) fast-fail on the exhausted path: without this guard every
-        // denied request pays one DELETE plus `limit` conflicting upserts
-        // (~101 statements with 100 row locks for the 100-slot finish
-        // lookup budget). The slot loop below still claims atomically, so a
-        // concurrent race that passes this snapshot simply fails closed there.
+        // O(1) fast-fail on the exhausted path (single source of truth:
+        // `handlers::RATE_LIMIT_EXHAUSTED_SQL`, pinned by statement-shape
+        // test): without this guard every denied request pays one DELETE
+        // plus `limit` conflicting upserts (~101 statements with 100 row
+        // locks for the 100-slot finish lookup budget). The slot loop below
+        // still claims atomically, so a concurrent race that passes this
+        // snapshot simply fails closed there.
         let exhausted = client
             .query_one(
-                "SELECT COUNT(*) FROM auth_rate_limit_slots \
-                 WHERE scope_key = $1 AND action = $2 AND expires_at > $3",
+                handlers::RATE_LIMIT_EXHAUSTED_SQL,
                 &[&scope_key, &action, &now],
             )
             .await
