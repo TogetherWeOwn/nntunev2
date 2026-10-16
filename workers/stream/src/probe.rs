@@ -35,7 +35,8 @@ use crate::pool::{Lane, Pool, PoolError};
 /// The user's provider as the pool dials it: connection settings (vetted by
 /// the dial-time SSRF guard) and the effective connection cap
 /// ([`effective_cap`](crate::pool::effective_cap) of BYOP and plan caps).
-#[derive(Debug, Clone)]
+/// Deliberately not `Debug`: the config carries the provider password.
+#[derive(Clone)]
 pub struct PoolProvider {
     pub config: NntpConfig,
     pub capacity: u32,
