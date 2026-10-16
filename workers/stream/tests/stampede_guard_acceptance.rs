@@ -115,31 +115,36 @@ fn ci_keeps_the_migrations_gate_job_required() {
 /// exactly 2 upstream fetches, not 3.
 #[test]
 fn fresh_flight_elected_after_a_leader_panic_is_a_replacement() {
-    // Panic lands (~20 ms) before any waiter times out (60 ms), so every
-    // waiter elects-or-joins fresh after the panic released the key; the
-    // fresh fetch then stalls (250 ms) past a second timeout chunk.
+    // Keep the leader parked until all waiters reach the call boundary, then
+    // leave a generous window for them to enter Singleflight before it panics.
+    // Their first timeout happens after that panic; the fresh flight then stalls
+    // past another timeout chunk to distinguish a replacement from a new flight.
     let group = Arc::new(Singleflight::<Vec<u8>, String>::with_timeout(
-        Duration::from_millis(60),
+        Duration::from_millis(500),
     ));
     let upstream_calls = Arc::new(AtomicUsize::new(0));
     let leader_registered = Arc::new(AtomicBool::new(false));
-    let start = Arc::new(std::sync::Barrier::new(3));
+    let start = Arc::new(std::sync::Barrier::new(4));
     let key = flight_key("<panic-seg@synthetic.test>");
 
     thread::scope(|s| {
-        let (group_l, calls_l, registered_l) = (
+        let (group_l, calls_l, registered_l, start_l) = (
             Arc::clone(&group),
             Arc::clone(&upstream_calls),
             Arc::clone(&leader_registered),
+            Arc::clone(&start),
         );
         let key_l = key.clone();
         let leader = s.spawn(move || {
             group_l.call(&key_l, || -> Result<Vec<u8>, String> {
                 calls_l.fetch_add(1, Ordering::SeqCst);
                 registered_l.store(true, Ordering::SeqCst);
-                // Panic before any waiter's 60 ms timeout: the panic
-                // cleanup releases the key with no result.
-                thread::sleep(Duration::from_millis(20));
+                // Include the leader in the rendezvous so the waiters are all
+                // at the call boundary before the panic window starts.
+                start_l.wait();
+                // Panic before any waiter's 500 ms timeout; the rendezvous plus
+                // this wider interval lets them enter the flight on loaded runners.
+                thread::sleep(Duration::from_millis(250));
                 panic!("simulated upstream panic before any timeout")
             })
         });
@@ -159,13 +164,13 @@ fn fresh_flight_elected_after_a_leader_panic_is_a_replacement() {
             );
             let key_w = key.clone();
             waiters.push(s.spawn(move || {
-                // Line everybody up so all three join before the 20 ms
-                // panic: none of them may become the first leader.
+                // Meet the leader and the other waiters before entering the
+                // flight, keeping post-barrier scheduling inside a wide window.
                 start_w.wait();
                 group_w.call(&key_w, || {
                     calls_w.fetch_add(1, Ordering::SeqCst);
-                    // Stall past the waiters' second 60 ms timeout chunk.
-                    thread::sleep(Duration::from_millis(250));
+                    // Stall past multiple 500 ms timeout chunks.
+                    thread::sleep(Duration::from_millis(1_500));
                     Ok::<_, String>(b"fresh-bytes".to_vec())
                 })
             }));
