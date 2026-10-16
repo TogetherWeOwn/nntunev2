@@ -13,8 +13,30 @@ compatibility_date = "2026-10-01"
 # binding = "MB_CACHE"
 # id = "<KV_NAMESPACE_ID>"
 
-# [[r2_buckets]]
+# Artwork cache: one R2 bucket per environment (docs/ops.md inventory).
+# Binding activation is a separate follow-up; uncomment when activating.
+# Staging (`wrangler deploy --env staging`); bindings do not inherit:
+# [[env.staging.hyperdrive]]
+# binding = "MB_DB"
+# id = "<STAGING_HYPERDRIVE_ID_FOR_nntunev2-mb>"
+# [[env.staging.kv_namespaces]]
+# binding = "MB_CACHE"
+# id = "<STAGING_KV_NAMESPACE_ID>"
+# [env.staging.vars]
+# ENVIRONMENT = "staging"
+# [[env.staging.r2_buckets]]
 # binding = "ART_CACHE"
-# Per-environment art bucket (see docs/ops.md): "nntunev2-art-staging" for
-# staging, "nntunev2-art-prod" for prod. There is no shared unsuffixed bucket.
 # bucket_name = "nntunev2-art-staging"
+#
+# Prod (`wrangler deploy --env production`); bindings do not inherit:
+# [[env.production.hyperdrive]]
+# binding = "MB_DB"
+# id = "<PRODUCTION_HYPERDRIVE_ID_FOR_nntunev2-mb>"
+# [[env.production.kv_namespaces]]
+# binding = "MB_CACHE"
+# id = "<PRODUCTION_KV_NAMESPACE_ID>"
+# [env.production.vars]
+# ENVIRONMENT = "production"
+# [[env.production.r2_buckets]]
+# binding = "ART_CACHE"
+# bucket_name = "nntunev2-art-prod"

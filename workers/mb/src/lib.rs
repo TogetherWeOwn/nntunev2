@@ -10,9 +10,10 @@
 //! binding `MB_DB`; successful responses are cached in KV (`MB_CACHE`) and
 //! at the edge via the Cache API / `Cache-Control`. Failures (400/404/500)
 //! are `no-store` and are never written to either cache. Interactive reads
-//! never call musicbrainz.org. Cover art bytes live in the per-environment
-//! R2 art buckets (`nntunev2-art-staging` / `nntunev2-art-prod`); this
-//! worker serves cacheable URLs, never secrets. See `README.md` and
+//! never call musicbrainz.org. Cover art bytes are intended for the
+//! per-environment R2 buckets (`nntunev2-art-staging` / `nntunev2-art-prod`,
+//! see `docs/ops.md`). Public release URLs are deferred until bucket
+//! bindings and public hosts are activated. See `README.md` and
 //! `migrations/0001_mb_mirror.sql`.
 //!
 //! Structure: [`handle_lookup`] / [`handle_search`] are the testable core
@@ -36,6 +37,33 @@ const MAX_QUERY_CHARS: usize = 100;
 /// Hyperdrive / KV binding names: must match `wrangler.toml.example`.
 const MB_DB_BINDING: &str = "MB_DB";
 const MB_CACHE_BINDING: &str = "MB_CACHE";
+
+/// R2 cover-art buckets per `docs/ops.md` ("R2 buckets", "Environments
+/// matrix"): one bucket per concern per environment. There is no shared
+/// unsuffixed art bucket; always use one of the two names below.
+pub const ART_BUCKET_STAGING: &str = "nntunev2-art-staging";
+pub const ART_BUCKET_PROD: &str = "nntunev2-art-prod";
+
+/// Resolve the cover-art bucket for an environment name: `"staging"` maps
+/// to the staging bucket; `"prod"` and `"production"` (the wrangler env
+/// name) map to the prod bucket. Anything else defaults to prod. Release
+/// responses do not use this mapping until a public host is configured.
+pub fn art_bucket_for_env(env: &str) -> &'static str {
+    match env {
+        "staging" => ART_BUCKET_STAGING,
+        "prod" | "production" => ART_BUCKET_PROD,
+        _ => ART_BUCKET_PROD,
+    }
+}
+
+/// Build an internal object URI for an art key (for example
+/// `art/ab/cd/<sha>-500`, ADR 0003) in the given bucket. This `r2://` URI
+/// is not a public HTTP URL and must not be sent to clients; public CAA
+/// URLs remain unchanged until a custom domain or r2.dev host is configured.
+pub fn caa_url_for_art(bucket: &str, key: &str) -> String {
+    let key = key.trim_start_matches('/');
+    format!("r2://{bucket}/{key}")
+}
 
 /// Entity selector. The only route into SQL: each variant maps to a
 /// static, parameterized statement (see [`lookup_sql`]/[`search_sql`]), so
@@ -800,6 +828,50 @@ mod tests {
         assert_eq!(body["year"], 1983);
         assert!(body["caa_url"].is_null());
         assert!(body["artist_mbid"].is_null());
+    }
+
+    #[test]
+    fn art_bucket_env_matrix_matches_ops_inventory() {
+        assert_eq!(ART_BUCKET_STAGING, "nntunev2-art-staging");
+        assert_eq!(ART_BUCKET_PROD, "nntunev2-art-prod");
+        assert_ne!(ART_BUCKET_STAGING, ART_BUCKET_PROD);
+        assert_eq!(art_bucket_for_env("staging"), ART_BUCKET_STAGING);
+        assert_eq!(art_bucket_for_env("prod"), ART_BUCKET_PROD);
+        assert_eq!(art_bucket_for_env("production"), ART_BUCKET_PROD);
+        // Unknown or missing env never resolves staging art.
+        assert_eq!(art_bucket_for_env(""), ART_BUCKET_PROD);
+        assert_eq!(art_bucket_for_env("dev"), ART_BUCKET_PROD);
+    }
+
+    #[test]
+    fn caa_url_builder_embeds_bucket_and_key() {
+        let url = caa_url_for_art(ART_BUCKET_STAGING, "art/ab/cd/0123456789abcdef-500");
+        assert!(url.contains(ART_BUCKET_STAGING), "{url}");
+        assert!(url.contains("art/ab/cd/0123456789abcdef-500"), "{url}");
+        assert!(!url.contains(ART_BUCKET_PROD), "{url}");
+        // Leading slashes do not produce an empty path segment.
+        let slashed = caa_url_for_art(ART_BUCKET_PROD, "/art/ab/cd/key-250");
+        assert_eq!(slashed, "r2://nntunev2-art-prod/art/ab/cd/key-250");
+    }
+
+    #[test]
+    fn lookup_release_preserves_stored_caa_url_until_public_host_is_configured() {
+        let stored = "https://coverartarchive.org/release/abc/front-500";
+        let repo = FakeRepo {
+            entity: Some(Entity::Release(Release {
+                mbid: MBID.to_string(),
+                artist_mbid: None,
+                title: "Blue Monday".to_string(),
+                release_type: Some("Single".to_string()),
+                year: Some(1983),
+                caa_url: Some(stored.to_string()),
+            })),
+            ..Default::default()
+        };
+        let cache = FakeCache::default();
+        let response = block_on(handle_lookup(&repo, &cache, Kind::Release, MBID));
+        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(body["caa_url"], stored);
     }
 
     #[test]
