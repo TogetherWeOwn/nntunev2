@@ -254,7 +254,7 @@ struct Live {
     buf_start: u64,
     /// Decoded segments not yet staged: `upload` only ever receives the
     /// contiguous prefix (`staged_seg..`), so a covering segment fetched
-    /// ahead of its prefix waits here until `finalize` fills the gap.
+    /// ahead of its prefix waits here until `load_next` or `finalize` fills the gap.
     pending: BTreeMap<usize, Arc<[u8]>>,
     staged_seg: usize,
     staged_bytes: u64,
