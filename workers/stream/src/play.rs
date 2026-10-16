@@ -728,34 +728,34 @@ mod tests {
     }
 
     fn test_parts() -> (Vec<u8>, Vec<Vec<u8>>) {
-        let first = b"small audio ";
-        let second = b"payload";
-        let plain = [first.as_slice(), second.as_slice()].concat();
+        split_parts(&[b"small audio ", b"payload"])
+    }
+
+    /// One multipart yEnc article per chunk; the whole-file CRC rides the
+    /// last part only, like real posters.
+    fn split_parts(chunks: &[&[u8]]) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let plain = chunks.concat();
         let crc = yenc::crc32(&plain);
-        let articles = vec![
-            yenc::encode_part(
-                first,
-                "track.flac",
-                yenc::PartSpec {
-                    file_size: plain.len() as u64,
-                    part: 1,
-                    total: 2,
-                    offset: 0,
-                    file_crc: None,
-                },
-            ),
-            yenc::encode_part(
-                second,
-                "track.flac",
-                yenc::PartSpec {
-                    file_size: plain.len() as u64,
-                    part: 2,
-                    total: 2,
-                    offset: first.len() as u64,
-                    file_crc: Some(crc),
-                },
-            ),
-        ];
+        let mut offset = 0;
+        let articles = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, chunk)| {
+                let article = yenc::encode_part(
+                    chunk,
+                    "track.flac",
+                    yenc::PartSpec {
+                        file_size: plain.len() as u64,
+                        part: i as u32 + 1,
+                        total: chunks.len() as u32,
+                        offset,
+                        file_crc: (i + 1 == chunks.len()).then_some(crc),
+                    },
+                );
+                offset += chunk.len() as u64;
+                article
+            })
+            .collect();
         (plain, articles)
     }
 
@@ -959,6 +959,55 @@ mod tests {
             .all(|event| event.kind != MeterKind::QuarantineExited));
     }
 
+    /// A segment fetched after the interleaved error leaves
+    /// `last_success_epoch` equal to the pool's epoch, so the epoch check
+    /// alone would let a play that later fails clear the quarantine; only the
+    /// `live.failed` guard in `finalize` stops it.
+    #[test]
+    fn late_decode_failure_after_post_error_success_does_not_clear_quarantine() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind NNTP server");
+        let address = listener.local_addr().expect("server address");
+        let (_, mut articles) = split_parts(&[b"small ", b"audio ", b"payload"]);
+        articles[2] = b"not a yEnc article".to_vec();
+        let server = serve_articles(listener, articles, false);
+        let segments = vec![
+            "track-seg0@synthetic.test".to_string(),
+            "track-seg1@synthetic.test".to_string(),
+            "track-seg2@synthetic.test".to_string(),
+        ];
+        let token = grant::issue("u", "track-a", GRANT_EXP_UNIX, b"s");
+        let mut pool = Pool::new(2);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+
+        let input = test_input(&token, "track-a", address, &segments);
+        let response = play(&mut pool, &mut cache, &mut meter, b"s", &input).expect("play");
+        let mut stream = response.stream;
+        let token = grant::issue("u", "track-b", GRANT_EXP_UNIX, b"s");
+        let dead = closed_address();
+        let other_segment = vec!["other-seg@synthetic.test".to_string()];
+        let input = test_input(&token, "track-b", dead, &other_segment);
+        assert!(matches!(
+            play(&mut pool, &mut cache, &mut meter, b"s", &input),
+            Err(PlayError::Upstream(_))
+        ));
+        assert!(pool.quarantined());
+
+        let body: Vec<u8> = stream.by_ref().flatten().collect();
+        server.join().expect("server thread");
+        assert_eq!(
+            body, b"small audio ",
+            "segment 1 must be served after the interleaved error, before segment 2 fails"
+        );
+        assert!(matches!(stream.error(), Some(PlayError::Decode(_))));
+        assert!(stream.finalize(&mut pool, &mut cache, &mut meter).is_err());
+        assert!(pool.quarantined(), "a failed play cannot clear it");
+        assert!(meter
+            .events
+            .iter()
+            .all(|event| event.kind != MeterKind::QuarantineExited));
+    }
+
     #[test]
     fn streamed_success_after_interleaved_error_clears_quarantine_on_finalize() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind NNTP server");
@@ -994,14 +1043,16 @@ mod tests {
             .finalize(&mut pool, &mut cache, &mut meter)
             .expect("finalize streamed play");
         assert!(!pool.quarantined());
-        assert_eq!(
-            meter
-                .events
-                .iter()
-                .filter(|event| event.kind == MeterKind::QuarantineExited)
-                .count(),
-            1
-        );
+        let exits: Vec<_> = meter
+            .events
+            .iter()
+            .filter(|event| event.kind == MeterKind::QuarantineExited)
+            .collect();
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].user_id, "u");
+        assert_eq!(exits[0].track_id, "track-a");
+        assert_eq!(exits[0].lane, Some(Lane::Playback));
+        assert_eq!(exits[0].backoff_ms, 0);
     }
 
     #[test]
