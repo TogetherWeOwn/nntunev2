@@ -371,7 +371,7 @@ fn meter_failure_response(err: &MeterWriteError) -> Result<Response> {
 ///    drops).
 ///
 /// Production uses the `metered_admission` table in the existing
-/// `LIBRARY_DB` Hyperdrive database (`migrations/0004_*`, `0005_*`) for
+/// `LIBRARY_DB` Hyperdrive database (`migrations/0004_*`, `0005_*`, `0006_*`) for
 /// durable marks. The cross-isolate atomic claim is the single-statement
 /// `UPDATE ... RETURNING` in `admission_claim_sql`; no connection, lock,
 /// transaction, or temp state is held across the queue/meter awaits.
@@ -426,8 +426,9 @@ fn admission_claim_lease_secs() -> u64 {
 }
 
 /// Parameterized statements owned here (execution lives with the ledger
-/// impls); see `migrations/0004_metered_admission.sql` and
-/// `migrations/0005_metered_admission_claim.sql` for the table.
+/// impls); see `migrations/0004_metered_admission.sql`,
+/// `migrations/0005_metered_admission_claim.sql`, and
+/// `migrations/0006_metered_admission_claim_epoch.sql` for the table.
 /// Every statement is single-transaction autocommit with `$1` = job id and
 /// `$2` = stage: no `BEGIN`, no session lock, no temp state, so each one is
 /// safe under Hyperdrive transaction-mode pooling.

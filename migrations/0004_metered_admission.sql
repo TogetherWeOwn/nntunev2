@@ -7,8 +7,9 @@
 -- record inserts converge (one row wins; every loser reads the same
 -- mark), which is what makes the entry meter idempotent across client
 -- retries. Statements live in workers/ingest/src/lib.rs
--- (`admission_record_sql` / `admission_read_mark_sql` /
--- `admission_mark_queued_sql`); this file only creates the table.
+-- (`admission_ensure_sql` / `admission_claim_sql` /
+-- `admission_read_mark_sql` / `admission_mark_queued_sql` /
+-- `admission_release_sql`); this file only creates the table.
 -- Analytics Engine stays a projection: it is never read for dedupe.
 --
 -- Apply out of band (staging first) before the worker build that records
