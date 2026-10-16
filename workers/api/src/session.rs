@@ -587,16 +587,31 @@ mod tests {
         let primary = b"primary-secret-00000000000000000000";
         let now = 1_700_000_000u64;
         // Minting under a weak key is refused, never issued.
-        assert!(issue_session(b"", "victim", now, 3600).is_err());
-        assert!(issue_session(b"short", "victim", now, 3600).is_err());
-        assert!(verify_session(b"", "x.y", now).is_err());
-        // An unset previous secret (empty slice) fails the whole call:
-        // a token minted under the empty key never verifies.
+        assert_eq!(
+            issue_session(b"", "victim", now, 3600),
+            Err(SessionError::Misconfigured)
+        );
+        assert_eq!(
+            issue_session(b"short", "victim", now, 3600),
+            Err(SessionError::Misconfigured)
+        );
+        assert_eq!(
+            verify_session(b"", "x.y", now),
+            Err(SessionError::Misconfigured)
+        );
+        // An unset previous secret (empty slice) fails the whole call
+        // before token verification.
         let empty_prev = SessionKeys::rotation(primary, b"");
-        assert!(verify_session_dual(&empty_prev, "x.y", now).is_err());
+        assert_eq!(
+            verify_session_dual(&empty_prev, "x.y", now),
+            Err(SessionError::Misconfigured)
+        );
         // The primary itself is length-checked even when a previous exists.
         let short_primary = SessionKeys::rotation(b"short", b"");
-        assert!(verify_session_dual(&short_primary, "x.y", now).is_err());
+        assert_eq!(
+            verify_session_dual(&short_primary, "x.y", now),
+            Err(SessionError::Misconfigured)
+        );
     }
 
     #[test]

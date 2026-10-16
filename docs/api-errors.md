@@ -2,11 +2,11 @@
 
 The `api`, `ingest`, `mb`, and `stream` crates define mappings to the same
 JSON error envelope. In this slice, `ingest` and `mb` serialize the envelope
-on their wired HTTP error paths; `api` emits it for session configuration and
-storage failures, while its other mappings and the `stream` mappings are
-pinned for HTTP wiring as those paths are integrated. Clients can handle auth,
-validation, billing limits, and upstream failures without per-worker special
-cases.
+on their wired HTTP error paths. The `api` and `stream` mappings are pinned for
+future HTTP wiring, not emitted by reachable HTTP paths here; in particular,
+the API session-configuration and storage mappings are not currently reachable
+from handlers. Clients can handle auth, validation, billing limits, and
+upstream failures without per-worker special cases.
 
 ## Envelope
 

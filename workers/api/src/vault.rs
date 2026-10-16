@@ -906,6 +906,25 @@ mod tests {
     }
 
     #[test]
+    fn malformed_stored_blobs_are_classified_as_corrupt_at_the_vault_boundary() {
+        let kek = [0x11u8; 32];
+        let new_kek = [0x33u8; 32];
+        let mut malformed_payload = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+        malformed_payload.payload_b64url = "!".into();
+        assert_eq!(
+            decrypt_vault(&kek, "user-1", &malformed_payload),
+            Err(VaultError::CorruptStoredData)
+        );
+
+        let mut malformed_wrap = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+        malformed_wrap.dek_wrapped_nonce_b64url = "!".into();
+        assert!(matches!(
+            rewrap_dek(&kek, &new_kek, 2, "user-1", &malformed_wrap),
+            Err(VaultError::CorruptStoredData)
+        ));
+    }
+
+    #[test]
     fn http_indexer_url_rejected_for_public_host() {
         // F-TRANS-01 Gap 1: `http://` would send the API key in cleartext.
         let plaintext = IndexerConfig {

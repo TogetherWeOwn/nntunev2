@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { ApiClient, ApiError, toProviderTestInput, toVaultSaveBody } from './client.js';
+import { KNOWN_ERROR_CODES } from './errors.js';
+import apiErrorsRaw from '../../../../../docs/api-errors.md?raw';
 // Canonical web/Worker contract, shared with the Rust handlers suite (which
 // asserts every route is served). Change both sides in the same PR.
 import contractRaw from '../../../../../workers/api/tests/fixtures/api-web-contract.json?raw';
@@ -15,6 +17,12 @@ interface ContractRoute {
 }
 
 const contract = JSON.parse(contractRaw) as { version: number; routes: ContractRoute[] };
+const documentedErrorCodes = new Set(
+	apiErrorsRaw.split('\n').flatMap((line) => {
+		const code = line.match(/^\| `([^`]+)` \|/)?.[1];
+		return code ? [code] : [];
+	})
+);
 
 function jsonResponse(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {
@@ -22,6 +30,12 @@ function jsonResponse(body: unknown, status = 200): Response {
 		headers: { 'content-type': 'application/json' }
 	});
 }
+
+describe('API error code registry', () => {
+	it('keeps the web parser codes aligned with docs/api-errors.md', () => {
+		expect([...KNOWN_ERROR_CODES].sort()).toEqual([...documentedErrorCodes].sort());
+	});
+});
 
 describe('toProviderTestInput', () => {
 	it('trims the provider host to match validation and server rules', () => {
