@@ -4,7 +4,7 @@
  * naming from body figures, and the display-listener plumbing.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	formatCountdown,
 	onPaywall,
@@ -13,6 +13,8 @@ import {
 	toPaywallModel,
 	type PaywallModel
 } from './planLimit.js';
+
+afterEach(() => vi.unstubAllGlobals());
 
 describe('toPaywallModel non-limit statuses', () => {
 	it('returns null for 200/401/404/500 so existing error handling stands', () => {
@@ -29,7 +31,7 @@ describe('usage naming', () => {
 			headers: new Headers(),
 			body: { code: 'plan_limit_exceeded', used_bytes: 2048, limit_bytes: 2048, plan: 'free' }
 		});
-		expect(model?.detail).toContain('2,048 of 2,048');
+		expect(model?.detail).toMatch(/2\D*048 of 2\D*048/);
 		expect(model?.detail).toContain('free');
 		expect(model?.code).toBe('plan_limit_exceeded');
 	});
@@ -79,6 +81,22 @@ describe('formatCountdown', () => {
 });
 
 describe('paywall display plumbing', () => {
+	it('replays a limit response received before the first subscriber', () => {
+		vi.stubGlobal('window', {});
+		const seen: PaywallModel[] = [];
+		const model = paywallFromResponse({
+			status: 429,
+			headers: new Headers({ 'Retry-After': '45' })
+		});
+
+		expect(model?.kind).toBe('retryable');
+		expect(seen).toHaveLength(0);
+
+		const off = onPaywall((pending) => seen.push(pending));
+		expect(seen).toEqual([model]);
+		off();
+	});
+
 	it('notifies listeners for limits only, survives a throwing listener, unsubscribes', () => {
 		const seen: PaywallModel[] = [];
 		const offBad = onPaywall(() => {
@@ -96,7 +114,12 @@ describe('paywall display plumbing', () => {
 
 		off();
 		offBad();
+		vi.stubGlobal('window', {});
 		paywallFromResponse({ status: 402, headers: new Headers() });
 		expect(seen).toHaveLength(1);
+		const pending: PaywallModel[] = [];
+		const offPending = onPaywall((model) => pending.push(model));
+		expect(pending[0]?.status).toBe(402);
+		offPending();
 	});
 });

@@ -70,9 +70,9 @@ async function readJson<T>(res: Response, label: string): Promise<T> {
 		} catch {
 			/* non-JSON error body: keep generic */
 		}
-		// Client-side calls (checkout/portal) surface 402/429 as a paywall via
-		// the layout listener; with no listener (SSR loaders) this is a no-op
-		// and the typed error below drives the existing handling.
+		// Client-side calls surface 402/429 through the layout listener; if it
+		// has not registered yet, the pending model replays on subscription.
+		// During SSR, no model is queued and the typed error remains the fallback.
 		const paywall = paywallFromResponse({ status: res.status, headers: res.headers, body });
 		throw new BillingApiError(res.status, label, hint, paywall);
 	}

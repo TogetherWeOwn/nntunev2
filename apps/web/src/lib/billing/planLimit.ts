@@ -23,8 +23,9 @@
  * Display plumbing: API clients call {@link paywallFromResponse} on any
  * non-OK response; it builds the model (null for non-limit statuses) and
  * notifies listeners registered via {@link onPaywall}. The root layout is
- * the listener and renders `PaywallModal`. With no listener (SSR, unit
- * tests) notification is a no-op, so clients stay environment-agnostic.
+ * the listener and renders `PaywallModal`. In the browser, a response received
+ * before the root layout subscribes is retained and replayed to the first
+ * listener so cold-load failures cannot disappear; SSR calls remain a no-op.
  */
 
 /** Documented analytics event fired once per paywall display. No PII. */
@@ -193,24 +194,36 @@ export function trackPaywallShown(track: TrackFn, model: PaywallModel): void {
 type PaywallListener = (model: PaywallModel) => void;
 
 const listeners = new Set<PaywallListener>();
+let pendingModel: PaywallModel | null = null;
 
 /** Subscribe to paywall displays (root layout). Returns the unsubscribe. */
 export function onPaywall(listener: PaywallListener): () => void {
 	listeners.add(listener);
+	if (pendingModel !== null) {
+		const pending = pendingModel;
+		pendingModel = null;
+		notifyListener(listener, pending);
+	}
 	return () => {
 		listeners.delete(listener);
 	};
 }
 
-/** Notify display listeners. A throwing listener never breaks the caller. */
-export function showPaywall(model: PaywallModel): void {
-	for (const listener of listeners) {
-		try {
-			listener(model);
-		} catch {
-			/* display is best-effort; the API error still propagates */
-		}
+function notifyListener(listener: PaywallListener, model: PaywallModel): void {
+	try {
+		listener(model);
+	} catch {
+		/* display is best-effort; the API error still propagates */
 	}
+}
+
+/** Notify display listeners, retaining the latest model until one subscribes. */
+export function showPaywall(model: PaywallModel): void {
+	if (listeners.size === 0) {
+		if (typeof window !== 'undefined') pendingModel = model;
+		return;
+	}
+	for (const listener of listeners) notifyListener(listener, model);
 }
 
 /**
