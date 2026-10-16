@@ -34,6 +34,7 @@ pub mod probe;
 pub mod queue;
 pub mod rate_limit;
 pub mod repair;
+pub mod retry;
 
 use dispatch::validate_user_id;
 use jobs::validate_job_id;

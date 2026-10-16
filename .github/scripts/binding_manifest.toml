@@ -38,6 +38,10 @@ staging = "nntunev2-ingest-staging"
 prod = "nntunev2-ingest-prod"
 
 [[worker.binding]]
+binding = "INGEST_DLQ"
+type = "queue_producer"
+
+[[worker.binding]]
 binding = "LIBRARY_DB"
 type = "hyperdrive"
 staging = "61c87403f119430bbc3a7f571df47002"
