@@ -13,6 +13,5 @@
   "mb.search_cache_ttl_s": 600,
   "mb.search_limit": 25,
   "session.ttl_secs": 3600,
-  "stream.r2_min_part_bytes": 5242880,
-  "vault.indexer_allow_redirects": false
+  "stream.r2_min_part_bytes": 5242880
 }

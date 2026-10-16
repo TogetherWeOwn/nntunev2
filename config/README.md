@@ -23,9 +23,10 @@ makes drift fail CI.
   `nntune_config::Config::load` (whole-set validation: defaults applied,
   missing required keys rejected, type mismatches rejected, undeclared keys
   rejected) plus `apply_env` for the documented per-key overrides. No raw
-  stringly KV lookups on config paths in new code. Pre-existing hardcoded
-  constants migrate to the accessor incrementally; the schema already
-  declares their key names and defaults.
+  stringly KV lookups on config paths in new code. Ordinary tuning constants
+  may migrate to the accessor incrementally; security invariants are not
+  configuration knobs and remain enforced in code (for example, the vault
+  indexer must never follow redirects per F-VAULT-01).
 - **Precedence is KV first, environment second.** `apply_env` only consults
   keys declared `env_overridable`, and only through their documented
   `env_var` name. Everything else in the environment is ignored.

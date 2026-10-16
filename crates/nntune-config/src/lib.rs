@@ -209,14 +209,6 @@ pub static KEYS: &[KeySpec] = &[
         env_overridable: false,
         env_var: None,
     },
-    KeySpec {
-        name: "vault.indexer_allow_redirects",
-        ty: ConfigType::Bool,
-        default: Some("false"),
-        required: true,
-        env_overridable: false,
-        env_var: None,
-    },
 ];
 
 fn spec_for(name: &str) -> Option<&'static KeySpec> {
@@ -370,10 +362,6 @@ mod tests {
         assert_eq!(config.get_u64("mb.search_cache_ttl_s"), Some(300));
         assert_eq!(config.get_u64("mb.search_limit"), Some(25));
         assert_eq!(config.get_u64("ingest.payload_ttl_secs"), Some(2592000));
-        assert_eq!(
-            config.get_bool("vault.indexer_allow_redirects"),
-            Some(false)
-        );
         assert_eq!(config.get_str("auth.rp_id"), Some("v2-staging.nntune.com"));
     }
 
@@ -381,13 +369,8 @@ mod tests {
     fn explicit_kv_values_win_over_defaults() {
         let mut raw = identity();
         raw.insert("session.ttl_secs".to_string(), "3600".to_string());
-        raw.insert(
-            "vault.indexer_allow_redirects".to_string(),
-            "true".to_string(),
-        );
         let config = Config::load(&raw).expect("explicit values load");
         assert_eq!(config.get_u64("session.ttl_secs"), Some(3600));
-        assert_eq!(config.get_bool("vault.indexer_allow_redirects"), Some(true));
     }
 
     #[test]
@@ -419,40 +402,6 @@ mod tests {
                 "bad value {bad:?} must fail"
             );
         }
-        // Bool keys reject anything outside true/false.
-        let mut raw = identity();
-        raw.insert(
-            "vault.indexer_allow_redirects".to_string(),
-            "perhaps".to_string(),
-        );
-        assert_eq!(
-            Config::load(&raw),
-            Err(ConfigError::InvalidType {
-                key: "vault.indexer_allow_redirects",
-                expected: ConfigType::Bool,
-            }),
-        );
-    }
-
-    #[test]
-    fn bool_parsing_is_strict_but_case_insensitive() {
-        for good in ["true", "TRUE", " True "] {
-            let mut raw = identity();
-            raw.insert(
-                "vault.indexer_allow_redirects".to_string(),
-                good.to_string(),
-            );
-            let config = Config::load(&raw).expect("bool spelling loads");
-            assert_eq!(config.get_bool("vault.indexer_allow_redirects"), Some(true));
-        }
-        for bad in ["yes", "1", "on", ""] {
-            let mut raw = identity();
-            raw.insert("vault.indexer_allow_redirects".to_string(), bad.to_string());
-            assert!(
-                Config::load(&raw).is_err(),
-                "bool spelling {bad:?} must fail"
-            );
-        }
     }
 
     #[test]
@@ -462,6 +411,18 @@ mod tests {
         assert_eq!(
             Config::load(&raw),
             Err(ConfigError::UnknownKey("debug.backdoor".to_string()))
+        );
+
+        raw.remove("debug.backdoor");
+        raw.insert(
+            "vault.indexer_allow_redirects".to_string(),
+            "true".to_string(),
+        );
+        assert_eq!(
+            Config::load(&raw),
+            Err(ConfigError::UnknownKey(
+                "vault.indexer_allow_redirects".to_string()
+            ))
         );
     }
 

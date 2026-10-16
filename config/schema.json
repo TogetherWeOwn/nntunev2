@@ -121,14 +121,6 @@
       "env_overridable": false,
       "env_var": null,
       "description": "Minimum R2 multipart part size in bytes (5 MiB)."
-    },
-    "vault.indexer_allow_redirects": {
-      "type": "bool",
-      "default": false,
-      "required": true,
-      "env_overridable": false,
-      "env_var": null,
-      "description": "Whether BYO indexer probe requests follow HTTP redirects. Fail-closed default."
     }
   }
 }
