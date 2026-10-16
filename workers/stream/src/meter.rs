@@ -215,10 +215,24 @@ pub struct ReconcileMismatch {
     pub ledger_bytes: Option<u64>,
 }
 
+fn escape_log_field(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':') {
+            escaped.push(byte as char);
+        } else {
+            escaped.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    escaped
+}
+
 impl ReconcileMismatch {
     /// Single-line structured log for the mismatch, carrying the
     /// [`RECONCILE_MISMATCH_METRIC`] event name, the play identity, and
     /// both byte counts (`ledger_bytes=missing` when there is no entry).
+    /// Identity values are percent-escaped, including when public fields
+    /// were constructed without [`derive_play_idempotency_key`].
     pub fn log_line(&self) -> String {
         let ledger_bytes = match self.ledger_bytes {
             Some(bytes) => bytes.to_string(),
@@ -227,9 +241,9 @@ impl ReconcileMismatch {
         format!(
             "event={} idempotency_key={} user_id={} track_id={} metered_bytes={} ledger_bytes={}",
             RECONCILE_MISMATCH_METRIC,
-            self.idempotency_key,
-            self.user_id,
-            self.track_id,
+            escape_log_field(&self.idempotency_key),
+            escape_log_field(&self.user_id),
+            escape_log_field(&self.track_id),
             self.metered_bytes,
             ledger_bytes,
         )
@@ -366,5 +380,22 @@ mod tests {
         assert!(derive_play_idempotency_key(&"u".repeat(129), "track", "play").is_err());
         assert!(derive_play_idempotency_key("user", &"t".repeat(513), "play").is_err());
         assert!(derive_play_idempotency_key("user", "track", &"p".repeat(513)).is_err());
+    }
+
+    #[test]
+    fn mismatch_log_escapes_public_unvalidated_identity_fields() {
+        let mismatch = ReconcileMismatch {
+            idempotency_key: "play:user\nledger_bytes=999".to_string(),
+            user_id: "user with space".to_string(),
+            track_id: "track=value".to_string(),
+            metered_bytes: 40,
+            ledger_bytes: Some(40),
+        };
+        let line = mismatch.log_line();
+        assert!(!line.contains('\n'));
+        assert!(line.contains("idempotency_key=play:user%0Aledger_bytes%3D999"));
+        assert!(line.contains("user_id=user%20with%20space"));
+        assert!(line.contains("track_id=track%3Dvalue"));
+        assert!(line.ends_with("metered_bytes=40 ledger_bytes=40"));
     }
 }

@@ -102,8 +102,9 @@ and `reconcile` does not currently emit to Analytics Engine or call
   metered bytes differ from the entry's bytes emits exactly one
   `ReconcileMismatch` meter event. `ReconcileMismatch::log_line()` formats
   a single-line representation with event `play_reconcile_mismatch` and
-  both byte counts (`ledger_bytes=missing` when there is no entry). The
-  pass takes `&UsageLedger` and never adjusts, backfills, or drops an entry.
+  both byte counts (`ledger_bytes=missing` when there is no entry). Identity
+  fields are percent-escaped even if callers bypass constructor validation.
+  The pass takes `&UsageLedger` and never adjusts, backfills, or drops an entry.
   Production wiring for the meter, log, and ledger remains future work.
 
 ## Production notes
