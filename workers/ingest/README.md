@@ -41,9 +41,14 @@ NZB upload ───────────────┘                     
   never accepted in API bodies, never logged (redacted URLs only), never
   committed. `http://` indexer URLs are refused.
 - Upload bodies are untrusted: capped, shape-checked, never logged.
-- NZB fetch-from-URL SSRF guard (`src/nzb_fetch.rs`): a server-side fetch
-  of a caller-supplied NZB URL is hostile input. The guard runs before ANY
-  transport call and on every redirect hop from scratch:
+- NZB fetch-from-URL SSRF guard (`src/nzb_fetch.rs`), NOT YET WIRED: the
+  module is unit-tested, but no route calls it and nothing reads
+  `NZB_FETCH_ALLOWLIST` yet. Wiring it (route, env read, real transport
+  that dials the validated addresses, block logging) is a tracked
+  follow-up. The contract below is what that wiring must enforce. A
+  server-side fetch of a caller-supplied NZB URL is hostile input. The
+  guard runs before ANY transport call and on every redirect hop from
+  scratch:
   - `https` only (any other scheme is `nzb_fetch_bad_scheme`, 400), no
     embedded credentials (`nzb_fetch_embedded_credentials`, 400), no
     explicit port other than 443;
@@ -68,8 +73,8 @@ NZB upload ───────────────┘                     
     returned. Bodies past the 2 MiB intake cap abort with
     `nzb_fetch_too_large` (413); other upstream statuses surface as
     `nzb_fetch_upstream_status` (502);
-  - every block is logged as host + stable code only (never the full URL:
-    it may embed credentials or an apikey).
+  - when wired, every block must be logged as host + stable code only
+    (never the full URL: it may embed credentials or an apikey).
 - Stable codes: `nzb_fetch_bad_scheme`, `nzb_fetch_malformed_url`,
   `nzb_fetch_embedded_credentials`, `nzb_fetch_host_not_allowlisted`,
   `nzb_fetch_forbidden_address`, `nzb_fetch_unresolvable_host`,
