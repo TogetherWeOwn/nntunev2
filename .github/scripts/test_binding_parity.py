@@ -624,6 +624,43 @@ reason = "fixture: value fix owned elsewhere"
         wrangler = MATCHING_WRANGLER + "\n[[env.staging.send_email]]\n"
         self.assert_wrangler_fails_closed_with_exit_two(wrangler)
 
+    def test_name_keyed_malformed_entries_fail_closed_with_exit_two(self):
+        # A name-keyed binding table that is present but not a table (or a
+        # list entry that is not a table) is malformed, not absent: it must
+        # fail closed instead of being silently ignored.
+        scalar_cases = {
+            "send_email": MATCHING_WRANGLER.replace(
+                "[env.staging]\n", '[env.staging]\nsend_email = "oops"\n', 1
+            ),
+            "ratelimits": MATCHING_WRANGLER.replace(
+                "[env.staging]\n", "[env.staging]\nratelimits = 123\n", 1
+            ),
+            "unsafe.bindings": MATCHING_WRANGLER
+            + '\n[env.staging.unsafe]\nbindings = "oops"\n',
+            "logfwdr.bindings": MATCHING_WRANGLER
+            + "\n[env.staging.logfwdr]\nbindings = 123\n",
+        }
+        for table, wrangler in scalar_cases.items():
+            with self.subTest(table=table, kind="scalar"):
+                self.assert_wrangler_fails_closed_with_exit_two(wrangler)
+        list_cases = {
+            "send_email": MATCHING_WRANGLER.replace(
+                "[env.staging]\n",
+                '[env.staging]\nsend_email = ["oops"]\n',
+                1,
+            ),
+            "ratelimits": MATCHING_WRANGLER.replace(
+                "[env.staging]\n", "[env.staging]\nratelimits = [123]\n", 1
+            ),
+            "unsafe.bindings": MATCHING_WRANGLER
+            + '\n[env.staging.unsafe]\nbindings = ["oops"]\n',
+            "logfwdr.bindings": MATCHING_WRANGLER
+            + "\n[env.staging.logfwdr]\nbindings = [123]\n",
+        }
+        for table, wrangler in list_cases.items():
+            with self.subTest(table=table, kind="list-entry"):
+                self.assert_wrangler_fails_closed_with_exit_two(wrangler)
+
     def test_manifest_key_typo_fails_closed(self):
         manifest = MANIFEST.replace('staging = "fx-audio-staging"',
                                      'stagign = "fx-audio-staging"')

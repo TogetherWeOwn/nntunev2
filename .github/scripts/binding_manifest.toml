@@ -115,22 +115,6 @@ type = "assets"
 # --- reconciliation work; delete each entry when its value lands) ---
 
 [[known_drift]]
-worker = "stream"
-env = "staging"
-binding = "AUDIO_CACHE"
-actual = "nntune-audio-cache"
-expected = "nntunev2-audio-staging"
-reason = "pre-existing value drift; alignment owned elsewhere (docs/ops.md reconciliation table)"
-
-[[known_drift]]
-worker = "stream"
-env = "prod"
-binding = "AUDIO_CACHE"
-actual = "nntune-audio-cache"
-expected = "nntunev2-audio-prod"
-reason = "pre-existing value drift; alignment owned elsewhere (docs/ops.md reconciliation table)"
-
-[[known_drift]]
 worker = "ingest"
 env = "staging"
 binding = "INGEST_QUEUE"

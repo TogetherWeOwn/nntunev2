@@ -202,6 +202,10 @@ def extract_bindings(data):
         name_keyed = key in _NAME_KEYED_BINDING_TABLES
         for item in candidates:
             if not isinstance(item, dict):
+                if name_keyed:
+                    raise ParityError(
+                        f"{key}: entry is not a table (unknown:{key})"
+                    )
                 continue
             binding_key = "binding" if "binding" in item else "name" if name_keyed else None
             if binding_key is None:
