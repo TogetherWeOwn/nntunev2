@@ -65,6 +65,20 @@ a captured grant must stop replaying soon after issuance.
   dialing out. Wrong-track binding is still rejected (`WrongTrack`) for
   within-cap grants.
 
+## Grant-rejection meter signals (meter.rs, play.rs)
+
+Each grant rejection emits exactly one distinct meter event and nothing
+else: no `PlayStart`, no cache events, no dial, no quarantine, no lease.
+
+- `GrantRejectedExpired` for `Unauthorized(Expired)`.
+- `GrantRejectedExcessiveExpiry` for `Unauthorized(TtlTooLong)`.
+- `GrantRejectedWrongTrack` for `WrongTrack` (with `track_id` set to the
+  *requested* track).
+- Rejection events carry the requested track, the granted user
+  (best-effort from the validly-signed payload, empty only when
+  undecodable), and `bytes = 0` — never secret or token material. The
+  accept path emits no `GrantRejected*` at all.
+
 ## TTFB targets
 
 First-byte latency is measured by `tests/stream_integration.rs`

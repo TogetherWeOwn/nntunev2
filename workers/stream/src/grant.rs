@@ -114,6 +114,31 @@ pub fn verify(token: &str, secret: &[u8], now_unix: u64) -> Result<Grant, GrantE
     })
 }
 
+/// Best-effort authenticated user for metering: the `user_id` embedded in
+/// `token` when its signature verifies and its payload parses, regardless
+/// of expiry or TTL-cap state. Returns `None` for malformed tokens,
+/// bad signatures, or unparsable payloads — callers must treat that as
+/// "unknown user", never as a secret or token echo.
+pub fn authenticated_user(token: &str, secret: &[u8]) -> Option<String> {
+    let rest = token.strip_prefix("v1.")?;
+    let (payload_b64, sig_b64) = rest.split_once('.')?;
+    if payload_b64.is_empty() || sig_b64.is_empty() {
+        return None;
+    }
+    let sig = base64url_decode(sig_b64)?;
+    let expected = hmac_sha256(secret, payload_b64.as_bytes());
+    if sig.len() != expected.len() || !constant_time_eq(&sig, &expected) {
+        return None;
+    }
+    let payload = base64url_decode(payload_b64)?;
+    let payload = String::from_utf8(payload).ok()?;
+    let mut parts = payload.split('|');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(u), Some(_), Some(_), None) => Some(u.to_string()),
+        _ => None,
+    }
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let mut diff = 0u8;
     for (x, y) in a.iter().zip(b.iter()) {
