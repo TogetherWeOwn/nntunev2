@@ -5,6 +5,7 @@ import {
 	ARTWORK_PLACEHOLDER_SRC,
 	isUsableArtworkSrc,
 	nextArtworkSrcAfterError,
+	resetFailedArtworkSrcOnChange,
 	resolveArtwork
 } from './artwork.js';
 
@@ -67,5 +68,18 @@ describe('nextArtworkSrcAfterError', () => {
 
 	it('stops on the placeholder instead of looping', () => {
 		expect(nextArtworkSrcAfterError(ARTWORK_PLACEHOLDER_SRC)).toBeNull();
+	});
+});
+
+describe('resetFailedArtworkSrcOnChange', () => {
+	it('clears a prior failure when the source changes away and back', () => {
+		const failedSrc = 'https://r2.example.com/art/missing.jpg';
+		const otherSrc = 'https://r2.example.com/art/other.jpg';
+
+		const afterChange = resetFailedArtworkSrcOnChange(failedSrc, otherSrc, failedSrc);
+		const afterReturn = resetFailedArtworkSrcOnChange(otherSrc, failedSrc, afterChange);
+
+		expect(afterChange).toBeNull();
+		expect(afterReturn).toBeNull();
 	});
 });

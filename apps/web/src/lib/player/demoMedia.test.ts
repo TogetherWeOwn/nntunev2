@@ -6,9 +6,10 @@ describe('demo media', () => {
 	it('keeps the original bytes when no track is requested', () => {
 		const body = syntheticBody();
 		expect(body).toHaveLength(MEDIA_BYTES);
-		// Seek specs read bytes 0-99 of the default stream.
-		expect(body[0]).toBe(13);
-		expect(body[1]).toBe((7919 + 13) % 256);
+		expect(new TextDecoder().decode(body.slice(0, 4))).toBe('RIFF');
+		expect(new TextDecoder().decode(body.slice(8, 12))).toBe('WAVE');
+		expect(new TextDecoder().decode(body.slice(12, 16))).toBe('fmt ');
+		expect(new TextDecoder().decode(body.slice(36, 40))).toBe('data');
 	});
 
 	it('serves distinct bytes for each queue track in the fixture', () => {
