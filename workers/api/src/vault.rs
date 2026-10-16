@@ -832,11 +832,14 @@ mod tests {
 
     fn unwrap_dek(kek: &[u8; 32], user_id: &str, blob: &VaultBlob) -> Vec<u8> {
         let cipher = Aes256Gcm::new_from_slice(kek).expect("kek cipher");
-        let wrap_nonce = crate::b64::decode(&blob.dek_wrapped_nonce_b64url).expect("wrap nonce");
+        let wrap_nonce: [u8; 12] = crate::b64::decode(&blob.dek_wrapped_nonce_b64url)
+            .expect("wrap nonce")
+            .try_into()
+            .expect("wrap nonce length");
         let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url).expect("wrapped dek");
         cipher
             .decrypt(
-                Nonce::from_slice(&wrap_nonce),
+                &Nonce::from(wrap_nonce),
                 Payload {
                     msg: &wrapped,
                     aad: dek_aad(user_id, blob.kek_version).as_bytes(),
