@@ -1,6 +1,6 @@
 # NNTune v2 operations
 
-Provisioned resource metadata for staging + prod, as of 2026-10-13.
+Provisioned resource metadata for staging + prod, as of 2026-10-16.
 **Never commit tokens, passwords, database URLs, or personal login identities.**
 Secret values live in GitHub Actions secrets, Cloudflare, and the host's secure
 credential storage. Resource IDs below are non-credential binding metadata;
@@ -36,8 +36,10 @@ integration prerequisites on sibling branches are:
 
 Their owners must coordinate these fixes at the next permitted review round and
 recheck actual bindings before deployment. This runbook does not change those
-branches, certify a deploy, or choose where the cache ADR's `tmp/` scratch prefix
-will live. Archive buckets are not implicitly scratch storage.
+branches or certify a deploy. Scratch storage is now provisioned separately
+from archive buckets. The ingest scratch buckets are isolated by environment
+and expire objects under `ingest-scratch/` after seven days; do not use archive
+buckets as scratch storage.
 
 | Bucket | Env | Intended consumer |
 |---|---|---|
@@ -47,6 +49,8 @@ will live. Archive buckets are not implicitly scratch storage.
 | `nntunev2-art-prod` | prod | MusicBrainz Worker artwork cache |
 | `nntunev2-archive-staging` | staging | reserved archive capacity; no Worker consumer configured |
 | `nntunev2-archive-prod` | prod | reserved archive capacity; no Worker consumer configured |
+| `nntunev2-ingest-scratch-staging` | staging | ingest repair scratch data; `ingest-scratch/` objects expire after 7 days |
+| `nntunev2-ingest-scratch-prod` | prod | ingest repair scratch data; `ingest-scratch/` objects expire after 7 days |
 
 The archive buckets were requested at provisioning time. They are not evidence
 of an implemented archival pipeline and must not be bound to a Worker by default.
@@ -64,6 +68,11 @@ part of a documentation fix.
 |---|---|---|
 | `nntunev2-ingest-staging` | `c9e6afdea0ca487c8d20f799a052b045` | staging |
 | `nntunev2-ingest-prod` | `2bf7e1a0edd347c9aada2afbc0c24ae5` | prod |
+| `nntunev2-ingest-dlq-staging` | `e7ab1d4b284f44f094c5fe62f9bf96a5` | staging DLQ |
+| `nntunev2-ingest-dlq-prod` | `e9d0a9f5549249df9eebaa5c00951328` | prod DLQ |
+
+The DLQ queues are provisioned but are not connected to a consumer. Configure
+the consumer's dead-letter handling only when the ingest consumer is enabled.
 
 UNDO: API `DELETE /accounts/<acct>/queues/<queue_id>` after authorized
 consumer removal and pending-message checks.
