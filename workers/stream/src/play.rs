@@ -32,6 +32,7 @@ use crate::cache::{ContentCache, MultipartUpload};
 use crate::grant::{self, GrantError};
 use crate::meter::{Meter, MeterEvent, MeterKind};
 use crate::nntp::{valid_message_id, NntpClient, NntpError};
+use crate::observability::CacheObserveEvent;
 use crate::pool::{Lane, Lease, OrphanedPlay, Pool, PoolError};
 use crate::prefetch::should_prefetch;
 use crate::range::{self, RangeOutcome};
@@ -59,6 +60,20 @@ pub enum PlayError {
     Upstream(String),
     /// A segment could not be decoded (corrupt or mis-placed yEnc part).
     Decode(YencError),
+}
+
+impl PlayError {
+    /// The stable Analytics Engine / log code for pool-level failures
+    /// (`blob4` / `pool_error_code` in [`crate::observability`]); `None` for
+    /// every non-pool failure. This is the single definition of the
+    /// `POOL_*` strings the dashboard groups by.
+    pub fn pool_error_code(&self) -> Option<&'static str> {
+        match self {
+            PlayError::PoolQuarantined { .. } => Some("POOL_QUARANTINED"),
+            PlayError::PoolExhausted => Some("POOL_EXHAUSTED"),
+            _ => None,
+        }
+    }
 }
 
 /// Everything the play path needs, by reference.
@@ -109,6 +124,7 @@ pub type StreamPool = Pool<NntpClient>;
 pub struct PlayStream {
     user_id: String,
     track_id: String,
+    cache_hit: bool,
     /// Next absolute byte to emit, and the exclusive end of the response.
     pos: u64,
     end: u64,
@@ -439,6 +455,7 @@ fn respond(
         stream: PlayStream {
             user_id: user.to_string(),
             track_id: track.to_string(),
+            cache_hit,
             pos: start,
             end,
             served: 0,
@@ -473,6 +490,29 @@ impl PlayStream {
     /// True on the miss path (chunks feed a staged multipart upload).
     pub fn is_writeback(&self) -> bool {
         matches!(self.source, Some(Source::Live(_)))
+    }
+
+    /// Bytes served to the client so far.
+    pub fn served_bytes(&self) -> u64 {
+        self.served
+    }
+
+    /// Project this play to its cache-observability event (Analytics Engine
+    /// row + log line; see [`crate::observability`]). The caller — the
+    /// Worker/DO entry point, which owns the request id and the clock —
+    /// supplies `request_id` and the `ttft_ms` it measured around the first
+    /// chunk; status, served bytes, hashed identity and any pool error
+    /// code come from the play itself. Call before `finalize`/`abort`
+    /// consumes the stream.
+    pub fn observe_event(&self, request_id: impl Into<String>, ttft_ms: u64) -> CacheObserveEvent {
+        CacheObserveEvent::from_play(
+            request_id,
+            &self.user_id,
+            self.cache_hit,
+            ttft_ms,
+            self.served,
+            self.error(),
+        )
     }
 
     /// Why the stream stopped early, if it did (miss path only).
@@ -652,5 +692,79 @@ mod tests {
             Err(PlayError::Unauthorized(GrantError::Malformed))
         ));
         assert_eq!(pool.connects(), 0, "rejected plays must not dial out");
+    }
+
+    #[test]
+    fn hit_play_projects_to_a_hit_observe_event_with_served_bytes() {
+        use crate::observability::{hash_user, CacheStatus};
+
+        let secret = b"s";
+        let token = grant::issue("user-9", "track-a", 9_999_999_999, secret);
+        let mut pool = Pool::new(1);
+        let mut cache = ContentCache::new();
+        cache.put_track("track-a", vec![7u8; 100]);
+        let mut meter = crate::meter::MemoryMeter::default();
+        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+        let input = PlayInput {
+            token: &token,
+            track_id: "track-a",
+            range: None,
+            server_addr: addr,
+            segments: &[],
+            cipher_key: 0,
+            now_unix: 1,
+            up_next: None,
+        };
+        let mut response = play(&mut pool, &mut cache, &mut meter, secret, &input).unwrap();
+        assert!(response.cache_hit);
+        let served: usize = response.stream.by_ref().map(|c| c.len()).sum();
+        assert_eq!(served, 100);
+
+        let ev = response.stream.observe_event("req-001", 7);
+        assert_eq!(ev.cache_status, CacheStatus::Hit);
+        assert_eq!(ev.bytes, 100);
+        assert_eq!(ev.ttft_ms, 7);
+        assert_eq!(ev.pool_error_code, None);
+        assert_eq!(ev.user_hash, hash_user("user-9"));
+        assert_eq!(
+            ev.analytics_blobs(),
+            vec!["hit", ev.user_hash.as_str(), "req-001", ""]
+        );
+    }
+
+    #[test]
+    fn quarantined_pool_play_error_maps_to_pool_quarantined_code() {
+        let secret = b"s";
+        let token = grant::issue("u", "track-a", 9_999_999_999, secret);
+        let mut pool = Pool::new(1);
+        pool.record_provider_error(); // quarantines the pool
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+        let segments = vec!["a-seg0@synthetic.test".to_string()];
+        let input = PlayInput {
+            token: &token,
+            track_id: "track-a",
+            range: None,
+            server_addr: addr,
+            segments: &segments,
+            cipher_key: 0,
+            now_unix: 1,
+            up_next: None,
+        };
+        let err = match play(&mut pool, &mut cache, &mut meter, secret, &input) {
+            Ok(_) => panic!("quarantined pool must fail the play"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, PlayError::PoolQuarantined { .. }),
+            "got: {err:?}"
+        );
+        assert_eq!(err.pool_error_code(), Some("POOL_QUARANTINED"));
+        assert_eq!(
+            PlayError::PoolExhausted.pool_error_code(),
+            Some("POOL_EXHAUSTED")
+        );
+        assert_eq!(PlayError::WrongTrack.pool_error_code(), None);
     }
 }
