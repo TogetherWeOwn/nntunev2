@@ -27,7 +27,9 @@ use nntune_stream::yenc::{self, PartSpec};
 
 const SECRET: &[u8] = b"stream-integration-secret";
 const NOW_UNIX: u64 = 1_700_000_000;
-const EXP_UNIX: u64 = 9_999_999_999;
+// Within the grant TTL cap (`MAX_GRANT_TTL` = 900 s): play-path fixtures must
+// carry grants `verify` accepts at `NOW_UNIX`, so the expiry sits at the cap.
+const EXP_UNIX: u64 = NOW_UNIX + 900;
 const CIPHER_KEY: u8 = 0x5A;
 
 type Fixture = (Vec<u8>, Vec<String>, HashMap<String, Vec<u8>>);

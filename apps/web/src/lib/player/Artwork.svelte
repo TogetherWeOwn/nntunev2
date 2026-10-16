@@ -1,5 +1,10 @@
 <script lang="ts">
-	import { ARTWORK_PLACEHOLDER_SRC, nextArtworkSrcAfterError, resolveArtwork } from './artwork.js';
+	import {
+		ARTWORK_PLACEHOLDER_SRC,
+		nextArtworkSrcAfterError,
+		resetFailedArtworkSrcOnChange,
+		resolveArtwork
+	} from './artwork.js';
 
 	interface Props {
 		src?: string | null;
@@ -17,7 +22,17 @@
 
 	let resolved = $derived(resolveArtwork(src, { fallbackSrc, alt }));
 	let failedSrc = $state<string | null>(null);
+	let lastResolvedSrc = $state<string | null>(null);
 	let shownSrc = $derived(failedSrc === resolved.src ? fallbackSrc : resolved.src);
+
+	$effect(() => {
+		const currentSrc = resolved.src;
+		if (lastResolvedSrc !== null) {
+			const nextFailedSrc = resetFailedArtworkSrcOnChange(lastResolvedSrc, currentSrc, failedSrc);
+			if (nextFailedSrc !== failedSrc) failedSrc = nextFailedSrc;
+		}
+		lastResolvedSrc = currentSrc;
+	});
 
 	function handleError(): void {
 		// Stops once the placeholder itself fails: no loop, no broken-image state.

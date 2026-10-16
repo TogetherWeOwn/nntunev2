@@ -8,7 +8,9 @@ import { syntheticBody } from '#lib/player/demoMedia.js';
  * selects a distinct body for queue tracks.
  */
 
-function parseRange(header: string | null, len: number): { start: number; end: number } | null {
+type ParsedRange = { start: number; end: number } | { unsatisfiable: true };
+
+function parseRange(header: string | null, len: number): ParsedRange | null {
 	if (header === null) return null;
 	const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
 	if (!match) return null;
@@ -16,14 +18,17 @@ function parseRange(header: string | null, len: number): { start: number; end: n
 	if (startText === '' && endText === '') return null;
 	if (startText === '') {
 		const suffix = Number(endText);
-		if (!Number.isFinite(suffix) || suffix <= 0) return null;
+		if (!Number.isFinite(suffix)) return null;
+		if (suffix <= 0) return { unsatisfiable: true };
 		const n = Math.min(suffix, len);
 		return { start: len - n, end: len - 1 };
 	}
 	const start = Number(startText);
-	if (!Number.isFinite(start) || start >= len) return null;
+	if (!Number.isFinite(start)) return null;
+	if (start >= len) return { unsatisfiable: true };
 	const end = endText === '' ? len - 1 : Math.min(Number(endText), len - 1);
-	if (!Number.isFinite(end) || end < start) return null;
+	if (!Number.isFinite(end)) return null;
+	if (end < start) return { unsatisfiable: true };
 	return { start, end };
 }
 
@@ -39,6 +44,11 @@ export const GET: RequestHandler = ({ request, url }) => {
 	const range = parseRange(request.headers.get('range'), body.length);
 	if (range === null) {
 		return new Response(body.buffer as ArrayBuffer, { status: 200, headers });
+	}
+	if ('unsatisfiable' in range) {
+		headers.set('content-range', `bytes */${body.length}`);
+		headers.set('content-length', '0');
+		return new Response(null, { status: 416, headers });
 	}
 	const slice = body.slice(range.start, range.end + 1);
 	headers.set('content-range', `bytes ${range.start}-${range.end}/${body.length}`);

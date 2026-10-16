@@ -64,3 +64,12 @@ export function nextArtworkSrcAfterError(
 	if (currentSrc === fallbackSrc) return null;
 	return fallbackSrc;
 }
+
+/** Clear a previous image error when the source changes, so returning to it retries. */
+export function resetFailedArtworkSrcOnChange(
+	previousSrc: string,
+	currentSrc: string,
+	failedSrc: string | null
+): string | null {
+	return previousSrc === currentSrc ? failedSrc : null;
+}
