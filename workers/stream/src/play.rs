@@ -753,7 +753,9 @@ mod tests {
         use crate::observability::{hash_user, CacheStatus};
 
         let secret = b"s";
-        let token = grant::issue("user-9", "track-a", 9_999_999_999, secret);
+        // Expiry stays within the 15-min grant TTL cap (now_unix = 1 below)
+        // so the test passes both pre-cap and post-cap `verify`.
+        let token = grant::issue("user-9", "track-a", 901, secret);
         let mut pool = Pool::new(1);
         let mut cache = ContentCache::new();
         cache.put_track("track-a", vec![7u8; 100]);
@@ -790,7 +792,9 @@ mod tests {
         use crate::observability::{hash_user, CacheStatus};
 
         let secret = b"s";
-        let token = grant::issue("u", "track-a", 9_999_999_999, secret);
+        // Expiry stays within the 15-min grant TTL cap (now_unix = 1 below)
+        // so the test passes both pre-cap and post-cap `verify`.
+        let token = grant::issue("u", "track-a", 901, secret);
         let mut pool = Pool::new(1);
         let held_lease = if quarantined {
             pool.record_provider_error();
