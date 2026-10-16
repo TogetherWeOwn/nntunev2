@@ -48,8 +48,9 @@ pub fn parse_upload(xml: &[u8], estimate: &IntakeEstimate) -> Result<ParsedNzb, 
 }
 
 /// Cross-check parser counts and identifiers against the intake scan. The
-/// cheap scan is deliberately conservative and can count tag-like text in
-/// comments or attributes, so parsed counts may be lower but never higher.
+/// cheap scan skips comments, CDATA and attribute text; the `<=` bound only
+/// tolerates interpretation differences with the parser, which may count
+/// fewer elements but must never count more.
 pub fn check_parsed(estimate: &IntakeEstimate, parsed: &ParsedNzb) -> Result<(), &'static str> {
     if parsed.file_count > estimate.file_count || parsed.segment_count > estimate.segment_count {
         return Err("parse exceeds the intake estimate");

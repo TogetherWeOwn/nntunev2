@@ -58,8 +58,8 @@ pub struct QueueMsg {
     /// [`PAYLOAD_RETRY_ATTEMPTS`](crate::dispatch::PAYLOAD_RETRY_ATTEMPTS)
     /// retries): a first-read miss is expected (KV cross-location lag plus
     /// edge-cached negative lookups), never a failed job. The consumer reads
-    /// with the minimum `cacheTtl` (30 s) so the cached miss expires before
-    /// the later retries.
+    /// with `cacheTtl = 60 s` (the KV API minimum) so the cached miss expires
+    /// before the later retries.
     #[serde(default)]
     pub payload_ref: Option<String>,
 }
