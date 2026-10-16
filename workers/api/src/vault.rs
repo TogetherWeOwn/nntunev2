@@ -943,7 +943,23 @@ mod tests {
             Err(VaultError::CorruptStoredData)
         );
 
+        // A well-formed but short wrapped-DEK nonce must hit the length
+        // classification branch in `decrypt_vault` too.
+        let mut short_wrapped_nonce = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+        short_wrapped_nonce.dek_wrapped_nonce_b64url = crate::b64::encode(&[0u8; 5]);
+        assert_eq!(
+            decrypt_vault(&kek, "user-1", &short_wrapped_nonce),
+            Err(VaultError::CorruptStoredData)
+        );
+
         // Both wrapped-DEK decode sites in `rewrap_dek` pin the same way.
+        let mut short_rewrap_nonce = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+        short_rewrap_nonce.dek_wrapped_nonce_b64url = crate::b64::encode(&[0u8; 5]);
+        assert!(matches!(
+            rewrap_dek(&kek, &new_kek, 2, "user-1", &short_rewrap_nonce),
+            Err(VaultError::CorruptStoredData)
+        ));
+
         let mut malformed_wrap = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
         malformed_wrap.dek_wrapped_nonce_b64url = "!".into();
         assert!(matches!(
