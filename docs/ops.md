@@ -30,8 +30,9 @@ integration prerequisites on sibling branches are:
 |---|---|
 | [#2](https://github.com/TogetherWeOwn/nntunev2/pull/2), cache ADR | Physical audio/art buckets are separate per environment; prefixes live inside them. |
 | [#14](https://github.com/TogetherWeOwn/nntunev2/pull/14), scaffold | Replace placeholders only when activating the correct consumer bindings. |
-| [#8](https://github.com/TogetherWeOwn/nntunev2/pull/8), stream | `workers/stream/wrangler.toml` uses `nntune-audio-cache` without environment sections; bind `AUDIO_CACHE` to `nntunev2-audio-staging` / `nntunev2-audio-prod`. |
+| [#8](https://github.com/TogetherWeOwn/nntunev2/pull/8), stream | `workers/stream/wrangler.toml` binds `AUDIO_CACHE` to `nntune-audio-cache` in both `[env.staging]` and `[env.production]`; bind it to `nntunev2-audio-staging` / `nntunev2-audio-prod`. |
 | [#10](https://github.com/TogetherWeOwn/nntunev2/pull/10), ingest | Both producer and consumer in `workers/ingest/wrangler.toml.example` use `nntune-ingest-jobs`; use `nntunev2-ingest-staging` / `nntunev2-ingest-prod`. |
+| `workers/mb/wrangler.toml.example`, MB art cache | The `ART_CACHE` template names only `nntunev2-art-staging`; the prod deploy must override it with `nntunev2-art-prod` when the binding is activated. |
 | [#11](https://github.com/TogetherWeOwn/nntunev2/pull/11), E2E | Supply the two pending Access client secrets before enabling the staging URL; see the Access section. |
 
 Their owners must coordinate these fixes at the next permitted review round and
@@ -307,7 +308,7 @@ this table.
 
 Known config drift (tracked in the R2 reconciliation table, fixed by the
 owning lanes, not here): the committed `workers/stream/wrangler.toml` still
-binds `AUDIO_CACHE` to `nntune-audio-cache` with no environment sections,
+binds `AUDIO_CACHE` to `nntune-audio-cache` in both environments,
 and `workers/ingest/wrangler.toml.example` still names the queue
 `nntune-ingest-jobs`.
 
