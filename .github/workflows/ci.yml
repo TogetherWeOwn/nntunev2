@@ -62,6 +62,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Scalar core (no transport features) and the Workers transport build.
       - run: cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
@@ -69,6 +70,9 @@ jobs:
       # The simd128 yEnc fast path must keep compiling (Workers run V8 with
       # Wasm SIMD; the deploy enables it via this RUSTFLAGS).
       - run: RUSTFLAGS="-C target-feature=+simd128" cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
+      # The stream Worker entry (NntpPool Durable Object) only compiles on
+      # wasm32: lint it on the target it deploys to.
+      - run: cargo clippy -p nntune-stream --target wasm32-unknown-unknown -- -D warnings
 
   # Public-repo hygiene: fail on internal tracker ids (TOG-<digits>),
   # internal hostnames, instance-UI paths and agent names in tracked text.
@@ -123,6 +127,9 @@ jobs:
       # The Worker deploys to wasm32: the crate must check on that target
       # (native-only CI once missed a getrandom/RNG breakage there).
       - run: cargo check --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
+      # The Hyperdrive cache gate fails closed without credentials; pin its
+      # exit codes with the built-in shim self-test (no network, no secrets).
+      - run: bash workers/api/check_hyperdrive_cache.sh --self-test
 
   rust-mb:
     name: rust (workers/mb)
@@ -182,7 +189,8 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 22
+          # Keep in sync with @types/node major in e2e/package.json.
+          node-version: 26
           cache: npm
           cache-dependency-path: e2e/package-lock.json
 

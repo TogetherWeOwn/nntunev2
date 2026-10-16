@@ -15,4 +15,6 @@ compatibility_date = "2026-10-01"
 
 # [[r2_buckets]]
 # binding = "ART_CACHE"
-# bucket_name = "nntunev2-art"
+# Per-environment art bucket (see docs/ops.md): "nntunev2-art-staging" for
+# staging, "nntunev2-art-prod" for prod. There is no shared unsuffixed bucket.
+# bucket_name = "nntunev2-art-staging"
