@@ -264,7 +264,17 @@ mod tests {
             let code = cells[1].trim_matches('`');
             let status: u16 = cells[2].parse().expect("registry status parses");
             let retryable: bool = cells[3].parse().expect("registry retryable parses");
-            if let Some(mine) = REGISTRY.iter().find(|s| s.code == code) {
+            let owners: Vec<&str> = cells[4].split(',').map(str::trim).collect();
+            let mine = REGISTRY.iter().find(|s| s.code == code);
+            // Reverse direction: a row naming this worker must be a code
+            // this worker actually emits, or the doc promises a code that
+            // can never appear.
+            assert_eq!(
+                owners.contains(&"api"),
+                mine.is_some(),
+                "owning-worker drift for {code}"
+            );
+            if let Some(mine) = mine {
                 assert_eq!(
                     (mine.status, mine.retryable),
                     (status, retryable),
