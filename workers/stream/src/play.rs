@@ -14,12 +14,18 @@
 //! pulls [`PlayStream`] chunks. Which segment comes first depends on
 //! [`PlayInput::segment_ranges`]: with per-segment byte ranges (NZB
 //! metadata) a mid-track `Range` fetches the *covering* article directly —
-//! one `BODY` to first byte — while without them (or with ranges that fail
-//! validation) the play path keeps the prefix walk from segment 0, since
-//! the covering article cannot be addressed (see the README TTFB notes).
-//! Memory is one decoded segment at a time (plus the staged write, which R2
-//! holds in production; out-of-order segments wait in that staged write,
-//! flushed into multipart parts only as the contiguous prefix grows).
+//! one `BODY` to first byte — while without them the play path keeps the
+//! prefix walk from segment 0, since the covering article cannot be
+//! addressed (see the README TTFB notes). Ranges are a verified hint: a
+//! ranges-only `416`, ranges that fail validation, or a covering article
+//! that disagrees with its declared range all drop the hint and fall back
+//! to the prefix walk, so wrong NZB metadata cannot make a playable track
+//! unplayable. Memory is the staged write (which R2 holds in production)
+//! plus one decoded segment at a time: the covering segment is the only
+//! one ever held out of order, because the skipped prefix is backfilled
+//! in file order before serving advances past it — staging only ever
+//! receives the contiguous prefix, flushed into multipart parts as it
+//! grows.
 //! [`PlayStream::finalize`] drains any segments the client's range did not
 //! need — including a skipped prefix — so the cache still gets the whole
 //! track, then completes the upload and hands the healthy connection back
@@ -228,22 +234,27 @@ pub fn play(
     if let Some(bad) = input.segments.iter().find(|s| !valid_segment_id(s)) {
         return Err(PlayError::InvalidSegment(bad.clone()));
     }
-    // Covering-segment plan: valid ranges know the file size up front, so
-    // the range resolves (or 416s) before any dial, and the first fetch is
-    // the article covering the range start. Absent/invalid ranges plan
-    // nothing and the prefix walk below behaves exactly as before.
-    let ranges = valid_ranges(input.segment_ranges, input.segments.len());
+    // Covering-segment plan: ranges are a *hint*, never trusted blindly.
+    // Valid-shape ranges tentatively resolve the range so the first fetch
+    // is the article covering its start — but a ranges-only 416, or a
+    // covering article that disagrees with its declared range (checked
+    // below), drops the hint and keeps the prefix walk, so wrong NZB
+    // metadata can never make a playable track unplayable. Absent/invalid
+    // ranges plan nothing and the prefix walk behaves exactly as before.
+    let mut ranges = valid_ranges(input.segment_ranges, input.segments.len());
     let mut first_seg = 0;
-    if let Some(ranges) = ranges {
-        let (_, _, start, _) = resolve_range(ranges[ranges.len() - 1].1, input.range)?;
-        first_seg = covering_segment(ranges, start);
+    if let Some(r) = ranges {
+        match resolve_range(r[r.len() - 1].1, input.range) {
+            Ok((_, _, start, _)) => first_seg = covering_segment(r, start),
+            Err(_) => ranges = None,
+        }
     }
     let lease = pool.try_acquire(Lane::Playback).map_err(|e| match e {
         PoolError::Quarantined { retry_after_ms } => PlayError::PoolQuarantined { retry_after_ms },
         PoolError::Exhausted => PlayError::PoolExhausted,
     })?;
 
-    let (client, first) = match open_and_fetch(pool, input, first_seg) {
+    let (mut client, mut first) = match open_and_fetch(pool, input, first_seg) {
         Ok(pair) => pair,
         Err((client, failure)) => {
             return Err(settle(
@@ -257,6 +268,48 @@ pub fn play(
             ))
         }
     };
+    if let Some(r) = ranges {
+        let agrees = first.file_size == r[r.len() - 1].1
+            && first.offset == r[first_seg].0
+            && first.data.len() as u64 == r[first_seg].1 - r[first_seg].0;
+        if !agrees {
+            ranges = None;
+            if first_seg != 0 {
+                // The hint lied about the covering article: discard it and
+                // restart as a prefix walk on the same connection.
+                match fetch_segment(&mut client, &input.segments[0]) {
+                    Ok(decoded) => {
+                        first = decoded;
+                        first_seg = 0;
+                    }
+                    Err(SegmentError::Nntp(e)) => {
+                        let failure = nntp_failure(e, &input.segments[0]);
+                        let keep = if failure.1 { None } else { Some(client) };
+                        return Err(settle(
+                            pool,
+                            meter,
+                            lease,
+                            keep,
+                            failure,
+                            &user,
+                            input.track_id,
+                        ));
+                    }
+                    Err(SegmentError::Decode(e)) => {
+                        return Err(settle(
+                            pool,
+                            meter,
+                            lease,
+                            Some(client),
+                            (PlayError::Decode(e), false),
+                            &user,
+                            input.track_id,
+                        ));
+                    }
+                }
+            }
+        }
+    }
     pool.record_success();
     let mut live = Live {
         client,
@@ -471,8 +524,20 @@ impl Live {
         }
     }
 
-    /// Fetch + ingest the next segment the client needs.
+    /// Fetch + ingest the next segment the client needs. A covering fetch
+    /// first backfills the prefix it skipped, in file order: the covering
+    /// segment then flushes out of `pending` into the staged upload, so at
+    /// most one segment ever waits out of order (the staged 5 MiB part plus
+    /// one segment bound holds however long the client's range runs). On
+    /// the prefix walk every earlier segment is already done and this is a
+    /// plain sequential fetch. `finalize` backfills the same way when the
+    /// client's range ends inside the covering segment.
     fn load_next(&mut self) -> Result<(), Failure> {
+        for idx in 0..self.next_seg {
+            if !self.seg_done[idx] {
+                self.load(idx)?;
+            }
+        }
         let idx = self.next_seg;
         self.load(idx)?;
         self.next_seg += 1;

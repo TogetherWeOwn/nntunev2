@@ -59,13 +59,17 @@ test asserts the server has received exactly one `BODY` when the first chunk
 arrives on a three-segment track. A mid-track seek on a cold cache gets the
 same one-`BODY` TTFB when `PlayInput::segment_ranges` carries the NZB
 per-segment byte ranges: the article covering the range start is fetched
-first, the skipped prefix is backfilled by `finalize` in file order (the
-multipart staging still only ever receives the contiguous prefix, so the
-5 MiB part coalescing and the one-part-plus-one-segment memory bound are
-unchanged), and the whole track still lands in cache. Without ranges — or
-with ranges that fail validation (wrong arity, gaps, non-zero start) — the
-play path keeps the prefix walk: it walks every earlier segment first and
-TTFB grows with the seek position. Integration tests pin both costs (one
+first, and the skipped prefix is backfilled in file order before serving
+advances past the covering segment (or by `finalize` when the range ends
+inside it), so multipart staging still only ever receives the contiguous
+prefix — 5 MiB part coalescing is unchanged and at most the covering
+segment is ever held out of order beyond the staged part. The whole track
+still lands in cache. Ranges are a verified hint, never trusted blindly:
+without ranges, with ranges that fail validation (wrong arity, gaps,
+non-zero start), with a ranges-only `416`, or when the covering article
+disagrees with its declared range, the play path keeps (or falls back to)
+the prefix walk: it walks every earlier segment first and TTFB grows with
+the seek position. Integration tests pin both costs (one
 `BODY` vs the whole prefix) and byte-identical output. Staging p95 numbers
 are owned by Analytics Engine monitoring (`PlayStart` → first-byte events)
 once deployed.
