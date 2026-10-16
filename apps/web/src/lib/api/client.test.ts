@@ -214,6 +214,38 @@ describe('ApiClient', () => {
 		expect(seen.map(({ init }) => init.method)).toEqual(['POST']);
 	});
 
+	it('revokes all sessions with an authenticated empty JSON POST', async () => {
+		const seen: { url: unknown; init: RequestInit }[] = [];
+		const fetchFn = (async (url: unknown, init: RequestInit) => {
+			seen.push({ url, init });
+			return jsonResponse({ ok: true });
+		}) as unknown as typeof fetch;
+		const client = new ApiClient({ baseUrl: 'https://api.example.com/', fetchFn });
+
+		await expect(client.revokeAllSessions()).resolves.toEqual({ ok: true });
+		expect(seen).toEqual([
+			{
+				url: 'https://api.example.com/v1/session/revoke-all',
+				init: expect.objectContaining({
+					method: 'POST',
+					body: '{}',
+					credentials: 'include',
+					headers: expect.objectContaining({ 'content-type': 'application/json' })
+				})
+			}
+		]);
+	});
+
+	it.each([401, 500])('preserves the typed ApiError for revoke-all status %i', async (status) => {
+		const fetchFn = vi.fn(async () => jsonResponse({ error: 'revoke failed' }, status));
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.revokeAllSessions().catch((error: unknown) => error);
+		expect(failure).toBeInstanceOf(ApiError);
+		expect((failure as ApiError).status).toBe(status);
+		expect((failure as ApiError).code).toBe(status === 401 ? 'unauthorized' : 'request_failed');
+	});
+
 	it('nests the provider fields under the save envelope', () => {
 		expect(
 			toVaultSaveBody({
