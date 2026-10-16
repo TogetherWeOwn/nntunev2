@@ -476,6 +476,22 @@ mod tests {
     }
 
     #[test]
+    fn malformed_origin_is_misconfigured() {
+        assert!(matches!(
+            new_registration_challenge("nntune.example.com", "https://", 0),
+            Err(AuthError::Misconfigured)
+        ));
+    }
+
+    #[test]
+    fn hostless_origin_is_misconfigured() {
+        assert!(matches!(
+            new_registration_challenge("nntune.example.com", "file:///", 0),
+            Err(AuthError::Misconfigured)
+        ));
+    }
+
+    #[test]
     fn invite_single_use() {
         let record = InviteRecord {
             code_hash: hash_invite_code("INVITE-1"),

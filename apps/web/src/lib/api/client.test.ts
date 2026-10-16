@@ -219,9 +219,14 @@ describe('ApiClient', () => {
 
 	it.each([
 		[400, 'invalid_request'],
+		[402, 'plan_limit_exceeded'],
+		[403, 'forbidden'],
+		[404, 'not_found'],
 		[413, 'payload_too_large'],
 		[416, 'range_not_satisfiable'],
 		[422, 'validation_failed'],
+		[429, 'rate_limited'],
+
 		[503, 'service_unavailable'],
 		[502, 'request_failed']
 	])('derives legacy error code for status %i', async (status, code) => {
