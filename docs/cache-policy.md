@@ -1,7 +1,9 @@
 # NNTune v2 cache policy (R2 TTL / eviction + archive reservation)
 
-Authoritative TTL and eviction policy for the provisioned R2 buckets
-inventoried in `docs/ops.md`. Bucket names below are exact; Worker
+Authoritative TTL and eviction policy for the six audio/art/archive R2
+buckets in the table below (`docs/ops.md` also inventories two
+ingest-scratch buckets, which are outside this table — see below).
+Bucket names below are exact; Worker
 configs must use them verbatim. This document creates no buckets,
 renames nothing, and binds nothing — it pins how long entries live and
 which buckets a Worker may never consume.
@@ -19,11 +21,14 @@ which buckets a Worker may never consume.
 
 ## What "TTL" means here
 
-No object-expiry lifecycle rule is configured: stored objects live until
+No object-expiry lifecycle rule is configured on the six table buckets:
+stored objects live until
 explicitly deleted. Cloudflare currently has a default lifecycle rule on
-all buckets (including the two ingest-scratch buckets) that aborts
+all six that aborts
 incomplete multipart uploads after 7 days; it
-does not expire completed objects. The TTL column therefore governs
+does not expire completed objects. The two ingest-scratch buckets are
+outside this table: they carry a 7-day delete rule on `ingest-scratch/`
+and no multipart-abort rule. The TTL column therefore governs
 **downstream copies only** (edge Cache API, KV, browser/CDN via
 `Cache-Control`), never completed R2 objects. Deleting or overwriting an
 R2 object does not purge edge/client copies already served; those linger
