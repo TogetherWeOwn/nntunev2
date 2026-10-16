@@ -50,7 +50,13 @@
 	<p data-testid="player-status">Status: {status}</p>
 
 	<!-- Missing R2 art (null) must render the placeholder with alt text. -->
-	<Artwork src={null} alt="Demo track artwork" />
+	<div data-testid="null-artwork">
+		<Artwork src={null} alt="Demo track artwork" />
+	</div>
+	<!-- A URL that 404s must swap to the placeholder after the image error. -->
+	<div data-testid="broken-artwork">
+		<Artwork src="/api/demo/missing-artwork.jpg" alt="Broken demo artwork" />
+	</div>
 
 	<audio data-testid="demo-audio" src={AUDIO_URL} preload="metadata" controls></audio>
 
