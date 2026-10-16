@@ -80,63 +80,53 @@ pub fn issue_at(
 
 /// Verify `token` against `secret` at time `now_unix`.
 pub fn verify(token: &str, secret: &[u8], now_unix: u64) -> Result<Grant, GrantError> {
-    let rest = token.strip_prefix("v1.").ok_or(GrantError::Malformed)?;
-    let (payload_b64, sig_b64) = rest.split_once('.').ok_or(GrantError::Malformed)?;
+    verify_with_user(token, secret, now_unix).map_err(|(err, _)| err)
+}
+
+/// Verify a grant and retain its signed user for rejection metering.
+///
+/// Only expiry and TTL-cap rejections carry a user; malformed and
+/// bad-signature tokens never produce an attribution candidate.
+pub(crate) fn verify_with_user(
+    token: &str,
+    secret: &[u8],
+    now_unix: u64,
+) -> Result<Grant, (GrantError, Option<String>)> {
+    let rest = token
+        .strip_prefix("v1.")
+        .ok_or((GrantError::Malformed, None))?;
+    let (payload_b64, sig_b64) = rest.split_once('.').ok_or((GrantError::Malformed, None))?;
     if payload_b64.is_empty() || sig_b64.is_empty() {
-        return Err(GrantError::Malformed);
+        return Err((GrantError::Malformed, None));
     }
-    let sig = base64url_decode(sig_b64).ok_or(GrantError::Malformed)?;
+    let sig = base64url_decode(sig_b64).ok_or((GrantError::Malformed, None))?;
     let expected = hmac_sha256(secret, payload_b64.as_bytes());
     if sig.len() != expected.len() || !constant_time_eq(&sig, &expected) {
-        return Err(GrantError::BadSignature);
+        return Err((GrantError::BadSignature, None));
     }
-    let payload = base64url_decode(payload_b64).ok_or(GrantError::Malformed)?;
-    let payload = String::from_utf8(payload).map_err(|_| GrantError::Malformed)?;
+    let payload = base64url_decode(payload_b64).ok_or((GrantError::Malformed, None))?;
+    let payload = String::from_utf8(payload).map_err(|_| (GrantError::Malformed, None))?;
     let mut parts = payload.split('|');
     let (user_id, track_id, exp) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
         (Some(u), Some(t), Some(e), None) => (u, t, e),
-        _ => return Err(GrantError::Malformed),
+        _ => return Err((GrantError::Malformed, None)),
     };
-    let exp_unix: u64 = exp.parse().map_err(|_| GrantError::Malformed)?;
+    let exp_unix: u64 = exp.parse().map_err(|_| (GrantError::Malformed, None))?;
+    let user_id = user_id.to_string();
     if now_unix >= exp_unix {
-        return Err(GrantError::Expired);
+        return Err((GrantError::Expired, Some(user_id)));
     }
     // `now_unix < exp_unix` here, so the subtraction cannot underflow;
     // comparing the difference (rather than `now + cap + skew`) also
     // cannot overflow near `u64::MAX`.
     if exp_unix - now_unix > MAX_GRANT_TTL + CLOCK_SKEW_SECS {
-        return Err(GrantError::TtlTooLong);
+        return Err((GrantError::TtlTooLong, Some(user_id)));
     }
     Ok(Grant {
-        user_id: user_id.to_string(),
+        user_id,
         track_id: track_id.to_string(),
         exp_unix,
     })
-}
-
-/// Best-effort authenticated user for metering: the `user_id` embedded in
-/// `token` when its signature verifies and its payload parses, regardless
-/// of expiry or TTL-cap state. Returns `None` for malformed tokens,
-/// bad signatures, or unparsable payloads — callers must treat that as
-/// "unknown user", never as a secret or token echo.
-pub fn authenticated_user(token: &str, secret: &[u8]) -> Option<String> {
-    let rest = token.strip_prefix("v1.")?;
-    let (payload_b64, sig_b64) = rest.split_once('.')?;
-    if payload_b64.is_empty() || sig_b64.is_empty() {
-        return None;
-    }
-    let sig = base64url_decode(sig_b64)?;
-    let expected = hmac_sha256(secret, payload_b64.as_bytes());
-    if sig.len() != expected.len() || !constant_time_eq(&sig, &expected) {
-        return None;
-    }
-    let payload = base64url_decode(payload_b64)?;
-    let payload = String::from_utf8(payload).ok()?;
-    let mut parts = payload.split('|');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(u), Some(_), Some(_), None) => Some(u.to_string()),
-        _ => None,
-    }
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
