@@ -41,6 +41,15 @@ binding = "AUDIO_CACHE"
 bucket_name = "nntunev2-archive-prod"
 """
 
+PREVIEW_ARCHIVE_MANIFEST = """\
+name = "nntune-stream"
+
+[[r2_buckets]]
+binding = "AUDIO_CACHE"
+bucket_name = "nntunev2-audio-staging"
+preview_bucket_name = "nntunev2-archive-staging"
+"""
+
 
 def _repo_with(manifests: dict[str, str]) -> Path:
     tmp = Path(tempfile.mkdtemp())
@@ -70,6 +79,13 @@ def test_archive_env_override_fails():
     hits = archive_bindings(repo)
     assert len(hits) == 1, f"expected one hit, got {hits}"
     assert hits[0][1] == "nntunev2-archive-prod"
+
+
+def test_preview_archive_binding_fails():
+    repo = _repo_with({"workers/stream/wrangler.toml": PREVIEW_ARCHIVE_MANIFEST})
+    hits = archive_bindings(repo)
+    assert len(hits) == 1, f"expected one hit, got {hits}"
+    assert hits[0][1] == "nntunev2-archive-staging"
 
 
 def test_commented_example_binding_ignored():
@@ -126,6 +142,7 @@ if __name__ == "__main__":
     test_clean_manifests_pass()
     test_archive_binding_fails()
     test_archive_env_override_fails()
+    test_preview_archive_binding_fails()
     test_commented_example_binding_ignored()
     test_malformed_manifest_fails_closed()
     test_missing_scan_root_fails()

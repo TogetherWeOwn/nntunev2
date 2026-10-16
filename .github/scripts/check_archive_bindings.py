@@ -75,7 +75,7 @@ def _bucket_names(manifest: Path) -> list[str]:
     def walk(node: object) -> None:
         if isinstance(node, dict):
             for key, value in node.items():
-                if key == "bucket_name" and isinstance(value, str):
+                if key in ("bucket_name", "preview_bucket_name") and isinstance(value, str):
                     found.append(value)
                 else:
                     walk(value)
