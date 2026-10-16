@@ -13,6 +13,7 @@ from pathlib import Path
 MANIFEST = Path("migrations/manifest.toml")
 MIGRATIONS = Path("migrations")
 NUMBERED_SQL = re.compile(r"^(\d{4})_.+\.sql$")
+NUMBER_PREFIX = re.compile(r"^(\d{4})_")
 VALID_TARGETS = {"app", "mirror"}
 
 
@@ -64,11 +65,19 @@ def check_manifest(root):
     entries = load_manifest(root)
     migrations_dir = root / MIGRATIONS
     try:
-        sql_paths = list(migrations_dir.glob("*.sql"))
+        sql_paths = [
+            path for path in migrations_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() == ".sql"
+        ]
+        symlink_paths = [path for path in migrations_dir.rglob("*") if path.is_symlink()]
     except OSError as exc:
         raise GateError(f"cannot list {MIGRATIONS}: {exc}") from exc
-    symlink_files = {path.name for path in sql_paths if path.is_symlink()}
-    sql_files = {path.name for path in sql_paths if path.is_file() and not path.is_symlink()}
+    symlink_files = {path.relative_to(migrations_dir).as_posix() for path in symlink_paths}
+    sql_files = {
+        path.relative_to(migrations_dir).as_posix()
+        for path in sql_paths
+        if not path.is_symlink()
+    }
 
     manifest_files = set()
     numbers = {}
@@ -138,14 +147,48 @@ def check_drift(root, base_ref):
     base_sql = {
         path: path
         for path in base_files
-        if path.startswith("migrations/") and path.endswith(".sql") and path.count("/") == 1
+        if path.startswith("migrations/") and Path(path).suffix.lower() == ".sql"
     }
+    base_numbers = [
+        int(match.group(1))
+        for path in base_sql
+        if Path(path).parent == Path("migrations")
+        and (match := NUMBER_PREFIX.match(Path(path).name))
+    ]
+    base_max = max(base_numbers, default=0)
+    base_flat_files = {
+        Path(path).name for path in base_sql if Path(path).parent == Path("migrations")
+    }
+    current_entries = {entry["file"]: entry for entry in load_manifest(root)}
+
+    base_manifest = {}
+    has_base_manifest = "migrations/manifest.toml" in base_files
+    if has_base_manifest:
+        try:
+            base_data = tomllib.loads(git(root, "show", f"{base_commit}:migrations/manifest.toml"))
+        except (UnicodeError, tomllib.TOMLDecodeError) as exc:
+            raise GateError(f"cannot parse base migrations/manifest.toml: {exc}") from exc
+        base_entries = base_data.get("migration", [])
+        if not isinstance(base_entries, list) or any(not isinstance(entry, dict) for entry in base_entries):
+            raise GateError("base migrations/manifest.toml must contain [[migration]] tables")
+        for index, entry in enumerate(base_entries, start=1):
+            if not all(isinstance(entry.get(key), str) for key in ("file", "target", "sha256")):
+                raise GateError(f"base migrations/manifest.toml entry {index} requires string file, target, and sha256")
+        base_manifest = {entry["file"]: entry for entry in base_entries}
+
     violations = 0
+    for filename, entry in current_entries.items():
+        if filename not in base_flat_files:
+            match = NUMBER_PREFIX.match(filename)
+            if match and int(match.group(1)) <= base_max:
+                report("out-of-order", filename, f"new migration number must exceed base maximum {base_max:04d}")
+                violations += 1
+
     for path in sorted(base_sql):
         filename = Path(path).name
         current = root / path
         if current.is_symlink():
-            report("applied-edited", filename, f"migration is a symlink instead of a regular file")
+            report("applied-edited", filename, "migration is a symlink instead of a regular file")
             violations += 1
             continue
         if not current.is_file():
@@ -157,9 +200,22 @@ def check_drift(root, base_ref):
             contents = current.read_bytes()
         except OSError as exc:
             raise GateError(f"cannot read {current}: {exc}") from exc
-        if contents != original:
+        contents_changed = contents != original
+        if contents_changed:
             report("applied-edited", filename, f"migration contents differ from base {base_ref}")
             violations += 1
+        if has_base_manifest and Path(path).parent == Path("migrations"):
+            previous = base_manifest.get(filename)
+            current_entry = current_entries.get(filename)
+            manifest_changed = (previous is None) != (current_entry is None)
+            if previous is not None and current_entry is not None:
+                manifest_changed = manifest_changed or (
+                    previous.get("target") != current_entry.get("target")
+                    or (not contents_changed and previous.get("sha256") != current_entry.get("sha256"))
+                )
+            if manifest_changed:
+                report("applied-edited", filename, f"manifest target or checksum differs from base {base_ref}")
+                violations += 1
     return violations
 
 

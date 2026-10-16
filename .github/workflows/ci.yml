@@ -104,7 +104,9 @@ jobs:
       - name: Check migration manifest and drift
         run: python3 .github/scripts/migrations_gate.py --root . --base-ref "$MIGRATIONS_BASE_REF"
       - name: Run migration gate self-tests
-        run: python3 .github/scripts/test_migrations_gate.py
+        run: |
+          python3 .github/scripts/test_migrations_gate.py
+          python3 .github/scripts/test_migrations_gate_regressions.py
 
   test-nntp:
     name: test-nntp
