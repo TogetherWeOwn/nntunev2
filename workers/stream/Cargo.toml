@@ -8,9 +8,26 @@ license = "MIT"
 [lib]
 name = "nntune_stream"
 path = "src/lib.rs"
+# cdylib for the Worker (wasm32); rlib so tests/ integration targets link it.
 crate-type = ["cdylib", "rlib"]
 
+[dependencies]
+# Pool probe (src/probe.rs): STAT over the shared transport-generic NNTP
+# client; the JSON envelope is the ingest crate's probe contract.
+nntune-core = { path = "../../crates/nntune-core", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Worker + NntpPool Durable Object entry (src/runtime.rs), wasm32 only: native
+# builds and `cargo test` stay free of the Workers runtime.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+nntune-core = { path = "../../crates/nntune-core", default-features = false, features = ["worker-transport"] }
 worker = "0.8"
-# The Durable Object macro expands to #[wasm_bindgen] items resolved by name.
+# `#[durable_object]` expands to `#[wasm_bindgen]` items resolved by name.
 wasm-bindgen = "0.2.129"
+futures-util = "0.3"
+
+[dev-dependencies]
+nntune-core = { path = "../../crates/nntune-core", features = ["native-tls"] }
+nntune-test-nntp = { path = "../../crates/nntune-test-nntp" }
+tokio = { version = "1", features = ["macros", "rt", "time"] }

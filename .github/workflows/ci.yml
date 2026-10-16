@@ -70,9 +70,8 @@ jobs:
       # The simd128 yEnc fast path must keep compiling (Workers run V8 with
       # Wasm SIMD; the deploy enables it via this RUSTFLAGS).
       - run: RUSTFLAGS="-C target-feature=+simd128" cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
-      # The stream Worker entrypoint (`runtime.rs`, wasm32-only) is compiled
-      # by no native job: check + clippy it here so a type/behavior break in
-      # the entrypoint fails the gate before deploy.
+      # The stream Worker entry (NntpPool Durable Object) only compiles on
+      # wasm32: check and lint it on the target it deploys to.
       - run: cargo check -p nntune-stream --target wasm32-unknown-unknown
       - run: cargo clippy -p nntune-stream --target wasm32-unknown-unknown -- -D warnings
 

@@ -2,7 +2,10 @@
 #
 # Deploy contract (provisioned by the DevOps card; no secrets here):
 # - One Durable Object instance per user (`NntpPool`, id = user id) owns the
-#   `nntune-stream` pool state machine (leases, lanes, quarantine).
+#   `nntune-stream` pool state machine (leases, lanes, quarantine). Its
+#   `POST /probe` route answers ingest segment probes (src/probe.rs); the
+#   ingest Worker reaches it through a cross-script Durable Object binding,
+#   so deploy this Worker first.
 # - The Worker authorizes each play against a signed grant from the `api`
 #   Worker, serves `200`/`206` from R2 on hits, and streams misses through
 #   the pool while completing the R2 multipart write (see src/play.rs).
