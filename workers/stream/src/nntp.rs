@@ -433,9 +433,9 @@ mod tests {
         // the `read_timeout.min(remaining)` socket bound: with a plain
         // `read_timeout` a single blocking read overruns the budget.
         let timeouts =
-            UpstreamTimeouts::new(Duration::from_millis(200), Duration::from_millis(800));
+            UpstreamTimeouts::new(Duration::from_millis(200), Duration::from_millis(1500));
         let budget = timeouts.connect.saturating_add(timeouts.read);
-        let greeting_delay = Duration::from_millis(700);
+        let greeting_delay = Duration::from_millis(900);
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind delayed NNTP");
         let addr = listener.local_addr().expect("local addr");

@@ -405,6 +405,19 @@ impl<C> Pool<C> {
         }
     }
 
+    /// A provider call succeeded on `lease_id`. Only the admitted half-open
+    /// probe closes the breaker; a stale lease's success clears a
+    /// closed-state streak but can never close an open breaker or release
+    /// another play's probe.
+    pub fn record_success_for(&mut self, lease_id: u64) {
+        if self.probe_in_flight() == Some(lease_id) {
+            self.record_success();
+        } else if self.quarantined_until_ms.is_none() {
+            self.consecutive_errors = 0;
+            self.window_start_ms = None;
+        }
+    }
+
     /// Advance the virtual clock by elapsed milliseconds. The embedding
     /// runtime must call this with wall-clock deltas before time-based pool
     /// operations; the pool does not advance time automatically.
@@ -779,5 +792,65 @@ mod tests {
         assert_eq!(pool.circuit_state(), super::CircuitState::Closed);
         pool.try_acquire(Lane::Playback)
             .expect("acquire after reset");
+    }
+
+    #[test]
+    fn stale_lease_success_while_open_leaves_the_breaker_open() {
+        use super::{CircuitState, CIRCUIT_OPEN_MS};
+        let mut pool = TestPool::new(2);
+        let stale = pool.try_acquire(Lane::Playback).expect("stale lease");
+        for _ in 0..super::CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        assert!(pool.quarantined());
+        pool.record_success_for(stale.id);
+        assert!(
+            pool.quarantined(),
+            "a stale lease must not close an open breaker"
+        );
+        assert_eq!(pool.circuit_state(), CircuitState::Open);
+        pool.release(stale, None);
+        // The streak is untouched too: expiry still half-opens for a probe.
+        pool.advance(CIRCUIT_OPEN_MS);
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn probe_success_closes_but_unrelated_success_does_not() {
+        use super::{CircuitState, CIRCUIT_OPEN_MS};
+        let mut pool = TestPool::new(3);
+        let stale = pool.try_acquire(Lane::Playback).expect("stale lease");
+        for _ in 0..super::CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        pool.advance(CIRCUIT_OPEN_MS);
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+        let probe = pool.try_acquire(Lane::Playback).expect("probe admitted");
+
+        // A concurrent stale success leaves the half-open breaker alone.
+        pool.record_success_for(stale.id);
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+
+        // The probe's own success closes it.
+        pool.record_success_for(probe.id);
+        assert_eq!(pool.circuit_state(), CircuitState::Closed);
+        pool.release(probe, None);
+        pool.release(stale, None);
+    }
+
+    #[test]
+    fn closed_state_success_still_clears_the_streak() {
+        let mut pool = TestPool::new(2);
+        let lease = pool.try_acquire(Lane::Playback).expect("lease");
+        pool.record_provider_error();
+        pool.record_provider_error();
+        pool.record_success_for(lease.id);
+        pool.release(lease, None);
+        pool.record_provider_error();
+        pool.record_provider_error();
+        assert!(
+            !pool.quarantined(),
+            "a closed-state success restarts the streak"
+        );
     }
 }

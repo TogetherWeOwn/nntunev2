@@ -288,7 +288,7 @@ pub fn play_with_timeouts(
             ))
         }
     };
-    pool.record_success();
+    pool.record_success_for(lease.id);
     let mut live = Live {
         client,
         lease,
@@ -614,8 +614,8 @@ impl PlayStream {
                     upload,
                     ..
                 } = *live;
+                pool.record_success_for(lease.id);
                 pool.release(lease, Some(client));
-                pool.record_success();
                 cache.put_track(&self.track_id, upload.complete());
                 Ok(())
             }
@@ -650,9 +650,19 @@ impl PlayStream {
             });
         }
         if let Some(Source::Live(live)) = source {
-            let live = *live;
-            let healthy = !matches!(live.failed, Some((_, true)));
-            pool.release(live.lease, healthy.then_some(live.client));
+            // An aborted stream that already failed still indicts (or clears)
+            // the provider, exactly like `finalize` would: otherwise a client
+            // that disconnects after a later segment fails hides repeated
+            // provider failures from the breaker.
+            let provider_failure = matches!(live.failed, Some((_, true)));
+            let non_provider_result = matches!(live.failed, Some((_, false)));
+            let Live { client, lease, .. } = *live;
+            if provider_failure {
+                pool.record_provider_error_for(lease.id);
+            } else if non_provider_result {
+                pool.record_non_provider_result_for(lease.id);
+            }
+            pool.release(lease, (!provider_failure).then_some(client));
         }
     }
 }

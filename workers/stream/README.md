@@ -80,7 +80,11 @@ A dead upstream must fail fast with a `503`, never hang playback
   acquires or a probe delayed by pool capacity are rejected with
   `Retry-After: 1`. A provider response (including a missing article) closes
   the breaker; a provider failure re-opens it for a fresh 30 s without
-  resetting the failure streak.
+  resetting the failure streak. Settlement is lease-scoped: only the admitted
+  probe's outcome closes or re-opens the breaker (a stale lease's success
+  clears a closed-state streak but never closes an open breaker), and an
+  `abort` after a failed segment records that failure exactly like
+  `finalize` would.
   The hung-upstream integration test trips the breaker at the threshold,
   asserts the `503` + `Retry-After` without touching the hung server, then
   probes recovery against the healthy server.
