@@ -1,10 +1,8 @@
 //! S9 acceptance: per-segment byte ranges in parse/probe envelopes.
 //!
-//! Test-first pair for slice S9 on
-//! [TOG-25575](/TOG/issues/TOG-25575#document-roadmap). This file is OWNED by
-//! the test card ([TOG-25579](/TOG/issues/TOG-25579)): the Builder
-//! ([TOG-25580](/TOG/issues/TOG-25580)) implements on this branch and never
-//! edits this file.
+//! Test-first pair for slice S9 of the roadmap. This file is owned by the
+//! acceptance-test work: the implementation lands alongside it and must
+//! make these tests pass without editing them.
 //!
 //! ## Expected post-S9 API (the Builder implements exactly this)
 //!
