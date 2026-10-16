@@ -145,10 +145,30 @@ fn schedule_sql_sets_fence_and_idempotently_returns_existing_operation() {
     let sql = normalize(SCHEDULE_ACCOUNT_DELETION_SQL);
     assert!(sql.contains("updateusers"), "{sql}");
     assert!(sql.contains("setdeleting_at"), "{sql}");
+    assert!(
+        sql.contains("setdeleting_at=coalesce(deleting_at,now())"),
+        "fence must preserve an existing deleting_at instead of overwriting it: {sql}"
+    );
+    assert!(
+        sql.contains("withfenced_useras(updateusers"),
+        "fenced_user CTE must wrap the user fence update: {sql}"
+    );
+    assert!(
+        sql.contains("whereid=$1returningid"),
+        "fence must be owner-scoped to a single user row: {sql}"
+    );
     assert!(sql.contains("insertintodelete_operations"), "{sql}");
     assert!(sql.contains("'account'"), "{sql}");
     assert!(sql.contains("'scheduled'"), "{sql}");
     assert!(sql.contains("now()+interval'24hours'"), "{sql}");
+    assert!(
+        sql.contains("state,erase_after,started_at"),
+        "operation columns must stay aligned as state, erase_after, started_at: {sql}"
+    );
+    assert!(
+        sql.contains("'scheduled',now()+interval'24hours',now()"),
+        "scheduled values must align as state, 24h deadline, start time: {sql}"
+    );
     assert!(
         sql.contains(
             "onconflict(user_id)wherescope='account'doupdatesetid=delete_operations.idreturningid"
