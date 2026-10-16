@@ -1,4 +1,4 @@
--- NNTune v2 migration 0006: bind challenge rows to their user.
+-- NNTune v2 migration 0007: bind challenge rows to their user.
 --
 -- `auth_challenges.user_id` was nullable without a foreign key, so a
 -- concurrent `register_start` reap could delete a resuming user between
