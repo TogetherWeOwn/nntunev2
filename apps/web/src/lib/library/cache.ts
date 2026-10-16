@@ -1,11 +1,10 @@
 /**
  * Offline-friendly library snapshot cache.
  *
- * The library view renders the last-good `/api/library` payload from
- * `localStorage` when the API is unreachable (tunnel down, Access hiccup,
- * airplane wifi) instead of going blank. A fresh success always replaces
- * the snapshot. The badge text always starts with `stale — updated` so the
- * journey specs can pin it by substring.
+ * The library view renders a last-good `/api/library` payload from
+ * tab-scoped `sessionStorage` after authentication succeeds in the current
+ * page. A fresh success always replaces the snapshot. The badge text always
+ * starts with `stale — updated` so the journey specs can pin it by substring.
  *
  * Bounded growth: the snapshot is capped by item count AND serialized
  * bytes. Eviction keeps the head of the list (the API's order) and drops
@@ -28,8 +27,24 @@ export interface LibrarySnapshot {
 	items: LibraryItem[];
 }
 
-/** `localStorage` key for the snapshot. Versioned so a shape change can rotate it. */
+/** Base key for snapshots; the tab's authentication context scopes each value. */
 export const LIBRARY_SNAPSHOT_KEY = 'nntune.library.snapshot.v1';
+export const LIBRARY_AUTH_CONTEXT_KEY = 'nntune.library.auth-context.v1';
+export const LIBRARY_AUTH_TRANSITION_KEY = 'nntune.library.auth-transition.v1';
+
+function snapshotKey(storage: SnapshotStorage, createContext = false): string | null {
+	let context: string | null;
+	try {
+		context = storage.getItem(LIBRARY_AUTH_CONTEXT_KEY);
+		if (!context && createContext) {
+			context = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
+			storage.setItem(LIBRARY_AUTH_CONTEXT_KEY, context);
+		}
+	} catch {
+		return null;
+	}
+	return context ? `${LIBRARY_SNAPSHOT_KEY}.${context}` : null;
+}
 
 /** Maximum tracks kept in the snapshot (count cap). */
 export const MAX_SNAPSHOT_ITEMS = 200;
@@ -62,7 +77,8 @@ export function toLibraryItems(payload: unknown): LibraryItem[] | null {
 			? (payload as Record<string, unknown>).items
 			: undefined;
 	if (!Array.isArray(raw)) return null;
-	return raw.filter(isLibraryItem);
+	const items = raw.filter(isLibraryItem);
+	return raw.length > 0 && items.length === 0 ? null : items;
 }
 
 function utf8Bytes(text: string): number {
@@ -84,15 +100,20 @@ export function evictToCap(
 	maxItems: number = MAX_SNAPSHOT_ITEMS,
 	maxBytes: number = MAX_SNAPSHOT_BYTES
 ): LibraryItem[] {
-	let kept = items.slice(0, Math.max(0, maxItems));
-	// Size the timestamp once; the real `savedAt` only makes the payload
-	// larger, so sizing against a representative value is conservative.
+	const kept = items.slice(0, Math.max(0, maxItems));
 	const probeAt = new Date().toISOString();
-	while (kept.length > 0 && snapshotByteSize(kept, probeAt) > maxBytes) {
-		kept = kept.slice(0, kept.length - 1);
+	if (snapshotByteSize(kept, probeAt) <= maxBytes) return kept;
+
+	// Find the largest head prefix that fits without repeatedly serializing each tail drop.
+	let low = 0;
+	let high = kept.length;
+	while (low < high) {
+		const middle = Math.ceil((low + high) / 2);
+		if (snapshotByteSize(kept.slice(0, middle), probeAt) <= maxBytes) low = middle;
+		else high = middle - 1;
 	}
-	// Drop an oversized final item rather than persisting a snapshot over the cap.
-	return kept;
+	// An oversized single item is dropped rather than persisting over the cap.
+	return kept.slice(0, low);
 }
 
 export function encodeSnapshot(items: LibraryItem[], nowMs: number = Date.now()): LibrarySnapshot {
@@ -109,6 +130,7 @@ export function decodeSnapshot(raw: string | null): LibrarySnapshot | null {
 		}
 		if (!Array.isArray(parsed.items)) return null;
 		const items = parsed.items.filter(isLibraryItem);
+		if (parsed.items.length > 0 && items.length === 0) return null;
 		return { savedAt: parsed.savedAt, items: evictToCap(items) };
 	} catch {
 		return null;
@@ -116,8 +138,10 @@ export function decodeSnapshot(raw: string | null): LibrarySnapshot | null {
 }
 
 export function loadSnapshot(storage: SnapshotStorage): LibrarySnapshot | null {
+	const key = snapshotKey(storage);
+	if (!key) return null;
 	try {
-		return decodeSnapshot(storage.getItem(LIBRARY_SNAPSHOT_KEY));
+		return decodeSnapshot(storage.getItem(key));
 	} catch {
 		return null;
 	}
@@ -130,8 +154,9 @@ export function saveSnapshot(
 	nowMs: number = Date.now()
 ): LibrarySnapshot {
 	const snapshot = encodeSnapshot(items, nowMs);
+	const key = snapshotKey(storage, true);
 	try {
-		storage.setItem(LIBRARY_SNAPSHOT_KEY, JSON.stringify(snapshot));
+		if (key) storage.setItem(key, JSON.stringify(snapshot));
 	} catch {
 		// Quota or privacy mode: the in-memory snapshot still renders this
 		// visit; the next load simply has no stale fallback.
@@ -141,9 +166,24 @@ export function saveSnapshot(
 
 export function clearSnapshot(storage: SnapshotStorage): void {
 	try {
+		const key = snapshotKey(storage);
+		// Revoke access to the snapshot before attempting to remove its bytes.
+		storage.removeItem(LIBRARY_AUTH_CONTEXT_KEY);
+		if (key) storage.removeItem(key);
 		storage.removeItem(LIBRARY_SNAPSHOT_KEY);
 	} catch {
-		// Best effort; a stale key is harmless (decode is fail-closed).
+		// Best effort; a stale key is never read without its auth context.
+	}
+}
+
+/** Notify other open tabs that the browser is crossing an auth boundary. */
+export function broadcastAuthTransition(storage: SnapshotStorage): void {
+	try {
+		const transitionId = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
+		storage.setItem(LIBRARY_AUTH_TRANSITION_KEY, transitionId);
+		storage.removeItem(LIBRARY_AUTH_TRANSITION_KEY);
+	} catch {
+		// Storage may be unavailable in privacy-restricted browser contexts.
 	}
 }
 

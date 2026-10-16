@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+	clearSnapshot,
 	decodeSnapshot,
 	encodeSnapshot,
 	evictToCap,
@@ -11,6 +12,7 @@ import {
 	snapshotByteSize,
 	staleLabel,
 	toLibraryItems,
+	LIBRARY_AUTH_CONTEXT_KEY,
 	LIBRARY_SNAPSHOT_KEY,
 	type LibraryItem,
 	type SnapshotStorage
@@ -54,6 +56,8 @@ describe('toLibraryItems', () => {
 		expect(toLibraryItems(null)).toBeNull();
 		expect(toLibraryItems({})).toBeNull();
 		expect(toLibraryItems({ error: 'not authorized' })).toBeNull();
+		expect(toLibraryItems([{ track_id: 'foreign-row' }])).toBeNull();
+		expect(toLibraryItems([item('a'), { track_id: 'ignored-row' }])).toEqual([item('a')]);
 		expect(toLibraryItems('nope')).toBeNull();
 	});
 });
@@ -115,6 +119,23 @@ describe('snapshot round-trip', () => {
 		const fresh = saveSnapshot(storage, [item('new')], 2_000);
 		expect(loadSnapshot(storage)).toEqual(fresh);
 		expect(loadSnapshot(storage)?.items.map((i) => i.id)).toEqual(['new']);
+	});
+
+	it('scopes snapshots to an auth context and clears the prior account on transition', () => {
+		const storage = memoryStorage();
+		saveSnapshot(storage, [item('account-a')], 1_000);
+		const accountAContext = storage.getItem(LIBRARY_AUTH_CONTEXT_KEY);
+		expect(accountAContext).toBeTruthy();
+		expect(storage.getItem(`${LIBRARY_SNAPSHOT_KEY}.${accountAContext}`)).not.toBeNull();
+
+		clearSnapshot(storage);
+		expect(loadSnapshot(storage)).toBeNull();
+		expect(storage.getItem(LIBRARY_AUTH_CONTEXT_KEY)).toBeNull();
+
+		saveSnapshot(storage, [item('account-b')], 2_000);
+		const accountBContext = storage.getItem(LIBRARY_AUTH_CONTEXT_KEY);
+		expect(accountBContext).not.toBe(accountAContext);
+		expect(loadSnapshot(storage)?.items.map((i) => i.id)).toEqual(['account-b']);
 	});
 
 	it('caps on save so storage can never grow unbounded', () => {

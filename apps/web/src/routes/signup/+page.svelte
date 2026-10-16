@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
+	import { broadcastAuthTransition, clearSnapshot } from '#lib/library/cache.js';
 	import { ApiClient } from '#lib/api/client.js';
 	import {
 		serializePublicKeyCredential,
@@ -39,6 +40,9 @@
 				'/v1/auth/passkey/register/verify',
 				serializePublicKeyCredential(credential)
 			);
+			clearSnapshot(window.sessionStorage);
+			clearSnapshot(window.localStorage);
+			broadcastAuthTransition(window.localStorage);
 			status = 'created';
 			window.location.href = '/onboarding/provider';
 		} catch {

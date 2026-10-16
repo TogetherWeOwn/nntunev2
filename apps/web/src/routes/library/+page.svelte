@@ -1,7 +1,9 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import {
+		broadcastAuthTransition,
 		clearSnapshot,
+		LIBRARY_AUTH_TRANSITION_KEY,
 		loadSnapshot,
 		saveSnapshot,
 		staleLabel,
@@ -13,6 +15,11 @@
 	let staleAt: string | null = $state(null);
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
+	let authenticatedThisLoad = false;
+	let activeRequest: AbortController | null = null;
+	let requestGeneration = 0;
+
+	const LIBRARY_REQUEST_TIMEOUT_MS = 10_000;
 
 	function displayTitle(track: LibraryItem): string {
 		const title = track.title;
@@ -26,28 +33,47 @@
 	}
 
 	async function refresh(fetchFn: typeof fetch = fetch): Promise<void> {
+		if (activeRequest) return;
+		const generation = ++requestGeneration;
 		loading = true;
 		loadError = null;
+		const controller = new AbortController();
+		activeRequest = controller;
+		let timeoutId: ReturnType<typeof setTimeout> | undefined;
+		const timeout = new Promise<never>((_, reject) => {
+			timeoutId = setTimeout(() => {
+				controller.abort();
+				reject(new Error('library request timed out'));
+			}, LIBRARY_REQUEST_TIMEOUT_MS);
+		});
+
 		try {
-			const response = await fetchFn('/api/library', { credentials: 'include' });
+			const response = await Promise.race([
+				fetchFn('/api/library', { credentials: 'include', signal: controller.signal }),
+				timeout
+			]);
 			if (response.status === 401 || response.status === 403) {
+				authenticatedThisLoad = false;
+				clearSnapshot(window.sessionStorage);
 				clearSnapshot(window.localStorage);
+				broadcastAuthTransition(window.localStorage);
 				items = [];
 				staleAt = null;
 				loadError = 'You are signed out or do not have access to this library.';
 				return;
 			}
 			if (!response.ok) throw new Error(`library request failed (${response.status})`);
-			const fresh = toLibraryItems(await response.json());
+			const payload = await Promise.race([response.json(), timeout]);
+			const fresh = toLibraryItems(payload);
 			if (fresh === null) throw new Error('library response has an invalid shape');
+			authenticatedThisLoad = true;
 			items = fresh;
 			staleAt = null;
-			saveSnapshot(window.localStorage, fresh);
+			saveSnapshot(window.sessionStorage, fresh);
 		} catch {
-			// API unreachable (tunnel down, Access hiccup, airplane wifi):
-			// render the last-good snapshot with an explicit staleness badge
-			// instead of a blank screen.
-			const snapshot = loadSnapshot(window.localStorage);
+			if (generation !== requestGeneration) return;
+			// Do not trust a tab's snapshot until this page has verified its session.
+			const snapshot = authenticatedThisLoad ? loadSnapshot(window.sessionStorage) : null;
 			if (snapshot) {
 				items = snapshot.items;
 				staleAt = snapshot.savedAt;
@@ -57,12 +83,37 @@
 				loadError = 'Library is not reachable and there is no saved copy yet.';
 			}
 		} finally {
-			loading = false;
+			if (timeoutId !== undefined) clearTimeout(timeoutId);
+			if (activeRequest === controller) {
+				activeRequest = null;
+				if (generation === requestGeneration) loading = false;
+			}
 		}
 	}
 
+	function handleAuthTransition(event: StorageEvent): void {
+		if (event.key !== LIBRARY_AUTH_TRANSITION_KEY) return;
+		requestGeneration += 1;
+		activeRequest?.abort();
+		activeRequest = null;
+		authenticatedThisLoad = false;
+		clearSnapshot(window.sessionStorage);
+		items = [];
+		staleAt = null;
+		loadError = 'Your session changed. Sign in again to see this library.';
+		loading = false;
+	}
+
 	onMount(() => {
+		window.addEventListener('storage', handleAuthTransition);
+		// Discard the old shared localStorage snapshot from earlier versions.
+		clearSnapshot(window.localStorage);
 		void refresh();
+		return () => {
+			requestGeneration += 1;
+			activeRequest?.abort();
+			window.removeEventListener('storage', handleAuthTransition);
+		};
 	});
 </script>
 
@@ -99,10 +150,8 @@
 			</ul>
 		{/if}
 
-		{#if staleAt}
-			<button class="nt-button nt-button--ghost" type="button" onclick={() => void refresh()}>
-				Retry
-			</button>
-		{/if}
+		<button class="nt-button nt-button--ghost" type="button" onclick={() => void refresh()}>
+			{staleAt ? 'Retry' : 'Refresh'}
+		</button>
 	{/if}
 </main>

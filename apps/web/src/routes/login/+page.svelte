@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
+	import { broadcastAuthTransition, clearSnapshot } from '#lib/library/cache.js';
 	import { ApiClient } from '#lib/api/client.js';
 	import {
 		serializePublicKeyCredential,
@@ -51,6 +52,9 @@
 				'/v1/auth/passkey/authenticate/verify',
 				serializePublicKeyCredential(assertion)
 			);
+			clearSnapshot(window.sessionStorage);
+			clearSnapshot(window.localStorage);
+			broadcastAuthTransition(window.localStorage);
 			window.location.href = '/onboarding/provider';
 		} catch {
 			// Generic: login errors stay non-enumerating, like the API.
