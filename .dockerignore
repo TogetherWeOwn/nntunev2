@@ -9,6 +9,7 @@ containers/*/
 !containers/mb-import/
 crates/*/
 !crates/mb-import-validate/
+!crates/nntune-config/
 !crates/nntune-core/
 !crates/nntune-test-nntp/
 workers/*
