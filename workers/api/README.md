@@ -90,9 +90,20 @@ config from secrets) is a follow-up slice.
   (`redacted_summary`); `test connection` returns a boolean, never provider
   banners; audit events carry ids/results only — there is no field for
   secret material anywhere in the API or schema.
-- **Sessions:** `__Host-nntune-session` (`__Host-` prefix: `Path=/`, `Secure`,
-  no `Domain=` by construction); `HttpOnly; SameSite=Lax`; immutable `created_at`
-  caps the lifetime at one day even across refreshes. Secret rotation runs a
+- **Sessions:** `__Host-nntune-session` (`__Host-` prefix: `Path=/` via the
+  pinned `COOKIE_PATH` constant, `Secure`, no `Domain=` by construction);
+  `HttpOnly; SameSite=Lax`; `Max-Age` clamped to `MAX_SESSION_SECS`, and the
+  immutable `created_at` caps the lifetime at one day even across refreshes.
+  Logout is POST-only: `logout_session_atomically` (`/v1/session/logout`)
+  revokes the one verified row, and `logout_everywhere_atomically`
+  (`/v1/session/revoke-all`) revokes every row for the verified token's user
+  — both authenticate via `verify_stored_session` first, then require the
+  committed conditional `SessionRevokeStore` UPDATE (owner-bound,
+  transition-counted; zero rows fail closed with `Invalid`, store failures
+  surface `Storage` with the verified user so the handler returns a
+  retryable 5xx without clearing the cookie). The pure
+  `revoke_session` / `revoke_all_sessions` helpers only prepare snapshots;
+  they revoke nothing server-side. Secret rotation runs a
   bounded dual-accept window — see `docs/security/session-secret-rotation.md`
   (`SessionKeys::rotation` verifies through `verify_stored_session` and
   re-signs with the primary; verify-only previous secret,
