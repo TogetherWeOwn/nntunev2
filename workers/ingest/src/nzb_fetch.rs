@@ -498,8 +498,13 @@ fn parse_log_host(url: &str) -> Option<String> {
     if scheme.is_empty() {
         return None;
     }
-    let authority = rest.split(['/', '?', '#']).next()?;
-    if authority.is_empty() {
+    let mut authority_parts = rest.splitn(2, ['/', '?', '#']);
+    let authority = authority_parts.next()?;
+    if authority.is_empty()
+        || authority_parts
+            .next()
+            .is_some_and(|suffix| suffix.contains('@'))
+    {
         return None;
     }
     // Strip credentials (everything through the last '@'); the userinfo
@@ -509,15 +514,15 @@ fn parse_log_host(url: &str) -> Option<String> {
         return None;
     }
     if let Some(bracketed) = hostport.strip_prefix('[') {
-        let (inside, _) = bracketed.split_once(']')?;
-        if inside.is_empty() {
+        let (inside, suffix) = bracketed.split_once(']')?;
+        if inside.is_empty() || !valid_log_port_suffix(suffix) {
             return None;
         }
         return Some(inside.to_ascii_lowercase());
     }
     let host = if hostport.chars().filter(|&c| c == ':').count() == 1 {
-        let (host, _) = hostport.split_once(':')?;
-        if host.is_empty() {
+        let (host, port) = hostport.split_once(':')?;
+        if host.is_empty() || !valid_log_port(port) {
             return None;
         }
         host.to_ascii_lowercase()
@@ -531,6 +536,16 @@ fn parse_log_host(url: &str) -> Option<String> {
         return None;
     }
     Some(host.to_string())
+}
+
+fn valid_log_port_suffix(suffix: &str) -> bool {
+    suffix.is_empty() || suffix.strip_prefix(':').is_some_and(valid_log_port)
+}
+
+fn valid_log_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
 }
 
 #[cfg(test)]
@@ -661,14 +676,32 @@ mod tests {
         ] {
             assert_eq!(url_host_for_log(evil), "invalid", "input: {evil:?}");
         }
-        // Sane inputs are unchanged.
+        // Malformed authority delimiters and ports fail closed rather than
+        // exposing userinfo as a host.
+        for malformed in [
+            "https://APIKEY:secret?x@evil.example/path",
+            "https://APIKEY:secret#x@evil.example/path",
+            "https://user:SECRET@nzb.example:invalid/x",
+            "https://user:SECRET@[2001:db8::1]:+443/x",
+        ] {
+            assert_eq!(
+                url_host_for_log(malformed),
+                "invalid",
+                "input: {malformed:?}"
+            );
+        }
+        // Sane inputs are unchanged, with valid ports removed from the host.
         assert_eq!(
             url_host_for_log("https://nzb.example/get/abc.nzb"),
             "nzb.example"
         );
         assert_eq!(
-            url_host_for_log("https://user:SECRET@nzb.example/x"),
+            url_host_for_log("https://user:SECRET@nzb.example:443/x"),
             "nzb.example"
+        );
+        assert_eq!(
+            url_host_for_log("https://user:SECRET@[2001:db8::1]:443/x"),
+            "2001:db8::1"
         );
     }
 }
