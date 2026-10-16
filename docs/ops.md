@@ -23,13 +23,12 @@ The provisioned layout is **one bucket per concern per environment**, not one
 shared bucket. Object key prefixes describe cache scope *within* those buckets;
 they do not replace the environment boundary. Worker configs and cache/MusicBrainz
 ADRs must use the exact names below. There is no bucket named `nntunev2-art`.
-Alignment is **not yet complete** on the sibling branches. Known integration
-prerequisites identified across the provisioning review rounds:
+The MB documentation/example references are reconciled here; remaining
+integration prerequisites on sibling branches are:
 
 | Owning PR | Required reconciliation |
 |---|---|
 | [#2](https://github.com/TogetherWeOwn/nntunev2/pull/2), cache ADR | Physical audio/art buckets are separate per environment; prefixes live inside them. |
-| [#4](https://github.com/TogetherWeOwn/nntunev2/pull/4), MB docs/example | Replace nonexistent `nntunev2-art` with the appropriate art bucket below. |
 | [#14](https://github.com/TogetherWeOwn/nntunev2/pull/14), scaffold | Replace placeholders only when activating the correct consumer bindings. |
 | [#8](https://github.com/TogetherWeOwn/nntunev2/pull/8), stream | `workers/stream/wrangler.toml` uses `nntune-audio-cache` without environment sections; bind `AUDIO_CACHE` to `nntunev2-audio-staging` / `nntunev2-audio-prod`. |
 | [#10](https://github.com/TogetherWeOwn/nntunev2/pull/10), ingest | Both producer and consumer in `workers/ingest/wrangler.toml.example` use `nntune-ingest-jobs`; use `nntunev2-ingest-staging` / `nntunev2-ingest-prod`. |
@@ -228,6 +227,21 @@ budget and cache freshness against the actual origin limits. Database CONNECT
 isolation does not isolate CPU, connections, storage/I/O, maintenance, or outages, and the
 app single-node allocation must not be described as highly available.
 
+App auth reads require cache-disabled Hyperdrive: the API reads sessions,
+credentials, users, challenges and vaults with plain `SELECT`s through the
+`HYPERDRIVE` binding (`workers/api/src/worker_entry.rs`), which Hyperdrive
+caches by default (60s + 15s stale-while-revalidate, never invalidated by
+writes). The staging/prod app configs (`HYPERDRIVE_ID_STAGING`,
+`HYPERDRIVE_ID_PROD`) MUST be updated with
+`wrangler hyperdrive update <id> --caching-disabled` before the API serves
+traffic; the MB mirror config may stay cached. Deploy checklist (with
+`CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID` exported):
+`workers/api/check_hyperdrive_cache.sh --config-id $HYPERDRIVE_ID_STAGING`
+(and prod) must report `caching.disabled=true`. The gate fails closed
+(exit 3) without credentials; `--allow-skip` is only for secret-less CI.
+Template and contract:
+`workers/api/wrangler.toml.example`, `workers/api/README.md`.
+
 UNDO: consolidation is not reversed by reusing the deleted branch's URLs or by
 blindly restoring the old PS-40 resize command. The authorized host executor's
 consolidation receipt records per-step rollback; consult it with current data,
@@ -252,3 +266,76 @@ Binding names are chosen in Worker configs; resource names must match this table
 | App PlanetScale branch / PostgreSQL database | `nntunev2` / `main` / `nntunev2_staging` | same `main` cluster / currently `postgres`; clean launch DB deferred |
 | MB Hyperdrive variable | `HYPERDRIVE_ID_MB` (shared mirror) | `HYPERDRIVE_ID_MB` (shared mirror) |
 | Migration secret | `PLANETSCALE_MIGRATOR_URL_STAGING` | intentionally deferred to gated workflow |
+
+## Worker bindings
+
+Intended consumer bindings per environment. Resource names must match the
+tables above. Where a committed config still carries a stale name, the
+reconciliation table in the R2 section governs: align the config to this
+table, never the reverse. IDs below are non-credential binding metadata;
+no database URLs or secret values are recorded here. Non-storage bindings
+(Durable Object, Analytics Engine, Container service) are out of scope of
+this table.
+
+| Worker (config source) | Binding | Type | staging | prod | ID / variable |
+|---|---|---|---|---|---|
+| `stream` (`workers/stream/wrangler.toml`) | `AUDIO_CACHE` | R2 | `nntunev2-audio-staging` | `nntunev2-audio-prod` | name-bound, no ID |
+| `mb` (`workers/mb/wrangler.toml.example`) | `ART_CACHE` | R2 | `nntunev2-art-staging` | `nntunev2-art-prod` | name-bound, no ID |
+| `mb` | `MB_DB` | Hyperdrive | `nntunev2-mb` (shared mirror) | same | `1c6460d5112448888031973c87f671bc` / `HYPERDRIVE_ID_MB` |
+| `api` (`workers/api/wrangler.toml.example`) | `HYPERDRIVE` | Hyperdrive | `nntunev2-staging` | reserved: do not enable; clean launch DB deferred | staging `61c87403f119430bbc3a7f571df47002` / `HYPERDRIVE_ID_STAGING`; prod `d38a229748f6452bb417c6d33d277a8d` / `HYPERDRIVE_ID_PROD` |
+| `ingest` (`workers/ingest/wrangler.toml.example`) | `LIBRARY_DB` | Hyperdrive | intended app `nntunev2-staging` | reserved: do not enable; clean launch DB deferred | same IDs / variables as `api`; prod must remain disabled until the clean launch DB is ready |
+| `ingest` | `INGEST_QUEUE` (producer) | Queue | `nntunev2-ingest-staging` | `nntunev2-ingest-prod` | staging `c9e6afdea0ca487c8d20f799a052b045`; prod `2bf7e1a0edd347c9aada2afbc0c24ae5` |
+| `mb` / `ingest` (at activation) | `MB_CACHE` / `INGEST_STATE` / `INGEST_PAYLOADS` | KV | reserved `nntunev2-config-staging` | reserved `nntunev2-config-prod` | staging `1d4f21508a214ebfa8ff7b594989d6f6`; prod `9664ceed71464521bb6baae2d9374006`; assigned at activation, never by default |
+
+Known config drift (tracked in the R2 reconciliation table, fixed by the
+owning lanes, not here): the committed `workers/stream/wrangler.toml` still
+binds `AUDIO_CACHE` to `nntune-audio-cache` with no environment sections,
+and `workers/ingest/wrangler.toml.example` still names the queue
+`nntune-ingest-jobs`.
+
+## Staging promotion checklist
+
+Promotion is `main` HEAD → staging; production promotion is a later gated
+lane. Complete every box on the exact head being promoted.
+
+- [ ] Exact-head CI: `ci-ok`, `gitleaks` and `pr-lint` green on the promotion
+  SHA, plus Paperclip Review 5/5 on that head (merge policy in
+  `CONTRIBUTING.md`). A red required check is fixed in code or recorded as
+  a flake/quarantine decision with a card link, never dismissed.
+- [ ] Staging deploy evidence: record the successful push-triggered
+  `deploy.yml` run for the promotion SHA, and require its `staging-web` job
+  conclusion to be `success` (not `skipped`); verify staging health. This
+  workflow deploys `apps/web` only; it does not deploy stream, MB, API or
+  ingest Workers. The current `/api/health` returns only `{ok:true}`, with no
+  build identity, so neither a green deploy run nor a health response proves
+  which SHA is serving. Do not claim same-build evidence until a deployed-build
+  identity is exposed and compared with the promotion SHA. The deploy owner
+  replaces the placeholder `100::` record through a Workers custom domain.
+- [ ] Staging E2E: after `staging-web` completes, run `e2e-staging` by
+  `workflow_dispatch` or use a scheduled run that starts afterward; the
+  push-triggered E2E run can race the independent deploy. Record its run and
+  result, and do not call it same-build evidence until the staging build
+  identity is verified against the deploy SHA. Pre-configuration skips do
+  not count once staging is configured; the workflow fails closed without
+  both Access client credentials.
+- [ ] Access intact: the `NNTune v2 staging` Access app, its owner-OTP allow
+  policy and the QA service-token policy still gate `v2-staging.nntune.com`.
+  No bypass, no shared-token rotation, and both `CF_ACCESS_CLIENT_*`
+  credentials verified available to the job through authorized injection
+  (names only, never values).
+- [ ] Data plane guarded: no production migration, no clean-launch-database
+  creation, and no resize, split, role change, or credential rotation as part
+  of promotion. Staging serves `nntunev2_staging` through its runtime roles;
+  the prod binding stays reserved.
+- [ ] Rollback pointer recorded: record the last good staging SHA and its
+  successful push-triggered `deploy.yml` run, with `staging-web` conclusion
+  `success` (not `skipped`), before promoting. To accept rollback evidence,
+  also require the rollback rerun's `staging-web` job conclusion to be `success`
+  (not `skipped`); overall workflow success and staging health alone are
+  insufficient. To roll back `apps/web`, open that Actions run and choose
+  **Re-run all jobs**; do not use `workflow_dispatch` on the old SHA because
+  `staging-web` is push-only and will be skipped. Verify the rerun's
+  `staging-web` success and staging health. This workflow does not
+  deploy Workers, which need their own rollback evidence. Staging rollback is
+  a redeploy, never a data restore; retain the UNDO blocks and consolidation
+  receipt for infrastructure-specific rollback.

@@ -1,7 +1,8 @@
 # `stream` Worker + per-user NNTP pool
 
-Portable Rust core (`nntune-stream`, zero dependencies) of the NNTune v2
-stream Worker and its per-user NNTP pool Durable Object.
+Rust core (`nntune-stream`) of the NNTune v2 stream Worker and its per-user
+NNTP pool Durable Object. The Workers entry (`src/runtime.rs`) compiles on
+wasm32 only; native builds and tests never link the Workers runtime.
 
 ## Play path
 
@@ -106,16 +107,88 @@ CI (`.github/workflows/ci.yml`, job `rust`, required through `ci-ok`) runs
 fmt, clippy `-D warnings` and every test; the integration test asserts the
 local hit budget (< 100 ms), so a regression turns `ci-ok` red.
 
+## Ingest probe (probe.rs, runtime.rs)
+
+The ingest pipeline checks segment availability before verify/repair. One
+call carries one batch envelope (the ingest crate's `ProbeRequest`, at most
+500 message-ids) and returns which ids the provider has:
+
+```text
+ingest consumer ── NNTP_POOL stub (id_from_name(user_id)) ── POST /probe ──▶ NntpPool DO
+  1. refuse envelopes naming another user (the DO id is the user id), bodies
+     over 1 MiB, batches outside 1..=500, ids that are not strict message-ids
+  2. lease on the Ingest lane (never the slot reserved for playback)
+  3. warm connection or dial; STAT each id: 223 present, 430 missing
+  4. 200 {"batch_index", "present", "missing"}: the request ids, partitioned
+```
+
+| Status | Code | Meaning | Ingest |
+|---|---|---|---|
+| 200 | | outcome | check partition, fold into the tally |
+| 400 / 413 | `bad_request` / `too_large` | envelope refused | contract bug, no retry |
+| 503 | `busy` | ingest lane full or pool quarantined; `Retry-After` set | redeliver |
+| 503 | `provider_unavailable` | provider settings not loaded | redeliver |
+| 502 | `provider_error` | connection, auth or protocol failure; pool quarantined | redeliver |
+
+There is no public route: only Workers holding the cross-script Durable
+Object binding reach the object. Provider text never leaves the DO. A
+warm connection the provider closed while idle is redialed once.
+
+Not connected yet: the DO's provider settings. The encrypted BYOP row lives
+in the account vault, and reading it inside the DO (Hyperdrive, the
+key-encryption key, and the SSRF guard on every connect, threat model §3/§6)
+is its own slice; until it lands every probe answers `503
+provider_unavailable`. The ingest consumer configuration stays disabled
+meanwhile.
+
 ## Test
 
 ```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p nntune-stream --target wasm32-unknown-unknown -- -D warnings
 cargo fmt --all --check
 ```
 
-No network, no Cloudflare account, no secrets: the synthetic NNTP server
-lives in `tests/stream_integration.rs` and serves canned yEnc multipart articles.
+No Cloudflare account, no secrets: the play-path synthetic NNTP server lives
+in `tests/stream_integration.rs` and serves canned yEnc multipart articles;
+`tests/probe_synthetic_nntp.rs` runs the probe against the shared
+`nntune-test-nntp` server over loopback TCP.
+
+## Metering reconciliation (portable-core model)
+
+The code in `meter.rs` models complete-play reconciliation and deduplication;
+it is not yet wired into the production `play()` path or production sinks.
+`UsageLedger` is an in-memory portable-core model, not a live Hyperdrive table,
+and `reconcile` does not currently emit to Analytics Engine or call
+`ReconcileMismatch::log_line`.
+
+- Idempotency key: `derive_play_idempotency_key(user_id, track_id,
+  play_id)` returns `play:{user}:{track}:{play}`. It rejects empty fields,
+  unsafe log/key characters, and fields longer than 128 bytes for user IDs
+  or 512 bytes for track and play IDs. Redelivery derives the same key; a
+  genuine second listen carries a different `play_id`.
+- Dedup rule: `UsageLedger::record` converges exact redeliveries to one
+  in-memory entry — first write wins, mismatch is flagged, never silently
+  adjusted. A redelivery that disagrees on user, track, or bytes, or a play
+  whose key is not exactly `play:{user_id}:{track_id}:{play_id}` with valid
+  fields, reports `RecordOutcome::Conflict` and changes nothing. The
+  production Hyperdrive uniqueness constraint and upsert are not wired
+  by this portable-core model.
+- Reconcile pass: `reconcile(plays, ledger, meter)` checks each distinct
+  play (first occurrence authoritative) against the ledger. A play whose
+  ledger entry is missing, whose user or track identity differs, or whose
+  metered bytes differ from the entry's bytes emits exactly one
+  `ReconcileMismatch` meter event. A redelivery inside the same batch that
+  conflicts with its first occurrence is flagged as its own mismatch.
+  Mismatch events are non-serving and carry `bytes = 0` so byte sums over
+  mixed event kinds cannot double-count; the flagged counts stay on the
+  `ReconcileMismatch` record. `ReconcileMismatch::log_line()` formats
+  a single-line representation with event `play_reconcile_mismatch` and
+  both byte counts (`ledger_bytes=missing` when there is no entry). Identity
+  fields are percent-escaped even if callers bypass constructor validation.
+  The pass takes `&UsageLedger` and never adjusts, backfills, or drops an entry.
+  Production wiring for the meter, log, and ledger remains future work.
 
 ## Production notes
 
@@ -125,5 +198,6 @@ lives in `tests/stream_integration.rs` and serves canned yEnc multipart articles
   fetch→decode→decrypt→fan-out shape. Production content keys arrive via
   the BYOP vault with the ingest-owned envelope (sibling cards); swap the
   marked lines, keep the flow.
-- Metering sinks: Analytics Engine dataset `nntune_meter` + the Hyperdrive
-  usage-ledger table (ledger writes owned by the api card).
+- Planned metering sinks: Analytics Engine dataset `nntune_meter` and a
+  Hyperdrive usage-ledger table. Neither sink is wired by the portable-core
+  reconciliation model described above.
