@@ -48,6 +48,10 @@ binding = "INGEST_STATE"
 type = "kv"
 
 [[worker.binding]]
+binding = "NNTP_POOL"
+type = "durable_object"
+
+[[worker.binding]]
 binding = "INGEST_PAYLOADS"
 type = "kv"
 
