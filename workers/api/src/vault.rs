@@ -957,6 +957,9 @@ mod tests {
         let new_kek = [0x22u8; 32];
         let blob = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
 
+        // Stored-blob nonce length mismatches are server-side corruption
+        // (TOG-25315 taxonomy): they map to CorruptStoredData -> 500
+        // internal_error, not caller-input Invalid -> 422.
         for len in [0, 1, 11, 13, 16, 24] {
             let nonce = crate::b64::encode(&vec![7u8; len]);
 
@@ -964,7 +967,7 @@ mod tests {
             bad_wrap_nonce.dek_wrapped_nonce_b64url = nonce.clone();
             assert_eq!(
                 decrypt_vault(&kek, "user-1", &bad_wrap_nonce),
-                Err(VaultError::Invalid),
+                Err(VaultError::CorruptStoredData),
                 "decrypt accepted a wrapped nonce of length {len}"
             );
             // `VaultBlob` has no `PartialEq`, so match on the error instead
@@ -972,7 +975,7 @@ mod tests {
             assert!(
                 matches!(
                     rewrap_dek(&kek, &new_kek, 2, "user-1", &bad_wrap_nonce),
-                    Err(VaultError::Invalid)
+                    Err(VaultError::CorruptStoredData)
                 ),
                 "rewrap accepted a wrapped nonce of length {len}"
             );
@@ -981,7 +984,7 @@ mod tests {
             bad_payload_nonce.payload_nonce_b64url = nonce;
             assert_eq!(
                 decrypt_vault(&kek, "user-1", &bad_payload_nonce),
-                Err(VaultError::Invalid),
+                Err(VaultError::CorruptStoredData),
                 "decrypt accepted a payload nonce of length {len}"
             );
         }
