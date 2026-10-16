@@ -704,22 +704,16 @@ impl Store for PgStore {
         ttl_secs: u64,
         protected_user_id: Option<&str>,
     ) -> Result<(), StoreError> {
-        // Delete abandoned signups only: preserve credentialed accounts,
-        // the account currently being resumed, and users with an unexpired
-        // registration challenge (including one consumed by an in-flight finish).
+        // Single source of truth lives in `handlers` (statement-shape test
+        // pins the purpose literal and the vault/session/magic exemptions):
+        // magic-only accounts and vault owners are never reaped, so a vault
+        // saved under a magic session cannot cascade-delete 24h later.
         let cutoff = i64_of(now.saturating_sub(ttl_secs))?;
         let now = i64_of(now)?;
         let client = self.connect().await?;
         client
             .execute(
-                "DELETE FROM users WHERE created_at <= $1 \
-                 AND ($2::TEXT IS NULL OR users.id <> $2) \
-                 AND NOT EXISTS (SELECT 1 FROM webauthn_credentials \
-                                 WHERE webauthn_credentials.user_id = users.id) \
-                 AND NOT EXISTS (SELECT 1 FROM auth_challenges \
-                                 WHERE auth_challenges.user_id = users.id \
-                                   AND auth_challenges.purpose = 'register' \
-                                   AND auth_challenges.expires_at > $3)",
+                &handlers::reap_unverified_users_sql(),
                 &[&cutoff, &protected_user_id, &now],
             )
             .await

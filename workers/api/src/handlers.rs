@@ -61,14 +61,18 @@ const AUTH_START_WINDOW_SECS: u64 = 3600;
 /// Finish-route attempt budgets (CISO follow-up): each forged assertion
 /// costs P-256 ECDSA verify + SHA-256 plus DB reads, while a failed verify
 /// does not burn the challenge — so one challenge id would otherwise allow
-/// unlimited CPU-heavy attempts. Reserve one slot per challenge (passkey
-/// finishes) or per client IP (magic finish) BEFORE any verification or
-/// lookup; excess attempts answer the same generic auth error as any other
-/// failure. Ten per challenge TTL admits legitimate single attempts and
-/// typo retries while cutting off bombardment.
+/// unlimited CPU-heavy attempts. Two layers: a per-IP lookup budget BEFORE
+/// any DB read bounds rotating unknown challenge ids (one Pg connect+SELECT
+/// each), then one slot per challenge (passkey finishes) or per client IP
+/// (magic finish) BEFORE verification; excess attempts answer the same
+/// generic auth error as any other failure. Ten per challenge TTL admits
+/// legitimate single attempts and typo retries while cutting off
+/// bombardment; 100 per 5 min per IP bounds lookup floods while admitting
+/// NAT bursts (the Pg slot reservation caps at 100).
 const REGISTER_FINISH_ATTEMPTS_PER_CHALLENGE: u64 = 10;
 const LOGIN_FINISH_ATTEMPTS_PER_CHALLENGE: u64 = 10;
 const MAGIC_FINISH_ATTEMPTS_PER_IP: u64 = 10;
+const FINISH_LOOKUP_ATTEMPTS_PER_IP: u64 = 100;
 const FINISH_ATTEMPT_WINDOW_SECS: u64 = crate::auth::CHALLENGE_TTL_SECS;
 /// Per-IP auth-start admission: 30/hour admits legitimate multi-user NAT
 /// while cutting distinct-email loops. Global capacity is reserved only for
@@ -83,12 +87,42 @@ const MAIL_PER_IP_PER_HOUR: u64 = 30;
 const MAIL_GLOBAL_PER_WINDOW: u64 = 100;
 const MAIL_GLOBAL_WINDOW_SECS: u64 = 300;
 /// Unverified-signup retention: a user row that still holds no credential
-/// after this is a never-completed signup; `register_start` reaps such
-/// rows best-effort (cascade removes their magic/session rows; their
-/// challenges expire within 5 minutes and are pruned with them).
+/// and no other account activity (vault, session, unexpired magic link or
+/// register challenge) after this is a never-completed signup;
+/// `register_start` reaps such rows best-effort (their challenges expire
+/// within 5 minutes and are pruned with them). Magic-only accounts (session
+/// without a passkey yet) and vault owners are never reaped: their
+/// vault/session/magic rows exempt them.
 const UNVERIFIED_USER_TTL_SECS: u64 = 24 * 3600;
 /// Fixed scope key for the fleet-wide auth-start and mail budgets.
 const GLOBAL_SCOPE_KEY: &str = "global";
+
+/// Canonical fleet-wide reap statement shape: the single source of truth
+/// for `PgStore::reap_unverified_users` (called from `worker_entry`) and
+/// the statement-shape test below. The purpose literal must stay
+/// `PURPOSE_REGISTER` (`'register'`): reaping on `'login'` would delete
+/// never-completed signups on the wrong ceremony. Exemptions (credentials,
+/// unexpired register challenges, vaults, sessions, unexpired magic links)
+/// must stay in sync with the `FakeStore` mirror.
+pub fn reap_unverified_users_sql() -> String {
+    format!(
+        "DELETE FROM users WHERE created_at <= $1 \
+         AND ($2::TEXT IS NULL OR users.id <> $2) \
+         AND NOT EXISTS (SELECT 1 FROM webauthn_credentials \
+                         WHERE webauthn_credentials.user_id = users.id) \
+         AND NOT EXISTS (SELECT 1 FROM auth_challenges \
+                         WHERE auth_challenges.user_id = users.id \
+                           AND auth_challenges.purpose = '{PURPOSE_REGISTER}' \
+                           AND auth_challenges.expires_at > $3) \
+         AND NOT EXISTS (SELECT 1 FROM provider_vaults \
+                         WHERE provider_vaults.user_id = users.id) \
+         AND NOT EXISTS (SELECT 1 FROM sessions \
+                         WHERE sessions.user_id = users.id) \
+         AND NOT EXISTS (SELECT 1 FROM magic_link_tokens \
+                         WHERE magic_link_tokens.user_id = users.id \
+                           AND magic_link_tokens.expires_at > $3)"
+    )
+}
 
 // --- Config ---------------------------------------------------------------------
 
@@ -278,10 +312,11 @@ pub trait Store {
     ) -> impl Future<Output = Result<bool, StoreError>>;
     /// Remove challenges that can no longer be redeemed.
     fn prune_expired_challenges(&self, now: u64) -> impl Future<Output = Result<(), StoreError>>;
-    /// Reap abandoned signups while preserving the current/resumed user and
-    /// users with unexpired registration challenges, including in-flight
-    /// finishes. Default no-op so out-of-tree `Store` impls keep compiling;
-    /// production and the test fake override it.
+    /// Reap abandoned signups while preserving the current/resumed user,
+    /// credentialed accounts, unexpired registration challenges (including
+    /// in-flight finishes), and any account activity (vault, session,
+    /// unexpired magic link). Default no-op so out-of-tree `Store` impls
+    /// keep compiling; production and the test fake override it.
     fn reap_unverified_users(
         &self,
         now: u64,
@@ -788,6 +823,13 @@ where
     };
     // Preserve a resumed signup through this cleanup pass. Other active
     // registration attempts are protected by their unexpired challenges.
+    // Same-request only: a concurrent `register_start` for another email
+    // can reap this resuming user between our lookup above and our
+    // challenge insert below (it holds no unexpired register challenge
+    // precisely because it is resuming). The post-insert revalidation
+    // below heals that race by recreating the user under the same id, so
+    // a resumed signup survives concurrent cleanup (client retries also
+    // recreate it; see migration 0006 FK note).
     if ctx
         .store
         .reap_unverified_users(
@@ -848,13 +890,56 @@ where
     if !admitted {
         return shape(user.id.clone());
     }
+    // Challenge insert plus concurrent-reap healing. With the migration
+    // 0006 FK (`auth_challenges.user_id -> users(id)`) a concurrent reap
+    // of our user fails here; without it (older DBs, fakes without FK) the
+    // insert succeeds orphaned and the revalidation below heals it. Either
+    // way a resumed signup survives a concurrent cleanup for another email.
     if ctx
         .store
         .insert_challenge(&challenge, Some(&user.id), PURPOSE_REGISTER)
         .await
         .is_err()
     {
-        return internal();
+        match ctx.store.user_by_email(&email).await {
+            Ok(None) => {
+                let healed = UserRecord {
+                    id: user.id.clone(),
+                    email: email.clone(),
+                    created_at: ctx.now,
+                };
+                if ctx.store.insert_user(&healed).await.is_err() {
+                    return shape(fake_user_id(ctx.cfg, &email));
+                }
+                if ctx
+                    .store
+                    .insert_challenge(&challenge, Some(&user.id), PURPOSE_REGISTER)
+                    .await
+                    .is_err()
+                {
+                    return internal();
+                }
+            }
+            _ => return internal(),
+        }
+    } else {
+        match ctx.store.user_by_email(&email).await {
+            Ok(Some(current)) if current.id == user.id => {}
+            Ok(None) => {
+                let healed = UserRecord {
+                    id: user.id.clone(),
+                    email: email.clone(),
+                    created_at: ctx.now,
+                };
+                if ctx.store.insert_user(&healed).await.is_err() {
+                    return shape(fake_user_id(ctx.cfg, &email));
+                }
+            }
+            Ok(Some(_)) => {
+                return shape(fake_user_id(ctx.cfg, &email));
+            }
+            Err(_) => return internal(),
+        }
     }
     // Email-ownership proof and magic login share one atomic per-email
     // issuance budget, so parallel requests cannot oversend.
@@ -875,6 +960,23 @@ where
     if !valid_challenge_id(&body.challenge) {
         return generic_auth();
     }
+    // Per-IP lookup budget BEFORE any DB read: rotating well-formed unknown
+    // challenge ids costs one Pg connect+SELECT each, so they must share one
+    // per-client pool. Denial is the generic error (no throttle oracle).
+    let lookup_admitted = ctx
+        .store
+        .reserve_rate_limit(
+            &ctx.source_ip,
+            "auth.register_finish_ip",
+            FINISH_LOOKUP_ATTEMPTS_PER_IP,
+            ctx.now,
+            FINISH_ATTEMPT_WINDOW_SECS,
+        )
+        .await
+        .unwrap_or(false);
+    if !lookup_admitted {
+        return generic_auth();
+    }
     let row = match ctx.store.challenge_by_id(&body.challenge).await {
         Ok(Some(row)) if row.purpose == PURPOSE_REGISTER => row,
         Ok(_) => return generic_auth(),
@@ -886,7 +988,7 @@ where
     ) else {
         return generic_auth();
     };
-    // Attempt budget BEFORE any DB read or CPU-heavy verification: a failed
+    // Per-challenge attempt budget BEFORE CPU-heavy verification: a failed
     // attestation verify must not grant unlimited retries on one challenge.
     // Same atomic slot pattern as register/start; denial is the generic
     // error so throttled and invalid attempts are indistinguishable.
@@ -1129,6 +1231,22 @@ where
     if !valid_challenge_id(&body.challenge) {
         return generic_auth();
     }
+    // Per-IP lookup budget BEFORE any DB read, same as register/finish:
+    // rotating well-formed unknown challenge ids must share one pool.
+    let lookup_admitted = ctx
+        .store
+        .reserve_rate_limit(
+            &ctx.source_ip,
+            "auth.login_finish_ip",
+            FINISH_LOOKUP_ATTEMPTS_PER_IP,
+            ctx.now,
+            FINISH_ATTEMPT_WINDOW_SECS,
+        )
+        .await
+        .unwrap_or(false);
+    if !lookup_admitted {
+        return generic_auth();
+    }
     let row = match ctx.store.challenge_by_id(&body.challenge).await {
         Ok(Some(row)) if row.purpose == PURPOSE_LOGIN => row,
         Ok(_) => return generic_auth(),
@@ -1141,7 +1259,7 @@ where
     ) else {
         return generic_auth();
     };
-    // Attempt budget BEFORE any DB read or CPU-heavy verification, same as
+    // Per-challenge attempt budget BEFORE CPU-heavy verification, same as
     // register/finish: one challenge id cannot fund unlimited assertions.
     let admitted = ctx
         .store
@@ -1791,6 +1909,14 @@ mod tests {
             user_id: Option<&str>,
             purpose: &str,
         ) -> Result<(), StoreError> {
+            // Mirror migration 0006 FK (`auth_challenges.user_id ->
+            // users(id)`): bound challenges fail when the user is gone, so a
+            // concurrent reap surfaces here instead of orphaning the row.
+            if let Some(uid) = user_id {
+                if !self.users.borrow().contains_key(uid) {
+                    return Err(StoreError);
+                }
+            }
             self.challenges.borrow_mut().insert(
                 challenge.id.clone(),
                 ChallengeRow {
@@ -1896,6 +2022,8 @@ mod tests {
             ttl_secs: u64,
             protected_user_id: Option<&str>,
         ) -> Result<(), StoreError> {
+            // Mirror `reap_unverified_users_sql`: magic-only accounts (session
+            // without a passkey yet) and vault owners are never reaped.
             let cutoff = now.saturating_sub(ttl_secs);
             let credentialed: HashSet<String> = self
                 .credentials
@@ -1910,10 +2038,27 @@ mod tests {
                 .filter(|row| row.purpose == PURPOSE_REGISTER && row.challenge.expires_at > now)
                 .filter_map(|row| row.user_id.clone())
                 .collect();
+            let vault_owners: HashSet<String> = self.vaults.borrow().keys().cloned().collect();
+            let session_owners: HashSet<String> = self
+                .sessions
+                .borrow()
+                .values()
+                .map(|row| row.user_id.clone())
+                .collect();
+            let magic_owners: HashSet<String> = self
+                .magic
+                .borrow()
+                .values()
+                .filter(|record| record.expires_at > now)
+                .map(|record| record.user_id.clone())
+                .collect();
             self.users.borrow_mut().retain(|_, user| {
                 user.created_at > cutoff
                     || credentialed.contains(&user.id)
                     || active_registrations.contains(&user.id)
+                    || vault_owners.contains(&user.id)
+                    || session_owners.contains(&user.id)
+                    || magic_owners.contains(&user.id)
                     || protected_user_id == Some(user.id.as_str())
             });
             Ok(())
@@ -3518,6 +3663,44 @@ mod tests {
     }
 
     #[test]
+    fn magic_start_mail_cap_binds_independently_of_start_budget() {
+        // Pins the per-IP mail cap itself: `admit_auth_start` (`auth.start_ip`)
+        // and the mail cap (`auth.mail_ip`) share the same 30/hour shape, so
+        // the victim-loop test above stays green even with the `!mail_ip_ok`
+        // check removed (the start budget cuts the loop first). Pre-seed only
+        // the mail slots, leaving the start budget fresh: the next start must
+        // admit but send/store nothing. Removing the mail check sends one mail
+        // and fails this test.
+        let h = harness();
+        seed_user(&h, "u1", "pinned@example.com");
+        for _ in 0..MAIL_PER_IP_PER_HOUR {
+            assert!(block_on(h.store.reserve_rate_limit(
+                "198.51.100.9",
+                "auth.mail_ip",
+                MAIL_PER_IP_PER_HOUR,
+                NOW,
+                3600,
+            ))
+            .unwrap());
+        }
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": "pinned@example.com"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(resp.body, r#"{"ok":true}"#);
+        assert!(
+            h.mailer.sent.borrow().is_empty(),
+            "exhausted mail_ip budget must send nothing"
+        );
+        assert!(
+            h.store.magic.borrow().is_empty(),
+            "exhausted mail_ip budget must store no magic row"
+        );
+    }
+
+    #[test]
     fn register_start_reaps_expired_unverified_users_and_prunes_challenges() {
         // Register-only traffic must not grow tables monotonically: a
         // never-completed signup past the TTL is reaped (credentialed
@@ -3624,6 +3807,281 @@ mod tests {
         assert!(block_on(h.store.user_by_email("abandoned@example.com"))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn reap_sql_pins_register_purpose_and_activity_exemptions() {
+        // Destructive-statement pin: mutating the purpose literal
+        // `'register'` -> `'login'` (or dropping an exemption) must fail
+        // this test even though all FakeStore-driven tests stay green.
+        let sql = reap_unverified_users_sql();
+        assert!(
+            sql.contains(&format!("'{PURPOSE_REGISTER}'")),
+            "reap must filter on PURPOSE_REGISTER"
+        );
+        assert!(
+            !sql.contains("'login'"),
+            "reap must never filter on the login purpose"
+        );
+        for table in [
+            "webauthn_credentials",
+            "auth_challenges",
+            "provider_vaults",
+            "sessions",
+            "magic_link_tokens",
+        ] {
+            assert!(sql.contains(table), "reap must exempt {table}");
+        }
+    }
+
+    #[test]
+    fn insert_challenge_enforces_user_fk_like_migration_0006() {
+        // Mirrors `migrations/0006_auth_challenge_user_fk.sql`: a bound
+        // challenge for a missing user fails instead of orphaning the row,
+        // so a concurrent reap surfaces at insert (healed by retry).
+        let h = harness();
+        let challenge = auth::new_registration_challenge("example.com", ORIGIN, NOW).unwrap();
+        assert!(
+            block_on(
+                h.store
+                    .insert_challenge(&challenge, Some("ghost"), PURPOSE_REGISTER)
+            )
+            .is_err(),
+            "bound challenge for a missing user must fail"
+        );
+        assert!(
+            block_on(h.store.insert_challenge(&challenge, None, PURPOSE_LOGIN)).is_ok(),
+            "unbound login challenges stay allowed"
+        );
+    }
+
+    #[test]
+    fn register_start_reaper_preserves_magic_only_vault_and_inbox() {
+        // CRITICAL pin: `magic_finish` issues a session with no credential
+        // check and the register inbox email carries a redeemable magic link,
+        // while `provider_vaults.user_id ... ON DELETE CASCADE` destroys a
+        // vault saved under that session. A stale magic-only account (session
+        // + vault, no passkey) and a stale inbox-only account (unexpired
+        // magic, no session yet) must both survive a later `register_start`
+        // for another email; a truly abandoned signup must still be reaped.
+        let h = harness();
+        let stale_at = NOW.saturating_sub(UNVERIFIED_USER_TTL_SECS + 1);
+        for (id, email) in [
+            ("magic-only", "magic-only@example.com"),
+            ("inbox-only", "inbox-only@example.com"),
+            ("abandoned", "abandoned2@example.com"),
+        ] {
+            block_on(h.store.insert_user(&UserRecord {
+                id: id.to_string(),
+                email: email.to_string(),
+                created_at: stale_at,
+            }))
+            .unwrap();
+        }
+        let (_, magic_only_record) =
+            auth::issue_magic_link("magic-only", "magic-only@example.com", NOW);
+        block_on(h.store.insert_magic(&magic_only_record)).unwrap();
+        block_on(h.store.insert_session(&SessionRecord {
+            id: "sess-magic-only".to_string(),
+            user_id: "magic-only".to_string(),
+            created_at: NOW,
+            expires_at: NOW + 3600,
+            rotation_counter: 0,
+            revoked: false,
+        }))
+        .unwrap();
+        h.store.vaults.borrow_mut().insert(
+            "magic-only".to_string(),
+            VaultRow {
+                blob: crate::vault::VaultBlob {
+                    kek_version: 1,
+                    dek_wrapped_nonce_b64url: "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                    dek_wrapped_b64url: "AA".to_string(),
+                    payload_nonce_b64url: "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                    payload_b64url: "AA".to_string(),
+                },
+                indexer_configured: false,
+                updated_at: NOW,
+            },
+        );
+        let (_, inbox_record) = auth::issue_magic_link("inbox-only", "inbox-only@example.com", NOW);
+        block_on(h.store.insert_magic(&inbox_record)).unwrap();
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "fresh2@example.com"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(
+            block_on(h.store.user_by_email("magic-only@example.com"))
+                .unwrap()
+                .is_some(),
+            "magic-only account with session/vault must survive reaping"
+        );
+        assert!(
+            block_on(h.store.user_by_email("inbox-only@example.com"))
+                .unwrap()
+                .is_some(),
+            "inbox-only account with redeemable magic must survive reaping"
+        );
+        assert!(
+            block_on(h.store.user_by_email("abandoned2@example.com"))
+                .unwrap()
+                .is_none(),
+            "truly abandoned signup must still be reaped"
+        );
+        assert!(
+            h.store.vaults.borrow().contains_key("magic-only"),
+            "surviving vault must not cascade-delete"
+        );
+    }
+
+    #[test]
+    fn register_start_heals_concurrently_reaped_resumed_signup() {
+        // Concurrency pin: a stale credential-less user holds no unexpired
+        // register challenge precisely because it is resuming, so a
+        // concurrent `register_start` for another email reaps it between
+        // this request's `user_by_email` and `insert_challenge`. Simulate
+        // the interleaving at the store layer (lookup, concurrent reap,
+        // insert with FK failure, heal-and-retry) and assert the resumed
+        // signup survives under the same id.
+        let h = harness();
+        let stale_at = NOW.saturating_sub(UNVERIFIED_USER_TTL_SECS + 1);
+        block_on(h.store.insert_user(&UserRecord {
+            id: "resumed-race".to_string(),
+            email: "race@example.com".to_string(),
+            created_at: stale_at,
+        }))
+        .unwrap();
+        let existing = block_on(h.store.user_by_email("race@example.com"))
+            .unwrap()
+            .unwrap();
+        block_on(
+            h.store
+                .reap_unverified_users(NOW, UNVERIFIED_USER_TTL_SECS, Some("other")),
+        )
+        .unwrap();
+        assert!(
+            block_on(h.store.user_by_email("race@example.com"))
+                .unwrap()
+                .is_none(),
+            "concurrent reap deletes the resuming user"
+        );
+        let challenge = auth::new_registration_challenge("example.com", ORIGIN, NOW).unwrap();
+        assert!(
+            block_on(
+                h.store
+                    .insert_challenge(&challenge, Some(&existing.id), PURPOSE_REGISTER)
+            )
+            .is_err(),
+            "FK failure surfaces the concurrent delete"
+        );
+        let healed = UserRecord {
+            id: existing.id.clone(),
+            email: "race@example.com".to_string(),
+            created_at: NOW,
+        };
+        block_on(h.store.insert_user(&healed)).unwrap();
+        block_on(
+            h.store
+                .insert_challenge(&challenge, Some(&existing.id), PURPOSE_REGISTER),
+        )
+        .unwrap();
+        assert!(
+            block_on(h.store.user_by_email("race@example.com"))
+                .unwrap()
+                .is_some(),
+            "healed resumed signup survives under the same id"
+        );
+    }
+
+    #[test]
+    fn register_finish_lookup_budget_bounds_rotating_ids_before_db() {
+        // Pins the per-IP lookup budget BEFORE any DB read: pre-seed the
+        // `auth.register_finish_ip` pool, then a VALID finish (built via
+        // register/start) must fail generically without enrolling.
+        // Removing the pre-lookup reservation would let it succeed (200).
+        let h = harness();
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "lookup@example.com"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let start: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let challenge = start["challenge"].as_str().unwrap().to_string();
+        let cred_id = b"lookup-cred";
+        let att = fx_none_attestation(cred_id, &fx_es256_cose(48));
+        let emailed = h.mailer.sent.borrow().last().unwrap().1.clone();
+        for _ in 0..FINISH_LOOKUP_ATTEMPTS_PER_IP {
+            assert!(block_on(h.store.reserve_rate_limit(
+                "198.51.100.9",
+                "auth.register_finish_ip",
+                FINISH_LOOKUP_ATTEMPTS_PER_IP,
+                NOW,
+                FINISH_ATTEMPT_WINDOW_SECS,
+            ))
+            .unwrap());
+        }
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/finish",
+            serde_json::json!({
+                "challenge": challenge.clone(),
+                "credential_id": b64url_encode(cred_id),
+                "attestation_object": b64url_encode(&att),
+                "client_data_json": b64url_encode(
+                    fx_client_json("webauthn.create", &challenge).as_bytes()
+                ),
+                "magic_token": emailed,
+                "invite_code": null,
+            }),
+        );
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        assert!(resp.set_cookie.is_none());
+        let user = block_on(h.store.user_by_email("lookup@example.com"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            block_on(h.store.credentials_for_user(&user.id))
+                .unwrap()
+                .is_empty(),
+            "lookup-blocked finish must enroll nothing"
+        );
+    }
+
+    #[test]
+    fn login_finish_lookup_budget_bounds_rotating_ids_before_db() {
+        // Same per-IP pre-read bound on the login finish: exhaust the
+        // `auth.login_finish_ip` pool, then even a well-formed unknown
+        // challenge id is rejected without reaching the per-challenge
+        // budget or verification. Removing the pre-lookup reservation
+        // would leave rotating ids unbound (one Pg SELECT each).
+        let h = harness();
+        for _ in 0..FINISH_LOOKUP_ATTEMPTS_PER_IP {
+            assert!(block_on(h.store.reserve_rate_limit(
+                "198.51.100.9",
+                "auth.login_finish_ip",
+                FINISH_LOOKUP_ATTEMPTS_PER_IP,
+                NOW,
+                FINISH_ATTEMPT_WINDOW_SECS,
+            ))
+            .unwrap());
+        }
+        let bogus = "A".repeat(43);
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/login/finish",
+            serde_json::json!({
+                "challenge": bogus,
+                "credential_id": b64url_encode(b"nope"),
+                "authenticator_data": b64url_encode(b"nope"),
+                "client_data_json": b64url_encode(b"nope"),
+                "signature": b64url_encode(b"nope"),
+            }),
+        );
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        assert!(resp.set_cookie.is_none());
     }
 
     #[test]
