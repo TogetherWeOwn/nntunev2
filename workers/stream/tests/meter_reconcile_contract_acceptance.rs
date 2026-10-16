@@ -1,11 +1,10 @@
-//! Acceptance tests (failing-first): the public contract the
-//! implementation must add to `nntune_stream::meter`.
+//! Acceptance tests for the public reconciliation contract in
+//! `nntune_stream::meter`.
 //!
-//! This file intentionally does not compile on the current head: it
-//! names the API surface the implementation has to provide. The
-//! documentation and non-regression expectations behind these names
-//! are pinned against the existing API in
-//! `meter_reconcile_acceptance.rs`.
+//! This is passing portable-core coverage. It verifies key-field
+//! validation and reconciliation behavior; it does not exercise
+//! production wiring. No production `play()` path, Hyperdrive table,
+//! Analytics Engine emission, or production log sink is currently wired.
 //!
 //! A *complete play* is the per-play usage record produced when a play
 //! finishes serving (the `BytesServed` moment): one record carrying the
@@ -14,26 +13,21 @@
 //! write); it is not a second listen. A genuine second listen is a
 //! different play and must bill separately.
 //!
-//! Contract to implement (all in `meter.rs`; change no existing
-//! signature — `Meter`, `MeterEvent` and `MemoryMeter` stay as they
-//! are, `MeterKind` gains exactly one variant; no `play()` wiring or
-//! new bindings are required by these tests):
+//! Implemented portable-core contract (in `meter.rs`; existing `Meter`,
+//! `MeterEvent` and `MemoryMeter` signatures remain unchanged):
 //!
 //! - `pub const RECONCILE_MISMATCH_METRIC: &str =
-//!   "play_reconcile_mismatch";` — the stable Analytics Engine metric
-//!   name (and structured-log event name) emitted once per mismatched
-//!   play. It rides the existing `Meter` trait → `METER` /
-//!   `nntune_meter` sink; no new dataset.
+//!   "play_reconcile_mismatch";` — the stable metric and structured-log
+//!   event name for a mismatch. Production Analytics Engine emission is
+//!   not wired.
 //! - `MeterKind::ReconcileMismatch` — the `MeterEvent` kind emitted for
 //!   a mismatch, with the play's `user_id`, `track_id` and
 //!   `bytes` = the metered byte count.
 //! - `pub fn derive_play_idempotency_key(user_id, track_id, play_id)
 //!   -> Result<String, &'static str>` — returns
-//!   `"play:{user_id}:{track_id}:{play_id}"`, mirroring the
-//!   `ingest:{user}:{sha}:{ref}` vocabulary of
-//!   `derive_idempotency_key` in the ingest Worker. Rejects (Err, no
-//!   panic) any field that is empty or contains `:` or NUL, so
-//!   `("a:b", "c", "d")` and `("a", "b:c", "d")` can never collide.
+//!   `"play:{user_id}:{track_id}:{play_id}"`. Each key field is rejected
+//!   if empty, over 128 bytes for a user ID or 512 bytes for a track or
+//!   play ID, or contains `:`, `=`, whitespace, or a control character.
 //! - `pub struct CompletePlay { idempotency_key, user_id, track_id,
 //!   bytes: u64 }` with `CompletePlay::new(user_id, track_id, play_id,
 //!   bytes) -> Result<CompletePlay, &'static str>` deriving the key.
@@ -58,8 +52,8 @@
 //!   meter: &mut dyn Meter) -> ReconcileReport` — compares each
 //!   distinct play (by idempotency key, first occurrence authoritative,
 //!   redeliveries checked once) against the ledger:
-//!   - a play whose ledger entry is missing, or whose metered bytes
-//!     differ from the entry's bytes, is a mismatch;
+//!   - a play whose ledger entry is missing, or whose user, track, or
+//!     byte count differs from the entry, is a mismatch;
 //!   - every mismatch emits exactly one `ReconcileMismatch` meter
 //!     event and produces one `ReconcileMismatch` record whose
 //!     `log_line()` is a single-line structured log with fields
@@ -79,7 +73,8 @@
 //!   dedup rule ("first write wins, mismatch is flagged, never
 //!   silently adjusted").
 //!
-//! Do not edit these tests to make them pass: implement the contract.
+//! These tests cover portable-core behavior only; they make no claim
+//! that production sinks or play-path wiring are active.
 
 use std::path::PathBuf;
 

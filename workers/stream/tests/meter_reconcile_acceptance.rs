@@ -1,15 +1,11 @@
-//! Acceptance tests (failing-first): complete-play reconciliation with a
-//! deduped usage ledger.
+//! Passing regression/acceptance tests for complete-play reconciliation
+//! with a deduped usage ledger.
 //!
-//! Behavioural half of the contract, written against the *existing*
-//! public API (`meter::{Meter, MeterEvent, MeterKind, MemoryMeter}` and
-//! the files on disk) so it compiles on the current head and fails at
-//! runtime exactly where the feature is missing:
+//! Behavioural coverage against the public API
+//! (`meter::{Meter, MeterEvent, MeterKind, MemoryMeter}`) and files on
+//! disk. The README documents the portable-core reconciliation model and
+//! metric name; production sinks are not claimed to be wired.
 //!
-//! - `workers/stream/README.md` must document the reconcile method and
-//!   the Analytics Engine metric name, so an operator alerting on the
-//!   mismatch metric can find what emits it (fails today: neither is
-//!   documented).
 //! - The `Meter` sink stays an append-only fact log: dedup belongs to
 //!   the usage ledger, never to `MemoryMeter`. Two identical
 //!   `BytesServed` events must both be recorded by the meter — a
@@ -21,10 +17,12 @@
 //!   `nntune_meter` dataset in `wrangler.toml`) must stay wired
 //!   (positive control).
 //!
-//! The API the implementation must add — idempotency-key derivation,
-//! the deduped ledger, and the reconcile pass — is pinned in
-//! `meter_reconcile_contract_acceptance.rs`.
-//! Do not edit these tests to make them pass: implement reconciliation.
+//! The API for idempotency-key derivation, the deduped ledger, and the
+//! reconcile pass is covered in
+//! `meter_reconcile_contract_acceptance.rs`. README describes the
+//! portable-core model; production `play()` wiring, Hyperdrive storage,
+//! Analytics Engine emission, and production log-sink wiring are not
+//! asserted or represented as active here.
 
 use std::path::PathBuf;
 
