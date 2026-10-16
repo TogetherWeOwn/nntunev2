@@ -13,8 +13,8 @@ binding = "INGEST_QUEUE"
 queue = "nntune-ingest-jobs"
 
 # Slice T2: DLQ producer (code: src/retry.rs). The consumer sends one
-# DlqEntry per quarantined message here — the original QueueMsg plus machine
-# reason headers (`x-ingest-error-code`, `x-ingest-attempts`) — then acks the
+# DlqEntry per quarantined message here — the original QueueMsg plus
+# `error_code` and `attempts` fields in the serialized body — then acks the
 # original so it is never redelivered. Producer-only: safe to declare before
 # the consumer ships.
 [[queues.producers]]
@@ -39,12 +39,11 @@ queue = "nntune-ingest-dlq"
 # KV lag plus the edge-cached negative-lookup window (consumer reads with
 # cacheTtl 30).
 # max_retries = 4
-# The native dead-letter route stays as the safety net for messages the
-# handler never settles (panic, timeout): Cloudflare moves the untouched body
-# with no reason envelope. Both shapes redrive via src/retry.rs (`redrive`
-# for DlqEntry, `redrive_raw` for native bodies); see README "Redrive".
-# [[queues.consumers.dead_letter_queue]]
-# queue = "nntune-ingest-dlq"
+# The native dead-letter route is a safety net for messages the handler never
+# settles (panic, timeout): Cloudflare moves the untouched body with no reason
+# envelope. Both shapes redrive via src/retry.rs (`redrive` for DlqEntry,
+# `redrive_raw` for native bodies); see README "Redrive".
+# dead_letter_queue = "nntune-ingest-dlq"
 
 # Workflows: NOT YET. workers-rs 0.3 has no Workflow client and this crate
 # exports no Workflow class, and `[[workflows]]` requires a `class_name`, so

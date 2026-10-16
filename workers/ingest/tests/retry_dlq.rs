@@ -1,7 +1,7 @@
 //! Retry-budget + DLQ acceptance.
 //!
 //! An always-failing ("poison") job must burn its bounded retry budget with
-//! backoff, then land in the DLQ carrying reason headers (error code,
+//! backoff, then land in the DLQ carrying reason body fields (error code,
 //! attempts) — while valid jobs in the same batch keep flowing. A redriven
 //! entry must return to the queue with a fresh budget.
 
@@ -32,7 +32,7 @@ fn always_fails(_: &QueueMsg) -> Result<(), JobError> {
 }
 
 #[test]
-fn poison_job_burns_the_budget_then_quarantines_with_reason_headers() {
+fn poison_job_burns_the_budget_then_quarantines_with_reason_body_fields() {
     let mut msg = poison_msg();
     let mut last = None;
     for attempt in 1..=MAX_ATTEMPTS {
@@ -57,17 +57,9 @@ fn poison_job_burns_the_budget_then_quarantines_with_reason_headers() {
     assert_eq!(entry.attempts, MAX_ATTEMPTS);
     assert_eq!(entry.error_code, ERR_PROBE_FAILED);
     assert_eq!(entry.message.job_id, msg.job_id);
-    let headers = entry.reason_headers();
-    let code = headers
-        .iter()
-        .find(|(k, _)| k == "x-ingest-error-code")
-        .expect("DLQ entry must carry the error-code header");
-    assert_eq!(code.1, ERR_PROBE_FAILED);
-    let attempts = headers
-        .iter()
-        .find(|(k, _)| k == "x-ingest-attempts")
-        .expect("DLQ entry must carry the attempts header");
-    assert_eq!(attempts.1, MAX_ATTEMPTS.to_string());
+    let body = serde_json::to_value(&entry).unwrap();
+    assert_eq!(body["error_code"], ERR_PROBE_FAILED);
+    assert_eq!(body["attempts"], MAX_ATTEMPTS);
     assert!(
         entry.reason.contains(ERR_PROBE_FAILED),
         "human reason must name the code"
@@ -113,6 +105,7 @@ fn poison_does_not_block_valid_jobs_behind_it() {
 fn redrive_returns_a_quarantined_job_to_the_queue_with_fresh_budget() {
     let mut poison = poison_msg();
     poison.attempt = MAX_ATTEMPTS;
+    poison.repair_rounds = nntune_ingest::jobs::MAX_REPAIR_ROUNDS;
     let entry = match decide(&poison, always_fails(&poison)) {
         Disposition::Quarantine(entry) => entry,
         d => panic!("expected quarantine, got {d:?}"),
@@ -129,5 +122,6 @@ fn redrive_returns_a_quarantined_job_to_the_queue_with_fresh_budget() {
     // Native-DLQ fallback shape (raw message, no reason envelope) redrives too.
     let raw = redrive_raw(&poison);
     assert_eq!(raw.attempt, 1);
+    assert_eq!(raw.repair_rounds, 0);
     assert_eq!(raw.job_id, poison.job_id);
 }

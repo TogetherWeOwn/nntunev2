@@ -98,12 +98,12 @@ KV reads in `GET /v1/ingest/jobs/:id`, and the repair Container runtime.
   bytes) skip the budget and quarantine at once.
 - DLQ quarantine: on exhaustion the consumer sends one `DlqEntry` to
   `nntune-ingest-dlq` (`INGEST_DLQ` binding) — the original `QueueMsg` plus
-  machine reason headers `x-ingest-error-code` / `x-ingest-attempts` — then
-  acks the original. The native dead-letter route stays configured as the
-  safety net for messages the handler never settles (panic, timeout), which
-  arrive as raw bodies with no reason envelope.
+  machine-readable `error_code` / `attempts` fields in the serialized DLQ
+  body — then acks the original. The native dead-letter route can be enabled
+  as a safety net for messages the handler never settles (panic, timeout),
+  which arrive as raw bodies with no reason envelope.
 - Poison coverage (`tests/retry_dlq.rs`): an always-failing job burns all 5
-  deliveries, lands in the DLQ with reason headers asserted, and never
+  deliveries, lands in the DLQ with reason body fields asserted, and never
   blocks the valid jobs behind it in the same batch.
 
 ## Redrive (DLQ back to queue)

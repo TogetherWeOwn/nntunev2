@@ -17,8 +17,9 @@
 //! Backoff ([`retry_delay_secs`]) mirrors the payload-fetch schedule
 //! (5/15/30/60 s): redeliveries stay spaced across the documented ~60 s KV
 //! read lag instead of hot-looping. Exhaustion sends a [`DlqEntry`] — the
-//! original message plus machine reason headers (error code, attempts) — to
-//! [`DLQ_QUEUE_NAME`]; the operator redrives with [`redrive`] (see README).
+//! original message plus machine-readable `error_code` and `attempts` body
+//! fields — to [`DLQ_QUEUE_NAME`]; the operator redrives with [`redrive`]
+//! (see README).
 
 use serde::{Deserialize, Serialize};
 
@@ -39,11 +40,6 @@ pub const CONSUMER_MAX_RETRIES: u32 = 4;
 /// Ceiling for [`retry_delay_secs`]: the longest single wait between
 /// redeliveries.
 pub const MAX_RETRY_DELAY_SECS: u32 = 60;
-
-/// Header carrying the machine error code on a [`DlqEntry`].
-pub const DLQ_HEADER_ERROR_CODE: &str = "x-ingest-error-code";
-/// Header carrying the spent delivery count on a [`DlqEntry`].
-pub const DLQ_HEADER_ATTEMPTS: &str = "x-ingest-attempts";
 
 /// Deterministic step failures, classified so the consumer knows whether a
 /// redelivery could ever succeed.
@@ -125,17 +121,6 @@ pub struct DlqEntry {
     pub attempts: u32,
     pub error_code: String,
     pub reason: String,
-}
-
-impl DlqEntry {
-    /// Machine reason headers: error code + spent attempts. Asserted by the
-    /// DLQ acceptance test; operators filter on these.
-    pub fn reason_headers(&self) -> [(String, String); 2] {
-        [
-            (DLQ_HEADER_ERROR_CODE.into(), self.error_code.clone()),
-            (DLQ_HEADER_ATTEMPTS.into(), self.attempts.to_string()),
-        ]
-    }
 }
 
 /// Decide one message's fate from its step result. Pure so the budget is
@@ -325,24 +310,16 @@ mod tests {
     }
 
     #[test]
-    fn dlq_entry_roundtrips_with_reason_headers() {
+    fn dlq_entry_roundtrips_with_reason_body_fields() {
         let entry = match decide(&msg_at(MAX_ATTEMPTS), boom()) {
             Disposition::Quarantine(entry) => entry,
             d => panic!("expected quarantine, got {d:?}"),
         };
         let back: DlqEntry = serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
         assert_eq!(back, *entry);
-        let headers = back.reason_headers();
-        assert_eq!(
-            headers,
-            [
-                (
-                    DLQ_HEADER_ERROR_CODE.to_string(),
-                    ERR_PROBE_FAILED.to_string()
-                ),
-                (DLQ_HEADER_ATTEMPTS.to_string(), MAX_ATTEMPTS.to_string()),
-            ]
-        );
+        let body = serde_json::to_value(&back).unwrap();
+        assert_eq!(body["error_code"], ERR_PROBE_FAILED);
+        assert_eq!(body["attempts"], MAX_ATTEMPTS);
     }
 
     #[test]
@@ -362,6 +339,7 @@ mod tests {
         let raw = redrive_raw(&spent);
         assert_eq!(raw.state, JobState::Queued);
         assert_eq!(raw.attempt, 1);
+        assert_eq!(raw.repair_rounds, 0);
     }
 
     #[test]
