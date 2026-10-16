@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::cache::{ContentCache, MultipartUpload};
 use crate::grant::{self, GrantError};
-use crate::meter::{Meter, MeterEvent, MeterKind};
+use crate::meter::{stream_seconds_for_bytes, Meter, MeterEvent, MeterKind};
 use crate::nntp::{valid_message_id, NntpClient, NntpError};
 use crate::pool::{Lane, Lease, OrphanedPlay, Pool, PoolError};
 use crate::prefetch::should_prefetch;
@@ -454,6 +454,7 @@ fn ev(kind: MeterKind, user: &str, track: &str, bytes: u64) -> MeterEvent {
         user_id: user.to_string(),
         track_id: track.to_string(),
         bytes,
+        seconds: stream_seconds_for_bytes(bytes),
     }
 }
 
@@ -652,5 +653,21 @@ mod tests {
             Err(PlayError::Unauthorized(GrantError::Malformed))
         ));
         assert_eq!(pool.connects(), 0, "rejected plays must not dial out");
+    }
+
+    #[test]
+    fn emitted_events_carry_seconds_derived_from_bytes() {
+        // The ledger row later derives seconds from the same byte count, so
+        // every event built here must already agree with the formula.
+        for bytes in [0, 1, 47_999, 48_000, 48_001, 100_000] {
+            let event = ev(MeterKind::BytesServed, "u", "t", bytes);
+            assert_eq!(
+                event.seconds,
+                crate::meter::stream_seconds_for_bytes(bytes),
+                "bytes {bytes}"
+            );
+        }
+        let idle = ev(MeterKind::PlayStart, "u", "t", 0);
+        assert_eq!((idle.bytes, idle.seconds), (0, 0));
     }
 }

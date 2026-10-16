@@ -87,5 +87,10 @@ lives in `tests/stream_integration.rs` and serves canned yEnc multipart articles
   fetch→decode→decrypt→fan-out shape. Production content keys arrive via
   the BYOP vault with the ingest-owned envelope (sibling cards); swap the
   marked lines, keep the flow.
-- Metering sinks: Analytics Engine dataset `nntune_meter` + the Hyperdrive
-  usage-ledger table (ledger writes owned by the api card).
+- Metering sinks: Analytics Engine dataset `nntune_meter` (point shape in
+  `src/meter.rs`: blobs `[kind, user_id, track_id]`, doubles
+  `[bytes, seconds]`) + the Hyperdrive usage-ledger table
+  (`migrations/0004_usage_ledger.sql`; row intents and statements owned by
+  the api worker's `src/ledger.rs`). Every event carries stream seconds at
+  the nominal 48 000 bytes/s rate, so the fast signal and the ledger row
+  derived from the same bytes agree by construction.

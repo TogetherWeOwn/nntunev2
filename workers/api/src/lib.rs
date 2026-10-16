@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod b64;
+pub mod ledger;
 pub mod library;
 pub mod session;
 pub mod vault;

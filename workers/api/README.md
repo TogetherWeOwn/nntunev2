@@ -14,15 +14,18 @@ workers/api/
   src/auth.rs     # magic links, passkey challenge lifecycle, invite codes
   src/vault.rs    # envelope encryption, validation, SSRF guard, redaction
   src/library.rs  # genres/playlists: opaque ids, owner-scoped authz
+  src/ledger.rs   # usage ledger: validated row intents, monthly folds, SQL
   tests/api_tests.rs  # acceptance tests (TDD)
   tests/library_tests.rs  # genre/playlist acceptance tests (TDD)
+  tests/ledger_tests.rs  # usage-ledger acceptance + property tests (TDD)
   wrangler.toml.example  # Worker config template (no secrets)
 ```
 
-`migrations/0002_auth_vault.sql` + `migrations/0003_library.sql` are the
-Postgres schema (PlanetScale via Hyperdrive). The HTTP + Hyperdrive wiring
-(Worker entry) lands in the follow-up slice once staging secrets are
-provisioned; this crate is the security-critical logic with tests.
+`migrations/0002_auth_vault.sql` + `migrations/0003_library.sql` +
+`migrations/0004_usage_ledger.sql` are the Postgres schema (PlanetScale via
+Hyperdrive). The HTTP + Hyperdrive wiring (Worker entry) lands in the
+follow-up slice once staging secrets are provisioned; this crate is the
+security-critical logic with tests.
 
 ## Security contract (threat-model §3–§4)
 
@@ -81,6 +84,13 @@ provisioned; this crate is the security-critical logic with tests.
   omit `items`, which single reads return. UPDATE/DELETE affecting 0 rows
   maps to 404 — the owner predicate already makes cross-owner writes
   inexpressible.
+- **Usage ledger:** one row per billed service window with a fresh 128-bit
+  idempotency key; the insert is `ON CONFLICT DO NOTHING`, so a retried
+  finalize inserts zero rows instead of double-billing. Stream seconds must
+  equal `ceil(bytes / 48_000)` — the stream worker's nominal rate — or the
+  row is rejected; `period_month` derives from `recorded_at`, and monthly
+  usage is `SUM` over (`user_id`, `period_month`). All SQL is parameterized;
+  errors stay generic and never echo handles.
 - **SSRF guard:** provider hosts are hostile input. Shape check (never a
   URL), resolve ALL DNS records, reject loopback/link-local/private/
   unique-local/multicast/reserved (v4+v6); literal IPs checked directly.
