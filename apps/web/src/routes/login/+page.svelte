@@ -2,11 +2,8 @@
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { broadcastAuthTransition, clearSnapshot } from '#lib/library/cache.js';
 	import { ApiClient } from '#lib/api/client.js';
-	import {
-		serializePublicKeyCredential,
-		toRequestOptions,
-		type AuthenticationOptionsJSON
-	} from '#lib/webauthn.js';
+	import { stashSignedInEmail } from '#lib/signed-in-email.js';
+	import { serializePublicKeyCredential, toRequestOptions } from '#lib/webauthn.js';
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
 
@@ -32,26 +29,53 @@
 	}
 
 	async function signInWithPasskey() {
+		if (passkeyStatus === 'working' || email.trim().length === 0) {
+			passkeyStatus = 'error';
+			return;
+		}
 		if (!passkeysSupported) {
 			passkeyStatus = 'unsupported';
 			return;
 		}
 		passkeyStatus = 'working';
 		try {
-			const options = await client.post<AuthenticationOptionsJSON>(
-				'/v1/auth/passkey/authenticate/options',
-				{}
-			);
+			// Email-first login: the API answers the same shape for known
+			// and unknown addresses (never an oracle) with an empty
+			// allow-list, and the browser offers any local credential.
+			const options = await client.loginStart(email.trim());
 			const assertion = await navigator.credentials.get({
-				publicKey: toRequestOptions(options)
+				publicKey: toRequestOptions({
+					challenge: options.challenge,
+					rpId: options.rp_id,
+					allowCredentials: []
+				})
 			});
 			if (!(assertion instanceof PublicKeyCredential)) {
 				throw new Error('no public-key credential');
 			}
-			await client.post(
-				'/v1/auth/passkey/authenticate/verify',
-				serializePublicKeyCredential(assertion)
-			);
+			const serialized = serializePublicKeyCredential(assertion);
+			const response = serialized.response as Record<string, unknown>;
+			const authenticatorData = response.authenticatorData;
+			const clientDataJSON = response.clientDataJSON;
+			const signature = response.signature;
+			const credentialId = serialized.id;
+			if (
+				typeof authenticatorData !== 'string' ||
+				typeof clientDataJSON !== 'string' ||
+				typeof signature !== 'string' ||
+				typeof credentialId !== 'string'
+			) {
+				throw new Error('credential missing assertion fields');
+			}
+			// Exact finish shape (the API rejects unknown fields).
+			await client.loginFinish({
+				challenge: options.challenge,
+				credentialId,
+				authenticatorData,
+				clientDataJson: clientDataJSON,
+				signature
+			});
+			stashSignedInEmail(email.trim());
 			clearSnapshot(window.sessionStorage);
 			clearSnapshot(window.localStorage);
 			broadcastAuthTransition(window.localStorage);
@@ -73,6 +97,7 @@
 
 	<section aria-labelledby="passkey-heading">
 		<h2 id="passkey-heading">Passkey</h2>
+		<p>Enter your email below, then use your passkey.</p>
 		<button class="nt-button" type="button" onclick={signInWithPasskey}>
 			Sign in with passkey
 		</button>

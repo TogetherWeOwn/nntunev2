@@ -54,6 +54,37 @@ export function encodeBase64Url(value: ArrayBuffer | ArrayBufferView): string {
 	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
+/**
+ * Build API JSON creation options from the Worker's `register/start`
+ * response (`{challenge, user_id, rp_id}`). The server deliberately returns
+ * only these three fields; the client assembles the full WebAuthn options
+ * (algorithms the server verifies: ES256 and EdDSA; `none` attestation,
+ * which the server accepts). Shape pinned by
+ * `workers/api/tests/fixtures/api-web-contract.json`.
+ */
+export function toRegistrationOptions(
+	challenge: string,
+	userId: string,
+	rpId: string,
+	email: string
+): RegistrationOptionsJSON {
+	return {
+		challenge,
+		rp: { name: 'NNTune', id: rpId },
+		user: { id: userId, name: email, displayName: email },
+		pubKeyCredParams: [
+			{ type: 'public-key', alg: -7 },
+			{ type: 'public-key', alg: -8 }
+		],
+		excludeCredentials: [],
+		authenticatorSelection: {
+			residentKey: 'required',
+			requireResidentKey: true
+		},
+		attestation: 'none'
+	};
+}
+
 /** Convert API JSON creation options into browser options, requiring discoverable credentials. */
 export function toCreationOptions(
 	options: RegistrationOptionsJSON
