@@ -17,16 +17,19 @@ workers/api/
   src/handlers.rs     # framework-agnostic HTTP handlers over store traits
   src/worker_entry.rs # Hyperdrive Postgres, DoH DNS, socket dialer, mailer
   src/library.rs      # genres/playlists: opaque ids, owner-scoped authz
+  src/ledger.rs       # usage ledger: validated row intents, monthly folds, SQL
   src/b64.rs          # strict base64 helpers
-  tests/              # acceptance + security-regression tests
+  tests/              # acceptance + security-regression tests, including ledger property tests
   wrangler.toml.example  # Worker config template (no secrets)
 ```
 
 `migrations/0002_auth_vault.sql` plus `0003` (library), `0004` (challenge
-purpose) and `0005` (atomic rate-limit slots and test leases) define the
-Postgres schema (PlanetScale via Hyperdrive). All queries are parameterized;
-single-use claims execute the conditional `UPDATE ... RETURNING` prepared by
-the core and require exactly one row before any response.
+purpose), `0005` (atomic rate-limit slots and test leases), and
+`0006_usage_ledger.sql` define the Postgres schema (PlanetScale via
+Hyperdrive). All queries are parameterized; single-use claims execute the
+conditional `UPDATE ... RETURNING` prepared by the core and require exactly
+one row before any response. The usage ledger validates row intents,
+aggregates monthly totals, and provides replay-safe parameterized SQL.
 
 ## Routes (all JSON, `Cache-Control: no-store`)
 
@@ -173,6 +176,13 @@ config from secrets) is a follow-up slice.
   omit `items`, which single reads return. UPDATE/DELETE affecting 0 rows
   maps to 404 — the owner predicate already makes cross-owner writes
   inexpressible.
+- **Usage ledger:** one row per billed service window with a fresh 128-bit
+  idempotency key; the insert is `ON CONFLICT DO NOTHING`, so a retried
+  finalize inserts zero rows instead of double-billing. Stream seconds must
+  equal `ceil(bytes / 48_000)` — the stream worker's nominal rate — or the
+  row is rejected; `period_month` derives from `recorded_at`, and monthly
+  usage is `SUM` over (`user_id`, `period_month`). All SQL is parameterized;
+  errors stay generic and never echo handles.
 - **SSRF guard:** provider hosts are hostile input. Shape check (never a
   URL), resolve ALL DNS records, reject loopback/link-local/private/
   unique-local/multicast/reserved (v4+v6); literal IPs checked directly.

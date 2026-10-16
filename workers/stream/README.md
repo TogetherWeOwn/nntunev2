@@ -201,6 +201,12 @@ and `reconcile` does not currently emit to Analytics Engine or call
   fetch→decode→decrypt→fan-out shape. Production content keys arrive via
   the BYOP vault with the ingest-owned envelope (sibling cards); swap the
   marked lines, keep the flow.
-- Planned metering sinks: Analytics Engine dataset `nntune_meter` and a
-  Hyperdrive usage-ledger table. Neither sink is wired by the portable-core
-  reconciliation model described above.
+- Planned metering sinks: Analytics Engine dataset `nntune_meter` (point
+  shape in `src/meter.rs`: blobs `[kind, user_id, track_id]`, doubles
+  `[bytes, seconds]`) and the Hyperdrive usage-ledger table
+  (`migrations/0006_usage_ledger.sql`; row intents and statements owned by
+  the api worker's `src/ledger.rs`). Neither sink is wired by the portable-core
+  reconciliation model described above. Every event carries stream seconds
+  at the nominal 48 000 bytes/s rate. Reconciliation must fold bytes first
+  (`served_bytes`) and derive seconds from that total: per-event seconds
+  each round up, so summing them overcounts split windows.
