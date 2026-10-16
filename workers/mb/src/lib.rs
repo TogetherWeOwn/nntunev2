@@ -859,7 +859,7 @@ mod tests {
         assert_eq!(resp.status, 500);
         assert_eq!(
             resp.body,
-            r#"{"code":"internal_error","message":"internal error","retryable":true}"#
+            r#"{"code":"internal_error","message":"unexpected error","retryable":true}"#
         );
         assert_eq!(resp.cache_ttl, None);
         assert!(cache.puts.borrow().is_empty());

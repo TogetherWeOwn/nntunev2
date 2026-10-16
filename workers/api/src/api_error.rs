@@ -1,11 +1,9 @@
-//! Structured error envelope shared by every worker: see
-//! `docs/api-errors.md` (the registry is the source of truth; the doc-lint
-//! test below fails if this module drifts from it).
+//! Structured error mappings for the API worker: see `docs/api-errors.md`.
+//! The registry test checks that this worker's declared codes stay in sync.
 //!
 //! Wire shape: `{"code": "...", "message": "...", "retryable": bool}` with
-//! the registry HTTP status. Messages on auth/session/vault paths stay
-//! generic by construction: those error types only Display generic text,
-//! and this module never formats internal detail into `message`.
+//! the registry HTTP status. Error messages on 5xx paths are sealed to fixed
+//! public text, and auth/session failures remain generic.
 
 use serde::Serialize;
 
@@ -82,6 +80,13 @@ pub fn spec(code: &str) -> CodeSpec {
         .unwrap_or(FALLBACK)
 }
 
+fn message_for_server_error(code: &str) -> &'static str {
+    match code {
+        "service_unavailable" => "service unavailable",
+        _ => "unexpected error",
+    }
+}
+
 /// A user-facing error ready for the HTTP layer: `status` is the response
 /// status, the serialized body is exactly `{code, message, retryable}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -95,14 +100,16 @@ pub struct ApiError {
 
 impl ApiError {
     /// Build from a registry code; unknown codes become the generic
-    /// fallback (code and status), keeping the caller's message only when
-    /// the code was registered.
+    /// fallback. Registered 5xx codes use fixed public text; other
+    /// registered codes keep the caller's message.
     pub fn by_code(code: &str, message: impl Into<String>) -> Self {
         let spec = spec(code);
-        let message = if spec.code == code {
-            message.into()
-        } else {
+        let message = if spec.code != code {
             "unexpected error".to_string()
+        } else if spec.status >= 500 {
+            message_for_server_error(spec.code).to_string()
+        } else {
+            message.into()
         };
         Self {
             code: spec.code,
@@ -156,25 +163,34 @@ impl From<LibraryError> for ApiError {
     }
 }
 
-/// Auth failures are one generic 401: the type cannot express which check
-/// failed, so neither can the wire code (no enumeration oracle).
+/// Credential failures are one generic 401: the type cannot express which
+/// check failed, so neither can the wire code (no enumeration oracle).
+/// Server-side RP/origin configuration failures map separately to 500.
 impl From<AuthError> for ApiError {
     fn from(e: AuthError) -> Self {
-        Self::unauthorized(e.to_string())
+        match e {
+            AuthError::Invalid => Self::unauthorized(e.to_string()),
+            AuthError::Misconfigured => Self::internal_error(e.to_string()),
+        }
     }
 }
 
 impl From<SessionError> for ApiError {
     fn from(e: SessionError) -> Self {
-        Self::unauthorized(e.to_string())
+        match e {
+            SessionError::Invalid => Self::unauthorized(e.to_string()),
+            SessionError::Misconfigured => Self::internal_error(e.to_string()),
+        }
     }
 }
 
 impl From<VaultError> for ApiError {
     fn from(e: VaultError) -> Self {
         match e {
-            VaultError::Invalid => Self::validation_failed(e.to_string()),
-            VaultError::Crypto => Self::internal_error(e.to_string()),
+            VaultError::Invalid => Self::validation_failed("invalid vault configuration"),
+            VaultError::CorruptStoredData | VaultError::Crypto => {
+                Self::internal_error(e.to_string())
+            }
         }
     }
 }
@@ -221,15 +237,31 @@ mod tests {
             ("validation_failed", 422)
         );
         assert_eq!(ApiError::from(AuthError::Invalid).code, "unauthorized");
-        assert_eq!(ApiError::from(SessionError::Invalid).code, "unauthorized");
+        let auth_config = ApiError::from(AuthError::Misconfigured);
         assert_eq!(
-            ApiError::from(VaultError::Invalid).code,
-            "validation_failed"
+            (auth_config.code, auth_config.status),
+            ("internal_error", 500)
+        );
+        assert_eq!(ApiError::from(SessionError::Invalid).code, "unauthorized");
+        let session_config = ApiError::from(SessionError::Misconfigured);
+        assert_eq!(
+            (session_config.code, session_config.status),
+            ("internal_error", 500)
+        );
+        let invalid_vault = ApiError::from(VaultError::Invalid);
+        assert_eq!(
+            (invalid_vault.code, invalid_vault.message.as_str()),
+            ("validation_failed", "invalid vault configuration")
+        );
+        let corrupt_vault = ApiError::from(VaultError::CorruptStoredData);
+        assert_eq!(
+            (corrupt_vault.code, corrupt_vault.status),
+            ("internal_error", 500)
         );
         let crypto = ApiError::from(VaultError::Crypto);
         assert_eq!(
             (crypto.code, crypto.status, crypto.message.as_str()),
-            ("internal_error", 500, "vault unavailable")
+            ("internal_error", 500, "unexpected error")
         );
     }
 
@@ -241,6 +273,17 @@ mod tests {
         let rate = ApiError::rate_limited("too many requests");
         assert_eq!((rate.status, rate.retryable), (429, true));
         assert_eq!(body(&rate)["code"], "rate_limited");
+    }
+
+    #[test]
+    fn server_error_messages_are_sealed_to_public_text() {
+        let err = ApiError::internal_error("database password and provider response");
+        assert_eq!(
+            body(&err),
+            serde_json::json!({"code":"internal_error","message":"unexpected error","retryable":true})
+        );
+        let unavailable = ApiError::service_unavailable("binding token");
+        assert_eq!(unavailable.message, "service unavailable");
     }
 
     #[test]
@@ -267,8 +310,8 @@ mod tests {
             let owners: Vec<&str> = cells[4].split(',').map(str::trim).collect();
             let mine = REGISTRY.iter().find(|s| s.code == code);
             // Reverse direction: a row naming this worker must be a code
-            // this worker actually emits, or the doc promises a code that
-            // can never appear.
+            // declared by its mapping module. This does not assert that an
+            // HTTP handler currently emits the mapping.
             assert_eq!(
                 owners.contains(&"api"),
                 mine.is_some(),
@@ -286,7 +329,7 @@ mod tests {
         assert_eq!(
             parsed,
             REGISTRY.len(),
-            "every emitted code must appear in docs/api-errors.md"
+            "every declared code must appear in docs/api-errors.md"
         );
     }
 }

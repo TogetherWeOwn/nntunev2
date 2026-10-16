@@ -1,8 +1,10 @@
 # API error taxonomy
 
-Every worker (`api`, `ingest`, `mb`, `stream`) returns the same JSON error
-envelope on its error paths, so clients handle auth, validation, billing
-limits, and upstream failures without per-worker special cases.
+The `api`, `ingest`, `mb`, and `stream` crates define mappings to the same
+JSON error envelope. In this slice, `ingest` and `mb` serialize the envelope
+on their wired HTTP error paths; `api` and `stream` mappings are pinned for
+HTTP wiring when those handlers land. Clients can handle auth, validation,
+billing limits, and upstream failures without per-worker special cases.
 
 ## Envelope
 
@@ -31,11 +33,14 @@ must fall back to the generic:
 { "code": "internal_error", "message": "unexpected error", "retryable": true }
 ```
 
-with HTTP status 500. Servers implement this in their `by_code` lookup;
-clients map an unknown `code` to their generic failure handling while
-keeping the server `message` for display. Legacy `{"error": "..."}` bodies
-(pre-taxonomy) are read as `{code: <derived from HTTP status>, message:
-<error text>}` by the web client during migration.
+with HTTP status 500. The worker implementations seal 5xx messages to fixed public text in their
+`by_code` lookup; caller-supplied details are never serialized on those paths. Clients map an unknown envelope
+`code` to `request_failed`, keeping the server `message` and boolean
+`retryable` for display/policy. Legacy `{"error": "..."}` bodies
+(pre-taxonomy) derive their code from unambiguous HTTP statuses (400, 401,
+402, 403, 404, 413, 416, 422, 429, 503); all other statuses use
+`request_failed`. The web client continues to support these legacy bodies
+during migration.
 
 ## Registry
 

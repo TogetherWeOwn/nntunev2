@@ -150,16 +150,16 @@ describe('ApiClient', () => {
 		expect((failure as ApiError).retryable).toBe(false);
 	});
 
-	it('falls back to the generic code for an unregistered envelope code', async () => {
+	it('falls back generically for unknown codes and preserves server retryability', async () => {
 		const fetchFn = vi.fn(async () =>
-			jsonResponse({ code: 'future_code', message: 'from a newer server', retryable: false }, 500)
+			jsonResponse({ code: 'future_code', message: 'from a newer server', retryable: false }, 429)
 		);
 		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
 
 		const failure = await client.get('/me').catch((error: unknown) => error);
 		expect((failure as ApiError).code).toBe('request_failed');
 		expect((failure as ApiError).message).toBe('from a newer server');
-		expect((failure as ApiError).retryable).toBe(true);
+		expect((failure as ApiError).retryable).toBe(false);
 	});
 
 	it('maps 401 to the unauthorized code', async () => {
@@ -169,6 +169,21 @@ describe('ApiClient', () => {
 		const failure = await client.get('/me').catch((error: unknown) => error);
 		expect(failure).toBeInstanceOf(ApiError);
 		expect((failure as ApiError).code).toBe('unauthorized');
+	});
+
+	it.each([
+		[400, 'invalid_request'],
+		[413, 'payload_too_large'],
+		[416, 'range_not_satisfiable'],
+		[422, 'validation_failed'],
+		[503, 'service_unavailable'],
+		[502, 'request_failed']
+	])('derives legacy error code for status %i', async (status, code) => {
+		const fetchFn = vi.fn(async () => jsonResponse({ error: 'legacy failure' }, status));
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/me').catch((error: unknown) => error);
+		expect((failure as ApiError).code).toBe(code);
 	});
 
 	it('posts JSON bodies with the right content type', async () => {

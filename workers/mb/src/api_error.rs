@@ -1,6 +1,5 @@
-//! Structured error envelope shared by every worker: see
-//! `docs/api-errors.md` (the registry is the source of truth; the doc-lint
-//! test below fails if this module drifts from it).
+//! Structured error mappings for the MB worker: see `docs/api-errors.md`.
+//! The registry test checks that this worker's declared codes stay in sync.
 //!
 //! Wire shape: `{"code": "...", "message": "...", "retryable": bool}` with
 //! the registry HTTP status. Repository failures stay a generic
@@ -49,6 +48,10 @@ pub fn spec(code: &str) -> CodeSpec {
         .unwrap_or(FALLBACK)
 }
 
+fn message_for_server_error(_code: &str) -> &'static str {
+    "unexpected error"
+}
+
 /// A user-facing error ready for the HTTP layer: `status` is the response
 /// status, the serialized body is exactly `{code, message, retryable}`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -62,14 +65,16 @@ pub struct ApiError {
 
 impl ApiError {
     /// Build from a registry code; unknown codes become the generic
-    /// fallback (code and status), keeping the caller's message only when
-    /// the code was registered.
+    /// fallback. Registered 5xx codes use fixed public text; other
+    /// registered codes keep the caller's message.
     pub fn by_code(code: &str, message: impl Into<String>) -> Self {
         let spec = spec(code);
-        let message = if spec.code == code {
-            message.into()
-        } else {
+        let message = if spec.code != code {
             "unexpected error".to_string()
+        } else if spec.status >= 500 {
+            message_for_server_error(spec.code).to_string()
+        } else {
+            message.into()
         };
         Self {
             code: spec.code,
@@ -86,13 +91,13 @@ impl ApiError {
         Self::by_code("not_found", message)
     }
     pub fn internal_error() -> Self {
-        Self::by_code("internal_error", "internal error")
+        Self::by_code("internal_error", "unexpected error")
     }
 
     /// Serialized envelope body. Infallible: the shape is three scalars.
     pub fn body_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| {
-            r#"{"code":"internal_error","message":"internal error","retryable":true}"#.to_string()
+            r#"{"code":"internal_error","message":"unexpected error","retryable":true}"#.to_string()
         })
     }
 }
@@ -116,8 +121,10 @@ mod tests {
         let internal = ApiError::internal_error();
         assert_eq!(
             body(&internal),
-            serde_json::json!({"code":"internal_error","message":"internal error","retryable":true})
+            serde_json::json!({"code":"internal_error","message":"unexpected error","retryable":true})
         );
+        let leaky = ApiError::by_code("internal_error", "driver failure: private detail");
+        assert_eq!(leaky.message, "unexpected error");
     }
 
     #[test]
@@ -143,8 +150,8 @@ mod tests {
             let owners: Vec<&str> = cells[4].split(',').map(str::trim).collect();
             let mine = REGISTRY.iter().find(|s| s.code == code);
             // Reverse direction: a row naming this worker must be a code
-            // this worker actually emits, or the doc promises a code that
-            // can never appear.
+            // declared by its mapping module. This does not assert that an
+            // HTTP handler currently emits the mapping.
             assert_eq!(
                 owners.contains(&"mb"),
                 mine.is_some(),
@@ -162,7 +169,7 @@ mod tests {
         assert_eq!(
             parsed,
             REGISTRY.len(),
-            "every emitted code must appear in docs/api-errors.md"
+            "every declared code must appear in docs/api-errors.md"
         );
     }
 }

@@ -1,6 +1,5 @@
-//! Structured error envelope shared by every worker: see
-//! `docs/api-errors.md` (the registry is the source of truth; the doc-lint
-//! test below fails if this module drifts from it).
+//! Structured error mappings for the stream worker: see `docs/api-errors.md`.
+//! The registry test checks that this worker's declared codes stay in sync.
 //!
 //! Wire shape: `{"code": "...", "message": "...", "retryable": bool}` with
 //! the registry HTTP status. This crate stays dependency-free, so the
@@ -85,6 +84,14 @@ pub fn spec(code: &str) -> CodeSpec {
         .unwrap_or(FALLBACK)
 }
 
+fn message_for_server_error(code: &str) -> &'static str {
+    match code {
+        "corrupt_content" => "content could not be decoded",
+        "upstream_unavailable" => "upstream unavailable",
+        _ => "unexpected error",
+    }
+}
+
 /// A user-facing error ready for the HTTP layer: `status` is the response
 /// status, [`ApiError::body_json`] is exactly `{code, message, retryable}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,13 +104,15 @@ pub struct ApiError {
 
 impl ApiError {
     /// Build from a registry code; unknown codes become the generic
-    /// fallback (code, status, and message).
+    /// fallback. Registered 5xx codes use fixed public text.
     pub fn by_code(code: &str, message: &'static str) -> Self {
         let spec = spec(code);
-        let message = if spec.code == code {
-            message
-        } else {
+        let message = if spec.code != code {
             "unexpected error"
+        } else if spec.status >= 500 {
+            message_for_server_error(spec.code)
+        } else {
+            message
         };
         Self {
             code: spec.code,
@@ -141,7 +150,7 @@ impl ApiError {
         Self::by_code("corrupt_content", "content could not be decoded")
     }
     pub fn upstream_unavailable() -> Self {
-        Self::by_code("upstream_unavailable", "provider unavailable")
+        Self::by_code("upstream_unavailable", "upstream unavailable")
     }
 
     /// Serialized envelope body.
@@ -210,6 +219,14 @@ mod tests {
     }
 
     #[test]
+    fn registered_server_errors_use_fixed_public_messages() {
+        let internal = ApiError::by_code("internal_error", "private database detail");
+        assert_eq!(internal.message, "unexpected error");
+        let upstream = ApiError::by_code("upstream_unavailable", "private provider response");
+        assert_eq!(upstream.message, "upstream unavailable");
+    }
+
+    #[test]
     fn json_escaping_covers_quotes_backslashes_and_controls() {
         assert_eq!(escape_json("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
     }
@@ -226,8 +243,8 @@ mod tests {
             let owners: Vec<&str> = cells[4].split(',').map(str::trim).collect();
             let mine = REGISTRY.iter().find(|s| s.code == code);
             // Reverse direction: a row naming this worker must be a code
-            // this worker actually emits, or the doc promises a code that
-            // can never appear.
+            // declared by its mapping module. This does not assert that an
+            // HTTP handler currently emits the mapping.
             assert_eq!(
                 owners.contains(&"stream"),
                 mine.is_some(),
@@ -245,7 +262,7 @@ mod tests {
         assert_eq!(
             parsed,
             REGISTRY.len(),
-            "every emitted code must appear in docs/api-errors.md"
+            "every declared code must appear in docs/api-errors.md"
         );
     }
 }

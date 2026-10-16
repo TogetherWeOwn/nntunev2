@@ -25,13 +25,16 @@ pub enum AuthError {
     /// Generic: every login/consume failure maps here. Never distinguish
     /// "unknown user" from "bad token" (enumeration oracle).
     Invalid,
+    /// Invalid server-side RP/origin configuration; this is not a bad credential.
+    Misconfigured,
 }
 
 impl std::fmt::Display for AuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            // Same message the API returns for every auth failure.
+            // Keep credential failures indistinguishable.
             AuthError::Invalid => write!(f, "check your email and try again"),
+            AuthError::Misconfigured => write!(f, "authentication service unavailable"),
         }
     }
 }
@@ -145,15 +148,16 @@ pub struct PasskeyChallenge {
 
 /// Start a registration (or authentication) ceremony. Validates the RP/origin
 /// shape now so misconfiguration fails before any credential is created.
-/// Returns [`AuthError::Invalid`] (never panics): in a Worker a panic is a
-/// 500, and request-adjacent misconfiguration must stay a generic rejection.
+/// Returns [`AuthError::Misconfigured`] (never panics) when the server's
+/// configured RP/origin is invalid; credential and challenge failures remain
+/// [`AuthError::Invalid`].
 pub fn new_registration_challenge(
     rp_id: &str,
     origin: &str,
     now: u64,
 ) -> Result<PasskeyChallenge, AuthError> {
-    let parsed = url::Url::parse(origin).map_err(|_| AuthError::Invalid)?;
-    let host = parsed.host_str().ok_or(AuthError::Invalid)?;
+    let parsed = url::Url::parse(origin).map_err(|_| AuthError::Misconfigured)?;
+    let host = parsed.host_str().ok_or(AuthError::Misconfigured)?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
     let local = matches!(host, "localhost" | "127.0.0.1" | "::1");
     if !(parsed.scheme() == "https" || (parsed.scheme() == "http" && local))
@@ -170,7 +174,7 @@ pub fn new_registration_challenge(
         || rp_id != host
         || (!local && !host.contains('.'))
     {
-        return Err(AuthError::Invalid);
+        return Err(AuthError::Misconfigured);
     }
     Ok(PasskeyChallenge {
         id: random_b64url_32(),

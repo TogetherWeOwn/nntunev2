@@ -31,13 +31,18 @@ export interface ParsedApiError {
 	retryable: boolean;
 }
 
-/** Code derived from status alone (legacy bodies, unknown codes). */
+/** Code derived from status alone for legacy bodies without a code. */
 export function codeFromStatus(status: number): string {
+	if (status === 400) return 'invalid_request';
 	if (status === 401) return 'unauthorized';
 	if (status === 402) return 'plan_limit_exceeded';
 	if (status === 403) return 'forbidden';
 	if (status === 404) return 'not_found';
+	if (status === 413) return 'payload_too_large';
+	if (status === 416) return 'range_not_satisfiable';
+	if (status === 422) return 'validation_failed';
 	if (status === 429) return 'rate_limited';
+	if (status === 503) return 'service_unavailable';
 	return 'request_failed';
 }
 
@@ -68,7 +73,15 @@ export function parseErrorBody(body: unknown, status: number): ParsedApiError {
 			retryable: typeof record.retryable === 'boolean' ? record.retryable : fallback.retryable
 		};
 	}
-	// Legacy body or an unregistered code: generic code, server message kept.
+	if (typeof record.code === 'string') {
+		// Unknown envelope code: do not infer a different category from its status.
+		return {
+			code: 'request_failed',
+			message,
+			retryable: typeof record.retryable === 'boolean' ? record.retryable : fallback.retryable
+		};
+	}
+	// Legacy body without a code: derive category and retry policy from status.
 	return { code: fallback.code, message, retryable: fallback.retryable };
 }
 

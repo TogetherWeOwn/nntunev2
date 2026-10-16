@@ -62,6 +62,8 @@ pub fn nntp_port_allowed(port: u16) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VaultError {
     Invalid,
+    /// Malformed persisted ciphertext or metadata: server-side stored data is corrupt.
+    CorruptStoredData,
     Crypto,
 }
 
@@ -450,8 +452,9 @@ fn random_nonce() -> [u8; 12] {
 }
 
 // Unpadded-base64url lives in one place: [`crate::b64`] over the `base64`
-// crate (F-HARD-01). The per-module hand-rolled copies are deleted; decode
-// errors map to generic [`VaultError::Invalid`] at each call site.
+// crate (F-HARD-01). The per-module hand-rolled copies are deleted; input
+// decode failures map to [`VaultError::Invalid`], stored-blob failures to
+// [`VaultError::CorruptStoredData`].
 fn dek_aad(user_id: &str, kek_version: u32) -> String {
     format!("v1|dek|{}|{}", user_id, kek_version)
 }
@@ -516,11 +519,12 @@ pub fn decrypt_vault(
     blob: &VaultBlob,
 ) -> Result<Vec<u8>, VaultError> {
     let kek_cipher = Aes256Gcm::new_from_slice(kek).map_err(|_| VaultError::Crypto)?;
-    let wrap_nonce =
-        crate::b64::decode(&blob.dek_wrapped_nonce_b64url).map_err(|_| VaultError::Invalid)?;
-    let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url).map_err(|_| VaultError::Invalid)?;
+    let wrap_nonce = crate::b64::decode(&blob.dek_wrapped_nonce_b64url)
+        .map_err(|_| VaultError::CorruptStoredData)?;
+    let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url)
+        .map_err(|_| VaultError::CorruptStoredData)?;
     if wrap_nonce.len() != 12 {
-        return Err(VaultError::Invalid);
+        return Err(VaultError::CorruptStoredData);
     }
     let mut dek_bytes = kek_cipher
         .decrypt(
@@ -542,11 +546,12 @@ pub fn decrypt_vault(
     let dek = Dek(arr);
 
     let dek_cipher = Aes256Gcm::new_from_slice(&dek.0).map_err(|_| VaultError::Crypto)?;
-    let payload_nonce =
-        crate::b64::decode(&blob.payload_nonce_b64url).map_err(|_| VaultError::Invalid)?;
-    let payload = crate::b64::decode(&blob.payload_b64url).map_err(|_| VaultError::Invalid)?;
+    let payload_nonce = crate::b64::decode(&blob.payload_nonce_b64url)
+        .map_err(|_| VaultError::CorruptStoredData)?;
+    let payload = crate::b64::decode(&blob.payload_b64url)
+        .map_err(|_| VaultError::CorruptStoredData)?;
     if payload_nonce.len() != 12 {
-        return Err(VaultError::Invalid);
+        return Err(VaultError::CorruptStoredData);
     }
     dek_cipher
         .decrypt(
@@ -570,11 +575,12 @@ pub fn rewrap_dek(
 ) -> Result<VaultBlob, VaultError> {
     // Unwrap with the old KEK (old AAD: old version).
     let old_cipher = Aes256Gcm::new_from_slice(old_kek).map_err(|_| VaultError::Crypto)?;
-    let wrap_nonce =
-        crate::b64::decode(&blob.dek_wrapped_nonce_b64url).map_err(|_| VaultError::Invalid)?;
-    let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url).map_err(|_| VaultError::Invalid)?;
+    let wrap_nonce = crate::b64::decode(&blob.dek_wrapped_nonce_b64url)
+        .map_err(|_| VaultError::CorruptStoredData)?;
+    let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url)
+        .map_err(|_| VaultError::CorruptStoredData)?;
     if wrap_nonce.len() != 12 {
-        return Err(VaultError::Invalid);
+        return Err(VaultError::CorruptStoredData);
     }
     let mut dek_bytes = old_cipher
         .decrypt(
