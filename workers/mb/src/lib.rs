@@ -320,7 +320,10 @@ fn health_response_parts() -> HealthResponseParts {
             .map(|(name, value)| {
                 (
                     name.as_str().to_owned(),
-                    value.to_str().expect("static health header is valid").to_owned(),
+                    value
+                        .to_str()
+                        .expect("static health header is valid")
+                        .to_owned(),
                 )
             })
             .collect(),
@@ -602,11 +605,9 @@ mod http_layer {
         for (name, value) in health.headers {
             headers.append(&name, &value)?;
         }
-        Ok(
-            Response::from_body(ResponseBody::Body(health.body))?
-                .with_status(health.status)
-                .with_headers(headers),
-        )
+        Ok(Response::from_body(ResponseBody::Body(health.body))?
+            .with_status(health.status)
+            .with_headers(headers))
     }
 
     pub async fn search_route(req: &Request, ctx: &RouteContext<()>) -> WorkerResult<Response> {
@@ -781,7 +782,10 @@ mod tests {
         let catchall = router
             .find(".or_else_any_method_async")
             .expect("router must retain its catch-all");
-        assert!(route < catchall, "healthz must be registered before catch-all");
+        assert!(
+            route < catchall,
+            "healthz must be registered before catch-all"
+        );
         assert_eq!(router.matches("\"/healthz\"").count(), 1);
 
         let handler = source
@@ -791,10 +795,15 @@ mod tests {
             .split_once("\n    }\n")
             .expect("healthz handler must close")
             .0;
-        let compact = |text: &str| text.chars().filter(|ch| !ch.is_whitespace()).collect::<String>();
+        let compact = |text: &str| {
+            text.chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+        };
         assert_eq!(
             compact(handler),
-            compact(r#"let health = health_response_parts();
+            compact(
+                r#"let health = health_response_parts();
         let headers = Headers::new();
         for (name, value) in health.headers {
             headers.append(&name, &value)?;
@@ -802,8 +811,10 @@ mod tests {
         Ok(
             Response::from_body(ResponseBody::Body(health.body))?
                 .with_status(health.status)
-                .with_headers(headers),
-        )"#));
+                .with_headers(headers)
+        )"#
+            )
+        );
     }
 
     #[test]
