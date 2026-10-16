@@ -179,7 +179,9 @@ impl From<SessionError> for ApiError {
     fn from(e: SessionError) -> Self {
         match e {
             SessionError::Invalid => Self::unauthorized(e.to_string()),
-            SessionError::Misconfigured => Self::internal_error(e.to_string()),
+            SessionError::Misconfigured | SessionError::Storage { .. } => {
+                Self::internal_error(e.to_string())
+            }
         }
     }
 }

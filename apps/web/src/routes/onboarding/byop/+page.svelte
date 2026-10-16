@@ -1,5 +1,7 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
+	import { readSignedInEmail } from '#lib/signed-in-email.js';
 	import {
 		ApiClient,
 		ApiError,
@@ -9,6 +11,14 @@
 	import { validateIndexerUrl, validateProviderConfig } from '#lib/vault-validation.js';
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
+
+	// Display-only identity label (see signed-in-email.ts): the account
+	// these provider credentials will be saved to, shown before anything
+	// is typed.
+	let signedInEmail = $state<string | null>(null);
+	onMount(() => {
+		signedInEmail = readSignedInEmail();
+	});
 
 	let step = $state<1 | 2 | 3>(1);
 
@@ -133,7 +143,10 @@
 		saveState = 'saving';
 		try {
 			await client.saveProviderConfig(input);
-			if (runId === testRunId && inputKey === currentTestKey()) saveState = 'saved';
+			if (runId === testRunId && inputKey === currentTestKey()) {
+				saveState = 'saved';
+				window.location.href = '/library';
+			}
 		} catch {
 			if (runId === testRunId && inputKey === currentTestKey()) saveState = 'failed';
 		}
@@ -150,6 +163,12 @@
 
 <main class="nt-wrap">
 	<h1>Connect your provider</h1>
+	{#if signedInEmail !== null}
+		<p role="status">
+			Signed in as <strong>{signedInEmail}</strong> — the provider details you save go to
+			this account. If that's not you, stop here and <a href="/login">sign in again</a>.
+		</p>
+	{/if}
 	<p>Step {step} of 3: {step === 1 ? 'Provider' : step === 2 ? 'Indexer (optional)' : 'Test'}</p>
 
 	{#if errors.length > 0}
@@ -169,15 +188,15 @@
 				nextFromProvider();
 			}}
 		>
-			<label>Hostname <input name="host" required autocomplete="off" bind:value={host} /></label>
+			<label>Hostname <input data-testid="byop-host" name="host" required autocomplete="off" bind:value={host} /></label>
 			<label>
 				Port
-				<select name="port" required bind:value={port}>
+				<select data-testid="byop-port" name="port" required bind:value={port}>
 					<option value={119}>119 (plaintext NNTP)</option>
 					<option value={563}>563 (TLS)</option>
 				</select>
 			</label>
-			<label><input name="tls" type="checkbox" bind:checked={tls} /> Use TLS</label>
+			<label><input data-testid="byop-tls" name="tls" type="checkbox" bind:checked={tls} /> Use TLS</label>
 			{#if !tls}
 				<p role="alert">
 					Without TLS your password is sent in cleartext. Only continue without TLS if
@@ -192,10 +211,10 @@
 					I understand my password will be sent unencrypted
 				</label>
 			{/if}
-			<label>Username <input name="username" required autocomplete="username" bind:value={username} /></label>
+			<label>Username <input data-testid="byop-user" name="username" required autocomplete="username" bind:value={username} /></label>
 			<label>
 				Password
-				<input name="password" type="password" required autocomplete="current-password" bind:value={password} />
+				<input data-testid="byop-pass" name="password" type="password" required autocomplete="current-password" bind:value={password} />
 			</label>
 			<label>
 				Connections
@@ -246,16 +265,18 @@
 				class="nt-button"
 				type="button"
 				onclick={runTest}
+					data-testid="byop-test-connection"
 				disabled={testState === 'testing'}
 			>
 				{testState === 'testing' ? 'Testing…' : 'Test connection'}
 			</button>
 			{#if testState === 'ok'}
-				<p role="status">{testDetail} No secrets were returned by the test.</p>
+				<p data-testid="byop-status" role="status">{testDetail} No secrets were returned by the test.</p>
 				<button
 					class="nt-button"
 					type="button"
 					onclick={save}
+						data-testid="byop-save"
 					disabled={saveState === 'saving' || saveState === 'saved'}
 				>
 					{saveState === 'saved'
@@ -265,7 +286,7 @@
 							: 'Save provider'}
 				</button>
 			{:else if testState === 'failed'}
-				<p role="alert">{testDetail}</p>
+				<p data-testid="byop-status" role="alert">{testDetail}</p>
 			{/if}
 			{#if saveState === 'saved'}
 				<p role="status">Saved. Your credentials are sealed in the encrypted vault.</p>

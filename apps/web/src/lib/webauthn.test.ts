@@ -5,6 +5,7 @@ import {
 	encodeBase64Url,
 	serializePublicKeyCredential,
 	toCreationOptions,
+	toRegistrationOptions,
 	toRequestOptions
 } from './webauthn.js';
 
@@ -82,6 +83,36 @@ describe('WebAuthn options', () => {
 		expect(options.allowCredentials).toEqual([
 			{ id: decodeBase64Url('BAUG'), type: 'public-key', transports: ['internal'] }
 		]);
+	});
+
+	it('builds creation options from the register/start triple', () => {
+		// The Worker returns only {challenge, user_id, rp_id}; the client
+		// assembles the rest (algorithms the server verifies, none
+		// attestation, resident key required).
+		const options = toRegistrationOptions('AQID', 'BAUG', 'example.com', 'ada@example.com');
+
+		expect(options.challenge).toBe('AQID');
+		expect(options.rp).toEqual({ name: 'NNTune', id: 'example.com' });
+		expect(options.user).toEqual({
+			id: 'BAUG',
+			name: 'ada@example.com',
+			displayName: 'ada@example.com'
+		});
+		expect(options.pubKeyCredParams).toEqual([
+			{ type: 'public-key', alg: -7 },
+			{ type: 'public-key', alg: -8 }
+		]);
+		expect(options.excludeCredentials).toEqual([]);
+		expect(options.attestation).toBe('none');
+
+		// The assembled options must survive the browser conversion.
+		const browser = toCreationOptions(options);
+		expect(Array.from(new Uint8Array(browser.challenge as ArrayBuffer))).toEqual([1, 2, 3]);
+		expect(Array.from(new Uint8Array(browser.user.id as ArrayBuffer))).toEqual([4, 5, 6]);
+		expect(browser.authenticatorSelection).toEqual({
+			residentKey: 'required',
+			requireResidentKey: true
+		});
 	});
 });
 

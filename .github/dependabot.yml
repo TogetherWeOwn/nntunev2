@@ -146,3 +146,8 @@ updates:
     commit-message:
       prefix: "chore"
       include: "scope"
+    # @types/node major must track the Node runtime in ci.yml (e2e-lint)
+    # and e2e-staging.yml; bump it manually alongside node-version.
+    ignore:
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]

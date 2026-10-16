@@ -6,7 +6,7 @@ import { defineEnvVars } from '@sveltejs/kit/env';
  * BYOP pages through {@link ApiClient}.
  *
  * `PUBLIC_API_BASE_URL` is empty by default, which makes the client use
- * same-origin relative URLs (e.g. `/v1/auth/magic-link`). Set it to the
+ * same-origin relative URLs (e.g. `/v1/auth/magic/start`). Set it to the
  * `workers/api` URL when the API deploys separately (wrangler `[vars]` or
  * platform env). ApiClient includes credentials so the HttpOnly session cookie
  * is sent. For a different origin, the API must allow the exact frontend origin

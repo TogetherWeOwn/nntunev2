@@ -36,6 +36,12 @@ export class ApiError extends Error {
 
 export interface MagicLinkResult {
 	ok: true;
+	/**
+	 * Present on magic-link finish only: the signed-in account's own
+	 * email, echoed back so the web app can show "Signed in as …" before
+	 * any provider credential is typed (login-CSRF defense in depth).
+	 */
+	email?: string;
 }
 
 export interface IndexerConfigInput {
@@ -53,6 +59,32 @@ export interface ProviderTestInput {
 	password: string;
 	max_connections: number;
 	indexer?: IndexerConfigInput;
+}
+
+/**
+ * Save/test envelope the API Worker expects (`PUT /v1/vault`,
+ * `POST /v1/vault/test`): the flat provider fields nested under
+ * `provider`, exactly as `workers/api` parses `VaultPutBody`. Field names
+ * are pinned by `workers/api/tests/fixtures/api-web-contract.json`, which
+ * both the vitest client suite and the Rust handlers suite consume — change
+ * both sides in the same PR, never one alone.
+ */
+export interface VaultSaveBody {
+	provider: {
+		host: string;
+		port: number;
+		tls: boolean;
+		allow_insecure_plaintext: boolean;
+		username: string;
+		password: string;
+		max_connections: number;
+	};
+	indexer?: IndexerConfigInput;
+}
+
+export function toVaultSaveBody(input: ProviderTestInput): VaultSaveBody {
+	const { indexer, ...provider } = input;
+	return indexer === undefined ? { provider } : { provider, indexer };
 }
 
 export function toProviderTestInput(
@@ -80,6 +112,67 @@ export interface ProviderTestResult {
 	ok: boolean;
 	latencyMs?: number;
 	error?: string;
+}
+
+/** `POST /v1/auth/passkey/register/start` response (fixed shape, never an oracle). */
+export interface RegisterStartResponse {
+	challenge: string;
+	user_id: string;
+	rp_id: string;
+}
+
+/** `POST /v1/auth/passkey/login/start` response (empty allow-list by design). */
+export interface LoginStartResponse {
+	challenge: string;
+	allow_credentials: unknown[];
+	rp_id: string;
+}
+
+/**
+ * Inputs for the passkey finish calls. Pages pass camelCase fields and the
+ * builders below emit the snake_case wire body the Worker parses
+ * (`deny_unknown_fields`), so a renamed field fails type-checking in the
+ * page and the fixture test in the client — never silently in production.
+ * Wire shapes are pinned by `api-web-contract.json`.
+ */
+export interface RegisterFinishInput {
+	challenge: string;
+	credentialId: string;
+	attestationObject: string;
+	clientDataJson: string;
+	magicToken: string;
+	inviteCode?: string;
+}
+
+export interface LoginFinishInput {
+	challenge: string;
+	credentialId: string;
+	authenticatorData: string;
+	clientDataJson: string;
+	signature: string;
+}
+
+export function toRegisterFinishBody(input: RegisterFinishInput): Record<string, string> {
+	return {
+		challenge: input.challenge,
+		credential_id: input.credentialId,
+		attestation_object: input.attestationObject,
+		client_data_json: input.clientDataJson,
+		magic_token: input.magicToken,
+		...(input.inviteCode !== undefined && input.inviteCode.length > 0
+			? { invite_code: input.inviteCode }
+			: {})
+	};
+}
+
+export function toLoginFinishBody(input: LoginFinishInput): Record<string, string> {
+	return {
+		challenge: input.challenge,
+		credential_id: input.credentialId,
+		authenticator_data: input.authenticatorData,
+		client_data_json: input.clientDataJson,
+		signature: input.signature
+	};
 }
 
 export class ApiClient {
@@ -111,12 +204,63 @@ export class ApiClient {
 		});
 	}
 
+	async put<T>(path: string, body: unknown): Promise<T> {
+		return this.request<T>(path, {
+			method: 'PUT',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+	}
+
 	/**
 	 * Request an email magic link. Always resolves the same way for unknown
 	 * and known addresses (the API never reveals which emails exist).
 	 */
 	async requestMagicLink(email: string): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>('/v1/auth/magic-link', { email });
+		return this.post<MagicLinkResult>('/v1/auth/magic/start', { email });
+	}
+
+	/** Redeem an emailed magic-link token (the `/auth/magic` page). */
+	async finishMagicLink(token: string): Promise<MagicLinkResult> {
+		return this.post<MagicLinkResult>('/v1/auth/magic/finish', { token });
+	}
+
+	/**
+	 * Sign out of the current session. The server revokes the session and
+	 * clears the HttpOnly cookie; the caller also drops its display-only
+	 * identity label (see `signed-in-email.ts`). Used by the `/auth/magic`
+	 * error state so a session-swapped user can sign out and redeem the
+	 * other account's link — the server's magic-finish rejection stays a
+	 * generic 401 either way.
+	 */
+	async logout(): Promise<void> {
+		await this.post<unknown>('/v1/session/logout', {});
+	}
+
+	/** Start passkey enrollment; the API also mails the inbox-proof code. */
+	async registerStart(email: string): Promise<RegisterStartResponse> {
+		return this.post<RegisterStartResponse>('/v1/auth/passkey/register/start', { email });
+	}
+
+	/** Finish passkey enrollment with the attestation + emailed code. */
+	async registerFinish(input: RegisterFinishInput): Promise<MagicLinkResult> {
+		return this.post<MagicLinkResult>(
+			'/v1/auth/passkey/register/finish',
+			toRegisterFinishBody(input)
+		);
+	}
+
+	/** Start passkey login for an email (empty allow-list response). */
+	async loginStart(email: string): Promise<LoginStartResponse> {
+		return this.post<LoginStartResponse>('/v1/auth/passkey/login/start', { email });
+	}
+
+	/** Finish passkey login with the assertion. */
+	async loginFinish(input: LoginFinishInput): Promise<MagicLinkResult> {
+		return this.post<MagicLinkResult>(
+			'/v1/auth/passkey/login/finish',
+			toLoginFinishBody(input)
+		);
 	}
 
 	/**
@@ -125,7 +269,7 @@ export class ApiClient {
 	 * secrets never come back in the response.
 	 */
 	async testProviderConnection(input: ProviderTestInput): Promise<ProviderTestResult> {
-		return this.post<ProviderTestResult>('/v1/vault/test', input);
+		return this.post<ProviderTestResult>('/v1/vault/test', toVaultSaveBody(input));
 	}
 
 	/**
@@ -134,7 +278,7 @@ export class ApiClient {
 	 * redacted summaries, never secret material.
 	 */
 	async saveProviderConfig(input: ProviderTestInput): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>('/v1/vault', input);
+		return this.put<MagicLinkResult>('/v1/vault', toVaultSaveBody(input));
 	}
 
 	private async request<T>(path: string, init: RequestInit): Promise<T> {

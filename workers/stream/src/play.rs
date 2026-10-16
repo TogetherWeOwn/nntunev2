@@ -696,7 +696,9 @@ mod tests {
     #[test]
     fn wrong_track_grant_is_rejected() {
         let secret = b"s";
-        let token = grant::issue("u", "track-a", 9_999_999_999, secret);
+        // Within the TTL cap (`now` is 1 below) so the test exercises track
+        // binding rather than the over-cap rejection.
+        let token = grant::issue("u", "track-a", 1 + grant::MAX_GRANT_TTL, secret);
         let mut pool = Pool::new(1);
         let mut cache = ContentCache::new();
         let mut meter = crate::meter::MemoryMeter::default();
