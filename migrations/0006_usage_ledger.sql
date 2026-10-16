@@ -1,4 +1,4 @@
--- NNTune v2 migration 0004: authoritative usage ledger.
+-- NNTune v2 migration 0006: authoritative usage ledger.
 --
 -- PlanetScale Postgres via Hyperdrive. All access uses the parameterized
 -- statements in workers/api/src/ledger.rs (never string-interpolated).
