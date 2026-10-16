@@ -36,8 +36,8 @@ integration prerequisites on sibling branches are:
 |---|---|
 | [#2](https://github.com/TogetherWeOwn/nntunev2/pull/2), cache ADR | Physical audio/art buckets are separate per environment; prefixes live inside them. |
 | [#14](https://github.com/TogetherWeOwn/nntunev2/pull/14), scaffold | Replace placeholders only when activating the correct consumer bindings. |
-| [#8](https://github.com/TogetherWeOwn/nntunev2/pull/8), stream | `workers/stream/wrangler.toml` uses `nntune-audio-cache` without environment sections; bind `AUDIO_CACHE` to `nntunev2-audio-staging` / `nntunev2-audio-prod`. |
 | [#10](https://github.com/TogetherWeOwn/nntunev2/pull/10), ingest | Producer and consumer still use `nntune-ingest-jobs`; the commented DLQ field is valid but staging-specific (`nntunev2-ingest-dlq-staging`). Use `nntunev2-ingest-dlq-prod` in prod, and align producer/consumer queue names with the per-environment inventory below. |
+| `workers/mb/wrangler.toml.example`, MB art cache | The `ART_CACHE` template names only `nntunev2-art-staging`; the prod deploy must override it with `nntunev2-art-prod` when the binding is activated. |
 | [#11](https://github.com/TogetherWeOwn/nntunev2/pull/11), E2E | Supply the two pending Access client secrets before enabling the staging URL; see the Access section. |
 
 Their owners must coordinate these fixes at the next permitted review round and
@@ -295,6 +295,24 @@ Binding names are chosen in Worker configs; resource names must match this table
 | MB Hyperdrive variable | `HYPERDRIVE_ID_MB` (shared mirror) | `HYPERDRIVE_ID_MB` (shared mirror) |
 | Migration secret | `PLANETSCALE_MIGRATOR_URL_STAGING` | intentionally deferred to gated workflow |
 
+## Binding parity check
+
+CI job `binding-parity` (part of `ci-ok`) discovers Wrangler TOML, JSON and
+JSONC configs recursively under `workers/` and `apps/`, then diffs mapped TOML
+configs against this inventory for staging and prod. JSON/JSONC configs are
+reported when unmapped and fail closed if mapped until parser support is added.
+Required bindings per Worker are mapped
+in `.github/scripts/binding_manifest.toml`, and
+`python3 .github/scripts/binding_parity.py` fails on a missing binding,
+staging/prod skew, or a resource name absent from the matrix or tables
+above, naming the Worker, environment and binding. Resource-name drift
+that predates the value-alignment work (see the reconciliation table
+near the top of this document) is recorded as exact-match
+`[[known_drift]]` manifest entries; delete each entry when its
+wrangler value is aligned — the check fails on a stale entry. Changing
+the binding values themselves, and KV key parity, are separate lanes
+and out of scope for this check.
+
 ## Worker bindings
 
 Intended consumer bindings per environment. Resource names must match the
@@ -316,15 +334,13 @@ this table.
 | `mb` / `ingest` (at activation) | `MB_CACHE` / `INGEST_STATE` / `INGEST_PAYLOADS` | KV | reserved `nntunev2-config-staging` | reserved `nntunev2-config-prod` | staging `1d4f21508a214ebfa8ff7b594989d6f6`; prod `9664ceed71464521bb6baae2d9374006`; assigned at activation, never by default |
 
 Known config drift (tracked in the R2 reconciliation table, fixed by the
-owning lanes, not here): the committed `workers/stream/wrangler.toml` still
-binds `AUDIO_CACHE` to `nntune-audio-cache` with no environment sections,
-and `workers/ingest/wrangler.toml.example` still names `nntune-ingest-jobs`
-for the producer/consumer. Its commented DLQ example now uses the valid
-`dead_letter_queue` field inside `[[queues.consumers]]`, but remains staging-
-specific; prod must use `nntunev2-ingest-dlq-prod`. Align all names with the
-per-environment inventory before enabling the configs. Do not add a nested
-`[[queues.consumers.dead_letter_queue]]` table: Wrangler rejects that shape,
-so it will not configure dead-letter routing.
+owning lanes, not here): `workers/ingest/wrangler.toml.example` still names
+`nntune-ingest-jobs` for the producer/consumer. Its commented DLQ example now
+uses the valid `dead_letter_queue` field inside `[[queues.consumers]]`, but
+remains staging-specific; prod must use `nntunev2-ingest-dlq-prod`. Align all
+names with the per-environment inventory before enabling the configs. Do not
+add a nested `[[queues.consumers.dead_letter_queue]]` table: Wrangler rejects
+that shape, so it will not configure dead-letter routing.
 
 ## Staging promotion checklist
 

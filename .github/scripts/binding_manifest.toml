@@ -1,0 +1,143 @@
+# Required wrangler bindings per worker, diffed by binding_parity.py
+# against the wrangler configs and the provisioned inventory in docs/ops.md
+# for staging AND prod.
+#
+# Per binding: `binding` + `type` are always checked for presence and
+# staging/prod parity. `staging` / `prod` name the expected ops-inventory
+# resource (a resource name, or the KV/Hyperdrive id for id-typed
+# bindings); omit them where the ops inventory has no provisioned
+# counterpart yet, and presence + parity are still enforced.
+#
+# Intentionally unmapped inventory: the reserved archive R2 buckets and
+# the config KV namespaces in docs/ops.md have no worker consumer yet,
+# so no binding below claims them.
+#
+# [[known_drift]] entries record pre-existing resource-name drift whose
+# value fix is owned by the reconciliation work in docs/ops.md. Each
+# entry suppresses exactly one mismatch and must be deleted once the
+# wrangler value is aligned; the check fails on a stale entry.
+
+[[worker]]
+name = "api"
+config = "workers/api/wrangler.toml.example"
+
+[[worker.binding]]
+binding = "HYPERDRIVE"
+type = "hyperdrive"
+staging = "61c87403f119430bbc3a7f571df47002"
+prod = "d38a229748f6452bb417c6d33d277a8d"
+
+[[worker]]
+name = "ingest"
+config = "workers/ingest/wrangler.toml.example"
+
+[[worker.binding]]
+binding = "INGEST_QUEUE"
+type = "queue_producer"
+staging = "nntunev2-ingest-staging"
+prod = "nntunev2-ingest-prod"
+
+[[worker.binding]]
+binding = "INGEST_DLQ"
+type = "queue_producer"
+
+[[worker.binding]]
+binding = "LIBRARY_DB"
+type = "hyperdrive"
+staging = "61c87403f119430bbc3a7f571df47002"
+prod = "d38a229748f6452bb417c6d33d277a8d"
+
+[[worker.binding]]
+binding = "INGEST_STATE"
+type = "kv"
+
+[[worker.binding]]
+binding = "NNTP_POOL"
+type = "durable_object"
+
+[[worker.binding]]
+binding = "INGEST_PAYLOADS"
+type = "kv"
+
+[[worker.binding]]
+binding = "INGEST_METER"
+type = "analytics_engine"
+
+[[worker.binding]]
+binding = "REPAIR_CONTAINER"
+type = "service"
+
+[[worker]]
+name = "mb"
+config = "workers/mb/wrangler.toml.example"
+
+# The MusicBrainz Hyperdrive config is one shared read mirror for both
+# environments (docs/ops.md), so staging and prod expect the same id.
+[[worker.binding]]
+binding = "MB_DB"
+type = "hyperdrive"
+staging = "1c6460d5112448888031973c87f671bc"
+prod = "1c6460d5112448888031973c87f671bc"
+
+[[worker.binding]]
+binding = "MB_CACHE"
+type = "kv"
+
+[[worker.binding]]
+binding = "ART_CACHE"
+type = "r2"
+staging = "nntunev2-art-staging"
+prod = "nntunev2-art-prod"
+
+[[worker]]
+name = "stream"
+config = "workers/stream/wrangler.toml"
+
+[[worker.binding]]
+binding = "NNTP_POOL"
+type = "durable_object"
+
+[[worker.binding]]
+binding = "AUDIO_CACHE"
+type = "r2"
+staging = "nntunev2-audio-staging"
+prod = "nntunev2-audio-prod"
+
+[[worker.binding]]
+binding = "METER"
+type = "analytics_engine"
+
+[[worker]]
+name = "web"
+config = "apps/web/wrangler.toml"
+
+[[worker.binding]]
+binding = "ASSETS"
+type = "assets"
+
+# --- Pre-existing value drift (fix owned by the docs/ops.md ---
+# --- reconciliation work; delete each entry when its value lands) ---
+
+[[known_drift]]
+worker = "ingest"
+env = "staging"
+binding = "INGEST_QUEUE"
+actual = "nntune-ingest-jobs"
+expected = "nntunev2-ingest-staging"
+reason = "pre-existing value drift; alignment owned elsewhere (docs/ops.md reconciliation table)"
+
+[[known_drift]]
+worker = "ingest"
+env = "prod"
+binding = "INGEST_QUEUE"
+actual = "nntune-ingest-jobs"
+expected = "nntunev2-ingest-prod"
+reason = "pre-existing value drift; alignment owned elsewhere (docs/ops.md reconciliation table)"
+
+[[known_drift]]
+worker = "mb"
+env = "prod"
+binding = "ART_CACHE"
+actual = "nntunev2-art-staging"
+expected = "nntunev2-art-prod"
+reason = "prod template override is pending; tracked in the MB art cache row of the docs/ops.md R2 reconciliation table"

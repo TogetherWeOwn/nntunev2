@@ -1,6 +1,7 @@
 //! NNTune v2 ingest pipeline worker.
 //!
 //! Routes (all JSON):
+//! - `GET /healthz` — unauthenticated Worker health check; no bindings.
 //! - `POST /v1/ingest/search` — Newznab search with the user's own indexer
 //!   (`indexer_ref` vault handle; raw keys are never accepted here).
 //! - `POST /v1/ingest/nzb` — NZB upload; guarded by intake caps, then
@@ -33,6 +34,7 @@ pub mod probe;
 pub mod queue;
 pub mod rate_limit;
 pub mod repair;
+pub mod retry;
 
 use dispatch::validate_user_id;
 use jobs::validate_job_id;
@@ -53,6 +55,42 @@ pub const MAX_UPLOAD_BODY_BYTES: usize = 13 * 1024 * 1024;
 #[derive(Debug, serde::Serialize)]
 struct ApiError {
     error: String,
+}
+
+fn health_response() -> http::Response<Vec<u8>> {
+    http::Response::builder()
+        .status(http::StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .body(r#"{"ok":true}"#.as_bytes().to_vec())
+        .expect("static health response is valid")
+}
+
+struct HealthResponseParts {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+fn health_response_parts() -> HealthResponseParts {
+    let response = health_response();
+    HealthResponseParts {
+        status: response.status().as_u16(),
+        headers: response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value
+                        .to_str()
+                        .expect("static health header is valid")
+                        .to_owned(),
+                )
+            })
+            .collect(),
+        body: response.into_body(),
+    }
 }
 
 fn json_error(message: &str, status: u16) -> Result<Response> {
@@ -413,6 +451,16 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Respons
     }
 }
 
+fn healthz() -> Result<Response> {
+    let health = health_response_parts();
+    let headers = worker::Headers::new();
+    for (name, value) in health.headers {
+        headers.append(&name, &value)?;
+    }
+    Response::from_body(worker::ResponseBody::Body(health.body))
+        .map(|response| response.with_status(health.status).with_headers(headers))
+}
+
 /// Job checkpoint status: validates the id shape before DB wiring lands.
 async fn job_status(_req: &Request, ctx: &RouteContext<()>) -> Result<Response> {
     let id = ctx.param("id").cloned().unwrap_or_default();
@@ -447,6 +495,67 @@ mod tests {
             "page": page,
         })
         .to_string()
+    }
+
+    #[test]
+    fn health_response_is_uncached_json_without_dependencies() {
+        let response = health_response_parts();
+        assert_eq!(response.status, http::StatusCode::OK.as_u16());
+        assert_eq!(response.headers.len(), 2);
+        assert!(response
+            .headers
+            .contains(&("content-type".to_owned(), "application/json".to_owned())));
+        assert!(response
+            .headers
+            .contains(&("cache-control".to_owned(), "no-store".to_owned())));
+        assert_eq!(response.body, br#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn healthz_route_contract_precedes_the_catchall() {
+        // Worker Response/Headers require wasm-bindgen, so pin the production
+        // route and adapter source while testing the HTTP contract natively.
+        let source = include_str!("lib.rs");
+        let router = source
+            .split_once("\n#[worker::event(fetch)]\npub async fn main")
+            .expect("worker entrypoint must exist")
+            .1;
+        let route = router
+            .find(".get_async(\"/healthz\", |_, _| async { healthz() })")
+            .expect("GET /healthz must dispatch to its handler");
+        let catchall = router
+            .find(".or_else_any_method_async")
+            .expect("router must retain its catch-all");
+        assert!(
+            route < catchall,
+            "healthz must be registered before catch-all"
+        );
+        assert_eq!(router.matches("\"/healthz\"").count(), 1);
+
+        let handler = source
+            .split_once("fn healthz() -> Result<Response> {")
+            .expect("healthz handler must exist")
+            .1
+            .split_once("\n}\n")
+            .expect("healthz handler must close")
+            .0;
+        let compact = |text: &str| {
+            text.chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+        };
+        assert_eq!(
+            compact(handler),
+            compact(
+                r#"let health = health_response_parts();
+    let headers = worker::Headers::new();
+    for (name, value) in health.headers {
+        headers.append(&name, &value)?;
+    }
+    Response::from_body(worker::ResponseBody::Body(health.body))
+        .map(|response| response.with_status(health.status).with_headers(headers))"#
+            )
+        );
     }
 
     #[test]
@@ -603,6 +712,7 @@ mod tests {
 #[worker::event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Response> {
     Router::new()
+        .get_async("/healthz", |_, _| async { healthz() })
         .post_async("/v1/ingest/search", |mut req, ctx| async move {
             search(&mut req, &ctx).await
         })
