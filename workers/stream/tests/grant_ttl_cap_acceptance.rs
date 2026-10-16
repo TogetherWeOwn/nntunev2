@@ -220,6 +220,7 @@ fn play_input<'a>(token: &'a str, track_id: &'a str) -> PlayInput<'a> {
         cipher_key: 0,
         now_unix: NOW,
         up_next: None,
+        segment_ranges: None,
     }
 }
 
