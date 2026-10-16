@@ -261,12 +261,12 @@ fn parse_cose_key(bytes: &[u8]) -> Result<CoseKey, WebAuthnError> {
             let x: [u8; 32] = x.try_into().map_err(|_| WebAuthnError::Invalid)?;
             let y: [u8; 32] = y.try_into().map_err(|_| WebAuthnError::Invalid)?;
             // Reject points not on P-256 (also rejects the identity).
-            let point = p256::EncodedPoint::from_affine_coordinates(
+            let point = p256::Sec1Point::from_affine_coordinates(
                 &p256::FieldBytes::from(x),
                 &p256::FieldBytes::from(y),
                 false,
             );
-            p256::ecdsa::VerifyingKey::from_encoded_point(&point)
+            p256::ecdsa::VerifyingKey::from_sec1_point(&point)
                 .map_err(|_| WebAuthnError::Invalid)?;
             Ok(CoseKey::Es256 { x, y })
         }
@@ -283,12 +283,12 @@ fn verify_signature(key: &CoseKey, message: &[u8], signature: &[u8]) -> Result<(
     match key {
         CoseKey::Es256 { x, y } => {
             use p256::ecdsa::signature::Verifier;
-            let point = p256::EncodedPoint::from_affine_coordinates(
+            let point = p256::Sec1Point::from_affine_coordinates(
                 &p256::FieldBytes::from(*x),
                 &p256::FieldBytes::from(*y),
                 false,
             );
-            let verifying = p256::ecdsa::VerifyingKey::from_encoded_point(&point)
+            let verifying = p256::ecdsa::VerifyingKey::from_sec1_point(&point)
                 .map_err(|_| WebAuthnError::Invalid)?;
             // WebAuthn ES256 signatures are ASN.1 DER.
             let sig =
@@ -573,7 +573,7 @@ mod tests {
     fn es256_keypair() -> (EsSigningKey, Vec<u8>) {
         let signing = EsSigningKey::from_slice(&[7u8; 32]).unwrap();
         let verifying = signing.verifying_key();
-        let point = verifying.to_encoded_point(false);
+        let point = verifying.to_sec1_point(false);
         let x = point.x().unwrap();
         let y = point.y().unwrap();
         let mut cose = Vec::new();

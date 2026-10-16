@@ -1,3 +1,5 @@
+import { KNOWN_ERROR_CODES } from '../api/errors.js';
+
 /**
  * Plan-limit (402/429) handling: turn a limit response into a paywall model
  * instead of a dead-end error toast.
@@ -89,17 +91,22 @@ function pickString(record: Record<string, unknown>, keys: string[]): string | n
 }
 
 /** Server limit code from `{ code }`, `{ error: "code" }`, or `{ error: { code } }`. */
+function isKnownErrorCode(code: string): boolean {
+	return KNOWN_ERROR_CODES.has(code) || code === 'indexer_auth_expired';
+}
+
 function bodyCode(body: unknown): string | null {
 	const record = asRecord(body);
 	if (!record) return null;
 	const direct = pickString(record, ['code']);
-	if (direct) return direct;
-	// A string `error` only counts as a code when it looks like one
-	// (snake_case); a prose message is not a code.
-	if (typeof record.error === 'string' && /^[a-z][a-z0-9_]*$/.test(record.error)) {
+	if (direct && isKnownErrorCode(direct)) return direct;
+	// A string `error` only counts as a code when it is registered; a prose
+	// message or unknown legacy value is not an analytics code.
+	if (typeof record.error === 'string' && isKnownErrorCode(record.error)) {
 		return record.error;
 	}
-	return pickString(asRecord(record.error) ?? {}, ['code']);
+	const nested = pickString(asRecord(record.error) ?? {}, ['code']);
+	return nested && isKnownErrorCode(nested) ? nested : null;
 }
 
 /**

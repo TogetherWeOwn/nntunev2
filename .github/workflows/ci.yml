@@ -249,6 +249,23 @@ jobs:
       # (native-only CI once missed a getrandom/RNG breakage there).
       - run: cargo check --manifest-path workers/ingest/Cargo.toml --target wasm32-unknown-unknown
 
+  # Cache policy: archive reservation guard (docs/cache-policy.md). Fails
+  # any Worker R2 binding that targets a reserved archive bucket.
+  # Keep this job id in ci-ok's needs.
+  cache-policy:
+    name: cache-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Archive reservation guard
+        run: python3 .github/scripts/check_archive_bindings.py
+      - name: Unit-test the guard
+        run: python3 .github/scripts/test_check_archive_bindings.py
+
   # E2E harness static checks: typecheck + spec discovery with no staging
   # needed, so every PR proves the harness still compiles. The live suite
   # runs in e2e-staging.yml (post-deploy). Keep this job id in ci-ok's needs.
@@ -374,14 +391,23 @@ jobs:
           cache: pnpm
           cache-dependency-path: apps/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
-      - run: pnpm exec playwright install --with-deps chromium
-      - run: pnpm test:e2e
+      - name: Install Playwright chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Run apps/web Playwright suite
+        run: pnpm test:e2e
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: web-e2e-report
+          path: apps/web/test-results/
+          retention-days: 7
 
   # Aggregate required check: every dependency must succeed, including
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, test-nntp, api, rust-mb, rust-ingest, config-parity, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate]
+    needs: [rust-test, rust-wasm, test-nntp, api, rust-mb, rust-ingest, config-parity, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

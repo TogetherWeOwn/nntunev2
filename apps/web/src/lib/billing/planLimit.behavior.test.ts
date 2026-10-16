@@ -44,6 +44,24 @@ describe('usage naming', () => {
 		});
 		expect(model?.code).toBeNull();
 	});
+
+	it.each([
+		{ error: 'quota' },
+		{ code: 'quota' },
+		{ error: { code: 'quota' } }
+	])('does not treat unknown codes as analytics codes: %o', (body) => {
+		const model = toPaywallModel({ status: 402, headers: new Headers(), body });
+		expect(model?.code).toBeNull();
+	});
+
+	it('preserves recognized legacy error codes', () => {
+		const model = toPaywallModel({
+			status: 429,
+			headers: new Headers(),
+			body: { error: 'indexer_auth_expired' }
+		});
+		expect(model?.code).toBe('indexer_auth_expired');
+	});
 });
 
 describe('parseRetryAfter', () => {
