@@ -11,6 +11,16 @@ import { expect, test, type Page } from '@playwright/test';
 
 const PLACEHOLDER_PATTERNS = ['placeholder', 'todo', 'example.com', 'javascript:'];
 
+async function collectPaywallEvents(page: Page): Promise<void> {
+	await page.addInitScript(() => {
+		const bucket: Array<Record<string, unknown>> = [];
+		(window as unknown as { __paywallEvents: typeof bucket }).__paywallEvents = bucket;
+		window.addEventListener('usage_limit_paywall_shown', (event) => {
+			bucket.push((event as CustomEvent).detail as Record<string, unknown>);
+		});
+	});
+}
+
 async function assertPricingActionsResolve(page: Page): Promise<void> {
 	// The pricing page must always offer a way forward (trial signup,
 	// current-usage check) even when checkout itself is limit-blocked.
@@ -48,6 +58,7 @@ async function choosePlus(page: Page): Promise<void> {
 }
 
 test('mocked 402 checkout keeps pricing actions reachable', async ({ page }) => {
+	await collectPaywallEvents(page);
 	let checkoutRequests = 0;
 	await page.route('**/v1/billing/checkout', (route) => {
 		checkoutRequests += 1;
@@ -60,35 +71,58 @@ test('mocked 402 checkout keeps pricing actions reachable', async ({ page }) => 
 
 	await choosePlus(page);
 
-	const alert = page.getByRole('alert');
-	await expect(alert).toBeVisible();
-	// Status-blind `toBeVisible()` lets 500/418 or an unmocked 404 pass.
-	// billingClient surfaces `${status}` + backend `error` in the message,
-	// so pin both to prove the 402 path rendered.
-	await expect(alert).toContainText('402');
-	await expect(alert).toContainText('plan_limit_exceeded');
+	const dialog = page.getByRole('dialog');
+	await expect(dialog).toBeVisible();
+	await expect(page.getByRole('alert')).toHaveCount(0);
+	await expect(dialog.getByRole('heading')).toHaveText("You've reached your plan limit");
+	await expect(dialog.getByRole('link', { name: /upgrade/i })).toHaveAttribute('href', '/pricing');
 	expect(checkoutRequests, 'checkout mock must intercept the request').toBeGreaterThan(0);
+	await dialog.getByRole('button', { name: /not now/i }).click();
+	await expect(dialog).toBeHidden();
 	await assertPricingActionsResolve(page);
+
+	const events = await page.evaluate(
+		() => (window as unknown as { __paywallEvents: Array<Record<string, unknown>> }).__paywallEvents
+	);
+	expect(events).toHaveLength(1);
+	expect(events[0]).toMatchObject({ kind: 'terminal', status: 402, code: 'plan_limit_exceeded' });
 });
 
 test('mocked 429 checkout keeps pricing actions reachable', async ({ page }) => {
+	await collectPaywallEvents(page);
 	let checkoutRequests = 0;
 	await page.route('**/v1/billing/checkout', (route) => {
 		checkoutRequests += 1;
 		return route.fulfill({
 			status: 429,
-			headers: { 'content-type': 'application/json' },
+			headers: { 'content-type': 'application/json', 'Retry-After': '45' },
 			body: JSON.stringify({ error: 'rate_limited' })
 		});
 	});
 
 	await choosePlus(page);
 
-	const alert = page.getByRole('alert');
-	await expect(alert).toBeVisible();
-	// Same status-blindness guard as the 402 case: pin status + error code.
-	await expect(alert).toContainText('429');
-	await expect(alert).toContainText('rate_limited');
+	const dialog = page.getByRole('dialog');
+	await expect(dialog).toBeVisible();
+	await expect(page.getByRole('alert')).toHaveCount(0);
+	await expect(dialog.getByRole('heading')).toHaveText('Please slow down a little');
+	await expect(dialog.getByRole('link', { name: /upgrade/i })).toHaveAttribute('href', '/pricing');
+	await expect(page.getByTestId('paywall-countdown')).toHaveText(
+		/Try again in (?:1[5-9]|[2-3]\d|4[0-5]) seconds\./
+	);
 	expect(checkoutRequests, 'checkout mock must intercept the request').toBeGreaterThan(0);
+	await dialog.getByRole('button', { name: /not now/i }).click();
+	await expect(dialog).toBeHidden();
 	await assertPricingActionsResolve(page);
+
+	const events = await page.evaluate(
+		() => (window as unknown as { __paywallEvents: Array<Record<string, unknown>> }).__paywallEvents
+	);
+	expect(events).toHaveLength(1);
+	expect(events[0]).toMatchObject({
+		kind: 'retryable',
+		status: 429,
+		code: 'rate_limited',
+		retryAfterSeconds: 45
+	});
 });
