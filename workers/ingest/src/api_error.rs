@@ -153,19 +153,13 @@ impl ApiError {
 impl From<IntakeRejection> for ApiError {
     fn from(e: IntakeRejection) -> Self {
         match e {
-            IntakeRejection::Empty => Self::invalid_request("nzb_xml must not be empty"),
-            IntakeRejection::TooLarge { .. } => Self::payload_too_large("nzb_xml exceeds 2 MiB"),
-            IntakeRejection::NotNzb => Self::invalid_request("nzb_xml is not an NZB document"),
-            IntakeRejection::Malformed => Self::invalid_request("nzb_xml is malformed"),
-            IntakeRejection::TooManyFiles { .. } => {
-                Self::payload_too_large("nzb has too many files")
+            IntakeRejection::Empty | IntakeRejection::NotNzb | IntakeRejection::Malformed => {
+                Self::invalid_request(e.message())
             }
-            IntakeRejection::TooManySegments { .. } => {
-                Self::payload_too_large("nzb has too many segments")
-            }
-            IntakeRejection::DeclaredBytesOverCap { .. } => {
-                Self::payload_too_large("nzb declared bytes over cap")
-            }
+            IntakeRejection::TooLarge { .. }
+            | IntakeRejection::TooManyFiles { .. }
+            | IntakeRejection::TooManySegments { .. }
+            | IntakeRejection::DeclaredBytesOverCap { .. } => Self::payload_too_large(e.message()),
         }
     }
 }

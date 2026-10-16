@@ -187,14 +187,19 @@ fn check_upload(req: &NzbUploadRequest) -> core::result::Result<(), &'static str
 }
 
 /// Build the status + JSON body for an intake refusal. Pure so the 4xx
-/// taxonomy (stable `code`, measured value + cap fields the client renders)
-/// is unit-tested without a Worker runtime.
+/// taxonomy (registry `code`, stable `intake_code`, measured value + cap fields
+/// the client renders) is unit-tested without a Worker runtime.
 fn intake_rejection_parts(rejection: &IntakeRejection) -> (u16, serde_json::Value) {
+    let error = ApiError::from(*rejection);
+    let status = error.status;
     let mut body = serde_json::json!({
+        "code": error.code,
+        "message": error.message,
+        "retryable": error.retryable,
         "error": rejection.message(),
-        "code": rejection.code(),
-        "intake_config_version": nzb_intake::INTAKE_CONFIG_VERSION,
     });
+    body["intake_code"] = serde_json::Value::String(rejection.code().into());
+    body["intake_config_version"] = nzb_intake::INTAKE_CONFIG_VERSION.into();
     match *rejection {
         IntakeRejection::TooLarge {
             size_bytes,
@@ -217,7 +222,7 @@ fn intake_rejection_parts(rejection: &IntakeRejection) -> (u16, serde_json::Valu
         }
         IntakeRejection::Empty | IntakeRejection::NotNzb | IntakeRejection::Malformed => {}
     }
-    (rejection.http_status(), body)
+    (status, body)
 }
 
 /// Answer an intake refusal with its stable code + reason fields.
@@ -551,8 +556,8 @@ mod tests {
     }
 
     #[test]
-    fn intake_corpus_maps_to_stable_4xx_codes_with_reason_fields() {
-        // (body, expected status, expected code)
+    fn intake_corpus_maps_to_registered_envelopes_with_reason_fields() {
+        // (body, expected status, registry code, stable intake-specific code)
         let over_bytes = r#"<?xml version="1.0"?>
 <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
 <file poster="a@b" date="1" subject="big.iso">
@@ -574,25 +579,54 @@ mod tests {
         }
         segment_bomb.push_str("</nzb>");
         assert!(segment_bomb.len() < MAX_NZB_BYTES);
-        let cases: &[(&str, u16, &str)] = &[
-            ("", 400, "NZB_EMPTY"),
-            ("<html><body>hi</body></html>", 400, "NZB_NOT_NZB"),
-            ("<?xml?><nzb><file>", 400, "NZB_MALFORMED"),
-            (over_bytes, 413, "NZB_DECLARED_BYTES_OVER_CAP"),
-            (&file_bomb, 413, "NZB_TOO_MANY_FILES"),
-            (&segment_bomb, 413, "NZB_TOO_MANY_SEGMENTS"),
-            (&"x".repeat(MAX_NZB_BYTES + 1), 413, "NZB_TOO_LARGE"),
+        let cases: &[(&str, u16, &str, &str)] = &[
+            ("", 400, "invalid_request", "NZB_EMPTY"),
+            (
+                "<html><body>hi</body></html>",
+                400,
+                "invalid_request",
+                "NZB_NOT_NZB",
+            ),
+            (
+                "<?xml?><nzb><file>",
+                400,
+                "invalid_request",
+                "NZB_MALFORMED",
+            ),
+            (
+                over_bytes,
+                413,
+                "payload_too_large",
+                "NZB_DECLARED_BYTES_OVER_CAP",
+            ),
+            (&file_bomb, 413, "payload_too_large", "NZB_TOO_MANY_FILES"),
+            (
+                &segment_bomb,
+                413,
+                "payload_too_large",
+                "NZB_TOO_MANY_SEGMENTS",
+            ),
+            (
+                &"x".repeat(MAX_NZB_BYTES + 1),
+                413,
+                "payload_too_large",
+                "NZB_TOO_LARGE",
+            ),
         ];
-        for (body, status, code) in cases {
+        for (body, status, api_code, intake_code) in cases {
             let rejection = estimate_nzb(body).unwrap_err();
             let (actual_status, actual_body) = intake_rejection_parts(&rejection);
-            assert_eq!(actual_status, *status, "status for {code}");
-            assert_eq!(actual_body["code"], *code, "code for {code}");
+            assert_eq!(actual_status, *status, "status for {intake_code}");
+            assert_eq!(actual_body["code"], *api_code, "API code for {intake_code}");
+            assert_eq!(actual_body["intake_code"], *intake_code);
+            assert_eq!(actual_body["message"], ApiError::from(rejection).message);
+            assert_eq!(actual_body["retryable"], false);
+            assert_eq!(actual_body["error"], actual_body["message"]);
+            assert_eq!(actual_status, rejection.http_status());
             assert_eq!(
                 actual_body["intake_config_version"],
                 crate::nzb_intake::INTAKE_CONFIG_VERSION
             );
-            assert!(actual_body["error"].is_string());
         }
         // Reason fields the client renders ride alongside the code.
         let (_, over_bytes_body) = intake_rejection_parts(&estimate_nzb(over_bytes).unwrap_err());

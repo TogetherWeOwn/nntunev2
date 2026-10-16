@@ -23,7 +23,10 @@ upstream failures without per-worker special cases.
   when present); `false` means fix the request, credentials, or plan first.
 - The HTTP status is the registry status for the `code`. Workers may add
   extra fields (for example `job_id` on an ingest 503 so a retry can be
-  correlated), but the three envelope fields are always present.
+  correlated), but the three envelope fields are always present. NZB intake
+  refusals use `invalid_request` or `payload_too_large` as the registry `code`
+  and preserve the stable intake-specific identifier in `intake_code`. During
+  migration, these responses also retain `error` as an alias of `message`.
 
 ## Fallback for unknown codes
 
