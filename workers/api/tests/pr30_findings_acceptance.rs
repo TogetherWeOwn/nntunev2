@@ -1074,14 +1074,14 @@ fn plaintext_opt_in_save_audits_insecure_action() {
             .store
             .audits_with(vault::INSECURE_PLAINTEXT_AUDIT_ACTION),
         1,
-        "cleartext opt-in save must be repudiation-safe, not plain vault.put"
+        "cleartext opt-in save must be repudiation-safe, not plain vault.update"
     );
-    assert_eq!(harness.store.audits_with("vault.put"), 0);
+    assert_eq!(harness.store.audits_with("vault.update"), 0);
 
     let cookie = magic_cookie(&harness, "tls-user", "tls@example.com");
     let response = put_vault(&harness, &cookie, public_provider(), None);
     assert_eq!(response.status, 200, "{}", response.body);
-    assert_eq!(harness.store.audits_with("vault.put"), 1);
+    assert_eq!(harness.store.audits_with("vault.update"), 1);
 }
 
 // --- Invite throttle (finding: late-novel-invite-redemption-unthrottled) -----------------

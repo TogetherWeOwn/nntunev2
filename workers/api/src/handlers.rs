@@ -1271,14 +1271,11 @@ where
             return generic_vault();
         }
     }
-    // Repudiation-safe audit action, taken BEFORE the move below: a save
-    // carrying the explicit cleartext opt-in must not look like a normal
-    // save in the audit log (`vault::INSECURE_PLAINTEXT_AUDIT_ACTION`).
-    let audit_action = if body.provider.insecure_plaintext_acknowledged() {
-        vault::INSECURE_PLAINTEXT_AUDIT_ACTION
-    } else {
-        "vault.put"
-    };
+    // Repudiation-safe audit action from the core contract
+    // (`vault::ProviderConfig::audit_action`), taken BEFORE the move
+    // below: a save carrying the explicit cleartext opt-in must not look
+    // like a normal save in the audit log.
+    let audit_action = body.provider.audit_action();
     let indexer_configured = body.indexer.is_some();
     let payload = VaultPayload {
         provider: body.provider,
@@ -2706,6 +2703,54 @@ mod tests {
     }
 
     #[test]
+    fn login_purpose_challenge_bound_to_credential_less_user_cannot_enroll() {
+        // Pins the register-direction purpose binding ALONE: the user
+        // exists with no credential yet, the login-purpose challenge is
+        // bound to Some(user_id), the attestation is valid and the inbox
+        // proof is that user's real token — so every later
+        // register_finish gate passes and only
+        // `row.purpose != PURPOSE_REGISTER` can reject. Disabling that
+        // check enrolls the attacker's key (200) and fails this test.
+        let h = harness();
+        seed_user(&h, "victim", "victim@example.com");
+
+        let challenge = auth::new_registration_challenge("example.com", ORIGIN, NOW).unwrap();
+        let challenge_id = challenge.id.clone();
+        block_on(
+            h.store
+                .insert_challenge(&challenge, Some("victim"), PURPOSE_LOGIN),
+        )
+        .unwrap();
+        let (token, record) = auth::issue_magic_link("victim", "victim@example.com", NOW);
+        block_on(h.store.insert_magic(&record)).unwrap();
+
+        let attacker_cred = b"attacker-cred";
+        let att = fx_none_attestation(attacker_cred, &fx_es256_cose(33));
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/finish",
+            serde_json::json!({
+                "challenge": challenge_id,
+                "credential_id": b64url_encode(attacker_cred),
+                "attestation_object": b64url_encode(&att),
+                "client_data_json": b64url_encode(
+                    fx_client_json("webauthn.create", &challenge_id).as_bytes()
+                ),
+                "magic_token": token,
+                "invite_code": null,
+            }),
+        );
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        assert!(resp.set_cookie.is_none());
+        assert!(
+            block_on(h.store.credentials_for_user("victim"))
+                .unwrap()
+                .is_empty(),
+            "login-purpose challenge must enroll nothing"
+        );
+    }
+
+    #[test]
     fn register_finish_requires_the_emailed_token() {
         // Regression: passkey enrollment requires inbox proof, so an
         // unregistered email cannot be claimed by a stranger.
@@ -3249,7 +3294,10 @@ mod tests {
         seed_user(&h, "u1", "a@example.com");
         let cookie = magic_login(&h, "a@example.com");
         put_test_vault(&h, &cookie);
-        assert_eq!(h.store.audits.borrow().last().unwrap().action, "vault.put");
+        assert_eq!(
+            h.store.audits.borrow().last().unwrap().action,
+            "vault.update"
+        );
         let put_body = serde_json::json!({
             "provider": {
                 "host": "news.example.com", "port": 119, "tls": false,
