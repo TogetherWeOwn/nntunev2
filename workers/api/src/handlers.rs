@@ -2470,7 +2470,7 @@ mod tests {
     fn fx_es256_cose(secret: u8) -> Vec<u8> {
         use p256::ecdsa::SigningKey;
         let sk = SigningKey::from_slice(&[secret; 32]).unwrap();
-        let point = sk.verifying_key().to_encoded_point(false);
+        let point = sk.verifying_key().to_sec1_point(false);
         let mut cose = Vec::new();
         fx_head(5, 5, &mut cose);
         fx_int(1, &mut cose);
@@ -2551,7 +2551,7 @@ mod tests {
 
         let h = harness();
         let sk = SigningKey::from_slice(&[11u8; 32]).unwrap();
-        let point = sk.verifying_key().to_encoded_point(false);
+        let point = sk.verifying_key().to_sec1_point(false);
         let mut cose = Vec::new();
         head(5, 5, &mut cose);
         eint(1, &mut cose);
