@@ -23,11 +23,13 @@ NZB upload ───────────────┘                     
 - NZB intake guard (`src/nzb_intake.rs`): versioned caps
   (`INTAKE_CONFIG_VERSION` v1: 2 MiB / 5k files / 60k segments / 64 GiB
   declared segment bytes) plus well-formedness validation before anything
-  spends provider connections. Refusals carry stable 4xx codes
-  (`NZB_EMPTY`, `NZB_TOO_LARGE`, `NZB_NOT_NZB`, `NZB_MALFORMED`,
-  `NZB_TOO_MANY_FILES`, `NZB_TOO_MANY_SEGMENTS`,
-  `NZB_DECLARED_BYTES_OVER_CAP`) and the `intake_config_version`; cap refusals
-  also return the measured value and cap (`file_count`/`max_files`,
+  spends provider connections. Refusals use the shared API error envelope:
+  `code` is `invalid_request` or `payload_too_large`, while the stable
+  intake-specific identifier (`NZB_EMPTY`, `NZB_TOO_LARGE`, `NZB_NOT_NZB`,
+  `NZB_MALFORMED`, `NZB_TOO_MANY_FILES`, `NZB_TOO_MANY_SEGMENTS`, or
+  `NZB_DECLARED_BYTES_OVER_CAP`) is in `intake_code`. The response also keeps
+  `error` as an alias of `message` and includes `intake_config_version`; cap
+  refusals return measured values and caps (`file_count`/`max_files`,
   `segment_count`/`max_segments`, `declared_bytes`/`max_declared_bytes`, …)
   so clients can render a reason.
 - Per-plan rate limits (`src/rate_limit.rs`): provisional base/5x/20x
@@ -40,9 +42,9 @@ NZB upload ───────────────┘                     
 - Routes (`src/lib.rs`): `POST /v1/ingest/search` (16 KiB body cap,
   ≤16 categories, paged window), `POST /v1/ingest/nzb` (wire cap accounting
   for JSON escaping, then the versioned intake guard) — malformed JSON is
-  400, intake refusals carry their stable `NZB_*` code (bad input 400,
-  over-cap 413 with measured + cap fields), busy store/queue is 503;
-  success is 202 + enqueue with job id + idempotency key.
+  400, intake refusals use the registered API code plus `intake_code` (bad
+  input 400, over-cap 413 with measured + cap fields), busy store/queue is
+  503; success is 202 + enqueue with job id + idempotency key.
   `GET /v1/ingest/jobs/:id` (checkpoint reads land with the consumer).
 
 ## Security rules

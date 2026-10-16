@@ -15,6 +15,7 @@
  * helpers only. No Stripe secret ever touches this code.
  */
 
+import { parseErrorResponse } from '../api/errors.js';
 import type { UsageSnapshot } from './usage';
 
 export interface PlanDTO {
@@ -48,25 +49,24 @@ export interface SubscriptionDTO {
  */
 export class BillingApiError extends Error {
 	readonly status: number;
+	/** Registry code from the error envelope (`docs/api-errors.md`). */
+	readonly code: string;
+	/** Whether retrying the same request may succeed (envelope flag). */
+	readonly retryable: boolean;
 
-	constructor(status: number, label: string, hint = '') {
+	constructor(status: number, label: string, hint = '', code = 'request_failed', retryable = false) {
 		super(`${label} failed (${status})${hint}`);
 		this.name = 'BillingApiError';
 		this.status = status;
+		this.code = code;
+		this.retryable = retryable;
 	}
 }
 
 async function readJson<T>(res: Response, label: string): Promise<T> {
 	if (!res.ok) {
-		let hint = '';
-		try {
-			const body = await res.json();
-			if (body && typeof body === 'object' && 'error' in body)
-				hint = `: ${(body as { error: unknown }).error}`;
-		} catch {
-			/* non-JSON error body: keep generic */
-		}
-		throw new BillingApiError(res.status, label, hint);
+		const { code, message, retryable } = await parseErrorResponse(res);
+		throw new BillingApiError(res.status, label, `: ${message}`, code, retryable);
 	}
 	return (await res.json()) as T;
 }
