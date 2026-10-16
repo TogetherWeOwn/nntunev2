@@ -32,7 +32,8 @@ export const LIBRARY_SNAPSHOT_KEY = 'nntune.library.snapshot.v1';
 export const LIBRARY_AUTH_CONTEXT_KEY = 'nntune.library.auth-context.v1';
 export const LIBRARY_AUTH_TRANSITION_KEY = 'nntune.library.auth-transition.v1';
 
-function snapshotKey(storage: SnapshotStorage, createContext = false): string | null {
+function snapshotKey(storage: SnapshotStorage | null, createContext = false): string | null {
+	if (!storage) return null;
 	let context: string | null;
 	try {
 		context = storage.getItem(LIBRARY_AUTH_CONTEXT_KEY);
@@ -56,6 +57,23 @@ export interface SnapshotStorage {
 	getItem(key: string): string | null;
 	setItem(key: string, value: string): void;
 	removeItem(key: string): void;
+}
+
+export type StorageKind = 'session' | 'local';
+
+/**
+ * Resolve a Web Storage area without ever throwing. Merely reading
+ * `window.sessionStorage` / `window.localStorage` raises a `SecurityError`
+ * where storage is blocked (disabled cookies, sandboxed or opaque origins),
+ * so call sites must never evaluate the getter themselves: a throw there
+ * lands in their auth catch after the session cookie is already set.
+ */
+export function browserStorage(kind: StorageKind): SnapshotStorage | null {
+	try {
+		return kind === 'session' ? window.sessionStorage : window.localStorage;
+	} catch {
+		return null;
+	}
 }
 
 export function isLibraryItem(value: unknown): value is LibraryItem {
@@ -137,9 +155,9 @@ export function decodeSnapshot(raw: string | null): LibrarySnapshot | null {
 	}
 }
 
-export function loadSnapshot(storage: SnapshotStorage): LibrarySnapshot | null {
+export function loadSnapshot(storage: SnapshotStorage | null): LibrarySnapshot | null {
 	const key = snapshotKey(storage);
-	if (!key) return null;
+	if (!storage || !key) return null;
 	try {
 		return decodeSnapshot(storage.getItem(key));
 	} catch {
@@ -149,14 +167,14 @@ export function loadSnapshot(storage: SnapshotStorage): LibrarySnapshot | null {
 
 /** Persist a fresh fetch result, enforcing caps; returns what was stored. */
 export function saveSnapshot(
-	storage: SnapshotStorage,
+	storage: SnapshotStorage | null,
 	items: LibraryItem[],
 	nowMs: number = Date.now()
 ): LibrarySnapshot {
 	const snapshot = encodeSnapshot(items, nowMs);
 	const key = snapshotKey(storage, true);
 	try {
-		if (key) storage.setItem(key, JSON.stringify(snapshot));
+		if (storage && key) storage.setItem(key, JSON.stringify(snapshot));
 	} catch {
 		// Quota or privacy mode: the in-memory snapshot still renders this
 		// visit; the next load simply has no stale fallback.
@@ -164,7 +182,8 @@ export function saveSnapshot(
 	return snapshot;
 }
 
-export function clearSnapshot(storage: SnapshotStorage): void {
+export function clearSnapshot(storage: SnapshotStorage | null): void {
+	if (!storage) return;
 	try {
 		const key = snapshotKey(storage);
 		// Revoke access to the snapshot before attempting to remove its bytes.
@@ -177,7 +196,8 @@ export function clearSnapshot(storage: SnapshotStorage): void {
 }
 
 /** Notify other open tabs that the browser is crossing an auth boundary. */
-export function broadcastAuthTransition(storage: SnapshotStorage): void {
+export function broadcastAuthTransition(storage: SnapshotStorage | null): void {
+	if (!storage) return;
 	try {
 		const transitionId = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
 		storage.setItem(LIBRARY_AUTH_TRANSITION_KEY, transitionId);
@@ -185,6 +205,19 @@ export function broadcastAuthTransition(storage: SnapshotStorage): void {
 	} catch {
 		// Storage may be unavailable in privacy-restricted browser contexts.
 	}
+}
+
+/**
+ * Cross an auth boundary: drop this tab's snapshots (current session-scoped
+ * and the legacy shared localStorage copy) and tell other tabs to do the
+ * same. Never throws, so it is safe to call right after a credential
+ * exchange succeeds.
+ */
+export function invalidateLibraryCache(): void {
+	clearSnapshot(browserStorage('session'));
+	const local = browserStorage('local');
+	clearSnapshot(local);
+	broadcastAuthTransition(local);
 }
 
 /**

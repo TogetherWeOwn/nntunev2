@@ -234,3 +234,69 @@ test('magic-link sign-out invalidates another tab library snapshot', async ({ pa
 	expect(await readSnapshot(page)).toBeNull();
 	await magicTab.close();
 });
+
+/** Make `window.sessionStorage` / `localStorage` throw on access, like a blocked origin. */
+async function blockStorage(page: import('@playwright/test').Page): Promise<void> {
+	await page.addInitScript(() => {
+		for (const name of ['sessionStorage', 'localStorage']) {
+			Object.defineProperty(window, name, {
+				configurable: true,
+				get() {
+					throw new DOMException('The operation is insecure.', 'SecurityError');
+				}
+			});
+		}
+	});
+}
+
+test('blocked storage still renders a fresh library list', async ({ page }) => {
+	await blockStorage(page);
+	await page.route('**/api/library', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify(SEEDED.items)
+		})
+	);
+
+	await page.goto('/library');
+
+	await expect(page.getByTestId('library-list')).toContainText('Seeded Song One');
+	await expect(page.getByTestId('library-item')).toHaveCount(2);
+	await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
+test('blocked storage still shows the signed-out state on 401', async ({ page }) => {
+	await blockStorage(page);
+	await page.route('**/api/library', (route) =>
+		route.fulfill({
+			status: 401,
+			contentType: 'application/json',
+			body: JSON.stringify({ error: 'unauthorized' })
+		})
+	);
+
+	await page.goto('/library');
+
+	await expect(page.getByRole('alert')).toContainText(/signed out|do not have access/i);
+	await expect(page.getByTestId('library-list')).toHaveCount(0);
+});
+
+test('blocked storage does not turn a successful magic-link sign-in into a failure', async ({
+	page
+}) => {
+	await blockStorage(page);
+	await page.route('**/v1/auth/magic/finish', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ ok: true, email: 'ada@example.com' })
+		})
+	);
+
+	await page.goto('/auth/magic?token=fixture-magic-token');
+	await page.getByRole('button', { name: /sign in with this link/i }).click();
+
+	// Cleanup after a successful redemption must not land in the error branch.
+	await page.waitForURL('/onboarding/byop');
+});

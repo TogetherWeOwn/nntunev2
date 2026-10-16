@@ -1,10 +1,13 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+	broadcastAuthTransition,
+	browserStorage,
 	clearSnapshot,
 	decodeSnapshot,
 	encodeSnapshot,
 	evictToCap,
+	invalidateLibraryCache,
 	loadSnapshot,
 	MAX_SNAPSHOT_BYTES,
 	MAX_SNAPSHOT_ITEMS,
@@ -13,6 +16,7 @@ import {
 	staleLabel,
 	toLibraryItems,
 	LIBRARY_AUTH_CONTEXT_KEY,
+	LIBRARY_AUTH_TRANSITION_KEY,
 	LIBRARY_SNAPSHOT_KEY,
 	type LibraryItem,
 	type SnapshotStorage
@@ -194,5 +198,70 @@ describe('staleLabel', () => {
 		const at = Date.parse('2026-10-15T12:00:00Z');
 		expect(staleLabel(new Date(at - 10_000).toISOString(), at)).toContain('just now');
 		expect(staleLabel(new Date(at - 5 * 60_000).toISOString(), at)).toContain('5m ago');
+	});
+});
+
+/** A `window` whose storage getters throw, like a blocked or sandboxed origin. */
+function blockedWindow(): Record<string, unknown> {
+	const win: Record<string, unknown> = {};
+	for (const name of ['sessionStorage', 'localStorage']) {
+		Object.defineProperty(win, name, {
+			get() {
+				throw new DOMException('The operation is insecure.', 'SecurityError');
+			}
+		});
+	}
+	return win;
+}
+
+describe('storage access that itself throws', () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+	});
+
+	it('browserStorage resolves null instead of throwing', () => {
+		vi.stubGlobal('window', blockedWindow());
+		expect(browserStorage('session')).toBeNull();
+		expect(browserStorage('local')).toBeNull();
+	});
+
+	it('browserStorage resolves null when there is no window at all', () => {
+		expect(browserStorage('session')).toBeNull();
+	});
+
+	it('every helper tolerates a null storage', () => {
+		expect(loadSnapshot(null)).toBeNull();
+		expect(() => saveSnapshot(null, [item('a')])).not.toThrow();
+		expect(saveSnapshot(null, [item('a')]).items.map((i) => i.id)).toEqual(['a']);
+		expect(() => clearSnapshot(null)).not.toThrow();
+		expect(() => broadcastAuthTransition(null)).not.toThrow();
+	});
+
+	it('invalidateLibraryCache never throws, so a finished sign-in cannot be undone by cleanup', () => {
+		vi.stubGlobal('window', blockedWindow());
+		expect(() => invalidateLibraryCache()).not.toThrow();
+	});
+
+	it('invalidateLibraryCache clears both areas and broadcasts when storage works', () => {
+		const session = memoryStorage();
+		saveSnapshot(session, [item('account-a')], 1_000);
+		const local = memoryStorage({ [LIBRARY_SNAPSHOT_KEY]: 'legacy' });
+		const broadcasts: string[] = [];
+		const watchedLocal: SnapshotStorage = {
+			getItem: (key) => local.getItem(key),
+			setItem: (key, value) => {
+				if (key === LIBRARY_AUTH_TRANSITION_KEY) broadcasts.push(value);
+				local.setItem(key, value);
+			},
+			removeItem: (key) => local.removeItem(key)
+		};
+		vi.stubGlobal('window', { sessionStorage: session, localStorage: watchedLocal });
+
+		invalidateLibraryCache();
+
+		expect(loadSnapshot(session)).toBeNull();
+		expect(session.getItem(LIBRARY_AUTH_CONTEXT_KEY)).toBeNull();
+		expect(local.getItem(LIBRARY_SNAPSHOT_KEY)).toBeNull();
+		expect(broadcasts).toHaveLength(1);
 	});
 });

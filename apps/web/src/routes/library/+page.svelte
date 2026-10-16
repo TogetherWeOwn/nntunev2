@@ -1,8 +1,9 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import {
-		broadcastAuthTransition,
+		browserStorage,
 		clearSnapshot,
+		invalidateLibraryCache,
 		LIBRARY_AUTH_TRANSITION_KEY,
 		loadSnapshot,
 		saveSnapshot,
@@ -61,9 +62,7 @@
 			]);
 			if (response.status === 401 || response.status === 403) {
 				authenticatedThisLoad = false;
-				clearSnapshot(window.sessionStorage);
-				clearSnapshot(window.localStorage);
-				broadcastAuthTransition(window.localStorage);
+				invalidateLibraryCache();
 				items = [];
 				staleAt = null;
 				loadError = 'You are signed out or do not have access to this library.';
@@ -76,18 +75,18 @@
 			authenticatedThisLoad = true;
 			items = fresh;
 			staleAt = null;
-			saveSnapshot(window.sessionStorage, fresh);
+			saveSnapshot(browserStorage('session'), fresh);
 		} catch {
 			if (generation !== requestGeneration) return;
 			// Do not trust a tab's snapshot until this page has verified its session.
-			const snapshot = authenticatedThisLoad ? loadSnapshot(window.sessionStorage) : null;
+			const snapshot = authenticatedThisLoad ? loadSnapshot(browserStorage('session')) : null;
 			if (snapshot) {
 				items = snapshot.items;
 				staleAt = snapshot.savedAt;
 			} else {
 				items = [];
 				staleAt = null;
-				loadError = 'Library is not reachable and there is no saved copy yet.';
+				loadError = 'Library is not reachable right now.';
 			}
 		} finally {
 			if (timeoutId !== undefined) clearTimeout(timeoutId);
@@ -104,7 +103,7 @@
 		activeRequest?.abort();
 		activeRequest = null;
 		authenticatedThisLoad = false;
-		clearSnapshot(window.sessionStorage);
+		clearSnapshot(browserStorage('session'));
 		items = [];
 		staleAt = null;
 		loadError = 'Your session changed. Sign in again to see this library.';
@@ -114,7 +113,7 @@
 	onMount(() => {
 		window.addEventListener('storage', handleAuthTransition);
 		// Discard the old shared localStorage snapshot from earlier versions.
-		clearSnapshot(window.localStorage);
+		clearSnapshot(browserStorage('local'));
 		void refresh();
 		return () => {
 			requestGeneration += 1;
