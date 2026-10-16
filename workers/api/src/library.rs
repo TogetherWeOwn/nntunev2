@@ -32,7 +32,6 @@
 //!   Internal row ids and `owner_user_id` never serialize. The authorizers
 //!   below return intents (validated parameters), never mutated rows.
 
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 /// Maximum display-name length (chars).
@@ -91,7 +90,7 @@ impl std::fmt::Display for LibraryError {
 /// (see the list pages).
 pub fn new_public_id() -> String {
     let mut bytes = [0u8; 16];
-    rand::rng().fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("secure randomness unavailable");
     crate::b64::encode(&bytes)
 }
 
