@@ -4,9 +4,9 @@
 //! structured logging standard` build card, which builds on this branch and
 //! never edits this file).
 //!
-//! NOTE: unlike api/ingest/mb, `stream` keeps its legacy stream log shape log shape and
+//! NOTE: unlike api/ingest/mb, `stream` keeps its legacy stream log shape and
 //! only adds `trace_id`. This file therefore asserts the shared schema as a
-//! SUPERSET (the six fields must be present; extras from the legacy stream log shape shape
+//! SUPERSET (the six fields must be present; extras from the legacy stream log shape
 //! are allowed) and accepts the existing stream event vocabulary — the event
 //! name only needs to be lowercase `[a-z0-9_.]`, with no `stream.` prefix
 //! requirement.
@@ -16,7 +16,7 @@
 //!    schema (`ts`, `level`, `worker`, `trace_id`, `event`, `fields`) plus
 //!    the trace-id propagation rule (`x-trace-id`) and the PII/redaction rule.
 //! 2. `workers/stream/tests/fixtures/logging_golden.json`: ONE JSON object,
-//!    the golden `stream` log line (legacy stream log shape shape + `trace_id`). Example
+//!    the golden `stream` log line (legacy stream log shape + `trace_id`). Example
 //!    (trace_id is 32 lowercase hex):
 //!    ```json
 //!    {
@@ -173,7 +173,7 @@ fn is_rfc3339_utc(s: &str) -> bool {
     core[..4].parse::<u32>().is_ok() && core[5..7].parse::<u32>().is_ok()
 }
 
-/// Stream keeps its legacy stream log shape event vocabulary: lowercase `[a-z0-9_.]`,
+/// Stream keeps its legacy stream event vocabulary: lowercase `[a-z0-9_.]`,
 /// non-empty, no leading/trailing separator. A dot is NOT required.
 fn is_stream_event_name(s: &str) -> bool {
     if s.is_empty() || s.len() > 96 {
