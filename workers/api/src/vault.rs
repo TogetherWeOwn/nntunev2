@@ -476,7 +476,7 @@ pub fn encrypt_vault(
     let wrap_nonce = random_nonce();
     let wrapped = kek_cipher
         .encrypt(
-            Nonce::from_slice(&wrap_nonce),
+            &Nonce::from(wrap_nonce),
             Payload {
                 msg: &dek.0,
                 aad: dek_aad(user_id, kek_version).as_bytes(),
@@ -489,7 +489,7 @@ pub fn encrypt_vault(
     let payload_nonce = random_nonce();
     let payload = dek_cipher
         .encrypt(
-            Nonce::from_slice(&payload_nonce),
+            &Nonce::from(payload_nonce),
             Payload {
                 msg: plaintext,
                 aad: payload_aad(user_id).as_bytes(),
@@ -518,12 +518,10 @@ pub fn decrypt_vault(
     let wrap_nonce =
         crate::b64::decode(&blob.dek_wrapped_nonce_b64url).map_err(|_| VaultError::Invalid)?;
     let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url).map_err(|_| VaultError::Invalid)?;
-    if wrap_nonce.len() != 12 {
-        return Err(VaultError::Invalid);
-    }
+    let wrap_nonce = Nonce::try_from(wrap_nonce.as_slice()).map_err(|_| VaultError::Invalid)?;
     let mut dek_bytes = kek_cipher
         .decrypt(
-            Nonce::from_slice(&wrap_nonce),
+            &wrap_nonce,
             Payload {
                 msg: &wrapped,
                 aad: dek_aad(user_id, blob.kek_version).as_bytes(),
@@ -544,12 +542,11 @@ pub fn decrypt_vault(
     let payload_nonce =
         crate::b64::decode(&blob.payload_nonce_b64url).map_err(|_| VaultError::Invalid)?;
     let payload = crate::b64::decode(&blob.payload_b64url).map_err(|_| VaultError::Invalid)?;
-    if payload_nonce.len() != 12 {
-        return Err(VaultError::Invalid);
-    }
+    let payload_nonce =
+        Nonce::try_from(payload_nonce.as_slice()).map_err(|_| VaultError::Invalid)?;
     dek_cipher
         .decrypt(
-            Nonce::from_slice(&payload_nonce),
+            &payload_nonce,
             Payload {
                 msg: &payload,
                 aad: payload_aad(user_id).as_bytes(),
@@ -572,12 +569,10 @@ pub fn rewrap_dek(
     let wrap_nonce =
         crate::b64::decode(&blob.dek_wrapped_nonce_b64url).map_err(|_| VaultError::Invalid)?;
     let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url).map_err(|_| VaultError::Invalid)?;
-    if wrap_nonce.len() != 12 {
-        return Err(VaultError::Invalid);
-    }
+    let wrap_nonce = Nonce::try_from(wrap_nonce.as_slice()).map_err(|_| VaultError::Invalid)?;
     let mut dek_bytes = old_cipher
         .decrypt(
-            Nonce::from_slice(&wrap_nonce),
+            &wrap_nonce,
             Payload {
                 msg: &wrapped,
                 aad: dek_aad(user_id, blob.kek_version).as_bytes(),
@@ -593,7 +588,7 @@ pub fn rewrap_dek(
     let new_cipher = Aes256Gcm::new_from_slice(new_kek).map_err(|_| VaultError::Crypto)?;
     let new_nonce = random_nonce();
     let wrap_result = new_cipher.encrypt(
-        Nonce::from_slice(&new_nonce),
+        &Nonce::from(new_nonce),
         Payload {
             msg: &dek_bytes,
             aad: dek_aad(user_id, new_version).as_bytes(),
@@ -750,6 +745,42 @@ mod tests {
     }
 
     #[test]
+    fn malformed_nonce_lengths_are_rejected() {
+        let kek = [0x11u8; 32];
+        let new_kek = [0x22u8; 32];
+        let blob = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+
+        for len in [0, 1, 11, 13, 16, 24] {
+            let nonce = crate::b64::encode(&vec![7u8; len]);
+
+            let mut bad_wrap_nonce = blob.clone();
+            bad_wrap_nonce.dek_wrapped_nonce_b64url = nonce.clone();
+            assert_eq!(
+                decrypt_vault(&kek, "user-1", &bad_wrap_nonce),
+                Err(VaultError::Invalid),
+                "decrypt accepted a wrapped nonce of length {len}"
+            );
+            // `VaultBlob` has no `PartialEq`, so match on the error instead
+            // of comparing the whole `Result` with `assert_eq!`.
+            assert!(
+                matches!(
+                    rewrap_dek(&kek, &new_kek, 2, "user-1", &bad_wrap_nonce),
+                    Err(VaultError::Invalid)
+                ),
+                "rewrap accepted a wrapped nonce of length {len}"
+            );
+
+            let mut bad_payload_nonce = blob.clone();
+            bad_payload_nonce.payload_nonce_b64url = nonce;
+            assert_eq!(
+                decrypt_vault(&kek, "user-1", &bad_payload_nonce),
+                Err(VaultError::Invalid),
+                "decrypt accepted a payload nonce of length {len}"
+            );
+        }
+    }
+
+    #[test]
     fn debug_redacts_credential_material() {
         // Threat-model §3: no log line may contain credential material.
         // A `{:#?}`/`dbg!`/assert dump of these configs must not carry
@@ -791,10 +822,11 @@ mod tests {
     fn unwrap_dek(kek: &[u8; 32], user_id: &str, blob: &VaultBlob) -> Vec<u8> {
         let cipher = Aes256Gcm::new_from_slice(kek).expect("kek cipher");
         let wrap_nonce = crate::b64::decode(&blob.dek_wrapped_nonce_b64url).expect("wrap nonce");
+        let wrap_nonce = Nonce::try_from(wrap_nonce.as_slice()).expect("wrap nonce length");
         let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url).expect("wrapped dek");
         cipher
             .decrypt(
-                Nonce::from_slice(&wrap_nonce),
+                &wrap_nonce,
                 Payload {
                     msg: &wrapped,
                     aad: dek_aad(user_id, blob.kek_version).as_bytes(),
