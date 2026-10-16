@@ -331,25 +331,66 @@ fn rust_code(source: &str) -> String {
     output
 }
 
-fn worker_import_binds(source: &str, expected: &str, visible_name: &str) -> bool {
+fn import_item_binds(item: &str, expected: &str, visible_name: &str) -> bool {
+    if item == "*" {
+        return expected == visible_name;
+    }
+    let (path, alias) = item.split_once("as").unwrap_or((item, item));
+    path.rsplit("::").next() == Some(expected) && alias == visible_name
+}
+
+fn worker_import_items(source: &str) -> Vec<String> {
     let source = compact(&rust_code(source));
-    ["useworker::", "use::worker::"].into_iter().any(|prefix| {
-        source.split(prefix).skip(1).any(|remainder| {
+    let mut items = Vec::new();
+    for prefix in ["useworker::", "use::worker::"] {
+        for remainder in source.split(prefix).skip(1) {
             let Some((imports, _)) = remainder.split_once(';') else {
-                return false;
+                continue;
             };
-            let Some(imports) = imports
+            let imports = imports
                 .strip_prefix('{')
                 .and_then(|imports| imports.strip_suffix('}'))
-            else {
-                return imports == "*" && expected == visible_name;
-            };
-            comma_separated_items(imports).into_iter().any(|item| {
-                let (path, alias) = item.split_once("as").unwrap_or((item, item));
-                path.rsplit("::").next() == Some(expected) && alias == visible_name
+                .unwrap_or(imports);
+            items.extend(
+                comma_separated_items(imports)
+                    .into_iter()
+                    .map(str::to_string),
+            );
+        }
+    }
+    items
+}
+
+fn worker_imported_name(source: &str, expected: &str) -> Option<String> {
+    worker_import_items(source).into_iter().find_map(|item| {
+        if item == "*" {
+            return None;
+        }
+        let (path, alias) = item.split_once("as").unwrap_or((&item, &item));
+        (path.rsplit("::").next() == Some(expected)).then(|| alias.to_string())
+    })
+}
+
+fn worker_import_binds(source: &str, expected: &str, visible_name: &str) -> bool {
+    worker_import_items(source)
+        .iter()
+        .any(|item| import_item_binds(item, expected, visible_name))
+}
+
+fn worker_module_alias(source: &str) -> Option<String> {
+    let source = compact(&rust_code(source));
+    ["useworkeras", "use::workeras"]
+        .into_iter()
+        .find_map(|prefix| {
+            source.split(prefix).skip(1).find_map(|remainder| {
+                let (alias, _) = remainder.split_once(';')?;
+                (!alias.is_empty()).then(|| alias.to_string())
             })
         })
-    })
+}
+
+fn worker_module_alias_binds(source: &str, visible_name: &str) -> bool {
+    worker_module_alias(source).as_deref() == Some(visible_name)
 }
 
 fn worker_type_matches(actual: &str, expected: &str, source: &str) -> bool {
@@ -359,7 +400,10 @@ fn worker_type_matches(actual: &str, expected: &str, source: &str) -> bool {
         return true;
     }
     if let Some((module, name)) = path.split_once("::") {
-        if name == expected && worker_import_binds(source, "self", module) {
+        if name == expected
+            && (worker_module_alias_binds(source, module)
+                || worker_import_binds(source, "self", module))
+        {
             return true;
         }
         return false;
@@ -402,12 +446,52 @@ fn return_type(signature: &str) -> Option<&str> {
     signature[close + 1..].strip_prefix("->")
 }
 
+fn skip_attributes(mut item: &str) -> Option<&str> {
+    while let Some(rest) = item.strip_prefix("#[") {
+        let mut depth = 1;
+        let mut closing = None;
+        for (index, character) in rest.char_indices() {
+            match character {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        closing = Some(index + character.len_utf8());
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        item = rest.get(closing?..)?;
+    }
+    Some(item)
+}
+
+fn function_after_visibility(item: &str) -> Option<&str> {
+    let Some(item) = item.strip_prefix("pub") else {
+        return Some(item);
+    };
+    if let Some(visibility) = item.strip_prefix('(') {
+        let end = visibility.find(')')?;
+        return Some(&visibility[end + 1..]);
+    }
+    Some(item)
+}
+
 fn attributed_signature(source: &str, attribute: &str, function_name: &str) -> Option<String> {
     let source = compact(&rust_code(source));
-    let item = source.split_once(attribute)?.1;
-    let function = item.find(&format!("asyncfn{function_name}("))?;
-    let signature = &item[function..];
-    Some(signature[..signature.find('{')?].to_string())
+    for item in source.split(attribute).skip(1) {
+        let Some(item) = skip_attributes(item).and_then(function_after_visibility) else {
+            continue;
+        };
+        let Some(function) = item.strip_prefix(&format!("asyncfn{function_name}(")) else {
+            continue;
+        };
+        let signature = format!("asyncfn{function_name}({function}");
+        return Some(signature[..signature.find('{')?].to_string());
+    }
+    None
 }
 
 fn worker_fetch_signature_is_valid(signature: &str, source: &str) -> bool {
@@ -429,40 +513,118 @@ fn worker_fetch_signature_is_valid(signature: &str, source: &str) -> bool {
         && result_response_type_matches(result, source)
 }
 
+fn matching_brace_end(source: &str, open: usize) -> Option<usize> {
+    let mut depth = 0;
+    for (offset, character) in source.get(open..)?.char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn nntp_pool_impl_fetch_signature(source: &str) -> Option<String> {
     let code = compact(&rust_code(source));
-    let imported = worker_import_binds(source, "DurableObject", "DurableObject");
-    let markers = [
-        "impl::worker::DurableObjectforNntpPool{",
-        "implworker::DurableObjectforNntpPool{",
+    let mut markers = vec![
+        "impl::worker::DurableObjectforNntpPool{".to_string(),
+        "implworker::DurableObjectforNntpPool{".to_string(),
     ];
-    let start = markers
-        .iter()
-        .find_map(|marker| code.find(marker).map(|start| start + marker.len()))
-        .or_else(|| {
-            imported
-                .then(|| code.find("implDurableObjectforNntpPool{"))
-                .flatten()
-                .map(|start| start + "implDurableObjectforNntpPool{".len())
-        })?;
-    let implementation = &code[start..];
-    let method = implementation.find("asyncfnfetch(")?;
-    let signature = &implementation[method..];
-    Some(signature[..signature.find('{')?].to_string())
+    if let Some(alias) = worker_imported_name(source, "DurableObject") {
+        markers.push(format!("impl{alias}forNntpPool{{"));
+    } else if worker_import_binds(source, "DurableObject", "DurableObject") {
+        markers.push("implDurableObjectforNntpPool{".to_string());
+    }
+    if let Some(alias) = worker_module_alias(source) {
+        markers.push(format!("impl{alias}::DurableObjectforNntpPool{{"));
+    }
+
+    for marker in markers {
+        let mut search_from = 0;
+        while let Some(relative_start) = code[search_from..].find(&marker) {
+            let start = search_from + relative_start;
+            search_from = start + marker.len();
+            let open = start + marker.len() - 1;
+            let Some(close) = matching_brace_end(&code, open) else {
+                continue;
+            };
+            let implementation = &code[open + 1..close];
+            let Some(method) = implementation.find("asyncfnfetch(") else {
+                continue;
+            };
+            let signature = &implementation[method..];
+            let Some(body) = signature.find('{') else {
+                continue;
+            };
+            return Some(signature[..body].to_string());
+        }
+    }
+    None
+}
+
+fn crate_types_match_worker_targets(mut crate_types: Vec<String>) -> bool {
+    crate_types.sort();
+    crate_types == ["cdylib", "rlib"]
+}
+
+fn runtime_module_is_wasm_gated(source: &str) -> bool {
+    let source = source.replace("\"wasm32\"", "WASM32");
+    let code = rust_code(&source);
+    let lines = code.lines().map(compact).collect::<Vec<_>>();
+    let cfg = "#[cfg(target_arch=WASM32)]";
+
+    for (index, line) in lines.iter().enumerate() {
+        let Some(mut remainder) = line.strip_prefix(cfg) else {
+            continue;
+        };
+        if let Some(after_attributes) = skip_attributes(remainder) {
+            remainder = after_attributes;
+        }
+        if remainder.starts_with("pubmodruntime;") {
+            return true;
+        }
+        if !remainder.is_empty() {
+            continue;
+        }
+
+        for next in lines.iter().skip(index + 1) {
+            if next.is_empty() {
+                continue;
+            }
+            if next.starts_with("//") {
+                continue;
+            }
+            if next.starts_with("#[") {
+                match skip_attributes(next) {
+                    Some("") => continue,
+                    Some(remainder) if remainder.starts_with("pubmodruntime;") => return true,
+                    _ => break,
+                }
+            }
+            return next.starts_with("pubmodruntime;");
+        }
+    }
+    false
 }
 
 fn worker_build_release_is_configured(command: &str) -> bool {
     command
-        .split(|character| character == '&' || character == ';')
+        .split(|character| matches!(character, '&' | '|' | ';'))
         .any(|stage| {
-            let mut words = stage.split_whitespace();
-            let executable = words
-                .next()
-                .unwrap_or_default()
-                .rsplit('/')
-                .next()
-                .unwrap_or_default();
-            executable == "worker-build" && words.next() == Some("--release")
+            let words = stage
+                .split_whitespace()
+                .map(|word| word.rsplit('/').next().unwrap_or_default())
+                .collect::<Vec<_>>();
+            words.first() == Some(&"worker-build") && words.get(1) == Some(&"--release")
+                || words.first() == Some(&"npx")
+                    && words.get(1) == Some(&"worker-build")
+                    && words.get(2) == Some(&"--release")
         })
 }
 
@@ -521,9 +683,9 @@ fn crate_configures_wasm_cdylib_and_target_scoped_worker_runtime() {
     let lib = tables(&manifest, "[lib]");
     assert_eq!(lib.len(), 1, "expected one library target");
     let crate_types = field(&lib[0], "crate-type").and_then(|value| string_array(&value));
-    assert_eq!(
-        crate_types,
-        Some(vec!["cdylib".to_string(), "rlib".to_string()])
+    assert!(
+        crate_types.map_or(false, crate_types_match_worker_targets),
+        "the library must emit exactly cdylib and rlib targets"
     );
 
     let dependencies = tables(
@@ -550,20 +712,19 @@ fn crate_configures_wasm_cdylib_and_target_scoped_worker_runtime() {
 
     let lib_source = source("src/lib.rs");
     assert!(
-        lib_source
-            .lines()
-            .collect::<Vec<_>>()
-            .windows(2)
-            .any(|pair| {
-                compact(pair[0]) == "#[cfg(target_arch=\"wasm32\")]"
-                    && compact(pair[1]) == "pubmodruntime;"
-            }),
+        runtime_module_is_wasm_gated(&lib_source),
         "pub mod runtime must be gated by target_arch = wasm32"
     );
 }
 
 #[test]
 fn wasm_runtime_declares_worker_fetch_and_nntp_pool_durable_object_handlers() {
+    let runtime_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/runtime.rs");
+    assert!(
+        runtime_path.is_file(),
+        "expected the wasm runtime module at {}",
+        runtime_path.display()
+    );
     let runtime = source("src/runtime.rs");
     let code = compact(&rust_code(&runtime));
     assert!(
@@ -625,6 +786,110 @@ fn parsers_handle_bounded_inline_versions_and_worker_glob_imports() {
     }
     assert!(!worker_type_matches("forged::Request", "Request", glob));
     assert!(!worker_type_matches("anyhow::Result", "Result", glob));
+}
+
+#[test]
+fn rust_contract_parser_accepts_import_variants_and_rejects_unattributed_handlers() {
+    let discrete = "use worker::Request; use worker::Env; use worker::Context; use worker::Result; use worker::Response;";
+    for ty in ["Request", "Env", "Context", "Result", "Response"] {
+        assert!(
+            worker_type_matches(ty, ty, discrete),
+            "discrete import should bind {ty}"
+        );
+    }
+
+    let aliases = "use worker::Request as Req; use worker as w;";
+    assert!(worker_type_matches("Req", "Request", aliases));
+    assert!(worker_type_matches("w::Request", "Request", aliases));
+    assert!(worker_type_matches(
+        "w::Request",
+        "Request",
+        "use worker::{self as w};"
+    ));
+    let grouped = "use worker::{Request as Req, Env};";
+    assert!(worker_type_matches("Req", "Request", grouped));
+    assert!(worker_type_matches("Env", "Env", grouped));
+
+    assert!(crate_types_match_worker_targets(vec![
+        "rlib".into(),
+        "cdylib".into()
+    ]));
+    assert!(!crate_types_match_worker_targets(vec!["cdylib".into()]));
+    assert!(!crate_types_match_worker_targets(vec![
+        "cdylib".into(),
+        "cdylib".into()
+    ]));
+
+    for gate in [
+        "#[cfg(target_arch = \"wasm32\")] pub mod runtime;",
+        r#"#[cfg(target_arch = "wasm32")]
+/// Runtime module.
+pub mod runtime;"#,
+        r#"#[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
+pub mod runtime;"#,
+    ] {
+        assert!(runtime_module_is_wasm_gated(gate), "accepted gate: {gate}");
+    }
+    assert!(!runtime_module_is_wasm_gated("pub mod runtime;"));
+
+    let decoy = r#"
+#[event(fetch)]
+async fn unrelated(req: Request, env: Env, ctx: Context) -> Result<Response> { todo!() }
+async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> { todo!() }
+"#;
+    assert!(
+        attributed_signature(decoy, "#[event(fetch)]", "fetch").is_none(),
+        "event(fetch) must apply to the fetch handler itself"
+    );
+    let public_handler = r#"
+#[event(fetch)]
+pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> { todo!() }
+"#;
+    assert!(attributed_signature(public_handler, "#[event(fetch)]", "fetch").is_some());
+    let crate_visible_handler = r#"
+#[event(fetch)]
+pub(crate) async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> { todo!() }
+"#;
+    assert!(attributed_signature(crate_visible_handler, "#[event(fetch)]", "fetch").is_some());
+
+    let aliased_trait = r#"
+use worker::DurableObject as DO;
+impl DO for NntpPool {
+    async fn fetch(&self, request: Request) -> Result<Response> { todo!() }
+}
+"#;
+    assert!(nntp_pool_impl_fetch_signature(aliased_trait).is_some());
+    let unrelated_fetch = r#"
+impl DurableObject for NntpPool {}
+impl Other for Other {
+    async fn fetch(&self, request: Request) -> Result<Response> { todo!() }
+}
+"#;
+    assert!(nntp_pool_impl_fetch_signature(unrelated_fetch).is_none());
+    let later_valid_impl = r#"
+use worker::DurableObject as DO;
+impl DO for NntpPool {}
+impl DO for NntpPool {
+    async fn fetch(&self, request: Request) -> Result<Response> { todo!() }
+}
+"#;
+    assert!(nntp_pool_impl_fetch_signature(later_valid_impl).is_some());
+
+    assert!(worker_build_release_is_configured(
+        "npx worker-build --release"
+    ));
+    assert!(worker_build_release_is_configured(
+        "exit 1 || worker-build --release"
+    ));
+    assert!(!worker_build_release_is_configured(
+        "echo worker-build --release"
+    ));
+    assert!(runtime_module_is_wasm_gated(
+        r#"#[cfg(target_arch = "wasm32")]
+/* gate comment */
+pub mod runtime;"#
+    ));
 }
 
 #[test]
