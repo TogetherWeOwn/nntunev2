@@ -8,6 +8,11 @@
 		toProviderTestInput,
 		type ProviderTestResult
 	} from '#lib/api/client.js';
+	import {
+		isIndexerAuthExpired,
+		isProviderAuthExpired,
+		reauthPromptFor
+	} from '#lib/provider-reauth.js';
 	import { validateIndexerUrl, validateProviderConfig } from '#lib/vault-validation.js';
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
@@ -38,6 +43,8 @@
 	let errors = $state<string[]>([]);
 	let testState = $state<'idle' | 'testing' | 'ok' | 'failed'>('idle');
 	let testDetail = $state('');
+	let reauthRequired = $state(false);
+	let reauthPasswordInput = $state<HTMLInputElement | null>(null);
 	let saveState = $state<'idle' | 'saving' | 'saved' | 'failed'>('idle');
 	let testedConfigKey = $state<string | null>(null);
 	let testRunId = 0;
@@ -48,6 +55,10 @@
 		if (tls && allowInsecurePlaintext) {
 			allowInsecurePlaintext = false;
 		}
+	});
+
+	$effect(() => {
+		if (reauthRequired) reauthPasswordInput?.focus();
 	});
 
 	function providerInput() {
@@ -67,6 +78,7 @@
 		testedConfigKey = null;
 		testState = 'idle';
 		testDetail = '';
+		reauthRequired = false;
 		saveState = 'idle';
 	}
 
@@ -106,6 +118,7 @@
 		testedConfigKey = null;
 		testState = 'testing';
 		testDetail = '';
+		reauthRequired = false;
 		try {
 			const result: ProviderTestResult = await client.testProviderConnection(input);
 			if (runId !== testRunId || inputKey !== currentTestKey()) return;
@@ -124,10 +137,25 @@
 		} catch (error) {
 			if (runId !== testRunId || inputKey !== currentTestKey()) return;
 			testState = 'failed';
-			testDetail =
-				error instanceof ApiError && error.status === 404
-					? 'The API is not deployed yet — try again later.'
-					: 'Connection test failed. Check the details and try again.';
+			// Stale stored credential: inline re-auth prompt (S7), never a
+			// generic error page. The step-3 prompt renders its own password
+			// field (the step-1 form is unmounted by now) so the user re-enters
+			// the password in place; the session stays signed in.
+			if (error instanceof ApiError && isIndexerAuthExpired(error)) {
+				// Wrong secret for the password prompt: name the API key and
+				// point at the indexer step; never mount the password field.
+				testDetail =
+					reauthPromptFor(error.code) ??
+					'Your indexer rejected its API key. Go back to the indexer step and re-enter it.';
+			} else if (error instanceof ApiError && isProviderAuthExpired(error)) {
+				reauthRequired = true;
+				testDetail = reauthPromptFor(error.code) ?? 'Your provider password has expired.';
+			} else {
+				testDetail =
+					error instanceof ApiError && error.status === 404
+						? 'The API is not deployed yet — try again later.'
+						: 'Connection test failed. Check the details and try again.';
+			}
 		}
 	}
 
@@ -286,7 +314,36 @@
 							: 'Save provider'}
 				</button>
 			{:else if testState === 'failed'}
-				<p data-testid="byop-status" role="alert">{testDetail}</p>
+				{#if reauthRequired}
+					<div data-testid="byop-status" role="alert" aria-labelledby="reauth-heading">
+						<h3 id="reauth-heading">Provider credentials expired</h3>
+						<p>{testDetail}</p>
+						<p>
+							Re-enter your password below and test again — your session stays
+							signed in, and the new password is tested before it is saved.
+						</p>
+						<label>
+							Password
+							<input
+								name="reauthPassword"
+								bind:this={reauthPasswordInput}
+								type="password"
+								required
+								autocomplete="current-password"
+								bind:value={password}
+								oninput={() => {
+									// A changed password voids any earlier test result,
+									// but typing must not dismiss this prompt.
+									testedConfigKey = null;
+									saveState = 'idle';
+								}}
+							/>
+						</label>
+						<button class="nt-button" type="button" onclick={runTest}>Test again</button>
+					</div>
+				{:else}
+					<p data-testid="byop-status" role="alert">{testDetail}</p>
+				{/if}
 			{/if}
 			{#if saveState === 'saved'}
 				<p role="status">Saved. Your credentials are sealed in the encrypted vault.</p>
