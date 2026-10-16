@@ -855,7 +855,7 @@ mod tests {
 
     #[test]
     fn overlapping_construct_terminators_are_rejected_and_fail_closed() {
-        for construct in ["<!-->", "<!--->", "<??>"] {
+        for construct in ["<!-->", "<!--->", "<?>"] {
             let doc = format!(
                 "<?xml?><nzb>{construct}<segment bytes=\"99999999999\">x@y</segment></nzb>"
             );
