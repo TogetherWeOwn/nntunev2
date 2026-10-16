@@ -711,26 +711,33 @@ mod tests {
             );
         }
         // ... while a store failure keeps the verified user for audit and
-        // must not be mistaken for an invalid session.
-        let store = RecordingRevokeStore {
-            outcome: Err(SessionError::Storage {
-                user_id: "user-1".to_string(),
-            }),
-            calls: std::cell::RefCell::new(Vec::new()),
-        };
-        assert_eq!(
-            ready(logout_session_atomically(
-                &keys,
-                &token,
-                now + 60,
-                &record,
-                &store
-            )),
+        // must not be mistaken for an invalid session. Both arms below pin
+        // the `map_err` normalization: the fake returns something OTHER than
+        // the expected value, so deleting the conversion fails the test.
+        for outcome in [
+            Err(SessionError::Invalid),
             Err(SessionError::Storage {
-                user_id: "user-1".to_string()
+                user_id: "intruder-wrong-user".to_string(),
             }),
-            "store failure must surface Storage with the verified user"
-        );
+        ] {
+            let store = RecordingRevokeStore {
+                outcome,
+                calls: std::cell::RefCell::new(Vec::new()),
+            };
+            assert_eq!(
+                ready(logout_session_atomically(
+                    &keys,
+                    &token,
+                    now + 60,
+                    &record,
+                    &store
+                )),
+                Err(SessionError::Storage {
+                    user_id: "user-1".to_string()
+                }),
+                "store failure must normalize to Storage with the verified user"
+            );
+        }
 
         // An already-revoked row never reaches the store: authentication
         // rejects it first, so a replayed logout grants nothing.
@@ -815,26 +822,33 @@ mod tests {
             );
         }
         // A store failure keeps the verified user for audit (retryable 5xx
-        // without clearing the cookie), never the generic error.
-        let store = RecordingRevokeStore {
-            outcome: Err(SessionError::Storage {
-                user_id: "user-1".to_string(),
-            }),
-            calls: std::cell::RefCell::new(Vec::new()),
-        };
-        assert_eq!(
-            ready(logout_everywhere_atomically(
-                &keys,
-                &token,
-                now + 60,
-                &record,
-                &store
-            )),
+        // without clearing the cookie), never the generic error. Both arms
+        // pin the `map_err` normalization: the fake returns something OTHER
+        // than the expected value, so deleting the conversion fails the test.
+        for outcome in [
+            Err(SessionError::Invalid),
             Err(SessionError::Storage {
-                user_id: "user-1".to_string()
+                user_id: "intruder-wrong-user".to_string(),
             }),
-            "store failure must surface Storage with the verified user"
-        );
+        ] {
+            let store = RecordingRevokeStore {
+                outcome,
+                calls: std::cell::RefCell::new(Vec::new()),
+            };
+            assert_eq!(
+                ready(logout_everywhere_atomically(
+                    &keys,
+                    &token,
+                    now + 60,
+                    &record,
+                    &store
+                )),
+                Err(SessionError::Storage {
+                    user_id: "user-1".to_string()
+                }),
+                "store failure must normalize to Storage with the verified user"
+            );
+        }
 
         // A token for one user presented with another user's row never
         // reaches the store (verify_stored_session binds the pair), so
