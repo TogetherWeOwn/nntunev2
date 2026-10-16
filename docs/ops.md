@@ -267,8 +267,8 @@ this table.
 | `stream` (`workers/stream/wrangler.toml`) | `AUDIO_CACHE` | R2 | `nntunev2-audio-staging` | `nntunev2-audio-prod` | name-bound, no ID |
 | `mb` (`workers/mb/wrangler.toml.example`) | `ART_CACHE` | R2 | `nntunev2-art-staging` | `nntunev2-art-prod` | name-bound, no ID |
 | `mb` | `MB_DB` | Hyperdrive | `nntunev2-mb` (shared mirror) | same | `1c6460d5112448888031973c87f671bc` / `HYPERDRIVE_ID_MB` |
-| `api` (`workers/api/wrangler.toml.example`) | `HYPERDRIVE` | Hyperdrive | `nntunev2-staging` | `nntunev2-prod` | staging `61c87403f119430bbc3a7f571df47002` / `HYPERDRIVE_ID_STAGING`; prod `d38a229748f6452bb417c6d33d277a8d` / `HYPERDRIVE_ID_PROD` |
-| `ingest` (`workers/ingest/wrangler.toml.example`) | `LIBRARY_DB` | Hyperdrive | intended app `nntunev2-staging` | intended app `nntunev2-prod` | same IDs / variables as `api`; owner confirms at activation |
+| `api` (`workers/api/wrangler.toml.example`) | `HYPERDRIVE` | Hyperdrive | `nntunev2-staging` | reserved: do not enable; clean launch DB deferred | staging `61c87403f119430bbc3a7f571df47002` / `HYPERDRIVE_ID_STAGING`; prod `d38a229748f6452bb417c6d33d277a8d` / `HYPERDRIVE_ID_PROD` |
+| `ingest` (`workers/ingest/wrangler.toml.example`) | `LIBRARY_DB` | Hyperdrive | intended app `nntunev2-staging` | reserved: do not enable; clean launch DB deferred | same IDs / variables as `api`; prod must remain disabled until the clean launch DB is ready |
 | `ingest` | `INGEST_QUEUE` (producer) | Queue | `nntunev2-ingest-staging` | `nntunev2-ingest-prod` | staging `c9e6afdea0ca487c8d20f799a052b045`; prod `2bf7e1a0edd347c9aada2afbc0c24ae5` |
 | `mb` / `ingest` (at activation) | `MB_CACHE` / `INGEST_STATE` / `INGEST_PAYLOADS` | KV | reserved `nntunev2-config-staging` | reserved `nntunev2-config-prod` | staging `1d4f21508a214ebfa8ff7b594989d6f6`; prod `9664ceed71464521bb6baae2d9374006`; assigned at activation, never by default |
 
@@ -288,7 +288,8 @@ lane. Complete every box on the exact head being promoted.
   `CONTRIBUTING.md`). A red required check is fixed in code or recorded as
   a flake/quarantine decision with a card link, never dismissed.
 - [ ] Staging deploy evidence: record the successful push-triggered
-  `deploy.yml` run for the promotion SHA and verify staging health. This
+  `deploy.yml` run for the promotion SHA, and require its `staging-web` job
+  conclusion to be `success` (not `skipped`); verify staging health. This
   workflow deploys `apps/web` only; it does not deploy stream, MB, API or
   ingest Workers. The current `/api/health` returns only `{ok:true}`, with no
   build identity, so neither a green deploy run nor a health response proves
@@ -312,7 +313,8 @@ lane. Complete every box on the exact head being promoted.
   of promotion. Staging serves `nntunev2_staging` through its runtime roles;
   the prod binding stays reserved.
 - [ ] Rollback pointer recorded: record the last good staging SHA and its
-  successful push-triggered `deploy.yml` run before promoting. To roll back
+  successful push-triggered `deploy.yml` run, with `staging-web` conclusion
+  `success` (not `skipped`), before promoting. To roll back
   `apps/web`, open that Actions run and choose **Re-run all jobs**; do not use
   `workflow_dispatch` on the old SHA because `staging-web` is push-only and
   will be skipped. Verify the rerun and staging health. This workflow does not
