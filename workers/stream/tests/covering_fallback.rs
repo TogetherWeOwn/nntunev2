@@ -241,6 +241,46 @@ fn wrong_interior_boundary_in_ranges_still_serves() {
 }
 
 #[test]
+fn covering_hint_offset_lie_falls_back_and_serves() {
+    // Only the covering article's offset disagrees with the hint (same
+    // length, same total): hint [(0,10000),(10000,30000),(30000,50000),
+    // (50000,80000)] puts bytes=15000 in segment 1, but that article really
+    // starts at 20000. Verification must reject the hint and the prefix
+    // walk serves the seek instead of failing with `Truncated`.
+    let (plain, segments, server) = fixture_track("a", 80_000, 20_000);
+    let lying = [
+        (0u64, 10_000u64),
+        (10_000, 30_000),
+        (30_000, 50_000),
+        (50_000, 80_000),
+    ];
+    let (status, body, cached) = run(&server, &segments, "bytes=15000-15099", &lying);
+    assert_eq!(status, 206);
+    assert_eq!(body, &plain[15_000..15_100]);
+    assert_eq!(cached, plain);
+}
+
+#[test]
+fn covering_hint_total_lie_with_suffix_range_falls_back_and_serves() {
+    // Only the hint total disagrees (same covering offset and length): hint
+    // total 90000 puts bytes=-45000 at 45000 in segment 2, but the real
+    // 80000-byte track starts that suffix at 35000 in segment 1. The
+    // covering article agrees on offset/length, so only the total check
+    // rejects the hint; the prefix walk then serves the real suffix.
+    let (plain, segments, server) = fixture_track("a", 80_000, 20_000);
+    let lying = [
+        (0u64, 20_000u64),
+        (20_000, 40_000),
+        (40_000, 60_000),
+        (60_000, 90_000),
+    ];
+    let (status, body, cached) = run(&server, &segments, "bytes=-45000", &lying);
+    assert_eq!(status, 206);
+    assert_eq!(body, &plain[35_000..]);
+    assert_eq!(cached, plain);
+}
+
+#[test]
 fn covering_seek_running_to_end_of_track_serves_every_byte() {
     // Open-ended seek from segment 1 of 4: serving advances past the
     // covering segment, which first backfills segment 0 so the covering
