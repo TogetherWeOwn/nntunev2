@@ -12,8 +12,15 @@
 //!   `challenge` constant-time-equals the server-issued challenge,
 //!   `origin` constant-time-equals the configured canonical origin, and
 //!   `crossOrigin` is not true.
-//! - `authenticatorData.rpIdHash == SHA-256(rp_id)` and the user-present
-//!   flag is set.
+//! - `authenticatorData.rpIdHash == SHA-256(rp_id)` and both the
+//!   user-present (UP) and user-verified (UV) flags are set. RP policy:
+//!   user verification is **required**. A passkey is the
+//!   only primary factor and login is usernameless, so a presence-only tap
+//!   would make a found or stolen roaming key a complete login. The web
+//!   client requests `userVerification: "required"` to match; authenticators
+//!   that cannot verify the user (no PIN/biometric) are refused. The BE/BS
+//!   (backup eligible/state) bits are deliberately not recorded: nothing in
+//!   the product branches on synced-vs-device-bound credentials yet.
 //! - Sign-count clone detection: a nonzero presented counter must be
 //!   strictly greater than the stored counter.
 //!
@@ -27,6 +34,10 @@ use subtle::ConstantTimeEq;
 
 /// Max attestation/authenticator payload accepted (bounds CBOR work).
 const MAX_INPUT_BYTES: usize = 16 * 1024;
+/// authenticatorData flag bits (WebAuthn §6.1).
+const FLAG_USER_PRESENT: u8 = 0x01;
+const FLAG_USER_VERIFIED: u8 = 0x04;
+const FLAG_ATTESTED_CREDENTIAL_DATA: u8 = 0x40;
 /// Max CBOR nesting depth accepted.
 const MAX_CBOR_DEPTH: usize = 8;
 
@@ -370,9 +381,10 @@ fn parse_auth_data(
         return Err(WebAuthnError::Invalid);
     }
     let flags = bytes[32];
-    let user_present = flags & 0x01 != 0;
-    let has_attested = flags & 0x40 != 0;
-    if !user_present || has_attested != attested {
+    let user_present = flags & FLAG_USER_PRESENT != 0;
+    let user_verified = flags & FLAG_USER_VERIFIED != 0;
+    let has_attested = flags & FLAG_ATTESTED_CREDENTIAL_DATA != 0;
+    if !user_present || !user_verified || has_attested != attested {
         return Err(WebAuthnError::Invalid);
     }
     let sign_count = u32::from_be_bytes([bytes[33], bytes[34], bytes[35], bytes[36]]);
@@ -634,7 +646,7 @@ mod tests {
     #[test]
     fn attestation_none_registers_es256_credential() {
         let (_sk, cose) = es256_keypair();
-        let auth = auth_data(0x41, 3, Some((b"cred-1", &cose)));
+        let auth = auth_data(0x45, 3, Some((b"cred-1", &cose)));
         let obj = attestation("none", &auth, empty_map());
         let cred = verify_attestation(
             &obj,
@@ -650,7 +662,7 @@ mod tests {
     #[test]
     fn attestation_packed_self_verifies_signature() {
         let (sk, cose) = es256_keypair();
-        let auth = auth_data(0x41, 0, Some((b"cred-2", &cose)));
+        let auth = auth_data(0x45, 0, Some((b"cred-2", &cose)));
         let cd = client_data("webauthn.create", CHALLENGE, ORIGIN);
         let sig: EsSignature = sk.sign(&signed_message(&auth, &cd));
         let mut stmt = Vec::new();
@@ -666,7 +678,7 @@ mod tests {
     #[test]
     fn attestation_packed_with_x5c_is_rejected() {
         let (sk, cose) = es256_keypair();
-        let auth = auth_data(0x41, 0, Some((b"cred-3", &cose)));
+        let auth = auth_data(0x45, 0, Some((b"cred-3", &cose)));
         let cd = client_data("webauthn.create", CHALLENGE, ORIGIN);
         let sig: EsSignature = sk.sign(&signed_message(&auth, &cd));
         let mut stmt = Vec::new();
@@ -685,7 +697,7 @@ mod tests {
     #[test]
     fn attestation_rejects_wrong_challenge_origin_and_type() {
         let (_sk, cose) = es256_keypair();
-        let auth = auth_data(0x41, 0, Some((b"cred-4", &cose)));
+        let auth = auth_data(0x45, 0, Some((b"cred-4", &cose)));
         let obj = attestation("none", &auth, empty_map());
         assert!(verify_attestation(
             &obj,
@@ -710,7 +722,7 @@ mod tests {
     #[test]
     fn assertion_verifies_and_advances_count() {
         let (sk, cose) = es256_keypair();
-        let auth = auth_data(0x01, 41, None);
+        let auth = auth_data(0x05, 41, None);
         let cd = client_data("webauthn.get", CHALLENGE, ORIGIN);
         let sig: EsSignature = sk.sign(&signed_message(&auth, &cd));
         let new_count =
@@ -721,7 +733,7 @@ mod tests {
     #[test]
     fn assertion_rejects_replayed_counter_and_bad_signature() {
         let (sk, cose) = es256_keypair();
-        let auth = auth_data(0x01, 41, None);
+        let auth = auth_data(0x05, 41, None);
         let cd = client_data("webauthn.get", CHALLENGE, ORIGIN);
         let sig: EsSignature = sk.sign(&signed_message(&auth, &cd));
         let der = sig.to_der();
@@ -733,7 +745,7 @@ mod tests {
         bad[last] ^= 0x01;
         assert!(verify_assertion(&cose, 40, &auth, &cd, &bad, &expect()).is_err());
         // Counterless authenticator (0/0) is allowed.
-        let auth0 = auth_data(0x01, 0, None);
+        let auth0 = auth_data(0x05, 0, None);
         let sig0: EsSignature = sk.sign(&signed_message(&auth0, &cd));
         assert_eq!(
             verify_assertion(&cose, 0, &auth0, &cd, sig0.to_der().as_bytes(), &expect()).unwrap(),
@@ -751,14 +763,64 @@ mod tests {
         assert!(
             verify_assertion(&cose, 0, &auth, &cd, sig.to_der().as_bytes(), &expect()).is_err()
         );
+        // UV without UP is still not a presence-checked ceremony.
+        let auth = auth_data(0x04, 5, None);
+        let sig: EsSignature = sk.sign(&signed_message(&auth, &cd));
+        assert!(
+            verify_assertion(&cose, 0, &auth, &cd, sig.to_der().as_bytes(), &expect()).is_err()
+        );
         // Signed for a different RP.
         let mut auth = Vec::new();
         auth.extend_from_slice(&Sha256::digest(b"other.example.com"));
-        auth.push(0x01);
+        auth.push(0x05);
         auth.extend_from_slice(&5u32.to_be_bytes());
         let sig: EsSignature = sk.sign(&signed_message(&auth, &cd));
         assert!(
             verify_assertion(&cose, 0, &auth, &cd, sig.to_der().as_bytes(), &expect()).is_err()
+        );
+    }
+
+    /// RP policy: user verification is required. The
+    /// passkey is the only primary factor and login is usernameless, so a
+    /// presence-only tap (UP=1, UV=0) must never authenticate: a found or
+    /// stolen roaming key would otherwise be a complete login.
+    #[test]
+    fn assertion_requires_user_verification() {
+        let (sk, cose) = es256_keypair();
+        let cd = client_data("webauthn.get", CHALLENGE, ORIGIN);
+        // Presence-only (UP) with a valid signature and counter: rejected.
+        let up_only = auth_data(0x01, 41, None);
+        let sig: EsSignature = sk.sign(&signed_message(&up_only, &cd));
+        assert_eq!(
+            verify_assertion(&cose, 40, &up_only, &cd, sig.to_der().as_bytes(), &expect()),
+            Err(WebAuthnError::Invalid)
+        );
+        // The identical ceremony with UP|UV verifies (the only delta is UV).
+        let up_uv = auth_data(0x05, 41, None);
+        let sig: EsSignature = sk.sign(&signed_message(&up_uv, &cd));
+        assert_eq!(
+            verify_assertion(&cose, 40, &up_uv, &cd, sig.to_der().as_bytes(), &expect()),
+            Ok(41)
+        );
+    }
+
+    #[test]
+    fn attestation_requires_user_verification() {
+        let (_sk, cose) = es256_keypair();
+        let cd = client_data("webauthn.create", CHALLENGE, ORIGIN);
+        // AT|UP without UV: a credential created by a presence-only tap
+        // is refused at enrollment, so it can never exist to be asserted.
+        let up_only = auth_data(0x41, 0, Some((b"cred-uv-0", &cose)));
+        let obj = attestation("none", &up_only, empty_map());
+        assert_eq!(
+            verify_attestation(&obj, &cd, &expect()).map(|c| c.cred_id),
+            Err(WebAuthnError::Invalid)
+        );
+        let up_uv = auth_data(0x45, 0, Some((b"cred-uv-1", &cose)));
+        let obj = attestation("none", &up_uv, empty_map());
+        assert_eq!(
+            verify_attestation(&obj, &cd, &expect()).map(|c| c.cred_id),
+            Ok(b"cred-uv-1".to_vec())
         );
     }
 
@@ -777,7 +839,7 @@ mod tests {
         enc_int(6, &mut cose);
         enc_int(-2, &mut cose);
         enc_bytes(vk.as_bytes(), &mut cose);
-        let auth = auth_data(0x01, 1, None);
+        let auth = auth_data(0x05, 1, None);
         let cd = client_data("webauthn.get", CHALLENGE, ORIGIN);
         let sig = signing.sign(&signed_message(&auth, &cd));
         assert_eq!(

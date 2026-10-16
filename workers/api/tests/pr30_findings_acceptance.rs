@@ -851,7 +851,7 @@ fn register_flow(
 
     let key = test_signing_key(key_seed);
     let cred_id = format!("synthetic-cred-{key_seed}-{email}").into_bytes();
-    let auth_data = authenticator_data(RP, 0x41, 0, Some((&cred_id, &es256_cose(&key))));
+    let auth_data = authenticator_data(RP, 0x45, 0, Some((&cred_id, &es256_cose(&key))));
     let client_data = client_json("webauthn.create", &challenge, ORIGIN);
     let response = harness.call(
         "POST",
@@ -887,7 +887,7 @@ fn login_flow(
     let challenge = start["challenge"].as_str().expect("challenge").to_string();
 
     let key = test_signing_key(key_seed);
-    let auth_data = authenticator_data(RP, 0x01, sign_count, None);
+    let auth_data = authenticator_data(RP, 0x05, sign_count, None);
     let client_data = client_json("webauthn.get", &challenge, ORIGIN);
     let signature = es256_sign(&key, &auth_data, &client_data);
     let response = harness.call(
@@ -1158,7 +1158,7 @@ fn invite_budget_denies_eleventh_attempt_with_generic_error() {
     let challenge = start["challenge"].as_str().expect("challenge").to_string();
     let key = test_signing_key(12);
     let cred_id = b"throttled-cred".to_vec();
-    let auth_data = authenticator_data(RP, 0x41, 0, Some((&cred_id, &es256_cose(&key))));
+    let auth_data = authenticator_data(RP, 0x45, 0, Some((&cred_id, &es256_cose(&key))));
     let client_data = client_json("webauthn.create", &challenge, ORIGIN);
     let response = harness.call(
         "POST",
@@ -1322,7 +1322,7 @@ fn register_finish_rejects_login_purpose_challenge() {
 
     let key = test_signing_key(21);
     let cred_id = b"attacker-cred".to_vec();
-    let auth_data = authenticator_data(RP, 0x41, 0, Some((&cred_id, &es256_cose(&key))));
+    let auth_data = authenticator_data(RP, 0x45, 0, Some((&cred_id, &es256_cose(&key))));
     let client_data = client_json("webauthn.create", &login_challenge, ORIGIN);
     let response = harness.call(
         "POST",
@@ -1372,7 +1372,7 @@ fn login_finish_rejects_register_purpose_challenge() {
     .expect("rogue challenge stored");
 
     let key = test_signing_key(22);
-    let auth_data = authenticator_data(RP, 0x01, 1, None);
+    let auth_data = authenticator_data(RP, 0x05, 1, None);
     let client_data = client_json("webauthn.get", &rogue_id, ORIGIN);
     let signature = es256_sign(&key, &auth_data, &client_data);
     let response = harness.call(
@@ -1417,7 +1417,7 @@ fn register_finish_without_inbox_proof_enrolls_nothing() {
 
     let key = test_signing_key(23);
     let cred_id = b"fresh-cred".to_vec();
-    let auth_data = authenticator_data(RP, 0x41, 0, Some((&cred_id, &es256_cose(&key))));
+    let auth_data = authenticator_data(RP, 0x45, 0, Some((&cred_id, &es256_cose(&key))));
     let client_data = client_json("webauthn.create", &challenge, ORIGIN);
     let response = harness.call(
         "POST",
@@ -1578,7 +1578,7 @@ fn register_finish_rejects_replayed_challenge() {
 
     let key = test_signing_key(25);
     let cred_id = b"double-cred".to_vec();
-    let auth_data = authenticator_data(RP, 0x41, 0, Some((&cred_id, &es256_cose(&key))));
+    let auth_data = authenticator_data(RP, 0x45, 0, Some((&cred_id, &es256_cose(&key))));
     let client_data = client_json("webauthn.create", &challenge, ORIGIN);
     let finish = serde_json::json!({
         "challenge": challenge,
@@ -1615,7 +1615,7 @@ fn login_finish_rejects_replayed_assertion_clone() {
     let body: serde_json::Value = serde_json::from_str(&start.body).expect("JSON");
     let challenge = body["challenge"].as_str().expect("challenge").to_string();
     let key = test_signing_key(26);
-    let auth_data = authenticator_data(RP, 0x01, 1, None);
+    let auth_data = authenticator_data(RP, 0x05, 1, None);
     let client_data = client_json("webauthn.get", &challenge, ORIGIN);
     let signature = es256_sign(&key, &auth_data, &client_data);
     let replay = harness.call(
@@ -1802,7 +1802,7 @@ fn fixture_registration(key_seed: u8) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let key = test_signing_key(key_seed);
     let cred_id = format!("fixture-cred-{key_seed}").into_bytes();
     let cose = es256_cose(&key);
-    let auth_data = authenticator_data(RP, 0x41, 0, Some((&cred_id, &cose)));
+    let auth_data = authenticator_data(RP, 0x45, 0, Some((&cred_id, &cose)));
     (cred_id, cose, auth_data)
 }
 
@@ -1974,7 +1974,7 @@ fn attestation_rejects_oversized_and_truncated_inputs() {
 
     // Empty credential id is rejected.
     let empty_cred =
-        authenticator_data(RP, 0x41, 0, Some((&[], &es256_cose(&test_signing_key(36)))));
+        authenticator_data(RP, 0x45, 0, Some((&[], &es256_cose(&test_signing_key(36)))));
     let empty_object = none_attestation(&empty_cred);
     assert_eq!(
         webauthn::verify_attestation(&empty_object, &client_data, &expect),
@@ -1990,7 +1990,7 @@ fn assertion_enforces_clone_detection_and_counterless() {
     let expect = ceremony_expect(FIXTURE_CHALLENGE);
 
     let assert_with = |stored: u32, presented: u32| {
-        let auth_data = authenticator_data(RP, 0x01, presented, None);
+        let auth_data = authenticator_data(RP, 0x05, presented, None);
         let client_data = client_json("webauthn.get", FIXTURE_CHALLENGE, ORIGIN);
         let signature = es256_sign(&key, &auth_data, &client_data);
         webauthn::verify_assertion(&cose, stored, &auth_data, &client_data, &signature, &expect)
@@ -2012,7 +2012,7 @@ fn assertion_enforces_clone_detection_and_counterless() {
     );
 
     // Wrong challenge never verifies, even with a valid signature shape.
-    let auth_data = authenticator_data(RP, 0x01, 2, None);
+    let auth_data = authenticator_data(RP, 0x05, 2, None);
     let bad_client = client_json("webauthn.get", "another-challenge", ORIGIN);
     let signature = es256_sign(&key, &auth_data, &bad_client);
     assert_eq!(

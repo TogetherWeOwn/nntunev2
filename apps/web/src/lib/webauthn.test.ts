@@ -61,7 +61,8 @@ describe('WebAuthn options', () => {
 		expect(options.excludeCredentials?.[0]?.transports).toEqual(['internal']);
 		expect(options.authenticatorSelection).toEqual({
 			residentKey: 'required',
-			requireResidentKey: true
+			requireResidentKey: true,
+			userVerification: 'required'
 		});
 		expect(options.timeout).toBe(60_000);
 	});
@@ -111,8 +112,30 @@ describe('WebAuthn options', () => {
 		expect(Array.from(new Uint8Array(browser.user.id as ArrayBuffer))).toEqual([4, 5, 6]);
 		expect(browser.authenticatorSelection).toEqual({
 			residentKey: 'required',
-			requireResidentKey: true
+			requireResidentKey: true,
+			userVerification: 'required'
 		});
+		expect(options.authenticatorSelection?.userVerification).toBe('required');
+	});
+
+	it('forces user verification on login even if the options ask for less', () => {
+		// RP policy: the Worker rejects assertions without the UV flag, so
+		// the browser must be asked for UV (PIN/biometric) up front.
+		expect(toRequestOptions({ challenge: 'AQID', rpId: 'example.com' }).userVerification).toBe(
+			'required'
+		);
+		expect(
+			toRequestOptions({ challenge: 'AQID', userVerification: 'discouraged' }).userVerification
+		).toBe('required');
+		expect(
+			toCreationOptions({
+				challenge: 'AQID',
+				rp: { name: 'NNTune', id: 'example.com' },
+				user: { id: 'BAUG', name: 'a', displayName: 'a' },
+				pubKeyCredParams: [{ alg: -7, type: 'public-key' }],
+				authenticatorSelection: { userVerification: 'discouraged' }
+			}).authenticatorSelection?.userVerification
+		).toBe('required');
 	});
 });
 

@@ -1054,10 +1054,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         dialer: &SocketDialer,
         dns: &DohDns,
         now: worker::Date::now().as_millis() / 1000,
-        source_ip: headers_map
-            .get("cf-connecting-ip")
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string()),
+        source_ip: client_source_ip(&headers_map),
     };
     let response = handlers::handle(&ctx, &request).await;
     // Exact match only: the configured origin is the one frontend origin
@@ -1072,9 +1069,39 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     render(&response, &cors)
 }
 
+/// Client address for audit rows and rate-limit keys. Header data is not
+/// trusted: only a canonical IP literal survives, else `unknown`
+/// (`vault::sanitize_source_ip`). `headers` keys are lowercased.
+fn client_source_ip(headers: &HashMap<String, String>) -> String {
+    crate::vault::sanitize_source_ip(headers.get("cf-connecting-ip").map(String::as_str))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_source_ip_takes_only_a_clean_cf_connecting_ip() {
+        let headers = |value: Option<&str>| -> HashMap<String, String> {
+            value
+                .map(|v| ("cf-connecting-ip".to_string(), v.to_string()))
+                .into_iter()
+                .collect()
+        };
+        assert_eq!(
+            client_source_ip(&headers(Some("203.0.113.7"))),
+            "203.0.113.7"
+        );
+        assert_eq!(client_source_ip(&headers(None)), "unknown");
+        assert_eq!(
+            client_source_ip(&headers(Some("203.0.113.7\nINJECTED"))),
+            "unknown"
+        );
+        // Only the Cloudflare-set header counts, never a client-forgeable one.
+        let mut forged = HashMap::new();
+        forged.insert("x-forwarded-for".to_string(), "203.0.113.7".to_string());
+        assert_eq!(client_source_ip(&forged), "unknown");
+    }
 
     fn previous_43() -> String {
         // 32 bytes as unpadded base64url (43 chars), like the template.

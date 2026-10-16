@@ -23,8 +23,11 @@ workers/api/
 ```
 
 `migrations/0002_auth_vault.sql` plus `0003` (library), `0004` (challenge
-purpose) and `0005` (atomic rate-limit slots and test leases) define the
-Postgres schema (PlanetScale via Hyperdrive). All queries are parameterized;
+purpose), `0005` (atomic rate-limit slots and test leases) and `0006`
+(database-enforced challenge purpose: CHECK plus an immutability trigger)
+define the Postgres schema (PlanetScale via Hyperdrive). CI applies every
+migration to a throwaway Postgres and runs `tests/sql/*.sql` against it
+(`tests/run_migration_tests.sh`). All queries are parameterized;
 single-use claims execute the conditional `UPDATE ... RETURNING` prepared by
 the core and require exactly one row before any response.
 
@@ -144,7 +147,25 @@ config from secrets) is a follow-up slice.
   (attestation `none`/packed-self, assertion ES256/EdDSA, RP-hash and
   exact origin/challenge pinning, monotonic `sign_count` clone
   detection) must finish before authentication. The handlers enforce
-  both, in that order, on every ceremony.
+  both, in that order, on every ceremony. RP policy: **user verification
+  is required** (authenticatorData UV flag, plus `userVerification:
+  "required"` requested by the web client) because the passkey is the only
+  primary factor and login is usernameless; a presence-only tap never
+  authenticates, and authenticators without PIN/biometric are refused.
+  The enrollment `sign_count` in a (unauthenticated) `none` attestation is
+  never stored: new credentials start at 0 and the first signed assertion
+  sets the baseline. Backup-eligibility (BE/BS) bits are not recorded:
+  nothing branches on synced-vs-device-bound credentials yet.
+- **Audit `source_ip`:** taken from `cf-connecting-ip` only if it parses as
+  one IP literal (stored in canonical form); anything else, or a missing
+  header, becomes `unknown` (`vault::sanitize_source_ip`, applied at
+  capture and again in `audit_event`), so audit rows and rate-limit keys
+  never carry control characters or markup.
+- **Dependencies:** `Cargo.lock` is committed. CI builds and tests with
+  `--locked`, and the Wrangler build command passes `--locked` through
+  `worker-build`, so deploys resolve the audited dependency set; crypto
+  crates stay caret ranges in `Cargo.toml` and move only via a reviewed
+  lockfile change (Dependabot).
 - **Library (genres/playlists):** missing caller is 401 before any
   existence check; callers see own + public rows only, invisible ids are
   404 (no oracle), visible-but-foreign mutations are 403. Responses carry

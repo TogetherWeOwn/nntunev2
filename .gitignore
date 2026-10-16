@@ -6,6 +6,9 @@
 /workers/ingest/target/
 **/*.rs.bk
 Cargo.lock
+# The API Worker deploys auth/vault crypto: its lockfile is committed so CI
+# and deploys resolve the exact audited dependency set (built with --locked).
+!/workers/api/Cargo.lock
 .cargo/
 
 # Rust wasm / workers

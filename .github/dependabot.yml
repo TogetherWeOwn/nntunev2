@@ -17,10 +17,12 @@
 # entry. npm watches the SvelteKit app (`apps/web`) and the e2e harness
 # (`e2e`), not a top-level `web/`.
 #
-# Lockfiles: the repo ignores `Cargo.lock` (see root `.gitignore`), so the
-# cargo entries update direct dependencies without transitive visibility.
-# Committing lockfiles for the worker crates would close that gap; that is
-# a scaffold-wide decision for the owning card, not this security PR.
+# Lockfiles: the repo ignores `Cargo.lock` (see root `.gitignore`) except
+# `workers/api/Cargo.lock`, which is committed (auth/vault crypto) and built
+# with `--locked`, so the `/workers/api` entry sees transitive dependencies
+# and its updates are reviewed lockfile changes. The other cargo entries
+# still update direct dependencies without transitive visibility; committing
+# their lockfiles is a scaffold-wide decision for the owning card.
 #
 # First Dependabot PR: confirm the required checks (`ci-ok`, `gitleaks`,
 # `pr-lint`, Paperclip Review) all appear on it before relying on them —

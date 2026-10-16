@@ -5,7 +5,9 @@ main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
 
 [build]
-command = "cargo install -q worker-build --locked && worker-build --release"
+# `--locked` (after `--`, forwarded to `cargo build`) builds exactly the
+# committed, audited workers/api/Cargo.lock and fails if it is stale.
+command = "cargo install -q worker-build --locked && worker-build --release -- --locked"
 
 [vars]
 # Public, non-secret config only. RP_ORIGIN must be the canonical
