@@ -125,9 +125,10 @@ fn no_bare_art_bucket_reference_remains() {
                 let rest = &line[start + bare.len()..];
                 let is_exact_allowed_bucket = ["-staging", "-prod"].iter().any(|suffix| {
                     rest.strip_prefix(suffix).is_some_and(|remaining| {
-                        remaining.chars().next().is_none_or(|ch| {
-                            !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-'
-                        })
+                        remaining
+                            .chars()
+                            .next()
+                            .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
                     })
                 });
                 if !is_exact_allowed_bucket {
