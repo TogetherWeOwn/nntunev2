@@ -344,6 +344,9 @@ pub fn rotate_session(
     now: u64,
     ttl_secs: u64,
 ) -> Result<String, SessionError> {
+    if ttl_secs == 0 {
+        return Err(SessionError::Invalid);
+    }
     // Dual path: a pre-cutover token verifies here and is re-signed below
     // with the primary, so rotation migrates sessions onto the new secret.
     let claims = verify_session_dual(keys, token, now)?;
@@ -799,6 +802,11 @@ mod tests {
             reauthenticate_session(&keys, &old_token, now + 60, &old_record, 0).unwrap_err(),
             SessionError::Invalid,
             "reauthentication must not return a dead replacement or slate the live row for revoke"
+        );
+        assert_eq!(
+            rotate_session(&keys, &old_token, now + 60, 0).unwrap_err(),
+            SessionError::Invalid,
+            "rotation must not return a dead token for a caller to persist"
         );
         assert_eq!(
             issue_session(secret, "user-1", now, 0).unwrap_err(),
