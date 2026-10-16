@@ -411,10 +411,11 @@ impl Live {
 
     fn load_next(&mut self) -> Result<(), Failure> {
         let mid = self.segments[self.next_seg].clone();
+        let fetch_epoch = self.provider_error_epoch.load(Ordering::Acquire);
         match fetch_segment(&mut self.client, &mid) {
             Ok(decoded) => {
                 self.ingest(decoded)?;
-                self.last_success_epoch = Some(self.provider_error_epoch.load(Ordering::Acquire));
+                self.last_success_epoch = Some(fetch_epoch);
                 Ok(())
             }
             Err(SegmentError::Nntp(e)) => Err(nntp_failure(e, &mid)),
