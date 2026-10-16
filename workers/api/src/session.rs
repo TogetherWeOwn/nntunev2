@@ -224,6 +224,9 @@ pub fn issue_session(
     now: u64,
     ttl_secs: u64,
 ) -> Result<String, SessionError> {
+    if ttl_secs == 0 {
+        return Err(SessionError::Invalid);
+    }
     let claims = SessionClaims {
         session_id: new_session_id(),
         user_id: user_id.to_string(),
@@ -425,6 +428,9 @@ pub fn reauthenticate_session(
     old_record: &SessionRecord,
     ttl_secs: u64,
 ) -> Result<ReauthenticatedSession, SessionError> {
+    if ttl_secs == 0 {
+        return Err(SessionError::Invalid);
+    }
     let old_claims = verify_stored_session(keys, old_token, now, old_record)
         .map_err(|_| SessionError::Invalid)?;
     let next = SessionClaims {
@@ -779,6 +785,25 @@ mod tests {
         );
         assert!(
             require_fresh_session(&keys, &reauthed.token, reauth_at, &reauthed.new_record).is_ok()
+        );
+    }
+
+    #[test]
+    fn session_issuers_reject_zero_ttl() {
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let keys = SessionKeys::single(secret);
+        let now = 1_700_000_000u64;
+        let old_token = issue_session(secret, "user-1", now, 3600).expect("issue");
+        let old_record = record_for(&verify_session(secret, &old_token, now).expect("verify"));
+        assert_eq!(
+            reauthenticate_session(&keys, &old_token, now + 60, &old_record, 0).unwrap_err(),
+            SessionError::Invalid,
+            "reauthentication must not return a dead replacement or slate the live row for revoke"
+        );
+        assert_eq!(
+            issue_session(secret, "user-1", now, 0).unwrap_err(),
+            SessionError::Invalid,
+            "initial issuance must not mint a token that is invalid immediately"
         );
     }
 
