@@ -42,8 +42,33 @@ mod tests {
     #[test]
     fn quarantined_pool_does_not_prefetch() {
         let mut pool = Pool::<()>::new(4);
-        pool.record_provider_error();
+        for _ in 0..crate::pool::CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
         assert!(!should_prefetch(&pool));
+    }
+
+    #[test]
+    fn prefetch_cannot_consume_the_half_open_probe() {
+        use crate::pool::{CircuitState, CIRCUIT_OPEN_MS, HALF_OPEN_PROBE_RETRY_MS};
+
+        let mut pool = Pool::<()>::new(4);
+        for _ in 0..crate::pool::CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        pool.advance(CIRCUIT_OPEN_MS);
+
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+        assert!(!should_prefetch(&pool));
+        assert_eq!(
+            pool.try_acquire(Lane::Prefetch)
+                .expect_err("prefetch cannot take the recovery probe"),
+            crate::pool::PoolError::Quarantined {
+                retry_after_ms: HALF_OPEN_PROBE_RETRY_MS
+            }
+        );
+        pool.try_acquire(Lane::Playback)
+            .expect("playback retains the recovery probe");
     }
 
     #[test]
