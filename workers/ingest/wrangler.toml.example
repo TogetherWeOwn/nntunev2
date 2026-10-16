@@ -41,9 +41,14 @@ queue = "nntune-ingest-dlq"
 # KV lag plus the edge-cached negative-lookup window (consumer reads with
 # cacheTtl 30).
 # max_retries = 4
-# The native dead-letter route is a safety net for messages the handler never
-# settles (panic, timeout): Cloudflare moves the untouched body with no reason
-# envelope. Both shapes redrive via src/retry.rs (`redrive` for DlqEntry,
+# On DLQ-send failure, the handler must call retry_with_options with a delay
+# (or return an error) for that message; merely skipping ack() and returning
+# implicitly acknowledges it. Each retry spends one of these four native
+# max_retries slots, after which Cloudflare moves the raw body to the configured
+# dead-letter queue; without dead_letter_queue, Cloudflare drops the message.
+# It is a safety net for messages the handler never settles
+# (panic, timeout): Cloudflare moves the untouched body with no reason envelope.
+# Both shapes redrive via src/retry.rs (`redrive` for DlqEntry,
 # `redrive_raw` for native bodies) after loading a matching Failed checkpoint;
 # see README "Redrive" for raw bodies whose checkpoint is nonterminal.
 # dead_letter_queue = "nntune-ingest-dlq"

@@ -96,9 +96,12 @@ KV reads in `GET /v1/ingest/jobs/:id`, and the repair Container runtime.
   `retry_with_options`. Backoff is derived from the payload-fetch schedule.
   The consumer settles **per message**, so one poison job costs retries but
   does not head-of-line block valid jobs. Permanent failures skip the budget
-  and quarantine at once; quarantine marks the checkpoint Failed before ack. If a DLQ send fails,
-  the consumer must not ack; redelivery of the Failed checkpoint retries the
-  send. A successful send followed by an ack failure may create a duplicate DLQ
+  and quarantine at once; quarantine marks the checkpoint Failed before ack. If a DLQ send fails, the consumer must call `retry_with_options` with a delay
+  (or return an error) for that message; merely skipping `ack()` and returning
+  implicitly acknowledges it. Each retry also spends one of the four native
+  `max_retries` slots, after which Cloudflare moves the raw body to its native
+  DLQ if `dead_letter_queue` is configured; otherwise Cloudflare drops it. A
+  successful send followed by an ack failure may create a duplicate DLQ
   entry, so DLQ processing must be idempotent by `job_id`.
 - DLQ quarantine: on exhaustion the consumer sends one `DlqEntry` to
   `nntune-ingest-dlq` (`INGEST_DLQ` binding) — the original `QueueMsg` plus

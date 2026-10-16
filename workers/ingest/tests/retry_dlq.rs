@@ -106,9 +106,9 @@ fn quarantine_redacts_and_bounds_untrusted_error_details() {
     };
     assert!(!entry.reason.contains("secret"));
     assert!(entry.reason.chars().count() <= MAX_DLQ_DETAIL_CHARS + 64);
-    assert!(
-        checkpoint.failure_reason.as_ref().unwrap().chars().count() <= MAX_DLQ_DETAIL_CHARS + 1
-    );
+    let failure_reason = checkpoint.failure_reason.as_ref().unwrap();
+    assert!(failure_reason.chars().count() <= MAX_DLQ_DETAIL_CHARS + 1);
+    assert!(!failure_reason.contains("secret"));
 }
 
 #[test]
