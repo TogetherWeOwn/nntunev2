@@ -21,6 +21,13 @@
 
 	const LIBRARY_REQUEST_TIMEOUT_MS = 10_000;
 
+	// e2e contract hooks (e2e/helpers/contract.ts TESTIDS) owned by sibling
+	// slices: usage metering, plan-limit enforcement and the player land with
+	// the venture slices that own them. Placeholders below keep the hooks
+	// rendered until then.
+	const overLimit = false;
+	const currentTrack: { id: string; title: string } | null = null;
+
 	function displayTitle(track: LibraryItem): string {
 		const title = track.title;
 		if (typeof title === 'string' && title.trim().length > 0) return title;
@@ -153,5 +160,28 @@
 		<button class="nt-button nt-button--ghost" type="button" onclick={() => void refresh()}>
 			{staleAt ? 'Retry' : 'Refresh'}
 		</button>
+	{/if}
+
+	<!-- Contract placeholders from main: usage-meter deliberately carries no
+		role so the offline/timeout specs' zero-status assertions still hold;
+		the smoke contract pins it by testid. -->
+	<section aria-label="Usage">
+		<h2>Usage</h2>
+		<p data-testid="usage-meter">
+			Usage metering lands with the usage-meter slice — no streamed bytes recorded yet.
+		</p>
+	</section>
+
+	{#if overLimit}
+		<p data-testid="plan-limit-notice" role="alert">
+			You are over your plan limit — streaming is paused until the next cycle or an upgrade.
+		</p>
+	{/if}
+
+	{#if currentTrack}
+		<section aria-label="Player">
+			<h2>Now playing</h2>
+			<audio data-testid="audio-player" controls src=""></audio>
+		</section>
 	{/if}
 </main>

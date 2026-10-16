@@ -44,7 +44,7 @@
 			clearSnapshot(window.localStorage);
 			broadcastAuthTransition(window.localStorage);
 			status = 'created';
-			window.location.href = '/onboarding/provider';
+			window.location.href = '/onboarding/byop';
 		} catch {
 			// Generic: account creation never says which step failed.
 			status = 'error';
@@ -67,6 +67,7 @@
 		<label>
 			Email
 			<input
+				data-testid="signup-email"
 				type="email"
 				name="email"
 				required
@@ -75,7 +76,7 @@
 				disabled={status === 'working'}
 			/>
 		</label>
-		<button class="nt-button" type="submit" disabled={status === 'working'}>
+		<button data-testid="signup-submit" class="nt-button" type="submit" disabled={status === 'working'}>
 			{status === 'working' ? 'Creating…' : 'Create account with passkey'}
 		</button>
 	</form>
@@ -85,7 +86,7 @@
 			instead.
 		</p>
 	{:else if status === 'error'}
-		<p role="alert">Something went wrong. Try again.</p>
+		<p data-testid="signup-error" role="alert">Something went wrong. Try again.</p>
 	{:else if status === 'created'}
 		<p role="status">Account created — taking you to provider setup…</p>
 	{/if}
