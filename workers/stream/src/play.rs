@@ -2039,6 +2039,7 @@ mod tests {
             cipher_key: 0,
             now_unix: stale_now,
             up_next: None,
+            segment_ranges: None,
         };
         let mut response = play(&mut pool, &mut cache, &mut meter, secret, &input).unwrap();
         assert!(response.cache_hit, "stale is still served from cache");
