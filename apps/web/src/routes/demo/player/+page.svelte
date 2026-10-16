@@ -119,7 +119,17 @@
 
 	<!-- Artwork reuse: the shared Artwork component's placeholder fallback
 	     renders for the current track when its art is missing (track 1). -->
-	<Artwork src={current?.artworkUrl ?? null} alt={current ? `${current.title} artwork` : 'Track artwork'} />
+	<div data-testid="current-artwork">
+		<Artwork src={current?.artworkUrl ?? null} alt={current ? `${current.title} artwork` : 'Track artwork'} />
+	</div>
+	<!-- Missing R2 art (null) must render the placeholder with alt text. -->
+	<div data-testid="null-artwork">
+		<Artwork src={null} alt="Demo track artwork" />
+	</div>
+	<!-- A URL that 404s must swap to the placeholder after the image error. -->
+	<div data-testid="broken-artwork">
+		<Artwork src="/api/demo/missing-artwork.jpg" alt="Broken demo artwork" />
+	</div>
 
 	<p data-testid="now-playing">
 		{#if current}

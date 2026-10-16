@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ARTWORK_PLACEHOLDER_SRC, resolveArtwork } from './artwork.js';
+	import { ARTWORK_PLACEHOLDER_SRC, nextArtworkSrcAfterError, resolveArtwork } from './artwork.js';
 
 	interface Props {
 		src?: string | null;
@@ -16,23 +16,21 @@
 	}: Props = $props();
 
 	let resolved = $derived(resolveArtwork(src, { fallbackSrc, alt }));
+	let failedSrc = $state<string | null>(null);
+	let shownSrc = $derived(failedSrc === resolved.src ? fallbackSrc : resolved.src);
 
-	function handleError(event: Event): void {
-		const img = event.currentTarget as HTMLImageElement;
-		if (img.dataset['fallback'] === 'true' || img.onerror === null) return;
-		// Swap to the placeholder exactly once; then stop so a missing
-		// placeholder can never loop or leave a broken-image icon.
-		img.dataset['fallback'] = 'true';
-		img.onerror = null;
-		img.src = fallbackSrc;
+	function handleError(): void {
+		// Stops once the placeholder itself fails: no loop, no broken-image state.
+		if (nextArtworkSrcAfterError(shownSrc, fallbackSrc) === null) return;
+		failedSrc = resolved.src;
 	}
 </script>
 
 <img
-	src={resolved.src}
+	src={shownSrc}
 	alt={resolved.alt}
 	class={className}
-	data-fallback={resolved.isFallback ? 'true' : 'false'}
+	data-fallback={shownSrc === fallbackSrc ? 'true' : 'false'}
 	data-testid="track-artwork"
 	onerror={handleError}
 />

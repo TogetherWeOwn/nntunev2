@@ -31,12 +31,21 @@ test('audio is private-cached and artwork is public-immutable', async ({ request
 test('missing artwork falls back to the placeholder with alt text', async ({ page }) => {
 	await page.goto('/demo/player');
 
-	const art = page.getByTestId('track-artwork');
+	const art = page.getByTestId('null-artwork').getByTestId('track-artwork');
 	await expect(art).toBeVisible();
 	await expect(art).toHaveAttribute('alt', 'Demo track artwork');
 	const src = await art.getAttribute('src');
 	expect(src).toContain('placeholder-artwork');
 	// No broken-image state: the rendered img has dimensions once loaded.
+	await expect.poll(async () => art.evaluate((img: HTMLImageElement) => img.naturalWidth)).toBeGreaterThan(0);
+});
+
+test('artwork that fails to load swaps to the placeholder once', async ({ page }) => {
+	await page.goto('/demo/player');
+
+	const art = page.getByTestId('broken-artwork').getByTestId('track-artwork');
+	await expect(art).toHaveAttribute('data-fallback', 'true');
+	await expect(art).toHaveAttribute('src', /placeholder-artwork/);
 	await expect.poll(async () => art.evaluate((img: HTMLImageElement) => img.naturalWidth)).toBeGreaterThan(0);
 });
 
