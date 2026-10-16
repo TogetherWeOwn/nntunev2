@@ -264,7 +264,11 @@ traffic; the MB mirror config may stay cached. Deploy checklist (with
 `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID` exported):
 `workers/api/check_hyperdrive_cache.sh --config-id $HYPERDRIVE_ID_STAGING`
 (and prod) must report `caching.disabled=true`. The gate fails closed
-(exit 3) without credentials; `--allow-skip` is only for secret-less CI.
+(exit 3) without credentials; `--allow-skip` is only for secret-less CI
+and MUST NOT be used in real deploys. The Worker additionally refuses to
+serve traffic without `HYPERDRIVE_CACHING_DISABLED=1` for that env — set
+it only after the gate passes for that Hyperdrive config (runtime
+attestation, fail-closed generic 500 otherwise).
 Template and contract:
 `workers/api/wrangler.toml.example`, `workers/api/README.md`.
 
