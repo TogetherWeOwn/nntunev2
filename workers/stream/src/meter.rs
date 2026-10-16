@@ -1,7 +1,5 @@
-//! Metering: every play emits events for Analytics Engine and the usage
-//! ledger (plan enforcement). [`MemoryMeter`] records them in-process for
-//! tests; production sinks them to the `meter` Analytics Engine dataset and
-//! the Hyperdrive usage-ledger table with the same shapes.
+//! Metering event types and portable-core reconciliation model. [`MemoryMeter`]
+//! records events in-process for tests; production sink wiring is separate.
 //!
 //! Complete-play reconciliation with a deduped usage ledger:
 //!
@@ -16,14 +14,12 @@
 //!   converges redeliveries to one entry, first write wins.
 //! - [`reconcile`] compares each distinct metered play against the ledger
 //!   and flags (never silently adjusts) every mismatch with one
-//!   [`MeterKind::ReconcileMismatch`] event on the existing `Meter` sink
-//!   (`METER` / `nntune_meter`) plus a single-line structured log from
-//!   [`ReconcileMismatch::log_line`] under the
-//!   [`RECONCILE_MISMATCH_METRIC`] event name.
+//!   [`MeterKind::ReconcileMismatch`] event and a single-line log
+//!   representation from [`ReconcileMismatch::log_line`]. Production sink
+//!   wiring is separate.
 
-/// Stable Analytics Engine metric name (and structured-log event name)
-/// emitted once per mismatched play by [`reconcile`]. It rides the
-/// existing `Meter` trait → `METER` / `nntune_meter` sink; no new dataset.
+/// Event name for the mismatch representation emitted by [`reconcile`].
+/// Wiring this event to Analytics Engine remains a production integration task.
 pub const RECONCILE_MISMATCH_METRIC: &str = "play_reconcile_mismatch";
 
 /// What happened, in billing-relevant order.
@@ -70,29 +66,34 @@ impl MemoryMeter {
     }
 }
 
-fn is_valid_key_field(field: &str) -> bool {
-    !field.is_empty() && !field.contains(':') && !field.contains('\0')
+fn is_valid_key_field(field: &str, max_bytes: usize) -> bool {
+    !field.is_empty()
+        && field.len() <= max_bytes
+        && !field.contains(':')
+        && !field.contains('=')
+        && !field.chars().any(|ch| ch.is_whitespace() || ch.is_control())
 }
 
 /// Derive the idempotency key for one play: `play:{user}:{track}:{play}`.
 ///
 /// Mirrors the `ingest:{user}:{sha}:{ref}` vocabulary of
 /// `derive_idempotency_key` in the ingest Worker. Rejects (Err, no panic)
-/// any field that is empty or contains `:` or NUL, so two different
-/// `(user, track, play)` triples can never format to the same key.
+/// any field that is empty, over its byte limit, or contains `:`, `=`,
+/// whitespace, or control characters, so keys remain unambiguous and safe
+/// to emit as single-line structured logs.
 pub fn derive_play_idempotency_key(
     user_id: &str,
     track_id: &str,
     play_id: &str,
 ) -> Result<String, &'static str> {
-    if !is_valid_key_field(user_id) {
-        return Err("user id must be non-empty and must not contain ':' or NUL");
+    if !is_valid_key_field(user_id, 128) {
+        return Err("user id must be 1-128 bytes without ':', '=', whitespace, or controls");
     }
-    if !is_valid_key_field(track_id) {
-        return Err("track id must be non-empty and must not contain ':' or NUL");
+    if !is_valid_key_field(track_id, 512) {
+        return Err("track id must be 1-512 bytes without ':', '=', whitespace, or controls");
     }
-    if !is_valid_key_field(play_id) {
-        return Err("play id must be non-empty and must not contain ':' or NUL");
+    if !is_valid_key_field(play_id, 512) {
+        return Err("play id must be 1-512 bytes without ':', '=', whitespace, or controls");
     }
     Ok(format!("play:{user_id}:{track_id}:{play_id}"))
 }
@@ -254,10 +255,10 @@ impl ReconcileReport {
 ///
 /// Each distinct play (by idempotency key, first occurrence authoritative,
 /// redeliveries checked once) is compared against the ledger: a play whose
-/// ledger entry is missing, or whose metered bytes differ from the entry's
-/// bytes, is a mismatch. Every mismatch emits exactly one
-/// [`MeterKind::ReconcileMismatch`] meter event (carrying the metered byte
-/// count) and produces one [`ReconcileMismatch`] record.
+/// ledger entry is missing, whose user or track differs, or whose metered
+/// bytes differ from the entry's bytes, is a mismatch. Every mismatch emits
+/// exactly one [`MeterKind::ReconcileMismatch`] meter event (carrying the
+/// metered byte count) and produces one [`ReconcileMismatch`] record.
 ///
 /// The pass takes `&UsageLedger` and never adjusts, backfills, or drops an
 /// entry: a mismatch is flagged, never silently fixed. Reconciliation is
@@ -278,9 +279,14 @@ pub fn reconcile(
         }
         seen.push(play.idempotency_key.as_str());
 
-        let ledger_bytes = ledger.get(&play.idempotency_key).map(|e| e.bytes);
-        let is_mismatch = match ledger_bytes {
-            Some(entry_bytes) => entry_bytes != play.bytes,
+        let ledger_entry = ledger.get(&play.idempotency_key);
+        let ledger_bytes = ledger_entry.map(|entry| entry.bytes);
+        let is_mismatch = match ledger_entry {
+            Some(entry) => {
+                entry.user_id != play.user_id
+                    || entry.track_id != play.track_id
+                    || entry.bytes != play.bytes
+            }
             None => true,
         };
         if !is_mismatch {
@@ -326,5 +332,39 @@ mod tests {
         assert_eq!(meter.events.len(), 2);
         assert!(meter.has_kind(MeterKind::PlayStart));
         assert!(!meter.has_kind(MeterKind::CacheHit));
+    }
+
+    #[test]
+    fn reconcile_detects_identity_mismatch_with_same_key_and_bytes() {
+        let metered = CompletePlay::new("user-1", "track-1", "play-1", 40).unwrap();
+        let mut ledger = UsageLedger::default();
+        ledger.record(&metered);
+
+        let mut wrong_identity = metered.clone();
+        wrong_identity.user_id = "user-2".to_string();
+        let mut meter = MemoryMeter::default();
+        let report = reconcile(&[wrong_identity], &ledger, &mut meter);
+
+        assert_eq!(report.mismatches.len(), 1);
+        assert_eq!(report.mismatches[0].ledger_bytes, Some(40));
+        assert_eq!(meter.events.len(), 1);
+
+        let mut wrong_track = metered.clone();
+        wrong_track.track_id = "track-2".to_string();
+        let report = reconcile(&[wrong_track], &ledger, &mut meter);
+        assert_eq!(report.mismatches.len(), 1);
+        assert_eq!(meter.events.len(), 2);
+    }
+
+    #[test]
+    fn idempotency_key_fields_reject_log_breakers_and_oversized_values() {
+        for invalid in ["has space", "has\t tab", "has\nnewline", "forged=value"] {
+            assert!(derive_play_idempotency_key(invalid, "track", "play").is_err());
+            assert!(derive_play_idempotency_key("user", invalid, "play").is_err());
+            assert!(derive_play_idempotency_key("user", "track", invalid).is_err());
+        }
+        assert!(derive_play_idempotency_key(&"u".repeat(129), "track", "play").is_err());
+        assert!(derive_play_idempotency_key("user", &"t".repeat(513), "play").is_err());
+        assert!(derive_play_idempotency_key("user", "track", &"p".repeat(513)).is_err());
     }
 }
