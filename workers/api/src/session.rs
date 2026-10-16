@@ -622,6 +622,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn revoke_all_sessions_empty_user_revokes_nothing_including_empty_owned_rows() {
+        // Pins the fail-closed empty-user guard: the fixture includes a row
+        // whose `user_id` IS empty, the only case the guard observably
+        // changes. Deleting the guard revokes that row and fails this test.
+        let mut records = vec![
+            SessionRecord {
+                id: "sess-a".to_string(),
+                user_id: "user-1".to_string(),
+                created_at: 1_700_000_000,
+                expires_at: 1_700_003_600,
+                rotation_counter: 0,
+                revoked: false,
+            },
+            SessionRecord {
+                id: "sess-empty-owner".to_string(),
+                user_id: String::new(),
+                created_at: 1_700_000_000,
+                expires_at: 1_700_003_600,
+                rotation_counter: 0,
+                revoked: false,
+            },
+        ];
+        assert_eq!(revoke_all_sessions(&mut records, ""), 0);
+        assert!(
+            records.iter().all(|record| !record.revoked),
+            "an empty user_id revokes nothing, not even empty-owned rows"
+        );
+        // Sanity: a real user id still revokes only its own rows.
+        assert_eq!(revoke_all_sessions(&mut records, "user-1"), 1);
+        assert!(records[0].revoked);
+        assert!(!records[1].revoked);
+    }
+
     // The only awaited operation is our immediately-ready in-memory store.
     fn ready<F: std::future::Future>(future: F) -> F::Output {
         let mut future = std::pin::pin!(future);
