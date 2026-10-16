@@ -53,7 +53,21 @@ fn run_plan(args: &[String]) {
     let out = std::io::stdout();
     let mut out = BufWriter::new(out.lock());
     for (start, end) in plan_chunks(completed, total, size) {
-        writeln!(out, "{start}-{end}").ok();
+        // A closed downstream (e.g. `| head -n 1`) reports BrokenPipe: that
+        // is a clean shutdown, not a failed plan. Anything else is exit 2.
+        if let Err(e) = writeln!(out, "{start}-{end}") {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                return;
+            }
+            eprintln!("mb-validate: cannot write plan: {e}");
+            std::process::exit(2);
+        }
+    }
+    if let Err(e) = out.flush() {
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            eprintln!("mb-validate: cannot write plan: {e}");
+            std::process::exit(2);
+        }
     }
 }
 
@@ -102,6 +116,10 @@ fn run_validate(args: &[String]) {
     }
     for (idx, chunk) in parts.iter().enumerate() {
         let line_no = offset + idx as u64 + 1;
+        // Every write below is checked: a short valid.tsv (disk full,
+        // closed pipe) must exit 2, never print counts that claim the chunk
+        // validated cleanly — import.sh advances the cursor on those counts,
+        // so a silent short write would skip rows forever on rerun.
         match String::from_utf8(chunk.to_vec()) {
             Err(_) => {
                 let lossy = String::from_utf8_lossy(chunk);
@@ -112,7 +130,10 @@ fn run_validate(args: &[String]) {
                     line_no,
                     escape_poison_field(&lossy)
                 )
-                .ok();
+                .unwrap_or_else(|e| {
+                    eprintln!("mb-validate: cannot write {poison_path:?}: {e}");
+                    std::process::exit(2);
+                });
                 poison_n += 1;
             }
             Ok(line) => {
@@ -121,20 +142,34 @@ fn run_validate(args: &[String]) {
                 let line = line.strip_suffix('\r').unwrap_or(&line);
                 match mb_import_validate::validate_line(table, line_no, line) {
                     Ok(normalized) => {
-                        writeln!(valid, "{normalized}").ok();
+                        writeln!(valid, "{normalized}").unwrap_or_else(|e| {
+                            eprintln!("mb-validate: cannot write {valid_path:?}: {e}");
+                            std::process::exit(2);
+                        });
                         valid_n += 1;
                     }
                     Err((why, _)) => {
-                        writeln!(poison, "{why}\t{line_no}\t{}", escape_poison_field(line)).ok();
+                        writeln!(poison, "{why}\t{line_no}\t{}", escape_poison_field(line))
+                            .unwrap_or_else(|e| {
+                                eprintln!("mb-validate: cannot write {poison_path:?}: {e}");
+                                std::process::exit(2);
+                            });
                         poison_n += 1;
                     }
                 }
             }
         }
     }
-    // valid/poison writers flush on drop; surface the summary for the log.
-    drop(valid);
-    drop(poison);
+    // BufWriter swallows flush errors on drop, so flush explicitly: without
+    // this a full disk still exits 0 with a truncated output file.
+    valid.flush().unwrap_or_else(|e| {
+        eprintln!("mb-validate: cannot write {valid_path:?}: {e}");
+        std::process::exit(2);
+    });
+    poison.flush().unwrap_or_else(|e| {
+        eprintln!("mb-validate: cannot write {poison_path:?}: {e}");
+        std::process::exit(2);
+    });
     println!("valid={valid_n} poison={poison_n}");
 }
 

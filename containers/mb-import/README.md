@@ -20,6 +20,14 @@ SELECT table_name, dump_id, line_no, reason, raw_line FROM mb_import_dlq
   ORDER BY created_at DESC LIMIT 20;
 ```
 
+Reasons are machine-readable: the validator files shape problems as
+`column_count`, `empty_line`, `bad_uuid`, `bad_int`, `bad_timestamp`,
+`bad_escape` (anything `COPY (FORMAT text)` would load mangled, e.g. `\o`,
+`\u`, a bare `\x`), `null_in_not_null`, `bad_country`,
+`negative_duration`, `invalid_encoding`; the loader files FK orphans —
+a release/recording whose parent was poisoned or never loaded — as
+`fk_missing_artist` / `fk_missing_release` instead of aborting the chunk.
+
 ## Build and test
 
 The image builds from the repository root (the validator stage needs the

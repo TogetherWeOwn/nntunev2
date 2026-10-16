@@ -185,10 +185,11 @@ impl FieldKind {
             return Ok("\\N".to_string());
         }
         // Every path below validates COPY text escapes for each raw field:
-        // only `\\`, `\b`, `\f`, `\n`, `\r`, `\t`, `\v`, `\o`, `\x`,
-        // `\u` may follow a backslash, else COPY would error or misread.
-        // (Run before numeric/uuid/timestamp checks so a bad escape reports
-        // as an escape, not as a bad value.)
+        // only `\\`, `\b`, `\f`, `\n`, `\r`, `\t`, `\v`, octal
+        // `\` + 1-3 octal digits, and hex `\x` + 1-2 hex digits may follow
+        // a backslash, else the row would load mangled or was never a
+        // canonical dump escape. (Run before numeric/uuid/timestamp checks
+        // so a bad escape reports as an escape, not as a bad value.)
         check_escapes(value)?;
         if value.is_empty() {
             if not_null {
@@ -242,8 +243,17 @@ impl FieldKind {
     }
 }
 
-/// `COPY (FORMAT text)` escape check: every backslash must start one of the
-/// documented sequences, and none may dangle at end of field.
+/// `COPY (FORMAT text)` escape check, mirroring exactly what `COPY FROM`
+/// documents: `\b \f \n \r \t \v \\`, backslash plus 1-3 octal digits, and
+/// `\x` plus 1-2 hex digits. Anything else after a backslash (including a
+/// dangling backslash, `\o`, `\u`, a bare `\x`, or `\x` with no hex digits)
+/// is poison: COPY would either load a different value than the dump holds
+/// (`\q` loads as `q`, dropping the backslash) or the row was never a
+/// canonical dump escape, so it goes to the dead-letter table for operator
+/// review instead of being mangled into the mirror. Deliberately stricter
+/// than COPY, which accepts any other backslashed character as itself: the
+/// importer only passes through escapes whose stored value is the documented
+/// control character or byte.
 fn check_escapes(value: &str) -> Result<(), &'static str> {
     let bytes = value.as_bytes();
     let mut i = 0;
@@ -258,11 +268,35 @@ fn check_escapes(value: &str) -> Result<(), &'static str> {
         }
         match bytes[i] {
             b'b' | b'f' | b'n' | b'r' | b't' | b'v' | b'\\' => i += 1,
-            b'o' | b'x' | b'u' => {
-                // `\o`, `\x`, `\u` take following digits as-is; COPY
-                // validates the digits itself. The loader keeps the raw
-                // sequence so valid ones pass through byte-equal.
+            b'0'..=b'7' => {
+                // Octal byte: up to 3 octal digits total (COPY is greedy),
+                // and the value must fit in one byte (`\400` is no byte, so
+                // it is poison rather than a chunk-aborting COPY error).
+                let mut value: u32 = (bytes[i] - b'0') as u32;
                 i += 1;
+                for _ in 0..2 {
+                    if i < bytes.len() && bytes[i].is_ascii_digit() && bytes[i] < b'8' {
+                        value = value * 8 + (bytes[i] - b'0') as u32;
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if value > 0o377 {
+                    return Err(reason::BAD_ESCAPE);
+                }
+            }
+            b'x' => {
+                // Hex byte: `\x` requires 1-2 hex digits.
+                i += 1;
+                let mut digits = 0;
+                while digits < 2 && i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                    i += 1;
+                    digits += 1;
+                }
+                if digits == 0 {
+                    return Err(reason::BAD_ESCAPE);
+                }
             }
             _ => return Err(reason::BAD_ESCAPE),
         }
@@ -581,6 +615,33 @@ mod tests {
         // Valid COPY escapes round-trip: literal backslash, tab, newline.
         let raw = artist_line(MBID, TS).replacen("The Band", "A \\\\ B \\t C \\n D", 1);
         assert!(validate_line(Table::Artist, 1, &raw).is_ok());
+    }
+
+    #[test]
+    fn copy_text_octal_hex_match_postgres_docs() {
+        // Octal `\` + 1-3 octal digits and hex `\x` + 1-2 hex digits are
+        // real COPY text escapes (sql-copy.html) and must validate.
+        for esc in ["\\0", "\\7", "\\40", "\\101", "\\x4", "\\x41", "\\x4a"] {
+            let raw = artist_line(MBID, TS).replacen("The Band", &format!("A {esc} B"), 1);
+            assert!(
+                validate_line(Table::Artist, 1, &raw).is_ok(),
+                "{esc} should validate"
+            );
+        }
+        // `\o` and `\u` are NOT COPY sequences (COPY would load them as the
+        // bare letter, mangling the dump), a bare `\x` or `\x` with no hex
+        // digits has no byte value, and `\8`/`\9` are not octal digits: all
+        // poison for operator review instead of silent mangling.
+        for esc in [
+            "\\o", "\\o141", "\\u", "\\u0041", "\\x", "\\xZZ", "\\8", "\\9", "\\400", "\\777",
+        ] {
+            let raw = artist_line(MBID, TS).replacen("The Band", &format!("A {esc} B"), 1);
+            assert_eq!(
+                validate_line(Table::Artist, 1, &raw),
+                Err((reason::BAD_ESCAPE, 1)),
+                "{esc} should be poison"
+            );
+        }
     }
 
     #[test]
