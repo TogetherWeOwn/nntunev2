@@ -658,6 +658,31 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_does_not_flag_an_agreeing_redelivery_in_the_same_batch() {
+        let play = CompletePlay::new("user-1", "track-9", "play-7", 40_000).unwrap();
+
+        // Matching ledger entry: at-least-once redelivery of the same play
+        // is expected and must reconcile clean.
+        let mut ledger = UsageLedger::default();
+        ledger.record(&play);
+        let mut meter = MemoryMeter::default();
+        let report = reconcile(&[play.clone(), play.clone()], &ledger, &mut meter);
+        assert_eq!(report.checked, 1);
+        assert!(report.is_clean());
+        assert!(meter.events.is_empty());
+
+        // Missing ledger entry: the first occurrence is flagged once; its
+        // agreeing redelivery must not be flagged a second time.
+        let empty = UsageLedger::default();
+        let mut meter = MemoryMeter::default();
+        let report = reconcile(&[play.clone(), play.clone(), play], &empty, &mut meter);
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.mismatches.len(), 1);
+        assert_eq!(report.mismatches[0].ledger_bytes, None);
+        assert_eq!(meter.events.len(), 1);
+    }
+
+    #[test]
     fn mismatch_log_escapes_public_unvalidated_identity_fields() {
         let mismatch = ReconcileMismatch {
             idempotency_key: "play:user\nledger_bytes=999".to_string(),
