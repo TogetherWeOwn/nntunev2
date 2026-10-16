@@ -7,8 +7,7 @@
 //! `verify_stored_session`, not signature-only verification. Secret comes
 //! from the Worker env, never code.
 
-use hmac::{Hmac, Mac};
-use rand::RngCore;
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -57,7 +56,7 @@ pub struct SessionClaims {
 
 fn new_session_id() -> String {
     let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("secure randomness unavailable");
     crate::b64::encode(&bytes)
 }
 

@@ -66,7 +66,7 @@
 //! Fixtures are synthetic only. No network, database, or secrets.
 
 use base64::Engine as _;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use nntune_api::session::{
     self, SessionError, SessionKeys, SessionRecord, PRIVILEGE_REAUTH_WINDOW_SECS,
     REAUTH_REQUIRED_CODE,
