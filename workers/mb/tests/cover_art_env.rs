@@ -37,7 +37,7 @@ fn staging_env_resolves_staging_art_bucket() {
     );
     assert_eq!(
         art_bucket_for_env("staging"),
-        "nntunev2-art-staging",
+        Some("nntunev2-art-staging"),
         "staging env must resolve the staging art bucket"
     );
 }
@@ -50,14 +50,35 @@ fn prod_env_resolves_prod_art_bucket() {
     );
     assert_eq!(
         art_bucket_for_env("prod"),
-        "nntunev2-art-prod",
+        Some("nntunev2-art-prod"),
         "prod env must resolve the prod art bucket"
     );
     assert_eq!(
         art_bucket_for_env("production"),
-        "nntunev2-art-prod",
+        Some("nntunev2-art-prod"),
         "production alias must resolve the prod art bucket"
     );
+}
+
+#[test]
+fn unknown_and_empty_env_resolves_to_none() {
+    for env in ["", "dev"] {
+        assert_eq!(
+            art_bucket_for_env(env),
+            None,
+            "unknown/empty env {env:?} must resolve to None, never staging or prod art"
+        );
+        assert_ne!(
+            art_bucket_for_env(env),
+            Some(ART_BUCKET_STAGING),
+            "unknown/empty env {env:?} must never resolve the staging art bucket"
+        );
+        assert_ne!(
+            art_bucket_for_env(env),
+            Some(ART_BUCKET_PROD),
+            "unknown/empty env {env:?} must never resolve the prod art bucket"
+        );
+    }
 }
 
 #[test]
@@ -65,6 +86,16 @@ fn staging_and_prod_buckets_differ() {
     assert_ne!(
         ART_BUCKET_STAGING, ART_BUCKET_PROD,
         "env boundary requires distinct buckets per docs/ops.md"
+    );
+    assert_eq!(
+        art_bucket_for_env("staging"),
+        Some(ART_BUCKET_STAGING),
+        "staging env must resolve Some(staging bucket)"
+    );
+    assert_eq!(
+        art_bucket_for_env("prod"),
+        Some(ART_BUCKET_PROD),
+        "prod env must resolve Some(prod bucket)"
     );
     assert_ne!(
         art_bucket_for_env("staging"),
@@ -76,8 +107,10 @@ fn staging_and_prod_buckets_differ() {
 #[test]
 fn caa_object_uri_uses_env_bucket_and_key() {
     let key = "art/ab/cd/0123456789abcdef-500";
-    let staging_uri = caa_url_for_art(art_bucket_for_env("staging"), key);
-    let prod_uri = caa_url_for_art(art_bucket_for_env("prod"), key);
+    let staging_bucket = art_bucket_for_env("staging").expect("staging env must resolve");
+    let prod_bucket = art_bucket_for_env("prod").expect("prod env must resolve");
+    let staging_uri = caa_url_for_art(staging_bucket, key);
+    let prod_uri = caa_url_for_art(prod_bucket, key);
 
     for (env, uri, bucket) in [
         ("staging", &staging_uri, "nntunev2-art-staging"),
@@ -148,16 +181,71 @@ fn no_bare_art_bucket_reference_remains() {
 }
 
 /// The deploy example must bind the env-specific buckets, not the bare name.
+/// Parses per-env sections so a swapped `bucket_name` (M2) or a deleted
+/// per-env `MB_DB` block (M3) fails instead of passing silently.
 #[test]
 fn wrangler_example_uses_env_specific_buckets() {
     let path = manifest_dir().join("wrangler.toml.example");
     let text = std::fs::read_to_string(&path).expect("read wrangler.toml.example");
+    let staging_start = text
+        .find("env.staging")
+        .expect("wrangler example must define a staging env section");
+    let production_start = text
+        .find("env.production")
+        .expect("wrangler example must define a production env section");
     assert!(
-        text.contains("nntunev2-art-staging"),
-        "wrangler example must name the staging art bucket"
+        staging_start < production_start,
+        "staging env section must precede production env section"
     );
-    assert!(
-        text.contains("nntunev2-art-prod"),
-        "wrangler example must name the prod art bucket"
-    );
+    let staging_section = &text[staging_start..production_start];
+    let production_section = &text[production_start..];
+
+    for (env, section, bucket, other_bucket) in [
+        (
+            "staging",
+            staging_section,
+            "nntunev2-art-staging",
+            "nntunev2-art-prod",
+        ),
+        (
+            "production",
+            production_section,
+            "nntunev2-art-prod",
+            "nntunev2-art-staging",
+        ),
+    ] {
+        let short = if env == "staging" {
+            "staging"
+        } else {
+            "production"
+        };
+        assert!(
+            section.contains(&format!("bucket_name = \"{bucket}\"")),
+            "{env} section must bind bucket {bucket} (swapped buckets M2 must fail)"
+        );
+        assert!(
+            !section.contains(other_bucket),
+            "{env} section must not reference the other env bucket {other_bucket} (M2 swap must fail)"
+        );
+        assert!(
+            section.contains(&format!("env.{short}.hyperdrive")),
+            "{env} section must declare its hyperdrive block"
+        );
+        assert!(
+            section.contains("binding = \"MB_DB\""),
+            "{env} section must bind MB_DB (deleted per-env MB_DB M3 must fail)"
+        );
+        assert!(
+            section.contains(&format!("env.{short}.kv_namespaces")),
+            "{env} section must declare its kv block"
+        );
+        assert!(
+            section.contains("binding = \"MB_CACHE\""),
+            "{env} section must bind MB_CACHE"
+        );
+        assert!(
+            section.contains(&format!("env.{short}.r2_buckets")),
+            "{env} section must declare its r2_buckets block"
+        );
+    }
 }
