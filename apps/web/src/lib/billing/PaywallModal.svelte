@@ -82,7 +82,7 @@
 	{/if}
 
 	<div class="paywall-actions">
-		<a class="nt-button" href={model.ctaHref}>Upgrade your plan</a>
+		<a class="nt-button" href={model.ctaHref} onclick={close}>Upgrade your plan</a>
 		<button type="button" class="nt-button nt-button--ghost" onclick={close}>Not now</button>
 	</div>
 </dialog>

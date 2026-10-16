@@ -44,6 +44,9 @@ test('pricing checkout limit shows paywall without a duplicate inline alert', as
 	await expect(dialog).toBeVisible();
 	await expect(page.getByRole('alert')).toHaveCount(0);
 	await expect(dialog.getByRole('link', { name: /upgrade/i })).toHaveAttribute('href', '/pricing');
+	await dialog.getByRole('link', { name: /upgrade/i }).click();
+	await expect(page).toHaveURL(/\/pricing\/?$/);
+	await expect(dialog).toBeHidden();
 
 	const events = await page.evaluate(
 		() => (window as unknown as { __paywallEvents: Array<Record<string, unknown>> }).__paywallEvents
@@ -120,4 +123,24 @@ test('402 limit shows terminal paywall with usage and upgrade CTA, no countdown'
 	);
 	expect(events).toHaveLength(1);
 	expect(events[0]).toMatchObject({ kind: 'terminal', status: 402, code: 'plan_limit_exceeded' });
+});
+
+test('upgrade CTA closes the paywall before navigating to pricing', async ({ page }) => {
+	await page.route('**/v1/vault/test', (route) =>
+		route.fulfill({
+			status: 402,
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ code: 'plan_limit_exceeded' })
+		})
+	);
+
+	await toConnectionTestStep(page);
+	await page.getByRole('button', { name: /test connection/i }).click();
+
+	const dialog = page.getByRole('dialog');
+	await expect(dialog).toBeVisible();
+	await dialog.getByRole('link', { name: /upgrade/i }).click();
+
+	await expect(page).toHaveURL(/\/pricing\/?$/);
+	await expect(dialog).toBeHidden();
 });
