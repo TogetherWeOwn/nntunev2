@@ -19,8 +19,16 @@ NZB upload ───────────────┘                     
 - Newznab search builder (`src/newznab.rs`): `t=music`, `https://` only,
   no embedded credentials. The URL is built **without** the key; the
   vault-resolved key is injected at request time and redacted in logs.
-- NZB intake guard (`src/nzb_intake.rs`): 2 MiB / 5k files / 60k segments
-  caps before anything spends provider connections.
+- NZB intake guard (`src/nzb_intake.rs`): versioned caps
+  (`INTAKE_CONFIG_VERSION` v1: 2 MiB / 5k files / 60k segments / 64 GiB
+  declared segment bytes) plus well-formedness validation before anything
+  spends provider connections. Refusals carry stable 4xx codes
+  (`NZB_EMPTY`, `NZB_TOO_LARGE`, `NZB_NOT_NZB`, `NZB_MALFORMED`,
+  `NZB_TOO_MANY_FILES`, `NZB_TOO_MANY_SEGMENTS`,
+  `NZB_DECLARED_BYTES_OVER_CAP`) and the `intake_config_version`; cap refusals
+  also return the measured value and cap (`file_count`/`max_files`,
+  `segment_count`/`max_segments`, `declared_bytes`/`max_declared_bytes`, …)
+  so clients can render a reason.
 - Per-plan rate limits (`src/rate_limit.rs`): provisional base/5x/20x
   tunables (exact numbers are set at launch); token buckets, no clock
   dependency.
@@ -30,10 +38,11 @@ NZB upload ───────────────┘                     
   `/v1/mb/search?type=…`).
 - Routes (`src/lib.rs`): `POST /v1/ingest/search` (16 KiB body cap,
   ≤16 categories, paged window), `POST /v1/ingest/nzb` (wire cap accounting
-  for JSON escaping, then the 2 MiB / 5k / 60k intake guard) — malformed JSON
-  is 400, over-cap is 413, busy store/queue is 503; success is 202 + enqueue
-  with job id + idempotency key. `GET /v1/ingest/jobs/:id` (checkpoint reads
-  land with the consumer).
+  for JSON escaping, then the versioned intake guard) — malformed JSON is
+  400, intake refusals carry their stable `NZB_*` code (bad input 400,
+  over-cap 413 with measured + cap fields), busy store/queue is 503;
+  success is 202 + enqueue with job id + idempotency key.
+  `GET /v1/ingest/jobs/:id` (checkpoint reads land with the consumer).
 
 ## Security rules
 

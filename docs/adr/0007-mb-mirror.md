@@ -26,7 +26,8 @@ serverless; batch runs in Containers.
 4. **Read API** lives in `workers/mb` (Rust `workers-rs`): MBID lookup for
    artist / release / recording plus trigram search, over Hyperdrive, with
    KV / Cache API caching. See `workers/mb/README.md`.
-5. **Cover art** is cached in R2 bucket `nntunev2-art` (derived renditions
+5. **Cover art** is cached in the per-environment R2 art buckets
+   (`nntunev2-art-staging` / `nntunev2-art-prod`; derived renditions
    per ADR 0003); the mirror stores only CAA URLs/hashes, never hotlinks
    at request time without cache.
 6. **Terms:** core data is CC0 (no attribution required, credit given
