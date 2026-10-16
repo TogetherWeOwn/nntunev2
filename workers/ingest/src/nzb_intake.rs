@@ -787,12 +787,33 @@ mod tests {
         // The `<nzb>` root keeps the NotNzb pre-filter from firing first, so
         // this pins the well-formedness gate: an unterminated internal subset
         // must be `Malformed`, never an element count that hides the decoys.
-        let mut doc = String::from("<?xml?><!DOCTYPE nzb [><nzb>");
-        for _ in 0..(MAX_SEGMENTS + 1) {
-            doc.push_str("<segment>");
-        }
+        // Both payloads are balanced on purpose: with unclosed `<segment>`
+        // decoys the Malformed verdict would also come from unbalanced
+        // nesting, so removing the `subset_depth == 0` guard in
+        // `skip_declaration` would leave the suite green. Balanced payloads
+        // isolate subset tracking — under that mutant the small case parses
+        // as Ok and the bomb hits the segment cap instead of Malformed.
+        let small_balanced =
+            "<?xml?><!DOCTYPE nzb [><nzb><segment bytes=\"100\">x@y</segment></nzb>";
+        assert_eq!(
+            estimate_nzb(small_balanced),
+            Err(IntakeRejection::Malformed),
+            "unterminated subset must be malformed, not counted"
+        );
 
-        assert_eq!(estimate_nzb(&doc), Err(IntakeRejection::Malformed));
+        // Self-closing segment bomb past the 60k cap in ~600 KB: the caps must
+        // never see these segments because the subset never terminates.
+        let mut bomb = String::from("<?xml?><!DOCTYPE nzb [><nzb>");
+        for _ in 0..(MAX_SEGMENTS + 1) {
+            bomb.push_str("<segment/>");
+        }
+        bomb.push_str("</nzb>");
+        assert!(bomb.len() < MAX_NZB_BYTES);
+        assert_eq!(
+            estimate_nzb(&bomb),
+            Err(IntakeRejection::Malformed),
+            "unterminated subset must hide the segment bomb as malformed"
+        );
     }
 
     #[test]
