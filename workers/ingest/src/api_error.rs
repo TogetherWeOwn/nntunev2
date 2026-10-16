@@ -157,9 +157,15 @@ impl From<IntakeRejection> for ApiError {
             IntakeRejection::TooLarge { .. } => Self::payload_too_large("nzb_xml exceeds 2 MiB"),
             IntakeRejection::NotNzb => Self::invalid_request("nzb_xml is not an NZB document"),
             IntakeRejection::Malformed => Self::invalid_request("nzb_xml is malformed"),
-            IntakeRejection::TooManyFiles { .. } => Self::payload_too_large("nzb has too many files"),
-            IntakeRejection::TooManySegments { .. } => Self::payload_too_large("nzb has too many segments"),
-            IntakeRejection::DeclaredBytesOverCap { .. } => Self::payload_too_large("nzb declared bytes over cap"),
+            IntakeRejection::TooManyFiles { .. } => {
+                Self::payload_too_large("nzb has too many files")
+            }
+            IntakeRejection::TooManySegments { .. } => {
+                Self::payload_too_large("nzb has too many segments")
+            }
+            IntakeRejection::DeclaredBytesOverCap { .. } => {
+                Self::payload_too_large("nzb declared bytes over cap")
+            }
         }
     }
 }
