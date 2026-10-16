@@ -115,12 +115,15 @@ config from secrets) is a follow-up slice.
   conditionally update the matching row/counter and commit before sending
   the cookie; a superseded cookie then fails. Privilege changes require
   reauthentication, revoking the old row and issuing a new session id.
-  Privilege-gated ops enforce a freshness window of 600 seconds
+  Vault credential writes (`PUT /v1/vault`) and deletes
+  (`DELETE /v1/vault`) require a freshness window of 600 seconds
   (10 minutes) on the immutable authentication time (`created_at`, never
   `issued_at`, so rotation cannot restore freshness): sessions
   authenticated outside the window are rejected with the documented
-  `reauth_required` error code (401), while successful re-auth mints a
-  new session id and revokes only the old row (single-session revoke).
+  `reauth_required` error code (401). Vault summary reads and boolean
+  connection tests retain ordinary session authentication. Successful
+  re-auth mints a new session id and revokes only the old row (single-session
+  revoke).
 - **Hyperdrive query caching:** the `HYPERDRIVE` binding MUST point to a
   Hyperdrive config with query caching disabled (`--caching-disabled`).
   Session, credential, user, challenge and vault reads are plain

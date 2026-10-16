@@ -1,0 +1,37 @@
+name = "fixture-demo"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+
+[[analytics_engine_datasets]]
+binding = "METER"
+dataset = "fixture_meter"
+
+[env.staging]
+name = "fixture-demo-staging"
+
+[[env.staging.r2_buckets]]
+binding = "AUDIO_CACHE"
+bucket_name = "fixture-audio-staging"
+
+[[env.staging.hyperdrive]]
+binding = "DB"
+id = "fixture-hyperdrive-staging"
+
+[[env.staging.queues.producers]]
+binding = "JOBS"
+queue = "fixture-ingest-staging"
+
+[env.production]
+name = "fixture-demo"
+
+[[env.production.r2_buckets]]
+binding = "AUDIO_CACHE"
+bucket_name = "fixture-audio-prod"
+
+[[env.production.hyperdrive]]
+binding = "DB"
+id = "fixture-hyperdrive-prod"
+
+[[env.production.queues.producers]]
+binding = "JOBS"
+queue = "fixture-ingest-prod"

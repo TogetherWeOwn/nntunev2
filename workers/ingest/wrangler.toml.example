@@ -12,22 +12,46 @@ compatibility_date = "2026-10-01"
 binding = "INGEST_QUEUE"
 queue = "nntune-ingest-jobs"
 
+# Slice T2: DLQ producer (code: src/retry.rs). The consumer sends one
+# DlqEntry per quarantined message here — the original QueueMsg plus
+# `error_code` and `attempts` fields in the serialized body — then acks the
+# original so it is never redelivered. Producer-only: safe to declare before
+# the consumer ships.
+[[queues.producers]]
+binding = "INGEST_DLQ"
+queue = "nntune-ingest-dlq"
+
 # Consumer: NOT YET. This crate has only `event(fetch)` — no `event(queue)`
 # handler — so declaring this worker a consumer would deliver every message
 # to a handler that does not exist (retried `max_retries` times, then
 # dropped, while callers saw 202 queued). Uncomment together with the Queue
-# handler and a dead-letter queue, e.g.:
+# handler, which settles per message via src/retry.rs (`decide_checkpoint`):
+# persist the mutated checkpoint before retry/ack, use `retry_with_options`
+# while budget remains, and persist Failed before DLQ send + ack. Never ack on DLQ-send failure; Failed
+# redelivery retries the send. A send-success/ack-failure may duplicate entries,
+# so DLQ processing must be idempotent by job_id. E.g.:
 #
 # [[queues.consumers]]
 # queue = "nntune-ingest-jobs"
 # max_batch_size = 10
-# Keep max_retries = PAYLOAD_RETRY_ATTEMPTS (4) in src/dispatch.rs: the
-# payload-fetch backoff (5/15/30/60 s, 110 s cumulative) needs all four
-# retries to cover the ~60 s KV lag plus the edge-cached negative-lookup
-# window (consumer reads with cacheTtl 30).
+# Keep max_retries = CONSUMER_MAX_RETRIES (4) in src/retry.rs: it equals
+# PAYLOAD_RETRY_ATTEMPTS in src/dispatch.rs and MAX_ATTEMPTS - 1 in
+# src/jobs.rs (a compile-time assert enforces this), and the retry backoff
+# (5/15/30/60 s, 110 s cumulative) needs all four retries to cover the ~60 s
+# KV lag plus the edge-cached negative-lookup window (consumer reads with
+# cacheTtl 30).
 # max_retries = 4
-# [[queues.consumers.dead_letter_queue]]
-# queue = "nntune-ingest-dlq"
+# On DLQ-send failure, the handler must call retry_with_options with a delay
+# (or return an error) for that message; merely skipping ack() and returning
+# implicitly acknowledges it. Each retry spends one of these four native
+# max_retries slots, after which Cloudflare moves the raw body to the configured
+# dead-letter queue; without dead_letter_queue, Cloudflare drops the message.
+# It is a safety net for messages the handler never settles
+# (panic, timeout): Cloudflare moves the untouched body with no reason envelope.
+# Both shapes redrive via src/retry.rs (`redrive` for DlqEntry,
+# `redrive_raw` for native bodies) after loading a matching Failed checkpoint;
+# see README "Redrive" for raw bodies whose checkpoint is nonterminal.
+# dead_letter_queue = "nntune-ingest-dlq"
 
 # Workflows: NOT YET. workers-rs 0.3 has no Workflow client and this crate
 # exports no Workflow class, and `[[workflows]]` requires a `class_name`, so
@@ -53,6 +77,15 @@ id = "<KV_NAMESPACE_ID>"
 [[kv_namespaces]]
 binding = "INGEST_PAYLOADS"
 id = "<KV_NAMESPACE_ID_FOR_PAYLOADS>"
+
+# Segment probe (code: src/pool_probe.rs). Cross-script binding to the stream
+# Worker's per-user `NntpPool` Durable Object, addressed by
+# `id_from_name(user_id)`; the object has no public route. Deploy the stream
+# Worker (which declares the class) before this one.
+[[durable_objects.bindings]]
+name = "NNTP_POOL"
+class_name = "NntpPool"
+script_name = "nntune-stream"
 
 # Slice 2: usage metering (code: src/metering.rs).
 [[analytics_engine_datasets]]

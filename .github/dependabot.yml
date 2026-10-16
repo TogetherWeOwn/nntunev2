@@ -32,6 +32,12 @@ version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -48,6 +54,12 @@ updates:
   # standalone crates and get their own entries below).
   - package-ecosystem: "cargo"
     directory: "/"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -63,6 +75,12 @@ updates:
   # Standalone worker crates (vault crypto: aes-gcm, hmac; base64).
   - package-ecosystem: "cargo"
     directory: "/workers/api"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -77,6 +95,12 @@ updates:
 
   - package-ecosystem: "cargo"
     directory: "/workers/ingest"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -92,6 +116,12 @@ updates:
   # MusicBrainz mirror worker (standalone crate, built by the rust-mb job).
   - package-ecosystem: "cargo"
     directory: "/workers/mb"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -107,6 +137,12 @@ updates:
   # Batch import image (FROM postgres).
   - package-ecosystem: "docker"
     directory: "/containers/mb-import"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -121,6 +157,12 @@ updates:
 
   - package-ecosystem: "npm"
     directory: "/apps/web"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -135,6 +177,12 @@ updates:
 
   - package-ecosystem: "npm"
     directory: "/e2e"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
     schedule:
       interval: "weekly"
       day: "monday"

@@ -9,6 +9,7 @@
  */
 
 import type { ProviderForm } from '../vault-validation.js';
+import { parseErrorResponse } from './errors.js';
 
 export type FetchFn = typeof fetch;
 
@@ -19,15 +20,26 @@ export interface ApiClientOptions {
 
 export class ApiError extends Error {
 	readonly status: number;
+	/** Registry code from the error envelope (`docs/api-errors.md`). */
 	readonly code: string;
+	/** Whether retrying the same request may succeed (envelope flag). */
+	readonly retryable: boolean;
 
-	constructor(status: number, code: string, message: string) {
+	constructor(status: number, code: string, message: string, retryable = false) {
 		super(message);
 		this.name = 'ApiError';
 		this.status = status;
 		this.code = code;
+		this.retryable = retryable;
 	}
 }
+
+/** Documented re-auth code (S7): stale provider credential. */
+export const PROVIDER_AUTH_EXPIRED_CODE = 'provider_auth_expired';
+
+/** Documented re-key code (S7): stale indexer API key. Distinct from the
+ * provider code: the web app names the API key (never the password) for it. */
+export const INDEXER_AUTH_EXPIRED_CODE = 'indexer_auth_expired';
 
 export interface MagicLinkResult {
 	ok: true;
@@ -289,26 +301,9 @@ export class ApiClient {
 			credentials: 'include'
 		});
 		if (!response.ok) {
-			throw new ApiError(response.status, this.errorCode(response.status), await this.message(response));
+			const { code, message, retryable } = await parseErrorResponse(response);
+			throw new ApiError(response.status, code, message, retryable);
 		}
 		return (await response.json()) as T;
-	}
-
-	private errorCode(status: number): string {
-		if (status === 401) return 'unauthorized';
-		if (status === 403) return 'forbidden';
-		if (status === 404) return 'not_found';
-		if (status === 429) return 'rate_limited';
-		return 'request_failed';
-	}
-
-	private async message(response: Response): Promise<string> {
-		try {
-			const body = (await response.json()) as { error?: unknown };
-			if (typeof body.error === 'string' && body.error.length > 0) return body.error;
-		} catch {
-			// Fall through to the status-based message below.
-		}
-		return `request failed with status ${response.status}`;
 	}
 }

@@ -1,6 +1,7 @@
 //! NNTune v2 ingest pipeline worker.
 //!
 //! Routes (all JSON):
+//! - `GET /healthz` — unauthenticated Worker health check; no bindings.
 //! - `POST /v1/ingest/search` — Newznab search with the user's own indexer
 //!   (`indexer_ref` vault handle; raw keys are never accepted here).
 //! - `POST /v1/ingest/nzb` — NZB upload; guarded by intake caps, then
@@ -20,6 +21,7 @@
 use futures_util::StreamExt;
 use worker::{console_log, Env, Request, Response, Result, RouteContext, Router};
 
+pub mod api_error;
 pub mod dispatch;
 pub mod fixtures;
 pub mod jobs;
@@ -28,11 +30,14 @@ pub mod metering;
 pub mod newznab;
 pub mod nzb_intake;
 pub mod parse;
+pub mod pool_probe;
 pub mod probe;
 pub mod queue;
 pub mod rate_limit;
 pub mod repair;
+pub mod retry;
 
+use api_error::ApiError;
 use dispatch::validate_user_id;
 use jobs::validate_job_id;
 use newznab::{MAX_CATEGORIES, MAX_LIMIT, MAX_PAGE};
@@ -49,17 +54,45 @@ pub const MAX_SEARCH_BODY_BYTES: usize = 16 * 1024;
 /// the wire, so the wire cap accounts for that before buffering.
 pub const MAX_UPLOAD_BODY_BYTES: usize = 13 * 1024 * 1024;
 
-#[derive(Debug, serde::Serialize)]
-struct ApiError {
-    error: String,
+fn health_response() -> http::Response<Vec<u8>> {
+    http::Response::builder()
+        .status(http::StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .body(r#"{"ok":true}"#.as_bytes().to_vec())
+        .expect("static health response is valid")
 }
 
-fn json_error(message: &str, status: u16) -> Result<Response> {
-    let body = serde_json::to_string(&ApiError {
-        error: message.to_string(),
-    })
-    .unwrap_or_else(|_| r#"{"error":"internal"}"#.to_string());
-    Response::from_body(worker::ResponseBody::Body(body.into_bytes())).map(|r| {
+struct HealthResponseParts {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+fn health_response_parts() -> HealthResponseParts {
+    let response = health_response();
+    HealthResponseParts {
+        status: response.status().as_u16(),
+        headers: response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value
+                        .to_str()
+                        .expect("static health header is valid")
+                        .to_owned(),
+                )
+            })
+            .collect(),
+        body: response.into_body(),
+    }
+}
+
+fn json_error(err: ApiError) -> Result<Response> {
+    let status = err.status;
+    Response::from_body(worker::ResponseBody::Body(err.body_json().into_bytes())).map(|r| {
         r.with_status(status)
             .with_headers(headers_json().unwrap_or_default())
     })
@@ -76,12 +109,9 @@ fn accepted(body: serde_json::Value) -> Result<Response> {
 }
 
 fn service_unavailable(message: &str) -> Result<Response> {
-    let body = serde_json::to_string(&ApiError {
-        error: message.to_string(),
-    })
-    .unwrap_or_else(|_| r#"{"error":"internal"}"#.to_string());
     let headers = headers_json().unwrap_or_default();
     headers.append("retry-after", "5")?;
+    let body = ApiError::service_unavailable(message).body_json();
     Response::from_body(worker::ResponseBody::Body(body.into_bytes()))
         .map(|r| r.with_status(503).with_headers(headers))
 }
@@ -132,23 +162,20 @@ fn push_chunk(
 /// unauthenticated route. This reads through `Request::stream()` and bails
 /// with 413 on the chunk that would cross the cap; non-UTF-8 bodies are a
 /// 400, as is an unreadable stream.
-async fn read_capped_text(
-    req: &mut Request,
-    cap: usize,
-) -> core::result::Result<String, (String, u16)> {
+async fn read_capped_text(req: &mut Request, cap: usize) -> core::result::Result<String, ApiError> {
     if let Err(message) = check_declared_len(content_length(req), cap) {
-        return Err((message.to_string(), 413));
+        return Err(ApiError::payload_too_large(message));
     }
     let stream = req
         .stream()
-        .map_err(|_| ("failed to read request body".to_string(), 400))?;
+        .map_err(|_| ApiError::invalid_request("failed to read request body"))?;
     let mut stream = Box::pin(stream);
     let mut buf = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| ("failed to read request body".to_string(), 400))?;
-        push_chunk(&mut buf, &chunk, cap).map_err(|m| (m.to_string(), 413))?;
+        let chunk = chunk.map_err(|_| ApiError::invalid_request("failed to read request body"))?;
+        push_chunk(&mut buf, &chunk, cap).map_err(ApiError::payload_too_large)?;
     }
-    String::from_utf8(buf).map_err(|_| ("request body must be UTF-8".to_string(), 400))
+    String::from_utf8(buf).map_err(|_| ApiError::invalid_request("request body must be UTF-8"))
 }
 
 /// Parse a search body: malformed JSON is a client error (400), never a 500.
@@ -197,6 +224,54 @@ fn check_upload(req: &NzbUploadRequest) -> core::result::Result<(), &'static str
     Ok(())
 }
 
+/// Build the status + JSON body for an intake refusal. Pure so the 4xx
+/// taxonomy (registry `code`, stable `intake_code`, measured value + cap fields
+/// the client renders) is unit-tested without a Worker runtime.
+fn intake_rejection_parts(rejection: &IntakeRejection) -> (u16, serde_json::Value) {
+    let error = ApiError::from(*rejection);
+    let status = error.status;
+    let mut body = serde_json::json!({
+        "code": error.code,
+        "message": error.message,
+        "retryable": error.retryable,
+        "error": rejection.message(),
+    });
+    body["intake_code"] = serde_json::Value::String(rejection.code().into());
+    body["intake_config_version"] = nzb_intake::INTAKE_CONFIG_VERSION.into();
+    match *rejection {
+        IntakeRejection::TooLarge {
+            size_bytes,
+            max_bytes,
+        } => {
+            body["size_bytes"] = size_bytes.into();
+            body["max_bytes"] = max_bytes.into();
+        }
+        IntakeRejection::TooManyFiles { count, max } => {
+            body["file_count"] = count.into();
+            body["max_files"] = max.into();
+        }
+        IntakeRejection::TooManySegments { count, max } => {
+            body["segment_count"] = count.into();
+            body["max_segments"] = max.into();
+        }
+        IntakeRejection::DeclaredBytesOverCap { declared, max } => {
+            body["declared_bytes"] = declared.into();
+            body["max_declared_bytes"] = max.into();
+        }
+        IntakeRejection::Empty | IntakeRejection::NotNzb | IntakeRejection::Malformed => {}
+    }
+    (status, body)
+}
+
+/// Answer an intake refusal with its stable code + reason fields.
+fn intake_rejection_response(rejection: &IntakeRejection) -> Result<Response> {
+    let (status, body) = intake_rejection_parts(rejection);
+    Response::from_json(&body).map(|r| {
+        r.with_status(status)
+            .with_headers(headers_json().unwrap_or_default())
+    })
+}
+
 /// Send one dispatch message. Returns true when the Queue accepted it; a
 /// missing or failing binding returns false and the route answers 503 (see
 /// [`queued_envelope`]), so the job is retried instead of silently lost.
@@ -220,12 +295,16 @@ async fn try_enqueue(env: &Env, msg: &QueueMsg) -> bool {
 /// Queue binding is 503 with `Retry-After` — never 202 — so clients, proxies,
 /// and retry middleware do not mistake a lost job for an accepted one.
 /// `status: queued` is only ever sent after a successful `send`.
-fn queued_envelope(
+/// Pure body builder behind [`queued_envelope`]: the 503 `!queued` path must
+/// always carry the shared `{code, message, retryable}` envelope fields
+/// alongside the job correlation fields (see docs/api-errors.md). Split out
+/// so the envelope fields are unit-tested without a `worker::Response`.
+fn queued_body(
     msg: &QueueMsg,
     source: &str,
     queued: bool,
     extra: serde_json::Value,
-) -> Result<Response> {
+) -> serde_json::Value {
     let mut body = serde_json::json!({
         "stage": "queued",
         "source": source,
@@ -234,15 +313,31 @@ fn queued_envelope(
         "idempotency_key": msg.idempotency_key,
     });
     if !queued {
-        body["hint"] = serde_json::Value::String(
+        // Error path: the shared envelope fields ride alongside the job
+        // correlation fields above (extra fields are allowed, see
+        // docs/api-errors.md).
+        body["code"] = serde_json::Value::String("service_unavailable".into());
+        body["message"] = serde_json::Value::String(
             "Queue unavailable; nothing was accepted, retry shortly.".into(),
         );
+        body["retryable"] = serde_json::Value::Bool(true);
+        body["hint"] = body["message"].clone();
     }
     if let serde_json::Value::Object(map) = extra {
         if let serde_json::Value::Object(ref mut body_map) = body {
             body_map.extend(map);
         }
     }
+    body
+}
+
+fn queued_envelope(
+    msg: &QueueMsg,
+    source: &str,
+    queued: bool,
+    extra: serde_json::Value,
+) -> Result<Response> {
+    let body = queued_body(msg, source, queued, extra);
     if !queued {
         let headers = headers_json().unwrap_or_default();
         headers.append("retry-after", "5")?;
@@ -294,14 +389,14 @@ async fn store_upload_payload(env: &Env, payload_ref: &str, nzb_xml: &str) -> bo
 async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
     let text = match read_capped_text(req, MAX_SEARCH_BODY_BYTES).await {
         Ok(text) => text,
-        Err((message, status)) => return json_error(&message, status),
+        Err(err) => return json_error(err),
     };
     let parsed = match parse_search(&text) {
         Ok(parsed) => parsed,
-        Err(message) => return json_error(message, 400),
+        Err(message) => return json_error(ApiError::invalid_request(message)),
     };
     if let Err(message) = check_search(&parsed) {
-        return json_error(message, 400);
+        return json_error(ApiError::invalid_request(message));
     }
     let q = parsed.query.trim().to_string();
     let msg = match dispatch::build_search_dispatch(
@@ -313,7 +408,7 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
         parsed.page,
     ) {
         Ok(msg) => msg,
-        Err(message) => return json_error(message, 400),
+        Err(message) => return json_error(ApiError::invalid_request(message)),
     };
     console_log!("ingest search q_len={} job={}", q.len(), msg.job_id);
     let queued = try_enqueue(&ctx.env, &msg).await;
@@ -325,25 +420,21 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
 async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
     let text = match read_capped_text(req, MAX_UPLOAD_BODY_BYTES).await {
         Ok(text) => text,
-        Err((message, status)) => return json_error(&message, status),
+        Err(err) => return json_error(err),
     };
     let parsed = match parse_upload(&text) {
         Ok(parsed) => parsed,
-        Err(message) => return json_error(message, 400),
+        Err(message) => return json_error(ApiError::invalid_request(message)),
     };
     if let Err(message) = check_upload(&parsed) {
-        return json_error(message, 400);
+        return json_error(ApiError::invalid_request(message));
     }
     match estimate_nzb(&parsed.nzb_xml) {
-        Err(IntakeRejection::Empty) => json_error("nzb_xml must not be empty", 400),
-        Err(IntakeRejection::TooLarge) => json_error("nzb_xml exceeds 2 MiB", 413),
-        Err(IntakeRejection::NotNzb) => json_error("nzb_xml is not an NZB document", 400),
-        Err(IntakeRejection::TooManyFiles) => json_error("nzb has too many files", 413),
-        Err(IntakeRejection::TooManySegments) => json_error("nzb has too many segments", 413),
+        Err(rejection) => intake_rejection_response(&rejection),
         Ok(est) => {
             let msg = match dispatch::build_upload_dispatch(&parsed.user_id, &parsed.nzb_xml) {
                 Ok(msg) => msg,
-                Err(message) => return json_error(message, 400),
+                Err(message) => return json_error(ApiError::invalid_request(message)),
             };
             // The bytes must be durably stored before the job exists: an
             // enqueued job without retrievable bytes can never run.
@@ -373,11 +464,21 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Respons
     }
 }
 
+fn healthz() -> Result<Response> {
+    let health = health_response_parts();
+    let headers = worker::Headers::new();
+    for (name, value) in health.headers {
+        headers.append(&name, &value)?;
+    }
+    Response::from_body(worker::ResponseBody::Body(health.body))
+        .map(|response| response.with_status(health.status).with_headers(headers))
+}
+
 /// Job checkpoint status: validates the id shape before DB wiring lands.
 async fn job_status(_req: &Request, ctx: &RouteContext<()>) -> Result<Response> {
     let id = ctx.param("id").cloned().unwrap_or_default();
     if !validate_job_id(&id) {
-        return json_error("unknown job id", 404);
+        return json_error(ApiError::not_found("unknown job id"));
     }
     Response::from_json(&serde_json::json!({
         "job_id": id,
@@ -389,7 +490,7 @@ async fn job_status(_req: &Request, ctx: &RouteContext<()>) -> Result<Response> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nzb_intake::MAX_NZB_BYTES;
+    use crate::nzb_intake::{MAX_FILES, MAX_NZB_BYTES};
 
     fn search_body(
         query: &str,
@@ -407,6 +508,67 @@ mod tests {
             "page": page,
         })
         .to_string()
+    }
+
+    #[test]
+    fn health_response_is_uncached_json_without_dependencies() {
+        let response = health_response_parts();
+        assert_eq!(response.status, http::StatusCode::OK.as_u16());
+        assert_eq!(response.headers.len(), 2);
+        assert!(response
+            .headers
+            .contains(&("content-type".to_owned(), "application/json".to_owned())));
+        assert!(response
+            .headers
+            .contains(&("cache-control".to_owned(), "no-store".to_owned())));
+        assert_eq!(response.body, br#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn healthz_route_contract_precedes_the_catchall() {
+        // Worker Response/Headers require wasm-bindgen, so pin the production
+        // route and adapter source while testing the HTTP contract natively.
+        let source = include_str!("lib.rs");
+        let router = source
+            .split_once("\n#[worker::event(fetch)]\npub async fn main")
+            .expect("worker entrypoint must exist")
+            .1;
+        let route = router
+            .find(".get_async(\"/healthz\", |_, _| async { healthz() })")
+            .expect("GET /healthz must dispatch to its handler");
+        let catchall = router
+            .find(".or_else_any_method_async")
+            .expect("router must retain its catch-all");
+        assert!(
+            route < catchall,
+            "healthz must be registered before catch-all"
+        );
+        assert_eq!(router.matches("\"/healthz\"").count(), 1);
+
+        let handler = source
+            .split_once("fn healthz() -> Result<Response> {")
+            .expect("healthz handler must exist")
+            .1
+            .split_once("\n}\n")
+            .expect("healthz handler must close")
+            .0;
+        let compact = |text: &str| {
+            text.chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+        };
+        assert_eq!(
+            compact(handler),
+            compact(
+                r#"let health = health_response_parts();
+    let headers = worker::Headers::new();
+    for (name, value) in health.headers {
+        headers.append(&name, &value)?;
+    }
+    Response::from_body(worker::ResponseBody::Body(health.body))
+        .map(|response| response.with_status(health.status).with_headers(headers))"#
+            )
+        );
     }
 
     #[test]
@@ -472,6 +634,144 @@ mod tests {
     }
 
     #[test]
+    fn unqueued_body_carries_the_error_envelope_with_job_correlation() {
+        // The 503 `!queued` path must always carry the shared
+        // `{code, message, retryable}` envelope fields alongside `job_id`
+        // (docs/api-errors.md): deleting any one of them must fail here.
+        let msg =
+            dispatch::build_search_dispatch("user_01", "dark side", "vault_idx_01-ab", &[], 25, 0)
+                .expect("dispatch");
+        let body = queued_body(&msg, "indexer_search", false, serde_json::json!({}));
+        assert_eq!(
+            body["code"],
+            serde_json::Value::String("service_unavailable".into())
+        );
+        assert_eq!(
+            body["message"],
+            serde_json::Value::String(
+                "Queue unavailable; nothing was accepted, retry shortly.".into()
+            )
+        );
+        assert_eq!(body["retryable"], serde_json::Value::Bool(true));
+        assert_eq!(
+            body["job_id"],
+            serde_json::Value::String(msg.job_id.clone())
+        );
+        assert_eq!(body["status"], serde_json::Value::String("retry".into()));
+
+        let ok = queued_body(&msg, "indexer_search", true, serde_json::json!({}));
+        assert_eq!(ok["status"], serde_json::Value::String("queued".into()));
+        assert_eq!(ok["job_id"], serde_json::Value::String(msg.job_id.clone()));
+    }
+
+    #[test]
+    fn intake_corpus_maps_to_registered_envelopes_with_reason_fields() {
+        // (body, expected status, registry code, stable intake-specific code)
+        let over_bytes = r#"<?xml version="1.0"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+<file poster="a@b" date="1" subject="big.iso">
+<groups><group>alt.binaries.music</group></groups>
+<segments>
+<segment bytes="42949672960" number="1">big-one@news</segment>
+<segment bytes="42949672960" number="2">big-two@news</segment>
+</segments>
+</file>
+</nzb>"#;
+        let mut file_bomb = String::from("<?xml?><nzb>");
+        for _ in 0..(MAX_FILES + 1) {
+            file_bomb.push_str("<file></file>");
+        }
+        file_bomb.push_str("</nzb>");
+        let mut segment_bomb = String::from("<?xml?><nzb>");
+        for _ in 0..(crate::nzb_intake::MAX_SEGMENTS + 1) {
+            segment_bomb.push_str("<segment></segment>");
+        }
+        segment_bomb.push_str("</nzb>");
+        assert!(segment_bomb.len() < MAX_NZB_BYTES);
+        let cases: &[(&str, u16, &str, &str)] = &[
+            ("", 400, "invalid_request", "NZB_EMPTY"),
+            (
+                "<html><body>hi</body></html>",
+                400,
+                "invalid_request",
+                "NZB_NOT_NZB",
+            ),
+            (
+                "<?xml?><nzb><file>",
+                400,
+                "invalid_request",
+                "NZB_MALFORMED",
+            ),
+            (
+                over_bytes,
+                413,
+                "payload_too_large",
+                "NZB_DECLARED_BYTES_OVER_CAP",
+            ),
+            (&file_bomb, 413, "payload_too_large", "NZB_TOO_MANY_FILES"),
+            (
+                &segment_bomb,
+                413,
+                "payload_too_large",
+                "NZB_TOO_MANY_SEGMENTS",
+            ),
+            (
+                &"x".repeat(MAX_NZB_BYTES + 1),
+                413,
+                "payload_too_large",
+                "NZB_TOO_LARGE",
+            ),
+        ];
+        for (body, status, api_code, intake_code) in cases {
+            let rejection = estimate_nzb(body).unwrap_err();
+            let (actual_status, actual_body) = intake_rejection_parts(&rejection);
+            assert_eq!(actual_status, *status, "status for {intake_code}");
+            assert_eq!(actual_body["code"], *api_code, "API code for {intake_code}");
+            assert_eq!(actual_body["intake_code"], *intake_code);
+            assert_eq!(actual_body["message"], ApiError::from(rejection).message);
+            assert_eq!(actual_body["retryable"], false);
+            assert_eq!(actual_body["error"], actual_body["message"]);
+            assert_eq!(actual_status, rejection.http_status());
+            assert_eq!(
+                actual_body["intake_config_version"],
+                crate::nzb_intake::INTAKE_CONFIG_VERSION
+            );
+        }
+        // Reason fields the client renders ride alongside the code.
+        let (_, over_bytes_body) = intake_rejection_parts(&estimate_nzb(over_bytes).unwrap_err());
+        assert!(over_bytes_body["declared_bytes"].as_u64().unwrap() > 0);
+        assert!(over_bytes_body["max_declared_bytes"].as_u64().unwrap() > 0);
+        let (_, too_large_body) =
+            intake_rejection_parts(&estimate_nzb(&"x".repeat(MAX_NZB_BYTES + 1)).unwrap_err());
+        assert_eq!(
+            too_large_body["max_bytes"].as_u64().unwrap(),
+            MAX_NZB_BYTES as u64
+        );
+        let (_, too_many_files_body) =
+            intake_rejection_parts(&estimate_nzb(&file_bomb).unwrap_err());
+        assert_eq!(
+            too_many_files_body["file_count"].as_u64().unwrap(),
+            (MAX_FILES + 1) as u64
+        );
+        assert_eq!(
+            too_many_files_body["max_files"].as_u64().unwrap(),
+            MAX_FILES as u64
+        );
+        let (_, too_many_segments_body) =
+            intake_rejection_parts(&estimate_nzb(&segment_bomb).unwrap_err());
+        assert_eq!(
+            too_many_segments_body["segment_count"].as_u64().unwrap(),
+            (crate::nzb_intake::MAX_SEGMENTS + 1) as u64
+        );
+        assert_eq!(
+            too_many_segments_body["max_segments"].as_u64().unwrap(),
+            crate::nzb_intake::MAX_SEGMENTS as u64
+        );
+        // A valid NZB has no rejection at all: it queues.
+        assert!(estimate_nzb(crate::fixtures::SMALL_NZB).is_ok());
+    }
+
+    #[test]
     fn body_caps_stay_small_and_fit_escaped_nzbs() {
         // Compile-time: the search cap stays small and the upload wire cap
         // always fits a maximally-escaped 2 MiB NZB.
@@ -485,6 +785,7 @@ mod tests {
 #[worker::event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Response> {
     Router::new()
+        .get_async("/healthz", |_, _| async { healthz() })
         .post_async("/v1/ingest/search", |mut req, ctx| async move {
             search(&mut req, &ctx).await
         })
@@ -494,7 +795,9 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
         .get_async("/v1/ingest/jobs/:id", |req, ctx| async move {
             job_status(&req, &ctx).await
         })
-        .or_else_any_method_async("/*catchall", |_, _| async { json_error("not found", 404) })
+        .or_else_any_method_async("/*catchall", |_, _| async {
+            json_error(ApiError::not_found("not found"))
+        })
         .run(req, env)
         .await
 }

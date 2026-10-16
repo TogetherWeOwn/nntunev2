@@ -10,6 +10,7 @@ NZB upload ───────────────┘                     
 
 ## This slice
 
+- `GET /healthz`: unauthenticated Worker-only health check returning `{"ok":true}` with `Cache-Control: no-store`; it does not access bindings.
 - Job state machine (`src/jobs.rs`): `Queued → Searching|Parsing →
   Probing → Verifying → (Repairing → Verifying)? → Matching → Writing →
   Done`, `Failed` terminal. Checkpoints make redelivery/replay converge;
@@ -19,8 +20,18 @@ NZB upload ───────────────┘                     
 - Newznab search builder (`src/newznab.rs`): `t=music`, `https://` only,
   no embedded credentials. The URL is built **without** the key; the
   vault-resolved key is injected at request time and redacted in logs.
-- NZB intake guard (`src/nzb_intake.rs`): 2 MiB / 5k files / 60k segments
-  caps before anything spends provider connections.
+- NZB intake guard (`src/nzb_intake.rs`): versioned caps
+  (`INTAKE_CONFIG_VERSION` v1: 2 MiB / 5k files / 60k segments / 64 GiB
+  declared segment bytes) plus well-formedness validation before anything
+  spends provider connections. Refusals use the shared API error envelope:
+  `code` is `invalid_request` or `payload_too_large`, while the stable
+  intake-specific identifier (`NZB_EMPTY`, `NZB_TOO_LARGE`, `NZB_NOT_NZB`,
+  `NZB_MALFORMED`, `NZB_TOO_MANY_FILES`, `NZB_TOO_MANY_SEGMENTS`, or
+  `NZB_DECLARED_BYTES_OVER_CAP`) is in `intake_code`. The response also keeps
+  `error` as an alias of `message` and includes `intake_config_version`; cap
+  refusals return measured values and caps (`file_count`/`max_files`,
+  `segment_count`/`max_segments`, `declared_bytes`/`max_declared_bytes`, …)
+  so clients can render a reason.
 - Per-plan rate limits (`src/rate_limit.rs`): provisional base/5x/20x
   tunables (exact numbers are set at launch); token buckets, no clock
   dependency.
@@ -30,10 +41,11 @@ NZB upload ───────────────┘                     
   `/v1/mb/search?type=…`).
 - Routes (`src/lib.rs`): `POST /v1/ingest/search` (16 KiB body cap,
   ≤16 categories, paged window), `POST /v1/ingest/nzb` (wire cap accounting
-  for JSON escaping, then the 2 MiB / 5k / 60k intake guard) — malformed JSON
-  is 400, over-cap is 413, busy store/queue is 503; success is 202 + enqueue
-  with job id + idempotency key. `GET /v1/ingest/jobs/:id` (checkpoint reads
-  land with the consumer).
+  for JSON escaping, then the versioned intake guard) — malformed JSON is
+  400, intake refusals use the registered API code plus `intake_code` (bad
+  input 400, over-cap 413 with measured + cap fields), busy store/queue is
+  503; success is 202 + enqueue with job id + idempotency key.
+  `GET /v1/ingest/jobs/:id` (checkpoint reads land with the consumer).
 
 ## Security rules
 
@@ -84,6 +96,60 @@ Usenet in CI). Ingest needs from that card:
 Blocked on siblings for the live half: pool-DO wire contract, `nntune-core`
 parse output, synthetic NNTP fixture server + CI E2E against it, checkpoint
 KV reads in `GET /v1/ingest/jobs/:id`, and the repair Container runtime.
+
+## Slice T2 — retry budget + DLQ (this slice)
+
+- Retry budget (`src/retry.rs`): 1 delivery + 4 redeliveries
+  (`jobs::MAX_ATTEMPTS` = 5 = `CONSUMER_MAX_RETRIES` + 1 =
+  `PAYLOAD_RETRY_ATTEMPTS` + 1, enforced by a compile-time assert).
+  The durable checkpoint in `INGEST_STATE` is authoritative because Cloudflare
+  redelivers the unchanged Queue body. `decide_checkpoint` increments the
+  checkpoint before returning Retry; the handler must persist it before calling
+  `retry_with_options`. Backoff is derived from the payload-fetch schedule.
+  The consumer settles **per message**, so one poison job costs retries but
+  does not head-of-line block valid jobs. Permanent failures skip the budget
+  and quarantine at once; quarantine marks the checkpoint Failed before ack. If a DLQ send fails, the consumer must call `retry_with_options` with a delay
+  (or return an error) for that message; merely skipping `ack()` and returning
+  implicitly acknowledges it. Each retry also spends one of the four native
+  `max_retries` slots, after which Cloudflare moves the raw body to its native
+  DLQ if `dead_letter_queue` is configured; otherwise Cloudflare drops it. A
+  successful send followed by an ack failure may create a duplicate DLQ
+  entry, so DLQ processing must be idempotent by `job_id`.
+- DLQ quarantine: on exhaustion the consumer sends one `DlqEntry` to
+  `nntune-ingest-dlq` (`INGEST_DLQ` binding) — the original `QueueMsg` plus
+  machine-readable `error_code` / `attempts` fields in the serialized DLQ
+  body — then acks the original. The native dead-letter route can be enabled
+  as a safety net for messages the handler never settles (panic, timeout),
+  which arrive as raw bodies with no reason envelope.
+- Poison coverage (`tests/retry_dlq.rs`): an always-failing job burns all 5
+  deliveries, lands in the DLQ with reason body fields asserted, and never
+  blocks the valid jobs behind it in the same batch.
+
+## Redrive (DLQ back to queue)
+
+1. On **Workers Paid**, the Cloudflare DLQ defaults to **4 days retention**;
+   configure up to 14 days with
+   `npx wrangler queues update nntune-ingest-dlq --message-retention-period-secs 1209600`
+   (60–1,209,600 seconds). On **Workers Free**, retention is fixed at 24 hours
+   and cannot be configured. Unconsumed entries are deleted at expiry on either
+   plan, so treat the applicable retention period as the redrive deadline; this
+   queue is not a permanent archive.
+2. Read the DLQ: each entry is either a `DlqEntry` (explicit quarantine, with
+   `error_code` / `attempts` / redacted, bounded `reason`) or a raw `QueueMsg`
+   (native dead-letter fallback). Fix the cause first.
+3. Load the matching `INGEST_STATE` checkpoint. The redrive helpers reject a
+   checkpoint that is not `Failed`, so for a raw native-DLQ body first mark any
+   nonterminal checkpoint `Failed` with code `native_dead_letter` and persist it.
+   A `Done` checkpoint must not be redriven. Then call
+   `retry::redrive(&entry, &mut checkpoint)` (or
+   `retry::redrive_raw(&msg, &mut checkpoint)`). The helper resets the durable
+   checkpoint and returns a matching message; persist the reset under the same
+   job id before enqueue. Identity and input are kept, budgets/state are reset,
+   and `probe_tally` / `failure_code` / `failure_reason` are cleared. Never
+   enqueue if the checkpoint write failed.
+4. No paging on DLQ depth in this slice (out of scope): inspect queue depth
+   before bulk redrive so a systemic cause does not re-poison the queue faster
+   than it drains.
 
 ## Develop
 

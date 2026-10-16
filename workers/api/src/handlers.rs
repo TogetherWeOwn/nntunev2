@@ -374,6 +374,20 @@ fn internal() -> Response {
     json_response(500, serde_json::json!({"error": "internal error"}))
 }
 
+fn session_error_response(error: session::SessionError) -> Response {
+    match error {
+        session::SessionError::Invalid => generic_auth(),
+        error => {
+            let error = crate::api_error::ApiError::from(error);
+            Response {
+                status: error.status,
+                body: error.body_json(),
+                set_cookie: None,
+            }
+        }
+    }
+}
+
 fn invalid_request() -> Response {
     json_response(400, serde_json::json!({"error": "invalid request"}))
 }
@@ -542,8 +556,8 @@ where
         // check below still enforces revocation, counter and expiry, and
         // minting always uses the primary.
         let keys = self.cfg.session_keys();
-        let claims =
-            session::verify_session_dual(&keys, &token, self.now).map_err(|_| generic_auth())?;
+        let claims = session::verify_session_dual(&keys, &token, self.now)
+            .map_err(session_error_response)?;
         let record = self
             .store
             .session_by_id(&claims.session_id)
@@ -551,7 +565,7 @@ where
             .map_err(|_| internal())?
             .ok_or_else(generic_auth)?;
         let claims = session::verify_stored_session(&keys, &token, self.now, &record)
-            .map_err(|_| generic_auth())?;
+            .map_err(session_error_response)?;
         Ok((claims, token))
     }
 
@@ -575,16 +589,8 @@ where
             .await
             .map_err(|_| internal())?
             .ok_or_else(generic_auth)?;
-        let claims =
-            session::require_fresh_session(&keys, &token, self.now, &record).map_err(|error| {
-                match error {
-                    session::SessionError::ReauthRequired => json_response(
-                        error.http_status(),
-                        serde_json::json!({"error": error.code()}),
-                    ),
-                    _ => generic_auth(),
-                }
-            })?;
+        let claims = session::require_fresh_session(&keys, &token, self.now, &record)
+            .map_err(session_error_response)?;
         Ok((claims, token))
     }
 
@@ -1164,7 +1170,7 @@ where
     let new_token = match session::rotate_session(&keys, &token, ctx.now, ctx.cfg.session_ttl_secs)
     {
         Ok(new_token) => new_token,
-        Err(_) => return generic_auth(),
+        Err(error) => return session_error_response(error),
     };
     let new_claims = match session::verify_session(&ctx.cfg.session_secret, &new_token, ctx.now) {
         Ok(new_claims) => new_claims,
@@ -1557,6 +1563,23 @@ mod tests {
 
     const NOW: u64 = 1_700_000_000;
     const ORIGIN: &str = "https://example.com";
+
+    #[test]
+    fn session_misconfiguration_is_retryable_server_error() {
+        let response = session_error_response(session::SessionError::Misconfigured);
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response.body,
+            r#"{"code":"internal_error","message":"unexpected error","retryable":true}"#
+        );
+
+        let response = session_error_response(session::SessionError::Invalid);
+        assert_eq!(response.status, 401);
+        assert_eq!(
+            response.body,
+            r#"{"error":"check your email and try again"}"#
+        );
+    }
 
     fn cfg() -> Config {
         Config::new(
@@ -2453,7 +2476,10 @@ mod tests {
         };
         let stale_put = block_on(handle(&stale_ctx, &stale_put_req));
         assert_eq!(stale_put.status, 401);
-        assert_eq!(stale_put.body, r#"{"error":"reauth_required"}"#);
+        assert_eq!(
+            stale_put.body,
+            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
+        );
 
         let stale_get_req = Request {
             method: "GET".to_string(),
@@ -2474,7 +2500,10 @@ mod tests {
         };
         let stale_delete = block_on(handle(&stale_ctx, &stale_delete_req));
         assert_eq!(stale_delete.status, 401);
-        assert_eq!(stale_delete.body, r#"{"error":"reauth_required"}"#);
+        assert_eq!(
+            stale_delete.body,
+            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
+        );
         assert!(h.store.vaults.borrow().contains_key("u1"));
     }
 
@@ -2569,7 +2598,7 @@ mod tests {
     fn fx_es256_cose(secret: u8) -> Vec<u8> {
         use p256::ecdsa::SigningKey;
         let sk = SigningKey::from_slice(&[secret; 32]).unwrap();
-        let point = sk.verifying_key().to_encoded_point(false);
+        let point = sk.verifying_key().to_sec1_point(false);
         let mut cose = Vec::new();
         fx_head(5, 5, &mut cose);
         fx_int(1, &mut cose);
@@ -2650,7 +2679,7 @@ mod tests {
 
         let h = harness();
         let sk = SigningKey::from_slice(&[11u8; 32]).unwrap();
-        let point = sk.verifying_key().to_encoded_point(false);
+        let point = sk.verifying_key().to_sec1_point(false);
         let mut cose = Vec::new();
         head(5, 5, &mut cose);
         eint(1, &mut cose);
