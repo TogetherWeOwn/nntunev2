@@ -2,7 +2,8 @@
 
 Rust core (`nntune-stream`) of the NNTune v2 stream Worker and its per-user
 NNTP pool Durable Object. The Workers entry (`src/runtime.rs`) compiles on
-wasm32 only; native builds and tests never link the Workers runtime.
+wasm32 only; its `worker`, `wasm-bindgen`, and transport dependencies are
+excluded from native builds and tests.
 
 ## Play path
 
@@ -154,6 +155,24 @@ No Cloudflare account, no secrets: the play-path synthetic NNTP server lives
 in `tests/stream_integration.rs` and serves canned yEnc multipart articles;
 `tests/probe_synthetic_nntp.rs` runs the probe against the shared
 `nntune-test-nntp` server over loopback TCP.
+
+## Worker build and current runtime boundary
+
+The crate builds the deployable Worker module with:
+
+```sh
+cargo build --manifest-path workers/stream/Cargo.toml --release --target wasm32-unknown-unknown
+```
+
+This emits `target/wasm32-unknown-unknown/release/nntune_stream.wasm` as well
+as the Rust library artifact. Wrangler's build command runs `worker-build
+--release` to generate the `build/worker/shim.mjs` entry configured below.
+The wasm32-only `runtime` exports the `NntpPool` Durable Object. Its probe
+route currently fails closed with `503 provider_unavailable` until provider
+configuration is wired from the account vault; the Worker's public fetch path
+remains `404` until the play path is connected to Cloudflare's R2 and metering
+adapters. This is a buildable runtime entrypoint, not a production playback
+deployment.
 
 ## Metering reconciliation (portable-core model)
 

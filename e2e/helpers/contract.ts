@@ -24,6 +24,8 @@ export const TESTIDS = {
   importFile: 'import-file',
   importStatus: 'import-status',
   libraryItem: 'library-item',
+  libraryList: 'library-list',
+  libraryStaleBadge: 'library-stale-badge',
   audioPlayer: 'audio-player',
   usageMeter: 'usage-meter',
   planLimitNotice: 'plan-limit-notice',
