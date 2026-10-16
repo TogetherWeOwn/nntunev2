@@ -320,40 +320,62 @@ fn meter_failure_response(err: &MeterWriteError) -> Result<Response> {
 /// never be the authority behind the idempotency: the ledger below is.
 ///
 /// Protocol per admission (`drive_metered_admission`):
-/// 1. `record_stage_once` atomically claims (`job_id`, `stage`) and inserts
-///    `pending`, or returns the existing mark. A competing claimant gets
-///    `Busy` and answers 503 + Retry-After without queue/meter side effects.
-///    A storage failure also answers 503 (fail-closed).
+/// 1. `record_stage_once` ensures the row exists (`pending`), then runs one
+///    atomic `UPDATE ... WHERE (pending OR claimed-but-expired) RETURNING`
+///    as the claim. Postgres serializes concurrent UPDATEs on the same row
+///    (row lock + predicate re-check), so exactly one claimant wins; every
+///    statement is single-transaction autocommit with no session state held
+///    across awaits, which is what makes it Hyperdrive-safe (transaction
+///    mode pools one origin connection per transaction; session advisory
+///    locks cannot survive that). A loser gets `Busy` and answers 503 +
+///    Retry-After without queue/meter side effects. A storage failure also
+///    answers 503 (fail-closed). Lease bound, stated honestly: the claim is
+///    single-flight only while the owner is live within its 30s lease. An
+///    owner stalled past the lease (isolate stall, not just death) lets a
+///    retry reclaim and re-drive concurrently, so a pathological >30s stall
+///    can double-drive queue + meter; the loser then fails closed at commit
+///    and the row still converges to `queued`. Normal admissions complete
+///    in milliseconds, so the window is narrow by construction — and the
+///    meter duplicate it risks is inside the crash-window tolerance step 5
+///    already accepts. A claimant fencing token would narrow it further but
+///    cannot retract an already-written meter event, so it stays out of
+///    this slice.
 /// 2. An existing `queued` mark means a previous attempt finished the
 ///    whole outbox (Queue accepted AND meter written): replay 202 without
 ///    re-queueing or re-metering. This is the idempotency that closes the
-///    retry race above.
+///    retry race above. `queued` is terminal by design in this slice (no
+///    TTL/delete): `job_id` is deterministic (`dispatch::make_job_id`) and
+///    there is no persisted lifecycle/checkpoint state yet to distinguish
+///    an active retry from a terminal job (`jobs.rs` dead-letter, checkpoint
+///    DB wiring not landed), so reopening the row alone would risk
+///    double-admission. Resubmission epochs belong to the lifecycle
+///    follow-up, not to this admission fix.
 /// 3. Otherwise the Queue send runs first, so the meter outcome below is
 ///    truthful: a failed send answers 503 with no meter event at all (the
-///    ledger stays `pending`; the retry resumes here and still owes
-///    exactly one `Ok`).
+///    claim is released back to `pending`; the retry resumes here and still
+///    owes exactly one `Ok`).
 /// 4. On a successful send exactly one `Ok` meter event is written. A
-///    meter failure answers 503 with the ledger left `pending`: the Queue
-///    already holds one message (an orphan), so the retry re-queues and
-///    re-meters. The duplicate Queue message is harmless by construction
-///    (the consumer converges on `idempotency_key` — `library.rs`
-///    `UNIQUE(idempotency_key)` — plus `jobs::JobCheckpoint` resume and
-///    Queue redelivery), while the meter count stays exact. Marking first
-///    and metering second would risk a silent drop instead; this order
-///    risks at most a wasted queue slot, never a lost event.
-/// 5. `mark_queued` commits the outbox; only then is 202 answered.
+///    meter failure answers 503 with the claim released to `pending`: the
+///    Queue already holds one message (an orphan), so the retry re-queues
+///    and re-meters. The duplicate Queue message is harmless by
+///    construction (the consumer converges on `idempotency_key` —
+///    `library.rs` `UNIQUE(idempotency_key)` — plus `jobs::JobCheckpoint`
+///    resume and Queue redelivery), while the meter count stays exact.
+///    Marking first and metering second would risk a silent drop instead;
+///    this order risks at most a wasted queue slot, never a lost event.
+/// 5. `mark_queued` commits `claimed -> queued`; only then is 202 answered.
 ///    Crash-window honesty: the dataset write and the ledger commit are
 ///    two systems with no shared transaction, so an isolate that dies
-///    between them can leave `pending` behind a written event; reload
-///    recovery re-drives `pending` (at most a duplicate `Ok` in that
-///    narrow window, never a silent drop — this slice forbids drops).
+///    between them can leave `claimed` behind a written event; lease expiry
+///    (30s) lets the retry reclaim and re-drive (at most a duplicate `Ok`
+///    in that narrow window, never a silent drop — this slice forbids
+///    drops).
 ///
 /// Production uses the `metered_admission` table in the existing
-/// `LIBRARY_DB` Hyperdrive database (`migrations/0004_*`) for durable marks,
-/// and a Postgres session advisory lock keyed by (`job_id`, `stage`) as the
-/// cross-isolate atomic claim. The lock stays on the request's dedicated DB
-/// connection until commit or retryable failure; process loss drops the
-/// session and releases it.
+/// `LIBRARY_DB` Hyperdrive database (`migrations/0004_*`, `0005_*`) for
+/// durable marks. The cross-isolate atomic claim is the single-statement
+/// `UPDATE ... RETURNING` in `admission_claim_sql`; no connection, lock,
+/// transaction, or temp state is held across the queue/meter awaits.
 ///
 /// Outbox mark for one (`job_id`, `stage`) admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -371,9 +393,10 @@ enum AdmissionMark {
 
 /// Authoritative durable ledger keyed by (`job_id`, `stage`).
 ///
-/// Production: [`PgAdmissionLedger`] over Hyperdrive Postgres, using a
-/// session advisory lock for atomic ownership and the table primary key for
-/// durable identity. Tests drive the same seam with in-memory and file-backed
+/// Production: [`PgAdmissionLedger`] over Hyperdrive Postgres. Atomic
+/// ownership comes from the single-statement `UPDATE ... RETURNING` claim
+/// plus the table primary key for durable identity — never from session
+/// state. Tests drive the same seam with in-memory and file-backed
 /// doubles (see `mod tests`).
 trait AdmissionLedger {
     /// Atomically claim (`job_id`, `stage`) before reading or creating the
@@ -383,25 +406,42 @@ trait AdmissionLedger {
         job_id: &str,
         stage: &str,
     ) -> Result<AdmissionMark, MeterWriteError>;
-    /// Commit a `pending` admission to `queued` after the Queue send was
-    /// accepted and the `Ok` meter event was written, then release its claim.
+    /// Commit a `claimed` admission to `queued` after the Queue send was
+    /// accepted and the `Ok` meter event was written.
     async fn mark_queued(&mut self, job_id: &str, stage: &str) -> Result<(), MeterWriteError>;
-    /// Release the claim after a failed attempt; a process loss also releases
-    /// the production session-level advisory lock.
-    async fn release_claim(&mut self) {}
+    /// Release a `claimed` admission back to `pending` after a failed
+    /// attempt; an expired lease also lets the next retry reclaim it, so a
+    /// lost isolate never blocks admission forever. Best-effort: ignored
+    /// errors still converge via lease expiry.
+    async fn release_claim(&mut self, job_id: &str, stage: &str);
+}
+
+/// Seconds a `claimed` admission stays owned before the next retry may
+/// reclaim it. Must match the `INTERVAL` in [`admission_claim_sql`]; the
+/// SQL test below pins both to the same value.
+const ADMISSION_CLAIM_LEASE_SECS: u64 = 30;
+
+#[allow(dead_code)]
+fn admission_claim_lease_secs() -> u64 {
+    ADMISSION_CLAIM_LEASE_SECS
 }
 
 /// Parameterized statements owned here (execution lives with the ledger
-/// impls); see `migrations/0004_metered_admission.sql` for the table.
-/// Ledger statements use `$1` for job id and `$2` for stage; claim SQL uses
-/// `$1` for their combined lock key.
-fn admission_claim_sql() -> &'static str {
-    "SELECT pg_try_advisory_lock(hashtextextended($1, 0))"
-}
-
-fn admission_record_sql() -> &'static str {
+/// impls); see `migrations/0004_metered_admission.sql` and
+/// `migrations/0005_metered_admission_claim.sql` for the table.
+/// Every statement is single-transaction autocommit with `$1` = job id and
+/// `$2` = stage: no `BEGIN`, no session lock, no temp state, so each one is
+/// safe under Hyperdrive transaction-mode pooling.
+fn admission_ensure_sql() -> &'static str {
     "INSERT INTO metered_admission (job_id, stage, state) VALUES ($1, $2, 'pending') \
      ON CONFLICT (job_id, stage) DO NOTHING"
+}
+
+fn admission_claim_sql() -> &'static str {
+    "UPDATE metered_admission SET state = 'claimed', claimed_at = now() \
+     WHERE job_id = $1 AND stage = $2 \
+     AND (state = 'pending' OR (state = 'claimed' AND claimed_at < now() - INTERVAL '30 seconds')) \
+     RETURNING state"
 }
 
 fn admission_read_mark_sql() -> &'static str {
@@ -409,26 +449,28 @@ fn admission_read_mark_sql() -> &'static str {
 }
 
 fn admission_mark_queued_sql() -> &'static str {
-    "UPDATE metered_admission SET state = 'queued' WHERE job_id = $1 AND stage = $2"
+    "UPDATE metered_admission SET state = 'queued', claimed_at = NULL \
+     WHERE job_id = $1 AND stage = $2 AND state = 'claimed'"
+}
+
+fn admission_release_sql() -> &'static str {
+    "UPDATE metered_admission SET state = 'pending', claimed_at = NULL \
+     WHERE job_id = $1 AND stage = $2 AND state = 'claimed'"
 }
 
 /// [`AdmissionLedger`] over the `LIBRARY_DB` Hyperdrive database.
 ///
-/// A dedicated connection is held for the full admission attempt so the
-/// session-level advisory lock remains owned across queue/meter awaits.
-/// Hyperdrive pools underneath; a connection hiccup fails closed as 503,
-/// never the isolate. Connection detail never reaches logs or errors.
+/// Every method opens a short-lived connection, runs one autocommit
+/// statement batch, and drops it before returning — nothing is held across
+/// the queue/meter awaits. A connection hiccup fails closed as 503, never
+/// the isolate. Connection detail never reaches logs or errors.
 struct PgAdmissionLedger {
     env: Env,
-    claim: Option<tokio_postgres::Client>,
 }
 
 impl PgAdmissionLedger {
     fn from_env(env: &Env) -> Self {
-        Self {
-            env: env.clone(),
-            claim: None,
-        }
+        Self { env: env.clone() }
     }
 
     async fn client(&self) -> Result<tokio_postgres::Client, MeterWriteError> {
@@ -459,16 +501,6 @@ impl PgAdmissionLedger {
         });
         Ok(client)
     }
-
-    fn parse_mark(state: String) -> Result<AdmissionMark, MeterWriteError> {
-        match state.as_str() {
-            "pending" => Ok(AdmissionMark::Pending),
-            "queued" => Ok(AdmissionMark::Queued),
-            _ => Err(MeterWriteError::Transport(
-                "admission ledger returned an unknown mark".to_string(),
-            )),
-        }
-    }
 }
 
 impl AdmissionLedger for PgAdmissionLedger {
@@ -478,25 +510,22 @@ impl AdmissionLedger for PgAdmissionLedger {
         stage: &str,
     ) -> Result<AdmissionMark, MeterWriteError> {
         let unavailable = || MeterWriteError::Transport("admission ledger unavailable".to_string());
+        // One short-lived connection for the whole claim sequence; it is
+        // dropped before the queue/meter awaits, so no session state ever
+        // crosses them. Atomicity comes from the single UPDATE claim below,
+        // not from holding a connection.
         let client = self.client().await?;
-        // A session advisory lock is the atomic claim. Keep this dedicated
-        // connection alive across queue/meter awaits; concurrent requests
-        // fail fast rather than both driving the same pending row.
-        let lock_key = format!("{job_id}:{stage}");
-        let locked: bool = client
-            .query_one(admission_claim_sql(), &[&lock_key])
-            .await
-            .map_err(|_| unavailable())?
-            .get(0);
-        if !locked {
-            return Ok(AdmissionMark::Busy);
-        }
-        self.claim = Some(client);
-        let client = self.claim.as_ref().expect("claim just stored");
         client
-            .execute(admission_record_sql(), &[&job_id, &stage])
+            .execute(admission_ensure_sql(), &[&job_id, &stage])
             .await
             .map_err(|_| unavailable())?;
+        let claimed = client
+            .query_opt(admission_claim_sql(), &[&job_id, &stage])
+            .await
+            .map_err(|_| unavailable())?;
+        if claimed.is_some() {
+            return Ok(AdmissionMark::Pending);
+        }
         let row = client
             .query_opt(admission_read_mark_sql(), &[&job_id, &stage])
             .await
@@ -504,7 +533,14 @@ impl AdmissionLedger for PgAdmissionLedger {
         match row {
             Some(row) => {
                 let state: String = row.get(0);
-                Self::parse_mark(state)
+                if state == "queued" {
+                    Ok(AdmissionMark::Queued)
+                } else {
+                    // `pending` here means our claim lost the race after the
+                    // ensure; `claimed` means a live owner or an unexpired
+                    // lease. Either way this request must not send or meter.
+                    Ok(AdmissionMark::Busy)
+                }
             }
             None => Err(unavailable()),
         }
@@ -512,24 +548,38 @@ impl AdmissionLedger for PgAdmissionLedger {
 
     async fn mark_queued(&mut self, job_id: &str, stage: &str) -> Result<(), MeterWriteError> {
         let client = self
-            .claim
-            .as_ref()
-            .ok_or_else(|| MeterWriteError::Transport("admission claim missing".to_string()))?;
-        client
+            .client()
+            .await
+            .map_err(|_| MeterWriteError::Transport("admission ledger unavailable".to_string()))?;
+        let updated = client
             .execute(admission_mark_queued_sql(), &[&job_id, &stage])
             .await
             .map_err(|e| {
                 console_log!("admission ledger commit failed: {:?}", e);
                 MeterWriteError::Transport("admission ledger unavailable".to_string())
             })?;
-        self.release_claim().await;
+        if updated != 1 {
+            // Lost the claim (lease expired and someone else reclaimed) or
+            // already committed: fail closed so the retry converges instead
+            // of answering 202-and-unmarked.
+            return Err(MeterWriteError::Transport(
+                "admission ledger unavailable".to_string(),
+            ));
+        }
         Ok(())
     }
 
-    async fn release_claim(&mut self) {
-        // Dropping the session releases the advisory lock even if explicit
-        // unlock fails; never reuse a claim after an incomplete attempt.
-        self.claim.take();
+    async fn release_claim(&mut self, job_id: &str, stage: &str) {
+        // Best-effort `claimed -> pending` so the immediate retry can
+        // reclaim without waiting out the lease; ignored errors still
+        // converge via lease expiry. Fresh short-lived connection: never
+        // held across the queue/meter awaits.
+        let Ok(client) = self.client().await else {
+            return;
+        };
+        let _ = client
+            .execute(admission_release_sql(), &[&job_id, &stage])
+            .await;
     }
 }
 
@@ -577,28 +627,24 @@ where
     }
     let mark = match ledger.record_stage_once(&msg.job_id, stage).await {
         Ok(mark) => mark,
-        Err(e) => {
-            ledger.release_claim().await;
-            return AdmissionDecision::MeterUnavailable(e);
-        }
+        Err(e) => return AdmissionDecision::MeterUnavailable(e),
     };
     if mark == AdmissionMark::Queued {
-        ledger.release_claim().await;
         return AdmissionDecision::AlreadyQueued;
     }
     if mark == AdmissionMark::Busy {
         return AdmissionDecision::Busy;
     }
     if !queue_send().await {
-        ledger.release_claim().await;
+        ledger.release_claim(&msg.job_id, stage).await;
         return AdmissionDecision::QueueUnavailable;
     }
     if let Err(e) = meter_emit(MeterOutcome::Ok).await {
-        ledger.release_claim().await;
+        ledger.release_claim(&msg.job_id, stage).await;
         return AdmissionDecision::MeterUnavailable(e);
     }
     if let Err(e) = ledger.mark_queued(&msg.job_id, stage).await {
-        ledger.release_claim().await;
+        ledger.release_claim(&msg.job_id, stage).await;
         return AdmissionDecision::MeterUnavailable(e);
     }
     AdmissionDecision::Admitted
@@ -920,15 +966,19 @@ mod tests {
 
     // --- Durable metered admission seam ---------------------------------
     //
-    // Production uses a Postgres session advisory lock for the concurrent
-    // claim and the primary key for durable marks. These doubles prove the
+    // Production uses single-statement autocommit UPDATE claims plus the
+    // primary key for durable marks — no session state, so it stays correct
+    // under Hyperdrive transaction-mode pooling. These doubles prove the
     // admission state machine at the `AdmissionLedger` seam under reload,
     // concurrency, and failure — no Worker runtime needed.
 
-    /// In-memory ledger double for durable marks. Injected `fail_*` flags
-    /// model ledger commit failures; `ConcurrentLedger` models claim races.
+    /// In-memory ledger double for durable marks. Models the production
+    /// pending/claimed/queued machine: `record_stage_once` claims (Busy on a
+    /// live claim), `mark_queued` requires the claim, `release_claim` drops
+    /// it back to pending. Injected `fail_*` flags model ledger outages.
     struct MemLedger {
         marks: std::collections::BTreeMap<(String, String), AdmissionMark>,
+        claimed: std::collections::BTreeSet<(String, String)>,
         fail_record: bool,
         fail_commit: bool,
         record_calls: usize,
@@ -938,6 +988,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 marks: std::collections::BTreeMap::new(),
+                claimed: std::collections::BTreeSet::new(),
                 fail_record: false,
                 fail_commit: false,
                 record_calls: 0,
@@ -963,10 +1014,16 @@ mod tests {
                     "injected commit_failure".to_string(),
                 ));
             }
-            Ok(*self
-                .marks
-                .entry((job_id.to_string(), stage.to_string()))
-                .or_insert(AdmissionMark::Pending))
+            let key = (job_id.to_string(), stage.to_string());
+            if self.marks.get(&key) == Some(&AdmissionMark::Queued) {
+                return Ok(AdmissionMark::Queued);
+            }
+            if self.claimed.contains(&key) {
+                return Ok(AdmissionMark::Busy);
+            }
+            self.claimed.insert(key.clone());
+            self.marks.entry(key).or_insert(AdmissionMark::Pending);
+            Ok(AdmissionMark::Pending)
         }
 
         async fn mark_queued(&mut self, job_id: &str, stage: &str) -> Result<(), MeterWriteError> {
@@ -975,11 +1032,19 @@ mod tests {
                     "injected commit_failure".to_string(),
                 ));
             }
-            self.marks.insert(
-                (job_id.to_string(), stage.to_string()),
-                AdmissionMark::Queued,
-            );
+            let key = (job_id.to_string(), stage.to_string());
+            if !self.claimed.remove(&key) {
+                return Err(MeterWriteError::Transport(
+                    "ledger commit without a claim".to_string(),
+                ));
+            }
+            self.marks.insert(key, AdmissionMark::Queued);
             Ok(())
+        }
+
+        async fn release_claim(&mut self, job_id: &str, stage: &str) {
+            self.claimed
+                .remove(&(job_id.to_string(), stage.to_string()));
         }
     }
 
@@ -1038,7 +1103,13 @@ mod tests {
                 .iter()
                 .find(|row| row.job_id == job_id && row.stage == stage)
             {
-                return Ok(row.state);
+                // File double is sequential (one handle drives one attempt):
+                // a persisted `queued` replays, anything else is reclaimable
+                // pending. Concurrent claims are covered by ClaimLedger.
+                if row.state == AdmissionMark::Queued {
+                    return Ok(AdmissionMark::Queued);
+                }
+                return Ok(AdmissionMark::Pending);
             }
             let mut rows = rows;
             rows.push(LedgerRow {
@@ -1066,6 +1137,8 @@ mod tests {
                 )),
             }
         }
+
+        async fn release_claim(&mut self, _job_id: &str, _stage: &str) {}
     }
 
     fn admission_msg() -> QueueMsg {
@@ -1145,23 +1218,57 @@ mod tests {
     #[test]
     fn admission_sql_owns_concurrency_clauses() {
         for sql in [
-            admission_record_sql(),
+            admission_ensure_sql(),
+            admission_claim_sql(),
             admission_read_mark_sql(),
             admission_mark_queued_sql(),
+            admission_release_sql(),
         ] {
             assert!(
                 sql.contains("job_id") && sql.contains("stage"),
                 "ledger statements are keyed by (job_id, stage): {sql}"
             );
         }
-        assert!(admission_claim_sql().contains("pg_try_advisory_lock"));
-        assert!(admission_claim_sql().contains("hashtextextended"));
+        // Hyperdrive transaction-mode pooling returns the origin connection
+        // per transaction, so no statement may rely on session state held
+        // across awaits: no advisory locks, no BEGIN, no temp state.
+        for sql in [
+            admission_ensure_sql(),
+            admission_claim_sql(),
+            admission_read_mark_sql(),
+            admission_mark_queued_sql(),
+            admission_release_sql(),
+        ] {
+            let lower = sql.to_lowercase();
+            assert!(
+                !lower.contains("pg_try_advisory")
+                    && !lower.contains("pg_advisory")
+                    && !lower.contains("begin")
+                    && !lower.contains("savepoint"),
+                "ledger statements must be single-statement autocommit: {sql}"
+            );
+        }
         assert!(
-            admission_record_sql().contains("ON CONFLICT (job_id, stage) DO NOTHING"),
+            admission_ensure_sql().contains("ON CONFLICT (job_id, stage) DO NOTHING"),
             "retries must converge on one durable row"
         );
-        assert!(admission_record_sql().contains("pending"));
-        assert!(admission_mark_queued_sql().contains("queued"));
+        assert!(admission_ensure_sql().contains("pending"));
+        // The atomic claim: one UPDATE whose WHERE admits pending rows or
+        // expired claimed leases, RETURNING the winner. Concurrent UPDATEs
+        // on the same row serialize in Postgres (row lock + predicate
+        // re-check), so exactly one claimant wins with no session lock.
+        let claim = admission_claim_sql();
+        assert!(claim.contains("UPDATE metered_admission"));
+        assert!(claim.contains("SET state = 'claimed'"));
+        assert!(claim.contains("state = 'pending'"));
+        assert!(claim.contains("claimed_at"));
+        assert!(claim.contains("RETURNING"));
+        assert_eq!(admission_claim_lease_secs(), 30);
+        assert!(claim.contains("30 seconds"));
+        assert!(admission_mark_queued_sql().contains("state = 'claimed'"));
+        assert!(admission_mark_queued_sql().contains("'queued'"));
+        assert!(admission_release_sql().contains("state = 'claimed'"));
+        assert!(admission_release_sql().contains("'pending'"));
     }
 
     #[test]
@@ -1388,25 +1495,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    struct ConcurrentLedger {
-        shared: std::sync::Arc<std::sync::Mutex<(AdmissionMark, bool)>>,
+    /// Lock-free claim double with Postgres UPDATE semantics: the claim is
+    /// a single atomic compare-exchange (row predicate re-check), never a
+    /// mutex held across the queue/meter awaits. Competitors interleave
+    /// freely after the first claim — exactly one wins.
+    struct ClaimLedger {
+        /// 0 = pending, 1 = queued (persisted mark).
+        mark: std::sync::Arc<std::sync::atomic::AtomicU8>,
+        /// false = unclaimed, true = claimed (lease owner).
+        claimed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
-    impl AdmissionLedger for ConcurrentLedger {
+    impl AdmissionLedger for ClaimLedger {
         async fn record_stage_once(
             &mut self,
             _job_id: &str,
             _stage: &str,
         ) -> Result<AdmissionMark, MeterWriteError> {
-            let mut state = self.shared.lock().expect("state lock");
-            if state.0 == AdmissionMark::Queued {
+            use std::sync::atomic::Ordering;
+            if self.mark.load(Ordering::SeqCst) == 1 {
                 return Ok(AdmissionMark::Queued);
             }
-            if state.1 {
-                return Ok(AdmissionMark::Busy);
+            // Atomic claim: mirrors
+            // `UPDATE ... WHERE (pending OR expired) RETURNING`. No lock is
+            // held here — losers observe the winner's claim immediately.
+            match self
+                .claimed
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => Ok(AdmissionMark::Pending),
+                Err(_) => {
+                    if self.mark.load(Ordering::SeqCst) == 1 {
+                        Ok(AdmissionMark::Queued)
+                    } else {
+                        Ok(AdmissionMark::Busy)
+                    }
+                }
             }
-            state.1 = true;
-            Ok(AdmissionMark::Pending)
         }
 
         async fn mark_queued(
@@ -1414,40 +1539,51 @@ mod tests {
             _job_id: &str,
             _stage: &str,
         ) -> Result<(), MeterWriteError> {
-            let mut state = self.shared.lock().expect("state lock");
-            state.0 = AdmissionMark::Queued;
-            state.1 = false;
+            use std::sync::atomic::Ordering;
+            // Commit requires the claim, like `WHERE state = 'claimed'`.
+            if !self.claimed.swap(false, Ordering::SeqCst) {
+                return Err(MeterWriteError::Transport(
+                    "ledger commit without a claim".to_string(),
+                ));
+            }
+            self.mark.store(1, Ordering::SeqCst);
             Ok(())
         }
 
-        async fn release_claim(&mut self) {
-            self.shared.lock().expect("state lock").1 = false;
+        async fn release_claim(&mut self, _job_id: &str, _stage: &str) {
+            use std::sync::atomic::Ordering;
+            self.claimed.store(false, Ordering::SeqCst);
         }
     }
 
     #[test]
     fn admission_competing_requests_claim_before_queue_or_meter() {
-        // Each request has its own ledger handle, just like production. The
-        // queue delay lets competitors interleave after the first claim.
+        // Each request has its own ledger handle over shared atomics, just
+        // like production isolates over one row. No mutex is held across
+        // the queue/meter awaits: the queue delay lets competitors
+        // interleave after the first claim, and the atomic claim admits
+        // exactly one sender+meter.
         use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc, Barrier, Mutex,
+            atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+            Arc, Barrier,
         };
-        let shared = Arc::new(Mutex::new((AdmissionMark::Pending, false)));
+        let mark = Arc::new(AtomicU8::new(0));
+        let claimed = Arc::new(AtomicBool::new(false));
         let start = Arc::new(Barrier::new(8));
         let meter_calls = Arc::new(AtomicUsize::new(0));
         let queued_calls = Arc::new(AtomicUsize::new(0));
         let msg = admission_msg();
         let handles: Vec<_> = (0..8)
             .map(|_| {
-                let shared = Arc::clone(&shared);
+                let mark = Arc::clone(&mark);
+                let claimed = Arc::clone(&claimed);
                 let start = Arc::clone(&start);
                 let meter_calls = Arc::clone(&meter_calls);
                 let queued_calls = Arc::clone(&queued_calls);
                 let msg = msg.clone();
                 std::thread::spawn(move || {
                     use futures_util::future::FutureExt as _;
-                    let mut ledger = ConcurrentLedger { shared };
+                    let mut ledger = ClaimLedger { mark, claimed };
                     start.wait();
                     drive_metered_admission(
                         &mut ledger,
@@ -1491,7 +1627,50 @@ mod tests {
         );
         assert_eq!(queued_calls.load(Ordering::SeqCst), 1);
         assert_eq!(meter_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(shared.lock().expect("state lock").0, AdmissionMark::Queued);
+        assert_eq!(mark.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn admission_claim_without_busy_winner_releases_for_retry() {
+        // Queue failure releases the atomic claim (production: claimed ->
+        // pending or lease expiry), so the immediate retry reclaims and
+        // still owes exactly one `Ok` — no Busy deadlock, no double meter.
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU8},
+            Arc,
+        };
+        let msg = admission_msg();
+        let mut ledger = ClaimLedger {
+            mark: Arc::new(AtomicU8::new(0)),
+            claimed: Arc::new(AtomicBool::new(false)),
+        };
+        let (mut queue_calls, mut meter_calls) = (0usize, 0usize);
+        assert_eq!(
+            drive_once(
+                &mut ledger,
+                &msg,
+                "parse",
+                false,
+                false,
+                &mut queue_calls,
+                &mut meter_calls,
+            ),
+            AdmissionDecision::QueueUnavailable
+        );
+        assert_eq!((queue_calls, meter_calls), (1, 0));
+        assert_eq!(
+            drive_once(
+                &mut ledger,
+                &msg,
+                "parse",
+                true,
+                false,
+                &mut queue_calls,
+                &mut meter_calls,
+            ),
+            AdmissionDecision::Admitted
+        );
+        assert_eq!((queue_calls, meter_calls), (2, 1));
     }
 }
 
