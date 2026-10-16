@@ -270,7 +270,7 @@
 							: 'Save provider'}
 				</button>
 			{:else if testState === 'failed'}
-				<p role="alert">{testDetail}</p>
+				<p data-testid="byop-status" role="alert">{testDetail}</p>
 			{/if}
 			{#if saveState === 'saved'}
 				<p role="status">Saved. Your credentials are sealed in the encrypted vault.</p>
