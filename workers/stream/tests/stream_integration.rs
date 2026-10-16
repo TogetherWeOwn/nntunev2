@@ -922,3 +922,54 @@ fn provider_outage_quarantines_then_recovers() {
         .expect("finalize");
     assert!(!pool.quarantined(), "success clears the quarantine");
 }
+
+#[test]
+fn finalizing_without_serving_any_bytes_emits_no_bytes_served() {
+    // Guards the `if self.served > 0` gate in `PlayStream::finalize`:
+    // removing the guard emits a zero-byte `BytesServed` event, which would
+    // widen the metering stream with billing-neutral noise. Finalizing an
+    // unread stream must still drain and cache the track.
+    let (plain, segments, articles) = fixture_track("a", 40_000, 20_000);
+    let server = FakeNntp::start(articles);
+    let mut pool: StreamPool = Pool::new(4);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+
+    // Miss path: finalize without pulling a single chunk.
+    let token = grant_for("track-a");
+    let inp = input(&token, "track-a", None, &server, &segments, None);
+    let resp = play(&mut pool, &mut cache, &mut meter, SECRET, &inp).expect("miss play");
+    let body_len = resp.body_len;
+    resp.stream
+        .finalize(&mut pool, &mut cache, &mut meter)
+        .expect("unread finalize");
+    assert!(
+        !meter
+            .events
+            .iter()
+            .any(|e| e.kind == MeterKind::BytesServed),
+        "unread miss finalize must not emit BytesServed (body_len was {body_len})"
+    );
+    assert_eq!(
+        cache.get_track("track-a").as_deref(),
+        Some(plain.as_slice()),
+        "unread finalize still drains and caches the whole track"
+    );
+
+    // Hit path: the now-cached track, again finalized unread.
+    let token2 = grant_for("track-a");
+    let inp2 = input(&token2, "track-a", None, &server, &segments, None);
+    let resp2 = play(&mut pool, &mut cache, &mut meter, SECRET, &inp2).expect("hit play");
+    assert!(resp2.cache_hit);
+    resp2
+        .stream
+        .finalize(&mut pool, &mut cache, &mut meter)
+        .expect("unread hit finalize");
+    assert!(
+        !meter
+            .events
+            .iter()
+            .any(|e| e.kind == MeterKind::BytesServed),
+        "unread hit finalize must not emit BytesServed either"
+    );
+}
