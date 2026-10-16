@@ -113,6 +113,15 @@ describe('in-session persistence', () => {
 		);
 	});
 
+	it('falls back when the stored order repeats a track id', () => {
+		// A duplicate would collide on the keyed panel and confuse moveTrack's
+		// find-by-id, so it is treated like any other unrecognizable payload.
+		const raw = '{"orderIds":["demo-track","demo-track"],"currentId":"demo-track"}';
+		const restored = restoreQueue(raw, DEMO_TRACKS);
+		expect(restored).toEqual(createQueue(DEMO_TRACKS));
+		expect(new Set(restored.tracks.map((t) => t.id)).size).toBe(restored.tracks.length);
+	});
+
 	it('restores a cleared queue instead of resurrecting the fixture', () => {
 		const cleared = clearQueue(createQueue(DEMO_TRACKS));
 		expect(restoreQueue(serializeQueue(cleared), DEMO_TRACKS)).toEqual(cleared);

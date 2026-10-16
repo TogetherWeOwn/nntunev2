@@ -78,6 +78,16 @@ function setHandler(
 	}
 }
 
+const NO_HANDLERS: MediaSessionHandlers = { onNext: () => {}, onPrevious: () => {} };
+
+/**
+ * Drop metadata and every action handler. Call on player teardown: the
+ * OS controls are global and would otherwise keep driving a destroyed page.
+ */
+export function clearMediaSession(options: ApplyMediaSessionOptions = {}): boolean {
+	return applyMediaSession(null, NO_HANDLERS, options);
+}
+
 /**
  * Point MediaSession at `track` (or clear it when null). Returns false
  * when the API is unavailable so callers can stay silent on old engines.

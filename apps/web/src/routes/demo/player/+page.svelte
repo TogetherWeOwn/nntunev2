@@ -4,10 +4,11 @@
 </svelte:head>
 
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import Artwork from '#lib/player/Artwork.svelte';
 	import { SeekController } from '#lib/player/seekController.js';
-	import { applyMediaSession } from '#lib/player/mediaSession.js';
+	import { applyMediaSession, clearMediaSession } from '#lib/player/mediaSession.js';
+	import { createPlayback, endedForCurrent } from '#lib/player/playback.js';
 	import {
 		addTrack,
 		clearQueue,
@@ -38,25 +39,61 @@
 	const current = $derived(currentTrack(queue));
 	const inQueue = $derived(new Set(queue.tracks.map((t) => t.id)));
 
-	function tryPlay(): void {
-		// Synthetic demo bytes may not decode in every engine; a rejected
-		// play() must never break queue navigation.
-		audioEl?.play().catch(() => {});
+	const playback = createPlayback({ audio: () => audioEl, flush: tick });
+
+	function resetEnded(): void {
+		if (status === 'ended') status = 'idle';
 	}
 
 	function goNext(): void {
+		if (!current) return;
 		const advanced = nextTrack(queue);
 		if (advanced === queue) {
+			// End of the queue: really stop, so status and playback agree.
+			playback.pause();
 			status = 'ended';
 			return;
 		}
 		queue = advanced;
-		tryPlay();
+		resetEnded();
+		void playback.play();
 	}
 
 	function goPrevious(): void {
-		queue = previousTrack(queue);
-		tryPlay();
+		const previous = previousTrack(queue);
+		// Clamped at the first track: nothing changed, so a paused track must
+		// not be resumed by a no-op Previous.
+		if (previous === queue) return;
+		queue = previous;
+		resetEnded();
+		void playback.play();
+	}
+
+	function selectAt(index: number): void {
+		queue = selectTrack(queue, index);
+		resetEnded();
+		void playback.play();
+	}
+
+	function addToQueue(track: (typeof DEMO_TRACKS)[number]): void {
+		const wasEmpty = queue.tracks.length === 0;
+		queue = addTrack(queue, track);
+		// The first add to an empty queue makes it current: start it like any
+		// other track change instead of showing a track that never plays.
+		if (wasEmpty) void playback.play();
+	}
+
+	function clearAll(): void {
+		queue = clearQueue(queue);
+		resetEnded();
+		void playback.unload();
+	}
+
+	// `ended` is only honoured for the source the queue still points at; a
+	// late event from a superseded track must not skip the new one.
+	function handleEnded(event: Event): void {
+		if (!endedForCurrent(event.currentTarget as HTMLAudioElement, current?.streamUrl)) return;
+		goNext();
 	}
 
 	// MediaSession follows the current track; queue order + current track
@@ -65,8 +102,8 @@
 		applyMediaSession(current, {
 			onNext: goNext,
 			onPrevious: goPrevious,
-			onPlay: tryPlay,
-			onPause: () => audioEl?.pause()
+			onPlay: () => void playback.play(),
+			onPause: () => playback.pause()
 		});
 		if (restored) {
 			try {
@@ -110,6 +147,10 @@
 			// Keep the fixture queue when storage is unavailable.
 		}
 		restored = true;
+		// OS media controls are global: release them when the page goes away.
+		return () => {
+			clearMediaSession();
+		};
 	});
 </script>
 
@@ -145,7 +186,7 @@
 		src={current?.streamUrl}
 		preload="metadata"
 		controls
-		onended={goNext}
+		onended={handleEnded}
 	></audio>
 
 	<div>
@@ -166,10 +207,7 @@
 						type="button"
 						data-testid="queue-select-{track.id}"
 						aria-current={i === queue.currentIndex ? 'true' : undefined}
-						onclick={() => {
-							queue = selectTrack(queue, i);
-							tryPlay();
-						}}
+						onclick={() => selectAt(i)}
 					>
 						{track.title} — {track.artist}{i === queue.currentIndex ? ' (playing)' : ''}
 					</button>
@@ -198,7 +236,7 @@
 			type="button"
 			data-testid="queue-clear"
 			disabled={queue.tracks.length === 0}
-			onclick={() => (queue = clearQueue(queue))}
+			onclick={clearAll}
 		>
 			Clear queue
 		</button>
@@ -211,7 +249,7 @@
 						type="button"
 						data-testid="queue-add-{track.id}"
 						disabled={inQueue.has(track.id)}
-						onclick={() => (queue = addTrack(queue, track))}
+						onclick={() => addToQueue(track)}
 					>
 						Add {track.title}
 					</button>

@@ -127,7 +127,9 @@ export function serializeQueue(state: QueueState): string {
  * Rebuild a queue from `serializeQueue` output against the known track
  * catalogue. Anything unrecognizable falls back to the full catalogue
  * queue, except an explicitly cleared queue (empty `orderIds`), which
- * stays cleared.
+ * stays cleared. Repeated ids are unrecognizable too: the panel keys on
+ * `track.id` and `moveTrack` locates the current track by id, so a
+ * duplicate would break both.
  */
 export function restoreQueue(raw: string | null, catalogue: readonly Track[]): QueueState {
 	const fallback = createQueue(catalogue);
@@ -138,6 +140,7 @@ export function restoreQueue(raw: string | null, catalogue: readonly Track[]): Q
 			return fallback;
 		}
 		if (parsed.orderIds.length === 0) return { tracks: [], currentIndex: -1 };
+		if (new Set(parsed.orderIds).size !== parsed.orderIds.length) return fallback;
 		const byId = new Map(catalogue.map((t) => [t.id, t]));
 		const tracks = parsed.orderIds.map((id) => byId.get(id as string));
 		if (tracks.some((t) => t === undefined)) return fallback;

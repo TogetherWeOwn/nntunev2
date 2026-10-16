@@ -3,6 +3,7 @@ import { ARTWORK_PLACEHOLDER_SRC } from './artwork.js';
 import {
 	applyMediaSession,
 	buildMediaMetadataInit,
+	clearMediaSession,
 	type MediaMetadataInit,
 	type MediaSessionLike
 } from './mediaSession.js';
@@ -75,14 +76,38 @@ describe('applyMediaSession', () => {
 
 	it('clears metadata and handlers when the queue empties', () => {
 		const { session, handlers } = fakeSession();
-		applyMediaSession(null, { onNext: vi.fn(), onPrevious: vi.fn() }, {
-			session,
-			MetadataCtor: FakeMetadata,
-			baseUrl: 'https://example.test'
-		});
+		const options = { session, MetadataCtor: FakeMetadata, baseUrl: 'https://example.test' };
+		const noop = { onNext: vi.fn(), onPrevious: vi.fn() };
+		// Start from a populated session: a fresh fake already has null
+		// metadata, which would let a missing clear pass unnoticed.
+		applyMediaSession(DEMO_TRACKS[1]!, noop, options);
+		expect(session.metadata).toBeInstanceOf(FakeMetadata);
+		expect(handlers.get('nexttrack')).toBeTypeOf('function');
+
+		applyMediaSession(null, noop, options);
 		expect(session.metadata).toBeNull();
 		expect(handlers.get('nexttrack')).toBeNull();
 		expect(handlers.get('previoustrack')).toBeNull();
+		expect(handlers.get('play')).toBeNull();
+		expect(handlers.get('pause')).toBeNull();
+	});
+
+	it('clearMediaSession releases a live session (player teardown)', () => {
+		const { session, handlers } = fakeSession();
+		const options = { session, MetadataCtor: FakeMetadata, baseUrl: 'https://example.test' };
+		applyMediaSession(
+			DEMO_TRACKS[0]!,
+			{ onNext: vi.fn(), onPrevious: vi.fn(), onPlay: vi.fn(), onPause: vi.fn() },
+			options
+		);
+		expect(session.metadata).not.toBeNull();
+
+		expect(clearMediaSession(options)).toBe(true);
+		expect(session.metadata).toBeNull();
+		for (const action of ['nexttrack', 'previoustrack', 'play', 'pause']) {
+			expect(handlers.get(action)).toBeNull();
+		}
+		expect(clearMediaSession({ session: null })).toBe(false);
 	});
 
 	it('reports false and throws nothing when MediaSession is unsupported', () => {

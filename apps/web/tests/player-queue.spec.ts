@@ -76,6 +76,8 @@ test('3-track queue plays through with next/prev and track end', async ({ page }
 
 	await page.getByTestId('player-prev').click();
 	await expect(page.getByTestId('now-playing')).toContainText('Second Signal');
+	// Navigating away from the end clears the stale `ended` status.
+	await expect(page.getByTestId('player-status')).not.toContainText('ended');
 });
 
 test('queue panel adds, clears and reorders; order persists in-session', async ({ page }) => {
