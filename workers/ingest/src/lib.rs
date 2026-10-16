@@ -427,7 +427,7 @@ async fn job_status(_req: &Request, ctx: &RouteContext<()>) -> Result<Response> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nzb_intake::MAX_NZB_BYTES;
+    use crate::nzb_intake::{MAX_FILES, MAX_NZB_BYTES};
 
     fn search_body(
         query: &str,
@@ -522,11 +522,17 @@ mod tests {
 </segments>
 </file>
 </nzb>"#;
+        let mut file_bomb = String::from("<?xml?><nzb>");
+        for _ in 0..(MAX_FILES + 1) {
+            file_bomb.push_str("<file></file>");
+        }
+        file_bomb.push_str("</nzb>");
         let cases: &[(&str, u16, &str)] = &[
             ("", 400, "NZB_EMPTY"),
             ("<html><body>hi</body></html>", 400, "NZB_NOT_NZB"),
             ("<?xml?><nzb><file>", 400, "NZB_MALFORMED"),
             (over_bytes, 413, "NZB_DECLARED_BYTES_OVER_CAP"),
+            (&file_bomb, 413, "NZB_TOO_MANY_FILES"),
             (&"x".repeat(MAX_NZB_BYTES + 1), 413, "NZB_TOO_LARGE"),
         ];
         for (body, status, code) in cases {
@@ -546,6 +552,10 @@ mod tests {
             too_large_body["max_bytes"].as_u64().unwrap(),
             MAX_NZB_BYTES as u64
         );
+        let (_, too_many_files_body) =
+            intake_rejection_parts(&estimate_nzb(&file_bomb).unwrap_err());
+        assert_eq!(too_many_files_body["file_count"].as_u64().unwrap(), (MAX_FILES + 1) as u64);
+        assert_eq!(too_many_files_body["max_files"].as_u64().unwrap(), MAX_FILES as u64);
         // A valid NZB has no rejection at all: it queues.
         assert!(estimate_nzb(crate::fixtures::SMALL_NZB).is_ok());
     }

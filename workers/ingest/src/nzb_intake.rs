@@ -161,28 +161,39 @@ fn is_name_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || matches!(b, b'_' | b':')
 }
 
-/// Count `<{name}` element starts, stopping once `over` is exceeded.
-///
-/// An occurrence only counts when the byte after the name is *not* a name
-/// character, so whitespace of any kind (` `, `\t`, `\r`, `\n`), `>` and
-/// `/` (self-closing) all count, while the `<segments>` container and
-/// longer names (`<segmentx>`) do not. Operates on bytes so it cannot miss
-/// a spelling the XML spec allows.
-fn count_elements(haystack: &str, name: &str, over: usize) -> usize {
-    let needle = format!("<{name}");
-    let mut n = 0;
-    let mut rest = haystack;
-    while let Some(i) = rest.find(needle.as_str()) {
-        let after = rest.as_bytes().get(i + needle.len()).copied();
-        // A truncated tail (`<segment` at the very end) counts: it is still
-        // attacker-controlled shape the parser would have to deal with.
-        if after.is_none() || !is_name_char(after.unwrap_or(0)) {
-            n += 1;
-            if n > over {
-                break;
-            }
+/// Return the name bounds for an opening element whose local name matches
+/// `name`, starting at or after `from`.
+fn find_element(body: &str, name: &str, from: usize) -> Option<(usize, usize)> {
+    let bytes = body.as_bytes();
+    let mut offset = from;
+    while let Some(rel) = body[offset..].find('<') {
+        let start = offset + rel;
+        let name_start = start + 1;
+        let Some(name_end) = read_name(bytes, name_start) else {
+            offset = name_start;
+            continue;
+        };
+        let qualified_name = &body[name_start..name_end];
+        if qualified_name.rsplit(':').next() == Some(name) {
+            return Some((start, name_end));
         }
-        rest = &rest[i + needle.len()..];
+        offset = name_end;
+    }
+    None
+}
+
+/// Count opening elements with local name `name`, stopping once `over` is
+/// exceeded. Prefixes are ignored so this agrees with nntune-core's
+/// namespace-aware local-name dispatch.
+fn count_elements(haystack: &str, name: &str, over: usize) -> usize {
+    let mut n = 0;
+    let mut offset = 0;
+    while let Some((start, name_end)) = find_element(haystack, name, offset) {
+        n += 1;
+        if n > over {
+            break;
+        }
+        offset = name_end.max(start + 1);
     }
     n
 }
@@ -363,20 +374,11 @@ fn check_well_formed(body: &str) -> bool {
 /// overflows `u64` saturates the total (it is over any sane cap).
 fn sum_segment_bytes(body: &str) -> Result<u64, ()> {
     let bytes = body.as_bytes();
-    let needle = "<segment";
     let mut total: u64 = 0;
     let mut rest = 0;
-    while let Some(rel) = body[rest..].find(needle) {
-        let tag_start = rest + rel;
-        let after = bytes.get(tag_start + needle.len()).copied();
-        if after.is_none() || after.is_some_and(is_name_char) {
-            // `<segments>` container, `<segmentx>`, or a truncated tail (the
-            // well-formedness check already refused truncations).
-            rest = tag_start + needle.len();
-            continue;
-        }
+    while let Some((tag_start, name_end)) = find_element(body, "segment", rest) {
         // Find the tag end, respecting quotes.
-        let mut j = tag_start + needle.len();
+        let mut j = name_end;
         let mut q: Option<u8> = None;
         while j < bytes.len() {
             let b = bytes[j];
@@ -397,7 +399,7 @@ fn sum_segment_bytes(body: &str) -> Result<u64, ()> {
         let tag = &body[tag_start..=j];
         // Walk this tag's attributes for `bytes`.
         let tag_bytes = tag.as_bytes();
-        let mut k = needle.len();
+        let mut k = name_end - tag_start - 1;
         let mut tag_value: Option<u64> = None;
         let mut malformed_attr = false;
         loop {
@@ -447,7 +449,7 @@ fn sum_segment_bytes(body: &str) -> Result<u64, ()> {
         if let Some(n) = tag_value {
             total = total.saturating_add(n);
         }
-        rest = tag_start + needle.len();
+        rest = name_end;
     }
     Ok(total)
 }
@@ -788,6 +790,47 @@ mod tests {
                 assert_eq!(max, MAX_SEGMENTS);
             }
             other => panic!("expected segment-cap rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_prefixed_segment_declared_bytes_over_cap() {
+        let mut doc = String::from("<?xml?><nzb><segment bytes=\"1\">x@y</segment>");
+        for _ in 0..40 {
+            doc.push_str("<x:segment bytes=\"2000000000\">x@y</x:segment>");
+        }
+        doc.push_str("</nzb>");
+
+        let rejected = estimate_nzb(&doc).unwrap_err();
+        assert_eq!(rejected.code(), "NZB_DECLARED_BYTES_OVER_CAP");
+        assert_eq!(rejected.http_status(), 413);
+        match rejected {
+            IntakeRejection::DeclaredBytesOverCap { declared, max } => {
+                assert_eq!(declared, 80_000_000_001);
+                assert_eq!(max, MAX_DECLARED_BYTES);
+            }
+            other => panic!("expected declared-bytes rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_file_bomb_with_taxonomy_fields() {
+        let mut bomb = String::from("<?xml?><nzb>");
+        for _ in 0..(MAX_FILES + 1) {
+            bomb.push_str("<file></file>");
+        }
+        bomb.push_str("</nzb>");
+        assert!(bomb.len() < MAX_NZB_BYTES);
+
+        let rejected = estimate_nzb(&bomb).unwrap_err();
+        assert_eq!(rejected.code(), "NZB_TOO_MANY_FILES");
+        assert_eq!(rejected.http_status(), 413);
+        match rejected {
+            IntakeRejection::TooManyFiles { count, max } => {
+                assert_eq!(count, MAX_FILES + 1);
+                assert_eq!(max, MAX_FILES);
+            }
+            other => panic!("expected file-cap rejection, got {other:?}"),
         }
     }
 
