@@ -448,7 +448,16 @@ mod tests {
 
     #[test]
     fn idempotency_key_fields_reject_log_breakers_and_oversized_values() {
-        for invalid in ["has space", "has\t tab", "has\nnewline", "forged=value"] {
+        // "bell\u{7}char" and "nul\0char" are control characters that are not
+        // whitespace, so they pin the control-character arm on its own.
+        for invalid in [
+            "has space",
+            "has\t tab",
+            "has\nnewline",
+            "forged=value",
+            "bell\u{7}char",
+            "nul\0char",
+        ] {
             assert!(derive_play_idempotency_key(invalid, "track", "play").is_err());
             assert!(derive_play_idempotency_key("user", invalid, "play").is_err());
             assert!(derive_play_idempotency_key("user", "track", invalid).is_err());
@@ -540,6 +549,112 @@ mod tests {
             meter.events[0].bytes, 0,
             "non-serving mismatch events must not inflate byte sums"
         );
+    }
+
+    #[test]
+    fn idempotency_key_fields_accept_exact_byte_limits() {
+        let user = "u".repeat(128);
+        let track = "t".repeat(512);
+        let play_id = "p".repeat(512);
+        let key = derive_play_idempotency_key(&user, &track, &play_id).unwrap();
+        assert_eq!(key, format!("play:{user}:{track}:{play_id}"));
+
+        // The limits count bytes, not chars: 64 two-byte chars are exactly
+        // 128 bytes, 65 are 130.
+        assert!(derive_play_idempotency_key(&"\u{e9}".repeat(64), "t", "p").is_ok());
+        assert!(derive_play_idempotency_key(&"\u{e9}".repeat(65), "t", "p").is_err());
+
+        // The ledger accepts exact-limit fields too, so its identity re-check
+        // uses the same inclusive limits as the derivation.
+        let play = CompletePlay::new(&user, &track, &play_id, 1).unwrap();
+        let mut ledger = UsageLedger::default();
+        assert_eq!(ledger.record(&play), RecordOutcome::Recorded);
+        assert_eq!(ledger.record(&play), RecordOutcome::Duplicate);
+        assert_eq!(ledger.len(), 1);
+    }
+
+    fn forged(key: &str, user: &str, track: &str) -> CompletePlay {
+        CompletePlay {
+            idempotency_key: key.to_string(),
+            user_id: user.to_string(),
+            track_id: track.to_string(),
+            bytes: 5,
+        }
+    }
+
+    #[test]
+    fn record_conflicts_on_each_forged_identity_arm() {
+        let long_user = "u".repeat(129);
+        let long_track = "t".repeat(513);
+        let long_play = "p".repeat(513);
+        // Every case fails exactly one arm of the identity re-check: the key
+        // matches the play's fields everywhere except the arm named.
+        let cases = [
+            (
+                "user differs from key",
+                forged("play:alice:t:1", "mallory", "t"),
+            ),
+            ("track differs from key", forged("play:u:t:1", "u", "other")),
+            ("empty user", forged("play::t:1", "", "t")),
+            ("whitespace user", forged("play:a b:t:1", "a b", "t")),
+            ("'=' user", forged("play:a=b:t:1", "a=b", "t")),
+            ("control user", forged("play:a\u{7}b:t:1", "a\u{7}b", "t")),
+            (
+                "oversized user",
+                forged(&format!("play:{long_user}:t:1"), &long_user, "t"),
+            ),
+            ("empty track", forged("play:u::1", "u", "")),
+            ("whitespace track", forged("play:u:a b:1", "u", "a b")),
+            ("'=' track", forged("play:u:a=b:1", "u", "a=b")),
+            (
+                "oversized track",
+                forged(&format!("play:u:{long_track}:1"), "u", &long_track),
+            ),
+            ("empty play id", forged("play:u:t:", "u", "t")),
+            ("whitespace play id", forged("play:u:t:p 1", "u", "t")),
+            ("'=' play id", forged("play:u:t:p=1", "u", "t")),
+            ("newline play id", forged("play:u:t:p\n1", "u", "t")),
+            (
+                "oversized play id",
+                forged(&format!("play:u:t:{long_play}"), "u", "t"),
+            ),
+            ("wrong prefix", forged("pay:u:t:1", "u", "t")),
+            ("missing play id segment", forged("play:u:t", "u", "t")),
+            ("extra segment", forged("play:u:t:1:2", "u", "t")),
+        ];
+        for (label, play) in cases {
+            let mut ledger = UsageLedger::default();
+            assert_eq!(ledger.record(&play), RecordOutcome::Conflict, "{label}");
+            assert!(ledger.is_empty(), "{label}");
+            assert_eq!(ledger.total_bytes_for_user(&play.user_id), 0, "{label}");
+        }
+    }
+
+    #[test]
+    fn reconcile_flags_a_forged_same_key_redelivery_with_equal_bytes() {
+        let first = CompletePlay::new("user-1", "track-9", "play-7", 40_000).unwrap();
+        let mut ledger = UsageLedger::default();
+        ledger.record(&first);
+
+        // Public fields let a redelivery keep the key and the bytes while
+        // changing only who is billed or which track it is attributed to.
+        let mut other_user = first.clone();
+        other_user.user_id = "user-2".to_string();
+        let mut other_track = first.clone();
+        other_track.track_id = "track-8".to_string();
+
+        for (label, replay) in [("user", other_user), ("track", other_track)] {
+            let mut meter = MemoryMeter::default();
+            let report = reconcile(&[first.clone(), replay.clone()], &ledger, &mut meter);
+            assert_eq!(report.checked, 1, "{label}");
+            assert_eq!(report.mismatches.len(), 1, "{label}");
+            assert_eq!(report.mismatches[0].user_id, replay.user_id, "{label}");
+            assert_eq!(report.mismatches[0].track_id, replay.track_id, "{label}");
+            assert_eq!(report.mismatches[0].metered_bytes, 40_000, "{label}");
+            assert_eq!(report.mismatches[0].ledger_bytes, Some(40_000), "{label}");
+            assert_eq!(meter.events.len(), 1, "{label}");
+            assert_eq!(meter.events[0].bytes, 0, "{label}");
+        }
     }
 
     #[test]
