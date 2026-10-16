@@ -34,6 +34,7 @@
 	let testState = $state<'idle' | 'testing' | 'ok' | 'failed'>('idle');
 	let testDetail = $state('');
 	let reauthRequired = $state(false);
+	let reauthPasswordInput = $state<HTMLInputElement | null>(null);
 	let saveState = $state<'idle' | 'saving' | 'saved' | 'failed'>('idle');
 	let testedConfigKey = $state<string | null>(null);
 	let testRunId = 0;
@@ -44,6 +45,10 @@
 		if (tls && allowInsecurePlaintext) {
 			allowInsecurePlaintext = false;
 		}
+	});
+
+	$effect(() => {
+		if (reauthRequired) reauthPasswordInput?.focus();
 	});
 
 	function providerInput() {
@@ -305,6 +310,7 @@
 							Password
 							<input
 								name="reauthPassword"
+								bind:this={reauthPasswordInput}
 								type="password"
 								required
 								autocomplete="current-password"

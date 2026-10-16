@@ -1,25 +1,25 @@
 /**
  * Inline provider re-auth prompt (S7).
  *
- * The API worker returns `provider_auth_expired` (HTTP 401) when the stored
- * provider credential is stale (NNTP 480/481 upstream), and the distinct
- * `indexer_auth_expired` when the indexer rejects its API key (HTTP 401
- * upstream). The web app renders an inline prompt naming the right secret
- * for each code — never a generic error page, and never the provider
- * password field for an indexer failure. No credential material lives here:
- * only the documented codes and human-readable copy.
+ * The web app recognizes `provider_auth_expired` for an inline provider
+ * password prompt and `indexer_auth_expired` for indexer API-key guidance.
+ * Core/stream classify provider NNTP auth failures; ingest classifies
+ * indexer 401s. API route wiring for those worker errors is separate. This
+ * module contains only error codes and human-readable copy, never credential
+ * material.
  */
 
-/** Documented worker/API code for stale provider credentials. */
-export const PROVIDER_AUTH_EXPIRED_CODE = 'provider_auth_expired';
+import {
+	INDEXER_AUTH_EXPIRED_CODE,
+	PROVIDER_AUTH_EXPIRED_CODE
+} from './api/client.js';
+
+export { INDEXER_AUTH_EXPIRED_CODE, PROVIDER_AUTH_EXPIRED_CODE };
 
 /** Minimal shape carrying an API error code. */
 export interface CodedError {
 	code: string;
 }
-
-/** Documented worker/API code for a stale indexer API key. */
-export const INDEXER_AUTH_EXPIRED_CODE = 'indexer_auth_expired';
 
 /** True only for the documented provider re-auth code. */
 export function isProviderAuthExpired(error: CodedError | null | undefined): boolean {
