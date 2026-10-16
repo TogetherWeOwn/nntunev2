@@ -1499,7 +1499,7 @@ where
         ("DELETE", "/v1/vault") => vault_delete(ctx, req).await,
         ("POST", "/v1/vault/test") | ("POST", "/v1/vault/test-connection") => {
             vault_test_connection(ctx, req).await
-        },
+        }
         ("OPTIONS", path) if is_known_path(path) => preflight_response(),
         _ => json_response(404, serde_json::json!({"error": "not found"})),
     }
