@@ -495,12 +495,14 @@ impl PlayStream {
         meter: &mut dyn Meter,
     ) -> Result<(), PlayError> {
         flush_orphaned(pool, meter);
-        meter.emit(ev(
-            MeterKind::BytesServed,
-            &self.user_id,
-            &self.track_id,
-            self.served,
-        ));
+        if self.served > 0 {
+            meter.emit(ev(
+                MeterKind::BytesServed,
+                &self.user_id,
+                &self.track_id,
+                self.served,
+            ));
+        }
         let mut live = match self.source.take() {
             Some(Source::Live(live)) => live,
             _ => return Ok(()),
