@@ -38,6 +38,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::cache::{ContentCache, MultipartUpload};
@@ -230,6 +231,8 @@ struct Live {
     staged_bytes: u64,
     upload: MultipartUpload,
     failed: Option<Failure>,
+    provider_error_epoch: Arc<AtomicU64>,
+    last_success_epoch: Option<u64>,
 }
 
 /// Result of starting a play with its early-failure observability projection.
@@ -345,8 +348,8 @@ fn play_authorized(
         PoolError::Exhausted => PlayError::PoolExhausted,
     })?;
 
-    let (mut client, mut first) = match open_and_fetch(pool, input, first_seg) {
-        Ok(pair) => pair,
+    let (mut client, mut first, redialed) = match open_and_fetch(pool, input, first_seg) {
+        Ok(result) => result,
         Err((client, failure)) => {
             return Err(settle(
                 pool,
@@ -402,7 +405,24 @@ fn play_authorized(
             }
         }
     }
-    pool.record_success();
+    if redialed {
+        meter.emit(ev_pool(
+            MeterKind::WarmRedial,
+            user,
+            input.track_id,
+            lease.lane,
+            0,
+        ));
+    }
+    if pool.record_success() {
+        meter.emit(ev_pool(
+            MeterKind::QuarantineExited,
+            user,
+            input.track_id,
+            lease.lane,
+            0,
+        ));
+    }
     let mut live = Live {
         client,
         lease,
@@ -419,6 +439,8 @@ fn play_authorized(
         staged_bytes: 0,
         upload: MultipartUpload::begin(input.track_id),
         failed: None,
+        provider_error_epoch: pool.provider_error_epoch_source(),
+        last_success_epoch: None,
     };
     if let Err(failure) = live.ingest(first_seg, first) {
         return Err(live.settle(pool, meter, Some(failure), user, input.track_id));
@@ -476,10 +498,11 @@ fn open_and_fetch(
     pool: &mut StreamPool,
     input: &PlayInput<'_>,
     idx: usize,
-) -> Result<(NntpClient, Decoded), (Option<NntpClient>, Failure)> {
+) -> Result<(NntpClient, Decoded, bool), (Option<NntpClient>, Failure)> {
     let mid = &input.segments[idx];
     let mut warm = pool.take_idle();
     let was_warm = warm.is_some();
+    let mut redialed = false;
     for attempt in 0..2 {
         let mut client = match warm.take() {
             Some(client) => client,
@@ -492,7 +515,7 @@ fn open_and_fetch(
             },
         };
         match fetch_segment(&mut client, mid) {
-            Ok(decoded) => return Ok((client, decoded)),
+            Ok(decoded) => return Ok((client, decoded, redialed)),
             Err(SegmentError::Nntp(e))
                 if was_warm
                     && attempt == 0
@@ -500,7 +523,8 @@ fn open_and_fetch(
             {
                 // Stale pooled connection (provider failure, or a warm
                 // session that is no longer authenticated): drop it and
-                // redial once.
+                // redial once. Meter only after replacement fetch succeeds.
+                redialed = true;
                 continue;
             }
             Err(SegmentError::Nntp(e)) => {
@@ -577,10 +601,18 @@ fn settle(
     user: &str,
     track: &str,
 ) -> PlayError {
+    let lane = lease.lane;
     pool.release(lease, if conn == Conn::KeepWarm { client } else { None });
     if conn == Conn::ProviderFailure {
-        pool.record_provider_error();
+        let backoff_ms = pool.record_provider_error();
         meter.emit(ev(MeterKind::ProviderError, user, track, 0));
+        meter.emit(ev_pool(
+            MeterKind::QuarantineEntered,
+            user,
+            track,
+            lane,
+            backoff_ms,
+        ));
     }
     err
 }
@@ -645,8 +677,13 @@ impl Live {
     /// Fetch + ingest segment `idx`, wherever it sits in the file.
     fn load(&mut self, idx: usize) -> Result<(), Failure> {
         let mid = self.segments[idx].clone();
+        let fetch_epoch = self.provider_error_epoch.load(Ordering::Acquire);
         match fetch_segment(&mut self.client, &mid) {
-            Ok(decoded) => self.ingest(idx, decoded),
+            Ok(decoded) => {
+                self.ingest(idx, decoded)?;
+                self.last_success_epoch = Some(fetch_epoch);
+                Ok(())
+            }
             Err(SegmentError::Nntp(e)) => Err(nntp_failure(e, &mid)),
             Err(SegmentError::Decode(e)) => Err((PlayError::Decode(e), Conn::KeepWarm)),
         }
@@ -743,6 +780,18 @@ fn ev(kind: MeterKind, user: &str, track: &str, bytes: u64) -> MeterEvent {
         user_id: user.to_string(),
         track_id: track.to_string(),
         bytes,
+        lane: None,
+        backoff_ms: 0,
+    }
+}
+
+/// A pool-health event (quarantine entry/exit, warm redial): carries the
+/// lane of the call it belongs to and, for quarantine entry, the backoff.
+fn ev_pool(kind: MeterKind, user: &str, track: &str, lane: Lane, backoff_ms: u64) -> MeterEvent {
+    MeterEvent {
+        lane: Some(lane),
+        backoff_ms,
+        ..ev(kind, user, track, 0)
     }
 }
 
@@ -828,6 +877,18 @@ impl PlayStream {
             }
             idx += 1;
         }
+        if live.failed.is_none()
+            && live.last_success_epoch == Some(pool.provider_error_epoch())
+            && pool.record_success()
+        {
+            meter.emit(ev_pool(
+                MeterKind::QuarantineExited,
+                &self.user_id,
+                &self.track_id,
+                live.lease.lane,
+                0,
+            ));
+        }
         match live.failed.take() {
             None => {
                 let Live {
@@ -837,7 +898,6 @@ impl PlayStream {
                     ..
                 } = *live;
                 pool.release(lease, Some(client));
-                pool.record_success();
                 cache.put_track(&self.track_id, upload.complete());
                 Ok(())
             }
@@ -924,6 +984,124 @@ impl Iterator for PlayStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread::{self, JoinHandle};
+
+    /// Grant expiry for these fixtures: `test_input` verifies at `now_unix`
+    /// = 1, so a 900 s lifetime stays inside the 15-minute grant TTL cap.
+    const GRANT_EXP_UNIX: u64 = 901;
+
+    fn serve_article(
+        listener: TcpListener,
+        article: Vec<u8>,
+        accept_redial: bool,
+    ) -> JoinHandle<()> {
+        serve_articles(listener, vec![article], accept_redial)
+    }
+
+    fn serve_articles(
+        listener: TcpListener,
+        articles: Vec<Vec<u8>>,
+        accept_redial: bool,
+    ) -> JoinHandle<()> {
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept initial connection");
+            serve_many_articles(stream, &articles);
+            if accept_redial {
+                let (stream, _) = listener.accept().expect("accept redial");
+                let mut writer = stream;
+                writer
+                    .write_all(b"200 synthetic NNTP ready\r\n")
+                    .expect("write redial greeting");
+            }
+        })
+    }
+
+    fn serve_many_articles(stream: TcpStream, articles: &[Vec<u8>]) {
+        let mut reader = BufReader::new(stream.try_clone().expect("clone connection"));
+        let mut writer = stream;
+        writer
+            .write_all(b"200 synthetic NNTP ready\r\n")
+            .expect("write greeting");
+        for article in articles {
+            let mut command = String::new();
+            reader.read_line(&mut command).expect("read BODY command");
+            writer
+                .write_all(b"222 article follows\r\n")
+                .expect("write article status");
+            for line in article.split(|&byte| byte == b'\n') {
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                writer.write_all(line).expect("write article line");
+                writer.write_all(b"\r\n").expect("write line ending");
+            }
+            writer.write_all(b".\r\n").expect("end article");
+        }
+    }
+
+    fn test_article() -> (Vec<u8>, Vec<u8>) {
+        let plain = b"small audio payload".to_vec();
+        let article = yenc::encode(&plain, "track.flac");
+        (plain, article)
+    }
+
+    fn test_parts() -> (Vec<u8>, Vec<Vec<u8>>) {
+        split_parts(&[b"small audio ", b"payload"])
+    }
+
+    /// One multipart yEnc article per chunk; the whole-file CRC rides the
+    /// last part only, like real posters.
+    fn split_parts(chunks: &[&[u8]]) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let plain = chunks.concat();
+        let crc = yenc::crc32(&plain);
+        let mut offset = 0;
+        let articles = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, chunk)| {
+                let article = yenc::encode_part(
+                    chunk,
+                    "track.flac",
+                    yenc::PartSpec {
+                        file_size: plain.len() as u64,
+                        part: i as u32 + 1,
+                        total: chunks.len() as u32,
+                        offset,
+                        file_crc: (i + 1 == chunks.len()).then_some(crc),
+                    },
+                );
+                offset += chunk.len() as u64;
+                article
+            })
+            .collect();
+        (plain, articles)
+    }
+
+    fn closed_address() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind temporary port");
+        let address = listener.local_addr().expect("temporary address");
+        drop(listener);
+        address
+    }
+
+    fn test_input<'a>(
+        token: &'a str,
+        track_id: &'a str,
+        address: SocketAddr,
+        segments: &'a [String],
+    ) -> PlayInput<'a> {
+        PlayInput {
+            token,
+            track_id,
+            range: None,
+            server_addr: address,
+            segments,
+            segment_ranges: None,
+            cipher_key: 0,
+            now_unix: 1,
+            up_next: None,
+        }
+    }
 
     #[test]
     fn wrong_track_grant_is_rejected() {
@@ -998,6 +1176,283 @@ mod tests {
             Err(PlayError::Unauthorized(GrantError::Malformed))
         ));
         assert_eq!(pool.connects(), 0, "rejected plays must not dial out");
+    }
+
+    #[test]
+    fn failed_warm_redial_does_not_emit_redial_event() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind NNTP server");
+        let address = listener.local_addr().expect("server address");
+        let (plain, article) = test_article();
+        let server = serve_article(listener, article, true);
+        let segment = vec!["track-seg@synthetic.test".to_string()];
+        let token = grant::issue("u", "track-a", GRANT_EXP_UNIX, b"s");
+        let mut pool = Pool::new(2);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+
+        let input = test_input(&token, "track-a", address, &segment);
+        let first = play(&mut pool, &mut cache, &mut meter, b"s", &input).expect("first play");
+        let mut body = Vec::new();
+        let mut stream = first.stream;
+        for chunk in stream.by_ref() {
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, plain);
+        stream
+            .finalize(&mut pool, &mut cache, &mut meter)
+            .expect("first finalize");
+
+        let token = grant::issue("u", "track-b", GRANT_EXP_UNIX, b"s");
+        let input = test_input(&token, "track-b", address, &segment);
+        assert!(matches!(
+            play(&mut pool, &mut cache, &mut meter, b"s", &input),
+            Err(PlayError::Upstream(_))
+        ));
+        server.join().expect("server thread");
+        assert!(meter
+            .events
+            .iter()
+            .all(|event| event.kind != MeterKind::WarmRedial));
+        assert_eq!(
+            meter
+                .events
+                .iter()
+                .filter(|event| event.kind == MeterKind::QuarantineEntered)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn finalize_without_fetch_does_not_clear_interleaved_quarantine() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind NNTP server");
+        let address = listener.local_addr().expect("server address");
+        let (plain, article) = test_article();
+        let server = serve_article(listener, article, false);
+        let segment = vec!["track-seg@synthetic.test".to_string()];
+        let token = grant::issue("u", "track-a", GRANT_EXP_UNIX, b"s");
+        let mut pool = Pool::new(2);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+
+        let input = test_input(&token, "track-a", address, &segment);
+        let response = play(&mut pool, &mut cache, &mut meter, b"s", &input).expect("play");
+        let mut stream = response.stream;
+        let body: Vec<u8> = stream.by_ref().flatten().collect();
+        assert_eq!(body, plain);
+        server.join().expect("server thread");
+
+        let token = grant::issue("u", "track-b", GRANT_EXP_UNIX, b"s");
+        let dead = closed_address();
+        let other_segment = vec!["other-seg@synthetic.test".to_string()];
+        let input = test_input(&token, "track-b", dead, &other_segment);
+        assert!(matches!(
+            play(&mut pool, &mut cache, &mut meter, b"s", &input),
+            Err(PlayError::Upstream(_))
+        ));
+        assert!(pool.quarantined());
+
+        stream
+            .finalize(&mut pool, &mut cache, &mut meter)
+            .expect("finalize already-fetched stream");
+        assert!(pool.quarantined(), "a no-fetch finalize cannot clear it");
+        assert!(meter
+            .events
+            .iter()
+            .all(|event| event.kind != MeterKind::QuarantineExited));
+    }
+
+    #[test]
+    fn failed_streamed_decode_does_not_clear_interleaved_quarantine() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind NNTP server");
+        let address = listener.local_addr().expect("server address");
+        let (_, articles) = test_parts();
+        let server = serve_articles(
+            listener,
+            vec![articles[0].clone(), b"not a yEnc article".to_vec()],
+            false,
+        );
+        let segments = vec![
+            "track-seg0@synthetic.test".to_string(),
+            "track-seg1@synthetic.test".to_string(),
+        ];
+        let token = grant::issue("u", "track-a", GRANT_EXP_UNIX, b"s");
+        let mut pool = Pool::new(2);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+
+        let input = test_input(&token, "track-a", address, &segments);
+        let response = play(&mut pool, &mut cache, &mut meter, b"s", &input).expect("play");
+        let mut stream = response.stream;
+        let token = grant::issue("u", "track-b", GRANT_EXP_UNIX, b"s");
+        let dead = closed_address();
+        let other_segment = vec!["other-seg@synthetic.test".to_string()];
+        let input = test_input(&token, "track-b", dead, &other_segment);
+        assert!(matches!(
+            play(&mut pool, &mut cache, &mut meter, b"s", &input),
+            Err(PlayError::Upstream(_))
+        ));
+        assert!(pool.quarantined());
+
+        let _body: Vec<u8> = stream.by_ref().flatten().collect();
+        server.join().expect("server thread");
+        assert!(matches!(stream.error(), Some(PlayError::Decode(_))));
+        assert!(stream.finalize(&mut pool, &mut cache, &mut meter).is_err());
+        assert!(pool.quarantined(), "a failed stream cannot clear it");
+        assert!(meter
+            .events
+            .iter()
+            .all(|event| event.kind != MeterKind::QuarantineExited));
+    }
+
+    /// A segment fetched after the interleaved error leaves
+    /// `last_success_epoch` equal to the pool's epoch, so the epoch check
+    /// alone would let a play that later fails clear the quarantine; only the
+    /// `live.failed` guard in `finalize` stops it.
+    #[test]
+    fn late_decode_failure_after_post_error_success_does_not_clear_quarantine() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind NNTP server");
+        let address = listener.local_addr().expect("server address");
+        let (_, mut articles) = split_parts(&[b"small ", b"audio ", b"payload"]);
+        articles[2] = b"not a yEnc article".to_vec();
+        let server = serve_articles(listener, articles, false);
+        let segments = vec![
+            "track-seg0@synthetic.test".to_string(),
+            "track-seg1@synthetic.test".to_string(),
+            "track-seg2@synthetic.test".to_string(),
+        ];
+        let token = grant::issue("u", "track-a", GRANT_EXP_UNIX, b"s");
+        let mut pool = Pool::new(2);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+
+        let input = test_input(&token, "track-a", address, &segments);
+        let response = play(&mut pool, &mut cache, &mut meter, b"s", &input).expect("play");
+        let mut stream = response.stream;
+        let token = grant::issue("u", "track-b", GRANT_EXP_UNIX, b"s");
+        let dead = closed_address();
+        let other_segment = vec!["other-seg@synthetic.test".to_string()];
+        let input = test_input(&token, "track-b", dead, &other_segment);
+        assert!(matches!(
+            play(&mut pool, &mut cache, &mut meter, b"s", &input),
+            Err(PlayError::Upstream(_))
+        ));
+        assert!(pool.quarantined());
+
+        let body: Vec<u8> = stream.by_ref().flatten().collect();
+        server.join().expect("server thread");
+        assert_eq!(
+            body, b"small audio ",
+            "segment 1 must be served after the interleaved error, before segment 2 fails"
+        );
+        assert!(matches!(stream.error(), Some(PlayError::Decode(_))));
+        assert!(stream.finalize(&mut pool, &mut cache, &mut meter).is_err());
+        assert!(pool.quarantined(), "a failed play cannot clear it");
+        assert!(meter
+            .events
+            .iter()
+            .all(|event| event.kind != MeterKind::QuarantineExited));
+    }
+
+    #[test]
+    fn streamed_success_after_interleaved_error_clears_quarantine_on_finalize() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind NNTP server");
+        let address = listener.local_addr().expect("server address");
+        let (plain, articles) = test_parts();
+        let server = serve_articles(listener, articles, false);
+        let segments = vec![
+            "track-seg0@synthetic.test".to_string(),
+            "track-seg1@synthetic.test".to_string(),
+        ];
+        let token = grant::issue("u", "track-a", GRANT_EXP_UNIX, b"s");
+        let mut pool = Pool::new(2);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+
+        let input = test_input(&token, "track-a", address, &segments);
+        let response = play(&mut pool, &mut cache, &mut meter, b"s", &input).expect("play");
+        let mut stream = response.stream;
+        let token = grant::issue("u", "track-b", GRANT_EXP_UNIX, b"s");
+        let dead = closed_address();
+        let other_segment = vec!["other-seg@synthetic.test".to_string()];
+        let input = test_input(&token, "track-b", dead, &other_segment);
+        assert!(matches!(
+            play(&mut pool, &mut cache, &mut meter, b"s", &input),
+            Err(PlayError::Upstream(_))
+        ));
+        assert!(pool.quarantined());
+
+        let body: Vec<u8> = stream.by_ref().flatten().collect();
+        assert_eq!(body, plain);
+        server.join().expect("server thread");
+        stream
+            .finalize(&mut pool, &mut cache, &mut meter)
+            .expect("finalize streamed play");
+        assert!(!pool.quarantined());
+        let exits: Vec<_> = meter
+            .events
+            .iter()
+            .filter(|event| event.kind == MeterKind::QuarantineExited)
+            .collect();
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].user_id, "u");
+        assert_eq!(exits[0].track_id, "track-a");
+        assert_eq!(exits[0].lane, Some(Lane::Playback));
+        assert_eq!(exits[0].backoff_ms, 0);
+    }
+
+    #[test]
+    fn later_interleaved_error_wins_over_earlier_streamed_success() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind NNTP server");
+        let address = listener.local_addr().expect("server address");
+        let (plain, articles) = test_parts();
+        let server = serve_articles(listener, articles, false);
+        let segments = vec![
+            "track-seg0@synthetic.test".to_string(),
+            "track-seg1@synthetic.test".to_string(),
+        ];
+        let token = grant::issue("u", "track-a", GRANT_EXP_UNIX, b"s");
+        let mut pool = Pool::new(2);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+
+        let input = test_input(&token, "track-a", address, &segments);
+        let response = play(&mut pool, &mut cache, &mut meter, b"s", &input).expect("play");
+        let mut stream = response.stream;
+        let token = grant::issue("u", "track-b", GRANT_EXP_UNIX, b"s");
+        let dead = closed_address();
+        let other_segment = vec!["other-seg@synthetic.test".to_string()];
+        let input = test_input(&token, "track-b", dead, &other_segment);
+        assert!(matches!(
+            play(&mut pool, &mut cache, &mut meter, b"s", &input),
+            Err(PlayError::Upstream(_))
+        ));
+        assert!(pool.quarantined());
+
+        let body: Vec<u8> = stream.by_ref().flatten().collect();
+        assert_eq!(body, plain);
+        server.join().expect("server thread");
+
+        pool.advance(1_000);
+        let token = grant::issue("u", "track-c", GRANT_EXP_UNIX, b"s");
+        let input = test_input(&token, "track-c", closed_address(), &other_segment);
+        assert!(matches!(
+            play(&mut pool, &mut cache, &mut meter, b"s", &input),
+            Err(PlayError::Upstream(_))
+        ));
+        assert!(pool.quarantined());
+
+        stream
+            .finalize(&mut pool, &mut cache, &mut meter)
+            .expect("finalize streamed play");
+        assert!(
+            pool.quarantined(),
+            "a newer provider error stays quarantined"
+        );
+        assert!(meter
+            .events
+            .iter()
+            .all(|event| event.kind != MeterKind::QuarantineExited));
     }
 
     #[test]

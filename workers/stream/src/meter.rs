@@ -27,6 +27,8 @@
 /// Wiring this event to Analytics Engine remains a production integration task.
 pub const RECONCILE_MISMATCH_METRIC: &str = "play_reconcile_mismatch";
 
+use crate::pool::Lane;
+
 /// What happened, in billing-relevant order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeterKind {
@@ -36,6 +38,14 @@ pub enum MeterKind {
     BytesServed,
     PrefetchEnqueued,
     ProviderError,
+    /// A provider-level failure quarantined the pool; the event carries the
+    /// failed call's lane and the backoff just applied.
+    QuarantineEntered,
+    /// A successful call cleared a pending quarantine (no backoff).
+    QuarantineExited,
+    /// A pooled connection the provider silently closed was transparently
+    /// redialed (no backoff, no quarantine).
+    WarmRedial,
     /// A flagged reconciliation mismatch. Non-serving: its [`MeterEvent`]
     /// always carries `bytes = 0`; the flagged counts stay on the
     /// [`ReconcileMismatch`] record returned by [`reconcile`].
@@ -50,6 +60,12 @@ pub struct MeterEvent {
     pub track_id: String,
     /// Bytes served to the client (0 for non-serving events).
     pub bytes: u64,
+    /// Pool lane of the call a pool-health event belongs to; `None` for
+    /// events unrelated to pool state.
+    pub lane: Option<Lane>,
+    /// Quarantine backoff in milliseconds for
+    /// [`MeterKind::QuarantineEntered`]; 0 otherwise.
+    pub backoff_ms: u64,
 }
 
 pub trait Meter {
@@ -362,6 +378,8 @@ pub fn reconcile(
             user_id: play.user_id.clone(),
             track_id: play.track_id.clone(),
             bytes: 0,
+            lane: None,
+            backoff_ms: 0,
         });
     };
 
@@ -417,9 +435,15 @@ mod tests {
                 user_id: "u".to_string(),
                 track_id: "t".to_string(),
                 bytes: 7,
+                lane: None,
+                backoff_ms: 0,
             });
         }
         assert_eq!(meter.events.len(), 2);
+        assert!(meter
+            .events
+            .iter()
+            .all(|e| e.lane.is_none() && e.backoff_ms == 0));
         assert!(meter.has_kind(MeterKind::PlayStart));
         assert!(!meter.has_kind(MeterKind::CacheHit));
     }
