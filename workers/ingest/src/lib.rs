@@ -204,6 +204,7 @@ fn intake_rejection_parts(rejection: &IntakeRejection) -> (u16, serde_json::Valu
     let mut body = serde_json::json!({
         "error": rejection.message(),
         "code": rejection.code(),
+        "intake_config_version": nzb_intake::INTAKE_CONFIG_VERSION,
     });
     match *rejection {
         IntakeRejection::TooLarge {
@@ -527,12 +528,19 @@ mod tests {
             file_bomb.push_str("<file></file>");
         }
         file_bomb.push_str("</nzb>");
+        let mut segment_bomb = String::from("<?xml?><nzb>");
+        for _ in 0..(crate::nzb_intake::MAX_SEGMENTS + 1) {
+            segment_bomb.push_str("<segment></segment>");
+        }
+        segment_bomb.push_str("</nzb>");
+        assert!(segment_bomb.len() < MAX_NZB_BYTES);
         let cases: &[(&str, u16, &str)] = &[
             ("", 400, "NZB_EMPTY"),
             ("<html><body>hi</body></html>", 400, "NZB_NOT_NZB"),
             ("<?xml?><nzb><file>", 400, "NZB_MALFORMED"),
             (over_bytes, 413, "NZB_DECLARED_BYTES_OVER_CAP"),
             (&file_bomb, 413, "NZB_TOO_MANY_FILES"),
+            (&segment_bomb, 413, "NZB_TOO_MANY_SEGMENTS"),
             (&"x".repeat(MAX_NZB_BYTES + 1), 413, "NZB_TOO_LARGE"),
         ];
         for (body, status, code) in cases {
@@ -540,6 +548,10 @@ mod tests {
             let (actual_status, actual_body) = intake_rejection_parts(&rejection);
             assert_eq!(actual_status, *status, "status for {code}");
             assert_eq!(actual_body["code"], *code, "code for {code}");
+            assert_eq!(
+                actual_body["intake_config_version"],
+                crate::nzb_intake::INTAKE_CONFIG_VERSION
+            );
             assert!(actual_body["error"].is_string());
         }
         // Reason fields the client renders ride alongside the code.
@@ -561,6 +573,16 @@ mod tests {
         assert_eq!(
             too_many_files_body["max_files"].as_u64().unwrap(),
             MAX_FILES as u64
+        );
+        let (_, too_many_segments_body) =
+            intake_rejection_parts(&estimate_nzb(&segment_bomb).unwrap_err());
+        assert_eq!(
+            too_many_segments_body["segment_count"].as_u64().unwrap(),
+            (crate::nzb_intake::MAX_SEGMENTS + 1) as u64
+        );
+        assert_eq!(
+            too_many_segments_body["max_segments"].as_u64().unwrap(),
+            crate::nzb_intake::MAX_SEGMENTS as u64
         );
         // A valid NZB has no rejection at all: it queues.
         assert!(estimate_nzb(crate::fixtures::SMALL_NZB).is_ok());

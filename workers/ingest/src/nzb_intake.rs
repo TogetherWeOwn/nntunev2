@@ -22,18 +22,18 @@
 //!
 //! | code | status | fields |
 //! |------|--------|--------|
-//! | `NZB_EMPTY` | 400 | — |
-//! | `NZB_TOO_LARGE` | 413 | `size_bytes`, `max_bytes` |
-//! | `NZB_NOT_NZB` | 400 | — |
-//! | `NZB_MALFORMED` | 400 | — |
-//! | `NZB_TOO_MANY_FILES` | 413 | `file_count`, `max_files` |
-//! | `NZB_TOO_MANY_SEGMENTS` | 413 | `segment_count`, `max_segments` |
-//! | `NZB_DECLARED_BYTES_OVER_CAP` | 413 | `declared_bytes`, `max_declared_bytes` |
+//! | `NZB_EMPTY` | 400 | `intake_config_version` |
+//! | `NZB_TOO_LARGE` | 413 | `intake_config_version`, `size_bytes`, `max_bytes` |
+//! | `NZB_NOT_NZB` | 400 | `intake_config_version` |
+//! | `NZB_MALFORMED` | 400 | `intake_config_version` |
+//! | `NZB_TOO_MANY_FILES` | 413 | `intake_config_version`, `file_count`, `max_files` |
+//! | `NZB_TOO_MANY_SEGMENTS` | 413 | `intake_config_version`, `segment_count`, `max_segments` |
+//! | `NZB_DECLARED_BYTES_OVER_CAP` | 413 | `intake_config_version`, `declared_bytes`, `max_declared_bytes` |
 //!
 //! Checks run in the order above: the first failure wins.
 
-/// Intake config version. Bump whenever a default cap changes so clients and
-/// dashboards can tell which policy refused an upload.
+/// Intake config version. Bump whenever a default cap changes; refusals
+/// include this value so clients and dashboards can identify the policy.
 pub const INTAKE_CONFIG_VERSION: u32 = 1;
 
 /// Largest accepted upload: NZBs are XML metadata, never content.
@@ -161,23 +161,100 @@ fn is_name_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || matches!(b, b'_' | b':')
 }
 
-/// Return the name bounds for an opening element whose local name matches
-/// `name`, starting at or after `from`.
-fn find_element(body: &str, name: &str, from: usize) -> Option<(usize, usize)> {
+#[derive(Debug, Clone, Copy)]
+struct OpenTag {
+    start: usize,
+    name_end: usize,
+    end: usize,
+}
+
+fn find_bytes(bytes: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    bytes[from..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|offset| from + offset)
+}
+
+/// Return the next opening XML tag, skipping comments, CDATA, processing
+/// instructions, declarations, and closing tags. The returned end offset is
+/// past `>` so subsequent scans never revisit the tag or its attributes.
+fn next_open_tag(body: &str, mut i: usize) -> Option<OpenTag> {
     let bytes = body.as_bytes();
-    let mut offset = from;
-    while let Some(rel) = body[offset..].find('<') {
-        let start = offset + rel;
-        let name_start = start + 1;
-        let Some(name_end) = read_name(bytes, name_start) else {
-            offset = name_start;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
             continue;
-        };
-        let qualified_name = &body[name_start..name_end];
-        if qualified_name.rsplit(':').next() == Some(name) {
-            return Some((start, name_end));
         }
-        offset = name_end;
+        if bytes[i..].starts_with(b"<!--") {
+            i = find_bytes(bytes, b"-->", i + 4)? + 3;
+            continue;
+        }
+        if bytes[i..].starts_with(b"<![CDATA[") {
+            i = find_bytes(bytes, b"]]>", i + 9)? + 3;
+            continue;
+        }
+        if bytes[i..].starts_with(b"<?") {
+            i = find_bytes(bytes, b"?>", i + 2)? + 2;
+            continue;
+        }
+        if bytes[i..].starts_with(b"<!") {
+            let mut j = i + 2;
+            let mut quote = None;
+            let mut subset_depth = 0usize;
+            while j < bytes.len() {
+                let b = bytes[j];
+                if let Some(open) = quote {
+                    if b == open {
+                        quote = None;
+                    }
+                } else if b == b'\'' || b == b'"' {
+                    quote = Some(b);
+                } else if b == b'[' {
+                    subset_depth += 1;
+                } else if b == b']' {
+                    subset_depth = subset_depth.saturating_sub(1);
+                } else if b == b'>' && subset_depth == 0 {
+                    break;
+                }
+                j += 1;
+            }
+            if j >= bytes.len() {
+                return None;
+            }
+            i = j + 1;
+            continue;
+        }
+        if bytes[i..].starts_with(b"</") {
+            i = find_bytes(bytes, b">", i + 2)? + 1;
+            continue;
+        }
+
+        let start = i;
+        let name_start = i + 1;
+        let name_end = read_name(bytes, name_start)?;
+        let mut j = name_end;
+        let mut quote = None;
+        while j < bytes.len() {
+            let b = bytes[j];
+            if let Some(open) = quote {
+                if b == open {
+                    quote = None;
+                }
+            } else if b == b'\'' || b == b'"' {
+                quote = Some(b);
+            } else if b == b'>' {
+                break;
+            }
+            j += 1;
+        }
+        if j >= bytes.len() {
+            return None;
+        }
+        return Some(OpenTag {
+            start,
+            name_end,
+            end: j + 1,
+        });
     }
     None
 }
@@ -185,17 +262,20 @@ fn find_element(body: &str, name: &str, from: usize) -> Option<(usize, usize)> {
 /// Count opening elements with local name `name`, stopping once `over` is
 /// exceeded. Prefixes are ignored so this agrees with nntune-core's
 /// namespace-aware local-name dispatch.
-fn count_elements(haystack: &str, name: &str, over: usize) -> usize {
-    let mut n = 0;
+fn count_elements(body: &str, name: &str, over: usize) -> usize {
+    let mut count = 0;
     let mut offset = 0;
-    while let Some((start, name_end)) = find_element(haystack, name, offset) {
-        n += 1;
-        if n > over {
-            break;
+    while let Some(tag) = next_open_tag(body, offset) {
+        let qualified_name = &body[tag.start + 1..tag.name_end];
+        if qualified_name.rsplit(':').next() == Some(name) {
+            count += 1;
+            if count > over {
+                break;
+            }
         }
-        offset = name_end.max(start + 1);
+        offset = tag.end;
     }
-    n
+    count
 }
 
 /// Skip ASCII whitespace, returning the new offset.
@@ -365,43 +445,22 @@ fn check_well_formed(body: &str) -> bool {
     saw_element && stack.is_empty()
 }
 
-/// Sum the `bytes="…"` attributes of every `<segment…>` tag.
-///
-/// Tags are located with the same boundary rule as [`count_elements`] (so
-/// `<segments>` never contributes), and each tag ends at the first unquoted
-/// `>` (attribute values may contain `>`). A missing `bytes` attribute
-/// contributes 0; a non-numeric value is malformed input; a value that
-/// overflows `u64` saturates the total (it is over any sane cap).
+/// Sum the `bytes="…"` attributes of every `<segment…>` tag. The shared
+/// tokenizer ignores tag-like text inside non-element XML constructs and
+/// advances past each full tag, making the scan linear in document length.
 fn sum_segment_bytes(body: &str) -> Result<u64, ()> {
-    let bytes = body.as_bytes();
     let mut total: u64 = 0;
-    let mut rest = 0;
-    while let Some((tag_start, name_end)) = find_element(body, "segment", rest) {
-        // Find the tag end, respecting quotes.
-        let mut j = name_end;
-        let mut q: Option<u8> = None;
-        while j < bytes.len() {
-            let b = bytes[j];
-            if let Some(open) = q {
-                if b == open {
-                    q = None;
-                }
-            } else if b == b'"' || b == b'\'' {
-                q = Some(b);
-            } else if b == b'>' {
-                break;
-            }
-            j += 1;
+    let mut offset = 0;
+    while let Some(open) = next_open_tag(body, offset) {
+        let qualified_name = &body[open.start + 1..open.name_end];
+        if qualified_name.rsplit(':').next() != Some("segment") {
+            offset = open.end;
+            continue;
         }
-        if j >= bytes.len() {
-            return Err(());
-        }
-        let tag = &body[tag_start..=j];
-        // Walk this tag's attributes for `bytes`.
+        let tag = &body[open.start..open.end];
         let tag_bytes = tag.as_bytes();
-        let mut k = name_end - tag_start - 1;
+        let mut k = open.name_end - open.start - 1;
         let mut tag_value: Option<u64> = None;
-        let mut malformed_attr = false;
         loop {
             k = skip_ws(tag_bytes, k);
             if k >= tag_bytes.len() || tag_bytes[k] == b'>' || tag[k..].starts_with("/>") {
@@ -415,8 +474,7 @@ fn sum_segment_bytes(body: &str) -> Result<u64, ()> {
             if k < tag_bytes.len() && tag_bytes[k] == b'=' {
                 k = skip_ws(tag_bytes, k + 1);
                 if k >= tag_bytes.len() || (tag_bytes[k] != b'"' && tag_bytes[k] != b'\'') {
-                    malformed_attr = true;
-                    break;
+                    return Err(());
                 }
                 let quote = tag_bytes[k];
                 let value_start = k + 1;
@@ -425,16 +483,13 @@ fn sum_segment_bytes(body: &str) -> Result<u64, ()> {
                     value_end += 1;
                 }
                 if value_end >= tag_bytes.len() {
-                    malformed_attr = true;
-                    break;
+                    return Err(());
                 }
                 if attr_name == "bytes" && tag_value.is_none() {
                     let raw = &tag[value_start..value_end];
                     if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
                         return Err(());
                     }
-                    // All digits: overflow is the only failure left, and a
-                    // value that overflows u64 is over any sane cap.
                     match raw.parse::<u64>() {
                         Ok(n) => tag_value = Some(n),
                         Err(_) => total = total.saturating_add(u64::MAX),
@@ -443,13 +498,10 @@ fn sum_segment_bytes(body: &str) -> Result<u64, ()> {
                 k = value_end + 1;
             }
         }
-        if malformed_attr {
-            return Err(());
-        }
         if let Some(n) = tag_value {
             total = total.saturating_add(n);
         }
-        rest = name_end;
+        offset = open.end;
     }
     Ok(total)
 }
@@ -565,17 +617,47 @@ mod tests {
         assert_eq!(DEFAULT_LIMITS.max_files, MAX_FILES);
         assert_eq!(DEFAULT_LIMITS.max_segments, MAX_SEGMENTS);
         assert_eq!(DEFAULT_LIMITS.max_declared_bytes, MAX_DECLARED_BYTES);
-        // Tightening a copy rejects bytes the default accepts: the policy is
-        // the config, not the call site.
-        let tight = IntakeLimits {
-            version: INTAKE_CONFIG_VERSION,
-            max_nzb_bytes: MAX_NZB_BYTES,
-            max_files: 0,
-            max_segments: 1,
-            max_declared_bytes: 199,
-        };
+        // Tighten exactly one cap per assertion so each configured field is
+        // independently proven to affect the estimate.
         assert!(estimate_nzb(SMALL_NZB).is_ok());
-        assert!(estimate_nzb_with_limits(SMALL_NZB, &tight).is_err());
+        let tight = IntakeLimits {
+            max_nzb_bytes: SMALL_NZB.len() - 1,
+            ..DEFAULT_LIMITS
+        };
+        assert_eq!(
+            estimate_nzb_with_limits(SMALL_NZB, &tight),
+            Err(IntakeRejection::TooLarge {
+                size_bytes: SMALL_NZB.len(),
+                max_bytes: SMALL_NZB.len() - 1,
+            })
+        );
+        let tight = IntakeLimits {
+            max_files: 0,
+            ..DEFAULT_LIMITS
+        };
+        assert_eq!(
+            estimate_nzb_with_limits(SMALL_NZB, &tight),
+            Err(IntakeRejection::TooManyFiles { count: 1, max: 0 })
+        );
+        let tight = IntakeLimits {
+            max_segments: 1,
+            ..DEFAULT_LIMITS
+        };
+        assert_eq!(
+            estimate_nzb_with_limits(SMALL_NZB, &tight),
+            Err(IntakeRejection::TooManySegments { count: 2, max: 1 })
+        );
+        let tight = IntakeLimits {
+            max_declared_bytes: 199,
+            ..DEFAULT_LIMITS
+        };
+        assert_eq!(
+            estimate_nzb_with_limits(SMALL_NZB, &tight),
+            Err(IntakeRejection::DeclaredBytesOverCap {
+                declared: 200,
+                max: 199,
+            })
+        );
     }
 
     #[test]
@@ -740,6 +822,35 @@ mod tests {
         let est = estimate_nzb(doc).unwrap();
         assert_eq!(est.segment_count, 1);
         assert_eq!(est.declared_bytes, 100);
+    }
+
+    #[test]
+    fn tag_like_text_in_non_element_constructs_does_not_feed_caps() {
+        let doc = concat!(
+            "<?xml?><!DOCTYPE nzb [<!ENTITY sample \"<segment bytes='90000000000'>\">]>\n",
+            "<nzb><!-- <file><segment bytes=\"99999999999\"> -->",
+            "<![CDATA[<file><segment bytes=\"88888888888\">]]>",
+            "<?target <file><segment bytes=\"77777777777\">?>",
+            "<file><segment bytes=\"100\">x@y</segment></file></nzb>"
+        );
+        let estimate = estimate_nzb(doc).unwrap();
+        assert_eq!(estimate.file_count, 1);
+        assert_eq!(estimate.segment_count, 1);
+        assert_eq!(estimate.declared_bytes, 100);
+    }
+
+    #[test]
+    fn many_comment_decoys_are_skipped_without_rescanning_tags() {
+        let mut doc = String::from("<?xml?><nzb><!--");
+        for _ in 0..5_000 {
+            doc.push_str("<segment bytes=\"99999999999\">");
+            doc.push_str(&"x".repeat(100));
+        }
+        doc.push_str("--><segment bytes=\"42\">x@y</segment></nzb>");
+        assert!(doc.len() < MAX_NZB_BYTES);
+        let estimate = estimate_nzb(&doc).unwrap();
+        assert_eq!(estimate.segment_count, 1);
+        assert_eq!(estimate.declared_bytes, 42);
     }
 
     #[test]

@@ -25,9 +25,10 @@ NZB upload ───────────────┘                     
   spends provider connections. Refusals carry stable 4xx codes
   (`NZB_EMPTY`, `NZB_TOO_LARGE`, `NZB_NOT_NZB`, `NZB_MALFORMED`,
   `NZB_TOO_MANY_FILES`, `NZB_TOO_MANY_SEGMENTS`,
-  `NZB_DECLARED_BYTES_OVER_CAP`); cap refusals also return the measured
-  value and the cap (`segment_count`/`max_segments`,
-  `declared_bytes`/`max_declared_bytes`, …) so clients can render a reason.
+  `NZB_DECLARED_BYTES_OVER_CAP`) and the `intake_config_version`; cap refusals
+  also return the measured value and cap (`file_count`/`max_files`,
+  `segment_count`/`max_segments`, `declared_bytes`/`max_declared_bytes`, …)
+  so clients can render a reason.
 - Per-plan rate limits (`src/rate_limit.rs`): provisional base/5x/20x
   tunables (exact numbers are set at launch); token buckets, no clock
   dependency.
