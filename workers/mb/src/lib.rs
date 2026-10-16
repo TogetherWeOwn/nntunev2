@@ -62,7 +62,8 @@ pub fn art_bucket_for_env(env: &str) -> &'static str {
 /// always embeds both the bucket name and the key; the release lookup
 /// serves this value as `caa_url`. The virtual-hosted shape is the
 /// convention until the public host stabilizes with binding activation
-/// (TOG-23680); KV/edge cache key schemes are unaffected.
+/// (a separate follow-up; out of scope here). KV/edge cache key schemes
+/// are unaffected.
 pub fn caa_url_for_art(bucket: &str, key: &str) -> String {
     let key = key.trim_start_matches('/');
     format!("https://{bucket}.r2.cloudflarestorage.com/{key}")

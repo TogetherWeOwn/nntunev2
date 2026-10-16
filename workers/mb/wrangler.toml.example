@@ -14,7 +14,7 @@ compatibility_date = "2026-10-01"
 # id = "<KV_NAMESPACE_ID>"
 
 # Artwork cache: one R2 bucket per environment (docs/ops.md inventory).
-# Binding activation stays with TOG-23680; uncomment when activating.
+# Binding activation is a separate follow-up; uncomment when activating.
 # Staging (`wrangler deploy --env staging`):
 # [env.staging.vars]
 # ENVIRONMENT = "staging"
