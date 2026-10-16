@@ -22,10 +22,7 @@ fn normalize(value: &str) -> String {
 fn creates_users_table(sql: &str) -> bool {
     let sql = sql
         .to_ascii_lowercase()
-        .replace('"', "")
-        .replace('`', "")
-        .replace('[', "")
-        .replace(']', "")
+        .replace(['"', '`', '[', ']'], "")
         .replace('(', " ( ")
         .replace(')', " ) ")
         .replace(',', " , ")
