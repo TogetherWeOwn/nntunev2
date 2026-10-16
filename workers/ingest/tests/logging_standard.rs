@@ -256,6 +256,72 @@ fn fields_are_flat(fields_body: &str) -> bool {
     !stripped.contains(['{', '}', '[', ']'])
 }
 
+/// Top-level keys of the outer JSON object: depth-1 `"key":` strings only,
+/// so nested `fields` keys are never counted as top-level fields.
+fn top_level_keys(json: &str) -> Vec<String> {
+    let chars: Vec<char> = json.chars().collect();
+    let mut keys = Vec::new();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if in_str {
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '"' {
+            let mut key = String::new();
+            let mut j = i + 1;
+            let mut e = false;
+            let mut closed = false;
+            while j < chars.len() {
+                let c = chars[j];
+                if e {
+                    key.push(c);
+                    e = false;
+                } else if c == '\\' {
+                    e = true;
+                } else if c == '"' {
+                    closed = true;
+                    break;
+                } else {
+                    key.push(c);
+                }
+                j += 1;
+            }
+            if !closed {
+                break;
+            }
+            let mut k = j + 1;
+            while k < chars.len() && chars[k].is_whitespace() {
+                k += 1;
+            }
+            if depth == 1 && k < chars.len() && chars[k] == ':' {
+                keys.push(key);
+            }
+            i = j + 1;
+            continue;
+        } else if ch == '{' {
+            depth += 1;
+        } else if ch == '}' {
+            if depth > 0 {
+                depth -= 1;
+            }
+        }
+        i += 1;
+    }
+    keys
+}
+
 #[test]
 fn golden_line_conforms_to_schema() {
     let line = read_artifact(FIXTURE_REL, "golden log-line fixture");
@@ -263,6 +329,19 @@ fn golden_line_conforms_to_schema() {
         assert!(
             has_key(&line, field),
             "golden line must carry `{field}`: {line}"
+        );
+    }
+    // Exact schema per docs/logging-standard.md: exactly these six top-level
+    // fields — an extra top-level key fails just like a missing key does.
+    {
+        let mut actual = top_level_keys(&line);
+        actual.sort();
+        let mut expected: Vec<String> =
+            REQUIRED_FIELDS.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(
+            actual, expected,
+            "golden line must contain exactly the six top-level fields {expected:?}, got {actual:?}: {line}"
         );
     }
     let level = extract_string_field(&line, "level").expect("level must be a JSON string");
