@@ -13,7 +13,8 @@ client ── play(token, range?) ──▶ stream Worker
   2. R2 hit: serve 200 / 206 straight from the shared cached blob
      (audio/<sha256>; cache.rs, range.rs) — no copy of the track
   3. R2 miss: lease a pool slot (Playback lane), take a warm connection
-     (or dial one), BODY the FIRST segment, yEnc-decode it (multipart
+     (or dial one), BODY the first segment (or, for a mid-track seek with
+     NZB segment ranges, the segment covering the range start), yEnc-decode it (multipart
      =ybegin/=ypart/=yend, pcrc32) and read the file size from =ybegin so
      Range/206 resolves before byte one. Later segments are fetched
      lazily as the client pulls 16 KiB chunks: decode → decrypt → client
@@ -210,13 +211,23 @@ First-byte latency is measured by `tests/stream_integration.rs`
 Miss TTFB for a range starting at byte 0 is dial (skipped on a warm pool) +
 **one** article fetch + decode, independent of track length: the integration
 test asserts the server has received exactly one `BODY` when the first chunk
-arrives on a three-segment track. A mid-track seek on a cold cache instead
-walks every earlier segment first (TTFB grows with the seek position):
-`PlayInput` carries only message-ids, so without NZB segment sizes the play
-path cannot know which article covers an offset — covering-segment fetch is
-a follow-up once ingest exposes per-segment byte ranges. An integration test
-pins the current prefix cost. Staging p95 numbers are owned by Analytics
-Engine monitoring (`PlayStart` → first-byte events) once deployed.
+arrives on a three-segment track. A mid-track seek on a cold cache gets the
+same one-`BODY` TTFB when `PlayInput::segment_ranges` carries the NZB
+per-segment byte ranges: the article covering the range start is fetched
+first, and the skipped prefix is backfilled in file order before serving
+advances past the covering segment (or by `finalize` when the range ends
+inside it), so multipart staging still only ever receives the contiguous
+prefix — 5 MiB part coalescing is unchanged and at most the covering
+segment is ever held out of order beyond the staged part. The whole track
+still lands in cache. Ranges are a verified hint, never trusted blindly:
+without ranges, with ranges that fail validation (wrong arity, gaps,
+non-zero start), with a ranges-only `416`, or when the covering article
+disagrees with its declared range, the play path keeps (or falls back to)
+the prefix walk: it walks every earlier segment first and TTFB grows with
+the seek position. Integration tests pin both costs (one
+`BODY` vs the whole prefix) and byte-identical output. Staging p95 numbers
+are owned by Analytics Engine monitoring (`PlayStart` → first-byte events)
+once deployed.
 
 CI (`.github/workflows/ci.yml`, job `rust`, required through `ci-ok`) runs
 fmt, clippy `-D warnings` and every test; the integration test asserts the
