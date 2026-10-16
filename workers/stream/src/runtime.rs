@@ -29,6 +29,8 @@ use crate::probe::{
 /// Durable Object route for one probe batch.
 pub const PROBE_PATH: &str = "/probe";
 
+/// The Worker's own route: only the Durable Object serves probes, so every
+/// request here is a 404 until the play routes land.
 #[event(fetch)]
 async fn fetch(_req: Request, _env: Env, _ctx: Context) -> Result<Response> {
     Response::error("not found", 404)
@@ -37,13 +39,16 @@ async fn fetch(_req: Request, _env: Env, _ctx: Context) -> Result<Response> {
 #[durable_object(fetch)]
 pub struct NntpPool {
     state: State,
-    /// Built on the first probe with the provider's cap; a changed cap
-    /// applies when the runtime next evicts this instance.
+    /// Built by the first probe that passes validation and loads provider
+    /// settings, with the provider's cap; a changed cap applies when the
+    /// runtime next evicts this instance.
     pool: OnceCell<RefCell<Pool<NntpClient<WorkerTransport>>>>,
     clock: WallClock,
 }
 
 impl DurableObject for NntpPool {
+    /// Builds the object without a pool; `pool` stays unset until a probe
+    /// passes validation and loads provider settings.
     fn new(state: State, _env: Env) -> Self {
         Self {
             state,
@@ -52,6 +57,7 @@ impl DurableObject for NntpPool {
         }
     }
 
+    /// Serves `POST /probe`; any other method or path is a 404.
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         if req.method() != Method::Post || req.path() != PROBE_PATH {
             return Response::error("not found", 404);
@@ -61,6 +67,7 @@ impl DurableObject for NntpPool {
 }
 
 impl NntpPool {
+    /// Reads, validates and runs one probe envelope against this object's pool.
     async fn probe(&self, req: &mut Request) -> ProbeReply {
         // The id came from `id_from_name(user_id)`; without the name there is
         // no owner to check the envelope against, so refuse.
@@ -122,6 +129,8 @@ async fn read_capped(req: &mut Request, cap: usize) -> core::result::Result<Vec<
     Ok(buf)
 }
 
+/// Turns a [`ProbeReply`] into the JSON `Response`, adding `Retry-After` when
+/// the reply carries one.
 fn respond(reply: ProbeReply) -> Result<Response> {
     let headers = Headers::new();
     headers.set("content-type", "application/json")?;

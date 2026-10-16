@@ -94,6 +94,7 @@ pub enum ProbeError {
 }
 
 impl ProbeError {
+    /// HTTP status the Durable Object answers with for this error.
     pub fn status(&self) -> u16 {
         match self {
             ProbeError::BadRequest(_) => 400,
@@ -103,6 +104,8 @@ impl ProbeError {
         }
     }
 
+    /// Stable, generic error code for the `{"error": <code>}` body; never
+    /// carries provider text.
     pub fn code(&self) -> &'static str {
         match self {
             ProbeError::BadRequest(_) => "bad_request",
@@ -132,6 +135,8 @@ pub struct ProbeReply {
 }
 
 impl From<Result<ProbeOutcome, ProbeError>> for ProbeReply {
+    /// Renders a probe result as its HTTP answer: the outcome JSON on `200`,
+    /// otherwise the error's status and generic code.
     fn from(result: Result<ProbeOutcome, ProbeError>) -> Self {
         match result {
             Ok(outcome) => match serde_json::to_string(&outcome) {
@@ -275,6 +280,7 @@ where
     }
 }
 
+/// Wraps the partitioned ids in the outcome that echoes the request's batch.
 fn outcome(req: &ProbeRequest, (present, missing): (Vec<String>, Vec<String>)) -> ProbeOutcome {
     ProbeOutcome {
         batch_index: req.batch_index,
@@ -283,6 +289,8 @@ fn outcome(req: &ProbeRequest, (present, missing): (Vec<String>, Vec<String>)) -
     }
 }
 
+/// Quarantines the pool, drops the leased connection and returns the generic
+/// provider error.
 fn provider_failed<T: Transport>(
     pool: &RefCell<Pool<NntpClient<T>>>,
     lease: crate::pool::Lease,
@@ -322,6 +330,8 @@ pub struct WallClock {
 }
 
 impl WallClock {
+    /// Advances `pool` by the wall-clock time since the latest time seen (zero
+    /// on the first call or when the clock stepped backwards).
     pub fn sync<C>(&self, pool: &mut Pool<C>, now_ms: u64) {
         let last = self.last_ms.get();
         if let Some(last) = last {
@@ -336,6 +346,7 @@ impl WallClock {
 mod tests {
     use super::*;
 
+    /// An ingest-shaped envelope body for `user` carrying `ids`.
     fn body(user: &str, ids: &[&str]) -> Vec<u8> {
         serde_json::json!({
             "job_id": "job_01",

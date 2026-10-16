@@ -20,6 +20,7 @@ type Client = NntpClient<NativeTlsTransport>;
 const MISSING: &str = "missing-430@nntune.test";
 const UNKNOWN: &str = "never-posted@nntune.test";
 
+/// Plain-TCP config for the synthetic server at `addr` with the given password.
 fn config(addr: SocketAddr, password: &str) -> NntpConfig {
     NntpConfig {
         host: addr.ip().to_string(),
@@ -32,6 +33,7 @@ fn config(addr: SocketAddr, password: &str) -> NntpConfig {
     }
 }
 
+/// Dials and authenticates a client, counting the attempt in `dials`.
 async fn dial(config: NntpConfig, dials: &Cell<u32>) -> nntune_core::Result<Client> {
     dials.set(dials.get() + 1);
     let transport = connect_native(&config)
@@ -49,6 +51,7 @@ fn posted_ids() -> Vec<String> {
         .collect()
 }
 
+/// A probe envelope for `user`'s pool carrying `ids` as batch `batch_index`.
 fn request(user: &str, batch_index: usize, ids: &[String]) -> ProbeRequest {
     ProbeRequest {
         job_id: "job_01".into(),

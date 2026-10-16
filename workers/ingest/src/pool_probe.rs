@@ -121,6 +121,7 @@ mod tests {
     use crate::jobs::JobState;
     use crate::probe::{apply_probe_batch, build_probe_request, ProbeTally};
 
+    /// A two-segment probe request for the small fixture NZB.
     fn request() -> ProbeRequest {
         let msg = build_upload_dispatch("user_01", SMALL_NZB).unwrap();
         build_probe_request(&msg, 1, &SMALL_NZB_SEGMENTS).unwrap()
