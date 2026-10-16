@@ -1,0 +1,24 @@
+[[migration]]
+file = "0001_mb_mirror.sql"
+target = "mirror"
+sha256 = "47309207c2e87761477e4b74884454afd5c68916477be64a9c3bbc2d105723c3"
+
+[[migration]]
+file = "0002_auth_vault.sql"
+target = "app"
+sha256 = "e8833add4082e4e9951f63af28c37c0d82c50737a60dc572ce86334f565b8587"
+
+[[migration]]
+file = "0003_library.sql"
+target = "app"
+sha256 = "d0f04ec912e6e8de47a976d021f3ca3c02aee7f5a18d498cb75d6dff5a90e172"
+
+[[migration]]
+file = "0004_auth_challenge_purpose.sql"
+target = "app"
+sha256 = "835b78b01f0d181ea2e6e472bde00e33d19055fa12dfdefeb53782b515a3362e"
+
+[[migration]]
+file = "0005_atomic_rate_limits_and_leases.sql"
+target = "app"
+sha256 = "fb61dd289c72b159299e56d0b5a3bfb3734dc5516665a9225c0cce0ffd64bbce"

@@ -87,6 +87,25 @@ jobs:
       - name: Unit-test the lint
         run: python3 .github/scripts/test_public_text_lint.py
 
+  migrations-gate:
+    name: migrations-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Compare pushes with their previous tip; comparing main to itself would miss drift.
+    env:
+      MIGRATIONS_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000' && github.event.before || 'main' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify Python version
+        run: python3 -c "import sys, tomllib; assert sys.version_info >= (3, 11), sys.version"
+      - name: Check migration manifest and drift
+        run: python3 .github/scripts/migrations_gate.py --root . --base-ref "$MIGRATIONS_BASE_REF"
+      - name: Run migration gate self-tests
+        run: python3 .github/scripts/test_migrations_gate.py
+
   test-nntp:
     name: test-nntp
     runs-on: ubuntu-latest
@@ -303,7 +322,7 @@ jobs:
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, test-nntp, api, rust-mb, rust-ingest, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text]
+    needs: [rust-test, rust-wasm, test-nntp, api, rust-mb, rust-ingest, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, migrations-gate]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
