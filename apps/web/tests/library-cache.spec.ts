@@ -35,6 +35,57 @@ test('offline library renders the stale snapshot with a badge when the API fails
 	await expect(badge).toContainText(/stale — updated /i);
 });
 
+test('401 clears the cached library instead of showing another session snapshot', async ({
+	page
+}) => {
+	await page.addInitScript(
+		({ key, snapshot }) => {
+			window.localStorage.setItem(key, JSON.stringify(snapshot));
+		},
+		{ key: SNAPSHOT_KEY, snapshot: SEEDED }
+	);
+	await page.route('**/api/library', (route) =>
+		route.fulfill({
+			status: 401,
+			contentType: 'application/json',
+			body: JSON.stringify({ error: 'unauthorized' })
+		})
+	);
+
+	await page.goto('/library');
+
+	await expect(page.getByRole('alert')).toContainText(/signed out|do not have access/i);
+	await expect(page.getByTestId('library-list')).toHaveCount(0);
+	await expect(page.getByTestId('library-stale-badge')).toHaveCount(0);
+	expect(await page.evaluate((key) => window.localStorage.getItem(key), SNAPSHOT_KEY)).toBeNull();
+});
+
+test('invalid 200 payload keeps the last-good snapshot', async ({ page }) => {
+	await page.addInitScript(
+		({ key, snapshot }) => {
+			window.localStorage.setItem(key, JSON.stringify(snapshot));
+		},
+		{ key: SNAPSHOT_KEY, snapshot: SEEDED }
+	);
+	await page.route('**/api/library', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ error: 'bad response' })
+		})
+	);
+
+	await page.goto('/library');
+
+	await expect(page.getByTestId('library-list')).toContainText('Seeded Song One');
+	await expect(page.getByTestId('library-stale-badge')).toBeVisible();
+	const stored = await page.evaluate((key) => window.localStorage.getItem(key), SNAPSHOT_KEY);
+	expect(JSON.parse(stored as string).items.map((i: { id: string }) => i.id)).toEqual([
+		'track-seed-1',
+		'track-seed-2'
+	]);
+});
+
 test('fresh library success replaces the snapshot and hides the badge', async ({ page }) => {
 	const fresh = [{ id: 'track-fresh-1', title: 'Fresh Song' }];
 	await page.route('**/api/library', (route) =>

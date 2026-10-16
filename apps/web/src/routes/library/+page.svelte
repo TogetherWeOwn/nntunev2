@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import {
+		clearSnapshot,
 		loadSnapshot,
 		saveSnapshot,
 		staleLabel,
@@ -29,8 +30,16 @@
 		loadError = null;
 		try {
 			const response = await fetchFn('/api/library', { credentials: 'include' });
+			if (response.status === 401 || response.status === 403) {
+				clearSnapshot(window.localStorage);
+				items = [];
+				staleAt = null;
+				loadError = 'You are signed out or do not have access to this library.';
+				return;
+			}
 			if (!response.ok) throw new Error(`library request failed (${response.status})`);
 			const fresh = toLibraryItems(await response.json());
+			if (fresh === null) throw new Error('library response has an invalid shape');
 			items = fresh;
 			staleAt = null;
 			saveSnapshot(window.localStorage, fresh);

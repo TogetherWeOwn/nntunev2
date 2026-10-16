@@ -10,7 +10,7 @@
  * Bounded growth: the snapshot is capped by item count AND serialized
  * bytes. Eviction keeps the head of the list (the API's order) and drops
  * the tail first — oldest-last display order is preserved, the snapshot
- * can never grow past `MAX_SNAPSHOT_ITEMS` entries or
+ * never keeps more than `MAX_SNAPSHOT_ITEMS` entries or
  * `MAX_SNAPSHOT_BYTES` bytes, and `evictToCap` is the single place that
  * enforces both limits.
  */
@@ -55,13 +55,13 @@ export function isLibraryItem(value: unknown): value is LibraryItem {
  * and drops entries without a string `id` so one malformed row can never
  * blank the list.
  */
-export function toLibraryItems(payload: unknown): LibraryItem[] {
+export function toLibraryItems(payload: unknown): LibraryItem[] | null {
 	const raw = Array.isArray(payload)
 		? payload
 		: typeof payload === 'object' && payload !== null
 			? (payload as Record<string, unknown>).items
 			: undefined;
-	if (!Array.isArray(raw)) return [];
+	if (!Array.isArray(raw)) return null;
 	return raw.filter(isLibraryItem);
 }
 
@@ -76,8 +76,8 @@ export function snapshotByteSize(items: LibraryItem[], savedAt: string): number 
 
 /**
  * Enforce both caps. Count first, then bytes: repeatedly drop the tail
- * until the serialized form fits or one item remains. Keeping the head
- * preserves the API's order; dropping the tail is the documented eviction.
+ * until the serialized form fits. Keeping the head preserves the API's
+ * order; dropping the tail is the documented eviction.
  */
 export function evictToCap(
 	items: LibraryItem[],
@@ -88,11 +88,10 @@ export function evictToCap(
 	// Size the timestamp once; the real `savedAt` only makes the payload
 	// larger, so sizing against a representative value is conservative.
 	const probeAt = new Date().toISOString();
-	while (kept.length > 1 && snapshotByteSize(kept, probeAt) > maxBytes) {
+	while (kept.length > 0 && snapshotByteSize(kept, probeAt) > maxBytes) {
 		kept = kept.slice(0, kept.length - 1);
 	}
-	// A single oversized item is kept rather than caching nothing: one stale
-	// row beats a blank screen, and the byte cap still bounds the total.
+	// Drop an oversized final item rather than persisting a snapshot over the cap.
 	return kept;
 }
 

@@ -35,23 +35,26 @@ function memoryStorage(seed: Record<string, string> = {}): SnapshotStorage {
 
 describe('toLibraryItems', () => {
 	it('accepts a bare array', () => {
-		expect(toLibraryItems([item('a'), item('b')]).map((i) => i.id)).toEqual(['a', 'b']);
+		expect(toLibraryItems([item('a'), item('b')])?.map((i) => i.id)).toEqual(['a', 'b']);
 	});
 
 	it('accepts an { items } envelope', () => {
-		expect(toLibraryItems({ items: [item('a')] }).map((i) => i.id)).toEqual(['a']);
+		expect(toLibraryItems({ items: [item('a')] })?.map((i) => i.id)).toEqual(['a']);
 	});
 
 	it('drops rows without a string id instead of blanking the list', () => {
 		expect(
-			toLibraryItems([item('a'), { nope: 1 }, { id: 42 }, item('b')]).map((i) => i.id)
+			toLibraryItems([item('a'), { nope: 1 }, { id: 42 }, item('b')])?.map((i) => i.id)
 		).toEqual(['a', 'b']);
 	});
 
-	it('returns empty for foreign shapes', () => {
-		expect(toLibraryItems(null)).toEqual([]);
-		expect(toLibraryItems({})).toEqual([]);
-		expect(toLibraryItems('nope')).toEqual([]);
+	it('distinguishes valid empty lists from foreign response shapes', () => {
+		expect(toLibraryItems([])).toEqual([]);
+		expect(toLibraryItems({ items: [] })).toEqual([]);
+		expect(toLibraryItems(null)).toBeNull();
+		expect(toLibraryItems({})).toBeNull();
+		expect(toLibraryItems({ error: 'not authorized' })).toBeNull();
+		expect(toLibraryItems('nope')).toBeNull();
 	});
 });
 
@@ -84,6 +87,14 @@ describe('evictToCap', () => {
 		const items = Array.from({ length: 5_000 }, (_, i) => item(`t${i}`));
 		const kept = evictToCap(items);
 		expect(kept.length).toBeLessThanOrEqual(MAX_SNAPSHOT_ITEMS);
+		expect(snapshotByteSize(kept, new Date().toISOString())).toBeLessThanOrEqual(
+			MAX_SNAPSHOT_BYTES
+		);
+	});
+
+	it('drops a single item that exceeds the byte cap', () => {
+		const kept = evictToCap([item('oversized', { blob: 'x'.repeat(250_000) })]);
+		expect(kept).toEqual([]);
 		expect(snapshotByteSize(kept, new Date().toISOString())).toBeLessThanOrEqual(
 			MAX_SNAPSHOT_BYTES
 		);
