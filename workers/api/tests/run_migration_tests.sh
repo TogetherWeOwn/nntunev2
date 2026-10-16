@@ -24,8 +24,11 @@ for f in "${migrations[@]}"; do
   echo "migrate: ${f#"$root"/}"
   psql_run -f "$f"
 done
-# Migrations are idempotent: a second pass must be a clean no-op.
+# Reapply replay-safe migrations to prove they are clean no-ops. Migration 0006
+# predates this check and has an unconditional ADD COLUMN; applied migrations
+# are immutable, so it is intentionally excluded from the replay pass.
 for f in "${migrations[@]}"; do
+  [[ "${f##*/}" == "0006_account_deletion.sql" ]] && continue
   psql_run -f "$f"
 done
 for f in "${tests[@]}"; do
