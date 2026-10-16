@@ -124,7 +124,7 @@ fn fake_480_481_replies_drive_play_to_provider_auth_expired_without_quarantine()
     // NntpError/PlayError, quarantining on it, or parking the stale
     // connection warm (idle != 0 / reused on the second play) fails here.
     // 480 is the standard BODY reply for a no-longer-authenticated
-    // session; 482 on BODY is out-of-sequence and is covered separately.
+    // session; 482 on BODY is out-of-sequence and remains a generic error.
     for reply in [
         "480 authentication required\r\n",
         "481 authentication rejected\r\n",

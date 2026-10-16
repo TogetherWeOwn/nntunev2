@@ -294,6 +294,48 @@ fn rotation_rejects_transport_divergence_from_stored_row() {
     )
     .is_err());
 
+    let plaintext_row = serde_json::json!({
+        "provider": {
+            "host": "news.example.com",
+            "port": 119,
+            "tls": false,
+            "username": "alice",
+            "password": "old-s3cret",
+            "max_connections": 4,
+            "allow_insecure_plaintext": true,
+        },
+        "indexer": {"url": "https://indexer.example.com/api", "api_key": "indexer-s3cret-key"},
+    });
+    let plaintext_blob = seal(&serde_json::to_vec(&plaintext_row).unwrap());
+
+    let mut by_tls = provider_with_password("new-s3cret-rotated");
+    by_tls.port = 119;
+    by_tls.tls = true;
+    by_tls.allow_insecure_plaintext = true;
+    assert!(by_tls.validate(&FakeDns).is_ok());
+    assert!(vault::rotate_provider_credentials(
+        &test_kek(),
+        1,
+        "user-1",
+        &plaintext_blob,
+        &by_tls,
+        &FakeDns
+    )
+    .is_err());
+
+    let mut by_plaintext_opt_in = provider_with_password("new-s3cret-rotated");
+    by_plaintext_opt_in.allow_insecure_plaintext = true;
+    assert!(by_plaintext_opt_in.validate(&FakeDns).is_ok());
+    assert!(vault::rotate_provider_credentials(
+        &test_kek(),
+        1,
+        "user-1",
+        &old_blob,
+        &by_plaintext_opt_in,
+        &FakeDns
+    )
+    .is_err());
+
     let mut by_max = provider_with_password("new-s3cret-rotated");
     by_max.max_connections = 8;
     assert!(vault::rotate_provider_credentials(
