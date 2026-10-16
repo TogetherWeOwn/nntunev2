@@ -23,6 +23,9 @@
 //! - [`prefetch`]: next-track prefetch on spare pool capacity (never the last connection).
 //! - [`probe`]: ingest segment-availability probe (`STAT` on the ingest
 //!   lane), served by the `NntpPool` Durable Object.
+//! - `stampede` (native only, compiled out on wasm32): singleflight
+//!   stampede-guard primitive (one upstream fetch per concurrent segment)
+//!   with waiter-timeout re-election. Not yet wired into the play path.
 //! - [`routes`]: fail-closed public fetch and probe routing decisions, natively
 //!   tested and rendered by the wasm32 [`runtime`] adapter.
 //!
@@ -45,5 +48,10 @@ pub mod range;
 pub mod routes;
 pub mod yenc;
 
+// Native only: the Mutex/Condvar waiter path traps on wasm32-unknown-unknown
+// (and a single-threaded isolate cannot park a waiter anyway). The Worker
+// entry point gets an async shared-future equivalent; see the module docs.
 #[cfg(target_arch = "wasm32")]
 pub mod runtime;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod stampede;

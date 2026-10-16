@@ -1,6 +1,7 @@
 //! NNTune v2 MusicBrainz mirror read API.
 //!
 //! Routes (all JSON, all read-only):
+//! - `GET /healthz` — unauthenticated Worker health check; no bindings.
 //! - `GET /v1/mb/artist/:mbid` — artist lookup by MBID.
 //! - `GET /v1/mb/release/:mbid` — release lookup by MBID.
 //! - `GET /v1/mb/recording/:mbid` — recording lookup by MBID.
@@ -296,6 +297,42 @@ fn success_response(body: String, ttl_s: u32) -> ApiResponse {
     }
 }
 
+fn health_response() -> http::Response<Vec<u8>> {
+    http::Response::builder()
+        .status(http::StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .body(r#"{"ok":true}"#.as_bytes().to_vec())
+        .expect("static health response is valid")
+}
+
+struct HealthResponseParts {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+fn health_response_parts() -> HealthResponseParts {
+    let response = health_response();
+    HealthResponseParts {
+        status: response.status().as_u16(),
+        headers: response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value
+                        .to_str()
+                        .expect("static health header is valid")
+                        .to_owned(),
+                )
+            })
+            .collect(),
+        body: response.into_body(),
+    }
+}
+
 /// Lookup core: validate → KV → DB. Only a found row is written to the
 /// cache; missing rows (404) and read failures (500) never are.
 async fn handle_lookup<R: MbRepo, C: SuccessCache>(
@@ -570,6 +607,17 @@ mod http_layer {
         serve(req.url()?.to_string(), api).await
     }
 
+    pub fn healthz_route() -> WorkerResult<Response> {
+        let health = health_response_parts();
+        let headers = Headers::new();
+        for (name, value) in health.headers {
+            headers.append(&name, &value)?;
+        }
+        Ok(Response::from_body(ResponseBody::Body(health.body))?
+            .with_status(health.status)
+            .with_headers(headers))
+    }
+
     pub async fn search_route(req: &Request, ctx: &RouteContext<()>) -> WorkerResult<Response> {
         if let Some(hit) = edge_hit(req).await {
             return Ok(hit);
@@ -603,6 +651,7 @@ pub async fn main(
     _ctx: worker::Context,
 ) -> worker::Result<worker::Response> {
     worker::Router::new()
+        .get_async("/healthz", |_, _| async { http_layer::healthz_route() })
         .get_async("/v1/mb/artist/:mbid", |req, ctx| async move {
             http_layer::lookup_route(Kind::Artist, &req, &ctx).await
         })
@@ -707,6 +756,73 @@ mod tests {
             label: format!("Hit {n}"),
             score: 1.0 - (n as f32 / 100.0),
         }
+    }
+
+    #[test]
+    fn health_response_is_uncached_json_without_dependencies() {
+        let response = health_response_parts();
+        assert_eq!(response.status, http::StatusCode::OK.as_u16());
+        assert_eq!(response.headers.len(), 2);
+        assert!(response
+            .headers
+            .contains(&("content-type".to_owned(), "application/json".to_owned())));
+        assert!(response
+            .headers
+            .contains(&("cache-control".to_owned(), "no-store".to_owned())));
+        assert_eq!(response.body, br#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn healthz_route_contract_precedes_the_catchall() {
+        // Worker Response/Headers require wasm-bindgen, so pin the production
+        // route and adapter source while testing the HTTP contract natively.
+        let source = include_str!("lib.rs");
+        let router = source
+            .split_once("\n#[worker::event(fetch)]\npub async fn main")
+            .expect("worker entrypoint must exist")
+            .1
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .expect("test module must follow the worker entrypoint")
+            .0;
+        let route = router
+            .find(".get_async(\"/healthz\", |_, _| async { http_layer::healthz_route() })")
+            .expect("GET /healthz must dispatch to its handler");
+        let catchall = router
+            .find(".or_else_any_method_async")
+            .expect("router must retain its catch-all");
+        assert!(
+            route < catchall,
+            "healthz must be registered before catch-all"
+        );
+        assert_eq!(router.matches("\"/healthz\"").count(), 1);
+
+        let handler = source
+            .split_once("pub fn healthz_route() -> WorkerResult<Response> {")
+            .expect("healthz handler must exist")
+            .1
+            .split_once("\n    }\n")
+            .expect("healthz handler must close")
+            .0;
+        let compact = |text: &str| {
+            text.chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+        };
+        assert_eq!(
+            compact(handler),
+            compact(
+                r#"let health = health_response_parts();
+        let headers = Headers::new();
+        for (name, value) in health.headers {
+            headers.append(&name, &value)?;
+        }
+        Ok(
+            Response::from_body(ResponseBody::Body(health.body))?
+                .with_status(health.status)
+                .with_headers(headers)
+        )"#
+            )
+        );
     }
 
     #[test]
