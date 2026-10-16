@@ -1,12 +1,12 @@
 //! S12 acceptance: ingest meter edge-write never silently drops.
 //!
-//! Slice contract (roadmap S12, build card TOG-25587): stage-transition
+//! Slice contract (roadmap S12): stage-transition
 //! events are written through the `INGEST_METER` dataset binding at enqueue;
 //! a missing or failing binding surfaces a retryable failure (HTTP 503 +
 //! `Retry-After`, never 202-and-dropped); the event shape stays owned by
 //! `metering.rs`; the stage allowlist (`WORKFLOW_STEPS`) is unchanged.
 //!
-//! Builder contract (TOG-25587): implement these four items in
+//! Builder contract: implement these four items in
 //! `src/metering.rs` WITHOUT editing this file:
 //!
 //! 1. `pub fn meter_write_body(event: &MeterEvent) -> serde_json::Value` —
@@ -67,7 +67,6 @@ struct FakeDatasetEndpoint {
     stop: Arc<AtomicBool>,
     hits: Arc<AtomicUsize>,
     received: Arc<Mutex<Vec<Received>>>,
-    status: u16,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -99,7 +98,6 @@ impl FakeDatasetEndpoint {
             stop,
             hits,
             received,
-            status,
             handle: Some(handle),
         }
     }
