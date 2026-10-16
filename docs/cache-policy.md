@@ -54,11 +54,11 @@ Cloudflare access-control boundary: it does not prevent writes through API
 or S3 credentials, or from Workers deployed outside this repository. No
 bucket lock is configured on either archive bucket.
 
-CI enforces this: `.github/scripts/check_archive_bindings.py` scans
-`wrangler*.toml` and `wrangler*.toml.example` files repo-wide (including
-named environment manifests and manifests outside `workers/` and `apps/`),
-and rejects unsupported
-Wrangler manifest formats rather than skipping them. It inspects only
+CI enforces this: `.github/scripts/check_archive_bindings.py` scans tracked
+repo files whose names start with `wrangler` (including named environment
+manifests and manifests outside `workers/` and `apps/`). It ignores untracked
+dependency/build-tree files in working copies, while rejecting unsupported
+tracked Wrangler manifest formats rather than skipping them. It inspects only
 `r2_buckets` binding tables and fails when either bucket name contains
 `archive` (case-insensitive), including per-environment overrides. The
 guard is name-based on purpose: renaming a bucket to dodge it breaks the

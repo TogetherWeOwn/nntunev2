@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -53,12 +54,14 @@ preview_bucket_name = "nntunev2-archive-staging"
 
 def _repo_with(manifests: dict[str, str]) -> Path:
     tmp = Path(tempfile.mkdtemp())
+    subprocess.run(["git", "init", "--quiet", str(tmp)], check=True)
     for root in ("workers", "apps"):
         (tmp / root).mkdir()
     for rel, body in manifests.items():
         path = tmp / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body)
+    subprocess.run(["git", "-C", str(tmp), "add", "--all"], check=True)
     return tmp
 
 
@@ -120,6 +123,26 @@ def test_nested_manifest_outside_scan_roots_fails():
     hits = archive_bindings(repo)
     assert len(hits) == 1, f"expected one hit, got {hits}"
     assert hits[0][1] == "nntunev2-archive-staging"
+
+
+def test_manifest_in_git_named_directory_is_scanned():
+    repo = _repo_with(
+        {
+            "workers/foo.git/wrangler.toml": ARCHIVE_MANIFEST,
+            "apps/web/wrangler.toml": CLEAN_MANIFEST,
+        }
+    )
+    hits = archive_bindings(repo)
+    assert len(hits) == 1, f"expected one hit, got {hits}"
+    assert hits[0][0] == repo / "workers/foo.git/wrangler.toml"
+
+
+def test_untracked_dependency_manifest_is_ignored():
+    repo = _repo_with({"workers/stream/wrangler.toml": CLEAN_MANIFEST})
+    dependency = repo / "node_modules/wrangler/bin/wrangler.js"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("not a Wrangler manifest")
+    assert archive_bindings(repo) == [], "untracked dependency file must be ignored"
 
 
 def test_unrelated_bucket_name_is_ignored():
@@ -186,6 +209,8 @@ if __name__ == "__main__":
     test_staged_manifest_archive_binding_fails()
     test_manifest_outside_scan_roots_fails()
     test_nested_manifest_outside_scan_roots_fails()
+    test_manifest_in_git_named_directory_is_scanned()
+    test_untracked_dependency_manifest_is_ignored()
     test_unrelated_bucket_name_is_ignored()
     test_commented_example_binding_ignored()
     test_malformed_manifest_fails_closed()

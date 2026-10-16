@@ -15,6 +15,7 @@ because TOML parsing skips comments — only effective bindings fail.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -34,12 +35,24 @@ def archive_bindings(repo_root: Path) -> list[tuple[Path, str]]:
         base = repo_root / root
         if not base.is_dir():
             raise ManifestError(f"required scan root is missing: {base}")
-    # Scan repo-wide so an effective manifest outside the expected roots
-    # (e.g. repo-root or crates/x wrangler.toml) cannot bypass the guard.
+    # Scan tracked files repo-wide so dependency and build trees in a working
+    # copy cannot introduce false positives or hide effective manifests.
+    try:
+        tracked = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ManifestError(f"cannot list tracked repository files: {exc}") from exc
     candidates = sorted(
-        path
-        for path in repo_root.rglob("wrangler*")
-        if path.is_file() and ".git/" not in path.as_posix()
+        repo_root / relative_path
+        for relative_path in (
+            Path(entry.decode()) for entry in tracked.split(b"\0") if entry
+        )
+        if relative_path.name.startswith("wrangler")
+        and (repo_root / relative_path).is_file()
     )
     manifests = [
         path
