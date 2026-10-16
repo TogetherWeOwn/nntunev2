@@ -25,7 +25,6 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -36,6 +35,8 @@ pub const DIAL_TIMEOUT_MS: u64 = 5_000;
 pub const TOTAL_TIMEOUT_MS: u64 = 15_000;
 /// Per-user concurrent `test connection` cap.
 pub const MAX_TEST_CONCURRENCY: u32 = 2;
+/// Maximum vetted DNS addresses attempted by one test-connection request.
+pub const MAX_DIAL_ADDRESSES: usize = 4;
 /// Sliding window for the per-user `test connection` rate limit (seconds).
 pub const TEST_CONNECTION_WINDOW_SECS: u64 = 60;
 /// Max `test connection` attempts per user per [`TEST_CONNECTION_WINDOW_SECS`].
@@ -57,6 +58,37 @@ pub const ALLOWED_NNTP_PORTS: &[u16] = &[119, 563];
 /// tested, or dialed.
 pub fn nntp_port_allowed(port: u16) -> bool {
     ALLOWED_NNTP_PORTS.contains(&port)
+}
+
+/// Documented provider-reauth code (S7). Core and stream NNTP handling
+/// classify `480`/`481` and `482` on `AUTHINFO` replies as this code;
+/// `482` elsewhere is out-of-sequence, not a re-auth signal. When surfaced
+/// as an API error it uses HTTP 401, which the web app recognizes for its
+/// inline provider-password prompt. This does not claim every worker/API
+/// path is wired to emit the code. Indexer HTTP 401 uses the distinct
+/// `indexer_auth_expired` code; 403 remains generic (see
+/// `workers/ingest/src/newznab.rs`). Safe to log and return in error bodies:
+/// it carries no credential material.
+pub const PROVIDER_AUTH_EXPIRED_CODE: &str = "provider_auth_expired";
+
+/// Audit action for an in-place provider credential rotation (S7). Callers
+/// MUST emit this (not the plain `vault.update`) when the vault write
+/// replaces the provider secret while keeping the same user session, so the
+/// rotation is repudiation-safe and distinguishable from a first-time save.
+pub const PROVIDER_ROTATE_AUDIT_ACTION: &str = "vault.rotate";
+
+/// Audit action for a provider credential rotation. Always
+/// [`PROVIDER_ROTATE_AUDIT_ACTION`]: rotation writes are never logged as
+/// generic updates.
+pub fn provider_rotation_audit_action() -> &'static str {
+    PROVIDER_ROTATE_AUDIT_ACTION
+}
+
+/// Minimal JSON error body carrying only the documented re-auth code.
+/// No credential material, no host/user detail: safe for logs and API
+/// responses. The HTTP status for this body is always 401.
+pub fn provider_auth_expired_body() -> String {
+    serde_json::json!({ "error": PROVIDER_AUTH_EXPIRED_CODE }).to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,13 +262,16 @@ fn resolve_public_target(
     port: u16,
     dns: &impl DnsResolver,
 ) -> Result<ValidatedTarget, VaultError> {
-    let addresses = match host.parse::<IpAddr>() {
+    let mut addresses = match host.parse::<IpAddr>() {
         Ok(ip) => vec![ip],
         Err(_) => dns.resolve(host),
     };
     if addresses.is_empty() || addresses.iter().any(ip_is_forbidden) {
         return Err(VaultError::Invalid);
     }
+    // Validate every answer before retaining a bounded prefix for dialing;
+    // a later forbidden DNS answer must still reject the whole target.
+    addresses.truncate(MAX_DIAL_ADDRESSES);
     Ok(ValidatedTarget {
         host: host.to_string(),
         port,
@@ -274,8 +309,9 @@ pub fn authorize_pool_dial(
 }
 
 impl ProviderConfig {
-    /// Validate shape + SSRF guard and retain ALL vetted addresses for a
-    /// pinned dial. Call at save AND immediately before dial. Every failure
+    /// Validate shape + SSRF guard across ALL resolved addresses, retaining
+    /// at most [`MAX_DIAL_ADDRESSES`] for a pinned dial. Call at save AND
+    /// immediately before dial. Every failure
     /// maps to generic [`VaultError::Invalid`] (no target/existence oracle).
     ///
     /// Transport confidentiality (threat-model §2 "TLS-everywhere"):
@@ -445,7 +481,7 @@ struct Dek([u8; 32]);
 
 fn random_nonce() -> [u8; 12] {
     let mut n = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut n);
+    getrandom::fill(&mut n).expect("secure randomness unavailable");
     n
 }
 
@@ -468,7 +504,7 @@ pub fn encrypt_vault(
     plaintext: &[u8],
 ) -> Result<VaultBlob, VaultError> {
     let mut dek_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut dek_bytes);
+    getrandom::fill(&mut dek_bytes).expect("secure randomness unavailable");
     let dek = Dek(dek_bytes);
     dek_bytes.zeroize();
 
@@ -477,7 +513,7 @@ pub fn encrypt_vault(
     let wrap_nonce = random_nonce();
     let wrapped = kek_cipher
         .encrypt(
-            Nonce::from_slice(&wrap_nonce),
+            &Nonce::from(wrap_nonce),
             Payload {
                 msg: &dek.0,
                 aad: dek_aad(user_id, kek_version).as_bytes(),
@@ -490,7 +526,7 @@ pub fn encrypt_vault(
     let payload_nonce = random_nonce();
     let payload = dek_cipher
         .encrypt(
-            Nonce::from_slice(&payload_nonce),
+            &Nonce::from(payload_nonce),
             Payload {
                 msg: plaintext,
                 aad: payload_aad(user_id).as_bytes(),
@@ -516,15 +552,14 @@ pub fn decrypt_vault(
     blob: &VaultBlob,
 ) -> Result<Vec<u8>, VaultError> {
     let kek_cipher = Aes256Gcm::new_from_slice(kek).map_err(|_| VaultError::Crypto)?;
-    let wrap_nonce =
-        crate::b64::decode(&blob.dek_wrapped_nonce_b64url).map_err(|_| VaultError::Invalid)?;
+    let wrap_nonce: [u8; 12] = crate::b64::decode(&blob.dek_wrapped_nonce_b64url)
+        .map_err(|_| VaultError::Invalid)?
+        .try_into()
+        .map_err(|_| VaultError::Invalid)?;
     let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url).map_err(|_| VaultError::Invalid)?;
-    if wrap_nonce.len() != 12 {
-        return Err(VaultError::Invalid);
-    }
     let mut dek_bytes = kek_cipher
         .decrypt(
-            Nonce::from_slice(&wrap_nonce),
+            &Nonce::from(wrap_nonce),
             Payload {
                 msg: &wrapped,
                 aad: dek_aad(user_id, blob.kek_version).as_bytes(),
@@ -542,15 +577,14 @@ pub fn decrypt_vault(
     let dek = Dek(arr);
 
     let dek_cipher = Aes256Gcm::new_from_slice(&dek.0).map_err(|_| VaultError::Crypto)?;
-    let payload_nonce =
-        crate::b64::decode(&blob.payload_nonce_b64url).map_err(|_| VaultError::Invalid)?;
+    let payload_nonce: [u8; 12] = crate::b64::decode(&blob.payload_nonce_b64url)
+        .map_err(|_| VaultError::Invalid)?
+        .try_into()
+        .map_err(|_| VaultError::Invalid)?;
     let payload = crate::b64::decode(&blob.payload_b64url).map_err(|_| VaultError::Invalid)?;
-    if payload_nonce.len() != 12 {
-        return Err(VaultError::Invalid);
-    }
     dek_cipher
         .decrypt(
-            Nonce::from_slice(&payload_nonce),
+            &Nonce::from(payload_nonce),
             Payload {
                 msg: &payload,
                 aad: payload_aad(user_id).as_bytes(),
@@ -570,15 +604,14 @@ pub fn rewrap_dek(
 ) -> Result<VaultBlob, VaultError> {
     // Unwrap with the old KEK (old AAD: old version).
     let old_cipher = Aes256Gcm::new_from_slice(old_kek).map_err(|_| VaultError::Crypto)?;
-    let wrap_nonce =
-        crate::b64::decode(&blob.dek_wrapped_nonce_b64url).map_err(|_| VaultError::Invalid)?;
+    let wrap_nonce: [u8; 12] = crate::b64::decode(&blob.dek_wrapped_nonce_b64url)
+        .map_err(|_| VaultError::Invalid)?
+        .try_into()
+        .map_err(|_| VaultError::Invalid)?;
     let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url).map_err(|_| VaultError::Invalid)?;
-    if wrap_nonce.len() != 12 {
-        return Err(VaultError::Invalid);
-    }
     let mut dek_bytes = old_cipher
         .decrypt(
-            Nonce::from_slice(&wrap_nonce),
+            &Nonce::from(wrap_nonce),
             Payload {
                 msg: &wrapped,
                 aad: dek_aad(user_id, blob.kek_version).as_bytes(),
@@ -594,7 +627,7 @@ pub fn rewrap_dek(
     let new_cipher = Aes256Gcm::new_from_slice(new_kek).map_err(|_| VaultError::Crypto)?;
     let new_nonce = random_nonce();
     let wrap_result = new_cipher.encrypt(
-        Nonce::from_slice(&new_nonce),
+        &Nonce::from(new_nonce),
         Payload {
             msg: &dek_bytes,
             aad: dek_aad(user_id, new_version).as_bytes(),
@@ -611,6 +644,129 @@ pub fn rewrap_dek(
         payload_nonce_b64url: blob.payload_nonce_b64url.clone(),
         payload_b64url: blob.payload_b64url.clone(),
     })
+}
+
+/// Rotate the provider credential in place. Helper only in this slice:
+/// no Worker entry route calls this yet (`workers/api/src/lib.rs` — the
+/// HTTP wiring is a follow-up). This function never reads or writes
+/// session state: the user session is an HMAC-signed cookie independent of
+/// the vault row, so a vault write cannot revoke it.
+///
+/// The contract:
+/// - proves ownership of the old credential by decrypting `old_blob` (fails
+///   closed when the caller cannot read the row they claim to rotate);
+/// - binds the full retained endpoint — `host`, `username`, and every
+///   retained transport field (`port`, `tls`, `max_connections`,
+///   `allow_insecure_plaintext`) — to the *decrypted stored row*, never to
+///   a caller-supplied "old" config: a `new_config` differing in any of
+///   them is rejected, so the endpoint a caller test-connects is provably
+///   the endpoint that gets sealed. A different endpoint is a fresh save
+///   (`vault.update`), not a rotation. Fields absent from a legacy flat
+///   row retain nothing, except `allow_insecure_plaintext` whose serde
+///   default (`false`) is its retained value;
+/// - validates `new_config` shape + SSRF guard ([`ProviderConfig::validate`]).
+///   This does NOT dial the provider: the caller MUST first verify the new
+///   secret with a real `test connection` (enforcing
+///   [`test_attempt_allowed`]/[`concurrent_test_allowed`] and
+///   [`TestConnectionBudget`]) — a wrong new password otherwise seals happily;
+/// - seals the **full stored row** with only the provider password replaced,
+///   under a fresh DEK: indexer secrets and every other provider/indexer
+///   field in the decrypted payload are preserved verbatim. A stored payload
+///   that is not a JSON object (or carries no bindable provider identity)
+///   fails closed rather than being replaced by a partial row.
+///
+/// The stored payload is the serialized provider+indexer row
+/// ([`encrypt_vault`]); the provider object is `payload["provider"]` when
+/// that is an object, otherwise the top-level object itself. The caller MUST
+/// audit with [`provider_rotation_audit_action`] and MUST NOT touch the
+/// session row.
+///
+/// Every failure maps to generic [`VaultError::Invalid`]/[`VaultError::Crypto`]:
+/// no credential material, no host/user detail, no crypto internals.
+pub fn rotate_provider_credentials(
+    kek: &[u8; 32],
+    kek_version: u32,
+    user_id: &str,
+    old_blob: &VaultBlob,
+    new_config: &ProviderConfig,
+    dns: &impl DnsResolver,
+) -> Result<VaultBlob, VaultError> {
+    if new_config.password.is_empty() {
+        return Err(VaultError::Invalid);
+    }
+    // Prove ownership of the row being rotated and load the full stored row.
+    let mut plaintext = decrypt_vault(kek, user_id, old_blob)?;
+    let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&plaintext);
+    plaintext.zeroize();
+    let mut row = parsed.map_err(|_| VaultError::Invalid)?;
+    let row_obj = row.as_object_mut().ok_or(VaultError::Invalid)?;
+    // The provider object: `provider` sub-object when present, else the
+    // top-level object (legacy flat rows).
+    let provider = match row_obj.get_mut("provider") {
+        Some(serde_json::Value::Object(_)) => row_obj["provider"]
+            .as_object_mut()
+            .ok_or(VaultError::Invalid)?,
+        Some(_) => return Err(VaultError::Invalid),
+        None => row_obj,
+    };
+    // Bind identity to the stored row: every stored host/username present
+    // must match the new config, and at least one must be present to bind to.
+    let mut bound = false;
+    for (field, expected) in [
+        ("host", new_config.host.as_str()),
+        ("username", new_config.username.as_str()),
+    ] {
+        match provider.get(field) {
+            Some(serde_json::Value::String(stored)) => {
+                bound = true;
+                if stored != expected {
+                    return Err(VaultError::Invalid);
+                }
+            }
+            Some(_) => return Err(VaultError::Invalid),
+            None => {}
+        }
+    }
+    if !bound {
+        return Err(VaultError::Invalid);
+    }
+    // Bind the retained transport fields, so the validated/tested
+    // `new_config` can never diverge from the row actually sealed (a
+    // stored port 80, or a stored 563/TLS row behind a plaintext-tested
+    // new_config, both fail here or in `validate` below).
+    let retained_matches = [
+        provider
+            .get("port")
+            .map(|v| v.as_u64() == Some(u64::from(new_config.port))),
+        provider
+            .get("tls")
+            .map(|v| v.as_bool() == Some(new_config.tls)),
+        provider
+            .get("max_connections")
+            .map(|v| v.as_u64() == Some(u64::from(new_config.max_connections))),
+    ];
+    // Present but divergent (or wrong JSON type): reject. A field absent
+    // from a legacy flat row retains nothing to diverge from.
+    if retained_matches.contains(&Some(false)) {
+        return Err(VaultError::Invalid);
+    }
+    match provider.get("allow_insecure_plaintext") {
+        // Absent means the serde default `false` is retained.
+        Some(v) if v.as_bool() == Some(new_config.allow_insecure_plaintext) => {}
+        None if !new_config.allow_insecure_plaintext => {}
+        _ => return Err(VaultError::Invalid),
+    }
+    // Shape + SSRF guard only — no dial (see caller obligations above).
+    // The binding above makes this a validation of the retained row, not
+    // of a throwaway config.
+    new_config.validate(dns)?;
+    // Replace only the password; preserve the rest of the row verbatim.
+    provider.insert(
+        "password".to_string(),
+        serde_json::Value::String(new_config.password.clone()),
+    );
+    let bytes = serde_json::to_vec(&row).map_err(|_| VaultError::Invalid)?;
+    encrypt_vault(kek, kek_version, user_id, &bytes)
 }
 
 // --- Redaction + audit (never secrets) --------------------------------------------
@@ -674,6 +830,13 @@ mod tests {
         }
     }
 
+    struct ListDns(Vec<IpAddr>);
+    impl DnsResolver for ListDns {
+        fn resolve(&self, _host: &str) -> Vec<IpAddr> {
+            self.0.clone()
+        }
+    }
+
     #[test]
     fn unresolvable_host_rejected() {
         let c = ProviderConfig {
@@ -687,6 +850,38 @@ mod tests {
             allow_insecure_plaintext: true,
         };
         assert!(c.validate(&EmptyDns).is_err());
+    }
+
+    #[test]
+    fn validated_target_retains_only_a_bounded_address_prefix_after_checking_all() {
+        let config = ProviderConfig {
+            host: "news.example.com".into(),
+            port: 119,
+            tls: false,
+            username: "u".into(),
+            password: "p".into(),
+            max_connections: 2,
+            // Opt in so this test exercises the DNS guard, not the TLS gate.
+            allow_insecure_plaintext: true,
+        };
+        let public = ListDns(vec![
+            "8.8.8.8".parse().unwrap(),
+            "1.1.1.1".parse().unwrap(),
+            "9.9.9.9".parse().unwrap(),
+            "4.2.2.1".parse().unwrap(),
+            "208.67.222.222".parse().unwrap(),
+        ]);
+        let target = config.validate(&public).unwrap();
+        assert_eq!(target.addresses().len(), MAX_DIAL_ADDRESSES);
+
+        let forbidden_after_prefix = ListDns(vec![
+            "8.8.8.8".parse().unwrap(),
+            "1.1.1.1".parse().unwrap(),
+            "9.9.9.9".parse().unwrap(),
+            "4.2.2.1".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+        ]);
+        assert!(config.validate(&forbidden_after_prefix).is_err());
     }
 
     #[test]
@@ -751,6 +946,42 @@ mod tests {
     }
 
     #[test]
+    fn malformed_nonce_lengths_are_rejected() {
+        let kek = [0x11u8; 32];
+        let new_kek = [0x22u8; 32];
+        let blob = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+
+        for len in [0, 1, 11, 13, 16, 24] {
+            let nonce = crate::b64::encode(&vec![7u8; len]);
+
+            let mut bad_wrap_nonce = blob.clone();
+            bad_wrap_nonce.dek_wrapped_nonce_b64url = nonce.clone();
+            assert_eq!(
+                decrypt_vault(&kek, "user-1", &bad_wrap_nonce),
+                Err(VaultError::Invalid),
+                "decrypt accepted a wrapped nonce of length {len}"
+            );
+            // `VaultBlob` has no `PartialEq`, so match on the error instead
+            // of comparing the whole `Result` with `assert_eq!`.
+            assert!(
+                matches!(
+                    rewrap_dek(&kek, &new_kek, 2, "user-1", &bad_wrap_nonce),
+                    Err(VaultError::Invalid)
+                ),
+                "rewrap accepted a wrapped nonce of length {len}"
+            );
+
+            let mut bad_payload_nonce = blob.clone();
+            bad_payload_nonce.payload_nonce_b64url = nonce;
+            assert_eq!(
+                decrypt_vault(&kek, "user-1", &bad_payload_nonce),
+                Err(VaultError::Invalid),
+                "decrypt accepted a payload nonce of length {len}"
+            );
+        }
+    }
+
+    #[test]
     fn debug_redacts_credential_material() {
         // Threat-model §3: no log line may contain credential material.
         // A `{:#?}`/`dbg!`/assert dump of these configs must not carry
@@ -787,6 +1018,75 @@ mod tests {
             dumped.contains("<redacted>"),
             "no redaction marker: {dumped}"
         );
+    }
+
+    fn unwrap_dek(kek: &[u8; 32], user_id: &str, blob: &VaultBlob) -> Vec<u8> {
+        let cipher = Aes256Gcm::new_from_slice(kek).expect("kek cipher");
+        let wrap_nonce: [u8; 12] = crate::b64::decode(&blob.dek_wrapped_nonce_b64url)
+            .expect("wrap nonce")
+            .try_into()
+            .expect("wrap nonce length");
+        let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url).expect("wrapped dek");
+        cipher
+            .decrypt(
+                &Nonce::from(wrap_nonce),
+                Payload {
+                    msg: &wrapped,
+                    aad: dek_aad(user_id, blob.kek_version).as_bytes(),
+                },
+            )
+            .expect("unwrap dek")
+    }
+
+    #[test]
+    fn encrypt_vault_randomness_differs_per_call() {
+        // Pin the secure-randomness fills: a dropped fill would leave a
+        // zero DEK and constant AES-GCM nonces (catastrophic nonce reuse)
+        // while round-trip tests stayed green.
+        let kek = [0x11u8; 32];
+        let a = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+        let b = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+        assert_ne!(
+            a.dek_wrapped_nonce_b64url, b.dek_wrapped_nonce_b64url,
+            "wrap nonce must be fresh per call"
+        );
+        assert_ne!(
+            a.payload_nonce_b64url, b.payload_nonce_b64url,
+            "payload nonce must be fresh per call"
+        );
+        assert_ne!(
+            a.dek_wrapped_b64url, b.dek_wrapped_b64url,
+            "wrapped DEK must differ per call"
+        );
+        let zero_nonce = crate::b64::encode(&[0u8; 12]);
+        for blob in [&a, &b] {
+            assert_ne!(blob.dek_wrapped_nonce_b64url, zero_nonce);
+            assert_ne!(blob.payload_nonce_b64url, zero_nonce);
+        }
+        // The wrapped DEKs differing could come from the wrap nonce alone;
+        // unwrap both so a zero-filled DEK itself is pinned too.
+        let dek_a = unwrap_dek(&kek, "user-1", &a);
+        let dek_b = unwrap_dek(&kek, "user-1", &b);
+        assert_ne!(dek_a, [0u8; 32], "DEK must not be the zero buffer");
+        assert_ne!(dek_b, [0u8; 32], "DEK must not be the zero buffer");
+        assert_ne!(dek_a, dek_b, "DEK must be fresh per call");
+    }
+
+    #[test]
+    fn rewrap_dek_uses_fresh_wrap_nonce() {
+        let old_kek = [0x11u8; 32];
+        let new_kek = [0x33u8; 32];
+        let blob = encrypt_vault(&old_kek, 1, "user-1", b"secret").expect("encrypt");
+        let rotated = rewrap_dek(&old_kek, &new_kek, 2, "user-1", &blob).expect("rewrap");
+        assert_ne!(
+            rotated.dek_wrapped_nonce_b64url, blob.dek_wrapped_nonce_b64url,
+            "re-wrap must use a fresh nonce, never reuse the old one"
+        );
+        assert_ne!(
+            rotated.dek_wrapped_nonce_b64url,
+            crate::b64::encode(&[0u8; 12])
+        );
+        assert_ne!(rotated.dek_wrapped_b64url, blob.dek_wrapped_b64url);
     }
 
     #[test]
