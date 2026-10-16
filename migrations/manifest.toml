@@ -27,3 +27,8 @@ sha256 = "fb61dd289c72b159299e56d0b5a3bfb3734dc5516665a9225c0cce0ffd64bbce"
 file = "0006_account_deletion.sql"
 target = "app"
 sha256 = "6d222588102fbff8bd5096a42e669722262ba84014fc5865bfbf3b8c19894245"
+
+[[migration]]
+file = "0007_kek_rotation.sql"
+target = "app"
+sha256 = "4e25ee4091d8e48620da5f86900f7ac319c9a7b791ef9586e0bf0815c5a23bcc"

@@ -1,4 +1,4 @@
--- NNTune v2 migration 0004: KEK re-wrap follow-up (docs/security/kek-rotation.md §2/§8).
+-- NNTune v2 migration 0007: KEK re-wrap follow-up (docs/security/kek-rotation.md §2/§8).
 --
 -- PlanetScale Postgres via Hyperdrive. Adds the authoritative re-wrap
 -- marker and the version index the re-wrap pass (§6) scans by. Before this
