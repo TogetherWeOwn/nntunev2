@@ -208,12 +208,16 @@ async fn try_enqueue(env: &Env, msg: &QueueMsg) -> bool {
 /// Queue binding is 503 with `Retry-After` — never 202 — so clients, proxies,
 /// and retry middleware do not mistake a lost job for an accepted one.
 /// `status: queued` is only ever sent after a successful `send`.
-fn queued_envelope(
+/// Pure body builder behind [`queued_envelope`]: the 503 `!queued` path must
+/// always carry the shared `{code, message, retryable}` envelope fields
+/// alongside the job correlation fields (see docs/api-errors.md). Split out
+/// so the envelope fields are unit-tested without a `worker::Response`.
+fn queued_body(
     msg: &QueueMsg,
     source: &str,
     queued: bool,
     extra: serde_json::Value,
-) -> Result<Response> {
+) -> serde_json::Value {
     let mut body = serde_json::json!({
         "stage": "queued",
         "source": source,
@@ -237,6 +241,16 @@ fn queued_envelope(
             body_map.extend(map);
         }
     }
+    body
+}
+
+fn queued_envelope(
+    msg: &QueueMsg,
+    source: &str,
+    queued: bool,
+    extra: serde_json::Value,
+) -> Result<Response> {
+    let body = queued_body(msg, source, queued, extra);
     if !queued {
         let headers = headers_json().unwrap_or_default();
         headers.append("retry-after", "5")?;
@@ -459,6 +473,37 @@ mod tests {
         assert!(check_declared_len(Some(10), 16).is_ok());
         assert!(check_declared_len(None, 16).is_ok());
         assert!(check_declared_len(Some(17), 16).is_err());
+    }
+
+    #[test]
+    fn unqueued_body_carries_the_error_envelope_with_job_correlation() {
+        // The 503 `!queued` path must always carry the shared
+        // `{code, message, retryable}` envelope fields alongside `job_id`
+        // (docs/api-errors.md): deleting any one of them must fail here.
+        let msg =
+            dispatch::build_search_dispatch("user_01", "dark side", "vault_idx_01-ab", &[], 25, 0)
+                .expect("dispatch");
+        let body = queued_body(&msg, "indexer_search", false, serde_json::json!({}));
+        assert_eq!(
+            body["code"],
+            serde_json::Value::String("service_unavailable".into())
+        );
+        assert_eq!(
+            body["message"],
+            serde_json::Value::String(
+                "Queue unavailable; nothing was accepted, retry shortly.".into()
+            )
+        );
+        assert_eq!(body["retryable"], serde_json::Value::Bool(true));
+        assert_eq!(
+            body["job_id"],
+            serde_json::Value::String(msg.job_id.clone())
+        );
+        assert_eq!(body["status"], serde_json::Value::String("retry".into()));
+
+        let ok = queued_body(&msg, "indexer_search", true, serde_json::json!({}));
+        assert_eq!(ok["status"], serde_json::Value::String("queued".into()));
+        assert_eq!(ok["job_id"], serde_json::Value::String(msg.job_id.clone()));
     }
 
     #[test]

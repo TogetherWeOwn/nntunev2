@@ -178,6 +178,24 @@ describe('ApiClient', () => {
 		expect((failure as ApiError).retryable).toBe(false);
 	});
 
+	it('preserves server retryable:false on corrupt_content@502 where status fallback would retry', async () => {
+		// `retryableFromStatus(502)` is `true`, so a client that ignored the
+		// server flag and derived retryability from status would retry corrupt
+		// content forever. The server flag (`false`) must win.
+		const fetchFn = vi.fn(async () =>
+			jsonResponse(
+				{ code: 'corrupt_content', message: 'segment could not be decoded', retryable: false },
+				502
+			)
+		);
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/me').catch((error: unknown) => error);
+		expect((failure as ApiError).code).toBe('corrupt_content');
+		expect((failure as ApiError).message).toBe('segment could not be decoded');
+		expect((failure as ApiError).retryable).toBe(false);
+	});
+
 	it('falls back generically for unknown codes and preserves server retryability', async () => {
 		const fetchFn = vi.fn(async () =>
 			jsonResponse({ code: 'future_code', message: 'from a newer server', retryable: false }, 429)
