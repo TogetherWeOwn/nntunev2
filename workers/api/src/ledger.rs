@@ -22,7 +22,6 @@
 //!   of audio at the nominal rate); zero-byte rows are rejected — an empty
 //!   row bills nothing and only widens the table.
 
-use rand::RngCore;
 use std::collections::BTreeMap;
 
 /// Nominal bytes per stream second. MUST match the stream worker's metering
@@ -67,7 +66,7 @@ impl std::fmt::Display for LedgerError {
 /// `ON CONFLICT (idempotency_key) DO NOTHING` can deduplicate retries.
 pub fn new_idempotency_key() -> String {
     let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("secure randomness unavailable");
     crate::b64::encode(&bytes)
 }
 
