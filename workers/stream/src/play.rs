@@ -697,14 +697,15 @@ mod tests {
         use crate::play::PlayInput;
 
         let secret = b"s";
-        let token = grant::issue("u", "track-swr", 9_999_999_999, secret);
+        let stale_now = 1_000 + CACHE_FRESH_TTL_SECS + 10;
+        // Within the TTL cap so the test exercises the cache path.
+        let token = grant::issue("u", "track-swr", stale_now + 60, secret);
         let mut pool = Pool::new(1);
         let mut cache = ContentCache::new();
         let mut meter = crate::meter::MemoryMeter::default();
         cache.put_track_at("track-swr", b"0123456789".to_vec(), 1_000);
 
         let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
-        let stale_now = 1_000 + CACHE_FRESH_TTL_SECS + 10;
         let input = PlayInput {
             token: &token,
             track_id: "track-swr",
@@ -747,7 +748,9 @@ mod tests {
         use crate::cache::{CacheStatus, CACHE_FRESH_TTL_SECS};
 
         let secret = b"s";
-        let token = grant::issue("u", "track-swr", 9_999_999_999, secret);
+        let now_unix = 1_000 + CACHE_FRESH_TTL_SECS + 1;
+        // Within the TTL cap so the test exercises the cache path.
+        let token = grant::issue("u", "track-swr", now_unix + 60, secret);
         let mut pool = Pool::new(1);
         let mut cache = ContentCache::new();
         let mut meter = crate::meter::MemoryMeter::default();
@@ -761,7 +764,7 @@ mod tests {
             server_addr: addr,
             segments: &[],
             cipher_key: 0,
-            now_unix: 1_000 + CACHE_FRESH_TTL_SECS + 1,
+            now_unix,
             up_next: None,
         };
         let resp = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("stale serves");
@@ -782,7 +785,9 @@ mod tests {
         use crate::cache::{CacheStatus, CACHE_FRESH_TTL_SECS};
 
         let secret = b"s";
-        let token = grant::issue("u", "track-swr", 9_999_999_999, secret);
+        let now_unix = 1_000 + CACHE_FRESH_TTL_SECS + 1;
+        // Within the TTL cap so the test exercises the cache path.
+        let token = grant::issue("u", "track-swr", now_unix + 60, secret);
         let mut pool = Pool::new(1);
         let mut cache = ContentCache::new();
         let mut meter = crate::meter::MemoryMeter::default();
@@ -796,7 +801,7 @@ mod tests {
             server_addr: addr,
             segments: &[],
             cipher_key: 0,
-            now_unix: 1_000 + CACHE_FRESH_TTL_SECS + 1,
+            now_unix,
             up_next: None,
         };
         let first = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("stale serves");
@@ -825,7 +830,8 @@ mod tests {
         use crate::cache::CacheStatus;
 
         let secret = b"s";
-        let token = grant::issue("u", "track-swr", 9_999_999_999, secret);
+        // Within the TTL cap so the test exercises the cache path.
+        let token = grant::issue("u", "track-swr", 1_010 + 60, secret);
         let mut pool = Pool::new(1);
         let mut cache = ContentCache::new();
         let mut meter = crate::meter::MemoryMeter::default();
@@ -861,7 +867,9 @@ mod tests {
         use crate::cache::{CACHE_FRESH_TTL_SECS, CACHE_SWR_WINDOW_SECS};
 
         let secret = b"s";
-        let token = grant::issue("u", "track-swr", 9_999_999_999, secret);
+        let now_unix = 1_000 + CACHE_FRESH_TTL_SECS + CACHE_SWR_WINDOW_SECS + 1;
+        // Within the TTL cap so the test exercises the cache path.
+        let token = grant::issue("u", "track-swr", now_unix + 60, secret);
         let mut pool = Pool::new(1);
         let mut cache = ContentCache::new();
         let mut meter = crate::meter::MemoryMeter::default();
@@ -875,7 +883,7 @@ mod tests {
             server_addr: addr,
             segments: &[],
             cipher_key: 0,
-            now_unix: 1_000 + CACHE_FRESH_TTL_SECS + CACHE_SWR_WINDOW_SECS + 1,
+            now_unix,
             up_next: None,
         };
         // Empty segments fail on the miss path: proof the expired entry did
@@ -937,7 +945,8 @@ mod tests {
         });
 
         let secret = b"s";
-        let token = grant::issue("u", "track-t1", 9_999_999_999, secret);
+        // Within the TTL cap so the test exercises the miss path.
+        let token = grant::issue("u", "track-t1", 5_000 + 60, secret);
         let mut pool = Pool::new(1);
         let mut cache = ContentCache::new();
         let mut meter = crate::meter::MemoryMeter::default();

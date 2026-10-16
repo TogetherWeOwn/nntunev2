@@ -57,6 +57,7 @@ pub fn flight_key(segment_id: &str) -> String {
 struct FlightState<T, E> {
     done: bool,
     result: Option<Result<T, E>>,
+    successor: Option<Arc<Flight<T, E>>>,
 }
 
 struct Flight<T, E> {
@@ -76,6 +77,7 @@ impl<T, E> Flight<T, E> {
             state: Mutex::new(FlightState {
                 done: false,
                 result: None,
+                successor: None,
             }),
             ready: Condvar::new(),
             is_replacement,
@@ -172,6 +174,15 @@ where
             if let Some(result) = previous.as_deref().and_then(Self::completed) {
                 return result;
             }
+            if let Some(successor) = Self::successor(&flight) {
+                // The replacement can finish and unregister before this
+                // staggered waiter reaches the map lock. Follow the durable
+                // link from the flight it joined instead of electing a third
+                // fetch after the replacement has disappeared from the map.
+                previous = Some(Arc::clone(&flight));
+                joined = Some(successor);
+                continue;
+            }
 
             // Re-run leader election. Invariant: a leader marks its flight
             // done only while holding the map lock, after removing its own
@@ -197,6 +208,11 @@ where
                     // the map entry if it is still its own (`Arc::ptr_eq`),
                     // so it cannot evict this new flight.
                     let replacement = Arc::new(Flight::new(true));
+                    flight
+                        .state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .successor = Some(Arc::clone(&replacement));
                     map.insert(key.to_string(), Arc::clone(&replacement));
                     drop(map);
                     let fetch = fetch.take().expect("fetch is consumed only by a leader");
@@ -220,6 +236,9 @@ where
                     }
                     if let Some(result) = previous.as_deref().and_then(Self::completed) {
                         return result;
+                    }
+                    if let Some(successor) = Self::successor(&flight) {
+                        joined = Some(successor);
                     }
                 }
             }
@@ -273,6 +292,16 @@ where
                 .clone()
                 .expect("a finished flight always carries its result")
         })
+    }
+
+    /// The replacement flight installed after this flight timed out, if any.
+    fn successor(flight: &Flight<T, E>) -> Option<Arc<Flight<T, E>>> {
+        flight
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .successor
+            .clone()
     }
 
     /// The flight's outcome if it has already completed, without waiting.
@@ -448,6 +477,92 @@ mod tests {
         assert!(
             (1..=2).contains(&calls),
             "50 callers behind a slow healthy leader cost at most one extra fetch, got {calls}"
+        );
+    }
+
+    #[test]
+    fn staggered_waiter_uses_completed_replacement_instead_of_starting_third_fetch() {
+        let group = Arc::new(Singleflight::<Vec<u8>, String>::with_timeout(
+            Duration::from_millis(300),
+        ));
+        let upstream_calls = Arc::new(AtomicUsize::new(0));
+        let leader_registered = Arc::new(AtomicBool::new(false));
+        let key = flight_key("<slow-seg@synthetic.test>");
+
+        thread::scope(|s| {
+            let (group_l, calls_l, registered_l) = (
+                Arc::clone(&group),
+                Arc::clone(&upstream_calls),
+                Arc::clone(&leader_registered),
+            );
+            let key_l = key.clone();
+            let leader = s.spawn(move || {
+                group_l.call(&key_l, || {
+                    calls_l.fetch_add(1, Ordering::SeqCst);
+                    registered_l.store(true, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(500));
+                    Ok::<_, String>(b"leader-bytes".to_vec())
+                })
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !leader_registered.load(Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "leader never registered");
+                thread::yield_now();
+            }
+
+            let (group_w1, calls_w1) = (Arc::clone(&group), Arc::clone(&upstream_calls));
+            let key_w1 = key.clone();
+            let first_waiter = s.spawn(move || {
+                group_w1.call(&key_w1, || {
+                    calls_w1.fetch_add(1, Ordering::SeqCst);
+                    // Complete the replacement before the staggered waiter
+                    // reaches its own timeout on the original flight.
+                    thread::sleep(Duration::from_millis(50));
+                    Ok::<_, String>(b"replacement-bytes".to_vec())
+                })
+            });
+
+            thread::sleep(Duration::from_millis(100));
+            let (group_w2, calls_w2) = (Arc::clone(&group), Arc::clone(&upstream_calls));
+            let w2_started = Arc::new(AtomicBool::new(false));
+            let w2_started_thread = Arc::clone(&w2_started);
+            let key_w2 = key.clone();
+            let staggered_waiter = s.spawn(move || {
+                w2_started_thread.store(true, Ordering::SeqCst);
+                group_w2.call(&key_w2, || {
+                    calls_w2.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, String>(b"third-fetch".to_vec())
+                })
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !w2_started.load(Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "staggered waiter never started");
+                thread::yield_now();
+            }
+
+            assert_eq!(
+                first_waiter.join().expect("first waiter thread").unwrap(),
+                b"replacement-bytes"
+            );
+            assert_eq!(
+                staggered_waiter
+                    .join()
+                    .expect("staggered waiter thread")
+                    .unwrap(),
+                b"replacement-bytes",
+                "original-flight waiters must retain access to replacement results"
+            );
+            assert_eq!(
+                leader.join().expect("leader thread").unwrap(),
+                b"leader-bytes"
+            );
+        });
+
+        assert_eq!(
+            upstream_calls.load(Ordering::SeqCst),
+            2,
+            "a completed replacement must not be followed by a third fetch"
         );
     }
 
