@@ -892,9 +892,9 @@ where
     }
     // Challenge insert plus concurrent-reap healing. With the migration
     // 0006 FK (`auth_challenges.user_id -> users(id)`) a concurrent reap
-    // of our user fails here; without it (older DBs, fakes without FK) the
-    // insert succeeds orphaned and the revalidation below heals it. Either
-    // way a resumed signup survives a concurrent cleanup for another email.
+    // of our user fails here; without it, an insert can succeed just before
+    // the reap and leave an orphaned challenge. Revalidation below heals the
+    // user and preserves that challenge, so either ordering can recover.
     if ctx
         .store
         .insert_challenge(&challenge, Some(&user.id), PURPOSE_REGISTER)
@@ -933,6 +933,27 @@ where
                 };
                 if ctx.store.insert_user(&healed).await.is_err() {
                     return shape(fake_user_id(ctx.cfg, &email));
+                }
+                match ctx.store.challenge_by_id(&challenge.id).await {
+                    Ok(Some(row))
+                        if row.challenge.id == challenge.id
+                            && row.challenge.rp_id == challenge.rp_id
+                            && row.challenge.origin == challenge.origin
+                            && row.challenge.expires_at == challenge.expires_at
+                            && !row.challenge.consumed
+                            && row.user_id.as_deref() == Some(user.id.as_str())
+                            && row.purpose == PURPOSE_REGISTER => {}
+                    Ok(None) => {
+                        if ctx
+                            .store
+                            .insert_challenge(&challenge, Some(&user.id), PURPOSE_REGISTER)
+                            .await
+                            .is_err()
+                        {
+                            return internal();
+                        }
+                    }
+                    _ => return internal(),
                 }
             }
             Ok(Some(_)) => {
@@ -1885,6 +1906,8 @@ mod tests {
         rate_limit_slots: RefCell<HashMap<(String, String, u32), u64>>,
         test_connection_leases: RefCell<HashMap<(String, u32), (String, u64)>>,
         delete_user_before_next_challenge: RefCell<Option<String>>,
+        delete_user_after_next_challenge: RefCell<Option<String>>,
+        orphan_user_after_next_challenge: RefCell<Option<String>>,
         challenge_reads: RefCell<usize>,
     }
 
@@ -1922,6 +1945,9 @@ mod tests {
                     return Err(StoreError);
                 }
             }
+            if self.challenges.borrow().contains_key(&challenge.id) {
+                return Err(StoreError);
+            }
             self.challenges.borrow_mut().insert(
                 challenge.id.clone(),
                 ChallengeRow {
@@ -1930,6 +1956,15 @@ mod tests {
                     purpose: purpose.to_string(),
                 },
             );
+            if let Some(id) = self.delete_user_after_next_challenge.borrow_mut().take() {
+                self.users.borrow_mut().remove(&id);
+                self.challenges
+                    .borrow_mut()
+                    .retain(|_, row| row.user_id.as_deref() != Some(id.as_str()));
+            }
+            if let Some(id) = self.orphan_user_after_next_challenge.borrow_mut().take() {
+                self.users.borrow_mut().remove(&id);
+            }
             Ok(())
         }
         async fn challenge_by_id(&self, id: &str) -> Result<Option<ChallengeRow>, StoreError> {
@@ -3985,6 +4020,74 @@ mod tests {
                 row.user_id.as_deref() == Some("resumed-race") && row.purpose == PURPOSE_REGISTER
             }),
             "handler retries and stores the registration challenge"
+        );
+    }
+
+    #[test]
+    fn register_start_reinserts_challenge_deleted_by_concurrent_reap() {
+        // Model a reaper deleting the user after the registration challenge
+        // insert; ON DELETE CASCADE removes that challenge before revalidation.
+        let h = harness();
+        let stale_at = NOW.saturating_sub(UNVERIFIED_USER_TTL_SECS + 1);
+        block_on(h.store.insert_user(&UserRecord {
+            id: "cascade-race".to_string(),
+            email: "cascade@example.com".to_string(),
+            created_at: stale_at,
+        }))
+        .unwrap();
+        *h.store.delete_user_after_next_challenge.borrow_mut() = Some("cascade-race".to_string());
+
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "cascade@example.com"}),
+        );
+
+        assert!(h.store.delete_user_after_next_challenge.borrow().is_none());
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let user = block_on(h.store.user_by_email("cascade@example.com"))
+            .unwrap()
+            .expect("handler recreates the concurrently reaped user");
+        assert_eq!(user.id, "cascade-race");
+        assert!(
+            h.store.challenges.borrow().values().any(|row| {
+                row.user_id.as_deref() == Some("cascade-race") && row.purpose == PURPOSE_REGISTER
+            }),
+            "handler must recreate the challenge removed by the user cascade"
+        );
+    }
+
+    #[test]
+    fn register_start_preserves_orphaned_challenge_without_user_fk() {
+        // Older schemas without the user FK can leave the successful insert
+        // behind when a concurrent reap deletes only the user row.
+        let h = harness();
+        let stale_at = NOW.saturating_sub(UNVERIFIED_USER_TTL_SECS + 1);
+        block_on(h.store.insert_user(&UserRecord {
+            id: "orphan-race".to_string(),
+            email: "orphan@example.com".to_string(),
+            created_at: stale_at,
+        }))
+        .unwrap();
+        *h.store.orphan_user_after_next_challenge.borrow_mut() = Some("orphan-race".to_string());
+
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "orphan@example.com"}),
+        );
+
+        assert!(h.store.orphan_user_after_next_challenge.borrow().is_none());
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let user = block_on(h.store.user_by_email("orphan@example.com"))
+            .unwrap()
+            .expect("handler recreates the concurrently reaped user");
+        assert_eq!(user.id, "orphan-race");
+        assert!(
+            h.store.challenges.borrow().values().any(|row| {
+                row.user_id.as_deref() == Some("orphan-race") && row.purpose == PURPOSE_REGISTER
+            }),
+            "handler must preserve the challenge inserted before the user was reaped"
         );
     }
 
