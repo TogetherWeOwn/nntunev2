@@ -946,6 +946,42 @@ mod tests {
     }
 
     #[test]
+    fn malformed_nonce_lengths_are_rejected() {
+        let kek = [0x11u8; 32];
+        let new_kek = [0x22u8; 32];
+        let blob = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+
+        for len in [0, 1, 11, 13, 16, 24] {
+            let nonce = crate::b64::encode(&vec![7u8; len]);
+
+            let mut bad_wrap_nonce = blob.clone();
+            bad_wrap_nonce.dek_wrapped_nonce_b64url = nonce.clone();
+            assert_eq!(
+                decrypt_vault(&kek, "user-1", &bad_wrap_nonce),
+                Err(VaultError::Invalid),
+                "decrypt accepted a wrapped nonce of length {len}"
+            );
+            // `VaultBlob` has no `PartialEq`, so match on the error instead
+            // of comparing the whole `Result` with `assert_eq!`.
+            assert!(
+                matches!(
+                    rewrap_dek(&kek, &new_kek, 2, "user-1", &bad_wrap_nonce),
+                    Err(VaultError::Invalid)
+                ),
+                "rewrap accepted a wrapped nonce of length {len}"
+            );
+
+            let mut bad_payload_nonce = blob.clone();
+            bad_payload_nonce.payload_nonce_b64url = nonce;
+            assert_eq!(
+                decrypt_vault(&kek, "user-1", &bad_payload_nonce),
+                Err(VaultError::Invalid),
+                "decrypt accepted a payload nonce of length {len}"
+            );
+        }
+    }
+
+    #[test]
     fn debug_redacts_credential_material() {
         // Threat-model §3: no log line may contain credential material.
         // A `{:#?}`/`dbg!`/assert dump of these configs must not carry

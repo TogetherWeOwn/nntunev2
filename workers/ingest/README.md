@@ -10,6 +10,7 @@ NZB upload ───────────────┘                     
 
 ## This slice
 
+- `GET /healthz`: unauthenticated Worker-only health check returning `{"ok":true}` with `Cache-Control: no-store`; it does not access bindings.
 - Job state machine (`src/jobs.rs`): `Queued → Searching|Parsing →
   Probing → Verifying → (Repairing → Verifying)? → Matching → Writing →
   Done`, `Failed` terminal. Checkpoints make redelivery/replay converge;

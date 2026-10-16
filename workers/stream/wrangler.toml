@@ -27,11 +27,39 @@ class_name = "NntpPool"
 tag = "v1"
 new_sqlite_classes = ["NntpPool"]
 
+# Top-level target is the default `wrangler deploy` (production). Named
+# environments below must restate their own bindings (Cloudflare does not
+# inherit them); production keeps the top-level worker name so the ingest
+# cross-script `script_name = "nntune-stream"` contract resolves.
 [[r2_buckets]]
 binding = "AUDIO_CACHE"
-bucket_name = "nntune-audio-cache"
+bucket_name = "nntunev2-audio-prod"
 
 [[analytics_engine_datasets]]
+binding = "METER"
+dataset = "nntune_meter"
+
+[env.staging]
+name = "nntune-stream-staging"
+[[env.staging.durable_objects.bindings]]
+name = "NNTP_POOL"
+class_name = "NntpPool"
+[[env.staging.r2_buckets]]
+binding = "AUDIO_CACHE"
+bucket_name = "nntunev2-audio-staging"
+[[env.staging.analytics_engine_datasets]]
+binding = "METER"
+dataset = "nntune_meter"
+
+[env.production]
+name = "nntune-stream"
+[[env.production.durable_objects.bindings]]
+name = "NNTP_POOL"
+class_name = "NntpPool"
+[[env.production.r2_buckets]]
+binding = "AUDIO_CACHE"
+bucket_name = "nntunev2-audio-prod"
+[[env.production.analytics_engine_datasets]]
 binding = "METER"
 dataset = "nntune_meter"
 

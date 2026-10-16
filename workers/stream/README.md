@@ -45,6 +45,60 @@ Pool semantics (`pool.rs`):
   (`430`/`423`) or a corrupt segment fails that one play
   (`ArticleMissing` / `Decode`) and returns the healthy connection.
 
+## Stampede guard (singleflight + stale-while-revalidate)
+
+What is in this crate today: the singleflight **primitive**
+(`src/stampede.rs`), the SWR cache tiers and headers, and a per-track
+revalidation claim. What is **not** here yet: the wiring. Nothing in the
+play path calls `Singleflight`, and no background revalidation runs until
+the Worker / pool Durable Object entry point (deploy slice) lands and
+consumes `needs_revalidate`. Until then, a stale entry serves inside its
+SWR window and hard-misses after it — the coalescing below describes the
+primitive the entry point will hold one-per-isolate, proven by its unit
+tests (50 concurrent callers, exactly 1 upstream fetch), not live play-path
+behaviour.
+
+- Key: `flight_key(segment message-id)` — the normalized message-id only
+  (same trim/`<>` strip as the wire). The upstream fetch is a whole-article
+  `BODY` that ignores the client's `Range` header (`Range`/`206` is resolved
+  against the fetched bytes), so seek storms asking for different ranges of
+  one segment are the same fetch and share one flight. Sharing is in-flight
+  only: once a flight's leader returns, later calls fetch again (freshness is
+  the cache's job, below).
+- Waiter timeout: `SINGLEFLIGHT_WAIT_TIMEOUT_MS = 5_000`. A waiter parked
+  longer than 5 s re-runs leader election instead of fetching on its own:
+  exactly one timed-out waiter replaces the flight and leads, the rest join
+  the replacement. A replacement is never replaced for slowness (its waiters
+  keep waiting in 5 s chunks), and no flight is led while a superseded leader
+  is still fetching unless it is itself a replacement. So a stalled key runs
+  at most **two upstream fetches at once**, however many callers pile up,
+  and no waiter hangs behind a wedged leader. When the original leader
+  succeeds first, its result goes to the replacement's waiters too: the first
+  success of the chain is the one every waiter takes. An error stays with the
+  flight that produced it, so the original's failure never fails callers
+  parked on a replacement that is still fetching. (The NNTP client's 10 s
+  timeout is per socket *read*, so a slow-but-healthy leader can be replaced
+  once and briefly overlap its replacement; that bounded overlap is the
+  documented trade-off.) A panicking leader releases its key, so later calls
+  start a fresh flight; its waiters recover through their own timeout.
+- Native only: the primitive parks waiters on a `Condvar`, which traps on
+  `wasm32-unknown-unknown`, so the module is `#[cfg(not(target_arch =
+  "wasm32"))]` and CI checks this crate on wasm32 to keep that fence
+  honest. The Worker entry point needs an async shared-future /
+  promise-map equivalent with the same key shape and timeout semantics.
+- SWR windows (`src/cache.rs`): `CACHE_FRESH_TTL_SECS = 300` serves `HIT`
+  with no revalidation; the next `CACHE_SWR_WINDOW_SECS = 3_600` serves
+  `STALE` immediately while flagging `needs_revalidate` — to exactly one
+  reader per stale entry, via `try_begin_revalidate` (the claim releases
+  when the rewrite lands, or via `finish_revalidate` after a failed
+  attempt). Freshness is stamped per track, so deduplicated blobs never
+  restamp a peer track. Past both windows the entry is a `MISS` and the
+  play path re-fetches upstream. Cache writes are stamped with the play
+  time on `finalize`, so the SWR clock runs from when the bytes were
+  fetched.
+- Headers: every play carries `Cache-Status: HIT|MISS|STALE` and
+  `Age: <seconds-since-write>` (see `PlayResponse::cache_headers`).
+
 ## Play grants: TTL cap and clock skew (grant.rs)
 
 Play grants (`v1.<payload>.<hmac-sha256>`) are short-lived bearer tokens:
