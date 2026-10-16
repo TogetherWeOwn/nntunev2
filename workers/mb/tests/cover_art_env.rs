@@ -181,17 +181,37 @@ fn no_bare_art_bucket_reference_remains() {
 }
 
 /// The deploy example must bind the env-specific buckets, not the bare name.
-/// Parses per-env sections so a swapped `bucket_name` (M2) or a deleted
-/// per-env `MB_DB` block (M3) fails instead of passing silently.
+/// Parses per-env sections and per-block bindings so a swapped `bucket_name`
+/// (M2), a deleted `ART_CACHE` block, a swapped `MB_DB`/`MB_CACHE` binding,
+/// or a deleted per-env `MB_DB` block fails instead of passing silently.
+///
+/// The example's env sections are commented lines (`# [[env.staging...`),
+/// so headers are matched without the leading `# ` (sections are sliced at
+/// the first `[[`, which drops the `# ` prefix on the opening header).
+fn block_for<'a>(section: &'a str, header: &str) -> &'a str {
+    let start = section
+        .find(header)
+        .unwrap_or_else(|| panic!("missing block {header}"));
+    let after = start + header.len();
+    let rest = &section[after..];
+    let mut end = rest.len();
+    for marker in ["\n# [[", "\n# ["] {
+        if let Some(idx) = rest.find(marker) {
+            end = end.min(idx);
+        }
+    }
+    &section[start..after + end]
+}
+
 #[test]
 fn wrangler_example_uses_env_specific_buckets() {
     let path = manifest_dir().join("wrangler.toml.example");
     let text = std::fs::read_to_string(&path).expect("read wrangler.toml.example");
     let staging_start = text
-        .find("env.staging")
+        .find("[[env.staging")
         .expect("wrangler example must define a staging env section");
     let production_start = text
-        .find("env.production")
+        .find("[[env.production")
         .expect("wrangler example must define a production env section");
     assert!(
         staging_start < production_start,
@@ -200,52 +220,95 @@ fn wrangler_example_uses_env_specific_buckets() {
     let staging_section = &text[staging_start..production_start];
     let production_section = &text[production_start..];
 
-    for (env, section, bucket, other_bucket) in [
+    for (env, section, short, bucket, other_bucket) in [
         (
             "staging",
             staging_section,
+            "staging",
             "nntunev2-art-staging",
             "nntunev2-art-prod",
         ),
         (
             "production",
             production_section,
+            "production",
             "nntunev2-art-prod",
             "nntunev2-art-staging",
         ),
     ] {
-        let short = if env == "staging" {
-            "staging"
-        } else {
-            "production"
-        };
+        let hyperdrive_header = format!("[[env.{short}.hyperdrive]]");
+        let kv_header = format!("[[env.{short}.kv_namespaces]]");
+        let r2_header = format!("[[env.{short}.r2_buckets]]");
         assert!(
-            section.contains(&format!("bucket_name = \"{bucket}\"")),
-            "{env} section must bind bucket {bucket} (swapped buckets M2 must fail)"
-        );
-        assert!(
-            !section.contains(other_bucket),
-            "{env} section must not reference the other env bucket {other_bucket} (M2 swap must fail)"
-        );
-        assert!(
-            section.contains(&format!("env.{short}.hyperdrive")),
+            section.contains(&hyperdrive_header),
             "{env} section must declare its hyperdrive block"
         );
         assert!(
-            section.contains("binding = \"MB_DB\""),
-            "{env} section must bind MB_DB (deleted per-env MB_DB M3 must fail)"
-        );
-        assert!(
-            section.contains(&format!("env.{short}.kv_namespaces")),
+            section.contains(&kv_header),
             "{env} section must declare its kv block"
         );
         assert!(
-            section.contains("binding = \"MB_CACHE\""),
-            "{env} section must bind MB_CACHE"
-        );
-        assert!(
-            section.contains(&format!("env.{short}.r2_buckets")),
+            section.contains(&r2_header),
             "{env} section must declare its r2_buckets block"
         );
+        let hyperdrive = block_for(section, &hyperdrive_header);
+        let kv = block_for(section, &kv_header);
+        let r2 = block_for(section, &r2_header);
+
+        assert!(
+            hyperdrive.contains("binding = \"MB_DB\""),
+            "{env} hyperdrive block must bind MB_DB (deleted per-env MB_DB must fail)"
+        );
+        assert!(
+            !hyperdrive.contains("binding = \"MB_CACHE\""),
+            "{env} hyperdrive block must not bind MB_CACHE (swapped MB_DB/MB_CACHE must fail)"
+        );
+        assert!(
+            kv.contains("binding = \"MB_CACHE\""),
+            "{env} kv block must bind MB_CACHE"
+        );
+        assert!(
+            !kv.contains("binding = \"MB_DB\""),
+            "{env} kv block must not bind MB_DB (swapped MB_DB/MB_CACHE must fail)"
+        );
+        assert!(
+            r2.contains("binding = \"ART_CACHE\""),
+            "{env} r2 block must bind ART_CACHE (deleted ART_CACHE must fail)"
+        );
+        assert!(
+            r2.contains(&format!("bucket_name = \"{bucket}\"")),
+            "{env} r2 block must bind bucket {bucket} (swapped buckets must fail)"
+        );
+        assert!(
+            !r2.contains(other_bucket),
+            "{env} r2 block must not reference the other env bucket {other_bucket} (swap must fail)"
+        );
     }
+}
+
+#[test]
+fn ops_inventory_lists_exact_art_buckets() {
+    let path = repo_root().join("docs/ops.md");
+    let text = std::fs::read_to_string(&path).expect("read docs/ops.md authoritative inventory");
+    for (bucket, env) in [(ART_BUCKET_STAGING, "staging"), (ART_BUCKET_PROD, "prod")] {
+        assert!(
+            text.contains(&format!("| `{bucket}` | {env} |")),
+            "docs/ops.md R2 buckets table must list {bucket} for {env} (rename in ops only must fail)"
+        );
+    }
+    assert!(
+        text.contains(&format!(
+            "| R2 artwork / MB Worker | `{}` | `{}` |",
+            ART_BUCKET_STAGING, ART_BUCKET_PROD
+        )),
+        "docs/ops.md Environments matrix must pin both art buckets"
+    );
+    let art_cache_line = text
+        .lines()
+        .find(|line| line.contains("`ART_CACHE`"))
+        .expect("docs/ops.md Worker bindings must document ART_CACHE");
+    assert!(
+        art_cache_line.contains(ART_BUCKET_STAGING) && art_cache_line.contains(ART_BUCKET_PROD),
+        "docs/ops.md ART_CACHE binding row must pin both buckets, got {art_cache_line:?}"
+    );
 }
