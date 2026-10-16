@@ -2665,7 +2665,7 @@ mod tests {
     /// migration would make every such insert fail at runtime.
     #[test]
     fn purpose_constants_match_the_migration_check() {
-        let sql = include_str!("../../../migrations/0006_auth_challenge_purpose_guard.sql");
+        let sql = include_str!("../../../migrations/0007_auth_challenge_purpose_guard.sql");
         let expected = format!("CHECK (purpose IN ('', '{PURPOSE_REGISTER}', '{PURPOSE_LOGIN}'))");
         assert!(
             sql.contains(&expected),

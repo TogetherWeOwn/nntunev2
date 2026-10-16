@@ -29,6 +29,13 @@ export class ApiError extends Error {
 	}
 }
 
+/** Documented re-auth code (S7): stale provider credential. */
+export const PROVIDER_AUTH_EXPIRED_CODE = 'provider_auth_expired';
+
+/** Documented re-key code (S7): stale indexer API key. Distinct from the
+ * provider code: the web app names the API key (never the password) for it. */
+export const INDEXER_AUTH_EXPIRED_CODE = 'indexer_auth_expired';
+
 export interface MagicLinkResult {
 	ok: true;
 	/**
@@ -289,12 +296,21 @@ export class ApiClient {
 			credentials: 'include'
 		});
 		if (!response.ok) {
-			throw new ApiError(response.status, this.errorCode(response.status), await this.message(response));
+			const body = await this.readErrorBody(response);
+			throw new ApiError(response.status, this.errorCode(response.status, body), this.message(response.status, body));
 		}
 		return (await response.json()) as T;
 	}
 
-	private errorCode(status: number): string {
+	private errorCode(status: number, body: { error?: unknown; code?: unknown }): string {
+		// The re-auth codes travel in the body (`{ error: "provider_auth_expired" }`
+		// or `{ error: "indexer_auth_expired" }` with HTTP 401); they take
+		// precedence over the status mapping so the UI renders the inline
+		// re-auth prompt instead of a generic signed-out page.
+		for (const field of [body.code, body.error] as unknown[]) {
+			if (field === PROVIDER_AUTH_EXPIRED_CODE) return PROVIDER_AUTH_EXPIRED_CODE;
+			if (field === INDEXER_AUTH_EXPIRED_CODE) return INDEXER_AUTH_EXPIRED_CODE;
+		}
 		if (status === 401) return 'unauthorized';
 		if (status === 403) return 'forbidden';
 		if (status === 404) return 'not_found';
@@ -302,13 +318,18 @@ export class ApiClient {
 		return 'request_failed';
 	}
 
-	private async message(response: Response): Promise<string> {
+	private async readErrorBody(response: Response): Promise<{ error?: unknown; code?: unknown }> {
 		try {
-			const body = (await response.json()) as { error?: unknown };
-			if (typeof body.error === 'string' && body.error.length > 0) return body.error;
+			const body = (await response.json()) as { error?: unknown; code?: unknown };
+			if (body !== null && typeof body === 'object') return body;
 		} catch {
-			// Fall through to the status-based message below.
+			// Fall through to the empty body below.
 		}
-		return `request failed with status ${response.status}`;
+		return {};
+	}
+
+	private message(status: number, body: { error?: unknown }): string {
+		if (typeof body.error === 'string' && body.error.length > 0) return body.error;
+		return `request failed with status ${status}`;
 	}
 }

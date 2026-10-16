@@ -1,4 +1,4 @@
--- NNTune v2 migration 0006: database-enforced challenge purpose.
+-- NNTune v2 migration 0007: database-enforced challenge purpose.
 --
 -- 0004 made `purpose` immutable by convention only: handlers pass it at
 -- insert and check it before the single-use claim, but nothing in the

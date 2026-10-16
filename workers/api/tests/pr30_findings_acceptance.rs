@@ -2315,7 +2315,7 @@ fn audit_source_ip_is_a_canonical_single_ip_or_unknown() {
 #[test]
 fn purpose_guard_migration_keeps_the_constraint_creation_strategy_pinned() {
     let migration_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../migrations/0006_auth_challenge_purpose_guard.sql");
+        .join("../../migrations/0007_auth_challenge_purpose_guard.sql");
     assert!(
         migration_path.is_file(),
         "purpose-guard migration must be present; this test does not apply it"

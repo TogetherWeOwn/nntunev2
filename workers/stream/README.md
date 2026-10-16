@@ -1,7 +1,9 @@
 # `stream` Worker + per-user NNTP pool
 
-Portable Rust core (`nntune-stream`, zero dependencies) of the NNTune v2
-stream Worker and its per-user NNTP pool Durable Object.
+Rust core (`nntune-stream`) of the NNTune v2 stream Worker and its per-user
+NNTP pool Durable Object. The Workers entry (`src/runtime.rs`) compiles on
+wasm32 only; its `worker`, `wasm-bindgen`, and transport dependencies are
+excluded from native builds and tests.
 
 ## Play path
 
@@ -43,6 +45,60 @@ Pool semantics (`pool.rs`):
   (`430`/`423`) or a corrupt segment fails that one play
   (`ArticleMissing` / `Decode`) and returns the healthy connection.
 
+## Stampede guard (singleflight + stale-while-revalidate)
+
+What is in this crate today: the singleflight **primitive**
+(`src/stampede.rs`), the SWR cache tiers and headers, and a per-track
+revalidation claim. What is **not** here yet: the wiring. Nothing in the
+play path calls `Singleflight`, and no background revalidation runs until
+the Worker / pool Durable Object entry point (deploy slice) lands and
+consumes `needs_revalidate`. Until then, a stale entry serves inside its
+SWR window and hard-misses after it — the coalescing below describes the
+primitive the entry point will hold one-per-isolate, proven by its unit
+tests (50 concurrent callers, exactly 1 upstream fetch), not live play-path
+behaviour.
+
+- Key: `flight_key(segment message-id)` — the normalized message-id only
+  (same trim/`<>` strip as the wire). The upstream fetch is a whole-article
+  `BODY` that ignores the client's `Range` header (`Range`/`206` is resolved
+  against the fetched bytes), so seek storms asking for different ranges of
+  one segment are the same fetch and share one flight. Sharing is in-flight
+  only: once a flight's leader returns, later calls fetch again (freshness is
+  the cache's job, below).
+- Waiter timeout: `SINGLEFLIGHT_WAIT_TIMEOUT_MS = 5_000`. A waiter parked
+  longer than 5 s re-runs leader election instead of fetching on its own:
+  exactly one timed-out waiter replaces the flight and leads, the rest join
+  the replacement. A replacement is never replaced for slowness (its waiters
+  keep waiting in 5 s chunks), and no flight is led while a superseded leader
+  is still fetching unless it is itself a replacement. So a stalled key runs
+  at most **two upstream fetches at once**, however many callers pile up,
+  and no waiter hangs behind a wedged leader. When the original leader
+  succeeds first, its result goes to the replacement's waiters too: the first
+  success of the chain is the one every waiter takes. An error stays with the
+  flight that produced it, so the original's failure never fails callers
+  parked on a replacement that is still fetching. (The NNTP client's 10 s
+  timeout is per socket *read*, so a slow-but-healthy leader can be replaced
+  once and briefly overlap its replacement; that bounded overlap is the
+  documented trade-off.) A panicking leader releases its key, so later calls
+  start a fresh flight; its waiters recover through their own timeout.
+- Native only: the primitive parks waiters on a `Condvar`, which traps on
+  `wasm32-unknown-unknown`, so the module is `#[cfg(not(target_arch =
+  "wasm32"))]` and CI checks this crate on wasm32 to keep that fence
+  honest. The Worker entry point needs an async shared-future /
+  promise-map equivalent with the same key shape and timeout semantics.
+- SWR windows (`src/cache.rs`): `CACHE_FRESH_TTL_SECS = 300` serves `HIT`
+  with no revalidation; the next `CACHE_SWR_WINDOW_SECS = 3_600` serves
+  `STALE` immediately while flagging `needs_revalidate` — to exactly one
+  reader per stale entry, via `try_begin_revalidate` (the claim releases
+  when the rewrite lands, or via `finish_revalidate` after a failed
+  attempt). Freshness is stamped per track, so deduplicated blobs never
+  restamp a peer track. Past both windows the entry is a `MISS` and the
+  play path re-fetches upstream. Cache writes are stamped with the play
+  time on `finalize`, so the SWR clock runs from when the bytes were
+  fetched.
+- Headers: every play carries `Cache-Status: HIT|MISS|STALE` and
+  `Age: <seconds-since-write>` (see `PlayResponse::cache_headers`).
+
 ## Play grants: TTL cap and clock skew (grant.rs)
 
 Play grants (`v1.<payload>.<hmac-sha256>`) are short-lived bearer tokens:
@@ -64,6 +120,22 @@ a captured grant must stop replaying soon after issuance.
   play path surfaces it as `PlayError::Unauthorized(TtlTooLong)` without
   dialing out. Wrong-track binding is still rejected (`WrongTrack`) for
   within-cap grants.
+
+## Grant-rejection meter signals (meter.rs, play.rs)
+
+Authenticated grant rejections emit exactly one distinct meter event and
+nothing else: no `PlayStart`, no cache events, no dial, no quarantine, no
+lease. Malformed and bad-signature tokens emit no meter event, preventing
+unauthenticated clients from driving meter writes.
+
+- `GrantRejectedExpired` for `Unauthorized(Expired)`.
+- `GrantRejectedExcessiveExpiry` for `Unauthorized(TtlTooLong)`.
+- `GrantRejectedWrongTrack` for `WrongTrack` (with `track_id` set to the
+  *requested* track).
+- Rejection events carry the requested track, the user from the
+  signature-verified payload, and `bytes = 0` — never secret or token
+  material. The
+  accept path emits no `GrantRejected*` at all.
 
 ## TTFB targets
 
@@ -90,16 +162,106 @@ CI (`.github/workflows/ci.yml`, job `rust`, required through `ci-ok`) runs
 fmt, clippy `-D warnings` and every test; the integration test asserts the
 local hit budget (< 100 ms), so a regression turns `ci-ok` red.
 
+## Ingest probe (probe.rs, runtime.rs)
+
+The ingest pipeline checks segment availability before verify/repair. One
+call carries one batch envelope (the ingest crate's `ProbeRequest`, at most
+500 message-ids) and returns which ids the provider has:
+
+```text
+ingest consumer ── NNTP_POOL stub (id_from_name(user_id)) ── POST /probe ──▶ NntpPool DO
+  1. refuse envelopes naming another user (the DO id is the user id), bodies
+     over 1 MiB, batches outside 1..=500, ids that are not strict message-ids
+  2. lease on the Ingest lane (never the slot reserved for playback)
+  3. warm connection or dial; STAT each id: 223 present, 430 missing
+  4. 200 {"batch_index", "present", "missing"}: the request ids, partitioned
+```
+
+| Status | Code | Meaning | Ingest |
+|---|---|---|---|
+| 200 | | outcome | check partition, fold into the tally |
+| 400 / 413 | `bad_request` / `too_large` | envelope refused | contract bug, no retry |
+| 503 | `busy` | ingest lane full or pool quarantined; `Retry-After` set | redeliver |
+| 503 | `provider_unavailable` | provider settings not loaded | redeliver |
+| 502 | `provider_error` | connection, auth or protocol failure; pool quarantined | redeliver |
+
+There is no public route: only Workers holding the cross-script Durable
+Object binding reach the object. Provider text never leaves the DO. A
+warm connection the provider closed while idle is redialed once.
+
+Not connected yet: the DO's provider settings. The encrypted BYOP row lives
+in the account vault, and reading it inside the DO (Hyperdrive, the
+key-encryption key, and the SSRF guard on every connect, threat model §3/§6)
+is its own slice; until it lands every probe answers `503
+provider_unavailable`. The ingest consumer configuration stays disabled
+meanwhile.
+
 ## Test
 
 ```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p nntune-stream --target wasm32-unknown-unknown -- -D warnings
 cargo fmt --all --check
 ```
 
-No network, no Cloudflare account, no secrets: the synthetic NNTP server
-lives in `tests/stream_integration.rs` and serves canned yEnc multipart articles.
+No Cloudflare account, no secrets: the play-path synthetic NNTP server lives
+in `tests/stream_integration.rs` and serves canned yEnc multipart articles;
+`tests/probe_synthetic_nntp.rs` runs the probe against the shared
+`nntune-test-nntp` server over loopback TCP.
+
+## Worker build and current runtime boundary
+
+The crate builds the deployable Worker module with:
+
+```sh
+cargo build --manifest-path workers/stream/Cargo.toml --release --target wasm32-unknown-unknown
+```
+
+This emits `target/wasm32-unknown-unknown/release/nntune_stream.wasm` as well
+as the Rust library artifact. Wrangler's build command runs `worker-build
+--release` to generate the `build/worker/shim.mjs` entry configured below.
+The wasm32-only `runtime` exports the `NntpPool` Durable Object. Its probe
+route currently fails closed with `503 provider_unavailable` until provider
+configuration is wired from the account vault; the Worker's public fetch path
+remains `404` until the play path is connected to Cloudflare's R2 and metering
+adapters. This is a buildable runtime entrypoint, not a production playback
+deployment.
+
+## Metering reconciliation (portable-core model)
+
+The code in `meter.rs` models complete-play reconciliation and deduplication;
+it is not yet wired into the production `play()` path or production sinks.
+`UsageLedger` is an in-memory portable-core model, not a live Hyperdrive table,
+and `reconcile` does not currently emit to Analytics Engine or call
+`ReconcileMismatch::log_line`.
+
+- Idempotency key: `derive_play_idempotency_key(user_id, track_id,
+  play_id)` returns `play:{user}:{track}:{play}`. It rejects empty fields,
+  unsafe log/key characters, and fields longer than 128 bytes for user IDs
+  or 512 bytes for track and play IDs. Redelivery derives the same key; a
+  genuine second listen carries a different `play_id`.
+- Dedup rule: `UsageLedger::record` converges exact redeliveries to one
+  in-memory entry — first write wins, mismatch is flagged, never silently
+  adjusted. A redelivery that disagrees on user, track, or bytes, or a play
+  whose key is not exactly `play:{user_id}:{track_id}:{play_id}` with valid
+  fields, reports `RecordOutcome::Conflict` and changes nothing. The
+  production Hyperdrive uniqueness constraint and upsert are not wired
+  by this portable-core model.
+- Reconcile pass: `reconcile(plays, ledger, meter)` checks each distinct
+  play (first occurrence authoritative) against the ledger. A play whose
+  ledger entry is missing, whose user or track identity differs, or whose
+  metered bytes differ from the entry's bytes emits exactly one
+  `ReconcileMismatch` meter event. A redelivery inside the same batch that
+  conflicts with its first occurrence is flagged as its own mismatch.
+  Mismatch events are non-serving and carry `bytes = 0` so byte sums over
+  mixed event kinds cannot double-count; the flagged counts stay on the
+  `ReconcileMismatch` record. `ReconcileMismatch::log_line()` formats
+  a single-line representation with event `play_reconcile_mismatch` and
+  both byte counts (`ledger_bytes=missing` when there is no entry). Identity
+  fields are percent-escaped even if callers bypass constructor validation.
+  The pass takes `&UsageLedger` and never adjusts, backfills, or drops an entry.
+  Production wiring for the meter, log, and ledger remains future work.
 
 ## Production notes
 
@@ -109,5 +271,6 @@ lives in `tests/stream_integration.rs` and serves canned yEnc multipart articles
   fetch→decode→decrypt→fan-out shape. Production content keys arrive via
   the BYOP vault with the ingest-owned envelope (sibling cards); swap the
   marked lines, keep the flow.
-- Metering sinks: Analytics Engine dataset `nntune_meter` + the Hyperdrive
-  usage-ledger table (ledger writes owned by the api card).
+- Planned metering sinks: Analytics Engine dataset `nntune_meter` and a
+  Hyperdrive usage-ledger table. Neither sink is wired by the portable-core
+  reconciliation model described above.

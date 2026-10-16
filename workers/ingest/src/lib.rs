@@ -1,6 +1,7 @@
 //! NNTune v2 ingest pipeline worker.
 //!
 //! Routes (all JSON):
+//! - `GET /healthz` — unauthenticated Worker health check; no bindings.
 //! - `POST /v1/ingest/search` — Newznab search with the user's own indexer
 //!   (`indexer_ref` vault handle; raw keys are never accepted here).
 //! - `POST /v1/ingest/nzb` — NZB upload; guarded by intake caps, then
@@ -28,10 +29,12 @@ pub mod metering;
 pub mod newznab;
 pub mod nzb_intake;
 pub mod parse;
+pub mod pool_probe;
 pub mod probe;
 pub mod queue;
 pub mod rate_limit;
 pub mod repair;
+pub mod retry;
 
 use dispatch::validate_user_id;
 use jobs::validate_job_id;
@@ -52,6 +55,42 @@ pub const MAX_UPLOAD_BODY_BYTES: usize = 13 * 1024 * 1024;
 #[derive(Debug, serde::Serialize)]
 struct ApiError {
     error: String,
+}
+
+fn health_response() -> http::Response<Vec<u8>> {
+    http::Response::builder()
+        .status(http::StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .body(r#"{"ok":true}"#.as_bytes().to_vec())
+        .expect("static health response is valid")
+}
+
+struct HealthResponseParts {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+fn health_response_parts() -> HealthResponseParts {
+    let response = health_response();
+    HealthResponseParts {
+        status: response.status().as_u16(),
+        headers: response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value
+                        .to_str()
+                        .expect("static health header is valid")
+                        .to_owned(),
+                )
+            })
+            .collect(),
+        body: response.into_body(),
+    }
 }
 
 fn json_error(message: &str, status: u16) -> Result<Response> {
@@ -197,6 +236,49 @@ fn check_upload(req: &NzbUploadRequest) -> core::result::Result<(), &'static str
     Ok(())
 }
 
+/// Build the status + JSON body for an intake refusal. Pure so the 4xx
+/// taxonomy (stable `code`, measured value + cap fields the client renders)
+/// is unit-tested without a Worker runtime.
+fn intake_rejection_parts(rejection: &IntakeRejection) -> (u16, serde_json::Value) {
+    let mut body = serde_json::json!({
+        "error": rejection.message(),
+        "code": rejection.code(),
+        "intake_config_version": nzb_intake::INTAKE_CONFIG_VERSION,
+    });
+    match *rejection {
+        IntakeRejection::TooLarge {
+            size_bytes,
+            max_bytes,
+        } => {
+            body["size_bytes"] = size_bytes.into();
+            body["max_bytes"] = max_bytes.into();
+        }
+        IntakeRejection::TooManyFiles { count, max } => {
+            body["file_count"] = count.into();
+            body["max_files"] = max.into();
+        }
+        IntakeRejection::TooManySegments { count, max } => {
+            body["segment_count"] = count.into();
+            body["max_segments"] = max.into();
+        }
+        IntakeRejection::DeclaredBytesOverCap { declared, max } => {
+            body["declared_bytes"] = declared.into();
+            body["max_declared_bytes"] = max.into();
+        }
+        IntakeRejection::Empty | IntakeRejection::NotNzb | IntakeRejection::Malformed => {}
+    }
+    (rejection.http_status(), body)
+}
+
+/// Answer an intake refusal with its stable code + reason fields.
+fn intake_rejection_response(rejection: &IntakeRejection) -> Result<Response> {
+    let (status, body) = intake_rejection_parts(rejection);
+    Response::from_json(&body).map(|r| {
+        r.with_status(status)
+            .with_headers(headers_json().unwrap_or_default())
+    })
+}
+
 /// Send one dispatch message. Returns true when the Queue accepted it; a
 /// missing or failing binding returns false and the route answers 503 (see
 /// [`queued_envelope`]), so the job is retried instead of silently lost.
@@ -335,11 +417,7 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Respons
         return json_error(message, 400);
     }
     match estimate_nzb(&parsed.nzb_xml) {
-        Err(IntakeRejection::Empty) => json_error("nzb_xml must not be empty", 400),
-        Err(IntakeRejection::TooLarge) => json_error("nzb_xml exceeds 2 MiB", 413),
-        Err(IntakeRejection::NotNzb) => json_error("nzb_xml is not an NZB document", 400),
-        Err(IntakeRejection::TooManyFiles) => json_error("nzb has too many files", 413),
-        Err(IntakeRejection::TooManySegments) => json_error("nzb has too many segments", 413),
+        Err(rejection) => intake_rejection_response(&rejection),
         Ok(est) => {
             let msg = match dispatch::build_upload_dispatch(&parsed.user_id, &parsed.nzb_xml) {
                 Ok(msg) => msg,
@@ -373,6 +451,16 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Respons
     }
 }
 
+fn healthz() -> Result<Response> {
+    let health = health_response_parts();
+    let headers = worker::Headers::new();
+    for (name, value) in health.headers {
+        headers.append(&name, &value)?;
+    }
+    Response::from_body(worker::ResponseBody::Body(health.body))
+        .map(|response| response.with_status(health.status).with_headers(headers))
+}
+
 /// Job checkpoint status: validates the id shape before DB wiring lands.
 async fn job_status(_req: &Request, ctx: &RouteContext<()>) -> Result<Response> {
     let id = ctx.param("id").cloned().unwrap_or_default();
@@ -389,7 +477,7 @@ async fn job_status(_req: &Request, ctx: &RouteContext<()>) -> Result<Response> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nzb_intake::MAX_NZB_BYTES;
+    use crate::nzb_intake::{MAX_FILES, MAX_NZB_BYTES};
 
     fn search_body(
         query: &str,
@@ -407,6 +495,67 @@ mod tests {
             "page": page,
         })
         .to_string()
+    }
+
+    #[test]
+    fn health_response_is_uncached_json_without_dependencies() {
+        let response = health_response_parts();
+        assert_eq!(response.status, http::StatusCode::OK.as_u16());
+        assert_eq!(response.headers.len(), 2);
+        assert!(response
+            .headers
+            .contains(&("content-type".to_owned(), "application/json".to_owned())));
+        assert!(response
+            .headers
+            .contains(&("cache-control".to_owned(), "no-store".to_owned())));
+        assert_eq!(response.body, br#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn healthz_route_contract_precedes_the_catchall() {
+        // Worker Response/Headers require wasm-bindgen, so pin the production
+        // route and adapter source while testing the HTTP contract natively.
+        let source = include_str!("lib.rs");
+        let router = source
+            .split_once("\n#[worker::event(fetch)]\npub async fn main")
+            .expect("worker entrypoint must exist")
+            .1;
+        let route = router
+            .find(".get_async(\"/healthz\", |_, _| async { healthz() })")
+            .expect("GET /healthz must dispatch to its handler");
+        let catchall = router
+            .find(".or_else_any_method_async")
+            .expect("router must retain its catch-all");
+        assert!(
+            route < catchall,
+            "healthz must be registered before catch-all"
+        );
+        assert_eq!(router.matches("\"/healthz\"").count(), 1);
+
+        let handler = source
+            .split_once("fn healthz() -> Result<Response> {")
+            .expect("healthz handler must exist")
+            .1
+            .split_once("\n}\n")
+            .expect("healthz handler must close")
+            .0;
+        let compact = |text: &str| {
+            text.chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+        };
+        assert_eq!(
+            compact(handler),
+            compact(
+                r#"let health = health_response_parts();
+    let headers = worker::Headers::new();
+    for (name, value) in health.headers {
+        headers.append(&name, &value)?;
+    }
+    Response::from_body(worker::ResponseBody::Body(health.body))
+        .map(|response| response.with_status(health.status).with_headers(headers))"#
+            )
+        );
     }
 
     #[test]
@@ -472,6 +621,84 @@ mod tests {
     }
 
     #[test]
+    fn intake_corpus_maps_to_stable_4xx_codes_with_reason_fields() {
+        // (body, expected status, expected code)
+        let over_bytes = r#"<?xml version="1.0"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+<file poster="a@b" date="1" subject="big.iso">
+<groups><group>alt.binaries.music</group></groups>
+<segments>
+<segment bytes="42949672960" number="1">big-one@news</segment>
+<segment bytes="42949672960" number="2">big-two@news</segment>
+</segments>
+</file>
+</nzb>"#;
+        let mut file_bomb = String::from("<?xml?><nzb>");
+        for _ in 0..(MAX_FILES + 1) {
+            file_bomb.push_str("<file></file>");
+        }
+        file_bomb.push_str("</nzb>");
+        let mut segment_bomb = String::from("<?xml?><nzb>");
+        for _ in 0..(crate::nzb_intake::MAX_SEGMENTS + 1) {
+            segment_bomb.push_str("<segment></segment>");
+        }
+        segment_bomb.push_str("</nzb>");
+        assert!(segment_bomb.len() < MAX_NZB_BYTES);
+        let cases: &[(&str, u16, &str)] = &[
+            ("", 400, "NZB_EMPTY"),
+            ("<html><body>hi</body></html>", 400, "NZB_NOT_NZB"),
+            ("<?xml?><nzb><file>", 400, "NZB_MALFORMED"),
+            (over_bytes, 413, "NZB_DECLARED_BYTES_OVER_CAP"),
+            (&file_bomb, 413, "NZB_TOO_MANY_FILES"),
+            (&segment_bomb, 413, "NZB_TOO_MANY_SEGMENTS"),
+            (&"x".repeat(MAX_NZB_BYTES + 1), 413, "NZB_TOO_LARGE"),
+        ];
+        for (body, status, code) in cases {
+            let rejection = estimate_nzb(body).unwrap_err();
+            let (actual_status, actual_body) = intake_rejection_parts(&rejection);
+            assert_eq!(actual_status, *status, "status for {code}");
+            assert_eq!(actual_body["code"], *code, "code for {code}");
+            assert_eq!(
+                actual_body["intake_config_version"],
+                crate::nzb_intake::INTAKE_CONFIG_VERSION
+            );
+            assert!(actual_body["error"].is_string());
+        }
+        // Reason fields the client renders ride alongside the code.
+        let (_, over_bytes_body) = intake_rejection_parts(&estimate_nzb(over_bytes).unwrap_err());
+        assert!(over_bytes_body["declared_bytes"].as_u64().unwrap() > 0);
+        assert!(over_bytes_body["max_declared_bytes"].as_u64().unwrap() > 0);
+        let (_, too_large_body) =
+            intake_rejection_parts(&estimate_nzb(&"x".repeat(MAX_NZB_BYTES + 1)).unwrap_err());
+        assert_eq!(
+            too_large_body["max_bytes"].as_u64().unwrap(),
+            MAX_NZB_BYTES as u64
+        );
+        let (_, too_many_files_body) =
+            intake_rejection_parts(&estimate_nzb(&file_bomb).unwrap_err());
+        assert_eq!(
+            too_many_files_body["file_count"].as_u64().unwrap(),
+            (MAX_FILES + 1) as u64
+        );
+        assert_eq!(
+            too_many_files_body["max_files"].as_u64().unwrap(),
+            MAX_FILES as u64
+        );
+        let (_, too_many_segments_body) =
+            intake_rejection_parts(&estimate_nzb(&segment_bomb).unwrap_err());
+        assert_eq!(
+            too_many_segments_body["segment_count"].as_u64().unwrap(),
+            (crate::nzb_intake::MAX_SEGMENTS + 1) as u64
+        );
+        assert_eq!(
+            too_many_segments_body["max_segments"].as_u64().unwrap(),
+            crate::nzb_intake::MAX_SEGMENTS as u64
+        );
+        // A valid NZB has no rejection at all: it queues.
+        assert!(estimate_nzb(crate::fixtures::SMALL_NZB).is_ok());
+    }
+
+    #[test]
     fn body_caps_stay_small_and_fit_escaped_nzbs() {
         // Compile-time: the search cap stays small and the upload wire cap
         // always fits a maximally-escaped 2 MiB NZB.
@@ -485,6 +712,7 @@ mod tests {
 #[worker::event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Response> {
     Router::new()
+        .get_async("/healthz", |_, _| async { healthz() })
         .post_async("/v1/ingest/search", |mut req, ctx| async move {
             search(&mut req, &ctx).await
         })

@@ -153,12 +153,13 @@ config from secrets) is a follow-up slice.
   suffixes are intentionally unsupported). Configuration must be a canonical
   serialized origin: https, or http with the host exactly `localhost`,
   `127.0.0.1` or `::1` for development, no userinfo/path/query/fragment.
-  Five-minute challenges must be consumed through
-  `consume_challenge_atomically`, and `webauthn.rs` signature verification
-  (attestation `none`/packed-self, assertion ES256/EdDSA, RP-hash and
-  exact origin/challenge pinning, monotonic `sign_count` clone
-  detection) must finish before authentication. The handlers enforce
-  both, in that order, on every ceremony. RP policy: **user verification
+  The handlers first verify WebAuthn signatures (attestation
+  `none`/packed-self, assertion ES256/EdDSA, RP-hash and exact
+  origin/challenge pinning, monotonic `sign_count` clone detection), then
+  atomically consume the five-minute challenge through
+  `consume_challenge_atomically`, and only then authenticate/create the
+  session. A failed verification never consumes a challenge. RP policy:
+  **user verification
   is required** (authenticatorData UV flag, plus `userVerification:
   "required"` requested by the web client) because the passkey is the only
   primary factor and login is usernameless; a presence-only tap never
