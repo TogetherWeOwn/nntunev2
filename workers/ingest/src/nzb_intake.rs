@@ -175,6 +175,31 @@ fn find_bytes(bytes: &[u8], needle: &[u8], from: usize) -> Option<usize> {
         .map(|offset| from + offset)
 }
 
+/// Skip an XML declaration, including a DOCTYPE internal subset.
+fn skip_declaration(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start + 2;
+    let mut quote = None;
+    let mut subset_depth = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(open) = quote {
+            if b == open {
+                quote = None;
+            }
+        } else if b == b'\'' || b == b'"' {
+            quote = Some(b);
+        } else if b == b'[' {
+            subset_depth += 1;
+        } else if b == b']' {
+            subset_depth = subset_depth.saturating_sub(1);
+        } else if b == b'>' && subset_depth == 0 {
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Return the next opening XML tag, skipping comments, CDATA, processing
 /// instructions, declarations, and closing tags. The returned end offset is
 /// past `>` so subsequent scans never revisit the tag or its attributes.
@@ -198,30 +223,7 @@ fn next_open_tag(body: &str, mut i: usize) -> Option<OpenTag> {
             continue;
         }
         if bytes[i..].starts_with(b"<!") {
-            let mut j = i + 2;
-            let mut quote = None;
-            let mut subset_depth = 0usize;
-            while j < bytes.len() {
-                let b = bytes[j];
-                if let Some(open) = quote {
-                    if b == open {
-                        quote = None;
-                    }
-                } else if b == b'\'' || b == b'"' {
-                    quote = Some(b);
-                } else if b == b'[' {
-                    subset_depth += 1;
-                } else if b == b']' {
-                    subset_depth = subset_depth.saturating_sub(1);
-                } else if b == b'>' && subset_depth == 0 {
-                    break;
-                }
-                j += 1;
-            }
-            if j >= bytes.len() {
-                return None;
-            }
-            i = j + 1;
+            i = skip_declaration(bytes, i)?;
             continue;
         }
         if bytes[i..].starts_with(b"</") {
@@ -355,26 +357,10 @@ fn check_well_formed(body: &str) -> bool {
                 None => return false,
             }
         } else if rest.starts_with("<!") {
-            // DOCTYPE and other declarations: skip to the first unquoted `>`.
-            let mut j = i + 2;
-            let mut q: Option<u8> = None;
-            while j < bytes.len() {
-                let b = bytes[j];
-                if let Some(open) = q {
-                    if b == open {
-                        q = None;
-                    }
-                } else if b == b'"' || b == b'\'' {
-                    q = Some(b);
-                } else if b == b'>' {
-                    break;
-                }
-                j += 1;
+            match skip_declaration(bytes, i) {
+                Some(end) => i = end,
+                None => return false,
             }
-            if j >= bytes.len() {
-                return false;
-            }
-            i = j + 1;
         } else if rest.starts_with("</") {
             let mut j = skip_ws(bytes, i + 2);
             let name_end = match read_name(bytes, j) {
@@ -779,6 +765,16 @@ mod tests {
             estimate_nzb("<?xml?><nzb><segment bytes=\"lots\">x@y</segment></nzb>").unwrap_err(),
             IntakeRejection::Malformed
         );
+    }
+
+    #[test]
+    fn unterminated_doctype_subset_is_malformed_before_counting_elements() {
+        let mut doc = String::from("<?xml?><!DOCTYPE nzb [>");
+        for _ in 0..(MAX_SEGMENTS + 1) {
+            doc.push_str("<segment>");
+        }
+
+        assert_eq!(estimate_nzb(&doc), Err(IntakeRejection::Malformed));
     }
 
     #[test]
