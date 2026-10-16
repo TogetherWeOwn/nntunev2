@@ -1,7 +1,11 @@
 # Fixture ops inventory (synthetic; proves the binding-parity CI job)
 
-Hyperdrive ids for this fixture: `fixture-hyperdrive-staging` (staging)
-and `fixture-hyperdrive-prod` (prod).
+### Hyperdrive bindings
+
+| Config | ID | Intended binding |
+|---|---|---|
+| `demo-staging` | `fixture-hyperdrive-staging` | staging app |
+| `demo-prod` | `fixture-hyperdrive-prod` | prod app |
 
 ## Environments matrix
 

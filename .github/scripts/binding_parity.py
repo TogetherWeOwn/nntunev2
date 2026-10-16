@@ -11,18 +11,19 @@ Three facts are diffed, for staging AND prod:
   1. The manifest (``binding_manifest.toml`` next to this script) maps each
      worker config to the bindings it is required to declare, by binding
      name and type (R2, KV, Queues, Hyperdrive, Analytics Engine, Durable
-     Objects, services, assets, D1). Every ``workers/*/wrangler.toml*`` and
-     ``apps/*/wrangler.toml*`` file must be mapped, and every active binding
+     Objects, services, assets, D1). Every ``workers/**/wrangler.*`` and
+     ``apps/**/wrangler.*`` file must be mapped, and every active binding
      found in a config must be claimed by the manifest.
-  2. The wrangler configs themselves. Effective bindings per environment
-     are the top-level bindings overridden by ``[env.staging]`` /
-     ``[env.production]`` bindings of the same name and type. The binding
+  2. The wrangler configs themselves. Cloudflare environment bindings are
+     non-inheritable: staging and production must each declare their own
+     bindings. The top-level ``assets`` binding is the documented exception.
+     Example templates retain their template-level declarations. The binding
      (name, type) sets must be identical across staging and prod — any
      difference is reported as staging/prod skew.
   3. The provisioned inventory in ``docs/ops.md``. Where the manifest names
      the expected resource for an environment, that resource must appear in
-     the ops inventory for that environment (the Environments matrix for
-     resource names; the resource tables for KV/Hyperdrive ids), and a
+     that environment's ops inventory (the Environments matrix for resource
+     names; environment-scoped KV/Hyperdrive rows for ids), and a
      non-placeholder resource value in the wrangler config must equal it.
 
 Template configs (``wrangler.toml.example``) may declare a binding in a
@@ -81,12 +82,7 @@ RESOURCE_KEY = {
 # printed: CI logs on this repo are public.
 ID_TYPES = frozenset({"kv", "hyperdrive"})
 
-CONFIG_GLOBS = (
-    "workers/*/wrangler.toml",
-    "workers/*/wrangler.toml.example",
-    "apps/*/wrangler.toml",
-    "apps/*/wrangler.toml.example",
-)
+CONFIG_ROOTS = ("workers", "apps")
 
 
 class ParityError(Exception):
@@ -284,16 +280,22 @@ def parse_config(path):
         raise ParityError(f"{path}: {exc}") from exc
     except (AttributeError, TypeError) as exc:
         raise ParityError(f"{path}: malformed wrangler table shape ({exc})") from exc
-    effective = {env: {**top, **per_env.get(env, {})} for env in ENVS}
+    template = path.name.endswith(".example")
+    top_level_assets = {key: item for key, item in top.items() if item["type"] == "assets"}
+    effective = {}
+    for env in ENVS:
+        # Templates describe the deploy contract, so their top-level declarations
+        # remain representative. Real Worker environments do not inherit bindings.
+        base = top if template else top_level_assets
+        effective[env] = {**base, **per_env.get(env, {})}
     return effective, unknown
 
 
 def parse_ops_inventory(text, source="docs/ops.md"):
-    """Return ({env: resource-name set}, {every backticked token}).
+    """Return ({env: resource-name set}, {env: resource-id set}).
 
-    Resource names come from the Environments matrix columns; the full
-    token set backs the id-typed inventory check (KV/Hyperdrive ids are
-    listed in their own tables, not the matrix).
+    Resource names come from the Environments matrix columns. KV and
+    Hyperdrive ids are collected only from table rows belonging to an env.
     """
     match = re.search(r"^## Environments matrix\s*$", text, re.MULTILINE)
     if not match:
@@ -311,7 +313,39 @@ def parse_ops_inventory(text, source="docs/ops.md"):
             inventory[env].update(re.findall(r"`([^`]+)`", cell))
     if not any(inventory.values()):
         raise ParityError(f"{source}: Environments matrix has no resources")
-    return inventory, set(re.findall(r"`([^`]+)`", text))
+
+    ids = {env: set() for env in ENVS}
+    for heading, kind in (("KV namespaces", "kv"), ("Hyperdrive bindings", "hyperdrive")):
+        section_match = re.search(
+            rf"^### {re.escape(heading)}\s*$", text, re.MULTILINE
+        )
+        if not section_match:
+            continue
+        section = text[section_match.end():]
+        next_heading = re.search(r"^#{2,3} ", section, re.MULTILINE)
+        if next_heading:
+            section = section[:next_heading.start()]
+        for line in section.splitlines():
+            cells = [cell.strip() for cell in line.split("|")]
+            if len(cells) < 3:
+                continue
+            row = " ".join(cells)
+            tokens = set(re.findall(r"`([^`]+)`", row))
+            if kind == "kv":
+                env_cell = cells[-2].lower() if len(cells) >= 4 else ""
+                for env in ENVS:
+                    if env in env_cell:
+                        ids[env].update(tokens)
+            else:
+                config = cells[1].lower() if len(cells) > 1 else ""
+                if "staging" in config:
+                    ids["staging"].update(tokens)
+                elif "prod" in config:
+                    ids["prod"].update(tokens)
+                elif "mb" in config:
+                    ids["staging"].update(tokens)
+                    ids["prod"].update(tokens)
+    return inventory, ids
 
 
 def load_manifest(path):
@@ -407,15 +441,21 @@ def check(root, manifest_path, ops_path):
         ops_text = ops_path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise ParityError(f"{ops_path}: cannot read inventory ({exc})") from exc
-    inventory, all_tokens = parse_ops_inventory(ops_text, str(ops_path))
+    inventory, id_inventory = parse_ops_inventory(ops_text, str(ops_path))
 
     drifts, warnings = [], []
     used_known_drift = set()
 
     mapped = {w["config"] for w in workers}
     on_disk = set()
-    for pattern in CONFIG_GLOBS:
-        on_disk.update(p.relative_to(root).as_posix() for p in root.glob(pattern))
+    for directory in CONFIG_ROOTS:
+        config_root = root / directory
+        if config_root.is_dir():
+            on_disk.update(
+                p.relative_to(root).as_posix()
+                for p in config_root.rglob("wrangler.*")
+                if p.is_file()
+            )
     for config in sorted(on_disk - mapped):
         drifts.append(
             _fmt(config, "-", "-", "-", "wrangler config is not mapped in the manifest")
@@ -441,11 +481,12 @@ def check(root, manifest_path, ops_path):
                 if expected is None:
                     continue
                 if binding["type"] in ID_TYPES:
-                    if expected not in all_tokens:
+                    if expected not in id_inventory[env]:
                         drifts.append(
                             _fmt(
                                 name, env, binding["binding"], binding["type"],
-                                "manifest inventory id is absent from the ops inventory",
+                                "manifest inventory id is absent from the ops inventory for "
+                                f"{env}",
                             )
                         )
                 elif expected not in inventory[env]:

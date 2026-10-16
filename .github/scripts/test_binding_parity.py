@@ -29,7 +29,12 @@ REPO_ROOT = SCRIPTS.parents[1]
 
 OPS_MD = """# fixture ops
 
-Hyperdrive ids: `fx-hd-staging`, `fx-hd-prod`.
+### Hyperdrive bindings
+
+| Config | ID | Intended binding |
+|---|---|---|
+| `demo-staging` | `fx-hd-staging` | staging app |
+| `demo-prod` | `fx-hd-prod` | prod app |
 
 ## Environments matrix
 
@@ -133,10 +138,12 @@ class TestFixtureRepos(unittest.TestCase):
 
 class TestOpsInventoryParsing(unittest.TestCase):
     def test_matrix_columns_map_to_envs(self):
-        inventory, tokens = parse_ops_inventory(OPS_MD)
+        inventory, ids = parse_ops_inventory(OPS_MD)
         self.assertEqual({"fx-audio-staging"}, inventory["staging"])
         self.assertEqual({"fx-audio-prod"}, inventory["prod"])
-        self.assertIn("fx-hd-staging", tokens)
+        self.assertIn("fx-hd-staging", ids["staging"])
+        self.assertNotIn("fx-hd-prod", ids["staging"])
+        self.assertIn("fx-hd-prod", ids["prod"])
 
     def test_missing_matrix_fails_closed(self):
         with self.assertRaises(ParityError):
@@ -215,7 +222,7 @@ class TestDriftCases(unittest.TestCase):
 
     def test_unexpected_active_binding_is_drift(self):
         wrangler = MATCHING_WRANGLER + (
-            '\n[[kv_namespaces]]\nbinding = "SURPRISE"\nid = "fx-kv"\n'
+            '\n[[env.staging.kv_namespaces]]\nbinding = "SURPRISE"\nid = "fx-kv"\n'
         )
         with tempfile.TemporaryDirectory() as tmp:
             drifts, _, _ = run_check(make_repo(tmp, wrangler=wrangler))
@@ -231,6 +238,44 @@ class TestDriftCases(unittest.TestCase):
             (orphan / "wrangler.toml").write_text('name = "orphan"\n')
             drifts, _, _ = run_check(root)
             self.assertIn("workers/orphan/wrangler.toml", "\n".join(drifts))
+
+    def test_unmapped_jsonc_config_is_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp)
+            orphan = root / "workers" / "orphan"
+            orphan.mkdir()
+            (orphan / "wrangler.jsonc").write_text('{"name":"orphan"}')
+            drifts, _, _ = run_check(root)
+            self.assertIn("workers/orphan/wrangler.jsonc", "\n".join(drifts))
+
+    def test_real_config_does_not_inherit_top_level_bindings(self):
+        wrangler = (
+            'name = "demo"\n'
+            '[[r2_buckets]]\nbinding = "AUDIO_CACHE"\nbucket_name = "fx-audio-staging"\n'
+            '[[hyperdrive]]\nbinding = "DB"\nid = "fx-hd-staging"\n'
+            '[env.staging]\n'
+            '[[env.staging.r2_buckets]]\nbinding = "AUDIO_CACHE"\n'
+            'bucket_name = "fx-audio-staging"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            drifts, _, _ = run_check(make_repo(tmp, wrangler=wrangler))
+            joined = "\n".join(drifts)
+            self.assertIn("env=staging binding=DB", joined)
+            self.assertIn("env=prod binding=AUDIO_CACHE", joined)
+            self.assertIn("env=prod binding=DB", joined)
+
+    def test_id_inventory_is_environment_scoped(self):
+        swapped = MANIFEST.replace(
+            'staging = "fx-hd-staging"\nprod = "fx-hd-prod"',
+            'staging = "fx-hd-prod"\nprod = "fx-hd-staging"',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            drifts, _, _ = run_check(make_repo(tmp, manifest=swapped))
+            joined = "\n".join(drifts)
+            self.assertIn("env=staging binding=DB", joined)
+            self.assertIn("env=prod binding=DB", joined)
+            self.assertIn("absent from the ops inventory for staging", joined)
+            self.assertIn("absent from the ops inventory for prod", joined)
 
     def test_id_mismatch_never_prints_id_values(self):
         sentinel = "sentinel-id-value-must-not-print"
@@ -305,7 +350,7 @@ reason = "fixture: value fix owned elsewhere"
 
     def test_unknown_binding_table_is_flagged_not_ignored(self):
         wrangler = MATCHING_WRANGLER + (
-            '\n[[vectorize]]\nbinding = "SEARCH"\nindex_name = "fx-idx"\n'
+            '\n[[env.staging.vectorize]]\nbinding = "SEARCH"\nindex_name = "fx-idx"\n'
         )
         with tempfile.TemporaryDirectory() as tmp:
             drifts, _, _ = run_check(make_repo(tmp, wrangler=wrangler))

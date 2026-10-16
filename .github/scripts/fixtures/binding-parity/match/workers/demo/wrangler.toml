@@ -2,16 +2,16 @@ name = "fixture-demo"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
 
-[[kv_namespaces]]
+[env.staging]
+name = "fixture-demo-staging"
+
+[[env.staging.kv_namespaces]]
 binding = "STATE"
 id = "fixture-kv-id"
 
-[[analytics_engine_datasets]]
+[[env.staging.analytics_engine_datasets]]
 binding = "METER"
 dataset = "fixture_meter"
-
-[env.staging]
-name = "fixture-demo-staging"
 
 [[env.staging.r2_buckets]]
 binding = "AUDIO_CACHE"
@@ -27,6 +27,14 @@ queue = "fixture-ingest-staging"
 
 [env.production]
 name = "fixture-demo"
+
+[[env.production.kv_namespaces]]
+binding = "STATE"
+id = "fixture-kv-id"
+
+[[env.production.analytics_engine_datasets]]
+binding = "METER"
+dataset = "fixture_meter"
 
 [[env.production.r2_buckets]]
 binding = "AUDIO_CACHE"
