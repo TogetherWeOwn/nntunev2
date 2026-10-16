@@ -41,9 +41,23 @@ pub fn check_parsed(estimate: &IntakeEstimate, parsed: &ParsedNzb) -> Result<(),
     if parsed.segment_bytes.len() != parsed.segment_count {
         return Err("segment byte-range count must match the segment count");
     }
+    if parsed.file_segment_bytes.len() != parsed.file_count {
+        return Err("per-file byte-range group count must match the file count");
+    }
     let ranged: usize = parsed.file_segment_bytes.iter().map(|f| f.len()).sum();
     if ranged != parsed.segment_count {
         return Err("per-file byte-range count must match the segment count");
+    }
+    // The flat and per-file lists are two views of the same ranges: they
+    // must agree slot for slot in NZB order, not just in total count, or
+    // the stream path would range-seek the wrong segments.
+    if !parsed
+        .file_segment_bytes
+        .iter()
+        .flatten()
+        .eq(parsed.segment_bytes.iter())
+    {
+        return Err("per-file byte ranges must match the flat segment byte ranges in order");
     }
     // Missing metadata is explicit-unknown (None): a zero-filled Some(0)
     // must fail here rather than spend provider connections on an empty
@@ -109,6 +123,17 @@ fn bytes_attr(open_tag: &str) -> Option<u64> {
     let bytes = open_tag.as_bytes();
     let mut i = 0;
     while i + 5 <= bytes.len() {
+        // A `bytes` lookalike inside another attribute's quoted value is
+        // not an attribute name: skip quoted spans while scanning.
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let quote = bytes[i];
+            i += 1;
+            while i < bytes.len() && bytes[i] != quote {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
         if &bytes[i..i + 5] == b"bytes" {
             let prev_ok = i == 0 || !is_tag_name_char(bytes[i - 1]);
             if prev_ok {
@@ -152,6 +177,23 @@ fn bytes_attr(open_tag: &str) -> Option<u64> {
     None
 }
 
+/// Index of the `>` that ends an opening tag, ignoring any `>` inside a
+/// quoted attribute value (valid XML such as `note="a>b"`).
+fn opening_tag_end(tag: &str) -> Option<usize> {
+    let bytes = tag.as_bytes();
+    let mut quote: Option<u8> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'"' || b == b'\'' => quote = Some(b),
+            None if b == b'>' => return Some(i),
+            None => {}
+        }
+    }
+    None
+}
+
 /// Scan one document (or file-block) slice for `<segment>` opens in order,
 /// returning one slot per element.
 fn segment_bytes_in(slice: &str) -> Vec<Option<u64>> {
@@ -165,7 +207,7 @@ fn segment_bytes_in(slice: &str) -> Vec<Option<u64>> {
             continue;
         }
         let tag_rest = &rest[i..];
-        let Some(end) = tag_rest.find('>') else {
+        let Some(end) = opening_tag_end(tag_rest) else {
             break;
         };
         out.push(bytes_attr(&tag_rest[..end]));
@@ -257,6 +299,39 @@ mod tests {
         let mut bad_id = parsed_small();
         bad_id.message_ids[0].clear();
         assert!(check_parsed(&est, &bad_id).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_range_representations_that_disagree() {
+        let est = estimate_nzb(SMALL_NZB).unwrap();
+        // Same counts, but the per-file ranges assign different sizes to
+        // the segments than the flat list: the two representations must
+        // agree in order, not just in total length.
+        let mut reversed = parsed_small();
+        reversed.segment_bytes = vec![Some(100), Some(200)];
+        reversed.file_segment_bytes = vec![vec![Some(200), Some(100)]];
+        assert!(check_parsed(&est, &reversed).is_err());
+        // Flattened values agree, but the number of per-file groups must
+        // match the file count.
+        let mut wrong_groups = parsed_small();
+        wrong_groups.segment_bytes = vec![Some(100), Some(200)];
+        wrong_groups.file_segment_bytes = vec![vec![Some(100)], vec![Some(200)]];
+        assert!(check_parsed(&est, &wrong_groups).is_err());
+    }
+
+    #[test]
+    fn segment_ranges_parse_past_angle_brackets_in_quoted_attributes() {
+        // A `>` inside a quoted attribute value does not end the opening
+        // tag, and a `bytes=` lookalike inside a quoted value is not the
+        // segment's range.
+        let doc = r#"<nzb><file><segments>
+<segment note="a>b" bytes="100" number="1">seg-a1@synthetic.invalid</segment>
+<segment note='x>y' bytes='200' number="2">seg-a2@synthetic.invalid</segment>
+<segment note="bytes=999" bytes="300" number="3">seg-a3@synthetic.invalid</segment>
+</segments></file></nzb>"#;
+        let (flat, per_file) = parse_segment_byte_ranges(doc);
+        assert_eq!(flat, vec![Some(100), Some(200), Some(300)]);
+        assert_eq!(per_file, vec![vec![Some(100), Some(200), Some(300)]]);
     }
 
     #[test]
