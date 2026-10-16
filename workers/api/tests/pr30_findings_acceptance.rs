@@ -2333,13 +2333,16 @@ fn purpose_guard_migration_keeps_the_constraint_creation_strategy_pinned() {
             "conrelid = 'auth_challenges'::regclass and ",
             "conname = 'auth_challenges_purpose_check' ) then ",
             "alter table auth_challenges add constraint ",
-            "auth_challenges_purpose_check check (purpose in ('', '{}', '{}')); ",
+            "auth_challenges_purpose_check check (purpose in ('', '{}', '{}')) not valid; ",
             "end if; end $$;"
         ),
         handlers::PURPOSE_REGISTER,
         handlers::PURPOSE_LOGIN
     );
     assert!(normalized.contains(&expected_constraint_guard));
+    assert!(normalized.contains(
+        "alter table auth_challenges validate constraint auth_challenges_purpose_check"
+    ));
     assert!(normalized.contains(
         "if new.purpose is distinct from old.purpose then raise exception 'auth_challenges.purpose is immutable'"
     ));
