@@ -29,8 +29,21 @@ export class ApiError extends Error {
 	}
 }
 
+/** Documented re-auth code (S7): stale provider credential. */
+export const PROVIDER_AUTH_EXPIRED_CODE = 'provider_auth_expired';
+
+/** Documented re-key code (S7): stale indexer API key. Distinct from the
+ * provider code: the web app names the API key (never the password) for it. */
+export const INDEXER_AUTH_EXPIRED_CODE = 'indexer_auth_expired';
+
 export interface MagicLinkResult {
 	ok: true;
+	/**
+	 * Present on magic-link finish only: the signed-in account's own
+	 * email, echoed back so the web app can show "Signed in as …" before
+	 * any provider credential is typed (login-CSRF defense in depth).
+	 */
+	email?: string;
 }
 
 export interface IndexerConfigInput {
@@ -48,6 +61,32 @@ export interface ProviderTestInput {
 	password: string;
 	max_connections: number;
 	indexer?: IndexerConfigInput;
+}
+
+/**
+ * Save/test envelope the API Worker expects (`PUT /v1/vault`,
+ * `POST /v1/vault/test`): the flat provider fields nested under
+ * `provider`, exactly as `workers/api` parses `VaultPutBody`. Field names
+ * are pinned by `workers/api/tests/fixtures/api-web-contract.json`, which
+ * both the vitest client suite and the Rust handlers suite consume — change
+ * both sides in the same PR, never one alone.
+ */
+export interface VaultSaveBody {
+	provider: {
+		host: string;
+		port: number;
+		tls: boolean;
+		allow_insecure_plaintext: boolean;
+		username: string;
+		password: string;
+		max_connections: number;
+	};
+	indexer?: IndexerConfigInput;
+}
+
+export function toVaultSaveBody(input: ProviderTestInput): VaultSaveBody {
+	const { indexer, ...provider } = input;
+	return indexer === undefined ? { provider } : { provider, indexer };
 }
 
 export function toProviderTestInput(
@@ -75,6 +114,67 @@ export interface ProviderTestResult {
 	ok: boolean;
 	latencyMs?: number;
 	error?: string;
+}
+
+/** `POST /v1/auth/passkey/register/start` response (fixed shape, never an oracle). */
+export interface RegisterStartResponse {
+	challenge: string;
+	user_id: string;
+	rp_id: string;
+}
+
+/** `POST /v1/auth/passkey/login/start` response (empty allow-list by design). */
+export interface LoginStartResponse {
+	challenge: string;
+	allow_credentials: unknown[];
+	rp_id: string;
+}
+
+/**
+ * Inputs for the passkey finish calls. Pages pass camelCase fields and the
+ * builders below emit the snake_case wire body the Worker parses
+ * (`deny_unknown_fields`), so a renamed field fails type-checking in the
+ * page and the fixture test in the client — never silently in production.
+ * Wire shapes are pinned by `api-web-contract.json`.
+ */
+export interface RegisterFinishInput {
+	challenge: string;
+	credentialId: string;
+	attestationObject: string;
+	clientDataJson: string;
+	magicToken: string;
+	inviteCode?: string;
+}
+
+export interface LoginFinishInput {
+	challenge: string;
+	credentialId: string;
+	authenticatorData: string;
+	clientDataJson: string;
+	signature: string;
+}
+
+export function toRegisterFinishBody(input: RegisterFinishInput): Record<string, string> {
+	return {
+		challenge: input.challenge,
+		credential_id: input.credentialId,
+		attestation_object: input.attestationObject,
+		client_data_json: input.clientDataJson,
+		magic_token: input.magicToken,
+		...(input.inviteCode !== undefined && input.inviteCode.length > 0
+			? { invite_code: input.inviteCode }
+			: {})
+	};
+}
+
+export function toLoginFinishBody(input: LoginFinishInput): Record<string, string> {
+	return {
+		challenge: input.challenge,
+		credential_id: input.credentialId,
+		authenticator_data: input.authenticatorData,
+		client_data_json: input.clientDataJson,
+		signature: input.signature
+	};
 }
 
 export class ApiClient {
@@ -106,12 +206,63 @@ export class ApiClient {
 		});
 	}
 
+	async put<T>(path: string, body: unknown): Promise<T> {
+		return this.request<T>(path, {
+			method: 'PUT',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+	}
+
 	/**
 	 * Request an email magic link. Always resolves the same way for unknown
 	 * and known addresses (the API never reveals which emails exist).
 	 */
 	async requestMagicLink(email: string): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>('/v1/auth/magic-link', { email });
+		return this.post<MagicLinkResult>('/v1/auth/magic/start', { email });
+	}
+
+	/** Redeem an emailed magic-link token (the `/auth/magic` page). */
+	async finishMagicLink(token: string): Promise<MagicLinkResult> {
+		return this.post<MagicLinkResult>('/v1/auth/magic/finish', { token });
+	}
+
+	/**
+	 * Sign out of the current session. The server revokes the session and
+	 * clears the HttpOnly cookie; the caller also drops its display-only
+	 * identity label (see `signed-in-email.ts`). Used by the `/auth/magic`
+	 * error state so a session-swapped user can sign out and redeem the
+	 * other account's link — the server's magic-finish rejection stays a
+	 * generic 401 either way.
+	 */
+	async logout(): Promise<void> {
+		await this.post<unknown>('/v1/session/logout', {});
+	}
+
+	/** Start passkey enrollment; the API also mails the inbox-proof code. */
+	async registerStart(email: string): Promise<RegisterStartResponse> {
+		return this.post<RegisterStartResponse>('/v1/auth/passkey/register/start', { email });
+	}
+
+	/** Finish passkey enrollment with the attestation + emailed code. */
+	async registerFinish(input: RegisterFinishInput): Promise<MagicLinkResult> {
+		return this.post<MagicLinkResult>(
+			'/v1/auth/passkey/register/finish',
+			toRegisterFinishBody(input)
+		);
+	}
+
+	/** Start passkey login for an email (empty allow-list response). */
+	async loginStart(email: string): Promise<LoginStartResponse> {
+		return this.post<LoginStartResponse>('/v1/auth/passkey/login/start', { email });
+	}
+
+	/** Finish passkey login with the assertion. */
+	async loginFinish(input: LoginFinishInput): Promise<MagicLinkResult> {
+		return this.post<MagicLinkResult>(
+			'/v1/auth/passkey/login/finish',
+			toLoginFinishBody(input)
+		);
 	}
 
 	/**
@@ -120,7 +271,7 @@ export class ApiClient {
 	 * secrets never come back in the response.
 	 */
 	async testProviderConnection(input: ProviderTestInput): Promise<ProviderTestResult> {
-		return this.post<ProviderTestResult>('/v1/vault/test', input);
+		return this.post<ProviderTestResult>('/v1/vault/test', toVaultSaveBody(input));
 	}
 
 	/**
@@ -129,7 +280,7 @@ export class ApiClient {
 	 * redacted summaries, never secret material.
 	 */
 	async saveProviderConfig(input: ProviderTestInput): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>('/v1/vault', input);
+		return this.put<MagicLinkResult>('/v1/vault', toVaultSaveBody(input));
 	}
 
 	private async request<T>(path: string, init: RequestInit): Promise<T> {
@@ -145,12 +296,21 @@ export class ApiClient {
 			credentials: 'include'
 		});
 		if (!response.ok) {
-			throw new ApiError(response.status, this.errorCode(response.status), await this.message(response));
+			const body = await this.readErrorBody(response);
+			throw new ApiError(response.status, this.errorCode(response.status, body), this.message(response.status, body));
 		}
 		return (await response.json()) as T;
 	}
 
-	private errorCode(status: number): string {
+	private errorCode(status: number, body: { error?: unknown; code?: unknown }): string {
+		// The re-auth codes travel in the body (`{ error: "provider_auth_expired" }`
+		// or `{ error: "indexer_auth_expired" }` with HTTP 401); they take
+		// precedence over the status mapping so the UI renders the inline
+		// re-auth prompt instead of a generic signed-out page.
+		for (const field of [body.code, body.error] as unknown[]) {
+			if (field === PROVIDER_AUTH_EXPIRED_CODE) return PROVIDER_AUTH_EXPIRED_CODE;
+			if (field === INDEXER_AUTH_EXPIRED_CODE) return INDEXER_AUTH_EXPIRED_CODE;
+		}
 		if (status === 401) return 'unauthorized';
 		if (status === 403) return 'forbidden';
 		if (status === 404) return 'not_found';
@@ -158,13 +318,18 @@ export class ApiClient {
 		return 'request_failed';
 	}
 
-	private async message(response: Response): Promise<string> {
+	private async readErrorBody(response: Response): Promise<{ error?: unknown; code?: unknown }> {
 		try {
-			const body = (await response.json()) as { error?: unknown };
-			if (typeof body.error === 'string' && body.error.length > 0) return body.error;
+			const body = (await response.json()) as { error?: unknown; code?: unknown };
+			if (body !== null && typeof body === 'object') return body;
 		} catch {
-			// Fall through to the status-based message below.
+			// Fall through to the empty body below.
 		}
-		return `request failed with status ${response.status}`;
+		return {};
+	}
+
+	private message(status: number, body: { error?: unknown }): string {
+		if (typeof body.error === 'string' && body.error.length > 0) return body.error;
+		return `request failed with status ${status}`;
 	}
 }
