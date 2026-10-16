@@ -1,0 +1,30 @@
+# Fixture manifest for the binding-parity match case.
+[[worker]]
+name = "demo"
+config = "workers/demo/wrangler.toml"
+
+[[worker.binding]]
+binding = "AUDIO_CACHE"
+type = "r2"
+staging = "fixture-audio-staging"
+prod = "fixture-audio-prod"
+
+[[worker.binding]]
+binding = "STATE"
+type = "kv"
+
+[[worker.binding]]
+binding = "DB"
+type = "hyperdrive"
+staging = "fixture-hyperdrive-staging"
+prod = "fixture-hyperdrive-prod"
+
+[[worker.binding]]
+binding = "JOBS"
+type = "queue_producer"
+staging = "fixture-ingest-staging"
+prod = "fixture-ingest-prod"
+
+[[worker.binding]]
+binding = "METER"
+type = "analytics_engine"

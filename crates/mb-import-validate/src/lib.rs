@@ -256,9 +256,14 @@ impl FieldKind {
 /// control character or byte.
 fn check_escapes(value: &str) -> Result<(), &'static str> {
     let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
+        if bytes[i] == b'\r' {
+            return Err(reason::BAD_ESCAPE);
+        }
         if bytes[i] != b'\\' {
+            decoded.push(bytes[i]);
             i += 1;
             continue;
         }
@@ -267,39 +272,52 @@ fn check_escapes(value: &str) -> Result<(), &'static str> {
             return Err(reason::BAD_ESCAPE);
         }
         match bytes[i] {
-            b'b' | b'f' | b'n' | b'r' | b't' | b'v' | b'\\' => i += 1,
+            b'b' => decoded.push(0x08),
+            b'f' => decoded.push(0x0c),
+            b'n' => decoded.push(b'\n'),
+            b'r' => decoded.push(b'\r'),
+            b't' => decoded.push(b'\t'),
+            b'v' => decoded.push(0x0b),
+            b'\\' => decoded.push(b'\\'),
             b'0'..=b'7' => {
-                // Octal byte: up to 3 octal digits total (COPY is greedy),
-                // and the value must fit in one byte (`\400` is no byte, so
-                // it is poison rather than a chunk-aborting COPY error).
-                let mut value: u32 = (bytes[i] - b'0') as u32;
+                // Octal byte: up to 3 octal digits total (COPY is greedy).
+                let mut byte = (bytes[i] - b'0') as u32;
                 i += 1;
                 for _ in 0..2 {
                     if i < bytes.len() && bytes[i].is_ascii_digit() && bytes[i] < b'8' {
-                        value = value * 8 + (bytes[i] - b'0') as u32;
+                        byte = byte * 8 + (bytes[i] - b'0') as u32;
                         i += 1;
                     } else {
                         break;
                     }
                 }
-                if value > 0o377 {
+                if byte > 0o377 {
                     return Err(reason::BAD_ESCAPE);
                 }
+                decoded.push(byte as u8);
+                continue;
             }
             b'x' => {
                 // Hex byte: `\x` requires 1-2 hex digits.
                 i += 1;
-                let mut digits = 0;
-                while digits < 2 && i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                let start = i;
+                let mut byte = 0;
+                while i < bytes.len() && i - start < 2 && bytes[i].is_ascii_hexdigit() {
+                    byte = byte * 16 + (bytes[i] as char).to_digit(16).unwrap() as u8;
                     i += 1;
-                    digits += 1;
                 }
-                if digits == 0 {
+                if i == start {
                     return Err(reason::BAD_ESCAPE);
                 }
+                decoded.push(byte);
+                continue;
             }
             _ => return Err(reason::BAD_ESCAPE),
         }
+        i += 1;
+    }
+    if decoded.contains(&0) || std::str::from_utf8(&decoded).is_err() {
+        return Err(reason::BAD_ESCAPE);
     }
     Ok(())
 }
@@ -379,7 +397,8 @@ fn split_zone(value: &str) -> Option<String> {
         } else {
             0
         };
-        if hh <= 23 && mm <= 59 {
+        // PostgreSQL rejects timezone displacements above 15 hours.
+        if hh <= 15 && mm <= 59 {
             return Some(bare.to_string());
         }
         return None;
@@ -582,6 +601,7 @@ mod tests {
             "2024-05-01T12:00:00+0560",
             "2024-05-01T12:00:00+05:60",
             "2024-05-01T12:00:00+05::30",
+            "2024-05-01T12:00:00+16:00",
         ] {
             assert!(
                 validate_line(Table::Artist, 1, &artist_line(MBID, ts)).is_err(),
@@ -621,7 +641,7 @@ mod tests {
     fn copy_text_octal_hex_match_postgres_docs() {
         // Octal `\` + 1-3 octal digits and hex `\x` + 1-2 hex digits are
         // real COPY text escapes (sql-copy.html) and must validate.
-        for esc in ["\\0", "\\7", "\\40", "\\101", "\\x4", "\\x41", "\\x4a"] {
+        for esc in ["\\7", "\\40", "\\101", "\\x4", "\\x41", "\\x4a"] {
             let raw = artist_line(MBID, TS).replacen("The Band", &format!("A {esc} B"), 1);
             assert!(
                 validate_line(Table::Artist, 1, &raw).is_ok(),
@@ -634,6 +654,7 @@ mod tests {
         // poison for operator review instead of silent mangling.
         for esc in [
             "\\o", "\\o141", "\\u", "\\u0041", "\\x", "\\xZZ", "\\8", "\\9", "\\400", "\\777",
+            "\\0", "\\00", "\\000", "\\x0", "\\x00", "\\xff", "\\200", "\\377", "\\xc3",
         ] {
             let raw = artist_line(MBID, TS).replacen("The Band", &format!("A {esc} B"), 1);
             assert_eq!(
@@ -642,6 +663,12 @@ mod tests {
                 "{esc} should be poison"
             );
         }
+        let raw = artist_line(MBID, TS).replacen("The Band", "A embedded\r carriage return B", 1);
+        assert_eq!(
+            validate_line(Table::Artist, 1, &raw),
+            Err((reason::BAD_ESCAPE, 1)),
+            "an embedded carriage return should be poison"
+        );
     }
 
     #[test]

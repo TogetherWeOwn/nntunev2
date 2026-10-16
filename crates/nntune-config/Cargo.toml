@@ -1,0 +1,9 @@
+[package]
+name = "nntune-config"
+version = "0.1.0"
+edition = "2021"
+description = "Typed accessor for the versioned NNTune v2 KV config schema (native + wasm32)"
+license = "MIT"
+
+[dev-dependencies]
+serde_json = "1"

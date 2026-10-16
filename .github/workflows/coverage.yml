@@ -1,0 +1,75 @@
+name: Rust coverage summary
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    name: Rust line coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Pinned SHAs: stable toolchain HEAD (2026-10-09) and cargo-llvm-cov v0.6.21.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        with:
+          tool: cargo-llvm-cov@0.6.21
+
+      - name: Coverage for root workspace
+        run: cargo llvm-cov --workspace --lcov --output-path coverage-root.lcov
+
+      - name: Coverage for standalone crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          for crate in api ingest mb; do
+            cargo llvm-cov --manifest-path "workers/${crate}/Cargo.toml" \
+              --lcov --output-path "coverage-${crate}.lcov"
+          done
+
+      - name: Write line coverage summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '| Crate | Lines found | Lines hit | Line coverage |\n' >> "$GITHUB_STEP_SUMMARY"
+          printf '| --- | ---: | ---: | ---: |\n' >> "$GITHUB_STEP_SUMMARY"
+          for crate in root api ingest mb; do
+            report="coverage-${crate}.lcov"
+            if [[ ! -s "$report" ]]; then
+              echo "Coverage report for ${crate} is missing or empty: ${report}" >&2
+              exit 1
+            fi
+            read -r found hit < <(awk -F: '
+              /^LF:/ { found += $2 }
+              /^LH:/ { hit += $2 }
+              END { printf "%d %d\n", found, hit }
+            ' "$report")
+            if (( found <= 0 )); then
+              echo "Coverage report for ${crate} contains no instrumented lines: ${report}" >&2
+              exit 1
+            fi
+            if (( hit < 0 || hit > found )); then
+              echo "Coverage report for ${crate} has invalid hit count ${hit} for ${found} lines: ${report}" >&2
+              exit 1
+            fi
+            percent=$(awk -v hit="$hit" -v found="$found" 'BEGIN { printf "%.1f%%", 100 * hit / found }')
+            printf '| `%s` | %s | %s | %s |\n' "$crate" "$found" "$hit" "$percent" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rust-coverage-lcov
+          path: coverage-*.lcov
+          if-no-files-found: error
+          retention-days: 14

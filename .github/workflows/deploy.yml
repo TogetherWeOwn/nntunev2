@@ -13,7 +13,11 @@ name: deploy
 # - Worker staging deploys are intentionally NOT wired here yet: no Worker
 #   has a deployable entry point on main (api/ingest are logic crates;
 #   stream/mb do not exist yet). Each Worker card adds its entry,
-#   wrangler config and deploy job when it lands.
+#   wrangler config and deploy job when it lands. When the API Worker
+#   deploy job lands, it must call
+#   workers/api/check_hyperdrive_cache.sh --config-id $HYPERDRIVE_ID_STAGING
+#   (and prod) with CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID set and fail
+#   the deploy on non-zero exit (auth reads require a cache-disabled config).
 # - Public-repo note: fork PRs get no secrets, so preview skips there too.
 
 on:
