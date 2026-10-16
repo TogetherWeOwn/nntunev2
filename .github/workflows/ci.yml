@@ -66,6 +66,7 @@ jobs:
       # Scalar core (no transport features) and the Workers transport build.
       - run: cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
       - run: cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features --features worker-transport
+      - run: cargo check -p nntune-config --target wasm32-unknown-unknown
       # The simd128 yEnc fast path must keep compiling (Workers run V8 with
       # Wasm SIMD; the deploy enables it via this RUSTFLAGS).
       - run: RUSTFLAGS="-C target-feature=+simd128" cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features

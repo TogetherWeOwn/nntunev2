@@ -5,5 +5,5 @@ edition = "2021"
 description = "Typed accessor for the versioned NNTune v2 KV config schema (native + wasm32)"
 license = "MIT"
 
-[dependencies]
+[dev-dependencies]
 serde_json = "1"

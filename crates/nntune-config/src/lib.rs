@@ -579,7 +579,10 @@ mod tests {
             .get("keys")
             .and_then(serde_json::Value::as_object)
             .expect("keys object");
-        assert_eq!(keys.len(), KEYS.len(), "schema/code key count drift");
+        let schema_names: std::collections::HashSet<_> = keys.keys().map(String::as_str).collect();
+        let code_names: std::collections::HashSet<_> = KEYS.iter().map(|spec| spec.name).collect();
+        assert_eq!(code_names.len(), KEYS.len(), "duplicate key in code table");
+        assert_eq!(schema_names, code_names, "schema/code key set drift");
         for spec in KEYS {
             let entry = keys
                 .get(spec.name)
