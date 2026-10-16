@@ -93,6 +93,28 @@ behaviour.
 - Headers: every play carries `Cache-Status: HIT|MISS|STALE` and
   `Age: <seconds-since-write>` (see `PlayResponse::cache_headers`).
 
+## Play grants: TTL cap and clock skew (grant.rs)
+
+Play grants (`v1.<payload>.<hmac-sha256>`) are short-lived bearer tokens:
+a captured grant must stop replaying soon after issuance.
+
+- `MAX_GRANT_TTL` = 900 s (15 min): the maximum grant lifetime.
+- `CLOCK_SKEW_SECS` = 60 s: bounded clock-skew allowance. An issuer whose
+  clock runs ahead of the verifier's produces grants that read as
+  over-cap; up to 60 s of skew still verifies.
+- Issuance clamps: `issue_at(user, track, now, ttl)` mints
+  `exp = now + min(ttl, MAX_GRANT_TTL)` (saturating near `u64::MAX`), so a
+  request beyond the cap is clamped to it rather than minted long-lived.
+- Verification rejects: `verify` checks the signature first, then expiry
+  (`now >= exp` stays `Expired` — skew never resurrects a grant), then the
+  cap. A validly-signed, unexpired grant with `exp - now` beyond
+  `MAX_GRANT_TTL + CLOCK_SKEW_SECS` (960 s) is rejected with the distinct
+  code `GrantError::TtlTooLong`, so "minted too long" is distinguishable
+  from `Expired`, `BadSignature` and `Malformed` in logs and callers. The
+  play path surfaces it as `PlayError::Unauthorized(TtlTooLong)` without
+  dialing out. Wrong-track binding is still rejected (`WrongTrack`) for
+  within-cap grants.
+
 ## TTFB targets
 
 First-byte latency is measured by `tests/stream_integration.rs`
