@@ -6,7 +6,10 @@ description = "NNTune v2 MusicBrainz mirror read API (Cloudflare Worker, Rust wo
 license = "MIT"
 
 [lib]
-crate-type = ["cdylib"]
+# `cdylib` is the Worker deploy target; `rlib` lets integration tests
+# (workers/mb/tests) link the crate (workers/api precedent).
+name = "nntune_mb"
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 worker = { version = "0.8", features = ["http", "tokio-postgres"] }

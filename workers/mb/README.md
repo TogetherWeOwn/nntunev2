@@ -10,7 +10,7 @@ Decision: `docs/adr/0007-mb-mirror.md`.
 |---|---|---|
 | `GET` | `/healthz` | Unauthenticated Worker health check; `{"ok":true}`, `Cache-Control: no-store`; does not access bindings |
 | `GET` | `/v1/mb/artist/:mbid` | Artist lookup over Hyperdrive (`MB_DB`); success `Cache-Control: public, max-age=86400` |
-| `GET` | `/v1/mb/release/:mbid` | Release lookup (includes `caa_url` when art is cached); same caching as artist |
+| `GET` | `/v1/mb/release/:mbid` | Release lookup (includes the stored `caa_url`); same caching as artist |
 | `GET` | `/v1/mb/recording/:mbid` | Recording lookup; same caching as artist |
 | `GET` | `/v1/mb/search?q=&type=` | `type` in `artist\|release\|recording`; `q` 2-100 chars; trigram (`pg_trgm`) ordered by similarity, `LIMIT 25`; success `Cache-Control: public, max-age=300` |
 
@@ -33,10 +33,15 @@ search success is `{"q", "type", "results": [{"mbid", "name"|"title",
   400/404/500 responses are `no-store` and written to neither cache.
   KV failures degrade to plain DB reads; a missing `MB_CACHE` binding
   disables KV, a missing/unreachable `MB_DB` yields the generic `500`.
-- Cover art bytes live in the per-environment R2 art buckets
-  (`nntunev2-art-staging` / `nntunev2-art-prod`,
-  `art/{hh}/{hh}/{sha}-{size}`, ADR 0003); this worker returns URLs,
-  never proxies full images inline.
+- Release responses currently preserve the stored `caa_url` unchanged, so
+  lookup cache keys remain environment-independent. When public R2 hosts are
+  activated and URLs become environment-specific, include the environment in
+  lookup cache keys before rewriting `caa_url`.
+- Cover art bytes are intended for the per-environment R2 art buckets
+  (`nntunev2-art-staging` / `nntunev2-art-prod`, `docs/ops.md` inventory;
+  keys `art/{hh}/{hh}/{sha}-{size}`, ADR 0003). Public release `caa_url`
+  generation remains deferred until bucket bindings and public hosts are
+  activated; this worker never proxies full images inline.
 
 ## p95 methodology (acceptance input)
 

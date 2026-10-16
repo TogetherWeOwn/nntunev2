@@ -294,8 +294,17 @@ test('magic-link redemption invalidates another tab library snapshot', async ({ 
 			body: JSON.stringify({ ok: true, email: 'new-account@example.test' })
 		})
 	);
+	// Keep this test focused on cross-tab cache invalidation, not the destination page.
+	await magicTab.route('**/onboarding/provider', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'text/html',
+			body: '<!doctype html><html><body></body></html>'
+		})
+	);
 	await magicTab.goto('/auth/magic?token=test-magic-token');
 	await magicTab.getByRole('button', { name: 'Sign in with this link' }).click();
+	await expect(magicTab).toHaveURL(/\/onboarding\/provider$/);
 
 	await expect(page.getByRole('alert')).toContainText(/session changed/i);
 	await expect(page.getByTestId('library-list')).toHaveCount(0);

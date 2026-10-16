@@ -172,6 +172,14 @@
 		<Artwork src="/api/demo/missing-artwork.jpg" alt="Broken demo artwork" />
 	</div>
 
+	<div data-testid="fallback-failure-artwork">
+		<Artwork
+			src="/api/demo/missing-artwork.jpg"
+			fallbackSrc="/api/demo/fallback-artwork.jpg"
+			alt="Fallback failure artwork"
+		/>
+	</div>
+
 	<p data-testid="now-playing">
 		{#if current}
 			Now playing: {current.title} — {current.artist}

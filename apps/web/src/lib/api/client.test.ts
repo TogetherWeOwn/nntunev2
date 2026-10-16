@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { ApiClient, ApiError, toProviderTestInput, toVaultSaveBody } from './client.js';
+import { KNOWN_ERROR_CODES } from './errors.js';
+import apiErrorsRaw from '../../../../../docs/api-errors.md?raw';
 // Canonical web/Worker contract, shared with the Rust handlers suite (which
 // asserts every route is served). Change both sides in the same PR.
 import contractRaw from '../../../../../workers/api/tests/fixtures/api-web-contract.json?raw';
@@ -15,6 +17,12 @@ interface ContractRoute {
 }
 
 const contract = JSON.parse(contractRaw) as { version: number; routes: ContractRoute[] };
+const documentedErrorCodes = new Set(
+	apiErrorsRaw.split('\n').flatMap((line) => {
+		const code = line.match(/^\| `([^`]+)` \|/)?.[1];
+		return code ? [code] : [];
+	})
+);
 
 function jsonResponse(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {
@@ -22,6 +30,12 @@ function jsonResponse(body: unknown, status = 200): Response {
 		headers: { 'content-type': 'application/json' }
 	});
 }
+
+describe('API error code registry', () => {
+	it('keeps the web parser codes aligned with docs/api-errors.md', () => {
+		expect([...KNOWN_ERROR_CODES].sort()).toEqual([...documentedErrorCodes].sort());
+	});
+});
 
 describe('toProviderTestInput', () => {
 	it('trims the provider host to match validation and server rules', () => {
@@ -140,6 +154,60 @@ describe('ApiClient', () => {
 		expect((failure as ApiError).status).toBe(500);
 	});
 
+	it('reads code, message, and retryable from the error envelope', async () => {
+		const fetchFn = vi.fn(async () =>
+			jsonResponse({ code: 'rate_limited', message: 'too many requests', retryable: true }, 429)
+		);
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/me').catch((error: unknown) => error);
+		expect(failure).toBeInstanceOf(ApiError);
+		expect((failure as ApiError).code).toBe('rate_limited');
+		expect((failure as ApiError).message).toBe('too many requests');
+		expect((failure as ApiError).retryable).toBe(true);
+	});
+
+	it('exposes the 402 plan-limit envelope as non-retryable', async () => {
+		const fetchFn = vi.fn(async () =>
+			jsonResponse({ code: 'plan_limit_exceeded', message: 'plan limit reached', retryable: false }, 402)
+		);
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/me').catch((error: unknown) => error);
+		expect((failure as ApiError).code).toBe('plan_limit_exceeded');
+		expect((failure as ApiError).retryable).toBe(false);
+	});
+
+	it('preserves server retryable:false on corrupt_content@502 where status fallback would retry', async () => {
+		// `retryableFromStatus(502)` is `true`, so a client that ignored the
+		// server flag and derived retryability from status would retry corrupt
+		// content forever. The server flag (`false`) must win.
+		const fetchFn = vi.fn(async () =>
+			jsonResponse(
+				{ code: 'corrupt_content', message: 'segment could not be decoded', retryable: false },
+				502
+			)
+		);
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/me').catch((error: unknown) => error);
+		expect((failure as ApiError).code).toBe('corrupt_content');
+		expect((failure as ApiError).message).toBe('segment could not be decoded');
+		expect((failure as ApiError).retryable).toBe(false);
+	});
+
+	it('falls back generically for unknown codes and preserves server retryability', async () => {
+		const fetchFn = vi.fn(async () =>
+			jsonResponse({ code: 'future_code', message: 'from a newer server', retryable: false }, 429)
+		);
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/me').catch((error: unknown) => error);
+		expect((failure as ApiError).code).toBe('request_failed');
+		expect((failure as ApiError).message).toBe('from a newer server');
+		expect((failure as ApiError).retryable).toBe(false);
+	});
+
 	it('maps 401 to the unauthorized code', async () => {
 		const fetchFn = vi.fn(async () => jsonResponse({ error: 'nope' }, 401));
 		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
@@ -147,6 +215,26 @@ describe('ApiClient', () => {
 		const failure = await client.get('/me').catch((error: unknown) => error);
 		expect(failure).toBeInstanceOf(ApiError);
 		expect((failure as ApiError).code).toBe('unauthorized');
+	});
+
+	it.each([
+		[400, 'invalid_request'],
+		[402, 'plan_limit_exceeded'],
+		[403, 'forbidden'],
+		[404, 'not_found'],
+		[413, 'payload_too_large'],
+		[416, 'range_not_satisfiable'],
+		[422, 'validation_failed'],
+		[429, 'rate_limited'],
+
+		[503, 'service_unavailable'],
+		[502, 'request_failed']
+	])('derives legacy error code for status %i', async (status, code) => {
+		const fetchFn = vi.fn(async () => jsonResponse({ error: 'legacy failure' }, status));
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/me').catch((error: unknown) => error);
+		expect((failure as ApiError).code).toBe(code);
 	});
 
 	it('posts JSON bodies with the right content type', async () => {

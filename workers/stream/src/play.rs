@@ -41,11 +41,12 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::api_error::ApiError;
 use crate::cache::{CacheServe, CacheStatus, ContentCache, MultipartUpload};
 use crate::grant::{self, GrantError};
 use crate::meter::{Meter, MeterEvent, MeterKind};
 use crate::nntp::{valid_message_id, NntpClient, NntpError};
-use crate::observability::CacheObserveEvent;
+use crate::observability::{CacheObserveEvent, CacheStatus as ObserveStatus};
 use crate::pool::{Lane, Lease, OrphanedPlay, Pool, PoolError};
 use crate::prefetch::should_prefetch;
 use crate::range::{self, RangeOutcome};
@@ -88,6 +89,25 @@ pub enum PlayError {
 }
 
 impl PlayError {
+    /// The shared user-facing envelope for this failure (see
+    /// `docs/api-errors.md`). Variant payloads (provider replies,
+    /// message-ids, decode detail) deliberately never reach the wire:
+    /// every message here is static per code.
+    pub fn api_error(&self) -> ApiError {
+        match self {
+            PlayError::Unauthorized(_) => ApiError::unauthorized(),
+            PlayError::ProviderAuthExpired => ApiError::provider_auth_expired(),
+            PlayError::WrongTrack => ApiError::forbidden(),
+            PlayError::RangeUnsatisfiable => ApiError::range_not_satisfiable(),
+            PlayError::PoolExhausted => ApiError::rate_limited(),
+            PlayError::PoolQuarantined { .. } => ApiError::upstream_unavailable(),
+            PlayError::ArticleMissing(_) => ApiError::not_found(),
+            PlayError::InvalidSegment(_) => ApiError::invalid_request(),
+            PlayError::Upstream(_) => ApiError::upstream_unavailable(),
+            PlayError::Decode(_) => ApiError::corrupt_content(),
+        }
+    }
+
     /// The stable Analytics Engine / log code for pool-level failures
     /// (`blob4` / `pool_error_code` in [`crate::observability`]); `None` for
     /// every non-pool failure. This is the single definition of the
@@ -145,8 +165,10 @@ pub struct PlayResponse {
     /// `ContentCache::try_begin_revalidate`): the worker entry point must
     /// re-fetch upstream and rewrite the entry while the client already has
     /// its bytes, or release the claim with `finish_revalidate` if that
-    /// re-fetch fails. Concurrent stale readers get `false` — one refresh
-    /// per stale entry, not one per reader.
+    /// re-fetch fails, passing the `now_unix` value used to claim it. Claims
+    /// expire after their bounded TTL if the owner disappears. Concurrent
+    /// stale readers get `false` — one refresh per stale entry, not one per
+    /// reader.
     pub needs_revalidate: bool,
     pub stream: PlayStream,
 }
@@ -191,7 +213,10 @@ pub type StreamPool = Pool<NntpClient>;
 pub struct PlayStream {
     user_id: String,
     track_id: String,
-    cache_hit: bool,
+    /// Analytics Engine row status for [`PlayStream::observe_event`]: fresh
+    /// serves project as `Hit`, misses as `Miss`, and stale-while-revalidate
+    /// serves as `Stale` so the row agrees with the `Cache-Status` header.
+    observe_status: ObserveStatus,
     /// Next absolute byte to emit, and the exclusive end of the response.
     pos: u64,
     end: u64,
@@ -306,9 +331,9 @@ pub fn play_with_observe_event(
     };
     let result = play_authorized(pool, cache, meter, input, &user);
     let error_event = result.as_ref().err().and_then(|error| {
-        error
-            .pool_error_code()
-            .map(|_| CacheObserveEvent::from_play(request_id, &user, false, 0, 0, Some(error)))
+        error.pool_error_code().map(|_| {
+            CacheObserveEvent::from_play(request_id, &user, ObserveStatus::Miss, 0, 0, Some(error))
+        })
     });
     ObservedPlayAttempt {
         result,
@@ -375,7 +400,7 @@ fn play_authorized(
         // `needs_revalidate`. Claimed only once the serve is known-good, so
         // a failed range never strands the claim with no one told to act.
         let needs_revalidate =
-            serve.needs_revalidate() && cache.try_begin_revalidate(input.track_id);
+            serve.needs_revalidate() && cache.try_begin_revalidate(input.track_id, input.now_unix);
         return Ok(respond(
             window,
             true,
@@ -840,6 +865,14 @@ fn respond(
         Some(serve) => (serve.cache_status(), serve.age_secs()),
         None => (CacheStatus::Miss, 0),
     };
+    // The observability row distinguishes stale from fresh: both are cache
+    // hits on the wire path (`cache_hit`), but the row must agree with the
+    // `Cache-Status` header, so a stale serve projects as `Stale`, not `Hit`.
+    let observe_status = match serve {
+        Some(CacheServe::Fresh { .. }) => ObserveStatus::Hit,
+        Some(CacheServe::Stale { .. }) => ObserveStatus::Stale,
+        None => ObserveStatus::Miss,
+    };
     PlayResponse {
         status,
         content_range,
@@ -851,7 +884,7 @@ fn respond(
         stream: PlayStream {
             user_id: user.to_string(),
             track_id: track.to_string(),
-            cache_hit,
+            observe_status,
             pos: start,
             end,
             served: 0,
@@ -916,7 +949,7 @@ impl PlayStream {
         CacheObserveEvent::from_play(
             request_id,
             &self.user_id,
-            self.cache_hit,
+            self.observe_status,
             ttft_ms,
             self.served,
             self.error(),
@@ -1189,6 +1222,82 @@ mod tests {
             now_unix: 1,
             up_next: None,
         }
+    }
+
+    #[test]
+    fn play_errors_map_to_the_shared_envelope() {
+        // Representative play failures across auth, range, limits, and
+        // upstream paths; payloads must not leak into the wire message.
+        let cases: Vec<(PlayError, &'static str, u16, bool)> = vec![
+            (
+                PlayError::Unauthorized(GrantError::Expired),
+                "unauthorized",
+                401,
+                false,
+            ),
+            (
+                PlayError::ProviderAuthExpired,
+                "provider_auth_expired",
+                401,
+                false,
+            ),
+            (PlayError::WrongTrack, "forbidden", 403, false),
+            (
+                PlayError::RangeUnsatisfiable,
+                "range_not_satisfiable",
+                416,
+                false,
+            ),
+            (PlayError::PoolExhausted, "rate_limited", 429, true),
+            (
+                PlayError::PoolQuarantined { retry_after_ms: 5 },
+                "upstream_unavailable",
+                502,
+                true,
+            ),
+            (
+                PlayError::ArticleMissing("seg@news.example".into()),
+                "not_found",
+                404,
+                false,
+            ),
+            (
+                PlayError::InvalidSegment("bad id".into()),
+                "invalid_request",
+                400,
+                false,
+            ),
+            (
+                PlayError::Upstream("502 provider detail".into()),
+                "upstream_unavailable",
+                502,
+                true,
+            ),
+            (
+                PlayError::Decode(YencError::Truncated),
+                "corrupt_content",
+                502,
+                false,
+            ),
+        ];
+        for (err, code, status, retryable) in cases {
+            let api = err.api_error();
+            assert_eq!(
+                (api.code, api.status, api.retryable),
+                (code, status, retryable),
+                "{err:?}"
+            );
+            assert!(!api.body_json().contains("seg@news"), "{err:?}");
+            assert!(!api.body_json().contains("provider detail"), "{err:?}");
+        }
+        assert_eq!(
+            PlayError::ProviderAuthExpired.api_error().body_json(),
+            r#"{"code":"provider_auth_expired","message":"provider credentials expired","retryable":false}"#
+        );
+        assert_eq!(
+            PlayError::WrongTrack.api_error().body_json(),
+            r#"{"code":"forbidden","message":"not the owner","retryable":false}"#
+        );
     }
 
     #[test]
@@ -1904,6 +2013,45 @@ mod tests {
         assert_eq!(
             ev.analytics_blobs(),
             vec!["hit", ev.user_hash.as_str(), "req-001", ""]
+        );
+    }
+
+    #[test]
+    fn stale_play_projects_to_a_stale_observe_event_with_served_bytes() {
+        use crate::cache::CACHE_FRESH_TTL_SECS;
+        use crate::observability::{hash_user, CacheStatus};
+
+        let secret = b"s";
+        let stale_now = 1_000 + CACHE_FRESH_TTL_SECS + 10;
+        // Within the 15-min grant TTL cap so the test exercises the cache path.
+        let token = grant::issue("user-9", "track-swr", stale_now + 60, secret);
+        let mut pool = Pool::new(1);
+        let mut cache = ContentCache::new();
+        cache.put_track_at("track-swr", vec![7u8; 100], 1_000);
+        let mut meter = crate::meter::MemoryMeter::default();
+        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+        let input = PlayInput {
+            token: &token,
+            track_id: "track-swr",
+            range: None,
+            server_addr: addr,
+            segments: &[],
+            cipher_key: 0,
+            now_unix: stale_now,
+            up_next: None,
+        };
+        let mut response = play(&mut pool, &mut cache, &mut meter, secret, &input).unwrap();
+        assert!(response.cache_hit, "stale is still served from cache");
+        let served: usize = response.stream.by_ref().map(|c| c.len()).sum();
+        assert_eq!(served, 100);
+
+        let ev = response.stream.observe_event("req-stale-001", 7);
+        assert_eq!(ev.cache_status, CacheStatus::Stale);
+        assert_eq!(ev.bytes, 100);
+        assert_eq!(ev.user_hash, hash_user("user-9"));
+        assert_eq!(
+            ev.analytics_blobs(),
+            vec!["stale", ev.user_hash.as_str(), "req-stale-001", ""]
         );
     }
 
