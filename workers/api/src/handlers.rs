@@ -522,6 +522,45 @@ fn fake_user_id(cfg: &Config, email: &str) -> String {
     fake_id(cfg, "fake-user", email, 0, 16)
 }
 
+/// Canonical per-IP rate-limit key: IPv6 clients sharing a /64 share one
+/// budget, IPv4 keeps the full address. Audit logs keep the full `source_ip`;
+/// only budget scopes use this key, so rotation inside one prefix cannot mint
+/// fresh budgets.
+fn rate_limit_ip_key(source_ip: &str) -> String {
+    let trimmed = source_ip.trim();
+    let Ok(addr) = trimmed.parse::<IpAddr>() else {
+        return trimmed.to_string();
+    };
+    match addr {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.to_string();
+            }
+            let segments = v6.segments();
+            std::net::Ipv6Addr::new(
+                segments[0],
+                segments[1],
+                segments[2],
+                segments[3],
+                0,
+                0,
+                0,
+                0,
+            )
+            .to_string()
+        }
+    }
+}
+
+/// Uniform per-IP throttle response: fixed 429 body independent of the
+/// request email, because the budget is keyed only on the client prefix.
+/// Callers must not return email-derived stand-ins on this path (that would
+/// be an account-existence oracle across the denial boundary).
+fn throttled() -> Response {
+    json_response(429, serde_json::json!({"error":"rate_limited"}))
+}
+
 /// Register/login challenge inserts allowed per account per hour.
 /// Excess starts keep the usual response shape but store no challenge.
 const AUTH_STARTS_PER_HOUR: u64 = 10;
@@ -650,10 +689,13 @@ where
     /// Per-IP admission shared by register, login and magic start routes.
     /// The global budget is reserved only for outbound mail, so exhaustion
     /// cannot prevent users from obtaining an authentication challenge.
+    /// The scope key is the client /64 (IPv6) or full address (IPv4), so
+    /// rotation inside one prefix cannot mint fresh budgets; audit logs keep
+    /// the full `source_ip`.
     async fn admit_auth_start(&self) -> bool {
         self.store
             .reserve_rate_limit(
-                &self.source_ip,
+                &rate_limit_ip_key(&self.source_ip),
                 "auth.start_ip",
                 AUTH_STARTS_PER_IP_PER_HOUR,
                 self.now,
@@ -670,7 +712,7 @@ where
         let mail_ip_ok = self
             .store
             .reserve_rate_limit(
-                &self.source_ip,
+                &rate_limit_ip_key(&self.source_ip),
                 "auth.mail_ip",
                 MAIL_PER_IP_PER_HOUR,
                 self.now,
@@ -793,10 +835,13 @@ where
     let Some(email) = normalize_email(&body.email) else {
         return generic_auth();
     };
-    // Identical 200 shape for every outcome below (new email, abandoned
-    // signup, already-registered account): this route must not be an
-    // account-existence oracle. A taken email gets an unbound challenge
-    // whose finish fails generically, and no mail is sent for it.
+    // Identical 200 shape for every admitted outcome below (new email,
+    // abandoned signup, already-registered account): this route must not be
+    // an account-existence oracle. A taken email gets an unbound challenge
+    // whose finish fails generically, and no mail is sent for it. Per-IP
+    // throttle denial is a fixed email-independent 429 (never an
+    // email-derived stand-in): the budget is keyed only on the client
+    // prefix, so the denied body is identical for taken and fresh emails.
     let challenge = match auth::new_registration_challenge(&ctx.cfg.rp_id, &ctx.cfg.origin, ctx.now)
     {
         Ok(challenge) => challenge,
@@ -815,7 +860,7 @@ where
     // Per-IP admission before user lookup or maintenance. The global budget
     // applies to outbound mail only, never to auth challenge issuance.
     if !ctx.admit_auth_start().await {
-        return shape(fake_user_id(ctx.cfg, &email));
+        return throttled();
     }
     let existing = match ctx.store.user_by_email(&email).await {
         Ok(user) => user,
@@ -983,11 +1028,12 @@ where
     }
     // Per-IP lookup budget BEFORE any DB read: rotating well-formed unknown
     // challenge ids costs one Pg connect+SELECT each, so they must share one
-    // per-client pool. Denial is the generic error (no throttle oracle).
+    // per-client pool (keyed on the client /64, not the raw address).
+    // Denial is the generic error (no throttle oracle).
     let lookup_admitted = ctx
         .store
         .reserve_rate_limit(
-            &ctx.source_ip,
+            &rate_limit_ip_key(&ctx.source_ip),
             "auth.register_finish_ip",
             FINISH_LOOKUP_ATTEMPTS_PER_IP,
             ctx.now,
@@ -1078,8 +1124,8 @@ where
         // Atomic per-client redemption budget BEFORE the lookup: parallel
         // guesses share one reservation (no check-then-act race), and the
         // denial is the generic error (no throttle oracle). Keyed by
-        // source IP and account, per `auth::invite_attempt_allowed`.
-        let attempt_key = format!("invite:{}:{}", ctx.source_ip, user_id);
+        // client prefix and account, per `auth::invite_attempt_allowed`.
+        let attempt_key = format!("invite:{}:{}", rate_limit_ip_key(&ctx.source_ip), user_id);
         let allowed = ctx
             .store
             .reserve_rate_limit(
@@ -1253,11 +1299,12 @@ where
         return generic_auth();
     }
     // Per-IP lookup budget BEFORE any DB read, same as register/finish:
-    // rotating well-formed unknown challenge ids must share one pool.
+    // rotating well-formed unknown challenge ids must share one pool
+    // (keyed on the client /64, not the raw address).
     let lookup_admitted = ctx
         .store
         .reserve_rate_limit(
-            &ctx.source_ip,
+            &rate_limit_ip_key(&ctx.source_ip),
             "auth.login_finish_ip",
             FINISH_LOOKUP_ATTEMPTS_PER_IP,
             ctx.now,
@@ -1406,13 +1453,14 @@ where
         return generic_auth();
     }
     // Attempt budget AFTER the exact-Origin pin and BEFORE the hash lookup:
-    // rotating tokens must share one per-client budget, or bogus finishes
-    // are an unbounded DB read. Cross-origin rejects above never reach this
-    // reservation, so an attacker cannot burn a victim IP's budget.
+    // rotating tokens must share one per-client budget (keyed on the client
+    // /64, not the raw address), or bogus finishes are an unbounded DB read.
+    // Cross-origin rejects above never reach this reservation, so an attacker
+    // cannot burn a victim IP's budget.
     let admitted = ctx
         .store
         .reserve_rate_limit(
-            &ctx.source_ip,
+            &rate_limit_ip_key(&ctx.source_ip),
             "auth.magic_finish",
             MAGIC_FINISH_ATTEMPTS_PER_IP,
             ctx.now,
@@ -1909,6 +1957,7 @@ mod tests {
         delete_user_after_next_challenge: RefCell<Option<String>>,
         orphan_user_after_next_challenge: RefCell<Option<String>>,
         challenge_reads: RefCell<usize>,
+        rate_limit_slot_probes: RefCell<usize>,
     }
 
     impl Store for FakeStore {
@@ -2041,7 +2090,20 @@ mod tests {
             let expires_at = now.saturating_add(window_secs);
             let mut slots = self.rate_limit_slots.borrow_mut();
             slots.retain(|_, expires| *expires > now);
+            // O(1) fast-fail mirrors the production `SELECT count(*)` guard:
+            // an exhausted budget returns without scanning all slots, so a
+            // sustained flood costs one lookup, not `limit` upserts.
+            let active = slots
+                .iter()
+                .filter(|((scope, act, _), expires)| {
+                    scope == scope_key && act == action && **expires > now
+                })
+                .count() as u64;
+            if active >= limit {
+                return Ok(false);
+            }
             for slot in 0..limit {
+                *self.rate_limit_slot_probes.borrow_mut() += 1;
                 let slot = u32::try_from(slot).map_err(|_| StoreError)?;
                 let key = (scope_key.to_string(), action.to_string(), slot);
                 if let std::collections::hash_map::Entry::Vacant(entry) = slots.entry(key) {
@@ -3614,7 +3676,9 @@ mod tests {
     fn register_start_distinct_email_loop_bounded_by_ip_budget() {
         // Distinct-email loop from one IP: per-account caps never bind on
         // fresh addresses, so the shared per-IP budget must cut the loop
-        // off with unchanged 200 shapes and no further user rows or mail.
+        // off with a fixed email-independent 429 (never an email-derived
+        // stand-in, which would be an oracle across the denial boundary)
+        // and no further user rows or mail.
         let h = harness();
         let total = AUTH_STARTS_PER_IP_PER_HOUR + 10;
         for i in 0..total {
@@ -3623,14 +3687,19 @@ mod tests {
                 "/v1/auth/passkey/register/start",
                 serde_json::json!({"email": format!("victim{i}@example.com")}),
             );
-            assert_eq!(resp.status, 200, "iteration {i}: {}", resp.body);
-            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
-            assert!(
-                body["challenge"].is_string(),
-                "iteration {i}: {}",
-                resp.body
-            );
-            assert!(body["user_id"].is_string(), "iteration {i}: {}", resp.body);
+            if i < AUTH_STARTS_PER_IP_PER_HOUR {
+                assert_eq!(resp.status, 200, "iteration {i}: {}", resp.body);
+                let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+                assert!(
+                    body["challenge"].is_string(),
+                    "iteration {i}: {}",
+                    resp.body
+                );
+                assert!(body["user_id"].is_string(), "iteration {i}: {}", resp.body);
+            } else {
+                assert_eq!(resp.status, 429, "iteration {i}: {}", resp.body);
+                assert_eq!(resp.body, r#"{"error":"rate_limited"}"#, "iteration {i}");
+            }
         }
         assert_eq!(
             h.store.users.borrow().len(),
@@ -3646,6 +3715,135 @@ mod tests {
             h.store.challenges.borrow().len(),
             AUTH_STARTS_PER_IP_PER_HOUR as usize,
             "no challenge stored past the per-IP budget"
+        );
+    }
+
+    #[test]
+    fn register_start_ip_throttle_is_email_independent() {
+        // Account-existence oracle pin: while admitted, a taken email returns
+        // the stable stand-in and a fresh email returns a fresh random id;
+        // once the per-IP budget is exhausted every email must get the same
+        // fixed 429, so pre/post comparison cannot distinguish taken/fresh.
+        let h = harness();
+        seed_user(&h, "u-taken", "taken@example.com");
+        block_on(h.store.insert_credential(&PasskeyCredential {
+            cred_id_b64url: b64url_encode(b"taken-cred-oracle"),
+            user_id: "u-taken".to_string(),
+            public_key: fx_es256_cose(61),
+            sign_count: 0,
+            registered_at: NOW,
+        }))
+        .unwrap();
+        let taken_admitted = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "taken@example.com"}),
+        );
+        assert_eq!(taken_admitted.status, 200, "{}", taken_admitted.body);
+        let fresh_admitted = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "fresh-oracle@example.com"}),
+        );
+        assert_eq!(fresh_admitted.status, 200, "{}", fresh_admitted.body);
+        for i in 0..(AUTH_STARTS_PER_IP_PER_HOUR - 2) {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/passkey/register/start",
+                serde_json::json!({"email": format!("filler{i}@example.com")}),
+            );
+            assert_eq!(resp.status, 200, "filler {i}: {}", resp.body);
+        }
+        let taken_denied = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "taken@example.com"}),
+        );
+        let fresh_denied = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "fresh-oracle@example.com"}),
+        );
+        assert_eq!(taken_denied.status, 429, "{}", taken_denied.body);
+        assert_eq!(fresh_denied.status, 429, "{}", fresh_denied.body);
+        assert_eq!(
+            taken_denied.body, fresh_denied.body,
+            "throttled bodies must be identical across emails"
+        );
+        assert_eq!(taken_denied.body, r#"{"error":"rate_limited"}"#);
+    }
+
+    #[test]
+    fn rate_limit_exhausted_path_skips_slot_scan() {
+        // DoS-amplification pin: an exhausted 100-slot finish-lookup budget
+        // must fast-fail without scanning every slot (production runs one
+        // `SELECT count(*)` then returns; the fake mirrors it and counts slot
+        // probes). Removing the guard drives 100 probes here.
+        let store = FakeStore::default();
+        for _ in 0..FINISH_LOOKUP_ATTEMPTS_PER_IP {
+            assert!(block_on(store.reserve_rate_limit(
+                "ip",
+                "auth.register_finish_ip",
+                FINISH_LOOKUP_ATTEMPTS_PER_IP,
+                NOW,
+                300
+            ))
+            .unwrap());
+        }
+        *store.rate_limit_slot_probes.borrow_mut() = 0;
+        assert!(!block_on(store.reserve_rate_limit(
+            "ip",
+            "auth.register_finish_ip",
+            FINISH_LOOKUP_ATTEMPTS_PER_IP,
+            NOW,
+            300
+        ))
+        .unwrap());
+        assert_eq!(
+            *store.rate_limit_slot_probes.borrow(),
+            0,
+            "exhausted budget must fast-fail without scanning slots"
+        );
+    }
+
+    #[test]
+    fn rate_limit_ip_key_groups_ipv6_slash64() {
+        // IPv6 rotation pin: two addresses in one /64 share one budget key,
+        // different /64s do not; IPv4 keeps the full address and unparsable
+        // values pass through (e.g. the "unknown" fallback).
+        assert_eq!(
+            rate_limit_ip_key("2001:db8:abcd:12::1"),
+            rate_limit_ip_key("2001:db8:abcd:12::2")
+        );
+        assert_ne!(
+            rate_limit_ip_key("2001:db8:abcd:12::1"),
+            rate_limit_ip_key("2001:db8:abcd:13::1")
+        );
+        assert_eq!(rate_limit_ip_key("198.51.100.9"), "198.51.100.9");
+        assert_eq!(rate_limit_ip_key("unknown"), "unknown");
+        let store = FakeStore::default();
+        let k1 = rate_limit_ip_key("2001:db8:abcd:12::1");
+        let k2 = rate_limit_ip_key("2001:db8:abcd:12::9");
+        for _ in 0..AUTH_STARTS_PER_IP_PER_HOUR {
+            assert!(block_on(store.reserve_rate_limit(
+                &k1,
+                "auth.start_ip",
+                AUTH_STARTS_PER_IP_PER_HOUR,
+                NOW,
+                3600
+            ))
+            .unwrap());
+        }
+        assert!(
+            !block_on(store.reserve_rate_limit(
+                &k2,
+                "auth.start_ip",
+                AUTH_STARTS_PER_IP_PER_HOUR,
+                NOW,
+                3600
+            ))
+            .unwrap(),
+            "same /64 must share one budget"
         );
     }
 

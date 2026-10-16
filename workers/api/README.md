@@ -138,19 +138,25 @@ config from secrets) is a follow-up slice.
   attempts reserve fixed slot rows through an atomic `INSERT .. ON CONFLICT`
   before side effects; magic-link and registration inbox-proof sends share
   one per-email window. Every auth start (register, login, magic) reserves
-  one per-IP slot (30/hour) before any user/challenge row or mail (no
+  one per-IP slot (30/hour, keyed on the client /64 for IPv6 and the full
+  address for IPv4) before any user/challenge row or mail (no
   global slot at start, so exhaustion cannot block challenge issuance),
   and every mail send reserves a per-IP (30/hour) plus global (100/5 min)
   issuance slot in front of the per-email window — distinct-email loops
-  and victim-list email-bombing from one IP stop with unchanged response
-  shapes. `register_start` also reaps never-completed signups older than
+  stop with a fixed email-independent `429 {"error":"rate_limited"}` on
+  `register/start` (never an email-derived stand-in, which would oracle
+  taken vs fresh across the denial boundary) and with unchanged response
+  shapes on login/magic starts, while victim-list email-bombing stops with
+  no further mail. Exhausted budgets fast-fail with one `SELECT count(*)`
+  before the slot loop, so denial costs O(1) statements, not one upsert per
+  slot. `register_start` also reaps never-completed signups older than
   24 h only when they have no credential, vault, session, unexpired magic
   link, or unexpired registration challenge. In-flight registration
   challenges (including consumed challenges awaiting finish) protect the
   signup until expiry; expired challenges are pruned. Passkey finishes
-  reserve 100 lookups per client IP
+  reserve 100 lookups per client prefix
   BEFORE any DB read plus 10 attempts per challenge before verification
-  (and magic finishes 10 per client IP, after the exact-Origin pin) per
+  (and magic finishes 10 per client prefix, after the exact-Origin pin) per
   5-minute window, so rotating unknown challenge ids cannot fund unbounded
   Pg reads and forged assertions cannot burn unlimited CPU on one
   challenge; legitimate single attempts and typo retries are unaffected.
