@@ -10,8 +10,8 @@ use nntune_ingest::fixtures::SMALL_NZB;
 use nntune_ingest::jobs::{JobCheckpoint, JobState, MAX_ATTEMPTS};
 use nntune_ingest::queue::QueueMsg;
 use nntune_ingest::retry::{
-    decide_checkpoint, drive_batch, redrive, redrive_checkpoint, redrive_raw, Disposition,
-    JobError, ERR_PROBE_FAILED, MAX_DLQ_DETAIL_CHARS,
+    decide_checkpoint, drive_batch, fail_checkpoint, redrive, redrive_checkpoint, redrive_raw,
+    Disposition, JobError, ERR_PARSE_FAILED, ERR_PROBE_FAILED, MAX_DLQ_DETAIL_CHARS,
 };
 
 /// The poison fixture: a well-formed job whose processing *always* fails
@@ -85,6 +85,28 @@ fn poison_job_burns_durable_budget_on_unchanged_queue_body() {
     assert_eq!(body["error_code"], ERR_PROBE_FAILED);
     assert_eq!(body["attempts"], MAX_ATTEMPTS);
     assert!(entry.reason.contains(ERR_PROBE_FAILED));
+}
+
+#[test]
+fn failed_checkpoint_redelivery_keeps_failure_code_in_dlq_entry() {
+    let msg = poison_msg();
+    let mut checkpoint = checkpoint_for(&msg);
+    checkpoint.attempt = MAX_ATTEMPTS;
+    fail_checkpoint(&mut checkpoint, ERR_PARSE_FAILED, "persisted parse failure");
+
+    let report = drive_batch(&[msg], &mut [checkpoint], |_| {
+        panic!("a failed checkpoint must not rerun processing")
+    })
+    .unwrap();
+
+    assert_eq!(report.acked, 0);
+    assert_eq!(report.retried, 0);
+    assert_eq!(report.quarantined.len(), 1);
+    let entry = &report.quarantined[0];
+    assert_eq!(entry.error_code, ERR_PARSE_FAILED);
+    assert_eq!(entry.attempts, MAX_ATTEMPTS);
+    assert_eq!(entry.message.attempt, MAX_ATTEMPTS);
+    assert!(entry.reason.contains("persisted parse failure"));
 }
 
 #[test]

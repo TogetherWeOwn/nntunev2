@@ -452,8 +452,9 @@ mod tests {
 
     #[test]
     fn terminal_failed_checkpoint_redelivery_preserves_failure_for_dlq() {
-        let msg = msg_at(1);
+        let mut msg = msg_at(1);
         let mut cp = checkpoint_for(&msg);
+        cp.attempt = MAX_ATTEMPTS;
         fail_checkpoint(&mut cp, ERR_PROBE_FAILED, "first failure");
         let original_code = cp.failure_code.clone();
         let original_reason = cp.failure_reason.clone();
@@ -462,10 +463,30 @@ mod tests {
             panic!("failed checkpoint must remain recoverable to DLQ");
         };
         assert_eq!(entry.error_code, ERR_PROBE_FAILED);
+        assert_eq!(entry.attempts, MAX_ATTEMPTS);
+        assert_eq!(entry.message.attempt, MAX_ATTEMPTS);
         assert!(entry.reason.contains("first failure"));
+        assert_eq!(entry.message.job_id, msg.job_id);
+        msg.attempt = MAX_ATTEMPTS;
         fail_checkpoint(&mut cp, ERR_PARSE_FAILED, "later failure");
         assert_eq!(cp.failure_code, original_code);
         assert_eq!(cp.failure_reason, original_reason);
+    }
+
+    #[test]
+    fn done_checkpoint_acks_even_when_direct_caller_reports_permanent_error() {
+        let msg = msg_at(1);
+        let mut cp = checkpoint_for(&msg);
+        cp.state = JobState::Done;
+        let error = JobError::permanent(ERR_PARSE_FAILED, "must not quarantine completed work");
+
+        assert_eq!(
+            decide_checkpoint(&msg, &mut cp, Err(error)).unwrap(),
+            Disposition::Ack
+        );
+        assert_eq!(cp.state, JobState::Done);
+        assert!(cp.failure_code.is_none());
+        assert!(cp.failure_reason.is_none());
     }
 
     #[test]

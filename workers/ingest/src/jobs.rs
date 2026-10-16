@@ -314,6 +314,7 @@ mod tests {
         assert_eq!(cp.attempt, 1);
         assert_eq!(cp.repair_rounds, MAX_REPAIR_ROUNDS);
         assert!(is_terminal(cp.state));
+        assert_eq!(cp.failure_code.as_deref(), Some("repair_budget_exhausted"));
         assert_eq!(
             cp.failure_reason.as_deref(),
             Some("repair budget exhausted")
