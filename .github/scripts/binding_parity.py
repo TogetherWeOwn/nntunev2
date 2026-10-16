@@ -11,9 +11,11 @@ Three facts are diffed, for staging AND prod:
   1. The manifest (``binding_manifest.toml`` next to this script) maps each
      worker config to the bindings it is required to declare, by binding
      name and type (R2, KV, Queues, Hyperdrive, Analytics Engine, Durable
-     Objects, services, assets, D1). Every ``workers/**/wrangler.*`` and
-     ``apps/**/wrangler.*`` file must be mapped, and every active binding
-     found in a config must be claimed by the manifest.
+     Objects, services, assets, D1). Standard TOML, JSON and JSONC Wrangler
+     config filenames under ``workers/`` and ``apps/`` must be mapped. This
+     checker currently parses TOML only; JSON/JSONC configs fail closed until
+     parser support is added. Every active binding in a parsed config must be
+     claimed by the manifest.
   2. The wrangler configs themselves. Cloudflare environment bindings are
      non-inheritable: staging and production must each declare their own
      bindings. The top-level ``assets`` binding is the documented exception.
@@ -83,6 +85,9 @@ RESOURCE_KEY = {
 ID_TYPES = frozenset({"kv", "hyperdrive"})
 
 CONFIG_ROOTS = ("workers", "apps")
+WRANGLER_CONFIG_NAMES = frozenset(
+    {"wrangler.toml", "wrangler.toml.example", "wrangler.json", "wrangler.jsonc"}
+)
 
 
 class ParityError(Exception):
@@ -257,7 +262,9 @@ def extract_commented_bindings(text):
 
 
 def parse_config(path):
-    """Return ({env: effective bindings}, [unknown env names])."""
+    """Return ({env: effective bindings}, [unknown env names], top-level bindings)."""
+    if path.name not in {"wrangler.toml", "wrangler.toml.example"}:
+        raise ParityError(f"{path}: unsupported wrangler config format; TOML is required")
     try:
         text = path.read_text(encoding="utf-8")
         data = tomllib.loads(text)
@@ -275,7 +282,9 @@ def parse_config(path):
             if normalized is None:
                 unknown.append(raw_name)
                 continue
-            per_env.setdefault(normalized, {}).update(extract_bindings(env_data))
+            if normalized in per_env:
+                raise ParityError(f"duplicate environment aliases for {normalized}")
+            per_env[normalized] = extract_bindings(env_data)
     except ParityError as exc:
         raise ParityError(f"{path}: {exc}") from exc
     except (AttributeError, TypeError) as exc:
@@ -288,15 +297,11 @@ def parse_config(path):
         # remain representative. Real Worker environments do not inherit bindings.
         base = top if template else top_level_assets
         effective[env] = {**base, **per_env.get(env, {})}
-    return effective, unknown
+    return effective, unknown, top
 
 
 def parse_ops_inventory(text, source="docs/ops.md"):
-    """Return ({env: resource-name set}, {env: resource-id set}).
-
-    Resource names come from the Environments matrix columns. KV and
-    Hyperdrive ids are collected only from table rows belonging to an env.
-    """
+    """Return resource names and type/environment-scoped ids from ops tables."""
     match = re.search(r"^## Environments matrix\s*$", text, re.MULTILINE)
     if not match:
         raise ParityError(f"{source}: no '## Environments matrix' section")
@@ -314,37 +319,111 @@ def parse_ops_inventory(text, source="docs/ops.md"):
     if not any(inventory.values()):
         raise ParityError(f"{source}: Environments matrix has no resources")
 
-    ids = {env: set() for env in ENVS}
+    ids = {env: {"kv": set(), "hyperdrive": set()} for env in ENVS}
     for heading, kind in (("KV namespaces", "kv"), ("Hyperdrive bindings", "hyperdrive")):
         section_match = re.search(
-            rf"^### {re.escape(heading)}\s*$", text, re.MULTILINE
+            rf"^### {re.escape(heading)}(?:\s+\(.*\))?\s*$",
+            text,
+            re.MULTILINE,
         )
         if not section_match:
-            continue
+            raise ParityError(f"{source}: no '### {heading}' section")
         section = text[section_match.end():]
         next_heading = re.search(r"^#{2,3} ", section, re.MULTILINE)
         if next_heading:
             section = section[:next_heading.start()]
+
+        if kind == "kv":
+            env_index = id_index = None
+            row_count = 0
+            for line in section.splitlines():
+                if not line.lstrip().startswith("|"):
+                    continue
+                cells = [cell.strip() for cell in line.split("|")]
+                normalized = [cell.lower() for cell in cells]
+                if "env" in normalized and any(
+                    name == "id" or name.startswith("id /") for name in normalized
+                ):
+                    env_index = normalized.index("env")
+                    id_index = next(
+                        i for i, name in enumerate(normalized)
+                        if name == "id" or name.startswith("id /")
+                    )
+                    continue
+                if env_index is None or id_index is None:
+                    continue
+                if len(cells) <= max(env_index, id_index):
+                    raise ParityError(f"{source}: malformed KV inventory row")
+                if all(not cell or re.fullmatch(r":?-{3,}:?", cell) for cell in cells):
+                    continue
+                env_cell = normalized[env_index]
+                id_values = [
+                    value
+                    for value in re.findall(r"`([^`]+)`", cells[id_index])
+                    if not re.fullmatch(r"[A-Z][A-Z0-9]*_[A-Z0-9_]*", value)
+                ]
+                if len(id_values) != 1:
+                    raise ParityError(f"{source}: KV inventory row lacks a unique id")
+                row_envs = {
+                    env
+                    for alias, env in ENV_ALIASES.items()
+                    if re.search(rf"(?<![a-z0-9]){alias}(?![a-z0-9])", env_cell)
+                }
+                if len(row_envs) != 1:
+                    raise ParityError(f"{source}: unrecognized or ambiguous KV inventory environment")
+                row_count += 1
+                ids[row_envs.pop()]["kv"].add(id_values[0])
+            if env_index is None or id_index is None or row_count == 0:
+                raise ParityError(f"{source}: KV namespaces section has no id/env table rows")
+            continue
+
+        config_index = id_index = None
+        row_count = 0
         for line in section.splitlines():
-            cells = [cell.strip() for cell in line.split("|")]
-            if len(cells) < 3:
+            if not line.lstrip().startswith("|"):
                 continue
-            row = " ".join(cells)
-            tokens = set(re.findall(r"`([^`]+)`", row))
-            if kind == "kv":
-                env_cell = cells[-2].lower() if len(cells) >= 4 else ""
-                for env in ENVS:
-                    if env in env_cell:
-                        ids[env].update(tokens)
+            cells = [cell.strip() for cell in line.split("|")]
+            normalized = [cell.lower() for cell in cells]
+            if "config" in normalized:
+                config_index = normalized.index("config")
+                id_index = next(
+                    (i for i, name in enumerate(normalized) if name == "id" or name.startswith("id /")),
+                    None,
+                )
+                continue
+            if config_index is None or id_index is None:
+                continue
+            if len(cells) <= max(config_index, id_index):
+                raise ParityError(f"{source}: malformed Hyperdrive inventory row")
+            if all(not cell or re.fullmatch(r":?-{3,}:?", cell) for cell in cells):
+                continue
+            config_values = re.findall(r"`([^`]+)`", cells[config_index])
+            config = config_values[0] if config_values else cells[config_index]
+            config = re.sub(r"\s*\([^)]*\)\s*$", "", config).lower()
+            id_values = [
+                value
+                for value in re.findall(r"`([^`]+)`", cells[id_index])
+                if not value.startswith("HYPERDRIVE_ID_")
+            ]
+            if not config or len(id_values) != 1:
+                raise ParityError(f"{source}: Hyperdrive inventory row lacks a unique config id")
+            row_count += 1
+            envs = {
+                env
+                for alias, env in ENV_ALIASES.items()
+                if re.search(rf"(?<![a-z0-9]){alias}(?![a-z0-9])", config)
+            }
+            if len(envs) > 1:
+                raise ParityError(f"{source}: ambiguous Hyperdrive inventory environment")
+            if envs:
+                ids[envs.pop()]["hyperdrive"].add(id_values[0])
+            elif config == "mb" or config.endswith("-mb"):
+                ids["staging"]["hyperdrive"].add(id_values[0])
+                ids["prod"]["hyperdrive"].add(id_values[0])
             else:
-                config = cells[1].lower() if len(cells) > 1 else ""
-                if "staging" in config:
-                    ids["staging"].update(tokens)
-                elif "prod" in config:
-                    ids["prod"].update(tokens)
-                elif "mb" in config:
-                    ids["staging"].update(tokens)
-                    ids["prod"].update(tokens)
+                raise ParityError(f"{source}: unrecognized Hyperdrive inventory config")
+        if config_index is None or id_index is None or row_count == 0:
+            raise ParityError(f"{source}: Hyperdrive bindings section has no config/id table rows")
     return inventory, ids
 
 
@@ -454,7 +533,7 @@ def check(root, manifest_path, ops_path):
             on_disk.update(
                 p.relative_to(root).as_posix()
                 for p in config_root.rglob("wrangler.*")
-                if p.is_file()
+                if p.is_file() and p.name in WRANGLER_CONFIG_NAMES
             )
     for config in sorted(on_disk - mapped):
         drifts.append(
@@ -468,12 +547,21 @@ def check(root, manifest_path, ops_path):
             drifts.append(_fmt(name, "-", "-", "-", f"mapped config {config_rel} is missing"))
             continue
         is_example = config_rel.endswith(".example")
-        effective, unknown_envs = parse_config(config_path)
+        effective, unknown_envs, top_level = parse_config(config_path)
         for raw_env in unknown_envs:
             drifts.append(
                 _fmt(name, raw_env, "-", "-", "unrecognized environment section")
             )
         required = {(b["type"], b["binding"]): b for b in worker["bindings"]}
+        if not is_example:
+            for key, item in sorted(top_level.items()):
+                if key not in required and item["type"] != "assets":
+                    drifts.append(
+                        _fmt(
+                            name, "-", item["binding"], item["type"],
+                            "top-level binding is not in the manifest",
+                        )
+                    )
 
         for binding in worker["bindings"]:
             for env in ENVS:
@@ -481,7 +569,7 @@ def check(root, manifest_path, ops_path):
                 if expected is None:
                     continue
                 if binding["type"] in ID_TYPES:
-                    if expected not in id_inventory[env]:
+                    if expected not in id_inventory[env][binding["type"]]:
                         drifts.append(
                             _fmt(
                                 name, env, binding["binding"], binding["type"],

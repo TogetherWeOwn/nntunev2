@@ -255,9 +255,11 @@ Binding names are chosen in Worker configs; resource names must match this table
 
 ## Binding parity check
 
-CI job `binding-parity` (part of `ci-ok`) diffs every
-`workers/*/wrangler.toml*` and `apps/*/wrangler.toml*` against this
-inventory for staging and prod: required bindings per Worker are mapped
+CI job `binding-parity` (part of `ci-ok`) discovers Wrangler TOML, JSON and
+JSONC configs recursively under `workers/` and `apps/`, then diffs mapped TOML
+configs against this inventory for staging and prod. JSON/JSONC configs are
+reported when unmapped and fail closed if mapped until parser support is added.
+Required bindings per Worker are mapped
 in `.github/scripts/binding_manifest.toml`, and
 `python3 .github/scripts/binding_parity.py` fails on a missing binding,
 staging/prod skew, or a resource name absent from the matrix or tables

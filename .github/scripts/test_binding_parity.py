@@ -8,6 +8,7 @@ remaining cases build throwaway mini-repos in a temp directory.
 import contextlib
 import io
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -29,12 +30,20 @@ REPO_ROOT = SCRIPTS.parents[1]
 
 OPS_MD = """# fixture ops
 
+### KV namespaces (created 2026-10-13)
+
+| Namespace | ID | Env |
+|---|---|---|
+| `demo-staging` | `fx-kv-staging` | staging |
+| `demo-prod` | `fx-kv-prod` | prod |
+
 ### Hyperdrive bindings
 
 | Config | ID | Intended binding |
 |---|---|---|
 | `demo-staging` | `fx-hd-staging` | staging app |
 | `demo-prod` | `fx-hd-prod` | prod app |
+| `demo-mb` | `fx-hd-mb` | shared mirror |
 
 ## Environments matrix
 
@@ -141,13 +150,148 @@ class TestOpsInventoryParsing(unittest.TestCase):
         inventory, ids = parse_ops_inventory(OPS_MD)
         self.assertEqual({"fx-audio-staging"}, inventory["staging"])
         self.assertEqual({"fx-audio-prod"}, inventory["prod"])
-        self.assertIn("fx-hd-staging", ids["staging"])
-        self.assertNotIn("fx-hd-prod", ids["staging"])
-        self.assertIn("fx-hd-prod", ids["prod"])
+        self.assertIn("fx-hd-staging", ids["staging"]["hyperdrive"])
+        self.assertNotIn("fx-hd-prod", ids["staging"]["hyperdrive"])
+        self.assertIn("fx-hd-prod", ids["prod"]["hyperdrive"])
 
     def test_missing_matrix_fails_closed(self):
         with self.assertRaises(ParityError):
             parse_ops_inventory("# ops\n\nno matrix here\n")
+
+    def test_missing_id_section_fails_closed(self):
+        ops_without_kv = OPS_MD.replace(
+            "### KV namespaces (created 2026-10-13)\n\n"
+            "| Namespace | ID | Env |\n|---|---|---|\n"
+            "| `demo-staging` | `fx-kv-staging` | staging |\n"
+            "| `demo-prod` | `fx-kv-prod` | prod |\n\n",
+            "",
+        )
+        with self.assertRaisesRegex(ParityError, "no '### KV namespaces' section"):
+            parse_ops_inventory(ops_without_kv)
+
+    def test_real_ops_kv_heading_and_environment_rows_are_parsed(self):
+        ops_text = (REPO_ROOT / "docs" / "ops.md").read_text()
+        _, ids = parse_ops_inventory(ops_text)
+        section_match = re.search(
+            r"^### KV namespaces[^\n]*\n(?P<section>.*?)(?=^#{2,3} |\Z)",
+            ops_text,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(section_match)
+        table_rows = [
+            [cell.strip() for cell in line.split("|")]
+            for line in section_match.group("section").splitlines()
+            if line.lstrip().startswith("|")
+        ]
+        header = [cell.lower() for cell in table_rows[0]]
+        env_index = header.index("env")
+        id_index = next(
+            i for i, name in enumerate(header)
+            if name == "id" or name.startswith("id /")
+        )
+        aliases = {"staging": "staging", "prod": "prod", "production": "prod"}
+        rows = []
+        for cells in table_rows[1:]:
+            if all(not cell or re.fullmatch(r":?-{3,}:?", cell) for cell in cells):
+                continue
+            env_cell = cells[env_index].lower()
+            envs = {
+                env
+                for alias, env in aliases.items()
+                if re.search(rf"(?<![a-z0-9]){alias}(?![a-z0-9])", env_cell)
+            }
+            values = [
+                value
+                for value in re.findall(r"`([^`]+)`", cells[id_index])
+                if not re.fullmatch(r"[A-Z][A-Z0-9]*_[A-Z0-9_]*", value)
+            ]
+            self.assertEqual(1, len(envs))
+            self.assertEqual(1, len(values))
+            rows.append((values[0], envs.pop()))
+        self.assertTrue(rows)
+        for resource_id, env in rows:
+            other_env = "prod" if env == "staging" else "staging"
+            self.assertIn(resource_id, ids[env]["kv"])
+            self.assertNotIn(resource_id, ids[other_env]["kv"])
+
+    def test_kv_environment_uses_header_columns(self):
+        ops = OPS_MD.replace(
+            "| Namespace | ID | Env |", "| Env | Namespace | ID / variable | Notes |"
+        ).replace(
+            "| `demo-staging` | `fx-kv-staging` | staging |",
+            "| staging | `demo-staging` | `fx-kv-staging` / `KV_NAMESPACE_STAGING` | note |",
+        ).replace(
+            "| `demo-prod` | `fx-kv-prod` | prod |",
+            "| prod | `demo-prod` | `fx-kv-prod` / `KV_NAMESPACE_PROD` | note |",
+        )
+        _, ids = parse_ops_inventory(ops)
+        self.assertIn("fx-kv-staging", ids["staging"]["kv"])
+        self.assertNotIn("fx-kv-staging", ids["prod"]["kv"])
+
+    def test_kv_ids_preserve_case_and_production_alias(self):
+        ops = OPS_MD.replace("fx-kv-staging", "FX-KV-STAGING").replace(
+            "`fx-kv-prod` | prod |", "`fx-kv-prod` | production |"
+        )
+        _, ids = parse_ops_inventory(ops)
+        self.assertIn("FX-KV-STAGING", ids["staging"]["kv"])
+        self.assertIn("fx-kv-prod", ids["prod"]["kv"])
+        self.assertNotIn("fx-kv-prod", ids["staging"]["kv"])
+
+    def test_kv_unknown_environment_fails_closed(self):
+        ops = OPS_MD.replace(
+            "| `demo-staging` | `fx-kv-staging` | staging |",
+            "| `demo-staging` | `fx-kv-staging` | stging |",
+        )
+        with self.assertRaisesRegex(
+            ParityError, "unrecognized or ambiguous KV inventory environment"
+        ):
+            parse_ops_inventory(ops)
+
+    def test_kv_inventory_requires_one_id_per_row(self):
+        ops = OPS_MD.replace(
+            "| `demo-staging` | `fx-kv-staging` | staging |",
+            "| `demo-staging` | `fx-kv-staging` (`old id`) | staging |",
+        )
+        with self.assertRaisesRegex(ParityError, "KV inventory row lacks a unique id"):
+            parse_ops_inventory(ops)
+
+    def test_hyperdrive_mb_match_requires_a_delimited_config_name(self):
+        for config in ("combo-drive", "team_mb"):
+            ops = OPS_MD.replace("`demo-staging`", f"`{config}`")
+            with self.assertRaisesRegex(ParityError, "unrecognized Hyperdrive inventory config"):
+                parse_ops_inventory(ops)
+
+    def test_hyperdrive_id_column_ignores_variable_token_order(self):
+        ops = OPS_MD.replace(
+            "`fx-hd-staging` | staging app",
+            "`HYPERDRIVE_ID_STAGING` / `fx-hd-staging` | staging app",
+        )
+        _, ids = parse_ops_inventory(ops)
+        self.assertIn("fx-hd-staging", ids["staging"]["hyperdrive"])
+        self.assertNotIn("HYPERDRIVE_ID_STAGING", ids["staging"]["hyperdrive"])
+
+    def test_hyperdrive_inventory_uses_only_id_column(self):
+        ops = OPS_MD.replace(
+            "| `demo-staging` | `fx-hd-staging` | staging app |",
+            "| `demo-staging` | `fx-hd-staging` | `main` staging app |",
+        )
+        _, ids = parse_ops_inventory(ops)
+        self.assertNotIn("main", ids["staging"]["hyperdrive"])
+        self.assertNotIn("main", ids["prod"]["hyperdrive"])
+
+    def test_shared_mb_config_allows_parenthetical_notes(self):
+        for config in ("`demo-mb` (shared mirror)", "`demo-mb (shared mirror)`"):
+            with self.subTest(config=config):
+                ops = OPS_MD.replace("`demo-mb`", config)
+                _, ids = parse_ops_inventory(ops)
+                self.assertIn("fx-hd-mb", ids["staging"]["hyperdrive"])
+                self.assertIn("fx-hd-mb", ids["prod"]["hyperdrive"])
+
+    def test_hyperdrive_production_alias_maps_to_prod(self):
+        ops = OPS_MD.replace("`demo-prod`", "`demo-production`")
+        _, ids = parse_ops_inventory(ops)
+        self.assertIn("fx-hd-prod", ids["prod"]["hyperdrive"])
+        self.assertNotIn("fx-hd-prod", ids["staging"]["hyperdrive"])
 
 
 class TestCommentedExamples(unittest.TestCase):
@@ -230,6 +374,16 @@ class TestDriftCases(unittest.TestCase):
             self.assertIn("binding=SURPRISE", joined)
             self.assertIn("not in the manifest", joined)
 
+    def test_unexpected_active_top_level_binding_is_drift(self):
+        wrangler = MATCHING_WRANGLER + (
+            '\n[[kv_namespaces]]\nbinding = "SURPRISE_TOP"\nid = "fx-kv"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            drifts, _, _ = run_check(make_repo(tmp, wrangler=wrangler))
+            joined = "\n".join(drifts)
+            self.assertIn("worker=demo env=- binding=SURPRISE_TOP", joined)
+            self.assertIn("top-level binding is not in the manifest", joined)
+
     def test_unmapped_config_file_is_drift(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_repo(tmp)
@@ -247,6 +401,36 @@ class TestDriftCases(unittest.TestCase):
             (orphan / "wrangler.jsonc").write_text('{"name":"orphan"}')
             drifts, _, _ = run_check(root)
             self.assertIn("workers/orphan/wrangler.jsonc", "\n".join(drifts))
+
+    def test_unmapped_non_config_named_wrangler_file_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp)
+            note = root / "workers" / "demo" / "wrangler.md"
+            note.write_text("Worker configuration notes\\n")
+            drifts, _, _ = run_check(root)
+            self.assertEqual([], drifts)
+
+    def test_mapped_jsonc_config_fails_closed_as_unsupported(self):
+        manifest = MANIFEST.replace("wrangler.toml", "wrangler.jsonc")
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ParityError, "TOML is required"):
+                run_check(
+                    make_repo(
+                        tmp,
+                        wrangler='{"name":"demo"}',
+                        manifest=manifest,
+                        config_name="wrangler.jsonc",
+                    )
+                )
+
+    def test_duplicate_environment_aliases_fail_closed(self):
+        wrangler = MATCHING_WRANGLER + "\n[env.prod]\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ParityError, "duplicate environment aliases") as raised:
+                run_check(make_repo(tmp, wrangler=wrangler))
+            self.assertEqual(
+                1, str(raised.exception).count("workers/demo/wrangler.toml")
+            )
 
     def test_real_config_does_not_inherit_top_level_bindings(self):
         wrangler = (
@@ -276,6 +460,21 @@ class TestDriftCases(unittest.TestCase):
             self.assertIn("env=prod binding=DB", joined)
             self.assertIn("absent from the ops inventory for staging", joined)
             self.assertIn("absent from the ops inventory for prod", joined)
+
+    def test_id_inventory_is_binding_type_scoped(self):
+        manifest = MANIFEST.replace(
+            'staging = "fx-hd-staging"', 'staging = "fx-kv-staging"'
+        )
+        wrangler = MATCHING_WRANGLER.replace(
+            'id = "fx-hd-staging"', 'id = "fx-kv-staging"'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            drifts, _, _ = run_check(
+                make_repo(tmp, wrangler=wrangler, manifest=manifest)
+            )
+            self.assertIn(
+                "absent from the ops inventory for staging", "\n".join(drifts)
+            )
 
     def test_id_mismatch_never_prints_id_values(self):
         sentinel = "sentinel-id-value-must-not-print"
