@@ -1934,6 +1934,42 @@ mod tests {
         panic!("future did not complete");
     }
 
+    /// Strip `//` line comments (outside string literals) so shape/wiring
+    /// pins cannot be satisfied by an explanatory comment naming the
+    /// constant. Full-line doc comments and trailing remarks are removed;
+    /// `https://` inside a string literal is preserved.
+    fn strip_line_comments(src: &str) -> String {
+        src.lines()
+            .map(|line| {
+                let bytes = line.as_bytes();
+                let mut in_str = false;
+                let mut escaped = false;
+                let mut cut = line.len();
+                let mut i = 0;
+                while i + 1 < line.len() {
+                    let c = bytes[i] as char;
+                    if in_str {
+                        if escaped {
+                            escaped = false;
+                        } else if c == '\\' {
+                            escaped = true;
+                        } else if c == '"' {
+                            in_str = false;
+                        }
+                    } else if c == '"' {
+                        in_str = true;
+                    } else if c == '/' && bytes[i + 1] == b'/' {
+                        cut = i;
+                        break;
+                    }
+                    i += 1;
+                }
+                line[..cut].to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     const NOW: u64 = 1_700_000_000;
     const ORIGIN: &str = "https://example.com";
 
@@ -3868,18 +3904,34 @@ mod tests {
             !sql.contains("expires_at <= $3"),
             "fast-fail must count live slots, never expired ones"
         );
-        // Wiring pin: production must execute this shared constant, not a
-        // divergent literal or no guard at all. Deleting the Pg fast-fail
-        // block (or inlining a hand-written literal) leaves the FakeStore
-        // probe test green, so this assertion observes the production path
-        // directly at compile time.
+        // Wiring pin: production must execute this shared constant via
+        // `query_one`, not a divergent literal or no guard at all. Deleting
+        // the Pg fast-fail block (or inlining a hand-written literal) leaves
+        // the FakeStore probe test green, so this assertion observes the
+        // production path directly at compile time. Comments are stripped
+        // first: the explanatory comment naming the constant must not
+        // satisfy the pin on its own.
         let entry = include_str!("worker_entry.rs");
+        let code = strip_line_comments(entry);
         assert!(
-            entry.contains("RATE_LIMIT_EXHAUSTED_SQL"),
+            code.contains("RATE_LIMIT_EXHAUSTED_SQL"),
             "Pg reserve_rate_limit must execute the shared exhausted SQL"
         );
         assert!(
-            !entry.contains("SELECT COUNT(*) FROM auth_rate_limit_slots"),
+            code.contains("query_one("),
+            "Pg fast-fail must run the shared SQL via query_one"
+        );
+        let query_pos = code.find("query_one(").expect("query_one call");
+        assert!(
+            code[query_pos..]
+                .chars()
+                .take(300)
+                .collect::<String>()
+                .contains("RATE_LIMIT_EXHAUSTED_SQL"),
+            "Pg query_one call must pass the shared exhausted SQL"
+        );
+        assert!(
+            !code.contains("SELECT COUNT(*) FROM auth_rate_limit_slots"),
             "Pg must not carry a divergent fast-fail literal"
         );
     }
@@ -3983,6 +4035,50 @@ mod tests {
             other.status, 200,
             "a different /64 must keep its own budget: {}",
             other.body
+        );
+    }
+
+    #[test]
+    fn ipv6_slash64_wiring_pins_all_rate_limit_scopes() {
+        // All-sites wiring pin: every per-IP scope must key on
+        // `rate_limit_ip_key`, not the raw `source_ip`. The behavioral test
+        // above covers `auth.start_ip` only; the other five scopes revert to
+        // raw IP with all handler tests green (the harness default
+        // `198.51.100.9` makes key == raw), so this shape test observes all
+        // six call sites directly at compile time. Comments are stripped
+        // first so prose mentioning a scope cannot satisfy its pin.
+        let code = strip_line_comments(include_str!("handlers.rs"));
+        let norm = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (scope, keyed) in [
+            (
+                "auth.start_ip",
+                "&rate_limit_ip_key(&self.source_ip), \"auth.start_ip\",",
+            ),
+            (
+                "auth.mail_ip",
+                "&rate_limit_ip_key(&self.source_ip), \"auth.mail_ip\",",
+            ),
+            (
+                "auth.register_finish_ip",
+                "&rate_limit_ip_key(&ctx.source_ip), \"auth.register_finish_ip\",",
+            ),
+            (
+                "auth.login_finish_ip",
+                "&rate_limit_ip_key(&ctx.source_ip), \"auth.login_finish_ip\",",
+            ),
+            (
+                "auth.magic_finish",
+                "&rate_limit_ip_key(&ctx.source_ip), \"auth.magic_finish\",",
+            ),
+        ] {
+            assert!(
+                norm.contains(keyed),
+                "scope {scope} must key on rate_limit_ip_key, not raw source_ip"
+            );
+        }
+        assert!(
+            norm.contains("format!(\"invite:{}:{}\", rate_limit_ip_key(&ctx.source_ip), user_id)"),
+            "scope auth.invite_redeem must key on rate_limit_ip_key, not raw source_ip",
         );
     }
 
