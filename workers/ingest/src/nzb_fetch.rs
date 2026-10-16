@@ -1,49 +1,45 @@
-//! Guarded server-side fetch of NZB URLs.
+//! Library-only NZB URL policy validation and buffered fetch simulation.
 //!
-//! Fetching an NZB from a caller-supplied URL is a fresh SSRF surface
-//! (distinct from the vault `test-connection` guard in `workers/api` and
-//! from the Newznab indexer fetch in [`crate::indexer_fetch`] where that
-//! slice exists): syntactic URL checks alone are bypassable through DNS
-//! (rebinding, mixed public/private answers) and redirects (metadata
-//! endpoints, http downgrades).
+//! **Not a production fetcher or a runtime SSRF boundary.** No ingest route
+//! calls this module; it has no real DNS/HTTPS implementation, environment
+//! read or decision-log emission. Runtime wiring is tracked in
+//! <https://github.com/TogetherWeOwn/nntunev2/issues/84>.
 //!
-//! Invariant (mirrors the `workers/api` vault guard; keep the three in sync):
-//! - `https` only, no embedded credentials, no explicit port other than
-//!   443 (the default when absent);
-//! - the host must be on the operator-configured allowlist (exact,
-//!   case-insensitive match — subdomains are NOT implied);
-//! - resolve ALL DNS records and reject loopback / link-local (including
-//!   the cloud metadata endpoint) / private / CGNAT /
-//!   multicast / reserved / documentation (v4+v6, including transition
-//!   space). A forbidden address is rejected even when its host was
-//!   allowlisted by mistake. IP-literal hosts are checked directly, with
-//!   no DNS call;
-//! - every redirect hop is re-guarded from scratch (cap
-//!   [`MAX_REDIRECTS`]);
-//! - a total timeout ([`FETCH_TIMEOUT_MS`]): chunk delays accumulating
-//!   past it abort with [`FetchRejection::Timeout`]; partial bytes are
-//!   never returned;
-//! - bodies past the intake cap abort with [`FetchRejection::TooLarge`];
-//! - every block maps to a stable [`FetchRejection::code`] +
-//!   [`FetchRejection::http_status`].
+//! [`validate_fetch_url`] checks HTTPS, credentials, port 443, an exact
+//! case-insensitive host allowlist, and every address returned by the supplied
+//! resolver. It rejects private, metadata, reserved and other forbidden address
+//! ranges, even for allowlisted hosts; IP literals bypass DNS but not policy.
+//! [`ValidatedUrl`] records the result, but does not bind a network connection.
 //!
-//! ## Allowlist config
+//! [`fetch_nzb`] models redirect revalidation, rejection codes, byte limits and
+//! accumulated *reported* chunk delays with an injected, buffered transport.
+//! It does not pass the vetted addresses to that transport. Its URL-only
+//! [`FetchTransport`] interface cannot enforce IP pinning or original-host TLS
+//! validation. [`RawResponse`] already contains every chunk before limits are
+//! checked: no streaming memory bound, wall-clock timeout or cancellation is
+//! enforced, and DNS/connect/header time is not measured. Do not implement a
+//! live HTTPS client behind this simulator interface.
 //!
-//! Not wired yet: no route calls [`fetch_nzb`] and nothing reads the
-//! variable below. The wiring follow-up loads the allowlist from the
-//! `NZB_FETCH_ALLOWLIST` environment variable: a comma-separated list of exact hostnames
-//! (e.g. `nzb.example,cdn.example`). Matching is exact and
-//! case-insensitive; `sub.nzb.example` is NOT covered by `nzb.example`.
-//! The default ([`FetchConfig::default`]) allows nothing (deny-all), so a
-//! worker without the variable answers every fetch URL with
-//! `nzb_fetch_host_not_allowlisted` (403).
+//! The future runtime must carry the validated host/address set to a pinned
+//! HTTPS transport, preserve original-host SNI/certificate checks and Host,
+//! stream with a byte cap, and apply one cancellable deadline to DNS, connect,
+//! TLS, headers, body and all redirects. Keep URL fetching unavailable until
+//! those properties are demonstrated; exporting this module is not wiring it.
 //!
-//! ## Numbers
+//! ## Policy configuration (not read from the Worker environment)
 //!
-//! - [`FETCH_TIMEOUT_MS`]: 10_000 (10 s total per fetch).
-//! - [`MAX_REDIRECTS`]: 3 redirect hops after the initial fetch.
-//! - Body cap: [`MAX_NZB_BYTES`](crate::nzb_intake::MAX_NZB_BYTES) (the
-//!   NZB intake cap, 2 MiB).
+//! [`FetchConfig::allowlist_from_env`] parses a caller-supplied string; it does
+//! not read `NZB_FETCH_ALLOWLIST`. That future variable is a comma-separated
+//! list of exact hostnames (e.g. `nzb.example,cdn.example`); subdomains are not
+//! implied. [`FetchConfig::default`] denies every host. The library returns
+//! `HostNotAllowlisted`; no route currently converts it to an HTTP response.
+//!
+//! ## Model defaults (not enforced network limits)
+//!
+//! - [`FETCH_TIMEOUT_MS`]: 10_000 ms of reported chunk delays across hops.
+//! - [`MAX_REDIRECTS`]: 3 redirect hops after the initial simulated response.
+//! - Returned-body cap: [`MAX_NZB_BYTES`](crate::nzb_intake::MAX_NZB_BYTES)
+//!   (2 MiB), checked after the transport has buffered its response.
 //!
 //! ## Stable codes (never reworded)
 //!
@@ -60,24 +56,22 @@
 //! | `TooLarge` | `nzb_fetch_too_large` | 413 |
 //! | `UpstreamStatus(_)` | `nzb_fetch_upstream_status` | 502 |
 //!
-//! ## Decision log
+//! ## Future decision log and acceptance boundary
 //!
-//! Log each block as host + code only (see [`url_host_for_log`]): the
-//! full URL may embed credentials or an apikey, so it never reaches the
-//! log.
+//! [`url_host_for_log`] extracts a host without credentials, path or query;
+//! it does not emit logs. Future wiring must log only that sanitized host
+//! and the stable rejection code, never a full URL or response body.
 //!
-//! `std`-only plus the crate's existing deps: the URL is parsed the same
-//! hand-rolled way `newznab::check_base_url` already does (no `url` crate
-//! in this worker). DNS is a trait so tests use a fake and the Worker uses
-//! real DNS; the HTTP hop is a trait so tests use a fake transport while
-//! the real Worker transport pins the TCP/TLS dial to
-//! [`ValidatedUrl::addresses`] with [`ValidatedUrl::host`] for SNI.
+//! The fake-transport acceptance suite exercises this library model only.
+//! Its original runtime-wiring prose describes the future end state, not
+//! functionality delivered here. It does not prove pinned HTTPS, streaming
+//! limits, actual deadlines, route/config wiring or block-log emission.
 
 use std::net::{IpAddr, Ipv4Addr};
 
 use crate::nzb_intake::MAX_NZB_BYTES;
 
-/// Total deadline for one fetch (ms).
+/// Default simulated chunk-delay budget (ms), not a wall-clock deadline.
 pub const FETCH_TIMEOUT_MS: u64 = 10_000;
 /// Maximum redirect hops followed after the initial fetch.
 pub const MAX_REDIRECTS: u32 = 3;
@@ -86,14 +80,14 @@ pub const MAX_REDIRECTS: u32 = 3;
 /// a port-scan primitive.
 const ALLOWED_FETCH_PORT: u16 = 443;
 
-/// DNS resolution as a trait so tests use a fake and the Worker uses real
-/// DNS. Resolve ALL records: any forbidden address in the set rejects.
+/// Injected address lookup for library policy checks; no runtime DNS adapter
+/// is supplied. Return ALL records: any forbidden address in the set rejects.
 pub trait DnsResolver {
     fn resolve(&self, host: &str) -> Vec<IpAddr>;
 }
 
-/// Tunables for [`fetch_nzb`]; defaults are the pinned contract
-/// (deny-all allowlist, 10 s timeout, 3 redirects, intake body cap).
+/// Tunables for the [`fetch_nzb`] policy simulator (deny-all allowlist,
+/// reported-delay budget, redirect cap and returned-body cap).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchConfig {
     pub allowed_hosts: Vec<String>,
@@ -114,9 +108,9 @@ impl Default for FetchConfig {
 }
 
 impl FetchConfig {
-    /// Parse the `NZB_FETCH_ALLOWLIST` value: comma-separated exact
-    /// hostnames; blanks are dropped, entries are trimmed (matching itself
-    /// is case-insensitive, so no case folding is needed here).
+    /// Parse a supplied allowlist string, not the Worker environment.
+    /// Comma-separated exact hostnames; blanks are dropped and entries
+    /// trimmed. Matching is case-insensitive.
     pub fn allowlist_from_env(raw: &str) -> Vec<String> {
         raw.split(',')
             .map(str::trim)
@@ -126,8 +120,8 @@ impl FetchConfig {
     }
 }
 
-/// Why a fetch was refused or failed. Guard blocks carry a stable 4xx;
-/// the timeout a stable 504; oversize a 413; upstream failures a 502.
+/// Library rejection reasons with proposed HTTP mappings for future wiring.
+/// No route currently emits these codes or statuses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FetchRejection {
     BadScheme,
@@ -159,7 +153,7 @@ impl FetchRejection {
         }
     }
 
-    /// Stable HTTP status the route answers with this rejection.
+    /// Stable HTTP status for a future route to map this rejection to.
     pub fn http_status(&self) -> u16 {
         match self {
             FetchRejection::BadScheme
@@ -175,29 +169,32 @@ impl FetchRejection {
     }
 }
 
-/// One fetch target that passed the guard, pinned for immediate use.
-/// Never store it across requests: revalidate at every fetch, dial ONLY
-/// `addresses`, and keep `host` for TLS SNI/certificate checks and the
-/// HTTP Host header. The transport never re-resolves `host`.
+/// URL and resolver answers that passed library policy, not a pinned socket.
+/// A future transport must consume this value, dial only these addresses,
+/// and use the host for TLS SNI/certificate checks and HTTP Host without
+/// re-resolution. The current simulator does NOT pass this value to `get`.
+/// Never cache it across requests; revalidate every hop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatedUrl {
     /// The URL as validated.
     pub url: String,
-    /// Lowercased hostname, no trailing dot or brackets: the exact name
-    /// that was resolved, and what TLS SNI sees.
+    /// Lowercased hostname, no trailing dot or brackets, used for lookup.
+    /// Future HTTPS wiring must preserve this name for TLS identity.
     pub host: String,
-    /// EVERY vetted address, in order: the only dial destinations.
+    /// Every vetted resolver answer, in order; no dialing happens here.
     pub addresses: Vec<IpAddr>,
 }
 
-/// One HTTP GET with NO redirect following (the fetcher follows manually
-/// so every hop is re-guarded). The real Worker transport must pin the
-/// dial to the validated addresses and keep the host for TLS SNI/Host.
+/// Buffered single-hop simulator seam; implementations must not follow
+/// redirects. This URL-only API receives neither vetted addresses nor a
+/// remaining deadline and cannot enforce safe live HTTPS. Use fakes only;
+/// the runtime follow-up must supply a different, pinned streaming contract.
 pub trait FetchTransport {
     fn get(&mut self, url: &str) -> Result<RawResponse, FetchRejection>;
 }
 
-/// Single-hop transport answer.
+/// Fully buffered simulated hop, not a streaming response. Limits are
+/// evaluated after this value has already been allocated and returned.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawResponse {
     pub status: u16,
@@ -205,8 +202,8 @@ pub struct RawResponse {
     pub chunks: Vec<BodyChunk>,
 }
 
-/// One body chunk with the ms elapsed before it arrived; the fetcher
-/// accumulates these against the timeout (slow-drip guard).
+/// Buffered bytes plus a supplied delay for simulation. Reported delays
+/// are accumulated, not measured: no real I/O is timed or interrupted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BodyChunk {
     pub delay_ms: u64,
@@ -420,18 +417,22 @@ fn is_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
-/// Guarded fetch of one NZB URL:
-/// - validate before ANY transport call, resolving each hop's host exactly
-///   once and dialing only that vetted set (a second, different DNS answer
-///   is never consulted — no rebinding window);
-/// - accumulate chunk delays against `config.timeout_ms`: at the deadline
-///   counts as expired (the vault `TestConnectionBudget` semantics), and
-///   the abort never returns partial bytes;
-/// - bodies past `config.max_bytes` abort with TooLarge as they stream;
-/// - on 301/302/303/307/308 re-validate the Location from scratch and
-///   follow at most `config.max_redirects` hops; a redirect status
-///   without a Location is UpstreamStatus(status), as is any other
-///   non-2xx.
+/// Simulate URL-fetch policy over already-buffered responses, not live I/O.
+///
+/// Validates before each simulated hop, but passes only the URL string to
+/// `get`: the validated addresses/host are NOT transport-pinned. A real client
+/// that re-resolves the host would have a DNS-rebinding window.
+///
+/// Accumulates reported chunk delays across hops and rejects at or beyond
+/// `config.timeout_ms`; no actual deadline bounds DNS or `get`. Checks the
+/// final body's size only after all response chunks have been buffered by
+/// the transport. Neither a stalled transport nor unbounded upstream memory
+/// use can be stopped by this API. Errors never return a partial result.
+///
+/// Revalidates 301/302/303/307/308 locations and follows at most
+/// `config.max_redirects` hops. A missing Location or other non-2xx status
+/// becomes UpstreamStatus(status). See the module's runtime follow-up before
+/// connecting this model to any caller-supplied URL-fetch route.
 pub fn fetch_nzb(
     url: &str,
     config: &FetchConfig,

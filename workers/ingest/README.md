@@ -41,45 +41,67 @@ NZB upload ───────────────┘                     
   never accepted in API bodies, never logged (redacted URLs only), never
   committed. `http://` indexer URLs are refused.
 - Upload bodies are untrusted: capped, shape-checked, never logged.
-- NZB fetch-from-URL SSRF guard (`src/nzb_fetch.rs`), NOT YET WIRED: the
-  module is unit-tested, but no route calls it and nothing reads
-  `NZB_FETCH_ALLOWLIST` yet. Wiring it (route, env read, real transport
-  that dials the validated addresses, block logging) is a tracked
-  follow-up. The contract below is what that wiring must enforce. A
-  server-side fetch of a caller-supplied NZB URL is hostile input. The
-  guard runs before ANY transport call and on every redirect hop from
-  scratch:
-  - `https` only (any other scheme is `nzb_fetch_bad_scheme`, 400), no
-    embedded credentials (`nzb_fetch_embedded_credentials`, 400), no
-    explicit port other than 443;
-  - host allowlist: exact, case-insensitive match against
-    `NZB_FETCH_ALLOWLIST` (comma-separated exact hostnames, e.g.
-    `nzb.example,cdn.example`; subdomains are NOT implied). The default
-    is deny-all, so a worker without the variable answers every fetch URL
-    with `nzb_fetch_host_not_allowlisted` (403);
-  - resolve ALL DNS records and reject loopback / link-local (including
-    the cloud metadata endpoint) / private / CGNAT /
-    multicast / reserved / documentation, v4+v6 including transition
-    space (`nzb_fetch_forbidden_address`, 403) — even when the host was
-    allowlisted by mistake. IP literals are checked directly, with no DNS
-    call. Unresolvable names are refused (`nzb_fetch_unresolvable_host`,
-    400);
-  - at most 3 redirect hops (`MAX_REDIRECTS`); past the cap the fetch
-    aborts with `nzb_fetch_too_many_redirects` (400). A redirect hop to a
-    forbidden address, an `http` downgrade, or an off-allowlist host is
-    blocked under its own code and never fetched;
-  - total timeout 10000 ms (`FETCH_TIMEOUT_MS`): chunk delays accumulating
-    past it abort with `nzb_fetch_timeout` (504); partial bytes are never
-    returned. Bodies past the 2 MiB intake cap abort with
-    `nzb_fetch_too_large` (413); other upstream statuses surface as
-    `nzb_fetch_upstream_status` (502);
-  - when wired, every block must be logged as host + stable code only
-    (never the full URL: it may embed credentials or an apikey).
-- Stable codes: `nzb_fetch_bad_scheme`, `nzb_fetch_malformed_url`,
-  `nzb_fetch_embedded_credentials`, `nzb_fetch_host_not_allowlisted`,
-  `nzb_fetch_forbidden_address`, `nzb_fetch_unresolvable_host`,
-  `nzb_fetch_too_many_redirects`, `nzb_fetch_timeout`, `nzb_fetch_too_large`,
-  `nzb_fetch_upstream_status`.
+
+## NZB URL policy library — no runtime URL fetching
+
+`src/nzb_fetch.rs` is a **library-only policy guard and buffered simulator**,
+not a live SSRF boundary. No ingest route calls it; no runtime resolver or
+HTTPS transport is provided, `NZB_FETCH_ALLOWLIST` is not read from the
+Worker environment, and no block logs are emitted. Exporting `pub mod
+nzb_fetch` does not wire a fetch-from-URL feature. Existing search and NZB
+upload routes are unchanged.
+
+### What the library checks
+
+- `validate_fetch_url` checks HTTPS, no embedded credentials, default/443
+  port, and exact case-insensitive host allowlisting (subdomains are not
+  implied). `FetchConfig::default()` denies every host. The parser accepts
+  a supplied comma-separated string such as `nzb.example,cdn.example`; it
+  does not load environment configuration.
+- Every answer from the supplied resolver is checked for forbidden ranges
+  (loopback, link-local/metadata, private, CGNAT, multicast, reserved and
+  documentation, including IPv6 transition space). IP literals skip DNS,
+  not policy. The result records vetted addresses, not a network binding.
+- `fetch_nzb` models per-hop validation and at most 3 redirects. It checks
+  accumulated reported chunk delays across hops against 10000 ms and the
+  final returned body against the 2 MiB intake cap, returning stable
+  rejection reasons without partial results.
+- `url_host_for_log` extracts a sanitized host. Stable codes/status mappings
+  are library values for future route wiring, not current HTTP responses.
+
+### Limits of the model
+
+`FetchTransport::get(&str)` receives only a URL, **not the validated
+addresses/hostname or a remaining deadline**. It cannot enforce IP-pinned
+dialing, original-host TLS verification or DNS-rebinding resistance. A
+`RawResponse` already contains all body chunks: size and reported-delay
+checks happen **after buffering**, not while streaming. DNS, connection,
+TLS and header durations are not measured; a hung transport cannot be
+cancelled. Do not attach a real HTTPS client to this simulator interface.
+
+The fake DNS/transport tests prove policy behavior only. The original
+runtime-wiring prose in `tests/nzb_fetch_ssrf_guard.rs` is the future end
+state, not delivered functionality; that test file is unchanged. Passing it
+is not evidence of runtime pinning, deadlines, streamed byte bounds,
+route/environment wiring or log emission.
+
+### Tracked runtime follow-up
+
+[Safe pinned HTTPS transport and ingest URL route (#84)](https://github.com/TogetherWeOwn/nntunev2/issues/84)
+owns the remaining work: a transport receiving the validated address/host
+set with original-host SNI/certificate/Host validation and no re-resolution;
+cancellable streaming with one deadline across DNS/connect/TLS/headers/body
+and all redirects; bounded buffering; authenticated route wiring with a
+deny-all `NZB_FETCH_ALLOWLIST`; and host + stable code-only rejection logs.
+The follow-up also owns acceptance tests proving those live properties.
+Keep URL fetching unavailable until a supported transport demonstrates them.
+
+Stable codes: `nzb_fetch_bad_scheme`, `nzb_fetch_malformed_url`,
+`nzb_fetch_embedded_credentials`, `nzb_fetch_host_not_allowlisted`,
+`nzb_fetch_forbidden_address`, `nzb_fetch_unresolvable_host`,
+`nzb_fetch_too_many_redirects`, `nzb_fetch_timeout`, `nzb_fetch_too_large`,
+`nzb_fetch_upstream_status`. HTTP mappings are documented on the module's
+`FetchRejection` type; no route emits them in this slice.
 
 ## E2E contract (synthetic NNTP server card)
 
