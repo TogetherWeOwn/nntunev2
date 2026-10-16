@@ -517,6 +517,36 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_bool_key_parses_and_is_read_by_get_bool() {
+        // Keep Bool parsing/getter coverage even while the shipped schema has
+        // no bool key; this synthetic spec must not become a production key.
+        let spec = KeySpec {
+            name: "test.bool_flag",
+            ty: ConfigType::Bool,
+            default: Some("false"),
+            required: false,
+            env_overridable: false,
+            env_var: None,
+        };
+
+        assert_eq!(spec.parse(" true "), Ok(Value::Bool(true)));
+        assert_eq!(spec.parse("FALSE"), Ok(Value::Bool(false)));
+        assert_eq!(
+            spec.parse("yes"),
+            Err(ConfigError::InvalidType {
+                key: "test.bool_flag",
+                expected: ConfigType::Bool,
+            })
+        );
+
+        let mut config = Config::default();
+        config
+            .values
+            .insert(spec.name.to_owned(), spec.parse("true").unwrap());
+        assert_eq!(config.get_bool(spec.name), Some(true));
+    }
+
+    #[test]
     fn typed_getters_return_none_for_absent_or_other_typed_keys() {
         let config = Config::load(&identity()).expect("identity loads");
         assert_eq!(config.get_u64("auth.rp_id"), None);

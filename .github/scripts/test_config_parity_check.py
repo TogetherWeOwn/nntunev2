@@ -144,6 +144,37 @@ class ParityCheckTests(unittest.TestCase):
             self.assertEqual(code, 1, out)
             self.assertIn("env_var", out)
 
+    def test_bool_schema_type_accepts_boolean_and_rejects_integer(self):
+        # Exercise bool validation without adding a bool key to the shipped schema.
+        schema = load_schema()
+        schema["keys"]["test.bool_flag"] = {
+            "type": "bool",
+            "default": False,
+            "required": False,
+            "env_overridable": False,
+            "env_var": None,
+        }
+        staging = json.loads(STAGING.read_text(encoding="utf-8"))
+        prod = json.loads((ROOT / "config" / "prod.json").read_text(encoding="utf-8"))
+        staging["test.bool_flag"] = True
+        prod["test.bool_flag"] = False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            schema_path = Path(tmp) / "schema.json"
+            staging_path = Path(tmp) / "staging.json"
+            prod_path = Path(tmp) / "prod.json"
+            write_json(schema_path, schema)
+            write_json(staging_path, staging)
+            write_json(prod_path, prod)
+            code, out = run_check(staging_path, prod_path, schema=schema_path)
+            self.assertEqual(code, 0, out)
+
+            staging["test.bool_flag"] = 1
+            write_json(staging_path, staging)
+            code, out = run_check(staging_path, prod_path, schema=schema_path)
+        self.assertEqual(code, 1, out)
+        self.assertIn("expected bool, got int", out)
+
     def test_missing_file_is_input_error(self):
         code, _ = run_check(STAGING, FIXTURES / "does-not-exist.json")
         self.assertEqual(code, 2)
