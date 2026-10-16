@@ -35,21 +35,25 @@ checked against its real contract for the first time. The smoke stays green
 on the current app; the items below are future contract, documented here so
 the activation checklist is accurate:
 
-- `GET /api/health` returns exactly `{ok:true}`
+- `GET /api/health` returns `{ok:true, version:<pkg>}`
   (`apps/web/src/routes/api/health/+server.ts`, pinned by
-  `apps/web/tests/smoke.spec.ts` `toEqual({ok:true})`). `health.spec.ts`
-  requires `ok === true` and asserts `version` only when the app ships it.
-- `GET /api/ready` does not exist yet (staging answers 404). The smoke
-  tolerates 404 as "not yet implemented" and pins the 200/503 + Retry-After
-  shape once the route lands.
-- `apps/web/src` has no `data-testid` hooks yet. The app-shell smoke accepts
-  `data-testid="app-root"` when present and otherwise falls back to the
-  landing's `NNTune` heading; signup/BYOP/library/player/meter hooks
-  (`helpers/contract.ts` `TESTIDS`) and `/signup`'s real form, the BYOP
-  wizard, ingest/library/stream/usage endpoints arrive with the venture
-  slices that own them. The journey specs (`signup-byop`, `ingest-play-meter`)
-  therefore remain red until those slices land — that failure is the signal,
-  not noise.
+  `apps/web/tests/smoke.spec.ts` exact-keys assertion). `health.spec.ts`
+  requires `ok === true` and asserts `version` whenever the deployed app
+  ships it, so the check stays green across the deploy boundary.
+- `GET /api/ready` currently returns 200 `{ok:true}` while the stateless app
+  can serve traffic (`apps/web/src/routes/api/ready/+server.ts`). The 503
+  `{ok:false}` plus `Retry-After` shape in `apps/web/src/lib/ready.ts` is
+  reserved for a future downstream dependency check; the current endpoint
+  does not emit it. The smoke tolerates 404 for builds predating the route and
+  otherwise requires the current 200 shape.
+- `apps/web/src/lib/contract.test.ts` checks that each hook in
+  `helpers/contract.ts` `TESTIDS` is declared in its expected route file.
+  This is a source-level route contract, not proof that conditional markup is
+  reachable or visible at runtime; the smoke separately checks selected hooks
+  in rendered pages. `/signup`'s real submission, the BYOP wizard's backend
+  behavior, ingest/library/stream/usage endpoints, and usage-meter enforcement
+  still depend on their venture slices; the journey specs expose those missing
+  backend behaviors directly.
 
 ## Run locally
 

@@ -5,12 +5,11 @@
 //! generic (no user-enumeration oracle); challenges are single-use with
 //! short expiry and RP/origin pinning.
 //!
-//! Full WebAuthn attestation/assertion signature verification wires to a
-//! WebAuthn library in the follow-up slice (child card): this module owns
-//! the challenge lifecycle, origin/RP binding, expiry, single-use, and
-//! credential storage shapes, all enforced and tested here.
+//! WebAuthn attestation/assertion signature verification lives in
+//! `crate::webauthn`; this module owns the challenge lifecycle,
+//! origin/RP binding, expiry, single-use claims, and credential
+//! storage shapes, all enforced and tested here.
 
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -38,7 +37,7 @@ impl std::fmt::Display for AuthError {
 
 fn random_b64url_32() -> String {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("secure randomness unavailable");
     // Shared unpadded-base64url (F-HARD-01): no per-module copies.
     crate::b64::encode(&bytes)
 }
@@ -64,6 +63,13 @@ pub struct MagicLinkRecord {
     pub issued_at: u64,
     pub expires_at: u64,
     pub used: bool,
+}
+
+/// SHA-256 hex of a presented magic-link token, for record lookup by hash.
+/// The HTTP layer looks the record up with this, then still requires
+/// [`consume_magic_link_atomically`] — a hash lookup is not authentication.
+pub fn hash_magic_token(token: &str) -> String {
+    sha256_hex(token)
 }
 
 /// Issue a magic link: returns `(plaintext_token, stored_record)`.
@@ -278,7 +284,7 @@ pub fn consume_invite(
 /// enumeration is infeasible and the throttle below is defense in depth.
 pub fn generate_invite_code() -> String {
     let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("secure randomness unavailable");
     crate::b64::encode(&bytes)
 }
 
@@ -432,6 +438,37 @@ mod tests {
         let (token, record) = issue_magic_link("u", "a@b.c", 0);
         assert_eq!(record.token_hash, sha256_hex(&token));
         assert_eq!(record.token_hash.len(), 64);
+    }
+
+    #[test]
+    fn magic_link_tokens_and_challenge_ids_are_random() {
+        // Pin the secure-randomness fill behind `random_b64url_32`: a
+        // dropped fill would make the magic-link token a constant login
+        // credential (43 'A's) and every passkey challenge id identical.
+        let (token_a, _) = issue_magic_link("u", "a@b.c", 0);
+        let (token_b, _) = issue_magic_link("u", "a@b.c", 0);
+        assert_ne!(token_a, token_b, "tokens must be unique per issue");
+        let zero_token = crate::b64::encode(&[0u8; 32]);
+        assert_ne!(token_a, zero_token);
+        assert_ne!(token_b, zero_token);
+        assert_eq!(
+            crate::b64::decode(&token_a).expect("token decodes").len(),
+            32,
+            "exactly 256 bits of entropy"
+        );
+
+        let challenge_a =
+            new_registration_challenge("nntune.example.com", "https://nntune.example.com", 0)
+                .expect("challenge");
+        let challenge_b =
+            new_registration_challenge("nntune.example.com", "https://nntune.example.com", 0)
+                .expect("challenge");
+        assert_ne!(
+            challenge_a.id, challenge_b.id,
+            "challenge ids must be unique per ceremony"
+        );
+        assert_ne!(challenge_a.id, zero_token);
+        assert_ne!(challenge_b.id, zero_token);
     }
 
     #[test]

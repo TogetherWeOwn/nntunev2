@@ -6,7 +6,7 @@
 	/>
 </svelte:head>
 
-<main class="nt-wrap">
+<main class="nt-wrap" data-testid="app-root">
 	<h1>NNTune</h1>
 	<p>
 		Your music, on your terms. NNTune never bundles or resells Usenet access — you bring your
