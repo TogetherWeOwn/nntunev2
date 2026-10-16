@@ -94,6 +94,8 @@ pub fn provider_auth_expired_body() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VaultError {
     Invalid,
+    /// Malformed persisted ciphertext or metadata: server-side stored data is corrupt.
+    CorruptStoredData,
     Crypto,
 }
 
@@ -486,8 +488,9 @@ fn random_nonce() -> [u8; 12] {
 }
 
 // Unpadded-base64url lives in one place: [`crate::b64`] over the `base64`
-// crate (F-HARD-01). The per-module hand-rolled copies are deleted; decode
-// errors map to generic [`VaultError::Invalid`] at each call site.
+// crate (F-HARD-01). The per-module hand-rolled copies are deleted; input
+// decode failures map to [`VaultError::Invalid`], stored-blob failures to
+// [`VaultError::CorruptStoredData`].
 fn dek_aad(user_id: &str, kek_version: u32) -> String {
     format!("v1|dek|{}|{}", user_id, kek_version)
 }
@@ -553,10 +556,11 @@ pub fn decrypt_vault(
 ) -> Result<Vec<u8>, VaultError> {
     let kek_cipher = Aes256Gcm::new_from_slice(kek).map_err(|_| VaultError::Crypto)?;
     let wrap_nonce: [u8; 12] = crate::b64::decode(&blob.dek_wrapped_nonce_b64url)
-        .map_err(|_| VaultError::Invalid)?
+        .map_err(|_| VaultError::CorruptStoredData)?
         .try_into()
-        .map_err(|_| VaultError::Invalid)?;
-    let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url).map_err(|_| VaultError::Invalid)?;
+        .map_err(|_| VaultError::CorruptStoredData)?;
+    let wrapped =
+        crate::b64::decode(&blob.dek_wrapped_b64url).map_err(|_| VaultError::CorruptStoredData)?;
     let mut dek_bytes = kek_cipher
         .decrypt(
             &Nonce::from(wrap_nonce),
@@ -578,10 +582,11 @@ pub fn decrypt_vault(
 
     let dek_cipher = Aes256Gcm::new_from_slice(&dek.0).map_err(|_| VaultError::Crypto)?;
     let payload_nonce: [u8; 12] = crate::b64::decode(&blob.payload_nonce_b64url)
-        .map_err(|_| VaultError::Invalid)?
+        .map_err(|_| VaultError::CorruptStoredData)?
         .try_into()
-        .map_err(|_| VaultError::Invalid)?;
-    let payload = crate::b64::decode(&blob.payload_b64url).map_err(|_| VaultError::Invalid)?;
+        .map_err(|_| VaultError::CorruptStoredData)?;
+    let payload =
+        crate::b64::decode(&blob.payload_b64url).map_err(|_| VaultError::CorruptStoredData)?;
     dek_cipher
         .decrypt(
             &Nonce::from(payload_nonce),
@@ -605,10 +610,11 @@ pub fn rewrap_dek(
     // Unwrap with the old KEK (old AAD: old version).
     let old_cipher = Aes256Gcm::new_from_slice(old_kek).map_err(|_| VaultError::Crypto)?;
     let wrap_nonce: [u8; 12] = crate::b64::decode(&blob.dek_wrapped_nonce_b64url)
-        .map_err(|_| VaultError::Invalid)?
+        .map_err(|_| VaultError::CorruptStoredData)?
         .try_into()
-        .map_err(|_| VaultError::Invalid)?;
-    let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url).map_err(|_| VaultError::Invalid)?;
+        .map_err(|_| VaultError::CorruptStoredData)?;
+    let wrapped =
+        crate::b64::decode(&blob.dek_wrapped_b64url).map_err(|_| VaultError::CorruptStoredData)?;
     let mut dek_bytes = old_cipher
         .decrypt(
             &Nonce::from(wrap_nonce),
@@ -951,6 +957,8 @@ mod tests {
         let new_kek = [0x22u8; 32];
         let blob = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
 
+        // Stored-blob nonce length mismatches are server-side corruption,
+        // not caller-input validation errors.
         for len in [0, 1, 11, 13, 16, 24] {
             let nonce = crate::b64::encode(&vec![7u8; len]);
 
@@ -958,7 +966,7 @@ mod tests {
             bad_wrap_nonce.dek_wrapped_nonce_b64url = nonce.clone();
             assert_eq!(
                 decrypt_vault(&kek, "user-1", &bad_wrap_nonce),
-                Err(VaultError::Invalid),
+                Err(VaultError::CorruptStoredData),
                 "decrypt accepted a wrapped nonce of length {len}"
             );
             // `VaultBlob` has no `PartialEq`, so match on the error instead
@@ -966,7 +974,7 @@ mod tests {
             assert!(
                 matches!(
                     rewrap_dek(&kek, &new_kek, 2, "user-1", &bad_wrap_nonce),
-                    Err(VaultError::Invalid)
+                    Err(VaultError::CorruptStoredData)
                 ),
                 "rewrap accepted a wrapped nonce of length {len}"
             );
@@ -975,7 +983,7 @@ mod tests {
             bad_payload_nonce.payload_nonce_b64url = nonce;
             assert_eq!(
                 decrypt_vault(&kek, "user-1", &bad_payload_nonce),
-                Err(VaultError::Invalid),
+                Err(VaultError::CorruptStoredData),
                 "decrypt accepted a payload nonce of length {len}"
             );
         }
@@ -1087,6 +1095,75 @@ mod tests {
             crate::b64::encode(&[0u8; 12])
         );
         assert_ne!(rotated.dek_wrapped_b64url, blob.dek_wrapped_b64url);
+    }
+
+    #[test]
+    fn malformed_stored_blobs_are_classified_as_corrupt_at_the_vault_boundary() {
+        let kek = [0x11u8; 32];
+        let new_kek = [0x33u8; 32];
+        // Every stored-blob decode site in `decrypt_vault` must map to
+        // `CorruptStoredData` (never caller-input `Invalid`): a regression of
+        // any one site to `Invalid` would surface stored corruption as a
+        // fix-your-request 422 instead of a 500.
+        for field in [
+            "dek_wrapped_nonce_b64url",
+            "dek_wrapped_b64url",
+            "payload_nonce_b64url",
+            "payload_b64url",
+        ] {
+            let mut blob = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+            match field {
+                "dek_wrapped_nonce_b64url" => blob.dek_wrapped_nonce_b64url = "!".into(),
+                "dek_wrapped_b64url" => blob.dek_wrapped_b64url = "!".into(),
+                "payload_nonce_b64url" => blob.payload_nonce_b64url = "!".into(),
+                "payload_b64url" => blob.payload_b64url = "!".into(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                decrypt_vault(&kek, "user-1", &blob),
+                Err(VaultError::CorruptStoredData),
+                "field {field} must classify as corrupt stored data"
+            );
+        }
+        // A well-formed base64 nonce of the wrong length is corrupt stored
+        // data too, not caller input: this pins the `try_into` length branch
+        // distinctly from the base64-decode branch above.
+        let mut short_nonce = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+        short_nonce.payload_nonce_b64url = crate::b64::encode(&[0u8; 5]);
+        assert_eq!(
+            decrypt_vault(&kek, "user-1", &short_nonce),
+            Err(VaultError::CorruptStoredData)
+        );
+
+        // A well-formed but short wrapped-DEK nonce must hit the length
+        // classification branch in `decrypt_vault` too.
+        let mut short_wrapped_nonce = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+        short_wrapped_nonce.dek_wrapped_nonce_b64url = crate::b64::encode(&[0u8; 5]);
+        assert_eq!(
+            decrypt_vault(&kek, "user-1", &short_wrapped_nonce),
+            Err(VaultError::CorruptStoredData)
+        );
+
+        // Both wrapped-DEK decode sites in `rewrap_dek` pin the same way.
+        let mut short_rewrap_nonce = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+        short_rewrap_nonce.dek_wrapped_nonce_b64url = crate::b64::encode(&[0u8; 5]);
+        assert!(matches!(
+            rewrap_dek(&kek, &new_kek, 2, "user-1", &short_rewrap_nonce),
+            Err(VaultError::CorruptStoredData)
+        ));
+
+        let mut malformed_wrap = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+        malformed_wrap.dek_wrapped_nonce_b64url = "!".into();
+        assert!(matches!(
+            rewrap_dek(&kek, &new_kek, 2, "user-1", &malformed_wrap),
+            Err(VaultError::CorruptStoredData)
+        ));
+        let mut malformed_wrapped = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+        malformed_wrapped.dek_wrapped_b64url = "!".into();
+        assert!(matches!(
+            rewrap_dek(&kek, &new_kek, 2, "user-1", &malformed_wrapped),
+            Err(VaultError::CorruptStoredData)
+        ));
     }
 
     #[test]

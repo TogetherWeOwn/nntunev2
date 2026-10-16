@@ -19,9 +19,11 @@
 //! not per deduplicated blob, so restamping one track never changes another
 //! track's serve. Revalidation itself is claimed per track via
 //! [`ContentCache::try_begin_revalidate`], so concurrent stale reads trigger
-//! one background refresh, not one per reader.
+//! one background refresh, not one per reader. Claims carry an acquisition
+//! timestamp and expire after [`REVALIDATE_CLAIM_TTL_SECS`] if their owner
+//! disappears without finishing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::grant::sha256;
@@ -34,6 +36,10 @@ pub const CACHE_FRESH_TTL_SECS: u64 = 300;
 /// still serves immediately (as `STALE`, flagging background revalidation)
 /// instead of blocking on upstream. Documented in `workers/stream/README.md`.
 pub const CACHE_SWR_WINDOW_SECS: u64 = 3_600;
+
+/// A background revalidation claim is reclaimable after this many seconds if
+/// its owner disappears without completing or explicitly releasing it.
+pub const REVALIDATE_CLAIM_TTL_SECS: u64 = 300;
 
 /// How a cached entry served a read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,9 +106,9 @@ struct TrackEntry {
 pub struct ContentCache {
     blobs: HashMap<String, BlobEntry>,
     index: HashMap<String, TrackEntry>,
-    /// Tracks with a background revalidation already claimed (see
-    /// [`ContentCache::try_begin_revalidate`]).
-    revalidating: HashSet<String>,
+    /// Tracks with a background revalidation already claimed, with claim time
+    /// so an abandoned claim can expire (see [`ContentCache::try_begin_revalidate`]).
+    revalidating: HashMap<String, u64>,
 }
 
 impl ContentCache {
@@ -110,7 +116,7 @@ impl ContentCache {
         Self {
             blobs: HashMap::new(),
             index: HashMap::new(),
-            revalidating: HashSet::new(),
+            revalidating: HashMap::new(),
         }
     }
 
@@ -158,19 +164,33 @@ impl ContentCache {
 
     /// Claim the background revalidation for `track_id`: returns `true` to
     /// exactly one caller until the claim is released — by the rewrite
-    /// landing ([`ContentCache::put_track_at`]) or by
-    /// [`ContentCache::finish_revalidate`] after a failed attempt. This is
-    /// what dedupes revalidation when many readers serve the same stale
-    /// entry at once: only the claimant is told to re-fetch.
-    pub fn try_begin_revalidate(&mut self, track_id: &str) -> bool {
-        self.revalidating.insert(track_id.to_string())
+    /// landing ([`ContentCache::put_track_at`]), by
+    /// [`ContentCache::finish_revalidate`] after a failed attempt, or by
+    /// [`REVALIDATE_CLAIM_TTL_SECS`] if the owner disappears. `now_secs` is
+    /// unix time, in the same clock domain as the cache entry timestamps.
+    /// This dedupes concurrent stale readers while ensuring an abandoned
+    /// revalidation does not suppress retries indefinitely.
+    pub fn try_begin_revalidate(&mut self, track_id: &str, now_secs: u64) -> bool {
+        match self.revalidating.get(track_id) {
+            Some(claimed_at)
+                if now_secs.saturating_sub(*claimed_at) < REVALIDATE_CLAIM_TTL_SECS =>
+            {
+                false
+            }
+            _ => {
+                self.revalidating.insert(track_id.to_string(), now_secs);
+                true
+            }
+        }
     }
 
-    /// Release a revalidation claim without a rewrite (the background
-    /// re-fetch failed or was abandoned), so a later stale serve can claim
-    /// it again and retry.
-    pub fn finish_revalidate(&mut self, track_id: &str) {
-        self.revalidating.remove(track_id);
+    /// Release `track_id`'s claim without a rewrite (the background re-fetch
+    /// failed or was abandoned). `claimed_at_secs` must be the timestamp used
+    /// to acquire that claim, so a late owner cannot release a newer claim.
+    pub fn finish_revalidate(&mut self, track_id: &str, claimed_at_secs: u64) {
+        if self.revalidating.get(track_id) == Some(&claimed_at_secs) {
+            self.revalidating.remove(track_id);
+        }
     }
 
     /// Fetch the cached plaintext for `track_id`, if any. Shared, not
@@ -465,25 +485,51 @@ mod tests {
         cache.put_track_at("t1", b"bytes".to_vec(), 1_000);
 
         assert!(
-            cache.try_begin_revalidate("t1"),
+            cache.try_begin_revalidate("t1", 1_000),
             "first stale reader claims"
         );
         assert!(
-            !cache.try_begin_revalidate("t1"),
+            !cache.try_begin_revalidate("t1", 1_001),
             "concurrent stale readers must not each start a revalidation"
         );
         assert!(
-            cache.try_begin_revalidate("t2"),
+            cache.try_begin_revalidate("t2", 1_000),
             "claims are per track, not global"
         );
 
         // A failed attempt releases the claim so a later reader retries.
-        cache.finish_revalidate("t1");
-        assert!(cache.try_begin_revalidate("t1"));
+        cache.finish_revalidate("t1", 1_000);
+        assert!(cache.try_begin_revalidate("t1", 1_002));
 
         // The rewrite landing also releases it (and refreshes the entry).
         cache.put_track_at("t1", b"bytes".to_vec(), 2_000);
-        assert!(cache.try_begin_revalidate("t1"));
+        assert!(cache.try_begin_revalidate("t1", 2_000));
+    }
+
+    #[test]
+    fn abandoned_revalidation_claim_expires_and_can_be_reclaimed() {
+        let mut cache = ContentCache::new();
+        assert!(cache.try_begin_revalidate("t1", 1_000));
+        assert!(
+            !cache.try_begin_revalidate("t1", 1_000 + REVALIDATE_CLAIM_TTL_SECS - 1),
+            "an active claim remains owned until its TTL elapses"
+        );
+        assert!(
+            cache.try_begin_revalidate("t1", 1_000 + REVALIDATE_CLAIM_TTL_SECS),
+            "an abandoned claim is available at the TTL boundary"
+        );
+        let reclaimed_at = 1_000 + REVALIDATE_CLAIM_TTL_SECS;
+        assert!(
+            !cache.try_begin_revalidate("t1", reclaimed_at),
+            "the reclaimed claim dedupes subsequent readers"
+        );
+        cache.finish_revalidate("t1", 1_000);
+        assert!(
+            !cache.try_begin_revalidate("t1", reclaimed_at),
+            "a late failed owner cannot release a newer claim"
+        );
+        cache.finish_revalidate("t1", reclaimed_at);
+        assert!(cache.try_begin_revalidate("t1", reclaimed_at));
     }
 
     #[test]

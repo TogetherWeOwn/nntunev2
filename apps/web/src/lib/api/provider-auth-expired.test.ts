@@ -10,12 +10,29 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe('ApiClient provider_auth_expired', () => {
-	it('maps a 401 provider_auth_expired body to the re-auth code', async () => {
-		const fetchFn = vi.fn(async () => jsonResponse({ error: 'provider_auth_expired' }, 401));
+	it('maps the structured provider_auth_expired envelope to the re-auth code', async () => {
+		const fetchFn = vi.fn(async () =>
+			jsonResponse(
+				{
+					code: 'provider_auth_expired',
+					message: 'provider credentials expired',
+					retryable: false
+				},
+				401
+			)
+		);
 		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
 
 		const failure = await client.get('/v1/stream').catch((error: unknown) => error);
 		expect(failure).toBeInstanceOf(ApiError);
+		expect((failure as ApiError).code).toBe('provider_auth_expired');
+	});
+
+	it('keeps the legacy provider_auth_expired body during migration', async () => {
+		const fetchFn = vi.fn(async () => jsonResponse({ error: 'provider_auth_expired' }, 401));
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/v1/stream').catch((error: unknown) => error);
 		expect((failure as ApiError).code).toBe('provider_auth_expired');
 	});
 
