@@ -7,10 +7,11 @@
 
 use nntune_ingest::dispatch::build_upload_dispatch;
 use nntune_ingest::fixtures::SMALL_NZB;
-use nntune_ingest::jobs::MAX_ATTEMPTS;
+use nntune_ingest::jobs::{JobCheckpoint, JobState, MAX_ATTEMPTS};
 use nntune_ingest::queue::QueueMsg;
 use nntune_ingest::retry::{
-    decide, drive_batch, redrive, redrive_raw, Disposition, JobError, ERR_PROBE_FAILED,
+    decide_checkpoint, drive_batch, redrive, redrive_checkpoint, redrive_raw, Disposition,
+    JobError, ERR_PROBE_FAILED, MAX_DLQ_DETAIL_CHARS,
 };
 
 /// The poison fixture: a well-formed job whose processing *always* fails
@@ -31,20 +32,37 @@ fn always_fails(_: &QueueMsg) -> Result<(), JobError> {
     ))
 }
 
+fn checkpoint_for(msg: &QueueMsg) -> JobCheckpoint {
+    JobCheckpoint {
+        job_id: msg.job_id.clone(),
+        user_id: msg.user_id.clone(),
+        idempotency_key: msg.idempotency_key.clone(),
+        source: msg.source,
+        state: msg.state,
+        attempt: 1,
+        repair_rounds: msg.repair_rounds,
+        probe_tally: None,
+        failure_code: None,
+        failure_reason: None,
+    }
+}
+
 #[test]
-fn poison_job_burns_the_budget_then_quarantines_with_reason_body_fields() {
-    let mut msg = poison_msg();
+fn poison_job_burns_durable_budget_on_unchanged_queue_body() {
+    let msg = poison_msg();
+    let original_body = serde_json::to_vec(&msg).unwrap();
+    let mut checkpoint = checkpoint_for(&msg);
     let mut last = None;
-    for attempt in 1..=MAX_ATTEMPTS {
-        assert_eq!(msg.attempt, attempt, "redelivery must bump the attempt");
-        match decide(&msg, always_fails(&msg)) {
+    for delivery in 1..=MAX_ATTEMPTS {
+        assert_eq!(checkpoint.attempt, delivery);
+        assert_eq!(serde_json::to_vec(&msg).unwrap(), original_body);
+        match decide_checkpoint(&msg, &mut checkpoint, always_fails(&msg)).unwrap() {
             Disposition::Retry { delay_secs } => {
-                assert!(
-                    (attempt as usize) < MAX_ATTEMPTS as usize,
-                    "budget left means retry, never quarantine"
-                );
+                assert!(delivery < MAX_ATTEMPTS, "spent budget must quarantine");
                 assert!(delay_secs >= 5, "redelivery must back off, not hot-loop");
-                msg.attempt += 1;
+                // The handler persists checkpoint.attempt before calling
+                // retry_with_options; the Queue body is unchanged on delivery.
+                assert_eq!(checkpoint.attempt, delivery + 1);
             }
             Disposition::Quarantine(entry) => {
                 last = Some(entry);
@@ -55,14 +73,73 @@ fn poison_job_burns_the_budget_then_quarantines_with_reason_body_fields() {
     }
     let entry = last.expect("poison must end in the DLQ after the budget");
     assert_eq!(entry.attempts, MAX_ATTEMPTS);
+    assert_eq!(checkpoint.state, JobState::Failed);
+    assert_eq!(checkpoint.failure_code.as_deref(), Some(ERR_PROBE_FAILED));
+    assert_eq!(
+        checkpoint.failure_reason.as_deref(),
+        Some("synthetic 430 on every segment, no par2 set")
+    );
     assert_eq!(entry.error_code, ERR_PROBE_FAILED);
     assert_eq!(entry.message.job_id, msg.job_id);
     let body = serde_json::to_value(&entry).unwrap();
     assert_eq!(body["error_code"], ERR_PROBE_FAILED);
     assert_eq!(body["attempts"], MAX_ATTEMPTS);
+    assert!(entry.reason.contains(ERR_PROBE_FAILED));
+}
+
+#[test]
+fn quarantine_redacts_and_bounds_untrusted_error_details() {
+    let msg = poison_msg();
+    let mut checkpoint = checkpoint_for(&msg);
+    let detail = format!(
+        "transport failed https://indexer.invalid/api?apikey=secret&x=1 {}",
+        "x".repeat(2_000)
+    );
+    let disposition = decide_checkpoint(
+        &msg,
+        &mut checkpoint,
+        Err(JobError::permanent(ERR_PROBE_FAILED, detail)),
+    )
+    .unwrap();
+    let Disposition::Quarantine(entry) = disposition else {
+        panic!("permanent failure must quarantine");
+    };
+    assert!(!entry.reason.contains("secret"));
+    assert!(entry.reason.chars().count() <= MAX_DLQ_DETAIL_CHARS + 64);
     assert!(
-        entry.reason.contains(ERR_PROBE_FAILED),
-        "human reason must name the code"
+        checkpoint.failure_reason.as_ref().unwrap().chars().count() <= MAX_DLQ_DETAIL_CHARS + 1
+    );
+}
+
+#[test]
+fn redrive_resets_checkpoint_budgets_and_terminal_fields() {
+    let msg = poison_msg();
+    let mut checkpoint = checkpoint_for(&msg);
+    checkpoint.state = JobState::Failed;
+    checkpoint.attempt = MAX_ATTEMPTS;
+    checkpoint.repair_rounds = nntune_ingest::jobs::MAX_REPAIR_ROUNDS;
+    checkpoint.failure_code = Some(ERR_PROBE_FAILED.into());
+    checkpoint.failure_reason = Some("previous failure".into());
+    checkpoint.probe_tally = Some(nntune_ingest::probe::ProbeTally::new(2));
+    let identity = (
+        checkpoint.job_id.clone(),
+        checkpoint.user_id.clone(),
+        checkpoint.idempotency_key.clone(),
+    );
+    redrive_checkpoint(&mut checkpoint);
+    assert_eq!(checkpoint.state, JobState::Queued);
+    assert_eq!(checkpoint.attempt, 1);
+    assert_eq!(checkpoint.repair_rounds, 0);
+    assert!(checkpoint.failure_code.is_none());
+    assert!(checkpoint.failure_reason.is_none());
+    assert!(checkpoint.probe_tally.is_none());
+    assert_eq!(
+        identity,
+        (
+            checkpoint.job_id.clone(),
+            checkpoint.user_id.clone(),
+            checkpoint.idempotency_key.clone()
+        )
     );
 }
 
@@ -72,29 +149,33 @@ fn poison_does_not_block_valid_jobs_behind_it() {
     // First delivery: poison retries, valids ack — nothing is quarantined yet
     // and no batch-level throw wedges the queue.
     let msgs = vec![poison_msg(), valid_msg("user_a"), valid_msg("user_b")];
-    let report = drive_batch(&msgs, |m| {
+    let mut checkpoints: Vec<_> = msgs.iter().map(checkpoint_for).collect();
+    let report = drive_batch(&msgs, &mut checkpoints, |m| {
         if m.user_id == "poison_user" {
             always_fails(m)
         } else {
             Ok(())
         }
-    });
+    })
+    .unwrap();
     assert_eq!(report.acked, 2);
     assert_eq!(report.retried, 1);
     assert!(report.quarantined.is_empty());
 
     // Last delivery: the poisoned attempt quarantines; the valids still ack.
     let mut last_round = vec![valid_msg("user_a"), valid_msg("user_b")];
-    let mut poison = poison_msg();
-    poison.attempt = MAX_ATTEMPTS;
+    let poison = poison_msg();
     last_round.insert(0, poison);
-    let report = drive_batch(&last_round, |m| {
+    let mut checkpoints: Vec<_> = last_round.iter().map(checkpoint_for).collect();
+    checkpoints[0].attempt = MAX_ATTEMPTS;
+    let report = drive_batch(&last_round, &mut checkpoints, |m| {
         if m.user_id == "poison_user" {
             always_fails(m)
         } else {
             Ok(())
         }
-    });
+    })
+    .unwrap();
     assert_eq!(report.acked, 2);
     assert_eq!(report.retried, 0);
     assert_eq!(report.quarantined.len(), 1);
@@ -103,25 +184,43 @@ fn poison_does_not_block_valid_jobs_behind_it() {
 
 #[test]
 fn redrive_returns_a_quarantined_job_to_the_queue_with_fresh_budget() {
-    let mut poison = poison_msg();
-    poison.attempt = MAX_ATTEMPTS;
-    poison.repair_rounds = nntune_ingest::jobs::MAX_REPAIR_ROUNDS;
-    let entry = match decide(&poison, always_fails(&poison)) {
+    let poison = poison_msg();
+    let mut checkpoint = checkpoint_for(&poison);
+    checkpoint.attempt = MAX_ATTEMPTS;
+    checkpoint.repair_rounds = nntune_ingest::jobs::MAX_REPAIR_ROUNDS;
+    let entry = match decide_checkpoint(&poison, &mut checkpoint, always_fails(&poison)).unwrap() {
         Disposition::Quarantine(entry) => entry,
         d => panic!("expected quarantine, got {d:?}"),
     };
-    // Operator redrives after fixing the cause; the job resumes and succeeds.
-    let again = redrive(&entry);
+    // Operator redrives after fixing the cause; reset and persist the
+    // checkpoint before enqueuing the matching message.
+    let again = redrive(&entry, &mut checkpoint).unwrap();
     assert_eq!(again.attempt, 1);
     assert_eq!(again.state, nntune_ingest::jobs::JobState::Queued);
+    assert_eq!(checkpoint.attempt, again.attempt);
+    assert_eq!(checkpoint.state, again.state);
+    assert_eq!(checkpoint.repair_rounds, again.repair_rounds);
+    assert_eq!(checkpoint.failure_reason, None);
     assert_eq!(again.job_id, poison.job_id);
     assert_eq!(again.idempotency_key, poison.idempotency_key);
     assert_eq!(again.payload_ref, poison.payload_ref);
-    assert!(matches!(decide(&again, Ok(())), Disposition::Ack));
+    assert!(matches!(
+        decide_checkpoint(&again, &mut checkpoint, Ok(())).unwrap(),
+        Disposition::Ack
+    ));
 
     // Native-DLQ fallback shape (raw message, no reason envelope) redrives too.
-    let raw = redrive_raw(&poison);
+    let mut raw_checkpoint = checkpoint_for(&poison);
+    raw_checkpoint.attempt = MAX_ATTEMPTS;
+    raw_checkpoint.repair_rounds = nntune_ingest::jobs::MAX_REPAIR_ROUNDS;
+    raw_checkpoint.state = JobState::Failed;
+    raw_checkpoint.failure_reason = Some("native failure".into());
+    let raw = redrive_raw(&poison, &mut raw_checkpoint).unwrap();
     assert_eq!(raw.attempt, 1);
     assert_eq!(raw.repair_rounds, 0);
+    assert_eq!(raw_checkpoint.attempt, raw.attempt);
+    assert_eq!(raw_checkpoint.repair_rounds, raw.repair_rounds);
+    assert_eq!(raw_checkpoint.state, raw.state);
+    assert_eq!(raw_checkpoint.failure_reason, None);
     assert_eq!(raw.job_id, poison.job_id);
 }

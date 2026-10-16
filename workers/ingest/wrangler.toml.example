@@ -25,9 +25,11 @@ queue = "nntune-ingest-dlq"
 # handler — so declaring this worker a consumer would deliver every message
 # to a handler that does not exist (retried `max_retries` times, then
 # dropped, while callers saw 202 queued). Uncomment together with the Queue
-# handler, which settles per message via src/retry.rs (`decide` /
-# `drive_batch`: ack on success, `retry_with_options` backoff while
-# `jobs::can_retry` allows it, DlqEntry + ack on exhaustion). E.g.:
+# handler, which settles per message via src/retry.rs (`decide_checkpoint`):
+# persist the mutated checkpoint before retry/ack, use `retry_with_options`
+# while budget remains, and persist Failed before DLQ send + ack. Never ack on DLQ-send failure; Failed
+# redelivery retries the send. A send-success/ack-failure may duplicate entries,
+# so DLQ processing must be idempotent by job_id. E.g.:
 #
 # [[queues.consumers]]
 # queue = "nntune-ingest-jobs"
@@ -42,7 +44,8 @@ queue = "nntune-ingest-dlq"
 # The native dead-letter route is a safety net for messages the handler never
 # settles (panic, timeout): Cloudflare moves the untouched body with no reason
 # envelope. Both shapes redrive via src/retry.rs (`redrive` for DlqEntry,
-# `redrive_raw` for native bodies); see README "Redrive".
+# `redrive_raw` for native bodies) after loading a matching Failed checkpoint;
+# see README "Redrive" for raw bodies whose checkpoint is nonterminal.
 # dead_letter_queue = "nntune-ingest-dlq"
 
 # Workflows: NOT YET. workers-rs 0.3 has no Workflow client and this crate

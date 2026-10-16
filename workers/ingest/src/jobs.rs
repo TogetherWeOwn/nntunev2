@@ -45,10 +45,10 @@ pub enum JobSource {
 
 /// Durable resume point written after every completed step.
 ///
-/// `attempt` is the Queue-delivery attempt (1-based): the consumer increments
-/// it on redelivery and [`can_retry`] gates another try. [`advance`] never
-/// touches it, so per-state retries cannot silently reset the job-level
-/// budget. `repair_rounds` counts started `Verifying -> Repairing` rounds and
+/// `attempt` is the Queue-delivery attempt (1-based), persisted by the
+/// consumer in `INGEST_STATE`; Queue message bodies are immutable on redelivery.
+/// [`advance`] never touches it, so per-state retries cannot silently reset the
+/// job-level budget. `repair_rounds` counts started `Verifying -> Repairing` rounds and
 /// bounds the verify↔repair loop (see [`advance_checkpoint`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobCheckpoint {
@@ -68,6 +68,9 @@ pub struct JobCheckpoint {
     /// before this field existed resumes probing from batch zero).
     #[serde(default)]
     pub probe_tally: Option<ProbeTally>,
+    /// Stable machine-readable failure category, retained for DLQ redelivery.
+    #[serde(default)]
+    pub failure_code: Option<String>,
     pub failure_reason: Option<String>,
 }
 
@@ -109,6 +112,7 @@ pub fn advance_checkpoint(cp: &mut JobCheckpoint, repair_needed: bool) -> JobSta
     match cp.state {
         JobState::Verifying if repair_needed => {
             if cp.repair_rounds >= MAX_REPAIR_ROUNDS {
+                cp.failure_code = Some("repair_budget_exhausted".to_string());
                 cp.failure_reason = Some("repair budget exhausted".to_string());
                 cp.state = JobState::Failed;
             } else {
@@ -292,6 +296,7 @@ mod tests {
             attempt: 1,
             repair_rounds: 0,
             probe_tally: None,
+            failure_code: None,
             failure_reason: None,
         }
     }

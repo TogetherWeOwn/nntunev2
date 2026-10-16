@@ -90,12 +90,16 @@ KV reads in `GET /v1/ingest/jobs/:id`, and the repair Container runtime.
 - Retry budget (`src/retry.rs`): 1 delivery + 4 redeliveries
   (`jobs::MAX_ATTEMPTS` = 5 = `CONSUMER_MAX_RETRIES` + 1 =
   `PAYLOAD_RETRY_ATTEMPTS` + 1, enforced by a compile-time assert).
-  Redeliveries back off 5/15/30/60 s (`retry_delay_secs`), spaced across the
-  ~60 s KV read lag instead of hot-looping. The consumer settles **per
-  message** (`decide` / `drive_batch`: ack on success, delayed retry while
-  `jobs::can_retry` allows it), so one poison job ahead of valid ones costs
-  retries, never head-of-line blocking. Permanent failures (unparseable
-  bytes) skip the budget and quarantine at once.
+  The durable checkpoint in `INGEST_STATE` is authoritative because Cloudflare
+  redelivers the unchanged Queue body. `decide_checkpoint` increments the
+  checkpoint before returning Retry; the handler must persist it before calling
+  `retry_with_options`. Backoff is derived from the payload-fetch schedule.
+  The consumer settles **per message**, so one poison job costs retries but
+  does not head-of-line block valid jobs. Permanent failures skip the budget
+  and quarantine at once; quarantine marks the checkpoint Failed before ack. If a DLQ send fails,
+  the consumer must not ack; redelivery of the Failed checkpoint retries the
+  send. A successful send followed by an ack failure may create a duplicate DLQ
+  entry, so DLQ processing must be idempotent by `job_id`.
 - DLQ quarantine: on exhaustion the consumer sends one `DlqEntry` to
   `nntune-ingest-dlq` (`INGEST_DLQ` binding) — the original `QueueMsg` plus
   machine-readable `error_code` / `attempts` fields in the serialized DLQ
@@ -108,19 +112,27 @@ KV reads in `GET /v1/ingest/jobs/:id`, and the repair Container runtime.
 
 ## Redrive (DLQ back to queue)
 
-1. Read the DLQ (`nntune-ingest-dlq`): each entry is either a `DlqEntry`
-   (explicit quarantine, with `error_code` / `attempts` / `reason`) or a raw
-   `QueueMsg` (native dead-letter fallback).
-2. Fix the cause first (bad bytes, downed dependency) — redrive resets both
-   the attempt and the repair-round budgets, so a still-poison message just
-   burns the fresh budget and quarantines again.
-3. Re-enqueue with `retry::redrive(&entry)` (or `retry::redrive_raw(&msg)`
-   for native bodies): same job id, idempotency key and input, `attempt`
-   reset to 1, back at `Queued`. A redriven job that now succeeds acks like
-   any first delivery.
-4. No paging on DLQ depth in this slice (out of scope): poll the queue depth
-   before redriving in bulk so a systemic cause does not re-poison the queue
-   faster than it drains.
+1. The Cloudflare DLQ defaults to **4 days retention**; unconsumed entries
+   are deleted at expiry. Configure the maximum 14-day window on the queue with
+   `npx wrangler queues update nntune-ingest-dlq --message-retention-period-secs 1209600`
+   (Cloudflare permits 60–1,209,600 seconds). Treat the configured period as
+   the redrive deadline; this queue is not a permanent archive.
+2. Read the DLQ: each entry is either a `DlqEntry` (explicit quarantine, with
+   `error_code` / `attempts` / redacted, bounded `reason`) or a raw `QueueMsg`
+   (native dead-letter fallback). Fix the cause first.
+3. Load the matching `INGEST_STATE` checkpoint. The redrive helpers reject a
+   checkpoint that is not `Failed`, so for a raw native-DLQ body first mark any
+   nonterminal checkpoint `Failed` with code `native_dead_letter` and persist it.
+   A `Done` checkpoint must not be redriven. Then call
+   `retry::redrive(&entry, &mut checkpoint)` (or
+   `retry::redrive_raw(&msg, &mut checkpoint)`). The helper resets the durable
+   checkpoint and returns a matching message; persist the reset under the same
+   job id before enqueue. Identity and input are kept, budgets/state are reset,
+   and `probe_tally` / `failure_code` / `failure_reason` are cleared. Never
+   enqueue if the checkpoint write failed.
+4. No paging on DLQ depth in this slice (out of scope): inspect queue depth
+   before bulk redrive so a systemic cause does not re-poison the queue faster
+   than it drains.
 
 ## Develop
 
