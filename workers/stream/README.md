@@ -92,15 +92,22 @@ and `reconcile` does not currently emit to Analytics Engine or call
   unsafe log/key characters, and fields longer than 128 bytes for user IDs
   or 512 bytes for track and play IDs. Redelivery derives the same key; a
   genuine second listen carries a different `play_id`.
-- Dedup rule: `UsageLedger::record` converges redeliveries to one in-memory
-  entry — first write wins, mismatch is flagged, never silently adjusted.
-  The production Hyperdrive uniqueness constraint and upsert are not wired
+- Dedup rule: `UsageLedger::record` converges exact redeliveries to one
+  in-memory entry — first write wins, mismatch is flagged, never silently
+  adjusted. A redelivery that disagrees on user, track, or bytes, or a play
+  whose key is not exactly `play:{user_id}:{track_id}:{play_id}` with valid
+  fields, reports `RecordOutcome::Conflict` and changes nothing. The
+  production Hyperdrive uniqueness constraint and upsert are not wired
   by this portable-core model.
 - Reconcile pass: `reconcile(plays, ledger, meter)` checks each distinct
   play (first occurrence authoritative) against the ledger. A play whose
   ledger entry is missing, whose user or track identity differs, or whose
   metered bytes differ from the entry's bytes emits exactly one
-  `ReconcileMismatch` meter event. `ReconcileMismatch::log_line()` formats
+  `ReconcileMismatch` meter event. A redelivery inside the same batch that
+  conflicts with its first occurrence is flagged as its own mismatch.
+  Mismatch events are non-serving and carry `bytes = 0` so byte sums over
+  mixed event kinds cannot double-count; the flagged counts stay on the
+  `ReconcileMismatch` record. `ReconcileMismatch::log_line()` formats
   a single-line representation with event `play_reconcile_mismatch` and
   both byte counts (`ledger_bytes=missing` when there is no entry). Identity
   fields are percent-escaped even if callers bypass constructor validation.
