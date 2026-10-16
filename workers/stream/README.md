@@ -79,34 +79,32 @@ cargo fmt --all --check
 No network, no Cloudflare account, no secrets: the synthetic NNTP server
 lives in `tests/stream_integration.rs` and serves canned yEnc multipart articles.
 
-## Metering reconciliation (deduped usage ledger)
+## Metering reconciliation (portable-core model)
 
-Complete-play metering converges at the usage ledger, never in the meter.
-The meter (`meter.rs`) stays an append-only fact log: every `BytesServed`
-emission is recorded verbatim, so a redelivered play still shows up twice
-in the raw events. The ledger is the dedup point.
+The code in `meter.rs` models complete-play reconciliation and deduplication;
+it is not yet wired into the production `play()` path or production sinks.
+`UsageLedger` is an in-memory portable-core model, not a live Hyperdrive table,
+and `reconcile` does not currently emit to Analytics Engine or call
+`ReconcileMismatch::log_line`.
 
 - Idempotency key: `derive_play_idempotency_key(user_id, track_id,
-  play_id)` returns `play:{user}:{track}:{play}` and rejects any field
-  that is empty or contains `:` or NUL. Redelivery derives the same
-  idempotency key; a genuine second listen carries a different `play_id`
-  and bills separately.
-- Dedup rule: `UsageLedger::record` converges redeliveries to one entry —
-  first write wins, mismatch is flagged, never silently adjusted. A
-  duplicate never appends, sums into, or overwrites the existing entry,
-  even when its byte count disagrees. Production keys the Hyperdrive
-  usage-ledger table `UNIQUE(idempotency_key)`, converging
-  `ON CONFLICT (idempotency_key)` like the ingest upsert.
+  play_id)` returns `play:{user}:{track}:{play}`. It rejects empty fields,
+  unsafe log/key characters, and fields longer than 128 bytes for user IDs
+  or 512 bytes for track and play IDs. Redelivery derives the same key; a
+  genuine second listen carries a different `play_id`.
+- Dedup rule: `UsageLedger::record` converges redeliveries to one in-memory
+  entry — first write wins, mismatch is flagged, never silently adjusted.
+  The production Hyperdrive uniqueness constraint and upsert are not wired
+  by this portable-core model.
 - Reconcile pass: `reconcile(plays, ledger, meter)` checks each distinct
   play (first occurrence authoritative) against the ledger. A play whose
-  ledger entry is missing, or whose metered bytes differ from the entry's
-  bytes, emits exactly one `ReconcileMismatch` meter event (carrying the
-  metered byte count) under the Analytics Engine metric
-  `play_reconcile_mismatch`, plus a single-line structured log
-  (`event=play_reconcile_mismatch idempotency_key=… user_id=…
-  track_id=… metered_bytes=… ledger_bytes=…`, with
-  `ledger_bytes=missing` when there is no entry). The pass takes
-  `&UsageLedger` and never adjusts, backfills, or drops an entry.
+  ledger entry is missing, whose user or track identity differs, or whose
+  metered bytes differ from the entry's bytes emits exactly one
+  `ReconcileMismatch` meter event. `ReconcileMismatch::log_line()` formats
+  a single-line representation with event `play_reconcile_mismatch` and
+  both byte counts (`ledger_bytes=missing` when there is no entry). The
+  pass takes `&UsageLedger` and never adjusts, backfills, or drops an entry.
+  Production wiring for the meter, log, and ledger remains future work.
 
 ## Production notes
 
@@ -116,5 +114,6 @@ in the raw events. The ledger is the dedup point.
   fetch→decode→decrypt→fan-out shape. Production content keys arrive via
   the BYOP vault with the ingest-owned envelope (sibling cards); swap the
   marked lines, keep the flow.
-- Metering sinks: Analytics Engine dataset `nntune_meter` + the Hyperdrive
-  usage-ledger table (ledger writes owned by the api card).
+- Planned metering sinks: Analytics Engine dataset `nntune_meter` and a
+  Hyperdrive usage-ledger table. Neither sink is wired by the portable-core
+  reconciliation model described above.
