@@ -73,6 +73,9 @@ part of a documentation fix.
 
 The DLQ queues are provisioned but are not connected to a consumer. Configure
 the consumer's dead-letter handling only when the ingest consumer is enabled.
+Cloudflare deletes messages delivered to a DLQ without an active consumer after
+four days ([DLQ documentation](https://developers.cloudflare.com/queues/configuration/dead-letter-queues/)).
+Enable dead-letter routing only with a plan to process each DLQ.
 
 UNDO: API `DELETE /accounts/<acct>/queues/<queue_id>` after authorized
 consumer removal and pending-message checks.
@@ -268,7 +271,9 @@ Binding names are chosen in Worker configs; resource names must match this table
 | R2 audio / stream Worker | `nntunev2-audio-staging` | `nntunev2-audio-prod` |
 | R2 artwork / MB Worker | `nntunev2-art-staging` | `nntunev2-art-prod` |
 | R2 archive / reserved, no consumer | `nntunev2-archive-staging` | `nntunev2-archive-prod` |
+| Ingest scratch | `nntunev2-ingest-scratch-staging` (`ingest-scratch/`, 7 days) | `nntunev2-ingest-scratch-prod` (`ingest-scratch/`, 7 days) |
 | Ingest Queue | `nntunev2-ingest-staging` | `nntunev2-ingest-prod` |
+| Ingest DLQ / no active consumer | `nntunev2-ingest-dlq-staging` (4-day expiry) | `nntunev2-ingest-dlq-prod` (4-day expiry) |
 | Config KV | `nntunev2-config-staging` | `nntunev2-config-prod` |
 | Hostname | `v2-staging.nntune.com` (+ Access; deployment pending) | TBD at launch |
 | App Hyperdrive variable | `HYPERDRIVE_ID_STAGING` | `HYPERDRIVE_ID_PROD` |
