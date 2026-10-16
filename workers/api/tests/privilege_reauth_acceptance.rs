@@ -42,23 +42,29 @@
 //!   Privilege-gated handlers call this instead of
 //!   `verify_stored_session`; ordinary handlers are unchanged.
 //! - `pub struct ReauthenticatedSession { pub token: String,
-//!   pub new_record: SessionRecord, pub revoked_session_id: String }`
-//!   (`Debug + Clone`) and
+//!   pub new_record: SessionRecord, pub revoked_session_id: String,
+//!   pub revoked_user_id: String, pub revoked_rotation_counter: u64 }`
+//!   (`Debug + Clone`) with `revocation_claim()` returning the
+//!   conditional revocation claim, and
 //!   `pub fn reauthenticate_session(keys: &SessionKeys<'_>,
 //!   old_token: &str, now: u64, old_record: &SessionRecord,
-//!   ttl_secs: u64) -> Result<ReauthenticatedSession, SessionError>`.
+//!   proven_user_id: &str, ttl_secs: u64) ->
+//!   Result<ReauthenticatedSession, SessionError>`.
 //!   Call ONLY after the caller has completed a fresh authentication
-//!   proof (passkey/magic-link ceremony is out of scope here). It MUST
-//!   `verify_stored_session` the old token first (any failure is
-//!   `Invalid`, nothing is minted), then mint a NEW session id under
-//!   `keys.primary` only (never the rotation-window previous secret),
-//!   with `created_at == issued_at == now`, `rotation_counter == 0` and
-//!   the expiry rules of `issue_session`. This is a pure prepare step,
-//!   like `rotate_session`: the caller MUST atomically INSERT
-//!   `new_record` and revoke exactly the one old row
-//!   (`UPDATE sessions SET revoked = TRUE WHERE id =
-//!   revoked_session_id`), commit, and only then send the new cookie.
-//!   Single-session revoke — never a logout-everywhere.
+//!   proof (passkey/magic-link ceremony is out of scope here); the caller
+//!   MUST pass the user identity returned by the verified fresh proof.
+//!   It MUST `verify_stored_session` the old token first (any failure is
+//!   `Invalid`, nothing is minted), then reject an empty or mismatched
+//!   proof identity as `Invalid` (nothing is minted), then mint a NEW
+//!   session id under `keys.primary` only (never the rotation-window
+//!   previous secret), with `created_at == issued_at == now`,
+//!   `rotation_counter == 0` and the expiry rules of `issue_session`.
+//!   This is a pure prepare step, like `rotate_session`: the caller MUST,
+//!   in the SAME transaction, execute the conditional revocation claim
+//!   (`UPDATE sessions SET revoked = TRUE WHERE id = $1 AND user_id = $2
+//!   AND rotation_counter = $3 AND revoked = FALSE`), require exactly one
+//!   affected row, then INSERT `new_record`, commit, and only then send
+//!   the new cookie. Single-session revoke — never a logout-everywhere.
 //! - `workers/api/README.md` (Sessions bullet of the security contract)
 //!   documents the freshness window value (600 seconds / 10 minutes)
 //!   and the `reauth_required` code.
@@ -259,11 +265,17 @@ fn reauth_mints_new_session_id_and_resets_freshness() {
         Err(SessionError::ReauthRequired),
         "precondition: the old session is stale"
     );
-    let reauthed = session::reauthenticate_session(&keys(), &old_token, reauth_at, &old_row, 3600)
-        .expect("re-authentication of a valid session mints a replacement");
+    let reauthed =
+        session::reauthenticate_session(&keys(), &old_token, reauth_at, &old_row, USER, 3600)
+            .expect("re-authentication of a valid session mints a replacement");
 
     // Exactly the old session — and only it — is slated for revocation.
     assert_eq!(reauthed.revoked_session_id, old_row.id);
+    assert_eq!(reauthed.revoked_user_id, USER);
+    assert_eq!(
+        reauthed.revoked_rotation_counter,
+        u64::from(old_row.rotation_counter)
+    );
 
     let claims =
         session::verify_session(SECRET, &reauthed.token, reauth_at).expect("new token verifies");
@@ -317,12 +329,14 @@ fn reauth_revokes_only_the_old_session_not_the_users_others() {
     assert_ne!(sibling_row.id, old_row.id);
 
     let reauth_at = NOW + 1200;
-    let reauthed = session::reauthenticate_session(&keys(), &old_token, reauth_at, &old_row, 3600)
-        .expect("re-auth");
+    let reauthed =
+        session::reauthenticate_session(&keys(), &old_token, reauth_at, &old_row, USER, 3600)
+            .expect("re-auth");
     assert_ne!(
         reauthed.revoked_session_id, sibling_row.id,
         "single-session revoke: the sibling is never slated"
     );
+    assert_eq!(reauthed.revoked_user_id, USER);
 
     // Caller applies the contract: revoke the old row, insert the new.
     let revoked_old = SessionRecord {
@@ -363,14 +377,16 @@ fn reauth_rejects_invalid_revoked_or_expired_old_sessions() {
         ..row.clone()
     };
     assert_eq!(
-        session::reauthenticate_session(&keys(), &token, NOW + 60, &revoked, 3600).unwrap_err(),
+        session::reauthenticate_session(&keys(), &token, NOW + 60, &revoked, USER, 3600)
+            .unwrap_err(),
         SessionError::Invalid
     );
     // Tampered old token.
     let mut tampered = token.clone();
     tampered.push('A');
     assert_eq!(
-        session::reauthenticate_session(&keys(), &tampered, NOW + 60, &row, 3600).unwrap_err(),
+        session::reauthenticate_session(&keys(), &tampered, NOW + 60, &row, USER, 3600)
+            .unwrap_err(),
         SessionError::Invalid
     );
     // Row belonging to another user (fixation / row-swap attempt).
@@ -379,12 +395,13 @@ fn reauth_rejects_invalid_revoked_or_expired_old_sessions() {
         ..row.clone()
     };
     assert_eq!(
-        session::reauthenticate_session(&keys(), &token, NOW + 60, &foreign, 3600).unwrap_err(),
+        session::reauthenticate_session(&keys(), &token, NOW + 60, &foreign, USER, 3600)
+            .unwrap_err(),
         SessionError::Invalid
     );
     // Expired old session: the user must log in again, not re-auth in place.
     assert_eq!(
-        session::reauthenticate_session(&keys(), &token, NOW + 3600, &row, 3600).unwrap_err(),
+        session::reauthenticate_session(&keys(), &token, NOW + 3600, &row, USER, 3600).unwrap_err(),
         SessionError::Invalid
     );
     // Short/weak secret fails closed.
@@ -394,10 +411,83 @@ fn reauth_rejects_invalid_revoked_or_expired_old_sessions() {
             &token,
             NOW + 60,
             &row,
+            USER,
             3600
         )
         .unwrap_err(),
         SessionError::Invalid
+    );
+}
+
+#[test]
+fn reauth_rejects_empty_or_mismatched_proof_identity() {
+    let (token, row) = active_session();
+    // Empty proof identity fails closed: nothing is minted.
+    assert_eq!(
+        session::reauthenticate_session(&keys(), &token, NOW + 60, &row, "", 3600).unwrap_err(),
+        SessionError::Invalid,
+        "empty proof identity must not mint a replacement"
+    );
+    // Mismatched proof identity fails closed: the fresh proof authenticated
+    // a different user than the session row owns.
+    assert_eq!(
+        session::reauthenticate_session(&keys(), &token, NOW + 60, &row, "other-user", 3600)
+            .unwrap_err(),
+        SessionError::Invalid,
+        "proof identity mismatch must not mint a replacement"
+    );
+    // A rejected proof mints nothing and revokes nothing: the presented
+    // session still verifies against its row.
+    assert!(
+        session::verify_stored_session(&keys(), &token, NOW + 60, &row).is_ok(),
+        "rejected proof must leave the old session live"
+    );
+    // Positive control: the verified proof identity mints a replacement
+    // owned by that same identity.
+    let reauthed = session::reauthenticate_session(&keys(), &token, NOW + 60, &row, USER, 3600)
+        .expect("matching proof identity mints");
+    assert_eq!(reauthed.new_record.user_id, USER);
+    assert_eq!(reauthed.revoked_user_id, USER);
+}
+
+#[test]
+fn reauth_revocation_claim_is_conditional_update_requiring_one_row_before_insert() {
+    let (old_token, old_row) = active_session();
+    let reauth_at = NOW + 1200;
+    let reauthed =
+        session::reauthenticate_session(&keys(), &old_token, reauth_at, &old_row, USER, 3600)
+            .expect("re-auth");
+    // The prepared claim binds the verified old row identity ...
+    assert_eq!(reauthed.revoked_session_id, old_row.id);
+    assert_eq!(reauthed.revoked_user_id, old_row.user_id);
+    assert_eq!(
+        reauthed.revoked_rotation_counter,
+        u64::from(old_row.rotation_counter)
+    );
+    // ... and the statement is a conditional UPDATE on id, user_id,
+    // rotation_counter with a revoked = FALSE guard. The caller MUST
+    // execute it in the SAME transaction as the INSERT of `new_record`,
+    // require exactly one affected row, and roll back otherwise.
+    let claim = reauthed.revocation_claim();
+    assert!(
+        claim
+            .statement()
+            .contains("id = $1 AND user_id = $2 AND rotation_counter = $3 AND revoked = FALSE"),
+        "reauth revoke must be conditional on id, user_id, counter, revoked: {}",
+        claim.statement()
+    );
+    assert_eq!(
+        claim.params(),
+        vec![
+            reauthed.revoked_session_id.as_str(),
+            reauthed.revoked_user_id.as_str()
+        ],
+        "claim must bind the verified old id then user_id"
+    );
+    assert_eq!(
+        claim.rotation_counter(),
+        Some(u64::from(old_row.rotation_counter)),
+        "claim must bind the verified old rotation counter"
     );
 }
 
@@ -413,8 +503,9 @@ fn reauth_mints_under_primary_secret_in_rotation_window() {
     let old_claims = session::verify_session_dual(&window, &old_token, NOW).expect("dual verifies");
     let old_row = record_for(&old_claims);
 
-    let reauthed = session::reauthenticate_session(&window, &old_token, NOW + 1200, &old_row, 3600)
-        .expect("re-auth in rotation window");
+    let reauthed =
+        session::reauthenticate_session(&window, &old_token, NOW + 1200, &old_row, USER, 3600)
+            .expect("re-auth in rotation window");
     assert!(
         session::verify_session(primary, &reauthed.token, NOW + 1200).is_ok(),
         "replacement must verify under the primary alone"

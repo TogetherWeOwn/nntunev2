@@ -402,40 +402,61 @@ pub fn require_fresh_session(
 /// Prepared replacement session from [`reauthenticate_session`]: the token
 /// and row to insert, plus the one old session id to revoke. Pure data —
 /// the caller MUST atomically INSERT `new_record` and revoke exactly the
-/// old row (`UPDATE sessions SET revoked = TRUE WHERE id =
-/// revoked_session_id`), commit, and only then send the new cookie.
-/// Single-session revoke, never a logout-everywhere.
+/// old row using [`ReauthenticatedSession::revocation_claim`] in the SAME
+/// transaction as the INSERT. The conditional UPDATE must return exactly one
+/// row before the replacement is inserted; otherwise roll back and return
+/// [`SessionError::Invalid`]. Commit before sending the new cookie. This is a
+/// single-session revoke, never a logout-everywhere.
 #[derive(Debug, Clone)]
 pub struct ReauthenticatedSession {
     pub token: String,
     pub new_record: SessionRecord,
     pub revoked_session_id: String,
+    pub revoked_user_id: String,
+    pub revoked_rotation_counter: u64,
+}
+
+impl ReauthenticatedSession {
+    /// Conditional claim for the old row. A concurrent revoke-all or
+    /// reauthentication makes this claim return no rows, preventing a new
+    /// session from surviving the concurrent revocation.
+    pub fn revocation_claim(&self) -> SessionRevokeClaim<'_> {
+        SessionRevokeClaim::Reauthentication {
+            session_id: &self.revoked_session_id,
+            user_id: &self.revoked_user_id,
+            rotation_counter: self.revoked_rotation_counter,
+        }
+    }
 }
 
 /// Mint a replacement session after a fresh authentication proof.
 ///
-/// Call ONLY after the caller has completed a fresh authentication proof
-/// (passkey/magic-link ceremony is out of scope here). Verifies the old
-/// token against its row first — any failure is [`SessionError::Invalid`
-/// and nothing is minted — then mints a NEW session id under
-/// `keys.primary` only (never the rotation-window previous secret), with
-/// `created_at == issued_at == now`, `rotation_counter == 0`, and the
-/// expiry rules of [`issue_session`].
+/// The caller must pass the user id returned by the verified fresh proof.
+/// Verifies the old token against its row first — any failure is
+/// [`SessionError::Invalid`] and nothing is minted — then rejects an empty
+/// or mismatched proof user before minting. The replacement uses a NEW
+/// session id under `keys.primary` only (never the rotation-window previous
+/// secret), with `created_at == issued_at == now`, `rotation_counter == 0`,
+/// and the expiry rules of [`issue_session`].
 ///
-/// This is a pure prepare step, like [`rotate_session`]: the database
-/// INSERT + single-row revoke happen in the caller's transaction.
+/// This is a pure prepare step, like [`rotate_session`]: the caller must
+/// execute the conditional revocation claim and INSERT in one transaction.
 pub fn reauthenticate_session(
     keys: &SessionKeys<'_>,
     old_token: &str,
     now: u64,
     old_record: &SessionRecord,
+    proven_user_id: &str,
     ttl_secs: u64,
 ) -> Result<ReauthenticatedSession, SessionError> {
-    if ttl_secs == 0 {
+    if ttl_secs == 0 || proven_user_id.is_empty() {
         return Err(SessionError::Invalid);
     }
     let old_claims = verify_stored_session(keys, old_token, now, old_record)
         .map_err(|_| SessionError::Invalid)?;
+    if proven_user_id != old_claims.user_id {
+        return Err(SessionError::Invalid);
+    }
     let next = SessionClaims {
         session_id: new_session_id(),
         user_id: old_claims.user_id.clone(),
@@ -462,6 +483,8 @@ pub fn reauthenticate_session(
         token,
         new_record,
         revoked_session_id: old_record.id.clone(),
+        revoked_user_id: old_claims.user_id,
+        revoked_rotation_counter: u64::from(old_claims.rotation_counter),
     })
 }
 
@@ -531,8 +554,16 @@ pub enum SessionRevokeClaim<'a> {
         session_id: &'a str,
         user_id: &'a str,
     },
-    /// Parameter: user_id (from the verified token, never the request).
+    /// Parameters: user_id (from the verified token, never the request).
     AllForUser { user_id: &'a str },
+    /// Parameters: id, user_id, rotation_counter from the verified old row.
+    /// Reauthentication requires the old row to still be active and at the
+    /// verified counter, so concurrent logout-all or reauthentication wins.
+    Reauthentication {
+        session_id: &'a str,
+        user_id: &'a str,
+        rotation_counter: u64,
+    },
 }
 
 impl SessionRevokeClaim<'_> {
@@ -543,28 +574,48 @@ impl SessionRevokeClaim<'_> {
         match self {
             Self::Single { .. } => "UPDATE sessions SET revoked = TRUE WHERE id = $1 AND user_id = $2 AND revoked = FALSE RETURNING id",
             Self::AllForUser { .. } => "UPDATE sessions SET revoked = TRUE WHERE user_id = $1 AND revoked = FALSE RETURNING id",
+            Self::Reauthentication { .. } => "UPDATE sessions SET revoked = TRUE WHERE id = $1 AND user_id = $2 AND rotation_counter = $3 AND revoked = FALSE RETURNING id",
         }
     }
 
-    /// Values to bind, in `$1, $2` order. The Worker adapter binds from this
-    /// method so the statement text and the bound values cannot drift apart;
-    /// tests assert these values with a `session_id` that differs from the
-    /// `user_id` so a swapped bind fails.
+    /// Text values to bind for the leading placeholders (`$1`, then `$2`)
+    /// in statement order. For a reauthentication claim, bind
+    /// [`Self::rotation_counter`] as `$3` after these values.
     pub fn params(&self) -> Vec<&str> {
         match self {
             Self::Single {
                 session_id,
                 user_id,
+            }
+            | Self::Reauthentication {
+                session_id,
+                user_id,
+                ..
             } => vec![*session_id, *user_id],
             Self::AllForUser { user_id } => vec![*user_id],
+        }
+    }
+
+    /// Rotation counter to bind as `$3` for reauthentication claims, if any.
+    /// The value is the verified claim counter represented as `u64`; adapters
+    /// targeting the Postgres `INTEGER` column must use a checked conversion
+    /// (for example, `i32::try_from`) and fail closed on overflow.
+    pub fn rotation_counter(&self) -> Option<u64> {
+        match self {
+            Self::Reauthentication {
+                rotation_counter, ..
+            } => Some(*rotation_counter),
+            Self::Single { .. } | Self::AllForUser { .. } => None,
         }
     }
 }
 
 /// Worker/Hyperdrive boundary. Implementations must execute the conditional
-/// UPDATE from [`SessionRevokeClaim::statement`], binding
-/// [`SessionRevokeClaim::params`] in order, and return the number of rows it
-/// returned, NOT perform SELECT + unconditional UPDATE. Return
+/// UPDATE from [`SessionRevokeClaim::statement`], binding the text values from
+/// [`SessionRevokeClaim::params`] in order; for a reauthentication claim, bind
+/// [`SessionRevokeClaim::rotation_counter`] as `$3` (using a checked conversion
+/// to the database integer type). Return the number of rows returned, NOT
+/// perform SELECT + unconditional UPDATE. Return
 /// [`SessionError::Storage`] (with the claim's `user_id`) on storage
 /// failure. Revocation is effective only after the transaction commits; the
 /// response (including [`clear_cookie_header`]) may be sent only after
@@ -768,6 +819,7 @@ mod tests {
             &old_token,
             reauth_at,
             &old_record,
+            "user-1",
             MAX_SESSION_SECS * 3,
         )
         .expect("re-auth mints a capped replacement");
@@ -792,6 +844,51 @@ mod tests {
     }
 
     #[test]
+    fn reauthentication_requires_matching_proof_identity_and_conditional_revoke() {
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let keys = SessionKeys::single(secret);
+        let now = 1_700_000_000u64;
+        let old_token = issue_session(secret, "user-a", now, 3600).expect("issue");
+        let old_record = record_for(&verify_session(secret, &old_token, now).expect("verify"));
+
+        assert_eq!(
+            reauthenticate_session(&keys, &old_token, now + 60, &old_record, "", 3600).unwrap_err(),
+            SessionError::Invalid,
+            "empty proof identity cannot mint a replacement"
+        );
+        assert_eq!(
+            reauthenticate_session(&keys, &old_token, now + 60, &old_record, "user-b", 3600)
+                .unwrap_err(),
+            SessionError::Invalid,
+            "a proof for another user cannot replace this session"
+        );
+
+        let replacement =
+            reauthenticate_session(&keys, &old_token, now + 60, &old_record, "user-a", 3600)
+                .expect("matching proof identity reauthenticates");
+        let claim = replacement.revocation_claim();
+        assert_eq!(
+            claim.statement(),
+            "UPDATE sessions SET revoked = TRUE WHERE id = $1 AND user_id = $2 AND rotation_counter = $3 AND revoked = FALSE RETURNING id"
+        );
+        assert_eq!(claim.params(), vec![old_record.id.as_str(), "user-a"]);
+        assert_eq!(
+            claim.rotation_counter(),
+            Some(u64::from(old_record.rotation_counter))
+        );
+        let store = RecordingRevokeStore {
+            outcome: Ok(1),
+            calls: std::cell::RefCell::new(Vec::new()),
+        };
+        assert_eq!(ready(store.revoke(claim)), Ok(1));
+        assert_eq!(
+            store.calls.borrow()[0].2,
+            Some(u64::from(old_record.rotation_counter)),
+            "the storage boundary must retain the third placeholder value"
+        );
+    }
+
+    #[test]
     fn session_issuers_reject_zero_ttl() {
         let secret = b"0123456789abcdef0123456789abcdef";
         let keys = SessionKeys::single(secret);
@@ -799,7 +896,8 @@ mod tests {
         let old_token = issue_session(secret, "user-1", now, 3600).expect("issue");
         let old_record = record_for(&verify_session(secret, &old_token, now).expect("verify"));
         assert_eq!(
-            reauthenticate_session(&keys, &old_token, now + 60, &old_record, 0).unwrap_err(),
+            reauthenticate_session(&keys, &old_token, now + 60, &old_record, "user-1", 0)
+                .unwrap_err(),
             SessionError::Invalid,
             "reauthentication must not return a dead replacement or slate the live row for revoke"
         );
@@ -885,9 +983,11 @@ mod tests {
         }
     }
 
+    type RecordedRevokeCall = (&'static str, Vec<String>, Option<u64>);
+
     struct RecordingRevokeStore {
         outcome: Result<u64, SessionError>,
-        calls: std::cell::RefCell<Vec<(&'static str, Vec<String>)>>,
+        calls: std::cell::RefCell<Vec<RecordedRevokeCall>>,
     }
 
     impl SessionRevokeStore for RecordingRevokeStore {
@@ -895,6 +995,7 @@ mod tests {
             self.calls.borrow_mut().push((
                 claim.statement(),
                 claim.params().into_iter().map(str::to_owned).collect(),
+                claim.rotation_counter(),
             ));
             self.outcome.clone()
         }
