@@ -248,7 +248,7 @@ pub fn play(
     secret: &[u8],
     input: &PlayInput<'_>,
 ) -> Result<PlayResponse, PlayError> {
-    let user = authorized_user(secret, input)?;
+    let user = authorized_user(secret, input, meter)?;
     play_authorized(pool, cache, meter, input, &user)
 }
 
@@ -264,7 +264,7 @@ pub fn play_with_observe_event(
     request_id: impl Into<String>,
 ) -> ObservedPlayAttempt {
     let request_id = request_id.into();
-    let user = match authorized_user(secret, input) {
+    let user = match authorized_user(secret, input, meter) {
         Ok(user) => user,
         Err(error) => {
             return ObservedPlayAttempt {
@@ -285,10 +285,39 @@ pub fn play_with_observe_event(
     }
 }
 
-fn authorized_user(secret: &[u8], input: &PlayInput<'_>) -> Result<String, PlayError> {
-    let grant =
-        grant::verify(input.token, secret, input.now_unix).map_err(PlayError::Unauthorized)?;
+fn authorized_user(
+    secret: &[u8],
+    input: &PlayInput<'_>,
+    meter: &mut dyn Meter,
+) -> Result<String, PlayError> {
+    let grant = match grant::verify_with_user(input.token, secret, input.now_unix) {
+        Ok(grant) => grant,
+        Err((err, signed_user)) => {
+            // Expiry and excessive-expiry rejections carry the verified user;
+            // malformed and bad-signature tokens remain silent.
+            let kind = match err {
+                GrantError::Expired => Some(MeterKind::GrantRejectedExpired),
+                GrantError::TtlTooLong => Some(MeterKind::GrantRejectedExcessiveExpiry),
+                GrantError::Malformed | GrantError::BadSignature => None,
+            };
+            if let Some(kind) = kind {
+                meter.emit(ev(
+                    kind,
+                    signed_user.as_deref().unwrap_or_default(),
+                    input.track_id,
+                    0,
+                ));
+            }
+            return Err(PlayError::Unauthorized(err));
+        }
+    };
     if grant.track_id != input.track_id {
+        meter.emit(ev(
+            MeterKind::GrantRejectedWrongTrack,
+            &grant.user_id,
+            input.track_id,
+            0,
+        ));
         return Err(PlayError::WrongTrack);
     }
     Ok(grant.user_id)
@@ -1321,27 +1350,40 @@ mod tests {
     }
 
     #[test]
-    fn garbage_token_is_unauthorized_without_touching_the_pool() {
+    fn unauthenticated_rejections_are_silent_and_do_not_touch_the_pool() {
         let secret = b"s";
-        let mut pool = Pool::new(1);
-        let mut cache = ContentCache::new();
-        let mut meter = crate::meter::MemoryMeter::default();
-        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
-        let input = PlayInput {
-            token: "not-a-token",
-            track_id: "t",
-            range: None,
-            server_addr: addr,
-            segments: &[],
-            cipher_key: 0,
-            now_unix: 1,
-            up_next: None,
-        };
-        assert!(matches!(
-            play(&mut pool, &mut cache, &mut meter, secret, &input),
-            Err(PlayError::Unauthorized(GrantError::Malformed))
-        ));
-        assert_eq!(pool.connects(), 0, "rejected plays must not dial out");
+        let forged_unexpired = grant::issue("attacker", "track", 600, b"other-secret");
+        let forged_expired = grant::issue("attacker", "track", 0, b"other-secret");
+        for (token, expected_error) in [
+            ("not-a-token", GrantError::Malformed),
+            ("v1.abc.def", GrantError::Malformed),
+            (forged_unexpired.as_str(), GrantError::BadSignature),
+            (forged_expired.as_str(), GrantError::BadSignature),
+        ] {
+            let mut pool = Pool::new(1);
+            let mut cache = ContentCache::new();
+            let mut meter = crate::meter::MemoryMeter::default();
+            let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+            let input = PlayInput {
+                token,
+                track_id: "t",
+                range: None,
+                server_addr: addr,
+                segments: &[],
+                cipher_key: 0,
+                now_unix: 1,
+                up_next: None,
+            };
+            assert!(
+                matches!(
+                    play(&mut pool, &mut cache, &mut meter, secret, &input),
+                    Err(PlayError::Unauthorized(err)) if err == expected_error
+                ),
+                "token {token:?}"
+            );
+            assert!(meter.events.is_empty(), "token {token:?}");
+            assert_eq!(pool.connects(), 0, "rejected plays must not dial out");
+        }
     }
 
     #[test]
