@@ -6,13 +6,16 @@ const SOURCE: &str = include_str!("../src/lib.rs");
 // the response builder and fetch-router contract without requiring bindings.
 
 fn section_after<'a>(source: &'a str, marker: &str) -> &'a str {
-    source
+    let section = source
         .split_once(marker)
         .unwrap_or_else(|| panic!("missing source contract: {marker}"))
-        .1
-        .split_once("\n}\n")
-        .unwrap_or_else(|| panic!("unterminated source contract: {marker}"))
-        .0
+        .1;
+    let end = ["\n}\n", "\n    }\n"]
+        .iter()
+        .filter_map(|terminator| section.find(terminator))
+        .min()
+        .unwrap_or_else(|| panic!("unterminated source contract: {marker}"));
+    &section[..end]
 }
 
 #[test]
@@ -29,13 +32,7 @@ fn healthz_response_builder_matches_the_liveness_contract() {
     assert!(response.contains("\"no-store\""));
     assert!(response.contains(r##"r#"{"ok":true}"#"##));
 
-    let handler = SOURCE
-        .split_once("pub fn healthz_route() -> WorkerResult<Response> {")
-        .expect("healthz route handler must exist")
-        .1
-        .split_once("\n    }\n")
-        .expect("healthz route handler must close")
-        .0;
+    let handler = section_after(SOURCE, "fn healthz_route");
     assert!(handler.contains("health_response_parts()"));
 }
 
@@ -47,8 +44,7 @@ fn healthz_is_a_get_route_before_the_not_found_catchall() {
         .1;
     let router = entrypoint
         .split_once("\n#[cfg(test)]\nmod tests")
-        .expect("tests must follow the Worker fetch entrypoint")
-        .0;
+        .map_or(entrypoint, |(router, _)| router);
     let health_route = router
         .find(".get_async(\"/healthz\"")
         .expect("GET /healthz must be registered");

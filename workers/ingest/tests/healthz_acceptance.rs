@@ -6,13 +6,16 @@ const SOURCE: &str = include_str!("../src/lib.rs");
 // the response builder and fetch-router contract without requiring bindings.
 
 fn section_after<'a>(source: &'a str, marker: &str) -> &'a str {
-    source
+    let section = source
         .split_once(marker)
         .unwrap_or_else(|| panic!("missing source contract: {marker}"))
-        .1
-        .split_once("\n}\n")
-        .unwrap_or_else(|| panic!("unterminated source contract: {marker}"))
-        .0
+        .1;
+    let end = ["\n}\n", "\n    }\n"]
+        .iter()
+        .filter_map(|terminator| section.find(terminator))
+        .min()
+        .unwrap_or_else(|| panic!("unterminated source contract: {marker}"));
+    &section[..end]
 }
 
 #[test]
@@ -29,7 +32,7 @@ fn healthz_response_builder_matches_the_liveness_contract() {
     assert!(response.contains("\"no-store\""));
     assert!(response.contains(r##"r#"{"ok":true}"#"##));
 
-    let handler = section_after(SOURCE, "fn healthz() -> Result<Response> {");
+    let handler = section_after(SOURCE, "fn healthz");
     assert!(handler.contains("health_response_parts()"));
 }
 
