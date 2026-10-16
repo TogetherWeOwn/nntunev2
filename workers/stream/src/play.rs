@@ -127,8 +127,10 @@ pub struct PlayResponse {
     /// `ContentCache::try_begin_revalidate`): the worker entry point must
     /// re-fetch upstream and rewrite the entry while the client already has
     /// its bytes, or release the claim with `finish_revalidate` if that
-    /// re-fetch fails. Concurrent stale readers get `false` — one refresh
-    /// per stale entry, not one per reader.
+    /// re-fetch fails, passing the `now_unix` value used to claim it. Claims
+    /// expire after their bounded TTL if the owner disappears. Concurrent
+    /// stale readers get `false` — one refresh per stale entry, not one per
+    /// reader.
     pub needs_revalidate: bool,
     pub stream: PlayStream,
 }
@@ -347,7 +349,7 @@ fn play_authorized(
         // `needs_revalidate`. Claimed only once the serve is known-good, so
         // a failed range never strands the claim with no one told to act.
         let needs_revalidate =
-            serve.needs_revalidate() && cache.try_begin_revalidate(input.track_id);
+            serve.needs_revalidate() && cache.try_begin_revalidate(input.track_id, input.now_unix);
         return Ok(respond(
             window,
             true,
