@@ -103,9 +103,9 @@ def _entry(table, item, type_name, binding_key):
             f"{table}: {binding_key!r} must be a string ({type_name})"
         )
     resource = item.get(RESOURCE_KEY[type_name])
-    if not isinstance(resource, str):
+    if not isinstance(resource, str) or not resource:
         raise ParityError(
-            f"{table}: {RESOURCE_KEY[type_name]} must be a string ({type_name})"
+            f"{table}: {RESOURCE_KEY[type_name]} must be a non-empty string ({type_name})"
         )
     return {
         "type": type_name,

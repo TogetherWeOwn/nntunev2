@@ -586,7 +586,28 @@ reason = "fixture: value fix owned elsewhere"
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = make_repo(tmp, wrangler=wrangler)
-            with self.assertRaisesRegex(ParityError, "bucket_name must be a string"):
+            with self.assertRaisesRegex(ParityError, "bucket_name must be a non-empty string"):
+                run_check(root)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(2, main(["--root", str(root)]))
+            self.assertIn("::error::binding-parity:", output.getvalue())
+            self.assertNotIn("Traceback", output.getvalue())
+
+    def test_empty_resource_fails_closed_with_exit_two_for_presence_only_binding(self):
+        wrangler = MATCHING_WRANGLER.replace(
+            '[[env.staging.hyperdrive]]',
+            '[[env.staging.kv_namespaces]]\nbinding = "STATE"\nid = ""\n'
+            '[[env.staging.hyperdrive]]',
+        ).replace(
+            '[[env.production.hyperdrive]]',
+            '[[env.production.kv_namespaces]]\nbinding = "STATE"\nid = "fx-state-prod"\n'
+            '[[env.production.hyperdrive]]',
+        )
+        manifest = MANIFEST + '\n[[worker.binding]]\nbinding = "STATE"\ntype = "kv"\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp, wrangler=wrangler, manifest=manifest)
+            with self.assertRaisesRegex(ParityError, "id must be a non-empty string"):
                 run_check(root)
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
