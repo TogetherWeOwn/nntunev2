@@ -7,7 +7,8 @@
 //!   path): [`Pool::release`] takes the connection back, [`Pool::take_idle`]
 //!   hands it to the next play, so a steady stream never reconnects per play.
 //! - [`Lane`]s are enforced at acquire time: playback may use every
-//!   connection; prefetch and ingest must leave one free for playback.
+//!   connection; prefetch and ingest leave one free for playback except that
+//!   ingest may use the single half-open recovery probe.
 //! - Provider errors drive a circuit breaker ([`CIRCUIT_FAILURE_THRESHOLD`]
 //!   consecutive failures inside [`CIRCUIT_WINDOW_MS`] opens it for
 //!   [`CIRCUIT_OPEN_MS`], then a single half-open probe); success closes it.
@@ -26,7 +27,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Priority lane. Ordering is priority order: `Playback < Prefetch < Ingest`.
+/// Priority lane. Ordering is priority order: `Playback < Prefetch < Ingest`;
+/// only Playback and Ingest may use the half-open recovery probe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Lane {
     Playback,
@@ -97,8 +99,8 @@ impl Drop for SlotGuard {
 /// Why an acquire failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PoolError {
-    /// The circuit breaker is open, a half-open playback probe is already
-    /// in flight, or the probe cannot run yet; retry after `retry_after_ms`.
+    /// The circuit breaker is open, a half-open probe is already in flight,
+    /// or the probe cannot run yet; retry after `retry_after_ms`.
     /// The play path maps this to `503` with a `Retry-After` header.
     Quarantined { retry_after_ms: u64 },
     /// All connections are leased out.
@@ -204,12 +206,14 @@ impl<C> Pool<C> {
         let Ok(state) = self.slots.lock() else {
             return false;
         };
-        if circuit_state == CircuitState::HalfOpen
-            && (lane != Lane::Playback || state.probe_in_flight.is_some())
-        {
+        let is_probe = circuit_state == CircuitState::HalfOpen
+            && matches!(lane, Lane::Playback | Lane::Ingest)
+            && state.probe_in_flight.is_none();
+        if circuit_state == CircuitState::HalfOpen && !is_probe {
             return false;
         }
-        state.in_use + Self::reserve(lane) < self.capacity
+        let reserve = if is_probe { 0 } else { Self::reserve(lane) };
+        state.in_use + reserve < self.capacity
     }
 
     /// Try to lease one connection slot on `lane`.
@@ -233,12 +237,15 @@ impl<C> Pool<C> {
             Ok(state) => state,
             Err(_) => return Err(PoolError::Exhausted),
         };
-        if is_probe && (lane != Lane::Playback || state.probe_in_flight.is_some()) {
+        if is_probe
+            && (!matches!(lane, Lane::Playback | Lane::Ingest) || state.probe_in_flight.is_some())
+        {
             return Err(PoolError::Quarantined {
                 retry_after_ms: HALF_OPEN_PROBE_RETRY_MS,
             });
         }
-        if state.in_use + Self::reserve(lane) >= self.capacity {
+        let reserve = if is_probe { 0 } else { Self::reserve(lane) };
+        if state.in_use + reserve >= self.capacity {
             return if is_probe {
                 Err(PoolError::Quarantined {
                     retry_after_ms: HALF_OPEN_PROBE_RETRY_MS,
@@ -378,9 +385,11 @@ impl<C> Pool<C> {
 
     /// A non-provider result still proves that the half-open probe reached the
     /// provider (for example, an article-missing or decode response).
-    pub fn record_non_provider_result_for(&mut self, lease_id: u64) {
+    pub fn record_non_provider_result_for(&mut self, lease_id: u64) -> bool {
         if self.probe_in_flight() == Some(lease_id) {
-            self.record_success();
+            self.record_success()
+        } else {
+            false
         }
     }
 
@@ -421,11 +430,15 @@ impl<C> Pool<C> {
         self.slots.lock().ok()?.probe_in_flight
     }
 
-    /// Clear provider failures only when no newer failure has been recorded
-    /// since the operation began.
-    pub(crate) fn record_success_if_epoch_matches(&mut self, epoch: u64) -> bool {
+    /// Settle a successful lease only when no newer provider failure has been
+    /// recorded since the operation began.
+    pub(crate) fn record_success_for_if_epoch_matches(
+        &mut self,
+        lease_id: u64,
+        epoch: u64,
+    ) -> bool {
         if self.provider_error_epoch() == epoch {
-            self.record_success()
+            self.record_success_for(lease_id)
         } else {
             false
         }
@@ -434,14 +447,14 @@ impl<C> Pool<C> {
     /// A provider call succeeded: clear the streak and close the breaker
     /// (including after a half-open probe).
     pub fn record_success(&mut self) -> bool {
-        let cleared = self.quarantined_until_ms.is_some() || self.consecutive_errors > 0;
+        let cleared_quarantine = self.quarantined_until_ms.is_some();
         self.consecutive_errors = 0;
         self.window_start_ms = None;
         self.quarantined_until_ms = None;
         if let Ok(mut state) = self.slots.lock() {
             state.probe_in_flight = None;
         }
-        cleared
+        cleared_quarantine
     }
 
     /// A provider call succeeded on `lease_id`. Only the admitted half-open
@@ -452,10 +465,9 @@ impl<C> Pool<C> {
         if self.probe_in_flight() == Some(lease_id) {
             self.record_success()
         } else if self.quarantined_until_ms.is_none() {
-            let cleared = self.consecutive_errors > 0;
             self.consecutive_errors = 0;
             self.window_start_ms = None;
-            cleared
+            false
         } else {
             false
         }
@@ -854,6 +866,18 @@ mod tests {
     }
 
     #[test]
+    fn closed_streak_clear_is_not_reported_as_quarantine_exit() {
+        let mut pool = TestPool::new(2);
+        let lease = pool.try_acquire(Lane::Playback).expect("lease");
+        pool.record_provider_error();
+
+        assert!(!pool.record_success_for(lease.id));
+        assert_eq!(pool.consecutive_errors, 0);
+        assert_eq!(pool.circuit_state(), super::CircuitState::Closed);
+        pool.release(lease, None);
+    }
+
+    #[test]
     fn stale_lease_success_while_open_leaves_the_breaker_open() {
         use super::{CircuitState, CIRCUIT_OPEN_MS};
         let mut pool = TestPool::new(2);
@@ -916,11 +940,13 @@ mod tests {
     #[test]
     fn stale_success_does_not_clear_a_newer_closed_state_failure() {
         let mut pool = TestPool::new(2);
+        let lease = pool.try_acquire(Lane::Playback).expect("lease");
         let success_epoch = pool.provider_error_epoch();
         pool.record_provider_error();
 
-        assert!(!pool.record_success_if_epoch_matches(success_epoch));
+        assert!(!pool.record_success_for_if_epoch_matches(lease.id, success_epoch));
         assert_eq!(pool.consecutive_errors, 1);
+        pool.release(lease, None);
     }
 
     #[test]

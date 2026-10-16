@@ -297,6 +297,47 @@ async fn concurrent_probes_share_the_pool_without_holding_a_borrow() {
 }
 
 #[tokio::test]
+async fn ingest_only_traffic_recovers_a_half_open_breaker() {
+    let server = TestNntpServer::spawn_for_test().await;
+    let good = config(server.addr(), "testpass");
+    let bad = config(server.addr(), "wrong-password");
+    let dials = Cell::new(0);
+    let pool: RefCell<Pool<Client>> = RefCell::new(Pool::new(2));
+    let req = request("u1", 0, &posted_ids());
+
+    for _ in 0..nntune_stream::pool::CIRCUIT_FAILURE_THRESHOLD {
+        assert_eq!(
+            run_probe(&pool, || dial(bad.clone(), &dials), no_tick, &req)
+                .await
+                .expect_err("provider failure"),
+            ProbeError::Provider
+        );
+    }
+    assert!(pool.borrow().quarantined());
+    pool.borrow_mut()
+        .advance(nntune_stream::pool::CIRCUIT_OPEN_MS);
+    assert_eq!(
+        run_probe(&pool, || dial(bad.clone(), &dials), no_tick, &req)
+            .await
+            .expect_err("failed ingest probe re-opens breaker"),
+        ProbeError::Provider
+    );
+    assert!(pool.borrow().quarantined());
+    pool.borrow_mut()
+        .advance(nntune_stream::pool::CIRCUIT_OPEN_MS);
+
+    let outcome = run_probe(&pool, || dial(good.clone(), &dials), no_tick, &req)
+        .await
+        .expect("ingest is admitted as the half-open probe");
+    assert_eq!(outcome.present, req.segment_ids);
+    assert!(!pool.borrow().quarantined());
+    assert_eq!(
+        pool.borrow().circuit_state(),
+        nntune_stream::pool::CircuitState::Closed
+    );
+}
+
+#[tokio::test]
 async fn serve_probe_answers_the_ingest_envelope_as_json() {
     let server = TestNntpServer::spawn_for_test().await;
     let cfg = config(server.addr(), "testpass");

@@ -663,8 +663,8 @@ fn settle(
                 crate::pool::CIRCUIT_OPEN_MS,
             ));
         }
-    } else {
-        pool.record_non_provider_result_for(lease.id);
+    } else if pool.record_non_provider_result_for(lease.id) {
+        meter.emit(ev_pool(MeterKind::QuarantineExited, user, track, lane, 0));
     }
     pool.release(lease, if conn == Conn::KeepWarm { client } else { None });
     err
@@ -2014,6 +2014,40 @@ mod tests {
             ]
         );
         drop(held_lease);
+    }
+
+    #[test]
+    fn half_open_non_provider_result_emits_one_quarantine_exit() {
+        let mut pool = StreamPool::new(2);
+        for _ in 0..crate::pool::CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        pool.advance(crate::pool::CIRCUIT_OPEN_MS);
+        let probe = pool.try_acquire(Lane::Playback).expect("probe admitted");
+        let mut meter = crate::meter::MemoryMeter::default();
+
+        settle(
+            &mut pool,
+            &mut meter,
+            probe,
+            None,
+            (
+                PlayError::ArticleMissing("gone@synthetic.test".into()),
+                Conn::KeepWarm,
+            ),
+            "u",
+            "track-a",
+        );
+
+        assert_eq!(pool.circuit_state(), crate::pool::CircuitState::Closed);
+        assert_eq!(
+            meter
+                .events
+                .iter()
+                .filter(|event| event.kind == MeterKind::QuarantineExited)
+                .count(),
+            1
+        );
     }
 
     #[test]

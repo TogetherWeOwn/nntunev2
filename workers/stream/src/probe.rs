@@ -264,7 +264,7 @@ where
             Ok(found) => {
                 let mut pool = pool.borrow_mut();
                 pool.record_reuse();
-                pool.record_success_if_epoch_matches(success_epoch);
+                pool.record_success_for_if_epoch_matches(lease.id, success_epoch);
                 pool.release(lease, Some(client));
                 return Ok(outcome(req, found));
             }
@@ -282,7 +282,7 @@ where
     match stat_batch(&mut client, &req.segment_ids).await {
         Ok(found) => {
             let mut pool = pool.borrow_mut();
-            pool.record_success_if_epoch_matches(success_epoch);
+            pool.record_success_for_if_epoch_matches(lease.id, success_epoch);
             pool.release(lease, Some(client));
             Ok(outcome(req, found))
         }
@@ -308,7 +308,7 @@ fn provider_failed<T: Transport>(
 ) -> ProbeError {
     let mut pool = pool.borrow_mut();
     tick(&mut pool);
-    pool.record_provider_error();
+    pool.record_provider_error_for(lease.id);
     pool.release(lease, None);
     ProbeError::Provider
 }

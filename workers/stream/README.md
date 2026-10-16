@@ -77,12 +77,13 @@ A dead upstream must fail fast with a `503`, never hang playback
   but carries no `Retry-After` (capacity, not an outage); auth and range
   failures keep `401`/`403`/`416`; other upstream failures are `502`.
 - Once the 30 s open interval elapses the breaker is half-open: exactly one
-  `Playback` probe acquire is admitted, tracked independently of other live
-  leases. `Prefetch` and `Ingest` cannot consume it; concurrent playback
-  acquires or a probe delayed by pool capacity are rejected with
-  `Retry-After: 1`. A provider response (including a missing article) closes
-  the breaker; a provider failure re-opens it for a fresh 30 s without
-  resetting the failure streak. A failure that lands while the breaker is
+  `Playback` or `Ingest` probe acquire is admitted, tracked independently of
+  other live leases. `Prefetch` cannot consume it; an ingest probe may use the
+  playback-reserved slot for this single recovery attempt. Concurrent acquires
+  or a probe delayed by pool capacity are rejected with `Retry-After: 1`. A
+  provider response (including a missing article) closes the breaker; a
+  provider failure re-opens it for a fresh 30 s without resetting the failure
+  streak. A failure that lands while the breaker is
   already open is held: the streak and the window are left alone, so the
   original open interval still half-opens for exactly one probe instead of
   silently closing. Settlement is lease-scoped: only the admitted
@@ -130,9 +131,9 @@ behaviour.
   success of the chain is the one every waiter takes. An error stays with the
   flight that produced it, so the original's failure never fails callers
   parked on a replacement that is still fetching. (The NNTP client's 10 s
-  timeout is per socket *read*, so a slow-but-healthy leader can be replaced
-  once and briefly overlap its replacement; that bounded overlap is the
-  documented trade-off.) A panicking leader releases its key, so later calls
+  deadline bounds the full article operation, so a slow-but-healthy leader can
+  be replaced once and briefly overlap its replacement; that bounded overlap
+  is the documented trade-off.) A panicking leader releases its key, so later calls
   start a fresh flight; its waiters recover through their own timeout.
 - Native only: the primitive parks waiters on a `Condvar`, which traps on
   `wasm32-unknown-unknown`, so the module is `#[cfg(not(target_arch =
@@ -225,7 +226,8 @@ call carries one batch envelope (the ingest crate's `ProbeRequest`, at most
 ingest consumer ── NNTP_POOL stub (id_from_name(user_id)) ── POST /probe ──▶ NntpPool DO
   1. refuse envelopes naming another user (the DO id is the user id), bodies
      over 1 MiB, batches outside 1..=500, ids that are not strict message-ids
-  2. lease on the Ingest lane (never the slot reserved for playback)
+  2. lease on the Ingest lane (normally leaves one slot reserved for playback;
+     a half-open recovery probe may use that slot)
   3. warm connection or dial; STAT each id: 223 present, 430 missing
   4. 200 {"batch_index", "present", "missing"}: the request ids, partitioned
 ```
