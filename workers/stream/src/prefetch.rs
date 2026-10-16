@@ -49,6 +49,29 @@ mod tests {
     }
 
     #[test]
+    fn prefetch_cannot_consume_the_half_open_probe() {
+        use crate::pool::{CircuitState, CIRCUIT_OPEN_MS, HALF_OPEN_PROBE_RETRY_MS};
+
+        let mut pool = Pool::<()>::new(4);
+        for _ in 0..crate::pool::CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        pool.advance(CIRCUIT_OPEN_MS);
+
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+        assert!(!should_prefetch(&pool));
+        assert_eq!(
+            pool.try_acquire(Lane::Prefetch)
+                .expect_err("prefetch cannot take the recovery probe"),
+            crate::pool::PoolError::Quarantined {
+                retry_after_ms: HALF_OPEN_PROBE_RETRY_MS
+            }
+        );
+        pool.try_acquire(Lane::Playback)
+            .expect("playback retains the recovery probe");
+    }
+
+    #[test]
     fn next_track_walks_the_queue() {
         let queue = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         assert_eq!(next_track(&queue, 0), Some("b"));

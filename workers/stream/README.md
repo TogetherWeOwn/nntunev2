@@ -51,15 +51,20 @@ A dead upstream must fail fast with a `503`, never hang playback
 | Setting | Value | Where |
 |---|---|---|
 | Dial (connect) timeout | 5 s default | `UpstreamTimeouts::default().connect` |
-| Read timeout (every blocking read) | 10 s default | `UpstreamTimeouts::default().read` |
+| Read timeout (idle read / total article response) | 10 s default | `UpstreamTimeouts::default().read` |
 | Failure threshold | 3 consecutive provider failures | `pool::CIRCUIT_FAILURE_THRESHOLD` |
 | Failure window | 30 s (older failures restart the streak at 1) | `pool::CIRCUIT_WINDOW_MS` |
 | Open interval | 30 s | `pool::CIRCUIT_OPEN_MS` |
 
-- Per-upstream timeouts ride `PlayInput::timeouts` and bind at dial time
-  (a warm pooled connection keeps the timeouts it was dialed with). Worst
-  case per segment op is `connect + read + margin`; the hung-upstream
-  integration test asserts a hung play stays within `read + 5 s`.
+- Per-upstream timeouts ride `PlayInput::timeouts`: `connect` bounds a new
+  dial, and the current `read` timeout is applied when reusing a warm
+  connection. A warm connection is reused only when its peer matches the
+  current `server_addr`. `read` is both the idle-read limit and the total
+  status-plus-body deadline for one
+  article, so a trickling response cannot extend playback indefinitely. The
+  first segment's connect, greeting, article and optional warm redial share a
+  `connect + read` deadline; later articles each get a `read` deadline.
+  The hung-upstream test asserts a silent article times out within that budget.
 - The breaker opens after 3 consecutive provider failures inside the 30 s
   window. While open, `try_acquire` fails with `PoolQuarantined` without
   dialing out, and the play path maps it to **`503` with
@@ -68,11 +73,15 @@ A dead upstream must fail fast with a `503`, never hang playback
   but carries no `Retry-After` (capacity, not an outage); auth and range
   failures keep `401`/`403`/`416`; other upstream failures are `502`.
 - Once the 30 s open interval elapses the breaker is half-open: exactly one
-  probe acquire is admitted (a second concurrent acquire is rejected with a
-  zero `Retry-After`). Probe success closes the breaker; a provider failure
-  re-opens it for a fresh 30 s. The hung-upstream integration test trips the
-  breaker at the threshold, asserts the `503` + `Retry-After` without
-  touching the hung server, then probes recovery against the healthy server.
+  `Playback` probe acquire is admitted, tracked independently of other live
+  leases. `Prefetch` and `Ingest` cannot consume it; concurrent playback
+  acquires or a probe delayed by pool capacity are rejected with
+  `Retry-After: 1`. A provider response (including a missing article) closes
+  the breaker; a provider failure re-opens it for a fresh 30 s without
+  resetting the failure streak.
+  The hung-upstream integration test trips the breaker at the threshold,
+  asserts the `503` + `Retry-After` without touching the hung server, then
+  probes recovery against the healthy server.
 
 ## TTFB targets
 
@@ -112,6 +121,10 @@ lives in `tests/stream_integration.rs` and serves canned yEnc multipart articles
 
 ## Production notes
 
+- The breaker clock is virtual: the embedding Worker/DO must call
+  `Pool::advance` with elapsed real milliseconds before time-based pool
+  operations. This portable crate has no runtime clock driver, so open
+  circuits will not recover automatically until the integration supplies it.
 - Deploy bindings: `wrangler.toml` (`NntpPool` DO, `AUDIO_CACHE` R2,
   `METER` Analytics Engine dataset).
 - Decryption in `play.rs` is a demo XOR stream cipher marking the

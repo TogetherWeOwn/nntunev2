@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 use crate::cache::{ContentCache, MultipartUpload};
 use crate::grant::{self, GrantError};
 use crate::meter::{Meter, MeterEvent, MeterKind};
-use crate::nntp::{valid_message_id, NntpClient, NntpError, UpstreamTimeouts};
+use crate::nntp::{valid_message_id, NntpClient, NntpDeadline, NntpError, UpstreamTimeouts};
 use crate::pool::{Lane, Lease, OrphanedPlay, Pool, PoolError};
 use crate::prefetch::should_prefetch;
 use crate::range::{self, RangeOutcome};
@@ -310,12 +310,25 @@ fn open_and_fetch_first(
     pool: &mut StreamPool,
     input: &PlayInput<'_>,
 ) -> Result<(NntpClient, Decoded), (Option<NntpClient>, Failure)> {
+    let deadline = NntpDeadline::new(input.timeouts.connect.saturating_add(input.timeouts.read));
     let mut warm = pool.take_idle();
+    if let Some(client) = warm.as_mut() {
+        if !client
+            .prepare_for_reuse(&input.server_addr, input.timeouts.read)
+            .unwrap_or(false)
+        {
+            warm = None;
+        }
+    }
     let was_warm = warm.is_some();
     for attempt in 0..2 {
         let mut client = match warm.take() {
             Some(client) => client,
-            None => match NntpClient::connect_with_timeouts(&input.server_addr, input.timeouts) {
+            None => match NntpClient::connect_with_deadline(
+                &input.server_addr,
+                input.timeouts,
+                &deadline,
+            ) {
                 Ok(client) => {
                     pool.record_connect();
                     client
@@ -323,8 +336,13 @@ fn open_and_fetch_first(
                 Err(e) => return Err((None, nntp_failure(e, &input.segments[0]))),
             },
         };
-        match fetch_segment(&mut client, &input.segments[0]) {
-            Ok(decoded) => return Ok((client, decoded)),
+        match fetch_segment_with_deadline(&mut client, &input.segments[0], &deadline) {
+            Ok(decoded) => {
+                if was_warm && attempt == 0 {
+                    pool.record_reuse();
+                }
+                return Ok((client, decoded));
+            }
             Err(SegmentError::Nntp(e)) if was_warm && attempt == 0 && e.is_provider_failure() => {
                 // Stale pooled connection: drop it and redial once.
                 continue;
@@ -357,6 +375,17 @@ fn fetch_segment(client: &mut NntpClient, message_id: &str) -> Result<Decoded, S
     yenc::decode_part(&raw).map_err(SegmentError::Decode)
 }
 
+fn fetch_segment_with_deadline(
+    client: &mut NntpClient,
+    message_id: &str,
+    deadline: &NntpDeadline,
+) -> Result<Decoded, SegmentError> {
+    let raw = client
+        .article_with_deadline(message_id, deadline)
+        .map_err(SegmentError::Nntp)?;
+    yenc::decode_part(&raw).map_err(SegmentError::Decode)
+}
+
 fn nntp_failure(e: NntpError, message_id: &str) -> Failure {
     let provider = e.is_provider_failure();
     let err = match e {
@@ -378,11 +407,13 @@ fn settle(
     user: &str,
     track: &str,
 ) -> PlayError {
-    pool.release(lease, if provider { None } else { client });
     if provider {
-        pool.record_provider_error();
+        pool.record_provider_error_for(lease.id);
         meter.emit(ev(MeterKind::ProviderError, user, track, 0));
+    } else {
+        pool.record_non_provider_result_for(lease.id);
     }
+    pool.release(lease, if provider { None } else { client });
     err
 }
 
@@ -675,16 +706,115 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_warm_peer_is_discarded_without_counting_a_reuse() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let timeouts = UpstreamTimeouts::new(Duration::from_secs(1), Duration::from_secs(1));
+        let old_listener = TcpListener::bind("127.0.0.1:0").expect("bind old NNTP");
+        let old_addr = old_listener.local_addr().expect("old address");
+        let old_server = std::thread::spawn(move || {
+            let (mut stream, _) = old_listener.accept().expect("accept warm connection");
+            stream.write_all(b"200 old NNTP ready\r\n").unwrap();
+            let mut byte = [0];
+            let _ = stream.read(&mut byte);
+        });
+        let warm_client =
+            NntpClient::connect_with_timeouts(&old_addr, timeouts).expect("warm greeting");
+
+        let current_listener = TcpListener::bind("127.0.0.1:0").expect("bind current NNTP");
+        let current_addr = current_listener.local_addr().expect("current address");
+        let current_server = std::thread::spawn(move || {
+            let (mut stream, _) = current_listener
+                .accept()
+                .expect("accept current connection");
+            stream.write_all(b"200 current NNTP ready\r\n").unwrap();
+            let mut command = Vec::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_until(b'\n', &mut command)
+                .unwrap();
+            stream.write_all(b"430 no such article\r\n").unwrap();
+        });
+
+        let mut pool = Pool::new(1);
+        pool.record_connect();
+        let lease = pool
+            .try_acquire(Lane::Playback)
+            .expect("lease for warm client");
+        pool.release(lease, Some(warm_client));
+        let segments = vec!["missing@synthetic.test".to_string()];
+        let input = PlayInput {
+            token: "unused by first-segment fetch",
+            track_id: "track",
+            range: None,
+            server_addr: current_addr,
+            timeouts,
+            segments: &segments,
+            cipher_key: 0,
+            now_unix: 0,
+            up_next: None,
+        };
+
+        let (client, failure) = match open_and_fetch_first(&mut pool, &input) {
+            Err(result) => result,
+            Ok(_) => panic!("missing article response"),
+        };
+        assert!(matches!(failure.0, PlayError::ArticleMissing(_)));
+        assert!(!failure.1, "a missing article is not a provider failure");
+        assert_eq!(
+            (pool.connects(), pool.reuses()),
+            (2, 0),
+            "the changed peer requires a cold dial, not a warm reuse"
+        );
+
+        drop(client);
+        current_server.join().expect("current server thread");
+        old_server.join().expect("old server thread");
+    }
+
+    #[test]
+    fn missing_article_settles_a_half_open_probe_as_a_live_provider() {
+        use crate::pool::{CircuitState, CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_OPEN_MS};
+
+        let mut pool = Pool::new(2);
+        for _ in 0..CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        pool.advance(CIRCUIT_OPEN_MS);
+        let probe = pool
+            .try_acquire(Lane::Playback)
+            .expect("half-open probe admitted");
+        let mut meter = crate::meter::MemoryMeter::default();
+        let error = settle(
+            &mut pool,
+            &mut meter,
+            probe,
+            None,
+            (PlayError::ArticleMissing("missing".into()), false),
+            "user",
+            "track",
+        );
+
+        assert_eq!(error, PlayError::ArticleMissing("missing".into()));
+        assert_eq!(pool.circuit_state(), CircuitState::Closed);
+        pool.try_acquire(Lane::Playback)
+            .expect("a provider response closes the breaker");
+    }
+
+    #[test]
     fn open_breaker_maps_to_503_with_retry_after() {
         let err = PlayError::PoolQuarantined {
             retry_after_ms: 30_000,
         };
         assert_eq!(err.http_status(), 503);
         assert_eq!(err.retry_after_header().as_deref(), Some("30"));
-        // A probe-in-flight rejection (zero wait) still signals retry.
-        let probe = PlayError::PoolQuarantined { retry_after_ms: 0 };
+        // A probe-in-flight rejection asks clients to wait before retrying.
+        let probe = PlayError::PoolQuarantined {
+            retry_after_ms: crate::pool::HALF_OPEN_PROBE_RETRY_MS,
+        };
         assert_eq!(probe.http_status(), 503);
-        assert_eq!(probe.retry_after_header().as_deref(), Some("0"));
+        assert_eq!(probe.retry_after_header().as_deref(), Some("1"));
         // Other failures keep their own statuses, never 503.
         assert_eq!(
             PlayError::Unauthorized(GrantError::Malformed).http_status(),
