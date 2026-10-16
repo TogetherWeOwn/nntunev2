@@ -59,9 +59,12 @@ pub fn nntp_port_allowed(port: u16) -> bool {
 }
 
 /// Documented worker/API error code for stale provider credentials (S7).
-/// Every worker path that observes an NNTP `481`/`482` (or an indexer HTTP
-/// 401/403) returns this code with HTTP 401; the web app renders an inline
-/// re-auth prompt on it instead of a generic error page. Safe to log and to
+/// Worker paths that observe NNTP `480`/`481` (and `482` on `AUTHINFO`
+/// replies only — a `482` elsewhere is out-of-sequence, not a re-auth
+/// signal) return this code with HTTP 401; the web app renders an inline
+/// re-auth prompt on it instead of a generic error page. Indexer failures
+/// use the distinct `indexer_auth_expired` (HTTP 401 only; a 403 stays
+/// generic) — see `workers/ingest/src/newznab.rs`. Safe to log and to
 /// return in error bodies: it carries no credential material.
 pub const PROVIDER_AUTH_EXPIRED_CODE: &str = "provider_auth_expired";
 

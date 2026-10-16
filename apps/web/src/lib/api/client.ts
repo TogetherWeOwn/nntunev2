@@ -32,6 +32,10 @@ export class ApiError extends Error {
 /** Documented re-auth code (S7): stale provider credential. */
 export const PROVIDER_AUTH_EXPIRED_CODE = 'provider_auth_expired';
 
+/** Documented re-key code (S7): stale indexer API key. Distinct from the
+ * provider code: the web app names the API key (never the password) for it. */
+export const INDEXER_AUTH_EXPIRED_CODE = 'indexer_auth_expired';
+
 export interface MagicLinkResult {
 	ok: true;
 }
@@ -155,11 +159,13 @@ export class ApiClient {
 	}
 
 	private errorCode(status: number, body: { error?: unknown; code?: unknown }): string {
-		// The re-auth code travels in the body (`{ error: "provider_auth_expired" }`
-		// with HTTP 401); it takes precedence over the status mapping so the UI
-		// renders the inline re-auth prompt instead of a generic signed-out page.
+		// The re-auth codes travel in the body (`{ error: "provider_auth_expired" }`
+		// or `{ error: "indexer_auth_expired" }` with HTTP 401); they take
+		// precedence over the status mapping so the UI renders the inline
+		// re-auth prompt instead of a generic signed-out page.
 		for (const field of [body.code, body.error] as unknown[]) {
 			if (field === PROVIDER_AUTH_EXPIRED_CODE) return PROVIDER_AUTH_EXPIRED_CODE;
+			if (field === INDEXER_AUTH_EXPIRED_CODE) return INDEXER_AUTH_EXPIRED_CODE;
 		}
 		if (status === 401) return 'unauthorized';
 		if (status === 403) return 'forbidden';
