@@ -155,6 +155,8 @@ def extract_bindings(data):
         if not isinstance(item, dict):
             raise ParityError("queues.consumers: entry is not a table")
         queue = item.get("queue")
+        if not isinstance(queue, str):
+            raise ParityError("queues.consumers: 'queue' must be a string")
         if not queue:
             raise ParityError("queues.consumers: entry without 'queue'")
         add(

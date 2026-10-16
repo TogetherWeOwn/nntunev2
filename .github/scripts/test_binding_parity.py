@@ -594,6 +594,28 @@ reason = "fixture: value fix owned elsewhere"
             self.assertIn("::error::binding-parity:", output.getvalue())
             self.assertNotIn("Traceback", output.getvalue())
 
+    def test_non_string_queue_consumer_fails_closed_with_exit_two(self):
+        wrangler = MATCHING_WRANGLER + (
+            '\n[env.staging.queues]\n'
+            '[[env.staging.queues.consumers]]\nqueue = 123\n'
+        )
+        manifest = MANIFEST + '''
+[[worker.binding]]
+binding = "consumer:fx-jobs"
+type = "queue_consumer"
+staging = "fx-jobs"
+prod = "fx-jobs"
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp, wrangler=wrangler, manifest=manifest)
+            with self.assertRaisesRegex(ParityError, "queue.*must be a string"):
+                run_check(root)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(2, main(["--root", str(root)]))
+            self.assertIn("::error::binding-parity:", output.getvalue())
+            self.assertNotIn("Traceback", output.getvalue())
+
     def test_unparsable_config_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_repo(tmp, wrangler="name = [not toml")
