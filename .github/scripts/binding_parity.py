@@ -193,9 +193,13 @@ def extract_bindings(data):
         if key not in _KNOWN_TABLES
     ]
     unsafe = data.get("unsafe")
+    if "unsafe" in data and not isinstance(unsafe, dict):
+        raise ParityError("unsafe: not a table")
     if isinstance(unsafe, dict) and "bindings" in unsafe:
         unknown_tables.append(("unsafe.bindings", unsafe["bindings"]))
     logfwdr = data.get("logfwdr")
+    if "logfwdr" in data and not isinstance(logfwdr, dict):
+        raise ParityError("logfwdr: not a table")
     if isinstance(logfwdr, dict) and "bindings" in logfwdr:
         unknown_tables.append(("logfwdr.bindings", logfwdr["bindings"]))
     for key, value in unknown_tables:

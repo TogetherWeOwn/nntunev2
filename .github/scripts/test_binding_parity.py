@@ -674,6 +674,27 @@ reason = "fixture: value fix owned elsewhere"
         for table, wrangler in list_cases.items():
             with self.subTest(table=table, kind="list-entry"):
                 self.assert_wrangler_fails_closed_with_exit_two(wrangler)
+        parent_cases = {
+            "unsafe-scalar": MATCHING_WRANGLER.replace(
+                "[env.staging]\n", '[env.staging]\nunsafe = "oops"\n', 1
+            ),
+            "unsafe-list": MATCHING_WRANGLER.replace(
+                "[env.staging]\n",
+                '[env.staging]\nunsafe = [{ bindings = [{ name = "LEGACY" }] }]\n',
+                1,
+            ),
+            "logfwdr-scalar": MATCHING_WRANGLER.replace(
+                "[env.staging]\n", "[env.staging]\nlogfwdr = 123\n", 1
+            ),
+            "logfwdr-list": MATCHING_WRANGLER.replace(
+                "[env.staging]\n",
+                '[env.staging]\nlogfwdr = [{ bindings = [{ name = "LOG" }] }]\n',
+                1,
+            ),
+        }
+        for case, wrangler in parent_cases.items():
+            with self.subTest(parent=case):
+                self.assert_wrangler_fails_closed_with_exit_two(wrangler)
 
     def test_manifest_key_typo_fails_closed(self):
         manifest = MANIFEST.replace('staging = "fx-audio-staging"',
