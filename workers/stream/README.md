@@ -11,7 +11,8 @@ client ── play(token, range?) ──▶ stream Worker
   2. R2 hit: serve 200 / 206 straight from the shared cached blob
      (audio/<sha256>; cache.rs, range.rs) — no copy of the track
   3. R2 miss: lease a pool slot (Playback lane), take a warm connection
-     (or dial one), BODY the FIRST segment, yEnc-decode it (multipart
+     (or dial one), BODY the first segment (or, for a mid-track seek with
+     NZB segment ranges, the segment covering the range start), yEnc-decode it (multipart
      =ybegin/=ypart/=yend, pcrc32) and read the file size from =ybegin so
      Range/206 resolves before byte one. Later segments are fetched
      lazily as the client pulls 16 KiB chunks: decode → decrypt → client
