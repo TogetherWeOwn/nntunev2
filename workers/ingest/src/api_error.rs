@@ -154,12 +154,12 @@ impl From<IntakeRejection> for ApiError {
     fn from(e: IntakeRejection) -> Self {
         match e {
             IntakeRejection::Empty => Self::invalid_request("nzb_xml must not be empty"),
-            IntakeRejection::TooLarge => Self::payload_too_large("nzb_xml exceeds 2 MiB"),
+            IntakeRejection::TooLarge { .. } => Self::payload_too_large("nzb_xml exceeds 2 MiB"),
             IntakeRejection::NotNzb => Self::invalid_request("nzb_xml is not an NZB document"),
-            IntakeRejection::TooManyFiles => Self::payload_too_large("nzb has too many files"),
-            IntakeRejection::TooManySegments => {
-                Self::payload_too_large("nzb has too many segments")
-            }
+            IntakeRejection::Malformed => Self::invalid_request("nzb_xml is malformed"),
+            IntakeRejection::TooManyFiles { .. } => Self::payload_too_large("nzb has too many files"),
+            IntakeRejection::TooManySegments { .. } => Self::payload_too_large("nzb has too many segments"),
+            IntakeRejection::DeclaredBytesOverCap { .. } => Self::payload_too_large("nzb declared bytes over cap"),
         }
     }
 }
@@ -191,10 +191,14 @@ mod tests {
             ),
             ("invalid_request", 400)
         );
+        let too_large = IntakeRejection::TooLarge {
+            size_bytes: 3,
+            max_bytes: 2,
+        };
         assert_eq!(
             (
-                ApiError::from(IntakeRejection::TooLarge).code,
-                ApiError::from(IntakeRejection::TooLarge).status
+                ApiError::from(too_large).code,
+                ApiError::from(too_large).status
             ),
             ("payload_too_large", 413)
         );
@@ -203,11 +207,19 @@ mod tests {
             "invalid_request"
         );
         assert_eq!(
-            ApiError::from(IntakeRejection::TooManyFiles).code,
+            ApiError::from(IntakeRejection::TooManyFiles { count: 6, max: 5 }).code,
             "payload_too_large"
         );
         assert_eq!(
-            ApiError::from(IntakeRejection::TooManySegments).code,
+            ApiError::from(IntakeRejection::TooManySegments { count: 61, max: 60 }).code,
+            "payload_too_large"
+        );
+        assert_eq!(
+            ApiError::from(IntakeRejection::DeclaredBytesOverCap {
+                declared: 11,
+                max: 10,
+            })
+            .code,
             "payload_too_large"
         );
     }

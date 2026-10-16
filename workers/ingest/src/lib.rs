@@ -29,6 +29,7 @@ pub mod metering;
 pub mod newznab;
 pub mod nzb_intake;
 pub mod parse;
+pub mod pool_probe;
 pub mod probe;
 pub mod queue;
 pub mod rate_limit;
@@ -38,7 +39,7 @@ use api_error::ApiError;
 use dispatch::validate_user_id;
 use jobs::validate_job_id;
 use newznab::{MAX_CATEGORIES, MAX_LIMIT, MAX_PAGE};
-use nzb_intake::estimate_nzb;
+use nzb_intake::{estimate_nzb, IntakeRejection};
 use queue::{validate_indexer_ref, NzbUploadRequest, QueueMsg, SearchRequest};
 
 /// Largest accepted `POST /v1/ingest/search` body: the request is a query plus
@@ -183,6 +184,49 @@ fn check_upload(req: &NzbUploadRequest) -> core::result::Result<(), &'static str
         return Err("user_id must be 1..=128 chars without ':'");
     }
     Ok(())
+}
+
+/// Build the status + JSON body for an intake refusal. Pure so the 4xx
+/// taxonomy (stable `code`, measured value + cap fields the client renders)
+/// is unit-tested without a Worker runtime.
+fn intake_rejection_parts(rejection: &IntakeRejection) -> (u16, serde_json::Value) {
+    let mut body = serde_json::json!({
+        "error": rejection.message(),
+        "code": rejection.code(),
+        "intake_config_version": nzb_intake::INTAKE_CONFIG_VERSION,
+    });
+    match *rejection {
+        IntakeRejection::TooLarge {
+            size_bytes,
+            max_bytes,
+        } => {
+            body["size_bytes"] = size_bytes.into();
+            body["max_bytes"] = max_bytes.into();
+        }
+        IntakeRejection::TooManyFiles { count, max } => {
+            body["file_count"] = count.into();
+            body["max_files"] = max.into();
+        }
+        IntakeRejection::TooManySegments { count, max } => {
+            body["segment_count"] = count.into();
+            body["max_segments"] = max.into();
+        }
+        IntakeRejection::DeclaredBytesOverCap { declared, max } => {
+            body["declared_bytes"] = declared.into();
+            body["max_declared_bytes"] = max.into();
+        }
+        IntakeRejection::Empty | IntakeRejection::NotNzb | IntakeRejection::Malformed => {}
+    }
+    (rejection.http_status(), body)
+}
+
+/// Answer an intake refusal with its stable code + reason fields.
+fn intake_rejection_response(rejection: &IntakeRejection) -> Result<Response> {
+    let (status, body) = intake_rejection_parts(rejection);
+    Response::from_json(&body).map(|r| {
+        r.with_status(status)
+            .with_headers(headers_json().unwrap_or_default())
+    })
 }
 
 /// Send one dispatch message. Returns true when the Queue accepted it; a
@@ -343,7 +387,7 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Respons
         return json_error(ApiError::invalid_request(message));
     }
     match estimate_nzb(&parsed.nzb_xml) {
-        Err(rejection) => json_error(ApiError::from(rejection)),
+        Err(rejection) => intake_rejection_response(&rejection),
         Ok(est) => {
             let msg = match dispatch::build_upload_dispatch(&parsed.user_id, &parsed.nzb_xml) {
                 Ok(msg) => msg,
@@ -393,7 +437,7 @@ async fn job_status(_req: &Request, ctx: &RouteContext<()>) -> Result<Response> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nzb_intake::MAX_NZB_BYTES;
+    use crate::nzb_intake::{MAX_FILES, MAX_NZB_BYTES};
 
     fn search_body(
         query: &str,
@@ -504,6 +548,84 @@ mod tests {
         let ok = queued_body(&msg, "indexer_search", true, serde_json::json!({}));
         assert_eq!(ok["status"], serde_json::Value::String("queued".into()));
         assert_eq!(ok["job_id"], serde_json::Value::String(msg.job_id.clone()));
+    }
+
+    #[test]
+    fn intake_corpus_maps_to_stable_4xx_codes_with_reason_fields() {
+        // (body, expected status, expected code)
+        let over_bytes = r#"<?xml version="1.0"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+<file poster="a@b" date="1" subject="big.iso">
+<groups><group>alt.binaries.music</group></groups>
+<segments>
+<segment bytes="42949672960" number="1">big-one@news</segment>
+<segment bytes="42949672960" number="2">big-two@news</segment>
+</segments>
+</file>
+</nzb>"#;
+        let mut file_bomb = String::from("<?xml?><nzb>");
+        for _ in 0..(MAX_FILES + 1) {
+            file_bomb.push_str("<file></file>");
+        }
+        file_bomb.push_str("</nzb>");
+        let mut segment_bomb = String::from("<?xml?><nzb>");
+        for _ in 0..(crate::nzb_intake::MAX_SEGMENTS + 1) {
+            segment_bomb.push_str("<segment></segment>");
+        }
+        segment_bomb.push_str("</nzb>");
+        assert!(segment_bomb.len() < MAX_NZB_BYTES);
+        let cases: &[(&str, u16, &str)] = &[
+            ("", 400, "NZB_EMPTY"),
+            ("<html><body>hi</body></html>", 400, "NZB_NOT_NZB"),
+            ("<?xml?><nzb><file>", 400, "NZB_MALFORMED"),
+            (over_bytes, 413, "NZB_DECLARED_BYTES_OVER_CAP"),
+            (&file_bomb, 413, "NZB_TOO_MANY_FILES"),
+            (&segment_bomb, 413, "NZB_TOO_MANY_SEGMENTS"),
+            (&"x".repeat(MAX_NZB_BYTES + 1), 413, "NZB_TOO_LARGE"),
+        ];
+        for (body, status, code) in cases {
+            let rejection = estimate_nzb(body).unwrap_err();
+            let (actual_status, actual_body) = intake_rejection_parts(&rejection);
+            assert_eq!(actual_status, *status, "status for {code}");
+            assert_eq!(actual_body["code"], *code, "code for {code}");
+            assert_eq!(
+                actual_body["intake_config_version"],
+                crate::nzb_intake::INTAKE_CONFIG_VERSION
+            );
+            assert!(actual_body["error"].is_string());
+        }
+        // Reason fields the client renders ride alongside the code.
+        let (_, over_bytes_body) = intake_rejection_parts(&estimate_nzb(over_bytes).unwrap_err());
+        assert!(over_bytes_body["declared_bytes"].as_u64().unwrap() > 0);
+        assert!(over_bytes_body["max_declared_bytes"].as_u64().unwrap() > 0);
+        let (_, too_large_body) =
+            intake_rejection_parts(&estimate_nzb(&"x".repeat(MAX_NZB_BYTES + 1)).unwrap_err());
+        assert_eq!(
+            too_large_body["max_bytes"].as_u64().unwrap(),
+            MAX_NZB_BYTES as u64
+        );
+        let (_, too_many_files_body) =
+            intake_rejection_parts(&estimate_nzb(&file_bomb).unwrap_err());
+        assert_eq!(
+            too_many_files_body["file_count"].as_u64().unwrap(),
+            (MAX_FILES + 1) as u64
+        );
+        assert_eq!(
+            too_many_files_body["max_files"].as_u64().unwrap(),
+            MAX_FILES as u64
+        );
+        let (_, too_many_segments_body) =
+            intake_rejection_parts(&estimate_nzb(&segment_bomb).unwrap_err());
+        assert_eq!(
+            too_many_segments_body["segment_count"].as_u64().unwrap(),
+            (crate::nzb_intake::MAX_SEGMENTS + 1) as u64
+        );
+        assert_eq!(
+            too_many_segments_body["max_segments"].as_u64().unwrap(),
+            crate::nzb_intake::MAX_SEGMENTS as u64
+        );
+        // A valid NZB has no rejection at all: it queues.
+        assert!(estimate_nzb(crate::fixtures::SMALL_NZB).is_ok());
     }
 
     #[test]
