@@ -239,6 +239,27 @@ mod tests {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let runtime = std::fs::read_to_string(dir.join("src/runtime.rs")).expect("read runtime.rs");
         let parsed = syn::parse_file(&runtime).expect("parse runtime.rs");
+        assert!(
+            non_doc_attributes(&parsed.attrs).is_empty(),
+            "runtime.rs must not have inner attributes that can disable its Worker exports"
+        );
+
+        let lib = std::fs::read_to_string(dir.join("src/lib.rs")).expect("read lib.rs");
+        let parsed_lib = syn::parse_file(&lib).expect("parse lib.rs");
+        let runtime_module = parsed_lib
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Mod(module) if module.ident == "runtime" => Some(module),
+                _ => None,
+            })
+            .expect("runtime module declaration");
+        let wasm_cfg: syn::Attribute = syn::parse_quote!(#[cfg(target_arch = "wasm32")]);
+        assert_eq!(
+            non_doc_attributes(&runtime_module.attrs),
+            vec![tokens(&wasm_cfg)],
+            "runtime module must be enabled only by the wasm32 target cfg"
+        );
 
         let public_fetch = parsed
             .items
