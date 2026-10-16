@@ -946,9 +946,7 @@ mod tests {
         let _body: Vec<u8> = stream.by_ref().flatten().collect();
         server.join().expect("server thread");
         assert!(matches!(stream.error(), Some(PlayError::Decode(_))));
-        assert!(stream
-            .finalize(&mut pool, &mut cache, &mut meter)
-            .is_err());
+        assert!(stream.finalize(&mut pool, &mut cache, &mut meter).is_err());
         assert!(pool.quarantined(), "a failed stream cannot clear it");
         assert!(meter
             .events
