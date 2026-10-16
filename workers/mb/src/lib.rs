@@ -510,7 +510,7 @@ mod http_layer {
     }
 
     fn json_headers(cache_ttl: Option<u32>) -> WorkerResult<Headers> {
-        let mut headers = Headers::new();
+        let headers = Headers::new();
         headers.append("content-type", "application/json; charset=utf-8")?;
         match cache_ttl {
             Some(ttl) => headers.append("cache-control", &cache_control(ttl))?,

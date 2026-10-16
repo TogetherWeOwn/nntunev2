@@ -70,3 +70,38 @@ test('provider wizard walks provider, indexer and test steps', async ({ page, re
 		page.getByRole('button', { name: /test connection/i })
 	).toBeVisible();
 });
+
+test('wizard offers only the NNTP allowlist ports 119 and 563', async ({ page }) => {
+	await page.goto('/onboarding/provider');
+
+	const values = await page.locator('select[name="port"] option').evaluateAll((options) =>
+		options.map((option) => option.getAttribute('value'))
+	);
+	expect(values).toEqual(['119', '563']);
+});
+
+test('wizard requires a plaintext acknowledgement when TLS is off', async ({ page }) => {
+	await page.goto('/onboarding/provider');
+
+	await page.locator('input[name="tls"]').uncheck();
+
+	await expect(page.getByText(/password is sent in cleartext/i)).toBeVisible();
+	await expect(page.locator('input[name="allowInsecurePlaintext"]')).toBeVisible();
+});
+
+test('wizard hides save until a connection test passes', async ({ page }) => {
+	await page.goto('/onboarding/provider');
+
+	await page.locator('input[name="host"]').fill('news.example.com');
+	await page.locator('input[name="username"]').fill('alice');
+	await page.locator('input[name="password"]').fill('s3cret');
+	await page.getByRole('button', { name: 'Continue' }).click();
+
+	await expect(page.getByText(/indexer improves search/i)).toBeVisible();
+	await page.getByRole('button', { name: 'Continue' }).click();
+
+	await expect(page.getByRole('heading', { level: 2 })).toContainText('Test the connection');
+	// Save stays hidden until the live test passes, so the wizard can never
+	// store credentials that were not just tested.
+	await expect(page.getByRole('button', { name: /save provider/i })).toHaveCount(0);
+});

@@ -347,7 +347,7 @@ impl<T: Transport> NntpClient<T> {
 /// must not surface the re-auth code.
 fn auth_reply_error(code: u16, text: String) -> Error {
     match code {
-        481 | 482 => Error::AuthFailed(text),
+        480..=482 => Error::AuthFailed(text),
         502 => Error::NoPermission(text),
         code => Error::NntpReply {
             code,

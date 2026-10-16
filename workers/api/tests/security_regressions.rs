@@ -6,7 +6,7 @@
 //! WebAuthn signatures, or connection-time DNS pinning.
 
 use base64::Engine as _;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use nntune_api::{auth, session, vault};
 use sha2::Sha256;
 use std::{cell::RefCell, future::Future, net::IpAddr, task::Poll};
