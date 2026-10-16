@@ -11,12 +11,17 @@
 //!   usage-ledger table, which in production must key
 //!   `UNIQUE(idempotency_key)` exactly as the ingest library upsert
 //!   converges `ON CONFLICT (idempotency_key)`. [`UsageLedger::record`]
-//!   converges redeliveries to one entry, first write wins.
+//!   converges exact redeliveries to one entry, first write wins, and
+//!   reports [`RecordOutcome::Conflict`] instead of converging when a
+//!   redelivery disagrees or the key does not bind its identity fields.
 //! - [`reconcile`] compares each distinct metered play against the ledger
 //!   and flags (never silently adjusts) every mismatch with one
 //!   [`MeterKind::ReconcileMismatch`] event and a single-line log
-//!   representation from [`ReconcileMismatch::log_line`]. Production sink
-//!   wiring is separate.
+//!   representation from [`ReconcileMismatch::log_line`]. A redelivery
+//!   inside the same batch that conflicts with its first occurrence is
+//!   flagged as its own mismatch. Mismatch events carry `bytes = 0`
+//!   (they serve nothing; counts stay on the [`ReconcileMismatch`]
+//!   record). Production sink wiring is separate.
 
 /// Event name for the mismatch representation emitted by [`reconcile`].
 /// Wiring this event to Analytics Engine remains a production integration task.
@@ -31,6 +36,9 @@ pub enum MeterKind {
     BytesServed,
     PrefetchEnqueued,
     ProviderError,
+    /// A flagged reconciliation mismatch. Non-serving: its [`MeterEvent`]
+    /// always carries `bytes = 0`; the flagged counts stay on the
+    /// [`ReconcileMismatch`] record returned by [`reconcile`].
     ReconcileMismatch,
 }
 
@@ -143,6 +151,37 @@ pub struct LedgerEntry {
 pub enum RecordOutcome {
     Recorded,
     Duplicate,
+    /// The play was not converged: either its idempotency key does not
+    /// bind its `(user_id, track_id)` identity fields (the key must be
+    /// exactly `play:{user_id}:{track_id}:{play_id}` with valid fields),
+    /// or a ledger entry already exists for the key with a different
+    /// user, track, or byte count. A conflict never appends, sums into,
+    /// or overwrites the existing entry.
+    Conflict,
+}
+
+/// The idempotency key must bind the play's identity: exactly
+/// `play:{user_id}:{track_id}:{play_id}` where every field passes
+/// [`is_valid_key_field`] with the same limits as
+/// [`derive_play_idempotency_key`]. [`CompletePlay`] exposes public
+/// fields, so a directly constructed value can bypass
+/// [`CompletePlay::new`]; the ledger re-checks the invariant here so
+/// the dedup point never accepts a key the derivation function would
+/// reject.
+fn key_binds_identity(play: &CompletePlay) -> bool {
+    if !is_valid_key_field(&play.user_id, 128) || !is_valid_key_field(&play.track_id, 512) {
+        return false;
+    }
+    let Some(rest) = play.idempotency_key.strip_prefix("play:") else {
+        return false;
+    };
+    let mut parts = rest.split(':');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(user), Some(track), Some(play_id), None) => {
+            user == play.user_id && track == play.track_id && is_valid_key_field(play_id, 512)
+        }
+        _ => false,
+    }
 }
 
 /// Portable-core model of the Hyperdrive usage-ledger table.
@@ -156,19 +195,31 @@ pub struct UsageLedger {
 
 impl UsageLedger {
     /// Record a complete play. A new idempotency key appends one entry
-    /// ([`RecordOutcome::Recorded`]); a redelivery converges to the
-    /// existing entry ([`RecordOutcome::Duplicate`]).
+    /// ([`RecordOutcome::Recorded`]); an exact redelivery converges to
+    /// the existing entry ([`RecordOutcome::Duplicate`]).
     ///
     /// First write wins: a duplicate never appends, sums into, or
-    /// overwrites the existing entry — even if its byte count disagrees
-    /// (that disagreement is [`reconcile`]'s job to flag).
+    /// overwrites the existing entry. A redelivery whose user, track, or
+    /// byte count disagrees with the entry, or a play whose key does not
+    /// bind its identity fields, reports [`RecordOutcome::Conflict`] and
+    /// likewise changes nothing (that disagreement is [`reconcile`]'s
+    /// job to flag).
     pub fn record(&mut self, play: &CompletePlay) -> RecordOutcome {
-        if self
+        if !key_binds_identity(play) {
+            return RecordOutcome::Conflict;
+        }
+        if let Some(existing) = self
             .entries
             .iter()
-            .any(|e| e.idempotency_key == play.idempotency_key)
+            .find(|e| e.idempotency_key == play.idempotency_key)
         {
-            return RecordOutcome::Duplicate;
+            if existing.user_id == play.user_id
+                && existing.track_id == play.track_id
+                && existing.bytes == play.bytes
+            {
+                return RecordOutcome::Duplicate;
+            }
+            return RecordOutcome::Conflict;
         }
         self.entries.push(LedgerEntry {
             idempotency_key: play.idempotency_key.clone(),
@@ -269,12 +320,16 @@ impl ReconcileReport {
 
 /// Reconcile metered complete plays against the usage ledger.
 ///
-/// Each distinct play (by idempotency key, first occurrence authoritative,
-/// redeliveries checked once) is compared against the ledger: a play whose
-/// ledger entry is missing, whose user or track differs, or whose metered
-/// bytes differ from the entry's bytes, is a mismatch. Every mismatch emits
-/// exactly one [`MeterKind::ReconcileMismatch`] meter event (carrying the
-/// metered byte count) and produces one [`ReconcileMismatch`] record.
+/// Each distinct play (by idempotency key, first occurrence authoritative)
+/// is compared against the ledger: a play whose ledger entry is missing,
+/// whose user or track differs, or whose metered bytes differ from the
+/// entry's bytes, is a mismatch. A redelivery inside the same batch whose
+/// user, track, or bytes conflict with its first occurrence is flagged as
+/// its own mismatch, so a truncated or corrupted replay cannot hide behind
+/// the first observation. Every mismatch emits exactly one
+/// [`MeterKind::ReconcileMismatch`] meter event (non-serving: `bytes = 0`)
+/// and produces one [`ReconcileMismatch`] record carrying the metered and
+/// ledger byte counts.
 ///
 /// The pass takes `&UsageLedger` and never adjusts, backfills, or drops an
 /// entry: a mismatch is flagged, never silently fixed. Reconciliation is
@@ -286,14 +341,45 @@ pub fn reconcile(
     ledger: &UsageLedger,
     meter: &mut dyn Meter,
 ) -> ReconcileReport {
-    let mut seen: Vec<&str> = Vec::with_capacity(plays.len());
+    let mut first_seen: Vec<&CompletePlay> = Vec::with_capacity(plays.len());
     let mut mismatches: Vec<ReconcileMismatch> = Vec::new();
 
+    // Emit one mismatch record + event for `play`. `ledger_bytes` is the
+    // ledger entry for the key when one exists.
+    let flag = |play: &CompletePlay,
+                ledger_bytes: Option<u64>,
+                meter: &mut dyn Meter,
+                mismatches: &mut Vec<ReconcileMismatch>| {
+        mismatches.push(ReconcileMismatch {
+            idempotency_key: play.idempotency_key.clone(),
+            user_id: play.user_id.clone(),
+            track_id: play.track_id.clone(),
+            metered_bytes: play.bytes,
+            ledger_bytes,
+        });
+        meter.emit(MeterEvent {
+            kind: MeterKind::ReconcileMismatch,
+            user_id: play.user_id.clone(),
+            track_id: play.track_id.clone(),
+            bytes: 0,
+        });
+    };
+
     for play in plays {
-        if seen.iter().any(|key| *key == play.idempotency_key) {
+        if let Some(first) = first_seen
+            .iter()
+            .find(|seen| seen.idempotency_key == play.idempotency_key)
+        {
+            if first.user_id != play.user_id
+                || first.track_id != play.track_id
+                || first.bytes != play.bytes
+            {
+                let ledger_bytes = ledger.get(&play.idempotency_key).map(|entry| entry.bytes);
+                flag(play, ledger_bytes, meter, &mut mismatches);
+            }
             continue;
         }
-        seen.push(play.idempotency_key.as_str());
+        first_seen.push(play);
 
         let ledger_entry = ledger.get(&play.idempotency_key);
         let ledger_bytes = ledger_entry.map(|entry| entry.bytes);
@@ -309,23 +395,11 @@ pub fn reconcile(
             continue;
         }
 
-        mismatches.push(ReconcileMismatch {
-            idempotency_key: play.idempotency_key.clone(),
-            user_id: play.user_id.clone(),
-            track_id: play.track_id.clone(),
-            metered_bytes: play.bytes,
-            ledger_bytes,
-        });
-        meter.emit(MeterEvent {
-            kind: MeterKind::ReconcileMismatch,
-            user_id: play.user_id.clone(),
-            track_id: play.track_id.clone(),
-            bytes: play.bytes,
-        });
+        flag(play, ledger_bytes, meter, &mut mismatches);
     }
 
     ReconcileReport {
-        checked: seen.len(),
+        checked: first_seen.len(),
         mismatches,
     }
 }
@@ -382,6 +456,90 @@ mod tests {
         assert!(derive_play_idempotency_key(&"u".repeat(129), "track", "play").is_err());
         assert!(derive_play_idempotency_key("user", &"t".repeat(513), "play").is_err());
         assert!(derive_play_idempotency_key("user", "track", &"p".repeat(513)).is_err());
+    }
+
+    #[test]
+    fn record_conflicts_on_disagreeing_redelivery_without_rewriting() {
+        let mut ledger = UsageLedger::default();
+        assert_eq!(
+            ledger.record(&CompletePlay::new("user-1", "track-9", "play-7", 40_000).unwrap()),
+            RecordOutcome::Recorded
+        );
+        assert_eq!(
+            ledger.record(&CompletePlay::new("user-1", "track-9", "play-7", 41_500).unwrap()),
+            RecordOutcome::Conflict
+        );
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(
+            ledger.get("play:user-1:track-9:play-7").map(|e| e.bytes),
+            Some(40_000),
+            "conflict must neither overwrite nor sum into the entry"
+        );
+        assert_eq!(ledger.total_bytes_for_user("user-1"), 40_000);
+    }
+
+    #[test]
+    fn record_conflicts_when_the_key_does_not_bind_its_identity() {
+        // Forged key: binds alice's identity but bills mallory.
+        let forged = CompletePlay {
+            idempotency_key: "play:alice:t:1".to_string(),
+            user_id: "mallory".to_string(),
+            track_id: "t".to_string(),
+            bytes: 5,
+        };
+        let mut ledger = UsageLedger::default();
+        assert_eq!(ledger.record(&forged), RecordOutcome::Conflict);
+        assert!(ledger.is_empty());
+        assert_eq!(ledger.total_bytes_for_user("mallory"), 0);
+
+        // Empty key/user/track is not a billable play either.
+        let empty = CompletePlay {
+            idempotency_key: String::new(),
+            user_id: String::new(),
+            track_id: String::new(),
+            bytes: 5,
+        };
+        assert_eq!(ledger.record(&empty), RecordOutcome::Conflict);
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn reconcile_flags_a_conflicting_redelivery_in_the_same_batch() {
+        // Same identity fields, different bytes: the derived keys match,
+        // so the second play is a conflicting redelivery of the first.
+        let first = CompletePlay::new("user-1", "track-9", "play-7", 40_000).unwrap();
+        let replay = CompletePlay::new("user-1", "track-9", "play-7", 41_500).unwrap();
+        debug_assert_eq!(first.idempotency_key, replay.idempotency_key);
+        let ledger = {
+            let mut ledger = UsageLedger::default();
+            ledger.record(&first);
+            ledger
+        };
+        let mut meter = MemoryMeter::default();
+        let report = reconcile(&[first, replay], &ledger, &mut meter);
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.mismatches.len(), 1);
+        assert_eq!(report.mismatches[0].metered_bytes, 41_500);
+        assert_eq!(report.mismatches[0].ledger_bytes, Some(40_000));
+        assert_eq!(meter.events.len(), 1);
+        assert_eq!(meter.events[0].bytes, 0);
+    }
+
+    #[test]
+    fn mismatch_events_carry_zero_bytes() {
+        let metered = CompletePlay::new("user-1", "track-9", "play-7", 39_999).unwrap();
+        let mut ledger = UsageLedger::default();
+        ledger.record(&CompletePlay::new("user-1", "track-9", "play-7", 40_000).unwrap());
+        let mut meter = MemoryMeter::default();
+        let report = reconcile(std::slice::from_ref(&metered), &ledger, &mut meter);
+        assert_eq!(report.mismatches.len(), 1);
+        assert_eq!(report.mismatches[0].metered_bytes, 39_999);
+        assert_eq!(meter.events.len(), 1);
+        assert_eq!(meter.events[0].kind, MeterKind::ReconcileMismatch);
+        assert_eq!(
+            meter.events[0].bytes, 0,
+            "non-serving mismatch events must not inflate byte sums"
+        );
     }
 
     #[test]
