@@ -2101,7 +2101,11 @@ fn registration_requires_user_verification_and_keeps_failed_challenge_retryable(
             "invite_code": null,
         }),
     );
-    assert_eq!(accepted.status, 200, "UV enrollment should work: {}", accepted.body);
+    assert_eq!(
+        accepted.status, 200,
+        "UV enrollment should work: {}",
+        accepted.body
+    );
 }
 
 #[test]
@@ -2140,7 +2144,10 @@ fn login_requires_user_verification_before_consuming_the_challenge() {
     let row = block_on(harness.store.challenge_by_id(&challenge))
         .expect("challenge lookup")
         .expect("challenge remains available");
-    assert!(!row.challenge.consumed, "failed UV verification must not burn the challenge");
+    assert!(
+        !row.challenge.consumed,
+        "failed UV verification must not burn the challenge"
+    );
 
     let user_verified = authenticator_data(RP, 0x05, 1, None);
     let accepted = harness.call(
@@ -2154,7 +2161,11 @@ fn login_requires_user_verification_before_consuming_the_challenge() {
             "signature": b64::encode(&es256_sign(&key, &user_verified, &client_data)),
         }),
     );
-    assert_eq!(accepted.status, 200, "UV login should work: {}", accepted.body);
+    assert_eq!(
+        accepted.status, 200,
+        "UV login should work: {}",
+        accepted.body
+    );
     let credential = block_on(harness.store.credential_by_id(&credential_id))
         .expect("credential lookup")
         .expect("credential remains stored");
@@ -2207,7 +2218,10 @@ fn enrollment_ignores_untrusted_attestation_counter_and_first_assertion_advances
     let credential = block_on(harness.store.credential_by_id(&credential_id))
         .expect("credential lookup")
         .expect("credential stored");
-    assert_eq!(credential.sign_count, 0, "attestation counter is unauthenticated");
+    assert_eq!(
+        credential.sign_count, 0,
+        "attestation counter is unauthenticated"
+    );
 
     let start = harness.call(
         "POST",
@@ -2230,7 +2244,11 @@ fn enrollment_ignores_untrusted_attestation_counter_and_first_assertion_advances
             "signature": b64::encode(&es256_sign(&key, &assertion_data, &assertion_client)),
         }),
     );
-    assert_eq!(logged_in.status, 200, "first signed assertion should establish count: {}", logged_in.body);
+    assert_eq!(
+        logged_in.status, 200,
+        "first signed assertion should establish count: {}",
+        logged_in.body
+    );
     let credential = block_on(harness.store.credential_by_id(&credential_id))
         .expect("credential lookup")
         .expect("credential stored");
@@ -2254,10 +2272,7 @@ fn login_rejects_a_losing_sign_count_race_without_issuing_a_session() {
     let key = test_signing_key(44);
     let auth_data = authenticator_data(RP, 0x05, 1, None);
     let client_data = client_json("webauthn.get", &challenge, ORIGIN);
-    harness
-        .store
-        .race_next_sign_count_advance
-        .set(true);
+    harness.store.race_next_sign_count_advance.set(true);
 
     let response = harness.call(
         "POST",
@@ -2270,7 +2285,10 @@ fn login_rejects_a_losing_sign_count_race_without_issuing_a_session() {
             "signature": b64::encode(&es256_sign(&key, &auth_data, &client_data)),
         }),
     );
-    assert_eq!(response.status, 401, "lost counter CAS must fail generically");
+    assert_eq!(
+        response.status, 401,
+        "lost counter CAS must fail generically"
+    );
     assert_eq!(response.body, GENERIC_AUTH_BODY);
     assert!(response.set_cookie.is_none());
     assert_eq!(harness.store.sessions.borrow().len(), sessions_before);
@@ -2278,7 +2296,10 @@ fn login_rejects_a_losing_sign_count_race_without_issuing_a_session() {
     let credential = block_on(harness.store.credential_by_id(&credential_id))
         .expect("credential lookup")
         .expect("credential stored");
-    assert_eq!(credential.sign_count, 1, "the concurrent winner advanced it");
+    assert_eq!(
+        credential.sign_count, 1,
+        "the concurrent winner advanced it"
+    );
 }
 
 #[test]
@@ -2322,9 +2343,8 @@ fn purpose_guard_migration_keeps_the_constraint_creation_strategy_pinned() {
     assert!(normalized.contains(
         "if new.purpose is distinct from old.purpose then raise exception 'auth_challenges.purpose is immutable'"
     ));
-    assert!(normalized.contains(
-        "drop trigger if exists auth_challenges_purpose_immutable on auth_challenges"
-    ));
+    assert!(normalized
+        .contains("drop trigger if exists auth_challenges_purpose_immutable on auth_challenges"));
     assert!(normalized.contains(
         "create trigger auth_challenges_purpose_immutable before update of purpose on auth_challenges"
     ));
