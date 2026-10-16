@@ -246,7 +246,7 @@ where
     F: Future<Output = nntune_core::Result<NntpClient<T>>>,
     S: Fn(&mut Pool<NntpClient<T>>),
 {
-    let (lease, warm) = {
+    let (lease, warm, success_epoch) = {
         let mut pool = pool.borrow_mut();
         tick(&mut pool);
         let lease = pool.try_acquire(Lane::Ingest).map_err(|e| match e {
@@ -256,14 +256,15 @@ where
             },
         })?;
         let warm = pool.take_idle();
-        (lease, warm)
+        (lease, warm, pool.provider_error_epoch())
     };
 
     if let Some(mut client) = warm {
         match stat_batch(&mut client, &req.segment_ids).await {
             Ok(found) => {
                 let mut pool = pool.borrow_mut();
-                pool.record_success();
+                pool.record_reuse();
+                pool.record_success_if_epoch_matches(success_epoch);
                 pool.release(lease, Some(client));
                 return Ok(outcome(req, found));
             }
@@ -281,7 +282,7 @@ where
     match stat_batch(&mut client, &req.segment_ids).await {
         Ok(found) => {
             let mut pool = pool.borrow_mut();
-            pool.record_success();
+            pool.record_success_if_epoch_matches(success_epoch);
             pool.release(lease, Some(client));
             Ok(outcome(req, found))
         }
@@ -490,14 +491,19 @@ mod tests {
         let mut pool: Pool<u32> = Pool::new(2);
         let clock = WallClock::default();
         clock.sync(&mut pool, 10_000);
-        pool.record_provider_error(); // 1 s quarantine from now
+        for _ in 0..crate::pool::CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
         clock.sync(&mut pool, 10_500);
         assert!(pool.quarantined());
         // A backwards step adds nothing and is not re-counted on recovery.
         clock.sync(&mut pool, 9_000);
-        clock.sync(&mut pool, 10_900);
-        assert!(pool.quarantined(), "only 900 ms have really elapsed");
-        clock.sync(&mut pool, 11_000);
+        clock.sync(&mut pool, 39_999);
+        assert!(
+            pool.quarantined(),
+            "the 30-second open interval is not over"
+        );
+        clock.sync(&mut pool, 40_000);
         assert!(!pool.quarantined());
     }
 }

@@ -175,17 +175,26 @@ async fn provider_failure_is_generic_and_quarantines_the_pool() {
     assert_eq!(pool.borrow().in_use(), 0, "the lease is returned");
     assert_eq!(pool.borrow().idle(), 0, "the failed connection is dropped");
 
-    // Quarantined: the next batch backs off without touching the provider.
+    // Two more failures reach the three-failure threshold; the next batch
+    // backs off without touching the provider.
+    for _ in 1..nntune_stream::pool::CIRCUIT_FAILURE_THRESHOLD {
+        assert_eq!(
+            run_probe(&pool, || dial(cfg.clone(), &dials), no_tick, &req)
+                .await
+                .expect_err("provider failure"),
+            ProbeError::Provider
+        );
+    }
     let err = run_probe(&pool, || dial(cfg.clone(), &dials), no_tick, &req)
         .await
         .expect_err("quarantined");
     assert_eq!(
         err,
         ProbeError::Busy {
-            retry_after_ms: 1_000
+            retry_after_ms: nntune_stream::pool::CIRCUIT_OPEN_MS
         }
     );
-    assert_eq!(dials.get(), 1);
+    assert_eq!(dials.get(), 3);
 }
 
 #[tokio::test]
@@ -205,18 +214,32 @@ async fn quarantine_backoff_counts_from_the_failure_not_the_request_start() {
     assert_eq!(err, ProbeError::Provider);
     assert_eq!(now.get(), 11_500);
 
-    // 100 ms after the failure, 900 ms of the 1 s step remain; no dial.
-    now.set(11_600);
+    // Two more slow failures reach the threshold; the breaker starts its
+    // 30-second open interval when the third failure is recorded.
+    for _ in 1..nntune_stream::pool::CIRCUIT_FAILURE_THRESHOLD {
+        assert_eq!(
+            run_probe(&pool, || slow_failing_dial(&now), tick, &req)
+                .await
+                .expect_err("provider failure"),
+            ProbeError::Provider
+        );
+    }
+    let failed_at = now.get();
+    now.set(failed_at + 100);
     let err = run_probe(&pool, || slow_failing_dial(&now), tick, &req)
         .await
         .expect_err("still quarantined");
     assert_eq!(
         err,
         ProbeError::Busy {
-            retry_after_ms: 900
+            retry_after_ms: nntune_stream::pool::CIRCUIT_OPEN_MS - 100
         }
     );
-    assert_eq!(now.get(), 11_600, "a quarantined probe never dials");
+    assert_eq!(
+        now.get(),
+        failed_at + 100,
+        "a quarantined probe never dials"
+    );
 }
 
 #[tokio::test]

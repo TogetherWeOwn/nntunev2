@@ -40,10 +40,63 @@ Pool semantics (`pool.rs`):
   cap of 1 they never run). Waiter ordering across async tasks arrives with
   the Durable Object entry point; the reservation is what guarantees
   playback priority today.
-- Only connection-level failures (I/O, protocol errors) quarantine the pool
-  with 1s → 5s → 30s → 5min backoff, cleared on success. A gone article
-  (`430`/`423`) or a corrupt segment fails that one play
-  (`ArticleMissing` / `Decode`) and returns the healthy connection.
+- Only connection-level failures (I/O, protocol errors, read timeouts)
+  count toward the circuit breaker; a gone article (`430`/`423`) or a corrupt
+  segment fails that one play (`ArticleMissing` / `Decode`) and returns the
+  healthy connection. Breaker values are documented below.
+
+## Upstream timeouts and circuit breaker
+
+A dead upstream must fail fast with a `503`, never hang playback
+(`nntp.rs`, `pool.rs`, `play.rs`):
+
+| Setting | Value | Where |
+|---|---|---|
+| Dial (connect) timeout | 5 s default | `UpstreamTimeouts::default().connect` |
+| Read timeout (idle read / total article response) | 10 s default | `UpstreamTimeouts::default().read` |
+| Failure threshold | 3 consecutive provider failures | `pool::CIRCUIT_FAILURE_THRESHOLD` |
+| Failure window | 30 s (older failures restart the streak at 1) | `pool::CIRCUIT_WINDOW_MS` |
+| Open interval | 30 s | `pool::CIRCUIT_OPEN_MS` |
+
+- Per-upstream timeouts ride `play_with_timeouts` (`play` uses
+  `UpstreamTimeouts::default()`): `connect` bounds a new dial, and the
+  current `read` timeout is applied when reusing a warm connection. They stay
+  out of `PlayInput` on purpose so existing `PlayInput` literals keep
+  compiling. A warm connection is reused only when its peer matches the
+  current `server_addr`. `read` is both the idle-read limit and the total
+  status-plus-body deadline for one
+  article, so a trickling response cannot extend playback indefinitely. The
+  first segment's connect, greeting, article and optional warm redial share a
+  `connect + read` deadline; later articles each get a `read` deadline.
+  The hung-upstream test asserts a silent article times out within that budget.
+- The breaker opens after 3 consecutive provider failures inside the 30 s
+  window. While open, `try_acquire` fails with `PoolQuarantined` without
+  dialing out, and the play path maps it to **`503` with
+  `Retry-After: 30`** (`PlayError::http_status` /
+  `retry_after_header`). An exhausted pool (all slots leased) is also `503`
+  but carries no `Retry-After` (capacity, not an outage); auth and range
+  failures keep `401`/`403`/`416`; other upstream failures are `502`.
+- Once the 30 s open interval elapses the breaker is half-open: exactly one
+  `Playback` probe acquire is admitted, tracked independently of other live
+  leases. `Prefetch` and `Ingest` cannot consume it; concurrent playback
+  acquires or a probe delayed by pool capacity are rejected with
+  `Retry-After: 1`. A provider response (including a missing article) closes
+  the breaker; a provider failure re-opens it for a fresh 30 s without
+  resetting the failure streak. A failure that lands while the breaker is
+  already open is held: the streak and the window are left alone, so the
+  original open interval still half-opens for exactly one probe instead of
+  silently closing. Settlement is lease-scoped: only the admitted
+  probe's outcome closes or re-opens the breaker. A first-segment success
+  settles only the probe and leaves a closed-state streak untouched, so a
+  provider that serves segment 0 and dies mid-track still trips the breaker;
+  the streak clears only when a play completes cleanly (`finalize` success
+  or an `abort` with no failure). A stale lease's success clears a
+  closed-state streak but never closes an open breaker, and an
+  `abort` after a failed segment records that failure exactly like
+  `finalize` would.
+  The hung-upstream integration test trips the breaker at the threshold,
+  asserts the `503` + `Retry-After` without touching the hung server, then
+  probes recovery against the healthy server.
 
 ## Stampede guard (singleflight + stale-while-revalidate)
 
@@ -265,6 +318,10 @@ and `reconcile` does not currently emit to Analytics Engine or call
 
 ## Production notes
 
+- The breaker clock is virtual: the embedding Worker/DO must call
+  `Pool::advance` with elapsed real milliseconds before time-based pool
+  operations. This portable crate has no runtime clock driver, so open
+  circuits will not recover automatically until the integration supplies it.
 - Deploy bindings: `wrangler.toml` (`NntpPool` DO, `AUDIO_CACHE` R2,
   `METER` Analytics Engine dataset).
 - Decryption in `play.rs` is a demo XOR stream cipher marking the
