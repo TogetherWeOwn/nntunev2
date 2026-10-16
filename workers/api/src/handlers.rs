@@ -70,6 +70,34 @@ const REGISTER_FINISH_ATTEMPTS_PER_CHALLENGE: u64 = 10;
 const LOGIN_FINISH_ATTEMPTS_PER_CHALLENGE: u64 = 10;
 const MAGIC_FINISH_ATTEMPTS_PER_IP: u64 = 10;
 const FINISH_ATTEMPT_WINDOW_SECS: u64 = crate::auth::CHALLENGE_TTL_SECS;
+/// Auth-start abuse budgets (CISO follow-up): per-email/per-account caps
+/// never bind across fresh addresses — each new email mints a fresh user
+/// id — so every start route also reserves one per-IP slot and one global
+/// slot BEFORE creating any user/challenge row or queuing mail. Denial
+/// keeps the route's usual response shape (no throttle oracle). 30/hour
+/// per IP admits legitimate multi-user NAT while cutting distinct-email
+/// loops; 100 per 5 minutes globally bounds fleet-wide mail/DB pressure
+/// within the atomic slot-table guard (`reserve_rate_limit` fails closed
+/// above 100 slots, so the global window is short instead of wide).
+const AUTH_STARTS_PER_IP_PER_HOUR: u64 = 30;
+const AUTH_START_GLOBAL_PER_WINDOW: u64 = 100;
+const AUTH_START_GLOBAL_WINDOW_SECS: u64 = 300;
+/// Outbound mail abuse cap: register/start and magic/start share one
+/// per-IP plus one global issuance budget in front of the per-email budget,
+/// so one IP cannot email-bomb unlimited distinct victims (3 mails/15 min
+/// per victim, unlimited victims). Any denial sends nothing and stores no
+/// magic row. Same sizing as the start budgets: 30/hour per IP, 100 per
+/// 5 minutes globally.
+const MAIL_PER_IP_PER_HOUR: u64 = 30;
+const MAIL_GLOBAL_PER_WINDOW: u64 = 100;
+const MAIL_GLOBAL_WINDOW_SECS: u64 = 300;
+/// Unverified-signup retention: a user row that still holds no credential
+/// after this is a never-completed signup; `register_start` reaps such
+/// rows best-effort (cascade removes their magic/session rows; their
+/// challenges expire within 5 minutes and are pruned with them).
+const UNVERIFIED_USER_TTL_SECS: u64 = 24 * 3600;
+/// Fixed scope key for the fleet-wide auth-start and mail budgets.
+const GLOBAL_SCOPE_KEY: &str = "global";
 
 // --- Config ---------------------------------------------------------------------
 
@@ -259,6 +287,21 @@ pub trait Store {
     ) -> impl Future<Output = Result<bool, StoreError>>;
     /// Remove challenges that can no longer be redeemed.
     fn prune_expired_challenges(&self, now: u64) -> impl Future<Output = Result<(), StoreError>>;
+    /// Best-effort reaping of never-completed signups: delete user rows
+    /// older than `ttl_secs` that still hold no credential. Cascade removes
+    /// their magic/session/vault rows. Default no-op so out-of-tree `Store`
+    /// impls keep compiling; the production Postgres store and the handler
+    /// test fake override it.
+    fn reap_unverified_users(
+        &self,
+        now: u64,
+        ttl_secs: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async move {
+            let _ = (now, ttl_secs);
+            Ok(())
+        }
+    }
     /// Acquire one of the per-user test-connection leases until `expires_at`.
     fn acquire_test_connection_lease(
         &self,
@@ -571,7 +614,72 @@ where
         Ok((claims, token))
     }
 
+    /// Per-IP plus global auth-start budget shared by the register, login
+    /// and magic start routes. Reserves one slot in each scope BEFORE any
+    /// user/challenge row or mail; denial or store error admits nothing
+    /// (fail-closed). Callers keep their usual response shape, so throttled
+    /// and ordinary starts are indistinguishable. (A denial after the IP
+    /// slot was taken wastes that one IP slot; acceptable for an abuse
+    /// budget and bounded by the same window.)
+    async fn admit_auth_start(&self) -> bool {
+        let ip_ok = self
+            .store
+            .reserve_rate_limit(
+                &self.source_ip,
+                "auth.start_ip",
+                AUTH_STARTS_PER_IP_PER_HOUR,
+                self.now,
+                AUTH_START_WINDOW_SECS,
+            )
+            .await
+            .unwrap_or(false);
+        if !ip_ok {
+            return false;
+        }
+        self.store
+            .reserve_rate_limit(
+                GLOBAL_SCOPE_KEY,
+                "auth.start_global",
+                AUTH_START_GLOBAL_PER_WINDOW,
+                self.now,
+                AUTH_START_GLOBAL_WINDOW_SECS,
+            )
+            .await
+            .unwrap_or(false)
+    }
+
     async fn send_magic_link_if_allowed(&self, user_id: &str, email: &str) {
+        // Outbound mail abuse cap BEFORE the per-email budget: one IP must
+        // not email-bomb unlimited distinct victims. Any denial sends
+        // nothing and stores no magic row.
+        let mail_ip_ok = self
+            .store
+            .reserve_rate_limit(
+                &self.source_ip,
+                "auth.mail_ip",
+                MAIL_PER_IP_PER_HOUR,
+                self.now,
+                AUTH_START_WINDOW_SECS,
+            )
+            .await
+            .unwrap_or(false);
+        if !mail_ip_ok {
+            return;
+        }
+        let mail_global_ok = self
+            .store
+            .reserve_rate_limit(
+                GLOBAL_SCOPE_KEY,
+                "auth.mail_global",
+                MAIL_GLOBAL_PER_WINDOW,
+                self.now,
+                MAIL_GLOBAL_WINDOW_SECS,
+            )
+            .await
+            .unwrap_or(false);
+        if !mail_global_ok {
+            return;
+        }
         let scope_key = email_rate_limit_key(self.cfg, email);
         let admitted = self
             .store
@@ -689,6 +797,28 @@ where
             }),
         )
     };
+    // Bound table growth first: reap never-completed signups and prune
+    // expired challenges (best-effort retention; failures fail closed like
+    // `login_start`, never silently skipping cleanup). Runs before the
+    // budget gate so cleanup never depends on budget.
+    if ctx
+        .store
+        .reap_unverified_users(ctx.now, UNVERIFIED_USER_TTL_SECS)
+        .await
+        .is_err()
+    {
+        return internal();
+    }
+    if ctx.store.prune_expired_challenges(ctx.now).await.is_err() {
+        return internal();
+    }
+    // Per-IP/global budget BEFORE any user row or mail: each new email
+    // would otherwise mint a fresh user id the per-account cap never binds
+    // on. Denial keeps the identical 200 shape (the taken-account stand-in
+    // id), so throttled and taken starts are indistinguishable.
+    if !ctx.admit_auth_start().await {
+        return shape(fake_user_id(ctx.cfg, &email));
+    }
     let user = match existing {
         Some(user) => {
             // Resume an abandoned signup only when no credential exists yet.
@@ -940,6 +1070,25 @@ where
     if ctx.store.prune_expired_challenges(ctx.now).await.is_err() {
         return internal();
     }
+    let challenge = match auth::new_registration_challenge(&ctx.cfg.rp_id, &ctx.cfg.origin, ctx.now)
+    {
+        Ok(challenge) => challenge,
+        Err(_) => return internal(),
+    };
+    // Per-IP/global budget BEFORE any lookup or challenge row: unknown
+    // emails would otherwise mint unbounded unbound challenge rows. Denial
+    // returns the same fixed-shape 200 with an unstored challenge, so
+    // throttled and ordinary starts are indistinguishable.
+    if !ctx.admit_auth_start().await {
+        return json_response(
+            200,
+            serde_json::json!({
+                "challenge": challenge.id,
+                "allow_credentials": [],
+                "rp_id": ctx.cfg.rp_id,
+            }),
+        );
+    }
     let user = match ctx.store.user_by_email(&email).await {
         Ok(user) => user,
         Err(_) => return internal(),
@@ -948,11 +1097,6 @@ where
         .as_ref()
         .map(|user| user.id.clone())
         .unwrap_or_else(|| email_rate_limit_key(ctx.cfg, &email));
-    let challenge = match auth::new_registration_challenge(&ctx.cfg.rp_id, &ctx.cfg.origin, ctx.now)
-    {
-        Ok(challenge) => challenge,
-        Err(_) => return internal(),
-    };
     // Use a discoverable/usernameless passkey flow: returning credential ids
     // here leaks their variable lengths even when the list is padded.
     let admitted = ctx
@@ -1099,6 +1243,14 @@ where
     let Some(email) = normalize_email(&body.email) else {
         return generic_auth();
     };
+    // Per-IP/global budget BEFORE the lookup: rotating addresses must share
+    // one pool, or magic starts fund unbounded reads. Denial keeps the
+    // identical response (the mail-budget denial inside
+    // `send_magic_link_if_allowed` likewise sends nothing and stores no
+    // magic row on the same shape).
+    if !ctx.admit_auth_start().await {
+        return json_response(200, serde_json::json!({"ok": true}));
+    }
     // Identical response whether or not the account exists or the atomic
     // per-email issuance budget has been exhausted.
     if let Ok(Some(user)) = ctx.store.user_by_email(&email).await {
@@ -1753,6 +1905,19 @@ mod tests {
             self.challenges
                 .borrow_mut()
                 .retain(|_, row| row.challenge.expires_at > now);
+            Ok(())
+        }
+        async fn reap_unverified_users(&self, now: u64, ttl_secs: u64) -> Result<(), StoreError> {
+            let cutoff = now.saturating_sub(ttl_secs);
+            let credentialed: HashSet<String> = self
+                .credentials
+                .borrow()
+                .values()
+                .map(|cred| cred.user_id.clone())
+                .collect();
+            self.users
+                .borrow_mut()
+                .retain(|_, user| user.created_at > cutoff || credentialed.contains(&user.id));
             Ok(())
         }
         async fn acquire_test_connection_lease(
@@ -3233,6 +3398,164 @@ mod tests {
             mails_before,
             "over-budget register/start must not send mail"
         );
+    }
+
+    #[test]
+    fn register_start_distinct_email_loop_bounded_by_ip_budget() {
+        // Distinct-email loop from one IP: per-account caps never bind on
+        // fresh addresses, so the shared per-IP budget must cut the loop
+        // off with unchanged 200 shapes and no further user rows or mail.
+        let h = harness();
+        let total = AUTH_STARTS_PER_IP_PER_HOUR + 10;
+        for i in 0..total {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/passkey/register/start",
+                serde_json::json!({"email": format!("victim{i}@example.com")}),
+            );
+            assert_eq!(resp.status, 200, "iteration {i}: {}", resp.body);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert!(
+                body["challenge"].is_string(),
+                "iteration {i}: {}",
+                resp.body
+            );
+            assert!(body["user_id"].is_string(), "iteration {i}: {}", resp.body);
+        }
+        assert_eq!(
+            h.store.users.borrow().len(),
+            AUTH_STARTS_PER_IP_PER_HOUR as usize,
+            "no user row past the per-IP budget"
+        );
+        assert_eq!(
+            h.mailer.sent.borrow().len(),
+            AUTH_STARTS_PER_IP_PER_HOUR as usize,
+            "no mail queued past the per-IP budget"
+        );
+        assert_eq!(
+            h.store.challenges.borrow().len(),
+            AUTH_STARTS_PER_IP_PER_HOUR as usize,
+            "no challenge stored past the per-IP budget"
+        );
+    }
+
+    #[test]
+    fn login_start_distinct_email_loop_bounded_by_ip_budget() {
+        // Unknown-email login starts mint unbound challenge rows per fresh
+        // address; the per-IP budget must cap them with the same 200 shape.
+        let h = harness();
+        let total = AUTH_STARTS_PER_IP_PER_HOUR + 10;
+        for i in 0..total {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/passkey/login/start",
+                serde_json::json!({"email": format!("ghost{i}@example.com")}),
+            );
+            assert_eq!(resp.status, 200, "iteration {i}: {}", resp.body);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(body["allow_credentials"], serde_json::json!([]));
+        }
+        assert_eq!(
+            h.store.challenges.borrow().len(),
+            AUTH_STARTS_PER_IP_PER_HOUR as usize,
+            "no challenge row past the per-IP budget"
+        );
+    }
+
+    #[test]
+    fn magic_start_mail_capped_per_ip_across_victims() {
+        // Third-party email-bombing shape: one IP working down a victim
+        // list (3 mails/15 min per victim, unlimited victims) must hit the
+        // shared per-IP mail cap with the identical {"ok":true} response.
+        let h = harness();
+        let victims = MAIL_PER_IP_PER_HOUR + 10;
+        for i in 0..victims {
+            seed_user(&h, &format!("u{i}"), &format!("victim{i}@example.com"));
+        }
+        for i in 0..victims {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/magic/start",
+                serde_json::json!({"email": format!("victim{i}@example.com")}),
+            );
+            assert_eq!(resp.status, 200, "iteration {i}: {}", resp.body);
+            assert_eq!(resp.body, r#"{"ok":true}"#);
+        }
+        assert_eq!(
+            h.mailer.sent.borrow().len(),
+            MAIL_PER_IP_PER_HOUR as usize,
+            "no mail queued past the per-IP mail cap"
+        );
+        assert_eq!(
+            h.store.magic.borrow().len(),
+            MAIL_PER_IP_PER_HOUR as usize,
+            "no magic row stored past the per-IP mail cap"
+        );
+    }
+
+    #[test]
+    fn register_start_reaps_expired_unverified_users_and_prunes_challenges() {
+        // Register-only traffic must not grow tables monotonically: a
+        // never-completed signup past the TTL is reaped (credentialed
+        // accounts survive), and expired challenges are pruned here too.
+        let h = harness();
+        let stale_at = NOW.saturating_sub(UNVERIFIED_USER_TTL_SECS + 1);
+        block_on(h.store.insert_user(&UserRecord {
+            id: "stale-unverified".to_string(),
+            email: "stale@example.com".to_string(),
+            created_at: stale_at,
+        }))
+        .unwrap();
+        block_on(h.store.insert_user(&UserRecord {
+            id: "old-verified".to_string(),
+            email: "old@example.com".to_string(),
+            created_at: stale_at,
+        }))
+        .unwrap();
+        block_on(h.store.insert_credential(&PasskeyCredential {
+            cred_id_b64url: b64url_encode(&[0x7e; 32]),
+            user_id: "old-verified".to_string(),
+            public_key: fx_es256_cose(77),
+            sign_count: 1,
+            registered_at: stale_at,
+        }))
+        .unwrap();
+        let expired = PasskeyChallenge {
+            id: "expired-challenge".to_string(),
+            rp_id: "example.com".to_string(),
+            origin: ORIGIN.to_string(),
+            issued_at: NOW.saturating_sub(auth::CHALLENGE_TTL_SECS + 1),
+            expires_at: NOW.saturating_sub(1),
+            consumed: false,
+        };
+        block_on(h.store.insert_challenge(&expired, None, PURPOSE_LOGIN)).unwrap();
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "fresh@example.com"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(
+            block_on(h.store.user_by_email("stale@example.com"))
+                .unwrap()
+                .is_none(),
+            "expired unverified signup must be reaped"
+        );
+        assert!(
+            block_on(h.store.user_by_email("old@example.com"))
+                .unwrap()
+                .is_some(),
+            "credentialed account must survive reaping"
+        );
+        assert!(
+            block_on(h.store.user_by_email("fresh@example.com"))
+                .unwrap()
+                .is_some(),
+            "the current signup still proceeds"
+        );
+        assert!(block_on(h.store.challenge_by_id("expired-challenge"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -698,6 +698,26 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn reap_unverified_users(&self, now: u64, ttl_secs: u64) -> Result<(), StoreError> {
+        // Never-completed signups only: rows past the TTL that still hold no
+        // credential (any user with a credential, session, or vault finished
+        // registration, because enrollment precedes all of those). Cascade
+        // removes their magic-link/session rows; their challenges expire
+        // within minutes and fall to the prune above.
+        let cutoff = i64_of(now.saturating_sub(ttl_secs))?;
+        let client = self.connect().await?;
+        client
+            .execute(
+                "DELETE FROM users WHERE created_at <= $1 \
+                 AND NOT EXISTS (SELECT 1 FROM webauthn_credentials \
+                                 WHERE webauthn_credentials.user_id = users.id)",
+                &[&cutoff],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        Ok(())
+    }
+
     async fn acquire_test_connection_lease(
         &self,
         user_id: &str,

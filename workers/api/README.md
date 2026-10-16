@@ -136,7 +136,14 @@ config from secrets) is a follow-up slice.
 - **Abuse budgets:** passkey starts, magic-link issuance and test-connection
   attempts reserve fixed slot rows through an atomic `INSERT .. ON CONFLICT`
   before side effects; magic-link and registration inbox-proof sends share
-  one per-email window. Passkey finishes reserve 10 attempts per challenge
+  one per-email window. Every auth start (register, login, magic) also
+  reserves one per-IP slot (30/hour) plus one global slot (100/5 min)
+  before any user/challenge row or mail, and every mail send reserves a
+  per-IP (30/hour) plus global (100/5 min) issuance slot in front of the
+  per-email window — distinct-email loops and victim-list email-bombing
+  from one IP stop with unchanged response shapes. `register_start` also
+  reaps never-completed signups (no credential after 24 h) and prunes
+  expired challenges. Passkey finishes reserve 10 attempts per challenge
   (and magic finishes 10 per client IP, after the exact-Origin pin) per
   5-minute window BEFORE any DB read or ECDSA verification, so forged
   assertions cannot burn unlimited CPU on one challenge; legitimate single
