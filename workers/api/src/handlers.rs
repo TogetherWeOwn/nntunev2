@@ -5033,7 +5033,7 @@ mod tests {
         let h = harness();
         seed_user(&h, "u1", "a@example.com");
         let sk = SigningKey::from_slice(&[62u8; 32]).unwrap();
-        let point = sk.verifying_key().to_encoded_point(false);
+        let point = sk.verifying_key().to_sec1_point(false);
         let mut cose = Vec::new();
         fx_head(5, 5, &mut cose);
         fx_int(1, &mut cose);
