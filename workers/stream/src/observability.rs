@@ -8,12 +8,12 @@
 //! (M4 metering builds on this row shape).
 //!
 //! Wiring status: [`CacheObserveEvent::from_play`] and
-//! [`crate::play::PlayStream::observe_event`] build the event from a play
-//! outcome, and [`crate::play::PlayError::pool_error_code`] defines the
-//! status/code mapping. This crate is lib-only — there is no Worker/DO
-//! entry point yet — so nothing calls `writeDataPoint` until that entry
-//! point lands and supplies the `request_id` and the TTFT it measures
-//! around the first served byte. Nothing in this module emits on its own.
+//! [`crate::play::PlayStream::observe_event`] build events from started
+//! streams; [`crate::play::play_with_observe_event`] projects pool-acquisition
+//! failures that return before a stream exists. The caller supplies the
+//! `request_id` and the TTFT it measures around the first served byte. This
+//! crate is lib-only — nothing calls `writeDataPoint` until the Worker/DO
+//! entry point lands, and nothing in this module emits on its own.
 //!
 //! Privacy: the raw user id never leaves the caller. [`CacheObserveEvent::new`]
 //! hashes it with [`hash_user`] (SHA-256 hex) before storage, so the event,

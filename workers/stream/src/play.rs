@@ -179,6 +179,13 @@ struct Live {
     failed: Option<Failure>,
 }
 
+/// Result of starting a play with its early-failure observability projection.
+pub struct ObservedPlayAttempt {
+    pub result: Result<PlayResponse, PlayError>,
+    /// Present for a pool acquisition error, which returns before a stream exists.
+    pub error_event: Option<CacheObserveEvent>,
+}
+
 /// Serve `track_id` to its granted owner.
 pub fn play(
     pool: &mut StreamPool,
@@ -187,29 +194,73 @@ pub fn play(
     secret: &[u8],
     input: &PlayInput<'_>,
 ) -> Result<PlayResponse, PlayError> {
+    let user = authorized_user(secret, input)?;
+    play_authorized(pool, cache, meter, input, &user)
+}
+
+/// Start a play and project early pool-acquisition errors while the verified
+/// user identity is still available. `ttft_ms` and bytes are zero because no
+/// first byte can be served on this path.
+pub fn play_with_observe_event(
+    pool: &mut StreamPool,
+    cache: &mut ContentCache,
+    meter: &mut dyn Meter,
+    secret: &[u8],
+    input: &PlayInput<'_>,
+    request_id: impl Into<String>,
+) -> ObservedPlayAttempt {
+    let request_id = request_id.into();
+    let user = match authorized_user(secret, input) {
+        Ok(user) => user,
+        Err(error) => {
+            return ObservedPlayAttempt {
+                result: Err(error),
+                error_event: None,
+            }
+        }
+    };
+    let result = play_authorized(pool, cache, meter, input, &user);
+    let error_event = result.as_ref().err().and_then(|error| {
+        error.pool_error_code().map(|_| {
+            CacheObserveEvent::from_play(request_id, &user, false, 0, 0, Some(error))
+        })
+    });
+    ObservedPlayAttempt { result, error_event }
+}
+
+fn authorized_user(secret: &[u8], input: &PlayInput<'_>) -> Result<String, PlayError> {
     let grant =
         grant::verify(input.token, secret, input.now_unix).map_err(PlayError::Unauthorized)?;
     if grant.track_id != input.track_id {
         return Err(PlayError::WrongTrack);
     }
-    let user = grant.user_id.clone();
+    Ok(grant.user_id)
+}
+
+fn play_authorized(
+    pool: &mut StreamPool,
+    cache: &mut ContentCache,
+    meter: &mut dyn Meter,
+    input: &PlayInput<'_>,
+    user: &str,
+) -> Result<PlayResponse, PlayError> {
     flush_orphaned(pool, meter);
-    meter.emit(ev(MeterKind::PlayStart, &user, input.track_id, 0));
+    meter.emit(ev(MeterKind::PlayStart, user, input.track_id, 0));
 
     if let Some(full) = cache.get_track(input.track_id) {
-        meter.emit(ev(MeterKind::CacheHit, &user, input.track_id, 0));
+        meter.emit(ev(MeterKind::CacheHit, user, input.track_id, 0));
         let window = resolve_range(full.len() as u64, input.range)?;
         return Ok(respond(
             window,
             true,
-            &user,
+            user,
             input.track_id,
             Source::Cached(full),
             pool.orphan_sink(),
         ));
     }
 
-    meter.emit(ev(MeterKind::CacheMiss, &user, input.track_id, 0));
+    meter.emit(ev(MeterKind::CacheMiss, user, input.track_id, 0));
     if input.segments.is_empty() {
         return Err(PlayError::Upstream("track has no segments".into()));
     }
@@ -232,7 +283,7 @@ pub fn play(
                 lease,
                 client,
                 failure,
-                &user,
+                user,
                 input.track_id,
             ))
         }
@@ -252,7 +303,7 @@ pub fn play(
         failed: None,
     };
     if let Err(failure) = live.ingest(first) {
-        return Err(live.settle(pool, meter, Some(failure), &user, input.track_id));
+        return Err(live.settle(pool, meter, Some(failure), user, input.track_id));
     }
     let window = match resolve_range(live.total, input.range) {
         Ok(window) => window,
@@ -264,13 +315,13 @@ pub fn play(
     };
     if let Some(next) = input.up_next {
         if should_prefetch(pool) {
-            meter.emit(ev(MeterKind::PrefetchEnqueued, &user, next, 0));
+            meter.emit(ev(MeterKind::PrefetchEnqueued, user, next, 0));
         }
     }
     Ok(respond(
         window,
         false,
-        &user,
+        user,
         input.track_id,
         Source::Live(Box::new(live)),
         pool.orphan_sink(),
@@ -732,12 +783,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn quarantined_pool_play_error_maps_to_pool_quarantined_code() {
+    fn assert_pool_failure_observation(quarantined: bool, expected_code: &str) {
+        use crate::observability::{hash_user, CacheStatus};
+
         let secret = b"s";
         let token = grant::issue("u", "track-a", 9_999_999_999, secret);
         let mut pool = Pool::new(1);
-        pool.record_provider_error(); // quarantines the pool
+        let held_lease = if quarantined {
+            pool.record_provider_error();
+            None
+        } else {
+            Some(pool.try_acquire(Lane::Playback).unwrap())
+        };
         let mut cache = ContentCache::new();
         let mut meter = crate::meter::MemoryMeter::default();
         let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
@@ -752,19 +809,42 @@ mod tests {
             now_unix: 1,
             up_next: None,
         };
-        let err = match play(&mut pool, &mut cache, &mut meter, secret, &input) {
-            Ok(_) => panic!("quarantined pool must fail the play"),
+        let attempt = play_with_observe_event(
+            &mut pool,
+            &mut cache,
+            &mut meter,
+            secret,
+            &input,
+            "req-pool-error",
+        );
+        let err = match attempt.result {
+            Ok(_) => panic!("pool failure must fail the play"),
             Err(e) => e,
         };
-        assert!(
-            matches!(err, PlayError::PoolQuarantined { .. }),
-            "got: {err:?}"
-        );
-        assert_eq!(err.pool_error_code(), Some("POOL_QUARANTINED"));
+        assert_eq!(err.pool_error_code(), Some(expected_code));
+        let event = attempt.error_event.expect("early pool errors need an event");
+        assert_eq!(event.cache_status, CacheStatus::Miss);
+        assert_eq!(event.request_id, "req-pool-error");
+        assert_eq!(event.user_hash, hash_user("u"));
+        assert_eq!(event.ttft_ms, 0);
+        assert_eq!(event.bytes, 0);
+        assert_eq!(event.pool_error_code.as_deref(), Some(expected_code));
         assert_eq!(
-            PlayError::PoolExhausted.pool_error_code(),
-            Some("POOL_EXHAUSTED")
+            event.analytics_blobs(),
+            vec![
+                "miss".to_string(),
+                hash_user("u"),
+                "req-pool-error".to_string(),
+                expected_code.to_string(),
+            ]
         );
+        drop(held_lease);
+    }
+
+    #[test]
+    fn quarantined_and_exhausted_plays_project_pool_error_events() {
+        assert_pool_failure_observation(true, "POOL_QUARANTINED");
+        assert_pool_failure_observation(false, "POOL_EXHAUSTED");
         assert_eq!(PlayError::WrongTrack.pool_error_code(), None);
     }
 }
