@@ -957,9 +957,8 @@ mod tests {
         let new_kek = [0x22u8; 32];
         let blob = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
 
-        // Stored-blob nonce length mismatches are server-side corruption
-        // (TOG-25315 taxonomy): they map to CorruptStoredData -> 500
-        // internal_error, not caller-input Invalid -> 422.
+        // Stored-blob nonce length mismatches are server-side corruption,
+        // not caller-input validation errors.
         for len in [0, 1, 11, 13, 16, 24] {
             let nonce = crate::b64::encode(&vec![7u8; len]);
 
