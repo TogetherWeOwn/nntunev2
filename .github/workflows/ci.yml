@@ -72,7 +72,8 @@ jobs:
       # Wasm SIMD; the deploy enables it via this RUSTFLAGS).
       - run: RUSTFLAGS="-C target-feature=+simd128" cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
       # The stream Worker entry (NntpPool Durable Object) only compiles on
-      # wasm32: check and lint it on the target it deploys to.
+      # wasm32: check and lint it on the target it deploys to. This also
+      # verifies the native-only stampede guard remains cfg'd out.
       - run: cargo check -p nntune-stream --target wasm32-unknown-unknown
       - run: cargo clippy -p nntune-stream --target wasm32-unknown-unknown -- -D warnings
 
