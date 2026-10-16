@@ -88,6 +88,21 @@ def test_preview_archive_binding_fails():
     assert hits[0][1] == "nntunev2-archive-staging"
 
 
+def test_staged_manifest_archive_binding_fails():
+    repo = _repo_with(
+        {"workers/stream/wrangler.staging.toml": ARCHIVE_MANIFEST}
+    )
+    hits = archive_bindings(repo)
+    assert len(hits) == 1, f"expected one hit, got {hits}"
+    assert hits[0][1] == "nntunev2-archive-staging"
+
+
+def test_unrelated_bucket_name_is_ignored():
+    manifest = CLEAN_MANIFEST + '\n[vars]\nbucket_name = "archive notes"\n'
+    repo = _repo_with({"apps/web/wrangler.toml": manifest})
+    assert archive_bindings(repo) == [], "unrelated variable must not fail"
+
+
 def test_commented_example_binding_ignored():
     body = (
         "# [[r2_buckets]]\n"
@@ -129,7 +144,7 @@ def test_empty_scan_fails():
 def test_json_manifests_are_rejected():
     for name in ("wrangler.json", "wrangler.jsonc"):
         repo = _repo_with({f"workers/stream/{name}": '{"name":"stream"}'})
-        _assert_rejected(repo, "unsupported Wrangler JSON manifest")
+        _assert_rejected(repo, "unsupported Wrangler manifest")
 
 
 def test_current_repo_manifests_pass():
@@ -143,6 +158,8 @@ if __name__ == "__main__":
     test_archive_binding_fails()
     test_archive_env_override_fails()
     test_preview_archive_binding_fails()
+    test_staged_manifest_archive_binding_fails()
+    test_unrelated_bucket_name_is_ignored()
     test_commented_example_binding_ignored()
     test_malformed_manifest_fails_closed()
     test_missing_scan_root_fails()

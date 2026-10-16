@@ -10,19 +10,21 @@ which buckets a Worker may never consume.
 
 | Bucket | Env | Consumer | Edge `Cache-Control` on reads | R2 object lifetime / eviction |
 |---|---|---|---|---|
-| `nntunev2-audio-staging` | staging | stream Worker (`AUDIO_CACHE`) | prescribed `private, max-age=3600`; not yet wired (see deltas) | persistent content-addressed blobs (`audio/<sha256>` + `track/<id>` pointers); no automatic expiry; explicit operator delete only |
-| `nntunev2-audio-prod` | prod | stream Worker (`AUDIO_CACHE`) | prescribed `private, max-age=3600`; not yet wired (see deltas) | same as staging |
-| `nntunev2-art-staging` | staging | MusicBrainz Worker artwork cache (`ART_CACHE`) | `public, max-age=86400, immutable` prescribed where art bytes are served; lookup/search JSON headers below are implemented | persistent immutable objects (`art/{hh}/{hh}/{sha}-{size}`); no automatic expiry; explicit operator delete only |
+| `nntunev2-audio-staging` | staging | stream Worker (`AUDIO_CACHE`) | prescribed `no-store`; not yet wired (see deltas) | persistent content-addressed blobs (`audio/<sha256>` + `track/<id>` pointers); no object expiry; incomplete multipart uploads abort after 7 days |
+| `nntunev2-audio-prod` | prod | stream Worker (`AUDIO_CACHE`) | prescribed `no-store`; not yet wired (see deltas) | same as staging |
+| `nntunev2-art-staging` | staging | MusicBrainz Worker artwork cache (`ART_CACHE`) | `public, max-age=86400, immutable` prescribed where art bytes are served; lookup/search JSON headers below are implemented | persistent immutable objects (`art/{hh}/{hh}/{sha}-{size}`); no object expiry; incomplete multipart uploads abort after 7 days |
 | `nntunev2-art-prod` | prod | MusicBrainz Worker artwork cache (`ART_CACHE`) | same as staging | same as staging |
-| `nntunev2-archive-staging` | staging | **none — reserved; no Worker consumer** | n/a (no reads) | write-restricted reserve; no Worker writes; no eviction path exists |
-| `nntunev2-archive-prod` | prod | **none — reserved; no Worker consumer** | n/a (no reads) | write-restricted reserve; no Worker writes; no eviction path exists |
+| `nntunev2-archive-staging` | staging | **none — reserved; no Worker binding in this repo (CI-enforced)** | n/a (no reads) | reserved; no bucket lock configured; no object expiry |
+| `nntunev2-archive-prod` | prod | **none — reserved; no Worker binding in this repo (CI-enforced)** | n/a (no reads) | reserved; no bucket lock configured; no object expiry |
 
 ## What "TTL" means here
 
-R2 has no per-object TTL or lifecycle rule configured as of 2026-10-15:
-stored objects live until explicitly deleted. The TTL column therefore
-governs **downstream copies only** (edge Cache API, KV, browser/CDN via
-`Cache-Control`), never the R2 object itself. Deleting or overwriting an
+No object-expiry lifecycle rule is configured: stored objects live until
+explicitly deleted. Cloudflare currently has a default lifecycle rule on
+all six buckets that aborts incomplete multipart uploads after 7 days; it
+does not expire completed objects. The TTL column therefore governs
+**downstream copies only** (edge Cache API, KV, browser/CDN via
+`Cache-Control`), never completed R2 objects. Deleting or overwriting an
 R2 object does not purge edge/client copies already served; those linger
 up to their served `max-age`.
 
@@ -45,16 +47,21 @@ operator pass reclaims. There is no background reaper.
 
 The two archive buckets are reserved capacity. They are not evidence of
 an archival pipeline, not scratch space, and not a fallback cache. No
-Worker — stream, MusicBrainz, api, ingest, web, or any future Worker —
-may declare an R2 binding whose `bucket_name` targets an archive bucket,
-in any environment section, active manifest, or shipped example.
+Worker in this repository may declare an R2 binding whose `bucket_name`
+or `preview_bucket_name` targets an archive bucket, in any supported
+manifest or environment override. This is a repository CI policy, not a
+Cloudflare access-control boundary: it does not prevent writes through API
+or S3 credentials, or from Workers deployed outside this repository. No
+bucket lock is configured on either archive bucket.
 
-CI enforces this: `.github/scripts/check_archive_bindings.py` parses
-every `wrangler.toml` and `wrangler.toml.example` under `workers/` and
-`apps/` and fails on any `bucket_name` containing `archive`
-(case-insensitive), including per-environment overrides. The guard is
-name-based on purpose: renaming a bucket to dodge it breaks the exact
-names in `docs/ops.md` first.
+CI enforces this: `.github/scripts/check_archive_bindings.py` scans
+`wrangler*.toml` and `wrangler*.toml.example` files under `workers/` and
+`apps/`, including named environment manifests, and rejects unsupported
+Wrangler manifest formats rather than skipping them. It inspects only
+`r2_buckets` binding tables and fails when either bucket name contains
+`archive` (case-insensitive), including per-environment overrides. The
+guard is name-based on purpose: renaming a bucket to dodge it breaks the
+exact names in `docs/ops.md` first.
 
 ## Header-consistency deltas (verified 2026-10-15)
 
@@ -64,9 +71,10 @@ names in `docs/ops.md` first.
   `workers/stream` currently ships the portable cache/orchestration core
   only — no Worker entry point exists to set response headers, and the
   deploy-config slice owns that file. Audio plays are grant-authorized
-  per user, so the prescription is `private` (never `public`), with a
-  one-hour starting `max-age`. The deploy-config slice applies it; this
-  table is the conformance target.
+  per user and metered per request, so the prescription is `no-store`:
+  browser replay must not skip grant-expiry checks, logout handling, or
+  usage metering. The deploy-config slice applies it; this table is the
+  conformance target.
 - Art bytes: the MusicBrainz Worker returns artwork URLs and never
   proxies full images inline, so no art-byte `Cache-Control` code path
   exists yet. Art objects are immutable content-addressed blobs, so the

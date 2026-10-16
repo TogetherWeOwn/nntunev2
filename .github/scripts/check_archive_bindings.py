@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Archive reservation guard: no Worker may bind an archive R2 bucket.
 
-Parses every ``wrangler.toml`` and ``wrangler.toml.example`` under
-``workers/`` and ``apps/`` and fails if any R2 binding (top-level or a
-per-environment override) points at an archive bucket. Wrangler JSON and
-JSONC manifests are rejected until the guard can parse them. Archive buckets
-are reserved capacity with no Worker consumer (see docs/cache-policy.md).
+Parses Wrangler TOML manifests under ``workers/`` and ``apps/`` and fails
+if any R2 binding (top-level or a per-environment override) points at an
+archive bucket. Wrangler manifests with unsupported formats are rejected
+until the guard can parse them. Archive buckets are reserved capacity with
+no Worker consumer (see docs/cache-policy.md).
 
 Name-based on purpose: the match is ``archive`` appearing anywhere in a
 ``bucket_name`` (case-insensitive), so per-env renames of the reserved
@@ -19,8 +19,7 @@ import sys
 import tomllib
 from pathlib import Path
 
-MANIFEST_NAMES = ("wrangler.toml", "wrangler.toml.example")
-UNSUPPORTED_MANIFEST_NAMES = ("wrangler.json", "wrangler.jsonc")
+SUPPORTED_MANIFEST_SUFFIXES = (".toml", ".toml.example")
 SCAN_ROOTS = ("workers", "apps")
 
 
@@ -36,20 +35,19 @@ def archive_bindings(repo_root: Path) -> list[tuple[Path, str]]:
         base = repo_root / root
         if not base.is_dir():
             raise ManifestError(f"required scan root is missing: {base}")
-        unsupported = sorted(
-            manifest
-            for name in UNSUPPORTED_MANIFEST_NAMES
-            for manifest in base.rglob(name)
-        )
+        candidates = sorted(path for path in base.rglob("wrangler*") if path.is_file())
+        manifests = [
+            path
+            for path in candidates
+            if path.name.endswith(SUPPORTED_MANIFEST_SUFFIXES)
+        ]
+        unsupported = [path for path in candidates if path not in manifests]
         if unsupported:
             paths = ", ".join(str(path) for path in unsupported)
             raise ManifestError(
-                f"unsupported Wrangler JSON manifest(s): {paths}; "
-                "use TOML until JSON/JSONC scanning is supported"
+                f"unsupported Wrangler manifest(s): {paths}; "
+                "use a TOML manifest until this format is supported"
             )
-        manifests = sorted(
-            manifest for name in MANIFEST_NAMES for manifest in base.rglob(name)
-        )
         manifest_count += len(manifests)
         for manifest in manifests:
             hits.extend(
@@ -72,18 +70,28 @@ def _bucket_names(manifest: Path) -> list[str]:
         ) from exc
     found: list[str] = []
 
-    def walk(node: object) -> None:
-        if isinstance(node, dict):
-            for key, value in node.items():
-                if key in ("bucket_name", "preview_bucket_name") and isinstance(value, str):
-                    found.append(value)
-                else:
-                    walk(value)
-        elif isinstance(node, list):
-            for item in node:
-                walk(item)
+    def bindings_from(scope: dict[str, object]) -> list[object]:
+        bindings = scope.get("r2_buckets", [])
+        if not isinstance(bindings, list):
+            raise ManifestError(f"invalid r2_buckets table in {manifest}")
+        return bindings
 
-    walk(data)
+    if not isinstance(data, dict):
+        raise ManifestError(f"invalid TOML document in {manifest}")
+    r2_bindings = bindings_from(data)
+    envs = data.get("env", {})
+    if isinstance(envs, dict):
+        for env in envs.values():
+            if isinstance(env, dict):
+                r2_bindings.extend(bindings_from(env))
+
+    for binding in r2_bindings:
+        if not isinstance(binding, dict):
+            raise ManifestError(f"invalid r2_buckets entry in {manifest}")
+        for key in ("bucket_name", "preview_bucket_name"):
+            value = binding.get(key)
+            if isinstance(value, str):
+                found.append(value)
     return found
 
 
