@@ -1016,22 +1016,39 @@ impl Mailer for WebhookMailer {
 
 // --- Fetch dispatch ------------------------------------------------------------------------------------
 
+fn render_header_pairs(
+    response: &handlers::Response,
+    cors: &[(&'static str, String)],
+) -> Vec<(&'static str, String)> {
+    let mut pairs = vec![
+        (
+            "content-type",
+            "application/json; charset=utf-8".to_string(),
+        ),
+        (
+            "content-security-policy",
+            "default-src 'none'; frame-ancestors 'none'".to_string(),
+        ),
+        ("cache-control", "no-store".to_string()),
+        ("x-content-type-options", "nosniff".to_string()),
+    ];
+    if let Some(cookie) = &response.set_cookie {
+        pairs.push(("set-cookie", cookie.clone()));
+    }
+    // Credentialed CORS for the configured origin only: the exact header
+    // set is decided by the unit-tested `cors_headers`; render only
+    // appends it.
+    pairs.extend(cors.iter().cloned());
+    pairs
+}
+
 fn render(
     response: &handlers::Response,
     cors: &[(&'static str, String)],
 ) -> WorkerResult<Response> {
     let headers = Headers::new();
-    headers.append("content-type", "application/json; charset=utf-8")?;
-    headers.append("cache-control", "no-store")?;
-    headers.append("x-content-type-options", "nosniff")?;
-    if let Some(cookie) = &response.set_cookie {
-        headers.append("set-cookie", cookie)?;
-    }
-    // Credentialed CORS for the configured origin only: the exact header
-    // set is decided by the unit-tested `cors_headers`; render only
-    // appends it.
-    for (name, value) in cors {
-        headers.append(name, value)?;
+    for (name, value) in render_header_pairs(response, cors) {
+        headers.append(name, &value)?;
     }
     Ok(
         Response::from_body(ResponseBody::Body(response.body.clone().into_bytes()))?
@@ -1142,6 +1159,56 @@ mod tests {
     fn previous_43() -> String {
         // 32 bytes as unpadded base64url (43 chars), like the template.
         crate::b64::encode(&[7u8; 32])
+    }
+
+    fn assert_render_security_headers(response: &handlers::Response) {
+        let headers = render_header_pairs(response, &[]);
+        assert!(headers.contains(&(
+            "content-security-policy",
+            "default-src 'none'; frame-ancestors 'none'".to_string()
+        )));
+        assert!(headers.contains(&("x-content-type-options", "nosniff".to_string())));
+        assert!(headers.contains(&("cache-control", "no-store".to_string())));
+    }
+
+    #[test]
+    fn render_adds_security_headers_to_successful_json() {
+        let response = handlers::Response {
+            status: 200,
+            body: r#"{"ok":true}"#.to_string(),
+            set_cookie: None,
+        };
+        let headers = render_header_pairs(&response, &[]);
+
+        assert!(headers.contains(&(
+            "content-type",
+            "application/json; charset=utf-8".to_string()
+        )));
+        assert_render_security_headers(&response);
+    }
+
+    #[test]
+    fn render_adds_security_headers_to_json_errors() {
+        let response = handlers::Response {
+            status: 400,
+            body: r#"{"error":"invalid request"}"#.to_string(),
+            set_cookie: None,
+        };
+
+        assert_render_security_headers(&response);
+    }
+
+    #[test]
+    fn render_preserves_empty_preflight_response() {
+        // OPTIONS preflight is an empty 204, not a JSON body. It shares
+        // render by design, so its response headers remain consistent too.
+        let response = handlers::Response {
+            status: 204,
+            body: String::new(),
+            set_cookie: None,
+        };
+        assert!(response.body.is_empty());
+        assert_render_security_headers(&response);
     }
 
     #[test]
