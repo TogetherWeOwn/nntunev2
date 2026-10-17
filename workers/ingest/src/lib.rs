@@ -415,16 +415,14 @@ fn meter_failure_response(err: &MeterWriteError) -> Result<Response> {
 ///    Queue send; those side effects remain part of the lease/crash-window
 ///    bound. Normal admissions complete in milliseconds, making the window
 ///    narrow by construction.
-/// 2. An existing `queued` mark means a previous attempt finished the
+/// 2. An existing recent `queued` mark means a previous attempt finished the
 ///    whole outbox (Queue accepted AND meter written): replay 202 without
-///    re-queueing or re-metering. This is the idempotency that closes the
-///    retry race above. `queued` is terminal by design in this slice (no
-///    TTL/delete): `job_id` is deterministic (`dispatch::make_job_id`) and
-///    there is no persisted lifecycle/checkpoint state yet to distinguish
-///    an active retry from a terminal job (`jobs.rs` dead-letter, checkpoint
-///    DB wiring not landed), so reopening the row alone would risk
-///    double-admission. Resubmission epochs belong to the lifecycle
-///    follow-up, not to this admission fix.
+///    re-queueing or re-metering. This closes the ordinary retry race. After
+///    15 days, queued rows can be claimed again: Cloudflare Queue retention is
+///    at most 14 days, so any message from that admission has expired before
+///    the replay window opens. Re-admission emits a fresh stage event; bounded
+///    replay can therefore produce a later event for the same deterministic
+///    job id, but prevents a permanently acknowledged message loss.
 /// 3. Otherwise the Queue send runs first, so the meter outcome below is
 ///    truthful: a failed send answers 503 with no meter event at all (the
 ///    claim is released back to `pending`; the retry resumes here and still
@@ -447,7 +445,7 @@ fn meter_failure_response(err: &MeterWriteError) -> Result<Response> {
 ///    drops).
 ///
 /// Production uses the `metered_admission` table in the existing
-/// `LIBRARY_DB` Hyperdrive database (`migrations/0009_*` through `0011_*`) for
+/// `LIBRARY_DB` Hyperdrive database (`migrations/0009_*` through `0012_*`) for
 /// durable marks. The cross-isolate atomic claim is the single-statement
 /// `UPDATE ... RETURNING` in `admission_claim_sql`; no connection, lock,
 /// transaction, or temp state is held across the queue/meter awaits.
@@ -502,9 +500,7 @@ fn admission_claim_lease_secs() -> u64 {
 }
 
 /// Parameterized statements owned here (execution lives with the ledger
-/// impls); see `migrations/0009_metered_admission.sql`,
-/// `migrations/0010_metered_admission_claim.sql`, and
-/// `migrations/0011_metered_admission_claim_epoch.sql` for the table.
+/// impls); see migrations `0009`–`0012` for the table and replay window.
 /// Every statement is single-transaction autocommit with `$1` = job id and
 /// `$2` = stage: no `BEGIN`, no session lock, no temp state, so each one is
 /// safe under Hyperdrive transaction-mode pooling.
@@ -516,16 +512,20 @@ fn admission_ensure_sql() -> &'static str {
 fn admission_claim_sql() -> &'static str {
     "UPDATE metered_admission SET state = 'claimed', claimed_at = now(), claim_epoch = claim_epoch + 1 \
      WHERE job_id = $1 AND stage = $2 \
-     AND (state = 'pending' OR (state = 'claimed' AND claimed_at < now() - INTERVAL '30 seconds')) \
+     AND (state = 'pending' \
+       OR (state = 'claimed' AND claimed_at < now() - INTERVAL '30 seconds') \
+       OR (state = 'queued' AND queued_at < now() - INTERVAL '15 days')) \
      RETURNING claim_epoch"
 }
 
 fn admission_read_mark_sql() -> &'static str {
-    "SELECT state FROM metered_admission WHERE job_id = $1 AND stage = $2"
+    // UPDATE ... RETURNING is not cacheable by Hyperdrive. A no-op assignment
+    // gives a fresh conflict-state read after a failed claim.
+    "UPDATE metered_admission SET state = state WHERE job_id = $1 AND stage = $2 RETURNING state"
 }
 
 fn admission_mark_queued_sql() -> &'static str {
-    "UPDATE metered_admission SET state = 'queued', claimed_at = NULL \
+    "UPDATE metered_admission SET state = 'queued', claimed_at = NULL, queued_at = now() \
      WHERE job_id = $1 AND stage = $2 AND state = 'claimed' AND claim_epoch = $3"
 }
 
@@ -1568,19 +1568,26 @@ mod tests {
             "retries must converge on one durable row"
         );
         assert!(admission_ensure_sql().contains("pending"));
-        // The atomic claim: one UPDATE whose WHERE admits pending rows or
-        // expired claimed leases, RETURNING the winner. Concurrent UPDATEs
+        // The atomic claim: one UPDATE whose WHERE admits pending rows,
+        // expired claimed leases, or queued rows past the replay window.
+        // RETURNING identifies the winner. Concurrent UPDATEs
         // on the same row serialize in Postgres (row lock + predicate
         // re-check), so exactly one claimant wins with no session lock.
         let claim = admission_claim_sql();
         assert!(claim.contains("UPDATE metered_admission"));
         assert!(claim.contains("SET state = 'claimed'"));
         assert!(claim.contains("state = 'pending'"));
+        assert!(claim.contains("state = 'queued' AND queued_at"));
+        assert!(claim.contains("15 days"));
         assert!(claim.contains("claimed_at"));
         assert!(claim.contains("claim_epoch = claim_epoch + 1"));
         assert!(claim.contains("RETURNING claim_epoch"));
         assert_eq!(admission_claim_lease_secs(), 30);
         assert!(claim.contains("30 seconds"));
+        let read_mark = admission_read_mark_sql().to_lowercase();
+        assert!(read_mark.starts_with("update metered_admission"));
+        assert!(read_mark.contains("returning state"));
+        assert!(admission_mark_queued_sql().contains("queued_at = now()"));
         assert!(admission_mark_queued_sql().contains("state = 'claimed'"));
         assert!(admission_mark_queued_sql().contains("claim_epoch = $3"));
         assert!(admission_mark_queued_sql().contains("'queued'"));
