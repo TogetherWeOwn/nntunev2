@@ -69,6 +69,9 @@ fn poison_job_burns_durable_budget_on_unchanged_queue_body() {
                 break;
             }
             Disposition::Ack => panic!("an always-failing job must never ack"),
+            Disposition::Continue => {
+                panic!("an always-failing job made no progress to continue on")
+            }
         }
     }
     let entry = last.expect("poison must end in the DLQ after the budget");

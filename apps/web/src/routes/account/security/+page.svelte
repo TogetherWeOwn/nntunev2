@@ -3,12 +3,16 @@
 	import type { PageProps } from './$types';
 	import { ApiClient, ApiError } from '#lib/api/client.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
+	import { invalidateLibraryCache } from '#lib/library/cache.js';
 
 	type Props = { data?: Partial<PageProps['data']> | void };
 	let { data = { sessionCheckFailed: false } }: Props = $props();
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
 
 	function redirectToLogin() {
+		// Crossing an auth boundary: drop this tab's library snapshots and
+		// broadcast the transition so other open tabs stop showing them.
+		invalidateLibraryCache();
 		clearSignedInEmail();
 		window.location.href = '/login';
 	}
@@ -48,7 +52,10 @@
 				// A 401 means this request was rejected before any session
 				// was revoked, so staying here with an explicit message keeps
 				// the failure distinguishable from a successful revocation
-				// (which navigates to /login with no message).
+				// (which navigates to /login with no message). The local
+				// session is confirmed gone, so local library snapshots
+				// still cross the auth boundary and are invalidated here.
+				invalidateLibraryCache();
 				clearSignedInEmail();
 				actionError =
 					'Your session expired before other devices were signed out. Sign in again and repeat Sign out everywhere.';

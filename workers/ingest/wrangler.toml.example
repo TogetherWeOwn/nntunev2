@@ -5,6 +5,12 @@ name = "nntune-ingest"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
 
+[vars]
+# Search rate-limit tunables (src/rate_limit.rs). Unset/invalid values
+# keep the documented defaults: 10 searches per 60s (base plan quota).
+# SEARCH_RATE_LIMIT_MAX = "10"
+# SEARCH_RATE_LIMIT_WINDOW_SECS = "60"
+
 # Slice 2: Queue producer (code: src/dispatch.rs, src/queue.rs). The routes
 # produce; the consumer below stays disabled, so every accepted enqueue
 # waits in the queue until it is enabled.
@@ -24,14 +30,25 @@ queue = "nntune-ingest-dlq"
 # Consumer: handler exists (`event(queue)` in src/queue_consumer.rs) but
 # stays DISABLED. It validates each message, writes its checkpoint exactly
 # once per delivery (Workers KV allows 1 write/s per key), digest-checks
-# and parses upload payloads with the shared parser, and settles per
-# message via src/retry.rs (`decide_checkpoint`): persist the mutated
-# checkpoint before retry/ack, use `retry_with_options` while budget
-# remains, and persist Failed before DLQ send + ack. Never ack on DLQ-send
-# failure; Failed redelivery retries the send. A send-success/ack-failure
-# may duplicate entries, so DLQ processing must be idempotent by job_id.
-# The search/probe/verify/repair runtime steps are not wired yet, so
-# enabling this now would burn every valid job's retry budget against an
+# and parses upload payloads with the shared parser, probes their segments
+# through the NNTP_POOL binding below (folded batches ride that one
+# checkpoint write; the tally is keyed by batch index, so redelivery
+# resumes without double-counting), and settles per message via
+# src/retry.rs (`decide_checkpoint`): persist the mutated checkpoint
+# before retry/ack, use `retry_with_options` while budget remains, and
+# persist Failed before DLQ send + ack. Never ack on DLQ-send failure;
+# Failed redelivery retries the send. A send-success/ack-failure may
+# duplicate entries, so DLQ processing must be idempotent by job_id.
+# Probing is capped per delivery (4 batches / 30 s in
+# src/queue_consumer.rs, sized against max_batch_size = 10 below and the
+# 15-minute consumer invocation limit): a budget stop persists the
+# partial tally, enqueues a fresh copy of the message via the
+# INGEST_QUEUE producer above (5 s delay), and acks the original, so a
+# progressing job spends neither its attempt budget nor the max_retries
+# slots below. If that enqueue fails the handler falls back to a native
+# retry, which does spend a slot.
+# The search/verify/repair runtime steps are not wired yet, so enabling
+# this now would burn every valid job's retry budget against an
 # unavailable boundary and quarantine it. Uncomment only when those steps
 # are executable. E.g.:
 #
@@ -101,3 +118,10 @@ dataset = "nntune_ingest_meter"
 [[services]]
 binding = "REPAIR_CONTAINER"
 service = "<REPAIR_CONTAINER_SERVICE>"
+
+# MusicBrainz read API for the Matching step (code: src/matching.rs,
+# src/queue_consumer.rs). The service is the workers/mb Worker
+# (`name = "nntune-mb"` in its wrangler example); deploy it before this one.
+[[services]]
+binding = "MB_API"
+service = "nntune-mb"
