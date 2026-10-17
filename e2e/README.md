@@ -12,7 +12,8 @@ Actions secrets (CI) or shell exports (local).
 
 1. **Pre-deploy (now):** `STAGING_BASE_URL` is unset. Every spec skips with a
    notice. PRs and `main` stay green; the `e2e-lint` CI job still typechecks
-   and lists the specs so the harness cannot rot silently.
+   and lists the specs so the harness cannot rot silently. A skipped live
+   run is not acceptance evidence: it proves nothing about staging.
 2. **Activation hold:** keep the Actions secret `STAGING_BASE_URL` unset until
    deployment exists and the authorized Operator provides a value-free delivery
    receipt for the existing QA Access pair through an approved secure source and
@@ -44,8 +45,13 @@ the activation checklist is accurate:
   can serve traffic (`apps/web/src/routes/api/ready/+server.ts`). The 503
   `{ok:false}` plus `Retry-After` shape in `apps/web/src/lib/ready.ts` is
   reserved for a future downstream dependency check; the current endpoint
-  does not emit it. The smoke tolerates 404 for builds predating the route and
-  otherwise requires the current 200 shape.
+  does not emit it. The smoke is a **promotion** gate, stricter than the
+  route: `assertPromotionReady` (`helpers/readiness.ts`) passes only for
+  HTTP 200 JSON `{ok:true}`. A 404 (build predating the route), a 503 (even
+  well-formed, with `Retry-After`), an HTML 200, malformed JSON or
+  `{ok:false}` all fail the smoke; the route's 503 not-ready semantics are
+  unchanged. The gate is pinned offline by `tests/readiness.spec.ts`
+  (`npm run test:unit`), with no staging or credentials needed.
 - `apps/web/src/lib/contract.test.ts` checks that each hook in
   `helpers/contract.ts` `TESTIDS` is declared in its expected route file.
   This is a source-level route contract, not proof that conditional markup is

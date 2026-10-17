@@ -1,0 +1,510 @@
+{
+  "$comment": "Synthetic, deterministic, non-production legacy-playlist fixtures. Every identifier, name, and ref is invented for tests; nothing here comes from staging or production data, and loading this file must never execute SQL or change runtime behavior. Contract: legacy-playlists-v1.contract.md in this directory.",
+  "schema": "legacy-playlist-fixtures/v1",
+  "version": 1,
+  "cases": [
+    {
+      "id": "fully-resolved",
+      "description": "Private owner playlist; every opaque legacy ref resolves, in stored order.",
+      "playlist": {
+        "internal_id": 9001,
+        "public_id": "plFullyResolved0000000",
+        "owner_user_id": "fixture-user-owner",
+        "name": "Fixture Fully Resolved",
+        "is_public": false,
+        "items": [
+          "legacy-ref-fr-alpha",
+          "legacy-ref-fr-beta",
+          "legacy-ref-fr-gamma"
+        ]
+      },
+      "entries": [
+        {
+          "position": 0,
+          "legacy_ref": "legacy-ref-fr-alpha",
+          "status": "resolved",
+          "track_public_id": "trkFrAlpha000000000000",
+          "locality": "catalog"
+        },
+        {
+          "position": 1,
+          "legacy_ref": "legacy-ref-fr-beta",
+          "status": "resolved",
+          "track_public_id": "trkFrBeta0000000000000",
+          "locality": "catalog"
+        },
+        {
+          "position": 2,
+          "legacy_ref": "legacy-ref-fr-gamma",
+          "status": "resolved",
+          "track_public_id": "trkFrGamma000000000000",
+          "locality": "catalog"
+        }
+      ],
+      "expected": {
+        "owner_read": {
+          "id": "plFullyResolved0000000",
+          "name": "Fixture Fully Resolved",
+          "is_public": false,
+          "legacy_item_count": 3,
+          "entries": [
+            {
+              "position": 0,
+              "legacy_ref": "legacy-ref-fr-alpha",
+              "track_public_id": "trkFrAlpha000000000000",
+              "locality": "catalog"
+            },
+            {
+              "position": 1,
+              "legacy_ref": "legacy-ref-fr-beta",
+              "track_public_id": "trkFrBeta0000000000000",
+              "locality": "catalog"
+            },
+            {
+              "position": 2,
+              "legacy_ref": "legacy-ref-fr-gamma",
+              "track_public_id": "trkFrGamma000000000000",
+              "locality": "catalog"
+            }
+          ],
+          "unresolved_legacy_remainder": []
+        },
+        "non_owner_read": {
+          "visibility": "not_found"
+        }
+      }
+    },
+    {
+      "id": "mixed-resolved-unresolved",
+      "description": "Public playlist; resolved and unresolved refs interleave. Non-owner entry_count counts only the resolvable entries; unresolved refs stay in the owner-only remainder, never guessed into tracks.",
+      "playlist": {
+        "internal_id": 9002,
+        "public_id": "plMixedResUnres0000000",
+        "owner_user_id": "fixture-user-owner",
+        "name": "Fixture Mixed",
+        "is_public": true,
+        "items": [
+          "legacy-ref-mx-alpha",
+          "legacy-ref-mx-unknown-1",
+          "legacy-ref-mx-beta",
+          "legacy-ref-mx-unknown-2"
+        ]
+      },
+      "entries": [
+        {
+          "position": 0,
+          "legacy_ref": "legacy-ref-mx-alpha",
+          "status": "resolved",
+          "track_public_id": "trkMxAlpha000000000000",
+          "locality": "catalog"
+        },
+        {
+          "position": 1,
+          "legacy_ref": "legacy-ref-mx-unknown-1",
+          "status": "unresolved"
+        },
+        {
+          "position": 2,
+          "legacy_ref": "legacy-ref-mx-beta",
+          "status": "resolved",
+          "track_public_id": "trkMxBeta0000000000000",
+          "locality": "catalog"
+        },
+        {
+          "position": 3,
+          "legacy_ref": "legacy-ref-mx-unknown-2",
+          "status": "unresolved"
+        }
+      ],
+      "expected": {
+        "owner_read": {
+          "id": "plMixedResUnres0000000",
+          "name": "Fixture Mixed",
+          "is_public": true,
+          "legacy_item_count": 4,
+          "entries": [
+            {
+              "position": 0,
+              "legacy_ref": "legacy-ref-mx-alpha",
+              "track_public_id": "trkMxAlpha000000000000",
+              "locality": "catalog"
+            },
+            {
+              "position": 2,
+              "legacy_ref": "legacy-ref-mx-beta",
+              "track_public_id": "trkMxBeta0000000000000",
+              "locality": "catalog"
+            }
+          ],
+          "unresolved_legacy_remainder": [
+            {
+              "position": 1,
+              "legacy_ref": "legacy-ref-mx-unknown-1"
+            },
+            {
+              "position": 3,
+              "legacy_ref": "legacy-ref-mx-unknown-2"
+            }
+          ]
+        },
+        "non_owner_read": {
+          "visibility": "metadata_only",
+          "id": "plMixedResUnres0000000",
+          "name": "Fixture Mixed",
+          "is_public": true,
+          "entry_count": 2
+        }
+      }
+    },
+    {
+      "id": "all-unresolved",
+      "description": "Private playlist; no legacy ref resolves. Owner entries are empty and the whole array is the owner-only legacy remainder.",
+      "playlist": {
+        "internal_id": 9003,
+        "public_id": "plAllUnresolved0000000",
+        "owner_user_id": "fixture-user-owner",
+        "name": "Fixture All Unresolved",
+        "is_public": false,
+        "items": [
+          "legacy-ref-au-unknown-1",
+          "legacy-ref-au-unknown-2"
+        ]
+      },
+      "entries": [
+        {
+          "position": 0,
+          "legacy_ref": "legacy-ref-au-unknown-1",
+          "status": "unresolved"
+        },
+        {
+          "position": 1,
+          "legacy_ref": "legacy-ref-au-unknown-2",
+          "status": "unresolved"
+        }
+      ],
+      "expected": {
+        "owner_read": {
+          "id": "plAllUnresolved0000000",
+          "name": "Fixture All Unresolved",
+          "is_public": false,
+          "legacy_item_count": 2,
+          "entries": [],
+          "unresolved_legacy_remainder": [
+            {
+              "position": 0,
+              "legacy_ref": "legacy-ref-au-unknown-1"
+            },
+            {
+              "position": 1,
+              "legacy_ref": "legacy-ref-au-unknown-2"
+            }
+          ]
+        },
+        "non_owner_read": {
+          "visibility": "not_found"
+        }
+      }
+    },
+    {
+      "id": "empty-items",
+      "description": "Public playlist with an empty legacy items array; non-owner sees metadata with entry_count 0.",
+      "playlist": {
+        "internal_id": 9004,
+        "public_id": "plEmptyItems0000000000",
+        "owner_user_id": "fixture-user-owner",
+        "name": "Fixture Empty",
+        "is_public": true,
+        "items": []
+      },
+      "entries": [],
+      "expected": {
+        "owner_read": {
+          "id": "plEmptyItems0000000000",
+          "name": "Fixture Empty",
+          "is_public": true,
+          "legacy_item_count": 0,
+          "entries": [],
+          "unresolved_legacy_remainder": []
+        },
+        "non_owner_read": {
+          "visibility": "metadata_only",
+          "id": "plEmptyItems0000000000",
+          "name": "Fixture Empty",
+          "is_public": true,
+          "entry_count": 0
+        }
+      }
+    },
+    {
+      "id": "public-with-owner-local-tracks",
+      "description": "Public playlist whose resolved entries include owner-local tracks. A non-owner still receives metadata and the resolvable entry count only: no entries, track handles, or locality.",
+      "playlist": {
+        "internal_id": 9005,
+        "public_id": "plPublicOwnerLocal0000",
+        "owner_user_id": "fixture-user-owner",
+        "name": "Fixture Public Owner Local",
+        "is_public": true,
+        "items": [
+          "legacy-ref-po-local-1",
+          "legacy-ref-po-catalog",
+          "legacy-ref-po-local-2"
+        ]
+      },
+      "entries": [
+        {
+          "position": 0,
+          "legacy_ref": "legacy-ref-po-local-1",
+          "status": "resolved",
+          "track_public_id": "trkPoLocal100000000000",
+          "locality": "owner_local"
+        },
+        {
+          "position": 1,
+          "legacy_ref": "legacy-ref-po-catalog",
+          "status": "resolved",
+          "track_public_id": "trkPoCatalog0000000000",
+          "locality": "catalog"
+        },
+        {
+          "position": 2,
+          "legacy_ref": "legacy-ref-po-local-2",
+          "status": "resolved",
+          "track_public_id": "trkPoLocal200000000000",
+          "locality": "owner_local"
+        }
+      ],
+      "expected": {
+        "owner_read": {
+          "id": "plPublicOwnerLocal0000",
+          "name": "Fixture Public Owner Local",
+          "is_public": true,
+          "legacy_item_count": 3,
+          "entries": [
+            {
+              "position": 0,
+              "legacy_ref": "legacy-ref-po-local-1",
+              "track_public_id": "trkPoLocal100000000000",
+              "locality": "owner_local"
+            },
+            {
+              "position": 1,
+              "legacy_ref": "legacy-ref-po-catalog",
+              "track_public_id": "trkPoCatalog0000000000",
+              "locality": "catalog"
+            },
+            {
+              "position": 2,
+              "legacy_ref": "legacy-ref-po-local-2",
+              "track_public_id": "trkPoLocal200000000000",
+              "locality": "owner_local"
+            }
+          ],
+          "unresolved_legacy_remainder": []
+        },
+        "non_owner_read": {
+          "visibility": "metadata_only",
+          "id": "plPublicOwnerLocal0000",
+          "name": "Fixture Public Owner Local",
+          "is_public": true,
+          "entry_count": 3
+        }
+      }
+    },
+    {
+      "id": "repeated-refs-order",
+      "description": "Private playlist repeating the same legacy ref at several positions. Repetitions are distinct entries, keep their positions and order, and resolve deterministically to the same track handle; nothing is deduplicated.",
+      "playlist": {
+        "internal_id": 9006,
+        "public_id": "plRepeatedRefs00000000",
+        "owner_user_id": "fixture-user-owner",
+        "name": "Fixture Repeated Refs",
+        "is_public": false,
+        "items": [
+          "legacy-ref-rp-repeat",
+          "legacy-ref-rp-middle",
+          "legacy-ref-rp-repeat",
+          "legacy-ref-rp-repeat"
+        ]
+      },
+      "entries": [
+        {
+          "position": 0,
+          "legacy_ref": "legacy-ref-rp-repeat",
+          "status": "resolved",
+          "track_public_id": "trkRpRepeat00000000000",
+          "locality": "catalog"
+        },
+        {
+          "position": 1,
+          "legacy_ref": "legacy-ref-rp-middle",
+          "status": "resolved",
+          "track_public_id": "trkRpMiddle00000000000",
+          "locality": "catalog"
+        },
+        {
+          "position": 2,
+          "legacy_ref": "legacy-ref-rp-repeat",
+          "status": "resolved",
+          "track_public_id": "trkRpRepeat00000000000",
+          "locality": "catalog"
+        },
+        {
+          "position": 3,
+          "legacy_ref": "legacy-ref-rp-repeat",
+          "status": "resolved",
+          "track_public_id": "trkRpRepeat00000000000",
+          "locality": "catalog"
+        }
+      ],
+      "expected": {
+        "owner_read": {
+          "id": "plRepeatedRefs00000000",
+          "name": "Fixture Repeated Refs",
+          "is_public": false,
+          "legacy_item_count": 4,
+          "entries": [
+            {
+              "position": 0,
+              "legacy_ref": "legacy-ref-rp-repeat",
+              "track_public_id": "trkRpRepeat00000000000",
+              "locality": "catalog"
+            },
+            {
+              "position": 1,
+              "legacy_ref": "legacy-ref-rp-middle",
+              "track_public_id": "trkRpMiddle00000000000",
+              "locality": "catalog"
+            },
+            {
+              "position": 2,
+              "legacy_ref": "legacy-ref-rp-repeat",
+              "track_public_id": "trkRpRepeat00000000000",
+              "locality": "catalog"
+            },
+            {
+              "position": 3,
+              "legacy_ref": "legacy-ref-rp-repeat",
+              "track_public_id": "trkRpRepeat00000000000",
+              "locality": "catalog"
+            }
+          ],
+          "unresolved_legacy_remainder": []
+        },
+        "non_owner_read": {
+          "visibility": "not_found"
+        }
+      }
+    },
+    {
+      "id": "distinct-identity-spaces",
+      "description": "Internal BIGSERIAL ids and 22-character public handles are different identity spaces: the internal id exceeds the 32-bit range, no public handle equals any internal id rendered as text, and track handles never collide with playlist handles.",
+      "playlist": {
+        "internal_id": 4294967297,
+        "public_id": "plDistinctIds000000000",
+        "owner_user_id": "fixture-user-other",
+        "name": "Fixture Distinct Identity",
+        "is_public": false,
+        "items": [
+          "legacy-ref-di-alpha",
+          "legacy-ref-di-beta"
+        ]
+      },
+      "entries": [
+        {
+          "position": 0,
+          "legacy_ref": "legacy-ref-di-alpha",
+          "status": "resolved",
+          "track_public_id": "9001trkDiAlpha00000000",
+          "locality": "catalog"
+        },
+        {
+          "position": 1,
+          "legacy_ref": "legacy-ref-di-beta",
+          "status": "resolved",
+          "track_public_id": "4294967297trkDiB000000",
+          "locality": "catalog"
+        }
+      ],
+      "expected": {
+        "owner_read": {
+          "id": "plDistinctIds000000000",
+          "name": "Fixture Distinct Identity",
+          "is_public": false,
+          "legacy_item_count": 2,
+          "entries": [
+            {
+              "position": 0,
+              "legacy_ref": "legacy-ref-di-alpha",
+              "track_public_id": "9001trkDiAlpha00000000",
+              "locality": "catalog"
+            },
+            {
+              "position": 1,
+              "legacy_ref": "legacy-ref-di-beta",
+              "track_public_id": "4294967297trkDiB000000",
+              "locality": "catalog"
+            }
+          ],
+          "unresolved_legacy_remainder": []
+        },
+        "non_owner_read": {
+          "visibility": "not_found"
+        }
+      }
+    },
+    {
+      "id": "private-mixed-second-owner",
+      "description": "Private mixed playlist belonging to a second owner; a non-owner read is not_found (no metadata, count, entries, or remainder) even though some refs resolve for the owner.",
+      "playlist": {
+        "internal_id": 9008,
+        "public_id": "plPrivateMixed20000000",
+        "owner_user_id": "fixture-user-other",
+        "name": "Fixture Private Mixed Second Owner",
+        "is_public": false,
+        "items": [
+          "legacy-ref-pm-unknown",
+          "legacy-ref-pm-alpha"
+        ]
+      },
+      "entries": [
+        {
+          "position": 0,
+          "legacy_ref": "legacy-ref-pm-unknown",
+          "status": "unresolved"
+        },
+        {
+          "position": 1,
+          "legacy_ref": "legacy-ref-pm-alpha",
+          "status": "resolved",
+          "track_public_id": "trkPmAlpha000000000000",
+          "locality": "owner_local"
+        }
+      ],
+      "expected": {
+        "owner_read": {
+          "id": "plPrivateMixed20000000",
+          "name": "Fixture Private Mixed Second Owner",
+          "is_public": false,
+          "legacy_item_count": 2,
+          "entries": [
+            {
+              "position": 1,
+              "legacy_ref": "legacy-ref-pm-alpha",
+              "track_public_id": "trkPmAlpha000000000000",
+              "locality": "owner_local"
+            }
+          ],
+          "unresolved_legacy_remainder": [
+            {
+              "position": 0,
+              "legacy_ref": "legacy-ref-pm-unknown"
+            }
+          ]
+        },
+        "non_owner_read": {
+          "visibility": "not_found"
+        }
+      }
+    }
+  ]
+}
