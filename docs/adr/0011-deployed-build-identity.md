@@ -42,11 +42,13 @@ why not in `/api/health`?
   when set on the Worker (it overrides the baked value), then the SHA baked
   at build time (sourced from `BUILD_SHA` / `GITHUB_SHA` via the
   `__BUILD_SHA__` build-time define), then Workers `CF_VERSION_METADATA`
-  `id` / `tag` as a last resort. The `CF_VERSION_METADATA` fallback needs a
-  `[version_metadata]` binding plus a deploy tag carrying the full SHA to
-  work: `id` is a Worker version UUID and never matches the
-  `^[0-9a-f]{40}$` rule, and the current deploy runs `deploy --env staging`
-  with no tag, so it collapses to `"unknown"` until that wiring lands. A
+  as a last resort. The `CF_VERSION_METADATA` fallback is inert as coded:
+  the handler reads `meta?.id ?? meta?.tag`, so with a `[version_metadata]`
+  binding present `id` is always a non-empty Worker version UUID and `tag`
+  is never consulted; the UUID never matches the `^[0-9a-f]{40}$` rule, and
+  the current deploy runs `deploy --env staging` with no such binding and
+  no tag, so it collapses to `"unknown"`. A binding plus a deploy tag alone
+  changes nothing without a handler change to try `tag` before `id`. A
   malformed runtime value likewise masks a valid baked SHA, so promotion
   lanes must compare the reported SHA against the promotion SHA rather than
   trust build provenance.
