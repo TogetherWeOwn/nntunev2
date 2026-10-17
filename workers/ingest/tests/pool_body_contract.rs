@@ -55,6 +55,19 @@ fn missing_article_reply_is_an_outcome_not_an_error() {
 }
 
 #[test]
+fn route_miss_404_is_not_classified_as_missing() {
+    // A stream deployment without the `/body` route answers 404 with the
+    // plain `not found` body: that is version skew, not a provider 430,
+    // and must retry instead of counting the article as gone.
+    assert_eq!(
+        classify_body_reply(404, None, b"not found"),
+        Err(PoolBodyError::Retry {
+            after_secs: DEFAULT_RETRY_SECS,
+        })
+    );
+}
+
+#[test]
 fn busy_and_provider_replies_retry_with_the_hint() {
     assert_eq!(
         classify_body_reply(503, None, br#"{"error":"provider_unavailable"}"#),

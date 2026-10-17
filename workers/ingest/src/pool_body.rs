@@ -88,7 +88,14 @@ pub fn classify_body_reply(
             }
             Ok(BodyFetch::Bytes(body.to_vec()))
         }
-        404 => Ok(BodyFetch::Missing),
+        // Only the pool's own `missing` body means the provider answered
+        // `430`. Any other 404 is a route miss (a stream deployment with
+        // no `/body` route yet, or a wrong path): counting it as missing
+        // data would quarantine every valid job during a version skew.
+        404 if body == br#"{"error":"missing"}"# => Ok(BodyFetch::Missing),
+        404 => Err(PoolBodyError::Retry {
+            after_secs: DEFAULT_RETRY_SECS,
+        }),
         400 | 413 => Err(PoolBodyError::Rejected),
         _ => Err(PoolBodyError::Retry {
             after_secs: retry_after

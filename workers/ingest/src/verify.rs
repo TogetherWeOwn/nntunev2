@@ -47,9 +47,17 @@ pub const SCRATCH_BINDING: &str = "INGEST_SCRATCH";
 pub const MAX_VERIFY_FILES: usize = 1024;
 
 /// Per-delivery spend caps for [`run_verifying_step`]. The defaults are
-/// sized for music posts inside a Worker isolate: the whole file being
-/// verified is held in memory, so the file cap plus one article buffer
-/// must stay well under the isolate limit.
+/// sized against the 128 MB per-isolate Worker memory limit. The live
+/// peaks are sequential, never additive: fetching holds the decoded
+/// segments (≤ `max_file_bytes`) plus one article buffer and its
+/// decode scratch (each ≤ `max_article_bytes`) ≈ 64 MiB; assembly
+/// copies the segments into one
+/// contiguous buffer while dropping each segment as it is copied, so
+/// its formal worst case is 2 × `max_file_bytes` = 64 MiB; restoring
+/// staged par2 in `load_sets` holds ≤ `max_par2_bytes` of groups plus
+/// one trial clone of the same bound = 48 MiB. Each peak stays well
+/// under the isolate limit with the parsed recovery sets (metadata
+/// only) and runtime overhead accounted for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifyCaps {
     /// Files fetched from the provider per delivery.
@@ -63,6 +71,10 @@ pub struct VerifyCaps {
     pub max_file_bytes: u64,
     /// Largest single article body accepted from the pool.
     pub max_article_bytes: usize,
+    /// Largest aggregate staged par2 bytes restored into memory by one
+    /// step (all recovery groups plus not-yet-merged bytes). Enforced
+    /// before any staged bytes are copied or cloned for trial parsing.
+    pub max_par2_bytes: u64,
 }
 
 impl Default for VerifyCaps {
@@ -71,8 +83,9 @@ impl Default for VerifyCaps {
             max_files_per_delivery: 16,
             max_segments_per_delivery: 512,
             max_bytes_per_delivery: 64 << 20,
-            max_file_bytes: 48 << 20,
+            max_file_bytes: 32 << 20,
             max_article_bytes: 16 << 20,
+            max_par2_bytes: 24 << 20,
         }
     }
 }
@@ -136,12 +149,16 @@ impl VerifyProgress {
         format!("ingest-scratch/{job_id}/r{round}/")
     }
 
-    /// Staged-input key for one file: the plan's
-    /// `ingest-scratch/{job_id}/r{round}/in/{sha256(file_name)}`. Hashing
-    /// the name keeps hostile NZB names out of key space entirely.
-    pub fn file_key(job_id: &str, round: u32, file_name: &str) -> String {
+    /// Staged-input key for one file:
+    /// `ingest-scratch/{job_id}/r{round}/in/{index:04}-{sha256(file_name)}`.
+    /// Hashing the name keeps hostile NZB names out of key space
+    /// entirely, and the NZB file index — deterministic across
+    /// deliveries because every delivery re-parses the digest-pinned
+    /// payload — keeps two files that share a name from sharing (or
+    /// adopting) one staged object.
+    pub fn file_key(job_id: &str, round: u32, file_index: usize, file_name: &str) -> String {
         format!(
-            "{}in/{}",
+            "{}in/{file_index:04}-{}",
             Self::scratch_prefix(job_id, round),
             content_sha256_hex(file_name.as_bytes())
         )
@@ -282,7 +299,7 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
         // Once the first data file starts, the par2 sets must be parsed;
         // entries judged on earlier deliveries stay claimed.
         if !file.is_par2 && !sets_loaded {
-            sets = load_sets(files, progress, scratch).await?;
+            sets = load_sets(files, progress, scratch, caps).await?;
             sets_loaded = true;
             claim_staged(&sets, files, progress, &mut claimed);
         }
@@ -303,7 +320,7 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
             // No record (first delivery, or a lost progress write): a
             // staged object from an earlier delivery carries its own
             // judgement in its metadata — adopt it instead of refetching.
-            let key = VerifyProgress::file_key(job_id, round, &file.name);
+            let key = VerifyProgress::file_key(job_id, round, idx, &file.name);
             if let Some(meta) = scratch.head(&key).await? {
                 if meta.key == key {
                     progress.staged.insert(idx, meta);
@@ -335,8 +352,21 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
         } else {
             match_set_file(&sets, file, &segments, &mut claimed)
         };
+        // Everything the judgement needs from the segments, captured
+        // before assembly consumes (and frees) them.
+        let missing_segments = segments
+            .iter()
+            .filter(|s| matches!(s, Seg::Missing))
+            .count() as u32;
+        let seg_crcs: Vec<(u32, u64)> = segments
+            .iter()
+            .map(|s| match s {
+                Seg::Present { bytes, crc32 } => (*crc32, bytes.len() as u64),
+                Seg::Missing => (0, 0),
+            })
+            .collect();
         let Some(assembled) = assemble(
-            &segments,
+            segments,
             matched.map(|(_, f)| f.length),
             caps.max_file_bytes,
         ) else {
@@ -348,10 +378,10 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
         let (missing_blocks, par2_set_id) = if file.is_par2 {
             (0, None)
         } else {
-            judge_file(matched, &segments, &assembled)
+            judge_file(matched, missing_segments, &seg_crcs, &assembled)
         };
 
-        let key = VerifyProgress::file_key(job_id, round, &file.name);
+        let key = VerifyProgress::file_key(job_id, round, idx, &file.name);
         let staged = StagedFile {
             size: assembled.len() as u64,
             sha256: content_sha256_hex(&assembled),
@@ -435,7 +465,12 @@ fn decode_segment(segment_id: &str, article: &[u8]) -> Option<Vec<u8>> {
 /// otherwise only the contiguous present prefix is kept. The buffer is
 /// sized from the par2 expected length when known, so the repair side
 /// receives a full-length damaged file.
-fn assemble(segments: &[Seg], expected_len: Option<u64>, max_file_bytes: u64) -> Option<Vec<u8>> {
+///
+/// Consumes the segments and drops each decoded buffer as soon as it is
+/// copied, so the segment bytes are never retained alongside the output
+/// through judging and staging. The copy itself is bounded by
+/// `max_file_bytes` (see [`VerifyCaps`] for the isolate budget).
+fn assemble(segments: Vec<Seg>, expected_len: Option<u64>, max_file_bytes: u64) -> Option<Vec<u8>> {
     if segments.iter().all(|s| matches!(s, Seg::Present { .. })) {
         let total = segments.iter().try_fold(0u64, |acc, s| match s {
             Seg::Present { bytes, .. } => acc.checked_add(bytes.len() as u64),
@@ -447,15 +482,15 @@ fn assemble(segments: &[Seg], expected_len: Option<u64>, max_file_bytes: u64) ->
         let mut out = Vec::with_capacity(total as usize);
         for seg in segments {
             if let Seg::Present { bytes, .. } = seg {
-                out.extend_from_slice(bytes);
+                out.extend_from_slice(&bytes);
             }
         }
         return Some(out);
     }
-    let part_size = uniform_part_size(segments);
+    let part_size = uniform_part_size(&segments);
     let Some(part_size) = part_size else {
         let mut total = 0u64;
-        for seg in segments {
+        for seg in &segments {
             match seg {
                 Seg::Present { bytes, .. } => {
                     total = total.checked_add(bytes.len() as u64)?;
@@ -469,7 +504,7 @@ fn assemble(segments: &[Seg], expected_len: Option<u64>, max_file_bytes: u64) ->
         let mut out = Vec::with_capacity(total as usize);
         for seg in segments {
             match seg {
-                Seg::Present { bytes, .. } => out.extend_from_slice(bytes),
+                Seg::Present { bytes, .. } => out.extend_from_slice(&bytes),
                 Seg::Missing => break,
             }
         }
@@ -491,7 +526,7 @@ fn assemble(segments: &[Seg], expected_len: Option<u64>, max_file_bytes: u64) ->
         return None;
     }
     let mut out = vec![0u8; total as usize];
-    for (i, seg) in segments.iter().enumerate() {
+    for (i, seg) in segments.into_iter().enumerate() {
         if let Seg::Present { bytes, .. } = seg {
             let start = (i as u64 * part_size) as usize;
             if start >= out.len() {
@@ -528,13 +563,37 @@ fn uniform_part_size(segments: &[Seg]) -> Option<u64> {
 /// its slices then count toward recovery. Bytes that parse under no
 /// group and not alone are dropped (their slices are simply absent,
 /// which the recoverability check then sees).
+///
+/// The restoration is aggregate-capped (`caps.max_par2_bytes`): staged
+/// par2 accumulated across deliveries must not be copied into `groups`
+/// — or cloned again for a trial parse — beyond that bound, because
+/// the per-delivery fetch caps do not bound scratch reads. An
+/// over-cap set fails permanently rather than being silently
+/// truncated into a false "unrecoverable".
 async fn load_sets<S: ScratchStore>(
     files: &[ParsedFile],
     progress: &VerifyProgress,
     scratch: &S,
+    caps: &VerifyCaps,
 ) -> Result<Vec<RecoverySet>, VerifyError> {
+    // Bound the working set from the staged sizes before reading or
+    // copying a single byte.
+    let mut staged_total: u64 = 0;
+    for (idx, file) in files.iter().enumerate() {
+        if file.is_par2 {
+            if let Some(staged) = progress.staged.get(&idx) {
+                staged_total = staged_total.saturating_add(staged.size);
+            }
+        }
+    }
+    if staged_total > caps.max_par2_bytes {
+        return Err(VerifyError::Permanent(
+            "staged par2 exceeds the verify size cap".into(),
+        ));
+    }
     let mut groups: HashMap<[u8; 16], Vec<u8>> = HashMap::new();
     let mut unparsed: Vec<u8> = Vec::new();
+    let mut restored_total: u64 = 0;
     let mut any_par2 = false;
     for (idx, file) in files.iter().enumerate() {
         if !file.is_par2 {
@@ -547,6 +606,14 @@ async fn load_sets<S: ScratchStore>(
         let Some(bytes) = scratch.get(&staged.key).await? else {
             continue;
         };
+        // The bytes actually read outrank the staged record: re-check the
+        // aggregate before copying them into a group or `unparsed`.
+        restored_total = restored_total.saturating_add(bytes.len() as u64);
+        if restored_total > caps.max_par2_bytes {
+            return Err(VerifyError::Permanent(
+                "staged par2 exceeds the verify size cap".into(),
+            ));
+        }
         match RecoverySet::parse(&bytes) {
             Ok(set) => groups
                 .entry(set.set_id)
@@ -673,32 +740,24 @@ fn claim_staged(
 }
 
 /// Judge one assembled data file: `(missing_blocks, covering set id)`.
+/// Takes the per-segment facts (missing count, decode-time CRC32s)
+/// captured before assembly consumed the segments.
 fn judge_file(
     matched: Option<(&RecoverySet, &RecoveryFile)>,
-    segments: &[Seg],
+    missing_segments: u32,
+    seg_crcs: &[(u32, u64)],
     assembled: &[u8],
 ) -> (u32, Option<String>) {
-    let missing_segments = segments
-        .iter()
-        .filter(|s| matches!(s, Seg::Missing))
-        .count() as u32;
     let Some((set, entry)) = matched else {
         // No set covers this file: healthy iff every segment decoded.
         return (missing_segments, None);
     };
     let set_hex = hex::encode(set.set_id);
     if missing_segments == 0 {
-        let seg_crcs: Vec<(u32, u64)> = segments
-            .iter()
-            .map(|s| match s {
-                Seg::Present { bytes, crc32 } => (*crc32, bytes.len() as u64),
-                Seg::Missing => (0, 0),
-            })
-            .collect();
         // Cheapest proof first: precheck recombines decode-time CRCs;
         // verify rehashes only when precheck cannot vouch for the file.
         if set
-            .precheck_bytes(&entry.filename_bytes, &seg_crcs)
+            .precheck_bytes(&entry.filename_bytes, seg_crcs)
             .unwrap_or(false)
             || set.verify_bytes(&entry.filename_bytes, assembled).is_ok()
         {
@@ -859,9 +918,14 @@ mod tests {
             VerifyProgress::scratch_prefix(JOB, 2),
             "ingest-scratch/job_x/r2/"
         );
-        let key = VerifyProgress::file_key(JOB, 0, "a/b.flac");
-        assert!(key.starts_with("ingest-scratch/job_x/r0/in/"));
+        let key = VerifyProgress::file_key(JOB, 0, 3, "a/b.flac");
+        assert!(key.starts_with("ingest-scratch/job_x/r0/in/0003-"));
         assert!(!key.contains("a/b"), "hostile names never reach key space");
+        // Same name, different NZB index: never the same staged object.
+        assert_ne!(
+            VerifyProgress::file_key(JOB, 0, 0, "track.flac"),
+            VerifyProgress::file_key(JOB, 0, 1, "track.flac")
+        );
         assert_eq!(
             VerifyProgress::manifest_key(JOB, 0),
             "ingest-scratch/job_x/r0/manifest.json"
@@ -871,7 +935,7 @@ mod tests {
     #[test]
     fn assemble_places_gaps_by_uniform_part_size() {
         let segments = vec![seg(b"aaaa"), Seg::Missing, seg(b"cc")];
-        let out = assemble(&segments, Some(10), 1024).expect("within cap");
+        let out = assemble(segments, Some(10), 1024).expect("within cap");
         assert_eq!(out, b"aaaa\0\0\0\0cc");
     }
 
@@ -879,10 +943,10 @@ mod tests {
     fn assemble_without_uniform_proof_keeps_the_present_prefix() {
         let segments = vec![seg(b"aaa"), Seg::Missing, seg(b"ccccc")];
         // Only one present non-last part of size 3 proves the part size.
-        let out = assemble(&segments, None, 1024).expect("within cap");
+        let out = assemble(segments, None, 1024).expect("within cap");
         assert_eq!(out.len(), 3 + 3 + 5);
         let segments = vec![Seg::Missing, seg(b"ccccc")];
-        let out = assemble(&segments, None, 1024).expect("within cap");
+        let out = assemble(segments, None, 1024).expect("within cap");
         assert!(out.is_empty(), "no proof, no prefix");
     }
 
@@ -892,12 +956,12 @@ mod tests {
         // most segments missing must fail the cap check, not allocate the
         // implied file first (and never truncate a >4 GiB length into a
         // short buffer on wasm32).
-        let segments = vec![seg(b"aaaa"), Seg::Missing, Seg::Missing];
-        assert_eq!(assemble(&segments, Some(100 << 20), 1 << 20), None);
-        assert_eq!(assemble(&segments, Some(u64::MAX), 48 << 20), None);
+        let gapped = || vec![seg(b"aaaa"), Seg::Missing, Seg::Missing];
+        assert_eq!(assemble(gapped(), Some(100 << 20), 1 << 20), None);
+        assert_eq!(assemble(gapped(), Some(u64::MAX), 32 << 20), None);
         // Implied geometry without par2 is capped the same way.
         let segments = vec![seg(&vec![0u8; 700_000]), Seg::Missing, Seg::Missing];
-        assert_eq!(assemble(&segments, None, 1 << 20), None);
+        assert_eq!(assemble(segments, None, 1 << 20), None);
     }
 
     #[test]

@@ -347,10 +347,13 @@ async fn run_probing(
 /// step errors are failed by `decide_checkpoint`, which keeps the
 /// settlement persist planner seeing a non-terminal checkpoint). Pure
 /// over the checkpoint so the mapping is unit-tested without bindings.
+/// `made_progress` is whether `progress.staged` grew during this
+/// delivery; it decides if an `Incomplete` step spends retry budget.
 fn apply_verify_outcome(
     msg: &QueueMsg,
     cp: &mut JobCheckpoint,
     outcome: VerifyOutcome,
+    made_progress: bool,
 ) -> Result<(), JobError> {
     match outcome {
         VerifyOutcome::Complete => {
@@ -411,6 +414,15 @@ fn apply_verify_outcome(
             ERR_VERIFY_FAILED,
             "release is missing blocks beyond par2 recovery",
         )),
+        // A capped step that staged more files is progress, not a
+        // failure: redeliver without spending the retry budget, or a
+        // valid large upload would be quarantined while every delivery
+        // succeeds. No growth keeps the ordinary transient budget, so a
+        // step that can never stage anything still exhausts and DLQs.
+        VerifyOutcome::Incomplete if made_progress => Err(JobError::progress(
+            ERR_VERIFY_FAILED,
+            "verifying in progress",
+        )),
         VerifyOutcome::Incomplete => Err(JobError::transient(
             ERR_VERIFY_FAILED,
             "verifying in progress",
@@ -457,6 +469,7 @@ async fn run_verifying(
     let deadline = move || {
         worker::Date::now().as_millis().saturating_sub(started_ms) > VERIFY_WALL_CLOCK_BUDGET_MS
     };
+    let staged_before = progress.staged.len();
     let outcome = crate::verify::run_verifying_step(
         &msg.job_id,
         files,
@@ -467,6 +480,7 @@ async fn run_verifying(
         &deadline,
     )
     .await;
+    let made_progress = progress.staged.len() > staged_before;
     // Persist progress before the checkpoint settlement so a crash
     // between the two writes resumes from the older state with the
     // newer progress (scratch adoption covers a lost progress write).
@@ -478,7 +492,7 @@ async fn run_verifying(
         ));
     }
     match outcome {
-        Ok(outcome) => apply_verify_outcome(msg, cp, outcome),
+        Ok(outcome) => apply_verify_outcome(msg, cp, outcome, made_progress),
         Err(VerifyError::Transient(detail)) => Err(JobError::transient(ERR_VERIFY_FAILED, detail)),
         Err(VerifyError::Permanent(detail)) => Err(JobError::permanent(ERR_VERIFY_FAILED, detail)),
     }
@@ -836,7 +850,8 @@ mod tests {
         let msg = search_message();
         let mut cp = verifying_checkpoint(&msg);
         cp.probe_tally = Some(crate::probe::ProbeTally::new(1));
-        let step = apply_verify_outcome(&msg, &mut cp, crate::verify::VerifyOutcome::Complete);
+        let step =
+            apply_verify_outcome(&msg, &mut cp, crate::verify::VerifyOutcome::Complete, true);
         // The next state has no executable step in this delivery: settle
         // transiently so the redelivery runs it (the Parsing pattern).
         let err = step.expect_err("matching runs on the next delivery");
@@ -857,6 +872,7 @@ mod tests {
                 par2_set_id: "ab".repeat(16),
                 missing_blocks: 2,
             },
+            true,
         );
         let err = step.expect_err("repair runs on the next delivery");
         assert!(err.transient);
@@ -881,6 +897,7 @@ mod tests {
                 par2_set_id: "ab".repeat(16),
                 missing_blocks: 1,
             },
+            true,
         );
         let err = step.expect_err("budget spent");
         assert!(!err.transient);
@@ -899,15 +916,38 @@ mod tests {
                 par2_set_id: None,
                 missing_blocks: 3,
             },
+            true,
         )
         .expect_err("unrecoverable");
         assert!(!err.transient);
         assert_eq!(err.code, ERR_VERIFY_FAILED);
         assert_eq!(cp.state, JobState::Verifying);
 
-        let err = apply_verify_outcome(&msg, &mut cp, crate::verify::VerifyOutcome::Incomplete)
-            .expect_err("incomplete");
+        // Incomplete with no staged growth is an ordinary transient
+        // failure: it spends retry budget in decide_checkpoint.
+        let err = apply_verify_outcome(
+            &msg,
+            &mut cp,
+            crate::verify::VerifyOutcome::Incomplete,
+            false,
+        )
+        .expect_err("incomplete");
         assert!(err.transient);
+        assert!(!err.made_progress);
+        assert_eq!(err.code, ERR_VERIFY_FAILED);
+        assert_eq!(cp.state, JobState::Verifying);
+
+        // Incomplete after staging more files is progress: the
+        // redelivery must not spend the retry budget.
+        let err = apply_verify_outcome(
+            &msg,
+            &mut cp,
+            crate::verify::VerifyOutcome::Incomplete,
+            true,
+        )
+        .expect_err("incomplete with progress");
+        assert!(err.transient);
+        assert!(err.made_progress);
         assert_eq!(err.code, ERR_VERIFY_FAILED);
         assert_eq!(cp.state, JobState::Verifying);
     }

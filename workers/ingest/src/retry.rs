@@ -83,11 +83,16 @@ fn bounded_redacted_detail(detail: &str) -> String {
 /// One failed step run. `transient` failures may succeed on redelivery (pool
 /// 430s, KV lag, Container 500s); permanent ones never will (bytes that fail
 /// the intake guard, an unparseable NZB), so they skip the budget and go
-/// straight to the DLQ.
+/// straight to the DLQ. A `made_progress` transient is not a failure at
+/// all: the step durably advanced its resumable state and only needs the
+/// next delivery to continue, so it must not spend the retry budget — a
+/// large valid job whose step is capped per delivery would otherwise be
+/// quarantined while every delivery succeeds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobError {
     pub code: &'static str,
     pub transient: bool,
+    pub made_progress: bool,
     pub detail: String,
 }
 
@@ -96,6 +101,18 @@ impl JobError {
         Self {
             code,
             transient: true,
+            made_progress: false,
+            detail: detail.into(),
+        }
+    }
+
+    /// The step made durable progress and needs a redelivery to continue:
+    /// settle as a retry without incrementing the attempt budget.
+    pub fn progress(code: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            transient: true,
+            made_progress: true,
             detail: detail.into(),
         }
     }
@@ -104,6 +121,7 @@ impl JobError {
         Self {
             code,
             transient: false,
+            made_progress: false,
             detail: detail.into(),
         }
     }
@@ -191,6 +209,20 @@ pub fn decide_checkpoint(
     }
     Ok(match result {
         Ok(()) => Disposition::Ack,
+        // Durable progress retries on the shared backoff without spending
+        // an attempt — even at the budget ceiling, where a genuine
+        // transient failure would quarantine. A corrupt attempt 0 never
+        // retries (it would loop with no accountable delivery count).
+        Err(e) if e.made_progress => {
+            if cp.attempt == 0 {
+                fail_checkpoint(cp, e.code, &e.detail);
+                Disposition::Quarantine(Box::new(quarantine(msg, cp.attempt, &e)))
+            } else {
+                Disposition::Retry {
+                    delay_secs: retry_delay_secs(cp.attempt),
+                }
+            }
+        }
         Err(e) if !e.transient => {
             fail_checkpoint(cp, e.code, &e.detail);
             Disposition::Quarantine(Box::new(quarantine(msg, cp.attempt, &e)))
@@ -449,6 +481,45 @@ mod tests {
             }
             d => panic!("spent budget must quarantine, got {d:?}"),
         }
+    }
+
+    #[test]
+    fn progress_retries_without_spending_the_attempt_budget() {
+        let msg = msg_at(1);
+        let mut cp = checkpoint_for(&msg);
+        let progress = || {
+            Err(JobError::progress(
+                ERR_VERIFY_FAILED,
+                "verifying in progress",
+            ))
+        };
+        // More progress deliveries than the whole budget: never an
+        // increment, never a quarantine, state untouched.
+        for _ in 0..MAX_ATTEMPTS + 2 {
+            match decide_checkpoint(&msg, &mut cp, progress()).unwrap() {
+                Disposition::Retry { delay_secs } => {
+                    assert_eq!(delay_secs, retry_delay_secs(1));
+                    assert_eq!(cp.attempt, 1);
+                    assert_ne!(cp.state, JobState::Failed);
+                }
+                d => panic!("progress must retry, got {d:?}"),
+            }
+        }
+        // Even at the ceiling, progress continues where a plain transient
+        // failure would quarantine.
+        cp.attempt = MAX_ATTEMPTS;
+        assert!(matches!(
+            decide_checkpoint(&msg, &mut cp, progress()).unwrap(),
+            Disposition::Retry { .. }
+        ));
+        assert_eq!(cp.attempt, MAX_ATTEMPTS);
+        // A corrupt attempt 0 still quarantines instead of looping.
+        let msg0 = msg_at(0);
+        let mut cp0 = checkpoint_for(&msg0);
+        assert!(matches!(
+            decide_checkpoint(&msg0, &mut cp0, progress()).unwrap(),
+            Disposition::Quarantine(_)
+        ));
     }
 
     #[test]

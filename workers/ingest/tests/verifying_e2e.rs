@@ -344,7 +344,7 @@ async fn complete_set_verifies_stages_and_writes_the_manifest() {
     assert_eq!(outcome, VerifyOutcome::Complete);
     assert_eq!(progress.missing_blocks, 0);
 
-    let data_key = VerifyProgress::file_key(JOB, 0, DATA_NAME);
+    let data_key = VerifyProgress::file_key(JOB, 0, 0, DATA_NAME);
     assert_eq!(scratch.bytes(&data_key).expect("staged data"), data);
     let manifest = scratch.manifest(JOB).expect("manifest staged");
     let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
@@ -640,6 +640,92 @@ async fn volume_only_recovery_slices_merge_with_the_index_set() {
         VerifyOutcome::RepairNeeded { missing_blocks, .. } => assert_eq!(missing_blocks, 2),
         other => panic!("expected repair via merged volume slices, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn staged_par2_over_the_aggregate_cap_fails_permanently() {
+    // Restoration of staged par2 is aggregate-capped before any bytes are
+    // copied into recovery groups: an over-cap set is a permanent error,
+    // never an unbounded in-memory restore across deliveries.
+    let data = payload(43, 1000);
+    let (articles, nzb, _hex) = complete_case(&data, 1);
+    let server = spawn(articles).await;
+    let scratch = MemoryScratch::default();
+    let mut progress = VerifyProgress::new(0);
+
+    // The step stages the par2 file, then must restore it before judging
+    // data: its staged size alone exceeds the 1-byte aggregate cap.
+    let caps = VerifyCaps {
+        max_par2_bytes: 1,
+        ..VerifyCaps::default()
+    };
+    let est = estimate_nzb(&nzb).expect("intake");
+    let files = parse_upload_files(nzb.as_bytes(), &est).expect("parse files");
+    let mut source = NntpSource::connect(&server).await;
+    let err = run_verifying_step(
+        JOB,
+        &files,
+        &mut progress,
+        &mut source,
+        &scratch,
+        &caps,
+        &|| false,
+    )
+    .await
+    .expect_err("over-cap staged par2");
+    assert!(
+        matches!(&err, VerifyError::Permanent(detail) if detail.contains("par2 exceeds")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_name_files_do_not_share_a_staged_object() {
+    // Two NZB files resolve to the same name; only the first is servable.
+    // The second must be fetched and judged on its own segments — if it
+    // adopted the first file's staged object (same name, same key), the
+    // step would wrongly return Complete.
+    let data = payload(41, 500);
+    let params = SegmentParams::single(DATA_NAME);
+    let articles = vec![yenc_article(
+        "d1@synthetic.invalid",
+        1,
+        DATA_NAME,
+        &params,
+        &data,
+    )];
+    let nzb = nzb_xml(&[
+        ServableFile {
+            name: DATA_NAME.into(),
+            segments: vec![("d1@synthetic.invalid".into(), encoded_len(&params, &data))],
+        },
+        ServableFile {
+            name: DATA_NAME.into(),
+            segments: vec![("d2@synthetic.invalid".into(), encoded_len(&params, &data))],
+        },
+    ]);
+    let server = spawn(articles).await;
+    let scratch = MemoryScratch::default();
+    let mut progress = VerifyProgress::new(0);
+
+    let (outcome, fetches) = run_step(
+        &server,
+        &nzb,
+        &VerifyCaps::default(),
+        &mut progress,
+        &scratch,
+    )
+    .await;
+    assert_ne!(outcome, VerifyOutcome::Complete);
+    assert!(
+        matches!(outcome, VerifyOutcome::Unrecoverable { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(fetches, ["d1@synthetic.invalid", "d2@synthetic.invalid"]);
+    assert_ne!(
+        VerifyProgress::file_key(JOB, 0, 0, DATA_NAME),
+        VerifyProgress::file_key(JOB, 0, 1, DATA_NAME)
+    );
 }
 
 #[tokio::test]
