@@ -231,7 +231,11 @@ fn key_binds_identity(play: &CompletePlay) -> bool {
 /// INSERT commits, so the scheduling `UPDATE users` either waits for
 /// the play-event/ledger write or fences it. A fenced INSERT affects 0
 /// rows and must be classified as `account_deleting`, never retried
-/// behind the delete.
+/// behind the delete. Zero rows is ambiguous under `DO NOTHING`, though:
+/// a duplicate redelivery with an open fence also affects 0 rows. The
+/// production sink must converge with `DO UPDATE` (like the ingest
+/// library upsert) or probe the fence first, so healthy duplicates never
+/// read as `account_deleting`.
 pub const LEDGER_WRITE_FENCE_SQL: &str =
     "(SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence";
 

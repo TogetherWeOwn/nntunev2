@@ -1990,6 +1990,77 @@ mod tests {
     }
 
     #[test]
+    fn fenced_vault_statements_pin_the_owner_fence_and_zero_row_guard() {
+        // ADR 0002 rule 3: PUT /v1/vault is reachable today, and the vault
+        // upsert fence, its zero-row guard, and the test-lease fence are the
+        // only things stopping credential writes behind the deletion marker.
+        // Pin them the same way `insert_magic_prune_is_per_user_and_expired_only`
+        // pins its statement: slice ONLY each fn body out of the pre-test
+        // source, so this test's own literals cannot satisfy the assertions.
+        // Dropping `AND deleting_at IS NULL` from either statement, or the
+        // `affected == 0` guard from the upsert, must fail here.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let fn_body = |name: &str| {
+            production
+                .split_once(name)
+                .unwrap_or_else(|| panic!("{name} must exist"))
+                .1
+                .split_once("\n    async fn ")
+                .expect("a following fn must bound the body")
+                .0
+                .to_string()
+        };
+        const FENCE: &str = "FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence";
+        // Vault upsert: the fence, the owner binding, and the fail-closed guard.
+        let upsert = fn_body("async fn upsert_vault(");
+        assert!(
+            upsert.contains(FENCE),
+            "upsert_vault must select its row through the owner fence"
+        );
+        assert!(
+            !upsert.contains("WHERE id = $2"),
+            "upsert_vault fence binds the owner ($1), never a column value"
+        );
+        assert!(
+            upsert.contains("SELECT $1, $2"),
+            "upsert_vault must keep SELECT $1 bound to the owner id"
+        );
+        let guard = upsert
+            .find("if affected == 0")
+            .expect("upsert_vault must fail closed on 0 rows");
+        let ok = upsert
+            .find("Ok(())")
+            .expect("upsert_vault must return Ok on the write path");
+        assert!(
+            guard < ok,
+            "the zero-row guard must precede the success return"
+        );
+        // Test-connection lease: the same fence on the same owner parameter,
+        // denied (not granted) when the fence returns no row.
+        let lease = fn_body("async fn acquire_test_connection_lease(");
+        assert!(
+            lease.contains(FENCE),
+            "acquire_test_connection_lease must select its row through the owner fence"
+        );
+        assert!(
+            lease.contains("SELECT $1, $2, $3"),
+            "lease must keep SELECT $1 bound to the owner id"
+        );
+        assert!(
+            lease.contains("RETURNING slot"),
+            "lease must only succeed on a returned slot row"
+        );
+        assert!(
+            lease.contains("if !rows.is_empty()"),
+            "lease must deny when the fence returns no row"
+        );
+    }
+
+    #[test]
     fn magic_link_payload_links_the_web_route_and_carries_the_code() {
         let payload = magic_link_payload(
             "https://app.example.com",

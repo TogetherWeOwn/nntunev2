@@ -18,6 +18,7 @@
 
 use crate::jobs::validate_job_id;
 use crate::queue::{validate_mbid, LibraryWrite};
+use crate::retry::{JobError, ERR_ACCOUNT_DELETING};
 
 /// Hyperdrive binding name: must match `[hyperdrive]` in
 /// `wrangler.toml.example`.
@@ -81,6 +82,22 @@ pub const fn upsert_outcome(affected_rows: u64) -> UpsertOutcome {
         UpsertOutcome::AccountDeleting
     } else {
         UpsertOutcome::Written
+    }
+}
+
+/// Map a fenced [`upsert_library_sql`] affected-row count to the consumer
+/// result: 0 rows is the permanent `account_deleting` failure, anything
+/// else is the committed write. Pure so the 0-row to permanent-code
+/// mapping is pinned without a live Env; the edge executor just forwards
+/// this (replacing the arm with `Ok(())` — the phantom `Done` — must fail
+/// the pin test below).
+pub fn upsert_job_result(affected_rows: u64) -> Result<(), JobError> {
+    match upsert_outcome(affected_rows) {
+        UpsertOutcome::Written => Ok(()),
+        UpsertOutcome::AccountDeleting => Err(JobError::permanent(
+            ERR_ACCOUNT_DELETING,
+            "account is being deleted",
+        )),
     }
 }
 
@@ -213,6 +230,20 @@ mod tests {
     fn upsert_outcome_only_zero_rows_is_the_fence_refusal() {
         assert_eq!(upsert_outcome(0), UpsertOutcome::AccountDeleting);
         assert_eq!(upsert_outcome(1), UpsertOutcome::Written);
+    }
+
+    #[test]
+    fn upsert_job_result_pins_the_fenced_zero_row_to_permanent_account_deleting() {
+        // The edge arm maps through this function, so weakening it to
+        // `Ok(())` (the phantom `Done`) must fail here.
+        assert!(upsert_job_result(1).is_ok());
+        assert!(upsert_job_result(u64::MAX).is_ok());
+        let err = upsert_job_result(0).expect_err("0 rows is the fence refusal");
+        assert_eq!(err.code, ERR_ACCOUNT_DELETING);
+        assert!(
+            !err.transient,
+            "a fenced writer never queues behind the delete"
+        );
     }
 
     #[test]

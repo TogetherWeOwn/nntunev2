@@ -88,8 +88,8 @@ use crate::probe::{
 };
 use crate::queue::{validate_indexer_ref, QueueMsg};
 use crate::retry::{
-    decide_checkpoint, Disposition, DlqEntry, JobError, DLQ_QUEUE_BINDING, ERR_ACCOUNT_DELETING,
-    ERR_MATCH_FAILED, ERR_PARSE_FAILED, ERR_PAYLOAD_MISSING, ERR_PROBE_FAILED, ERR_REPAIR_FAILED,
+    decide_checkpoint, Disposition, DlqEntry, JobError, DLQ_QUEUE_BINDING, ERR_MATCH_FAILED,
+    ERR_PARSE_FAILED, ERR_PAYLOAD_MISSING, ERR_PROBE_FAILED, ERR_REPAIR_FAILED,
     ERR_SEARCH_FAILED, ERR_VERIFY_FAILED, ERR_WRITE_FAILED,
 };
 use crate::verify::{
@@ -1151,14 +1151,10 @@ impl MatchWriteRuntime for EdgeMatchWrite<'_> {
         // rows means the account is being deleted. Fail permanently with
         // the stable code — a fenced writer never queues behind the
         // delete, and the (already-metered) match work must not settle
-        // as a phantom Done for a row that was never written.
-        match crate::library::upsert_outcome(affected) {
-            crate::library::UpsertOutcome::Written => Ok(()),
-            crate::library::UpsertOutcome::AccountDeleting => Err(JobError::permanent(
-                ERR_ACCOUNT_DELETING,
-                "account is being deleted",
-            )),
-        }
+        // as a phantom Done for a row that was never written. The mapping
+        // lives in [`crate::library::upsert_job_result`] (pinned there),
+        // so this arm stays a forward.
+        crate::library::upsert_job_result(affected)
     }
 }
 
@@ -2081,6 +2077,36 @@ mod tests {
         assert_eq!(asked, vec![0]);
         assert!(err.made_progress);
         assert_eq!(cp.state, JobState::Probing);
+    }
+
+    #[test]
+    fn edge_upsert_forwards_the_fenced_write_through_upsert_job_result() {
+        // The 0-row to permanent `account_deleting` mapping is pinned pure
+        // in `library::upsert_job_result`; pin here that the edge arm
+        // forwards through it, so weakening the arm to `Ok(())` (the
+        // phantom `Done` the comment warns about) fails here. Slice from
+        // the edge impl out of the pre-test source, so this test's own
+        // literal cannot satisfy the assertion.
+        let source = include_str!("queue_consumer.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let edge = production
+            .split_once("impl MatchWriteRuntime for EdgeMatchWrite")
+            .expect("edge impl must exist")
+            .1;
+        let body = edge
+            .split_once("async fn upsert(")
+            .expect("edge upsert must exist")
+            .1
+            .split_once("\nasync fn execute_write_with")
+            .expect("execute_write_with must bound the edge impl")
+            .0;
+        assert!(
+            body.contains("upsert_job_result(affected)"),
+            "edge upsert must forward the affected-row count through upsert_job_result"
+        );
     }
 
     #[test]
