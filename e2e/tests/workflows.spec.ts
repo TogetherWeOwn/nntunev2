@@ -162,13 +162,19 @@ test.describe('credential scope (static pins)', () => {
       'ingest-play-meter.spec.ts',
       'signup-byop.spec.ts',
       'player-queue-order.spec.ts',
+      'demo-media-sessionless.spec.ts',
     ]) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must not carry credentials on a raw request call`).not.toMatch(
         RAW_API_CALL,
       );
     }
-    for (const name of ['health.spec.ts', 'ingest-play-meter.spec.ts', 'player-queue-order.spec.ts']) {
+    for (const name of [
+      'health.spec.ts',
+      'ingest-play-meter.spec.ts',
+      'player-queue-order.spec.ts',
+      'demo-media-sessionless.spec.ts',
+    ]) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must use the no-follow wrapper`).toContain('apiGet(');
     }
