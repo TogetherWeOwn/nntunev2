@@ -125,6 +125,146 @@ fn service_unavailable(message: &str) -> Result<Response> {
         .map(|r| r.with_status(503).with_headers(headers))
 }
 
+// --- Search abuse guard (roadmap R6) -------------------------------------------
+
+thread_local! {
+    /// Per-isolate search buckets. Scope is deliberately honest: this
+    /// bounds bursts per isolate, complementing the durable per-plan
+    /// metering downstream (see `rate_limit::SearchThrottleStore`).
+    static SEARCH_THROTTLE: std::cell::RefCell<rate_limit::SearchThrottleStore> =
+        std::cell::RefCell::new(rate_limit::SearchThrottleStore::new());
+}
+
+/// Canonical source-IP scope for the search throttle: only a clean IP
+/// literal from the Cloudflare-set header survives, else `unknown` (all
+/// unidentified callers share one bucket — fail-closed, never a fresh
+/// budget per forged header). IPv6 is keyed by its /64 (IPv4-mapped by the
+/// embedded IPv4), mirroring the API worker's `rate_limit_ip_key`, so
+/// rotation inside one prefix cannot mint fresh budgets. The value keys
+/// buckets in memory only; it is never logged.
+fn search_source_ip(raw: Option<String>) -> String {
+    use std::net::IpAddr;
+    match raw {
+        Some(value) => match value.trim().parse::<IpAddr>() {
+            Ok(IpAddr::V4(v4)) => v4.to_string(),
+            Ok(IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+                Some(v4) => v4.to_string(),
+                None => {
+                    let segments = v6.segments();
+                    std::net::Ipv6Addr::new(
+                        segments[0],
+                        segments[1],
+                        segments[2],
+                        segments[3],
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                    .to_string()
+                }
+            },
+            Err(_) => "unknown".to_string(),
+        },
+        None => "unknown".to_string(),
+    }
+}
+
+/// The [vars] names `SearchRateLimitConfig::from_vars` reads. One
+/// const list so the glue test can pin every name against its field.
+const SEARCH_RATE_LIMIT_VAR_NAMES: [&str; 2] =
+    ["SEARCH_RATE_LIMIT_MAX", "SEARCH_RATE_LIMIT_WINDOW_SECS"];
+
+/// Cloudflare-set connecting-IP header. One const so the glue test
+/// pins the exact name the route reads.
+const CONNECTING_IP_HEADER: &str = "cf-connecting-ip";
+
+/// Search throttle tunables from a [vars] lookup; `from_vars` fails
+/// safe to the documented defaults on anything missing or invalid.
+/// Pure over the lookup closure (mirrors the api worker's
+/// `rate_limits_from_lookup`) so a renamed key fails a native test.
+fn search_throttle_vars_from_lookup(
+    get: impl Fn(&str) -> Option<String>,
+) -> std::collections::HashMap<String, String> {
+    SEARCH_RATE_LIMIT_VAR_NAMES
+        .iter()
+        .filter_map(|name| get(name).map(|v| ((*name).to_string(), v)))
+        .collect()
+}
+
+/// Read the connecting IP through a header lookup: asks for exactly
+/// [`CONNECTING_IP_HEADER`], so a renamed header fails a native test
+/// instead of silently collapsing every caller into `unknown`.
+fn search_connecting_ip(get_header: impl Fn(&str) -> Option<String>) -> Option<String> {
+    get_header(CONNECTING_IP_HEADER)
+}
+
+/// The search route's throttle decision, extracted over plain inputs
+/// (connecting-IP header value, [vars], account, now) so native tests
+/// drive the exact function the route calls — `Request`/`Env` need
+/// wasm-bindgen and cannot be built in a unit test.
+fn search_attempt_decision(
+    store: &mut rate_limit::SearchThrottleStore,
+    connecting_ip: Option<String>,
+    vars: &std::collections::HashMap<String, String>,
+    user_id: &str,
+    now_s: u64,
+) -> rate_limit::SearchDecision {
+    let ip = search_source_ip(connecting_ip);
+    let key = rate_limit::SearchThrottleKey::new(&ip, user_id);
+    let cfg = rate_limit::SearchRateLimitConfig::from_vars(vars);
+    store.check(&key, &cfg, now_s)
+}
+
+/// The full route glue over plain lookups: header name, [vars]
+/// names and the store decision composed exactly as the route runs
+/// them. A native test drives THIS fn end to end, so neutering any
+/// link (unconditional Allow, renamed var, renamed header) fails.
+fn check_search_attempt_in(
+    store: &mut rate_limit::SearchThrottleStore,
+    get_header: impl Fn(&str) -> Option<String>,
+    get_var: impl Fn(&str) -> Option<String>,
+    user_id: &str,
+    now_s: u64,
+) -> rate_limit::SearchDecision {
+    let connecting_ip = search_connecting_ip(get_header);
+    let vars = search_throttle_vars_from_lookup(get_var);
+    search_attempt_decision(store, connecting_ip, &vars, user_id, now_s)
+}
+
+/// Run the dual (per-IP + per-account) search gate for one attempt.
+/// Thin wasm wrapper: supplies the `Request`/`Env` lookups and the
+/// per-isolate store to [`check_search_attempt_in`].
+fn check_search_attempt(req: &Request, env: &Env, user_id: &str) -> rate_limit::SearchDecision {
+    let now_s = worker::Date::now().as_millis() / 1000;
+    SEARCH_THROTTLE.with(|store| {
+        check_search_attempt_in(
+            &mut store.borrow_mut(),
+            |name| req.headers().get(name).ok().flatten(),
+            |name| env.var(name).ok().map(|v| v.to_string()),
+            user_id,
+            now_s,
+        )
+    })
+}
+
+/// 429 for a throttled search: generic zero-arg body (no query, key or
+/// caller identity can leak into it) plus `Retry-After`.
+fn search_rate_limited_response(retry_after_secs: u64) -> Result<Response> {
+    let headers = headers_json().unwrap_or_default();
+    headers.append(
+        rate_limit::RETRY_AFTER_HEADER,
+        &rate_limit::search_retry_after_header(retry_after_secs),
+    )?;
+    Response::from_body(worker::ResponseBody::Body(
+        rate_limit::search_rate_limited_body().into_bytes(),
+    ))
+    .map(|r| {
+        r.with_status(rate_limit::SEARCH_RATE_LIMIT_STATUS)
+            .with_headers(headers)
+    })
+}
+
 /// Declared `Content-Length`, if the caller sent one.
 fn content_length(req: &Request) -> Option<usize> {
     req.headers()
@@ -942,6 +1082,14 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
     if let Err(message) = check_search(&parsed) {
         return json_error(ApiError::invalid_request(message));
     }
+    // Abuse guard before any dispatch is built or metered (roadmap R6):
+    // per-IP AND per-account token buckets; a denied attempt consumes
+    // nothing and answers the generic 429 + Retry-After.
+    if let rate_limit::SearchDecision::Deny { retry_after_secs } =
+        check_search_attempt(req, &ctx.env, &parsed.user_id)
+    {
+        return search_rate_limited_response(retry_after_secs);
+    }
     let q = parsed.query.trim().to_string();
     let msg = match dispatch::build_search_dispatch(
         &parsed.user_id,
@@ -1147,6 +1295,224 @@ mod tests {
     Response::from_body(worker::ResponseBody::Body(health.body))
         .map(|response| response.with_status(health.status).with_headers(headers))"#
             )
+        );
+    }
+
+    #[test]
+    fn search_source_ip_takes_only_a_clean_ip_literal() {
+        assert_eq!(
+            search_source_ip(Some("203.0.113.9".to_string())),
+            "203.0.113.9"
+        );
+        assert_eq!(search_source_ip(None), "unknown");
+        assert_eq!(
+            search_source_ip(Some("203.0.113.9\nINJECTED".to_string())),
+            "unknown"
+        );
+        assert_eq!(search_source_ip(Some("not-an-ip".to_string())), "unknown");
+        // IPv6 scopes to the /64: rotating the interface id stays one budget.
+        assert_eq!(
+            search_source_ip(Some("2001:db8:1:2:3:4:5:6".to_string())),
+            search_source_ip(Some("2001:db8:1:2:ffff:ffff:ffff:ffff".to_string()))
+        );
+        assert_ne!(
+            search_source_ip(Some("2001:db8:1:2::1".to_string())),
+            search_source_ip(Some("2001:db8:1:3::1".to_string()))
+        );
+    }
+
+    #[test]
+    fn search_attempt_decision_enforces_configured_dual_cap() {
+        // Route-level pin over the exact decision fn `check_search_attempt`
+        // runs: [vars] cap of 2 binds per-IP AND per-account, denial
+        // carries a bounded retry-after, and a denied attempt by a second
+        // account leaves that account's budget intact on a fresh IP.
+        use rate_limit::{SearchDecision, SearchThrottleStore};
+        let vars: std::collections::HashMap<String, String> = [
+            ("SEARCH_RATE_LIMIT_MAX".to_string(), "2".to_string()),
+            (
+                "SEARCH_RATE_LIMIT_WINDOW_SECS".to_string(),
+                "60".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut store = SearchThrottleStore::new();
+        let ip1 = || Some("203.0.113.7".to_string());
+        let ip2 = || Some("203.0.113.8".to_string());
+        assert_eq!(
+            search_attempt_decision(&mut store, ip1(), &vars, "user_a", 1_000),
+            SearchDecision::Allow
+        );
+        assert_eq!(
+            search_attempt_decision(&mut store, ip1(), &vars, "user_a", 1_000),
+            SearchDecision::Allow
+        );
+        match search_attempt_decision(&mut store, ip1(), &vars, "user_a", 1_000) {
+            SearchDecision::Deny { retry_after_secs } => {
+                assert!((1..=60).contains(&retry_after_secs), "{retry_after_secs}");
+            }
+            SearchDecision::Allow => panic!("third attempt inside the cap must deny"),
+        }
+        // Per-IP: a different account behind the same IP is also denied…
+        assert!(matches!(
+            search_attempt_decision(&mut store, ip1(), &vars, "user_b", 1_000),
+            SearchDecision::Deny { .. }
+        ));
+        // …but that denial consumed nothing from user_b's account budget.
+        assert_eq!(
+            search_attempt_decision(&mut store, ip2(), &vars, "user_b", 1_000),
+            SearchDecision::Allow
+        );
+        // Per-account: user_a stays denied even from a fresh IP.
+        assert!(matches!(
+            search_attempt_decision(&mut store, ip2(), &vars, "user_a", 1_000),
+            SearchDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn search_gate_glue_enforces_configured_cap_end_to_end() {
+        // Drive the exact glue `check_search_attempt` runs
+        // (header name -> IP scope, [vars] names -> config, store
+        // decision) with stub lookups that answer ONLY the correct
+        // names. Each classic wiring mutant fails behaviorally:
+        // a renamed var falls back to the default cap of 10 (third
+        // attempt would Allow), a renamed window var changes the
+        // retry-after, a renamed header collapses both IPs into the
+        // shared `unknown` bucket (user_b could not be admitted on
+        // the second IP), and an unconditional Allow never denies.
+        use rate_limit::{SearchDecision, SearchRateLimitConfig, SearchThrottleStore};
+        // Var name -> field pins, mirroring the api overlay test.
+        let only = |name: &'static str, value: &'static str| {
+            SearchRateLimitConfig::from_vars(&search_throttle_vars_from_lookup(|key| {
+                (key == name).then(|| value.to_string())
+            }))
+        };
+        let defaults = SearchRateLimitConfig::default();
+        assert_eq!(
+            SearchRateLimitConfig::from_vars(&search_throttle_vars_from_lookup(|_| None)),
+            defaults
+        );
+        assert_eq!(
+            only("SEARCH_RATE_LIMIT_MAX", "3"),
+            SearchRateLimitConfig {
+                max_attempts: 3,
+                ..defaults
+            }
+        );
+        assert_eq!(
+            only("SEARCH_RATE_LIMIT_WINDOW_SECS", "120"),
+            SearchRateLimitConfig {
+                window_secs: 120,
+                ..defaults
+            }
+        );
+        assert_eq!(SEARCH_RATE_LIMIT_VAR_NAMES.len(), 2);
+        // End to end through the route glue.
+        let get_var = |key: &str| match key {
+            "SEARCH_RATE_LIMIT_MAX" => Some("2".to_string()),
+            "SEARCH_RATE_LIMIT_WINDOW_SECS" => Some("120".to_string()),
+            _ => None,
+        };
+        let at_ip = |ip: &'static str| {
+            move |name: &str| (name == "cf-connecting-ip").then(|| ip.to_string())
+        };
+        let mut store = SearchThrottleStore::new();
+        let attempt = |store: &mut SearchThrottleStore, ip: &'static str, user: &str| {
+            check_search_attempt_in(store, at_ip(ip), get_var, user, 1_000)
+        };
+        assert_eq!(
+            attempt(&mut store, "203.0.113.7", "user_a"),
+            SearchDecision::Allow
+        );
+        assert_eq!(
+            attempt(&mut store, "203.0.113.7", "user_a"),
+            SearchDecision::Allow
+        );
+        // Third attempt denies; retry-after 60 == one token at
+        // 2-per-120s pins BOTH configured values (default window
+        // would give 30, default cap would not deny at all).
+        assert_eq!(
+            attempt(&mut store, "203.0.113.7", "user_a"),
+            SearchDecision::Deny {
+                retry_after_secs: 60
+            }
+        );
+        // Per-IP via the header: another account on the same IP denies…
+        assert!(matches!(
+            attempt(&mut store, "203.0.113.7", "user_b"),
+            SearchDecision::Deny { .. }
+        ));
+        // …but a distinct header IP is a distinct budget (a renamed
+        // header would share `unknown` and deny here too).
+        assert_eq!(
+            attempt(&mut store, "203.0.113.8", "user_b"),
+            SearchDecision::Allow
+        );
+        // Per-account follows the account across IPs.
+        assert!(matches!(
+            attempt(&mut store, "203.0.113.8", "user_a"),
+            SearchDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn search_route_denial_short_circuits_before_dispatch() {
+        // The route itself needs wasm-bindgen, so pin its shape in
+        // source: the throttle denial must return before any dispatch
+        // is built. Slice ONLY the route body out of the pre-test
+        // source — searching the whole file could match this test's
+        // own literals. (The glue BEHIND the call is pinned
+        // behaviorally by `search_gate_glue_enforces_configured_cap_end_to_end`.)
+        let source = include_str!("lib.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let route = production
+            .split_once("async fn search(req: &mut Request")
+            .expect("search route must exist")
+            .1
+            .split_once("\nasync fn ")
+            .expect("a following route must bound the body")
+            .0;
+        let gate = route
+            .find("check_search_attempt(req, &ctx.env, &parsed.user_id)")
+            .expect("search route must run the throttle gate");
+        let denied = route
+            .find("return search_rate_limited_response(retry_after_secs);")
+            .expect("throttle denial must return the 429 response");
+        let dispatch = route
+            .find("build_search_dispatch(")
+            .expect("search route must build a dispatch");
+        assert!(gate < denied && denied < dispatch);
+        // The wasm wrapper must delegate to the behaviorally-pinned
+        // glue over the per-isolate store: replacing its body with an
+        // unconditional Allow removes this call from its pre-test
+        // body slice and fails here.
+        let wrapper = production
+            .split_once("fn check_search_attempt(req: &Request")
+            .expect("check_search_attempt wrapper must exist")
+            .1
+            .split_once("\nfn ")
+            .expect("a following fn must bound the wrapper body")
+            .0;
+        assert!(
+            wrapper.contains("check_search_attempt_in("),
+            "check_search_attempt must run the pinned glue"
+        );
+        assert!(
+            wrapper.contains("SEARCH_THROTTLE.with("),
+            "check_search_attempt must use the per-isolate store"
+        );
+        // An early `return …::Allow` ABOVE the glue call would leave
+        // both substrings in place, so forbid a direct Allow in the
+        // wrapper outright: the only decision it may produce is the
+        // glue's.
+        assert!(
+            !wrapper.contains("SearchDecision::Allow"),
+            "check_search_attempt must not short-circuit the glue with Allow"
         );
     }
 
