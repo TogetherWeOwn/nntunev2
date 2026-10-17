@@ -16,19 +16,21 @@
 //!
 //! ## 4xx taxonomy
 //!
-//! Every rejection maps to a stable `code` + HTTP status the client can
-//! switch on; count/byte variants also carry the measured value and the cap
-//! so the client can render a reason without parsing message text:
+//! Every rejection uses the registered API envelope `code` and HTTP status;
+//! the stable NZB-specific identifier is retained as `intake_code`. Count/byte
+//! variants also carry the measured value and cap so clients can render a
+//! reason without parsing message text. For compatibility, responses also
+//! retain `error` as an alias of the envelope `message`:
 //!
-//! | code | status | fields |
-//! |------|--------|--------|
-//! | `NZB_EMPTY` | 400 | `intake_config_version` |
-//! | `NZB_TOO_LARGE` | 413 | `intake_config_version`, `size_bytes`, `max_bytes` |
-//! | `NZB_NOT_NZB` | 400 | `intake_config_version` |
-//! | `NZB_MALFORMED` | 400 | `intake_config_version` |
-//! | `NZB_TOO_MANY_FILES` | 413 | `intake_config_version`, `file_count`, `max_files` |
-//! | `NZB_TOO_MANY_SEGMENTS` | 413 | `intake_config_version`, `segment_count`, `max_segments` |
-//! | `NZB_DECLARED_BYTES_OVER_CAP` | 413 | `intake_config_version`, `declared_bytes`, `max_declared_bytes` |
+//! | intake_code | API code | status | extra fields |
+//! |-------------|----------|--------|--------------|
+//! | `NZB_EMPTY` | `invalid_request` | 400 | `intake_config_version` |
+//! | `NZB_TOO_LARGE` | `payload_too_large` | 413 | `intake_config_version`, `size_bytes`, `max_bytes` |
+//! | `NZB_NOT_NZB` | `invalid_request` | 400 | `intake_config_version` |
+//! | `NZB_MALFORMED` | `invalid_request` | 400 | `intake_config_version` |
+//! | `NZB_TOO_MANY_FILES` | `payload_too_large` | 413 | `intake_config_version`, `file_count`, `max_files` |
+//! | `NZB_TOO_MANY_SEGMENTS` | `payload_too_large` | 413 | `intake_config_version`, `segment_count`, `max_segments` |
+//! | `NZB_DECLARED_BYTES_OVER_CAP` | `payload_too_large` | 413 | `intake_config_version`, `declared_bytes`, `max_declared_bytes` |
 //!
 //! Checks run in the order above: the first failure wins.
 
@@ -114,7 +116,7 @@ impl IntakeRejection {
         }
     }
 
-    /// HTTP status for this refusal: 400 for "not an NZB", 413 when a cap bit.
+    /// Registry-aligned HTTP status: 400 for invalid requests, 413 for cap failures.
     pub fn http_status(&self) -> u16 {
         match self {
             Self::Empty | Self::NotNzb | Self::Malformed => 400,
@@ -125,8 +127,9 @@ impl IntakeRejection {
         }
     }
 
-    /// Human-readable reason. The stable contract is [`code`](Self::code) +
-    /// status; this text is for logs and default rendering only.
+    /// Human-readable reason. The stable intake identifier is
+    /// [`code`](Self::code); the HTTP envelope carries the registry code and
+    /// status, while this text is user-facing.
     pub fn message(&self) -> &'static str {
         match self {
             Self::Empty => "nzb_xml must not be empty",

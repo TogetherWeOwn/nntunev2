@@ -14,6 +14,10 @@
 //!   [`session::verify_stored_session`] against the current server row
 //!   (revoked/missing/stale-counter/mismatched rows reject), and cookie-
 //!   authenticated mutations require an exact `Origin` match (CSRF).
+//!   `POST /v1/auth/magic/finish` mints a cookie from a pure bearer token,
+//!   so it requires the same exact `Origin` match even when unauthenticated
+//!   (login-CSRF session planting): browsers always send `Origin` on this
+//!   fetch POST, and API-only clients must send `Origin: <configured origin>`.
 //! - Vault reads/writes are keyed ONLY by the session's `user_id` — there
 //!   is no handler parameter naming a vault, so a non-owner cannot even
 //!   address another vault (no existence oracle).
@@ -54,6 +58,82 @@ pub const MAGIC_LINKS_PER_WINDOW: u64 = 3;
 // Expired leases outlive the bounded test-connection probe by five seconds.
 const TEST_CONNECTION_LEASE_SECS: u64 = 20;
 const AUTH_START_WINDOW_SECS: u64 = 3600;
+/// Finish-route attempt budgets (CISO follow-up): each forged assertion
+/// costs P-256 ECDSA verify + SHA-256 plus DB reads, while a failed verify
+/// does not burn the challenge — so one challenge id would otherwise allow
+/// unlimited CPU-heavy attempts. Two layers: a per-IP lookup budget BEFORE
+/// any DB read bounds rotating unknown challenge ids (one Pg connect+SELECT
+/// each), then one slot per challenge (passkey finishes) or per client IP
+/// (magic finish) BEFORE verification; excess attempts answer the same
+/// generic auth error as any other failure. Ten per challenge TTL admits
+/// legitimate single attempts and typo retries while cutting off
+/// bombardment; 100 per 5 min per IP bounds lookup floods while admitting
+/// NAT bursts (the Pg slot reservation caps at 100).
+const REGISTER_FINISH_ATTEMPTS_PER_CHALLENGE: u64 = 10;
+const LOGIN_FINISH_ATTEMPTS_PER_CHALLENGE: u64 = 10;
+const MAGIC_FINISH_ATTEMPTS_PER_IP: u64 = 10;
+const FINISH_LOOKUP_ATTEMPTS_PER_IP: u64 = 100;
+const FINISH_ATTEMPT_WINDOW_SECS: u64 = crate::auth::CHALLENGE_TTL_SECS;
+/// Per-IP auth-start admission: 30/hour admits legitimate multi-user NAT
+/// while cutting distinct-email loops. Global capacity is reserved only for
+/// outbound mail, so exhaustion cannot block auth challenge issuance.
+const AUTH_STARTS_PER_IP_PER_HOUR: u64 = 30;
+/// Outbound mail abuse cap: register/start and magic/start share one
+/// per-IP plus one global issuance budget in front of the per-email budget,
+/// so one IP cannot email-bomb unlimited distinct victims (3 mails/15 min
+/// per victim, unlimited victims). Any denial sends nothing and stores no
+/// magic row. The global cap is 100 per 5 minutes.
+const MAIL_PER_IP_PER_HOUR: u64 = 30;
+const MAIL_GLOBAL_PER_WINDOW: u64 = 100;
+const MAIL_GLOBAL_WINDOW_SECS: u64 = 300;
+/// Unverified-signup retention: a user row that still holds no credential
+/// and no other account activity (vault, session, unexpired magic link or
+/// register challenge) after this is a never-completed signup;
+/// `register_start` reaps such rows best-effort (their challenges expire
+/// within 5 minutes and are pruned with them). Magic-only accounts (session
+/// without a passkey yet) and vault owners are never reaped: their
+/// vault/session/magic rows exempt them.
+const UNVERIFIED_USER_TTL_SECS: u64 = 24 * 3600;
+/// Fixed scope key for the fleet-wide auth-start and mail budgets.
+const GLOBAL_SCOPE_KEY: &str = "global";
+
+/// Canonical fleet-wide reap statement shape: the single source of truth
+/// for `PgStore::reap_unverified_users` (called from `worker_entry`) and
+/// the statement-shape test below. The purpose literal must stay
+/// `PURPOSE_REGISTER` (`'register'`): reaping on `'login'` would delete
+/// never-completed signups on the wrong ceremony. Exemptions (credentials,
+/// unexpired register challenges, vaults, sessions, unexpired magic links)
+/// must stay in sync with the `FakeStore` mirror.
+pub fn reap_unverified_users_sql() -> String {
+    format!(
+        "DELETE FROM users WHERE created_at <= $1 \
+         AND ($2::TEXT IS NULL OR users.id <> $2) \
+         AND NOT EXISTS (SELECT 1 FROM webauthn_credentials \
+                         WHERE webauthn_credentials.user_id = users.id) \
+         AND NOT EXISTS (SELECT 1 FROM auth_challenges \
+                         WHERE auth_challenges.user_id = users.id \
+                           AND auth_challenges.purpose = '{PURPOSE_REGISTER}' \
+                           AND auth_challenges.expires_at > $3) \
+         AND NOT EXISTS (SELECT 1 FROM provider_vaults \
+                         WHERE provider_vaults.user_id = users.id) \
+         AND NOT EXISTS (SELECT 1 FROM sessions \
+                         WHERE sessions.user_id = users.id) \
+         AND NOT EXISTS (SELECT 1 FROM magic_link_tokens \
+                         WHERE magic_link_tokens.user_id = users.id \
+                           AND magic_link_tokens.expires_at > $3)"
+    )
+}
+
+/// Canonical rate-limit exhausted fast-fail statement shape: the single
+/// source of truth for the `PgStore::reserve_rate_limit` O(1) guard
+/// (called from `worker_entry`) and the statement-shape test below. The
+/// production guard must stay a single `SELECT COUNT(*)` over the live
+/// window; without it every denied request pays one DELETE plus `limit`
+/// conflicting upserts (~101 statements with 100 row locks for the
+/// 100-slot finish-lookup budget). The `FakeStore` mirror exercises the
+/// same exhausted-decision behavior and counts slot probes.
+pub const RATE_LIMIT_EXHAUSTED_SQL: &str = "SELECT COUNT(*) FROM auth_rate_limit_slots \
+     WHERE scope_key = $1 AND action = $2 AND expires_at > $3";
 
 // --- Config ---------------------------------------------------------------------
 
@@ -250,6 +330,22 @@ pub trait Store {
     ) -> impl Future<Output = Result<bool, StoreError>>;
     /// Remove challenges that can no longer be redeemed.
     fn prune_expired_challenges(&self, now: u64) -> impl Future<Output = Result<(), StoreError>>;
+    /// Reap abandoned signups while preserving the current/resumed user,
+    /// credentialed accounts, unexpired registration challenges (including
+    /// in-flight finishes), and any account activity (vault, session,
+    /// unexpired magic link). Default no-op so out-of-tree `Store` impls
+    /// keep compiling; production and the test fake override it.
+    fn reap_unverified_users(
+        &self,
+        now: u64,
+        ttl_secs: u64,
+        protected_user_id: Option<&str>,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async move {
+            let _ = (now, ttl_secs, protected_user_id);
+            Ok(())
+        }
+    }
     /// Acquire one of the per-user test-connection leases until `expires_at`.
     fn acquire_test_connection_lease(
         &self,
@@ -381,6 +477,20 @@ fn internal() -> Response {
     json_response(500, serde_json::json!({"error": "internal error"}))
 }
 
+fn session_error_response(error: session::SessionError) -> Response {
+    match error {
+        session::SessionError::Invalid => generic_auth(),
+        error => {
+            let error = crate::api_error::ApiError::from(error);
+            Response {
+                status: error.status,
+                body: error.body_json(),
+                set_cookie: None,
+            }
+        }
+    }
+}
+
 fn invalid_request() -> Response {
     json_response(400, serde_json::json!({"error": "invalid request"}))
 }
@@ -433,8 +543,54 @@ fn email_rate_limit_key(cfg: &Config, email: &str) -> String {
 
 /// Stand-in user id for register/start taken-email shapes, shaped like
 /// the real 16-byte random user ids and stable per email.
+fn valid_challenge_id(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
 fn fake_user_id(cfg: &Config, email: &str) -> String {
     fake_id(cfg, "fake-user", email, 0, 16)
+}
+
+/// Canonical per-IP rate-limit key: IPv6 clients sharing a /64 share one
+/// budget, IPv4 keeps the full address. Audit logs keep the full `source_ip`;
+/// only budget scopes use this key, so rotation inside one prefix cannot mint
+/// fresh budgets.
+fn rate_limit_ip_key(source_ip: &str) -> String {
+    let trimmed = source_ip.trim();
+    let Ok(addr) = trimmed.parse::<IpAddr>() else {
+        return trimmed.to_string();
+    };
+    match addr {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.to_string();
+            }
+            let segments = v6.segments();
+            std::net::Ipv6Addr::new(
+                segments[0],
+                segments[1],
+                segments[2],
+                segments[3],
+                0,
+                0,
+                0,
+                0,
+            )
+            .to_string()
+        }
+    }
+}
+
+/// Uniform per-IP throttle response: fixed 429 body independent of the
+/// request email, because the budget is keyed only on the client prefix.
+/// Callers must not return email-derived stand-ins on this path (that would
+/// be an account-existence oracle across the denial boundary).
+fn throttled() -> Response {
+    json_response(429, serde_json::json!({"error":"rate_limited"}))
 }
 
 /// Register/login challenge inserts allowed per account per hour.
@@ -549,8 +705,8 @@ where
         // check below still enforces revocation, counter and expiry, and
         // minting always uses the primary.
         let keys = self.cfg.session_keys();
-        let claims =
-            session::verify_session_dual(&keys, &token, self.now).map_err(|_| generic_auth())?;
+        let claims = session::verify_session_dual(&keys, &token, self.now)
+            .map_err(session_error_response)?;
         let record = self
             .store
             .session_by_id(&claims.session_id)
@@ -558,11 +714,65 @@ where
             .map_err(|_| internal())?
             .ok_or_else(generic_auth)?;
         let claims = session::verify_stored_session(&keys, &token, self.now, &record)
-            .map_err(|_| generic_auth())?;
+            .map_err(session_error_response)?;
         Ok((claims, token))
     }
 
+    /// Per-IP admission shared by register, login and magic start routes.
+    /// The global budget is reserved only for outbound mail, so exhaustion
+    /// cannot prevent users from obtaining an authentication challenge.
+    /// The scope key is the client /64 (IPv6) or full address (IPv4), so
+    /// rotation inside one prefix cannot mint fresh budgets; audit logs keep
+    /// the full `source_ip`.
+    async fn admit_auth_start(&self) -> bool {
+        self.store
+            .reserve_rate_limit(
+                &rate_limit_ip_key(&self.source_ip),
+                "auth.start_ip",
+                AUTH_STARTS_PER_IP_PER_HOUR,
+                self.now,
+                AUTH_START_WINDOW_SECS,
+            )
+            .await
+            .unwrap_or(false)
+    }
+
     async fn send_magic_link_if_allowed(&self, user_id: &str, email: &str) {
+        // Outbound mail abuse cap BEFORE the per-email budget: one IP must
+        // not email-bomb unlimited distinct victims. Any denial sends
+        // nothing and stores no magic row.
+        let mail_ip_ok = self
+            .store
+            .reserve_rate_limit(
+                &rate_limit_ip_key(&self.source_ip),
+                "auth.mail_ip",
+                MAIL_PER_IP_PER_HOUR,
+                self.now,
+                AUTH_START_WINDOW_SECS,
+            )
+            .await
+            .unwrap_or(false);
+        if !mail_ip_ok {
+            return;
+        }
+        let mail_global_ok = self
+            .store
+            .reserve_rate_limit(
+                GLOBAL_SCOPE_KEY,
+                "auth.mail_global",
+                MAIL_GLOBAL_PER_WINDOW,
+                self.now,
+                MAIL_GLOBAL_WINDOW_SECS,
+            )
+            .await
+            .unwrap_or(false);
+        if !mail_global_ok {
+            // Alert without including request/user data; this signals fleet-wide
+            // outbound-mail pressure while keeping auth starts available.
+            #[cfg(target_arch = "wasm32")]
+            worker::console_log!("api global mail budget exhausted");
+            return;
+        }
         let scope_key = email_rate_limit_key(self.cfg, email);
         let admitted = self
             .store
@@ -657,14 +867,13 @@ where
     let Some(email) = normalize_email(&body.email) else {
         return generic_auth();
     };
-    let existing = match ctx.store.user_by_email(&email).await {
-        Ok(user) => user,
-        Err(_) => return internal(),
-    };
-    // Identical 200 shape for every outcome below (new email, abandoned
-    // signup, already-registered account): this route must not be an
-    // account-existence oracle. A taken email gets an unbound challenge
-    // whose finish fails generically, and no mail is sent for it.
+    // Identical 200 shape for every admitted outcome below (new email,
+    // abandoned signup, already-registered account): this route must not be
+    // an account-existence oracle. A taken email gets an unbound challenge
+    // whose finish fails generically, and no mail is sent for it. Per-IP
+    // throttle denial is a fixed email-independent 429 (never an
+    // email-derived stand-in): the budget is keyed only on the client
+    // prefix, so the denied body is identical for taken and fresh emails.
     let challenge = match auth::new_registration_challenge(&ctx.cfg.rp_id, &ctx.cfg.origin, ctx.now)
     {
         Ok(challenge) => challenge,
@@ -680,6 +889,39 @@ where
             }),
         )
     };
+    // Per-IP admission before user lookup or maintenance. The global budget
+    // applies to outbound mail only, never to auth challenge issuance.
+    if !ctx.admit_auth_start().await {
+        return throttled();
+    }
+    let existing = match ctx.store.user_by_email(&email).await {
+        Ok(user) => user,
+        Err(_) => return internal(),
+    };
+    // Preserve a resumed signup through this cleanup pass. Other active
+    // registration attempts are protected by their unexpired challenges.
+    // Same-request only: a concurrent `register_start` for another email
+    // can reap this resuming user between our lookup above and our
+    // challenge insert below (it holds no unexpired register challenge
+    // precisely because it is resuming). The post-insert revalidation
+    // below heals that race by recreating the user under the same id, so
+    // a resumed signup survives concurrent cleanup (client retries also
+    // recreate it; see migration 0006 FK note).
+    if ctx
+        .store
+        .reap_unverified_users(
+            ctx.now,
+            UNVERIFIED_USER_TTL_SECS,
+            existing.as_ref().map(|user| user.id.as_str()),
+        )
+        .await
+        .is_err()
+    {
+        return internal();
+    }
+    if ctx.store.prune_expired_challenges(ctx.now).await.is_err() {
+        return internal();
+    }
     let user = match existing {
         Some(user) => {
             // Resume an abandoned signup only when no credential exists yet.
@@ -725,13 +967,77 @@ where
     if !admitted {
         return shape(user.id.clone());
     }
+    // Challenge insert plus concurrent-reap healing. With the migration
+    // 0006 FK (`auth_challenges.user_id -> users(id)`) a concurrent reap
+    // of our user fails here; without it, an insert can succeed just before
+    // the reap and leave an orphaned challenge. Revalidation below heals the
+    // user and preserves that challenge, so either ordering can recover.
     if ctx
         .store
         .insert_challenge(&challenge, Some(&user.id), PURPOSE_REGISTER)
         .await
         .is_err()
     {
-        return internal();
+        match ctx.store.user_by_email(&email).await {
+            Ok(None) => {
+                let healed = UserRecord {
+                    id: user.id.clone(),
+                    email: email.clone(),
+                    created_at: ctx.now,
+                };
+                if ctx.store.insert_user(&healed).await.is_err() {
+                    return shape(fake_user_id(ctx.cfg, &email));
+                }
+                if ctx
+                    .store
+                    .insert_challenge(&challenge, Some(&user.id), PURPOSE_REGISTER)
+                    .await
+                    .is_err()
+                {
+                    return internal();
+                }
+            }
+            _ => return internal(),
+        }
+    } else {
+        match ctx.store.user_by_email(&email).await {
+            Ok(Some(current)) if current.id == user.id => {}
+            Ok(None) => {
+                let healed = UserRecord {
+                    id: user.id.clone(),
+                    email: email.clone(),
+                    created_at: ctx.now,
+                };
+                if ctx.store.insert_user(&healed).await.is_err() {
+                    return shape(fake_user_id(ctx.cfg, &email));
+                }
+                match ctx.store.challenge_by_id(&challenge.id).await {
+                    Ok(Some(row))
+                        if row.challenge.id == challenge.id
+                            && row.challenge.rp_id == challenge.rp_id
+                            && row.challenge.origin == challenge.origin
+                            && row.challenge.expires_at == challenge.expires_at
+                            && !row.challenge.consumed
+                            && row.user_id.as_deref() == Some(user.id.as_str())
+                            && row.purpose == PURPOSE_REGISTER => {}
+                    Ok(None) => {
+                        if ctx
+                            .store
+                            .insert_challenge(&challenge, Some(&user.id), PURPOSE_REGISTER)
+                            .await
+                            .is_err()
+                        {
+                            return internal();
+                        }
+                    }
+                    _ => return internal(),
+                }
+            }
+            Ok(Some(_)) => {
+                return shape(fake_user_id(ctx.cfg, &email));
+            }
+            Err(_) => return internal(),
+        }
     }
     // Email-ownership proof and magic login share one atomic per-email
     // issuance budget, so parallel requests cannot oversend.
@@ -749,18 +1055,54 @@ where
     let Some(body) = parse_body::<RegisterFinishBody>(req) else {
         return generic_auth();
     };
+    if !valid_challenge_id(&body.challenge) {
+        return generic_auth();
+    }
+    // Per-IP lookup budget BEFORE any DB read: rotating well-formed unknown
+    // challenge ids costs one Pg connect+SELECT each, so they must share one
+    // per-client pool (keyed on the client /64, not the raw address).
+    // Denial is the generic error (no throttle oracle).
+    let lookup_admitted = ctx
+        .store
+        .reserve_rate_limit(
+            &rate_limit_ip_key(&ctx.source_ip),
+            "auth.register_finish_ip",
+            FINISH_LOOKUP_ATTEMPTS_PER_IP,
+            ctx.now,
+            FINISH_ATTEMPT_WINDOW_SECS,
+        )
+        .await
+        .unwrap_or(false);
+    if !lookup_admitted {
+        return generic_auth();
+    }
+    let row = match ctx.store.challenge_by_id(&body.challenge).await {
+        Ok(Some(row)) if row.purpose == PURPOSE_REGISTER => row,
+        Ok(_) => return generic_auth(),
+        Err(_) => return internal(),
+    };
     let (Ok(attestation_object), Ok(client_data_json)) = (
         b64url_decode(&body.attestation_object),
         b64url_decode(&body.client_data_json),
     ) else {
         return generic_auth();
     };
-    let row = match ctx.store.challenge_by_id(&body.challenge).await {
-        Ok(Some(row)) => row,
-        Ok(None) => return generic_auth(),
-        Err(_) => return internal(),
-    };
-    if row.purpose != PURPOSE_REGISTER {
+    // Per-challenge attempt budget BEFORE CPU-heavy verification: a failed
+    // attestation verify must not grant unlimited retries on one challenge.
+    // Same atomic slot pattern as register/start; denial is the generic
+    // error so throttled and invalid attempts are indistinguishable.
+    let admitted = ctx
+        .store
+        .reserve_rate_limit(
+            &body.challenge,
+            "auth.register_finish",
+            REGISTER_FINISH_ATTEMPTS_PER_CHALLENGE,
+            ctx.now,
+            FINISH_ATTEMPT_WINDOW_SECS,
+        )
+        .await
+        .unwrap_or(false);
+    if !admitted {
         return generic_auth();
     }
     let Some(user_id) = row.user_id.clone() else {
@@ -814,8 +1156,8 @@ where
         // Atomic per-client redemption budget BEFORE the lookup: parallel
         // guesses share one reservation (no check-then-act race), and the
         // denial is the generic error (no throttle oracle). Keyed by
-        // source IP and account, per `auth::invite_attempt_allowed`.
-        let attempt_key = format!("invite:{}:{}", ctx.source_ip, user_id);
+        // client prefix and account, per `auth::invite_attempt_allowed`.
+        let attempt_key = format!("invite:{}:{}", rate_limit_ip_key(&ctx.source_ip), user_id);
         let allowed = ctx
             .store
             .reserve_rate_limit(
@@ -910,6 +1252,24 @@ where
     let Some(email) = normalize_email(&body.email) else {
         return generic_auth();
     };
+    let challenge = match auth::new_registration_challenge(&ctx.cfg.rp_id, &ctx.cfg.origin, ctx.now)
+    {
+        Ok(challenge) => challenge,
+        Err(_) => return internal(),
+    };
+    // Per-IP admission before maintenance or lookup: unknown emails would
+    // otherwise mint unbounded unbound challenge rows. Denial returns the
+    // same fixed-shape 200 with an unstored challenge.
+    if !ctx.admit_auth_start().await {
+        return json_response(
+            200,
+            serde_json::json!({
+                "challenge": challenge.id,
+                "allow_credentials": [],
+                "rp_id": ctx.cfg.rp_id,
+            }),
+        );
+    }
     if ctx.store.prune_expired_challenges(ctx.now).await.is_err() {
         return internal();
     }
@@ -921,11 +1281,6 @@ where
         .as_ref()
         .map(|user| user.id.clone())
         .unwrap_or_else(|| email_rate_limit_key(ctx.cfg, &email));
-    let challenge = match auth::new_registration_challenge(&ctx.cfg.rp_id, &ctx.cfg.origin, ctx.now)
-    {
-        Ok(challenge) => challenge,
-        Err(_) => return internal(),
-    };
     // Use a discoverable/usernameless passkey flow: returning credential ids
     // here leaks their variable lengths even when the list is padded.
     let admitted = ctx
@@ -972,6 +1327,31 @@ where
     let Some(body) = parse_body::<LoginFinishBody>(req) else {
         return generic_auth();
     };
+    if !valid_challenge_id(&body.challenge) {
+        return generic_auth();
+    }
+    // Per-IP lookup budget BEFORE any DB read, same as register/finish:
+    // rotating well-formed unknown challenge ids must share one pool
+    // (keyed on the client /64, not the raw address).
+    let lookup_admitted = ctx
+        .store
+        .reserve_rate_limit(
+            &rate_limit_ip_key(&ctx.source_ip),
+            "auth.login_finish_ip",
+            FINISH_LOOKUP_ATTEMPTS_PER_IP,
+            ctx.now,
+            FINISH_ATTEMPT_WINDOW_SECS,
+        )
+        .await
+        .unwrap_or(false);
+    if !lookup_admitted {
+        return generic_auth();
+    }
+    let row = match ctx.store.challenge_by_id(&body.challenge).await {
+        Ok(Some(row)) if row.purpose == PURPOSE_LOGIN => row,
+        Ok(_) => return generic_auth(),
+        Err(_) => return internal(),
+    };
     let (Ok(authenticator_data), Ok(client_data_json), Ok(signature)) = (
         b64url_decode(&body.authenticator_data),
         b64url_decode(&body.client_data_json),
@@ -979,12 +1359,20 @@ where
     ) else {
         return generic_auth();
     };
-    let row = match ctx.store.challenge_by_id(&body.challenge).await {
-        Ok(Some(row)) => row,
-        Ok(None) => return generic_auth(),
-        Err(_) => return internal(),
-    };
-    if row.purpose != PURPOSE_LOGIN {
+    // Per-challenge attempt budget BEFORE CPU-heavy verification, same as
+    // register/finish: one challenge id cannot fund unlimited assertions.
+    let admitted = ctx
+        .store
+        .reserve_rate_limit(
+            &body.challenge,
+            "auth.login_finish",
+            LOGIN_FINISH_ATTEMPTS_PER_CHALLENGE,
+            ctx.now,
+            FINISH_ATTEMPT_WINDOW_SECS,
+        )
+        .await
+        .unwrap_or(false);
+    if !admitted {
         return generic_auth();
     }
     let Some(user_id) = row.user_id.clone() else {
@@ -1056,6 +1444,14 @@ where
     let Some(email) = normalize_email(&body.email) else {
         return generic_auth();
     };
+    // Per-IP/global budget BEFORE the lookup: rotating addresses must share
+    // one pool, or magic starts fund unbounded reads. Denial keeps the
+    // identical response (the mail-budget denial inside
+    // `send_magic_link_if_allowed` likewise sends nothing and stores no
+    // magic row on the same shape).
+    if !ctx.admit_auth_start().await {
+        return json_response(200, serde_json::json!({"ok": true}));
+    }
     // Identical response whether or not the account exists or the atomic
     // per-email issuance budget has been exhausted.
     if let Ok(Some(user)) = ctx.store.user_by_email(&email).await {
@@ -1071,10 +1467,40 @@ where
     D: Dialer,
     N: AsyncDns,
 {
+    // Login-CSRF session-planting pin: this route mints a cookie from a pure
+    // bearer token, so a cross-site POST would plant the attacker's session
+    // in the victim's browser — response `Set-Cookie` is not stopped by
+    // `SameSite=Lax`, and CORS alone does not stop form/nav POSTs. Require
+    // the same exact-`Origin` match as cookie-authenticated mutations,
+    // BEFORE any token lookup or consume (so a rejected cross-origin
+    // attempt leaves the token unspent). Browsers always send `Origin` on
+    // this fetch POST; API-only clients must send `Origin: <configured origin>`.
+    if req.origin.as_deref() != Some(ctx.cfg.origin.as_str()) {
+        return generic_auth();
+    }
     let Some(body) = parse_body::<MagicFinishBody>(req) else {
         return generic_auth();
     };
     if body.token.is_empty() || body.token.len() > 256 {
+        return generic_auth();
+    }
+    // Attempt budget AFTER the exact-Origin pin and BEFORE the hash lookup:
+    // rotating tokens must share one per-client budget (keyed on the client
+    // /64, not the raw address), or bogus finishes are an unbounded DB read.
+    // Cross-origin rejects above never reach this reservation, so an attacker
+    // cannot burn a victim IP's budget.
+    let admitted = ctx
+        .store
+        .reserve_rate_limit(
+            &rate_limit_ip_key(&ctx.source_ip),
+            "auth.magic_finish",
+            MAGIC_FINISH_ATTEMPTS_PER_IP,
+            ctx.now,
+            FINISH_ATTEMPT_WINDOW_SECS,
+        )
+        .await
+        .unwrap_or(false);
+    if !admitted {
         return generic_auth();
     }
     let record = match ctx
@@ -1086,14 +1512,14 @@ where
         Ok(None) => return generic_auth(),
         Err(_) => return internal(),
     };
-    // Login-CSRF guard: an emailed link must never silently REPLACE an
-    // existing session for a different account. If the request already
-    // authenticates as someone else, fail generically WITHOUT consuming
-    // the token (its owner can still redeem it after signing out). An
-    // absent or invalid session is the ordinary sign-in path. The web
-    // landing page adds the second half: no auto-redeem, an explicit
-    // confirm, and the signed-in identity shown before any credential
-    // is typed.
+    // Login-CSRF guard (second layer after the exact-`Origin` pin above):
+    // an emailed link must never silently REPLACE an existing session for
+    // a different account. If the request already authenticates as someone
+    // else, fail generically WITHOUT consuming the token (its owner can
+    // still redeem it after signing out). An absent or invalid session is
+    // the ordinary sign-in path. The web landing page adds the third layer:
+    // no auto-redeem, an explicit confirm, and the signed-in identity shown
+    // before any credential is typed.
     if session_cookie_value(req).is_some() {
         if let Ok((claims, _)) = ctx.authenticate(req, false).await {
             if claims.user_id != record.user_id {
@@ -1138,7 +1564,7 @@ where
     let new_token = match session::rotate_session(&keys, &token, ctx.now, ctx.cfg.session_ttl_secs)
     {
         Ok(new_token) => new_token,
-        Err(_) => return generic_auth(),
+        Err(error) => return session_error_response(error),
     };
     let new_claims = match session::verify_session(&ctx.cfg.session_secret, &new_token, ctx.now) {
         Ok(new_claims) => new_claims,
@@ -1529,8 +1955,61 @@ mod tests {
         panic!("future did not complete");
     }
 
+    /// Strip `//` line comments (outside string literals) so shape/wiring
+    /// pins cannot be satisfied by an explanatory comment naming the
+    /// constant. Full-line doc comments and trailing remarks are removed;
+    /// `https://` inside a string literal is preserved.
+    fn strip_line_comments(src: &str) -> String {
+        src.lines()
+            .map(|line| {
+                let bytes = line.as_bytes();
+                let mut in_str = false;
+                let mut escaped = false;
+                let mut cut = line.len();
+                let mut i = 0;
+                while i + 1 < line.len() {
+                    let c = bytes[i] as char;
+                    if in_str {
+                        if escaped {
+                            escaped = false;
+                        } else if c == '\\' {
+                            escaped = true;
+                        } else if c == '"' {
+                            in_str = false;
+                        }
+                    } else if c == '"' {
+                        in_str = true;
+                    } else if c == '/' && bytes[i + 1] == b'/' {
+                        cut = i;
+                        break;
+                    }
+                    i += 1;
+                }
+                line[..cut].to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     const NOW: u64 = 1_700_000_000;
     const ORIGIN: &str = "https://example.com";
+
+    #[test]
+    fn session_misconfiguration_is_retryable_server_error() {
+        let response = session_error_response(session::SessionError::Misconfigured);
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response.body,
+            r#"{"code":"internal_error","message":"unexpected error","retryable":true}"#
+        );
+
+        let response = session_error_response(session::SessionError::Invalid);
+        assert_eq!(response.status, 401);
+        assert_eq!(
+            response.body,
+            r#"{"error":"check your email and try again"}"#
+        );
+    }
 
     fn cfg() -> Config {
         Config::new(
@@ -1559,6 +2038,11 @@ mod tests {
         audits: RefCell<Vec<AuditEvent>>,
         rate_limit_slots: RefCell<HashMap<(String, String, u32), u64>>,
         test_connection_leases: RefCell<HashMap<(String, u32), (String, u64)>>,
+        delete_user_before_next_challenge: RefCell<Option<String>>,
+        delete_user_after_next_challenge: RefCell<Option<String>>,
+        orphan_user_after_next_challenge: RefCell<Option<String>>,
+        challenge_reads: RefCell<usize>,
+        rate_limit_slot_probes: RefCell<usize>,
     }
 
     impl Store for FakeStore {
@@ -1584,6 +2068,20 @@ mod tests {
             user_id: Option<&str>,
             purpose: &str,
         ) -> Result<(), StoreError> {
+            if let Some(id) = self.delete_user_before_next_challenge.borrow_mut().take() {
+                self.users.borrow_mut().remove(&id);
+            }
+            // Mirror migration 0006 FK (`auth_challenges.user_id ->
+            // users(id)`): bound challenges fail when the user is gone, so a
+            // concurrent reap surfaces here instead of orphaning the row.
+            if let Some(uid) = user_id {
+                if !self.users.borrow().contains_key(uid) {
+                    return Err(StoreError);
+                }
+            }
+            if self.challenges.borrow().contains_key(&challenge.id) {
+                return Err(StoreError);
+            }
             self.challenges.borrow_mut().insert(
                 challenge.id.clone(),
                 ChallengeRow {
@@ -1592,9 +2090,19 @@ mod tests {
                     purpose: purpose.to_string(),
                 },
             );
+            if let Some(id) = self.delete_user_after_next_challenge.borrow_mut().take() {
+                self.users.borrow_mut().remove(&id);
+                self.challenges
+                    .borrow_mut()
+                    .retain(|_, row| row.user_id.as_deref() != Some(id.as_str()));
+            }
+            if let Some(id) = self.orphan_user_after_next_challenge.borrow_mut().take() {
+                self.users.borrow_mut().remove(&id);
+            }
             Ok(())
         }
         async fn challenge_by_id(&self, id: &str) -> Result<Option<ChallengeRow>, StoreError> {
+            *self.challenge_reads.borrow_mut() += 1;
             Ok(self.challenges.borrow().get(id).cloned())
         }
         async fn insert_credential(
@@ -1667,7 +2175,20 @@ mod tests {
             let expires_at = now.saturating_add(window_secs);
             let mut slots = self.rate_limit_slots.borrow_mut();
             slots.retain(|_, expires| *expires > now);
+            // O(1) fast-fail mirrors the production `SELECT count(*)` guard:
+            // an exhausted budget returns without scanning all slots, so a
+            // sustained flood costs one lookup, not `limit` upserts.
+            let active = slots
+                .iter()
+                .filter(|((scope, act, _), expires)| {
+                    scope == scope_key && act == action && **expires > now
+                })
+                .count() as u64;
+            if active >= limit {
+                return Ok(false);
+            }
             for slot in 0..limit {
+                *self.rate_limit_slot_probes.borrow_mut() += 1;
                 let slot = u32::try_from(slot).map_err(|_| StoreError)?;
                 let key = (scope_key.to_string(), action.to_string(), slot);
                 if let std::collections::hash_map::Entry::Vacant(entry) = slots.entry(key) {
@@ -1681,6 +2202,53 @@ mod tests {
             self.challenges
                 .borrow_mut()
                 .retain(|_, row| row.challenge.expires_at > now);
+            Ok(())
+        }
+        async fn reap_unverified_users(
+            &self,
+            now: u64,
+            ttl_secs: u64,
+            protected_user_id: Option<&str>,
+        ) -> Result<(), StoreError> {
+            // Mirror `reap_unverified_users_sql`: magic-only accounts (session
+            // without a passkey yet) and vault owners are never reaped.
+            let cutoff = now.saturating_sub(ttl_secs);
+            let credentialed: HashSet<String> = self
+                .credentials
+                .borrow()
+                .values()
+                .map(|cred| cred.user_id.clone())
+                .collect();
+            let active_registrations: HashSet<String> = self
+                .challenges
+                .borrow()
+                .values()
+                .filter(|row| row.purpose == PURPOSE_REGISTER && row.challenge.expires_at > now)
+                .filter_map(|row| row.user_id.clone())
+                .collect();
+            let vault_owners: HashSet<String> = self.vaults.borrow().keys().cloned().collect();
+            let session_owners: HashSet<String> = self
+                .sessions
+                .borrow()
+                .values()
+                .map(|row| row.user_id.clone())
+                .collect();
+            let magic_owners: HashSet<String> = self
+                .magic
+                .borrow()
+                .values()
+                .filter(|record| record.expires_at > now)
+                .map(|record| record.user_id.clone())
+                .collect();
+            self.users.borrow_mut().retain(|_, user| {
+                user.created_at > cutoff
+                    || credentialed.contains(&user.id)
+                    || active_registrations.contains(&user.id)
+                    || vault_owners.contains(&user.id)
+                    || session_owners.contains(&user.id)
+                    || magic_owners.contains(&user.id)
+                    || protected_user_id == Some(user.id.as_str())
+            });
             Ok(())
         }
         async fn acquire_test_connection_lease(
@@ -1908,6 +2476,32 @@ mod tests {
             self.call_full(method, path, Some(body.to_string()), None, Some(ORIGIN))
         }
 
+        fn call_with_ip(
+            &self,
+            source_ip: &str,
+            method: &str,
+            path: &str,
+            body: serde_json::Value,
+        ) -> Response {
+            let ctx = Ctx {
+                cfg: &self.config,
+                store: &self.store,
+                mailer: &self.mailer,
+                dialer: &self.dialer,
+                dns: &self.dns,
+                now: NOW,
+                source_ip: source_ip.to_string(),
+            };
+            let req = Request {
+                method: method.to_string(),
+                path: path.to_string(),
+                cookie: None,
+                origin: Some(ORIGIN.to_string()),
+                body: body.to_string().into_bytes(),
+            };
+            block_on(handle(&ctx, &req))
+        }
+
         fn call_full(
             &self,
             method: &str,
@@ -2073,6 +2667,55 @@ mod tests {
             "signed-in identity must be in the body: {}",
             resp.body
         );
+    }
+
+    #[test]
+    fn magic_finish_requires_exact_origin_and_leaves_token_unspent() {
+        // Login-CSRF session planting: an unauthenticated cross-origin POST
+        // carrying the attacker's token must not mint a cookie (response
+        // `Set-Cookie` is not stopped by `SameSite=Lax`), and the rejected
+        // attempt must not spend the token — the same-origin explicit-confirm
+        // flow still redeems afterwards.
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": "a@example.com"}),
+        );
+        assert_eq!(resp.status, 200);
+        let token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        // Cross-origin: no cookie, generic body, token survives.
+        for origin in [Some("https://evil.test"), None] {
+            let resp = h.call_full(
+                "POST",
+                "/v1/auth/magic/finish",
+                Some(serde_json::json!({"token": token}).to_string()),
+                None,
+                origin,
+            );
+            assert_eq!(resp.status, 401, "origin={origin:?}: {}", resp.body);
+            assert_eq!(resp.body, r#"{"error":"check your email and try again"}"#);
+            assert!(
+                resp.set_cookie.is_none(),
+                "no planted cookie for {origin:?}"
+            );
+        }
+        // Same-origin explicit confirm still redeems and spends the token.
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(resp.set_cookie.is_some(), "same-origin must set a cookie");
+        let replay = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(replay.status, 401);
+        assert!(replay.set_cookie.is_none());
     }
 
     #[test]
@@ -2477,7 +3120,7 @@ mod tests {
     fn fx_es256_cose(secret: u8) -> Vec<u8> {
         use p256::ecdsa::SigningKey;
         let sk = SigningKey::from_slice(&[secret; 32]).unwrap();
-        let point = sk.verifying_key().to_encoded_point(false);
+        let point = sk.verifying_key().to_sec1_point(false);
         let mut cose = Vec::new();
         fx_head(5, 5, &mut cose);
         fx_int(1, &mut cose);
@@ -2561,7 +3204,7 @@ mod tests {
 
         let h = harness();
         let sk = SigningKey::from_slice(&[11u8; 32]).unwrap();
-        let point = sk.verifying_key().to_encoded_point(false);
+        let point = sk.verifying_key().to_sec1_point(false);
         let mut cose = Vec::new();
         head(5, 5, &mut cose);
         eint(1, &mut cose);
@@ -2660,16 +3303,16 @@ mod tests {
         assert_eq!(resp.status, 401);
     }
 
-    /// The database CHECK (migration 0006) must list exactly the purposes
+    /// The database CHECK (migration 0008) must list exactly the purposes
     /// the handlers mint. Adding a purpose constant without updating the
     /// migration would make every such insert fail at runtime.
     #[test]
     fn purpose_constants_match_the_migration_check() {
-        let sql = include_str!("../../../migrations/0007_auth_challenge_purpose_guard.sql");
+        let sql = include_str!("../../../migrations/0008_auth_challenge_purpose_guard.sql");
         let expected = format!("CHECK (purpose IN ('', '{PURPOSE_REGISTER}', '{PURPOSE_LOGIN}'))");
         assert!(
             sql.contains(&expected),
-            "0006 CHECK must be exactly: {expected}"
+            "0008 CHECK must be exactly: {expected}"
         );
     }
 
@@ -3213,6 +3856,906 @@ mod tests {
     }
 
     #[test]
+    fn global_mail_budget_exhaustion_does_not_block_registration_challenge() {
+        let h = harness();
+        for _ in 0..MAIL_GLOBAL_PER_WINDOW {
+            assert!(block_on(h.store.reserve_rate_limit(
+                GLOBAL_SCOPE_KEY,
+                "auth.mail_global",
+                MAIL_GLOBAL_PER_WINDOW,
+                NOW,
+                MAIL_GLOBAL_WINDOW_SECS,
+            ))
+            .unwrap());
+        }
+
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "budget-global@example.com"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert!(body["challenge"].is_string());
+        assert_eq!(h.store.challenges.borrow().len(), 1);
+        assert!(h.mailer.sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn register_start_distinct_email_loop_bounded_by_ip_budget() {
+        // Distinct-email loop from one IP: per-account caps never bind on
+        // fresh addresses, so the shared per-IP budget must cut the loop
+        // off with a fixed email-independent 429 (never an email-derived
+        // stand-in, which would be an oracle across the denial boundary)
+        // and no further user rows or mail.
+        let h = harness();
+        let total = AUTH_STARTS_PER_IP_PER_HOUR + 10;
+        for i in 0..total {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/passkey/register/start",
+                serde_json::json!({"email": format!("victim{i}@example.com")}),
+            );
+            if i < AUTH_STARTS_PER_IP_PER_HOUR {
+                assert_eq!(resp.status, 200, "iteration {i}: {}", resp.body);
+                let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+                assert!(
+                    body["challenge"].is_string(),
+                    "iteration {i}: {}",
+                    resp.body
+                );
+                assert!(body["user_id"].is_string(), "iteration {i}: {}", resp.body);
+            } else {
+                assert_eq!(resp.status, 429, "iteration {i}: {}", resp.body);
+                assert_eq!(resp.body, r#"{"error":"rate_limited"}"#, "iteration {i}");
+            }
+        }
+        assert_eq!(
+            h.store.users.borrow().len(),
+            AUTH_STARTS_PER_IP_PER_HOUR as usize,
+            "no user row past the per-IP budget"
+        );
+        assert_eq!(
+            h.mailer.sent.borrow().len(),
+            AUTH_STARTS_PER_IP_PER_HOUR as usize,
+            "no mail queued past the per-IP budget"
+        );
+        assert_eq!(
+            h.store.challenges.borrow().len(),
+            AUTH_STARTS_PER_IP_PER_HOUR as usize,
+            "no challenge stored past the per-IP budget"
+        );
+    }
+
+    #[test]
+    fn register_start_ip_throttle_is_email_independent() {
+        // Account-existence oracle pin: while admitted, a taken email returns
+        // the stable stand-in and a fresh email returns a fresh random id;
+        // once the per-IP budget is exhausted every email must get the same
+        // fixed 429, so pre/post comparison cannot distinguish taken/fresh.
+        let h = harness();
+        seed_user(&h, "u-taken", "taken@example.com");
+        block_on(h.store.insert_credential(&PasskeyCredential {
+            cred_id_b64url: b64url_encode(b"taken-cred-oracle"),
+            user_id: "u-taken".to_string(),
+            public_key: fx_es256_cose(61),
+            sign_count: 0,
+            registered_at: NOW,
+        }))
+        .unwrap();
+        let taken_admitted = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "taken@example.com"}),
+        );
+        assert_eq!(taken_admitted.status, 200, "{}", taken_admitted.body);
+        let fresh_admitted = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "fresh-oracle@example.com"}),
+        );
+        assert_eq!(fresh_admitted.status, 200, "{}", fresh_admitted.body);
+        for i in 0..(AUTH_STARTS_PER_IP_PER_HOUR - 2) {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/passkey/register/start",
+                serde_json::json!({"email": format!("filler{i}@example.com")}),
+            );
+            assert_eq!(resp.status, 200, "filler {i}: {}", resp.body);
+        }
+        let taken_denied = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "taken@example.com"}),
+        );
+        let fresh_denied = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "fresh-oracle@example.com"}),
+        );
+        assert_eq!(taken_denied.status, 429, "{}", taken_denied.body);
+        assert_eq!(fresh_denied.status, 429, "{}", fresh_denied.body);
+        assert_eq!(
+            taken_denied.body, fresh_denied.body,
+            "throttled bodies must be identical across emails"
+        );
+        assert_eq!(taken_denied.body, r#"{"error":"rate_limited"}"#);
+    }
+
+    #[test]
+    fn rate_limit_exhausted_path_skips_slot_scan() {
+        // DoS-amplification pin: an exhausted 100-slot finish-lookup budget
+        // must fast-fail without scanning every slot (production runs one
+        // `RATE_LIMIT_EXHAUSTED_SQL` count then returns; the fake mirrors it
+        // and counts slot probes). Removing the guard drives 100 probes here.
+        let store = FakeStore::default();
+        for _ in 0..FINISH_LOOKUP_ATTEMPTS_PER_IP {
+            assert!(block_on(store.reserve_rate_limit(
+                "ip",
+                "auth.register_finish_ip",
+                FINISH_LOOKUP_ATTEMPTS_PER_IP,
+                NOW,
+                300
+            ))
+            .unwrap());
+        }
+        *store.rate_limit_slot_probes.borrow_mut() = 0;
+        assert!(!block_on(store.reserve_rate_limit(
+            "ip",
+            "auth.register_finish_ip",
+            FINISH_LOOKUP_ATTEMPTS_PER_IP,
+            NOW,
+            300
+        ))
+        .unwrap());
+        assert_eq!(
+            *store.rate_limit_slot_probes.borrow(),
+            0,
+            "exhausted budget must fast-fail without scanning slots"
+        );
+    }
+
+    #[test]
+    fn rate_limit_exhausted_sql_pins_production_fast_fail() {
+        // Pin the production `PgStore::reserve_rate_limit` fast-fail itself:
+        // the guard must stay a single `SELECT COUNT(*)` over the live
+        // window (`worker_entry` executes this shared constant). Deleting or
+        // retargeting the Pg guard leaves the fake-mirror probe test green,
+        // so this shape test observes the production path directly.
+        let sql = RATE_LIMIT_EXHAUSTED_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            sql.starts_with("SELECT COUNT(*) FROM auth_rate_limit_slots"),
+            "fast-fail must count live slots in one statement, got: {sql}"
+        );
+        for predicate in ["scope_key = $1", "action = $2", "expires_at > $3"] {
+            assert!(
+                sql.contains(predicate),
+                "fast-fail must include `{predicate}`"
+            );
+        }
+        assert!(
+            !sql.contains("expires_at <= $3"),
+            "fast-fail must count live slots, never expired ones"
+        );
+        // Wiring pin: production must execute this shared constant via
+        // `query_one`, not a divergent literal or no guard at all. Deleting
+        // the Pg fast-fail block (or inlining a hand-written literal) leaves
+        // the FakeStore probe test green, so this assertion observes the
+        // production path directly at compile time. Comments are stripped
+        // first: the explanatory comment naming the constant must not
+        // satisfy the pin on its own.
+        let entry = include_str!("worker_entry.rs");
+        let code = strip_line_comments(entry);
+        assert!(
+            code.contains("RATE_LIMIT_EXHAUSTED_SQL"),
+            "Pg reserve_rate_limit must execute the shared exhausted SQL"
+        );
+        assert!(
+            code.contains("query_one("),
+            "Pg fast-fail must run the shared SQL via query_one"
+        );
+        let query_pos = code.find("query_one(").expect("query_one call");
+        assert!(
+            code[query_pos..]
+                .chars()
+                .take(300)
+                .collect::<String>()
+                .contains("RATE_LIMIT_EXHAUSTED_SQL"),
+            "Pg query_one call must pass the shared exhausted SQL"
+        );
+        assert!(
+            !code.contains("SELECT COUNT(*) FROM auth_rate_limit_slots"),
+            "Pg must not carry a divergent fast-fail literal"
+        );
+    }
+
+    #[test]
+    fn rate_limit_ip_key_groups_ipv6_slash64() {
+        // IPv6 rotation pin: two addresses in one /64 share one budget key,
+        // different /64s do not; IPv4 keeps the full address and unparsable
+        // values pass through (e.g. the "unknown" fallback).
+        assert_eq!(
+            rate_limit_ip_key("2001:db8:abcd:12::1"),
+            rate_limit_ip_key("2001:db8:abcd:12::2")
+        );
+        assert_ne!(
+            rate_limit_ip_key("2001:db8:abcd:12::1"),
+            rate_limit_ip_key("2001:db8:abcd:13::1")
+        );
+        assert_eq!(rate_limit_ip_key("198.51.100.9"), "198.51.100.9");
+        assert_eq!(rate_limit_ip_key("unknown"), "unknown");
+        let store = FakeStore::default();
+        let k1 = rate_limit_ip_key("2001:db8:abcd:12::1");
+        let k2 = rate_limit_ip_key("2001:db8:abcd:12::9");
+        for _ in 0..AUTH_STARTS_PER_IP_PER_HOUR {
+            assert!(block_on(store.reserve_rate_limit(
+                &k1,
+                "auth.start_ip",
+                AUTH_STARTS_PER_IP_PER_HOUR,
+                NOW,
+                3600
+            ))
+            .unwrap());
+        }
+        assert!(
+            !block_on(store.reserve_rate_limit(
+                &k2,
+                "auth.start_ip",
+                AUTH_STARTS_PER_IP_PER_HOUR,
+                NOW,
+                3600
+            ))
+            .unwrap(),
+            "same /64 must share one budget"
+        );
+    }
+
+    #[test]
+    fn register_start_ipv6_slash64_shares_handler_budget() {
+        // Handler wiring pin: two IPv6 addresses in one /64 share one
+        // `admit_auth_start` budget through the real `register_start`
+        // handler — not just the `rate_limit_ip_key` unit above (which
+        // pre-keys via the function itself) and not the IPv4-only harness
+        // default. Reverting `admit_auth_start` to the raw `source_ip`
+        // leaves every other test green but fails here: the second address
+        // would get a fresh budget instead of the shared refusal.
+        let h = harness();
+        let ip_a = "2001:db8:abcd:12::1";
+        let ip_b = "2001:db8:abcd:12::9";
+        let ip_other = "2001:db8:abcd:13::1";
+        let from_a = AUTH_STARTS_PER_IP_PER_HOUR - 10;
+        for i in 0..from_a {
+            let resp = h.call_with_ip(
+                ip_a,
+                "POST",
+                "/v1/auth/passkey/register/start",
+                serde_json::json!({"email": format!("v6a{i}@example.com")}),
+            );
+            assert_eq!(resp.status, 200, "ip_a iteration {i}: {}", resp.body);
+        }
+        for i in 0..10 {
+            let resp = h.call_with_ip(
+                ip_b,
+                "POST",
+                "/v1/auth/passkey/register/start",
+                serde_json::json!({"email": format!("v6b{i}@example.com")}),
+            );
+            assert_eq!(
+                resp.status, 200,
+                "ip_b iteration {i} must share the remaining /64 budget: {}",
+                resp.body
+            );
+        }
+        let denied = h.call_with_ip(
+            ip_b,
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "v6b-final@example.com"}),
+        );
+        assert_eq!(
+            denied.status, 429,
+            "second address in the same /64 must hit the shared budget: {}",
+            denied.body
+        );
+        assert_eq!(denied.body, r#"{"error":"rate_limited"}"#);
+        let other = h.call_with_ip(
+            ip_other,
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "v6other@example.com"}),
+        );
+        assert_eq!(
+            other.status, 200,
+            "a different /64 must keep its own budget: {}",
+            other.body
+        );
+    }
+
+    #[test]
+    fn ipv6_slash64_wiring_pins_all_rate_limit_scopes() {
+        // All-sites wiring pin: every per-IP scope must key on
+        // `rate_limit_ip_key`, not the raw `source_ip`. The behavioral test
+        // above covers `auth.start_ip` only; the other five scopes revert to
+        // raw IP with all handler tests green (the harness default
+        // `198.51.100.9` makes key == raw), so this shape test observes all
+        // six call sites directly at compile time. Comments are stripped
+        // first so prose mentioning a scope cannot satisfy its pin.
+        let code = strip_line_comments(include_str!("handlers.rs"));
+        let norm = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (scope, keyed) in [
+            (
+                "auth.start_ip",
+                "&rate_limit_ip_key(&self.source_ip), \"auth.start_ip\",",
+            ),
+            (
+                "auth.mail_ip",
+                "&rate_limit_ip_key(&self.source_ip), \"auth.mail_ip\",",
+            ),
+            (
+                "auth.register_finish_ip",
+                "&rate_limit_ip_key(&ctx.source_ip), \"auth.register_finish_ip\",",
+            ),
+            (
+                "auth.login_finish_ip",
+                "&rate_limit_ip_key(&ctx.source_ip), \"auth.login_finish_ip\",",
+            ),
+            (
+                "auth.magic_finish",
+                "&rate_limit_ip_key(&ctx.source_ip), \"auth.magic_finish\",",
+            ),
+        ] {
+            assert!(
+                norm.contains(keyed),
+                "scope {scope} must key on rate_limit_ip_key, not raw source_ip"
+            );
+        }
+        assert!(
+            norm.contains("format!(\"invite:{}:{}\", rate_limit_ip_key(&ctx.source_ip), user_id)"),
+            "scope auth.invite_redeem must key on rate_limit_ip_key, not raw source_ip",
+        );
+    }
+
+    #[test]
+    fn login_start_distinct_email_loop_bounded_by_ip_budget() {
+        // Unknown-email login starts mint unbound challenge rows per fresh
+        // address; the per-IP budget must cap them with the same 200 shape.
+        let h = harness();
+        let total = AUTH_STARTS_PER_IP_PER_HOUR + 10;
+        for i in 0..total {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/passkey/login/start",
+                serde_json::json!({"email": format!("ghost{i}@example.com")}),
+            );
+            assert_eq!(resp.status, 200, "iteration {i}: {}", resp.body);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(body["allow_credentials"], serde_json::json!([]));
+        }
+        assert_eq!(
+            h.store.challenges.borrow().len(),
+            AUTH_STARTS_PER_IP_PER_HOUR as usize,
+            "no challenge row past the per-IP budget"
+        );
+    }
+
+    #[test]
+    fn magic_start_mail_capped_per_ip_across_victims() {
+        // Third-party email-bombing shape: one IP working down a victim
+        // list (3 mails/15 min per victim, unlimited victims) must hit the
+        // shared per-IP mail cap with the identical {"ok":true} response.
+        let h = harness();
+        let victims = MAIL_PER_IP_PER_HOUR + 10;
+        for i in 0..victims {
+            seed_user(&h, &format!("u{i}"), &format!("victim{i}@example.com"));
+        }
+        for i in 0..victims {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/magic/start",
+                serde_json::json!({"email": format!("victim{i}@example.com")}),
+            );
+            assert_eq!(resp.status, 200, "iteration {i}: {}", resp.body);
+            assert_eq!(resp.body, r#"{"ok":true}"#);
+        }
+        assert_eq!(
+            h.mailer.sent.borrow().len(),
+            MAIL_PER_IP_PER_HOUR as usize,
+            "no mail queued past the per-IP mail cap"
+        );
+        assert_eq!(
+            h.store.magic.borrow().len(),
+            MAIL_PER_IP_PER_HOUR as usize,
+            "no magic row stored past the per-IP mail cap"
+        );
+    }
+
+    #[test]
+    fn magic_start_mail_cap_binds_independently_of_start_budget() {
+        // Pins the per-IP mail cap itself: `admit_auth_start` (`auth.start_ip`)
+        // and the mail cap (`auth.mail_ip`) share the same 30/hour shape, so
+        // the victim-loop test above stays green even with the `!mail_ip_ok`
+        // check removed (the start budget cuts the loop first). Pre-seed only
+        // the mail slots, leaving the start budget fresh: the next start must
+        // admit but send/store nothing. Removing the mail check sends one mail
+        // and fails this test.
+        let h = harness();
+        seed_user(&h, "u1", "pinned@example.com");
+        for _ in 0..MAIL_PER_IP_PER_HOUR {
+            assert!(block_on(h.store.reserve_rate_limit(
+                "198.51.100.9",
+                "auth.mail_ip",
+                MAIL_PER_IP_PER_HOUR,
+                NOW,
+                3600,
+            ))
+            .unwrap());
+        }
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": "pinned@example.com"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(resp.body, r#"{"ok":true}"#);
+        assert!(
+            h.mailer.sent.borrow().is_empty(),
+            "exhausted mail_ip budget must send nothing"
+        );
+        assert!(
+            h.store.magic.borrow().is_empty(),
+            "exhausted mail_ip budget must store no magic row"
+        );
+    }
+
+    #[test]
+    fn register_start_reaps_expired_unverified_users_and_prunes_challenges() {
+        // Register-only traffic must not grow tables monotonically: a
+        // never-completed signup past the TTL is reaped (credentialed
+        // accounts survive), and expired challenges are pruned here too.
+        let h = harness();
+        let stale_at = NOW.saturating_sub(UNVERIFIED_USER_TTL_SECS + 1);
+        block_on(h.store.insert_user(&UserRecord {
+            id: "stale-unverified".to_string(),
+            email: "stale@example.com".to_string(),
+            created_at: stale_at,
+        }))
+        .unwrap();
+        block_on(h.store.insert_user(&UserRecord {
+            id: "old-verified".to_string(),
+            email: "old@example.com".to_string(),
+            created_at: stale_at,
+        }))
+        .unwrap();
+        block_on(h.store.insert_credential(&PasskeyCredential {
+            cred_id_b64url: b64url_encode(&[0x7e; 32]),
+            user_id: "old-verified".to_string(),
+            public_key: fx_es256_cose(77),
+            sign_count: 1,
+            registered_at: stale_at,
+        }))
+        .unwrap();
+        let expired = PasskeyChallenge {
+            id: "expired-challenge".to_string(),
+            rp_id: "example.com".to_string(),
+            origin: ORIGIN.to_string(),
+            issued_at: NOW.saturating_sub(auth::CHALLENGE_TTL_SECS + 1),
+            expires_at: NOW.saturating_sub(1),
+            consumed: false,
+        };
+        block_on(h.store.insert_challenge(&expired, None, PURPOSE_LOGIN)).unwrap();
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "fresh@example.com"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(
+            block_on(h.store.user_by_email("stale@example.com"))
+                .unwrap()
+                .is_none(),
+            "expired unverified signup must be reaped"
+        );
+        assert!(
+            block_on(h.store.user_by_email("old@example.com"))
+                .unwrap()
+                .is_some(),
+            "credentialed account must survive reaping"
+        );
+        assert!(
+            block_on(h.store.user_by_email("fresh@example.com"))
+                .unwrap()
+                .is_some(),
+            "the current signup still proceeds"
+        );
+        assert!(block_on(h.store.challenge_by_id("expired-challenge"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn register_start_reaper_preserves_resumed_and_active_signups() {
+        let h = harness();
+        let stale_at = NOW.saturating_sub(UNVERIFIED_USER_TTL_SECS + 1);
+        for (id, email) in [
+            ("resumed", "resume@example.com"),
+            ("active", "active@example.com"),
+            ("abandoned", "abandoned@example.com"),
+        ] {
+            block_on(h.store.insert_user(&UserRecord {
+                id: id.to_string(),
+                email: email.to_string(),
+                created_at: stale_at,
+            }))
+            .unwrap();
+        }
+        let mut finishing_challenge =
+            auth::new_registration_challenge("example.com", ORIGIN, NOW).unwrap();
+        // Finish consumes the challenge before credential insertion; cleanup
+        // must still protect the user during that in-flight interval.
+        finishing_challenge.consumed = true;
+        block_on(
+            h.store
+                .insert_challenge(&finishing_challenge, Some("active"), PURPOSE_REGISTER),
+        )
+        .unwrap();
+
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "resume@example.com"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(block_on(h.store.user_by_email("resume@example.com"))
+            .unwrap()
+            .is_some());
+        assert!(block_on(h.store.user_by_email("active@example.com"))
+            .unwrap()
+            .is_some());
+        assert!(block_on(h.store.user_by_email("abandoned@example.com"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn reap_sql_pins_register_purpose_and_activity_exemptions() {
+        // Pin the destructive SQL predicates themselves: the FakeStore
+        // exercises an independent mirror and cannot establish Pg semantics.
+        let sql = reap_unverified_users_sql();
+        let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            sql.contains("created_at <= $1"),
+            "reap must enforce the TTL"
+        );
+        assert!(
+            sql.contains("users.id <> $2"),
+            "reap must preserve the current user"
+        );
+        assert!(sql.contains("auth_challenges.purpose = 'register'"));
+        assert!(sql.contains("auth_challenges.expires_at > $3"));
+        assert!(sql.contains("magic_link_tokens.expires_at > $3"));
+        for predicate in [
+            "NOT EXISTS (SELECT 1 FROM webauthn_credentials",
+            "NOT EXISTS (SELECT 1 FROM auth_challenges",
+            "NOT EXISTS (SELECT 1 FROM provider_vaults",
+            "NOT EXISTS (SELECT 1 FROM sessions",
+            "NOT EXISTS (SELECT 1 FROM magic_link_tokens",
+        ] {
+            assert!(sql.contains(predicate), "reap must include `{predicate}`");
+        }
+        assert!(!sql.contains("auth_challenges.expires_at <= $3"));
+        assert!(!sql.contains("magic_link_tokens.expires_at <= $3"));
+    }
+
+    #[test]
+    fn insert_challenge_enforces_user_fk_like_migration_0006() {
+        // Mirrors `migrations/0006_auth_challenge_user_fk.sql`: a bound
+        // challenge for a missing user fails instead of orphaning the row,
+        // so a concurrent reap surfaces at insert (healed by retry).
+        let h = harness();
+        let challenge = auth::new_registration_challenge("example.com", ORIGIN, NOW).unwrap();
+        assert!(
+            block_on(
+                h.store
+                    .insert_challenge(&challenge, Some("ghost"), PURPOSE_REGISTER)
+            )
+            .is_err(),
+            "bound challenge for a missing user must fail"
+        );
+        assert!(
+            block_on(h.store.insert_challenge(&challenge, None, PURPOSE_LOGIN)).is_ok(),
+            "unbound login challenges stay allowed"
+        );
+    }
+
+    #[test]
+    fn register_start_reaper_preserves_magic_only_vault_and_inbox() {
+        // CRITICAL pin: `magic_finish` issues a session with no credential
+        // check and the register inbox email carries a redeemable magic link,
+        // while `provider_vaults.user_id ... ON DELETE CASCADE` destroys a
+        // vault saved under that session. A stale magic-only account (session
+        // + vault, no passkey) and a stale inbox-only account (unexpired
+        // magic, no session yet) must both survive a later `register_start`
+        // for another email; a truly abandoned signup must still be reaped.
+        let h = harness();
+        let stale_at = NOW.saturating_sub(UNVERIFIED_USER_TTL_SECS + 1);
+        for (id, email) in [
+            ("magic-only", "magic-only@example.com"),
+            ("inbox-only", "inbox-only@example.com"),
+            ("abandoned", "abandoned2@example.com"),
+        ] {
+            block_on(h.store.insert_user(&UserRecord {
+                id: id.to_string(),
+                email: email.to_string(),
+                created_at: stale_at,
+            }))
+            .unwrap();
+        }
+        let (_, magic_only_record) =
+            auth::issue_magic_link("magic-only", "magic-only@example.com", NOW);
+        block_on(h.store.insert_magic(&magic_only_record)).unwrap();
+        block_on(h.store.insert_session(&SessionRecord {
+            id: "sess-magic-only".to_string(),
+            user_id: "magic-only".to_string(),
+            created_at: NOW,
+            expires_at: NOW + 3600,
+            rotation_counter: 0,
+            revoked: false,
+        }))
+        .unwrap();
+        h.store.vaults.borrow_mut().insert(
+            "magic-only".to_string(),
+            VaultRow {
+                blob: crate::vault::VaultBlob {
+                    kek_version: 1,
+                    dek_wrapped_nonce_b64url: "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                    dek_wrapped_b64url: "AA".to_string(),
+                    payload_nonce_b64url: "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                    payload_b64url: "AA".to_string(),
+                },
+                indexer_configured: false,
+                updated_at: NOW,
+            },
+        );
+        let (_, inbox_record) = auth::issue_magic_link("inbox-only", "inbox-only@example.com", NOW);
+        block_on(h.store.insert_magic(&inbox_record)).unwrap();
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "fresh2@example.com"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(
+            block_on(h.store.user_by_email("magic-only@example.com"))
+                .unwrap()
+                .is_some(),
+            "magic-only account with session/vault must survive reaping"
+        );
+        assert!(
+            block_on(h.store.user_by_email("inbox-only@example.com"))
+                .unwrap()
+                .is_some(),
+            "inbox-only account with redeemable magic must survive reaping"
+        );
+        assert!(
+            block_on(h.store.user_by_email("abandoned2@example.com"))
+                .unwrap()
+                .is_none(),
+            "truly abandoned signup must still be reaped"
+        );
+        assert!(
+            h.store.vaults.borrow().contains_key("magic-only"),
+            "surviving vault must not cascade-delete"
+        );
+    }
+
+    #[test]
+    fn register_start_heals_concurrently_reaped_resumed_signup() {
+        // Delete the resumed user at the handler's challenge insert to model
+        // another register_start reaping it after lookup; the handler must
+        // recreate the row and retry the challenge insert.
+        let h = harness();
+        let stale_at = NOW.saturating_sub(UNVERIFIED_USER_TTL_SECS + 1);
+        block_on(h.store.insert_user(&UserRecord {
+            id: "resumed-race".to_string(),
+            email: "race@example.com".to_string(),
+            created_at: stale_at,
+        }))
+        .unwrap();
+        *h.store.delete_user_before_next_challenge.borrow_mut() = Some("resumed-race".to_string());
+
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "race@example.com"}),
+        );
+
+        assert!(
+            h.store.delete_user_before_next_challenge.borrow().is_none(),
+            "race hook must fire during register_start"
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let user = block_on(h.store.user_by_email("race@example.com"))
+            .unwrap()
+            .expect("handler heals the user deleted during challenge insert");
+        assert_eq!(
+            user.id, "resumed-race",
+            "healing retains the original user id"
+        );
+        assert!(
+            h.store.challenges.borrow().values().any(|row| {
+                row.user_id.as_deref() == Some("resumed-race") && row.purpose == PURPOSE_REGISTER
+            }),
+            "handler retries and stores the registration challenge"
+        );
+    }
+
+    #[test]
+    fn register_start_reinserts_challenge_deleted_by_concurrent_reap() {
+        // Model a reaper deleting the user after the registration challenge
+        // insert; ON DELETE CASCADE removes that challenge before revalidation.
+        let h = harness();
+        let stale_at = NOW.saturating_sub(UNVERIFIED_USER_TTL_SECS + 1);
+        block_on(h.store.insert_user(&UserRecord {
+            id: "cascade-race".to_string(),
+            email: "cascade@example.com".to_string(),
+            created_at: stale_at,
+        }))
+        .unwrap();
+        *h.store.delete_user_after_next_challenge.borrow_mut() = Some("cascade-race".to_string());
+
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "cascade@example.com"}),
+        );
+
+        assert!(h.store.delete_user_after_next_challenge.borrow().is_none());
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let user = block_on(h.store.user_by_email("cascade@example.com"))
+            .unwrap()
+            .expect("handler recreates the concurrently reaped user");
+        assert_eq!(user.id, "cascade-race");
+        assert!(
+            h.store.challenges.borrow().values().any(|row| {
+                row.user_id.as_deref() == Some("cascade-race") && row.purpose == PURPOSE_REGISTER
+            }),
+            "handler must recreate the challenge removed by the user cascade"
+        );
+    }
+
+    #[test]
+    fn register_start_preserves_orphaned_challenge_without_user_fk() {
+        // Older schemas without the user FK can leave the successful insert
+        // behind when a concurrent reap deletes only the user row.
+        let h = harness();
+        let stale_at = NOW.saturating_sub(UNVERIFIED_USER_TTL_SECS + 1);
+        block_on(h.store.insert_user(&UserRecord {
+            id: "orphan-race".to_string(),
+            email: "orphan@example.com".to_string(),
+            created_at: stale_at,
+        }))
+        .unwrap();
+        *h.store.orphan_user_after_next_challenge.borrow_mut() = Some("orphan-race".to_string());
+
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "orphan@example.com"}),
+        );
+
+        assert!(h.store.orphan_user_after_next_challenge.borrow().is_none());
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let user = block_on(h.store.user_by_email("orphan@example.com"))
+            .unwrap()
+            .expect("handler recreates the concurrently reaped user");
+        assert_eq!(user.id, "orphan-race");
+        assert!(
+            h.store.challenges.borrow().values().any(|row| {
+                row.user_id.as_deref() == Some("orphan-race") && row.purpose == PURPOSE_REGISTER
+            }),
+            "handler must preserve the challenge inserted before the user was reaped"
+        );
+    }
+
+    #[test]
+    fn register_finish_lookup_budget_bounds_rotating_ids_before_db() {
+        // Pins the per-IP lookup budget BEFORE any DB read: pre-seed the
+        // `auth.register_finish_ip` pool, then a VALID finish (built via
+        // register/start) must fail generically without enrolling.
+        // Removing the pre-lookup reservation would let it succeed (200).
+        let h = harness();
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "lookup@example.com"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let start: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let challenge = start["challenge"].as_str().unwrap().to_string();
+        let cred_id = b"lookup-cred";
+        let att = fx_none_attestation(cred_id, &fx_es256_cose(48));
+        let emailed = h.mailer.sent.borrow().last().unwrap().1.clone();
+        for _ in 0..FINISH_LOOKUP_ATTEMPTS_PER_IP {
+            assert!(block_on(h.store.reserve_rate_limit(
+                "198.51.100.9",
+                "auth.register_finish_ip",
+                FINISH_LOOKUP_ATTEMPTS_PER_IP,
+                NOW,
+                FINISH_ATTEMPT_WINDOW_SECS,
+            ))
+            .unwrap());
+        }
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/finish",
+            serde_json::json!({
+                "challenge": challenge.clone(),
+                "credential_id": b64url_encode(cred_id),
+                "attestation_object": b64url_encode(&att),
+                "client_data_json": b64url_encode(
+                    fx_client_json("webauthn.create", &challenge).as_bytes()
+                ),
+                "magic_token": emailed,
+                "invite_code": null,
+            }),
+        );
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        assert!(resp.set_cookie.is_none());
+        let user = block_on(h.store.user_by_email("lookup@example.com"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            block_on(h.store.credentials_for_user(&user.id))
+                .unwrap()
+                .is_empty(),
+            "lookup-blocked finish must enroll nothing"
+        );
+    }
+
+    #[test]
+    fn login_finish_lookup_budget_bounds_rotating_ids_before_db() {
+        // Exhaust the per-IP lookup budget while providing a real stored
+        // challenge. Rejection must happen before challenge_by_id, rather
+        // than passing vacuously because a bogus challenge misses lookup.
+        let h = harness();
+        let challenge = auth::new_registration_challenge("example.com", ORIGIN, NOW).unwrap();
+        let challenge_id = challenge.id.clone();
+        block_on(h.store.insert_challenge(&challenge, None, PURPOSE_LOGIN)).unwrap();
+        for _ in 0..FINISH_LOOKUP_ATTEMPTS_PER_IP {
+            assert!(block_on(h.store.reserve_rate_limit(
+                "198.51.100.9",
+                "auth.login_finish_ip",
+                FINISH_LOOKUP_ATTEMPTS_PER_IP,
+                NOW,
+                FINISH_ATTEMPT_WINDOW_SECS,
+            ))
+            .unwrap());
+        }
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/login/finish",
+            serde_json::json!({
+                "challenge": challenge_id.clone(),
+                "credential_id": b64url_encode(b"nope"),
+                "authenticator_data": b64url_encode(b"nope"),
+                "client_data_json": b64url_encode(b"nope"),
+                "signature": b64url_encode(b"nope"),
+            }),
+        );
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        assert!(resp.set_cookie.is_none());
+        assert_eq!(
+            *h.store.challenge_reads.borrow(),
+            0,
+            "budget denial must precede challenge lookup"
+        );
+        assert!(h.store.challenges.borrow().contains_key(&challenge_id));
+    }
+
+    #[test]
     fn vault_test_connection_window_reopens_after_60s_at_handler() {
         let h = harness();
         seed_user(&h, "u1", "a@example.com");
@@ -3504,6 +5047,187 @@ mod tests {
         let resp = finish_with_code("u2", "b@example.com", b"throttle-cred-2", "correct-code-2");
         assert_eq!(resp.status, 200, "{}", resp.body);
         assert!(resp.set_cookie.is_some());
+    }
+
+    #[test]
+    fn register_finish_attempt_budget_cuts_off_forged_attestations() {
+        // One challenge id funds at most 10 finish attempts: 10 forged
+        // attestations exhaust it, and the 11th attempt with a VALID
+        // attestation + inbox proof still fails generically without
+        // enrolling. A fresh challenge is unaffected (proves the budget is
+        // per-challenge, and legitimate single attempts still pass).
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let challenge = auth::new_registration_challenge("example.com", ORIGIN, NOW).unwrap();
+        let challenge_id = challenge.id.clone();
+        block_on(
+            h.store
+                .insert_challenge(&challenge, Some("u1"), PURPOSE_REGISTER),
+        )
+        .unwrap();
+        let (token, record) = auth::issue_magic_link("u1", "a@example.com", NOW);
+        block_on(h.store.insert_magic(&record)).unwrap();
+        let cred_id = b"budget-cred";
+        let att = fx_none_attestation(cred_id, &fx_es256_cose(61));
+        let client_json = fx_client_json("webauthn.create", &challenge_id);
+        let forged = serde_json::json!({
+            "challenge": challenge_id.clone(),
+            "credential_id": b64url_encode(cred_id),
+            "attestation_object": b64url_encode(b"forged-attestation"),
+            "client_data_json": b64url_encode(client_json.as_bytes()),
+            "magic_token": token.clone(),
+            "invite_code": null,
+        });
+        for _ in 0..REGISTER_FINISH_ATTEMPTS_PER_CHALLENGE {
+            let resp = h.call("POST", "/v1/auth/passkey/register/finish", forged.clone());
+            assert_eq!(resp.status, 401);
+            assert!(resp.set_cookie.is_none());
+        }
+        // Valid assertion on the spent challenge is now cut off by budget.
+        let valid = serde_json::json!({
+            "challenge": challenge_id.clone(),
+            "credential_id": b64url_encode(cred_id),
+            "attestation_object": b64url_encode(&att),
+            "client_data_json": b64url_encode(client_json.as_bytes()),
+            "magic_token": token.clone(),
+            "invite_code": null,
+        });
+        let resp = h.call("POST", "/v1/auth/passkey/register/finish", valid);
+        assert_eq!(resp.status, 401);
+        assert!(resp.set_cookie.is_none());
+        assert!(
+            block_on(h.store.credentials_for_user("u1"))
+                .unwrap()
+                .is_empty(),
+            "budget-cutoff attempt must not enroll"
+        );
+        // A fresh challenge for the same account still admits one attempt
+        // shape (fails only on the forged bytes, not the budget).
+        let challenge2 = auth::new_registration_challenge("example.com", ORIGIN, NOW).unwrap();
+        let challenge_id2 = challenge2.id.clone();
+        block_on(
+            h.store
+                .insert_challenge(&challenge2, Some("u1"), PURPOSE_REGISTER),
+        )
+        .unwrap();
+        let (token2, record2) = auth::issue_magic_link("u1", "a@example.com", NOW);
+        block_on(h.store.insert_magic(&record2)).unwrap();
+        let client_json2 = fx_client_json("webauthn.create", &challenge_id2);
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/finish",
+            serde_json::json!({
+                "challenge": challenge_id2,
+                "credential_id": b64url_encode(cred_id),
+                "attestation_object": b64url_encode(b"forged-attestation"),
+                "client_data_json": b64url_encode(client_json2.as_bytes()),
+                "magic_token": token2,
+                "invite_code": null,
+            }),
+        );
+        assert_eq!(resp.status, 401);
+    }
+
+    #[test]
+    fn login_finish_attempt_budget_cuts_off_forged_assertions() {
+        // Same per-challenge budget on the login finish: 10 forged
+        // assertions exhaust the challenge, and the 11th valid assertion
+        // still fails without a session.
+        use p256::ecdsa::{signature::Signer, Signature as EsSignature, SigningKey};
+        use sha2::Digest;
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let sk = SigningKey::from_slice(&[62u8; 32]).unwrap();
+        let point = sk.verifying_key().to_sec1_point(false);
+        let mut cose = Vec::new();
+        fx_head(5, 5, &mut cose);
+        fx_int(1, &mut cose);
+        fx_int(2, &mut cose);
+        fx_int(3, &mut cose);
+        fx_int(-7, &mut cose);
+        fx_int(-1, &mut cose);
+        fx_int(1, &mut cose);
+        fx_int(-2, &mut cose);
+        fx_bytes(point.x().unwrap(), &mut cose);
+        fx_int(-3, &mut cose);
+        fx_bytes(point.y().unwrap(), &mut cose);
+        let cred_id = b"budget-login-cred";
+        block_on(h.store.insert_credential(&PasskeyCredential {
+            cred_id_b64url: b64url_encode(cred_id),
+            user_id: "u1".to_string(),
+            public_key: cose,
+            sign_count: 1,
+            registered_at: NOW,
+        }))
+        .unwrap();
+        let challenge = auth::new_registration_challenge("example.com", ORIGIN, NOW).unwrap();
+        let challenge_id = challenge.id.clone();
+        block_on(
+            h.store
+                .insert_challenge(&challenge, Some("u1"), PURPOSE_LOGIN),
+        )
+        .unwrap();
+        let forged = serde_json::json!({
+            "challenge": challenge_id.clone(),
+            "credential_id": b64url_encode(cred_id),
+            "authenticator_data": b64url_encode(b"forged-auth"),
+            "client_data_json": b64url_encode(b"forged-client"),
+            "signature": b64url_encode(b"forged-sig"),
+        });
+        for _ in 0..LOGIN_FINISH_ATTEMPTS_PER_CHALLENGE {
+            let resp = h.call("POST", "/v1/auth/passkey/login/finish", forged.clone());
+            assert_eq!(resp.status, 401);
+            assert!(resp.set_cookie.is_none());
+        }
+        // Build the valid assertion (sign_count 2 > stored 1) — still cut off.
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
+        auth_data.push(0x01);
+        auth_data.extend_from_slice(&2u32.to_be_bytes());
+        let cd_get = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"{}","crossOrigin":false}}"#,
+            challenge_id, ORIGIN
+        );
+        let mut msg = auth_data.clone();
+        msg.extend_from_slice(&sha2::Sha256::digest(cd_get.as_bytes()));
+        let sig: EsSignature = sk.sign(&msg);
+        let valid = serde_json::json!({
+            "challenge": challenge_id,
+            "credential_id": b64url_encode(cred_id),
+            "authenticator_data": b64url_encode(&auth_data),
+            "client_data_json": b64url_encode(cd_get.as_bytes()),
+            "signature": b64url_encode(sig.to_der().as_bytes()),
+        });
+        let resp = h.call("POST", "/v1/auth/passkey/login/finish", valid);
+        assert_eq!(resp.status, 401);
+        assert!(resp.set_cookie.is_none());
+    }
+
+    #[test]
+    fn magic_finish_attempt_budget_cuts_off_per_ip() {
+        // Rotating tokens must share one per-client budget: 10 bogus
+        // finishes exhaust the IP, and the valid token is then cut off
+        // without a session. All calls carry the exact Origin (required by
+        // the login-CSRF pin) so rejections prove the budget, not the pin.
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let (token, record) = auth::issue_magic_link("u1", "a@example.com", NOW);
+        block_on(h.store.insert_magic(&record)).unwrap();
+        for i in 0..MAGIC_FINISH_ATTEMPTS_PER_IP {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/magic/finish",
+                serde_json::json!({"token": format!("bogus-token-{i}")}),
+            );
+            assert_eq!(resp.status, 401, "{i}");
+        }
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(resp.status, 401);
+        assert!(resp.set_cookie.is_none());
     }
 
     #[test]

@@ -23,7 +23,8 @@ workers/api/
 ```
 
 `migrations/0002_auth_vault.sql` plus `0003` (library), `0004` (challenge
-purpose), `0005` (atomic rate-limit slots and test leases) and `0006`
+purpose), `0005` (atomic rate-limit slots and test leases), `0006` (account
+deletion), `0007` (registration-challenge user foreign key) and `0008`
 (database-enforced challenge purpose: CHECK plus an immutability trigger)
 define the Postgres schema (PlanetScale via Hyperdrive). CI applies every
 migration to a throwaway Postgres and runs `tests/sql/*.sql` against it
@@ -134,7 +135,11 @@ config from secrets) is a follow-up slice.
   `./check_hyperdrive_cache.sh --config-id <id>` asserts
   `caching.disabled == true` (see `wrangler.toml.example`). The gate
   fails closed without Cloudflare credentials (exit 3); `--allow-skip`
-  is only for secret-less CI.
+  is only for secret-less CI and MUST NOT be used in real deploys.
+  Runtime attestation: the Worker refuses to serve traffic (generic 500,
+  same as any misconfiguration) unless `HYPERDRIVE_CACHING_DISABLED=1`
+  is set for that env — set it only after the gate passes for that
+  Hyperdrive config.
 - **Magic links:** 256-bit random tokens, SHA-256 hash at rest, 15-minute
   expiry. HTTP callers must use `consume_magic_link_atomically`, not the
   pure record-preparation helper. Magic links, passkey challenges and
@@ -146,9 +151,32 @@ config from secrets) is a follow-up slice.
 - **Abuse budgets:** passkey starts, magic-link issuance and test-connection
   attempts reserve fixed slot rows through an atomic `INSERT .. ON CONFLICT`
   before side effects; magic-link and registration inbox-proof sends share
-  one per-email window. Unknown login emails use a keyed stand-in scope,
-  expired challenges are pruned, and login options omit `allow_credentials`
-  to avoid leaking variable-length credential IDs.
+  one per-email window. Every auth start (register, login, magic) reserves
+  one per-IP slot (30/hour, keyed on the client /64 for IPv6 and the full
+  address for IPv4) before any user/challenge row or mail (no
+  global slot at start, so exhaustion cannot block challenge issuance),
+  and every mail send reserves a per-IP (30/hour) plus global (100/5 min)
+  issuance slot in front of the per-email window — distinct-email loops
+  stop with a fixed email-independent `429 {"error":"rate_limited"}` on
+  `register/start` (never an email-derived stand-in, which would oracle
+  taken vs fresh across the denial boundary) and with unchanged response
+  shapes on login/magic starts, while victim-list email-bombing stops with
+  no further mail. Exhausted budgets fast-fail with one `SELECT count(*)`
+  before the slot loop, so denial costs O(1) statements, not one upsert per
+  slot. `register_start` also reaps never-completed signups older than
+  24 h only when they have no credential, vault, session, unexpired magic
+  link, or unexpired registration challenge. In-flight registration
+  challenges (including consumed challenges awaiting finish) protect the
+  signup until expiry; expired challenges are pruned. Passkey finishes
+  reserve 100 lookups per client prefix
+  BEFORE any DB read plus 10 attempts per challenge before verification
+  (and magic finishes 10 per client prefix, after the exact-Origin pin) per
+  5-minute window, so rotating unknown challenge ids cannot fund unbounded
+  Pg reads and forged assertions cannot burn unlimited CPU on one
+  challenge; legitimate single attempts and typo retries are unaffected.
+  Unknown login emails use a keyed stand-in scope, expired challenges are
+  pruned, and login options omit `allow_credentials` to avoid leaking
+  variable-length credential IDs.
 - **Passkeys:** RP ID equals the exact origin host (cross-subdomain RP
   suffixes are intentionally unsupported). Configuration must be a canonical
   serialized origin: https, or http with the host exactly `localhost`,

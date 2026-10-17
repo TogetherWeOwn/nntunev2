@@ -1,4 +1,4 @@
--- Regression test for migration 0006. Run after
+-- Regression test for migration 0008. Run after
 -- ALL migrations are applied (see ../run_migration_tests.sh). Everything
 -- happens inside one transaction that is rolled back, so it leaves no rows;
 -- any broken expectation RAISEs and (with ON_ERROR_STOP) fails the run.

@@ -97,6 +97,7 @@ fn play_input<'a>(token: &'a str, track_id: &'a str) -> PlayInput<'a> {
         // Never dialed in rejection cases: authorization fails first.
         server_addr: "127.0.0.1:119".parse::<SocketAddr>().unwrap(),
         segments: &[],
+        segment_ranges: None,
         cipher_key: 0,
         now_unix: NOW,
         up_next: None,

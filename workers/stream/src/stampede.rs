@@ -31,8 +31,10 @@ use std::time::Duration;
 /// NNTP client's 10 s timeout, but that timeout is per socket *read*
 /// (`nntp.rs`), not per article, so a slow-but-healthy leader can still be
 /// replaced once and briefly overlap its replacement; the waiters then take
-/// whichever success lands first. That bounded overlap is the price of never
-/// parking a waiter behind a wedged leader.
+/// whichever success lands first. That bounded overlap avoids parking a waiter
+/// behind a single wedged leader. If the replacement also stalls, its waiters
+/// keep waiting in timeout chunks with no overall deadline until either fetch
+/// settles; callers needing a hard bound must add their own.
 pub const SINGLEFLIGHT_WAIT_TIMEOUT_MS: u64 = 5_000;
 
 /// Singleflight key for a segment fetch: the NZB segment message-id,
@@ -861,6 +863,7 @@ mod tests {
         let inflight = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
         let leader_registered = AtomicBool::new(false);
+        let fresh_registered = AtomicBool::new(false);
         let key = flight_key("<stall-seg@synthetic.test>");
 
         thread::scope(|s| {
@@ -887,10 +890,15 @@ mod tests {
             // times out on that fresh flight. Neither may replace it.
             let fresh = s.spawn(|| {
                 group.call(&key, || {
+                    fresh_registered.store(true, Ordering::SeqCst);
                     tracked_fetch(&inflight, &peak, Duration::from_millis(400), "fresh")
                 })
             });
-            thread::sleep(Duration::from_millis(10));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !fresh_registered.load(Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "fresh leader never registered");
+                thread::yield_now();
+            }
             let late = s.spawn(|| {
                 group.call(&key, || {
                     tracked_fetch(&inflight, &peak, Duration::from_millis(400), "late")

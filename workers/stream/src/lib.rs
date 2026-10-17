@@ -5,7 +5,9 @@
 //!
 //! - [`pool`]: one pool per user, capped at the user's provider connection
 //!   cap (from BYOP settings and plan), with leases, priority lanes
-//!   (playback > prefetch > ingest) and quarantine/backoff on provider errors.
+//!   (playback > prefetch > ingest) and a circuit breaker on provider errors
+//!   (3-in-30s opens for 30s with `503` + `Retry-After`; half-open probe
+//!   recovers).
 //! - [`grant`]: signed play grants issued by the `api` Worker; the stream
 //!   Worker authorizes every play against them.
 //! - [`range`]: HTTP `Range` parsing / `206` resolution for seeking.
@@ -34,6 +36,7 @@
 //! exports the `NntpPool` Durable Object with its probe route. Native builds
 //! and `cargo test` never link the Workers runtime.
 
+pub mod api_error;
 pub mod cache;
 pub mod grant;
 pub mod meter;

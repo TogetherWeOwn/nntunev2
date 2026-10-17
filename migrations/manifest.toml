@@ -29,6 +29,11 @@ target = "app"
 sha256 = "6d222588102fbff8bd5096a42e669722262ba84014fc5865bfbf3b8c19894245"
 
 [[migration]]
-file = "0007_auth_challenge_purpose_guard.sql"
+file = "0007_auth_challenge_user_fk.sql"
 target = "app"
-sha256 = "06c0b81b74bccdd4e4ef18e5a1ed2c0d21170c4d03bbccc16d3822d3e5c3fafc"
+sha256 = "ce0350f7d08a251bbfab9a817d1c4c3dc72a7484cb2379869c5e6c11a0fb6791"
+
+[[migration]]
+file = "0008_auth_challenge_purpose_guard.sql"
+target = "app"
+sha256 = "35508144971de4bdf9919e28a6979963053fa7eb76956df1fd6e98dac004b595"

@@ -735,7 +735,7 @@ fn test_signing_key(seed: u8) -> p256::ecdsa::SigningKey {
 }
 
 fn es256_cose(key: &p256::ecdsa::SigningKey) -> Vec<u8> {
-    let point = key.verifying_key().to_encoded_point(false);
+    let point = key.verifying_key().to_sec1_point(false);
     let mut cose = Vec::new();
     cbor_head(5, 5, &mut cose);
     cbor_int(1, &mut cose);
@@ -2315,7 +2315,7 @@ fn audit_source_ip_is_a_canonical_single_ip_or_unknown() {
 #[test]
 fn purpose_guard_migration_keeps_the_constraint_creation_strategy_pinned() {
     let migration_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../migrations/0007_auth_challenge_purpose_guard.sql");
+        .join("../../migrations/0008_auth_challenge_purpose_guard.sql");
     assert!(
         migration_path.is_file(),
         "purpose-guard migration must be present; this test does not apply it"
