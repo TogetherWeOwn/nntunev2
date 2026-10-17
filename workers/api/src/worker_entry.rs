@@ -1161,7 +1161,44 @@ mod tests {
         crate::b64::encode(&[7u8; 32])
     }
 
+    #[cfg(target_arch = "wasm32")]
     fn assert_render_security_headers(response: &handlers::Response) {
+        let rendered = render(response, &[]).expect("response renders");
+        let headers = rendered.headers();
+        assert_eq!(rendered.status_code(), response.status);
+        assert_eq!(
+            headers
+                .get("content-type")
+                .expect("content-type header is readable")
+                .as_deref(),
+            Some("application/json; charset=utf-8")
+        );
+        assert_eq!(
+            headers
+                .get("content-security-policy")
+                .expect("CSP header is readable")
+                .as_deref(),
+            Some("default-src 'none'; frame-ancestors 'none'")
+        );
+        assert_eq!(
+            headers
+                .get("x-content-type-options")
+                .expect("nosniff header is readable")
+                .as_deref(),
+            Some("nosniff")
+        );
+        assert_eq!(
+            headers
+                .get("cache-control")
+                .expect("cache-control header is readable")
+                .as_deref(),
+            Some("no-store")
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn assert_render_security_headers(response: &handlers::Response) {
+        // wasm-bindgen Response accessors cannot run on native targets.
         let headers = render_header_pairs(response, &[]);
         assert!(headers.contains(&(
             "content-security-policy",
