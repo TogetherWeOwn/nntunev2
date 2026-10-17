@@ -268,6 +268,116 @@ class TestAnchors(unittest.TestCase):
             )
 
 
+class TestFenceHandling(unittest.TestCase):
+    def test_longer_opener_ignores_inner_fence(self):
+        # A ``` line inside a ```` block is content, not a closer: the
+        # sample link must stay ignored and the real link must pass.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": "````md\n```\n[gone](missing.md)\n```\n````\n\n"
+                                 "# Title\n\n[ok](#title)\n",
+                    "docs/b.md": "# B\n",
+                },
+            )
+            self.assertEqual([], check(root, "docs/a.md"))
+
+    def test_closing_fence_with_info_string_is_content(self):
+        # ```python inside a ``` block is sample text, not a closer.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": "```\n```python\n[gone](missing.md)\n```\n\n"
+                                 "# Title\n\n[ok](#title)\n",
+                },
+            )
+            self.assertEqual([], check(root, "docs/a.md"))
+
+    def test_mismatched_fence_character_is_content(self):
+        # ~~~ inside a ``` block never closes it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": "```\n~~~\n[gone](missing.md)\n~~~\n```\n\n"
+                                 "# Title\n\n[ok](#title)\n",
+                },
+            )
+            self.assertEqual([], check(root, "docs/a.md"))
+
+    def test_shorter_closing_fence_is_content(self):
+        # A 3-tick line cannot close a 4-tick opener.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": "````\n```\n[gone](missing.md)\n````\n\n"
+                                 "# Title\n\n[ok](#title)\n",
+                },
+            )
+            self.assertEqual([], check(root, "docs/a.md"))
+
+    def test_heading_inside_nested_example_is_not_an_anchor(self):
+        # strip_fences and code_free_lines must agree: the sample heading
+        # is not linkable, so the anchor link fails.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": "[x](b.md#not-a-heading)\n",
+                    "docs/b.md": "````md\n```\n# Not a heading\n```\n````\n\n"
+                                 "# Real\n",
+                },
+            )
+            hits = check(root, "docs/a.md")
+            self.assertEqual(1, len(hits))
+            self.assertIn("anchor", hits[0][2])
+
+
+class TestMarkdownFileDiscovery(unittest.TestCase):
+    def _git_env(self):
+        return dict(os.environ, GIT_CONFIG_NOSYSTEM="1",
+                    GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                    GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+
+    def test_untracked_node_modules_are_excluded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = self._git_env()
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True, env=env)
+            make_root(
+                tmp,
+                {
+                    "docs/a.md": "[b](b.md)\n",
+                    "docs/b.md": "# B\n",
+                    "node_modules/somepkg/README.md": "[gone](missing.md)\n",
+                },
+            )
+            subprocess.run(["git", "add", "docs"], cwd=root, check=True, env=env)
+            found = markdown_files(root)
+            self.assertEqual([Path("docs/a.md"), Path("docs/b.md")], found)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, main(["--root", str(root)]))
+
+    def test_walk_fallback_skips_vendor_trees_outside_git(self):
+        # Throwaway roots outside git (no `git` repo) still skip vendored
+        # trees instead of flagging files nobody owns.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": "[b](b.md)\n",
+                    "docs/b.md": "# B\n",
+                    "node_modules/somepkg/README.md": "[gone](missing.md)\n",
+                    "target/doc/README.md": "[gone](missing.md)\n",
+                },
+            )
+            found = markdown_files(root)
+            self.assertEqual([Path("docs/a.md"), Path("docs/b.md")], found)
+
+
 class TestChangedScope(unittest.TestCase):
     def test_only_changed_files_are_checked(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -340,8 +450,10 @@ class TestFixtureRepos(unittest.TestCase):
             )
 
     def test_real_repo_docs_are_clean(self):
-        with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(0, main(["--root", str(REPO_ROOT)]))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(["--root", str(REPO_ROOT)])
+        self.assertEqual(0, rc, buf.getvalue())
 
     def test_lint_fixtures_are_excluded_from_full_scan(self):
         self.assertEqual(

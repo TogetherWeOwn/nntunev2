@@ -41,7 +41,8 @@ Usage:
   --files: check exactly these markdown files (resolved under --root).
   --base-ref: check markdown files changed between the base commit and the
       working tree (the CI mode; scoped so history never reds the build).
-  Neither: scan every markdown file under --root (local full check).
+  Neither: scan every tracked markdown file under --root (local full
+      check; untracked/ignored trees such as node_modules are skipped).
   Exit 0 = clean, 1 = broken links found or an input failed,
   2 = a usage or repository error (fail closed, no traceback).
 """
@@ -60,7 +61,8 @@ MARKDOWN_SUFFIXES = (".md", ".markdown", ".mdown")
 FIXTURE_PREFIX = Path(".github/scripts/fixtures")
 
 _LINK = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
-_FENCE = re.compile(r"(```.*?```|~~~.*?~~~)", re.DOTALL)
+_FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_FENCE_CLOSE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
 _INLINE_CODE = re.compile(r"`[^`\n]+`")
 _SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 _HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*(?:#+\s*)?$")
@@ -94,9 +96,35 @@ def _escape_annotation_property(value):
     return "".join(escaped)
 
 
+def lines_outside_fences(text):
+    """Yield (lineno, line) for lines outside CommonMark fenced code blocks.
+
+    A closing fence must use the opener's character, be at least as long,
+    and carry only whitespace after the marker — so a ````` ``` ````` line
+    inside a ```` ````md ```` block, or a ```` ```python ```` info-string
+    line, is content, not a closer.
+    """
+    fence = None
+    for lineno, line in enumerate(text.split("\n"), start=1):
+        if fence is not None:
+            close = _FENCE_CLOSE.match(line)
+            if (
+                close
+                and close.group(1)[0] == fence[0]
+                and len(close.group(1)) >= len(fence)
+            ):
+                fence = None
+            continue
+        opened = _FENCE_OPEN.match(line)
+        if opened:
+            fence = opened.group(1)
+            continue
+        yield lineno, line
+
+
 def strip_fences(text):
     """Remove fenced code blocks, keeping inline code spans intact."""
-    return _FENCE.sub("", text)
+    return "\n".join(line for _, line in lines_outside_fences(text))
 
 
 def code_free_lines(text):
@@ -106,16 +134,7 @@ def code_free_lines(text):
     the original file, so error annotations point at the real line even
     when a fenced block precedes the violation.
     """
-    in_fence = None
-    for lineno, line in enumerate(text.split("\n"), start=1):
-        stripped = line.lstrip()
-        if in_fence is not None:
-            if stripped.startswith(in_fence):
-                in_fence = None
-            continue
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            in_fence = stripped[:3]
-            continue
+    for lineno, line in lines_outside_fences(text):
         yield lineno, _INLINE_CODE.sub("", line)
 
 
@@ -282,13 +301,77 @@ def is_fixture_path(path):
     return tuple(parts[: len(prefix)]) == tuple(prefix)
 
 
+def _tracked_markdown_files(root):
+    """Tracked markdown files under root, or None when root is outside git.
+
+    Returns paths relative to root. Fixture roots (which hold intentionally
+    broken links) are real subdirectories of the repo, so callers still
+    apply the fixture filter; here we only scope the walk to versioned
+    files so untracked/ignored trees (node_modules, build output) can never
+    red a local full scan or the whole-tree self-test.
+    """
+    try:
+        toplevel = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        out = subprocess.run(
+            # --full-name: paths stay relative to the toplevel even when
+            # root is a subdirectory (e.g. a fixture root), so the
+            # relative_to(root) scoping below resolves correctly.
+            ["git", "-C", str(root), "ls-files", "-z", "--full-name", "--",
+             "*.md", "*.markdown", "*.mdown"],
+            check=True,
+            capture_output=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    if not toplevel:
+        return None
+    try:
+        resolved_root = Path(root).resolve()
+    except OSError:
+        return None
+    top = Path(toplevel)
+    found = []
+    for entry in out.split(b"\0"):
+        if not entry:
+            continue
+        try:
+            name = entry.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        try:
+            rel = (top / name).relative_to(resolved_root)
+        except ValueError:
+            continue
+        if rel.suffix.lower() not in MARKDOWN_SUFFIXES:
+            continue
+        if is_fixture_path(rel):
+            continue
+        found.append(rel)
+    return sorted(found)
+
+
 def markdown_files(root):
-    """Every markdown file under root except lint-test fixtures."""
+    """Every tracked markdown file under root except lint-test fixtures.
+
+    Outside a git repo (throwaway test roots, fixture dirs in isolation)
+    falls back to a directory walk that still skips .git, node_modules
+    and target trees.
+    """
+    tracked = _tracked_markdown_files(root)
+    if tracked is not None:
+        return tracked
     found = []
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
         if ".git" in path.parts:
+            continue
+        if "node_modules" in path.parts or "target" in path.parts:
             continue
         if path.suffix.lower() not in MARKDOWN_SUFFIXES:
             continue

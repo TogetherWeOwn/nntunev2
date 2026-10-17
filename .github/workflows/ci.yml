@@ -451,16 +451,26 @@ jobs:
         run: python3 .github/scripts/docs_link_lint.py --root . --base-ref "$DOCS_LINKS_BASE_REF"
       - name: Run docs-link lint self-tests
         run: python3 .github/scripts/test_docs_link_lint.py
+      - name: Lint whole tree on this repo
+        run: python3 .github/scripts/docs_link_lint.py --root .
       - name: Lint passes on the matching fixture
         run: python3 .github/scripts/docs_link_lint.py --root .github/scripts/fixtures/docs-links/match
       - name: Lint goes red on broken-link fixtures
         run: |
           for fixture in broken-file broken-anchor; do
-            if python3 .github/scripts/docs_link_lint.py \
-              --root ".github/scripts/fixtures/docs-links/$fixture"; then
-              echo "docs-links: $fixture fixture must fail but passed" >&2
+            expected="target file does not exist"
+            if [ "$fixture" = "broken-anchor" ]; then
+              expected="anchor does not exist"
+            fi
+            rc=0
+            output=$(python3 .github/scripts/docs_link_lint.py \
+              --root ".github/scripts/fixtures/docs-links/$fixture" 2>&1) || rc=$?
+            if [ "$rc" -ne 1 ] || ! printf '%s\n' "$output" | grep -Fq "docs-links: $expected"; then
+              printf '%s\n' "$output" >&2
+              echo "docs-links: $fixture must report '$expected' and exit 1, got $rc" >&2
               exit 1
             fi
+            printf '%s\n' "$output"
             echo "docs-links: $fixture fixture correctly failed"
           done
 
