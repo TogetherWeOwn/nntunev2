@@ -8,6 +8,8 @@
  * log or persist a secret value.
  */
 
+import { SUPPORTED_NNTP_PORTS } from './contract.js';
+
 export interface WallProbe {
   status: number;
   headers: Record<string, string>;
@@ -146,13 +148,6 @@ export interface NntpEndpoint {
   // TLS-off outright, so no endpoint with tls=false can exist here.
   tls: true;
 }
-
-/**
- * Ports the BYOP UI offers; the fixture transport must stay inside this
- * allowlist. Pinned against ALLOWED_NNTP_PORTS (vault-validation.ts, itself
- * mirroring vault.rs) by apps/web/src/lib/contract.test.ts.
- */
-export const SUPPORTED_NNTP_PORTS: readonly number[] = [119, 563];
 
 /**
  * NNTP endpoint config. Host/user have fixture defaults (not secrets); the

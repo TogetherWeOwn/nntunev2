@@ -3,8 +3,7 @@ import { describe, expect, it } from 'vitest';
 // Single source of truth lives in the e2e harness: if the app drifts
 // (renamed hook), this test names the missing contract key — the failure
 // IS the signal, not noise. Test-only import; never bundled into the app.
-import { TESTIDS } from '../../../../e2e/helpers/contract.js';
-import { SUPPORTED_NNTP_PORTS } from '../../../../e2e/helpers/access.js';
+import { SUPPORTED_NNTP_PORTS, TESTIDS } from '../../../../e2e/helpers/contract.js';
 import { ALLOWED_NNTP_PORTS } from './vault-validation.js';
 
 // Raw route markup via Vite glob: no node:fs, no @types/node needed.
