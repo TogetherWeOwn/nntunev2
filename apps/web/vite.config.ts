@@ -12,8 +12,8 @@ export default defineConfig({
 					filename.split(/[/\\]/).includes('node_modules') ? undefined : true
 			},
 
-			// Cloudflare Workers (serverless). Wrangler config lands with the
-			// DevOps provisioning card; the adapter works without one locally.
+			// Cloudflare Workers (serverless), via the tracked wrangler.toml
+			// in this directory; local dev/checks run without deploying.
 			adapter: adapter()
 		})
 	],

@@ -4,19 +4,26 @@ name: deploy
 #
 # - Push to `main` deploys apps/web to its `staging` env.
 # - Pull requests get a live preview of apps/web (`wrangler preview`).
-# - Both paths need the provisioning card's secrets (CLOUDFLARE_API_TOKEN,
-#   CLOUDFLARE_ACCOUNT_ID). Until those land, the jobs skip via the `gate`
-#   job below (secrets cannot appear in a job-level `if`, so the gate maps
-#   the token to an output) — CI stays green and the first staging deploy
-#   succeeds once secrets land. Production deploys are intentionally not
-#   wired here (a later card adds the promotion gate).
-# - Worker staging deploys are intentionally NOT wired here yet: no Worker
-#   has a deployable entry point on main (api/ingest are logic crates;
-#   stream/mb do not exist yet). Each Worker card adds its entry,
-#   wrangler config and deploy job when it lands. When the API Worker
-#   deploy job lands, it must call
+# - Both paths need the repo Actions secrets CLOUDFLARE_API_TOKEN and
+#   CLOUDFLARE_ACCOUNT_ID (names only; the full account ID stays private).
+#   When the token is absent, the jobs skip via the `gate` job below
+#   (secrets cannot appear in a job-level `if`, so the gate maps the
+#   token to an output) — CI stays green without deploying. Production
+#   deploys are intentionally not wired here (a later gated lane adds
+#   the promotion step; the staging evidence from this workflow is
+#   web-only, see docs/ops.md).
+# - Backend Worker deploys are intentionally NOT wired here: this
+#   workflow deploys apps/web only. The Worker sources and entry points
+#   exist under workers/ (api, ingest, stream, mb), but source existence
+#   is not deployment or acceptance: backend binding activation,
+#   migrations, health and rollback evidence are still outstanding
+#   (docs/ops.md), and each backend deploy lane must add its own job
+#   with that evidence before claiming a deployed Worker. When the API
+#   Worker deploy job lands, it must call
 #   workers/api/check_hyperdrive_cache.sh --config-id $HYPERDRIVE_ID_STAGING
-#   (and prod) with CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID set and fail
+#   (and prod; the HYPERDRIVE_ID_* names are non-credential Actions
+#   variables, not secrets or database URLs) with
+#   CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID set and fail
 #   the deploy on non-zero exit (auth reads require a cache-disabled config).
 #   Real deploys MUST NOT pass --allow-skip (CI-only); the Worker also
 #   refuses to serve traffic without HYPERDRIVE_CACHING_DISABLED=1, set only

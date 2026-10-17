@@ -135,6 +135,39 @@ test.describe('assertNoAccessWall', () => {
     ).toThrow(/Access wall/);
   });
 
+  test('403 wall error never echoes the probe URL (host, path, query, fragment)', () => {
+    const url =
+      'https://sentinel-staging-host.example/sentinel-wall-path?token=sentinel-wall-query#sentinel-wall-frag';
+    let message = '';
+    try {
+      assertNoAccessWall(
+        {
+          status: 403,
+          headers: { 'cf-mitigated': 'challenge' },
+          bodyText: '<title>Access | Cloudflare</title>',
+          url,
+        },
+        'health',
+      );
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain('health');
+    expect(message).toMatch(/Access wall/);
+    expect(message).toContain('403');
+    expect(message).toContain('CF_ACCESS_CLIENT_ID');
+    expect(message).toContain('CF_ACCESS_CLIENT_SECRET');
+    for (const sentinel of [
+      url,
+      'sentinel-staging-host.example',
+      'sentinel-wall-path',
+      'sentinel-wall-query',
+      'sentinel-wall-frag',
+    ]) {
+      expect(message, `Access-wall diagnostic leaked "${sentinel}"`).not.toContain(sentinel);
+    }
+  });
+
   test('passes a normal app response through', () => {
     expect(() =>
       assertNoAccessWall(
@@ -608,6 +641,24 @@ test.describe('tryMintTestAccount fail-closed seam', () => {
     });
   });
 
+  test('walled seam error never echoes the staging host', async () => {
+    await withEnvAsync(seamEnv, async () => {
+      let message = '';
+      try {
+        await tryMintTestAccount(
+          fakeRequest(
+            async () => fakeResponse(403, { 'cf-mitigated': 'challenge' }, '<title>Access</title>'),
+          ),
+          'https://sentinel-staging-host.example',
+        );
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).toMatch(/Access wall/);
+      expect(message).not.toContain('sentinel-staging-host.example');
+    });
+  });
+
   test('throws on a non-JSON body', async () => {
     await withEnvAsync(seamEnv, async () => {
       await expect(
@@ -631,5 +682,71 @@ test.describe('tryMintTestAccount fail-closed seam', () => {
         ),
       ).resolves.toEqual({ email: 'a@b', session: 't', viaApi: true });
     });
+  });
+});
+
+test.describe('redirect location-state diagnostics (value-free)', () => {
+  // Pins the malformed/present notes from locationNote via a fake request
+  // context: a regression collapsing malformed into present (or dropping
+  // the whitespace/control guard) must fail here, and neither state may
+  // echo the header value.
+  const fakeRedirect = (location?: string): APIRequestContext =>
+    ({
+      get: async () => ({
+        status: () => 302,
+        headers: () => (location === undefined ? {} : { location }),
+      }),
+    }) as unknown as APIRequestContext;
+
+  const redirectMessage = async (location?: string): Promise<string> => {
+    try {
+      await apiGet(fakeRedirect(location), 'https://staging.example/probe', {}, 'probe');
+    } catch (error) {
+      return (error as Error).message;
+    }
+    throw new Error('expected the credentialed redirect to throw, but it resolved');
+  };
+
+  test('malformed Location is reported as malformed, value not echoed', async () => {
+    const malformed = ':://sentinel-malformed-loc not a url ?q=sentinel-malformed-query';
+    const message = await redirectMessage(malformed);
+    expect(message).toMatch(/unexpected redirect/i);
+    expect(message).toContain('302');
+    expect(message).toMatch(/malformed/i);
+    expect(message).not.toMatch(/location present/i);
+    expect(message).not.toContain('sentinel-malformed-loc');
+    expect(message).not.toContain('sentinel-malformed-query');
+    expect(message).not.toContain(malformed);
+  });
+
+  test('whitespace-bearing Location is malformed even though URL parsing would tolerate it', async () => {
+    // `new URL('/landed path', base)` percent-encodes and succeeds, so only
+    // the whitespace/control guard classifies this as malformed.
+    const message = await redirectMessage('/landed path?next=sentinel-space-query');
+    expect(message).toMatch(/malformed/i);
+    expect(message).not.toMatch(/location present/i);
+    expect(message).not.toContain('sentinel-space-query');
+    expect(message).not.toContain('landed path');
+  });
+
+  test('well-formed Location is reported as present, value not echoed', async () => {
+    const message = await redirectMessage(
+      'https://foreign.example/sentinel-loc-path?next=sentinel-loc-query#sentinel-loc-frag',
+    );
+    expect(message).toMatch(/unexpected redirect/i);
+    expect(message).toContain('302');
+    expect(message).toMatch(/location present/i);
+    expect(message).not.toMatch(/malformed/i);
+    expect(message).not.toContain('foreign.example');
+    expect(message).not.toContain('sentinel-loc-path');
+    expect(message).not.toContain('sentinel-loc-query');
+    expect(message).not.toContain('sentinel-loc-frag');
+  });
+
+  test('relative Location is present, not malformed', async () => {
+    const message = await redirectMessage('/library?next=sentinel-rel-query');
+    expect(message).toMatch(/location present/i);
+    expect(message).not.toMatch(/malformed/i);
+    expect(message).not.toContain('sentinel-rel-query');
   });
 });

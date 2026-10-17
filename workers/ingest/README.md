@@ -291,12 +291,25 @@ stub whose NZB references fixture message-ids.
   fold/resume/retry/budget policy against a scripted pool fake; no live
   Worker runs in CI.
 
-Still blocked for the live half: wiring the consumer's search step to a
-Newznab provider call (search-sourced jobs therefore cannot reach the
-probe yet), provider settings in the pool DO, verify/repair to the
-Container runtime, and the match/write steps to MB + library/metering
-calls. Until those land the consumer stays disabled and no live
-provider, pool, repair, library, or metering invocation is claimed here.
+The match/write steps are wired in the consumer (`src/matching.rs` +
+`src/queue_consumer.rs`): MB release search through the `MB_API` service
+binding, the idempotent library upsert through `LIBRARY_DB`, and one
+meter event per transition, with the terminal `Done` checkpoint written
+only after the upsert commits. Recording MBIDs stay empty until the MB
+worker grows a release-to-recordings route. Still blocked for the live
+half: wiring the consumer's search step to a Newznab provider call
+(search-sourced jobs therefore cannot reach the probe yet), provider
+settings in the pool DO, verify/repair to the Container runtime, and
+the library schema itself — no migration creates the upsert's `library`
+table or its `UNIQUE(idempotency_key)` (`migrations/0003_library.sql`
+defines only `genres`/`playlists`), and per ADR 0002 the follow-up adds
+normalized tables and changes the post-match writer after inspecting
+staging rather than assuming the flat table exists. Enabling the
+consumer before that lands would fail every `Writing` delivery
+(deterministic SQLSTATEs such as 42P01/42P10 are mapped to a permanent
+failure so they quarantine at once). Until those land the consumer
+stays disabled and no live provider, pool, repair, library, or metering
+invocation is claimed here.
 
 ## Slice T2 — retry budget + DLQ (this slice)
 

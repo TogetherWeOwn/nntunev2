@@ -65,6 +65,10 @@ export function isStagingOrigin(requestUrl: string, baseURL: string): boolean {
  * the service token is missing or wrong. Status and markers are checked
  * jointly so a legitimate app 401/403 is never misreported as a wall.
  * Never silently treat the wall as an app response.
+ * The error names only the fixed context, status and config variable
+ * names: `probe.url` is never interpolated (the staging origin is not
+ * scrubbed from public artifacts, and URLs can carry secret-bearing
+ * components), matching the redirect diagnostics in accounts.ts.
  */
 export function assertNoAccessWall(probe: WallProbe, context: string): void {
   const headerDump = Object.entries(probe.headers)
@@ -83,7 +87,7 @@ export function assertNoAccessWall(probe: WallProbe, context: string): void {
     redirectToAccess;
   if (wallStatus && hasMarkers) {
     throw new Error(
-      `[${context}] hit the Cloudflare Access wall at ${probe.url} ` +
+      `[${context}] hit the Cloudflare Access wall ` +
         `(HTTP ${probe.status}). Set CF_ACCESS_CLIENT_ID + ` +
         'CF_ACCESS_CLIENT_SECRET for a QA service token with staging access. ' +
         'See e2e/README.md. No secret values are logged here by design.',

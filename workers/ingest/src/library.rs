@@ -4,6 +4,17 @@
 //! and Workflow replay converge instead of duplicating. This module owns the
 //! parameterized statement and its validation; the worker executes it through
 //! the `LIBRARY_DB` Hyperdrive binding (see `wrangler.toml.example`).
+//!
+//! **Enablement blocker:** no migration creates `library` (or its
+//! `UNIQUE(idempotency_key)`) yet — `migrations/0003_library.sql` defines
+//! only `genres`/`playlists`, and ADR 0002 directs the follow-up to inspect
+//! staging, add normalized tables, and change this writer rather than
+//! assume the flat table exists. The Queue consumer stays disabled until
+//! that schema lands; if this statement ever runs against a database
+//! without the table, Postgres answers a deterministic SQLSTATE (42P01 /
+//! 42P10), which [`is_deterministic_sqlstate`] maps to a permanent failure
+//! so the job quarantines at once instead of burning its retry budget as
+//! "database unavailable".
 
 use crate::jobs::validate_job_id;
 use crate::queue::{validate_mbid, LibraryWrite};
@@ -32,6 +43,47 @@ pub fn upsert_library_sql() -> &'static str {
      job_id = EXCLUDED.job_id, \
      release_mbid = EXCLUDED.release_mbid, \
      recording_mbids = EXCLUDED.recording_mbids"
+}
+
+/// One upsert's bound values, in [`UPSERT_PARAM_ORDER`] (`$1`..=`$5`)
+/// order. The edge executor binds exactly these values in field order;
+/// keeping the projection here lets the order be unit-tested without a
+/// database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpsertParams<'a> {
+    pub job_id: &'a str,
+    pub user_id: &'a str,
+    pub idempotency_key: &'a str,
+    pub release_mbid: Option<&'a str>,
+    pub recording_mbids: &'a [String],
+}
+
+/// Project a validated [`LibraryWrite`] into its bound parameters.
+/// Replaying the same write always yields the same parameters, which is
+/// what makes the `ON CONFLICT DO UPDATE` replay a no-op.
+pub fn upsert_params(write: &LibraryWrite) -> UpsertParams<'_> {
+    UpsertParams {
+        job_id: &write.job_id,
+        user_id: &write.user_id,
+        idempotency_key: &write.idempotency_key,
+        release_mbid: write.release_mbid.as_deref(),
+        recording_mbids: &write.recording_mbids,
+    }
+}
+
+/// Whether a Postgres SQLSTATE is deterministic for this statement: the
+/// same upsert replayed unchanged will fail the same way, so retrying
+/// only burns the delivery budget. Covers class 42 (syntax / access rule
+/// violation — including 42P01 undefined table and 42P10 invalid
+/// `ON CONFLICT` target, i.e. the missing-`library`-table case), class 22
+/// (data exception) and class 23 (integrity constraint violation).
+/// Anything else (connection class 08, operator intervention 57, no
+/// SQLSTATE at all, …) may succeed on redelivery and stays transient.
+pub fn is_deterministic_sqlstate(sqlstate: Option<&str>) -> bool {
+    matches!(
+        sqlstate.and_then(|code| code.get(..2)),
+        Some("42" | "22" | "23")
+    )
 }
 
 /// Check a [`LibraryWrite`] before it touches the database.
@@ -114,6 +166,67 @@ mod tests {
         w = write();
         w.job_id.clear();
         assert!(validate_library_write(&w).is_err());
+    }
+
+    #[test]
+    fn upsert_params_follow_the_declared_order() {
+        let w = write();
+        let params = upsert_params(&w);
+        // Field order is the `$n` binding order in UPSERT_PARAM_ORDER.
+        let bound = [
+            params.job_id,
+            params.user_id,
+            params.idempotency_key,
+            params.release_mbid.unwrap(),
+        ];
+        assert_eq!(
+            bound,
+            [
+                w.job_id.as_str(),
+                w.user_id.as_str(),
+                w.idempotency_key.as_str(),
+                w.release_mbid.as_deref().unwrap(),
+            ]
+        );
+        assert_eq!(params.recording_mbids, w.recording_mbids.as_slice());
+        assert_eq!(
+            UPSERT_PARAM_ORDER,
+            [
+                "job_id",
+                "user_id",
+                "idempotency_key",
+                "release_mbid",
+                "recording_mbids"
+            ]
+        );
+        // An unmatched write binds NULL release and an empty recording list.
+        let mut unmatched = write();
+        unmatched.release_mbid = None;
+        unmatched.recording_mbids.clear();
+        let params = upsert_params(&unmatched);
+        assert_eq!(params.release_mbid, None);
+        assert!(params.recording_mbids.is_empty());
+    }
+
+    #[test]
+    fn upsert_params_replay_is_identical() {
+        let w = write();
+        assert_eq!(upsert_params(&w), upsert_params(&w.clone()));
+    }
+
+    #[test]
+    fn deterministic_sqlstate_classes_fail_fast() {
+        // Missing table / missing unique constraint (the enablement
+        // blocker), data exceptions and integrity violations replay
+        // identically, so they must not be retried as "unavailable".
+        for code in ["42P01", "42P10", "42501", "22001", "22P02", "23505"] {
+            assert!(is_deterministic_sqlstate(Some(code)), "{code}");
+        }
+        // Connection/operator classes and a missing SQLSTATE may succeed
+        // on redelivery.
+        for code in [Some("08006"), Some("57P03"), Some(""), Some("4"), None] {
+            assert!(!is_deterministic_sqlstate(code), "{code:?}");
+        }
     }
 
     #[test]

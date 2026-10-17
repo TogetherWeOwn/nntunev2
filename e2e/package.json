@@ -8,7 +8,7 @@
     "e2e:staging": "playwright test --config=playwright.config.ts",
     "e2e:smoke": "playwright test --config=playwright.config.ts --project=staging tests/health.spec.ts",
     "e2e:list": "playwright test --config=playwright.config.ts --list",
-    "test:unit": "playwright test --config=playwright.config.ts tests/helpers.spec.ts tests/readiness.spec.ts tests/workflows.spec.ts tests/account-identity.spec.ts tests/byop-transport.spec.ts tests/byop-tls-setting.spec.ts",
+    "test:unit": "playwright test --config=playwright.config.ts tests/helpers.spec.ts tests/readiness.spec.ts tests/workflows.spec.ts tests/redirect-diagnostics.spec.ts tests/account-identity.spec.ts tests/byop-transport.spec.ts tests/byop-tls-setting.spec.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

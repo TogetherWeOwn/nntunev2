@@ -93,6 +93,8 @@ jobs:
         run: python3 .github/scripts/public_text_lint.py
       - name: Unit-test the lint
         run: python3 .github/scripts/test_public_text_lint.py
+      - name: Acceptance-test unreadable-input handling
+        run: python3 .github/scripts/test_public_text_read_errors.py
 
   # Wrangler binding parity: every worker config's required bindings
   # (R2, KV, Queues, Hyperdrive, Analytics Engine, ...) must be present
