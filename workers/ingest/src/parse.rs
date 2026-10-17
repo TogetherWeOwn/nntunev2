@@ -204,6 +204,40 @@ fn opening_tag_end(tag: &str) -> Option<usize> {
     None
 }
 
+/// Index of the `>` ending a markup declaration, allowing a DOCTYPE internal
+/// subset and quoted `>` characters.
+fn markup_declaration_end(declaration: &str) -> Option<usize> {
+    let bytes = declaration.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut subset_depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        if quote.is_none() {
+            let rest = &bytes[i..];
+            if rest.starts_with(b"<!--") {
+                i += rest.windows(3).position(|window| window == b"-->")? + 3;
+                continue;
+            }
+            if rest.starts_with(b"<?") {
+                i += rest.windows(2).position(|window| window == b"?>")? + 2;
+                continue;
+            }
+        }
+        let b = bytes[i];
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == 34 || b == 39 => quote = Some(b),
+            None if b == b'[' => subset_depth += 1,
+            None if b == b']' => subset_depth = subset_depth.saturating_sub(1),
+            None if b == b'>' && subset_depth == 0 => return Some(i),
+            None => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Scan a document (or file-block) slice for unprefixed or namespaced
 /// `<segment>` opens, ignoring comments and other markup.
 fn segment_bytes_in(slice: &str) -> Vec<Option<u64>> {
@@ -232,6 +266,13 @@ fn segment_bytes_in(slice: &str) -> Vec<Option<u64>> {
                 break;
             };
             rest = &rest[end + 3..];
+            continue;
+        }
+        if rest.starts_with("<!") {
+            let Some(end) = markup_declaration_end(rest) else {
+                break;
+            };
+            rest = &rest[end + 1..];
             continue;
         }
         let Some(end) = opening_tag_end(rest) else {
@@ -308,6 +349,15 @@ fn file_blocks(doc: &str) -> Vec<&str> {
                 break;
             };
             let next = end + 3;
+            offset += next;
+            rest = &rest[next..];
+            continue;
+        }
+        if rest.starts_with("<!") {
+            let Some(end) = markup_declaration_end(rest) else {
+                break;
+            };
+            let next = end + 1;
             offset += next;
             rest = &rest[next..];
             continue;
@@ -433,6 +483,31 @@ mod tests {
         wrong_groups.segment_bytes = vec![Some(100), Some(200)];
         wrong_groups.file_segment_bytes = vec![vec![Some(100)], vec![Some(200)]];
         assert!(check_parsed(&est, &wrong_groups).is_err());
+    }
+
+    #[test]
+    fn segment_ranges_parse_doctype_prefixed_nzb() {
+        let doc = r#"<!DOCTYPE nzb PUBLIC "-//newzBin//DTD NZB 1.1//EN" "http://www.newzbin.com/DTD/nzb/nzb-1.1.dtd">
+<nzb><file><segments>
+<segment bytes="42" number="1">real@synthetic.invalid</segment>
+<segment bytes="84" number="2">real2@synthetic.invalid</segment>
+</segments></file><file><segments>
+<segment bytes="126" number="1">other@synthetic.invalid</segment>
+</segments></file></nzb>"#;
+        let (flat, per_file) = parse_segment_byte_ranges(doc);
+        assert_eq!(flat, vec![Some(42), Some(84), Some(126)]);
+        assert_eq!(per_file, vec![vec![Some(42), Some(84)], vec![Some(126)]]);
+    }
+
+    #[test]
+    fn segment_ranges_skip_markup_like_content_in_doctype_subset() {
+        let doc = r#"<!DOCTYPE nzb [<!-- A `] >` comment with fake <file> markup and café. -->
+<?nzb-hint data="also > not the declaration end"?>
+<!ENTITY sample "<segment bytes='90000000000'>">]>
+<nzb><file><segments><segment bytes="42">real@synthetic.invalid</segment></segments></file></nzb>"#;
+        let (flat, per_file) = parse_segment_byte_ranges(doc);
+        assert_eq!(flat, vec![Some(42)]);
+        assert_eq!(per_file, vec![vec![Some(42)]]);
     }
 
     #[test]
