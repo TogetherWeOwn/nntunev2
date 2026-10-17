@@ -130,6 +130,7 @@ impl Fixture {
         serde_json::json!({
             "job_id": job,
             "round": round,
+            "staging_id": "staging-0000000000000001",
             "files": [
                 {"file_name": "track.flac", "key": object_key_for_file_name("track.flac"), "size": 7, "role": "data"},
                 {"file_name": "set.par2", "key": object_key_for_file_name("set.par2"), "size": 8, "role": "par2"},
@@ -181,6 +182,35 @@ fn repeated_repair_is_idempotent_and_runs_par2_once() {
     assert_eq!((s1, s2), (200, 200));
     assert_eq!(r1, r2);
     assert_eq!(f.invocations(), 1);
+}
+
+#[test]
+fn new_staging_of_same_set_reruns_instead_of_replaying() {
+    // A redrive re-stages the same file names at the same sizes with
+    // different bytes under a fresh staging_id. The stored result of
+    // the old staging must not replay: par2 runs again on the
+    // re-staged inputs. (The Worker re-stages every input before each
+    // /repair call, hence the second pair of PUTs.)
+    let f = Fixture::new("printf 'GOODBYTES' > track.flac\nprintf 'Repair complete.\\n'");
+    let req = f.staged_request(JOB, 1);
+    assert_eq!(f.post_repair(&req).0, 200);
+    assert_eq!(f.invocations(), 1);
+
+    assert_eq!(f.put_in(JOB, 1, "track.flac", b"DAMAGED"), 201);
+    assert_eq!(f.put_in(JOB, 1, "set.par2", b"PAR2DATA"), 201);
+    let mut restaged = req.clone();
+    restaged["staging_id"] = serde_json::json!("staging-0000000000000002");
+    let (status, result) = f.post_repair(&restaged);
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(result["status"], "repaired");
+    assert_eq!(f.invocations(), 2);
+    let (status, bytes) = f.get_out(JOB, 1, "track.flac");
+    assert_eq!(status, 200);
+    assert_eq!(bytes, b"GOODBYTES");
+
+    // The new staging is now the idempotent one.
+    assert_eq!(f.post_repair(&restaged).0, 200);
+    assert_eq!(f.invocations(), 2);
 }
 
 #[test]
@@ -272,6 +302,7 @@ fn missing_staged_input_is_a_stable_error() {
     let req = serde_json::json!({
         "job_id": JOB,
         "round": 1,
+        "staging_id": "staging-0000000000000001",
         "files": [
             {"file_name": "track.flac", "key": object_key_for_file_name("track.flac"), "size": 7, "role": "data"},
             {"file_name": "set.par2", "key": object_key_for_file_name("set.par2"), "size": 8, "role": "par2"},

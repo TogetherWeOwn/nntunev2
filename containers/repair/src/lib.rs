@@ -7,9 +7,12 @@
 //! [`nntune_core::par2::repair::repair_with_limits`] against the
 //! image-pinned `par2` binary), and streams outputs back
 //! (`GET /jobs/{job}/r{round}/out/{key}`). A repeated `(job_id, round)`
-//! request with the same manifest returns the stored result without
-//! running `par2` again; a different manifest for the same round is a
-//! conflict. Errors are stable machine-readable codes; logs carry job
+//! request for the same staging returns the stored result without
+//! running `par2` again; the same file set under a new `staging_id`
+//! is a new generation and reruns on the re-staged inputs; a
+//! different file set for the same round is a conflict (the Worker
+//! cleans the round first when it means to replace the set). Errors
+//! are stable machine-readable codes; logs carry job
 //! ids and counts only, never file names.
 
 use std::collections::HashSet;
@@ -23,8 +26,8 @@ use std::time::Duration;
 use nntune_core::error::Error as CoreError;
 use nntune_core::par2::repair::{repair_with_limits, RepairLimits};
 use nntune_core::par2::scratch::{
-    object_key_for_file_name, validate_file_name, validate_object_key, MAX_SCRATCH_FILES,
-    MAX_SCRATCH_TOTAL_BYTES,
+    object_key_for_file_name, validate_file_name, validate_object_key, validate_staging_id,
+    MAX_SCRATCH_FILES, MAX_SCRATCH_TOTAL_BYTES,
 };
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +72,10 @@ pub enum FileRole {
 pub struct RepairJobRequest {
     pub job_id: String,
     pub round: u32,
+    /// The manifest's per-staging id: idempotency binds to it, so the
+    /// same file names/sizes restaged with different bytes (new id)
+    /// rerun instead of replaying the old staging's result.
+    pub staging_id: String,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     pub files: Vec<ScratchFile>,
@@ -130,6 +137,9 @@ pub fn validate_request(req: &RepairJobRequest) -> Result<(), ApiError> {
     if nntune_core::par2::scratch::scratch_prefix(&req.job_id, req.round).is_none() {
         return Err(ApiError::invalid());
     }
+    if !validate_staging_id(&req.staging_id) {
+        return Err(ApiError::invalid());
+    }
     if req.files.is_empty() || req.files.len() > MAX_SCRATCH_FILES {
         return Err(ApiError::invalid());
     }
@@ -186,13 +196,26 @@ pub fn run_repair(
     if let Ok(stored) = fs::read(&request_path) {
         let stored_req: RepairJobRequest = serde_json::from_slice(&stored)
             .map_err(|_| ApiError::new(500, "repair_unavailable"))?;
-        if stored_req != *req {
+        if stored_req == *req {
+            if let Ok(stored_result) = fs::read(&result_path) {
+                let result: RepairJobResult = serde_json::from_slice(&stored_result)
+                    .map_err(|_| ApiError::new(500, "repair_unavailable"))?;
+                return Ok(result);
+            }
+            // Same staging, no terminal result yet: fall through and
+            // (re)run on the re-staged inputs.
+        } else if stored_req.staging_id != req.staging_id && stored_req.files == req.files {
+            // New staging of the same file set: the bytes under `in/`
+            // were just re-staged by the Worker and may differ, so
+            // the old staging's verdict and outputs must not replay.
+            // Discard them and run fresh as the new generation. (A
+            // different file *set* still conflicts below: replacing
+            // the set goes through the Worker's explicit cleanup.)
+            let _ = fs::remove_file(&result_path);
+            let _ = fs::remove_dir_all(dir.join("out"));
+            write_atomic(&request_path, &serde_json::to_vec(req).unwrap())?;
+        } else {
             return Err(ApiError::new(409, "repair_manifest_conflict"));
-        }
-        if let Ok(stored_result) = fs::read(&result_path) {
-            let result: RepairJobResult = serde_json::from_slice(&stored_result)
-                .map_err(|_| ApiError::new(500, "repair_unavailable"))?;
-            return Ok(result);
         }
     } else {
         fs::create_dir_all(dir.join("in"))?;

@@ -13,6 +13,14 @@
 //! The prefix is derived, never trusted: callers validate an incoming
 //! prefix by rebuilding it from `(job_id, round)` and comparing, so a
 //! crafted prefix cannot point repair at another job's objects.
+//!
+//! `manifest.json` also carries a `staging_id`: the writer (verify)
+//! mints a fresh random id for every (re)staging of a round's inputs
+//! and never reuses one across stagings. File names and sizes alone
+//! do not identify a staging — a damaged file usually keeps its full
+//! length — so repair idempotency keys on a digest that includes the
+//! `staging_id`; otherwise a redriven job (which reuses round 1)
+//! would replay the previous generation's verdict.
 
 use sha2::{Digest, Sha256};
 
@@ -79,6 +87,18 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// file name, so object keys never carry untrusted name bytes.
 pub fn object_key_for_file_name(file_name: &str) -> String {
     sha256_hex(file_name.as_bytes())
+}
+
+/// A `staging_id` is an opaque per-staging token minted by the
+/// manifest writer (UUID/ULID/hex shapes all fit): 16–128 chars of
+/// `[A-Za-z0-9_-]`, long enough that two stagings never collide in
+/// practice. Anything else cannot prove which staging a stored
+/// repair result belongs to, so it is rejected.
+pub fn validate_staging_id(raw: &str) -> bool {
+    (16..=128).contains(&raw.len())
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// True for a 64-char lowercase hex object key.

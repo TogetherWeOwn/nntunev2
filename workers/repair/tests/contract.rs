@@ -23,14 +23,19 @@ fn request_json() -> Vec<u8> {
     .unwrap()
 }
 
-fn manifest_json() -> Vec<u8> {
+fn manifest_json_with_staging(staging_id: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
+        "staging_id": staging_id,
         "files": [
             {"file_name": "track.flac", "key": object_key_for_file_name("track.flac"), "size": 7, "role": "data"},
             {"file_name": "set.par2", "key": object_key_for_file_name("set.par2"), "size": 8, "role": "par2"},
         ]
     }))
     .unwrap()
+}
+
+fn manifest_json() -> Vec<u8> {
+    manifest_json_with_staging("staging-0000000000000001")
 }
 
 #[test]
@@ -145,6 +150,60 @@ fn stored_result_for_a_different_manifest_reruns() {
 }
 
 #[test]
+fn same_names_and_sizes_with_a_new_staging_id_rerun() {
+    // The common redrive case: verify re-stages the same set — same
+    // file names, same lengths (a damaged file keeps its full length),
+    // different bytes. The digest must bind to the staging, not just
+    // the file list, or the old verdict replays with no repair run.
+    let req = parse_request(&request_json()).unwrap();
+    let first = parse_manifest(&manifest_json_with_staging("staging-0000000000000001")).unwrap();
+    let restaged = parse_manifest(&manifest_json_with_staging("staging-0000000000000002")).unwrap();
+    assert_eq!(first.files, restaged.files);
+    let first_digest = manifest_digest(&first);
+    let restaged_digest = manifest_digest(&restaged);
+    assert_ne!(first_digest, restaged_digest);
+
+    // A result stamped by the first staging must not short-circuit the
+    // restaged generation.
+    let stored = serde_json::to_vec(&serde_json::json!({
+        "status": "unrepairable",
+        "exit_code": 1,
+        "files": [],
+        "manifest_digest": first_digest,
+    }))
+    .unwrap();
+    assert_eq!(
+        plan(&req, Some(&stored), &restaged_digest).unwrap(),
+        Plan::Rerun
+    );
+    // The same staging still short-circuits a duplicate delivery.
+    match plan(&req, Some(&stored), &first_digest).unwrap() {
+        Plan::AlreadyDone(result) => assert_eq!(result.status.as_str(), "unrepairable"),
+        other => panic!("same staging must short-circuit, got {other:?}"),
+    }
+}
+
+#[test]
+fn manifest_requires_a_well_formed_staging_id() {
+    // Missing: unidentifiable staging, cannot prove result ownership.
+    let mut value: serde_json::Value = serde_json::from_slice(&manifest_json()).unwrap();
+    value.as_object_mut().unwrap().remove("staging_id");
+    assert!(parse_manifest(&serde_json::to_vec(&value).unwrap()).is_err());
+
+    for bad in [
+        "",
+        "short",
+        "has spaces in it......",
+        "slash/inside........",
+    ] {
+        assert!(
+            parse_manifest(&manifest_json_with_staging(bad)).is_err(),
+            "staging_id {bad:?} must be rejected"
+        );
+    }
+}
+
+#[test]
 fn ingest_reply_is_status_only_even_for_max_file_count() {
     // The full RepairResult for MAX_SCRATCH_FILES (1024) outputs
     // exceeds ingest's 64 KiB reply cap; the wire reply to ingest
@@ -182,6 +241,7 @@ fn container_body_carries_only_the_manifest() {
     let value = serde_json::to_value(&body).unwrap();
     assert_eq!(value["job_id"], JOB);
     assert_eq!(value["round"], 1);
+    assert_eq!(value["staging_id"], "staging-0000000000000001");
     assert_eq!(value["files"].as_array().unwrap().len(), 2);
     // No user ids, idempotency keys or credentials reach the Container.
     assert!(value.get("user_id").is_none());

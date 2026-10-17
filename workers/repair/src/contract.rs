@@ -11,7 +11,7 @@ use std::collections::HashSet;
 
 use nntune_core::par2::scratch::{
     object_key_for_file_name, sha256_hex, validate_file_name, validate_object_key,
-    validate_scratch_prefix, MAX_SCRATCH_FILES, MAX_SCRATCH_TOTAL_BYTES,
+    validate_scratch_prefix, validate_staging_id, MAX_SCRATCH_FILES, MAX_SCRATCH_TOTAL_BYTES,
 };
 use serde::{Deserialize, Serialize};
 
@@ -102,6 +102,12 @@ pub enum FileRole {
 /// `in/manifest.json`: everything verify staged for this repair round.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScratchManifest {
+    /// Fresh random id minted by verify for this staging (never
+    /// reused across restagings; see `nntune_core::par2::scratch`).
+    /// Required: without it a stored result cannot be proven to
+    /// belong to these inputs — names and sizes repeat across a
+    /// redrive even when the bytes changed.
+    pub staging_id: String,
     pub files: Vec<ScratchFile>,
 }
 
@@ -119,6 +125,9 @@ pub fn parse_manifest(body: &[u8]) -> Result<ScratchManifest, ApiFault> {
 
 pub fn validate_manifest(manifest: &ScratchManifest) -> Result<(), ApiFault> {
     let invalid = || ApiFault::new(400, "invalid_manifest");
+    if !validate_staging_id(&manifest.staging_id) {
+        return Err(invalid());
+    }
     if manifest.files.is_empty() || manifest.files.len() > MAX_SCRATCH_FILES {
         return Err(invalid());
     }
@@ -182,18 +191,23 @@ pub struct RepairResult {
     pub exit_code: Option<i32>,
     pub files: Vec<OutputFile>,
     /// [`manifest_digest`] of the staged inputs this result was
-    /// produced from. Idempotency is keyed on the manifest, not just
+    /// produced from. Idempotency is keyed on the staging, not just
     /// `(job_id, round)`: a redrive resets the round to 1, so a result
-    /// from a previous generation's inputs must not replay.
+    /// from a previous generation's staging must not replay.
     #[serde(default)]
     pub manifest_digest: String,
 }
 
-/// Canonical digest of one staged manifest: sha256 of its compact
-/// JSON file list (struct field order and list order are the
-/// canonical form, so two serialisations of the same staging agree).
+/// Canonical digest of one staging: sha256 of the manifest's compact
+/// JSON — `staging_id` plus the file list (struct field order and
+/// list order are the canonical form, so two serialisations of the
+/// same staging agree). The `staging_id` is what binds the digest to
+/// one staging event: a redrive re-stages the same file names at the
+/// same sizes with different bytes, and only the fresh `staging_id`
+/// distinguishes it from the generation that produced a stored
+/// result.
 pub fn manifest_digest(manifest: &ScratchManifest) -> String {
-    let canonical = serde_json::to_vec(&manifest.files).unwrap_or_default();
+    let canonical = serde_json::to_vec(manifest).unwrap_or_default();
     sha256_hex(&canonical)
 }
 
@@ -203,8 +217,9 @@ pub enum Plan {
     /// No stored result: run the Container.
     Run,
     /// A stored result exists but was produced from a different
-    /// manifest (a redriven job reusing this round): clear the
-    /// Container's stale round state and run again.
+    /// staging (a redriven job reusing this round): clear the
+    /// Container's stale round state, delete the stale stored
+    /// result, and run again.
     Rerun,
     AlreadyDone(RepairResult),
 }
@@ -272,11 +287,14 @@ pub fn out_key(prefix: &str, key: &str) -> String {
 
 /// The `POST /repair` body for the Container: the manifest and nothing
 /// else. No user ids, idempotency keys or credentials cross into the
-/// Container — it sees staged bytes plus ids for logging.
+/// Container — it sees staged bytes plus ids for logging. The
+/// `staging_id` crosses so the Container's own replay check binds to
+/// the same staging identity as this Worker's digest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerRepairRequest {
     pub job_id: String,
     pub round: u32,
+    pub staging_id: String,
     pub files: Vec<ScratchFile>,
 }
 
@@ -287,6 +305,7 @@ pub fn container_repair_body(
     ContainerRepairRequest {
         job_id: req.job_id.clone(),
         round: req.round,
+        staging_id: manifest.staging_id.clone(),
         files: manifest.files.clone(),
     }
 }

@@ -183,13 +183,27 @@ impl RepairContainer {
 
         let container = self.container_port().await?;
         if stale_generation {
-            // The Container still holds the previous generation's
-            // request/result for this (job, round); clear it before
-            // staging or it rightly 409s the new manifest.
+            // Order matters: clean the Container, then delete the
+            // stale R2 result, then stage and run. The Container still
+            // holds the previous generation's request/result for this
+            // (job, round); clear it before staging or it rightly
+            // 409s the new manifest. Deleting the stale R2 marker
+            // right after means a retry inside this new generation
+            // plans as `Run` (no stored result) and the Container
+            // replays its own finished result instead of being
+            // cleaned again and paid for twice.
             let cleanup =
                 serde_json::to_vec(&serde_json::json!({"job_id": req.job_id, "round": req.round}))
                     .unwrap_or_default();
-            container_json(&container, Method::Post, "/cleanup", Some(cleanup)).await?;
+            let (status, _) =
+                container_json(&container, Method::Post, "/cleanup", Some(cleanup)).await?;
+            if status != 200 {
+                return Err(ApiFault::new(502, "container_unavailable"));
+            }
+            bucket
+                .delete(result_key(prefix))
+                .await
+                .map_err(|_| ApiFault::new(503, "scratch_unavailable"))?;
         }
 
         // Stage inputs. Data files with size 0 are missing targets the
