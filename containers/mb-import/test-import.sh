@@ -376,7 +376,73 @@ check "poison rerun: still no rows" "0" "$(db -c 'SELECT count(*) FROM mb_artist
 check "poison rerun: downstream tables never loaded" "0" "$(db -c 'SELECT (SELECT count(*) FROM mb_release) + (SELECT count(*) FROM mb_recording) + (SELECT count(*) FROM mb_track);')"
 check "poison rerun: replication state still untouched" "0" "$(db -c 'SELECT last_packet FROM mb_import_state WHERE id = 1;')"
 
-rm -rf "$FIX" "$DUPE" "$NEWER" "$FKDIR" "$POISON"
+echo "=== 11. changed tracks: repoint replaces, dropped position is pruned ==="
+# The mb_track key is the position (release, medium, track), so a newer
+# dump that repoints track 1 at a different recording must leave exactly
+# one row at that position, and a position the newer dump no longer
+# lists must be pruned — never two recordings for one track downstream.
+reset_db
+CHG="$FIX-changed"
+rm -rf "$CHG" "$CHG-newer" "$CHG-old"
+mkdir -p "$CHG"
+python3 - "$CHG" <<'EOF'
+import sys, uuid
+d = sys.argv[1]
+def eid(n): return str(uuid.UUID(int=n))
+with open(f'{d}/mbdump-artist.tsv', 'w') as f:
+    f.write(f'{eid(1)}\tBand 1\t1, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n')
+with open(f'{d}/mbdump-release.tsv', 'w') as f:
+    f.write(f'{eid(100001)}\t{eid(1)}\tAlbum\tAlbum\t2024\t\\N\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording.tsv', 'w') as f:
+    for i in range(1, 4):
+        f.write(f'{eid(200000+i)}\t{eid(100001)}\tTrack {i}\t{i}\t180000\t2024-05-03T00:00:00Z\n')
+with open(f'{d}/mbdump-track.tsv', 'w') as f:
+    for i in range(1, 4):
+        f.write(f'{eid(100001)}\t{eid(200000+i)}\t1\t{i}\t2024-05-03T00:00:00Z\n')
+EOF
+bash "$SELF_DIR/import.sh" "$CHG" >/dev/null
+check "changed: tracks before" "3" "$(db -c 'SELECT count(*) FROM mb_track;')"
+check "changed: track 1 before" "$(python3 -c 'import uuid; print(uuid.UUID(int=200001))')" \
+  "$(db -c 'SELECT recording_mbid FROM mb_track WHERE medium_no = 1 AND track_no = 1;')"
+cp -R "$CHG" "$CHG-newer"
+python3 - "$CHG-newer" <<'EOF'
+import sys, uuid
+d = sys.argv[1]
+def eid(n): return str(uuid.UUID(int=n))
+with open(f'{d}/mbdump-track.tsv', 'w') as f:
+    # Track 1 repointed at recording 3, track 2 unchanged, track 3 dropped.
+    f.write(f'{eid(100001)}\t{eid(200003)}\t1\t1\t2025-05-03T00:00:00Z\n')
+    f.write(f'{eid(100001)}\t{eid(200002)}\t1\t2\t2025-05-03T00:00:00Z\n')
+EOF
+bash "$SELF_DIR/import.sh" "$CHG-newer" >/dev/null
+check "changed: tracks after" "2" "$(db -c 'SELECT count(*) FROM mb_track;')"
+check "changed: track 1 repointed" "$(python3 -c 'import uuid; print(uuid.UUID(int=200003))')" \
+  "$(db -c 'SELECT recording_mbid FROM mb_track WHERE medium_no = 1 AND track_no = 1;')"
+check "changed: one row per position" "0" \
+  "$(db -c 'SELECT count(*) FROM (SELECT medium_no, track_no FROM mb_track GROUP BY 1, 2 HAVING count(*)>1) d;')"
+check "changed: dropped track pruned" "0" "$(db -c 'SELECT count(*) FROM mb_track WHERE track_no = 3;')"
+check "changed: album order after repoint" \
+  "$(python3 -c 'import uuid; print(str(uuid.UUID(int=200003)) + chr(44) + str(uuid.UUID(int=200002)))')" \
+  "$(db -c 'SELECT string_agg(recording_mbid::text, chr(44) ORDER BY medium_no, track_no, recording_mbid) FROM mb_track;')"
+# An older dump (new bytes, so it really reloads; older timestamps)
+# must neither roll the repoint back nor resurrect the dropped track:
+# the forward-only upsert guard and the prune's updated_at comparison
+# both refuse to move rows backwards.
+cp -R "$CHG" "$CHG-old"
+python3 - "$CHG-old" <<'EOF'
+import sys, uuid
+d = sys.argv[1]
+def eid(n): return str(uuid.UUID(int=n))
+with open(f'{d}/mbdump-track.tsv', 'w') as f:
+    for i in (3, 2, 1):
+        f.write(f'{eid(100001)}\t{eid(200000+i)}\t1\t{i}\t2024-05-03T00:00:00Z\n')
+EOF
+bash "$SELF_DIR/import.sh" "$CHG-old" >/dev/null
+check "changed: older dump leaves rows alone" "2" "$(db -c 'SELECT count(*) FROM mb_track;')"
+check "changed: older dump keeps repoint" "$(python3 -c 'import uuid; print(uuid.UUID(int=200003))')" \
+  "$(db -c 'SELECT recording_mbid FROM mb_track WHERE medium_no = 1 AND track_no = 1;')"
+
+rm -rf "$FIX" "$DUPE" "$NEWER" "$FKDIR" "$POISON" "$CHG" "$CHG-newer" "$CHG-old"
 if (( fail != 0 )); then
   echo "test-import: FAILED" >&2
   exit 1

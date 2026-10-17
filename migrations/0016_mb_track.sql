@@ -10,6 +10,11 @@ BEGIN;
 -- position, and workers/mb lists a release's recordings from it in
 -- (medium_no, track_no) album order. Positions follow MusicBrainz:
 -- medium.position and track.position (a pregap track is position 0).
+-- The key is the position, not the recording: when a later dump
+-- repoints a track at a different recording the upsert replaces it,
+-- and the importer keeps only each touched release's newest-dump
+-- rows (dropped tracks are pruned; an older dump cannot resurrect
+-- them), so no stale row outlives its dump.
 -- Roles: importer owns this table (same as 0001). No grants here:
 -- no migration in this series grants mirror read access, so the MB
 -- read role picks mb_track up the same way it reads the other mb_*
@@ -22,7 +27,7 @@ CREATE TABLE IF NOT EXISTS mb_track (
     track_no       SMALLINT NOT NULL CHECK (track_no >= 0),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     line_no        BIGINT,
-    PRIMARY KEY (release_mbid, medium_no, track_no, recording_mbid)
+    PRIMARY KEY (release_mbid, medium_no, track_no)
 );
 
 CREATE INDEX IF NOT EXISTS mb_track_recording_idx

@@ -11,6 +11,9 @@
 # number is recorded per (table, dump hash), so kill -9 resumes the same
 # dump while a newer dump starts at line 0. The upsert carries a
 # forward-only updated_at guard (older dumps never roll a row back).
+# Contract: every row of a dump file carries that dump's single
+# updated_at (the ETL stamps one DUMP_TS); the track prune compares
+# per-release maxima and relies on that uniformity.
 
 # Poison rows never abort the import: the mb-validate pre-pass checks every
 # line against the typed upsert contract (uuid/int/timestamp shapes, COPY
@@ -118,6 +121,7 @@ for table in artist release recording track; do
     echo "import: missing $tsv (expected curated TSV; see header comment)" >&2
     exit 1
   fi
+  prune_sql=""
   case "$table" in
     artist)
       columns="mbid, name, sort_name, \"type\", country, updated_at"
@@ -136,8 +140,28 @@ for table in artist release recording track; do
       ;;
     track)
       columns="release_mbid, recording_mbid, medium_no, track_no, updated_at"
-      upsert="updated_at = EXCLUDED.updated_at"
-      conflict="(release_mbid, medium_no, track_no, recording_mbid)"
+      # The key is the position: a track repointed at a different
+      # recording in a newer dump replaces the old row instead of
+      # sitting beside it at the same medium/track.
+      upsert="recording_mbid = EXCLUDED.recording_mbid, updated_at = EXCLUDED.updated_at"
+      conflict="(release_mbid, medium_no, track_no)"
+      # Prune superseded rows in the same chunk transaction: every row
+      # of one dump carries that dump's updated_at, so after the upsert
+      # a release this chunk touched keeps only its newest-dump rows.
+      # That deletes dropped/renumbered positions a newer dump no
+      # longer lists, and also deletes the rows an older dump just
+      # inserted (the upsert guard blocks its updates, but a fresh
+      # insert has no conflict to guard, so without this it would
+      # resurrect tracks the newer dump dropped). Rows an earlier
+      # chunk of this same dump committed carry this dump's
+      # updated_at, so they are already at the max and survive;
+      # positions a later chunk will load are deleted here and
+      # re-inserted there, so a kill between chunks is healed by the
+      # resume. Releases absent from the chunk are untouched, exactly
+      # like the entity tables (the import never deletes them). A
+      # position whose new row landed in the DLQ (poison/FK orphan)
+      # loses its old row too: a visible gap, never a stale recording.
+      prune_sql="DELETE FROM mb_track old WHERE EXISTS (SELECT 1 FROM stage s WHERE s.release_mbid = old.release_mbid) AND old.updated_at < (SELECT max(t.updated_at) FROM mb_track t WHERE t.release_mbid = old.release_mbid);"
       ;;
   esac
   # awk NR counts a trailing partial line; the validator counts the same
@@ -150,12 +174,12 @@ for table in artist release recording track; do
   dump_id="$(sha256sum "$tsv" | cut -d ' ' -f 1)"
   psql -v ON_ERROR_STOP=1 -c "INSERT INTO mb_import_cursor (table_name, dump_id, lines_done) VALUES ('$table', '$dump_id', 0) ON CONFLICT (table_name, dump_id) DO NOTHING;" >/dev/null
   # Duplicate-key pre-check. Entity tables key on the MBID in column 1;
-  # track keys on the membership tuple (release, medium, track,
-  # recording), where column 1 legitimately repeats per release.
+  # track keys on the position tuple (release, medium, track), where
+  # column 1 legitimately repeats per track of a release.
   if [[ "$table" == "track" ]]; then
     # Positions are normalized numerically ($3+0) so "01" and "1" cannot
     # slip past as distinct keys for the same SMALLINT primary key.
-    awk -F '\t' 'NF >= 4 && $3 ~ /^[+-]?[0-9]+$/ && $4 ~ /^[+-]?[0-9]+$/ { print tolower($1) "/" ($3+0) "/" ($4+0) "/" tolower($2) }' "$tsv" \
+    awk -F '\t' 'NF >= 4 && $3 ~ /^[+-]?[0-9]+$/ && $4 ~ /^[+-]?[0-9]+$/ { print tolower($1) "/" ($3+0) "/" ($4+0) }' "$tsv" \
       | sort -T "$work" >"$work/mbids.sorted"
   else
     awk -F '\t' 'length($1) == 36 && substr($1, 9, 1) == "-" && substr($1, 14, 1) == "-" && substr($1, 19, 1) == "-" && substr($1, 24, 1) == "-" { id = $1; gsub(/-/, "", id); if (length(id) == 32 && id ~ /^[[:xdigit:]]+$/) print tolower($1) }' "$tsv" \
@@ -236,7 +260,7 @@ for table in artist release recording track; do
       exit 1
     fi
     if [[ "$table" == "track" ]]; then
-      dupes="$(awk -F'\t' '{ print tolower($1) "/" ($3+0) "/" ($4+0) "/" tolower($2) }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
+      dupes="$(awk -F'\t' '{ print tolower($1) "/" ($3+0) "/" ($4+0) }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
     else
       dupes="$(awk -F'\t' '{ print $1 }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
     fi
@@ -353,6 +377,7 @@ CREATE TEMP TABLE stage (LIKE mb_${table}) ON COMMIT DROP;
 INSERT INTO mb_${table} ($columns, line_no) SELECT $columns, line_no FROM stage
 ON CONFLICT $conflict DO UPDATE SET $upsert
 WHERE mb_${table}.updated_at < EXCLUDED.updated_at;
+$prune_sql
 CREATE TEMP TABLE poison (reason text, line_no bigint, raw text) ON COMMIT DROP;
 \copy poison FROM '$work/poison.tsv' WITH (FORMAT text)
 INSERT INTO mb_import_dlq (table_name, dump_id, line_no, reason, raw_line)
