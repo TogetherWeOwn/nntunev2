@@ -28,6 +28,8 @@ use serde::Serialize;
 mod api_error;
 use api_error::ApiError;
 
+pub mod replication;
+
 /// Cache TTLs: lookups are immutable-ish (long TTL), search is short TTL.
 /// They apply to successful responses only; failures serve `no-store`.
 const LOOKUP_CACHE_TTL_S: u32 = 86_400;
