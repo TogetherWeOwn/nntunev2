@@ -24,6 +24,7 @@
 //! - internal BIGSERIAL ids and 22-character public handles are distinct
 //!   identity spaces, and repeated legacy refs stay distinct ordered
 //!   entries resolving deterministically.
+//!
 //! Negative cases mutate one coherent thing at a time (the same value is
 //! changed everywhere it appears) so exactly the named rule is violated
 //! and the expected `FixtureErrorKind` is unambiguous.
