@@ -780,11 +780,21 @@ impl Store for PgStore {
 
     async fn upsert_vault(&self, user_id: &str, row: &VaultRow) -> Result<(), StoreError> {
         let client = self.connect().await?;
-        client
+        // Account-deletion fence (ADR 0002 rule 3): the upsert only lands
+        // while the owner's deleting_at is NULL, holding the user row
+        // FOR SHARE through the statement, so saving provider credentials
+        // cannot repopulate user-owned state behind the deletion marker.
+        // A fenced (0-row) upsert fails closed as StoreError; the
+        // handler classifies it through `account_deleting` into the
+        // typed 409. delete_vault below is deliberately not fenced:
+        // removal cannot restore state, and the executor deletes the
+        // row anyway.
+        let affected = client
             .execute(
                 "INSERT INTO provider_vaults (user_id, kek_version, dek_wrapped_nonce, dek_wrapped, \
                  payload_nonce, payload, indexer_configured, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 SELECT $1, $2, $3, $4, $5, $6, $7, $8 \
+                 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence \
                  ON CONFLICT (user_id) DO UPDATE SET kek_version = EXCLUDED.kek_version, \
                  dek_wrapped_nonce = EXCLUDED.dek_wrapped_nonce, dek_wrapped = EXCLUDED.dek_wrapped, \
                  payload_nonce = EXCLUDED.payload_nonce, payload = EXCLUDED.payload, \
@@ -802,6 +812,9 @@ impl Store for PgStore {
             )
             .await
             .map_err(|_| StoreError)?;
+        if affected == 0 {
+            return Err(StoreError);
+        }
         Ok(())
     }
 
@@ -815,6 +828,23 @@ impl Store for PgStore {
             .await
             .map_err(|_| StoreError)?;
         Ok(())
+    }
+
+    async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
+        let client = self.connect().await?;
+        let row = client
+            .query_opt(
+                crate::account_deletion::ACCOUNT_DELETING_PROBE_SQL,
+                &[&user_id],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        match row {
+            Some(row) => row.try_get("deleting").map_err(|_| StoreError),
+            // The user row is gone (erased or reaped): not a fenced
+            // write, so the handler keeps its generic failure.
+            None => Ok(false),
+        }
     }
 
     async fn insert_audit(&self, event: &AuditEvent) -> Result<(), StoreError> {
@@ -955,10 +985,14 @@ impl Store for PgStore {
             .map_err(|_| StoreError)?;
         for slot in 0..max_concurrency {
             let slot = i16::try_from(slot).map_err(|_| StoreError)?;
+            // Fenced like the vault upsert (ADR 0002 rule 3): a deleting
+            // account acquires no new lease rows; every slot probe then
+            // returns no row and the lease is simply denied.
             let rows = client
                 .query(
                     "INSERT INTO vault_test_leases (user_id, slot, token, expires_at) \
-                     VALUES ($1, $2, $3, FLOOR(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT + $4) \
+                     SELECT $1, $2, $3, FLOOR(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT + $4 \
+                     FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence \
                      ON CONFLICT (user_id, slot) DO UPDATE \
                      SET token = EXCLUDED.token, expires_at = EXCLUDED.expires_at \
                      WHERE vault_test_leases.expires_at <= FLOOR(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT \
@@ -1952,6 +1986,77 @@ mod tests {
                 && bind_pos("&record.email") < bind_pos("&i64_of(record.issued_at)?")
                 && bind_pos("&i64_of(record.issued_at)?") < bind_pos("&i64_of(record.expires_at)?"),
             "insert_magic binds must keep issued_at as $4 and expires_at as $5"
+        );
+    }
+
+    #[test]
+    fn fenced_vault_statements_pin_the_owner_fence_and_zero_row_guard() {
+        // ADR 0002 rule 3: PUT /v1/vault is reachable today, and the vault
+        // upsert fence, its zero-row guard, and the test-lease fence are the
+        // only things stopping credential writes behind the deletion marker.
+        // Pin them the same way `insert_magic_prune_is_per_user_and_expired_only`
+        // pins its statement: slice ONLY each fn body out of the pre-test
+        // source, so this test's own literals cannot satisfy the assertions.
+        // Dropping `AND deleting_at IS NULL` from either statement, or the
+        // `affected == 0` guard from the upsert, must fail here.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let fn_body = |name: &str| {
+            production
+                .split_once(name)
+                .unwrap_or_else(|| panic!("{name} must exist"))
+                .1
+                .split_once("\n    async fn ")
+                .expect("a following fn must bound the body")
+                .0
+                .to_string()
+        };
+        const FENCE: &str = "FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence";
+        // Vault upsert: the fence, the owner binding, and the fail-closed guard.
+        let upsert = fn_body("async fn upsert_vault(");
+        assert!(
+            upsert.contains(FENCE),
+            "upsert_vault must select its row through the owner fence"
+        );
+        assert!(
+            !upsert.contains("WHERE id = $2"),
+            "upsert_vault fence binds the owner ($1), never a column value"
+        );
+        assert!(
+            upsert.contains("SELECT $1, $2"),
+            "upsert_vault must keep SELECT $1 bound to the owner id"
+        );
+        let guard = upsert
+            .find("if affected == 0")
+            .expect("upsert_vault must fail closed on 0 rows");
+        let ok = upsert
+            .find("Ok(())")
+            .expect("upsert_vault must return Ok on the write path");
+        assert!(
+            guard < ok,
+            "the zero-row guard must precede the success return"
+        );
+        // Test-connection lease: the same fence on the same owner parameter,
+        // denied (not granted) when the fence returns no row.
+        let lease = fn_body("async fn acquire_test_connection_lease(");
+        assert!(
+            lease.contains(FENCE),
+            "acquire_test_connection_lease must select its row through the owner fence"
+        );
+        assert!(
+            lease.contains("SELECT $1, $2, $3"),
+            "lease must keep SELECT $1 bound to the owner id"
+        );
+        assert!(
+            lease.contains("RETURNING slot"),
+            "lease must only succeed on a returned slot row"
+        );
+        assert!(
+            lease.contains("if !rows.is_empty()"),
+            "lease must deny when the fence returns no row"
         );
     }
 
