@@ -318,12 +318,38 @@ export async function completeByopWizard(page: Page, baseURL: string): Promise<v
   await page.getByTestId(TESTIDS.byopPort).selectOption(String(endpoint.port));
   await page.getByTestId(TESTIDS.byopUser).fill(endpoint.user);
   await page.getByTestId(TESTIDS.byopPass).fill(password);
-  if (endpoint.tls) {
-    const tls = page.getByTestId(TESTIDS.byopTls);
-    if ((await tls.count()) > 0 && (await tls.getAttribute('type')) === 'checkbox') {
-      const checked = await tls.isChecked().catch(() => false);
-      if (!checked) await tls.check().catch(() => {});
-    }
+  // Fail closed on transport fidelity: explicitly set AND verify the TLS
+  // checkbox's requested state. A missing, unusable or un-settable control
+  // must stop the wizard here — never submit test/save with whatever
+  // transport the page happened to default to.
+  const tlsToggle = page.getByTestId(TESTIDS.byopTls);
+  const tlsMatches = await tlsToggle.count();
+  if (tlsMatches !== 1) {
+    throw new Error(
+      `[byop] expected exactly one TLS checkbox (${TESTIDS.byopTls}) on the BYOP page, ` +
+        `found ${tlsMatches}: cannot verify the requested transport — refusing to test ` +
+        'or save. The page contract may have drifted (names only — no values logged).',
+    );
+  }
+  const tlsType = await tlsToggle.getAttribute('type').catch(() => null);
+  if (tlsType?.toLowerCase() !== 'checkbox') {
+    throw new Error(
+      '[byop] the BYOP TLS control is not a checkbox — cannot set or verify the ' +
+        'requested TLS state; refusing to test or save (names only — no values logged).',
+    );
+  }
+  // endpoint.tls is always true (TLS-off is rejected in syntheticNntpEndpoint),
+  // so the requested state is unconditionally checked.
+  try {
+    await tlsToggle.check();
+    await expect(tlsToggle).toBeChecked();
+  } catch {
+    // The underlying Playwright error can carry page detail; replace it with
+    // a names-only diagnostic instead of letting it propagate.
+    throw new Error(
+      '[byop] could not set and verify the BYOP TLS checkbox to checked: ' +
+        'refusing to test or save with an unverified transport (names only — no values logged).',
+    );
   }
   await page.getByRole('button', { name: 'Continue' }).click();
   await page.getByRole('button', { name: 'Continue' }).click();
