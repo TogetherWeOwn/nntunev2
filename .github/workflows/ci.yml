@@ -467,6 +467,20 @@ jobs:
         working-directory: e2e
         run: npm run e2e:list
 
+      # M1 exit traceability gate: docs/m1-exit-traceability.md must cite
+      # every spec Playwright sees. Offline (captured --list output only),
+      # no staging credentials. Keep this step in ci-ok's e2e-lint job.
+      - name: Check traceability matrix cites every spec (offline)
+        run: |
+          npm --prefix e2e run e2e:list > "$RUNNER_TEMP/e2e-list.txt" 2>&1
+          cat "$RUNNER_TEMP/e2e-list.txt"
+          python3 .github/scripts/check_traceability.py \
+            --matrix docs/m1-exit-traceability.md \
+            --list-output "$RUNNER_TEMP/e2e-list.txt"
+
+      - name: Self-test the traceability check
+        run: python3 .github/scripts/test_check_traceability.py
+
   svelte-check:
     name: svelte-check
     runs-on: ubuntu-latest

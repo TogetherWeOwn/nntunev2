@@ -146,7 +146,9 @@ How the suite uses them:
   configured staging never skips for missing credentials. Failure artifacts
   are kept 7 days.
 - `e2e-lint` inside `ci.yml` (part of `ci-ok`) — `npm ci`, `tsc --noEmit`,
-  helper/workflow self-tests, and `playwright test --list`. Runs on every PR
+  helper/workflow self-tests, `playwright test --list`, and the
+  traceability-matrix check (`docs/m1-exit-traceability.md` must cite every
+  listed spec). Runs on every PR
   with no staging needed. Offline tests execute both checked-in preflights
   and the aggregate gate with dummy inputs; failures, cancellations and skips
   of required jobs make `ci-ok` red.
