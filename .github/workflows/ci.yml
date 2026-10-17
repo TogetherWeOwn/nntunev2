@@ -320,8 +320,8 @@ jobs:
           persist-credentials: false
       - name: Build importer image from clean checkout
         run: docker build -f containers/mb-import/Dockerfile -t mb-import:ci .
-      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
-      # (2026-08-06); re-pin deliberately, never float.
+      # Apply only the mirror-target migrations (base 0001 + importer 0013);
+      # app migrations need the full app schema and run in api-migrations.
       - name: Apply mirror migrations
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_mb_mirror.sql -f migrations/0013_mb_import_resume_dlq.sql
         env:

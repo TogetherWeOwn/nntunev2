@@ -127,8 +127,18 @@ check "same line poison is keyed by dump" "2" \
 
 echo "=== 4. kill -9 mid-import resumes from cursor ==="
 reset_db
+# Own process group (`set -m`): the kill below must take the in-flight psql
+# chunk transaction with the bash. Killing only the bash orphans the psql
+# child; if it commits after the resume run reads the cursor, the resume's
+# conditional cursor UPDATE matches nothing and the suite fails spuriously.
+# Monitor mode puts this background job in its own group (pgid == $!, set at
+# fork and kept after `set +m`), so the group kill below is deterministic —
+# unlike setsid, which forks (and strands $! on a dead parent) whenever the
+# parent shell already gave the job its own group.
+set -m
 bash "$SELF_DIR/import.sh" "$FIX" >/dev/null 2>&1 &
 imp=$!
+set +m
 killed_at=""
 for _ in $(seq 1 1200); do
   sleep 0.05
@@ -140,7 +150,7 @@ for _ in $(seq 1 1200); do
 done
 if [[ -z "$killed_at" ]]; then
   echo "FAIL: import never reached line 25 (cannot test kill-resume)" >&2
-  kill "$imp" 2>/dev/null || true
+  kill -- "-$imp" 2>/dev/null || true
   wait "$imp" 2>/dev/null || true
   fail=1
 # A resume test that never interrupts proves nothing: a completed import +
@@ -160,11 +170,16 @@ else
   rec_at="$(cursor recording "$FIX/mbdump-recording.tsv")"
   if [[ "$killed_at" == "123" && "$rel_at" == "61" && "$rec_at" == "60" ]]; then
     echo "FAIL: import completed before kill -9 (nothing to resume)" >&2
-    kill "$imp" 2>/dev/null || true
+    kill -- "-$imp" 2>/dev/null || true
     wait "$imp" 2>/dev/null || true
     fail=1
   else
-    kill -9 "$imp" 2>/dev/null
+    # Group kill: the whole job group (bash + in-flight psql) dies
+    # together, so no orphaned chunk transaction can commit after the resume
+    # run reads the cursor. Either the chunk committed before this point
+    # (resume sees the advanced cursor) or its transaction aborts — both are
+    # consistent resume states.
+    kill -9 -- "-$imp" 2>/dev/null
     kstatus=0
     wait "$imp" 2>/dev/null || kstatus=$?
     if (( kstatus == 0 )); then
@@ -288,7 +303,43 @@ else
   echo "ok: /dev/full unavailable on this platform, skipping write-failure check"
 fi
 
-rm -rf "$FIX" "$DUPE" "$NEWER" "$FKDIR"
+echo "=== 10. all-poison dump is refused, replication state untouched ==="
+# Regression test for the all-poison refusal guard: with
+# refuse_all_poison_dump neutered (`return 0`) both runs below exit 0 and the
+# second seeds last_packet=500 over an empty table. Assert non-zero exits on
+# the chunk-loop path (first run) and the already-complete path (rerun), with
+# no rows loaded and last_packet still 0 either way.
+reset_db
+POISON="$FIX-poison"
+rm -rf "$POISON"
+mkdir -p "$POISON"
+cp "$FIX/mbdump-release.tsv" "$FIX/mbdump-recording.tsv" "$POISON/"
+python3 - "$POISON/mbdump-artist.tsv" <<'EOF'
+import sys
+p = sys.argv[1]
+with open(p, 'w') as f:
+    for i in range(5):
+        f.write(f'not-a-uuid-{i}\tBad {i}\tBad {i}\tGroup\tUS\tnot-a-date\n')
+EOF
+if DUMP_SEQ=500 bash "$SELF_DIR/import.sh" "$POISON" >/dev/null 2>&1; then
+  echo "FAIL: all-poison dump imported without error" >&2
+  fail=1
+else
+  echo "ok: all-poison dump refused on first run"
+fi
+check "poison: no rows loaded" "0" "$(db -c 'SELECT count(*) FROM mb_artist;')"
+check "poison: DLQ holds every row" "5" "$(db -c "SELECT count(*) FROM mb_import_dlq WHERE table_name='artist';")"
+check "poison: replication state untouched" "0" "$(db -c 'SELECT last_packet FROM mb_import_state WHERE id = 1;')"
+if DUMP_SEQ=500 bash "$SELF_DIR/import.sh" "$POISON" >/dev/null 2>&1; then
+  echo "FAIL: all-poison rerun imported without error (already-complete path)" >&2
+  fail=1
+else
+  echo "ok: all-poison rerun refused on already-complete path"
+fi
+check "poison rerun: still no rows" "0" "$(db -c 'SELECT count(*) FROM mb_artist;')"
+check "poison rerun: replication state still untouched" "0" "$(db -c 'SELECT last_packet FROM mb_import_state WHERE id = 1;')"
+
+rm -rf "$FIX" "$DUPE" "$NEWER" "$FKDIR" "$POISON"
 if (( fail != 0 )); then
   echo "test-import: FAILED" >&2
   exit 1
