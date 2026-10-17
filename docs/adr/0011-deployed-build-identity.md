@@ -38,20 +38,15 @@ why not in `/api/health`?
 `/api/health`, whose package-only semantics are frozen.**
 
 - `GET /api/build` returns exactly `{ sha }`: the 40-character lowercase
-  hex commit SHA. Sources in precedence order: the runtime `BUILD_SHA` env
-  when set on the Worker (it overrides the baked value), then the SHA baked
-  at build time (sourced from `BUILD_SHA` / `GITHUB_SHA` via the
-  `__BUILD_SHA__` build-time define), then Workers `CF_VERSION_METADATA`
-  as a last resort. The `CF_VERSION_METADATA` fallback is inert as coded:
-  the handler reads `meta?.id ?? meta?.tag`, so with a `[version_metadata]`
-  binding present `id` is always a non-empty Worker version UUID and `tag`
-  is never consulted; the UUID never matches the `^[0-9a-f]{40}$` rule, and
-  the current deploy runs `deploy --env staging` with no such binding and
-  no tag, so it collapses to `"unknown"`. A binding plus a deploy tag alone
-  changes nothing without a handler change to try `tag` before `id`. A
-  malformed runtime value likewise masks a valid baked SHA, so promotion
-  lanes must compare the reported SHA against the promotion SHA rather than
-  trust build provenance.
+  hex commit SHA. The sole source is the SHA baked at build time (sourced
+  from `BUILD_SHA` / `GITHUB_SHA` via the `__BUILD_SHA__` build-time
+  define, validated to `^[0-9a-f]{40}$` with everything else collapsing to
+  `"unknown"`). The baked value is authoritative by design: a runtime var
+  or Workers version field is mutable per-request/per-deploy state, so
+  letting one override the bake would let an empty, invalid, or stale value
+  mask the exact head this artifact was built from. Promotion lanes must
+  compare the reported SHA against the promotion SHA rather than trust
+  build provenance.
 - Unknown or unset build identity renders as the explicit string
   `"unknown"` — never silently omitted, never an empty string. The `sha`
   key is always present. An `unknown` identity is a build-configuration
