@@ -130,17 +130,30 @@ def parse_list_output(text, source="<list-output>"):
 
 
 def parse_matrix(text):
-    """Return (cited spec files, cited e2e paths, cited titles)."""
+    """Return (cited spec files, cited e2e paths, cited titles).
+
+    Scans per paragraph, not per line: the matrix prose is hard-wrapped, so
+    a quoted title (or backticked path) split across two lines would never
+    match the per-line spans and a retitled test would pass unchecked.
+    Joining each paragraph's lines with a space keeps wrapped citations
+    checkable; normalize() already collapses the extra whitespace.
+    """
     prose = strip_fences(text)
     spec_files, other_paths, titles = set(), set(), set()
-    for line in prose.splitlines():
-        for span in BACKTICK_SPAN.findall(line):
-            spec = SPEC_CITE.fullmatch(span)
+    paragraphs = re.split(r"\n\s*\n", prose)
+    for paragraph in paragraphs:
+        joined = " ".join(paragraph.splitlines())
+        for span in BACKTICK_SPAN.findall(joined):
+            # Undo a hard-wrap split inside a spaceless token: real paths
+            # never contain whitespace, so `al\npha` joins as `al pha`
+            # and must be compacted before matching.
+            compact = re.sub(r"\s+", "", span)
+            spec = SPEC_CITE.fullmatch(compact)
             if spec:
                 spec_files.add(f"e2e/tests/{spec.group(1)}")
                 continue
             # A trailing :line is informational (see module docstring).
-            path = LINE_SUFFIX.sub(r"\1", span)
+            path = LINE_SUFFIX.sub(r"\1", compact)
             if (
                 path.startswith("e2e/")
                 and "*" not in path
@@ -148,7 +161,7 @@ def parse_matrix(text):
                 and "." in path.rsplit("/", 1)[-1]
             ):
                 other_paths.add(path)
-        for span in QUOTED_SPAN.findall(line):
+        for span in QUOTED_SPAN.findall(joined):
             candidate = normalize(span)
             if candidate:
                 titles.add(candidate)

@@ -7,6 +7,8 @@ cited pair passes, while a missing spec, a stale path, a stale title, an
 unknown quote, and an unparseable list each fail with the drift named.
 """
 
+import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -109,6 +111,28 @@ class CheckTraceabilityTest(unittest.TestCase):
         self.assertEqual(len(drifts), 1)
         self.assertIn("renamed away title", drifts[0])
 
+    def test_wrapped_stale_title_across_lines_fails(self):
+        # Matrix prose is hard-wrapped: a stale title split over two lines
+        # must still drift, not pass unchecked.
+        matrix = MATRIX_COVERING_BOTH + '"renamed away\ntitle"\n'
+        drifts = self.run_check(matrix, LIST_TWO_FILES)
+        self.assertEqual(len(drifts), 1)
+        self.assertIn("renamed away title", drifts[0])
+
+    def test_wrapped_valid_title_across_lines_passes(self):
+        matrix = MATRIX_COVERING_BOTH.replace(
+            '"first title"', '"first\ntitle"'
+        )
+        self.assertEqual(self.run_check(matrix, LIST_TWO_FILES), [])
+
+    def test_wrapped_spec_path_mid_token_passes(self):
+        # A hard-wrap split inside a spaceless path token must still cite
+        # the spec, not drift under a mangled name.
+        matrix = MATRIX_COVERING_BOTH.replace(
+            "`e2e/tests/beta.spec.ts:5`", "`e2e/tests/be\nta.spec.ts:5`"
+        )
+        self.assertEqual(self.run_check(matrix, LIST_TWO_FILES), [])
+
     def test_unknown_quote_fails(self):
         matrix = MATRIX_COVERING_BOTH + 'A new "Prose Section" reference.\n'
         drifts = self.run_check(matrix, LIST_TWO_FILES)
@@ -142,35 +166,41 @@ class CheckTraceabilityTest(unittest.TestCase):
         self.assertEqual(paths, set())
 
     def test_main_missing_file_is_exit_2(self):
+        # Capture stdout: main() prints `::error::` workflow commands, which
+        # Actions would turn into error annotations on every PR's e2e-lint
+        # job, even on green runs.
         with tempfile.TemporaryDirectory() as tmp:
             matrix_path = write_tree(tmp, MATRIX_COVERING_BOTH, LIST_TWO_FILES)
             list_path = os.path.join(tmp, "list.txt")
-            self.assertEqual(
-                main(
-                    [
-                        "--root",
-                        tmp,
-                        "--matrix",
-                        str(matrix_path),
-                        "--list-output",
-                        list_path,
-                    ]
-                ),
-                0,
-            )
-            self.assertEqual(
-                main(
-                    [
-                        "--root",
-                        tmp,
-                        "--matrix",
-                        str(matrix_path),
-                        "--list-output",
-                        os.path.join(tmp, "nope.txt"),
-                    ]
-                ),
-                2,
-            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    main(
+                        [
+                            "--root",
+                            tmp,
+                            "--matrix",
+                            str(matrix_path),
+                            "--list-output",
+                            list_path,
+                        ]
+                    ),
+                    0,
+                )
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                self.assertEqual(
+                    main(
+                        [
+                            "--root",
+                            tmp,
+                            "--matrix",
+                            str(matrix_path),
+                            "--list-output",
+                            os.path.join(tmp, "nope.txt"),
+                        ]
+                    ),
+                    2,
+                )
+            self.assertIn("::error::traceability", buf.getvalue())
 
 
 if __name__ == "__main__":
