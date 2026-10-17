@@ -1,8 +1,8 @@
 //! Pinned, cancellable NNTP transport proof for NZB fetch.
 //!
-//! Fail-closed policy consumed by the NZB intake wiring
-//! ([TOG-26211](/TOG/issues/TOG-26211), untouched): TLS-on only, NNTP port
-//! allowlist, cooperative cancellation, names-only diagnostics.
+//! Fail-closed policy consumed by the NZB intake wiring (separate intake
+//! card, untouched here): TLS-on only, NNTP port allowlist, cooperative
+//! cancellation, names-only diagnostics.
 //!
 //! - **Allowlist:** [`ALLOWED_NNTP_PORTS`] (`119`, `563` — the NNTP
 //!   conventions; the policy additionally requires TLS-on, so `119` is only
