@@ -6,12 +6,14 @@ const RANGE_REQUEST_PATTERN = /^bytes=(\d+)-(\d+)$/;
 const FINAL_STORM_RANGE = 'bytes=9000-9099';
 
 function mismatchedRange(start: number, end: number) {
-	const mismatchedStart = start + 1;
-	return { start: mismatchedStart, end: mismatchedStart + end - start };
+	return { start: start + 1, end };
 }
 
 async function runSeekStormWithInjectedResponse(page: Page, status: 200 | 206) {
 	await page.goto('/demo/player');
+	await page.waitForFunction(
+		() => typeof (window as unknown as { __seekStorm?: unknown }).__seekStorm === 'function'
+	);
 	await page.route(/\/api\/demo\/audio(?:\?.*)?$/, async (route) => {
 		const range = route.request().headers()['range'];
 		const match = range?.match(RANGE_REQUEST_PATTERN);
@@ -34,7 +36,7 @@ async function runSeekStormWithInjectedResponse(page: Page, status: 200 | 206) {
 			status,
 			contentType: 'audio/mpeg',
 			headers,
-			body: String.fromCharCode(0).repeat(status === 200 ? MEDIA_BYTES : end - start + 1)
+			body: String.fromCharCode(0).repeat(status === 200 ? MEDIA_BYTES : mismatched.end - mismatched.start + 1)
 		});
 	});
 
@@ -51,6 +53,9 @@ async function runSeekStormWithInjectedResponse(page: Page, status: 200 | 206) {
 
 test('demo audio plays and advances in the browser', async ({ page }) => {
 	await page.goto('/demo/player');
+	await page.waitForFunction(
+		() => typeof (window as unknown as { __seekStorm?: unknown }).__seekStorm === 'function'
+	);
 
 	const audio = page.getByTestId('demo-audio');
 	await expect(audio).toBeVisible();
@@ -119,7 +124,8 @@ test('seek storm does not count a mismatched Content-Range response', async ({ p
 	const responseEnd = Number(contentRangeMatch[2]);
 	const responseTotal = Number(contentRangeMatch[3]);
 	expect(responseStart).not.toBe(requestedStart);
-	expect(responseEnd - responseStart).toBe(requestedEnd - requestedStart);
+	expect(responseEnd).toBe(requestedEnd);
+	expect(responseEnd - responseStart + 1).toBe(99);
 	expect(responseTotal).toBe(MEDIA_BYTES);
 
 	await expect(page.getByTestId('seek-stats')).toContainText(/completed 1\b/);
