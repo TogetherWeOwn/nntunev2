@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { readSignedInEmail } from '#lib/signed-in-email.js';
+	import { serializePublicKeyCredential, toRequestOptions } from '#lib/webauthn.js';
 	import {
 		ApiClient,
 		ApiError,
@@ -46,6 +47,7 @@
 	let reauthRequired = $state(false);
 	let reauthPasswordInput = $state<HTMLInputElement | null>(null);
 	let saveReauthRequired = $state(false);
+	let reauthState = $state<'idle' | 'working' | 'failed'>('idle');
 	let saveState = $state<'idle' | 'saving' | 'saved' | 'failed'>('idle');
 	let testedConfigKey = $state<string | null>(null);
 	let testRunId = 0;
@@ -165,6 +167,59 @@
 						? 'The API is not deployed yet — try again later.'
 						: 'Connection test failed. Check the details and try again.';
 			}
+		}
+	}
+
+	async function reauthenticateAndSave() {
+		if (reauthState === 'working') return;
+		const inputKey = currentTestKey();
+		if (testState !== 'ok' || testedConfigKey !== inputKey) return;
+		const input = currentTestInput();
+		if (typeof PublicKeyCredential === 'undefined') {
+			reauthState = 'failed';
+			return;
+		}
+		reauthState = 'working';
+		try {
+			const options = await client.reauthenticateStart();
+			const assertion = await navigator.credentials.get({
+				publicKey: toRequestOptions({
+					challenge: options.challenge,
+					rpId: options.rp_id,
+					allowCredentials: []
+				})
+			});
+			if (!(assertion instanceof PublicKeyCredential)) throw new Error('no public-key credential');
+			const serialized = serializePublicKeyCredential(assertion);
+			const response = serialized.response as Record<string, unknown>;
+			const authenticatorData = response.authenticatorData;
+			const clientDataJson = response.clientDataJSON;
+			const signature = response.signature;
+			if (
+				typeof authenticatorData !== 'string' ||
+				typeof clientDataJson !== 'string' ||
+				typeof signature !== 'string' ||
+				typeof serialized.id !== 'string'
+			) {
+				throw new Error('credential missing assertion fields');
+			}
+			await client.reauthenticateFinish({
+				challenge: options.challenge,
+				credentialId: serialized.id,
+				authenticatorData,
+				clientDataJson,
+				signature
+			});
+			if (currentTestKey() !== inputKey || testedConfigKey !== inputKey) {
+				throw new Error('provider configuration changed after testing');
+			}
+			await client.saveProviderConfig(input);
+			reauthState = 'idle';
+			saveReauthRequired = false;
+			saveState = 'saved';
+			window.location.href = '/library';
+		} catch {
+			reauthState = 'failed';
 		}
 	}
 
@@ -301,7 +356,7 @@
 				class="nt-button nt-button--ghost"
 				type="button"
 				onclick={() => backTo(2)}
-				disabled={saveState === 'saving'}
+				disabled={saveState === 'saving' || reauthState === 'working'}
 			>
 				Back
 			</button>
@@ -321,7 +376,7 @@
 					type="button"
 					onclick={save}
 						data-testid="byop-save"
-					disabled={saveState === 'saving' || saveState === 'saved'}
+					disabled={saveState === 'saving' || saveState === 'saved' || reauthState === 'working'}
 				>
 					{saveState === 'saved'
 						? 'Saved'
@@ -364,10 +419,20 @@
 			{#if saveState === 'saved'}
 				<p role="status">Saved. Your credentials are sealed in the encrypted vault.</p>
 			{:else if saveState === 'failed' && saveReauthRequired}
-				<p role="alert">
-					Your session is too old to save provider details. <a href="/login">Sign in again</a>,
-					then enter your provider details and test the connection before saving.
-				</p>
+				<div role="alert">
+					<p>Your session is too old to save provider details. Reauthenticate with your passkey to continue.</p>
+					<button
+						class="nt-button"
+						type="button"
+						onclick={reauthenticateAndSave}
+						disabled={reauthState === 'working'}
+					>
+						{reauthState === 'working' ? 'Verifying…' : 'Reauthenticate and save'}
+					</button>
+					{#if reauthState === 'failed'}
+						<p role="status">Reauthentication failed. <a href="/login">Sign in again</a> to continue.</p>
+					{/if}
+				</div>
 			{:else if saveState === 'failed'}
 				<p role="alert">Could not save. Your details were not stored — try again.</p>
 			{/if}

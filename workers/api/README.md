@@ -38,6 +38,7 @@ the core and require exactly one row before any response.
 | `POST /v1/auth/passkey/login/start` / `finish` | usernameless passkey login (empty `allow_credentials`; assertion + sign-count clone detection) |
 | `POST /v1/auth/magic/start` / `finish` | email magic link (atomic per-email issuance reservation shared with register inbox proof; finish never replaces an existing session for a different account and echoes the signed-in account's own email for display) |
 | `POST /v1/session/refresh` / `logout` / `revoke-all` | stored-session rotation/revocation |
+| `POST /v1/session/reauthenticate/start` / `finish` | current-session-bound passkey proof and atomic single-session replacement |
 | `GET` / `PUT` / `DELETE /v1/vault` | booleans-only summary / encrypted upsert / delete |
 | `POST /v1/vault/test` (`/v1/vault/test-connection` compatibility alias) | `{"ok": bool}` only; atomically rate-limited, per-user concurrency lease, bounded pinned-address dial; empty body tests the stored vault, a `{provider, indexer}` envelope tests a candidate without persisting it |
 
@@ -121,13 +122,17 @@ config from secrets) is a follow-up slice.
   sessions authenticated outside the window are rejected with the documented
   `reauth_required` error code (401). Vault summary reads and boolean
   connection tests retain ordinary session authentication. The pure
-  `reauthenticate_session` helper binds the verified proof identity and
-  prepares a replacement session plus a conditional single-row revocation
-  claim; callers must execute both writes in one transaction and send the
-  cookie only after commit. The current `login_finish` and `magic_finish`
-  routes remain ordinary sign-in and issue independent sessions without
-  revoking existing rows; a proof-bound HTTP reauthentication route is not
-  part of this slice.
+  `POST /v1/session/reauthenticate/start` authenticates the existing cookie
+  with exact-Origin CSRF protection and stores a `reauth` passkey challenge
+  bound to that session's user. `/finish` requires the same active session,
+  that same-user challenge, and a verified assertion from a credential owned
+  by that user. It consumes the challenge and advances the credential counter,
+  then uses `reauthenticate_session` with the verified credential user id.
+  The store conditionally revokes exactly the old row and inserts the new row
+  in one transaction; zero-row claims, conflicts, insert errors, and commit
+  errors return without a replacement cookie. The cookie is emitted only
+  after commit. `login_finish` and `magic_finish` remain ordinary sign-in and
+  issue independent sessions without revoking existing rows.
 - **Hyperdrive query caching:** the `HYPERDRIVE` binding MUST point to a
   Hyperdrive config with query caching disabled (`--caching-disabled`).
   Session, credential, user, challenge and vault reads are plain

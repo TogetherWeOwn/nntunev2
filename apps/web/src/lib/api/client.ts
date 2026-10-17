@@ -284,6 +284,19 @@ export class ApiClient {
 		);
 	}
 
+	/** Start a passkey proof bound to the currently authenticated session. */
+	async reauthenticateStart(): Promise<LoginStartResponse> {
+		return this.post<LoginStartResponse>('/v1/session/reauthenticate/start', {});
+	}
+
+	/** Complete proof-bound reauthentication without affecting ordinary login. */
+	async reauthenticateFinish(input: LoginFinishInput): Promise<MagicLinkResult> {
+		return this.post<MagicLinkResult>(
+			'/v1/session/reauthenticate/finish',
+			toLoginFinishBody(input)
+		);
+	}
+
 	/**
 	 * Live-test a provider (+ optional indexer) config without storing it.
 	 * The API validates (SSRF guard), dials, and returns a redacted result —

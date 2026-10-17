@@ -94,6 +94,26 @@
       }
     },
     {
+      "id": "session-reauthenticate-finish",
+      "method": "POST",
+      "path": "/v1/session/reauthenticate/finish",
+      "web": "reauthenticateFinish",
+      "input": {
+        "challenge": "Zml4dHVyZS1yZWF1dGgtY2hhbGxlbmdl",
+        "credentialId": "Zml4dHVyZS1jcmVkZW50aWFs",
+        "authenticatorData": "fixture-authenticator-data",
+        "clientDataJson": "Zml4dHVyZS1jbGllbnQtZGF0YQ",
+        "signature": "Zml4dHVyZS1zaWduYXR1cmU"
+      },
+      "wire": {
+        "challenge": "Zml4dHVyZS1yZWF1dGgtY2hhbGxlbmdl",
+        "credential_id": "Zml4dHVyZS1jcmVkZW50aWFs",
+        "authenticator_data": "fixture-authenticator-data",
+        "client_data_json": "Zml4dHVyZS1jbGllbnQtZGF0YQ",
+        "signature": "Zml4dHVyZS1zaWduYXR1cmU"
+      }
+    },
+    {
       "id": "magic-start",
       "method": "POST",
       "path": "/v1/auth/magic/start",
@@ -131,6 +151,11 @@
       "id": "session-revoke-all",
       "method": "POST",
       "path": "/v1/session/revoke-all"
+    },
+    {
+      "id": "session-reauthenticate-start",
+      "method": "POST",
+      "path": "/v1/session/reauthenticate/start"
     },
     {
       "id": "vault-get",
