@@ -90,7 +90,7 @@ dependencies this harness needs.
 |---|---|---|
 | `STAGING_BASE_URL` | yes (post-deploy) | `https://` staging origin. Unset → skip with notice. |
 | `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | whenever staging is configured | QA service-token pair. Both absent or either absent → fail closed before requests. |
-| `QA_AUTH_TOKEN` | optional | Bearer for `POST /api/test-accounts` (staging-only seam). Absent → UI signup fallback. |
+| `QA_AUTH_TOKEN` | optional | Bearer for `POST /api/test-accounts` (staging-only seam). Absent → UI signup fallback. The dedicated public UI-signup case ignores the seam either way. |
 | `SYNTHETIC_NNTP_HOST` / `_PORT` / `_USER` / `_TLS` | for BYOP spec | Hosted fixture server or test provider (defaults: `synthetic-nntp`, `563`, `e2e`, TLS on). The port must be in the BYOP allowlist (`119` or `563`) and TLS-off is rejected — the harness fails closed on a fixture transport the wizard cannot represent. |
 | `SYNTHETIC_NNTP_PASS` | for BYOP spec | No default — fail closed when missing. |
 
@@ -122,9 +122,17 @@ How the suite uses them:
   `helpers/accounts.ts` names it; cookie sessions would update the helper +
   specs together).
 - Test accounts are throwaway (`e2e+<stamp>@example.test`); the API seam is
-  tried first, a fully-implemented UI signup second (each journey file signs
+  tried first, a form-submission UI signup (emailed-code step) second (each journey file signs
   up its own identity — Playwright isolates module state per file, so there
-  is no cross-file account sharing). Once `QA_AUTH_TOKEN` is set the seam is
+  is no cross-file account sharing). Independently of that choice,
+  `signup-byop.spec.ts` carries a dedicated public UI-signup case
+  (`submitPublicUiSignup`, null identity): it always submits the real
+  `/signup` form with a unique synthetic mailbox and requires the
+  emailed-code step with no inline error, even when `QA_AUTH_TOKEN`
+  is set, so a seam-backed run still proves public UI form submission.
+  Wizard arrival via the form is not asserted: the code-plus-passkey
+  finish needs a staging code-retrieval seam that does not exist yet
+  (see row 1 of `docs/m1-exit-traceability.md`). Once `QA_AUTH_TOKEN` is set the seam is
   required infrastructure: transport errors, non-2xx and non-JSON mint
   responses throw instead of collapsing into a silent skip, and API-driven
   steps (`requireApiAccount`) refuse to run anonymously. The identity that
@@ -138,9 +146,14 @@ How the suite uses them:
 
 ## CI
 
-- `.github/workflows/e2e-staging.yml` — full suite on `push` to `main`,
-  manual dispatch, and a 6-hour synthetic schedule. The deployment lane must
-  sequence execution after staging deploy; a push alone is not deploy proof.
+- `.github/workflows/e2e-staging.yml` — no `push` trigger. The full
+  journey runs only as a reusable-workflow call from `deploy.yml`'s
+  `post-deploy-e2e` job, which `needs` the same run's `staging-web`
+  deploy, so a skipped/failed deploy cannot produce a full-journey PASS
+  and the E2E run cannot race its deploy. Manual dispatch and the
+  6-hour schedule run the synthetic smoke only (monitoring, not
+  post-deploy promotion evidence); dispatch defines no `post_deploy`
+  input, so it cannot mint that evidence by hand.
   Missing `STAGING_BASE_URL` → step-level skip with notice (pre-deploy).
   Both jobs require the Access pair in preflight before activating tests;
   configured staging never skips for missing credentials. Failure artifacts
@@ -151,9 +164,13 @@ How the suite uses them:
   and the aggregate gate with dummy inputs; failures, cancellations and skips
   of required jobs make `ci-ok` red.
 - **Prod promotion gate (required integration):** the deployment lane must
-  require the `e2e-staging` result on the deployed SHA and block promotion on
-  failure. Wiring and live enforcement are still acceptance prerequisites,
-  not a verified result of this PR.
+  require the post-deploy full-journey result (the `post-deploy-e2e` job in
+  the same `deploy.yml` run as the successful `staging-web` deploy) and
+  block promotion on failure. Sequencing after the deploy is wired;
+  blocking a later production promotion on that result, and live
+  enforcement, are still acceptance prerequisites of that later lane. A
+  source SHA is not deployed-build identity, so the result is not
+  same-build evidence until build identity is separately proven.
 
 ## Evidence
 
@@ -172,8 +189,10 @@ apply the exact checked-in sanitize blocks, and assert the marker password
 is absent from every uploaded file including base64-decoded payloads. Do not
 enable traces/screenshots or the html reporter for credential-bearing runs
 without a verified redaction path. A QA PASS verdict cites the green
-`e2e-staging` run URL + deployed head SHA; NEEDS WORK cites the failing
-spec + step. Every spec that branches on the test-account seam records a
+post-deploy run URL (the `deploy.yml` run whose `staging-web` succeeded
+and whose `post-deploy-e2e` full journey passed) + the source head SHA —
+never a scheduled/manual synthetic run, which is monitoring only; NEEDS
+WORK cites the failing spec + step. Every spec that branches on the test-account seam records a
 bounded `signup-path` test annotation — exactly `public-ui-signup` or
 `api-minted-account`, with no email, account id, token or provider data.
 Both staging jobs publish those labels to the run's step summary on every
