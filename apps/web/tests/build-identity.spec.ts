@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
 
 /**
- * Deployed-build identity acceptance (test-first, TOG-28338).
+ * Deployed-build identity acceptance (test-first contract).
  *
  * Dedicated surface: GET /api/build -> exactly `{ sha }`, where sha is a
  * 40-char lowercase hex commit SHA on staging builds or the explicit string

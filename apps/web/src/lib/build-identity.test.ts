@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 /**
- * Deployed-build identity acceptance contract (test-first, TOG-28338).
+ * Deployed-build identity acceptance contract (test-first).
  *
  * The Builder implements this contract on this branch without editing this
  * file. Dedicated surface (separate from `/api/health`):
@@ -92,7 +92,7 @@ describe('build-identity contract (documented shape)', () => {
 		// tokens, or binding names. Any value that looks like one fails.
 		const leaks = [
 			'localhost',
-			'myhost.internal',
+			'myhost.example.com',
 			'AKIAIOSFODNN7EXAMPLE',
 			'xoxb-token-value',
 			'-----BEGIN PRIVATE KEY-----'
