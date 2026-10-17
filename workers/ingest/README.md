@@ -296,7 +296,8 @@ The match/write steps are wired in the consumer (`src/matching.rs` +
 binding, the idempotent library upsert through `LIBRARY_DB`, and one
 meter event per transition, with the terminal `Done` checkpoint written
 only after the upsert commits. After a release pick the matcher fetches
-the release's recordings to fill `recording_mbids` in track order; a
+the release's recordings to fill `recording_mbids` in album order
+(medium, then track, from the mirror's `mb_track` membership); a
 recordings-fetch failure never loses the release match (transient
 retries the job, permanent writes the release with an empty list).
 Still blocked for the live

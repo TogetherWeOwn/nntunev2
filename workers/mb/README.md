@@ -12,7 +12,7 @@ Decision: `docs/adr/0007-mb-mirror.md`.
 | `GET` | `/v1/mb/artist/:mbid` | Artist lookup over Hyperdrive (`MB_DB`); success `Cache-Control: public, max-age=86400` |
 | `GET` | `/v1/mb/release/:mbid` | Release lookup (includes the stored `caa_url`); same caching as artist |
 | `GET` | `/v1/mb/recording/:mbid` | Recording lookup; same caching as artist |
-| `GET` | `/v1/mb/release/:mbid/recordings` | Recordings of a release ordered by `track_no` (nulls last), then MBID, `LIMIT 1000`; existing release with no recordings is `200` with an empty list, missing release is `404`; same caching as lookups |
+| `GET` | `/v1/mb/release/:mbid/recordings` | Recordings of a release in album order (`medium_no`, then `track_no`, then MBID), listed from `mb_track` membership, `LIMIT 1000`; existing release with no recordings is `200` with an empty list, missing release is `404`; same caching as lookups |
 | `GET` | `/v1/mb/search?q=&type=` | `type` in `artist\|release\|recording`; `q` 2-100 chars; trigram (`pg_trgm`) ordered by similarity, `LIMIT 25`; success `Cache-Control: public, max-age=300` |
 
 Errors are JSON (`{"error": "..."}`) with `Cache-Control: no-store`:
@@ -26,7 +26,12 @@ search success is `{"q", "type", "results": [{"mbid", "name"|"title",
 "Artist - Album" queries against the artist instead of the title-only
 score; release-recordings success is `{"release_mbid",
 "recordings": [{"mbid", "release_mbid", "title", "track_no",
-"duration_ms"}]}`. Interactive reads never call musicbrainz.org.
+"duration_ms", "medium_no"}]}`. The listing reads `mb_track`
+(`migrations/0016_mb_track.sql`), which stores every track appearance
+with its medium position — unlike `mb_recording.release_mbid`, which
+keeps one canonical release per recording and would drop a reissue's
+shared tracks; a bare recording lookup answers `medium_no: null`.
+Interactive reads never call musicbrainz.org.
 
 ## Caching
 

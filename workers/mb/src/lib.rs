@@ -130,8 +130,12 @@ fn lookup_sql(kind: Kind) -> &'static str {
              FROM mb_release WHERE mbid = $1::text::uuid"
         }
         Kind::Recording => {
+            // A bare recording lookup has no release context, so it has
+            // no medium: NULL keeps the shared row shape (the canonical
+            // mb_recording row stores neither medium nor a complete
+            // release list; mb_track does).
             "SELECT mbid::text AS mbid, release_mbid::text AS release_mbid, title, \
-             track_no, duration_ms \
+             track_no, duration_ms, NULL::smallint AS medium_no \
              FROM mb_recording WHERE mbid = $1::text::uuid"
         }
     }
@@ -142,14 +146,21 @@ fn lookup_sql(kind: Kind) -> &'static str {
 /// (200, empty list), which the recordings query alone cannot.
 const RELEASE_EXISTS_SQL: &str = "SELECT 1 FROM mb_release WHERE mbid = $1::text::uuid";
 
-/// Recordings of one release, in track order with a deterministic
-/// tiebreak and a hard limit. `track_no` is nullable in the mirror, so
-/// untracked rows sort last instead of scattering by planner choice.
+/// Recordings of one release, in album order with a deterministic
+/// tiebreak and a hard limit. Listed from `mb_track` (migration 0016),
+/// not from `mb_recording.release_mbid`: the mirror keeps only one
+/// canonical release per recording there, so a reissue or compilation
+/// would silently miss its shared tracks, and `mb_recording.track_no`
+/// is the position within one medium, which interleaves the discs of
+/// a multi-medium release. `mb_track` holds every track appearance
+/// with its medium position, so ordering by (medium_no, track_no) is
+/// true album order. Both positions are NOT NULL in `mb_track`.
 const RELEASE_RECORDINGS_SQL: &str =
-    "SELECT mbid::text AS mbid, release_mbid::text AS release_mbid, title, \
-     track_no, duration_ms \
-     FROM mb_recording WHERE release_mbid = $1::text::uuid \
-     ORDER BY track_no ASC NULLS LAST, mbid ASC LIMIT 1000";
+    "SELECT r.mbid::text AS mbid, t.release_mbid::text AS release_mbid, r.title, \
+     t.track_no AS track_no, r.duration_ms, t.medium_no AS medium_no \
+     FROM mb_track t JOIN mb_recording r ON r.mbid = t.recording_mbid \
+     WHERE t.release_mbid = $1::text::uuid \
+     ORDER BY t.medium_no ASC, t.track_no ASC, r.mbid ASC LIMIT 1000";
 
 /// Trigram search statement per kind. `$1` is the normalized query; `%` is
 /// the `pg_trgm` similarity predicate (GIN index in migration 0001),
@@ -266,6 +277,10 @@ struct Recording {
     title: String,
     track_no: Option<i16>,
     duration_ms: Option<i32>,
+    /// Medium (disc) position within the release, from `mb_track`.
+    /// Only the release-recordings listing sets it; a bare recording
+    /// lookup answers `null`.
+    medium_no: Option<i16>,
 }
 
 /// One lookup row, tagged by [`Kind`] again at serialization time so the
@@ -347,9 +362,9 @@ struct RepoError;
 trait MbRepo {
     async fn lookup(&self, kind: Kind, mbid: &str) -> Result<Option<Entity>, RepoError>;
     async fn search(&self, kind: Kind, normalized_q: &str) -> Result<Vec<SearchHit>, RepoError>;
-    /// Recordings of one release in track order. `None` means the release
-    /// itself does not exist; `Some(empty)` is a release with no
-    /// recordings in the mirror yet.
+    /// Recordings of one release in album order (medium, then track).
+    /// `None` means the release itself does not exist; `Some(empty)`
+    /// is a release with no recordings in the mirror yet.
     async fn release_recordings(
         &self,
         release_mbid: &str,
@@ -697,6 +712,7 @@ mod http_layer {
             title: row.try_get("title").map_err(|_| RepoError)?,
             track_no: row.try_get("track_no").map_err(|_| RepoError)?,
             duration_ms: row.try_get("duration_ms").map_err(|_| RepoError)?,
+            medium_no: row.try_get("medium_no").map_err(|_| RepoError)?,
         })
     }
 
@@ -1288,17 +1304,21 @@ mod tests {
             title: format!("Track {n}"),
             track_no,
             duration_ms: Some(180_000),
+            medium_no: Some(1),
         }
     }
 
     #[test]
     fn release_recordings_sql_is_track_ordered_bounded_and_parameterized() {
+        // Listed from mb_track membership (every appearance, with the
+        // medium position), never from the canonical
+        // mb_recording.release_mbid, which omits shared recordings.
         assert!(
-            RELEASE_RECORDINGS_SQL.contains("FROM mb_recording"),
+            RELEASE_RECORDINGS_SQL.contains("FROM mb_track t JOIN mb_recording r"),
             "{RELEASE_RECORDINGS_SQL}"
         );
         assert!(
-            RELEASE_RECORDINGS_SQL.contains("release_mbid = $1::text::uuid"),
+            RELEASE_RECORDINGS_SQL.contains("t.release_mbid = $1::text::uuid"),
             "{RELEASE_RECORDINGS_SQL}"
         );
         assert!(
@@ -1306,7 +1326,7 @@ mod tests {
             "{RELEASE_RECORDINGS_SQL}"
         );
         assert!(
-            RELEASE_RECORDINGS_SQL.contains("ORDER BY track_no ASC NULLS LAST, mbid ASC"),
+            RELEASE_RECORDINGS_SQL.contains("ORDER BY t.medium_no ASC, t.track_no ASC, r.mbid ASC"),
             "{RELEASE_RECORDINGS_SQL}"
         );
         assert!(
@@ -1343,6 +1363,7 @@ mod tests {
         let recordings = body["recordings"].as_array().unwrap();
         assert_eq!(recordings.len(), 2);
         assert_eq!(recordings[0]["track_no"], 1);
+        assert_eq!(recordings[0]["medium_no"], 1);
         assert_eq!(recordings[0]["title"], "Track 1");
         assert_eq!(recordings[1]["track_no"], 2);
         // The repo sees the normalized (lowercase) MBID, matching the key.

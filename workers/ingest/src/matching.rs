@@ -83,6 +83,10 @@ pub struct MbRecording {
     pub mbid: String,
     #[serde(default)]
     pub track_no: Option<i16>,
+    /// Medium (disc) position within the release. Absent in responses
+    /// cached before the field existed, hence the default.
+    #[serde(default)]
+    pub medium_no: Option<i16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,9 +161,9 @@ pub fn mb_release_recordings_url(release_mbid: &str) -> String {
 }
 
 /// Classify one MB release-recordings response into recording MBIDs in
-/// track order. The MB worker orders server-side (`track_no` nulls
-/// last, then MBID), but — like [`pick_release_mbid`] — this does not
-/// trust wire order: entries are re-sorted the same way, malformed
+/// album order. The MB worker orders server-side (medium, then
+/// `track_no`, then MBID), but — like [`pick_release_mbid`] — this does
+/// not trust wire order: entries are re-sorted the same way, malformed
 /// MBIDs are dropped, duplicates keep their first position, and the
 /// list is capped at [`MAX_RECORDING_MBIDS`]. An empty recordings list
 /// is a successful empty result. Status classification mirrors
@@ -177,17 +181,27 @@ pub fn parse_mb_recordings_response(status: u16, body: &str) -> Result<Vec<Strin
     }
 }
 
-/// Recording MBIDs ordered by track number (missing numbers last),
-/// ties broken by the lexicographically smallest MBID.
+/// Recording MBIDs ordered by medium (disc) number, then track number
+/// within the medium (missing numbers last), ties broken by the
+/// lexicographically smallest MBID. Sorting by track number alone
+/// would interleave the discs of a multi-medium release (disc 1
+/// track 1, disc 2 track 1, disc 1 track 2, ...). A response cached
+/// before `medium_no` existed has it missing on every entry, which
+/// ties and falls back to track order.
 fn recording_mbids_in_track_order(recordings: &[MbRecording]) -> Vec<String> {
     let mut valid: Vec<&MbRecording> = recordings
         .iter()
         .filter(|recording| validate_mbid(&recording.mbid))
         .collect();
     valid.sort_by(|a, b| {
-        a.track_no
+        a.medium_no
             .unwrap_or(i16::MAX)
-            .cmp(&b.track_no.unwrap_or(i16::MAX))
+            .cmp(&b.medium_no.unwrap_or(i16::MAX))
+            .then_with(|| {
+                a.track_no
+                    .unwrap_or(i16::MAX)
+                    .cmp(&b.track_no.unwrap_or(i16::MAX))
+            })
             .then_with(|| a.mbid.cmp(&b.mbid))
     });
     let mut seen = std::collections::HashSet::with_capacity(valid.len());
@@ -630,21 +644,24 @@ mod tests {
     fn recordings_response_is_sorted_into_track_order() {
         // Wire order is not trusted: track 2 arrives before track 1, an
         // untracked entry and a malformed MBID are mixed in, and track 1
-        // is duplicated.
+        // is duplicated. Disc 2 track 1 must land after all of disc 1,
+        // not interleaved with it.
         const REC1: &str = "11111111-1111-4111-8111-111111111111";
         const REC2: &str = "22222222-2222-4222-8222-222222222222";
         const REC_UNTRACKED: &str = "33333333-3333-4333-8333-333333333333";
+        const REC_D2T1: &str = "44444444-4444-4444-8444-444444444444";
         let body = format!(
             r#"{{"release_mbid":"{MBID_A}","recordings":[
-                {{"mbid":"{REC2}","title":"Second","track_no":2}},
-                {{"mbid":"{REC_UNTRACKED}","title":"Bonus","track_no":null}},
-                {{"mbid":"not-an-mbid","title":"Bogus","track_no":1}},
-                {{"mbid":"{REC1}","title":"First","track_no":1}},
-                {{"mbid":"{REC1}","title":"First again","track_no":1}}
+                {{"mbid":"{REC2}","title":"Second","track_no":2,"medium_no":1}},
+                {{"mbid":"{REC_UNTRACKED}","title":"Bonus","track_no":null,"medium_no":null}},
+                {{"mbid":"{REC_D2T1}","title":"Disc two opener","track_no":1,"medium_no":2}},
+                {{"mbid":"not-an-mbid","title":"Bogus","track_no":1,"medium_no":1}},
+                {{"mbid":"{REC1}","title":"First","track_no":1,"medium_no":1}},
+                {{"mbid":"{REC1}","title":"First again","track_no":1,"medium_no":1}}
             ]}}"#
         );
         let mbids = parse_mb_recordings_response(200, &body).unwrap();
-        assert_eq!(mbids, vec![REC1, REC2, REC_UNTRACKED]);
+        assert_eq!(mbids, vec![REC1, REC2, REC_D2T1, REC_UNTRACKED]);
     }
 
     #[test]

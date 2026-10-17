@@ -16,7 +16,7 @@ Run `DUMP_TS=<ISO-8601 timestamp> ./etl.sh <mbdump-dir>` before
 `import.sh <mbdump-dir>/curated`. The input directory must contain the official,
 uncompressed, headerless MusicBrainz COPY files (for example `artist`,
 `release`, and `recording`) plus the lookup/relationship files listed in
-`etl.py`. The ETL writes the three curated `mbdump-<table>.tsv` files into an
+`etl.py`. The ETL writes the four curated `mbdump-<table>.tsv` files into an
 immutable snapshot and atomically swaps `<mbdump-dir>/curated` to point to it;
 previous snapshots are retained. It uses the image's Python 3 and a temporary,
 disk-backed SQLite projection (no external database). Run the fixture check
@@ -42,10 +42,21 @@ field order; use an extract from the matching schema revision. Derivations:
   If a recording appears more than once, select by lowest release table id,
   then medium position, track position, and track id. `track_no` is the selected
   track's position in its medium; duration comes from nullable
-  `recording.length` milliseconds.
+  `recording.length` milliseconds. That single canonical release is only
+  the recording row's own pointer: `mbdump-track.tsv` additionally emits
+  every track appearance as `(release_mbid, recording_mbid, medium_no,
+  track_no)` — medium position, then track position within the medium —
+  so a release listing keeps shared recordings and true album order
+  (`mb_track`, migration 0016). FK orphans in that file land in the DLQ as
+  `fk_missing_release` / `fk_missing_recording`; negative positions are
+  validator poison (`negative_position`).
 - Every row gets the single supplied `DUMP_TS`; no row-specific time is created.
   Missing inputs, wrong field counts, and non-empty entity input that projects
   to zero rows fail closed.
+- Snapshots curated before `mb_track` have no `mbdump-track.tsv`: re-run
+  the ETL for such a dump instead of pointing the new `import.sh` at it
+  (the import refuses the missing file after the earlier tables load;
+  cursors make the rerun resume, but the curated set is the unit).
 
 ## Operator queries
 
