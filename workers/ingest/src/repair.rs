@@ -21,7 +21,7 @@ pub const REPAIR_SERVICE_BINDING: &str = "REPAIR_CONTAINER";
 pub const REPAIR_ENDPOINT: &str = "/repair";
 /// Internal URL for the service-binding fetch (host is a placeholder;
 /// the binding routes it).
-pub const REPAIR_URL: &str = "https://repair.internal/repair";
+pub const REPAIR_URL: &str = "https://repair-worker/repair";
 /// The result body is a small status document; anything larger is not
 /// a repair reply we can trust.
 const MAX_REPAIR_REPLY_BYTES: usize = 64 << 10;
