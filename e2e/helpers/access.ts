@@ -80,11 +80,12 @@ export function isAccessWall(probe: WallProbe): boolean {
   // markers (`cf-mitigated`, `cf_clearance`) are deliberately excluded: a
   // bot-management/WAF challenge is not proof of Access enforcement, and
   // accepting it would let anonymous checks pass without Access in play.
+  // A generic `<title>Access...` page is excluded for the same reason: only
+  // an explicit `Cloudflare Access` marker proves Access enforcement.
   const hasMarkers =
     /cf-access|cf_authorization/i.test(headerNames) ||
     /cloudflare.?access/i.test(headerNames) ||
     /cloudflare.?access/i.test(probe.bodyText) ||
-    /<title>\s*Access/i.test(probe.bodyText) ||
     redirectToAccess;
   return wallStatus && hasMarkers;
 }

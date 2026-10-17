@@ -132,7 +132,7 @@ test.describe('assertNoAccessWall', () => {
         {
           status: 403,
           headers: { 'cf-mitigated': 'challenge' },
-          bodyText: '<title>Access | Cloudflare</title>',
+          bodyText: '<title>Access | Cloudflare Access</title>',
           url: 'https://staging.example/api/health',
         },
         'health',
@@ -149,7 +149,7 @@ test.describe('assertNoAccessWall', () => {
         {
           status: 403,
           headers: { 'cf-mitigated': 'challenge' },
-          bodyText: '<title>Access | Cloudflare</title>',
+          bodyText: '<title>Access | Cloudflare Access</title>',
           url,
         },
         'health',
@@ -234,7 +234,7 @@ test.describe('isAccessWall / assertAccessWall (anonymous denial)', () => {
   const wall403 = {
     status: 403,
     headers: { 'cf-mitigated': 'challenge' },
-    bodyText: '<title>Access | Cloudflare</title>',
+    bodyText: '<title>Access | Cloudflare Access</title>',
     url: 'https://staging.example/api/health',
   };
   const wall302 = {
@@ -326,6 +326,22 @@ test.describe('isAccessWall / assertAccessWall (anonymous denial)', () => {
     );
   });
 
+  test('a generic 403 title without an Access marker is NOT an Access denial', () => {
+    // Regression pin: a generic `<title>Access denied...` page proves
+    // nothing about Cloudflare Access. Only an explicit `Cloudflare
+    // Access` marker passes as proof of enforcement.
+    const probe = {
+      status: 403,
+      headers: { 'content-type': 'text/html' },
+      bodyText: '<title>Access denied | example.com</title>',
+      url: 'https://staging.example/api/health',
+    };
+    expect(isAccessWall(probe)).toBe(false);
+    expect(() => assertAccessWall(probe, 'health-anonymous')).toThrow(
+      /expected Cloudflare Access denial/,
+    );
+  });
+
   test('a plain app 302 without markers is NOT Access-specific denial', () => {
     expect(() =>
       assertAccessWall(
@@ -356,7 +372,7 @@ test.describe('anonymousApiGet (isolated, credential-free, no-follow)', () => {
       hits.push({ ...req.headers });
       if (req.url === '/walled') {
         res.writeHead(403, { 'cf-mitigated': 'challenge', 'content-type': 'text/html' });
-        res.end('<title>Access | Cloudflare</title>');
+        res.end('<title>Access | Cloudflare Access</title>');
         return;
       }
       if (req.url === '/redir-access') {
@@ -433,7 +449,7 @@ test.describe('readApiBody', () => {
         {
           status: () => 403,
           headers: () => ({ 'cf-mitigated': 'challenge' }),
-          text: async () => '<title>Access | Cloudflare</title>',
+          text: async () => '<title>Access | Cloudflare Access</title>',
         },
         'https://staging.example/api/library',
         'range',
@@ -821,7 +837,7 @@ test.describe('tryMintTestAccount fail-closed seam', () => {
       await expect(
         tryMintTestAccount(
           fakeRequest(
-            async () => fakeResponse(403, { 'cf-mitigated': 'challenge' }, '<title>Access</title>'),
+            async () => fakeResponse(403, { 'cf-mitigated': 'challenge' }, '<title>Access</title><p>Cloudflare Access</p>'),
           ),
           base,
         ),
@@ -835,7 +851,7 @@ test.describe('tryMintTestAccount fail-closed seam', () => {
       try {
         await tryMintTestAccount(
           fakeRequest(
-            async () => fakeResponse(403, { 'cf-mitigated': 'challenge' }, '<title>Access</title>'),
+            async () => fakeResponse(403, { 'cf-mitigated': 'challenge' }, '<title>Access</title><p>Cloudflare Access</p>'),
           ),
           'https://sentinel-staging-host.example',
         );
