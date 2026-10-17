@@ -2992,6 +2992,34 @@ mod tests {
             };
             block_on(handle(&self.ctx(), &req))
         }
+
+        fn call_full_with_ip(
+            &self,
+            source_ip: &str,
+            method: &str,
+            path: &str,
+            body: Option<String>,
+            cookie: Option<String>,
+            origin: Option<&str>,
+        ) -> Response {
+            let ctx = Ctx {
+                cfg: &self.config,
+                store: &self.store,
+                mailer: &self.mailer,
+                dialer: &self.dialer,
+                dns: &self.dns,
+                now: NOW,
+                source_ip: source_ip.to_string(),
+            };
+            let req = Request {
+                method: method.to_string(),
+                path: path.to_string(),
+                cookie,
+                origin: origin.map(str::to_string),
+                body: body.map(|b| b.into_bytes()).unwrap_or_default(),
+            };
+            block_on(handle(&ctx, &req))
+        }
     }
 
     fn cookie_of(resp: &Response) -> String {
@@ -5094,9 +5122,18 @@ mod tests {
         // above covers `auth.start_ip` only; the other scopes revert to
         // raw IP with all handler tests green (the harness default
         // `198.51.100.9` makes key == raw), so this shape test observes all
-        // call sites directly at compile time. Comments are stripped
-        // first so prose mentioning a scope cannot satisfy its pin.
-        let code = strip_line_comments(include_str!("handlers.rs"));
+        // call sites directly at compile time. Slice ONLY the pre-test
+        // production source first: the unquoted `let ip_key = ...` needles
+        // below appear verbatim in this test's own string literals, so
+        // searching the whole file would match the test itself and pass
+        // even with a call site reverted to the raw address. Comments are
+        // stripped next so prose mentioning a scope cannot satisfy its pin.
+        let source = include_str!("handlers.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let code = strip_line_comments(production);
         let norm = code.split_whitespace().collect::<Vec<_>>().join(" ");
         // `admit_auth_start` claims its two budgets as a pair keyed on
         // one shared `ip_key`; pin both the derivation and the scopes.
@@ -5831,6 +5868,92 @@ mod tests {
             dials,
             "per-IP denial must happen before any dial"
         );
+    }
+
+    #[test]
+    fn vault_test_ipv6_slash64_shares_ip_budget_at_handler() {
+        // Handler wiring pin for the vault per-IP key: probes spread
+        // across two addresses in one IPv6 /64 must share the single
+        // `vault.test_ip` budget through the real `vault_test_connection`
+        // handler. Each address alone stays well under the per-IP cap,
+        // so keying on the raw `source_ip` (instead of
+        // `rate_limit_ip_key`) would admit the victim's first probe and
+        // fail here — while the IPv4 harness default, where key == raw,
+        // keeps every other vault test green. A different /64 keeps its
+        // own budget.
+        let h = harness();
+        let account_cap = h.config.rate_limits.vault_test_max_attempts;
+        let ip_cap = h.config.rate_limits.vault_test_ip_max_attempts;
+        assert_eq!(
+            ip_cap % account_cap,
+            0,
+            "test arithmetic assumes whole account budgets fill the IP budget"
+        );
+        let fillers = (ip_cap / account_cap) as usize;
+        let ip_a = "2001:db8:abcd:12::1";
+        let ip_b = "2001:db8:abcd:12::9";
+        let ip_other = "2001:db8:abcd:13::1";
+        // fillers accounts to exhaust the shared /64 budget, plus one victim.
+        let mut cookies = Vec::new();
+        for i in 0..=fillers {
+            let user_id = format!("v6u{i}");
+            let email = format!("v6nat{i}@example.com");
+            seed_user(&h, &user_id, &email);
+            let cookie = magic_login(&h, &email);
+            put_test_vault(&h, &cookie);
+            cookies.push(cookie);
+        }
+        let probe = |cookie: &str, ip: &str| {
+            h.call_full_with_ip(
+                ip,
+                "POST",
+                "/v1/vault/test-connection",
+                None,
+                Some(cookie.to_string()),
+                Some(ORIGIN),
+            )
+        };
+
+        // Fill the per-IP budget, alternating the two addresses in the
+        // /64 so neither raw address ever reaches the cap on its own.
+        let mut dialled = 0usize;
+        for (idx, cookie) in cookies.iter().enumerate().take(fillers) {
+            for i in 0..account_cap {
+                let ip = if dialled.is_multiple_of(2) {
+                    ip_a
+                } else {
+                    ip_b
+                };
+                assert_eq!(
+                    probe(cookie, ip).body,
+                    r#"{"ok":true}"#,
+                    "probe {i} by v6u{idx} from {ip}"
+                );
+                dialled += 1;
+            }
+        }
+        assert_eq!(dialled, ip_cap as usize);
+        let dials = h.dialer.seen.borrow().len();
+        assert_eq!(dials, ip_cap as usize);
+
+        // The victim's per-account budget is untouched, but the /64's
+        // shared per-IP budget is exhausted: denied before any dial.
+        let resp = probe(&cookies[fillers], ip_b);
+        assert_eq!(resp.body, r#"{"ok":false}"#);
+        assert_eq!(
+            h.dialer.seen.borrow().len(),
+            dials,
+            "shared-/64 denial must happen before any dial"
+        );
+
+        // A different /64 keeps its own budget: the same victim is
+        // admitted from there (the denial above consumed neither budget).
+        let resp = probe(&cookies[fillers], ip_other);
+        assert_eq!(
+            resp.body, r#"{"ok":true}"#,
+            "a different /64 must keep its own budget"
+        );
+        assert_eq!(h.dialer.seen.borrow().len(), dials + 1);
     }
 
     #[test]
