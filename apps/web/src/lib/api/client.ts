@@ -258,6 +258,11 @@ export class ApiClient {
 		await this.post<unknown>('/v1/session/logout', {});
 	}
 
+	/** Revoke every session for the authenticated account. */
+	async revokeAllSessions(): Promise<{ ok: true }> {
+		return this.post<{ ok: true }>('/v1/session/revoke-all', {});
+	}
+
 	/** Start passkey enrollment; the API also mails the inbox-proof code. */
 	async registerStart(email: string): Promise<RegisterStartResponse> {
 		return this.post<RegisterStartResponse>('/v1/auth/passkey/register/start', { email });
