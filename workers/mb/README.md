@@ -21,7 +21,10 @@ are `400`; a well-formed MBID with no row and unknown routes are `404`;
 mirror read failures are a generic `500` (no DB detail leaves the
 worker). Lookup success is the flat entity fields plus `"kind"`;
 search success is `{"q", "type", "results": [{"mbid", "name"|"title",
-"score"}]}`; release-recordings success is `{"release_mbid",
+"score"}]}`; release results also carry `artist_mbid`/`artist_name`
+(null when the release has no artist) so callers can verify
+"Artist - Album" queries against the artist instead of the title-only
+score; release-recordings success is `{"release_mbid",
 "recordings": [{"mbid", "release_mbid", "title", "track_no",
 "duration_ms"}]}`. Interactive reads never call musicbrainz.org.
 

@@ -154,20 +154,28 @@ const RELEASE_RECORDINGS_SQL: &str =
 /// Trigram search statement per kind. `$1` is the normalized query; `%` is
 /// the `pg_trgm` similarity predicate (GIN index in migration 0001),
 /// ordered by score with a deterministic tiebreak and a hard limit.
+/// Release hits also carry the release's artist (`artist_mbid` /
+/// `artist_name`, NULL when the release has none) so callers can verify
+/// an "Artist - Album" query against the artist instead of trusting a
+/// title-only score; other kinds select NULLs for the same columns.
 fn search_sql(kind: Kind) -> &'static str {
     match kind {
         Kind::Artist => {
-            "SELECT mbid::text AS mbid, name AS label, similarity(name, $1) AS score \
+            "SELECT mbid::text AS mbid, name AS label, similarity(name, $1) AS score, \
+             NULL::text AS artist_mbid, NULL::text AS artist_name \
              FROM mb_artist WHERE name % $1 \
              ORDER BY score DESC, label ASC, mbid ASC LIMIT 25"
         }
         Kind::Release => {
-            "SELECT mbid::text AS mbid, title AS label, similarity(title, $1) AS score \
-             FROM mb_release WHERE title % $1 \
-             ORDER BY score DESC, label ASC, mbid ASC LIMIT 25"
+            "SELECT r.mbid::text AS mbid, r.title AS label, similarity(r.title, $1) AS score, \
+             r.artist_mbid::text AS artist_mbid, a.name AS artist_name \
+             FROM mb_release r LEFT JOIN mb_artist a ON a.mbid = r.artist_mbid \
+             WHERE r.title % $1 \
+             ORDER BY score DESC, label ASC, r.mbid ASC LIMIT 25"
         }
         Kind::Recording => {
-            "SELECT mbid::text AS mbid, title AS label, similarity(title, $1) AS score \
+            "SELECT mbid::text AS mbid, title AS label, similarity(title, $1) AS score, \
+             NULL::text AS artist_mbid, NULL::text AS artist_name \
              FROM mb_recording WHERE title % $1 \
              ORDER BY score DESC, label ASC, mbid ASC LIMIT 25"
         }
@@ -292,6 +300,9 @@ struct SearchHit {
     mbid: String,
     label: String,
     score: f32,
+    /// Release hits only: the release's artist, when it has one.
+    artist_mbid: Option<String>,
+    artist_name: Option<String>,
 }
 
 impl SearchHit {
@@ -302,11 +313,26 @@ impl SearchHit {
             Kind::Artist => "name",
             Kind::Release | Kind::Recording => "title",
         };
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "mbid": self.mbid,
             label_key: self.label,
             "score": self.score,
-        })
+        });
+        // Release hits always carry the artist keys (null when the
+        // release has no artist) so consumers can require them.
+        if kind == Kind::Release {
+            if let serde_json::Value::Object(map) = &mut value {
+                map.insert(
+                    "artist_mbid".to_string(),
+                    serde_json::json!(self.artist_mbid),
+                );
+                map.insert(
+                    "artist_name".to_string(),
+                    serde_json::json!(self.artist_name),
+                );
+            }
+        }
+        value
     }
 }
 
@@ -679,6 +705,8 @@ mod http_layer {
             mbid: row.try_get("mbid").map_err(|_| RepoError)?,
             label: row.try_get("label").map_err(|_| RepoError)?,
             score: row.try_get("score").map_err(|_| RepoError)?,
+            artist_mbid: row.try_get("artist_mbid").map_err(|_| RepoError)?,
+            artist_name: row.try_get("artist_name").map_err(|_| RepoError)?,
         })
     }
 
@@ -916,6 +944,8 @@ mod tests {
             mbid: format!("123e4567-e89b-12d3-a456-42661417{n:04}"),
             label: format!("Hit {n}"),
             score: 1.0 - (n as f32 / 100.0),
+            artist_mbid: None,
+            artist_name: None,
         }
     }
 
@@ -1012,8 +1042,62 @@ mod tests {
             assert!(sql.contains("similarity("), "{sql}");
             assert!(sql.contains("ORDER BY score DESC"), "{sql}");
             assert!(sql.contains("LIMIT 25"), "{sql}");
+            // Every kind selects the artist columns hit_from_row reads.
+            assert!(sql.contains("AS artist_mbid"), "{sql}");
+            assert!(sql.contains("AS artist_name"), "{sql}");
         }
         assert_eq!(SEARCH_LIMIT, 25);
+        // Release search is artist-aware: the artist comes from the
+        // joined mb_artist row, not from the title score.
+        let release_sql = search_sql(Kind::Release);
+        assert!(
+            release_sql.contains("LEFT JOIN mb_artist a ON a.mbid = r.artist_mbid"),
+            "{release_sql}"
+        );
+        assert!(
+            release_sql.contains("a.name AS artist_name"),
+            "{release_sql}"
+        );
+    }
+
+    #[test]
+    fn search_release_hits_carry_the_artist_other_kinds_do_not() {
+        let repo = FakeRepo {
+            hits: vec![SearchHit {
+                mbid: MBID.to_string(),
+                label: "Load".to_string(),
+                score: 0.333,
+                artist_mbid: Some("65f4f0c5-ef9e-490c-aee3-909e7ae6b2ab".to_string()),
+                artist_name: Some("Metallica".to_string()),
+            }],
+            ..Default::default()
+        };
+        let cache = FakeCache::default();
+        let resp = block_on(handle_search(
+            &repo,
+            &cache,
+            Some("release".to_string()),
+            "Metallica - Load",
+        ));
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let first = &body["results"][0];
+        assert_eq!(first["title"], "Load");
+        assert_eq!(first["artist_name"], "Metallica");
+        assert_eq!(first["artist_mbid"], "65f4f0c5-ef9e-490c-aee3-909e7ae6b2ab");
+
+        // A release without an artist still carries the keys, as null.
+        let no_artist = SearchHit {
+            artist_mbid: None,
+            artist_name: None,
+            ..hit(0)
+        }
+        .to_json(Kind::Release);
+        assert!(no_artist["artist_mbid"].is_null());
+        assert!(no_artist["artist_name"].is_null());
+        // Non-release hits do not carry the keys at all.
+        let artist_hit = hit(0).to_json(Kind::Artist);
+        assert!(artist_hit.get("artist_name").is_none());
     }
 
     #[test]
