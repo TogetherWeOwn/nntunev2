@@ -32,6 +32,8 @@ the ADR wins and the deck is wrong.
 | `{{time_remaining}}` | Time left to cancel, rounded down | `about 6 hours` |
 | `{{email}}` | The account email address | `you@example.com` |
 | `{{support_contact}}` | How to reach support | *(undecided — §11)* |
+| `{{retained_records_sentence}}` | Approved disclosure of any records kept after erasure; omitted until approved | *(undecided — §11)* |
+| `{{re_registration_sentence}}` | Approved sentence about registering again; omitted until approved | *(undecided — §11)* |
 
 Rules: `{{time_remaining}}` always rounds **down** (never promise more
 time than is left), and when less than one hour remains it renders in
@@ -101,13 +103,16 @@ This is the state for the whole grace window (operation `scheduled`).
   left to cancel).
 - **Primary action:** Cancel deletion
 
-### 5.4 Status page (pending)
+### 5.4 Status page (status during grace)
 
-- **Heading:** Deletion pending
+The operation state here is `scheduled` for the whole window; do not
+branch this page on the `pending` operation state.
+
+- **Heading:** Deletion scheduled
 - **Body:** Status: **scheduled**. Your grace period ends at
   {{erase_after}}; erasure can start any time after that. Until erasure
   starts, you can cancel and your account stays unchanged. While deletion
-  is pending, some changes to your account are paused.
+  is scheduled, some changes to your account are paused.
 - **Primary action:** Cancel deletion
 
 ### 5.5 Blocked change (a write refused while deletion is pending)
@@ -176,14 +181,16 @@ confirmation email (ADR 0006) is the completion record.
 - **Subject:** Your account has been erased
 - **Body:** Erasure of your account is complete. Your account, library
   and listening history have been erased and cannot be restored.
-  {{retained_records_sentence}} You can create a new account at any time.
+  {{retained_records_sentence}} {{re_registration_sentence}}
   If you did not ask us to delete your account, contact
   {{support_contact}}.
 
-`{{retained_records_sentence}}` is deliberately not drafted here: what,
-if anything, is retained (for example billing records) is a policy
-decision for the approving change (§11). Until that sentence is
-approved, no surface may claim that *every* record was erased.
+`{{retained_records_sentence}}` and `{{re_registration_sentence}}` are
+deliberately not drafted here: what, if anything, is retained (for
+example billing records), and whether the same address may register
+again, are policy decisions for the approving change (§11). Until those
+sentences are approved, no surface may claim that *every* record was
+erased or invite re-registration with the same address.
 
 ### 8.2 Signing in afterwards
 
@@ -205,10 +212,12 @@ Do not give a new date unless engineering can stand behind it.
 
 ## 10. Language rules (every surface)
 
-1. **Never claim erasure before completion.** Before §8, the account is
-   "scheduled for deletion" or "erasure in progress" — never "deleted",
-   "erased" or "removed". Those words are reserved for the completion
-   email in §8.1.
+1. **Never claim erasure before completion.** Before §8, never
+   affirmatively state that the account is "deleted", "erased" or
+   "removed"; it is "scheduled for deletion" or "erasure in progress".
+   Affirmative completion wording is reserved for the completion email
+   in §8.1. Negations that reassure ("nothing has been erased yet") are
+   required, not banned.
 2. **Explain the grace period every time it matters.** Any surface that
    mentions the request also states, in plain words: nothing is erased
    yet, you have {{grace_duration}}, and you can cancel. Do not rely on
@@ -246,8 +255,9 @@ Do not give a new date unless engineering can stand behind it.
 - [ ] Every §3–§9 string checked against the shipped state machine
   (`scheduled` through the whole grace window; cancel only before
   erasure starts).
-- [ ] No pre-completion surface uses "deleted"/"erased" of the account
-  (rule 1); grep the shipped strings, not just this deck.
+- [ ] No pre-completion surface affirmatively states the account is
+  "deleted"/"erased"/"removed" (rule 1); grep the shipped strings, not
+  just this deck, and confirm every pre-completion hit is a negation.
 - [ ] Placeholders filled from live operation data (`erase_after`),
   remaining time rounded down.
 - [ ] Plain-language pass by a reader outside the deletion work.
