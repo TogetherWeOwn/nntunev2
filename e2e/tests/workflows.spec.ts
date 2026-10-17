@@ -566,3 +566,172 @@ test.describe('fail-closed artifact publication gate', () => {
     });
   }
 });
+
+// Post-deploy sequencing contract: the full journey is promotion evidence,
+// so it may run only after the same run's staging-web deploy succeeds.
+// e2e-staging.yml must not race deploy.yml on push; instead deploy.yml
+// calls it as a reusable workflow from a job that `needs` staging-web,
+// and the journey job additionally requires the caller-only
+// `inputs.post_deploy`. Scheduled/manual runs stay synthetic monitoring.
+const deployWorkflow = readFileSync(new URL('deploy.yml', workflowDir), 'utf8');
+
+function jobSection(workflow: string, job: string): string {
+  const marker = `\n  ${job}:\n`;
+  const start = workflow.indexOf(marker);
+  expect(start, `job ${job} not found`).toBeGreaterThan(-1);
+  const bodyStart = start + marker.length;
+  const next = /\n  [A-Za-z0-9_-]+:\n/.exec(workflow.slice(bodyStart));
+  return workflow.slice(bodyStart, next ? bodyStart + next.index : undefined);
+}
+
+function jobIf(workflow: string, job: string): string | undefined {
+  // Job-level keys sit at 4-space indent; step conditions are deeper.
+  return jobSection(workflow, job).match(/^    if: (.+)$/m)?.[1];
+}
+
+const stagingOnBlock = stagingWorkflow
+  .split('\non:\n')[1]!
+  .split('\npermissions:\n')[0]!;
+
+test.describe('post-deploy sequencing (deploy → full journey)', () => {
+  test('e2e-staging does not trigger on push (no deploy race)', () => {
+    expect(stagingOnBlock).not.toMatch(/^  push:/m);
+    expect(stagingOnBlock).toMatch(/^  workflow_call:/m);
+    // Manual runs exist but define no inputs, so a dispatch cannot set
+    // post_deploy and mint promotion evidence by hand.
+    expect(stagingOnBlock).toContain('  workflow_dispatch:\n  schedule:');
+    expect(stagingOnBlock).toContain('- cron: "17 */6 * * *"');
+  });
+
+  test('post_deploy is a required boolean workflow_call input', () => {
+    const callBlock = stagingOnBlock
+      .split('  workflow_call:\n')[1]!
+      .split('\n  workflow_dispatch:')[0]!;
+    expect(callBlock).toMatch(/ {6}post_deploy:\n(?:.*\n)*? {8}type: boolean\n {8}required: true/);
+  });
+
+  test('full journey runs only for the post-deploy call (evaluated)', () => {
+    const condition = jobIf(stagingWorkflow, 'e2e');
+    expect(condition, 'e2e job must carry a job-level if').toBeDefined();
+    expect(condition).not.toContain('always()');
+    expect(condition).not.toContain('!cancelled()');
+    expect(jobSection(stagingWorkflow, 'e2e')).toContain('needs: [synthetic]');
+
+    const evaluate = (postDeploy: boolean | ''): boolean => {
+      const inner = condition!
+        .replace(/^\$\{\{\s*/, '')
+        .replace(/\s*\}\}$/, '');
+      const expr = inner.replace(
+        /inputs\.post_deploy/g,
+        postDeploy === '' ? 'false' : String(postDeploy),
+      );
+      expect(expr, `unmodelled journey-gate syntax in: ${condition}`).toMatch(
+        /^[\s()!&|truefals]+$/,
+      );
+      return Function(`"use strict"; return (${expr});`)() as boolean;
+    };
+    // workflow_call from deploy.yml passes post_deploy: true.
+    expect(evaluate(true)).toBe(true);
+    // workflow_dispatch/schedule leave the input unset: monitoring only.
+    expect(evaluate('')).toBe(false);
+    expect(evaluate(false)).toBe(false);
+  });
+
+  test('synthetic smoke stays ungated monitoring on every trigger', () => {
+    // No job-level if: scheduled and manual runs execute the smoke (and
+    // step-level skip while staging is unconfigured), distinct from the
+    // gated full journey above.
+    expect(jobIf(stagingWorkflow, 'synthetic')).toBeUndefined();
+  });
+
+  test('deploy calls e2e-staging only after a successful push staging-web (evaluated)', () => {
+    // The deploy being sequenced after is itself push-only and gated on
+    // the Cloudflare token; when it skips, dependents must skip too.
+    expect(jobIf(deployWorkflow, 'staging-web')).toContain("github.event_name == 'push'");
+    expect(jobIf(deployWorkflow, 'staging-web')).toContain("needs.gate.outputs.enabled == 'true'");
+
+    const section = jobSection(deployWorkflow, 'post-deploy-e2e');
+    expect(section).toContain('needs: [staging-web]');
+    expect(section).toContain('uses: ./.github/workflows/e2e-staging.yml');
+    expect(section).toMatch(/post_deploy: true/);
+
+    const condition = jobIf(deployWorkflow, 'post-deploy-e2e');
+    expect(condition, 'post-deploy-e2e must carry a job-level if').toBeDefined();
+    // No status-check function in the condition: GitHub then applies the
+    // implicit success() over `needs`, which is the whole contract — a
+    // skipped/failed/cancelled staging-web can never run this job.
+    for (const statusFn of ['always()', '!cancelled()', 'success()', 'failure()', 'cancelled()']) {
+      expect(condition, `post-deploy-e2e if must not use ${statusFn}`).not.toContain(statusFn);
+    }
+
+    const evaluate = (stagingWebResult: string, eventName: string): boolean => {
+      const inner = condition!
+        .replace(/^\$\{\{\s*/, '')
+        .replace(/\s*\}\}$/, '');
+      const expr = inner.replace(
+        /github\.event_name\s*==\s*'push'/g,
+        String(eventName === 'push'),
+      );
+      expect(expr, `unmodelled post-deploy syntax in: ${condition}`).toMatch(
+        /^[\s()!&|truefals]+$/,
+      );
+      const conditionHolds = Function(`"use strict"; return (${expr});`)() as boolean;
+      // Implicit success() over needs.
+      return stagingWebResult === 'success' && conditionHolds;
+    };
+    expect(evaluate('success', 'push')).toBe(true);
+    for (const result of ['skipped', 'failure', 'cancelled']) {
+      expect(
+        evaluate(result, 'push'),
+        `staging-web ${result} must not produce a full-journey run`,
+      ).toBe(false);
+    }
+    for (const event of ['pull_request', 'workflow_dispatch', 'schedule']) {
+      expect(evaluate('success', event), `${event} must not run post-deploy E2E`).toBe(false);
+    }
+  });
+
+  test('deploy.yml is the only reusable-workflow caller of e2e-staging', () => {
+    for (const name of readdirSync(fileURLToPath(workflowDir)).filter(n => n.endsWith('.yml'))) {
+      const workflow = readFileSync(new URL(name, workflowDir), 'utf8');
+      const calls = workflow.split('uses: ./.github/workflows/e2e-staging.yml').length - 1;
+      expect(calls, `${name} calls e2e-staging.yml`).toBe(name === 'deploy.yml' ? 1 : 0);
+    }
+  });
+
+  test('caller passes exactly the secrets e2e-staging reads, explicitly', () => {
+    expect(deployWorkflow).not.toContain('secrets: inherit');
+    const used = [...new Set(
+      [...stagingWorkflow.matchAll(/secrets\.([A-Z0-9_]+)/g)].map(m => m[1]!),
+    )].sort();
+    const declaredBlock = stagingOnBlock
+      .split('    secrets:\n')[1]!
+      .split('\n  workflow_dispatch:')[0]!;
+    const declared = [...declaredBlock.matchAll(/^      ([A-Z0-9_]+):$/gm)]
+      .map(m => m[1]!)
+      .sort();
+    const passedBlock = jobSection(deployWorkflow, 'post-deploy-e2e').split('    secrets:\n')[1]!;
+    const passed = [...passedBlock.matchAll(/^      ([A-Z0-9_]+): \$\{\{ secrets\.([A-Z0-9_]+) \}\}$/gm)];
+    expect(declared, 'workflow_call secret declarations').toEqual(used);
+    expect(passed.map(m => m[1]!).sort(), 'secrets passed by deploy.yml').toEqual(used);
+    for (const m of passed) expect(m[2], 'secret passed under its own name').toBe(m[1]);
+    // Every declared secret stays optional so the pre-configuration
+    // step-level skip (staging not configured yet) keeps working.
+    for (const m of declaredBlock.matchAll(/required: (\w+)/g)) {
+      expect(m[1]).toBe('false');
+    }
+  });
+
+  test('least permissions and no production deploy path are preserved', () => {
+    for (const workflow of [stagingWorkflow, deployWorkflow]) {
+      expect(workflow).toContain('\npermissions:\n  contents: read\n');
+    }
+    expect(stagingWorkflow).not.toMatch(/:\s*write\b/);
+    const section = jobSection(deployWorkflow, 'post-deploy-e2e');
+    expect(section).toContain('    permissions:\n      contents: read\n');
+    expect(section).not.toMatch(/:\s*write\b/);
+    expect(stagingWorkflow).not.toContain('wrangler');
+    expect(stagingWorkflow).not.toContain('--env production');
+    expect(section).not.toContain('deploy --env');
+  });
+});

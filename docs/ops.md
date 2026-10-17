@@ -403,13 +403,17 @@ lane. Complete every box on the exact head being promoted.
   which SHA is serving. Do not claim same-build evidence until a deployed-build
   identity is exposed and compared with the promotion SHA. The deploy owner
   replaces the placeholder `100::` record through a Workers custom domain.
-- [ ] Staging E2E: after `staging-web` completes, run `e2e-staging` by
-  `workflow_dispatch` or use a scheduled run that starts afterward; the
-  push-triggered E2E run can race the independent deploy. Record its run and
-  result, and do not call it same-build evidence until the staging build
-  identity is verified against the deploy SHA. Pre-configuration skips do
-  not count once staging is configured; the workflow fails closed without
-  both Access client credentials.
+- [ ] Staging E2E: `deploy.yml` sequences it — its `post-deploy-e2e` job
+  calls `e2e-staging.yml` (reusable workflow) only after the same run's
+  `staging-web` job succeeds (`needs`, no `always()`), so a skipped/failed
+  deploy cannot produce a full-journey PASS and no separate dispatch is
+  needed or accepted as evidence. Scheduled/manual `e2e-staging` runs are
+  synthetic monitoring only (the full-journey job is skipped there).
+  Record the deploy run and the `post-deploy-e2e` result, and do not call
+  it same-build evidence until the staging build identity is verified
+  against the deploy SHA (a source SHA alone is not build identity).
+  Pre-configuration skips do not count once staging is configured; the
+  workflow fails closed without both Access client credentials.
 - [ ] Access intact: the `NNTune v2 staging` Access app, its owner-OTP allow
   policy and the QA service-token policy still gate `v2-staging.nntune.com`.
   No bypass, no shared-token rotation, and both `CF_ACCESS_CLIENT_*`

@@ -138,9 +138,14 @@ How the suite uses them:
 
 ## CI
 
-- `.github/workflows/e2e-staging.yml` — full suite on `push` to `main`,
-  manual dispatch, and a 6-hour synthetic schedule. The deployment lane must
-  sequence execution after staging deploy; a push alone is not deploy proof.
+- `.github/workflows/e2e-staging.yml` — no `push` trigger. The full
+  journey runs only as a reusable-workflow call from `deploy.yml`'s
+  `post-deploy-e2e` job, which `needs` the same run's `staging-web`
+  deploy, so a skipped/failed deploy cannot produce a full-journey PASS
+  and the E2E run cannot race its deploy. Manual dispatch and the
+  6-hour schedule run the synthetic smoke only (monitoring, not
+  post-deploy promotion evidence); dispatch defines no `post_deploy`
+  input, so it cannot mint that evidence by hand.
   Missing `STAGING_BASE_URL` → step-level skip with notice (pre-deploy).
   Both jobs require the Access pair in preflight before activating tests;
   configured staging never skips for missing credentials. Failure artifacts
@@ -151,9 +156,13 @@ How the suite uses them:
   and the aggregate gate with dummy inputs; failures, cancellations and skips
   of required jobs make `ci-ok` red.
 - **Prod promotion gate (required integration):** the deployment lane must
-  require the `e2e-staging` result on the deployed SHA and block promotion on
-  failure. Wiring and live enforcement are still acceptance prerequisites,
-  not a verified result of this PR.
+  require the post-deploy full-journey result (the `post-deploy-e2e` job in
+  the same `deploy.yml` run as the successful `staging-web` deploy) and
+  block promotion on failure. Sequencing after the deploy is wired;
+  blocking a later production promotion on that result, and live
+  enforcement, are still acceptance prerequisites of that later lane. A
+  source SHA is not deployed-build identity, so the result is not
+  same-build evidence until build identity is separately proven.
 
 ## Evidence
 
@@ -172,5 +181,7 @@ apply the exact checked-in sanitize blocks, and assert the marker password
 is absent from every uploaded file including base64-decoded payloads. Do not
 enable traces/screenshots or the html reporter for credential-bearing runs
 without a verified redaction path. A QA PASS verdict cites the green
-`e2e-staging` run URL + deployed head SHA; NEEDS WORK cites the failing
-spec + step.
+post-deploy run URL (the `deploy.yml` run whose `staging-web` succeeded
+and whose `post-deploy-e2e` full journey passed) + the source head SHA —
+never a scheduled/manual synthetic run, which is monitoring only; NEEDS
+WORK cites the failing spec + step.
