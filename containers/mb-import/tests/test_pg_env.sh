@@ -278,6 +278,21 @@ run_refused "URI with a trailing raw '#' after a query value" 'SENTINELPW'
 check_err_guidance "URI with a trailing raw '#' after a query value"
 
 reset_pg
+DATABASE_URL='postgres://u:SENTINELPW%00tail@h/db'
+run_refused "URI with a %00 in the password" 'SENTINELPW'
+check_err_contains "URI with a %00 in the password" 'NUL byte'
+
+reset_pg
+DATABASE_URL='postgres://u:p@h/db%00SENTINELDB'
+run_refused "URI with a %00 in the database name" 'SENTINELDB'
+check_err_contains "URI with a %00 in the database name" 'NUL byte'
+
+reset_pg
+DATABASE_URL='postgres://u:p@h/db?application_name=a%00SENTINELAPP'
+run_refused "URI with a %00 in a query value" 'SENTINELAPP'
+check_err_contains "URI with a %00 in a query value" 'NUL byte'
+
+reset_pg
 DATABASE_URL='postgres://u:p@h?application_name=a@b'
 run_ok "pathless URI with '@' in a query value"
 check_eq "pathless query host" 'h' "${PGHOST-}"

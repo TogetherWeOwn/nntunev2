@@ -47,7 +47,13 @@ sys.stdout.reconfigure(errors="surrogateescape")
 
 
 def dec(value):
-    return unquote(value, errors="surrogateescape")
+    decoded = unquote(value, errors="surrogateescape")
+    # libpq rejects %00, and bash command substitution would silently
+    # drop the NUL byte, connecting with a different value than the
+    # URL names; refuse instead of rewriting it.
+    if "\x00" in decoded:
+        fail("DATABASE_URL contains a NUL byte after percent-decoding")
+    return decoded
 
 
 SERVICE_REFUSAL = (
