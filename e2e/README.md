@@ -117,6 +117,14 @@ How the suite uses them:
   offline checks remain usable with no staging URL and no Access pair. An Access wall (wall status + Access markers, including
   302s to the Access login) fails closed with a remediation message instead
   of masquerading as an app failure; plain app 4xx responses pass through.
+- The smoke also proves the inverse: an anonymous `GET /` from a fresh,
+  isolated request context (no Access pair, no cookies, redirects never
+  followed — `anonymousGet` in `helpers/accounts.ts`) must be denied by the
+  Access wall under the same joint status+markers predicate
+  (`assertAccessWall`, `helpers/access.ts`) and must not return the 200 app
+  shell. The credentialed app-shell test in the same file is the authorized
+  control. The anonymous probe changes no Access policy, needs no
+  credential, and never emits response bodies, headers or cookies.
 - Test-account sessions minted by the seam travel as
   `Authorization: Bearer <session>` (contract owned by the auth card —
   `helpers/accounts.ts` names it; cookie sessions would update the helper +
