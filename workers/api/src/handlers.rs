@@ -247,6 +247,13 @@ pub struct UserRecord {
 pub const PURPOSE_REGISTER: &str = "register";
 pub const PURPOSE_LOGIN: &str = "login";
 
+/// Counter stored for a new credential, whatever the attestation said.
+/// `none` attestation is unauthenticated, so its enrollment counter is
+/// attacker-chosen: persisting `u32::MAX` would make every later
+/// (strictly-increasing) assertion fail. The first assertion's signed
+/// counter becomes the baseline; counterless authenticators stay at 0.
+const ENROLLMENT_SIGN_COUNT: u32 = 0;
+
 #[derive(Debug, Clone)]
 pub struct ChallengeRow {
     pub challenge: PasskeyChallenge,
@@ -707,6 +714,31 @@ where
             .map_err(|_| internal())?
             .ok_or_else(generic_auth)?;
         let claims = session::verify_stored_session(&keys, &token, self.now, &record)
+            .map_err(session_error_response)?;
+        Ok((claims, token))
+    }
+
+    /// Authenticate a privilege-changing request and require a fresh session.
+    /// Ordinary authentication remains valid for non-privileged operations.
+    async fn authenticate_privileged(
+        &self,
+        req: &Request,
+    ) -> Result<(SessionClaims, String), Response> {
+        match req.origin.as_deref() {
+            Some(origin) if origin == self.cfg.origin => {}
+            _ => return Err(generic_auth()),
+        }
+        let token = session_cookie_value(req).ok_or_else(generic_auth)?;
+        let keys = self.cfg.session_keys();
+        let claims =
+            session::verify_session_dual(&keys, &token, self.now).map_err(|_| generic_auth())?;
+        let record = self
+            .store
+            .session_by_id(&claims.session_id)
+            .await
+            .map_err(|_| internal())?
+            .ok_or_else(generic_auth)?;
+        let claims = session::require_fresh_session(&keys, &token, self.now, &record)
             .map_err(session_error_response)?;
         Ok((claims, token))
     }
@@ -1217,7 +1249,7 @@ where
         cred_id_b64url: body.credential_id.clone(),
         user_id: user_id.clone(),
         public_key: credential.public_key_cose.clone(),
-        sign_count: credential.sign_count,
+        sign_count: ENROLLMENT_SIGN_COUNT,
         registered_at: ctx.now,
     };
     match ctx.store.insert_credential(&stored).await {
@@ -1671,7 +1703,7 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    let (claims, _token) = match ctx.authenticate(req, true).await {
+    let (claims, _token) = match ctx.authenticate_privileged(req).await {
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
@@ -1739,7 +1771,7 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    let (claims, _token) = match ctx.authenticate(req, true).await {
+    let (claims, _token) = match ctx.authenticate_privileged(req).await {
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
@@ -3023,6 +3055,78 @@ mod tests {
     }
 
     #[test]
+    fn vault_mutations_require_fresh_session_but_reads_do_not() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let put_body = serde_json::json!({
+            "provider": {
+                "host": "news.example.com", "port": 563, "tls": true,
+                "username": "synthetic-user", "password": "synthetic-pass",
+                "max_connections": 4
+            },
+            "indexer": null
+        });
+
+        let fresh_put = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(fresh_put.status, 200, "{}", fresh_put.body);
+
+        let stale_ctx = Ctx {
+            cfg: &h.config,
+            store: &h.store,
+            mailer: &h.mailer,
+            dialer: &h.dialer,
+            dns: &h.dns,
+            now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
+            source_ip: "198.51.100.9".to_string(),
+        };
+        let stale_put_req = Request {
+            method: "PUT".to_string(),
+            path: "/v1/vault".to_string(),
+            cookie: Some(cookie.clone()),
+            origin: Some(ORIGIN.to_string()),
+            body: put_body.to_string().into_bytes(),
+        };
+        let stale_put = block_on(handle(&stale_ctx, &stale_put_req));
+        assert_eq!(stale_put.status, 401);
+        assert_eq!(
+            stale_put.body,
+            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
+        );
+
+        let stale_get_req = Request {
+            method: "GET".to_string(),
+            path: "/v1/vault".to_string(),
+            cookie: Some(cookie.clone()),
+            origin: None,
+            body: Vec::new(),
+        };
+        let stale_get = block_on(handle(&stale_ctx, &stale_get_req));
+        assert_eq!(stale_get.status, 200, "{}", stale_get.body);
+
+        let stale_delete_req = Request {
+            method: "DELETE".to_string(),
+            path: "/v1/vault".to_string(),
+            cookie: Some(cookie),
+            origin: Some(ORIGIN.to_string()),
+            body: Vec::new(),
+        };
+        let stale_delete = block_on(handle(&stale_ctx, &stale_delete_req));
+        assert_eq!(stale_delete.status, 401);
+        assert_eq!(
+            stale_delete.body,
+            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
+        );
+        assert!(h.store.vaults.borrow().contains_key("u1"));
+    }
+
+    #[test]
     fn test_connection_dials_only_vetted_addresses_and_rate_limits() {
         let h = harness();
         seed_user(&h, "u1", "a@example.com");
@@ -3129,11 +3233,14 @@ mod tests {
         cose
     }
     fn fx_none_attestation(cred_id: &[u8], cose: &[u8]) -> Vec<u8> {
+        fx_none_attestation_with_count(cred_id, cose, 1)
+    }
+    fn fx_none_attestation_with_count(cred_id: &[u8], cose: &[u8], sign_count: u32) -> Vec<u8> {
         use sha2::Digest;
         let mut auth = Vec::new();
         auth.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
-        auth.push(0x41);
-        auth.extend_from_slice(&1u32.to_be_bytes());
+        auth.push(0x45);
+        auth.extend_from_slice(&sign_count.to_be_bytes());
         auth.extend_from_slice(&[0u8; 16]);
         auth.extend_from_slice(&(cred_id.len() as u16).to_be_bytes());
         auth.extend_from_slice(cred_id);
@@ -3220,7 +3327,7 @@ mod tests {
         let cred_id = b"synthetic-cred";
         let mut auth = Vec::new();
         auth.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
-        auth.push(0x41);
+        auth.push(0x45);
         auth.extend_from_slice(&1u32.to_be_bytes());
         auth.extend_from_slice(&[0u8; 16]);
         auth.extend_from_slice(&(cred_id.len() as u16).to_be_bytes());
@@ -3270,7 +3377,7 @@ mod tests {
         assert_eq!(start["allow_credentials"], serde_json::json!([]));
         let mut auth = Vec::new();
         auth.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
-        auth.push(0x01);
+        auth.push(0x05);
         auth.extend_from_slice(&2u32.to_be_bytes());
         let cd_get = format!(
             r#"{{"type":"webauthn.get","challenge":"{}","origin":"{}","crossOrigin":false}}"#,
@@ -3291,6 +3398,101 @@ mod tests {
         // Replaying the same assertion/challenge fails generically.
         let resp = h.call("POST", "/v1/auth/passkey/login/finish", finish);
         assert_eq!(resp.status, 401);
+    }
+
+    /// The database CHECK (migration 0008) must list exactly the purposes
+    /// the handlers mint. Adding a purpose constant without updating the
+    /// migration would make every such insert fail at runtime.
+    #[test]
+    fn purpose_constants_match_the_migration_check() {
+        let sql = include_str!("../../../migrations/0008_auth_challenge_purpose_guard.sql");
+        let expected = format!("CHECK (purpose IN ('', '{PURPOSE_REGISTER}', '{PURPOSE_LOGIN}'))");
+        assert!(
+            sql.contains(&expected),
+            "0008 CHECK must be exactly: {expected}"
+        );
+    }
+
+    /// `none` attestation is unauthenticated, so
+    /// the enrollment counter is attacker-chosen: a crafted attestation
+    /// carrying `u32::MAX` used to be stored verbatim and then rejected
+    /// every legitimate assertion (strict-increase rule) forever. The
+    /// enrollment counter must never be persisted; the first assertion's
+    /// signed counter establishes the baseline.
+    #[test]
+    fn register_ignores_attestation_supplied_sign_count() {
+        use p256::ecdsa::{signature::Signer, Signature as EsSignature, SigningKey};
+        use sha2::Digest;
+
+        let h = harness();
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "pinned@example.com"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let start: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let challenge = start["challenge"].as_str().unwrap().to_string();
+        let magic_token = h.mailer.sent.borrow().last().unwrap().1.clone();
+
+        let cred_id = b"pinned-counter-cred";
+        let att = fx_none_attestation_with_count(cred_id, &fx_es256_cose(11), u32::MAX);
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/finish",
+            serde_json::json!({
+                "challenge": challenge,
+                "credential_id": b64url_encode(cred_id),
+                "attestation_object": b64url_encode(&att),
+                "client_data_json": b64url_encode(
+                    fx_client_json("webauthn.create", &challenge).as_bytes()
+                ),
+                "magic_token": magic_token,
+                "invite_code": null,
+            }),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+
+        let user = block_on(h.store.user_by_email("pinned@example.com"))
+            .unwrap()
+            .unwrap();
+        let creds = block_on(h.store.credentials_for_user(&user.id)).unwrap();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(
+            creds[0].sign_count, 0,
+            "attestation-supplied counter must not be stored"
+        );
+
+        // A legitimate first assertion (counter 1) still logs in.
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/login/start",
+            serde_json::json!({"email": "pinned@example.com"}),
+        );
+        let start: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let challenge = start["challenge"].as_str().unwrap().to_string();
+        let mut auth = Vec::new();
+        auth.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
+        auth.push(0x05);
+        auth.extend_from_slice(&1u32.to_be_bytes());
+        let cd_get = fx_client_json("webauthn.get", &challenge);
+        let mut msg = auth.clone();
+        msg.extend_from_slice(&sha2::Sha256::digest(cd_get.as_bytes()));
+        let sig: EsSignature = SigningKey::from_slice(&[11u8; 32]).unwrap().sign(&msg);
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/login/finish",
+            serde_json::json!({
+                "challenge": challenge,
+                "credential_id": b64url_encode(cred_id),
+                "authenticator_data": b64url_encode(&auth),
+                "client_data_json": b64url_encode(cd_get.as_bytes()),
+                "signature": b64url_encode(sig.to_der().as_bytes()),
+            }),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let creds = block_on(h.store.credentials_for_user(&user.id)).unwrap();
+        assert_eq!(creds[0].sign_count, 1);
     }
 
     #[test]

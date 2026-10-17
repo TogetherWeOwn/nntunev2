@@ -1,4 +1,4 @@
--- 0008_mb_import_resume_dlq: per-dump resume cursors + dead-letter queue.
+-- 0009_mb_import_resume_dlq: per-dump resume cursors + dead-letter queue.
 BEGIN;
 --
 -- The cursor is scoped to a content hash, so a newer dump of any size starts

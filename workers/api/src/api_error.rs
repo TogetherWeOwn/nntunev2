@@ -28,6 +28,11 @@ pub const REGISTRY: &[CodeSpec] = &[
         retryable: false,
     },
     CodeSpec {
+        code: "reauth_required",
+        status: 401,
+        retryable: false,
+    },
+    CodeSpec {
         code: "provider_auth_expired",
         status: 401,
         retryable: false,
@@ -187,6 +192,7 @@ impl From<SessionError> for ApiError {
     fn from(e: SessionError) -> Self {
         match e {
             SessionError::Invalid => Self::unauthorized(e.to_string()),
+            SessionError::ReauthRequired => Self::by_code(e.code(), e.to_string()),
             SessionError::Misconfigured | SessionError::Storage { .. } => {
                 Self::internal_error(e.to_string())
             }
@@ -253,6 +259,15 @@ mod tests {
             ("internal_error", 500)
         );
         assert_eq!(ApiError::from(SessionError::Invalid).code, "unauthorized");
+        let reauth_required = ApiError::from(SessionError::ReauthRequired);
+        assert_eq!(
+            (
+                reauth_required.code,
+                reauth_required.status,
+                reauth_required.retryable
+            ),
+            ("reauth_required", 401, false)
+        );
         let session_config = ApiError::from(SessionError::Misconfigured);
         assert_eq!(
             (session_config.code, session_config.status),

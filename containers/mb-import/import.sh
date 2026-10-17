@@ -128,7 +128,7 @@ for table in artist release recording; do
   fi
   completed="$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tAX -c "SELECT lines_done FROM mb_import_cursor WHERE table_name = '$table' AND dump_id = '$dump_id';")"
   if [[ ! "$completed" =~ ^[0-9]+$ ]]; then
-    echo "import: unexpected lines_done '$completed' for $table in mb_import_cursor (migration 0008_mb_import_resume_dlq missing?)" >&2
+    echo "import: unexpected lines_done '$completed' for $table in mb_import_cursor (migration 0009_mb_import_resume_dlq missing?)" >&2
     exit 1
   fi
   if (( 10#$completed > 10#$total )); then
