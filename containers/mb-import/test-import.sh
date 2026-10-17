@@ -442,7 +442,89 @@ check "changed: older dump leaves rows alone" "2" "$(db -c 'SELECT count(*) FROM
 check "changed: older dump keeps repoint" "$(python3 -c 'import uuid; print(uuid.UUID(int=200003))')" \
   "$(db -c 'SELECT recording_mbid FROM mb_track WHERE medium_no = 1 AND track_no = 1;')"
 
-rm -rf "$FIX" "$DUPE" "$NEWER" "$FKDIR" "$POISON" "$CHG" "$CHG-newer" "$CHG-old"
+echo "=== 12. interrupted multi-chunk track import never truncates a release ==="
+# The prune runs only in the final track chunk's transaction. A release
+# whose tracks straddle a chunk boundary in a newer dump must keep its
+# older-dump rows for not-yet-reloaded positions when the import stops
+# between chunks (the route serves mb_track directly, so a truncated
+# listing would be cached and persisted as final). Failure is injected
+# deterministically: a validator wrapper that fails on the second
+# track chunk, after the first chunk (and its cursor advance) commits.
+reset_db
+SPLIT="$FIX-split"
+SPLITN="$FIX-split-newer"
+SPLITTOOLS="$FIX-split-tools"
+rm -rf "$SPLIT" "$SPLITN" "$SPLITTOOLS"
+mkdir -p "$SPLIT" "$SPLITTOOLS"
+python3 - "$SPLIT" <<'EOF'
+import sys, uuid
+d = sys.argv[1]
+def eid(n): return str(uuid.UUID(int=n))
+with open(f'{d}/mbdump-artist.tsv', 'w') as f:
+    f.write(f'{eid(1)}\tBand 1\t1, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n')
+with open(f'{d}/mbdump-release.tsv', 'w') as f:
+    f.write(f'{eid(100001)}\t{eid(1)}\tAlbum\tAlbum\t2024\t\\N\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording.tsv', 'w') as f:
+    for i in range(1, 11):
+        f.write(f'{eid(200000+i)}\t{eid(100001)}\tTrack {i}\t{i}\t180000\t2024-05-03T00:00:00Z\n')
+with open(f'{d}/mbdump-track.tsv', 'w') as f:
+    for i in range(1, 11):
+        f.write(f'{eid(100001)}\t{eid(200000+i)}\t1\t{i}\t2024-05-03T00:00:00Z\n')
+EOF
+bash "$SELF_DIR/import.sh" "$SPLIT" >/dev/null
+check "split: tracks before" "10" "$(db -c 'SELECT count(*) FROM mb_track;')"
+cp -R "$SPLIT" "$SPLITN"
+python3 - "$SPLITN" <<'EOF'
+import sys, uuid
+d = sys.argv[1]
+def eid(n): return str(uuid.UUID(int=n))
+with open(f'{d}/mbdump-track.tsv', 'w') as f:
+    # Track 1 repointed at recording 10, track 10 dropped: 9 rows, so
+    # chunk size 4 splits this one release across three chunks.
+    f.write(f'{eid(100001)}\t{eid(200010)}\t1\t1\t2025-05-03T00:00:00Z\n')
+    for i in range(2, 10):
+        f.write(f'{eid(100001)}\t{eid(200000+i)}\t1\t{i}\t2025-05-03T00:00:00Z\n')
+EOF
+python3 - "$SPLITTOOLS/fail-second-track-validate" "$VALIDATE_BIN" "$SPLITTOOLS/track-validate-count" <<'EOF'
+import os, sys
+path, real, count = sys.argv[1], sys.argv[2], sys.argv[3]
+script = f"""#!/usr/bin/env bash
+if [[ "${{2:-}}" == "track" ]]; then
+  n=0
+  [[ -f '{count}' ]] && n="$(cat '{count}')"
+  n=$((n + 1))
+  printf '%s' "$n" >'{count}'
+  if (( n == 2 )); then
+    echo "injected validator failure on track chunk 2" >&2
+    exit 1
+  fi
+fi
+exec '{real}' "$@"
+"""
+with open(path, 'w') as f:
+    f.write(script)
+os.chmod(path, 0o755)
+EOF
+if MB_IMPORT_CHUNK_LINES=4 MB_VALIDATE_BIN="$SPLITTOOLS/fail-second-track-validate" bash "$SELF_DIR/import.sh" "$SPLITN" >/dev/null 2>&1; then
+  echo "FAIL: split dump imported without the injected validator failure" >&2
+  fail=1
+else
+  echo "ok: injected failure stopped the split import between track chunks"
+fi
+check "split: track cursor stopped after chunk 1" "4" "$(cursor track "$SPLITN/mbdump-track.tsv")"
+check "split: interrupted import keeps all 10 old positions" "10" "$(db -c 'SELECT count(*) FROM mb_track;')"
+check "split: not-yet-reloaded position 10 still present" "1" "$(db -c 'SELECT count(*) FROM mb_track WHERE track_no = 10;')"
+check "split: positions unchanged while interrupted" "1,2,3,4,5,6,7,8,9,10" \
+  "$(db -c 'SELECT string_agg(track_no::text, chr(44) ORDER BY track_no) FROM mb_track;')"
+MB_IMPORT_CHUNK_LINES=4 bash "$SELF_DIR/import.sh" "$SPLITN" >/dev/null
+check "split: resumed import completes cursor" "9" "$(cursor track "$SPLITN/mbdump-track.tsv")"
+check "split: final prune drops position 10" "9" "$(db -c 'SELECT count(*) FROM mb_track;')"
+check "split: track 1 repointed after resume" "$(python3 -c 'import uuid; print(uuid.UUID(int=200010))')" \
+  "$(db -c 'SELECT recording_mbid FROM mb_track WHERE medium_no = 1 AND track_no = 1;')"
+check "split: final positions" "1,2,3,4,5,6,7,8,9" \
+  "$(db -c 'SELECT string_agg(track_no::text, chr(44) ORDER BY track_no) FROM mb_track;')"
+
+rm -rf "$FIX" "$DUPE" "$NEWER" "$FKDIR" "$POISON" "$CHG" "$CHG-newer" "$CHG-old" "$SPLIT" "$SPLITN" "$SPLITTOOLS"
 if (( fail != 0 )); then
   echo "test-import: FAILED" >&2
   exit 1

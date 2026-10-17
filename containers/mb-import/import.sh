@@ -13,7 +13,10 @@
 # forward-only updated_at guard (older dumps never roll a row back).
 # Contract: every row of a dump file carries that dump's single
 # updated_at (the ETL stamps one DUMP_TS); the track prune compares
-# per-release maxima and relies on that uniformity.
+# per-release maxima and relies on that uniformity. The prune runs
+# only in the track dump's final chunk transaction, atomically with
+# the cursor advancing to the end of the dump, so an interrupted
+# import leaves rows at worst stale, never truncated.
 
 # Poison rows never abort the import: the mb-validate pre-pass checks every
 # line against the typed upsert contract (uuid/int/timestamp shapes, COPY
@@ -122,6 +125,7 @@ for table in artist release recording track; do
     exit 1
   fi
   prune_sql=""
+  final_prune_sql=""
   case "$table" in
     artist)
       columns="mbid, name, sort_name, \"type\", country, updated_at"
@@ -145,23 +149,27 @@ for table in artist release recording track; do
       # sitting beside it at the same medium/track.
       upsert="recording_mbid = EXCLUDED.recording_mbid, updated_at = EXCLUDED.updated_at"
       conflict="(release_mbid, medium_no, track_no)"
-      # Prune superseded rows in the same chunk transaction: every row
-      # of one dump carries that dump's updated_at, so after the upsert
-      # a release this chunk touched keeps only its newest-dump rows.
-      # That deletes dropped/renumbered positions a newer dump no
-      # longer lists, and also deletes the rows an older dump just
-      # inserted (the upsert guard blocks its updates, but a fresh
-      # insert has no conflict to guard, so without this it would
-      # resurrect tracks the newer dump dropped). Rows an earlier
-      # chunk of this same dump committed carry this dump's
-      # updated_at, so they are already at the max and survive;
-      # positions a later chunk will load are deleted here and
-      # re-inserted there, so a kill between chunks is healed by the
-      # resume. Releases absent from the chunk are untouched, exactly
-      # like the entity tables (the import never deletes them). A
+      # Prune superseded rows, but ONLY in the final chunk's
+      # transaction (selected per part below): every row of one dump
+      # carries that dump's updated_at, so once the last chunk is in,
+      # each release keeps only its newest-dump rows. That deletes
+      # dropped/renumbered positions a newer dump no longer lists,
+      # and also deletes the rows an older dump just inserted (the
+      # upsert guard blocks its updates, but a fresh insert has no
+      # conflict to guard, so without this it would resurrect tracks
+      # the newer dump dropped). Running it in an earlier chunk would
+      # delete a straddling release's not-yet-reloaded positions, so
+      # a kill/failure between chunks would leave a truncated (but
+      # cacheable, ingest-persistable) listing until the resume;
+      # deferred to the last chunk, the prune and the cursor reaching
+      # the end of the dump commit atomically and an interrupted
+      # import leaves rows at worst stale, never truncated. The form
+      # is release-wide (no stage restriction): by the final chunk
+      # every release this dump lists is fully loaded, and a release
+      # absent from the dump keeps all its rows at its own max. A
       # position whose new row landed in the DLQ (poison/FK orphan)
       # loses its old row too: a visible gap, never a stale recording.
-      prune_sql="DELETE FROM mb_track old WHERE EXISTS (SELECT 1 FROM stage s WHERE s.release_mbid = old.release_mbid) AND old.updated_at < (SELECT max(t.updated_at) FROM mb_track t WHERE t.release_mbid = old.release_mbid);"
+      final_prune_sql="DELETE FROM mb_track old WHERE old.updated_at < (SELECT max(t.updated_at) FROM mb_track t WHERE t.release_mbid = old.release_mbid);"
       ;;
   esac
   # awk NR counts a trailing partial line; the validator counts the same
@@ -370,6 +378,12 @@ EOF
     # -q keeps stdout to just the RETURNING value: without it every command
     # tag (BEGIN/COPY/INSERT/...) lands in the capture and the cursor check
     # below misfires.
+    # The track prune runs only in the part that ends at the dump's last
+    # line, so it commits atomically with the cursor completing the dump.
+    prune_sql=""
+    if (( 10#$end == 10#$total )); then
+      prune_sql="$final_prune_sql"
+    fi
     advanced="$(psql -q -v ON_ERROR_STOP=1 -tAX <<SQL
 BEGIN;
 CREATE TEMP TABLE stage (LIKE mb_${table}) ON COMMIT DROP;
