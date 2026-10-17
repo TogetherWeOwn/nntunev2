@@ -1,10 +1,9 @@
 # ADR 0011: Deployed-build identity separation
 
-- **Status:** Accepted design; implementation ([TOG-28340](/TOG/issues/TOG-28340))
+- **Status:** Accepted design; implementation
   and independent review gates remain.
 - **Date:** 2026-10-17
-- **Roadmap:** `roadmap`, M1 row-7 remainder; cut from
-  [TOG-28364](/TOG/issues/TOG-28364).
+- **Roadmap:** `roadmap`, M1 row-7 remainder.
 
 ## Context
 
@@ -52,7 +51,7 @@ why not in `/api/health`?
   with everything else collapsing to `"unknown"`.
 - `GET /api/health` keeps serving exactly `{ ok, version }` with the
   package version. The acceptance specs for this surface
-  ([TOG-28338](/TOG/issues/TOG-28338): `apps/web/src/lib/build-identity.test.ts`,
+  (`apps/web/src/lib/build-identity.test.ts`,
   `apps/web/tests/build-identity.spec.ts`) assert both the new surface and
   the untouched health pins.
 
@@ -60,7 +59,7 @@ why not in `/api/health`?
 
 1. **Add `sha` to `/api/health`.** Breaks the exact-keys assertion in
    `smoke.spec.ts` and the no-hex-run assertion in `version.test.ts` — both
-   pinned by [TOG-28340](/TOG/issues/TOG-28340) to pass unmodified. It also
+   pinned to pass unmodified. It also
    conflates two audiences: the public version contract consumed by clients
    and monitors, and the deploy-verification signal consumed by promotion
    lanes. Every health consumer would need re-auditing for the widened
@@ -91,7 +90,7 @@ why not in `/api/health`?
   digest) extends the dedicated surface, never health — widening health
   needs a new ADR.
 - Rollback trust assumptions are out of scope here; they are owned by
-  [TOG-28344](/TOG/issues/TOG-28344).
-- Until the [TOG-28340](/TOG/issues/TOG-28340) surface lands, this ADR is the
+  a separate card.
+- Until the build-identity surface lands, this ADR is the
   contract its implementation PR is reviewed against; the reviewer checks
   the diff for accuracy against that surface.
