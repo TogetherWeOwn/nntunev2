@@ -3,7 +3,7 @@
 - **Status:** Accepted design; implementation
   and independent review gates remain.
 - **Date:** 2026-10-17
-- **Roadmap:** `roadmap`, M1 row-7 remainder.
+- **Roadmap:** M1 exit traceability row 7 (deployed-build identity gap).
 
 ## Context
 
@@ -28,7 +28,7 @@ two places that must keep passing unmodified:
   `pkg.version` and matches no whitespace, hostname, path, or 20+ hex run
   pattern.
 
-Any identity signal added to `/api/health` breaks both pins. The decision
+Any identity signal added to `/api/health` breaks the exact-keys smoke pin. The decision
 therefore needs recording: where does the deployed-build identity live, and
 why not in `/api/health`?
 
@@ -38,9 +38,18 @@ why not in `/api/health`?
 `/api/health`, whose package-only semantics are frozen.**
 
 - `GET /api/build` returns exactly `{ sha }`: the 40-character lowercase
-  hex commit SHA baked at build time (sourced from `BUILD_SHA` /
-  `GITHUB_SHA` via the `__BUILD_SHA__` build-time define, with the runtime
-  `BUILD_SHA` env and Workers `CF_VERSION_METADATA` as fallback sources).
+  hex commit SHA. Sources in precedence order: the runtime `BUILD_SHA` env
+  when set on the Worker (it overrides the baked value), then the SHA baked
+  at build time (sourced from `BUILD_SHA` / `GITHUB_SHA` via the
+  `__BUILD_SHA__` build-time define), then Workers `CF_VERSION_METADATA`
+  `id` / `tag` as a last resort. The `CF_VERSION_METADATA` fallback needs a
+  `[version_metadata]` binding plus a deploy tag carrying the full SHA to
+  work: `id` is a Worker version UUID and never matches the
+  `^[0-9a-f]{40}$` rule, and the current deploy runs `deploy --env staging`
+  with no tag, so it collapses to `"unknown"` until that wiring lands. A
+  malformed runtime value likewise masks a valid baked SHA, so promotion
+  lanes must compare the reported SHA against the promotion SHA rather than
+  trust build provenance.
 - Unknown or unset build identity renders as the explicit string
   `"unknown"` — never silently omitted, never an empty string. The `sha`
   key is always present. An `unknown` identity is a build-configuration
@@ -58,8 +67,9 @@ why not in `/api/health`?
 ## Rejected alternatives
 
 1. **Add `sha` to `/api/health`.** Breaks the exact-keys assertion in
-   `smoke.spec.ts` and the no-hex-run assertion in `version.test.ts` — both
-   pinned to pass unmodified. It also
+   `smoke.spec.ts`, pinned to pass unmodified. (The `version.test.ts`
+   no-hex-run pin guards the `APP_VERSION` constant itself, so it constrains
+   alternative 4, not a separate `sha` key.) It also
    conflates two audiences: the public version contract consumed by clients
    and monitors, and the deploy-verification signal consumed by promotion
    lanes. Every health consumer would need re-auditing for the widened
