@@ -1512,33 +1512,54 @@ work. Production DB creation/migration remains gated by the ops contract.
      the app DB and mirror-targeted files only to the mirror DB, and records the
      applied filename and SHA-256 checksum per database. Refuse checksum drift
      before applying further files; fail closed for missing/ambiguous targets,
-     and make replay of an already-applied matching file a no-op. Execution-level
-     acceptance: use separate synthetic app and mirror databases plus a
-     mirror-targeted fixture migration; prove it executes against the mirror DB
-     only, never the app DB, and assert the corresponding per-DB applied-file
-     record. Also assert app-targeted routing, matching replay, and altered-file
-     drift refusal. Existing `migrations-gate` and
-     `workers/api/tests/run_migration_tests.sh` remain required source/empty-DB
-     gates, not substitutes for these runner tests. Safeguards: throwaway DBs and
-     synthetic migration inputs only; no staging or production connections, no
-     edits/moves of applied migrations, and no playlist schema or behavior change.
-     If this runner cannot credibly fit in one day, leave it unscheduled and add
-     only non-behavioral preparation; the atomic cutover remains blocked on it.
+     and make replay of an already-applied matching file a no-op. Add an explicit,
+     opt-in adoption path for an existing database with no runner history: build
+     canonical schema snapshots by applying each target's manifest migrations in
+     order to throwaway databases, then compare the existing database's
+     migration-owned catalog state (columns, types, nullability, defaults,
+     constraints, indexes, sequences and foreign keys) against those exact
+     post-migration snapshots. Adopt only one exact match for a contiguous
+     target-specific manifest prefix; atomically record the matched manifest
+     filenames and their trusted SHA-256 values without executing historical SQL.
+     Do not infer history from a maximum migration number or allow hand-inserted
+     history rows. Refuse ambiguous, partial, unknown or drifted state, and leave
+     history untouched on refusal. Any database with migration-owned schema but
+     no history must fail closed until this explicit adoption succeeds.
+     Execution-level acceptance: on throwaway DBs, verify a pre-populated app
+     schema at 0008 with no history adopts and then replays as a no-op; a schema
+     partway through a migration or otherwise not matching a completed contiguous
+     manifest prefix, unknown schema, and post-adoption schema drift all refuse
+     without applying SQL or recording guessed history. Also assert app-targeted
+     routing, matching replay and altered-file checksum drift refusal. Existing
+     `migrations-gate` and `workers/api/tests/run_migration_tests.sh` remain
+     required source/empty-DB gates, not substitutes for these runner tests.
+     Safeguards: throwaway DBs and synthetic migration inputs only; no staging or
+     production connections, no edits/moves of applied migrations, and no playlist
+     schema or behavior change. If the runner plus safe adoption path cannot
+     credibly fit in one day, leave it unscheduled and add only non-behavioral
+     preparation; the atomic cutover remains blocked on it.
 
   2. **Applied-shape rehearsal fixture and harness (≤1 day; no playlist cutover).**
-     Using the runner from slice 1, build a synthetic app database from the
-     app-targeted 0002 auth and 0003 library migrations, seed representative
-     playlist rows after 0003, then apply the already-existing later app
-     migrations. Assert playlist columns, internal BIGSERIAL ids, external
-     `public_id`s, owner, order, `items`, and visibility flags remain unchanged.
-     Carry forward slice 1's execution-level mirror-routing assertion; this
-     rehearsal also reuses `migrations-gate` for repository ordering,
-     target/checksum/drift checks and runs the existing `api-migrations` gate for
-     the empty-database path. No playlist migration is introduced. Safeguards:
-     synthetic data and throwaway DBs only; no production or staging DB access,
-     no edit/move of applied migrations, and explicit app/mirror manifest targets.
-     This proves the starting point without releasing a new playlist schema or
-     read path.
+     Build a synthetic app database that emulates a pre-runner deployment by
+     applying app-targeted 0002 and 0003 without runner history, seed
+     representative playlist rows after 0003, and exercise slice 1's explicit
+     adoption path. Assert adoption matches and records the validated 0002/0003
+     prefix without re-running either migration; then use the runner to apply the
+     already-existing later app migrations. Assert playlist columns, internal
+     BIGSERIAL ids, external `public_id`s, owner, order, `items`, and visibility
+     flags remain unchanged. In a separate throwaway mirror
+     database, execute the migrations selected by `target = "mirror"` in
+     `migrations/manifest.toml`; assert the selected migration IDs exactly equal
+     the mirror-target manifest entries and that no app-targeted migration ran
+     there. This is an execution-level mirror-routing check, not an inference
+     from the unfiltered `api-migrations` runner or `migrations-gate`. Reuse
+     `migrations-gate` for repository ordering, targets, checksums and drift, and
+     run `api-migrations` for the empty-database app path; neither gate substitutes
+     for the runner's separate mirror-database check. No playlist migration is
+     introduced. Safeguards: synthetic data and throwaway DBs only; no production
+     or staging DB access, no edit/move of applied migrations, and explicit
+     app/mirror manifest targets. This proves the starting point without
+     releasing a new playlist schema or read path.
 
   3. **Legacy-data fixture package (≤1 day; fixtures only, no runtime/schema or
      acceptance-test edits by the implementation author).** Have the Test Author
@@ -1558,9 +1579,14 @@ work. Production DB creation/migration remains gated by the ops contract.
 
   4. **Single atomic playlist cutover PR (≤1 day, hard ceiling; not yet estimated
      as fitting).** This slice is explicitly blocked until slice 1's per-database
-     runner and slices 2–3's rehearsals/fixtures pass. The implementation owner
-     must either demonstrate a one-day estimate for the complete scope above or
-     leave this implementation unscheduled and add only further safe preparations.
+     runner and adoption path, and slices 2–3's rehearsals/fixtures pass. Before
+     applying the cutover migration, run and verify adoption on the intended
+     staging app database under the existing ops contract; the runner must refuse
+     to proceed if adoption does not match one exact known schema prefix. This is
+     not authorization to connect to or migrate production. The implementation
+     owner must either demonstrate a one-day estimate for the complete scope above
+     or leave this implementation unscheduled and add only further safe
+     preparations.
      Required acceptance fixtures/checks in that PR: the complete fixture package
      from slice 3; owner/public/private/unknown and unauthenticated read/list cases;
      visible public metadata with no non-owner `items`, entries, catalog ids, tags,
@@ -1572,8 +1598,9 @@ work. Production DB creation/migration remains gated by the ops contract.
      durable executor; RESTRICT FK/source cleanup; plus the existing exact SQL
      pins and visibility tests in `workers/api/tests/library_single_row_visibility.rs`
      and `workers/api/tests/library_tests.rs` updated in lockstep. Forward-only
-     safeguards: allocate one new unique top-level migration number after 0008,
-     target app DB explicitly through the per-database runner, require its
+     safeguards: allocate the next unique top-level migration number after the
+     current highest entry in `migrations/manifest.toml`, target the app DB
+     explicitly through the per-database runner, and require its
      applied-file SHA-256/drift refusal and replay gates, retain all 0003 playlist
      rows and existing columns until the same PR's coordinated migration/backfill/
      read-write cutover passes parity checks; add only the specified nullable
