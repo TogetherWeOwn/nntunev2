@@ -159,12 +159,12 @@ if url.startswith(("postgres://", "postgresql://")):
         params[key] = unquote(value)
 elif "=" in url:
     params = parse_keyword_conninfo(url)
-elif url and not any(c.isspace() for c in url):
+elif url:
+    # No '=' and no URI prefix: libpq treated the old argument as a
+    # literal database name, whitespace and all.
     params["dbname"] = url
 else:
-    fail(
-        "DATABASE_URL must be a postgres:// URI or libpq keyword/value conninfo"
-    )
+    fail("DATABASE_URL is empty")
 
 for key, value in params.items():
     print("export %s=%s" % (ENV_FOR_PARAM[key], shlex.quote(value)))

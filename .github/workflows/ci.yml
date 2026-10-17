@@ -203,6 +203,8 @@ jobs:
         run: bash containers/mb-import/tests/test_etl.sh
       - name: Run mb-import argv-hygiene tests
         run: bash containers/mb-import/tests/test_argv_hygiene.sh
+      - name: Run mb-import pg-env tests
+        run: bash containers/mb-import/tests/test_pg_env.sh
 
   # Real-Postgres migration tests: applies every migrations/*.sql, in order,
   # to an empty throwaway database (twice, to prove idempotency) and runs
