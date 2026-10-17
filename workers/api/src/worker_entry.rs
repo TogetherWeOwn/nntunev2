@@ -24,7 +24,8 @@ use crate::auth::{
     SingleUseStore,
 };
 use crate::handlers::{
-    self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, Store, StoreError, UserRecord, VaultRow,
+    self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, RateLimitBudget, Store, StoreError,
+    UserRecord, VaultRow,
 };
 use crate::session::SessionRecord;
 use crate::vault::{
@@ -88,7 +89,7 @@ fn config_from_env(env: &Env) -> Option<Config> {
         Ok(previous) => previous,
         Err(()) => return None,
     };
-    Config::new(
+    let config = Config::new(
         &rp_id,
         &origin,
         session_secret,
@@ -99,7 +100,24 @@ fn config_from_env(env: &Env) -> Option<Config> {
         truthy("ALLOW_LOOPBACK_DEV"),
         session_previous_secret,
     )
-    .ok()
+    .ok()?;
+    Some(config.with_rate_limits(rate_limits_from_env(env)))
+}
+
+/// Rate-limit tunables from [vars]; `from_vars` fails safe to the
+/// documented defaults on anything missing or invalid, so a typo'd
+/// override keeps limiting on (never unlimited, never deny-all).
+fn rate_limits_from_env(env: &Env) -> crate::rate_limit::RateLimitConfig {
+    let vars: HashMap<String, String> = [
+        "AUTH_RATE_LIMIT_MAX",
+        "AUTH_RATE_LIMIT_WINDOW_SECS",
+        "VAULT_TEST_RATE_LIMIT_MAX",
+        "VAULT_TEST_RATE_LIMIT_WINDOW_SECS",
+    ]
+    .iter()
+    .filter_map(|name| env_string(env, name).map(|v| ((*name).to_string(), v)))
+    .collect();
+    crate::rate_limit::RateLimitConfig::from_vars(&vars)
 }
 
 /// Pure Hyperdrive caching attestation decision: `Some("1"/"true"/"TRUE")`
@@ -209,6 +227,105 @@ fn u64_of(v: i64) -> Result<u64, StoreError> {
 
 fn u32_of(v: i64) -> Result<u32, StoreError> {
     u32::try_from(v).map_err(|_| StoreError)
+}
+
+/// Durable-slot budgets are bounded: a zero limit/window admits
+/// nothing, and the slot scan is capped at 100 (the largest in-tree
+/// budget). A configured limit above the cap fails closed here
+/// rather than scanning unboundedly.
+fn rate_limit_budget_admissible(budget: &RateLimitBudget<'_>) -> bool {
+    budget.limit != 0 && budget.window_secs != 0 && budget.limit <= 100
+}
+
+async fn delete_expired_rate_limit_slots(
+    client: &tokio_postgres::Client,
+    now: i64,
+) -> Result<(), StoreError> {
+    client
+        .execute(
+            "DELETE FROM auth_rate_limit_slots WHERE expires_at <= $1",
+            &[&now],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    Ok(())
+}
+
+/// Claim one slot of `budget` on `client`; `Ok(Some(slot))` is the
+/// claimed slot index (the pair path needs it for its compensating
+/// release), `Ok(None)` is an exhausted budget. Caller has already
+/// deleted expired rows for `now_i`.
+async fn claim_rate_limit_slot(
+    client: &tokio_postgres::Client,
+    budget: &RateLimitBudget<'_>,
+    now: u64,
+    now_i: i64,
+) -> Result<Option<i32>, StoreError> {
+    let expires_at = i64_of(now.saturating_add(budget.window_secs))?;
+    // O(1) fast-fail on the exhausted path (single source of truth:
+    // `handlers::RATE_LIMIT_EXHAUSTED_SQL`, pinned by statement-shape
+    // test): without this guard every denied request pays one DELETE
+    // plus `limit` conflicting upserts (~101 statements with 100 row
+    // locks for the 100-slot finish lookup budget). The slot loop below
+    // still claims atomically, so a concurrent race that passes this
+    // snapshot simply fails closed there.
+    let exhausted = client
+        .query_one(
+            handlers::RATE_LIMIT_EXHAUSTED_SQL,
+            &[&budget.scope_key, &budget.action, &now_i],
+        )
+        .await
+        .map_err(|_| StoreError)?
+        .get::<_, i64>(0);
+    if exhausted >= i64::try_from(budget.limit).map_err(|_| StoreError)? {
+        return Ok(None);
+    }
+    for slot in 0..budget.limit {
+        let slot = i32::try_from(slot).map_err(|_| StoreError)?;
+        let rows = client
+            .query(
+                "INSERT INTO auth_rate_limit_slots (scope_key, action, slot, expires_at) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (scope_key, action, slot) DO UPDATE \
+                 SET expires_at = EXCLUDED.expires_at \
+                 WHERE auth_rate_limit_slots.expires_at <= $5 \
+                 RETURNING slot",
+                &[
+                    &budget.scope_key,
+                    &budget.action,
+                    &slot,
+                    &expires_at,
+                    &now_i,
+                ],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        if !rows.is_empty() {
+            return Ok(Some(slot));
+        }
+    }
+    Ok(None)
+}
+
+/// Release the exact slot `claim_rate_limit_slot` took for `budget`
+/// at `now` (same scope, action, slot and expiry), so the pair
+/// path's compensation can never free another request's slot.
+async fn release_rate_limit_slot(
+    client: &tokio_postgres::Client,
+    budget: &RateLimitBudget<'_>,
+    slot: i32,
+    now: u64,
+) -> Result<(), StoreError> {
+    let expires_at = i64_of(now.saturating_add(budget.window_secs))?;
+    client
+        .execute(
+            "DELETE FROM auth_rate_limit_slots \
+             WHERE scope_key = $1 AND action = $2 AND slot = $3 AND expires_at = $4",
+            &[&budget.scope_key, &budget.action, &slot, &expires_at],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    Ok(())
 }
 
 struct PgStore {
@@ -699,56 +816,56 @@ impl Store for PgStore {
         now: u64,
         window_secs: u64,
     ) -> Result<bool, StoreError> {
-        if limit == 0 || window_secs == 0 || limit > 100 {
+        let budget = RateLimitBudget {
+            scope_key,
+            action,
+            limit,
+            window_secs,
+        };
+        if !rate_limit_budget_admissible(&budget) {
             return Ok(false);
         }
         let client = self.connect().await?;
-        let expires_at = i64_of(now.saturating_add(window_secs))?;
-        let now = i64_of(now)?;
-        client
-            .execute(
-                "DELETE FROM auth_rate_limit_slots WHERE expires_at <= $1",
-                &[&now],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        // O(1) fast-fail on the exhausted path (single source of truth:
-        // `handlers::RATE_LIMIT_EXHAUSTED_SQL`, pinned by statement-shape
-        // test): without this guard every denied request pays one DELETE
-        // plus `limit` conflicting upserts (~101 statements with 100 row
-        // locks for the 100-slot finish lookup budget). The slot loop below
-        // still claims atomically, so a concurrent race that passes this
-        // snapshot simply fails closed there.
-        let exhausted = client
-            .query_one(
-                handlers::RATE_LIMIT_EXHAUSTED_SQL,
-                &[&scope_key, &action, &now],
-            )
-            .await
-            .map_err(|_| StoreError)?
-            .get::<_, i64>(0);
-        if exhausted >= i64::try_from(limit).map_err(|_| StoreError)? {
+        let now_i = i64_of(now)?;
+        delete_expired_rate_limit_slots(&client, now_i).await?;
+        Ok(claim_rate_limit_slot(&client, &budget, now, now_i)
+            .await?
+            .is_some())
+    }
+
+    async fn reserve_rate_limit_pair(
+        &self,
+        first: RateLimitBudget<'_>,
+        second: RateLimitBudget<'_>,
+        now: u64,
+    ) -> Result<bool, StoreError> {
+        if !rate_limit_budget_admissible(&first) || !rate_limit_budget_admissible(&second) {
             return Ok(false);
         }
-        for slot in 0..limit {
-            let slot = i32::try_from(slot).map_err(|_| StoreError)?;
-            let rows = client
-                .query(
-                    "INSERT INTO auth_rate_limit_slots (scope_key, action, slot, expires_at) \
-                     VALUES ($1, $2, $3, $4) \
-                     ON CONFLICT (scope_key, action, slot) DO UPDATE \
-                     SET expires_at = EXCLUDED.expires_at \
-                     WHERE auth_rate_limit_slots.expires_at <= $5 \
-                     RETURNING slot",
-                    &[&scope_key, &action, &slot, &expires_at, &now],
-                )
-                .await
-                .map_err(|_| StoreError)?;
-            if !rows.is_empty() {
-                return Ok(true);
+        // All-or-none on one connection: claim the first slot, then the
+        // second; if the second does not admit, release the first by
+        // its exact identity (scope, action, slot, expiry). A live
+        // slot cannot be overwritten by another claim (reuse requires
+        // an expired row), so the compensating DELETE can only remove
+        // the slot this call just took — a denied attempt ends up
+        // consuming neither budget.
+        let client = self.connect().await?;
+        let now_i = i64_of(now)?;
+        delete_expired_rate_limit_slots(&client, now_i).await?;
+        let Some(first_slot) = claim_rate_limit_slot(&client, &first, now, now_i).await? else {
+            return Ok(false);
+        };
+        match claim_rate_limit_slot(&client, &second, now, now_i).await {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => {
+                release_rate_limit_slot(&client, &first, first_slot, now).await?;
+                Ok(false)
+            }
+            Err(err) => {
+                let _ = release_rate_limit_slot(&client, &first, first_slot, now).await;
+                Err(err)
             }
         }
-        Ok(false)
     }
 
     async fn prune_expired_challenges(&self, now: u64) -> Result<(), StoreError> {

@@ -18,11 +18,16 @@
 //! falls back to these defaults on missing, unparseable, or zero values:
 //! invalid config keeps limiting on (never unlimited, never deny-all).
 //!
-//! Live enforcement: the handler layer's durable slot budgets
-//! (`Store::reserve_rate_limit`) remain the cross-isolate authority for auth
-//! starts/finishes and outbound mail; this module supplies the shared
-//! config, bucket math and 429/`Retry-After` shape, and its config drives
-//! the vault test-connection dual (per-IP + per-account) reservation.
+//! Live enforcement: the Worker entry overlays [vars] through
+//! [`RateLimitConfig::from_vars`] into `handlers::Config`, and the
+//! handler layer's durable slot budgets (`Store::reserve_rate_limit` /
+//! `Store::reserve_rate_limit_pair`) remain the cross-isolate
+//! authority: the auth config bounds auth-start bursts per IP
+//! alongside the pre-existing hourly budgets, and the vault config
+//! drives the test-connection dual (per-IP + per-account) claim. The
+//! durable store caps any single budget at 100 slots, so a configured
+//! max above 100 fails closed there. This module supplies the shared
+//! config, bucket math and 429/`Retry-After` shape.
 //!
 //! No credential or IP in cleartext: [`rate_limited_body`] takes ZERO args
 //! (per-request data cannot leak into it) and [`ThrottleKey`]'s `Debug`

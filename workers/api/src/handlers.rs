@@ -157,6 +157,11 @@ pub struct Config {
     /// recorded rotation window, `None` in steady state. Never mints;
     /// length-checked like the primary (a short previous fails closed).
     pub session_previous_secret: Option<Vec<u8>>,
+    /// Rate-limit tunables for the auth-start burst and vault
+    /// test-connection budgets. `Config::new` uses the documented
+    /// defaults; the Worker entry overlays [vars] via
+    /// `RateLimitConfig::from_vars` + [`Config::with_rate_limits`].
+    pub rate_limits: crate::rate_limit::RateLimitConfig,
 }
 
 impl Config {
@@ -198,7 +203,16 @@ impl Config {
             session_ttl_secs: session_ttl_secs.min(session::MAX_SESSION_SECS),
             invites_required,
             session_previous_secret,
+            rate_limits: crate::rate_limit::RateLimitConfig::default(),
         })
+    }
+
+    /// Overlay operator-configured rate limits (from [vars]); the
+    /// constructor keeps the documented defaults so existing callers
+    /// and tests need no change.
+    pub fn with_rate_limits(mut self, rate_limits: crate::rate_limit::RateLimitConfig) -> Self {
+        self.rate_limits = rate_limits;
+        self
     }
 
     /// Signing/verification keys for this worker: rotation (the primary
@@ -270,6 +284,17 @@ pub struct VaultRow {
     pub updated_at: u64,
 }
 
+/// One durable rate-limit budget: `limit` slots for
+/// `(scope_key, action)` per `window_secs`. See
+/// [`Store::reserve_rate_limit_pair`].
+#[derive(Debug, Clone, Copy)]
+pub struct RateLimitBudget<'a> {
+    pub scope_key: &'a str,
+    pub action: &'a str,
+    pub limit: u64,
+    pub window_secs: u64,
+}
+
 /// Persistence over migration-0002 tables. Implementations must use
 /// parameterized statements only, and conditional single-row updates for
 /// the rotation/sign-count advances. `Store` implementors also implement
@@ -329,6 +354,45 @@ pub trait Store {
         now: u64,
         window_secs: u64,
     ) -> impl Future<Output = Result<bool, StoreError>>;
+    /// Reserve one slot from EACH of two budgets as a single admission
+    /// decision: an allowed attempt consumes both, a denied attempt
+    /// consumes NEITHER. The two budgets must be distinct
+    /// `(scope_key, action)` pairs. Sequential single reserves would let an
+    /// account that exhausted its own budget keep burning the shared
+    /// per-IP budget (locking out other accounts behind the same
+    /// address) on requests that never proceed. Production and the
+    /// test fake override this with a truly all-or-none claim; the
+    /// default keeps out-of-tree `Store` impls compiling with the
+    /// weaker sequential semantics.
+    fn reserve_rate_limit_pair(
+        &self,
+        first: RateLimitBudget<'_>,
+        second: RateLimitBudget<'_>,
+        now: u64,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            if !self
+                .reserve_rate_limit(
+                    first.scope_key,
+                    first.action,
+                    first.limit,
+                    now,
+                    first.window_secs,
+                )
+                .await?
+            {
+                return Ok(false);
+            }
+            self.reserve_rate_limit(
+                second.scope_key,
+                second.action,
+                second.limit,
+                now,
+                second.window_secs,
+            )
+            .await
+        }
+    }
     /// Remove challenges that can no longer be redeemed.
     fn prune_expired_challenges(&self, now: u64) -> impl Future<Output = Result<(), StoreError>>;
     /// Reap abandoned signups while preserving the current/resumed user,
@@ -771,13 +835,26 @@ where
     /// rotation inside one prefix cannot mint fresh budgets; audit logs keep
     /// the full `source_ip`.
     async fn admit_auth_start(&self) -> bool {
+        // Hourly budget AND the configured short-window burst budget
+        // (`AUTH_RATE_LIMIT_*`, default 10/60s), claimed as one
+        // all-or-none decision: a burst-denied start must not burn an
+        // hourly slot, and vice versa.
+        let ip_key = rate_limit_ip_key(&self.source_ip);
         self.store
-            .reserve_rate_limit(
-                &rate_limit_ip_key(&self.source_ip),
-                "auth.start_ip",
-                AUTH_STARTS_PER_IP_PER_HOUR,
+            .reserve_rate_limit_pair(
+                RateLimitBudget {
+                    scope_key: &ip_key,
+                    action: "auth.start_ip",
+                    limit: AUTH_STARTS_PER_IP_PER_HOUR,
+                    window_secs: AUTH_START_WINDOW_SECS,
+                },
+                RateLimitBudget {
+                    scope_key: &ip_key,
+                    action: "auth.start_ip_burst",
+                    limit: u64::from(self.cfg.rate_limits.auth_max_attempts),
+                    window_secs: self.cfg.rate_limits.auth_window_secs,
+                },
                 self.now,
-                AUTH_START_WINDOW_SECS,
             )
             .await
             .unwrap_or(false)
@@ -2008,37 +2085,34 @@ where
     // host verdict or vault-existence signal).
     let fail = || json_response(200, serde_json::json!({"ok": false}));
     // Dual budget (per-IP AND per-account; roadmap R6): the limits come
-    // from `rate_limit::RateLimitConfig`, whose vault-test defaults ARE
+    // from `ctx.cfg.rate_limits` (`VAULT_TEST_RATE_LIMIT_*` [vars]
+    // overlaid by the Worker entry), whose defaults ARE
     // `vault::TEST_CONNECTION_MAX_ATTEMPTS` per
-    // `vault::TEST_CONNECTION_WINDOW_SECS` — one source, see rate_limit.rs
-    // (`from_vars` is the [vars] overlay seam for callers that carry env).
-    // Both slots are reserved atomically before any lookup or dial, so one
-    // host cannot burn probes across accounts and one account cannot burn
-    // them across hosts. Denial keeps the same boolean collapse as every
-    // other failure on this route (never a 429 oracle here).
-    let limits = crate::rate_limit::RateLimitConfig::default();
-    let ip_admitted = ctx
-        .store
-        .reserve_rate_limit(
-            &rate_limit_ip_key(&ctx.source_ip),
-            "vault.test_ip",
-            u64::from(limits.vault_test_max_attempts),
-            ctx.now,
-            limits.vault_test_window_secs,
-        )
-        .await
-        .unwrap_or(false);
-    if !ip_admitted {
-        return fail();
-    }
+    // `vault::TEST_CONNECTION_WINDOW_SECS` — one source, see
+    // rate_limit.rs. Both slots are claimed as one all-or-none pair
+    // before any lookup or dial, so one host cannot burn probes across
+    // accounts, one account cannot burn them across hosts, and a
+    // denied attempt consumes neither budget. Denial keeps the same
+    // boolean collapse as every other failure on this route (never a
+    // 429 oracle here).
+    let limits = ctx.cfg.rate_limits;
+    let ip_key = rate_limit_ip_key(&ctx.source_ip);
     let admitted = ctx
         .store
-        .reserve_rate_limit(
-            &claims.user_id,
-            "vault.test",
-            u64::from(limits.vault_test_max_attempts),
+        .reserve_rate_limit_pair(
+            RateLimitBudget {
+                scope_key: &ip_key,
+                action: "vault.test_ip",
+                limit: u64::from(limits.vault_test_max_attempts),
+                window_secs: limits.vault_test_window_secs,
+            },
+            RateLimitBudget {
+                scope_key: &claims.user_id,
+                action: "vault.test",
+                limit: u64::from(limits.vault_test_max_attempts),
+                window_secs: limits.vault_test_window_secs,
+            },
             ctx.now,
-            limits.vault_test_window_secs,
         )
         .await
         .unwrap_or(false);
@@ -2275,6 +2349,11 @@ mod tests {
     }
 
     fn cfg() -> Config {
+        // The hourly per-IP budget pins predate the configured burst
+        // budget: raise the burst to the durable-store cap so the
+        // hourly cap stays the binding constraint in those loops. The
+        // burst at its documented default is pinned separately by
+        // `auth_start_burst_budget_binds_before_hourly`.
         Config::new(
             "example.com",
             ORIGIN,
@@ -2287,6 +2366,10 @@ mod tests {
             None,
         )
         .unwrap()
+        .with_rate_limits(crate::rate_limit::RateLimitConfig {
+            auth_max_attempts: 100,
+            ..crate::rate_limit::RateLimitConfig::default()
+        })
     }
 
     #[derive(Default)]
@@ -2462,6 +2545,70 @@ mod tests {
                 }
             }
             Ok(false)
+        }
+        async fn reserve_rate_limit_pair(
+            &self,
+            first: RateLimitBudget<'_>,
+            second: RateLimitBudget<'_>,
+            now: u64,
+        ) -> Result<bool, StoreError> {
+            // All-or-none under the single slot-map borrow: count and
+            // locate a free slot in BOTH budgets first, insert only
+            // when both admit.
+            if first.limit == 0
+                || first.window_secs == 0
+                || second.limit == 0
+                || second.window_secs == 0
+            {
+                return Ok(false);
+            }
+            let mut slots = self.rate_limit_slots.borrow_mut();
+            slots.retain(|_, expires| *expires > now);
+            let free_slot = |budget: &RateLimitBudget<'_>,
+                             slots: &std::collections::HashMap<(String, String, u32), u64>|
+             -> Option<u32> {
+                let active = slots
+                    .iter()
+                    .filter(|((scope, act, _), expires)| {
+                        scope == budget.scope_key && act == budget.action && **expires > now
+                    })
+                    .count() as u64;
+                if active >= budget.limit {
+                    return None;
+                }
+                (0..budget.limit).find_map(|slot| {
+                    let slot = u32::try_from(slot).ok()?;
+                    let key = (
+                        budget.scope_key.to_string(),
+                        budget.action.to_string(),
+                        slot,
+                    );
+                    (!slots.contains_key(&key)).then_some(slot)
+                })
+            };
+            let (Some(first_slot), Some(second_slot)) =
+                (free_slot(&first, &slots), free_slot(&second, &slots))
+            else {
+                return Ok(false);
+            };
+            *self.rate_limit_slot_probes.borrow_mut() += 2;
+            slots.insert(
+                (
+                    first.scope_key.to_string(),
+                    first.action.to_string(),
+                    first_slot,
+                ),
+                now.saturating_add(first.window_secs),
+            );
+            slots.insert(
+                (
+                    second.scope_key.to_string(),
+                    second.action.to_string(),
+                    second_slot,
+                ),
+                now.saturating_add(second.window_secs),
+            );
+            Ok(true)
         }
         async fn prune_expired_challenges(&self, now: u64) -> Result<(), StoreError> {
             self.challenges
@@ -4606,6 +4753,97 @@ mod tests {
     }
 
     #[test]
+    fn auth_start_burst_budget_binds_before_hourly() {
+        // The configured burst (documented default 10/60s from
+        // `RateLimitConfig`) is live on the auth-start path: the 11th
+        // start inside the window is denied long before the hourly
+        // per-IP budget (30) would bind. `cfg()` raises the burst for
+        // the hourly pins, so restore the default here.
+        let mut h = harness();
+        h.config.rate_limits = crate::rate_limit::RateLimitConfig::default();
+        let burst = h.config.rate_limits.auth_max_attempts as usize;
+        assert!((burst as u64) < AUTH_STARTS_PER_IP_PER_HOUR);
+        for i in 0..burst {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/passkey/register/start",
+                serde_json::json!({"email": format!("burst{i}@example.com")}),
+            );
+            assert_eq!(resp.status, 200, "iteration {i}: {}", resp.body);
+        }
+        let denied = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "burst-over@example.com"}),
+        );
+        assert_eq!(denied.status, 429, "{}", denied.body);
+        assert_eq!(denied.body, r#"{"error":"rate_limited"}"#);
+        assert_eq!(
+            h.store.users.borrow().len(),
+            burst,
+            "no user row past the burst budget"
+        );
+    }
+
+    #[test]
+    fn rate_limit_pair_denial_consumes_neither_budget() {
+        // All-or-none pin for the dual claim: with the second budget
+        // exhausted, denied pair claims must leave the first budget
+        // fully intact (a sequential reserve would burn one first
+        // slot per denial).
+        let store = FakeStore::default();
+        let first = RateLimitBudget {
+            scope_key: "ip-scope",
+            action: "pair.first",
+            limit: 2,
+            window_secs: 60,
+        };
+        let second = RateLimitBudget {
+            scope_key: "account-scope",
+            action: "pair.second",
+            limit: 1,
+            window_secs: 60,
+        };
+        // Exhaust the second budget on its own.
+        assert!(block_on(store.reserve_rate_limit(
+            second.scope_key,
+            second.action,
+            second.limit,
+            NOW,
+            second.window_secs
+        ))
+        .unwrap());
+        for _ in 0..3 {
+            assert!(!block_on(store.reserve_rate_limit_pair(first, second, NOW)).unwrap());
+        }
+        // Both first-budget slots are still available to single claims.
+        assert!(block_on(store.reserve_rate_limit(
+            first.scope_key,
+            first.action,
+            first.limit,
+            NOW,
+            first.window_secs
+        ))
+        .unwrap());
+        assert!(block_on(store.reserve_rate_limit(
+            first.scope_key,
+            first.action,
+            first.limit,
+            NOW,
+            first.window_secs
+        ))
+        .unwrap());
+        assert!(!block_on(store.reserve_rate_limit(
+            first.scope_key,
+            first.action,
+            first.limit,
+            NOW,
+            first.window_secs
+        ))
+        .unwrap());
+    }
+
+    #[test]
     fn rate_limit_exhausted_path_skips_slot_scan() {
         // DoS-amplification pin: an exhausted 100-slot finish-lookup budget
         // must fast-fail without scanning every slot (production runs one
@@ -4801,17 +5039,35 @@ mod tests {
     fn ipv6_slash64_wiring_pins_all_rate_limit_scopes() {
         // All-sites wiring pin: every per-IP scope must key on
         // `rate_limit_ip_key`, not the raw `source_ip`. The behavioral test
-        // above covers `auth.start_ip` only; the other five scopes revert to
+        // above covers `auth.start_ip` only; the other scopes revert to
         // raw IP with all handler tests green (the harness default
         // `198.51.100.9` makes key == raw), so this shape test observes all
-        // six call sites directly at compile time. Comments are stripped
+        // call sites directly at compile time. Comments are stripped
         // first so prose mentioning a scope cannot satisfy its pin.
         let code = strip_line_comments(include_str!("handlers.rs"));
         let norm = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        // `admit_auth_start` claims its two budgets as a pair keyed on
+        // one shared `ip_key`; pin both the derivation and the scopes.
+        assert!(
+            norm.contains("let ip_key = rate_limit_ip_key(&self.source_ip);"),
+            "auth-start pair key must derive from rate_limit_ip_key, not raw source_ip",
+        );
+        assert!(
+            norm.contains("let ip_key = rate_limit_ip_key(&ctx.source_ip);"),
+            "vault-test pair key must derive from rate_limit_ip_key, not raw source_ip",
+        );
         for (scope, keyed) in [
             (
                 "auth.start_ip",
-                "&rate_limit_ip_key(&self.source_ip), \"auth.start_ip\",",
+                "scope_key: &ip_key, action: \"auth.start_ip\",",
+            ),
+            (
+                "auth.start_ip_burst",
+                "scope_key: &ip_key, action: \"auth.start_ip_burst\",",
+            ),
+            (
+                "vault.test_ip",
+                "scope_key: &ip_key, action: \"vault.test_ip\",",
             ),
             (
                 "auth.mail_ip",

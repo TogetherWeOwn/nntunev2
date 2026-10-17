@@ -21,7 +21,9 @@ SESSION_TTL_SECS = "86400"
 # EMAIL_WEBHOOK_URL = "https://<mail-provider-webhook>"  # magic-link delivery
 # Rate-limit defaults live in src/rate_limit.rs (documented there: auth
 # 10/60s, vault test-connection 5/60s, single-sourced with src/vault.rs).
-# RateLimitConfig::from_vars is the tested overlay seam for these keys:
+# The Worker entry reads these [vars] overrides at startup via
+# RateLimitConfig::from_vars (invalid values fall back to the defaults;
+# a max over 100 fails closed at the durable slot store):
 # AUTH_RATE_LIMIT_MAX / AUTH_RATE_LIMIT_WINDOW_SECS /
 # VAULT_TEST_RATE_LIMIT_MAX / VAULT_TEST_RATE_LIMIT_WINDOW_SECS.
 
