@@ -101,8 +101,21 @@ pub struct ReplicationSloReport {
 /// been published yet). `now` is reserved for probes that later account for
 /// published-but-not-yet-applied packets; until then such packets surface
 /// only as `missing_sequence` breaches and are excluded from lag/p95.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ReplicationSloProbe;
+/// `slo_secs` is the lag budget a packet must stay within; it defaults to
+/// [`REPLICATION_LAG_SLO_SECS`] and exists as a field so callers (and tests)
+/// can evaluate against a tighter budget without changing the ADR constant.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplicationSloProbe {
+    pub slo_secs: i64,
+}
+
+impl Default for ReplicationSloProbe {
+    fn default() -> Self {
+        Self {
+            slo_secs: REPLICATION_LAG_SLO_SECS,
+        }
+    }
+}
 
 impl ReplicationSloProbe {
     pub fn evaluate(
@@ -114,7 +127,7 @@ impl ReplicationSloProbe {
         let records = ledger.records();
         let mut breaches = Vec::new();
         for record in &records {
-            if record.lag_secs > REPLICATION_LAG_SLO_SECS {
+            if record.lag_secs > self.slo_secs {
                 breaches.push(ReplicationBreach {
                     kind: "lag_exceeded",
                     sequence: Some(record.sequence),
@@ -204,7 +217,7 @@ mod tests {
     #[test]
     fn empty_ledger_is_a_breach_not_a_pass() {
         let ledger = PacketLedger::default();
-        let report = ReplicationSloProbe.evaluate(&ledger, 5, 0);
+        let report = ReplicationSloProbe::default().evaluate(&ledger, 5, 0);
         assert_eq!(report.breach_count, 1);
         assert_eq!(report.breaches[0].kind, "empty_ledger");
     }
@@ -212,7 +225,7 @@ mod tests {
     #[test]
     fn empty_ledger_with_nothing_published_passes() {
         let ledger = PacketLedger::default();
-        let report = ReplicationSloProbe.evaluate(&ledger, -1, 0);
+        let report = ReplicationSloProbe::default().evaluate(&ledger, -1, 0);
         assert_eq!(report.breach_count, 0);
     }
 
@@ -220,7 +233,7 @@ mod tests {
     fn huge_latest_sequence_truncates_instead_of_scanning() {
         let mut ledger = PacketLedger::default();
         ledger.record(0, 0, 0);
-        let report = ReplicationSloProbe.evaluate(&ledger, i64::MAX, 0);
+        let report = ReplicationSloProbe::default().evaluate(&ledger, i64::MAX, 0);
         assert_eq!(
             report.breach_count,
             MAX_MISSING_SEQUENCE_BREACHES + 1,
@@ -237,7 +250,7 @@ mod tests {
         let mut ledger = PacketLedger::default();
         ledger.record(7, 0, 0);
         ledger.record(9, 0, 0);
-        let report = ReplicationSloProbe.evaluate(&ledger, 7, 0);
+        let report = ReplicationSloProbe::default().evaluate(&ledger, 7, 0);
         assert_eq!(report.breach_count, 0);
     }
 }
