@@ -354,7 +354,7 @@ fn outcome(req: &ProbeRequest, (present, missing): (Vec<String>, Vec<String>)) -
 
 /// Quarantines the pool, drops the leased connection and returns the generic
 /// provider error. The clock is ticked first so the backoff starts now.
-fn provider_failed<T: Transport>(
+pub(crate) fn provider_failed<T: Transport>(
     pool: &RefCell<Pool<NntpClient<T>>>,
     tick: &impl Fn(&mut Pool<NntpClient<T>>),
     lease: crate::pool::Lease,

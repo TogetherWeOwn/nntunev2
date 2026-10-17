@@ -551,11 +551,13 @@ impl Store for PgStore {
         Ok(rows.len() == 1)
     }
 
+    // Per-user prune: magic_link_tokens has no expires_at index, so a global sweep would scan.
     async fn insert_magic(&self, record: &MagicLinkRecord) -> Result<(), StoreError> {
         let client = self.connect().await?;
         client
             .execute(
-                "INSERT INTO magic_link_tokens (token_hash, user_id, email, issued_at, expires_at, used) \
+                "WITH pruned AS (DELETE FROM magic_link_tokens WHERE user_id = $2 AND expires_at <= $4) \
+                 INSERT INTO magic_link_tokens (token_hash, user_id, email, issued_at, expires_at, used) \
                  VALUES ($1, $2, $3, $4, $5, FALSE)",
                 &[
                     &record.token_hash,
@@ -1910,6 +1912,46 @@ mod tests {
         assert!(
             !body.contains("Some(config)"),
             "config_from_env must not return the un-overlaid config"
+        );
+    }
+
+    #[test]
+    fn insert_magic_prune_is_per_user_and_expired_only() {
+        // `PgStore::insert_magic` only compiles into the wasm Worker, so
+        // pin its statement text natively the same way the
+        // `config_from_env` test pins its call site: slice ONLY the fn
+        // body out of the pre-test source, so this test's own literals
+        // cannot satisfy the assertions. Keyed to `$5` (the new row's
+        // expiry) or missing either predicate, the prune would delete
+        // still-valid links or other users' rows and fail here.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let body = production
+            .split_once("async fn insert_magic(")
+            .expect("insert_magic must exist")
+            .1
+            .split_once("\n    async fn ")
+            .expect("a following fn must bound the body")
+            .0;
+        assert!(
+            body.contains("DELETE FROM magic_link_tokens WHERE user_id = $2 AND expires_at <= $4"),
+            "insert_magic must prune only the issuing user's expired rows"
+        );
+        // `$4` is only issued_at if the binds stay in column order:
+        // token_hash, user_id, email, issued_at, expires_at.
+        let bind_pos = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("insert_magic must bind {needle}"))
+        };
+        assert!(
+            bind_pos("&record.token_hash") < bind_pos("&record.user_id")
+                && bind_pos("&record.user_id") < bind_pos("&record.email")
+                && bind_pos("&record.email") < bind_pos("&i64_of(record.issued_at)?")
+                && bind_pos("&i64_of(record.issued_at)?") < bind_pos("&i64_of(record.expires_at)?"),
+            "insert_magic binds must keep issued_at as $4 and expires_at as $5"
         );
     }
 
