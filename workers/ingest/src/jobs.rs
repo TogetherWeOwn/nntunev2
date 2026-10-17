@@ -68,6 +68,15 @@ pub struct JobCheckpoint {
     /// before this field existed resumes probing from batch zero).
     #[serde(default)]
     pub probe_tally: Option<ProbeTally>,
+    /// PAR2 set covering the damaged files, recorded by `Verifying`
+    /// before it hands off to `Repairing`. `None` until verify runs;
+    /// `#[serde(default)]` keeps pre-existing checkpoints readable.
+    #[serde(default)]
+    pub par2_set_id: Option<String>,
+    /// Blocks verify found missing, recorded alongside `par2_set_id`;
+    /// the `Repairing` step dispatches exactly this repair request.
+    #[serde(default)]
+    pub missing_blocks: u32,
     /// Stable machine-readable failure category, retained for DLQ redelivery.
     #[serde(default)]
     pub failure_code: Option<String>,
@@ -296,6 +305,8 @@ mod tests {
             attempt: 1,
             repair_rounds: 0,
             probe_tally: None,
+            par2_set_id: None,
+            missing_blocks: 0,
             failure_code: None,
             failure_reason: None,
         }

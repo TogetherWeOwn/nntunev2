@@ -25,11 +25,14 @@
 //! ([`crate::checkpoint::admission_plan`]), never here, so redeliveries
 //! of one enqueue cannot resurrect it.
 //!
-//! No live runtime boundary is claimed: indexer search, pool probe,
-//! verify, repair, match and write steps have no executable consumer
-//! wiring yet, so those states settle as transient failures through the
-//! shared retry budget. The consumer therefore stays disabled in
-//! `wrangler.toml.example` until those boundaries land.
+//! No complete live pipeline is claimed: indexer search, pool probe,
+//! verify, match and write steps have no executable consumer wiring
+//! yet, so those states settle as transient failures through the shared
+//! retry budget. `Repairing` is executable (it calls the repair Worker
+//! through the `REPAIR_CONTAINER` service binding and returns to
+//! `Verifying`), but it is only reachable once verify can stage its
+//! inputs. The consumer therefore stays disabled in
+//! `wrangler.toml.example` until the remaining boundaries land.
 
 use worker::{console_log, Env, MessageExt, QueueRetryOptionsBuilder};
 
@@ -157,9 +160,69 @@ fn unavailable_code(state: JobState) -> &'static str {
 /// so the delivery settles through the shared retry budget instead of
 /// claiming progress it cannot finish. Every other non-terminal state is
 /// a transient boundary failure today.
+/// Run the `Repairing` step: dispatch the recorded repair request to
+/// the repair Worker, then return to `Verifying` on success. Verify has
+/// no executable wiring yet, so a repaired job then settles as a
+/// transient verify-boundary failure (same posture as `Parsing`).
+/// A checkpoint in `Repairing` without recorded verify inputs is a
+/// permanent failure: there is nothing a redelivery could add.
+async fn run_repair_step(env: &Env, cp: &mut JobCheckpoint) -> Result<(), JobError> {
+    use crate::repair::RepairCall;
+
+    let Some(par2_set_id) = cp.par2_set_id.clone() else {
+        return Err(JobError::permanent(
+            ERR_REPAIR_FAILED,
+            "repair inputs missing from checkpoint",
+        ));
+    };
+    let req = match crate::repair::decide_repair(
+        &cp.job_id,
+        &cp.user_id,
+        &cp.idempotency_key,
+        &par2_set_id,
+        cp.missing_blocks,
+        cp.repair_rounds,
+    ) {
+        Ok(Some(req)) => req,
+        Ok(None) => {
+            advance_checkpoint(cp, false);
+            return Err(JobError::transient(
+                ERR_VERIFY_FAILED,
+                "ingest runtime boundary unavailable",
+            ));
+        }
+        Err(_) => {
+            return Err(JobError::permanent(
+                ERR_REPAIR_FAILED,
+                "repair request cannot be built from checkpoint",
+            ))
+        }
+    };
+    match crate::repair::call_repair(env, &req).await {
+        RepairCall::Repaired => {
+            advance_checkpoint(cp, false);
+            Err(JobError::transient(
+                ERR_VERIFY_FAILED,
+                "ingest runtime boundary unavailable",
+            ))
+        }
+        RepairCall::Unrepairable => Err(JobError::permanent(
+            ERR_REPAIR_FAILED,
+            "par2 repair reported the set unrepairable",
+        )),
+        RepairCall::Retry => Err(JobError::transient(
+            ERR_REPAIR_FAILED,
+            "repair runtime unavailable",
+        )),
+    }
+}
+
 async fn run_step(env: &Env, msg: &QueueMsg, cp: &mut JobCheckpoint) -> Result<(), JobError> {
     if cp.state == JobState::Queued {
         advance_checkpoint(cp, false);
+    }
+    if cp.state == JobState::Repairing {
+        return run_repair_step(env, cp).await;
     }
     if !(cp.state == JobState::Parsing && cp.source == JobSource::NzbUpload) {
         return Err(JobError::transient(

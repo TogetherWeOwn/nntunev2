@@ -96,8 +96,8 @@ script_name = "nntune-stream"
 binding = "INGEST_METER"
 dataset = "nntune_ingest_meter"
 
-# Slice 2: repair dispatch target (code: src/repair.rs). The Container service
-# name lands with the repair runtime; until then this stays a placeholder.
+# Repair dispatch target (code: src/repair.rs): the no-route repair
+# Worker in workers/repair, which fronts the par2 Container.
 [[services]]
 binding = "REPAIR_CONTAINER"
-service = "<REPAIR_CONTAINER_SERVICE>"
+service = "nntune-repair"
