@@ -24,6 +24,44 @@ export interface TestAccount {
   viaApi: boolean;
 }
 
+/**
+ * Bounded evidence label for which signup path a test's account came from.
+ * M1 exit evidence must distinguish the real public UI signup from the
+ * API test-account seam: a seam-backed run does not prove public signup.
+ * The label is one of exactly these two fixed strings — never an email,
+ * account id, session/token, provider setting or any other account data.
+ */
+export type SignupPathLabel = 'public-ui-signup' | 'api-minted-account';
+
+/**
+ * Label for the branch selected by a tryMintTestAccount result: a minted
+ * (viaApi) account is the seam path; null (seam unconfigured) means the
+ * caller proceeds to the public UI signup form. Call only at that branch
+ * point — a null result elsewhere does not imply a UI signup happened.
+ */
+export function signupPathLabel(minted: TestAccount | null): SignupPathLabel {
+  return minted?.viaApi ? 'api-minted-account' : 'public-ui-signup';
+}
+
+/**
+ * Record the signup-path label as a test annotation so it rides along in
+ * reporter output (the sanitized junit CI artifact) next to the test
+ * result. The list reporter does not print annotations, and green runs
+ * upload no artifacts, so the staging workflow additionally publishes the
+ * label to the run's step summary on every configured run. A passing
+ * test's label is the path that produced its evidence; on failure it names
+ * the path under exercise. The annotation carries only the bounded label
+ * above (names only — no values logged).
+ */
+export function annotateSignupPath(
+  target: { annotations: Array<{ type: string; description?: string }> },
+  minted: TestAccount | null,
+): SignupPathLabel {
+  const label = signupPathLabel(minted);
+  target.annotations.push({ type: 'signup-path', description: label });
+  return label;
+}
+
 /** First value that is a nonblank string, else undefined (value kept as-is). */
 function nonblankString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
