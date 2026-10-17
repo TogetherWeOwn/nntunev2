@@ -3,8 +3,9 @@
 The `api`, `ingest`, `mb`, and `stream` crates define mappings to the same
 JSON error envelope. In this slice, `ingest` and `mb` serialize the envelope
 on their wired HTTP error paths. The API emits `reauth_required` from
-privilege-gated vault mutations; other API and stream mappings are pinned for
-future HTTP wiring, not emitted by reachable HTTP paths here. Clients can
+privilege-gated vault mutations and `account_deleting` when a vault save is
+refused by the account-deletion fence; other API and stream mappings are pinned
+for future HTTP wiring, not emitted by reachable HTTP paths here. Clients can
 handle auth, validation, billing limits, and upstream failures without
 per-worker special cases.
 

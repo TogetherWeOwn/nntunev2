@@ -107,8 +107,7 @@ const GLOBAL_SCOPE_KEY: &str = "global";
 /// scheduled deletion (`deleting_at IS NOT NULL`) are also exempt: they
 /// are owned by the deletion executor, and their `delete_operations`
 /// row's `ON DELETE RESTRICT` FK would otherwise abort the whole reap
-/// (the `FakeStore` cannot model the column — it has no deleting state —
-/// so the SQL pin below is the only mirror for this one predicate).
+/// (`FakeStore` mirrors this through `deleting_users`).
 pub fn reap_unverified_users_sql() -> String {
     format!(
         "DELETE FROM users WHERE created_at <= $1 \
@@ -2727,8 +2726,10 @@ mod tests {
                 .filter(|record| record.expires_at > now)
                 .map(|record| record.user_id.clone())
                 .collect();
+            let deleting_users = self.deleting_users.borrow();
             self.users.borrow_mut().retain(|_, user| {
                 user.created_at > cutoff
+                    || deleting_users.contains(&user.id)
                     || credentialed.contains(&user.id)
                     || active_registrations.contains(&user.id)
                     || vault_owners.contains(&user.id)
@@ -5502,6 +5503,7 @@ mod tests {
         for (id, email) in [
             ("resumed", "resume@example.com"),
             ("active", "active@example.com"),
+            ("deleting", "deleting@example.com"),
             ("abandoned", "abandoned@example.com"),
         ] {
             block_on(h.store.insert_user(&UserRecord {
@@ -5521,6 +5523,7 @@ mod tests {
                 .insert_challenge(&finishing_challenge, Some("active"), PURPOSE_REGISTER),
         )
         .unwrap();
+        h.store.deleting_users.borrow_mut().insert("deleting".to_string());
 
         let resp = h.call(
             "POST",
@@ -5532,6 +5535,9 @@ mod tests {
             .unwrap()
             .is_some());
         assert!(block_on(h.store.user_by_email("active@example.com"))
+            .unwrap()
+            .is_some());
+        assert!(block_on(h.store.user_by_email("deleting@example.com"))
             .unwrap()
             .is_some());
         assert!(block_on(h.store.user_by_email("abandoned@example.com"))
