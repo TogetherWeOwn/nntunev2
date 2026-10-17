@@ -184,6 +184,48 @@ test.describe('credential scope (static pins)', () => {
   });
 });
 
+test.describe('public UI signup coverage (static pin)', () => {
+  // Isolate the dedicated case and the shared form helper by slicing from
+  // their markers to the next top-level test/export (or EOF), so a mint call
+  // added to either segment (the bypass this coverage exists to prevent)
+  // fails here even though other tests in the file legitimately mint.
+  test('dedicated UI-signup case submits the form with no account-seam mint', () => {
+    const spec = readFileSync(new URL('../tests/signup-byop.spec.ts', import.meta.url), 'utf8');
+    const marker = "test('public UI signup succeeds even when the test-account seam is configured'";
+    const start = spec.indexOf(marker);
+    expect(start, 'dedicated public UI signup case is missing').toBeGreaterThan(-1);
+    const rest = spec.slice(start + marker.length);
+    const nextTest = rest.search(/\ntest(?:\(|\.describe)/);
+    const dedicated = nextTest === -1 ? spec.slice(start) : spec.slice(start, start + marker.length + nextTest);
+    // Null identity = Access pair only: the page starts unauthenticated, so
+    // the form is the only account-creation path even with QA_AUTH_TOKEN set.
+    expect(dedicated).toContain('applyAccountToPage(page, null, baseURL)');
+    expect(dedicated).toContain('submitPublicUiSignup(page, baseURL)');
+    expect(dedicated).not.toContain('tryMintTestAccount');
+
+    const accounts = readFileSync(new URL('../helpers/accounts.ts', import.meta.url), 'utf8');
+    const helperStart = accounts.indexOf('export async function submitPublicUiSignup');
+    expect(helperStart, 'shared public UI signup helper is missing').toBeGreaterThan(-1);
+    const helperRest = accounts.slice(helperStart + 'export async function submitPublicUiSignup'.length);
+    const nextExport = helperRest.search(/\nexport /);
+    const helper = nextExport === -1 ? accounts.slice(helperStart) : accounts.slice(helperStart, helperStart + 'export async function submitPublicUiSignup'.length + nextExport);
+    expect(helper).toContain('uniqueTestEmail(');
+    expect(helper).toContain('`${baseURL}/signup`');
+    expect(helper).toContain('TESTIDS.signupEmail');
+    expect(helper).toContain('TESTIDS.signupSubmit');
+    expect(helper).toContain('TESTIDS.signupError');
+    // The real page is two-step: the helper asserts the emailed-code step
+    // (magic_code form), never wizard arrival — asserting the wizard without
+    // the code-retrieval seam reds every configured run.
+    expect(helper).toContain('magic_code');
+    expect(helper).not.toContain('TESTIDS.byopHost');
+    expect(helper).not.toContain("'/onboarding/byop'");
+    expect(helper).not.toContain('tryMintTestAccount');
+    expect(helper).not.toContain('API.testAccounts');
+    expect(helper).not.toContain('qaAuthHeader');
+  });
+});
+
 // Execute the exact checked-in sanitize blocks: Playwright 1.55 writes
 // test-results/**/error-context.md (ARIA snapshots rendering filled input
 // values, including the BYOP password) and the junit reporter embeds failure
