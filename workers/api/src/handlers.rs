@@ -4778,6 +4778,9 @@ mod tests {
         );
         assert_eq!(denied.status, 429, "{}", denied.body);
         assert_eq!(denied.body, r#"{"error":"rate_limited"}"#);
+        // Handler-level Retry-After pin: the denied register/start must
+        // carry the throttle window, not just a hand-built Response.
+        assert_eq!(denied.retry_after, Some(AUTH_START_WINDOW_SECS));
         assert_eq!(
             h.store.users.borrow().len(),
             burst,
@@ -5694,6 +5697,51 @@ mod tests {
         assert!(
             h.store.test_connection_leases.borrow().is_empty(),
             "re-admitted probe must release its lease"
+        );
+    }
+
+    #[test]
+    fn vault_test_ip_budget_blocks_other_account_at_handler() {
+        // Per-IP gate isolated at the handler: account A exhausts the
+        // shared per-IP vault-test budget from the harness IP, then
+        // account B — whose own per-account budget is untouched — is
+        // denied on its FIRST probe with the usual boolean collapse
+        // and no dial. Removing the handler's admission check lets B
+        // dial and answer ok:true, failing this test.
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        seed_user(&h, "u2", "b@example.com");
+        let cookie_a = magic_login(&h, "a@example.com");
+        let cookie_b = magic_login(&h, "b@example.com");
+        put_test_vault(&h, &cookie_a);
+        put_test_vault(&h, &cookie_b);
+
+        let ip_cap = h.config.rate_limits.vault_test_max_attempts;
+        for i in 0..ip_cap {
+            let resp = h.call_full(
+                "POST",
+                "/v1/vault/test-connection",
+                None,
+                Some(cookie_a.clone()),
+                Some(ORIGIN),
+            );
+            assert_eq!(resp.body, r#"{"ok":true}"#, "probe {i} by A");
+        }
+        let dials = h.dialer.seen.borrow().len();
+        assert_eq!(dials, ip_cap as usize);
+
+        let resp = h.call_full(
+            "POST",
+            "/v1/vault/test-connection",
+            None,
+            Some(cookie_b),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.body, r#"{"ok":false}"#);
+        assert_eq!(
+            h.dialer.seen.borrow().len(),
+            dials,
+            "per-IP denial must happen before any dial"
         );
     }
 

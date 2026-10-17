@@ -168,26 +168,48 @@ fn search_source_ip(raw: Option<String>) -> String {
 
 /// Search throttle tunables from [vars]; `from_vars` fails safe to the
 /// documented defaults on anything missing or invalid.
-fn search_throttle_config(env: &Env) -> rate_limit::SearchRateLimitConfig {
-    let vars: std::collections::HashMap<String, String> =
-        ["SEARCH_RATE_LIMIT_MAX", "SEARCH_RATE_LIMIT_WINDOW_SECS"]
-            .iter()
-            .filter_map(|name| {
-                env.var(name)
-                    .ok()
-                    .map(|v| ((*name).to_string(), v.to_string()))
-            })
-            .collect();
-    rate_limit::SearchRateLimitConfig::from_vars(&vars)
+fn search_throttle_vars(env: &Env) -> std::collections::HashMap<String, String> {
+    ["SEARCH_RATE_LIMIT_MAX", "SEARCH_RATE_LIMIT_WINDOW_SECS"]
+        .iter()
+        .filter_map(|name| {
+            env.var(name)
+                .ok()
+                .map(|v| ((*name).to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// The search route's throttle decision, extracted over plain inputs
+/// (connecting-IP header value, [vars], account, now) so native tests
+/// drive the exact function the route calls — `Request`/`Env` need
+/// wasm-bindgen and cannot be built in a unit test.
+fn search_attempt_decision(
+    store: &mut rate_limit::SearchThrottleStore,
+    connecting_ip: Option<String>,
+    vars: &std::collections::HashMap<String, String>,
+    user_id: &str,
+    now_s: u64,
+) -> rate_limit::SearchDecision {
+    let ip = search_source_ip(connecting_ip);
+    let key = rate_limit::SearchThrottleKey::new(&ip, user_id);
+    let cfg = rate_limit::SearchRateLimitConfig::from_vars(vars);
+    store.check(&key, &cfg, now_s)
 }
 
 /// Run the dual (per-IP + per-account) search gate for one attempt.
 fn check_search_attempt(req: &Request, env: &Env, user_id: &str) -> rate_limit::SearchDecision {
-    let ip = search_source_ip(req.headers().get("cf-connecting-ip").ok().flatten());
-    let key = rate_limit::SearchThrottleKey::new(&ip, user_id);
-    let cfg = search_throttle_config(env);
+    let connecting_ip = req.headers().get("cf-connecting-ip").ok().flatten();
+    let vars = search_throttle_vars(env);
     let now_s = worker::Date::now().as_millis() / 1000;
-    SEARCH_THROTTLE.with(|store| store.borrow_mut().check(&key, &cfg, now_s))
+    SEARCH_THROTTLE.with(|store| {
+        search_attempt_decision(
+            &mut store.borrow_mut(),
+            connecting_ip,
+            &vars,
+            user_id,
+            now_s,
+        )
+    })
 }
 
 /// 429 for a throttled search: generic zero-arg body (no query, key or
@@ -1185,6 +1207,78 @@ mod tests {
             search_source_ip(Some("2001:db8:1:2::1".to_string())),
             search_source_ip(Some("2001:db8:1:3::1".to_string()))
         );
+    }
+
+    #[test]
+    fn search_attempt_decision_enforces_configured_dual_cap() {
+        // Route-level pin over the exact decision fn `check_search_attempt`
+        // runs: [vars] cap of 2 binds per-IP AND per-account, denial
+        // carries a bounded retry-after, and a denied attempt by a second
+        // account leaves that account's budget intact on a fresh IP.
+        use rate_limit::{SearchDecision, SearchThrottleStore};
+        let vars: std::collections::HashMap<String, String> = [
+            ("SEARCH_RATE_LIMIT_MAX".to_string(), "2".to_string()),
+            (
+                "SEARCH_RATE_LIMIT_WINDOW_SECS".to_string(),
+                "60".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut store = SearchThrottleStore::new();
+        let ip1 = || Some("203.0.113.7".to_string());
+        let ip2 = || Some("203.0.113.8".to_string());
+        assert_eq!(
+            search_attempt_decision(&mut store, ip1(), &vars, "user_a", 1_000),
+            SearchDecision::Allow
+        );
+        assert_eq!(
+            search_attempt_decision(&mut store, ip1(), &vars, "user_a", 1_000),
+            SearchDecision::Allow
+        );
+        match search_attempt_decision(&mut store, ip1(), &vars, "user_a", 1_000) {
+            SearchDecision::Deny { retry_after_secs } => {
+                assert!((1..=60).contains(&retry_after_secs), "{retry_after_secs}");
+            }
+            SearchDecision::Allow => panic!("third attempt inside the cap must deny"),
+        }
+        // Per-IP: a different account behind the same IP is also denied…
+        assert!(matches!(
+            search_attempt_decision(&mut store, ip1(), &vars, "user_b", 1_000),
+            SearchDecision::Deny { .. }
+        ));
+        // …but that denial consumed nothing from user_b's account budget.
+        assert_eq!(
+            search_attempt_decision(&mut store, ip2(), &vars, "user_b", 1_000),
+            SearchDecision::Allow
+        );
+        // Per-account: user_a stays denied even from a fresh IP.
+        assert!(matches!(
+            search_attempt_decision(&mut store, ip2(), &vars, "user_a", 1_000),
+            SearchDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn search_route_denial_short_circuits_before_dispatch() {
+        // The route itself needs wasm-bindgen, so pin its shape in source
+        // (same pattern as the healthz route pin above): the throttle
+        // denial must return before any dispatch is built.
+        let source = include_str!("lib.rs");
+        let route = source
+            .split_once("async fn search(req: &mut Request")
+            .expect("search route must exist")
+            .1;
+        let gate = route
+            .find("check_search_attempt(req, &ctx.env, &parsed.user_id)")
+            .expect("search route must run the throttle gate");
+        let denied = route
+            .find("return search_rate_limited_response(retry_after_secs);")
+            .expect("throttle denial must return the 429 response");
+        let dispatch = route
+            .find("build_search_dispatch(")
+            .expect("search route must build a dispatch");
+        assert!(gate < denied && denied < dispatch);
     }
 
     #[test]
