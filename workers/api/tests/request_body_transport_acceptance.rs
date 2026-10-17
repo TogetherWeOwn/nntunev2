@@ -117,6 +117,8 @@ use nntune_api::worker_entry::{
 };
 use nntune_api::{auth, handlers, session, vault};
 
+type SeenBodies = Rc<RefCell<Vec<(String, String, Vec<u8>)>>>;
+
 // --- Constants -------------------------------------------------------------
 
 const NOW: u64 = 1_700_000_000;
@@ -466,7 +468,7 @@ fn oversized_never_invokes_the_handler() {
 #[test]
 fn complete_invokes_the_handler_once_with_exactly_the_collected_bytes() {
     let calls = Rc::new(Cell::new(0usize));
-    let bodies: Rc<RefCell<Vec<(String, String, Vec<u8>)>>> = Rc::new(RefCell::new(Vec::new()));
+    let bodies: SeenBodies = Rc::new(RefCell::new(Vec::new()));
     let (seen_calls, seen_bodies) = (Rc::clone(&calls), Rc::clone(&bodies));
     let response = block_on(dispatch_collected(
         CollectedBody::Complete(br#"{"email":"a@b.example"}"#.to_vec()),
