@@ -568,9 +568,13 @@ test.describe('requireApiAccount', () => {
     });
   });
 
-  test('passes on the seam token alone', () => {
+  // Updated expectation (account-identity contract, tests/account-identity.spec.ts):
+  // the generic QA seam token is setup-only and must NOT satisfy the
+  // account-identity guard — account-specific assertions need the minted
+  // account's own nonblank session.
+  test('throws on the seam token alone (QA token cannot satisfy the guard)', () => {
     withEnv({ QA_AUTH_TOKEN: 'dummy-qa-token' }, () => {
-      expect(() => requireApiAccount(null, 'meter')).not.toThrow();
+      expect(() => requireApiAccount(null, 'meter')).toThrow(/\[meter\]/);
     });
   });
 });

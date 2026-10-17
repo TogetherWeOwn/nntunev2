@@ -13,7 +13,9 @@ export interface TestAccount {
   /**
    * Opaque session for the minted account, when the seam provisions one.
    * Contract (owned by the auth card): the staging API accepts it as
-   * `Authorization: Bearer <session>`, taking precedence over QA_AUTH_TOKEN.
+   * `Authorization: Bearer <session>`. Account-specific assertions require
+   * this per-account credential; QA_AUTH_TOKEN is seam-setup-only and never
+   * substitutes for it. Absent is a setup-only result.
    * If the auth card implements cookie sessions instead, update
    * accountHeaders/applyAccountToPage together with the specs.
    */
@@ -22,9 +24,21 @@ export interface TestAccount {
   viaApi: boolean;
 }
 
+/** First value that is a nonblank string, else undefined (value kept as-is). */
+function nonblankString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() !== '' ? value : undefined;
+}
+
+/** The account's own usable session credential, if it has one. */
+function accountSession(account: TestAccount | null): string | undefined {
+  return account ? nonblankString(account.session) : undefined;
+}
+
 /**
  * Headers for API calls as a specific test account: Access pair +
- * per-account session (preferred) falling back to the QA seam token.
+ * per-account session. Every caller is account-specific, so a missing or
+ * blank minted session throws instead of falling back to the generic QA
+ * seam token (setup-only; it proves nothing about this account).
  * Every credentialed API call MUST go through apiGet/apiPost below, which
  * fetch with maxRedirects: 0: Playwright's APIRequestContext follows
  * redirects by default (up to 20) and forwards custom headers — including
@@ -33,9 +47,15 @@ export interface TestAccount {
  * must fail by name, never follow with credentials.
  */
 export function accountHeaders(account: TestAccount | null): Record<string, string> {
-  const headers: Record<string, string> = { ...accessHeaders(), ...qaAuthHeader() };
-  if (account?.session) headers.Authorization = `Bearer ${account.session}`;
-  return headers;
+  const session = accountSession(account);
+  if (!session) {
+    throw new Error(
+      'accountHeaders requires the minted account session credential: ' +
+        'no nonblank per-account session is available, and the generic QA seam ' +
+        'token cannot stand in for an account identity (names only — no values logged).',
+    );
+  }
+  return { ...accessHeaders(), Authorization: `Bearer ${session}` };
 }
 
 /**
@@ -146,8 +166,20 @@ export async function applyAccountToPage(
   account: TestAccount | null,
   baseURL: string,
 ): Promise<void> {
+  // A non-null account is an account-specific identity: without its own
+  // nonblank session it must fail before any routing, never silently become
+  // an Access-only page. Null stays allowed for the UI-signup fallback and
+  // health checks (Access pair only, no Authorization).
+  const session = accountSession(account);
+  if (account && !session) {
+    throw new Error(
+      'applyAccountToPage requires the minted account session credential: ' +
+        'a non-null account has no nonblank per-account session, and the generic ' +
+        'QA seam token cannot stand in for an account identity (names only — no values logged).',
+    );
+  }
   const stagingHeaders: Record<string, string> = { ...accessHeaders() };
-  if (account?.session) stagingHeaders.Authorization = `Bearer ${account.session}`;
+  if (session) stagingHeaders.Authorization = `Bearer ${session}`;
   const context = page.context();
   await context.unrouteAll({ behavior: 'wait' }).catch(() => {});
   if (Object.keys(stagingHeaders).length === 0) return;
@@ -171,16 +203,17 @@ export async function applyAccountToPage(
 }
 
 /**
- * Fail closed when an API-driven step has no credential at all: neither a
- * minted session nor the QA seam token. Running the Range/meter assertions
- * anonymously would pass or fail for the wrong reasons while looking green.
+ * Fail closed when an account-specific API step lacks the minted account's
+ * own nonblank session. The generic QA seam token is setup-only and cannot
+ * satisfy this guard: running Range/meter assertions as the seam identity
+ * (or anonymously) would pass or fail for the wrong reasons while looking green.
  */
 export function requireApiAccount(account: TestAccount | null, context: string): void {
-  if (account?.session || process.env.QA_AUTH_TOKEN) return;
+  if (accountSession(account)) return;
   throw new Error(
-    `[${context}] no authenticated account: the test-account seam is unavailable ` +
-      '(no session and no QA_AUTH_TOKEN) and this step cannot run anonymously. ' +
-      'Set QA_AUTH_TOKEN with a staging POST /api/test-accounts seam. See e2e/README.md.',
+    `[${context}] no authenticated account: this account-specific step requires the ` +
+      "minted account's own nonblank session credential, and the generic QA seam " +
+      'token cannot satisfy it (names only — no values logged). See e2e/README.md.',
   );
 }
 
@@ -231,19 +264,31 @@ export async function tryMintTestAccount(
         'names only, no values logged).',
     );
   }
-  let body: Record<string, unknown>;
+  let parsed: unknown;
   try {
-    body = JSON.parse(bodyText) as Record<string, unknown>;
+    parsed = JSON.parse(bodyText) as unknown;
   } catch {
     throw new Error('[seam] POST /api/test-accounts returned a non-JSON body (seam outage — not a skip).');
   }
-  const email = typeof body.email === 'string' ? body.email : uniqueTestEmail('e2e');
-  const session =
-    typeof body.session === 'string'
-      ? body.session
-      : typeof body.token === 'string'
-        ? body.token
-        : undefined;
+  // A 2xx alone does not prove an account was minted: require a plain
+  // object carrying a nonblank identity email. Never fabricate the email
+  // client-side — a malformed success body is a seam failure, not an account.
+  const body: Record<string, unknown> =
+    parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  const email = nonblankString(body.email);
+  if (!email) {
+    throw new Error(
+      '[seam] POST /api/test-accounts returned no usable account identity: ' +
+        'the response is not an object with a nonblank email identity ' +
+        '(names only — no values logged; refusing to fabricate an account).',
+    );
+  }
+  // Documented variants: session preferred, token otherwise; the first
+  // nonblank string wins. No usable variant stays a setup-only result
+  // (session undefined) — never a blank-string session.
+  const session = nonblankString(body.session) ?? nonblankString(body.token);
   return { email, session, viaApi: true };
 }
 
