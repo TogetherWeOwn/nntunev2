@@ -239,11 +239,14 @@ fn unavailable_code(state: JobState) -> &'static str {
 }
 
 /// Run the `Repairing` step: dispatch the recorded repair request to
-/// the repair Worker, then return to `Verifying` on success. Verify has
-/// no executable wiring yet, so a repaired job then settles as a
-/// transient verify-boundary failure (same posture as `Parsing`).
-/// A checkpoint in `Repairing` without recorded verify inputs is a
-/// permanent failure: there is nothing a redelivery could add.
+/// the repair Worker, then return to `Verifying` on success (the next
+/// delivery re-runs the verify step). Note the re-verify feedback loop
+/// is still open: `Verifying` re-fetches from the pool and does not yet
+/// consume the repair round's `out/` objects, so this step must not be
+/// exercised live until that consumption lands (the consumer stays
+/// disabled meanwhile). A checkpoint in `Repairing` without recorded
+/// verify inputs is a permanent failure: there is nothing a redelivery
+/// could add.
 async fn run_repair_step(env: &Env, cp: &mut JobCheckpoint) -> Result<(), JobError> {
     use crate::repair::RepairCall;
 

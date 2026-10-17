@@ -372,6 +372,22 @@ async fn complete_set_verifies_stages_and_writes_the_manifest() {
     assert!(entries
         .iter()
         .any(|e| e["file_name"] == PAR2_NAME && e["role"] == "par2"));
+
+    // Rewriting the manifest over identical staged bytes keeps the
+    // staging id (content-derived); evicting and refetching a damaged
+    // file's staging mints a different one.
+    let (outcome, _) = run_step(
+        &server,
+        &nzb,
+        &VerifyCaps::default(),
+        &mut progress,
+        &scratch,
+    )
+    .await;
+    assert_eq!(outcome, VerifyOutcome::Complete);
+    let again = scratch.manifest(JOB).expect("manifest staged");
+    let again: serde_json::Value = serde_json::from_str(&again).unwrap();
+    assert_eq!(again["staging_id"], manifest["staging_id"]);
 }
 
 #[tokio::test]

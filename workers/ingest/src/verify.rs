@@ -20,8 +20,10 @@
 //! a larger file is judged by streaming its spooled segments back one
 //! at a time (incremental SHA-256 and per-block CRC32s, so memory stays
 //! O(segment)) and staged *as* its spool — the manifest rows then carry
-//! the segment keys for the repair handoff to concatenate. Staged par2
-//! is restored the same way, packet by packet into a
+//! the segment keys (a later enablement slice materializes them into a
+//! single bytestream; the repair worker's current input contract reads
+//! whole objects by content-hash key, see the staged-key docs). Staged
+//! par2 is restored the same way, packet by packet into a
 //! [`RecoverySetBuilder`], so aggregate par2 size is not capped either;
 //! only one buffered packet is bounded (see `max_par2_bytes`).
 //!
@@ -148,7 +150,8 @@ pub struct StagedFile {
     pub par2_set_id: Option<String>,
     /// Spool-segment keys when the staged file *is* its segment spool
     /// (too large to assemble in memory): the manifest then lists these
-    /// in order for the repair handoff to concatenate, and `key` names
+    /// in order (enablement-slice work: the repair input worker does
+    /// not consume spools yet), and `key` names
     /// the segment index (see [`VerifyProgress::spool_meta_key`]) rather
     /// than a byte object. Empty for an ordinarily assembled file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -245,7 +248,13 @@ impl VerifyProgress {
     /// entirely, and the NZB file index — deterministic across
     /// deliveries because every delivery re-parses the digest-pinned
     /// payload — keeps two files that share a name from sharing (or
-    /// adopting) one staged object.
+    /// adopting) one staged object. Note this is the full bucket key,
+    /// deliberately distinct from the repair worker's input addressing
+    /// (`{prefix}in/{sha256(file_name)}` in the core scratch contract):
+    /// reconciling the two key namespaces — and how duplicate NZB file
+    /// names map onto the manifest's unique names — is enablement work
+    /// before the consumer is switched on; the manifest rows carry
+    /// these full keys today so resume/adoption never guess.
     pub fn file_key(job_id: &str, round: u32, file_index: usize, file_name: &str) -> String {
         format!(
             "{}in/{file_index:04}-{}",
@@ -254,7 +263,7 @@ impl VerifyProgress {
         )
     }
 
-    /// Manifest key for one round (next to `in/`, per the scratch contract).
+    /// Manifest key for one round (inside `in/`, per the scratch contract).
     pub fn manifest_key(job_id: &str, round: u32) -> String {
         format!("{}in/manifest.json", Self::scratch_prefix(job_id, round))
     }
@@ -353,9 +362,11 @@ pub struct ManifestEntry {
     /// `data` or `par2`.
     pub role: String,
     /// Spool-segment keys in file order when the file was staged as its
-    /// segment spool (too large to assemble in-Worker): the handoff
-    /// concatenates these (zero-filling each gap named in `missing`)
-    /// instead of reading `key`'s bytes. Empty for an assembled file.
+    /// segment spool (too large to assemble in-Worker): a future
+    /// materialization step concatenates these (zero-filling each gap
+    /// named in `missing`) — the repair worker's current input
+    /// contract reads whole objects only, so a spooled staging is not
+    /// yet repairable. Empty for an assembled file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub segments: Vec<String>,
     /// Indexes (into `segments`) whose articles are gone: those byte
