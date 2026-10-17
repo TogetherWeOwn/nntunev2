@@ -1,4 +1,4 @@
--- 0004_mb_replication_packet_ledger: durable per-packet SLO evidence.
+-- 0016_mb_replication_packet_ledger: durable per-packet SLO evidence.
 -- One row per published/applied packet; sequence gaps remain observable.
 CREATE TABLE IF NOT EXISTS mb_replication_packet (
     sequence      BIGINT PRIMARY KEY CHECK (sequence >= 0),

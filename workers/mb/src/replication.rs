@@ -1,11 +1,16 @@
 //! Per-packet replication accounting and an in-memory SLO probe.
 //!
 //! The applier persists the same fields in `mb_replication_packet` (migration
-//! 0004); this module keeps the probe deterministic and independently testable.
+//! 0016); this module keeps the probe deterministic and independently testable.
 use serde::Serialize;
 
 /// Replication lag budget promised by ADR 0007.
 pub const REPLICATION_LAG_SLO_SECS: i64 = 2 * 60 * 60;
+/// Cap on individually enumerated `missing_sequence` breaches per evaluation.
+/// A corrupt `latest_sequence` cursor must not turn one probe call into an
+/// unbounded scan; past the cap the report carries one
+/// `missing_sequence_truncated` breach instead of silently stopping.
+pub const MAX_MISSING_SEQUENCE_BREACHES: usize = 10_000;
 /// Counter name emitted with every non-empty breach report.
 pub const BREACH_METRIC_NAME: &str = "mb_replication_slo_breach_total";
 
@@ -33,6 +38,13 @@ impl PacketLedger {
     }
 
     /// Record a packet with its upstream identifier and sequence number.
+    ///
+    /// Callers must satisfy the durable schema's constraints (migration
+    /// 0016): `sequence >= 0`, `applied_at >= published_at`, and `packet_id`
+    /// unique across sequences. This in-memory model does not re-validate
+    /// them; in particular clock skew (`applied_at < published_at`) clamps
+    /// `lag_secs` to 0 here while the applier's insert is rejected by the
+    /// SQL `CHECK`, so pre-validate before recording.
     pub fn record_packet(
         &mut self,
         packet_id: String,
@@ -82,8 +94,13 @@ pub struct ReplicationSloReport {
 
 /// Evaluates the ledger through `latest_sequence`. Missing sequences are
 /// reported only between the first and latest observed sequences, since no
-/// earlier baseline is implied by this ledger. `now` is reserved for probes
-/// that later account for published-but-not-yet-applied packets.
+/// earlier baseline is implied by this ledger. An empty ledger with a
+/// non-negative `latest_sequence` is an `empty_ledger` breach, not a health
+/// signal: no applied packet means no baseline, so a total stall must not
+/// read as SLO-healthy (pass a negative `latest_sequence` when nothing has
+/// been published yet). `now` is reserved for probes that later account for
+/// published-but-not-yet-applied packets; until then such packets surface
+/// only as `missing_sequence` breaches and are excluded from lag/p95.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ReplicationSloProbe;
 
@@ -106,17 +123,61 @@ impl ReplicationSloProbe {
             }
         }
 
-        if let Some(first_sequence) = records.first().map(|record| record.sequence) {
-            let present: std::collections::HashSet<i64> =
-                records.iter().map(|record| record.sequence).collect();
-            for sequence in first_sequence..=latest_sequence {
-                if !present.contains(&sequence) {
+        if records.is_empty() {
+            if latest_sequence >= 0 {
+                breaches.push(ReplicationBreach {
+                    kind: "empty_ledger",
+                    sequence: None,
+                    lag_secs: None,
+                });
+            }
+        } else {
+            // Enumerate gaps arithmetically from the sorted present
+            // sequences instead of scanning first..=latest: the work is
+            // bounded by the record count plus the reported-breaches cap,
+            // never by a caller-supplied cursor span.
+            let mut reported_missing = 0usize;
+            let mut truncated = false;
+            let mut report_gap = |start: i64, end: i64, breaches: &mut Vec<ReplicationBreach>| {
+                let mut sequence = start;
+                while sequence <= end {
+                    if reported_missing >= MAX_MISSING_SEQUENCE_BREACHES {
+                        truncated = true;
+                        return;
+                    }
                     breaches.push(ReplicationBreach {
                         kind: "missing_sequence",
                         sequence: Some(sequence),
                         lag_secs: None,
                     });
+                    reported_missing += 1;
+                    match sequence.checked_add(1) {
+                        Some(next) => sequence = next,
+                        None => return,
+                    }
                 }
+            };
+            let mut expected = records[0].sequence;
+            for record in &records {
+                if record.sequence > expected {
+                    // Clip to latest_sequence: sequences past the reported
+                    // latest are not yet missing.
+                    let gap_end = (record.sequence - 1).min(latest_sequence);
+                    if gap_end >= expected {
+                        report_gap(expected, gap_end, &mut breaches);
+                    }
+                }
+                expected = record.sequence.saturating_add(1);
+            }
+            if latest_sequence >= expected {
+                report_gap(expected, latest_sequence, &mut breaches);
+            }
+            if truncated {
+                breaches.push(ReplicationBreach {
+                    kind: "missing_sequence_truncated",
+                    sequence: None,
+                    lag_secs: None,
+                });
             }
         }
 
@@ -133,5 +194,50 @@ impl ReplicationSloProbe {
             metric_name: BREACH_METRIC_NAME.to_string(),
             breach_count,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_ledger_is_a_breach_not_a_pass() {
+        let ledger = PacketLedger::default();
+        let report = ReplicationSloProbe.evaluate(&ledger, 5, 0);
+        assert_eq!(report.breach_count, 1);
+        assert_eq!(report.breaches[0].kind, "empty_ledger");
+    }
+
+    #[test]
+    fn empty_ledger_with_nothing_published_passes() {
+        let ledger = PacketLedger::default();
+        let report = ReplicationSloProbe.evaluate(&ledger, -1, 0);
+        assert_eq!(report.breach_count, 0);
+    }
+
+    #[test]
+    fn huge_latest_sequence_truncates_instead_of_scanning() {
+        let mut ledger = PacketLedger::default();
+        ledger.record(0, 0, 0);
+        let report = ReplicationSloProbe.evaluate(&ledger, i64::MAX, 0);
+        assert_eq!(
+            report.breach_count,
+            MAX_MISSING_SEQUENCE_BREACHES + 1,
+            "cap of enumerated missing sequences plus one truncation breach"
+        );
+        assert_eq!(
+            report.breaches.last().map(|b| b.kind),
+            Some("missing_sequence_truncated")
+        );
+    }
+
+    #[test]
+    fn gaps_beyond_latest_sequence_are_not_missing() {
+        let mut ledger = PacketLedger::default();
+        ledger.record(7, 0, 0);
+        ledger.record(9, 0, 0);
+        let report = ReplicationSloProbe.evaluate(&ledger, 7, 0);
+        assert_eq!(report.breach_count, 0);
     }
 }

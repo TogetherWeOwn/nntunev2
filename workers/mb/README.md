@@ -62,14 +62,21 @@ method, not the measurements.
 The **p95 source** for replication lag is the `lag_secs` value of each
 applied packet in `mb_replication_packet`, not the aggregate
 `mb_import_state` snapshot. Compute p95 over the observed packet records in
-the reporting window; the SLO is p95 lag **under 2 hours**. The **breach definition** is any packet with `lag_secs > 7200` seconds (exactly 7200 passes), or any missing sequence between the lowest observed packet and the reported latest packet sequence. Missing packets cannot be dropped from the
-accounting: each is returned as a `missing_sequence` breach.
+the reporting window; the SLO is p95 lag **under 2 hours**. Published but
+not-yet-applied packets have no `lag_secs` yet, so p95 excludes them; they
+surface as `missing_sequence` breaches instead. The **breach definition** is any packet with `lag_secs > 7200` seconds (exactly 7200 passes), or any missing sequence between the lowest observed packet and the reported latest packet sequence. Missing packets cannot be dropped from the
+accounting: each is returned as a `missing_sequence` breach, capped at
+10,000 enumerated breaches per evaluation (with one
+`missing_sequence_truncated` breach past the cap, so truncation is never
+silent). An empty ledger evaluated against a non-negative latest sequence
+is an `empty_ledger` breach, not a pass: with no applied packet there is no
+baseline, and a total stall must not read as healthy.
 
 `ReplicationSloProbe` returns a JSON structured event named
 `mb_replication_slo_breach` for every evaluation, including `breach_count`
 and its breach details. When the count is non-zero, increment the documented
 counter metric `mb_replication_slo_breach_total` by that count. The durable
-ledger schema is `migrations/0004_mb_replication_packet_ledger.sql`; packet
+ledger schema is `migrations/0016_mb_replication_packet_ledger.sql`; packet
 application remains the separate replication-applier responsibility.
 
 ## Terms
