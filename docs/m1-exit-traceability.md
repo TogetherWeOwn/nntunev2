@@ -50,13 +50,50 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   offline self-tests (wall detection, credential scope, workflow
   preflights, artifact sanitization). They run in the `e2e-lint` CI job on
   every PR and keep the harness honest, but produce no staging evidence.
+- The `apps/web/tests/` offline specs below run in the `web-e2e` CI job
+  on every PR with all network traffic intercepted and fulfilled locally.
+  They pin product behavior outside the M1 exit list and produce no
+  staging evidence:
+  - `apps/web/tests/player-queue.spec.ts` — pins the 3-track queue
+    play-through (next/prev/track-end), queue panel add/clear/reorder
+    with in-session order persistence, and MediaSession metadata plus OS
+    next/prev handlers following the current track.
+  - `apps/web/tests/player-seek.spec.ts` — pins the demo audio/seek
+    contract: private-cached audio vs public-immutable artwork, byte-Range
+    206 handling, the artwork fallback chain, and 10x rapid seeks never
+    wedging the player.
+  - `apps/web/tests/player-browser-contract.spec.ts` — pins real-browser
+    playback advancing, the seek storm ignoring offset-ignoring and
+    mismatched Content-Range responses, and artwork staying understandable
+    when its image and placeholder both fail.
+  - `apps/web/tests/pricing-selection.spec.ts` — pins `/pricing`
+    plan-selection serialization: at most one checkout POST in flight,
+    re-entry refused while held, ordinary failure restoring choices, and
+    success/401/402/429 routing unchanged.
+  - `apps/web/tests/byop-reauth.spec.ts` — pins stale-session provider
+    save directing the user to sign in again, and successful passkey
+    reauthentication saving once with controls disabled while pending.
+  - `apps/web/tests/auth-magic.spec.ts` — pins the magic-link landing
+    never redeeming on load (explicit confirm redeems once, then names the
+    account), swap-guard sign-out recovery, paywall token preservation,
+    and logout failure/401 handling.
+  - `apps/web/tests/library-cache.spec.ts` — pins the library snapshot
+    cache contract: offline retry rendering the stale snapshot with a
+    badge, 401/auth-transition invalidation, in-flight response discard,
+    last-good preservation, and blocked-storage behavior.
+  - `apps/web/tests/account-security-library-cache.spec.ts` — pins
+    sign-out invalidating library snapshots across tabs (logout, revoke-all,
+    and confirmed 401 clear stored snapshots; 500/transport failure claims
+    nothing and clears nothing).
 
 ## Re-verifying this matrix
 
 ```sh
 find e2e/tests -name '*.spec.ts' | sort
 npm --prefix e2e run e2e:list   # spec files + test titles Playwright sees
-grep -n "test('" e2e/tests/*.spec.ts
+find apps/web/tests -name '*.spec.ts' | sort
+(cd apps/web && pnpm exec playwright test --list)   # web spec files + titles
+grep -n "test('" e2e/tests/*.spec.ts apps/web/tests/*.spec.ts
 ```
 
 Every path and title cited above must appear in that output. If a cited
