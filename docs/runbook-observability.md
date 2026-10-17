@@ -14,7 +14,7 @@ This runbook covers the Cloudflare-hosted NNTune v2 app. It does not cover the l
 ## Where to look after the kit is enabled
 
 1. Open the Cloudflare dashboard for the account that owns NNTune v2.
-2. Go to **Workers & Pages** and select the affected service/environment: `nntune-web-staging` or `nntune-web`; Worker services, when deployed, are named `nntune-api`, `nntune-ingest`, `nntune-stream`, and `nntune-mb`.
+2. Go to **Workers & Pages** and select the affected service/environment: `nntune-web-staging` or `nntune-web`; Worker services, when deployed, are named `nntune-api`, `nntune-ingest`, `nntune-stream`, `nntune-mb`, and `nntune-repair`; staging Workers use the `-staging` suffix (for example `nntune-stream-staging`, `nntune-repair-staging`).
 3. In **Observability → Logs**, search for a `trace_id` (or legacy `request_id`/job identifier) and inspect `build_sha`, `release`, `route`/`job`, and `error_class` **only after those fields are present in the deployed structured events**. Follow the same trace ID through downstream Worker, Durable Object, and queue/consumer events where propagation has been implemented.
 4. In **Observability → Issues**, inspect grouped uncaught Worker failures. Use the linked structured event or configured tail-consumer/error-tracking event to find its release and error class; the native issue view may not carry those fields.
 5. In **Notifications**, inspect the configured NNTune alert rule and Discord destination. Test delivery with a controlled staging alert and verify the resulting message in the ops channel. Never copy a webhook value into a ticket, terminal transcript, or repository.
@@ -25,9 +25,9 @@ Dashboard labels and service names are navigation hints; exact URLs and availabi
 
 Once release-tagged alert events are available:
 
-1. Open the alert's log link. Record timestamp, environment, `request_id` or job ID, `error_class`, and full `build_sha`/`release`. Do not copy user data or secret-bearing fields into incident notes.
+1. Open the alert's log link. Record timestamp, environment, `trace_id` (legacy `stream` events may carry `request_id` instead) or job ID, `error_class`, and full `build_sha`/`release`. Do not copy user data or secret-bearing fields into incident notes.
 2. Open the commit for that full SHA in GitHub and inspect its associated pull request. If the alert does not link directly, search the repository's commit/PR history for the exact SHA and compare it with the release reported by the deployed service. Do not infer causality from the newest PR title alone.
-3. Follow `request_id` across Worker → Durable Object/queue → consumer logs where propagation is implemented. For an uncaught exception, start with the Cloudflare Issue and its stack trace, then confirm the matching release in the structured event or error-tracking view.
+3. Follow the `trace_id` across Worker → Durable Object/queue → consumer logs where propagation is implemented. (Legacy `stream` events may still carry `request_id`.) For an uncaught exception, start with the Cloudflare Issue and its stack trace, then confirm the matching release in the structured event or error-tracking view.
 4. Record the environment, first/last-seen times, error class, correlation ID, release SHA, related commit/PR URL, impact without PII, and mitigation/rollback decision.
 
 Until the deployed service exposes and verifies its build identity, neither a workflow run nor the public `/api/health` response proves which SHA is serving. See the build-identity caveat in [`docs/ops.md`](ops.md#staging-promotion-checklist).
@@ -35,13 +35,13 @@ Until the deployed service exposes and verifies its build identity, neither a wo
 ## Alert response
 
 - **5xx/error-rate spike or red health/readiness:** open the linked logs and establish whether the signal is isolated or sustained. The requested readiness alert threshold is more than two minutes continuously red; until that rule is configured and tested in staging, use this as a response target, not a claim about current paging behavior. Confirm environment and serving SHA before changing anything.
-- **Unhandled exception or crash loop:** inspect the Cloudflare Issue and corresponding structured/error-tracking event. Correlate by `error_class` and request/job ID when those fields are deployed; do not log raw exception messages if they may contain secrets or personal data.
+- **Unhandled exception or crash loop:** inspect the Cloudflare Issue and corresponding structured/error-tracking event. Correlate by `error_class` and trace/job ID (legacy `stream` events may carry `request_id`) when those fields are deployed; do not log raw exception messages if they may contain secrets or personal data.
 - **Synthetic failure:** inspect the run's environment, flow step, and timestamp. Current scheduled coverage is staging-only: a health smoke every six hours (scheduled/manual runs never run the full journey). The requested five-minute staging flow and a separate passive, read-only production check are not configured; do not claim either is active until each is implemented and verified in its allowed environment.
 - **Discord notification missing:** inspect the alert rule and destination configuration after they have been provisioned. Verify secret availability by name only through the authorized configuration path. Never print, fetch, or rotate the webhook value as a diagnostic shortcut.
 
 ## Rollback and verification boundaries
 
-Staging is the first verification target. The current web rollback procedure is to rerun all jobs for the last known-good successful staging deployment as documented in [`docs/ops.md`](ops.md#staging-promotion-checklist); confirm `staging-web` succeeds and verify staging health. This does not deploy or roll back the API, ingest, stream, or MB Workers, and does not prove the serving SHA. Establish and test each Worker rollback separately before relying on it.
+Staging is the first verification target. The current web rollback procedure is to rerun all jobs for the last known-good successful staging deployment as documented in [`docs/ops.md`](ops.md#staging-promotion-checklist); confirm `staging-web` succeeds and verify staging health. This does not deploy or roll back the API, ingest, stream, MB, or repair Workers, and does not prove the serving SHA. Establish and test each Worker rollback separately before relying on it.
 
 Production monitoring is passive. No production deploy, synthetic write, data migration, secret change, or alert-suppression change is authorized by this runbook. Do not manufacture production incidents to test alert delivery.
 
