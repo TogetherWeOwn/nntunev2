@@ -2464,7 +2464,10 @@ where
 /// Every path the router serves. The Worker answers `OPTIONS` on exactly
 /// these paths with an empty 204 (the entry renders credentialed CORS
 /// headers only for an exact `Origin` match); anything else 404s, so a
-/// preflight never maps the API surface.
+/// preflight never maps the API surface. The staging-only
+/// `POST /api/test-codes` seam is deliberately absent: its POST arm matches
+/// independently, and listing it here would answer `OPTIONS` with 204 in
+/// every posture — making the seam enumerable from production.
 pub fn is_known_path(path: &str) -> bool {
     matches!(
         path,
@@ -2483,7 +2486,6 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/vault"
             | "/v1/vault/test"
             | "/v1/vault/test-connection"
-            | QA_TEST_CODES_PATH
     )
 }
 
@@ -3401,6 +3403,18 @@ mod tests {
         );
         assert_eq!(unknown.status, 404);
         assert_eq!(unknown.body, resp.body);
+        // The seam path is not enumerable: `OPTIONS` on it answers the
+        // same 404 as an unknown path, with or without an `Origin`
+        // (the e2e seam client never sends a CORS preflight).
+        let pre = h.call_full("OPTIONS", QA_TEST_CODES_PATH, None, None, Some(ORIGIN));
+        assert_eq!(pre.status, 404);
+        assert_eq!(pre.body, r#"{"error":"not found"}"#);
+        let pre_unknown =
+            h.call_full("OPTIONS", "/api/no-such-seam", None, None, Some(ORIGIN));
+        assert_eq!(pre_unknown.status, 404);
+        assert_eq!(pre_unknown.body, pre.body);
+        let pre_no_origin = h.call_full("OPTIONS", QA_TEST_CODES_PATH, None, None, None);
+        assert_eq!(pre_no_origin.status, 404);
     }
 
     #[test]

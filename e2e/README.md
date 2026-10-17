@@ -144,8 +144,10 @@ How the suite uses them:
   `/signup` form with a unique synthetic mailbox and requires the
   emailed-code step with no inline error, even when `QA_AUTH_TOKEN`
   is set, so a seam-backed run still proves public UI form submission.
-  Wizard arrival via the form is not asserted: the code-plus-passkey
-  finish needs a staging code-retrieval seam that does not exist yet
+  Form-to-wizard arrival is asserted by `signup-wizard-arrival.spec.ts`: the
+  code-plus-passkey finish retrieves the code from the staging-only
+  `POST /api/test-codes` seam, which is implemented in the API worker but
+  awaits its staging deployment and activation
   (see row 1 of `docs/m1-exit-traceability.md`). Once `QA_AUTH_TOKEN` is set the seam is
   required infrastructure: transport errors, non-2xx and non-JSON mint
   responses throw instead of collapsing into a silent skip, and API-driven

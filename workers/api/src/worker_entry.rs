@@ -108,7 +108,9 @@ fn config_from_env(env: &Env) -> Option<Config> {
     // armed — an unflagged env never holds it in config.
     if truthy("QA_CODE_SEAM") {
         config = config.with_qa_code_seam(true);
-        if let Some(token) = env_string(env, "QA_AUTH_TOKEN") {
+        if let Some(token) = env_string(env, "QA_AUTH_TOKEN")
+            .filter(|token| !token.trim().is_empty())
+        {
             config = config.with_qa_auth_token(&token);
         }
     }
@@ -2030,6 +2032,10 @@ mod tests {
         assert!(
             body.contains("with_qa_auth_token(") && body.contains("\"QA_AUTH_TOKEN\""),
             "config_from_env must stage the QA bearer from the secret inside the flag gate"
+        );
+        assert!(
+            body.contains("trim().is_empty()"),
+            "config_from_env must reject whitespace-only QA bearer values"
         );
     }
 
