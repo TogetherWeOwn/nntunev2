@@ -38,6 +38,99 @@ function parseContentRange(value: string | null): { start: number; end: number; 
 	return { start, end, total };
 }
 
+function abortError(): DOMException {
+	return new DOMException('Seek superseded by a newer seek', 'AbortError');
+}
+
+/**
+ * Read at most `expectedLength` body bytes incrementally, so a finite
+ * range never accumulates an oversized response before validation.
+ * Accumulated buffers are bounded by `expectedLength` (a boundary
+ * chunk is copied only up to the boundary); a single upstream chunk's
+ * own allocation remains the producer's. With `exact`, a body longer
+ * or shorter than `expectedLength` is rejected; without it, only the
+ * prefix is collected and the unused remainder is cancelled. Aborting
+ * `signal` cancels the reader, and the reader is always released.
+ */
+async function readFiniteBody(
+	response: Response,
+	expectedLength: number,
+	signal: AbortSignal,
+	options: { exact: boolean; shortMessage: string; lengthMessage: string }
+): Promise<Uint8Array> {
+	if (signal.aborted) throw abortError();
+	if (response.body === null) {
+		// No readable stream to bound; fall back to a length-checked read.
+		const buffer = await response.arrayBuffer();
+		if (signal.aborted) throw abortError();
+		if (buffer.byteLength < expectedLength) throw new Error(options.shortMessage);
+		if (options.exact && buffer.byteLength !== expectedLength) {
+			throw new Error(options.lengthMessage);
+		}
+		return new Uint8Array(buffer.slice(0, expectedLength));
+	}
+
+	const reader = response.body.getReader();
+	const onAbort = () => {
+		void reader.cancel().catch(() => undefined);
+	};
+	signal.addEventListener('abort', onAbort, { once: true });
+
+	const parts: Uint8Array[] = [];
+	let collected = 0;
+	let overflow = false;
+	let streamDone = false;
+	try {
+		while (collected < expectedLength) {
+			const { done, value } = await reader.read();
+			if (signal.aborted) throw abortError();
+			if (done) {
+				streamDone = true;
+				break;
+			}
+			if (value === undefined || value.byteLength === 0) continue;
+			const remaining = expectedLength - collected;
+			if (value.byteLength > remaining) overflow = true;
+			// Copy only up to the boundary so we never retain the excess
+			// of a boundary-crossing chunk.
+			parts.push(value.slice(0, remaining));
+			collected += Math.min(value.byteLength, remaining);
+		}
+		if (signal.aborted) throw abortError();
+		if (collected < expectedLength) throw new Error(options.shortMessage);
+		if (options.exact) {
+			if (overflow) throw new Error(options.lengthMessage);
+			if (!streamDone) {
+				// Exactly full: one probe read distinguishes an exact body
+				// from one with an unrequested remainder.
+				const probe = await reader.read();
+				if (signal.aborted) throw abortError();
+				if (!probe.done) throw new Error(options.lengthMessage);
+				streamDone = true;
+			}
+		}
+		const bytes = new Uint8Array(expectedLength);
+		let offset = 0;
+		for (const part of parts) {
+			bytes.set(part, offset);
+			offset += part.byteLength;
+		}
+		return bytes;
+	} finally {
+		signal.removeEventListener('abort', onAbort);
+		if (!streamDone) {
+			// Prefix satisfied, body rejected, or seek aborted: cancel
+			// whatever remains so the producer stops and nothing leaks.
+			await reader.cancel().catch(() => undefined);
+		}
+		try {
+			reader.releaseLock();
+		} catch {
+			// Already released; nothing to free.
+		}
+	}
+}
+
 export class SeekController {
 	private current: AbortController | null = null;
 	private fetchFn: SeekFetch;
@@ -98,39 +191,58 @@ export class SeekController {
 				) {
 					throw new Error('Range response does not satisfy the requested byte range');
 				}
-				const buffer = await response.arrayBuffer();
-				if (buffer.byteLength !== range.end - range.start + 1) {
-					throw new Error('Range response body length does not match Content-Range');
-				}
-				if (controller.signal.aborted) {
-					throw new DOMException('Seek superseded by a newer seek', 'AbortError');
-				}
+				const expectedLength = range.end - range.start + 1;
+				const bytes =
+					requestedEnd === undefined
+						? await this.readOpenEnded206(response, expectedLength, controller.signal)
+						: await readFiniteBody(response, expectedLength, controller.signal, {
+								exact: true,
+								shortMessage: 'Range response body length does not match Content-Range',
+								lengthMessage: 'Range response body length does not match Content-Range'
+							});
+				if (controller.signal.aborted) throw abortError();
 				this.completed += 1;
-				return { status: response.status, bytes: new Uint8Array(buffer), generation };
+				return { status: response.status, bytes, generation };
 			}
 
 			// A 200 is a full representation, so it only satisfies a range
 			// starting at byte zero. Slice only when the caller asked for an end.
 			if (requestedStart !== 0) throw new Error('Server ignored a non-zero byte range');
+			if (requestedEnd !== undefined) {
+				// Finite prefix: collect only the requested bytes and cancel
+				// the unused remainder instead of buffering the whole body.
+				const bytes = await readFiniteBody(response, requestedEnd + 1, controller.signal, {
+					exact: false,
+					shortMessage: 'Full response is shorter than the requested byte range',
+					lengthMessage: 'Full response is shorter than the requested byte range'
+				});
+				if (controller.signal.aborted) throw abortError();
+				this.completed += 1;
+				return { status: response.status, bytes, generation };
+			}
 			const buffer = await response.arrayBuffer();
-			if (requestedEnd !== undefined && buffer.byteLength <= requestedEnd) {
-				throw new Error('Full response is shorter than the requested byte range');
-			}
-			if (controller.signal.aborted) {
-				throw new DOMException('Seek superseded by a newer seek', 'AbortError');
-			}
+			if (controller.signal.aborted) throw abortError();
 			this.completed += 1;
-			const bytes = new Uint8Array(buffer);
-			return {
-				status: response.status,
-				bytes: requestedEnd === undefined ? bytes : bytes.slice(0, requestedEnd + 1),
-				generation
-			};
+			return { status: response.status, bytes: new Uint8Array(buffer), generation };
 		} finally {
 			if (this.current === controller) {
 				this.current = null;
 			}
 		}
+	}
+
+	/** Open-ended policy is unchanged: consume and validate the full body. */
+	private async readOpenEnded206(
+		response: Response,
+		expectedLength: number,
+		signal: AbortSignal
+	): Promise<Uint8Array> {
+		const buffer = await response.arrayBuffer();
+		if (buffer.byteLength !== expectedLength) {
+			throw new Error('Range response body length does not match Content-Range');
+		}
+		if (signal.aborted) throw abortError();
+		return new Uint8Array(buffer);
 	}
 
 	/** Abort the in-flight seek, if any. Never wedges: the next seek works. */
