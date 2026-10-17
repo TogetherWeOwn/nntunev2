@@ -1269,10 +1269,7 @@ mod tests {
         .expect("both batches answer");
         assert_eq!(asked, vec![0, 1]);
         // Per-segment byte ranges ride the probe envelope, parallel to ids.
-        assert_eq!(
-            asked_bytes,
-            vec![vec![Some(100)], vec![Some(200), None]]
-        );
+        assert_eq!(asked_bytes, vec![vec![Some(100)], vec![Some(200), None]]);
         assert_eq!(missing, 1);
         assert_eq!(cp.state, JobState::Verifying);
         let tally = cp.probe_tally.as_ref().expect("tally retained");
