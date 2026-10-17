@@ -7,7 +7,6 @@ import {
   TESTIDS,
   extractPlanMeta,
   extractUsageBytes,
-  uniqueTestEmail,
 } from '../helpers/contract.js';
 import { assertNoAccessWall, readApiBody, stagingBaseUrl } from '../helpers/access.js';
 import {
@@ -16,6 +15,7 @@ import {
   applyAccountToPage,
   completeByopWizard,
   requireApiAccount,
+  submitPublicUiSignup,
   tryMintTestAccount,
   type TestAccount,
 } from '../helpers/accounts.js';
@@ -54,27 +54,12 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
       sharedAccount = minted;
       await page.goto(baseURL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     } else {
-      // Real UI signup fallback (not a bare navigation): fill the form and
-      // require the wizard. The browser identity is authenticated from here
-      // via storage; API-driven steps below additionally require the seam —
-      // see requireApiAccount.
-      const email = uniqueTestEmail();
-      await page.goto(`${baseURL}/signup`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-      await expect(page.getByTestId(TESTIDS.signupEmail)).toBeVisible({ timeout: 15_000 });
-      await page.getByTestId(TESTIDS.signupEmail).fill(email);
-      await page.getByTestId(TESTIDS.signupSubmit).click();
-      const wizard = page.getByTestId(TESTIDS.byopHost);
-      const error = page.getByTestId(TESTIDS.signupError);
-      await expect(async () => {
-        const onWizard = await wizard.isVisible().catch(() => false);
-        const onError = await error.isVisible().catch(() => false);
-        expect(onWizard || onError, 'neither BYOP wizard nor signup error appeared').toBe(true);
-      }).toPass({ timeout: 30_000 });
-      expect(await error.isVisible().catch(() => false), 'signup rejected the test mailbox').toBe(
-        false,
-      );
-      expect(page.url()).toContain('/onboarding/byop');
-      sharedAccount = { email, viaApi: false };
+      // Real UI signup fallback (not a bare navigation): shared helper with
+      // the signup spec. It asserts the emailed-code step — the
+      // code-plus-passkey finish needs a staging code-retrieval seam that
+      // does not exist yet, so this path cannot enroll an account. API-driven
+      // steps below additionally require the seam — see requireApiAccount.
+      sharedAccount = await submitPublicUiSignup(page, baseURL);
     }
 
     // The ingest worker probes through the user's authenticated provider

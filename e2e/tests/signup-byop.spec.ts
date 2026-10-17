@@ -15,7 +15,10 @@ import {
 let sharedAccount: TestAccount | null = null;
 
 // Golden path part 1: signup → BYOP wizard pointing at the synthetic NNTP
-// endpoint. Each run mints a fresh account so reruns never collide.
+// endpoint. Each run mints a fresh account so reruns never collide. The
+// seam-absent fallback submits the real /signup form and asserts the
+// emailed-code step (the full code-plus-passkey finish needs a staging
+// code-retrieval seam that does not exist yet).
 //
 // File-level skip: pre-deploy (no STAGING_BASE_URL) the whole file skips
 // without launching a browser. See health.spec.ts.
@@ -76,8 +79,11 @@ test.describe.serial('signup → BYOP wizard', () => {
 // account seam, so it exercises the real /signup submission on every
 // configured-staging run — including seam-backed ones, where the first
 // test takes the API path. Playwright gives each test a fresh context, so
-// no session from an earlier test can leak into this one. The offline pin
-// in workflows.spec.ts isolates this case by title and forbids a mint in it.
+// no session from an earlier test can leak into this one. The helper asserts
+// the emailed-code step, not wizard arrival: the code-plus-passkey finish
+// needs a staging code-retrieval seam that does not exist yet (row 1 of
+// docs/m1-exit-traceability.md names the gap). The offline pin in
+// workflows.spec.ts isolates this case by title and forbids a mint in it.
 test('public UI signup succeeds even when the test-account seam is configured', async ({ page }) => {
   const baseURL = stagingBaseUrl('skip', 'ui-signup');
   if (!baseURL) {
@@ -89,6 +95,6 @@ test('public UI signup succeeds even when the test-account seam is configured', 
   // the only account-creation path. Must precede the first navigation.
   await applyAccountToPage(page, null, baseURL);
   // Asserts: unique synthetic identity submitted, no inline signup error,
-  // BYOP wizard reached at /onboarding/byop. Diagnostics name no values.
+  // emailed-code step reached. Diagnostics name no values.
   await submitPublicUiSignup(page, baseURL);
 });

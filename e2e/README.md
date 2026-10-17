@@ -122,14 +122,17 @@ How the suite uses them:
   `helpers/accounts.ts` names it; cookie sessions would update the helper +
   specs together).
 - Test accounts are throwaway (`e2e+<stamp>@example.test`); the API seam is
-  tried first, a fully-implemented UI signup second (each journey file signs
+  tried first, a form-submission UI signup (emailed-code step) second (each journey file signs
   up its own identity — Playwright isolates module state per file, so there
   is no cross-file account sharing). Independently of that choice,
   `signup-byop.spec.ts` carries a dedicated public UI-signup case
   (`submitPublicUiSignup`, null identity): it always submits the real
-  `/signup` form with a unique synthetic mailbox and requires the BYOP
-  wizard with no inline error, even when `QA_AUTH_TOKEN` is set, so a
-  seam-backed run still proves public UI signup. Once `QA_AUTH_TOKEN` is set the seam is
+  `/signup` form with a unique synthetic mailbox and requires the
+  emailed-code step with no inline error, even when `QA_AUTH_TOKEN`
+  is set, so a seam-backed run still proves public UI form submission.
+  Wizard arrival via the form is not asserted: the code-plus-passkey
+  finish needs a staging code-retrieval seam that does not exist yet
+  (see row 1 of `docs/m1-exit-traceability.md`). Once `QA_AUTH_TOKEN` is set the seam is
   required infrastructure: transport errors, non-2xx and non-JSON mint
   responses throw instead of collapsing into a silent skip, and API-driven
   steps (`requireApiAccount`) refuse to run anonymously. The identity that

@@ -214,8 +214,12 @@ test.describe('public UI signup coverage (static pin)', () => {
     expect(helper).toContain('TESTIDS.signupEmail');
     expect(helper).toContain('TESTIDS.signupSubmit');
     expect(helper).toContain('TESTIDS.signupError');
-    expect(helper).toContain('TESTIDS.byopHost');
-    expect(helper).toContain("'/onboarding/byop'");
+    // The real page is two-step: the helper asserts the emailed-code step
+    // (magic_code form), never wizard arrival — asserting the wizard without
+    // the code-retrieval seam reds every configured run.
+    expect(helper).toContain('magic_code');
+    expect(helper).not.toContain('TESTIDS.byopHost');
+    expect(helper).not.toContain("'/onboarding/byop'");
     expect(helper).not.toContain('tryMintTestAccount');
     expect(helper).not.toContain('API.testAccounts');
     expect(helper).not.toContain('qaAuthHeader');
