@@ -267,6 +267,22 @@ DATABASE_URL='postgres://u:p@h/db?application_name=a#SENTINELFRAG'
 run_refused "URI with a raw '#' in a query value" 'SENTINELFRAG'
 check_err_guidance "URI with a raw '#' in a query value"
 
+reset_pg
+DATABASE_URL='postgres://u:SENTINELPW@h/db#'
+run_refused "URI with a trailing raw '#' after the database name" 'SENTINELPW'
+check_err_guidance "URI with a trailing raw '#' after the database name"
+
+reset_pg
+DATABASE_URL='postgres://u:SENTINELPW@h/db?application_name=a#'
+run_refused "URI with a trailing raw '#' after a query value" 'SENTINELPW'
+check_err_guidance "URI with a trailing raw '#' after a query value"
+
+reset_pg
+DATABASE_URL='postgres://u:p@h?application_name=a@b'
+run_ok "pathless URI with '@' in a query value"
+check_eq "pathless query host" 'h' "${PGHOST-}"
+check_eq "'@' in query value kept" 'a@b' "${PGAPPNAME-}"
+
 echo
 echo "test-pg-env: $passes passed, $failures failed"
 if (( failures > 0 )); then

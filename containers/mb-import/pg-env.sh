@@ -217,7 +217,10 @@ if url.startswith(("postgres://", "postgresql://")):
         parts = urlsplit(url)
     except ValueError:
         fail("DATABASE_URL is not a well-formed URI")
-    if parts.fragment:
+    # Test the raw URL, not parts.fragment: a trailing '#' leaves the
+    # fragment empty, so a fragment test would silently drop it and
+    # truncate the database name or the last query value.
+    if "#" in url:
         fail(
             "DATABASE_URL contains a raw '#': "
             "percent-encode it (%23) in the URI"
