@@ -59,16 +59,20 @@ class WorkerTableTests(unittest.TestCase):
         for spec in WORKERS:
             self.assertTrue(spec["wasm"].endswith(".wasm"), spec)
 
-    def test_only_api_builds_locked(self):
+    def test_audited_workers_build_locked(self):
         locked = [spec["worker"] for spec in WORKERS if spec.get("locked")]
-        self.assertEqual(locked, ["api"])
+        self.assertEqual(locked, ["api", "ingest", "mb", "stream"])
 
-    def test_cargo_args_stream_uses_package(self):
+    def test_repair_builds_unlocked_without_committed_lockfile(self):
+        repair = next(s for s in WORKERS if s["worker"] == "repair")
+        self.assertNotIn("--locked", cargo_args(repair))
+
+    def test_cargo_args_stream_uses_package_locked(self):
         stream = next(s for s in WORKERS if s["worker"] == "stream")
         args = cargo_args(stream)
         self.assertIn("-p", args)
         self.assertIn("nntune-stream", args)
-        self.assertNotIn("--locked", args)
+        self.assertIn("--locked", args)
 
     def test_cargo_args_api_uses_manifest_locked(self):
         api = next(s for s in WORKERS if s["worker"] == "api")
@@ -170,6 +174,23 @@ class RenderTests(unittest.TestCase):
         table = render_table(rows, 3_000_000, ["api: too big"])
         self.assertIn("FAIL", table)
         self.assertIn("api: too big", table)
+
+    def test_status_pipes_are_escaped(self):
+        rows = [
+            {
+                "worker": "api",
+                "raw": None,
+                "compressed": None,
+                "status": "error: build failed (exit 1: 1 | foo)",
+            },
+        ]
+        table = render_table(rows, 3_000_000, ["api: boom"])
+        self.assertIn("1 \\| foo", table)
+        for line in table.splitlines():
+            if line.startswith("| `api`"):
+                # Seven structural pipes delimit the six data columns; an
+                # unescaped diagnostic pipe would add an eighth.
+                self.assertEqual(line.replace("\\|", "").count("|"), 7)
 
 
 class MainTests(unittest.TestCase):

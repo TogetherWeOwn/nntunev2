@@ -29,6 +29,9 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
 
 [licenses]
+# Dev-dependencies ship in no artifact but still enter the tree; check them
+# against the same allow list so a disallowed dev-only license fails loudly.
+include-dev = true
 # Fail-closed allow list: any license not named here rejects the build.
 # Copyleft licenses (GPL/AGPL/LGPL-any, SSPL, ...) are deliberately absent.
 allow = [

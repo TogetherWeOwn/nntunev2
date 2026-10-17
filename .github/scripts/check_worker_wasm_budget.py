@@ -52,9 +52,10 @@ BUDGET_BYTES = 3_000_000
 
 # One entry per Worker. ``kind`` selects how the crate is addressed:
 # standalone crates (own Cargo.toml, own target dir) vs the stream crate
-# (workspace member, repo-root target dir). Only the api crate has a
-# committed, audited Cargo.lock, so only it builds with ``--locked`` --
-# matching the required CI lanes for each crate.
+# (workspace member, repo-root target dir). Crates with a committed,
+# cargo-deny-audited Cargo.lock build with ``--locked`` so the measured
+# module matches the audited dependency graph; repair has no committed
+# lockfile, so it builds unlocked -- matching the required CI lanes.
 WORKERS = (
     {
         "worker": "api",
@@ -68,7 +69,7 @@ WORKERS = (
         "worker": "ingest",
         "kind": "manifest",
         "manifest": "workers/ingest/Cargo.toml",
-        "locked": False,
+        "locked": True,
         "target_dir": "workers/ingest/target",
         "wasm": "nntune_ingest.wasm",
     },
@@ -76,7 +77,7 @@ WORKERS = (
         "worker": "mb",
         "kind": "manifest",
         "manifest": "workers/mb/Cargo.toml",
-        "locked": False,
+        "locked": True,
         "target_dir": "workers/mb/target",
         "wasm": "nntune_mb.wasm",
     },
@@ -92,7 +93,7 @@ WORKERS = (
         "worker": "stream",
         "kind": "package",
         "package": "nntune-stream",
-        "locked": False,
+        "locked": True,
         "target_dir": "target",
         "wasm": "nntune_stream.wasm",
     },
@@ -142,6 +143,12 @@ def summarize_failure(output: str, returncode: int) -> str:
     return f"exit {returncode}" + (f": {tail}" if tail else "")
 
 
+# Generous per-Worker ceiling: a hung cargo (registry stall, stuck linker)
+# must surface as a fail-closed build failure with the table still printed,
+# never as a job wedged until the GitHub workflow timeout.
+BUILD_TIMEOUT_SECONDS = 1800
+
+
 def build_worker(root: Path, spec: dict) -> tuple[bool, str]:
     """Run the release wasm build for one worker. Returns (ok, detail)."""
     try:
@@ -151,7 +158,10 @@ def build_worker(root: Path, spec: dict) -> tuple[bool, str]:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            timeout=BUILD_TIMEOUT_SECONDS,
         )
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {BUILD_TIMEOUT_SECONDS}s"
     except OSError as exc:
         return False, f"cargo not runnable: {exc}"
     if proc.returncode != 0:
@@ -235,10 +245,12 @@ def render_table(rows: list[dict], budget: int, failures: list[str]) -> str:
         "| --- | ---: | ---: | ---: | ---: | --- |",
     ]
     for row in rows:
-        # The status cell must stay on one line or the markdown table
-        # breaks; flatten any stray newlines defensively (build summaries
-        # already arrive single-line from summarize_failure).
-        status = row["status"].replace("\n", " ")
+        # The status cell must stay on one line and one column or the
+        # markdown table breaks; flatten stray newlines defensively and
+        # escape pipes (rustc gutter lines like ``1 | foo`` would otherwise
+        # open extra cells). Build summaries already arrive single-line
+        # from summarize_failure.
+        status = row["status"].replace("\n", " ").replace("|", "\\|")
         lines.append(
             "| `{worker}` | {raw_h} | {gz_h} | {raw} | {gz} | {status} |".format(
                 worker=row["worker"],
