@@ -75,7 +75,7 @@
 	{/if}
 
 	{#if data.signedOut}
-		<p><a href="/signup">Sign in</a> to see your billing.</p>
+		<p><a href="/login">Sign in</a> to see your billing.</p>
 	{/if}
 
 	{#if data.hadFetchError}
