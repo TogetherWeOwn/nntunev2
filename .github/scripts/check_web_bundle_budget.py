@@ -33,7 +33,7 @@ import sys
 from pathlib import Path
 
 # Pinned budget, raw bytes. See module docstring for how to update.
-BUDGET_CLIENT_JS_BYTES = 230_400  # 225 KiB; measured 176,417 B on 2026-10-17
+BUDGET_CLIENT_JS_BYTES = 100_000  # PROBE: deliberately below the 176,417 B baseline
 
 CLIENT_DIR_PARTS = ("apps", "web", ".svelte-kit", "output", "client")
 
