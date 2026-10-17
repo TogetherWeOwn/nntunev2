@@ -276,19 +276,17 @@ jobs:
         run: docker build -f containers/mb-import/Dockerfile -t mb-import:ci .
       # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
       # (2026-08-06); re-pin deliberately, never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo build -p mb-import-validate
       - name: Apply mirror migrations
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_mb_mirror.sql -f migrations/0002_auth_vault.sql -f migrations/0008_mb_import_resume_dlq.sql
         env:
           DATABASE_URL: host=localhost port=5432 user=postgres dbname=postgres
-      - name: Run import integration suite
-        run: bash containers/mb-import/test-import.sh
-        env:
-          DATABASE_URL: host=localhost port=5432 user=postgres dbname=postgres
-          ALLOW_TEST_TRUNCATE: "1"
-          MB_VALIDATE_BIN: ${{ github.workspace }}/target/debug/mb-validate
+      - name: Run import integration suite in the shipped image
+        run: >-
+          docker run --rm --network host
+          -e DATABASE_URL='host=localhost port=5432 user=postgres dbname=postgres'
+          -e ALLOW_TEST_TRUNCATE=1
+          -v "$GITHUB_WORKSPACE/containers/mb-import/test-import.sh:/job/test-import.sh:ro"
+          mb-import:ci bash /job/test-import.sh
 
   # Cache policy: archive reservation guard (docs/cache-policy.md). Fails
   # any Worker R2 binding that targets a reserved archive bucket.

@@ -126,7 +126,7 @@ pub fn validate_line(table: Table, line_no: u64, raw: &str) -> Result<String, (&
 }
 
 /// Escape a poison raw line so `reason \t line_no \t raw` round-trips
-/// through `COPY (FORMAT text)`: backslash first, then tab/CR/LF.
+/// through `COPY (FORMAT text)`: backslash first, then tab/CR/LF and NUL.
 pub fn escape_poison_field(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for c in raw.chars() {
@@ -135,6 +135,7 @@ pub fn escape_poison_field(raw: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\\\x00"),
             _ => out.push(c),
         }
     }
@@ -418,7 +419,7 @@ fn is_date(date: &str) -> bool {
     ) else {
         return false;
     };
-    if !(1..=12).contains(&m) || d < 1 {
+    if y < 1 || !(1..=12).contains(&m) || d < 1 {
         return false;
     }
     let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
@@ -519,6 +520,11 @@ mod tests {
     }
 
     #[test]
+    fn poison_field_encodes_nul_as_copy_safe_text() {
+        assert_eq!(escape_poison_field("bad\0row"), "bad\\\\x00row");
+    }
+
+    #[test]
     fn empty_line_is_poison() {
         assert_eq!(
             validate_line(Table::Artist, 3, ""),
@@ -593,6 +599,7 @@ mod tests {
             );
         }
         for ts in [
+            "0000-01-01T00:00:00Z",
             "2023-02-29",
             "2024-13-01",
             "2024-05-01T25:00:00Z",

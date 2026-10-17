@@ -20,9 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /job
 COPY containers/mb-import/import.sh /job/import.sh
 COPY containers/mb-import/replicate.sh /job/replicate.sh
-COPY containers/mb-import/test-import.sh /job/test-import.sh
 COPY --from=validator /src/target/release/mb-validate /usr/local/bin/mb-validate
-RUN chmod 0755 /job/import.sh /job/replicate.sh /job/test-import.sh
+RUN chmod 0755 /job/import.sh /job/replicate.sh
 
 # Default: show usage; the scheduler overrides CMD per run.
 CMD ["bash", "/job/import.sh", "--help"]

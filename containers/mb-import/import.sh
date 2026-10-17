@@ -112,9 +112,13 @@ for table in artist release recording; do
   # awk NR counts a trailing partial line; the validator counts the same
   # way, so cursor line numbers and part-file ranges agree on every shape.
   total="$(awk 'END { print NR+0 }' "$tsv")"
+  if (( 10#$total == 0 )); then
+    echo "import: refusing empty $table dump; replication state remains unchanged" >&2
+    exit 1
+  fi
   dump_id="$(sha256sum "$tsv" | cut -d ' ' -f 1)"
   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "INSERT INTO mb_import_cursor (table_name, dump_id, lines_done) VALUES ('$table', '$dump_id', 0) ON CONFLICT (table_name, dump_id) DO NOTHING;" >/dev/null
-  awk -F '\t' '$1 ~ /^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$/ { print tolower($1) }' "$tsv" \
+  awk -F '\t' 'length($1) == 36 && substr($1, 9, 1) == "-" && substr($1, 14, 1) == "-" && substr($1, 19, 1) == "-" && substr($1, 24, 1) == "-" { id = $1; gsub(/-/, "", id); if (length(id) == 32 && id ~ /^[[:xdigit:]]+$/) print tolower($1) }' "$tsv" \
     | sort -T "$work" >"$work/mbids.sorted"
   uniq -d "$work/mbids.sorted" >"$work/mbids.duplicates"
   if [[ -s "$work/mbids.duplicates" ]]; then
@@ -124,7 +128,7 @@ for table in artist release recording; do
   fi
   completed="$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tAX -c "SELECT lines_done FROM mb_import_cursor WHERE table_name = '$table' AND dump_id = '$dump_id';")"
   if [[ ! "$completed" =~ ^[0-9]+$ ]]; then
-    echo "import: unexpected lines_done '$completed' for $table in mb_import_cursor (migration 0007 missing?)" >&2
+    echo "import: unexpected lines_done '$completed' for $table in mb_import_cursor (migration 0008_mb_import_resume_dlq missing?)" >&2
     exit 1
   fi
   if (( 10#$completed > 10#$total )); then
@@ -135,6 +139,7 @@ for table in artist release recording; do
     echo "import: $table already complete ($total/$total lines); skipping"
     continue
   fi
+  valid_table_n=0
   echo "import: loading $table from $tsv (resuming at line $((10#$completed + 1)) of $total)"
   # One linear pass over the not-yet-loaded tail: stream it into fixed-size
   # part files. (A per-chunk `sed -n start,endp` re-scans the dump from line
@@ -165,7 +170,9 @@ for table in artist release recording; do
     # valid.tsv can never print counts the cursor would advance on. The
     # explicit status check keeps that fatal even under `set -e` quirks, and
     # the file recount below catches any summary/file disagreement.
-    if ! summary="$("$VALIDATE_BIN" --table "$table" --in "$part" --valid-out "$work/valid.tsv" --poison-out "$work/poison.tsv" --line-offset "$offset")"; then
+    if summary="$("$VALIDATE_BIN" --table "$table" --in "$part" --valid-out "$work/valid.tsv" --poison-out "$work/poison.tsv" --line-offset "$offset")"; then
+      :
+    else
       validator_status=$?
       echo "import: validator failed for $table lines $range (exit $validator_status); cursor stays at $offset" >&2
       exit 1
@@ -309,8 +316,13 @@ SQL
       exit 1
     fi
     echo "import: $table lines $start-$end committed ($valid_n rows, $poison_n poison)"
+    valid_table_n="$((valid_table_n + 10#$valid_n))"
     start="$((10#$end + 1))"
   done
+  if (( valid_table_n == 0 )); then
+    echo "import: refusing $table dump with no valid rows; replication state remains unchanged" >&2
+    exit 1
+  fi
 done
 
 # Record the dump's replication sequence so replicate.sh accepts the first
