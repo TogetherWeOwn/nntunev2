@@ -32,9 +32,11 @@
 //! to the pool. [`PlayStream::abort`] returns the connection without
 //! caching (client went away).
 //!
-//! Failure handling: only connection-level trouble (I/O, protocol errors)
-//! quarantines the pool. A missing article or a bad segment fails that play
-//! alone — the connection is fine and goes back to the pool warm.
+//! Failure handling: only connection-level trouble (I/O, protocol errors,
+//! read timeouts) counts toward the pool circuit breaker (3-in-30s opens for
+//! 30s; the open breaker maps to `503` + `Retry-After`, see
+//! [`PlayError::http_status`]). A missing article or a bad segment fails that
+//! play alone — the connection is fine and goes back to the pool warm.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -45,7 +47,7 @@ use crate::api_error::ApiError;
 use crate::cache::{CacheServe, CacheStatus, ContentCache, MultipartUpload};
 use crate::grant::{self, GrantError};
 use crate::meter::{Meter, MeterEvent, MeterKind};
-use crate::nntp::{valid_message_id, NntpClient, NntpError};
+use crate::nntp::{valid_message_id, NntpClient, NntpDeadline, NntpError, UpstreamTimeouts};
 use crate::observability::{CacheObserveEvent, CacheStatus as ObserveStatus};
 use crate::pool::{Lane, Lease, OrphanedPlay, Pool, PoolError};
 use crate::prefetch::should_prefetch;
@@ -100,7 +102,7 @@ impl PlayError {
             PlayError::WrongTrack => ApiError::forbidden(),
             PlayError::RangeUnsatisfiable => ApiError::range_not_satisfiable(),
             PlayError::PoolExhausted => ApiError::rate_limited(),
-            PlayError::PoolQuarantined { .. } => ApiError::upstream_unavailable(),
+            PlayError::PoolQuarantined { .. } => ApiError::upstream_circuit_open(),
             PlayError::ArticleMissing(_) => ApiError::not_found(),
             PlayError::InvalidSegment(_) => ApiError::invalid_request(),
             PlayError::Upstream(_) => ApiError::upstream_unavailable(),
@@ -119,9 +121,56 @@ impl PlayError {
             _ => None,
         }
     }
+
+    /// HTTP status for the Worker shim: an open breaker is `503` (with
+    /// [`PlayError::retry_after_header`]); an exhausted pool is `429`
+    /// (`rate_limited`); auth, range, missing-article, and invalid-segment
+    /// failures use their shared-envelope statuses; provider failures are `502`.
+    pub fn http_status(&self) -> u16 {
+        match self {
+            PlayError::Unauthorized(_) | PlayError::ProviderAuthExpired => 401,
+            PlayError::WrongTrack => 403,
+            PlayError::RangeUnsatisfiable => 416,
+            PlayError::PoolExhausted => 429,
+            PlayError::PoolQuarantined { .. } => 503,
+            PlayError::ArticleMissing(_) => 404,
+            PlayError::InvalidSegment(_) => 400,
+            PlayError::Upstream(_) | PlayError::Decode(_) => 502,
+        }
+    }
+
+    /// Value for the HTTP `Retry-After` response header (whole seconds,
+    /// rounded up): `Some` only for [`PlayError::PoolQuarantined`]. The Worker
+    /// shim sends `503` + this header instead of hanging a play on a dead
+    /// upstream.
+    pub fn retry_after_header(&self) -> Option<String> {
+        match self {
+            PlayError::PoolQuarantined { retry_after_ms } => {
+                Some(retry_after_secs(*retry_after_ms).to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// Stable worker/API code for stale provider credentials.
+    pub fn code(&self) -> &'static str {
+        match self {
+            PlayError::ProviderAuthExpired => PROVIDER_AUTH_EXPIRED_CODE,
+            _ => "request_failed",
+        }
+    }
 }
 
+/// Whole-second `Retry-After` for a millisecond wait, rounded up.
+fn retry_after_secs(retry_after_ms: u64) -> u64 {
+    retry_after_ms.div_ceil(1000)
+}
 /// Everything the play path needs, by reference.
+///
+/// `UpstreamTimeouts` stay out of this struct on purpose: adding a required
+/// field here breaks every existing `PlayInput` literal (including grant-TTL
+/// acceptance helpers on `main`). Per-play timeouts go through
+/// [`play_with_timeouts`]; [`play`] uses `UpstreamTimeouts::default()`.
 pub struct PlayInput<'a> {
     /// Signed grant from the `api` Worker.
     pub token: &'a str,
@@ -296,7 +345,7 @@ pub struct ObservedPlayAttempt {
     pub error_event: Option<CacheObserveEvent>,
 }
 
-/// Serve `track_id` to its granted owner.
+/// Serve `track_id` to its granted owner (default upstream timeouts).
 pub fn play(
     pool: &mut StreamPool,
     cache: &mut ContentCache,
@@ -304,8 +353,30 @@ pub fn play(
     secret: &[u8],
     input: &PlayInput<'_>,
 ) -> Result<PlayResponse, PlayError> {
+    play_with_timeouts(
+        pool,
+        cache,
+        meter,
+        secret,
+        input,
+        UpstreamTimeouts::default(),
+    )
+}
+
+/// Serve `track_id` with explicit per-upstream dial/read timeouts.
+///
+/// `connect` bounds a new dial and `read` bounds each article op (idle-read
+/// limit plus total status-plus-body deadline); see `UpstreamTimeouts`.
+pub fn play_with_timeouts(
+    pool: &mut StreamPool,
+    cache: &mut ContentCache,
+    meter: &mut dyn Meter,
+    secret: &[u8],
+    input: &PlayInput<'_>,
+    timeouts: UpstreamTimeouts,
+) -> Result<PlayResponse, PlayError> {
     let user = authorized_user(secret, input, meter)?;
-    play_authorized(pool, cache, meter, input, &user)
+    play_authorized(pool, cache, meter, input, &user, timeouts)
 }
 
 /// Start a play and project early pool-acquisition errors while the verified
@@ -329,7 +400,14 @@ pub fn play_with_observe_event(
             }
         }
     };
-    let result = play_authorized(pool, cache, meter, input, &user);
+    let result = play_authorized(
+        pool,
+        cache,
+        meter,
+        input,
+        &user,
+        UpstreamTimeouts::default(),
+    );
     let error_event = result.as_ref().err().and_then(|error| {
         error.pool_error_code().map(|_| {
             CacheObserveEvent::from_play(request_id, &user, ObserveStatus::Miss, 0, 0, Some(error))
@@ -385,6 +463,7 @@ fn play_authorized(
     meter: &mut dyn Meter,
     input: &PlayInput<'_>,
     user: &str,
+    timeouts: UpstreamTimeouts,
 ) -> Result<PlayResponse, PlayError> {
     flush_orphaned(pool, meter);
     meter.emit(ev(MeterKind::PlayStart, user, input.track_id, 0));
@@ -442,7 +521,7 @@ fn play_authorized(
         PoolError::Exhausted => PlayError::PoolExhausted,
     })?;
 
-    let (mut client, mut first, redialed) = match open_and_fetch(pool, input, first_seg) {
+    let (mut client, mut first, redialed) = match open_and_fetch(pool, input, first_seg, timeouts) {
         Ok(result) => result,
         Err((client, failure)) => {
             return Err(settle(
@@ -508,7 +587,9 @@ fn play_authorized(
             0,
         ));
     }
-    if pool.record_success() {
+    // A first segment settles a half-open probe but preserves a closed-state
+    // failure streak so later segment failures still count toward the breaker.
+    if pool.record_probe_success_for(lease.id) {
         meter.emit(ev_pool(
             MeterKind::QuarantineExited,
             user,
@@ -535,7 +616,7 @@ fn play_authorized(
         upload: MultipartUpload::begin(input.track_id),
         failed: None,
         provider_error_epoch: pool.provider_error_epoch_source(),
-        last_success_epoch: None,
+        last_success_epoch: Some(pool.provider_error_epoch()),
     };
     if let Err(failure) = live.ingest(first_seg, first) {
         return Err(live.settle(pool, meter, Some(failure), user, input.track_id));
@@ -595,32 +676,48 @@ fn open_and_fetch(
     pool: &mut StreamPool,
     input: &PlayInput<'_>,
     idx: usize,
+    timeouts: UpstreamTimeouts,
 ) -> Result<(NntpClient, Decoded, bool), (Option<NntpClient>, Failure)> {
     let mid = &input.segments[idx];
+    let deadline = NntpDeadline::new(timeouts.connect.saturating_add(timeouts.read));
     let mut warm = pool.take_idle();
+    if let Some(client) = warm.as_mut() {
+        if !client
+            .prepare_for_reuse(&input.server_addr, timeouts.read)
+            .unwrap_or(false)
+        {
+            warm = None;
+        }
+    }
     let was_warm = warm.is_some();
     let mut redialed = false;
     for attempt in 0..2 {
         let mut client = match warm.take() {
             Some(client) => client,
-            None => match NntpClient::connect(&input.server_addr) {
-                Ok(client) => {
-                    pool.record_connect();
-                    client
+            None => {
+                match NntpClient::connect_with_deadline(&input.server_addr, timeouts, &deadline) {
+                    Ok(client) => {
+                        pool.record_connect();
+                        client
+                    }
+                    Err(e) => return Err((None, nntp_failure(e, mid))),
                 }
-                Err(e) => return Err((None, nntp_failure(e, mid))),
-            },
+            }
         };
-        match fetch_segment(&mut client, mid) {
-            Ok(decoded) => return Ok((client, decoded, redialed)),
+        match fetch_segment_with_deadline(&mut client, mid, &deadline) {
+            Ok(decoded) => {
+                if was_warm && attempt == 0 {
+                    pool.record_reuse();
+                }
+                return Ok((client, decoded, redialed));
+            }
             Err(SegmentError::Nntp(e))
                 if was_warm
                     && attempt == 0
                     && (e.is_provider_failure() || matches!(e, NntpError::AuthExpired)) =>
             {
-                // Stale pooled connection (provider failure, or a warm
-                // session that is no longer authenticated): drop it and
-                // redial once. Meter only after replacement fetch succeeds.
+                // A stale provider session, including expired auth, is dropped
+                // and redialed once. Meter only after replacement fetch succeeds.
                 redialed = true;
                 continue;
             }
@@ -656,17 +753,15 @@ fn fetch_segment(client: &mut NntpClient, message_id: &str) -> Result<Decoded, S
     yenc::decode_part(&raw).map_err(SegmentError::Decode)
 }
 
-impl PlayError {
-    /// Stable worker/API code for this failure. Only
-    /// [`PlayError::ProviderAuthExpired`] maps to
-    /// [`PROVIDER_AUTH_EXPIRED_CODE`]; the API worker returns it with HTTP
-    /// 401 and the web app renders the inline re-auth prompt on it.
-    pub fn code(&self) -> &'static str {
-        match self {
-            PlayError::ProviderAuthExpired => PROVIDER_AUTH_EXPIRED_CODE,
-            _ => "request_failed",
-        }
-    }
+fn fetch_segment_with_deadline(
+    client: &mut NntpClient,
+    message_id: &str,
+    deadline: &NntpDeadline,
+) -> Result<Decoded, SegmentError> {
+    let raw = client
+        .article_with_deadline(message_id, deadline)
+        .map_err(SegmentError::Nntp)?;
+    yenc::decode_part(&raw).map_err(SegmentError::Decode)
 }
 
 fn nntp_failure(e: NntpError, message_id: &str) -> Failure {
@@ -699,18 +794,23 @@ fn settle(
     track: &str,
 ) -> PlayError {
     let lane = lease.lane;
-    pool.release(lease, if conn == Conn::KeepWarm { client } else { None });
     if conn == Conn::ProviderFailure {
-        let backoff_ms = pool.record_provider_error();
+        let was_quarantined = pool.quarantined();
+        pool.record_provider_error_for(lease.id);
         meter.emit(ev(MeterKind::ProviderError, user, track, 0));
-        meter.emit(ev_pool(
-            MeterKind::QuarantineEntered,
-            user,
-            track,
-            lane,
-            backoff_ms,
-        ));
+        if !was_quarantined && pool.quarantined() {
+            meter.emit(ev_pool(
+                MeterKind::QuarantineEntered,
+                user,
+                track,
+                lane,
+                crate::pool::CIRCUIT_OPEN_MS,
+            ));
+        }
+    } else if pool.record_non_provider_result_for(lease.id) {
+        meter.emit(ev_pool(MeterKind::QuarantineExited, user, track, lane, 0));
     }
+    pool.release(lease, if conn == Conn::KeepWarm { client } else { None });
     err
 }
 
@@ -999,7 +1099,7 @@ impl PlayStream {
         }
         if live.failed.is_none()
             && live.last_success_epoch == Some(pool.provider_error_epoch())
-            && pool.record_success()
+            && pool.record_success_for(live.lease.id)
         {
             meter.emit(ev_pool(
                 MeterKind::QuarantineExited,
@@ -1053,8 +1153,21 @@ impl PlayStream {
             });
         }
         if let Some(Source::Live(live)) = source {
+            // A failed aborted stream affects the breaker just like finalize;
+            // auth/article-local failures settle a probe without quarantining.
             let live = *live;
-            let healthy = !matches!(&live.failed, Some((_, conn)) if *conn != Conn::KeepWarm);
+            let conn = live.failed.as_ref().map(|(_, conn)| *conn);
+            if conn == Some(Conn::ProviderFailure) {
+                pool.record_provider_error_for(live.lease.id);
+            } else if conn.is_some() {
+                pool.record_non_provider_result_for(live.lease.id);
+            } else if live.last_success_epoch == Some(pool.provider_error_epoch()) {
+                // Clean abort: the first segment served fine and no later
+                // fetch failed, so clear a closed-state failure streak unless
+                // a newer provider failure arrived while this play was live.
+                pool.record_success_for(live.lease.id);
+            }
+            let healthy = !matches!(conn, Some(Conn::Drop | Conn::ProviderFailure));
             pool.release(live.lease, healthy.then_some(live.client));
         }
     }
@@ -1251,8 +1364,8 @@ mod tests {
             (PlayError::PoolExhausted, "rate_limited", 429, true),
             (
                 PlayError::PoolQuarantined { retry_after_ms: 5 },
-                "upstream_unavailable",
-                502,
+                "upstream_circuit_open",
+                503,
                 true,
             ),
             (
@@ -1287,6 +1400,7 @@ mod tests {
                 (code, status, retryable),
                 "{err:?}"
             );
+            assert_eq!(err.http_status(), api.status, "status drift for {err:?}");
             assert!(!api.body_json().contains("seg@news"), "{err:?}");
             assert!(!api.body_json().contains("provider detail"), "{err:?}");
         }
@@ -1328,26 +1442,126 @@ mod tests {
     }
 
     #[test]
-    fn ranges_validate_only_in_covering_shape() {
-        let good = [(0, 10), (10, 25), (25, 30)];
-        assert_eq!(valid_ranges(Some(&good), 3), Some(&good[..]));
-        // Absent, wrong arity, non-zero start, a gap, an empty segment:
-        // all fall back to the prefix walk instead of failing the play.
-        assert_eq!(valid_ranges(None, 3), None);
-        assert_eq!(valid_ranges(Some(&good), 2), None);
-        assert_eq!(valid_ranges(Some(&[(1, 10)]), 1), None);
-        assert_eq!(valid_ranges(Some(&[(0, 10), (11, 20)]), 2), None);
-        assert_eq!(valid_ranges(Some(&[(0, 10), (10, 10)]), 2), None);
-        assert_eq!(valid_ranges(Some(&[]), 0), None);
+    fn mismatched_warm_peer_is_discarded_without_counting_a_reuse() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let timeouts = UpstreamTimeouts::new(Duration::from_secs(1), Duration::from_secs(1));
+        let old_listener = TcpListener::bind("127.0.0.1:0").expect("bind old NNTP");
+        let old_addr = old_listener.local_addr().expect("old address");
+        let old_server = std::thread::spawn(move || {
+            let (mut stream, _) = old_listener.accept().expect("accept warm connection");
+            stream.write_all(b"200 old NNTP ready\r\n").unwrap();
+            let mut byte = [0];
+            let _ = stream.read(&mut byte);
+        });
+        let warm_client =
+            NntpClient::connect_with_timeouts(&old_addr, timeouts).expect("warm greeting");
+
+        let current_listener = TcpListener::bind("127.0.0.1:0").expect("bind current NNTP");
+        let current_addr = current_listener.local_addr().expect("current address");
+        let current_server = std::thread::spawn(move || {
+            let (mut stream, _) = current_listener
+                .accept()
+                .expect("accept current connection");
+            stream.write_all(b"200 current NNTP ready\r\n").unwrap();
+            let mut command = Vec::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_until(b'\n', &mut command)
+                .unwrap();
+            stream.write_all(b"430 no such article\r\n").unwrap();
+        });
+
+        let mut pool = Pool::new(1);
+        pool.record_connect();
+        let lease = pool
+            .try_acquire(Lane::Playback)
+            .expect("lease for warm client");
+        pool.release(lease, Some(warm_client));
+        let segments = vec!["missing@synthetic.test".to_string()];
+        let input = PlayInput {
+            token: "unused by first-segment fetch",
+            track_id: "track",
+            range: None,
+            server_addr: current_addr,
+            segments: &segments,
+            segment_ranges: None,
+            cipher_key: 0,
+            now_unix: 0,
+            up_next: None,
+        };
+
+        let (client, failure) = match open_and_fetch(&mut pool, &input, 0, timeouts) {
+            Err(result) => result,
+            Ok(_) => panic!("missing article response"),
+        };
+        assert!(matches!(failure.0, PlayError::ArticleMissing(_)));
+        assert!(
+            matches!(failure.1, Conn::KeepWarm),
+            "a missing article is not a provider failure"
+        );
+        assert_eq!(
+            (pool.connects(), pool.reuses()),
+            (2, 0),
+            "the changed peer requires a cold dial, not a warm reuse"
+        );
+
+        drop(client);
+        current_server.join().expect("current server thread");
+        old_server.join().expect("old server thread");
     }
 
     #[test]
-    fn covering_segment_addresses_the_range_start() {
-        let ranges = [(0, 10), (10, 25), (25, 30)];
-        assert_eq!(covering_segment(&ranges, 0), 0);
-        assert_eq!(covering_segment(&ranges, 9), 0);
-        assert_eq!(covering_segment(&ranges, 10), 1);
-        assert_eq!(covering_segment(&ranges, 29), 2);
+    fn missing_article_settles_a_half_open_probe_as_a_live_provider() {
+        use crate::pool::{CircuitState, CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_OPEN_MS};
+
+        let mut pool = Pool::new(2);
+        for _ in 0..CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        pool.advance(CIRCUIT_OPEN_MS);
+        let probe = pool
+            .try_acquire(Lane::Playback)
+            .expect("half-open probe admitted");
+        let mut meter = crate::meter::MemoryMeter::default();
+        let error = settle(
+            &mut pool,
+            &mut meter,
+            probe,
+            None,
+            (PlayError::ArticleMissing("missing".into()), Conn::KeepWarm),
+            "user",
+            "track",
+        );
+
+        assert_eq!(error, PlayError::ArticleMissing("missing".into()));
+        assert_eq!(pool.circuit_state(), CircuitState::Closed);
+        pool.try_acquire(Lane::Playback)
+            .expect("a provider response closes the breaker");
+    }
+
+    #[test]
+    fn open_breaker_maps_to_503_with_retry_after() {
+        let err = PlayError::PoolQuarantined {
+            retry_after_ms: 30_000,
+        };
+        assert_eq!(err.http_status(), 503);
+        assert_eq!(err.retry_after_header().as_deref(), Some("30"));
+        // A probe-in-flight rejection asks clients to wait before retrying.
+        let probe = PlayError::PoolQuarantined {
+            retry_after_ms: crate::pool::HALF_OPEN_PROBE_RETRY_MS,
+        };
+        assert_eq!(probe.http_status(), 503);
+        assert_eq!(probe.retry_after_header().as_deref(), Some("1"));
+        // Other failures keep their own statuses, never 503.
+        assert_eq!(
+            PlayError::Unauthorized(GrantError::Malformed).http_status(),
+            401
+        );
+        assert_eq!(PlayError::PoolExhausted.http_status(), 429);
+        assert_eq!(PlayError::PoolExhausted.retry_after_header(), None);
+        assert_eq!(PlayError::ArticleMissing("m".into()).http_status(), 404);
     }
 
     #[test]
@@ -1739,7 +1953,8 @@ mod tests {
                 .iter()
                 .filter(|event| event.kind == MeterKind::QuarantineEntered)
                 .count(),
-            1
+            0,
+            "one failed play must not trip the three-failure breaker"
         );
     }
 
@@ -1770,6 +1985,8 @@ mod tests {
             play(&mut pool, &mut cache, &mut meter, b"s", &input),
             Err(PlayError::Upstream(_))
         ));
+        pool.record_provider_error();
+        pool.record_provider_error();
         assert!(pool.quarantined());
 
         stream
@@ -1812,6 +2029,8 @@ mod tests {
             play(&mut pool, &mut cache, &mut meter, b"s", &input),
             Err(PlayError::Upstream(_))
         ));
+        pool.record_provider_error();
+        pool.record_provider_error();
         assert!(pool.quarantined());
 
         let _body: Vec<u8> = stream.by_ref().flatten().collect();
@@ -1857,6 +2076,8 @@ mod tests {
             play(&mut pool, &mut cache, &mut meter, b"s", &input),
             Err(PlayError::Upstream(_))
         ));
+        pool.record_provider_error();
+        pool.record_provider_error();
         assert!(pool.quarantined());
 
         let body: Vec<u8> = stream.by_ref().flatten().collect();
@@ -1900,6 +2121,8 @@ mod tests {
             play(&mut pool, &mut cache, &mut meter, b"s", &input),
             Err(PlayError::Upstream(_))
         ));
+        pool.record_provider_error();
+        pool.record_provider_error();
         assert!(pool.quarantined());
 
         let body: Vec<u8> = stream.by_ref().flatten().collect();
@@ -1908,17 +2131,19 @@ mod tests {
         stream
             .finalize(&mut pool, &mut cache, &mut meter)
             .expect("finalize streamed play");
-        assert!(!pool.quarantined());
+        assert!(
+            pool.quarantined(),
+            "a play started before the provider failures cannot clear quarantine"
+        );
         let exits: Vec<_> = meter
             .events
             .iter()
             .filter(|event| event.kind == MeterKind::QuarantineExited)
             .collect();
-        assert_eq!(exits.len(), 1);
-        assert_eq!(exits[0].user_id, "u");
-        assert_eq!(exits[0].track_id, "track-a");
-        assert_eq!(exits[0].lane, Some(Lane::Playback));
-        assert_eq!(exits[0].backoff_ms, 0);
+        assert!(
+            exits.is_empty(),
+            "stale success cannot emit quarantine exit"
+        );
     }
 
     #[test]
@@ -1947,13 +2172,15 @@ mod tests {
             play(&mut pool, &mut cache, &mut meter, b"s", &input),
             Err(PlayError::Upstream(_))
         ));
+        pool.record_provider_error();
+        pool.record_provider_error();
         assert!(pool.quarantined());
 
         let body: Vec<u8> = stream.by_ref().flatten().collect();
         assert_eq!(body, plain);
         server.join().expect("server thread");
 
-        pool.advance(1_000);
+        pool.advance(30_000);
         let token = grant::issue("u", "track-c", GRANT_EXP_UNIX, b"s");
         let input = test_input(&token, "track-c", closed_address(), &other_segment);
         assert!(matches!(
@@ -2065,6 +2292,9 @@ mod tests {
         let token = grant::issue("u", "track-a", 901, secret);
         let mut pool = Pool::new(1);
         let held_lease = if quarantined {
+            for _ in 1..crate::pool::CIRCUIT_FAILURE_THRESHOLD {
+                pool.record_provider_error();
+            }
             pool.record_provider_error();
             None
         } else {
@@ -2120,9 +2350,66 @@ mod tests {
     }
 
     #[test]
+    fn half_open_non_provider_result_emits_one_quarantine_exit() {
+        let mut pool = StreamPool::new(2);
+        for _ in 0..crate::pool::CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        pool.advance(crate::pool::CIRCUIT_OPEN_MS);
+        let probe = pool.try_acquire(Lane::Playback).expect("probe admitted");
+        let mut meter = crate::meter::MemoryMeter::default();
+
+        settle(
+            &mut pool,
+            &mut meter,
+            probe,
+            None,
+            (
+                PlayError::ArticleMissing("gone@synthetic.test".into()),
+                Conn::KeepWarm,
+            ),
+            "u",
+            "track-a",
+        );
+
+        assert_eq!(pool.circuit_state(), crate::pool::CircuitState::Closed);
+        assert_eq!(
+            meter
+                .events
+                .iter()
+                .filter(|event| event.kind == MeterKind::QuarantineExited)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn quarantined_and_exhausted_plays_project_pool_error_events() {
         assert_pool_failure_observation(true, "POOL_QUARANTINED");
         assert_pool_failure_observation(false, "POOL_EXHAUSTED");
         assert_eq!(PlayError::WrongTrack.pool_error_code(), None);
+    }
+
+    #[test]
+    fn ranges_validate_only_in_covering_shape() {
+        let good = [(0, 10), (10, 25), (25, 30)];
+        assert_eq!(valid_ranges(Some(&good), 3), Some(&good[..]));
+        // Absent, wrong arity, non-zero start, a gap, an empty segment:
+        // all fall back to the prefix walk instead of failing the play.
+        assert_eq!(valid_ranges(None, 3), None);
+        assert_eq!(valid_ranges(Some(&good), 2), None);
+        assert_eq!(valid_ranges(Some(&[(1, 10)]), 1), None);
+        assert_eq!(valid_ranges(Some(&[(0, 10), (11, 20)]), 2), None);
+        assert_eq!(valid_ranges(Some(&[(0, 10), (10, 10)]), 2), None);
+        assert_eq!(valid_ranges(Some(&[]), 0), None);
+    }
+
+    #[test]
+    fn covering_segment_addresses_the_range_start() {
+        let ranges = [(0, 10), (10, 25), (25, 30)];
+        assert_eq!(covering_segment(&ranges, 0), 0);
+        assert_eq!(covering_segment(&ranges, 9), 0);
+        assert_eq!(covering_segment(&ranges, 10), 1);
+        assert_eq!(covering_segment(&ranges, 29), 2);
     }
 }

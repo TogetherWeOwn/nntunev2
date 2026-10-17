@@ -79,13 +79,19 @@ export function toRegistrationOptions(
 		excludeCredentials: [],
 		authenticatorSelection: {
 			residentKey: 'required',
-			requireResidentKey: true
+			requireResidentKey: true,
+			userVerification: 'required'
 		},
 		attestation: 'none'
 	};
 }
 
-/** Convert API JSON creation options into browser options, requiring discoverable credentials. */
+/**
+ * Convert API JSON creation options into browser options, requiring
+ * discoverable credentials and user verification (PIN/biometric). The Worker
+ * rejects any ceremony whose authenticatorData lacks the UV flag, so the
+ * browser is asked for it up front instead of failing after the tap.
+ */
 export function toCreationOptions(
 	options: RegistrationOptionsJSON
 ): PublicKeyCredentialCreationOptions {
@@ -98,12 +104,17 @@ export function toCreationOptions(
 		authenticatorSelection: {
 			...authenticatorSelection,
 			residentKey: 'required',
-			requireResidentKey: true
+			requireResidentKey: true,
+			userVerification: 'required'
 		}
 	};
 }
 
-/** Convert API JSON request options; omitted allowCredentials enables usernameless login. */
+/**
+ * Convert API JSON request options; omitted allowCredentials enables
+ * usernameless login. User verification is always required (see
+ * `toCreationOptions`); a caller-supplied weaker value is overridden.
+ */
 export function toRequestOptions(
 	options: AuthenticationOptionsJSON
 ): PublicKeyCredentialRequestOptions {
@@ -111,6 +122,7 @@ export function toRequestOptions(
 	return {
 		...rest,
 		challenge: decodeBase64Url(challenge),
+		userVerification: 'required',
 		...(allowCredentials === undefined
 			? {}
 			: { allowCredentials: allowCredentials.map(toCredentialDescriptor) })

@@ -24,6 +24,7 @@ export const KNOWN_ERROR_CODES = new Set([
 	'internal_error',
 	'corrupt_content',
 	'upstream_unavailable',
+	'upstream_circuit_open',
 	'service_unavailable'
 ]);
 
