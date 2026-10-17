@@ -2,6 +2,7 @@ import { test, expect } from '@playwright/test';
 import { API, TESTIDS } from '../helpers/contract.js';
 import { accessHeaders, assertNoAccessWall, stagingBaseUrl } from '../helpers/access.js';
 import { apiGet, applyAccountToPage } from '../helpers/accounts.js';
+import { assertPromotionReady } from '../helpers/readiness.js';
 
 // Fast synthetic smoke: runs post-deploy AND on a schedule. Must stay under
 // ~2 minutes total — the deep journey lives in the other specs.
@@ -50,29 +51,28 @@ test.describe('staging synthetic smoke', () => {
     expect(Date.now() - started).toBeLessThan(2000);
   });
 
-  test('GET /api/ready reports readiness shape (200, or 503 with Retry-After)', async ({
-    request,
-  }) => {
+  test('GET /api/ready is promotion-ready (200 JSON {ok:true} only)', async ({ request }) => {
     const baseURL = stagingBaseUrl('skip', 'ready');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
+    // apiGet fetches with maxRedirects: 0 so a staging 302 never carries the
+    // Access pair to another origin (see helpers/accounts.ts).
     const res = await apiGet(request, `${baseURL}${API.ready}`, accessHeaders(), 'ready');
     const bodyText = await res.text().catch(() => '');
-    assertNoAccessWall(
-      { status: res.status(), headers: res.headers(), bodyText, url: `${baseURL}${API.ready}` },
-      'ready',
-    );
-    // Contract drift: the merged app has no /api/ready route yet, so staging
-    // answers 404 until the backend slice lands. Tolerate 404 as "not yet
-    // implemented" (documented in e2e/README.md); any other status must match
-    // the readiness shape so the check still pins the contract once shipped.
-    if (res.status() === 404) return;
-    expect([200, 503], `ready body: ${bodyText.slice(0, 500)}`).toContain(res.status());
-    if (res.status() === 503) {
-      expect(res.headers()['retry-after'] !== undefined).toBe(true);
-    }
+    const readyProbe = {
+      status: res.status(),
+      headers: res.headers(),
+      bodyText,
+      url: `${baseURL}${API.ready}`,
+    };
+    assertNoAccessWall(readyProbe, 'ready');
+    // Promotion readiness is strict: only 200 JSON {ok:true} passes. A 404
+    // (route missing), a 503 (well-formed or not), an HTML 200, malformed
+    // JSON or {ok:false} must fail this smoke — never green it. The shared
+    // helper is pinned offline by tests/readiness.spec.ts.
+    assertPromotionReady(readyProbe, 'ready');
   });
 
   test('GET / serves the app shell behind Access', async ({ page }) => {

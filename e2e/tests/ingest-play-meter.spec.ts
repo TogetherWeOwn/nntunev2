@@ -5,17 +5,21 @@ import {
   API,
   PLAN_LIMIT_STATUSES,
   TESTIDS,
+  extractLibraryItems,
   extractPlanMeta,
+  extractRecordingMbids,
   extractUsageBytes,
-  uniqueTestEmail,
 } from '../helpers/contract.js';
 import { assertNoAccessWall, readApiBody, stagingBaseUrl } from '../helpers/access.js';
+import { playbackFailure, type PlaybackEvidence } from '../helpers/playback.js';
 import {
   accountHeaders,
+  annotateSignupPath,
   apiGet,
   applyAccountToPage,
   completeByopWizard,
   requireApiAccount,
+  submitPublicUiSignup,
   tryMintTestAccount,
   type TestAccount,
 } from '../helpers/accounts.js';
@@ -42,39 +46,27 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
   // and metering run as the same identity. Retries mint a fallback.
   let sharedAccount: TestAccount | null = null;
 
-  test('NZB fixture ingests and appears in the library', async ({ page, request }) => {
+  test('NZB fixture ingests and appears in the library', async ({ page, request }, testInfo) => {
     const baseURL = stagingBaseUrl('skip', 'ingest');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
     const minted = await tryMintTestAccount(request, baseURL);
+    // Evidence provenance: this test duplicates the signup branch, so it
+    // records the same bounded signup-path label (no account data).
+    annotateSignupPath(testInfo, minted);
     await applyAccountToPage(page, minted, baseURL);
     if (minted?.viaApi) {
       sharedAccount = minted;
       await page.goto(baseURL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     } else {
-      // Real UI signup fallback (not a bare navigation): fill the form and
-      // require the wizard. The browser identity is authenticated from here
-      // via storage; API-driven steps below additionally require the seam —
-      // see requireApiAccount.
-      const email = uniqueTestEmail();
-      await page.goto(`${baseURL}/signup`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-      await expect(page.getByTestId(TESTIDS.signupEmail)).toBeVisible({ timeout: 15_000 });
-      await page.getByTestId(TESTIDS.signupEmail).fill(email);
-      await page.getByTestId(TESTIDS.signupSubmit).click();
-      const wizard = page.getByTestId(TESTIDS.byopHost);
-      const error = page.getByTestId(TESTIDS.signupError);
-      await expect(async () => {
-        const onWizard = await wizard.isVisible().catch(() => false);
-        const onError = await error.isVisible().catch(() => false);
-        expect(onWizard || onError, 'neither BYOP wizard nor signup error appeared').toBe(true);
-      }).toPass({ timeout: 30_000 });
-      expect(await error.isVisible().catch(() => false), 'signup rejected the test mailbox').toBe(
-        false,
-      );
-      expect(page.url()).toContain('/onboarding/byop');
-      sharedAccount = { email, viaApi: false };
+      // Real UI signup fallback (not a bare navigation): shared helper with
+      // the signup spec. It asserts the emailed-code step — the
+      // code-plus-passkey finish needs a staging code-retrieval seam that
+      // does not exist yet, so this path cannot enroll an account. API-driven
+      // steps below additionally require the seam — see requireApiAccount.
+      sharedAccount = await submitPublicUiSignup(page, baseURL);
     }
 
     // The ingest worker probes through the user's authenticated provider
@@ -102,6 +94,73 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     ).toBeVisible({ timeout: 60_000 });
   });
 
+  test('ingested library persists across reload without re-import', async ({ page, request }) => {
+    const baseURL = stagingBaseUrl('skip', 'reload');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    // Fail closed instead of asserting anonymously when neither a minted
+    // session nor the QA seam token exists.
+    requireApiAccount(account, 'reload');
+    const headers = accountHeaders(account);
+    const libraryUrl = `${baseURL}${API.library}`;
+    const library = await apiGet(request, libraryUrl, headers, 'reload');
+    const libraryBody = await readApiBody(library, libraryUrl, 'reload');
+    expect(library.ok(), `library listing failed: HTTP ${library.status()}`).toBe(true);
+    const items = extractLibraryItems(libraryBody);
+    const trackId = items[0]?.id;
+    expect(trackId, 'library is empty — ingest spec must run first').toBeTruthy();
+
+    await applyAccountToPage(page, account, baseURL);
+    await page.goto(`${baseURL}/library`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    const libraryItems = page.getByTestId(TESTIDS.libraryItem);
+    await expect(
+      libraryItems.first(),
+      'ingested track missing from library before reload',
+    ).toBeVisible({ timeout: 60_000 });
+    const before = await libraryItems.evaluateAll((els) =>
+      els.map((el) => ({
+        id: el.getAttribute('data-id'),
+        text: (el.textContent ?? '').trim(),
+      })),
+    );
+    const beforeEntry = before.find((entry) => entry.id === trackId);
+    expect(
+      beforeEntry,
+      `ingested track ${trackId} missing from library before reload`,
+    ).toBeTruthy();
+    expect(
+      beforeEntry?.text.length ?? 0,
+      `ingested track ${trackId} has no visible title before reload`,
+    ).toBeGreaterThan(0);
+
+    // No re-import step here by design: no /library/import visit, no
+    // setInputFiles — a plain reload must keep the ingested track.
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
+    const reloadedItems = page.getByTestId(TESTIDS.libraryItem);
+    await expect(
+      reloadedItems.first(),
+      `ingested track ${trackId} missing after reload without re-import`,
+    ).toBeVisible({ timeout: 60_000 });
+    const after = await reloadedItems.evaluateAll((els) =>
+      els.map((el) => ({
+        id: el.getAttribute('data-id'),
+        text: (el.textContent ?? '').trim(),
+      })),
+    );
+    const afterEntry = after.find((entry) => entry.id === trackId);
+    expect(
+      afterEntry,
+      `ingested track ${trackId} missing after reload without re-import`,
+    ).toBeTruthy();
+    expect(
+      afterEntry?.text,
+      `ingested track ${trackId} text changed across reload`,
+    ).toBe(beforeEntry?.text);
+  });
+
   test('streaming answers byte Ranges with 206 + Content-Range', async ({ request }) => {
     const baseURL = stagingBaseUrl('skip', 'range');
     if (!baseURL) {
@@ -117,8 +176,8 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     const library = await apiGet(request, libraryUrl, headers, 'range');
     const libraryBody = await readApiBody(library, libraryUrl, 'range');
     expect(library.ok(), `library listing failed: HTTP ${library.status()}`).toBe(true);
-    const items = JSON.parse(libraryBody) as Array<{ id?: string }>;
-    const trackId = Array.isArray(items) ? items[0]?.id : undefined;
+    const items = extractLibraryItems(libraryBody);
+    const trackId = items[0]?.id;
     expect(trackId, 'library is empty — ingest spec must run first').toBeTruthy();
 
     // Binary success bodies are probed headers-only (no megabyte buffering);
@@ -177,8 +236,8 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     const library = await apiGet(request, libraryUrl, headers, 'meter');
     const libraryBody = await readApiBody(library, libraryUrl, 'meter');
     expect(library.ok(), `library listing failed: HTTP ${library.status()}`).toBe(true);
-    const items = JSON.parse(libraryBody) as Array<{ id?: string }>;
-    const trackId = Array.isArray(items) ? items[0]?.id : undefined;
+    const items = extractLibraryItems(libraryBody);
+    const trackId = items[0]?.id;
     expect(trackId, 'meter needs the ingested track — ingest spec must run first').toBeTruthy();
     const streamUrl = `${baseURL}${API.stream(trackId as string)}`;
     const rangeRes = await apiGet(request, streamUrl, { ...headers, Range: 'bytes=0-0' }, 'meter');
@@ -258,13 +317,14 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     const readTrackId = async (): Promise<string | undefined> => {
       const library = await apiGet(request, libraryUrl, headers, 'plan-limit');
       const libraryBody = await readApiBody(library, libraryUrl, 'plan-limit');
-      let items: Array<{ id?: string }>;
+      let items: Array<Record<string, unknown>>;
       try {
-        items = JSON.parse(libraryBody) as Array<{ id?: string }>;
+        items = extractLibraryItems(libraryBody);
       } catch {
         items = [];
       }
-      return Array.isArray(items) ? items[0]?.id : undefined;
+      const trackId = items[0]?.id;
+      return typeof trackId === 'string' ? trackId : undefined;
     };
     let trackId = await readTrackId();
     if (!trackId) {
@@ -305,5 +365,408 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
       (PLAN_LIMIT_STATUSES as readonly number[]).includes(res.status()),
       `expected a plan-limit status (${PLAN_LIMIT_STATUSES.join('/')}), got HTTP ${res.status()}`,
     ).toBe(true);
+  });
+
+  test('synthetic audio actually plays in the browser', async ({ page, request }) => {
+    const baseURL = stagingBaseUrl('skip', 'playback');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    // Same identity discipline as Range/meter: playback must run as the
+    // ingesting account, never anonymously or as the generic QA seam.
+    const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    requireApiAccount(account, 'playback');
+
+    // Names only: a page-error message can embed the staging origin or other
+    // values that must stay out of public CI artifacts.
+    const pageErrorNames: string[] = [];
+    page.on('pageerror', (error) => pageErrorNames.push(error.name || 'Error'));
+
+    await applyAccountToPage(page, account, baseURL);
+    await page.goto(`${baseURL}/library`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    const item = page.getByTestId(TESTIDS.libraryItem).first();
+    await expect(item, 'synthetic staged track missing from library — ingest spec must run first').toBeVisible({
+      timeout: 60_000,
+    });
+
+    // User gesture #1: selecting the staged synthetic track in the library.
+    // A player may start on selection or only load the track; both are
+    // handled below, but nothing here calls play() programmatically.
+    await item.click();
+    const audio = page.getByTestId(TESTIDS.audioPlayer);
+    await expect(audio, 'selecting the library track did not show the audio player').toBeVisible({
+      timeout: 15_000,
+    });
+
+    // Record playing/timeupdate evidence on the element itself before any
+    // play gesture: the synthetic WAV is sub-second, so polling alone could
+    // sample only after it has already ended. Booleans/numbers only — the
+    // source URL is never read out of the page.
+    await audio.evaluate((element) => {
+      const player = element as HTMLAudioElement & {
+        __nnPlayback?: { sawPlaying: boolean; maxCurrentTime: number };
+      };
+      const recorder = {
+        sawPlaying: !player.paused && !player.ended,
+        maxCurrentTime: Number.isFinite(player.currentTime) ? player.currentTime : 0,
+      };
+      player.__nnPlayback = recorder;
+      player.addEventListener('playing', () => {
+        recorder.sawPlaying = true;
+        recorder.maxCurrentTime = Math.max(recorder.maxCurrentTime, player.currentTime || 0);
+      });
+      player.addEventListener('timeupdate', () => {
+        recorder.maxCurrentTime = Math.max(recorder.maxCurrentTime, player.currentTime || 0);
+      });
+    });
+    const snapshot = (): Promise<PlaybackEvidence> =>
+      audio.evaluate((element) => {
+        const player = element as HTMLAudioElement & {
+          __nnPlayback?: { sawPlaying: boolean; maxCurrentTime: number };
+        };
+        const recorder = player.__nnPlayback ?? { sawPlaying: false, maxCurrentTime: 0 };
+        return {
+          sawPlaying: recorder.sawPlaying,
+          maxCurrentTime: Math.max(recorder.maxCurrentTime, player.currentTime || 0),
+          paused: player.paused,
+          ended: player.ended,
+          currentTime: player.currentTime,
+          duration: player.duration,
+          readyState: player.readyState,
+          errorCode: player.error ? player.error.code : null,
+          hasSource: Boolean(player.currentSrc),
+        };
+      });
+
+    await expect
+      .poll(async () => (await snapshot()).hasSource, {
+        timeout: 15_000,
+        message: 'audio player never loaded the synthetic track after selection',
+      })
+      .toBe(true);
+
+    let before = await snapshot();
+    if (playbackFailure(before, 0) !== null) {
+      let baseline: number;
+      if (before.paused) {
+        // Reset the recorder so only the gesture below can produce the
+        // evidence (an ended element replays from 0; a paused one resumes
+        // from its baseline). This also covers selection-autoplay of the
+        // sub-second track ending before the recorder above was installed:
+        // the missed first play is discarded and the replay below is the
+        // measured one. Re-install if the player recreated the element
+        // since the recorder was attached (a fresh node has no expando).
+        baseline = await audio.evaluate((element) => {
+          const player = element as HTMLAudioElement & {
+            __nnPlayback?: { sawPlaying: boolean; maxCurrentTime: number };
+          };
+          const start = player.ended ? 0 : player.currentTime || 0;
+          if (!player.__nnPlayback) {
+            const recorder = { sawPlaying: false, maxCurrentTime: start };
+            player.__nnPlayback = recorder;
+            player.addEventListener('playing', () => {
+              recorder.sawPlaying = true;
+              recorder.maxCurrentTime = Math.max(recorder.maxCurrentTime, player.currentTime || 0);
+            });
+            player.addEventListener('timeupdate', () => {
+              recorder.maxCurrentTime = Math.max(recorder.maxCurrentTime, player.currentTime || 0);
+            });
+          } else {
+            player.__nnPlayback.sawPlaying = false;
+            player.__nnPlayback.maxCurrentTime = start;
+          }
+          return start;
+        });
+        // User gesture #2: the player's own visible play control. Native
+        // <audio controls> live in shadow DOM, and in the Desktop Chrome
+        // project the leftmost control is play/pause — clicking the element
+        // centre would hit the seek bar instead. This respects autoplay
+        // policy; no evaluate-driven play() call is made.
+        const box = await audio.boundingBox();
+        expect(box, 'audio player is visible but has no clickable controls').not.toBeNull();
+        await audio.click({ position: { x: 20, y: Math.floor(((box?.height ?? 40) / 2)) } });
+      } else {
+        // Already playing but not yet past 0: require further advancement
+        // rather than toggling it paused with another click.
+        baseline = before.maxCurrentTime;
+      }
+      // The poll value is the named playback failure (or null): a 206, a
+      // loaded element, or a paused element keeps returning its reason
+      // instead of passing. See helpers/playback.ts + tests/playback.spec.ts.
+      await expect
+        .poll(async () => playbackFailure(await snapshot(), baseline), {
+          timeout: 15_000,
+          message: 'synthetic audio did not enter the playing state and advance',
+        })
+        .toBeNull();
+      before = await snapshot();
+    }
+    expect(playbackFailure(before, 0), 'final playback evidence regressed').toBeNull();
+    expect(pageErrorNames, 'page errors during browser playback').toEqual([]);
+  });
+
+  // FIXMEd until the staging MB mirror can match the synthetic fixture:
+  // synthetic.nzb's subject ("NNTune-Fixture sine-660 [01/03]") derives to
+  // the plain-title query "NNTune-Fixture sine-660", which has no release in
+  // the shared MB mirror, so the library write is empty by design
+  // (library_write_for in workers/ingest/src/matching.rs drops recordings
+  // without a release; the queue consumer resolves unmatched to Vec::new()).
+  // Below playback and FIXMEd, so it can never fail or skip a later step.
+  // Un-fixme paths: (a) ingest an `Artist - Album` fixture for a real,
+  // unambiguous mirrored release, or (b) seed a fixture release in staging.
+  test.fixme('ingested track carries recording_mbids', async ({ request }) => {
+    const baseURL = stagingBaseUrl('skip', 'recording-mbids');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    // Fail closed instead of asserting anonymously when neither the
+    // ingesting session nor the QA seam token exists.
+    requireApiAccount(account, 'recording-mbids');
+    const headers = accountHeaders(account);
+    const libraryUrl = `${baseURL}${API.library}`;
+    // The MB match + library write settle after the import status flips,
+    // so poll the listing until the ingested track carries its recording
+    // MBIDs. Every failure names the gap: transport/list shape, an empty
+    // library, or the missing/empty/malformed fill itself (see
+    // extractRecordingMbids in e2e/helpers/contract.ts).
+    await expect(async () => {
+      const library = await apiGet(request, libraryUrl, headers, 'recording-mbids');
+      const libraryBody = await readApiBody(library, libraryUrl, 'recording-mbids');
+      expect(library.ok(), `library listing failed: HTTP ${library.status()}`).toBe(true);
+      const items = extractLibraryItems(libraryBody);
+      expect(items.length, 'library is empty — ingest spec must run first').toBeGreaterThan(0);
+      const mbids = extractRecordingMbids(items[0]);
+      expect(
+        mbids.length,
+        '[recording-mbids] ingested track carries an empty recording_mbids list',
+      ).toBeGreaterThan(0);
+    }).toPass({ timeout: 60_000 });
+  });
+
+  // Player-UI seek, as distinct from the API Range control above: that test
+  // proves the stream endpoint answers byte ranges; this one proves the
+  // user-visible player actually moves the active track's playback position
+  // when a person seeks, and can play from there. The seek is a click on the
+  // native controls timeline (the contract markup is `<audio controls>`),
+  // never a `currentTime` assignment and never a test-issued Range GET.
+  //
+  // Last in the serial chain on purpose: the library player is still a
+  // contract placeholder, so on configured staging this test fails by name
+  // until the player slice lands — placing it last keeps that expected red
+  // from suppressing the meter/plan-limit evidence above it.
+  //
+  // The seek is performed while PAUSED. That is what makes the assertion
+  // non-vacuous: a paused position cannot drift into the seeked region by
+  // natural playback advance, so arriving there while still paused can only
+  // be the seek. It also works with the pinned 210 ms synthetic WAV
+  // (crates/nntune-test-nntp fixtures), where seek-while-playing would race
+  // the end of the track.
+  test('player UI seek moves the active audio position and playback continues', async ({
+    page,
+    request,
+  }) => {
+    const baseURL = stagingBaseUrl('skip', 'player-seek');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    // Fail closed instead of driving the player anonymously when neither a
+    // minted session nor the QA seam token exists.
+    requireApiAccount(account, 'player-seek');
+
+    const pageErrors: string[] = [];
+    page.on('pageerror', (error) => pageErrors.push(error.message));
+
+    await applyAccountToPage(page, account, baseURL);
+    await page.goto(`${baseURL}/library`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    const firstTrack = page.getByTestId(TESTIDS.libraryItem).first();
+    await expect(
+      firstTrack,
+      'ingested track missing from library — ingest spec must run first',
+    ).toBeVisible({ timeout: 60_000 });
+    await firstTrack.click();
+
+    const player = page.getByTestId(TESTIDS.audioPlayer);
+    await expect(
+      player,
+      'clicking the ingested track did not surface the audio player',
+    ).toBeVisible({ timeout: 15_000 });
+
+    const audioState = (): Promise<{
+      currentTime: number;
+      duration: number;
+      paused: boolean;
+      ended: boolean;
+      errorCode: number | null;
+      hasSource: boolean;
+      hasControls: boolean;
+    }> =>
+      player.evaluate((element) => {
+        const audio = element as HTMLAudioElement;
+        return {
+          currentTime: audio.currentTime,
+          duration: audio.duration,
+          paused: audio.paused,
+          ended: audio.ended,
+          errorCode: audio.error?.code ?? null,
+          hasSource: audio.currentSrc !== '',
+          hasControls: audio.controls,
+        };
+      });
+
+    // Metadata must load and give a finite, seekable duration. NaN (no
+    // metadata yet) and Infinity (unbounded stream) are reported as not
+    // ready; any positive finite duration works, including the 210 ms
+    // fixture, because the seek below happens while paused.
+    await expect
+      .poll(
+        async () => {
+          const { duration } = await audioState();
+          return Number.isFinite(duration) ? duration : 0;
+        },
+        {
+          timeout: 30_000,
+          message: 'player never reported a finite duration for the ingested track',
+        },
+      )
+      .toBeGreaterThan(0);
+    const ready = await audioState();
+    expect(ready.hasSource, 'player has no media source for the selected track').toBe(true);
+    expect(ready.errorCode, 'player reported a media error before seeking').toBeNull();
+    expect(
+      ready.hasControls,
+      'player no longer exposes native controls — update this UI seek to the new controls',
+    ).toBe(true);
+
+    const box = await player.boundingBox();
+    expect(box, 'player has no layout box to click').not.toBeNull();
+    const { width, height } = box as { width: number; height: number };
+    // The native play/pause toggle sits at the left edge of the control bar.
+    const togglePosition = { x: 16, y: Math.round(height / 2) };
+
+    // Reach a paused state through the UI: selecting the track may autoplay
+    // (the 210 ms fixture can also have already ended, which reads paused).
+    if (!ready.paused) {
+      await player.click({ position: togglePosition });
+    }
+    await expect
+      .poll(async () => (await audioState()).paused, {
+        timeout: 15_000,
+        message: 'player did not reach a paused state before the seek',
+      })
+      .toBe(true);
+    const beforeSeek = await audioState();
+
+    // User-visible seek: click the timeline a little past its middle. The
+    // timeline does not span the full element width (play button and time
+    // labels flank it), so assert the requested REGION — well past the
+    // opening stretch, short of the end — rather than an exact timestamp.
+    // `currentTime` is the position the native timeline renders; there is
+    // no separate visible-position hook.
+    //
+    // Movement is proven by a `seeked` event (counted by a listener installed
+    // before the click), not by distance from the pre-seek position: with
+    // selection-autoplay the pause can land arbitrarily close to where the
+    // timeline click lands, so a distance predicate can never become true
+    // even when the seek worked.
+    await player.evaluate((element) => {
+      const audio = element as HTMLAudioElement & { __seeked?: number };
+      audio.__seeked = 0;
+      audio.addEventListener('seeked', () => {
+        audio.__seeked = (audio.__seeked ?? 0) + 1;
+      });
+    });
+    await player.click({
+      position: { x: Math.round(width * 0.55), y: Math.round(height / 2) },
+    });
+
+    const regionLow = beforeSeek.duration * 0.3;
+    const regionHigh = beforeSeek.duration * 0.95;
+    await expect
+      .poll(
+        async () => {
+          const state = await audioState();
+          const seeked = await player.evaluate(
+            (element) =>
+              (element as HTMLAudioElement & { __seeked?: number }).__seeked ?? 0,
+          );
+          // Still-paused is part of the match: while paused, only the seek
+          // itself can have moved the position into the region, and the
+          // `seeked` event proves a seek completed rather than the position
+          // having started there.
+          return (
+            state.paused &&
+            state.currentTime >= regionLow &&
+            state.currentTime <= regionHigh &&
+            seeked > 0
+          );
+        },
+        {
+          timeout: 15_000,
+          message: 'seeking via the player UI did not move the paused audio position',
+        },
+      )
+      .toBe(true);
+    const afterSeek = await audioState();
+    expect(afterSeek.errorCode, 'player reported a media error after seeking').toBeNull();
+
+    // Playback must continue from the seeked position: resume through the UI
+    // toggle and require the position to advance past where the seek left
+    // it (on the 210 ms fixture this is satisfied by playing out to the
+    // end, where currentTime reaches duration). Advancing past the seek
+    // alone is not enough — restarting the track from 0 and playing to the
+    // end would also pass — so track the lowest position observed during
+    // resumed playback and require playback never to have dropped back
+    // toward the start.
+    //
+    // The floor is seeded with the paused seek position and then takes the
+    // minimum over both the browser's `timeupdate` events and every poll
+    // sample, so the check always has a finite sample: an `Infinity`
+    // initial value would pass the floor comparison vacuously when the
+    // clip ends before any `timeupdate` fires.
+    await player.evaluate((element) => {
+      const audio = element as HTMLAudioElement & { __resumeMin?: number };
+      audio.__resumeMin = audio.currentTime;
+      audio.addEventListener('timeupdate', () => {
+        audio.__resumeMin = Math.min(audio.__resumeMin ?? Infinity, audio.currentTime);
+      });
+    });
+    await player.click({ position: togglePosition });
+    let polledMin = Infinity;
+    await expect
+      .poll(
+        async () => {
+          const { currentTime } = await audioState();
+          if (Number.isFinite(currentTime)) {
+            polledMin = Math.min(polledMin, currentTime);
+          }
+          return currentTime;
+        },
+        {
+          timeout: 15_000,
+          message: 'playback did not continue from the seeked position',
+        },
+      )
+      .toBeGreaterThan(afterSeek.currentTime);
+    const eventMin = await player.evaluate(
+      (element) =>
+        (element as HTMLAudioElement & { __resumeMin?: number }).__resumeMin,
+    );
+    const resumeMin = Math.min(eventMin ?? Infinity, polledMin);
+    expect(
+      Number.isFinite(resumeMin),
+      'no playback position was sampled during resumed playback',
+    ).toBe(true);
+    expect(
+      resumeMin,
+      'playback restarted instead of continuing from the seek',
+    ).toBeGreaterThanOrEqual(afterSeek.currentTime - beforeSeek.duration * 0.05);
+    const continued = await audioState();
+    expect(continued.errorCode, 'player reported a media error after resuming').toBeNull();
+    expect(pageErrors, `page errors during player seek: ${pageErrors.join('; ')}`).toEqual([]);
   });
 });

@@ -20,8 +20,8 @@ use crate::queue::{validate_indexer_ref, QueueMsg};
 /// `wrangler.toml.example`.
 pub const INGEST_QUEUE_BINDING: &str = "INGEST_QUEUE";
 /// Queue name: must match `[[queues.producers]]` in `wrangler.toml.example`.
-/// (The consumer entry stays commented out there until the Queue handler and
-/// its dead-letter queue land.)
+/// (The consumer entry stays commented out until all runtime boundaries are
+/// executable; see `src/queue_consumer.rs` and `wrangler.toml.example`.)
 pub const INGEST_QUEUE_NAME: &str = "nntune-ingest-jobs";
 /// KV binding holding uploaded NZB bytes keyed by [`payload_ref`](QueueMsg::payload_ref).
 pub const PAYLOAD_KV_BINDING: &str = "INGEST_PAYLOADS";
@@ -55,8 +55,8 @@ pub const MAX_PAYLOAD_RETRY_DELAY_MS: u64 = 60_000;
 /// itself is edge-cached), so the consumer retries on this schedule instead
 /// of failing the job: 5 s, 15 s, 30 s, 60 s (cumulative 110 s, covering the
 /// documented ~60 s lag). Saturating, so any `u32` attempt maps to a sane
-/// delay. Contract for the consumer card: fetch with the minimum `cacheTtl`
-/// (30 s) so a cached miss expires before the later retries, and keep
+/// delay. The consumer fetches with the minimum `cacheTtl` (30 s) so a
+/// cached miss expires before the later retries, and keeps
 /// `max_retries = PAYLOAD_RETRY_ATTEMPTS` so the full window is usable.
 pub fn payload_retry_delay_ms(attempt: u32) -> u64 {
     match attempt {
@@ -144,7 +144,7 @@ pub fn build_search_dispatch(
     page: u32,
 ) -> Result<QueueMsg, &'static str> {
     let q = query.trim();
-    if q.is_empty() || q.len() > 200 {
+    if q.is_empty() || q.chars().count() > 200 {
         return Err("query must be 1..=200 chars");
     }
     if !validate_indexer_ref(indexer_ref) {
@@ -279,6 +279,40 @@ mod tests {
         assert!(build_search_dispatch(USER, "q", INDEXER, &[], 10, 101).is_err());
         // ':' would collide idempotency fields.
         assert!(bad_user("user:01"));
+    }
+
+    #[test]
+    fn search_dispatch_counts_query_scalars_not_utf8_bytes() {
+        // The contract is `1..=200 chars`: U+00E9 is one Unicode scalar
+        // but two UTF-8 bytes, so 200 of them (400 bytes) must build a
+        // dispatch and 201 must fail. A byte-length check rejects 200.
+        let exact = "\u{e9}".repeat(200);
+        let over = "\u{e9}".repeat(201);
+        assert_eq!(exact.chars().count(), 200);
+        assert_eq!(exact.len(), 400);
+        assert_eq!(over.chars().count(), 201);
+        let msg = build_search_dispatch(USER, &exact, INDEXER, &[], 10, 0)
+            .expect("200 scalars must be accepted");
+        assert_eq!(msg.query.as_deref(), Some(exact.as_str()));
+        assert_eq!(
+            build_search_dispatch(USER, &over, INDEXER, &[], 10, 0).err(),
+            Some("query must be 1..=200 chars")
+        );
+        // The ASCII boundary is unchanged (scalars == bytes).
+        assert!(build_search_dispatch(USER, &"x".repeat(200), INDEXER, &[], 10, 0).is_ok());
+        assert_eq!(
+            build_search_dispatch(USER, &"x".repeat(201), INDEXER, &[], 10, 0).err(),
+            Some("query must be 1..=200 chars")
+        );
+        // Trimming happens before counting and the stored query is the
+        // trimmed one; a padded over-limit query still fails.
+        let padded = build_search_dispatch(USER, &format!("  {exact}  "), INDEXER, &[], 10, 0)
+            .expect("padding must not count toward the limit");
+        assert_eq!(padded.query.as_deref(), Some(exact.as_str()));
+        assert_eq!(
+            build_search_dispatch(USER, &format!("  {over}  "), INDEXER, &[], 10, 0).err(),
+            Some("query must be 1..=200 chars")
+        );
     }
 
     #[test]

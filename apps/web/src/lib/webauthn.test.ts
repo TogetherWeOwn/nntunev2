@@ -5,6 +5,7 @@ import {
 	encodeBase64Url,
 	serializePublicKeyCredential,
 	toCreationOptions,
+	toRegistrationOptions,
 	toRequestOptions
 } from './webauthn.js';
 
@@ -60,7 +61,8 @@ describe('WebAuthn options', () => {
 		expect(options.excludeCredentials?.[0]?.transports).toEqual(['internal']);
 		expect(options.authenticatorSelection).toEqual({
 			residentKey: 'required',
-			requireResidentKey: true
+			requireResidentKey: true,
+			userVerification: 'required'
 		});
 		expect(options.timeout).toBe(60_000);
 	});
@@ -82,6 +84,58 @@ describe('WebAuthn options', () => {
 		expect(options.allowCredentials).toEqual([
 			{ id: decodeBase64Url('BAUG'), type: 'public-key', transports: ['internal'] }
 		]);
+	});
+
+	it('builds creation options from the register/start triple', () => {
+		// The Worker returns only {challenge, user_id, rp_id}; the client
+		// assembles the rest (algorithms the server verifies, none
+		// attestation, resident key required).
+		const options = toRegistrationOptions('AQID', 'BAUG', 'example.com', 'ada@example.com');
+
+		expect(options.challenge).toBe('AQID');
+		expect(options.rp).toEqual({ name: 'NNTune', id: 'example.com' });
+		expect(options.user).toEqual({
+			id: 'BAUG',
+			name: 'ada@example.com',
+			displayName: 'ada@example.com'
+		});
+		expect(options.pubKeyCredParams).toEqual([
+			{ type: 'public-key', alg: -7 },
+			{ type: 'public-key', alg: -8 }
+		]);
+		expect(options.excludeCredentials).toEqual([]);
+		expect(options.attestation).toBe('none');
+
+		// The assembled options must survive the browser conversion.
+		const browser = toCreationOptions(options);
+		expect(Array.from(new Uint8Array(browser.challenge as ArrayBuffer))).toEqual([1, 2, 3]);
+		expect(Array.from(new Uint8Array(browser.user.id as ArrayBuffer))).toEqual([4, 5, 6]);
+		expect(browser.authenticatorSelection).toEqual({
+			residentKey: 'required',
+			requireResidentKey: true,
+			userVerification: 'required'
+		});
+		expect(options.authenticatorSelection?.userVerification).toBe('required');
+	});
+
+	it('forces user verification on login even if the options ask for less', () => {
+		// RP policy: the Worker rejects assertions without the UV flag, so
+		// the browser must be asked for UV (PIN/biometric) up front.
+		expect(toRequestOptions({ challenge: 'AQID', rpId: 'example.com' }).userVerification).toBe(
+			'required'
+		);
+		expect(
+			toRequestOptions({ challenge: 'AQID', userVerification: 'discouraged' }).userVerification
+		).toBe('required');
+		expect(
+			toCreationOptions({
+				challenge: 'AQID',
+				rp: { name: 'NNTune', id: 'example.com' },
+				user: { id: 'BAUG', name: 'a', displayName: 'a' },
+				pubKeyCredParams: [{ alg: -7, type: 'public-key' }],
+				authenticatorSelection: { userVerification: 'discouraged' }
+			}).authenticatorSelection?.userVerification
+		).toBe('required');
 	});
 });
 
@@ -144,4 +198,26 @@ describe('serializePublicKeyCredential', () => {
 			clientExtensionResults: {}
 		});
 	});
+});
+
+it('requires user verification for creation and request options', () => {
+	const registration = toRegistrationOptions('AQID', 'BAUG', 'example.com', 'ada@example.com');
+	expect(registration.authenticatorSelection?.userVerification).toBe('required');
+
+	const weakenedCreation = toCreationOptions({
+		...registration,
+		authenticatorSelection: {
+			...registration.authenticatorSelection,
+			userVerification: 'discouraged'
+		}
+	});
+	expect(weakenedCreation.authenticatorSelection?.userVerification).toBe('required');
+
+	expect(toRequestOptions({ challenge: 'AQID' }).userVerification).toBe('required');
+
+	const weakenedRequest = toRequestOptions({
+		challenge: 'AQID',
+		userVerification: 'discouraged'
+	});
+	expect(weakenedRequest.userVerification).toBe('required');
 });

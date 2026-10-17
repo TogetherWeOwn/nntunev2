@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 
@@ -174,16 +175,16 @@ pub fn resolve_trace_id(header: Option<&str>) -> String {
 /// Last-resort ID when the entropy source fails (production targets always
 /// provide entropy; this keeps a handler total instead of panicking the
 /// isolate). Fixed prefix marks the weakness so a flood of `f`-prefixed IDs
-/// in logs points straight at the RNG, not at a caller.
+/// in logs points straight at the RNG, not at a caller. A process-local
+/// atomic counter supplies the distinct low bits: unlike wall-clock time it
+/// works on every target (`SystemTime::now` panics on wasm32), and it keeps
+/// IDs distinct inside one isolate. Obviously not random.
 fn fallback_trace_id() -> String {
-    // 31 fixed chars + 1 nibble of process time: unique enough to correlate a
-    // single incident window, obviously not random.
-    let nibble = (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0)
-        % 16) as u8;
-    format!("fffffffffffffffffffffffffffffff{:x}", nibble & 0x0f)
+    static FALLBACK_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = FALLBACK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // 16 fixed chars + 16 hex chars of counter: full 128-bit shape, valid
+    // under `is_valid_trace_id` so downstream propagation never breaks.
+    format!("ffffffffffffffff{seq:016x}")
 }
 
 /// Format unix millis as an RFC 3339 UTC timestamp ending in `Z`, always with

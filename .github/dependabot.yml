@@ -17,10 +17,12 @@
 # entry. npm watches the SvelteKit app (`apps/web`) and the e2e harness
 # (`e2e`), not a top-level `web/`.
 #
-# Lockfiles: the repo ignores `Cargo.lock` (see root `.gitignore`), so the
-# cargo entries update direct dependencies without transitive visibility.
-# Committing lockfiles for the worker crates would close that gap; that is
-# a scaffold-wide decision for the owning card, not this security PR.
+# Lockfiles: the repo ignores `Cargo.lock` (see root `.gitignore`) except
+# `workers/api/Cargo.lock`, which is committed (auth/vault crypto) and built
+# with `--locked`, so the `/workers/api` entry sees transitive dependencies
+# and its updates are reviewed lockfile changes. The other cargo entries
+# still update direct dependencies without transitive visibility; committing
+# their lockfiles is a scaffold-wide decision for the owning card.
 #
 # First Dependabot PR: confirm the required checks (`ci-ok`, `gitleaks`,
 # `pr-lint`, Paperclip Review) all appear on it before relying on them —
@@ -32,6 +34,12 @@ version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -48,6 +56,12 @@ updates:
   # standalone crates and get their own entries below).
   - package-ecosystem: "cargo"
     directory: "/"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -63,6 +77,12 @@ updates:
   # Standalone worker crates (vault crypto: aes-gcm, hmac; base64).
   - package-ecosystem: "cargo"
     directory: "/workers/api"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -77,6 +97,12 @@ updates:
 
   - package-ecosystem: "cargo"
     directory: "/workers/ingest"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -92,6 +118,12 @@ updates:
   # MusicBrainz mirror worker (standalone crate, built by the rust-mb job).
   - package-ecosystem: "cargo"
     directory: "/workers/mb"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -107,6 +139,12 @@ updates:
   # Batch import image (FROM postgres).
   - package-ecosystem: "docker"
     directory: "/containers/mb-import"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -121,6 +159,12 @@ updates:
 
   - package-ecosystem: "npm"
     directory: "/apps/web"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -135,6 +179,12 @@ updates:
 
   - package-ecosystem: "npm"
     directory: "/e2e"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -146,3 +196,8 @@ updates:
     commit-message:
       prefix: "chore"
       include: "scope"
+    # @types/node major must track the Node runtime in ci.yml (e2e-lint)
+    # and e2e-staging.yml; bump it manually alongside node-version.
+    ignore:
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]

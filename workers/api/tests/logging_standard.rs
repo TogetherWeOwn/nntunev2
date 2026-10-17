@@ -30,6 +30,10 @@ const BANNED_KEY_PARTS: &[&str] = &[
     "cvv",
     "email",
     "session",
+    "address",
+    "phone",
+    "payment",
+    "postal",
 ];
 
 fn manifest_dir() -> PathBuf {

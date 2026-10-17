@@ -54,7 +54,44 @@ export function encodeBase64Url(value: ArrayBuffer | ArrayBufferView): string {
 	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
-/** Convert API JSON creation options into browser options, requiring discoverable credentials. */
+/**
+ * Build API JSON creation options from the Worker's `register/start`
+ * response (`{challenge, user_id, rp_id}`). The server deliberately returns
+ * only these three fields; the client assembles the full WebAuthn options
+ * (algorithms the server verifies: ES256 and EdDSA; `none` attestation,
+ * which the server accepts). Shape pinned by
+ * `workers/api/tests/fixtures/api-web-contract.json`.
+ */
+export function toRegistrationOptions(
+	challenge: string,
+	userId: string,
+	rpId: string,
+	email: string
+): RegistrationOptionsJSON {
+	return {
+		challenge,
+		rp: { name: 'NNTune', id: rpId },
+		user: { id: userId, name: email, displayName: email },
+		pubKeyCredParams: [
+			{ type: 'public-key', alg: -7 },
+			{ type: 'public-key', alg: -8 }
+		],
+		excludeCredentials: [],
+		authenticatorSelection: {
+			residentKey: 'required',
+			requireResidentKey: true,
+			userVerification: 'required'
+		},
+		attestation: 'none'
+	};
+}
+
+/**
+ * Convert API JSON creation options into browser options, requiring
+ * discoverable credentials and user verification (PIN/biometric). The Worker
+ * rejects any ceremony whose authenticatorData lacks the UV flag, so the
+ * browser is asked for it up front instead of failing after the tap.
+ */
 export function toCreationOptions(
 	options: RegistrationOptionsJSON
 ): PublicKeyCredentialCreationOptions {
@@ -67,12 +104,17 @@ export function toCreationOptions(
 		authenticatorSelection: {
 			...authenticatorSelection,
 			residentKey: 'required',
-			requireResidentKey: true
+			requireResidentKey: true,
+			userVerification: 'required'
 		}
 	};
 }
 
-/** Convert API JSON request options; omitted allowCredentials enables usernameless login. */
+/**
+ * Convert API JSON request options; omitted allowCredentials enables
+ * usernameless login. User verification is always required (see
+ * `toCreationOptions`); a caller-supplied weaker value is overridden.
+ */
 export function toRequestOptions(
 	options: AuthenticationOptionsJSON
 ): PublicKeyCredentialRequestOptions {
@@ -80,6 +122,7 @@ export function toRequestOptions(
 	return {
 		...rest,
 		challenge: decodeBase64Url(challenge),
+		userVerification: 'required',
 		...(allowCredentials === undefined
 			? {}
 			: { allowCredentials: allowCredentials.map(toCredentialDescriptor) })

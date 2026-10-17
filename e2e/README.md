@@ -12,7 +12,8 @@ Actions secrets (CI) or shell exports (local).
 
 1. **Pre-deploy (now):** `STAGING_BASE_URL` is unset. Every spec skips with a
    notice. PRs and `main` stay green; the `e2e-lint` CI job still typechecks
-   and lists the specs so the harness cannot rot silently.
+   and lists the specs so the harness cannot rot silently. A skipped live
+   run is not acceptance evidence: it proves nothing about staging.
 2. **Activation hold:** keep the Actions secret `STAGING_BASE_URL` unset until
    deployment exists and the authorized Operator provides a value-free delivery
    receipt for the existing QA Access pair through an approved secure source and
@@ -35,21 +36,30 @@ checked against its real contract for the first time. The smoke stays green
 on the current app; the items below are future contract, documented here so
 the activation checklist is accurate:
 
-- `GET /api/health` returns exactly `{ok:true}`
+- `GET /api/health` returns `{ok:true, version:<pkg>}`
   (`apps/web/src/routes/api/health/+server.ts`, pinned by
-  `apps/web/tests/smoke.spec.ts` `toEqual({ok:true})`). `health.spec.ts`
-  requires `ok === true` and asserts `version` only when the app ships it.
-- `GET /api/ready` does not exist yet (staging answers 404). The smoke
-  tolerates 404 as "not yet implemented" and pins the 200/503 + Retry-After
-  shape once the route lands.
-- `apps/web/src` has no `data-testid` hooks yet. The app-shell smoke accepts
-  `data-testid="app-root"` when present and otherwise falls back to the
-  landing's `NNTune` heading; signup/BYOP/library/player/meter hooks
-  (`helpers/contract.ts` `TESTIDS`) and `/signup`'s real form, the BYOP
-  wizard, ingest/library/stream/usage endpoints arrive with the venture
-  slices that own them. The journey specs (`signup-byop`, `ingest-play-meter`)
-  therefore remain red until those slices land — that failure is the signal,
-  not noise.
+  `apps/web/tests/smoke.spec.ts` exact-keys assertion). `health.spec.ts`
+  requires `ok === true` and asserts `version` whenever the deployed app
+  ships it, so the check stays green across the deploy boundary.
+- `GET /api/ready` currently returns 200 `{ok:true}` while the stateless app
+  can serve traffic (`apps/web/src/routes/api/ready/+server.ts`). The 503
+  `{ok:false}` plus `Retry-After` shape in `apps/web/src/lib/ready.ts` is
+  reserved for a future downstream dependency check; the current endpoint
+  does not emit it. The smoke is a **promotion** gate, stricter than the
+  route: `assertPromotionReady` (`helpers/readiness.ts`) passes only for
+  HTTP 200 JSON `{ok:true}`. A 404 (build predating the route), a 503 (even
+  well-formed, with `Retry-After`), an HTML 200, malformed JSON or
+  `{ok:false}` all fail the smoke; the route's 503 not-ready semantics are
+  unchanged. The gate is pinned offline by `tests/readiness.spec.ts`
+  (`npm run test:unit`), with no staging or credentials needed.
+- `apps/web/src/lib/contract.test.ts` checks that each hook in
+  `helpers/contract.ts` `TESTIDS` is declared in its expected route file.
+  This is a source-level route contract, not proof that conditional markup is
+  reachable or visible at runtime; the smoke separately checks selected hooks
+  in rendered pages. `/signup`'s real submission, the BYOP wizard's backend
+  behavior, ingest/library/stream/usage endpoints, and usage-meter enforcement
+  still depend on their venture slices; the journey specs expose those missing
+  backend behaviors directly.
 
 ## Run locally
 
@@ -80,8 +90,8 @@ dependencies this harness needs.
 |---|---|---|
 | `STAGING_BASE_URL` | yes (post-deploy) | `https://` staging origin. Unset → skip with notice. |
 | `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | whenever staging is configured | QA service-token pair. Both absent or either absent → fail closed before requests. |
-| `QA_AUTH_TOKEN` | optional | Bearer for `POST /api/test-accounts` (staging-only seam). Absent → UI signup fallback. |
-| `SYNTHETIC_NNTP_HOST` / `_PORT` / `_USER` / `_TLS` | for BYOP spec | Hosted fixture server or test provider (defaults: `synthetic-nntp`, `563`, `e2e`, TLS on). |
+| `QA_AUTH_TOKEN` | optional | Bearer for `POST /api/test-accounts` (staging-only seam). Absent → UI signup fallback. The dedicated public UI-signup case ignores the seam either way. |
+| `SYNTHETIC_NNTP_HOST` / `_PORT` / `_USER` / `_TLS` | for BYOP spec | Hosted fixture server or test provider (defaults: `synthetic-nntp`, `563`, `e2e`, TLS on). The port must be in the BYOP allowlist (`119` or `563`) and TLS-off is rejected — the harness fails closed on a fixture transport the wizard cannot represent. |
 | `SYNTHETIC_NNTP_PASS` | for BYOP spec | No default — fail closed when missing. |
 
 How the suite uses them:
@@ -112,9 +122,17 @@ How the suite uses them:
   `helpers/accounts.ts` names it; cookie sessions would update the helper +
   specs together).
 - Test accounts are throwaway (`e2e+<stamp>@example.test`); the API seam is
-  tried first, a fully-implemented UI signup second (each journey file signs
+  tried first, a form-submission UI signup (emailed-code step) second (each journey file signs
   up its own identity — Playwright isolates module state per file, so there
-  is no cross-file account sharing). Once `QA_AUTH_TOKEN` is set the seam is
+  is no cross-file account sharing). Independently of that choice,
+  `signup-byop.spec.ts` carries a dedicated public UI-signup case
+  (`submitPublicUiSignup`, null identity): it always submits the real
+  `/signup` form with a unique synthetic mailbox and requires the
+  emailed-code step with no inline error, even when `QA_AUTH_TOKEN`
+  is set, so a seam-backed run still proves public UI form submission.
+  Wizard arrival via the form is not asserted: the code-plus-passkey
+  finish needs a staging code-retrieval seam that does not exist yet
+  (see row 1 of `docs/m1-exit-traceability.md`). Once `QA_AUTH_TOKEN` is set the seam is
   required infrastructure: transport errors, non-2xx and non-JSON mint
   responses throw instead of collapsing into a silent skip, and API-driven
   steps (`requireApiAccount`) refuse to run anonymously. The identity that
@@ -128,9 +146,14 @@ How the suite uses them:
 
 ## CI
 
-- `.github/workflows/e2e-staging.yml` — full suite on `push` to `main`,
-  manual dispatch, and a 6-hour synthetic schedule. The deployment lane must
-  sequence execution after staging deploy; a push alone is not deploy proof.
+- `.github/workflows/e2e-staging.yml` — no `push` trigger. The full
+  journey runs only as a reusable-workflow call from `deploy.yml`'s
+  `post-deploy-e2e` job, which `needs` the same run's `staging-web`
+  deploy, so a skipped/failed deploy cannot produce a full-journey PASS
+  and the E2E run cannot race its deploy. Manual dispatch and the
+  6-hour schedule run the synthetic smoke only (monitoring, not
+  post-deploy promotion evidence); dispatch defines no `post_deploy`
+  input, so it cannot mint that evidence by hand.
   Missing `STAGING_BASE_URL` → step-level skip with notice (pre-deploy).
   Both jobs require the Access pair in preflight before activating tests;
   configured staging never skips for missing credentials. Failure artifacts
@@ -141,9 +164,13 @@ How the suite uses them:
   and the aggregate gate with dummy inputs; failures, cancellations and skips
   of required jobs make `ci-ok` red.
 - **Prod promotion gate (required integration):** the deployment lane must
-  require the `e2e-staging` result on the deployed SHA and block promotion on
-  failure. Wiring and live enforcement are still acceptance prerequisites,
-  not a verified result of this PR.
+  require the post-deploy full-journey result (the `post-deploy-e2e` job in
+  the same `deploy.yml` run as the successful `staging-web` deploy) and
+  block promotion on failure. Sequencing after the deploy is wired;
+  blocking a later production promotion on that result, and live
+  enforcement, are still acceptance prerequisites of that later lane. A
+  source SHA is not deployed-build identity, so the result is not
+  same-build evidence until build identity is separately proven.
 
 ## Evidence
 
@@ -162,5 +189,14 @@ apply the exact checked-in sanitize blocks, and assert the marker password
 is absent from every uploaded file including base64-decoded payloads. Do not
 enable traces/screenshots or the html reporter for credential-bearing runs
 without a verified redaction path. A QA PASS verdict cites the green
-`e2e-staging` run URL + deployed head SHA; NEEDS WORK cites the failing
-spec + step.
+post-deploy run URL (the `deploy.yml` run whose `staging-web` succeeded
+and whose `post-deploy-e2e` full journey passed) + the source head SHA —
+never a scheduled/manual synthetic run, which is monitoring only; NEEDS
+WORK cites the failing spec + step. Every spec that branches on the test-account seam records a
+bounded `signup-path` test annotation — exactly `public-ui-signup` or
+`api-minted-account`, with no email, account id, token or provider data.
+Both staging jobs publish those labels to the run's step summary on every
+configured run (pass or fail), because green runs upload no artifacts and
+the list reporter does not print annotations; the sanitized junit upload
+stays failure-only (7 days). A seam-backed (`api-minted-account`) run
+never counts as proof of the public UI signup.

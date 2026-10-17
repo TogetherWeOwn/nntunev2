@@ -14,9 +14,14 @@
 //! - Mutations: invisible rows are [`LibraryError::NotFound`]; visible rows
 //!   owned by someone else are [`LibraryError::Forbidden`]. The Worker
 //!   decides this from [`MutationLookup`] (an `is_owner` boolean), never
-//!   from the owner id itself, and maps 0 affected UPDATE/DELETE rows to
-//!   [`LibraryError::NotFound`] (the row vanished between lookup and write;
-//!   the owner predicate already makes cross-owner writes inexpressible).
+//!   from the owner id itself, and maps 0 affected UPDATE/DELETE rows via
+//!   [`fenced_write_outcome`]: normally [`LibraryError::NotFound`] (the row
+//!   vanished between lookup and write; the owner predicate already makes
+//!   cross-owner writes inexpressible), but [`LibraryError::AccountDeleting`]
+//!   when the account-deletion fence closed the write (ADR 0002 rule 3).
+//!   Every write statement below carries that fence in-statement (see the
+//!   statement docs), so a create/restore can never repopulate user-owned
+//!   rows after `users.deleting_at` is set.
 //! - Lists are keyset pages ordered by the opaque public id descending
 //!   (`ORDER BY public_id COLLATE "C" DESC`), capped at
 //!   [`MAX_PAGE_SIZE`]. The order is by the random 128-bit handle, NOT
@@ -32,7 +37,6 @@
 //!   Internal row ids and `owner_user_id` never serialize. The authorizers
 //!   below return intents (validated parameters), never mutated rows.
 
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 /// Maximum display-name length (chars).
@@ -59,6 +63,10 @@ pub enum LibraryError {
     Forbidden,
     /// Invisible or unknown id: the HTTP layer returns 404.
     NotFound,
+    /// The caller's account is being deleted (`users.deleting_at` is set),
+    /// so the fenced write is refused: the HTTP layer returns 409 with
+    /// the stable `account_deleting` code (ADR 0002 rule 3).
+    AccountDeleting,
     /// Shape violation (blank/overlong name or items): HTTP layer returns 422.
     Invalid,
 }
@@ -69,6 +77,7 @@ impl LibraryError {
             LibraryError::Unauthorized => 401,
             LibraryError::Forbidden => 403,
             LibraryError::NotFound => 404,
+            LibraryError::AccountDeleting => 409,
             LibraryError::Invalid => 422,
         }
     }
@@ -80,8 +89,32 @@ impl std::fmt::Display for LibraryError {
             LibraryError::Unauthorized => write!(f, "authentication required"),
             LibraryError::Forbidden => write!(f, "not the owner"),
             LibraryError::NotFound => write!(f, "not found"),
+            LibraryError::AccountDeleting => write!(f, "account is being deleted"),
             LibraryError::Invalid => write!(f, "invalid genre or playlist"),
         }
+    }
+}
+
+/// Map a fenced write's affected-row count to its library outcome.
+///
+/// The write statements carry the account-deletion fence in-statement, so
+/// 0 affected rows means either the target row vanished (`NotFound`, the
+/// pre-fence behavior) or the fence closed between the mutation lookup
+/// and the write. The Worker disambiguates the 0-row case with
+/// `account_deletion::ACCOUNT_DELETING_PROBE_SQL` for the caller and
+/// passes the result here (`None` when the user row no longer exists, in
+/// which case the session that authorized the call is gone with it and
+/// `NotFound` keeps the no-oracle shape). Affected rows > 0 always means
+/// the write landed while the fence was open.
+pub fn fenced_write_outcome(
+    affected_rows: u64,
+    account_deleting: Option<bool>,
+) -> Result<(), LibraryError> {
+    use crate::account_deletion::{classify_fenced_write, FencedWriteOutcome};
+    match classify_fenced_write(affected_rows, account_deleting) {
+        FencedWriteOutcome::Written => Ok(()),
+        FencedWriteOutcome::AccountDeleting => Err(LibraryError::AccountDeleting),
+        FencedWriteOutcome::NoRow => Err(LibraryError::NotFound),
     }
 }
 
@@ -91,7 +124,7 @@ impl std::fmt::Display for LibraryError {
 /// (see the list pages).
 pub fn new_public_id() -> String {
     let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("secure randomness unavailable");
     crate::b64::encode(&bytes)
 }
 
@@ -679,9 +712,26 @@ pub fn authorize_playlist_delete(
 // 403-vs-404 question without exposing the id itself.
 //
 // Mutation statements affect 0 rows when the row vanished between lookup and
-// write (or never existed): the Worker maps that to NotFound (404). The
-// owner predicate already makes cross-owner writes inexpressible, so a 0-row
-// write is never a silent foreign mutation.
+// write (or never existed): the Worker maps that through
+// [`fenced_write_outcome`] to NotFound (404), or AccountDeleting (409) when
+// the fence closed the write. The owner predicate already makes cross-owner
+// writes inexpressible, so a 0-row write is never a silent foreign mutation.
+//
+// Account-deletion fence (ADR 0002 rule 3): every write statement opens with
+// the `writer_fence` derived table — `SELECT id FROM users WHERE id = $2 AND
+// deleting_at IS NULL FOR SHARE` on the owner's row — joined into the write,
+// so the write can only land while the fence is open and the `FOR SHARE`
+// lock is held until the statement commits. The scheduling
+// `UPDATE users SET deleting_at = ...` needs that row's lock, so it either
+// waits for an in-flight writer to commit or fences every later one; no
+// writer can pass the marker check and commit after it. Genre/playlist
+// UPDATE/DELETE additionally fence the target container: the container row
+// is locked by the UPDATE/DELETE itself, and that lock is only taken for
+// rows that joined through `writer_fence`, so the lock order is always
+// user row first, container row second — the same order scheduling uses.
+// (The container `deleting_at` marker itself lands with the playlist
+// forward migration in ADR 0002; until then the held container lock is
+// what a container-delete marker UPDATE will conflict with.)
 
 /// Caller-visible genre page, ordered by the opaque public id descending
 /// (arbitrary order, NOT newest-first).
@@ -713,20 +763,25 @@ pub fn genre_mutation_lookup_statement() -> &'static str {
 }
 
 /// Parameters: public_id, owner_user_id, name, is_public, created_at.
+/// Fenced: inserts only while the owner's `deleting_at` is NULL, holding
+/// the user row `FOR SHARE` through the insert. 0 affected rows maps
+/// through [`fenced_write_outcome`].
 pub fn genre_insert_statement() -> &'static str {
-    "INSERT INTO genres (public_id, owner_user_id, name, is_public, created_at) VALUES ($1, $2, $3, $4, $5)"
+    "INSERT INTO genres (public_id, owner_user_id, name, is_public, created_at) SELECT $1, $2, $3, $4, $5 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence"
 }
 
 /// Parameters: public_id, owner_user_id, name, is_public.
-/// 0 affected rows maps to NotFound (404).
+/// Fenced on the user row first, then the container row lock the UPDATE
+/// itself takes. 0 affected rows maps through [`fenced_write_outcome`].
 pub fn genre_update_statement() -> &'static str {
-    "UPDATE genres SET name = $3, is_public = $4 WHERE public_id = $1 AND owner_user_id = $2"
+    "UPDATE genres SET name = $3, is_public = $4 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE genres.public_id = $1 AND genres.owner_user_id = $2"
 }
 
 /// Parameters: public_id, owner_user_id.
-/// 0 affected rows maps to NotFound (404).
+/// Fenced like [`genre_update_statement`]. 0 affected rows maps through
+/// [`fenced_write_outcome`].
 pub fn genre_delete_statement() -> &'static str {
-    "DELETE FROM genres WHERE public_id = $1 AND owner_user_id = $2"
+    "DELETE FROM genres USING (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE genres.public_id = $1 AND genres.owner_user_id = $2"
 }
 
 /// Caller-visible playlist page (summaries: no `items`), ordered by the
@@ -752,20 +807,24 @@ pub fn playlist_mutation_lookup_statement() -> &'static str {
 }
 
 /// Parameters: public_id, owner_user_id, name, items, is_public, created_at.
+/// Fenced like [`genre_insert_statement`]: 0 affected rows maps through
+/// [`fenced_write_outcome`].
 pub fn playlist_insert_statement() -> &'static str {
-    "INSERT INTO playlists (public_id, owner_user_id, name, items, is_public, created_at) VALUES ($1, $2, $3, $4, $5, $6)"
+    "INSERT INTO playlists (public_id, owner_user_id, name, items, is_public, created_at) SELECT $1, $2, $3, $4, $5, $6 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence"
 }
 
 /// Parameters: public_id, owner_user_id, name, items, is_public.
-/// 0 affected rows maps to NotFound (404).
+/// Fenced on the user row first, then the container row lock the UPDATE
+/// itself takes. 0 affected rows maps through [`fenced_write_outcome`].
 pub fn playlist_update_statement() -> &'static str {
-    "UPDATE playlists SET name = $3, items = $4, is_public = $5 WHERE public_id = $1 AND owner_user_id = $2"
+    "UPDATE playlists SET name = $3, items = $4, is_public = $5 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE playlists.public_id = $1 AND playlists.owner_user_id = $2"
 }
 
 /// Parameters: public_id, owner_user_id.
-/// 0 affected rows maps to NotFound (404).
+/// Fenced like [`playlist_update_statement`]. 0 affected rows maps
+/// through [`fenced_write_outcome`].
 pub fn playlist_delete_statement() -> &'static str {
-    "DELETE FROM playlists WHERE public_id = $1 AND owner_user_id = $2"
+    "DELETE FROM playlists USING (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE playlists.public_id = $1 AND playlists.owner_user_id = $2"
 }
 
 #[cfg(test)]
@@ -1206,49 +1265,67 @@ mod tests {
         // asserts below name the failing dimension.
         assert_eq!(
             genre_insert_statement(),
-            "INSERT INTO genres (public_id, owner_user_id, name, is_public, created_at) VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO genres (public_id, owner_user_id, name, is_public, created_at) SELECT $1, $2, $3, $4, $5 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence",
             "genre insert"
         );
         assert_eq!(
             genre_update_statement(),
-            "UPDATE genres SET name = $3, is_public = $4 WHERE public_id = $1 AND owner_user_id = $2",
+            "UPDATE genres SET name = $3, is_public = $4 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE genres.public_id = $1 AND genres.owner_user_id = $2",
             "genre update"
         );
         assert_eq!(
             genre_delete_statement(),
-            "DELETE FROM genres WHERE public_id = $1 AND owner_user_id = $2",
+            "DELETE FROM genres USING (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE genres.public_id = $1 AND genres.owner_user_id = $2",
             "genre delete"
         );
         assert_eq!(
             playlist_insert_statement(),
-            "INSERT INTO playlists (public_id, owner_user_id, name, items, is_public, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO playlists (public_id, owner_user_id, name, items, is_public, created_at) SELECT $1, $2, $3, $4, $5, $6 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence",
             "playlist insert"
         );
         assert_eq!(
             playlist_update_statement(),
-            "UPDATE playlists SET name = $3, items = $4, is_public = $5 WHERE public_id = $1 AND owner_user_id = $2",
+            "UPDATE playlists SET name = $3, items = $4, is_public = $5 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE playlists.public_id = $1 AND playlists.owner_user_id = $2",
             "playlist update"
         );
         assert_eq!(
             playlist_delete_statement(),
-            "DELETE FROM playlists WHERE public_id = $1 AND owner_user_id = $2",
+            "DELETE FROM playlists USING (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE playlists.public_id = $1 AND playlists.owner_user_id = $2",
             "playlist delete"
         );
         // Targeted dimensions (same failure, named cause): the owner predicate
         // must stay grouped as one `AND` unit; `OR` would wipe or rename every
         // row of the caller plus a foreign public row.
-        for (sql, table, other_table) in [
-            (genre_update_statement(), "UPDATE genres", "playlists"),
-            (genre_delete_statement(), "DELETE FROM genres", "playlists"),
-            (playlist_update_statement(), "UPDATE playlists", "genres"),
+        for (sql, table, other_table, qualified) in [
+            (
+                genre_update_statement(),
+                "UPDATE genres",
+                "playlists",
+                "genres",
+            ),
+            (
+                genre_delete_statement(),
+                "DELETE FROM genres",
+                "playlists",
+                "genres",
+            ),
+            (
+                playlist_update_statement(),
+                "UPDATE playlists",
+                "genres",
+                "playlists",
+            ),
             (
                 playlist_delete_statement(),
                 "DELETE FROM playlists",
                 "genres",
+                "playlists",
             ),
         ] {
             assert!(
-                sql.contains("WHERE public_id = $1 AND owner_user_id = $2"),
+                sql.contains(&format!(
+                    "WHERE {qualified}.public_id = $1 AND {qualified}.owner_user_id = $2"
+                )),
                 "{sql}"
             );
             assert!(!sql.contains(" OR owner_user_id"), "{sql}");
@@ -1270,15 +1347,95 @@ mod tests {
         // INSERT column/placeholder order: swapping $2/$3, $3/$4, or $4/$5
         // must fail the exact pins above; the placeholders below name it.
         assert!(
-            genre_insert_statement().contains("VALUES ($1, $2, $3, $4, $5)"),
+            genre_insert_statement().contains("SELECT $1, $2, $3, $4, $5 FROM"),
             "{}",
             genre_insert_statement()
         );
         assert!(
-            playlist_insert_statement().contains("VALUES ($1, $2, $3, $4, $5, $6)"),
+            playlist_insert_statement().contains("SELECT $1, $2, $3, $4, $5, $6 FROM"),
             "{}",
             playlist_insert_statement()
         );
+    }
+
+    #[test]
+    fn write_statements_carry_the_account_deletion_fence_in_lock_order() {
+        // ADR 0002 rule 3: every writer takes the owner row FOR SHARE and
+        // refuses a set deleting_at; the fence must be joined into the
+        // write itself (not a preceding read the delete can slip behind),
+        // and it must textually precede the container predicate so lock
+        // order stays user -> container on update/delete.
+        const FENCE: &str =
+            "(SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence";
+        for sql in [
+            genre_insert_statement(),
+            genre_update_statement(),
+            genre_delete_statement(),
+            playlist_insert_statement(),
+            playlist_update_statement(),
+            playlist_delete_statement(),
+        ] {
+            assert_eq!(sql.matches(FENCE).count(), 1, "{sql}");
+            // FOR SHARE, never FOR UPDATE (sibling writers must not block
+            // each other) and never NOWAIT/SKIP (a skipped fence row would
+            // read as "not deleting").
+            assert!(!sql.contains("FOR UPDATE"), "{sql}");
+            assert!(!sql.contains("NOWAIT"), "{sql}");
+            assert!(!sql.contains("SKIP LOCKED"), "{sql}");
+            // The marker predicate is IS NULL on deleting_at: weakening it
+            // to IS NOT NULL or dropping it lets writes through the marker.
+            assert!(!sql.contains("deleting_at IS NOT NULL"), "{sql}");
+        }
+        for (sql, qualified) in [
+            (genre_update_statement(), "genres"),
+            (genre_delete_statement(), "genres"),
+            (playlist_update_statement(), "playlists"),
+            (playlist_delete_statement(), "playlists"),
+        ] {
+            let fence_at = sql.find(FENCE).unwrap();
+            let container_at = sql
+                .find(&format!("WHERE {qualified}.public_id = $1"))
+                .unwrap();
+            assert!(
+                fence_at < container_at,
+                "user fence must precede the container predicate: {sql}"
+            );
+        }
+        // Inserts bind the fence to the owner parameter ($2), never the
+        // new public id ($1): fencing on $1 would lock a nonexistent user
+        // and admit every write.
+        for sql in [genre_insert_statement(), playlist_insert_statement()] {
+            assert!(
+                sql.contains("FROM (SELECT id FROM users WHERE id = $2"),
+                "{sql}"
+            );
+            assert!(!sql.contains("WHERE id = $1"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn fenced_write_outcome_maps_rows_and_probe_to_stable_errors() {
+        // Normal write: rows landed, probe never reclassifies it.
+        for probe in [Some(true), Some(false), None] {
+            assert_eq!(fenced_write_outcome(1, probe), Ok(()), "{probe:?}");
+        }
+        // Deleting user: 0 rows + set marker is the typed 409, never the
+        // generic 404 a vanished row gets.
+        assert_eq!(
+            fenced_write_outcome(0, Some(true)),
+            Err(LibraryError::AccountDeleting)
+        );
+        assert_eq!(LibraryError::AccountDeleting.http_status(), 409);
+        assert_eq!(
+            LibraryError::AccountDeleting.to_string(),
+            "account is being deleted"
+        );
+        // Vanished row / gone user with the fence open keeps 404.
+        assert_eq!(
+            fenced_write_outcome(0, Some(false)),
+            Err(LibraryError::NotFound)
+        );
+        assert_eq!(fenced_write_outcome(0, None), Err(LibraryError::NotFound));
     }
 
     fn response_genre_rows() -> Vec<GenreRow> {

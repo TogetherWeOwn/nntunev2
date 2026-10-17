@@ -24,6 +24,8 @@ export const TESTIDS = {
   importFile: 'import-file',
   importStatus: 'import-status',
   libraryItem: 'library-item',
+  libraryList: 'library-list',
+  libraryStaleBadge: 'library-stale-badge',
   audioPlayer: 'audio-player',
   usageMeter: 'usage-meter',
   planLimitNotice: 'plan-limit-notice',
@@ -39,10 +41,23 @@ export const API = {
   library: '/api/library',
   stream: (id: string) => `/api/stream/${id}`,
   usage: '/api/usage',
+  // Deterministic no-auth WAV (`apps/web/src/routes/api/demo/audio/+server.ts`,
+  // bytes pinned by `helpers/demo-audio.ts`). A renamed path fails the
+  // demo-audio specs with this key named.
+  demoAudio: '/api/demo/audio',
 } as const;
 
 /** HTTP statuses the API uses to signal plan-limit enforcement. */
 export const PLAN_LIMIT_STATUSES = [402, 429] as const;
+
+/**
+ * Ports the BYOP UI offers; the fixture transport must stay inside this
+ * allowlist. Lives here (not access.ts, which reads `process.env`) so the
+ * web contract test can pin it against ALLOWED_NNTP_PORTS
+ * (vault-validation.ts, itself mirroring vault.rs) without dragging Node
+ * types into the web tsconfig — see apps/web/src/lib/contract.test.ts.
+ */
+export const SUPPORTED_NNTP_PORTS: readonly number[] = [119, 563];
 
 /** A fresh, collision-free test mailbox per run (example.test never routes). */
 export function uniqueTestEmail(prefix = 'e2e'): string {
@@ -114,4 +129,111 @@ export function extractPlanMeta(body: unknown): { limit: number; used: number; t
     );
   }
   return { limit, used, tier };
+}
+
+/** Canonical MBID shape: 8-4-4-4-12 hex (mirrors validate_mbid in workers/ingest/src/queue.rs). */
+const MBID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+/** True for a canonical 8-4-4-4-12 hex MBID string. */
+export function isMbid(value: unknown): value is string {
+  return typeof value === 'string' && MBID_RE.test(value);
+}
+
+/**
+ * Normalize a /api/library payload into its track rows. Accepts either a
+ * bare array (the documented shape) or `{ items: [...] }` (the shape the
+ * library view also renders), and drops entries without a string `id` so
+ * one malformed row can never blank the list. Throws naming the actual
+ * shape so a contract change shows up as an explicit diff, not a silent
+ * empty list.
+ */
+export function extractLibraryItems(bodyText: string): Array<Record<string, unknown>> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bodyText) as unknown;
+  } catch {
+    throw new Error(
+      '[library] library payload is not JSON ' +
+        `(${bodyText.length} chars received). If the library card changed the encoding, ` +
+        'update extractLibraryItems + this spec together.',
+    );
+  }
+  const raw = Array.isArray(parsed)
+    ? parsed
+    : typeof parsed === 'object' && parsed !== null
+      ? (parsed as Record<string, unknown>).items
+      : undefined;
+  if (!Array.isArray(raw)) {
+    const keys =
+      typeof parsed === 'object' && parsed !== null
+        ? Object.keys(parsed as Record<string, unknown>).join(', ') || '(empty)'
+        : typeof parsed;
+    throw new Error(
+      '[library] expected a bare array or { items: [...] } from /api/library, ' +
+        `got keys: ${keys}. If the library card reshaped the payload, ` +
+        'update extractLibraryItems + this spec together.',
+    );
+  }
+  return raw.filter(
+    (entry): entry is Record<string, unknown> =>
+      typeof entry === 'object' &&
+      entry !== null &&
+      typeof (entry as Record<string, unknown>).id === 'string' &&
+      ((entry as Record<string, unknown>).id as string).length > 0,
+  );
+}
+
+/**
+ * Pull the ingested track's recording MBIDs out of one /api/library row.
+ * The release-to-recordings route (#143) fills `recording_mbids` on the
+ * library write, so a matched ingest must carry a non-empty list here.
+ * Throws naming the track's actual keys (and the release state) so a
+ * missing fill fails by name instead of passing silently: a absent field
+ * is an exposure gap, an empty list on a release-less row is the
+ * by-design unmatched write (see `library_write_for` in
+ * workers/ingest/src/matching.rs), and an empty list beside a release
+ * is a dropped recordings fetch.
+ */
+export function extractRecordingMbids(item: unknown): string[] {
+  if (typeof item !== 'object' || item === null) {
+    throw new Error(`[recording-mbids] expected a library track object, got ${typeof item}.`);
+  }
+  const record = item as Record<string, unknown>;
+  const raw = record.recording_mbids ?? record.recordingMbids;
+  if (raw === undefined) {
+    throw new Error(
+      '[recording-mbids] library track carries no recording MBIDs: expected `recording_mbids` ' +
+        "(or the 'recordingMbids' alias), got keys: " +
+        `${Object.keys(record).join(', ') || '(empty)'}. ` +
+        'If the library card renamed the field, update extractRecordingMbids + this spec together.',
+    );
+  }
+  if (!Array.isArray(raw)) {
+    throw new Error(
+      `[recording-mbids] expected recording_mbids to be an array, got ${typeof raw}.`,
+    );
+  }
+  if (raw.length === 0) {
+    const release =
+      typeof record.release_mbid === 'string' && record.release_mbid.length > 0
+        ? `release_mbid ${record.release_mbid}`
+        : typeof record.releaseMbid === 'string' && (record.releaseMbid as string).length > 0
+          ? `releaseMbid ${record.releaseMbid as string}`
+          : 'no release_mbid on the row';
+    throw new Error(
+      '[recording-mbids] library track carries an empty recording_mbids list ' +
+        `(${release}). An unmatched ingest writes empty by design; a matched release with ` +
+        'no recordings is a dropped recordings fetch (see recording_mbids_or_fallback in ' +
+        'workers/ingest/src/matching.rs).',
+    );
+  }
+  const bad = raw.findIndex((entry) => !isMbid(entry));
+  if (bad !== -1) {
+    const entry = raw[bad];
+    throw new Error(
+      `[recording-mbids] recording_mbids[${bad}] is not a canonical 8-4-4-4-12 hex MBID, ` +
+        `got ${typeof entry === 'string' ? JSON.stringify(entry).slice(0, 60) : typeof entry}.`,
+    );
+  }
+  return raw as string[];
 }

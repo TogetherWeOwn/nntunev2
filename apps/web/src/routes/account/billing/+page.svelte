@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { invalidateAll } from '$app/navigation';
+	import { BillingApiError } from '#lib/billing/billingClient.js';
 	import { getPlan } from '#lib/billing/plans.js';
 	import type { PageData } from './$types';
 
@@ -36,7 +37,9 @@
 			const { startCheckout } = await import('#lib/billing/billingClient.js');
 			window.location.href = await startCheckout(status.upgradeTo);
 		} catch (err) {
-			actionError = err instanceof Error ? err.message : 'Checkout failed';
+			if (!(err instanceof BillingApiError && err.paywall)) {
+				actionError = err instanceof Error ? err.message : 'Checkout failed';
+			}
 			busy = null;
 		}
 	}
@@ -48,7 +51,9 @@
 			const { openPortal } = await import('#lib/billing/billingClient.js');
 			window.location.href = await openPortal();
 		} catch (err) {
-			actionError = err instanceof Error ? err.message : 'Portal failed';
+			if (!(err instanceof BillingApiError && err.paywall)) {
+				actionError = err instanceof Error ? err.message : 'Portal failed';
+			}
 			busy = null;
 		}
 	}
@@ -70,7 +75,7 @@
 	{/if}
 
 	{#if data.signedOut}
-		<p><a href="/signup">Sign in</a> to see your billing.</p>
+		<p><a href="/login">Sign in</a> to see your billing.</p>
 	{/if}
 
 	{#if data.hadFetchError}

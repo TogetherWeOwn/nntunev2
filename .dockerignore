@@ -1,0 +1,18 @@
+# Keep the mb-import root-context build small: the validator stage only
+# needs workspace metadata plus its own crate (see
+# containers/mb-import/Dockerfile).
+.git/
+target/
+apps/
+e2e/
+containers/*/
+!containers/mb-import/
+!containers/repair/
+crates/*/
+!crates/mb-import-validate/
+!crates/nntune-config/
+!crates/nntune-core/
+!crates/nntune-test-nntp/
+workers/*
+!workers/stream/
+*.md

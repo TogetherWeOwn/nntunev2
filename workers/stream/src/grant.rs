@@ -8,6 +8,24 @@
 //!
 //! Note: `user_id` and `track_id` must not contain `|` (our IDs never do);
 //! anything else that fails to parse is rejected as [`GrantError::Malformed`].
+//!
+//! Grants are short-lived: [`MAX_GRANT_TTL`] caps the lifetime at 15 minutes
+//! (900 s). The production issuer [`issue_at`] clamps longer requests to the
+//! cap, and [`verify`] rejects any grant with `exp - now` beyond
+//! `MAX_GRANT_TTL + CLOCK_SKEW_SECS` as [`GrantError::TtlTooLong`] so a
+//! captured grant stops replaying soon after issuance.
+
+/// Maximum grant lifetime: 15 minutes, in seconds.
+///
+/// Enforced at issuance (requests beyond the cap are clamped by [`issue_at`])
+/// and at verification ([`verify`] rejects over-cap grants even when the
+/// signature is valid).
+pub const MAX_GRANT_TTL: u64 = 900;
+
+/// Clock skew tolerated on top of [`MAX_GRANT_TTL`] when verifying, in
+/// seconds: an at-cap grant minted by an issuer whose clock runs ahead of
+/// the verifier's still verifies, up to 60 s over the cap.
+pub const CLOCK_SKEW_SECS: u64 = 60;
 
 /// A verified play grant.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,9 +41,19 @@ pub enum GrantError {
     Malformed,
     BadSignature,
     Expired,
+    /// The grant's remaining lifetime (`exp - now`) exceeds
+    /// `MAX_GRANT_TTL + CLOCK_SKEW_SECS`. Returned even for a validly-signed
+    /// token, so callers can tell "minted too long" apart from expiry.
+    TtlTooLong,
 }
 
 /// Issue a grant for (`user_id`, `track_id`) expiring at `exp_unix`.
+///
+/// This is the raw signer: it mints exactly the requested expiry so tests
+/// and offline tooling can construct arbitrary tokens. Production code must
+/// use [`issue_at`], which clamps the requested lifetime to
+/// [`MAX_GRANT_TTL`]; [`verify`] rejects over-cap grants regardless of
+/// which issuer minted them.
 pub fn issue(user_id: &str, track_id: &str, exp_unix: u64, secret: &[u8]) -> String {
     let payload = format!("{user_id}|{track_id}|{exp_unix}");
     let payload_b64 = base64url_encode(payload.as_bytes());
@@ -33,31 +61,69 @@ pub fn issue(user_id: &str, track_id: &str, exp_unix: u64, secret: &[u8]) -> Str
     format!("v1.{payload_b64}.{}", base64url_encode(&sig))
 }
 
+/// Issue a grant for (`user_id`, `track_id`) with a requested lifetime of
+/// `ttl_secs` seconds from `now_unix`.
+///
+/// Requests beyond [`MAX_GRANT_TTL`] are clamped to the cap: the minted
+/// grant expires at `now_unix + min(ttl_secs, MAX_GRANT_TTL)` (saturating,
+/// so issuance near `u64::MAX` yields `u64::MAX` instead of wrapping).
+pub fn issue_at(
+    user_id: &str,
+    track_id: &str,
+    now_unix: u64,
+    ttl_secs: u64,
+    secret: &[u8],
+) -> String {
+    let exp_unix = now_unix.saturating_add(ttl_secs.min(MAX_GRANT_TTL));
+    issue(user_id, track_id, exp_unix, secret)
+}
+
 /// Verify `token` against `secret` at time `now_unix`.
 pub fn verify(token: &str, secret: &[u8], now_unix: u64) -> Result<Grant, GrantError> {
-    let rest = token.strip_prefix("v1.").ok_or(GrantError::Malformed)?;
-    let (payload_b64, sig_b64) = rest.split_once('.').ok_or(GrantError::Malformed)?;
+    verify_with_user(token, secret, now_unix).map_err(|(err, _)| err)
+}
+
+/// Verify a grant and retain its signed user for rejection metering.
+///
+/// Only expiry and TTL-cap rejections carry a user; malformed and
+/// bad-signature tokens never produce an attribution candidate.
+pub(crate) fn verify_with_user(
+    token: &str,
+    secret: &[u8],
+    now_unix: u64,
+) -> Result<Grant, (GrantError, Option<String>)> {
+    let rest = token
+        .strip_prefix("v1.")
+        .ok_or((GrantError::Malformed, None))?;
+    let (payload_b64, sig_b64) = rest.split_once('.').ok_or((GrantError::Malformed, None))?;
     if payload_b64.is_empty() || sig_b64.is_empty() {
-        return Err(GrantError::Malformed);
+        return Err((GrantError::Malformed, None));
     }
-    let sig = base64url_decode(sig_b64).ok_or(GrantError::Malformed)?;
+    let sig = base64url_decode(sig_b64).ok_or((GrantError::Malformed, None))?;
     let expected = hmac_sha256(secret, payload_b64.as_bytes());
     if sig.len() != expected.len() || !constant_time_eq(&sig, &expected) {
-        return Err(GrantError::BadSignature);
+        return Err((GrantError::BadSignature, None));
     }
-    let payload = base64url_decode(payload_b64).ok_or(GrantError::Malformed)?;
-    let payload = String::from_utf8(payload).map_err(|_| GrantError::Malformed)?;
+    let payload = base64url_decode(payload_b64).ok_or((GrantError::Malformed, None))?;
+    let payload = String::from_utf8(payload).map_err(|_| (GrantError::Malformed, None))?;
     let mut parts = payload.split('|');
     let (user_id, track_id, exp) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
         (Some(u), Some(t), Some(e), None) => (u, t, e),
-        _ => return Err(GrantError::Malformed),
+        _ => return Err((GrantError::Malformed, None)),
     };
-    let exp_unix: u64 = exp.parse().map_err(|_| GrantError::Malformed)?;
+    let exp_unix: u64 = exp.parse().map_err(|_| (GrantError::Malformed, None))?;
+    let user_id = user_id.to_string();
     if now_unix >= exp_unix {
-        return Err(GrantError::Expired);
+        return Err((GrantError::Expired, Some(user_id)));
+    }
+    // `now_unix < exp_unix` here, so the subtraction cannot underflow;
+    // comparing the difference (rather than `now + cap + skew`) also
+    // cannot overflow near `u64::MAX`.
+    if exp_unix - now_unix > MAX_GRANT_TTL + CLOCK_SKEW_SECS {
+        return Err((GrantError::TtlTooLong, Some(user_id)));
     }
     Ok(Grant {
-        user_id: user_id.to_string(),
+        user_id,
         track_id: track_id.to_string(),
         exp_unix,
     })

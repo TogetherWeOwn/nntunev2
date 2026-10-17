@@ -65,21 +65,31 @@ bound under either secret.
 1. Generate unpadded base64url (256 bits, 43 chars, decodes via
    `nntune_api::b64::decode`): `openssl rand 32 | basenc --base64url | tr -d '='`
    on the operator machine. Do not reuse a KEK, password, or any other secret.
-2. Stage the current primary as previous:
-   `wrangler secret put SESSION_SECRET_PREVIOUS_BASE64` (paste current
-   primary value), then `wrangler secret put SESSION_SECRET_BASE64`
-   (paste the new value). Staging first, bake ≥24h, then prod. Never
-   both at once.
-3. Deploy the Worker. From cutover, new sessions sign with the primary;
-   pre-cutover sessions verify via the previous secret through
-   `verify_session_dual`. Confirm: fresh login works, pre-cutover cookie
-   still authenticates (one synthetic check each — never a real user
-   session).
+2. Arm the rotation FIRST: set the `SESSION_SECRET_ROTATION` Worker var
+   to `1` and deploy. The flag alone is single-secret steady state
+   (the Worker starts normally), so this step cannot take login down.
+   Rehearse the whole procedure in staging, bake ≥24h, then prod.
+3. Stage the current primary as previous
+   (`wrangler secret put SESSION_SECRET_PREVIOUS_BASE64`, paste current
+   primary value), then rotate the primary
+   (`wrangler secret put SESSION_SECRET_BASE64`, paste the new value).
+   Each command deploys on its own; because the flag is already armed,
+   every intermediate version is either steady state or the intended
+   window — never a refusal. (Staging the previous BEFORE arming would
+   refuse to start until the flag lands, so keep the flag-first order.)
+   From cutover, new sessions sign with the primary; pre-cutover
+   sessions verify via the previous secret through `verify_session_dual`.
+   Confirm: fresh login works, pre-cutover cookie still authenticates
+   (one synthetic check each — never a real user session).
 4. Wait until `window_end` (§2). No action needed during the wait; the
    bound is enforced by token verification, not by a sweeper.
-5. Delete the previous secret (`wrangler secret delete
-   SESSION_SECRET_PREVIOUS_BASE64`), deploy, confirm the Worker starts
-   with no previous configured. Steady state is single-secret again.
+5. Delete the previous secret FIRST (`wrangler secret delete
+   SESSION_SECRET_PREVIOUS_BASE64`) and deploy: flag-set with nothing
+   staged is steady state, so login stays up. Then clear the
+   `SESSION_SECRET_ROTATION` var and deploy. Confirm the Worker starts
+   with no previous configured. Steady state is single-secret again —
+   teardown has no outage window in either order, but keep
+   previous-first so no deploy ever carries a stray secret.
 6. Record the rotation (date, environments, cutover time, operator) in
    the audit log. Stragglers presenting pre-cutover tokens after the
    window re-authenticate via magic link — expected, not an incident.
@@ -96,8 +106,13 @@ bound under either secret.
   sessions onto the new secret.
 - The Worker builds `SessionKeys` from env as: previous = `Some` ONLY
   when `SESSION_SECRET_PREVIOUS_BASE64` is set AND a rotation is
-  recorded; unset means `SessionKeys::single(primary)`. A set-but-short
-  previous fails every verification closed (code-enforced).
+  recorded; otherwise `SessionKeys::single(primary)`. A set-but-short
+  (or undecodable) previous fails every verification closed
+  (code-enforced). Recorded means `SESSION_SECRET_ROTATION=1` is set
+  for the window alongside the staged previous. A staged previous
+  WITHOUT the flag refuses to start; the flag with nothing staged is
+  single-secret steady state (safe teardown order — see §3 step 5). The
+  four combinations are unit-tested (`worker_entry::tests`).
 - The Worker MUST fail closed when `SESSION_SECRET_PREVIOUS_BASE64` is
   set outside a recorded rotation (unexpected second secret = alert).
 - `Set-Cookie` emission is unchanged (`__Host-nntune-session`, `Path=/`,

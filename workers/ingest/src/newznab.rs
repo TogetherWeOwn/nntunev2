@@ -9,6 +9,26 @@
 //! - [`redact_api_key`] scrubs the key for logs. Log the redacted URL only.
 //! - `http://` indexer URLs are refused: the key would travel in cleartext.
 
+/// Documented worker/API error code for a stale *indexer* API key (S7).
+/// Deliberately distinct from the NNTP provider's `provider_auth_expired`
+/// (`nntune-core`, `workers/api`, `workers/stream`): the two secrets are
+/// fixed through different prompts, and provider rotation preserves the
+/// indexer key verbatim. The web app answers this code with copy asking
+/// for the indexer API key, never the provider password. Safe to log and
+/// to return in error bodies.
+pub const INDEXER_AUTH_EXPIRED_CODE: &str = "indexer_auth_expired";
+
+/// True when an indexer HTTP status means the stored API key was rejected
+/// and the user must re-enter it (S7). Only 401 maps here: 403 from an
+/// indexer is routinely a rate limit, WAF, or blocked account rather than
+/// a bad key, so it must not trigger a credential prompt. Every other
+/// status stays a generic failure. The caller returns
+/// [`INDEXER_AUTH_EXPIRED_CODE`] and MUST NOT include the key, the URL, or
+/// the upstream body.
+pub fn is_indexer_auth_failure(http_status: u16) -> bool {
+    http_status == 401
+}
+
 /// Newznab search caps for one request.
 pub const MAX_LIMIT: u32 = 100;
 /// Music-only search (`t=music`); the pipeline ingests audio releases.
@@ -81,7 +101,7 @@ fn check_base_url(base_url: &str) -> Result<String, &'static str> {
 pub fn build_search_url(params: &SearchParams<'_>) -> Result<String, &'static str> {
     let base = check_base_url(params.base_url)?;
     let q = params.query.trim();
-    if q.is_empty() || q.len() > 200 {
+    if q.is_empty() || q.chars().count() > 200 {
         return Err("query must be 1..=200 chars");
     }
     if params.limit == 0 || params.limit > MAX_LIMIT {
@@ -202,6 +222,49 @@ mod tests {
         assert!(build_search_url(&p).is_err());
         p.limit = MAX_LIMIT + 1;
         assert!(build_search_url(&p).is_err());
+    }
+
+    #[test]
+    fn search_url_counts_query_scalars_not_utf8_bytes_and_percent_encodes() {
+        // The contract is `1..=200 chars`: U+00E9 is one Unicode scalar
+        // but two UTF-8 bytes, so 200 of them (400 bytes) must build a
+        // URL and 201 must fail. A byte-length check rejects the 200 case.
+        // `build_search_url` is pure, so this makes no network request.
+        let exact = "\u{e9}".repeat(200);
+        let over = "\u{e9}".repeat(201);
+        assert_eq!(exact.chars().count(), 200);
+        assert_eq!(exact.len(), 400);
+        assert_eq!(over.chars().count(), 201);
+        let url = build_search_url(&params("https://indexer.example", &exact))
+            .expect("200 scalars must be accepted");
+        // The accepted query is percent-encoded as its UTF-8 bytes
+        // (U+00E9 is 0xC3 0xA9); no raw query text reaches the URL.
+        assert!(
+            url.contains(&format!("q={}&limit=25&offset=0", "%C3%A9".repeat(200))),
+            "unexpected url: {url}"
+        );
+        assert!(!url.contains('\u{e9}'));
+        assert_eq!(
+            build_search_url(&params("https://indexer.example", &over)).err(),
+            Some("query must be 1..=200 chars")
+        );
+        // The ASCII boundary is unchanged (scalars == bytes).
+        let ascii = build_search_url(&params("https://indexer.example", &"x".repeat(200)))
+            .expect("200 ASCII chars must be accepted");
+        assert!(ascii.contains(&format!("q={}&limit=25", "x".repeat(200))));
+        assert_eq!(
+            build_search_url(&params("https://indexer.example", &"x".repeat(201))).err(),
+            Some("query must be 1..=200 chars")
+        );
+        // Trimming happens before counting and encoding: a padded query
+        // builds the same URL as the bare one; padded over-limit fails.
+        let padded = build_search_url(&params("https://indexer.example", &format!("  {exact}  ")))
+            .expect("padding must not count toward the limit");
+        assert_eq!(padded, url);
+        assert_eq!(
+            build_search_url(&params("https://indexer.example", &format!("  {over}  "))).err(),
+            Some("query must be 1..=200 chars")
+        );
     }
 
     #[test]
