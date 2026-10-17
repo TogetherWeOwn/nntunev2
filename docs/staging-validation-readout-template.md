@@ -102,6 +102,13 @@ VERDICT: GO | NO-GO | KILL — <one sentence naming the deciding evidence IDs> (
   ambiguous evidence may instead be resolved on the same build by adding
   that evidence and having QA re-verify it; if the evidence cannot be
   produced for that build, a new build and readout are required.
+- A ceiling-type kill rule (for example "estimated monthly infra cost
+  exceeds $50") is `NOT TRIGGERED` only when the observed value is all-in,
+  or every unpriced part is covered by an evidenced upper bound and the
+  resulting bounded total is at or below the threshold. A floor — a total
+  with unpriced parts and no evidenced upper bound for them — can never
+  prove `NOT TRIGGERED`: it is `TRIGGERED` when the floor already exceeds
+  the threshold, and `INCONCLUSIVE` otherwise.
 - `GO` requires every must-pass row `PASS`, every kill rule
   `NOT TRIGGERED`, and QA sign-off on the evidence index.
 - `GO` in a staging readout means "eligible for the launch decision". It is
@@ -177,7 +184,11 @@ visible.
 State below the table: what usage the total assumes, which line dominates as
 usage grows, and what was **not** metered — naming every unpriced part of a
 partly priced row (for example operations on a storage-only formula), not
-only wholly unmetered rows. Cost-recovery arithmetic belongs to the
+only wholly unmetered rows. If any part is unpriced, say whether the total
+is a floor or is bounded above by evidenced upper bounds for the unpriced
+parts; a floor feeds a ceiling-type cost kill rule as `TRIGGERED` (floor
+already above the threshold) or `INCONCLUSIVE`, never `NOT TRIGGERED` (see
+the kill-rule verdict rules above). Cost-recovery arithmetic belongs to the
 decision record, not here; this table supplies its input only.
 
 ### 4. Explicit non-goals
@@ -313,11 +324,11 @@ not an all-in bill.
 | ID | Condition (pre-registered) | Source of threshold | Observed value | Evidence | Verdict |
 |---|---|---|---|---|---|
 | K1 | Any must-pass synthetic-flow step `FAIL` on two consecutive promoted builds | Launch-quality bar for the core journey | 1 consecutive failing build (step 5 on this build; none on the previous promoted build) | E10, E16 | NOT TRIGGERED |
-| K2 | Estimated monthly infra cost at stated usage exceeds $50 | Pre-launch cost ceiling for the validation phase | $12.03 | E15, E17 | NOT TRIGGERED |
+| K2 | Estimated monthly infra cost at stated usage exceeds $50 | Pre-launch cost ceiling for the validation phase | $12.03 floor (five cost parts unpriced, no evidenced upper bound — section 3) | E15, E17 | INCONCLUSIVE |
 | K3 | Any secret value or personal data found in staging logs/evidence during the run | "Must never contain" rules in this template | None found | E18 | NOT TRIGGERED |
 
 ```text
-VERDICT: NO-GO — must-pass step 5 (play/seek) failed per E10; no kill rule triggered (K1–K3) (product lead, 2026-01-15)
+VERDICT: NO-GO — must-pass step 5 (play/seek) failed per E10 and cost kill rule K2 is INCONCLUSIVE on the $12.03 floor per E15, E17; no kill rule triggered (product lead, 2026-01-15)
 ```
 
 ### 7. Sign-off
@@ -330,4 +341,5 @@ VERDICT: NO-GO — must-pass step 5 (play/seek) failed per E10; no kill rule tri
   `product lead, 2026-01-15`
 - What could not be verified: the unmetered/unpriced costs listed in
   section 3 (Workers CPU, R2 operations, KV writes and storage, Postgres
-  storage, and egress).
+  storage, and egress); K2 is therefore `INCONCLUSIVE`, not
+  `NOT TRIGGERED`.
