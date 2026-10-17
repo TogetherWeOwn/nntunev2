@@ -27,7 +27,7 @@ serde_json = "1"
 # Structured log emitter + trace-ID propagation (docs/logging-standard.md).
 # The api Worker's HTTP entry (fetch boundary) lands in a follow-up slice;
 # this exposes the emitter the entry will use.
-nntune-logging = { path = "../../crates/nntune-logging" }
+nntune-logging = { version = "0.1.0", path = "../../crates/nntune-logging" }
 zeroize = { version = "1", features = ["derive"] }
 url = "2"
 subtle = "2"
