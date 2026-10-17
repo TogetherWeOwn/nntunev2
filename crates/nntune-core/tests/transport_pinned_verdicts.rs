@@ -1,9 +1,8 @@
 //! Pinned, cancellable NNTP transport verdicts (acceptance).
 //!
-//! Paired acceptance tests for the `core: pinned, cancellable HTTPS
-//! transport proof for NZB fetch` build slice ([TOG-28781](/TOG/issues/TOG-28781),
-//! roadmap M3). The NZB intake wiring ([TOG-26211](/TOG/issues/TOG-26211)) stays
-//! untouched: this file pins the transport contract the intake will consume.
+//! Paired acceptance tests for the pinned, cancellable transport build slice
+//! (roadmap M3); the NZB intake wiring stays untouched: this file pins the
+//! transport contract the intake will consume.
 //!
 //! Acceptance mapping:
 //!
