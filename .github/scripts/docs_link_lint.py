@@ -8,8 +8,11 @@ reader-facing surprise.
 Scope (by design, so unrelated history never reds the build):
 
   * Only markdown files (``.md``, ``.markdown``, ``.mdown``) are scanned, and
-    on CI only the files changed in the PR (``--base-ref`` diff) are
-    checked. A broken link in an untouched file never fails the build.
+    the CI lint step checks only the files changed in the PR (``--base-ref``
+    diff). The CI self-test step additionally pins the whole checked-in tree
+    clean, so a rename that breaks another file's link still fails
+    (fail-safe): a green main means a clean tree, so only a PR that
+    introduces breakage — on the source or the target side — can go red.
   * Only *internal* links are checked: relative file links
     (``cost-basis.md``, ``../ops.md#section``), repo-root absolute links
     (``/docs/ops.md``) and same-file anchors (``#section``). External links
@@ -94,6 +97,26 @@ def _escape_annotation_property(value):
 def strip_fences(text):
     """Remove fenced code blocks, keeping inline code spans intact."""
     return _FENCE.sub("", text)
+
+
+def code_free_lines(text):
+    """Yield (lineno, line) for lines outside fenced code blocks.
+
+    Inline code spans are removed per line. Line numbers always refer to
+    the original file, so error annotations point at the real line even
+    when a fenced block precedes the violation.
+    """
+    in_fence = None
+    for lineno, line in enumerate(text.split("\n"), start=1):
+        stripped = line.lstrip()
+        if in_fence is not None:
+            if stripped.startswith(in_fence):
+                in_fence = None
+            continue
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = stripped[:3]
+            continue
+        yield lineno, _INLINE_CODE.sub("", line)
 
 
 def strip_code(text):
@@ -211,8 +234,7 @@ def check_source(source_rel, root, anchor_cache):
     except (OSError, UnicodeError) as exc:
         raise LintError(f"cannot read {source_rel}: {exc}") from exc
     violations = []
-    stripped = strip_code(text)
-    for lineno, line in enumerate(stripped.split("\n"), start=1):
+    for lineno, line in code_free_lines(text):
         for target in extract_link_targets(line):
             if is_external(target):
                 continue

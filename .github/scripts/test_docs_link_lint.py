@@ -218,6 +218,19 @@ class TestCheckSource(unittest.TestCase):
             )
             self.assertEqual([], check(root, "docs/a.md"))
 
+    def test_violation_line_numbers_survive_preceding_fences(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": "# Title\n\n```md\n[x](y.md)\n```\n\n"
+                                 "[gone](missing.md)\n"
+                },
+            )
+            hits = check(root, "docs/a.md")
+            self.assertEqual(1, len(hits))
+            self.assertEqual(7, hits[0][0])
+
     def test_image_links_are_checked(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_root(tmp, {"docs/a.md": "![pic](missing.png)\n"})

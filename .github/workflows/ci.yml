@@ -429,11 +429,12 @@ jobs:
         run: python3 .github/scripts/test_check_archive_bindings.py
 
   # Docs internal-link lint: broken file links/anchors in changed markdown
-  # (roadmap, matrix, ops, ADRs) fail the build. Scoped to changed files so
-  # unrelated history never reds the build; external links are out of scope.
-  # The fixture pair proves the job goes red on breakage: `match` must pass,
-  # `broken-file` / `broken-anchor` must fail. Keep this job id in ci-ok's
-  # needs.
+  # (roadmap, matrix, ops, ADRs) fail the build. The lint step is scoped to
+  # changed files and the self-test step pins the whole tree clean, so only
+  # a PR that introduces breakage (source or target side) can go red;
+  # external links are out of scope. The fixture pair proves the job goes
+  # red on breakage: `match` must pass, `broken-file` / `broken-anchor`
+  # must fail. Keep this job id in ci-ok's needs.
   docs-links:
     name: docs-links
     runs-on: ubuntu-latest
