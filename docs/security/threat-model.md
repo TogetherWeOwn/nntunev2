@@ -199,3 +199,109 @@ exact implementation PR head:
 V1 lessons carried forward: per-user resource authorization precedes lookup (no
 existence oracles — cf. avatar-oracle fix); every credential-adjacent finding
 gets a card with exact head, never a bare comment.
+
+## 10. Demo-media surfaces (no auth by design)
+
+`apps/web` serves `/demo/player` and `/api/demo/{audio,artwork}` (plus
+`/api/demo/` 404-probe paths used only as broken-image fixtures) with
+explicitly no auth. This is intentional, not an auth gap, and holds ONLY
+while every bullet below stays true:
+
+- Synthetic bytes only: the audio handler serves deterministic PCM WAV
+  bytes synthesized in `demoMedia.ts` (`?track=<id>` selects among
+  allowlisted salts; unknown ids serve the default stream); the artwork
+  handler serves a constant placeholder SVG (the R2 object is
+  "missing"). No provider dial, no R2/cache read, no vault, session,
+  or grant lookup.
+- No credential or identity surface: the routes accept no session,
+  token, grant, or credential input and emit no authenticated bytes.
+  Range handling slices the synthetic body; nothing reflects free-form
+  request input into bodies or headers.
+- Smoke-test scope only: the player page exists for seek-storm and
+  artwork-fallback smoke tests. Real playback must use the §5 grant
+  transport (header player or grant cookie, never signed query strings)
+  and must never be pointed at these routes.
+
+**Invariant violations** (treat as security findings requiring a CISO
+disposition before merge): serving library, cache, or R2 bytes from a
+demo route; reading or forwarding credentials, sessions, or grants
+there; reflecting request input beyond the allowlisted `track` salt
+selector and byte-range slicing; or wiring real user playback through
+these routes. Any such change moves the route out of this section and
+under §§4–6.
+
+## 11. Web security-header posture (static headers + nonce CSP)
+
+`apps/web` applies `SECURITY_HEADERS` (`src/lib/security/headers.ts`) to
+every response from the `handle` hook (`src/hooks.server.ts`, `set` not
+`append` so a route can never weaken or duplicate them), and emits the
+`Content-Security-Policy` from SvelteKit's `csp` option
+(`vite.config.ts`), which owns the per-request nonces. Unit coverage in
+`src/lib/security/headers.test.ts`; header + no-violation coverage on
+public pages in `tests/security-headers.spec.ts`. The entries below are
+trust assumptions, not header documentation: each states what would
+violate it.
+
+- **Nonce CSP, no `unsafe-inline`/`unsafe-eval` on scripts.** `csp`
+  runs in `mode: 'nonce'`: every inline script/style SvelteKit emits
+  carries a per-request nonce. `script-src` is `'self'`-only (no
+  `unsafe-inline`, no `unsafe-eval`); style *elements* stay nonce-only
+  while `style-src-attr 'unsafe-inline'` covers style *attributes* only
+  (the `app.html` wrapper, Svelte `style:` directives), which nonces
+  cannot; `script-src-attr` allows exactly one inline handler via
+  `unsafe-hashes` plus its pinned hash
+  (`sha256-7dQwUgLau1NFCCGjfn9FsYptB6ZtWxJin6VohGIu20I=` for the Svelte 5
+  SSR `onerror="this.__e=event"` capture on the artwork `<img>`
+  fallback). `default-src`/`base-uri`/`form-action` are `'self'`,
+  `object-src` is `'none'`, `frame-ancestors` is `'none'`,
+  `img-src` is `'self'` + `data:`/`blob:` (artwork sources),
+  `media-src`/`connect-src` are the `cspSources` allowlist only. **Violated
+  by:** adding `unsafe-inline`/`unsafe-eval` to `script-src`; widening
+  any directive to a wildcard or to an origin that serves
+  user-controlled bytes, user data, or credentials (an allowlisted
+  origin becomes a script/data exfiltration path); adding a second inline
+  handler without a hash review (recompute the hash after a Svelte
+  upgrade if the artwork fallback tests fail).
+- **HSTS without preload (reversible, separate decision).**
+  `Strict-Transport-Security: max-age=31536000; includeSubDomains` with
+  deliberately no `preload`: preload submissions are hard to reverse and
+  are a separate decision. **Violated by:** adding `preload` without that
+  independent decision, or shortening/removing `max-age` so TLS
+  downgrade protection silently lapses.
+- **`Referrer-Policy: no-referrer` (load-bearing).** Magic-link tokens
+  travel in the query string (`/auth/magic?token=…`, asset A5), so no
+  outbound click or third-party subresource may ever leak them via
+  `Referer`. **Violated by:** relaxing the policy (e.g. to `origin` or
+  `unsafe-url`); adding a third-party subresource or outbound navigation
+  that receives a `Referer`; or putting token/grant material in query
+  strings on any new flow (signed stream grants already travel in the
+  `Authorization` header, POST body, or grant cookie per §5, never query
+  strings).
+- **`Permissions-Policy` denies unused capabilities, never WebAuthn.**
+  `camera=(), microphone=(), geolocation=()` turns off capabilities the
+  app never uses; the policy must never mention
+  `publickey-credentials-*`, or passkey signup/login (asset A4) breaks.
+  **Violated by:** adding `publickey-credentials-get`/`-create`
+  restrictions (breaks WebAuthn), or enabling a capability the app does
+  not need (widens the compromise/request-forgery surface for no
+  function).
+- **Deny framing twice.** `X-Frame-Options: DENY` plus CSP
+  `frame-ancestors 'none'` (defense in depth against clickjacking on
+  auth/vault flows, assets A1–A5). **Violated by:** relaxing either side
+  (`SAMEORIGIN`, `allow-from`, or a `frame-ancestors` origin list) so the
+  login, magic-link, passkey, or vault pages become frameable.
+- **Fail-closed `cspSources` (misconfiguration throws at build).** Empty
+  base URL means same-origin (`'self'` only). Anything else must be an
+  absolute `https:` URL with any path stripped to its origin; a
+  plaintext or malformed API base throws and fails the build instead of
+  silently widening or corrupting the policy. SvelteKit's `csp` option is
+  evaluated at build time, so `PUBLIC_API_BASE_URL` must be set in the
+  build environment — a runtime-only override leaves the compiled CSP
+  narrower than the client. `allowHttpLoopback` exists for local
+  development only (`vitest`, `vite dev`, `svelte-check` against a local
+  API worker); production builds always pass `false`, so any `http:` API
+  base — loopback included — still throws. **Violated by:** catching or
+  ignoring the throw, allowing `http:` in a production build, or relying
+  on a runtime-only API-base override that the compiled
+  `media-src`/`connect-src` does not cover (browser blocks the calls the
+  client tries to make).
