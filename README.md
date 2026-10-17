@@ -60,11 +60,13 @@ below was run verbatim against a clean checkout; expected results are noted.
 ```sh
 # Web frontend
 cd apps/web && pnpm install --frozen-lockfile && cd ../..
-# E2E harness (Playwright)
-cd e2e && npm ci && cd ..
+# E2E harness (Playwright; chromium needed for browser-level self-tests)
+cd e2e && npm ci && npx playwright install chromium && cd ..
 ```
 
 Rust needs no install step: `cargo` fetches dependencies on first build.
+On Linux without system browser dependencies, use
+`npx playwright install --with-deps chromium` instead (as CI does).
 If `NODE_ENV=production` is exported in your shell, npm silently omits the
 dev dependencies the harness needs — install it with
 `npm ci --include=dev` instead (same caveat as in `e2e/README.md`).
@@ -72,12 +74,15 @@ dev dependencies the harness needs — install it with
 ### Test
 
 ```sh
-# Rust workspace (core, config, stream, repair, test fixtures)
+# Rust workspace (core, config, stream, containers/repair, test fixtures)
 cargo test --workspace
-# Standalone Worker crates (outside the workspace, locked deps as in CI)
+# Standalone Worker crates (outside the workspace, as in CI:
+# api is locked via its committed Cargo.lock; mb, ingest and repair
+# resolve fresh)
 cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets
-cargo test --locked --manifest-path workers/mb/Cargo.toml --all-targets
-cargo test --locked --manifest-path workers/ingest/Cargo.toml --all-targets
+cargo test --manifest-path workers/mb/Cargo.toml --all-targets
+cargo test --manifest-path workers/ingest/Cargo.toml --all-targets
+cargo test --manifest-path workers/repair/Cargo.toml --all-targets
 # Web frontend (from apps/web): unit tests, then typecheck
 pnpm test
 pnpm check
