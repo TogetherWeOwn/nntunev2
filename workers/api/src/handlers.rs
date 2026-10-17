@@ -103,10 +103,15 @@ const GLOBAL_SCOPE_KEY: &str = "global";
 /// `PURPOSE_REGISTER` (`'register'`): reaping on `'login'` would delete
 /// never-completed signups on the wrong ceremony. Exemptions (credentials,
 /// unexpired register challenges, vaults, sessions, unexpired magic links)
-/// must stay in sync with the `FakeStore` mirror.
+/// must stay in sync with the `FakeStore` mirror. Accounts with a
+/// scheduled deletion (`deleting_at IS NOT NULL`) are also exempt: they
+/// are owned by the deletion executor, and their `delete_operations`
+/// row's `ON DELETE RESTRICT` FK would otherwise abort the whole reap
+/// (`FakeStore` mirrors this through `deleting_users`).
 pub fn reap_unverified_users_sql() -> String {
     format!(
         "DELETE FROM users WHERE created_at <= $1 \
+         AND deleting_at IS NULL \
          AND ($2::TEXT IS NULL OR users.id <> $2) \
          AND NOT EXISTS (SELECT 1 FROM webauthn_credentials \
                          WHERE webauthn_credentials.user_id = users.id) \
@@ -484,6 +489,16 @@ pub trait Store {
         row: &VaultRow,
     ) -> impl Future<Output = Result<(), StoreError>>;
     fn delete_vault(&self, user_id: &str) -> impl Future<Output = Result<(), StoreError>>;
+    /// Whether the user's account is fenced for deletion
+    /// (`users.deleting_at IS NOT NULL`, ADR 0002 rule 3). Handlers use
+    /// it only to classify a fenced write's failure as the typed 409
+    /// instead of the generic storage error; it is never the fence
+    /// itself (production writes carry the fence in-statement).
+    /// Default `Ok(false)` keeps out-of-tree `Store` impls compiling;
+    /// production and the test fake override it.
+    fn account_deleting(&self, _user_id: &str) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Ok(false) }
+    }
     fn insert_audit(&self, event: &AuditEvent) -> impl Future<Output = Result<(), StoreError>>;
 }
 
@@ -564,6 +579,20 @@ fn generic_auth() -> Response {
 
 fn generic_vault() -> Response {
     json_response(400, serde_json::json!({"error": "vault unavailable"}))
+}
+
+/// The typed account-deletion fence refusal (ADR 0002 rule 3): HTTP 409
+/// with the registered `account_deleting` envelope. The blocking
+/// operation id and retry hint join this body with the deletion routes,
+/// which own the operation lookup.
+fn account_deleting_response() -> Response {
+    let error = crate::api_error::ApiError::account_deleting("account is being deleted");
+    Response {
+        status: error.status,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    }
 }
 
 fn internal() -> Response {
@@ -2073,6 +2102,12 @@ where
         updated_at: ctx.now,
     };
     if ctx.store.upsert_vault(&claims.user_id, &row).await.is_err() {
+        // A fenced upsert (account being deleted) is the typed 409,
+        // never the generic vault failure; anything else stays generic
+        // so a probe failure cannot leak a new shape.
+        if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+            return account_deleting_response();
+        }
         return generic_vault();
     }
     ctx.audit(&claims.user_id, audit_action, true).await;
@@ -2185,7 +2220,7 @@ where
         let dns = ctx.resolve_all(&provider.host).await;
         let target: ValidatedTarget = match provider.validate(&dns) {
             Ok(target) => target,
-            Err(_) => return false,
+            Err(_) => return Some(false),
         };
         // A candidate that would not save fails the test instead of
         // testing half a config (the stored path was validated at save).
@@ -2195,11 +2230,11 @@ where
                 .and_then(|u| u.host_str().map(|h| h.trim_matches(['[', ']']).to_string()))
             {
                 Some(host) => host,
-                None => return false,
+                None => return Some(false),
             };
             let indexer_dns = ctx.resolve_all(&host).await;
             if indexer.validate(&indexer_dns).is_err() {
-                return false;
+                return Some(false);
             }
         }
         let lease_token = random_id(16);
@@ -2213,17 +2248,31 @@ where
             )
             .await
             .unwrap_or(false);
+        // A denied lease is `None` (fenced or contended, told apart
+        // below); every other failure stays the collapsed boolean.
         if !lease_acquired {
-            return false;
+            return None;
         }
         let ok = ctx.dialer.probe(&target, provider.port, provider.tls).await;
         let _ = ctx
             .store
             .release_test_connection_lease(&claims.user_id, &lease_token)
             .await;
-        ok
+        Some(ok)
     }
     .await;
+    // A fenced lease (account being deleted) is the typed 409, never the
+    // boolean collapse: the lease is the fenced writer on this route
+    // (ADR 0002 rule 3), matching `vault_put`.
+    let Some(result) = result else {
+        if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+            return account_deleting_response();
+        }
+        // Lease contention (slots exhausted): same boolean as every other
+        // failure on this route, never a distinct shape.
+        ctx.audit(&claims.user_id, "vault.test", false).await;
+        return json_response(200, serde_json::json!({"ok": false}));
+    };
     ctx.audit(&claims.user_id, "vault.test", result).await;
     json_response(200, serde_json::json!({"ok": result}))
 }
@@ -2422,6 +2471,9 @@ mod tests {
         rate_limit_slot_probes: RefCell<usize>,
         fail_reauth_revocation: RefCell<bool>,
         fail_reauth_insert: RefCell<bool>,
+        /// Users whose `users.deleting_at` is set (ADR 0002 rule 3):
+        /// fenced writers refuse them, mirroring the production SQL.
+        deleting_users: RefCell<std::collections::HashSet<String>>,
     }
 
     impl Store for FakeStore {
@@ -2685,8 +2737,10 @@ mod tests {
                 .filter(|record| record.expires_at > now)
                 .map(|record| record.user_id.clone())
                 .collect();
+            let deleting_users = self.deleting_users.borrow();
             self.users.borrow_mut().retain(|_, user| {
                 user.created_at > cutoff
+                    || deleting_users.contains(&user.id)
                     || credentialed.contains(&user.id)
                     || active_registrations.contains(&user.id)
                     || vault_owners.contains(&user.id)
@@ -2703,6 +2757,11 @@ mod tests {
             lease_secs: u64,
             max_concurrency: u32,
         ) -> Result<bool, StoreError> {
+            // Mirror the production in-statement fence: a deleting
+            // account acquires no new lease rows.
+            if self.deleting_users.borrow().contains(user_id) {
+                return Ok(false);
+            }
             let expires_at = NOW.saturating_add(lease_secs);
             let mut leases = self.test_connection_leases.borrow_mut();
             leases.retain(|_, (_, expires)| *expires > NOW);
@@ -2805,10 +2864,18 @@ mod tests {
             Ok(self.vaults.borrow().get(user_id).cloned())
         }
         async fn upsert_vault(&self, user_id: &str, row: &VaultRow) -> Result<(), StoreError> {
+            // Mirror the production in-statement fence: a deleting
+            // account's upsert writes nothing and fails.
+            if self.deleting_users.borrow().contains(user_id) {
+                return Err(StoreError);
+            }
             self.vaults
                 .borrow_mut()
                 .insert(user_id.to_string(), row.clone());
             Ok(())
+        }
+        async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
+            Ok(self.deleting_users.borrow().contains(user_id))
         }
         async fn delete_vault(&self, user_id: &str) -> Result<(), StoreError> {
             self.vaults.borrow_mut().remove(user_id);
@@ -3529,6 +3596,95 @@ mod tests {
             resp.body.contains("\"provider_configured\":false"),
             "{}",
             resp.body
+        );
+    }
+
+    #[test]
+    fn vault_put_for_a_deleting_account_is_the_typed_409_and_writes_nothing() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let put_body = serde_json::json!({
+            "provider": {
+                "host": "news.example.com", "port": 563, "tls": true,
+                "username": "synthetic-user", "password": "synthetic-pass",
+                "max_connections": 4
+            },
+            "indexer": null
+        });
+        // Normal write first: fence open, the save lands.
+        let resp = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        // Deletion scheduled: the same save is the typed fence refusal,
+        // never the generic 400, and the stored row is not replaced.
+        h.store.deleting_users.borrow_mut().insert("u1".to_string());
+        let resp = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"account_deleting","message":"account is being deleted","retryable":false}"#
+        );
+        // Reads still work during grace (cancel must stay possible),
+        // and the pre-fence row is what they see.
+        let resp = h.call_full("GET", "/v1/vault", None, Some(cookie), None);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(
+            resp.body.contains("\"provider_configured\":true"),
+            "{}",
+            resp.body
+        );
+    }
+
+    #[test]
+    fn test_connection_for_a_deleting_account_is_the_typed_409() {
+        // ADR 0002 rule 3: the test-connection lease is a fenced writer, so
+        // a deleting account gets the typed 409 (like `vault_put`), never
+        // the collapsed `{"ok": false}` of an unreachable provider.
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let candidate = serde_json::json!({
+            "provider": {
+                "host": "news.example.com", "port": 563, "tls": true,
+                "username": "synthetic-user", "password": "synthetic-pass",
+                "max_connections": 4
+            },
+            "indexer": null
+        });
+        // Fence open: the route answers its boolean (the fake dialer is up).
+        let resp = h.call_full(
+            "POST",
+            "/v1/vault/test",
+            Some(candidate.to_string()),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        // Deletion scheduled: the fenced lease is the typed refusal.
+        h.store.deleting_users.borrow_mut().insert("u1".to_string());
+        let resp = h.call_full(
+            "POST",
+            "/v1/vault/test",
+            Some(candidate.to_string()),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"account_deleting","message":"account is being deleted","retryable":false}"#
         );
     }
 
@@ -5401,6 +5557,7 @@ mod tests {
         for (id, email) in [
             ("resumed", "resume@example.com"),
             ("active", "active@example.com"),
+            ("deleting", "deleting@example.com"),
             ("abandoned", "abandoned@example.com"),
         ] {
             block_on(h.store.insert_user(&UserRecord {
@@ -5420,6 +5577,10 @@ mod tests {
                 .insert_challenge(&finishing_challenge, Some("active"), PURPOSE_REGISTER),
         )
         .unwrap();
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert("deleting".to_string());
 
         let resp = h.call(
             "POST",
@@ -5431,6 +5592,9 @@ mod tests {
             .unwrap()
             .is_some());
         assert!(block_on(h.store.user_by_email("active@example.com"))
+            .unwrap()
+            .is_some());
+        assert!(block_on(h.store.user_by_email("deleting@example.com"))
             .unwrap()
             .is_some());
         assert!(block_on(h.store.user_by_email("abandoned@example.com"))
@@ -5451,6 +5615,11 @@ mod tests {
         assert!(
             sql.contains("users.id <> $2"),
             "reap must preserve the current user"
+        );
+        assert!(
+            sql.contains("deleting_at IS NULL"),
+            "reap must never delete an account already scheduled for \
+             deletion (its delete_operations RESTRICT FK owns it)"
         );
         assert!(sql.contains("auth_challenges.purpose = 'register'"));
         assert!(sql.contains("auth_challenges.expires_at > $3"));
