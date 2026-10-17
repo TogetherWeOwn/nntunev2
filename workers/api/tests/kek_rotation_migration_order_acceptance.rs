@@ -1,7 +1,9 @@
 //! Test-only regression coverage for KEK migration discovery and ordering.
 //!
 //! The KEK follow-up must be a uniquely numbered, manifest-listed migration
-//! after the existing schema history so deployment discovery applies it.
+//! after the pre-KEK schema history (through 0014) so deployment discovery
+//! applies it. Later migrations may follow it; `migrations_gate.py` enforces
+//! global ordering and manifest membership.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -43,7 +45,7 @@ fn migration_files(root: &Path) -> Vec<String> {
 }
 
 #[test]
-fn kek_rewrap_migration_is_discoverable_and_appended_after_existing_migrations() {
+fn kek_rewrap_migration_is_discoverable_and_after_pre_kek_migrations() {
     let root = migrations_dir();
     let files = migration_files(&root);
     let kek_migrations = files
@@ -58,14 +60,9 @@ fn kek_rewrap_migration_is_discoverable_and_appended_after_existing_migrations()
     );
     let kek_migration = kek_migrations[0];
     let kek_number = migration_number(kek_migration);
-    let max_number = files
-        .iter()
-        .map(|filename| migration_number(filename))
-        .max()
-        .expect("at least one migration must exist");
-    assert_eq!(
-        kek_number, max_number,
-        "KEK migration {kek_migration} must be appended after all existing migration numbers"
+    assert!(
+        kek_number > 14,
+        "KEK migration {kek_migration} must be numbered after 0014, the last pre-KEK migration"
     );
     assert_eq!(
         files
@@ -94,10 +91,5 @@ fn kek_rewrap_migration_is_discoverable_and_appended_after_existing_migrations()
             .count(),
         1,
         "KEK migration {kek_migration} must be listed exactly once in migrations/manifest.toml"
-    );
-    assert_eq!(
-        manifest_entries.last().map(String::as_str),
-        Some(kek_migration.as_str()),
-        "KEK migration {kek_migration} must be last in manifest discovery order"
     );
 }
