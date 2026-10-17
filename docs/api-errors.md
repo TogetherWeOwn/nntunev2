@@ -2,11 +2,11 @@
 
 The `api`, `ingest`, `mb`, and `stream` crates define mappings to the same
 JSON error envelope. In this slice, `ingest` and `mb` serialize the envelope
-on their wired HTTP error paths. The `api` and `stream` mappings are pinned for
-future HTTP wiring, not emitted by reachable HTTP paths here; in particular,
-the API session-configuration and storage mappings are not currently reachable
-from handlers. Clients can handle auth, validation, billing limits, and
-upstream failures without per-worker special cases.
+on their wired HTTP error paths. The API emits `reauth_required` from
+privilege-gated vault mutations; other API and stream mappings are pinned for
+future HTTP wiring, not emitted by reachable HTTP paths here. Clients can
+handle auth, validation, billing limits, and upstream failures without
+per-worker special cases.
 
 ## Envelope
 
@@ -59,6 +59,7 @@ emit the code.
 | code | HTTP status | retryable | owning worker | meaning |
 | --- | --- | --- | --- | --- |
 | `unauthorized` | 401 | false | api, stream | Missing, invalid, or expired credentials/session/grant. Deliberately generic: never says which check failed. |
+| `reauth_required` | 401 | false | api | Session is valid for ordinary operations but too old for a vault credential change; complete a fresh authentication proof. |
 | `provider_auth_expired` | 401 | false | api, stream | Provider credentials expired; prompts inline credential refresh rather than signing the user out. |
 | `plan_limit_exceeded` | 402 | false | api, ingest, stream | The plan quota (streams, library, ingest jobs) is exhausted; upgrade or wait for the period reset. Defined ahead of server-side enforcement so clients can build the upgrade path now. |
 | `forbidden` | 403 | false | api, stream | Authenticated, but the resource belongs to someone else (or the grant names a different track). |

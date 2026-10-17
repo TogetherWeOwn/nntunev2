@@ -711,6 +711,31 @@ where
         Ok((claims, token))
     }
 
+    /// Authenticate a privilege-changing request and require a fresh session.
+    /// Ordinary authentication remains valid for non-privileged operations.
+    async fn authenticate_privileged(
+        &self,
+        req: &Request,
+    ) -> Result<(SessionClaims, String), Response> {
+        match req.origin.as_deref() {
+            Some(origin) if origin == self.cfg.origin => {}
+            _ => return Err(generic_auth()),
+        }
+        let token = session_cookie_value(req).ok_or_else(generic_auth)?;
+        let keys = self.cfg.session_keys();
+        let claims =
+            session::verify_session_dual(&keys, &token, self.now).map_err(|_| generic_auth())?;
+        let record = self
+            .store
+            .session_by_id(&claims.session_id)
+            .await
+            .map_err(|_| internal())?
+            .ok_or_else(generic_auth)?;
+        let claims = session::require_fresh_session(&keys, &token, self.now, &record)
+            .map_err(session_error_response)?;
+        Ok((claims, token))
+    }
+
     /// Per-IP admission shared by register, login and magic start routes.
     /// The global budget is reserved only for outbound mail, so exhaustion
     /// cannot prevent users from obtaining an authentication challenge.
@@ -1671,7 +1696,7 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    let (claims, _token) = match ctx.authenticate(req, true).await {
+    let (claims, _token) = match ctx.authenticate_privileged(req).await {
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
@@ -1739,7 +1764,7 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    let (claims, _token) = match ctx.authenticate(req, true).await {
+    let (claims, _token) = match ctx.authenticate_privileged(req).await {
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
@@ -3020,6 +3045,78 @@ mod tests {
             "{}",
             resp.body
         );
+    }
+
+    #[test]
+    fn vault_mutations_require_fresh_session_but_reads_do_not() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let put_body = serde_json::json!({
+            "provider": {
+                "host": "news.example.com", "port": 563, "tls": true,
+                "username": "synthetic-user", "password": "synthetic-pass",
+                "max_connections": 4
+            },
+            "indexer": null
+        });
+
+        let fresh_put = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(fresh_put.status, 200, "{}", fresh_put.body);
+
+        let stale_ctx = Ctx {
+            cfg: &h.config,
+            store: &h.store,
+            mailer: &h.mailer,
+            dialer: &h.dialer,
+            dns: &h.dns,
+            now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
+            source_ip: "198.51.100.9".to_string(),
+        };
+        let stale_put_req = Request {
+            method: "PUT".to_string(),
+            path: "/v1/vault".to_string(),
+            cookie: Some(cookie.clone()),
+            origin: Some(ORIGIN.to_string()),
+            body: put_body.to_string().into_bytes(),
+        };
+        let stale_put = block_on(handle(&stale_ctx, &stale_put_req));
+        assert_eq!(stale_put.status, 401);
+        assert_eq!(
+            stale_put.body,
+            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
+        );
+
+        let stale_get_req = Request {
+            method: "GET".to_string(),
+            path: "/v1/vault".to_string(),
+            cookie: Some(cookie.clone()),
+            origin: None,
+            body: Vec::new(),
+        };
+        let stale_get = block_on(handle(&stale_ctx, &stale_get_req));
+        assert_eq!(stale_get.status, 200, "{}", stale_get.body);
+
+        let stale_delete_req = Request {
+            method: "DELETE".to_string(),
+            path: "/v1/vault".to_string(),
+            cookie: Some(cookie),
+            origin: Some(ORIGIN.to_string()),
+            body: Vec::new(),
+        };
+        let stale_delete = block_on(handle(&stale_ctx, &stale_delete_req));
+        assert_eq!(stale_delete.status, 401);
+        assert_eq!(
+            stale_delete.body,
+            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
+        );
+        assert!(h.store.vaults.borrow().contains_key("u1"));
     }
 
     #[test]

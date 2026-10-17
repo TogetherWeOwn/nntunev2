@@ -114,8 +114,20 @@ config from secrets) is a follow-up slice.
   `verify_stored_session` against the current `sessions` row on every
   request: owner, expiry, counter and revocation must match. Refresh must
   conditionally update the matching row/counter and commit before sending
-  the cookie; a superseded cookie then fails. Privilege changes require
-  reauthentication, revoking the old row and issuing a new session id.
+  the cookie; a superseded cookie then fails. Vault credential writes
+  (`PUT /v1/vault`) and deletes (`DELETE /v1/vault`) require a freshness
+  window of 600 seconds (10 minutes) on the immutable authentication time
+  (`created_at`, never `issued_at`, so rotation cannot restore freshness):
+  sessions authenticated outside the window are rejected with the documented
+  `reauth_required` error code (401). Vault summary reads and boolean
+  connection tests retain ordinary session authentication. The pure
+  `reauthenticate_session` helper binds the verified proof identity and
+  prepares a replacement session plus a conditional single-row revocation
+  claim; callers must execute both writes in one transaction and send the
+  cookie only after commit. The current `login_finish` and `magic_finish`
+  routes remain ordinary sign-in and issue independent sessions without
+  revoking existing rows; a proof-bound HTTP reauthentication route is not
+  part of this slice.
 - **Hyperdrive query caching:** the `HYPERDRIVE` binding MUST point to a
   Hyperdrive config with query caching disabled (`--caching-disabled`).
   Session, credential, user, challenge and vault reads are plain
