@@ -3,7 +3,7 @@
 # rerun, newer-dump upsert, DLQ query, and refusal guards. Needs psql,
 # python3 and mb-validate
 # on PATH (or MB_VALIDATE_BIN), plus DATABASE_URL to a SCRATCH database.
-# DESTRUCTIVE: truncates mb_artist/mb_release/mb_recording/mb_import_dlq and
+# DESTRUCTIVE: truncates mb_artist/mb_release/mb_recording/mb_track/mb_import_dlq and
 # resets mb_import_cursor/mb_import_state, so it refuses to run unless
 # ALLOW_TEST_TRUNCATE=1 is set. Never point it at staging or production.
 set -euo pipefail
@@ -43,7 +43,7 @@ check() {
 }
 
 reset_db() {
-  db -c "TRUNCATE mb_recording, mb_release, mb_artist, mb_import_dlq;" \
+  db -c "TRUNCATE mb_track, mb_recording, mb_release, mb_artist, mb_import_dlq;" \
      -c "UPDATE mb_import_cursor SET lines_done = 0;" \
      -c "UPDATE mb_import_state SET last_packet = 0, last_applied_at = NULL, lag_seconds = NULL;" >/dev/null
 }
@@ -69,6 +69,12 @@ with open(f'{d}/mbdump-release.tsv', 'w') as f:
 with open(f'{d}/mbdump-recording.tsv', 'w') as f:
     for i in range(1, N_REC + 1):
         f.write(f'{eid(200000+i)}\t{eid(100000 + (i % N_REL) + 1)}\tTrack {i}\t{(i % 12) + 1}\t180000\t2024-05-03T00:00:00Z\n')
+with open(f'{d}/mbdump-track.tsv', 'w') as f:
+    for i in range(1, N_REC + 1):
+        f.write(f'{eid(100000 + (i % N_REL) + 1)}\t{eid(200000+i)}\t1\t{(i % 12) + 1}\t2024-05-03T00:00:00Z\n')
+    # One recording also appears on a second release (medium 2): the
+    # membership file, unlike the canonical recording row, keeps both.
+    f.write(f'{eid(100001)}\t{eid(200001)}\t2\t1\t2024-05-03T00:00:00Z\n')
 EOF
 
 echo "--- target: $(db -c "SELECT current_database() || chr(47) || current_user || '@' || coalesce(inet_server_addr()::text, 'socket');")"
@@ -79,9 +85,13 @@ bash "$SELF_DIR/import.sh" "$FIX" >/dev/null
 check "artists loaded" "120" "$(db -c 'SELECT count(*) FROM mb_artist;')"
 check "releases loaded" "60" "$(db -c 'SELECT count(*) FROM mb_release;')"
 check "recordings loaded" "60" "$(db -c 'SELECT count(*) FROM mb_recording;')"
+check "tracks loaded" "61" "$(db -c 'SELECT count(*) FROM mb_track;')"
+check "shared recording keeps both memberships" "2" \
+  "$(db -c "SELECT count(*) FROM mb_track WHERE recording_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200001))')';")"
 check "artist cursor" "123" "$(cursor artist "$FIX/mbdump-artist.tsv")"
 check "release cursor" "61" "$(cursor release "$FIX/mbdump-release.tsv")"
 check "recording cursor" "60" "$(cursor recording "$FIX/mbdump-recording.tsv")"
+check "track cursor" "61" "$(cursor track "$FIX/mbdump-track.tsv")"
 check "dlq rows" "4" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
 check "dlq reasons" "bad_uuid,bad_timestamp,column_count,bad_uuid" \
   "$(db -c "SELECT string_agg(reason, ',' ORDER BY table_name, line_no) FROM mb_import_dlq;")"
@@ -96,9 +106,9 @@ check "operator DLQ query works" "1" \
   "$(db -c "SELECT count(*) FROM mb_import_dlq WHERE table_name='artist' AND reason='bad_uuid';")"
 
 echo "=== 2. rerun over same dump: zero dupes, zero movement ==="
-before="$(db -c 'SELECT (SELECT count(*) FROM mb_artist), (SELECT count(*) FROM mb_release), (SELECT count(*) FROM mb_recording), (SELECT count(*) FROM mb_import_dlq), (SELECT sum(lines_done) FROM mb_import_cursor);')"
+before="$(db -c 'SELECT (SELECT count(*) FROM mb_artist), (SELECT count(*) FROM mb_release), (SELECT count(*) FROM mb_recording), (SELECT count(*) FROM mb_track), (SELECT count(*) FROM mb_import_dlq), (SELECT sum(lines_done) FROM mb_import_cursor);')"
 bash "$SELF_DIR/import.sh" "$FIX" >/dev/null
-after="$(db -c 'SELECT (SELECT count(*) FROM mb_artist), (SELECT count(*) FROM mb_release), (SELECT count(*) FROM mb_recording), (SELECT count(*) FROM mb_import_dlq), (SELECT sum(lines_done) FROM mb_import_cursor);')"
+after="$(db -c 'SELECT (SELECT count(*) FROM mb_artist), (SELECT count(*) FROM mb_release), (SELECT count(*) FROM mb_recording), (SELECT count(*) FROM mb_track), (SELECT count(*) FROM mb_import_dlq), (SELECT sum(lines_done) FROM mb_import_cursor);')"
 check "rerun changes nothing" "$before" "$after"
 
 echo "=== 3. same-sized newer dump upserts rows and isolates cursor/DLQ ==="
@@ -119,7 +129,7 @@ EOF
 [[ "$(wc -c <"$FIX/mbdump-artist.tsv")" == "$(wc -c <"$NEWER/mbdump-artist.tsv")" ]]
 bash "$SELF_DIR/import.sh" "$NEWER" >/dev/null
 check "new dump updates existing artist" "Band 9|2025-05-01 12:00:00+00"   "$(db -c "SELECT name || '|' || updated_at FROM mb_artist WHERE mbid='00000000-0000-0000-0000-000000000001';")"
-check "new dump preserves table row counts" "120|60|60"   "$(db -c 'SELECT (SELECT count(*) FROM mb_artist) || chr(124) || (SELECT count(*) FROM mb_release) || chr(124) || (SELECT count(*) FROM mb_recording);')"
+check "new dump preserves table row counts" "120|60|60|61"   "$(db -c 'SELECT (SELECT count(*) FROM mb_artist) || chr(124) || (SELECT count(*) FROM mb_release) || chr(124) || (SELECT count(*) FROM mb_recording) || chr(124) || (SELECT count(*) FROM mb_track);')"
 check "new dump starts an independent cursor" "123" "$(cursor artist "$NEWER/mbdump-artist.tsv")"
 check "DLQ retains poison from both dumps" "7" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
 check "same line poison is keyed by dump" "2" \
@@ -168,7 +178,8 @@ elif ! kill -0 "$imp" 2>/dev/null; then
 else
   rel_at="$(cursor release "$FIX/mbdump-release.tsv")"
   rec_at="$(cursor recording "$FIX/mbdump-recording.tsv")"
-  if [[ "$killed_at" == "123" && "$rel_at" == "61" && "$rec_at" == "60" ]]; then
+  trk_at="$(cursor track "$FIX/mbdump-track.tsv")"
+  if [[ "$killed_at" == "123" && "$rel_at" == "61" && "$rec_at" == "60" && "$trk_at" == "61" ]]; then
     echo "FAIL: import completed before kill -9 (nothing to resume)" >&2
     kill -- "-$imp" 2>/dev/null || true
     wait "$imp" 2>/dev/null || true
@@ -186,9 +197,9 @@ else
       echo "FAIL: importer exited 0 before kill -9 landed; resume untested" >&2
       fail=1
     else
-      echo "killed mid-flight at cursor artist=$killed_at release=$rel_at recording=$rec_at (signal, wait=$kstatus); resuming"
-      partial="$(db -c 'SELECT (SELECT count(*) FROM mb_artist), (SELECT count(*) FROM mb_release), (SELECT count(*) FROM mb_recording);')"
-      if [[ "$partial" == "120|60|60" ]]; then
+      echo "killed mid-flight at cursor artist=$killed_at release=$rel_at recording=$rec_at track=$trk_at (signal, wait=$kstatus); resuming"
+      partial="$(db -c 'SELECT (SELECT count(*) FROM mb_artist), (SELECT count(*) FROM mb_release), (SELECT count(*) FROM mb_recording), (SELECT count(*) FROM mb_track);')"
+      if [[ "$partial" == "120|60|60|61" ]]; then
         echo "FAIL: kill left nothing to resume ($partial already fully loaded)" >&2
         fail=1
       else
@@ -196,6 +207,7 @@ else
         check "resume: artists" "120" "$(db -c 'SELECT count(*) FROM mb_artist;')"
         check "resume: releases" "60" "$(db -c 'SELECT count(*) FROM mb_release;')"
         check "resume: recordings" "60" "$(db -c 'SELECT count(*) FROM mb_recording;')"
+        check "resume: tracks" "61" "$(db -c 'SELECT count(*) FROM mb_track;')"
         check "resume: dlq" "4" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
         check "resume: artist dupes" "0" "$(db -c 'SELECT count(*) FROM (SELECT mbid FROM mb_artist GROUP BY mbid HAVING count(*)>1) d;')"
         check "resume: release dupes" "0" "$(db -c 'SELECT count(*) FROM (SELECT mbid FROM mb_release GROUP BY mbid HAVING count(*)>1) d;')"
@@ -211,7 +223,7 @@ reset_db
 DUPE="$FIX-dupe"
 rm -rf "$DUPE"
 mkdir -p "$DUPE"
-cp "$FIX/mbdump-release.tsv" "$FIX/mbdump-recording.tsv" "$DUPE/"
+cp "$FIX/mbdump-release.tsv" "$FIX/mbdump-recording.tsv" "$FIX/mbdump-track.tsv" "$DUPE/"
 python3 - "$DUPE" <<'EOF'
 import sys, uuid
 d = sys.argv[1]
@@ -268,6 +280,10 @@ with open(f'{d}/mbdump-release.tsv', 'w') as f:
 with open(f'{d}/mbdump-recording.tsv', 'w') as f:
     f.write(f'{eid(200001)}\t{eid(100001)}\tGood Track\t1\t180000\t2024-05-03T00:00:00Z\n')
     f.write(f'{eid(200002)}\t{eid(100002)}\tOrphan Track\t1\t180000\t2024-05-03T00:00:00Z\n')
+with open(f'{d}/mbdump-track.tsv', 'w') as f:
+    f.write(f'{eid(100001)}\t{eid(200001)}\t1\t1\t2024-05-03T00:00:00Z\n')
+    f.write(f'{eid(100002)}\t{eid(200001)}\t1\t1\t2024-05-03T00:00:00Z\n')
+    f.write(f'{eid(100001)}\t{eid(200002)}\t1\t2\t2024-05-03T00:00:00Z\n')
 EOF
 # Old behavior: the orphan's REFERENCES violation rolled back the whole
 # chunk, the cursor never advanced, and the row was never DLQ'd. Now the
@@ -281,11 +297,13 @@ fi
 check "fk: artists loaded" "1" "$(db -c 'SELECT count(*) FROM mb_artist;')"
 check "fk: releases loaded" "2" "$(db -c 'SELECT count(*) FROM mb_release;')"
 check "fk: recordings loaded" "1" "$(db -c 'SELECT count(*) FROM mb_recording;')"
+check "fk: tracks loaded" "1" "$(db -c 'SELECT count(*) FROM mb_track;')"
 check "fk: artist cursor" "2" "$(cursor artist "$FKDIR/mbdump-artist.tsv")"
 check "fk: release cursor" "3" "$(cursor release "$FKDIR/mbdump-release.tsv")"
 check "fk: recording cursor" "2" "$(cursor recording "$FKDIR/mbdump-recording.tsv")"
-check "fk: dlq rows" "3" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
-check "fk: dlq reasons" "bad_uuid,fk_missing_release,fk_missing_artist" \
+check "fk: track cursor" "3" "$(cursor track "$FKDIR/mbdump-track.tsv")"
+check "fk: dlq rows" "5" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
+check "fk: dlq reasons" "bad_uuid,fk_missing_release,fk_missing_artist,fk_missing_release,fk_missing_recording" \
   "$(db -c "SELECT string_agg(reason, ',' ORDER BY table_name, line_no) FROM mb_import_dlq;")"
 check "fk: orphan raw keeps dump key" "$(python3 -c 'import uuid; print(uuid.UUID(int=100002))')" \
   "$(db -c "SELECT split_part(raw_line, chr(9), 1) FROM mb_import_dlq WHERE reason='fk_missing_artist';")"
@@ -335,6 +353,9 @@ with open(f'{d}/mbdump-release.tsv', 'w') as f:
 with open(f'{d}/mbdump-recording.tsv', 'w') as f:
     for i in range(1, 4):
         f.write(f'{eid(400000+i)}\t\\N\tTrack {i}\t1\t180000\t2024-05-03T00:00:00Z\n')
+with open(f'{d}/mbdump-track.tsv', 'w') as f:
+    for i in range(1, 4):
+        f.write(f'{eid(300000+i)}\t{eid(400000+i)}\t1\t{i}\t2024-05-03T00:00:00Z\n')
 EOF
 if DUMP_SEQ=500 bash "$SELF_DIR/import.sh" "$POISON" >/dev/null 2>&1; then
   echo "FAIL: all-poison dump imported without error" >&2
@@ -352,10 +373,158 @@ else
   echo "ok: all-poison rerun refused on already-complete path"
 fi
 check "poison rerun: still no rows" "0" "$(db -c 'SELECT count(*) FROM mb_artist;')"
-check "poison rerun: downstream tables never loaded" "0" "$(db -c 'SELECT (SELECT count(*) FROM mb_release) + (SELECT count(*) FROM mb_recording);')"
+check "poison rerun: downstream tables never loaded" "0" "$(db -c 'SELECT (SELECT count(*) FROM mb_release) + (SELECT count(*) FROM mb_recording) + (SELECT count(*) FROM mb_track);')"
 check "poison rerun: replication state still untouched" "0" "$(db -c 'SELECT last_packet FROM mb_import_state WHERE id = 1;')"
 
-rm -rf "$FIX" "$DUPE" "$NEWER" "$FKDIR" "$POISON"
+echo "=== 11. changed tracks: repoint replaces, dropped position is pruned ==="
+# The mb_track key is the position (release, medium, track), so a newer
+# dump that repoints track 1 at a different recording must leave exactly
+# one row at that position, and a position the newer dump no longer
+# lists must be pruned — never two recordings for one track downstream.
+reset_db
+CHG="$FIX-changed"
+rm -rf "$CHG" "$CHG-newer" "$CHG-old"
+mkdir -p "$CHG"
+python3 - "$CHG" <<'EOF'
+import sys, uuid
+d = sys.argv[1]
+def eid(n): return str(uuid.UUID(int=n))
+with open(f'{d}/mbdump-artist.tsv', 'w') as f:
+    f.write(f'{eid(1)}\tBand 1\t1, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n')
+with open(f'{d}/mbdump-release.tsv', 'w') as f:
+    f.write(f'{eid(100001)}\t{eid(1)}\tAlbum\tAlbum\t2024\t\\N\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording.tsv', 'w') as f:
+    for i in range(1, 4):
+        f.write(f'{eid(200000+i)}\t{eid(100001)}\tTrack {i}\t{i}\t180000\t2024-05-03T00:00:00Z\n')
+with open(f'{d}/mbdump-track.tsv', 'w') as f:
+    for i in range(1, 4):
+        f.write(f'{eid(100001)}\t{eid(200000+i)}\t1\t{i}\t2024-05-03T00:00:00Z\n')
+EOF
+bash "$SELF_DIR/import.sh" "$CHG" >/dev/null
+check "changed: tracks before" "3" "$(db -c 'SELECT count(*) FROM mb_track;')"
+check "changed: track 1 before" "$(python3 -c 'import uuid; print(uuid.UUID(int=200001))')" \
+  "$(db -c 'SELECT recording_mbid FROM mb_track WHERE medium_no = 1 AND track_no = 1;')"
+cp -R "$CHG" "$CHG-newer"
+python3 - "$CHG-newer" <<'EOF'
+import sys, uuid
+d = sys.argv[1]
+def eid(n): return str(uuid.UUID(int=n))
+with open(f'{d}/mbdump-track.tsv', 'w') as f:
+    # Track 1 repointed at recording 3, track 2 unchanged, track 3 dropped.
+    f.write(f'{eid(100001)}\t{eid(200003)}\t1\t1\t2025-05-03T00:00:00Z\n')
+    f.write(f'{eid(100001)}\t{eid(200002)}\t1\t2\t2025-05-03T00:00:00Z\n')
+EOF
+bash "$SELF_DIR/import.sh" "$CHG-newer" >/dev/null
+check "changed: tracks after" "2" "$(db -c 'SELECT count(*) FROM mb_track;')"
+check "changed: track 1 repointed" "$(python3 -c 'import uuid; print(uuid.UUID(int=200003))')" \
+  "$(db -c 'SELECT recording_mbid FROM mb_track WHERE medium_no = 1 AND track_no = 1;')"
+check "changed: one row per position" "0" \
+  "$(db -c 'SELECT count(*) FROM (SELECT medium_no, track_no FROM mb_track GROUP BY 1, 2 HAVING count(*)>1) d;')"
+check "changed: dropped track pruned" "0" "$(db -c 'SELECT count(*) FROM mb_track WHERE track_no = 3;')"
+check "changed: album order after repoint" \
+  "$(python3 -c 'import uuid; print(str(uuid.UUID(int=200003)) + chr(44) + str(uuid.UUID(int=200002)))')" \
+  "$(db -c 'SELECT string_agg(recording_mbid::text, chr(44) ORDER BY medium_no, track_no, recording_mbid) FROM mb_track;')"
+# An older dump (new bytes, so it really reloads; older timestamps)
+# must neither roll the repoint back nor resurrect the dropped track:
+# the forward-only upsert guard and the prune's updated_at comparison
+# both refuse to move rows backwards.
+cp -R "$CHG" "$CHG-old"
+python3 - "$CHG-old" <<'EOF'
+import sys, uuid
+d = sys.argv[1]
+def eid(n): return str(uuid.UUID(int=n))
+with open(f'{d}/mbdump-track.tsv', 'w') as f:
+    for i in (3, 2, 1):
+        f.write(f'{eid(100001)}\t{eid(200000+i)}\t1\t{i}\t2024-05-03T00:00:00Z\n')
+EOF
+bash "$SELF_DIR/import.sh" "$CHG-old" >/dev/null
+check "changed: older dump leaves rows alone" "2" "$(db -c 'SELECT count(*) FROM mb_track;')"
+check "changed: older dump keeps repoint" "$(python3 -c 'import uuid; print(uuid.UUID(int=200003))')" \
+  "$(db -c 'SELECT recording_mbid FROM mb_track WHERE medium_no = 1 AND track_no = 1;')"
+
+echo "=== 12. interrupted multi-chunk track import never truncates a release ==="
+# The prune runs only in the final track chunk's transaction. A release
+# whose tracks straddle a chunk boundary in a newer dump must keep its
+# older-dump rows for not-yet-reloaded positions when the import stops
+# between chunks (the route serves mb_track directly, so a truncated
+# listing would be cached and persisted as final). Failure is injected
+# deterministically: a validator wrapper that fails on the second
+# track chunk, after the first chunk (and its cursor advance) commits.
+reset_db
+SPLIT="$FIX-split"
+SPLITN="$FIX-split-newer"
+SPLITTOOLS="$FIX-split-tools"
+rm -rf "$SPLIT" "$SPLITN" "$SPLITTOOLS"
+mkdir -p "$SPLIT" "$SPLITTOOLS"
+python3 - "$SPLIT" <<'EOF'
+import sys, uuid
+d = sys.argv[1]
+def eid(n): return str(uuid.UUID(int=n))
+with open(f'{d}/mbdump-artist.tsv', 'w') as f:
+    f.write(f'{eid(1)}\tBand 1\t1, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n')
+with open(f'{d}/mbdump-release.tsv', 'w') as f:
+    f.write(f'{eid(100001)}\t{eid(1)}\tAlbum\tAlbum\t2024\t\\N\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording.tsv', 'w') as f:
+    for i in range(1, 11):
+        f.write(f'{eid(200000+i)}\t{eid(100001)}\tTrack {i}\t{i}\t180000\t2024-05-03T00:00:00Z\n')
+with open(f'{d}/mbdump-track.tsv', 'w') as f:
+    for i in range(1, 11):
+        f.write(f'{eid(100001)}\t{eid(200000+i)}\t1\t{i}\t2024-05-03T00:00:00Z\n')
+EOF
+bash "$SELF_DIR/import.sh" "$SPLIT" >/dev/null
+check "split: tracks before" "10" "$(db -c 'SELECT count(*) FROM mb_track;')"
+cp -R "$SPLIT" "$SPLITN"
+python3 - "$SPLITN" <<'EOF'
+import sys, uuid
+d = sys.argv[1]
+def eid(n): return str(uuid.UUID(int=n))
+with open(f'{d}/mbdump-track.tsv', 'w') as f:
+    # Track 1 repointed at recording 10, track 10 dropped: 9 rows, so
+    # chunk size 4 splits this one release across three chunks.
+    f.write(f'{eid(100001)}\t{eid(200010)}\t1\t1\t2025-05-03T00:00:00Z\n')
+    for i in range(2, 10):
+        f.write(f'{eid(100001)}\t{eid(200000+i)}\t1\t{i}\t2025-05-03T00:00:00Z\n')
+EOF
+python3 - "$SPLITTOOLS/fail-second-track-validate" "$VALIDATE_BIN" "$SPLITTOOLS/track-validate-count" <<'EOF'
+import os, sys
+path, real, count = sys.argv[1], sys.argv[2], sys.argv[3]
+script = f"""#!/usr/bin/env bash
+if [[ "${{2:-}}" == "track" ]]; then
+  n=0
+  [[ -f '{count}' ]] && n="$(cat '{count}')"
+  n=$((n + 1))
+  printf '%s' "$n" >'{count}'
+  if (( n == 2 )); then
+    echo "injected validator failure on track chunk 2" >&2
+    exit 1
+  fi
+fi
+exec '{real}' "$@"
+"""
+with open(path, 'w') as f:
+    f.write(script)
+os.chmod(path, 0o755)
+EOF
+if MB_IMPORT_CHUNK_LINES=4 MB_VALIDATE_BIN="$SPLITTOOLS/fail-second-track-validate" bash "$SELF_DIR/import.sh" "$SPLITN" >/dev/null 2>&1; then
+  echo "FAIL: split dump imported without the injected validator failure" >&2
+  fail=1
+else
+  echo "ok: injected failure stopped the split import between track chunks"
+fi
+check "split: track cursor stopped after chunk 1" "4" "$(cursor track "$SPLITN/mbdump-track.tsv")"
+check "split: interrupted import keeps all 10 old positions" "10" "$(db -c 'SELECT count(*) FROM mb_track;')"
+check "split: not-yet-reloaded position 10 still present" "1" "$(db -c 'SELECT count(*) FROM mb_track WHERE track_no = 10;')"
+check "split: positions unchanged while interrupted" "1,2,3,4,5,6,7,8,9,10" \
+  "$(db -c 'SELECT string_agg(track_no::text, chr(44) ORDER BY track_no) FROM mb_track;')"
+MB_IMPORT_CHUNK_LINES=4 bash "$SELF_DIR/import.sh" "$SPLITN" >/dev/null
+check "split: resumed import completes cursor" "9" "$(cursor track "$SPLITN/mbdump-track.tsv")"
+check "split: final prune drops position 10" "9" "$(db -c 'SELECT count(*) FROM mb_track;')"
+check "split: track 1 repointed after resume" "$(python3 -c 'import uuid; print(uuid.UUID(int=200010))')" \
+  "$(db -c 'SELECT recording_mbid FROM mb_track WHERE medium_no = 1 AND track_no = 1;')"
+check "split: final positions" "1,2,3,4,5,6,7,8,9" \
+  "$(db -c 'SELECT string_agg(track_no::text, chr(44) ORDER BY track_no) FROM mb_track;')"
+
+rm -rf "$FIX" "$DUPE" "$NEWER" "$FKDIR" "$POISON" "$CHG" "$CHG-newer" "$CHG-old" "$SPLIT" "$SPLITN" "$SPLITTOOLS"
 if (( fail != 0 )); then
   echo "test-import: FAILED" >&2
   exit 1

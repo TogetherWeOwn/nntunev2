@@ -931,6 +931,12 @@ impl ScratchStore for R2Scratch {
 /// hits; anything larger is a contract break, handled as transient).
 const MAX_MB_RESPONSE_BYTES: usize = 64 * 1024;
 
+/// Cap on the MB release-recordings response body (the route returns at
+/// most 1000 recording objects; at a few hundred JSON bytes each, 1 MiB
+/// is generous headroom — anything larger is a contract break, handled
+/// as transient like the search cap).
+const MAX_MB_RECORDINGS_RESPONSE_BYTES: usize = 1024 * 1024;
+
 /// Load the upload payload for match-query derivation only (it was
 /// digest-checked and parsed in `Parsing`). Absence is distinguished
 /// from failure: a genuinely missing payload (its 30-day TTL expired
@@ -983,29 +989,40 @@ async fn match_query(env: &Env, msg: &QueueMsg) -> Result<Option<String>, JobErr
     }
 }
 
-/// One MB release search through the `MB_API` service binding, classified
-/// into the retry budget by [`crate::matching::parse_mb_search_response`].
-async fn fetch_release_match(env: &Env, query: &str) -> Result<Option<String>, JobError> {
-    let unavailable = |detail: &'static str| JobError::transient(ERR_MATCH_FAILED, detail);
+/// One fetch through the `MB_API` service binding, body capped at
+/// `max_bytes`. Every failure mode (missing binding, transport, oversize
+/// body, non-UTF-8) collapses to `Err(())`: callers classify all of them
+/// as transient, matching the retry-budget split in `matching`.
+async fn fetch_mb_body(env: &Env, url: String, max_bytes: usize) -> Result<(u16, String), ()> {
     let fetcher = env
         .service(crate::matching::MB_API_BINDING)
-        .map_err(|_| unavailable("musicbrainz lookup unavailable"))?;
-    let response = fetcher
-        .fetch(crate::matching::mb_search_url(query), None)
-        .await
-        .map_err(|_| unavailable("musicbrainz lookup unavailable"))?;
+        .map_err(|_| ())?;
+    let response = fetcher.fetch(url, None).await.map_err(|_| ())?;
     let status = response.status().as_u16();
     let mut body = response.into_body();
     let mut bytes = Vec::new();
     while let Some(chunk) = body.next().await {
-        let chunk = chunk.map_err(|_| unavailable("musicbrainz lookup unavailable"))?;
-        if bytes.len() + chunk.len() > MAX_MB_RESPONSE_BYTES {
-            return Err(unavailable("musicbrainz response too large"));
+        let chunk = chunk.map_err(|_| ())?;
+        if bytes.len() + chunk.len() > max_bytes {
+            return Err(());
         }
         bytes.extend_from_slice(&chunk);
     }
-    let text =
-        String::from_utf8(bytes).map_err(|_| unavailable("musicbrainz lookup unavailable"))?;
+    let text = String::from_utf8(bytes).map_err(|_| ())?;
+    Ok((status, text))
+}
+
+/// One MB release search through the `MB_API` service binding, classified
+/// into the retry budget by [`crate::matching::parse_mb_search_response`].
+async fn fetch_release_match(env: &Env, query: &str) -> Result<Option<String>, JobError> {
+    let unavailable = |detail: &'static str| JobError::transient(ERR_MATCH_FAILED, detail);
+    let (status, text) = fetch_mb_body(
+        env,
+        crate::matching::mb_search_url(query),
+        MAX_MB_RESPONSE_BYTES,
+    )
+    .await
+    .map_err(|()| unavailable("musicbrainz lookup unavailable"))?;
     let hits =
         crate::matching::parse_mb_search_response(status, &text).map_err(
             |failure| match failure {
@@ -1020,10 +1037,34 @@ async fn fetch_release_match(env: &Env, query: &str) -> Result<Option<String>, J
     Ok(crate::matching::pick_release_mbid(query, &hits))
 }
 
+/// One MB release-recordings fetch through the `MB_API` service binding,
+/// classified into the retry budget by
+/// [`crate::matching::parse_mb_recordings_response`]. Transport failures
+/// are `Transient`, exactly like a 5xx.
+async fn fetch_release_recordings(
+    env: &Env,
+    release_mbid: &str,
+) -> Result<Vec<String>, crate::matching::MatchFailure> {
+    let (status, text) = fetch_mb_body(
+        env,
+        crate::matching::mb_release_recordings_url(release_mbid),
+        MAX_MB_RECORDINGS_RESPONSE_BYTES,
+    )
+    .await
+    .map_err(|()| crate::matching::MatchFailure::Transient)?;
+    crate::matching::parse_mb_recordings_response(status, &text)
+}
+
 /// Resolve the job's library write: MB lookup when a query exists, an
 /// unmatched write when it does not. Resolution is a pure function of the
 /// query and the MB mirror, so `Writing` re-resolves on redelivery
 /// instead of the checkpoint carrying the match between states.
+///
+/// A picked release also fetches its recordings. That failure must not
+/// lose the release match ([`crate::matching::recording_mbids_or_fallback`]):
+/// a permanent recordings failure writes the release with an empty list,
+/// while a transient one retries the job so redelivery re-resolves the
+/// match — recordings included.
 async fn resolve_library_write(
     env: &Env,
     msg: &QueueMsg,
@@ -1032,7 +1073,18 @@ async fn resolve_library_write(
         Some(query) => fetch_release_match(env, &query).await?,
         None => None,
     };
-    Ok(crate::matching::library_write_for(msg, release_mbid))
+    let recording_mbids = match release_mbid.as_deref() {
+        Some(release_mbid) => crate::matching::recording_mbids_or_fallback(
+            fetch_release_recordings(env, release_mbid).await,
+        )
+        .map_err(|_| JobError::transient(ERR_MATCH_FAILED, "musicbrainz lookup unavailable"))?,
+        None => Vec::new(),
+    };
+    Ok(crate::matching::library_write_for(
+        msg,
+        release_mbid,
+        recording_mbids,
+    ))
 }
 
 /// The side effects [`run_match_write_with`] sequences, behind a trait so
@@ -1599,7 +1651,7 @@ mod tests {
     impl MatchWriteRuntime for FakeMatchWrite {
         async fn resolve(&self, msg: &QueueMsg) -> Result<crate::queue::LibraryWrite, JobError> {
             self.calls.borrow_mut().push("resolve");
-            Ok(crate::matching::library_write_for(msg, None))
+            Ok(crate::matching::library_write_for(msg, None, Vec::new()))
         }
 
         async fn meter(&self, _msg: &QueueMsg, stage: &'static str) -> Result<(), ()> {

@@ -13,12 +13,17 @@ DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/mbdump"
 diff -u "$expected/mbdump-artist.tsv" "$temp_dir/mbdump/curated/mbdump-artist.tsv"
 diff -u "$expected/mbdump-release.tsv" "$temp_dir/mbdump/curated/mbdump-release.tsv"
 diff -u "$expected/mbdump-recording.tsv" "$temp_dir/mbdump/curated/mbdump-recording.tsv"
+# The fixture recording appears on both releases and on a second medium
+# of the first: the membership file must keep every appearance in
+# (release, medium, track) order, not just the canonical one the
+# recording file carries.
+diff -u "$expected/mbdump-track.tsv" "$temp_dir/mbdump/curated/mbdump-track.tsv"
 
 first_snapshot="$(readlink "$temp_dir/mbdump/curated")"
 DUMP_TS=2025-02-03T04:05:07Z "$container_dir/etl.sh" "$temp_dir/mbdump"
 second_snapshot="$(readlink "$temp_dir/mbdump/curated")"
 [[ "$first_snapshot" != "$second_snapshot" ]]
-for table in artist release recording; do
+for table in artist release recording track; do
   grep -q '2025-02-03T04:05:07Z$' "$temp_dir/mbdump/curated/mbdump-$table.tsv"
 done
 

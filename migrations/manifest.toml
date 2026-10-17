@@ -72,3 +72,8 @@ sha256 = "8385253fbddb464361f30678cfb8464b7c3d73f7ae5614f0eced870876dcef88"
 file = "0015_kek_rotation.sql"
 target = "app"
 sha256 = "c12d9f869611df9d5a4203ba96089aea41c88e3c1e85714dfdcff2e9cf474529"
+
+[[migration]]
+file = "0016_mb_track.sql"
+target = "mirror"
+sha256 = "4e984b85eb9d62a498402dc2ddf9474ac8297fe988b22cbfc1434bd8c7cbdbaa"

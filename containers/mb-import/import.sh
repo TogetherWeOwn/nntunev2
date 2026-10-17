@@ -11,18 +11,25 @@
 # number is recorded per (table, dump hash), so kill -9 resumes the same
 # dump while a newer dump starts at line 0. The upsert carries a
 # forward-only updated_at guard (older dumps never roll a row back).
+# Contract: every row of a dump file carries that dump's single
+# updated_at (the ETL stamps one DUMP_TS); the track prune compares
+# per-release maxima and relies on that uniformity. The prune runs
+# only in the track dump's final chunk transaction, atomically with
+# the cursor advancing to the end of the dump, so an interrupted
+# import leaves rows at worst stale, never truncated.
 
 # Poison rows never abort the import: the mb-validate pre-pass checks every
 # line against the typed upsert contract (uuid/int/timestamp shapes, COPY
 # escapes, canonical dump layout) and poison lines land in mb_import_dlq
 # with reason + raw line for the operator. FK orphans join them instead of
-# aborting the chunk: a release/recording whose parent MBID was poisoned or
-# never loaded would violate REFERENCES inside the transaction (whole chunk
-# rolls back, cursor pinned, row never DLQ'd), so orphan rows are detected
-# up front and filed under fk_missing_artist / fk_missing_release.
+# aborting the chunk: a release/recording/track whose parent MBID was
+# poisoned or never loaded would violate REFERENCES inside the transaction
+# (whole chunk rolls back, cursor pinned, row never DLQ'd), so orphan rows
+# are detected up front and filed under fk_missing_artist /
+# fk_missing_release / fk_missing_recording.
 # Duplicate valid MBIDs within a dump are rejected before import; the same
 # MBID across distinct dumps is expected and is handled by the forward-only
-# upsert. FK order is artist -> release -> recording: every chunk of a
+# upsert. FK order is artist -> release -> recording -> track: every chunk of a
 # later table only references rows an earlier table already committed, and
 # immediate FK checks never see a half-chunk (a failed chunk rolls
 # back whole).
@@ -39,6 +46,7 @@
 #   <dump-dir>/mbdump-artist.tsv     mb_artist    (mbid, name, sort_name, type, country, updated_at)
 #   <dump-dir>/mbdump-release.tsv    mb_release   (mbid, artist_mbid, title, release_type, year, caa_url, updated_at)
 #   <dump-dir>/mbdump-recording.tsv  mb_recording (mbid, release_mbid, title, track_no, duration_ms, updated_at)
+#   <dump-dir>/mbdump-track.tsv      mb_track     (release_mbid, recording_mbid, medium_no, track_no, updated_at)
 # Produce them from an official mbdump/ extract (mbdump/artist, mbdump/release,
 # mbdump/recording with the full upstream column layout) by projecting the
 # curated columns in dump order, e.g. with a small ETL step that SELECTs the
@@ -50,7 +58,7 @@ if [[ "${1:-}" == "--help" || $# -lt 1 ]]; then
   cat <<'USAGE'
 Usage: DATABASE_URL=<postgres-url> ./import.sh <dump-dir>
 
-Imports curated mbdump TSV dumps (artist, release, recording) in kill-safe
+Imports curated mbdump TSV dumps (artist, release, recording, track) in kill-safe
 chunks: validate -> COPY -> typed upsert -> cursor advance, one transaction
 per chunk, poison rows to mb_import_dlq. A rerun resumes from
 mb_import_cursor and inserts zero dupes. See the header comment for the
@@ -110,24 +118,58 @@ refuse_all_poison_dump() {
   fi
 }
 
-for table in artist release recording; do
+for table in artist release recording track; do
   tsv="$dump_dir/mbdump-$table.tsv"
   if [[ ! -f "$tsv" ]]; then
     echo "import: missing $tsv (expected curated TSV; see header comment)" >&2
     exit 1
   fi
+  prune_sql=""
+  final_prune_sql=""
   case "$table" in
     artist)
       columns="mbid, name, sort_name, \"type\", country, updated_at"
       upsert="name = EXCLUDED.name, sort_name = EXCLUDED.sort_name, \"type\" = EXCLUDED.\"type\", country = EXCLUDED.country, updated_at = EXCLUDED.updated_at"
+      conflict="(mbid)"
       ;;
     release)
       columns="mbid, artist_mbid, title, release_type, year, caa_url, updated_at"
       upsert="artist_mbid = EXCLUDED.artist_mbid, title = EXCLUDED.title, release_type = EXCLUDED.release_type, year = EXCLUDED.year, caa_url = EXCLUDED.caa_url, updated_at = EXCLUDED.updated_at"
+      conflict="(mbid)"
       ;;
     recording)
       columns="mbid, release_mbid, title, track_no, duration_ms, updated_at"
       upsert="release_mbid = EXCLUDED.release_mbid, title = EXCLUDED.title, track_no = EXCLUDED.track_no, duration_ms = EXCLUDED.duration_ms, updated_at = EXCLUDED.updated_at"
+      conflict="(mbid)"
+      ;;
+    track)
+      columns="release_mbid, recording_mbid, medium_no, track_no, updated_at"
+      # The key is the position: a track repointed at a different
+      # recording in a newer dump replaces the old row instead of
+      # sitting beside it at the same medium/track.
+      upsert="recording_mbid = EXCLUDED.recording_mbid, updated_at = EXCLUDED.updated_at"
+      conflict="(release_mbid, medium_no, track_no)"
+      # Prune superseded rows, but ONLY in the final chunk's
+      # transaction (selected per part below): every row of one dump
+      # carries that dump's updated_at, so once the last chunk is in,
+      # each release keeps only its newest-dump rows. That deletes
+      # dropped/renumbered positions a newer dump no longer lists,
+      # and also deletes the rows an older dump just inserted (the
+      # upsert guard blocks its updates, but a fresh insert has no
+      # conflict to guard, so without this it would resurrect tracks
+      # the newer dump dropped). Running it in an earlier chunk would
+      # delete a straddling release's not-yet-reloaded positions, so
+      # a kill/failure between chunks would leave a truncated (but
+      # cacheable, ingest-persistable) listing until the resume;
+      # deferred to the last chunk, the prune and the cursor reaching
+      # the end of the dump commit atomically and an interrupted
+      # import leaves rows at worst stale, never truncated. The form
+      # is release-wide (no stage restriction): by the final chunk
+      # every release this dump lists is fully loaded, and a release
+      # absent from the dump keeps all its rows at its own max. A
+      # position whose new row landed in the DLQ (poison/FK orphan)
+      # loses its old row too: a visible gap, never a stale recording.
+      final_prune_sql="DELETE FROM mb_track old WHERE old.updated_at < (SELECT max(t.updated_at) FROM mb_track t WHERE t.release_mbid = old.release_mbid);"
       ;;
   esac
   # awk NR counts a trailing partial line; the validator counts the same
@@ -139,11 +181,21 @@ for table in artist release recording; do
   fi
   dump_id="$(sha256sum "$tsv" | cut -d ' ' -f 1)"
   psql -v ON_ERROR_STOP=1 -c "INSERT INTO mb_import_cursor (table_name, dump_id, lines_done) VALUES ('$table', '$dump_id', 0) ON CONFLICT (table_name, dump_id) DO NOTHING;" >/dev/null
-  awk -F '\t' 'length($1) == 36 && substr($1, 9, 1) == "-" && substr($1, 14, 1) == "-" && substr($1, 19, 1) == "-" && substr($1, 24, 1) == "-" { id = $1; gsub(/-/, "", id); if (length(id) == 32 && id ~ /^[[:xdigit:]]+$/) print tolower($1) }' "$tsv" \
-    | sort -T "$work" >"$work/mbids.sorted"
+  # Duplicate-key pre-check. Entity tables key on the MBID in column 1;
+  # track keys on the position tuple (release, medium, track), where
+  # column 1 legitimately repeats per track of a release.
+  if [[ "$table" == "track" ]]; then
+    # Positions are normalized numerically ($3+0) so "01" and "1" cannot
+    # slip past as distinct keys for the same SMALLINT primary key.
+    awk -F '\t' 'NF >= 4 && $3 ~ /^[+-]?[0-9]+$/ && $4 ~ /^[+-]?[0-9]+$/ { print tolower($1) "/" ($3+0) "/" ($4+0) }' "$tsv" \
+      | sort -T "$work" >"$work/mbids.sorted"
+  else
+    awk -F '\t' 'length($1) == 36 && substr($1, 9, 1) == "-" && substr($1, 14, 1) == "-" && substr($1, 19, 1) == "-" && substr($1, 24, 1) == "-" { id = $1; gsub(/-/, "", id); if (length(id) == 32 && id ~ /^[[:xdigit:]]+$/) print tolower($1) }' "$tsv" \
+      | sort -T "$work" >"$work/mbids.sorted"
+  fi
   uniq -d "$work/mbids.sorted" >"$work/mbids.duplicates"
   if [[ -s "$work/mbids.duplicates" ]]; then
-    echo "import: duplicate MBID(s) in $tsv (dump contradicts itself):" >&2
+    echo "import: duplicate key(s) in $tsv (dump contradicts itself):" >&2
     head -n 5 "$work/mbids.duplicates" >&2
     exit 1
   fi
@@ -215,9 +267,13 @@ for table in artist release recording; do
       echo "import: chunk $table lines $range yielded $((10#$valid_n + 10#$poison_n)) of $lines lines; the dump changed under the import: refusing" >&2
       exit 1
     fi
-    dupes="$(awk -F'\t' '{ print $1 }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
+    if [[ "$table" == "track" ]]; then
+      dupes="$(awk -F'\t' '{ print tolower($1) "/" ($3+0) "/" ($4+0) }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
+    else
+      dupes="$(awk -F'\t' '{ print $1 }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
+    fi
     if [[ -n "$dupes" ]]; then
-      echo "import: duplicate MBID inside $table chunk lines $range (dump contradicts itself; fix the dump, cursor stays at $offset):" >&2
+      echo "import: duplicate key inside $table chunk lines $range (dump contradicts itself; fix the dump, cursor stays at $offset):" >&2
       echo "$dupes" >&2
       exit 1
     fi
@@ -226,18 +282,25 @@ for table in artist release recording; do
     # REFERENCES inside the transaction, rolling back the whole chunk with
     # the cursor pinned and the row never DLQ'd. Detect those rows up front
     # against the already-committed parent table and file them under
-    # fk_missing_artist / fk_missing_release with their exact dump bytes.
+    # fk_missing_artist / fk_missing_release / fk_missing_recording with
+    # their exact dump bytes.
     # (artist has no parent; release parents commit before any release chunk
     # runs and recording parents before any recording chunk, so a missing
-    # parent is poison, never chunk ordering.)
+    # parent is poison, never chunk ordering. track has two parents and is
+    # split once per parent; a row moved by the first split is already out
+    # of valid.tsv for the second.)
     if (( 10#$valid_n > 0 )) && [[ "$table" != "artist" ]]; then
       case "$table" in
-        release) parent_table="mb_artist"; fk_reason="fk_missing_artist" ;;
-        recording) parent_table="mb_release"; fk_reason="fk_missing_release" ;;
+        release) fk_specs=("2 mb_artist fk_missing_artist") ;;
+        recording) fk_specs=("2 mb_release fk_missing_release") ;;
+        track) fk_specs=("1 mb_release fk_missing_release" "2 mb_recording fk_missing_recording") ;;
       esac
-      # Parent MBID is column 2 of the normalized valid rows; `\N` is NULL
-      # (no parent) and always passes. Trailing column is the dump line_no.
-      awk -F'\t' '$2 != "\\N" { print $2 "\t" $NF }' "$work/valid.tsv" >"$work/parents.tsv"
+      for fk_spec in "${fk_specs[@]}"; do
+      read -r fk_col parent_table fk_reason <<<"$fk_spec"
+      (( 10#$valid_n > 0 )) || break
+      # Parent MBID is column $fk_col of the normalized valid rows; `\N` is
+      # NULL (no parent) and always passes. Trailing column is line_no.
+      awk -F'\t' -v c="$fk_col" '$c != "\\N" { print $c "\t" $NF }' "$work/valid.tsv" >"$work/parents.tsv"
       # No explicit transaction here, so no ON COMMIT DROP: each statement
       # autocommits, which would drop the temp table before COPY runs. The
       # table dies with the session instead.
@@ -300,6 +363,7 @@ EOF
         poison_n="$(awk 'END { print NR+0 }' "$work/poison.tsv")"
         echo "import: $table lines $range: $fk_moved orphan row(s) reference missing parents ($fk_reason), moved to DLQ"
       fi
+      done
     fi
     # Single psql session + single transaction: the TEMP stage tables are
     # session-scoped, so create, COPY, upsert, DLQ load and cursor advance
@@ -314,13 +378,20 @@ EOF
     # -q keeps stdout to just the RETURNING value: without it every command
     # tag (BEGIN/COPY/INSERT/...) lands in the capture and the cursor check
     # below misfires.
+    # The track prune runs only in the part that ends at the dump's last
+    # line, so it commits atomically with the cursor completing the dump.
+    prune_sql=""
+    if (( 10#$end == 10#$total )); then
+      prune_sql="$final_prune_sql"
+    fi
     advanced="$(psql -q -v ON_ERROR_STOP=1 -tAX <<SQL
 BEGIN;
 CREATE TEMP TABLE stage (LIKE mb_${table}) ON COMMIT DROP;
 \copy stage ($columns, line_no) FROM '$work/valid.tsv' WITH (FORMAT text)
 INSERT INTO mb_${table} ($columns, line_no) SELECT $columns, line_no FROM stage
-ON CONFLICT (mbid) DO UPDATE SET $upsert
+ON CONFLICT $conflict DO UPDATE SET $upsert
 WHERE mb_${table}.updated_at < EXCLUDED.updated_at;
+$prune_sql
 CREATE TEMP TABLE poison (reason text, line_no bigint, raw text) ON COMMIT DROP;
 \copy poison FROM '$work/poison.tsv' WITH (FORMAT text)
 INSERT INTO mb_import_dlq (table_name, dump_id, line_no, reason, raw_line)

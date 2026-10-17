@@ -9,11 +9,14 @@
 //! classification, and the deterministic pick so all of it is unit-tested
 //! without a binding.
 //!
-//! Recording MBIDs stay empty for now: the MB worker has no
-//! release-to-recordings route yet (only per-recording lookup/search), so
-//! there is no honest way to populate them. The library upsert converges
-//! (`ON CONFLICT DO UPDATE`), so a later replay can fill them in once that
-//! route exists.
+//! After a release pick, the matcher also fetches the release's
+//! recordings (`GET /v1/mb/release/:mbid/recordings`) to fill
+//! `recording_mbids`. A recordings-fetch failure never loses the release
+//! match: transient failures retry the job (the match is re-resolved on
+//! redelivery), and permanent failures write the matched release with an
+//! empty list — the library upsert converges (`ON CONFLICT DO UPDATE`),
+//! so a later replay can still fill them in. See
+//! [`recording_mbids_or_fallback`].
 
 use serde::Deserialize;
 
@@ -45,6 +48,13 @@ pub const MIN_MATCH_SCORE: f32 = 0.6;
 /// instead of an arbitrary MBID pick.
 pub const MIN_MATCH_MARGIN: f32 = 0.1;
 
+/// Upper bound on `recording_mbids` carried into a library write. Mirrors
+/// the 10k validation cap in `library::validate_library_write`:
+/// truncating here keeps an oversized listing from failing validation
+/// and losing the whole write. The MB route caps at 1000 rows, so this
+/// only bites if that contract grows past the library cap.
+pub const MAX_RECORDING_MBIDS: usize = 10_000;
+
 /// One MB release-search hit (`GET /v1/mb/search?type=release`).
 /// `artist_mbid`/`artist_name` come from the release's joined
 /// `mb_artist` row and are null when the release has no artist (or when
@@ -64,6 +74,24 @@ pub struct MbSearchHit {
 #[derive(Debug, Deserialize)]
 struct MbSearchBody {
     results: Vec<MbSearchHit>,
+}
+
+/// One entry of `GET /v1/mb/release/:mbid/recordings`. Only the fields
+/// the library write needs are decoded; extra fields are ignored.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct MbRecording {
+    pub mbid: String,
+    #[serde(default)]
+    pub track_no: Option<i16>,
+    /// Medium (disc) position within the release. Absent in responses
+    /// cached before the field existed, hence the default.
+    #[serde(default)]
+    pub medium_no: Option<i16>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MbRecordingsBody {
+    recordings: Vec<MbRecording>,
 }
 
 /// Why an MB lookup failed, in retry-budget terms.
@@ -121,6 +149,90 @@ pub fn parse_mb_search_response(status: u16, body: &str) -> Result<Vec<MbSearchH
             .map_err(|_| MatchFailure::Transient),
         400..=499 => Err(MatchFailure::Permanent),
         _ => Err(MatchFailure::Transient),
+    }
+}
+
+/// Absolute MB release-recordings URL for the `MB_API` service binding.
+/// Callers pass a picked release MBID, which [`pick_release_mbid`] has
+/// already validated as canonical hex-and-hyphens, so it needs no
+/// percent-encoding.
+pub fn mb_release_recordings_url(release_mbid: &str) -> String {
+    format!("{MB_SERVICE_HOST}/v1/mb/release/{release_mbid}/recordings")
+}
+
+/// Classify one MB release-recordings response into recording MBIDs in
+/// album order. The MB worker orders server-side (medium, then
+/// `track_no`, then MBID), but — like [`pick_release_mbid`] — this does
+/// not trust wire order: entries are re-sorted the same way, malformed
+/// MBIDs are dropped, duplicates keep their first position, and the
+/// list is capped at [`MAX_RECORDING_MBIDS`]. An empty recordings list
+/// is a successful empty result. Status classification mirrors
+/// [`parse_mb_search_response`]; note a 404 here is `Permanent` (the
+/// release vanished between search and this fetch, or a contract bug),
+/// and [`recording_mbids_or_fallback`] decides what that means for the
+/// write.
+pub fn parse_mb_recordings_response(status: u16, body: &str) -> Result<Vec<String>, MatchFailure> {
+    match status {
+        200 => serde_json::from_str::<MbRecordingsBody>(body)
+            .map(|parsed| recording_mbids_in_track_order(&parsed.recordings))
+            .map_err(|_| MatchFailure::Transient),
+        400..=499 => Err(MatchFailure::Permanent),
+        _ => Err(MatchFailure::Transient),
+    }
+}
+
+/// Recording MBIDs ordered by medium (disc) number, then track number
+/// within the medium (missing numbers last), ties broken by the
+/// lexicographically smallest MBID. Sorting by track number alone
+/// would interleave the discs of a multi-medium release (disc 1
+/// track 1, disc 2 track 1, disc 1 track 2, ...). A response cached
+/// before `medium_no` existed has it missing on every entry, which
+/// ties and falls back to track order.
+fn recording_mbids_in_track_order(recordings: &[MbRecording]) -> Vec<String> {
+    let mut valid: Vec<&MbRecording> = recordings
+        .iter()
+        .filter(|recording| validate_mbid(&recording.mbid))
+        .collect();
+    valid.sort_by(|a, b| {
+        a.medium_no
+            .unwrap_or(i16::MAX)
+            .cmp(&b.medium_no.unwrap_or(i16::MAX))
+            .then_with(|| {
+                a.track_no
+                    .unwrap_or(i16::MAX)
+                    .cmp(&b.track_no.unwrap_or(i16::MAX))
+            })
+            .then_with(|| a.mbid.cmp(&b.mbid))
+    });
+    let mut seen = std::collections::HashSet::with_capacity(valid.len());
+    let mut mbids: Vec<String> = Vec::with_capacity(valid.len().min(MAX_RECORDING_MBIDS));
+    for recording in valid {
+        if seen.insert(recording.mbid.as_str()) {
+            mbids.push(recording.mbid.clone());
+        }
+        if mbids.len() == MAX_RECORDING_MBIDS {
+            break;
+        }
+    }
+    mbids
+}
+
+/// Decide the `recording_mbids` for a matched write from the recordings
+/// fetch outcome, without ever losing the release match itself:
+///
+/// - success → the fetched MBIDs;
+/// - `Permanent` → an empty list. Retrying cannot fix a 4xx, so the
+///   matched release is still written (with no recordings) rather than
+///   failing the job; a later replay converges the row once fixed.
+/// - `Transient` → propagate, so the caller retries the job and the
+///   match is re-resolved — recordings included — on redelivery.
+pub fn recording_mbids_or_fallback(
+    fetch: Result<Vec<String>, MatchFailure>,
+) -> Result<Vec<String>, MatchFailure> {
+    match fetch {
+        Ok(mbids) => Ok(mbids),
+        Err(MatchFailure::Permanent) => Ok(Vec::new()),
+        Err(transient) => Err(transient),
     }
 }
 
@@ -279,17 +391,29 @@ pub fn derive_upload_query(subjects: &[String]) -> Option<String> {
     validate_match_query(&candidate)
 }
 
-/// The library write for a job and its match outcome. `None` is a
-/// legitimate unmatched write (no query, or no hit passed the pick), not
-/// a failure: the row records the job and converges if a later replay
-/// refines the match.
-pub fn library_write_for(msg: &QueueMsg, release_mbid: Option<String>) -> LibraryWrite {
+/// The library write for a job and its match outcome. A `None` release
+/// is a legitimate unmatched write (no query, or no hit passed the
+/// pick), not a failure: the row records the job and converges if a
+/// later replay refines the match. Recordings only ever accompany a
+/// matched release — a caller that passes recordings without one has
+/// them dropped rather than writing recording MBIDs unattributable to
+/// any release.
+pub fn library_write_for(
+    msg: &QueueMsg,
+    release_mbid: Option<String>,
+    recording_mbids: Vec<String>,
+) -> LibraryWrite {
+    let recording_mbids = if release_mbid.is_some() {
+        recording_mbids
+    } else {
+        Vec::new()
+    };
     LibraryWrite {
         job_id: msg.job_id.clone(),
         user_id: msg.user_id.clone(),
         idempotency_key: msg.idempotency_key.clone(),
         release_mbid,
-        recording_mbids: Vec::new(),
+        recording_mbids,
     }
 }
 
@@ -496,15 +620,115 @@ mod tests {
     }
 
     #[test]
-    fn library_write_carries_job_identity_and_no_recordings_yet() {
+    fn library_write_carries_job_identity() {
         let msg =
             build_search_dispatch("user_01", "animals", "vault_idx_01", &[3000], 25, 0).unwrap();
-        let write = library_write_for(&msg, Some(MBID_A.to_string()));
+        let write = library_write_for(&msg, Some(MBID_A.to_string()), Vec::new());
         assert_eq!(write.job_id, msg.job_id);
         assert_eq!(write.user_id, msg.user_id);
         assert_eq!(write.idempotency_key, msg.idempotency_key);
         assert_eq!(write.release_mbid.as_deref(), Some(MBID_A));
         assert!(write.recording_mbids.is_empty());
         assert!(crate::library::validate_library_write(&write).is_ok());
+    }
+
+    #[test]
+    fn recordings_url_targets_the_release_listing_route() {
+        assert_eq!(
+            mb_release_recordings_url(MBID_A),
+            format!("https://mb-api.invalid/v1/mb/release/{MBID_A}/recordings")
+        );
+    }
+
+    #[test]
+    fn recordings_response_is_sorted_into_track_order() {
+        // Wire order is not trusted: track 2 arrives before track 1, an
+        // untracked entry and a malformed MBID are mixed in, and track 1
+        // is duplicated. Disc 2 track 1 must land after all of disc 1,
+        // not interleaved with it.
+        const REC1: &str = "11111111-1111-4111-8111-111111111111";
+        const REC2: &str = "22222222-2222-4222-8222-222222222222";
+        const REC_UNTRACKED: &str = "33333333-3333-4333-8333-333333333333";
+        const REC_D2T1: &str = "44444444-4444-4444-8444-444444444444";
+        let body = format!(
+            r#"{{"release_mbid":"{MBID_A}","recordings":[
+                {{"mbid":"{REC2}","title":"Second","track_no":2,"medium_no":1}},
+                {{"mbid":"{REC_UNTRACKED}","title":"Bonus","track_no":null,"medium_no":null}},
+                {{"mbid":"{REC_D2T1}","title":"Disc two opener","track_no":1,"medium_no":2}},
+                {{"mbid":"not-an-mbid","title":"Bogus","track_no":1,"medium_no":1}},
+                {{"mbid":"{REC1}","title":"First","track_no":1,"medium_no":1}},
+                {{"mbid":"{REC1}","title":"First again","track_no":1,"medium_no":1}}
+            ]}}"#
+        );
+        let mbids = parse_mb_recordings_response(200, &body).unwrap();
+        assert_eq!(mbids, vec![REC1, REC2, REC_D2T1, REC_UNTRACKED]);
+    }
+
+    #[test]
+    fn recordings_response_classification_mirrors_search() {
+        assert!(parse_mb_recordings_response(
+            200,
+            &format!(r#"{{"release_mbid":"{MBID_A}","recordings":[]}}"#)
+        )
+        .unwrap()
+        .is_empty());
+        assert_eq!(
+            parse_mb_recordings_response(404, "{}"),
+            Err(MatchFailure::Permanent)
+        );
+        assert_eq!(
+            parse_mb_recordings_response(400, "{}"),
+            Err(MatchFailure::Permanent)
+        );
+        assert_eq!(
+            parse_mb_recordings_response(500, "{}"),
+            Err(MatchFailure::Transient)
+        );
+        assert_eq!(
+            parse_mb_recordings_response(200, "not json"),
+            Err(MatchFailure::Transient)
+        );
+    }
+
+    #[test]
+    fn recordings_fallback_never_loses_the_release_match() {
+        let fetched = vec![MBID_B.to_string()];
+        assert_eq!(
+            recording_mbids_or_fallback(Ok(fetched.clone())).unwrap(),
+            fetched
+        );
+        // Permanent: write the matched release with no recordings.
+        assert!(recording_mbids_or_fallback(Err(MatchFailure::Permanent))
+            .unwrap()
+            .is_empty());
+        // Transient: propagate so the job retries and re-resolves.
+        assert_eq!(
+            recording_mbids_or_fallback(Err(MatchFailure::Transient)),
+            Err(MatchFailure::Transient)
+        );
+    }
+
+    #[test]
+    fn matched_write_carries_recording_mbids_in_track_order() {
+        let msg =
+            build_search_dispatch("user_01", "animals", "vault_idx_01", &[3000], 25, 0).unwrap();
+        const REC1: &str = "11111111-1111-4111-8111-111111111111";
+        const REC2: &str = "22222222-2222-4222-8222-222222222222";
+        let body = format!(
+            r#"{{"release_mbid":"{MBID_A}","recordings":[
+                {{"mbid":"{REC2}","track_no":2}},
+                {{"mbid":"{REC1}","track_no":1}}
+            ]}}"#
+        );
+        let recording_mbids =
+            recording_mbids_or_fallback(parse_mb_recordings_response(200, &body)).unwrap();
+        let write = library_write_for(&msg, Some(MBID_A.to_string()), recording_mbids);
+        assert_eq!(write.release_mbid.as_deref(), Some(MBID_A));
+        assert_eq!(write.recording_mbids, vec![REC1, REC2]);
+        assert!(crate::library::validate_library_write(&write).is_ok());
+        // Recordings without a release are dropped, never written orphaned.
+        let unmatched = library_write_for(&msg, None, vec![REC1.to_string()]);
+        assert!(unmatched.recording_mbids.is_empty());
+        assert!(crate::library::validate_library_write(&unmatched).is_ok());
     }
 }
