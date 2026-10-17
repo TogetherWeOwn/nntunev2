@@ -5,6 +5,20 @@ import { defineConfig, loadEnv } from 'vite';
 
 import { cspSources } from './src/lib/security/headers.js';
 
+// Build-time commit SHA for the deployed-build identity surface
+// (`src/lib/build.ts` -> `GET /api/build`). GitHub Actions always sets
+// `GITHUB_SHA`, so staging builds bake the exact head with no workflow
+// change; `BUILD_SHA` wins when explicitly provided (e.g. promotion lanes).
+// Falls back to explicit "unknown", never silent. No node types needed.
+// `||` (not `??`): an empty BUILD_SHA (e.g. an unset optional workflow
+// input) must fall through to GITHUB_SHA instead of baking "unknown".
+const buildSha =
+	(globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env
+		?.BUILD_SHA ||
+	(globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env
+		?.GITHUB_SHA ||
+	'unknown';
+
 export default defineConfig(({ command, mode }) => {
 	// SvelteKit's `csp` option is baked in at build time, so the API origin
 	// must come from the build environment (process env or an `.env` file),
@@ -31,6 +45,9 @@ export default defineConfig(({ command, mode }) => {
 	);
 
 	return {
+		define: {
+			__BUILD_SHA__: JSON.stringify(buildSha)
+		},
 		plugins: [
 			sveltekit({
 				compilerOptions: {

@@ -19,7 +19,14 @@ Cargo.lock
 # Node / SvelteKit
 node_modules/
 .svelte-kit/
-build/
+# Rooted: a bare `build/` would also swallow source dirs named `build`
+# (e.g. `apps/web/src/routes/api/build/`), so generated per-worker and
+# per-app build output is ignored explicitly instead (workers/stream and
+# workers/repair emit build/worker/shim.mjs via worker-build; see their
+# wrangler.toml [build] commands).
+/build/
+/workers/*/build/
+/apps/*/build/
 dist/
 package-lock.json
 yarn.lock
