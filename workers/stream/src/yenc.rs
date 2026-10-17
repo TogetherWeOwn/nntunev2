@@ -188,9 +188,21 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
             seen_begin = true;
             // Byte-based: the line carries `name=<poster bytes>`, which is
             // often Latin-1/CP1252 and not UTF-8. The numeric tags precede it
-            // and are pure ASCII, so parse them from bytes.
-            file_size = tag_u64(line, b"size");
-            multipart = tag_u64(line, b"part").is_some();
+            // and are pure ASCII, so parse them from bytes. Only the prefix
+            // before `name=` is control fields: everything from `name=` on
+            // is filename text, which may contain spaces and tag-looking
+            // tokens (`part=1`, `size=999`, ...) that must not change the
+            // single/multipart interpretation or satisfy missing metadata.
+            let fields = before_filename(line);
+            file_size = tag_u64(fields, b"size");
+            // A present but non-numeric `part=` in the real control fields
+            // is malformed multipart metadata, not a single-part article:
+            // only an absent `part=` means single-part.
+            let part = tag_u64(fields, b"part");
+            if part.is_none() && tag_value(fields, b"part").is_some() {
+                return Err(YencError::BadPart);
+            }
+            multipart = part.is_some();
             continue;
         }
         if line.starts_with(b"=ypart") {
@@ -279,6 +291,24 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
         offset,
         multipart,
     })
+}
+
+/// The prefix of a `=ybegin` line before the `name=` field. The filename
+/// runs from `name=` to end-of-line and may contain spaces, tabs, and
+/// tag-looking tokens, so control tags are read only from this prefix.
+/// Returns the whole line when there is no `name=` field.
+fn before_filename(line: &[u8]) -> &[u8] {
+    let mut pos = 0;
+    while pos < line.len() {
+        if line[pos..].starts_with(b"name=") {
+            return &line[..pos];
+        }
+        match line[pos..].iter().position(|&b| b == b' ' || b == b'\t') {
+            Some(sep) => pos += sep + 1,
+            None => break,
+        }
+    }
+    line
 }
 
 /// Value of the ASCII `key=` tag on a yEnc header line, parsed from bytes so
@@ -488,6 +518,30 @@ mod tests {
         let got = decode_part(&latin1).expect("latin-1 name must decode");
         assert_eq!(got.data, data);
         assert_eq!((got.file_size, got.offset, got.multipart), (1500, 0, true));
+    }
+
+    #[test]
+    fn malformed_real_part_value_is_bad_part_even_when_size_matches() {
+        // A present-but-non-numeric `part=` in the real control fields must
+        // not silently downgrade the article to single-part. The declared
+        // size matches the payload, so only the malformed `part=` can fail.
+        let data = b"tiny synthetic payload".to_vec();
+        let mut text = part(
+            &data,
+            PartSpec {
+                file_size: data.len() as u64,
+                part: 1,
+                total: 1,
+                offset: 0,
+                file_crc: None,
+            },
+        );
+        let at = text
+            .windows(b"part=1".len())
+            .position(|w| w == b"part=1")
+            .expect("ybegin part tag present");
+        text[at + b"part=".len()] = b'x';
+        assert_eq!(decode_part(&text), Err(YencError::BadPart));
     }
 
     #[test]
