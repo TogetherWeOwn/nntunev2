@@ -170,6 +170,7 @@ fn run(
     let mut meter = MemoryMeter::default();
     let token = grant::issue("user-1", "track-a", EXP_UNIX, SECRET);
     let inp = PlayInput {
+        trace_id: None,
         token: &token,
         track_id: "track-a",
         range: Some(range),
@@ -230,6 +231,7 @@ fn covering_seek_backfills_prefix_before_serving_past_the_covering_segment() {
     let mut meter = MemoryMeter::default();
     let token = grant::issue("user-1", "track-a", EXP_UNIX, SECRET);
     let inp = PlayInput {
+        trace_id: None,
         token: &token,
         track_id: "track-a",
         range: Some("bytes=25000-"),
@@ -277,6 +279,7 @@ fn duplicate_interior_article_is_rejected_on_prefix_and_covering_paths() {
     let mut meter = MemoryMeter::default();
     let token = grant::issue("user-1", "track-a", EXP_UNIX, SECRET);
     let inp = PlayInput {
+        trace_id: None,
         token: &token,
         track_id: "track-a",
         range: Some("bytes=20000-20099"),
@@ -310,6 +313,7 @@ fn duplicate_interior_article_is_rejected_on_prefix_and_covering_paths() {
     let mut meter = MemoryMeter::default();
     let token = grant::issue("user-1", "track-a", EXP_UNIX, SECRET);
     let inp = PlayInput {
+        trace_id: None,
         token: &token,
         track_id: "track-a",
         range: Some("bytes=45000-"),

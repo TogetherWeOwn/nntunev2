@@ -32,10 +32,13 @@ const BANNED_KEY_PARTS: &[&str] = &[
     "card_number",
     "cvv",
     "payment_details",
+    "payment_method",
     "email",
     "session",
     "postal",
     "address",
+    "phone",
+    // NOTE: no bare "payment" — payment_id must stay loggable (precision test below).
     "street",
     "postcode",
     "zip_code",
@@ -672,6 +675,17 @@ fn golden_line_conforms_to_exact_schema() {
     );
 }
 
+/// The fixture's `fields` must pass the production validator
+/// (`nntune_logging::fields_from_json`), not just this file's hand-copied
+/// list, so the test and the emitter cannot drift apart.
+#[test]
+fn golden_fields_pass_the_shared_validator() {
+    let line = read_artifact(FIXTURE_REL, "golden log-line fixture");
+    let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+    nntune_logging::fields_from_json(parsed["fields"].clone())
+        .expect("fixture fields must pass the production validator");
+}
+
 #[test]
 fn timestamp_validation_rejects_impossible_dates_and_times() {
     for timestamp in [
@@ -732,6 +746,7 @@ fn golden_line_has_no_prohibited_keys_or_obvious_secret_values() {
         "passphrase",
         "privatekey",
         "payment_details",
+        "payment_method",
         "postal_code",
         "zip_code",
         "home_address",
@@ -875,4 +890,65 @@ fn logging_standard_doc_pins_schema() {
         lower.contains("redact") || lower.contains("pii") || lower.contains("secret"),
         "doc must state its redaction rule"
     );
+}
+
+/// The local matcher must agree with the shared emitter (`nntune-logging`)
+/// on every prohibited and acceptable key, so the two cannot drift apart.
+#[test]
+fn banned_key_lists_agree_with_shared_validator() {
+    for key in [
+        "contact_email",
+        "client_ip",
+        "ip_address",
+        "ipv4",
+        "ipv6",
+        "ipv4_address",
+        "ipv6_address",
+        "client_ipv4",
+        "session_id",
+        "name",
+        "display_name",
+        "nickname",
+        "surname",
+        "password",
+        "grant_token",
+        "user_credentials",
+        "passphrase",
+        "privatekey",
+        "payment_details",
+        "payment_method",
+        "postal_code",
+        "zip_code",
+        "home_address",
+        "street_name",
+        "request_body",
+        "response_body",
+        "complete_headers",
+        "raw_query",
+        "query_string",
+        "nzb_contents",
+        "nzb_xml",
+    ] {
+        assert!(
+            nntune_logging::is_banned_field_key(key),
+            "shared validator accepts prohibited key {key}"
+        );
+    }
+    for key in [
+        "ship_id",
+        "filename",
+        "namespace",
+        "trip",
+        "nzb_id",
+        "query_ms",
+        "body_bytes",
+        "header_count",
+        "payment_id",
+        "gzip_ratio",
+    ] {
+        assert!(
+            !nntune_logging::is_banned_field_key(key),
+            "shared validator rejects acceptable key {key}"
+        );
+    }
 }
