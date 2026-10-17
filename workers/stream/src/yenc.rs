@@ -25,6 +25,10 @@ pub enum YencError {
         expected: u32,
         actual: u32,
     },
+    /// The covering checksum tag is present but its value is empty, non-hex,
+    /// non-UTF-8, or out of `u32` range. An absent tag stays optional; a
+    /// present malformed one is never treated as absent.
+    BadChecksum,
 }
 
 /// IEEE CRC-32 over `data` (bitwise; no table needed at this size).
@@ -149,10 +153,16 @@ pub fn decode(text: &[u8]) -> Result<Vec<u8>, YencError> {
 
 /// Decode a yEnc article (single- or multipart) and report its placement.
 ///
-/// - Single-part: size from `=yend`, `crc32=` (when present) over the data.
+/// - Single-part: size from `=yend`, `crc32=` (when present) over the data,
+///   with `pcrc32=` as the compatible fallback when `crc32=` is absent.
 /// - Multipart: `=ypart begin= end=` gives the placement and must agree with
 ///   the payload length; `pcrc32=` (when present) covers the part. A
 ///   `crc32=` on a part is the whole-file CRC and is *not* checked here.
+///
+/// Checksums are optional when absent, but a present covering checksum with
+/// malformed syntax (empty, non-hex, non-UTF-8, or out of `u32` range) is
+/// rejected with [`YencError::BadChecksum`] rather than treated as omitted,
+/// and never falls through to a different checksum field.
 pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
     let mut out = Vec::new();
     let mut in_body = false;
@@ -164,8 +174,10 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
     let mut multipart = false;
     let mut part_range: Option<(u64, u64)> = None;
     let mut yend_size: Option<u64> = None;
-    let mut crc: Option<u32> = None;
-    let mut pcrc: Option<u32> = None;
+    // `None` = tag absent (optional); `Some(Err(_))` = tag present but
+    // malformed. Collapsing both into `None` would skip CRC validation.
+    let mut crc: Option<Result<u32, YencError>> = None;
+    let mut pcrc: Option<Result<u32, YencError>> = None;
     for raw_line in text.split(|&b| b == b'\n') {
         let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
         if line.starts_with(b"=ybegin") {
@@ -247,9 +259,15 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
         }
         0
     };
-    // Single-part: `crc32` covers the data. Multipart: only `pcrc32` does.
+    // Single-part: `crc32` covers the data (with `pcrc32` only as the
+    // fallback when `crc32` is absent). Multipart: only `pcrc32` does; a
+    // `crc32` there is the whole-file CRC and is ignored here. Selecting via
+    // `Option<Result<_>>` keeps a present-but-malformed selected field as
+    // `Some(Err(_))`, so it cannot fall through to the other field or to
+    // the omitted-checksum path.
     let covering = if multipart { pcrc } else { crc.or(pcrc) };
     if let Some(expected) = covering {
+        let expected = expected?;
         let actual = crc32(&out);
         if actual != expected {
             return Err(YencError::CrcMismatch { expected, actual });
@@ -281,8 +299,19 @@ fn tag_u64(line: &[u8], key: &[u8]) -> Option<u64> {
         .ok()
 }
 
-fn tag_hex_u32(line: &[u8], key: &[u8]) -> Option<u32> {
-    u32::from_str_radix(std::str::from_utf8(tag_value(line, key)?).ok()?, 16).ok()
+/// Parse a hex `u32` tag strictly enough to tell absence from malformed
+/// presence: `None` only when the tag is absent, `Some(Err(BadChecksum))`
+/// when it is present but empty, non-hex, non-UTF-8, or out of `u32` range.
+fn tag_hex_u32(line: &[u8], key: &[u8]) -> Option<Result<u32, YencError>> {
+    let raw = tag_value(line, key)?;
+    // Pure ASCII hex digits only: rejects non-UTF-8 and empty values, and
+    // also the leading `+` that `from_str_radix` would otherwise accept.
+    // The radix parse then only fails on `u32` overflow.
+    if raw.is_empty() || !raw.iter().all(u8::is_ascii_hexdigit) {
+        return Some(Err(YencError::BadChecksum));
+    }
+    let text = std::str::from_utf8(raw).map_err(|_| YencError::BadChecksum);
+    Some(text.and_then(|t| u32::from_str_radix(t, 16).map_err(|_| YencError::BadChecksum)))
 }
 
 #[cfg(test)]
