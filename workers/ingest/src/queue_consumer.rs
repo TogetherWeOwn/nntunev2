@@ -27,7 +27,9 @@
 //!
 //! Match and write are wired here (MB search via the `MB_API` service
 //! binding, the library upsert via `LIBRARY_DB`, one meter event per
-//! transition; see [`run_match_write`]). No live runtime boundary is
+//! transition; see [`run_match_write`]). Enablement is additionally gated
+//! on the library schema: no migration creates the upsert's `library`
+//! table yet (see [`crate::library`]). No live runtime boundary is
 //! claimed for the rest: indexer search, pool probe, verify and repair
 //! steps have no executable consumer wiring yet, so those states settle
 //! as transient failures through the shared retry budget. The consumer
@@ -348,7 +350,71 @@ async fn resolve_library_write(
     Ok(crate::matching::library_write_for(msg, release_mbid))
 }
 
-/// Execute the library upsert, then meter `write`, then advance to `Done`.
+/// The side effects [`run_match_write_with`] sequences, behind a trait so
+/// the meter-before-advance ordering is regression-tested with a fake
+/// instead of resting on prose (the edge impl needs an `Env`). `meter`
+/// failures are unit errors: the sequencer maps them to the failing
+/// stage's error code, so a fake cannot accidentally bless the wrong code.
+trait MatchWriteRuntime {
+    async fn resolve(&self, msg: &QueueMsg) -> Result<crate::queue::LibraryWrite, JobError>;
+    async fn meter(&self, msg: &QueueMsg, stage: &'static str) -> Result<(), ()>;
+    async fn upsert(&self, write: &crate::queue::LibraryWrite) -> Result<(), JobError>;
+}
+
+/// Edge [`MatchWriteRuntime`]: MB resolution, Analytics Engine meter, and
+/// the Hyperdrive library upsert.
+struct EdgeMatchWrite<'a> {
+    env: &'a Env,
+}
+
+impl MatchWriteRuntime for EdgeMatchWrite<'_> {
+    async fn resolve(&self, msg: &QueueMsg) -> Result<crate::queue::LibraryWrite, JobError> {
+        resolve_library_write(self.env, msg).await
+    }
+
+    async fn meter(&self, msg: &QueueMsg, stage: &'static str) -> Result<(), ()> {
+        crate::try_meter(self.env, msg, stage, crate::metering::MeterOutcome::Ok).map_err(|_| ())
+    }
+
+    async fn upsert(&self, write: &crate::queue::LibraryWrite) -> Result<(), JobError> {
+        let client = crate::library_db_client(self.env)
+            .await
+            .map_err(|()| JobError::transient(ERR_WRITE_FAILED, "library database unavailable"))?;
+        let params = crate::library::upsert_params(write);
+        client
+            .execute(
+                crate::library::upsert_library_sql(),
+                &[
+                    &params.job_id,
+                    &params.user_id,
+                    &params.idempotency_key,
+                    &params.release_mbid,
+                    &params.recording_mbids,
+                ],
+            )
+            .await
+            .map_err(|error| {
+                // Log the SQLSTATE only (never connection detail) and fail
+                // fast on deterministic classes: a schema mismatch such as
+                // the not-yet-migrated `library` table (42P01/42P10) must
+                // quarantine with an accurate reason, not burn the retry
+                // budget as "unavailable".
+                let sqlstate = error.as_db_error().map(|db| db.code().code());
+                console_log!(
+                    "ingest library upsert failed: sqlstate={}",
+                    sqlstate.unwrap_or("none")
+                );
+                if crate::library::is_deterministic_sqlstate(sqlstate) {
+                    JobError::permanent(ERR_WRITE_FAILED, "library database schema mismatch")
+                } else {
+                    JobError::transient(ERR_WRITE_FAILED, "library database unavailable")
+                }
+            })?;
+        Ok(())
+    }
+}
+
+/// Upsert, then meter `write`, then advance to `Done`.
 ///
 /// The terminal checkpoint is only persisted (`plan_settlement`) after
 /// this returns `Ok`, so a `Done` checkpoint exists only once the upsert
@@ -356,33 +422,19 @@ async fn resolve_library_write(
 /// retry *before* the `Done` advance: the redelivery replays the upsert
 /// (a converged no-op on the idempotency key) and retries the meter, so
 /// the event is never silently dropped.
-async fn execute_write(
-    env: &Env,
+async fn execute_write_with<R: MatchWriteRuntime>(
+    runtime: &R,
     msg: &QueueMsg,
     cp: &mut JobCheckpoint,
     write: &crate::queue::LibraryWrite,
 ) -> Result<(), JobError> {
     crate::library::validate_library_write(write)
         .map_err(|_| JobError::permanent(ERR_WRITE_FAILED, "library write failed validation"))?;
-    let client = crate::library_db_client(env)
+    runtime.upsert(write).await?;
+    runtime
+        .meter(msg, "write")
         .await
-        .map_err(|()| JobError::transient(ERR_WRITE_FAILED, "library database unavailable"))?;
-    let params = crate::library::upsert_params(write);
-    client
-        .execute(
-            crate::library::upsert_library_sql(),
-            &[
-                &params.job_id,
-                &params.user_id,
-                &params.idempotency_key,
-                &params.release_mbid,
-                &params.recording_mbids,
-            ],
-        )
-        .await
-        .map_err(|_| JobError::transient(ERR_WRITE_FAILED, "library database unavailable"))?;
-    crate::try_meter(env, msg, "write", crate::metering::MeterOutcome::Ok)
-        .map_err(|_| JobError::transient(ERR_WRITE_FAILED, "meter write unavailable"))?;
+        .map_err(|()| JobError::transient(ERR_WRITE_FAILED, "meter write unavailable"))?;
     advance_checkpoint(cp, false);
     Ok(())
 }
@@ -393,18 +445,28 @@ async fn execute_write(
 /// instead of dropping the event. A delivery that enters in `Writing`
 /// (checkpoint persisted after the match transition) re-resolves and
 /// writes without re-emitting `match`.
+async fn run_match_write_with<R: MatchWriteRuntime>(
+    runtime: &R,
+    msg: &QueueMsg,
+    cp: &mut JobCheckpoint,
+) -> Result<(), JobError> {
+    let write = runtime.resolve(msg).await?;
+    if cp.state == JobState::Matching {
+        runtime
+            .meter(msg, "match")
+            .await
+            .map_err(|()| JobError::transient(ERR_MATCH_FAILED, "meter write unavailable"))?;
+        advance_checkpoint(cp, false);
+    }
+    execute_write_with(runtime, msg, cp, &write).await
+}
+
 async fn run_match_write(
     env: &Env,
     msg: &QueueMsg,
     cp: &mut JobCheckpoint,
 ) -> Result<(), JobError> {
-    let write = resolve_library_write(env, msg).await?;
-    if cp.state == JobState::Matching {
-        crate::try_meter(env, msg, "match", crate::metering::MeterOutcome::Ok)
-            .map_err(|_| JobError::transient(ERR_MATCH_FAILED, "meter write unavailable"))?;
-        advance_checkpoint(cp, false);
-    }
-    execute_write(env, msg, cp, &write).await
+    run_match_write_with(&EdgeMatchWrite { env }, msg, cp).await
 }
 
 /// Decide one delivery's settlement and whether the mutated checkpoint
@@ -659,6 +721,108 @@ mod tests {
         let (persist, settlement) = plan_settlement(&msg, &mut cp, Ok(()), true);
         assert!(persist);
         assert_eq!(settlement, Settlement::Ack);
+    }
+
+    /// Fake [`MatchWriteRuntime`] recording every effect in call order, so
+    /// the meter-before-advance sequencing is asserted, not just prose.
+    struct FakeMatchWrite {
+        calls: std::cell::RefCell<Vec<&'static str>>,
+        fail_meter_stage: Option<&'static str>,
+    }
+
+    impl FakeMatchWrite {
+        fn new(fail_meter_stage: Option<&'static str>) -> Self {
+            Self {
+                calls: std::cell::RefCell::new(Vec::new()),
+                fail_meter_stage,
+            }
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl MatchWriteRuntime for FakeMatchWrite {
+        async fn resolve(&self, msg: &QueueMsg) -> Result<crate::queue::LibraryWrite, JobError> {
+            self.calls.borrow_mut().push("resolve");
+            Ok(crate::matching::library_write_for(msg, None))
+        }
+
+        async fn meter(&self, _msg: &QueueMsg, stage: &'static str) -> Result<(), ()> {
+            self.calls.borrow_mut().push(match stage {
+                "match" => "meter:match",
+                _ => "meter:write",
+            });
+            if self.fail_meter_stage == Some(stage) {
+                return Err(());
+            }
+            Ok(())
+        }
+
+        async fn upsert(&self, _write: &crate::queue::LibraryWrite) -> Result<(), JobError> {
+            self.calls.borrow_mut().push("upsert");
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn matching_entry_meters_match_before_advancing_then_writes() {
+        let msg = search_message();
+        let mut cp = crate::checkpoint::initial(&msg);
+        cp.state = JobState::Matching;
+        let runtime = FakeMatchWrite::new(None);
+        run_match_write_with(&runtime, &msg, &mut cp)
+            .await
+            .expect("matching delivery succeeds");
+        assert_eq!(
+            runtime.calls(),
+            ["resolve", "meter:match", "upsert", "meter:write"]
+        );
+        assert_eq!(cp.state, JobState::Done);
+    }
+
+    #[tokio::test]
+    async fn writing_entry_re_resolves_without_re_emitting_match() {
+        let msg = search_message();
+        let mut cp = crate::checkpoint::initial(&msg);
+        cp.state = JobState::Writing;
+        let runtime = FakeMatchWrite::new(None);
+        run_match_write_with(&runtime, &msg, &mut cp)
+            .await
+            .expect("writing delivery succeeds");
+        assert_eq!(runtime.calls(), ["resolve", "upsert", "meter:write"]);
+        assert_eq!(cp.state, JobState::Done);
+    }
+
+    #[tokio::test]
+    async fn meter_failures_stop_before_the_advance_they_guard() {
+        let msg = search_message();
+        // `match` meter down: no advance out of Matching, no upsert spent.
+        let mut cp = crate::checkpoint::initial(&msg);
+        cp.state = JobState::Matching;
+        let runtime = FakeMatchWrite::new(Some("match"));
+        let err = run_match_write_with(&runtime, &msg, &mut cp)
+            .await
+            .expect_err("match meter failure must fail the step");
+        assert_eq!(err.code, ERR_MATCH_FAILED);
+        assert!(err.transient);
+        assert_eq!(runtime.calls(), ["resolve", "meter:match"]);
+        assert_eq!(cp.state, JobState::Matching);
+
+        // `write` meter down after the upsert: the checkpoint stays in
+        // Writing, so redelivery replays the converged upsert and retries
+        // the meter instead of acking a Done that was never metered.
+        let mut cp = crate::checkpoint::initial(&msg);
+        cp.state = JobState::Writing;
+        let runtime = FakeMatchWrite::new(Some("write"));
+        let err = run_match_write_with(&runtime, &msg, &mut cp)
+            .await
+            .expect_err("write meter failure must fail the step");
+        assert_eq!(err.code, ERR_WRITE_FAILED);
+        assert!(err.transient);
+        assert_eq!(runtime.calls(), ["resolve", "upsert", "meter:write"]);
+        assert_eq!(cp.state, JobState::Writing);
     }
 
     #[test]
