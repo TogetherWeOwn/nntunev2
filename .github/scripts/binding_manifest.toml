@@ -67,6 +67,10 @@ type = "analytics_engine"
 binding = "REPAIR_CONTAINER"
 type = "service"
 
+[[worker.binding]]
+binding = "MB_API"
+type = "service"
+
 [[worker]]
 name = "mb"
 config = "workers/mb/wrangler.toml.example"
