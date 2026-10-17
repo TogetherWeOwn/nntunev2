@@ -387,6 +387,24 @@ fn rewrap_records_timestamp_and_mixed_versions_test_only_kek_by_versions() {
     assert_eq!(version_counts, vec![(1, 1), (CURRENT_VERSION as i64, 2)]);
 }
 
+/// §10 text only, whitespace-collapsed so the pin below keys on the
+/// stated guard, not on markdown line wrapping.
+fn section_10_normalized() -> String {
+    let runbook = runbook_text();
+    let section_start = runbook
+        .find("## 10.")
+        .expect("runbook must have a §10 compromise rotation section");
+    let section = &runbook[section_start..];
+    let section_end = section[1..]
+        .find("\n## ")
+        .map(|offset| offset + 1)
+        .unwrap_or(section.len());
+    section[..section_end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[test]
 fn rotation_runbook_documents_per_version_progress_counts() {
     let runbook = runbook_text();
@@ -402,6 +420,50 @@ fn rotation_runbook_documents_per_version_progress_counts() {
          captured wrapped DEK and its nonce (dek_wrapped = \
          $captured_wrapped AND dek_wrapped_nonce = \
          $captured_wrapped_nonce), not by user/version alone"
+    );
+}
+
+#[test]
+fn compromise_rekey_uses_captured_envelope_cas_not_timestamp_guard() {
+    let section_10 = section_10_normalized();
+
+    // Production change that must fail this test: §10 reverting to the
+    // old (`user_id`, `kek_version`, `updated_at`) guard. A same-version
+    // replacement can land in the same `updated_at` tick (see the §6
+    // race tests), so a timestamp-keyed guard would let a stale re-key
+    // overwrite a newer envelope.
+    assert!(
+        section_10.contains(
+            "ONE conditional UPDATE guarded by the same captured-envelope \
+             compare-and-swap as §6 (`user_id`, captured `kek_version`, \
+             captured `dek_wrapped` and `dek_wrapped_nonce` — never a \
+             timestamp-only guard)"
+        ),
+        "§10 must guard the compromise re-key with the same §6 \
+         captured-envelope compare-and-swap (captured `dek_wrapped` + \
+         `dek_wrapped_nonce`)"
+    );
+    assert!(
+        section_10.contains("Zero affected rows is a lost claim as in §6"),
+        "§10 must define zero affected rows as a lost claim as in §6"
+    );
+    assert!(
+        section_10.contains(
+            "the stale re-key is discarded, the row is reloaded and \
+             re-driven against the current envelope, and the newer \
+             envelope is never overwritten"
+        ),
+        "§10 must discard a stale re-key, reload, and never overwrite \
+         the newer envelope"
+    );
+    assert!(
+        !section_10
+            .contains("conditional UPDATE keyed on (`user_id`, `kek_version`, `updated_at`)"),
+        "§10 must not key the compromise re-key guard on `updated_at`"
+    );
+    assert!(
+        !section_10.contains("a concurrent vault update changes `updated_at` and loses the race"),
+        "§10 must not treat an `updated_at` change as the race guard"
     );
 }
 
