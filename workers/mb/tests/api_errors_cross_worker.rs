@@ -315,9 +315,9 @@ fn conflicting_duplicate_status_fails_naming_both_workers() {
     let errors = check_consistency(&rows, &decls);
     assert!(!errors.is_empty(), "conflicting duplicate status must fail");
     assert!(
-        errors
-            .iter()
-            .any(|e| e.contains("api") && e.contains("stream")),
+        errors.iter().any(|e| e.contains("conflicting duplicate declarations")
+            && e.contains("worker \"api\"")
+            && e.contains("worker \"stream\"")),
         "conflict must name both modules, got: {}",
         errors.join("\n")
     );
@@ -336,9 +336,9 @@ fn conflicting_duplicate_retryable_fails_naming_both_workers() {
         "conflicting duplicate retryable must fail"
     );
     assert!(
-        errors
-            .iter()
-            .any(|e| e.contains("api") && e.contains("stream")),
+        errors.iter().any(|e| e.contains("conflicting duplicate declarations")
+            && e.contains("worker \"api\"")
+            && e.contains("worker \"stream\"")),
         "conflict must name both modules, got: {}",
         errors.join("\n")
     );
