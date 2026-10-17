@@ -1517,19 +1517,24 @@ work. Production DB creation/migration remains gated by the ops contract.
      canonical schema snapshots by applying each target's manifest migrations in
      order to throwaway databases, then compare the existing database's
      migration-owned catalog state (columns, types, nullability, defaults,
-     constraints, indexes, sequences and foreign keys) against those exact
-     post-migration snapshots. Adopt only one exact match for a contiguous
-     target-specific manifest prefix; atomically record the matched manifest
-     filenames and their trusted SHA-256 values without executing historical SQL.
-     Do not infer history from a maximum migration number or allow hand-inserted
-     history rows. Refuse ambiguous, partial, unknown or drifted state, and leave
-     history untouched on refusal. Any database with migration-owned schema but
-     no history must fail closed until this explicit adoption succeeds.
-     Execution-level acceptance: on throwaway DBs, verify a pre-populated app
-     schema at 0008 with no history adopts and then replays as a no-op; a schema
-     partway through a migration or otherwise not matching a completed contiguous
-     manifest prefix, unknown schema, and post-adoption schema drift all refuse
-     without applying SQL or recording guessed history. Also assert app-targeted
+     constraints, indexes, sequences, foreign keys, function definitions, and
+     trigger definitions and enabled states) against those exact post-migration
+     snapshots. Adopt
+     only one exact match for a contiguous target-specific manifest prefix;
+     atomically record the matched manifest filenames and their trusted SHA-256
+     values without executing historical SQL. Do not infer history from a maximum
+     migration number or allow hand-inserted history rows. Refuse ambiguous,
+     partial, unknown or drifted state, and leave history untouched on refusal.
+     Any database with migration-owned schema but no history must fail closed
+     until this explicit adoption succeeds. Execution-level acceptance: on
+     throwaway DBs, verify a pre-populated app schema at 0008 with no history
+     adopts and then replays as a no-op; a schema partway through a migration,
+     including 0008 with its `auth_challenges_purpose_check` constraint present
+     but its `auth_challenges_purpose_immutable()` function or trigger absent,
+     or with the expected trigger definition present but disabled, or otherwise
+     not matching a completed contiguous manifest prefix, unknown
+     schema, and post-adoption schema drift all refuse without applying SQL or
+     recording guessed history. Also assert app-targeted
      routing, matching replay and altered-file checksum drift refusal. Existing
      `migrations-gate` and `workers/api/tests/run_migration_tests.sh` remain
      required source/empty-DB gates, not substitutes for these runner tests.
@@ -1579,11 +1584,33 @@ work. Production DB creation/migration remains gated by the ops contract.
 
   4. **Single atomic playlist cutover PR (≤1 day, hard ceiling; not yet estimated
      as fitting).** This slice is explicitly blocked until slice 1's per-database
-     runner and adoption path, and slices 2–3's rehearsals/fixtures pass. Before
-     applying the cutover migration, run and verify adoption on the intended
-     staging app database under the existing ops contract; the runner must refuse
-     to proceed if adoption does not match one exact known schema prefix. This is
-     not authorization to connect to or migrate production. The implementation
+     runner and adoption path, slices 2–3's rehearsals/fixtures pass, and the
+     normalized catalog schema and post-match ingest writer described above have
+     landed and passed only the non-playlist §6 checks for normalized
+     ingest/match/write, ownership-checked library membership and `track_sources`,
+     deterministic local/mirror identity and grouping, and library-only catalog
+     reads/writes. No new playlist schema or behavior may be required to satisfy
+     this prerequisite: §6 checks whose preconditions or
+     assertions need the cutover's new `playlist_tracks` table, `/v1/playlists`
+     routes, playlist delete, or entry-keyed restore/dormancy belong to this slice
+     and are required cutover acceptance below. Slice 2's rehearsal may seed and
+     verify the retained 0003 `playlists` shape, but does not require the cutover
+     schema or routes. The current migration history does not create `tracks`,
+     `library_tracks`, or `track_sources`, although `playlist_tracks.track_id`
+     references `tracks(id)` and playlist ownership checks require the caller's
+     library membership and source rows. Treat this as separate prerequisite work,
+     not work to absorb into or split from the atomic playlist cutover; do not
+     estimate or schedule the cutover until the prerequisite exists. On each
+     existing populated database without runner
+     history, adoption is a one-time bootstrap before the first runner-managed
+     migration; empty databases use the runner's empty-database path. Under the
+     existing ops contract, verify the intended staging app database has the
+     expected adopted/applied history and no drift before cutover. If it is still
+     unadopted, complete adoption before any normalized-catalog or playlist
+     migration; never rerun adoption after runner-managed history exists. The
+     runner must refuse to proceed if adoption does not match one exact known
+     schema prefix. This is not authorization to connect to or migrate production.
+     The implementation
      owner must either demonstrate a one-day estimate for the complete scope above
      or leave this implementation unscheduled and add only further safe
      preparations.
@@ -1593,11 +1620,20 @@ work. Production DB creation/migration remains gated by the ops contract.
      or cover-art ids; owner-only unresolved legacy reads; count equivalence for
      fully resolvable lists at the freeze boundary; migration/backfill idempotence
      and before/after row-count/order reconciliation; duplicate and unresolved ref
-     handling; write rejection or canonical route for legacy `items`; concurrent
-     writer-versus-delete fence; DELETE returning 202 and resuming through the
-     durable executor; RESTRICT FK/source cleanup; plus the existing exact SQL
-     pins and visibility tests in `workers/api/tests/library_single_row_visibility.rs`
-     and `workers/api/tests/library_tests.rs` updated in lockstep. Forward-only
+     handling; write rejection or canonical route for legacy `items`; the joint
+     §6 `Playlist/library consistency` acceptance cases for local and
+     mirror-verified tracks, including cross-user playlist reads and rejected
+     cross-user playlist inserts, stable entry ids/positions/counts and
+     metadata-free dormant tombstones when the last library membership is removed,
+     entry-keyed restore to an own library, negative cross-user/missing-source/
+     ordinary-library-add cases, and source retention while either library or
+     playlist reference remains plus final-reference cleanup/races; the
+     `playlist_tracks(track_id)` index exists and is used by the seeded
+     GC/reference test and RESTRICT/delete cleanup;
+     concurrent writer-versus-delete fence; DELETE returning 202 and resuming
+     through the durable executor; plus the existing exact SQL pins and visibility
+     tests in `workers/api/tests/library_single_row_visibility.rs` and
+     `workers/api/tests/library_tests.rs` updated in lockstep. Forward-only
      safeguards: allocate the next unique top-level migration number after the
      current highest entry in `migrations/manifest.toml`, target the app DB
      explicitly through the per-database runner, and require its
