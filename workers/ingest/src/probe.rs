@@ -16,6 +16,8 @@ use crate::queue::QueueMsg;
 /// Upper bound on message-ids per probe call: keeps one pool round-trip
 /// small and the checkpoint resume cheap.
 pub const MAX_PROBE_SEGMENTS: usize = 500;
+/// Maximum declared encoded size accepted for one NZB segment.
+pub const MAX_SEGMENT_BYTES: u64 = (1 << 31) - 1;
 
 /// Availability check for one batch of segments.
 ///
@@ -114,6 +116,12 @@ pub fn build_probe_request_with_ranges(
     }
     if segments.iter().any(|(s, _)| !validate_message_id(s)) {
         return Err("segment ids must be valid message-ids");
+    }
+    if segments
+        .iter()
+        .any(|(_, bytes)| bytes.is_some_and(|n| n == 0 || n > MAX_SEGMENT_BYTES))
+    {
+        return Err("segment byte ranges must be within the valid bounds");
     }
     Ok(ProbeRequest {
         job_id: msg.job_id.clone(),

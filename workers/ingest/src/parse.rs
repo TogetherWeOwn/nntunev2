@@ -9,17 +9,19 @@
 use serde::{Deserialize, Serialize};
 
 use crate::nzb_intake::IntakeEstimate;
-use crate::probe::{validate_message_id, MAX_PROBE_SEGMENTS};
+use crate::probe::{validate_message_id, MAX_PROBE_SEGMENTS, MAX_SEGMENT_BYTES};
+
+/// Match the parser's compiled-in cap for total declared NZB bytes.
+const MAX_ENCODED_BYTES: u64 = 64 << 30;
 
 /// What the `Parsing` step stores in the checkpoint: the segment map the
 /// pool probe walks. Produced by `nntune-core` once that card lands; until
 /// then tests and the synthetic E2E construct it from fixtures.
 ///
 /// `segment_bytes` runs flat in document order, parallel to `message_ids`;
-/// `file_segment_bytes` runs per-file in NZB order. `None` is
-/// explicit-unknown (the NZB carried no usable `bytes=` for that segment),
-/// never zero-filled: a `Some(0)` would send the stream path to fetch an
-/// empty range.
+/// `file_segment_bytes` runs per-file in NZB order. Values are the NZB's
+/// declared encoded wire sizes, not decoded file offsets; `None` is
+/// explicit-unknown (the NZB carried no usable `bytes=` for that segment).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedNzb {
     pub file_count: usize,
@@ -59,17 +61,20 @@ pub fn check_parsed(estimate: &IntakeEstimate, parsed: &ParsedNzb) -> Result<(),
     {
         return Err("per-file byte ranges must match the flat segment byte ranges in order");
     }
-    // Missing metadata is explicit-unknown (None): a zero-filled Some(0)
-    // must fail here rather than spend provider connections on an empty
-    // fetch downstream.
-    if parsed.segment_bytes.contains(&Some(0))
-        || parsed
-            .file_segment_bytes
-            .iter()
-            .flatten()
-            .any(|b| *b == Some(0))
-    {
-        return Err("segment byte ranges must be explicit-unknown, never zero-filled");
+    // Missing metadata is explicit-unknown (None). Keep known ranges within
+    // the core parser's per-segment and document-wide encoded-byte limits.
+    let total_bytes = parsed.segment_bytes.iter().try_fold(0u64, |total, bytes| {
+        match bytes {
+            Some(n) if *n == 0 || *n > MAX_SEGMENT_BYTES => None,
+            Some(n) => total.checked_add(*n),
+            None => Some(total),
+        }
+    });
+    let Some(total_bytes) = total_bytes else {
+        return Err("segment byte ranges exceed their valid bounds");
+    };
+    if total_bytes > MAX_ENCODED_BYTES {
+        return Err("total segment byte ranges exceed the document limit");
     }
     // Ids flow into NNTP STAT/ARTICLE lines on the user's provider
     // connection: only strict message-ids pass, so a hostile NZB (or BYO
@@ -93,6 +98,11 @@ pub fn probe_batches(parsed: &ParsedNzb) -> Vec<Vec<String>> {
 /// order. Same order and cap as [`probe_batches`]; ranges ride parallel so
 /// the stream path can range-seek without re-reading the NZB.
 pub fn probe_batches_with_ranges(parsed: &ParsedNzb) -> Vec<Vec<(String, Option<u64>)>> {
+    assert_eq!(
+        parsed.message_ids.len(),
+        parsed.segment_bytes.len(),
+        "message ids and segment byte ranges must be parallel"
+    );
     let pairs: Vec<(String, Option<u64>)> = parsed
         .message_ids
         .iter()
@@ -161,9 +171,8 @@ fn bytes_attr(open_tag: &str) -> Option<u64> {
                                 return None;
                             }
                             match s.parse::<u64>() {
-                                Ok(0) => return None,
-                                Ok(n) => return Some(n),
-                                Err(_) => return None,
+                                Ok(n) if (1..=MAX_SEGMENT_BYTES).contains(&n) => return Some(n),
+                                _ => return None,
                             }
                         }
                         return None;
@@ -194,68 +203,114 @@ fn opening_tag_end(tag: &str) -> Option<usize> {
     None
 }
 
-/// Scan one document (or file-block) slice for `<segment>` opens in order,
-/// returning one slot per element.
+/// Scan a document (or file-block) slice for unprefixed or namespaced
+/// `<segment>` opens, ignoring comments and other markup.
 fn segment_bytes_in(slice: &str) -> Vec<Option<u64>> {
     let mut out = Vec::new();
     let mut rest = slice;
-    while let Some(i) = rest.find("<segment") {
-        let after = rest.as_bytes().get(i + "<segment".len()).copied();
-        if after.is_some_and(is_tag_name_char) {
-            // `<segments>` container or a longer name: not a segment.
-            rest = &rest[i + "<segment".len()..];
+    while let Some(i) = rest.find('<') {
+        rest = &rest[i..];
+        if rest.starts_with("<!--") {
+            let Some(end) = rest.find("-->") else {
+                break;
+            };
+            rest = &rest[end + 3..];
             continue;
         }
-        let tag_rest = &rest[i..];
-        let Some(end) = opening_tag_end(tag_rest) else {
+        if rest.starts_with("<![CDATA[") {
+            let Some(end) = rest.find("]]>") else {
+                break;
+            };
+            rest = &rest[end + 3..];
+            continue;
+        }
+        let Some(end) = opening_tag_end(rest) else {
             break;
         };
-        out.push(bytes_attr(&tag_rest[..end]));
-        rest = &tag_rest[end + 1..];
+        let tag = &rest[..end];
+        let name = tag
+            .strip_prefix('<')
+            .unwrap_or_default()
+            .split(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>')
+            .next()
+            .unwrap_or_default();
+        if !name.starts_with('/') && name.rsplit(':').next() == Some("segment") {
+            out.push(bytes_attr(tag));
+        }
+        rest = &rest[end + 1..];
     }
     out
 }
 
-/// Split the document into `<file>…</file>` blocks in NZB order.
+/// Split actual `<file>…</file>` elements into NZB-order blocks.
 fn file_blocks(doc: &str) -> Vec<&str> {
     let mut blocks = Vec::new();
-    let mut pos = 0;
-    while pos < doc.len() {
-        let Some(rel) = doc[pos..].find("<file") else {
-            break;
-        };
-        let abs = pos + rel;
-        if doc
-            .as_bytes()
-            .get(abs + "<file".len())
-            .copied()
-            .is_some_and(is_tag_name_char)
-        {
-            pos = abs + "<file".len();
+    let mut rest = doc;
+    let mut offset = 0;
+    let mut file_start = None;
+    while let Some(i) = rest.find('<') {
+        offset += i;
+        rest = &rest[i..];
+        if rest.starts_with("<!--") {
+            let Some(end) = rest.find("-->") else {
+                break;
+            };
+            let next = end + 3;
+            offset += next;
+            rest = &rest[next..];
             continue;
         }
-        let tail = &doc[abs..];
-        if let Some(close_rel) = tail.find("</file") {
-            let after_close = &tail[close_rel..];
-            if let Some(gt) = after_close.find('>') {
-                let end = abs + close_rel + gt + 1;
-                blocks.push(&doc[abs..end]);
-                pos = end;
-                continue;
+        if rest.starts_with("<![CDATA[") {
+            let Some(end) = rest.find("]]>") else {
+                break;
+            };
+            let next = end + 3;
+            offset += next;
+            rest = &rest[next..];
+            continue;
+        }
+        let Some(end) = opening_tag_end(rest) else {
+            break;
+        };
+        let tag = &rest[..=end];
+        let raw_name = tag.strip_prefix('<').unwrap_or_default();
+        let closing = raw_name.starts_with('/');
+        let name = raw_name
+            .trim_start_matches('/')
+            .split(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>')
+            .next()
+            .unwrap_or_default();
+        let local_name = name.rsplit(':').next();
+        let self_closing = tag[..end].trim_end().ends_with('/');
+        if local_name == Some("file") {
+            if closing {
+                if let Some(start) = file_start.take() {
+                    blocks.push(&doc[start..offset + end + 1]);
+                }
+            } else if self_closing {
+                blocks.push(&doc[offset..offset + end + 1]);
+            } else {
+                file_start = Some(offset);
             }
         }
-        // Unclosed trailing file: take the rest of the document.
-        blocks.push(&doc[abs..]);
-        break;
+        let next = end + 1;
+        offset += next;
+        rest = &rest[next..];
+    }
+    if let Some(start) = file_start {
+        // An unclosed trailing file: preserve the remaining block for the
+        // later parser to reject or cross-check.
+        blocks.push(&doc[start..]);
     }
     blocks
 }
 
-/// Per-segment byte ranges sourced from NZB `bytes=` metadata.
+/// Per-segment encoded wire sizes sourced from NZB `bytes=` metadata.
 ///
-/// Returns `(flat_in_document_order, per_file_in_nzb_order)`. Every slot is
-/// `Some(n)` for a usable positive range, `None` for explicit-unknown
-/// (missing, non-numeric, zero, or negative `bytes=`), never `Some(0)`.
+/// These are size hints, not decoded file offsets. Returns
+/// `(flat_in_document_order, per_file_in_nzb_order)`. Every slot is `Some(n)`
+/// for a usable positive size, `None` for explicit-unknown (missing,
+/// non-numeric, zero, negative, or out-of-bounds `bytes=`).
 pub fn parse_segment_byte_ranges(nzb_xml: &str) -> (Vec<Option<u64>>, Vec<Vec<Option<u64>>>) {
     let flat = segment_bytes_in(nzb_xml);
     let per_file: Vec<Vec<Option<u64>>> = file_blocks(nzb_xml)

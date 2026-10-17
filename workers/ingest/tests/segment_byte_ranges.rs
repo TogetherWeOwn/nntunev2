@@ -270,3 +270,65 @@ fn check_parsed_rejects_range_length_mismatch_and_zero_filled() {
     .is_err());
     assert!(build_probe_request_with_ranges(&msg, 0, &[]).is_err());
 }
+
+#[test]
+fn range_scanner_ignores_comments_and_matches_prefixed_segment_names() {
+    let xml = r#"<nzb xmlns:n="urn:nzb"><file>
+<!-- <segment bytes="18446744073709551615" number="1">fake@invalid</segment> -->
+<n:segment bytes="111" number="1">real@invalid</n:segment>
+</file></nzb>"#;
+    let (flat, per_file) = parse_segment_byte_ranges(xml);
+    assert_eq!(flat, vec![Some(111)]);
+    assert_eq!(per_file, vec![vec![Some(111)]]);
+}
+
+#[test]
+fn invalid_or_unbounded_ranges_are_unknown_or_rejected() {
+    let xml = r#"<nzb><file><segment bytes="18446744073709551615" number="1">x@y</segment></file></nzb>"#;
+    let (flat, _) = parse_segment_byte_ranges(xml);
+    assert_eq!(flat, vec![None]);
+
+    let est = nntune_ingest::nzb_intake::estimate_nzb(MULTI_FILE_NZB).unwrap();
+    let mut oversized = parsed_multi_file();
+    oversized.segment_bytes[0] = Some(2_147_483_648);
+    oversized.file_segment_bytes[0][0] = Some(2_147_483_648);
+    assert!(check_parsed(&est, &oversized).is_err());
+    let segment_count = 33;
+    let excessive_total = ParsedNzb {
+        file_count: 1,
+        segment_count,
+        message_ids: (0..segment_count)
+            .map(|i| format!("seg-{i}@synthetic.invalid"))
+            .collect(),
+        segment_bytes: vec![Some(2_147_483_647); segment_count],
+        file_segment_bytes: vec![vec![Some(2_147_483_647); segment_count]],
+    };
+    let estimate = nntune_ingest::nzb_intake::IntakeEstimate {
+        file_count: 1,
+        segment_count,
+    };
+    assert!(check_parsed(&estimate, &excessive_total).is_err());
+
+    let msg = build_upload_dispatch("user_01", MULTI_FILE_NZB).unwrap();
+    assert!(build_probe_request_with_ranges(&msg, 0, &[("x@y", Some(0))]).is_err());
+    assert!(build_probe_request_with_ranges(&msg, 0, &[("x@y", Some(2_147_483_648))]).is_err());
+}
+
+#[test]
+fn file_blocks_ignore_commented_out_file_markup() {
+    let xml = r#"<nzb><file poster="a@b" date="1" subject="t1">
+<segments><segment bytes="100" number="1">a@x.invalid</segment></segments></file>
+<!-- <file poster="a@b" date="2" subject="t2">
+<segments><segment bytes="200" number="1">b@x.invalid</segment></segments></file> -->
+</nzb>"#;
+    let (flat, per_file) = parse_segment_byte_ranges(xml);
+    assert_eq!(flat, vec![Some(100)]);
+    assert_eq!(per_file, vec![vec![Some(100)]]);
+}
+
+#[test]
+fn ranged_probe_batches_reject_mismatched_parallel_arrays() {
+    let mut parsed = parsed_multi_file();
+    parsed.segment_bytes.pop();
+    assert!(std::panic::catch_unwind(|| probe_batches_with_ranges(&parsed)).is_err());
+}
