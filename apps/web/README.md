@@ -26,6 +26,24 @@ pnpm --dir apps/web test:e2e  # Playwright smoke (builds + serves preview)
 Playwright needs a Chromium build (`playwright install chromium`) plus the
 system libraries Chromium links against; see `playwright.config.ts`.
 
+## Bundle budget
+
+CI fails `web-build` when total client JS exceeds **230,400 B (225 KiB)**,
+measured as raw bytes over every `*.js` file under
+`.svelte-kit/output/client` after `pnpm build`. The budget is pinned in
+[`check_web_bundle_budget.py`](../../.github/scripts/check_web_bundle_budget.py)
+(`BUDGET_CLIENT_JS_BYTES`), which also documents the value and this update
+procedure — that script is the single source of truth. Baseline was 176,417 B
+(~172 KiB, 31 files) on 2026-10-17, leaving ~30% headroom for framework
+upgrades while catching heavy additions (a charting or date library typically
+adds 50+ KiB).
+
+To update the budget deliberately, in its own PR: rebuild, confirm the growth
+is expected from the dependency/route change, bump `BUDGET_CLIENT_JS_BYTES`
+with a comment citing the reason, and update the number in this paragraph.
+Never bump it just to make a red build green. Wasm/script size gates are out
+of scope here (tracked separately as Wasm enforcement).
+
 ## Deploy
 
 The tracked Wrangler config is [`wrangler.toml`](wrangler.toml) in this
