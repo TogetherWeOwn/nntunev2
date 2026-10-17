@@ -6,7 +6,6 @@
   segments below reconstruct that 1724-byte generated WAV exactly, so the
   staging spec's Range seeks (bytes 0-8 and 9-17) stay in bounds.
 -->
-<!DOCTYPE nzb PUBLIC "-//newzBin//DTD NZB 1.1//EN" "http://www.newzbin.com/DTD/nzb/nzb-1.1.dtd">
 <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
   <head>
     <meta type="title">nntune-e2e-synthetic-track</meta>

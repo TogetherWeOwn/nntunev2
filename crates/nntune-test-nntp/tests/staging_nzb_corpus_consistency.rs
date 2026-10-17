@@ -16,13 +16,19 @@
 //! * positive/negative controls prove the validator itself catches a
 //!   missing/renamed ID and accepts a known-good canonical NZB.
 //!
+//! * the production NZB parser accepts the fixture and the production
+//!   NNTP client + yEnc decoder reproduce the canonical WAV, so a fixture
+//!   ingest itself would reject cannot pass here.
+//!
 //! Offline and deterministic: loopback fixture server only, synthetic
-//! `@nntune.test` data only. This file is Test-Author-owned; the Builder's
-//! correction target is `e2e/fixtures/synthetic.nzb` alone.
+//! `@nntune.test` data only.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
+use nntune_core::nntp::{NntpClient, NntpConfig};
+use nntune_core::transports::connect_native;
 use nntune_test_nntp::{default_corpus, generate_wav_bytes, Article, TestNntpServer};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -273,9 +279,12 @@ fn validator_rejects_unknown_and_renamed_ids() {
         "synthetic-e2e-part1@nntune.test",
         "single-yenc-002@nntune.test",
     );
+    let errors = validate_nzb_against_corpus(&renamed);
     assert!(
-        !validate_nzb_against_corpus(&renamed).is_empty(),
-        "renamed ID slipped through"
+        errors
+            .iter()
+            .any(|e| e.contains("<single-yenc-002@nntune.test>")),
+        "renamed ID not reported: {errors:?}"
     );
     let wrong_bytes = r#"<?xml version="1.0" encoding="UTF-8"?>
 <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
@@ -553,5 +562,99 @@ async fn staging_nzb_reconstructs_one_complete_canonical_wav_via_nntp() {
         canonical.iter().any(|w| w == &reassembled),
         "reconstructed payload ({} bytes) is not a canonical generated sine WAV",
         reassembled.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Production path: the parser, NNTP client and yEnc decoder ingest uses
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn staging_nzb_parses_fetches_and_decodes_via_production_pipeline() {
+    // Corpus consistency alone is not ingestability: the hand-rolled scanner
+    // above accepts documents the production parser rejects (it refuses every
+    // DOCTYPE as XXE hardening). This test runs the production components —
+    // `nntune_core::nzb::parse` (the parser the ingest upload handler calls),
+    // `NntpClient` and `yenc::decode_to` — so a fixture the upload would
+    // reject with a 400 fails here.
+    let text = staging_nzb_text();
+    let document = nntune_core::nzb::parse(text.as_bytes())
+        .expect("production NZB parser accepts the staging fixture");
+    assert_eq!(document.files.len(), 1, "staging NZB carries one file");
+    let file = &document.files[0];
+    assert!(
+        !file.segments.is_empty(),
+        "staging NZB declares no segments"
+    );
+
+    // The production parse must agree with the corpus view: the same segment
+    // IDs (production IDs are bare, corpus IDs are bracketed), in order.
+    let corpus_ids: Vec<String> = parse_nzb(&text)
+        .segments()
+        .into_iter()
+        .map(|s| s.id.trim_matches(['<', '>']).to_string())
+        .collect();
+    let production_ids: Vec<&str> = file
+        .segments
+        .iter()
+        .map(|s| s.message_id.as_str())
+        .collect();
+    assert_eq!(production_ids, corpus_ids);
+
+    let server = TestNntpServer::spawn_for_test().await;
+    let config = NntpConfig {
+        host: "127.0.0.1".into(),
+        port: server.addr().port(),
+        tls: false,
+        username: Some("testuser".into()),
+        password: Some("testpass".into()),
+        timeout: Duration::from_secs(2),
+        max_pipelined: 4,
+        ..NntpConfig::default()
+    };
+    let transport = connect_native(&config)
+        .await
+        .expect("connect to fixture server");
+    let mut client = NntpClient::connect(transport, &config)
+        .await
+        .expect("NNTP handshake");
+    let fetched = client
+        .fetch_many(&production_ids)
+        .await
+        .expect("fetch staging segments via production NNTP client");
+    client.quit().await;
+    assert_eq!(fetched.len(), file.segments.len());
+
+    // Decode each fetched article with the production decoder (which also
+    // verifies CRC) into a buffer sized by the declared segment bytes, and
+    // reassemble in segment-number order.
+    let mut reassembled = Vec::new();
+    for segment in &file.segments {
+        let article = fetched
+            .iter()
+            .find(|f| f.message_id == segment.message_id)
+            .unwrap_or_else(|| panic!("no fetched article for {}", segment.message_id));
+        let mut decoded = vec![0u8; segment.encoded_bytes as usize];
+        let decoded_len =
+            nntune_core::yenc::decode_to(&segment.message_id, &article.article, &mut decoded)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "production yEnc decoder rejects {}: {e:?}",
+                        segment.message_id
+                    )
+                });
+        assert_eq!(
+            decoded_len,
+            decoded.len(),
+            "decoded length disagrees with NZB bytes= for {}",
+            segment.message_id
+        );
+        reassembled.extend_from_slice(&decoded);
+    }
+
+    assert_eq!(
+        reassembled,
+        generate_wav_bytes(660.0, 210, 8000),
+        "production pipeline does not reproduce the canonical 660 Hz WAV"
     );
 }
