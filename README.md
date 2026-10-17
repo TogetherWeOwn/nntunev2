@@ -35,6 +35,87 @@ workers/             # Rust workers-rs backends incl. Durable Objects
 apps/web/            # SvelteKit frontend (adapter-cloudflare)
 ```
 
+## Quickstart
+
+Setup, test, then read the runbooks before touching staging. Every command
+below was run verbatim against a clean checkout; expected results are noted.
+
+### Prerequisites
+
+- Rust stable with the `wasm32-unknown-unknown` target (all backends compile
+  to `wasm32` for deployment):
+
+  ```sh
+  rustup target add wasm32-unknown-unknown
+  ```
+
+- Node 24 and pnpm 10 (the `apps/web` frontend pins its lockfile for pnpm).
+- Python 3.11+ (repo lint scripts).
+- No secrets are needed for any local test. Secret *names* are listed under
+  [Secrets](#secrets-never-committed); values live in GitHub Actions secrets
+  or shell exports, never in this repo.
+
+### Setup
+
+```sh
+# Web frontend
+cd apps/web && pnpm install --frozen-lockfile && cd ../..
+# E2E harness (Playwright)
+cd e2e && npm ci && cd ..
+```
+
+Rust needs no install step: `cargo` fetches dependencies on first build.
+If `NODE_ENV=production` is exported in your shell, npm silently omits the
+dev dependencies the harness needs — install it with
+`npm ci --include=dev` instead (same caveat as in `e2e/README.md`).
+
+### Test
+
+```sh
+# Rust workspace (core, config, stream, repair, test fixtures)
+cargo test --workspace
+# Standalone Worker crates (outside the workspace, locked deps as in CI)
+cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets
+cargo test --locked --manifest-path workers/mb/Cargo.toml --all-targets
+cargo test --locked --manifest-path workers/ingest/Cargo.toml --all-targets
+# Web frontend (from apps/web): unit tests, then typecheck
+pnpm test
+pnpm check
+# E2E harness (from e2e): typecheck, offline self-tests, then spec discovery
+npm run typecheck
+npm run test:unit
+npm run e2e:list
+```
+
+`npm run e2e:list` compiles the suite and lists the specs (202 tests across
+11 files) with no staging needed. Live staging runs stay in CI — see below.
+
+Public-repo hygiene gate (part of `ci-ok`, from the repo root):
+
+```sh
+python3 .github/scripts/public_text_lint.py
+```
+
+### Deploy / staging evidence
+
+Deploys are push-triggered in CI; there is nothing to deploy from a laptop:
+
+- Pushing to `main` runs `.github/workflows/deploy.yml`, which deploys
+  `apps/web` to staging (`staging-web` job) and then sequences the full
+  Playwright journey as `post-deploy-e2e` (same run, only after a successful
+  deploy — a skipped/failed deploy cannot produce a PASS).
+- The exact-head promotion boxes (CI green, deploy run, E2E result, Access
+  intact, data-plane guards, rollback pointer) are defined in the
+  [Staging promotion checklist](docs/ops.md#staging-promotion-checklist).
+- How the harness uses staging credentials, what counts as evidence for a QA
+  PASS verdict, and the pre-deploy skip behavior are documented in
+  [e2e/README.md](e2e/README.md) (sections `Activation progression`, `CI`,
+  `Evidence`).
+
+Credential setup beyond these pointers is out of scope here: staging E2E
+needs the authorized QA credential wiring described in those documents, and
+production promotion is a separate gated lane.
+
 ## Secrets (never committed)
 
 | Secret | Purpose |
