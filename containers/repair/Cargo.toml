@@ -6,7 +6,7 @@ description = "Native par2 repair HTTP server for the repair Container image (ba
 license = "MIT"
 
 [dependencies]
-nntune-core = { path = "../../crates/nntune-core", default-features = false }
+nntune-core = { version = "0.1.0", path = "../../crates/nntune-core", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
