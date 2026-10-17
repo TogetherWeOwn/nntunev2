@@ -29,7 +29,7 @@
 //! the real Worker transport pins the TCP/TLS dial to
 //! [`ValidatedTarget::addresses`] with [`ValidatedTarget::host`] for SNI.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// The only port an indexer fetch may dial (https default). Any other
 /// explicit port turns the fetch into a port-scan primitive.
@@ -171,6 +171,37 @@ pub struct BodyChunk {
 }
 
 // --- Address guard (mirrors workers/api vault guard; keep in sync) --------
+
+/// Host shape check, copied from `workers/api` vault `host_shape_ok`
+/// (keep the two in sync). Applied to every non-literal host before any
+/// DNS lookup — including redirect `Location` hosts, which never pass
+/// through the vault — so bytes a WHATWG parser treats as delimiters
+/// (`\`, `%`, controls, other non-LDH) cannot smuggle a different host
+/// past the guard than the transport would dial.
+fn host_shape_ok(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    // Never a URL: no scheme, no path, no userinfo, no port suffix.
+    if host.contains("://")
+        || host.contains('/')
+        || host.contains('@')
+        || host.contains(':')
+        || host.contains(' ')
+    {
+        return false;
+    }
+    // DNS name labels or an IP literal.
+    if host.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    !host.starts_with('.')
+        && !host.ends_with('.')
+        && !host.contains("..")
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+}
 
 fn v4_is_forbidden(o: &[u8; 4]) -> bool {
     let v4 = Ipv4Addr::from(*o);
@@ -314,6 +345,9 @@ pub fn validate_indexer_url(
     if host.is_empty() {
         return Err(FetchRejection::MalformedUrl);
     }
+    if host.parse::<IpAddr>().is_err() && !host_shape_ok(host) {
+        return Err(FetchRejection::MalformedUrl);
+    }
     let addresses = match host.parse::<IpAddr>() {
         Ok(ip) => vec![ip],
         Err(_) => dns.resolve(host),
@@ -356,6 +390,12 @@ fn resolve_location(current_host: &str, location: &str) -> Result<String, FetchR
         return Ok(location.to_string());
     }
     if let Some(_path) = location.strip_prefix('/') {
+        // `current_host` is stored without brackets; an IPv6 literal
+        // must be re-bracketed or the rebuilt authority is unbracketed
+        // multi-colon and (correctly) rejected as malformed.
+        if current_host.parse::<Ipv6Addr>().is_ok() {
+            return Ok(format!("https://[{current_host}]{location}"));
+        }
         return Ok(format!("https://{current_host}{location}"));
     }
     Err(FetchRejection::MalformedUrl)
@@ -388,6 +428,8 @@ pub fn fetch_indexer(
 ) -> Result<Vec<u8>, FetchRejection> {
     let mut current = url.to_string();
     let mut followed: u32 = 0;
+    // Total deadline spans ALL hops: never reset per redirect.
+    let mut elapsed: u64 = 0;
     loop {
         let target = validate_indexer_url(&current, config, dns)?;
         let request = PinnedRequest {
@@ -402,18 +444,20 @@ pub fn fetch_indexer(
         if response.connect_delay_ms >= config.dial_timeout_ms {
             return Err(FetchRejection::DialTimeout);
         }
-        let mut elapsed = response.connect_delay_ms;
+        elapsed = elapsed.saturating_add(response.connect_delay_ms);
         if elapsed >= config.timeout_ms {
             return Err(FetchRejection::Timeout);
+        }
+        for chunk in &response.chunks {
+            elapsed = elapsed.saturating_add(chunk.delay_ms);
+            if elapsed >= config.timeout_ms {
+                return Err(FetchRejection::Timeout);
+            }
         }
         match response.status {
             200..=299 => {
                 let mut body = Vec::new();
                 for chunk in &response.chunks {
-                    elapsed = elapsed.saturating_add(chunk.delay_ms);
-                    if elapsed >= config.timeout_ms {
-                        return Err(FetchRejection::Timeout);
-                    }
                     body.extend_from_slice(&chunk.bytes);
                 }
                 return Ok(body);
@@ -482,11 +526,76 @@ fn parse_log_host(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    const PUBLIC_V4: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34);
+    const PUBLIC_V6: Ipv6Addr = Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
 
     struct NoDns;
     impl DnsResolver for NoDns {
         fn resolve(&self, _host: &str) -> Vec<IpAddr> {
             vec![]
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeDns {
+        map: HashMap<String, Vec<IpAddr>>,
+        lookups: RefCell<Vec<String>>,
+    }
+    impl FakeDns {
+        fn with(host: &str, addrs: &[IpAddr]) -> Self {
+            let mut dns = Self::default();
+            dns.map.insert(host.to_string(), addrs.to_vec());
+            dns
+        }
+    }
+    impl DnsResolver for FakeDns {
+        fn resolve(&self, host: &str) -> Vec<IpAddr> {
+            self.lookups.borrow_mut().push(host.to_string());
+            self.map.get(host).cloned().unwrap_or_default()
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeTransport {
+        routes: HashMap<String, RawResponse>,
+        dials: Vec<PinnedRequest>,
+    }
+    impl FakeTransport {
+        fn serve(mut self, url: &str, response: RawResponse) -> Self {
+            self.routes.insert(url.to_string(), response);
+            self
+        }
+    }
+    impl IndexerTransport for FakeTransport {
+        fn get(&mut self, request: &PinnedRequest) -> Result<RawResponse, FetchRejection> {
+            self.dials.push(request.clone());
+            self.routes
+                .get(&request.url)
+                .cloned()
+                .ok_or(FetchRejection::UpstreamStatus(404))
+        }
+    }
+
+    fn ok(connect_delay_ms: u64, chunk_delay_ms: u64) -> RawResponse {
+        RawResponse {
+            status: 200,
+            location: None,
+            connect_delay_ms,
+            chunks: vec![BodyChunk {
+                delay_ms: chunk_delay_ms,
+                bytes: b"ok".to_vec(),
+            }],
+        }
+    }
+    fn redirect(location: &str, connect_delay_ms: u64) -> RawResponse {
+        RawResponse {
+            status: 302,
+            location: Some(location.to_string()),
+            connect_delay_ms,
+            chunks: vec![],
         }
     }
 
@@ -497,5 +606,72 @@ mod tests {
             validate_indexer_url("https://indexer.example:65536/api", &cfg, &NoDns),
             Err(FetchRejection::PortNotAllowed)
         );
+    }
+
+    #[test]
+    fn host_shape_is_checked_before_dns() {
+        // Even a (wildcard) DNS answer that is public must not rescue a
+        // non-LDH host: a WHATWG parser would read `\`/`%` differently.
+        for host in [
+            r"127.0.0.1\x.evil.example",
+            "indexer%2eexample",
+            "indexer_example",
+            ".indexer.example",
+            "indexer..example",
+        ] {
+            let dns = FakeDns::with(host, &[IpAddr::V4(PUBLIC_V4)]);
+            let url = format!("https://{host}/api");
+            assert_eq!(
+                validate_indexer_url(&url, &FetchConfig::default(), &dns),
+                Err(FetchRejection::MalformedUrl),
+                "host {host}"
+            );
+            assert!(dns.lookups.borrow().is_empty(), "no DNS for {host}");
+        }
+    }
+
+    #[test]
+    fn backslash_redirect_location_is_blocked_and_never_dialed() {
+        let start = "https://indexer.example/api";
+        let dns = FakeDns::with("indexer.example", &[IpAddr::V4(PUBLIC_V4)]);
+        let mut transport = FakeTransport::default()
+            .serve(start, redirect(r"https://127.0.0.1\x.evil.example/", 5));
+        assert_eq!(
+            fetch_indexer(start, &FetchConfig::default(), &dns, &mut transport),
+            Err(FetchRejection::MalformedUrl)
+        );
+        assert_eq!(transport.dials.len(), 1, "only the initial dial");
+    }
+
+    #[test]
+    fn total_timeout_spans_all_redirect_hops() {
+        // Reviewer probe: 3x 4900ms redirect connects + final 4900ms
+        // connect + 10000ms chunk = 29.6s > 15s total, each hop alone
+        // under both budgets.
+        let dns = FakeDns::with("indexer.example", &[IpAddr::V4(PUBLIC_V4)]);
+        let u = |n: u8| format!("https://indexer.example/hop{n}");
+        let mut transport = FakeTransport::default()
+            .serve(&u(0), redirect(&u(1), 4_900))
+            .serve(&u(1), redirect(&u(2), 4_900))
+            .serve(&u(2), redirect(&u(3), 4_900))
+            .serve(&u(3), ok(4_900, 10_000));
+        assert_eq!(
+            fetch_indexer(&u(0), &FetchConfig::default(), &dns, &mut transport),
+            Err(FetchRejection::Timeout)
+        );
+    }
+
+    #[test]
+    fn path_absolute_redirect_from_ipv6_literal_host_is_rebracketed() {
+        let start = format!("https://[{PUBLIC_V6}]/api");
+        let next = format!("https://[{PUBLIC_V6}]/next");
+        let mut transport = FakeTransport::default()
+            .serve(&start, redirect("/next", 5))
+            .serve(&next, ok(5, 5));
+        assert_eq!(
+            fetch_indexer(&start, &FetchConfig::default(), &NoDns, &mut transport),
+            Ok(b"ok".to_vec())
+        );
+        assert_eq!(transport.dials[1].url, next);
     }
 }
