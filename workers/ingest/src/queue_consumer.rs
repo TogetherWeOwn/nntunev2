@@ -3,9 +3,9 @@
 //! Settlement is decided by [`crate::retry::decide_checkpoint`] (the retry
 //! budget + DLQ contract): this module validates each message against its
 //! deterministic job identity, loads or creates the durable checkpoint,
-//! runs the one executable step (upload payload digest + shared-parser
-//! validation), and maps the decision onto ack / delayed retry / DLQ
-//! quarantine per message.
+//! runs the executable steps (upload payload digest + shared-parser
+//! validation, then the pool-DO segment probe), and maps the decision onto
+//! ack / delayed retry / DLQ quarantine per message.
 //!
 //! **One checkpoint write per delivery.** Workers KV allows 1 write per
 //! second to the same key and returns 429 otherwise, so every state
@@ -25,11 +25,20 @@
 //! ([`crate::checkpoint::admission_plan`]), never here, so redeliveries
 //! of one enqueue cannot resurrect it.
 //!
-//! No live runtime boundary is claimed: indexer search, pool probe,
-//! verify, repair, match and write steps have no executable consumer
-//! wiring yet, so those states settle as transient failures through the
-//! shared retry budget. The consumer therefore stays disabled in
-//! `wrangler.toml.example` until those boundaries land.
+//! Probing folds each answered batch into the checkpoint's probe tally
+//! in memory as it lands; the delivery's single persist (before
+//! settlement, above) is what makes the folded batches durable. KV's
+//! 1 write/s/key cap forbids a write per batch (a cap-sized NZB has ~120
+//! batches), so a crash before that persist simply re-asks the batches it
+//! had folded: `STAT` is idempotent and the tally is keyed by batch
+//! index, so a redelivery resumes without ever double-counting.
+//!
+//! No other live runtime boundary is claimed: indexer search (hence
+//! probing for search-sourced jobs), verify, repair, match and write
+//! steps have no executable consumer wiring yet, so those states settle
+//! as transient failures through the shared retry budget. The consumer
+//! therefore stays disabled in `wrangler.toml.example` until those
+//! boundaries land.
 
 use worker::{console_log, Env, MessageExt, QueueRetryOptionsBuilder};
 
@@ -41,6 +50,11 @@ use crate::jobs::{
     MAX_REPAIR_ROUNDS,
 };
 use crate::newznab::{MAX_CATEGORIES, MAX_LIMIT, MAX_PAGE};
+use crate::parse::ParsedNzb;
+use crate::pool_probe::{call_pool_probe, check_outcome, PoolProbeError};
+use crate::probe::{
+    apply_probe_batch, build_probe_request, ProbeOutcome, ProbeRequest, ProbeTally,
+};
 use crate::queue::{validate_indexer_ref, QueueMsg};
 use crate::retry::{
     decide_checkpoint, Disposition, DlqEntry, JobError, DLQ_QUEUE_BINDING, ERR_MATCH_FAILED,
@@ -149,24 +163,128 @@ fn unavailable_code(state: JobState) -> &'static str {
     }
 }
 
-/// Run the executable part of one delivery, mutating `cp` in memory only.
-///
-/// Uploads in `Parsing` fetch and digest-check the payload, run the intake
-/// guard and the shared parser, and advance to `Probing` on success — then
-/// still report the (not yet wired) probe boundary as a transient failure,
-/// so the delivery settles through the shared retry budget instead of
-/// claiming progress it cannot finish. Every other non-terminal state is
-/// a transient boundary failure today.
-async fn run_step(env: &Env, msg: &QueueMsg, cp: &mut JobCheckpoint) -> Result<(), JobError> {
-    if cp.state == JobState::Queued {
-        advance_checkpoint(cp, false);
+/// Map a pool probe refusal/failure onto the job's error contract. The
+/// detail stays generic: pool/provider internals never reach job status
+/// or the DLQ reason.
+fn pool_probe_job_error(error: PoolProbeError) -> JobError {
+    match error {
+        PoolProbeError::Retry { after_secs } => {
+            JobError::transient_after(ERR_PROBE_FAILED, "pool probe unavailable", after_secs)
+        }
+        PoolProbeError::Rejected => {
+            JobError::permanent(ERR_PROBE_FAILED, "pool probe rejected the request")
+        }
     }
-    if !(cp.state == JobState::Parsing && cp.source == JobSource::NzbUpload) {
+}
+
+/// Prepare the checkpoint tally for `batches`: create it on first entry
+/// to `Probing`, and refuse a stored tally that cannot belong to this
+/// parse (different batch count, out-of-range index, or a missing count
+/// larger than its batch). The payload is content-addressed and the
+/// parser deterministic, so a mismatch is corrupt checkpoint state:
+/// permanent, not something a redelivery can repair.
+fn prepare_probe_tally(cp: &mut JobCheckpoint, batches: &[Vec<String>]) -> Result<(), JobError> {
+    let inconsistent = || {
+        JobError::permanent(
+            ERR_PROBE_FAILED,
+            "probe tally disagrees with the parsed NZB",
+        )
+    };
+    match cp.probe_tally.as_ref() {
+        None => {
+            cp.probe_tally = Some(ProbeTally::new(batches.len()));
+            Ok(())
+        }
+        Some(tally) if tally.total_batches != batches.len() => Err(inconsistent()),
+        Some(tally) => {
+            for (batch_index, missing) in &tally.missing_by_batch {
+                match batches.get(*batch_index) {
+                    Some(batch) if (*missing as usize) <= batch.len() => {}
+                    _ => return Err(inconsistent()),
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Ask the pool about every batch the tally has not yet recorded, folding
+/// each answer in as it lands ([`apply_probe_batch`]). Returns the total
+/// missing-segment count once every batch has reported, with `cp` moved
+/// to `Verifying` and the completed tally retained for that step to read.
+///
+/// An answer is checked against its request before folding (the live
+/// caller, [`call_pool_probe`], checks too; the driver refuses an
+/// unpartitioned answer regardless of caller). On a retryable pool
+/// failure the batches folded so far stay in `cp.probe_tally`, so the
+/// delivery's settlement persist carries them and the redelivery only
+/// asks the remainder. Injected `call` keeps the fold policy unit-testable
+/// without a Durable Object binding.
+async fn run_probing_batches<C, Fut>(
+    msg: &QueueMsg,
+    cp: &mut JobCheckpoint,
+    batches: &[Vec<String>],
+    mut call: C,
+) -> Result<u32, JobError>
+where
+    C: FnMut(ProbeRequest) -> Fut,
+    Fut: core::future::Future<Output = Result<ProbeOutcome, PoolProbeError>>,
+{
+    if cp.state != JobState::Probing {
+        // Never spend a provider connection from the wrong state; the
+        // caller settles this like any other unavailable boundary.
         return Err(JobError::transient(
             unavailable_code(cp.state),
             "ingest runtime boundary unavailable",
         ));
     }
+    if batches.is_empty() {
+        // A zero-batch tally would read as trivially complete; intake
+        // rejects segment-less NZBs, so this is a parse contract bug.
+        return Err(JobError::permanent(
+            ERR_PARSE_FAILED,
+            "NZB has no segments to probe",
+        ));
+    }
+    prepare_probe_tally(cp, batches)?;
+    let pending: Vec<usize> = {
+        let tally = cp.probe_tally.as_ref().expect("tally prepared above");
+        (0..tally.total_batches)
+            .filter(|batch_index| !tally.missing_by_batch.contains_key(batch_index))
+            .collect()
+    };
+    for batch_index in pending {
+        let segment_ids: Vec<&str> = batches[batch_index].iter().map(String::as_str).collect();
+        // The parser cross-check already validated these ids, so a build
+        // failure here is a contract bug: same generic permanent refusal
+        // as a pool-side rejection.
+        let request = build_probe_request(msg, batch_index, &segment_ids)
+            .map_err(|_| pool_probe_job_error(PoolProbeError::Rejected))?;
+        let outcome = call(request.clone()).await.map_err(pool_probe_job_error)?;
+        check_outcome(&request, &outcome).map_err(pool_probe_job_error)?;
+        let tally = cp.probe_tally.as_mut().expect("tally prepared above");
+        let (next, _) = apply_probe_batch(cp.state, tally, &outcome);
+        cp.state = next;
+    }
+    let tally = cp.probe_tally.as_ref().expect("tally prepared above");
+    if !tally.is_complete() {
+        // Defensive: the pending snapshot covered every unrecorded batch,
+        // so incompleteness means an answer folded against a different
+        // index than asked. Redeliver and resume from the tally.
+        return Err(JobError::transient(
+            ERR_PROBE_FAILED,
+            "pool probe incomplete",
+        ));
+    }
+    cp.state = JobState::Verifying;
+    Ok(tally.missing_segments())
+}
+
+/// Fetch, digest-check and parse the upload payload for `msg`. Re-parsing
+/// on every `Parsing`/`Probing` delivery is deliberate: the checkpoint
+/// stores no parse, and the content-addressed payload plus deterministic
+/// parser make the re-parse converge on the same batches.
+async fn load_parsed_upload(env: &Env, msg: &QueueMsg) -> Result<ParsedNzb, JobError> {
     let Some(payload_ref) = msg.payload_ref.as_deref() else {
         return Err(JobError::permanent(
             ERR_PAYLOAD_MISSING,
@@ -217,18 +335,53 @@ async fn run_step(env: &Env, msg: &QueueMsg, cp: &mut JobCheckpoint) -> Result<(
     let estimate = crate::nzb_intake::estimate_nzb(&payload).map_err(|_| {
         JobError::permanent(ERR_PARSE_FAILED, "upload payload failed intake validation")
     })?;
-    let parsed = crate::parse::parse_upload(payload.as_bytes(), &estimate)
-        .map_err(|_| JobError::permanent(ERR_PARSE_FAILED, "shared NZB parser rejected payload"))?;
-    if crate::parse::probe_batches(&parsed).is_empty() {
+    crate::parse::parse_upload(payload.as_bytes(), &estimate)
+        .map_err(|_| JobError::permanent(ERR_PARSE_FAILED, "shared NZB parser rejected payload"))
+}
+
+/// Run the executable part of one delivery, mutating `cp` in memory only.
+///
+/// Uploads fetch and digest-check the payload, run the intake guard and
+/// the shared parser, advance `Parsing -> Probing`, and ask the user's
+/// pool about every not-yet-tallied batch ([`run_probing_batches`]) —
+/// including on the same delivery that parsed, so a fresh job does not
+/// spend a retry just to change state. Completed probing advances to
+/// `Verifying` and then still reports that (not yet wired) boundary as a
+/// transient failure, so the delivery settles through the shared retry
+/// budget instead of claiming progress it cannot finish. Every other
+/// non-terminal state (including `Probing` for search-sourced jobs, whose
+/// NZB bytes do not exist until the search step is wired) is a transient
+/// boundary failure today.
+async fn run_step(env: &Env, msg: &QueueMsg, cp: &mut JobCheckpoint) -> Result<(), JobError> {
+    if cp.state == JobState::Queued {
+        advance_checkpoint(cp, false);
+    }
+    if !(cp.source == JobSource::NzbUpload
+        && matches!(cp.state, JobState::Parsing | JobState::Probing))
+    {
+        return Err(JobError::transient(
+            unavailable_code(cp.state),
+            "ingest runtime boundary unavailable",
+        ));
+    }
+    let parsed = load_parsed_upload(env, msg).await?;
+    let batches = crate::parse::probe_batches(&parsed);
+    if batches.is_empty() {
         return Err(JobError::permanent(
             ERR_PARSE_FAILED,
             "NZB has no segments to probe",
         ));
     }
-    advance_checkpoint(cp, false);
+    if cp.state == JobState::Parsing {
+        advance_checkpoint(cp, false);
+    }
+    run_probing_batches(msg, cp, &batches, |request| async move {
+        call_pool_probe(env, &request).await
+    })
+    .await?;
     Err(JobError::transient(
-        ERR_PROBE_FAILED,
-        "pool probe runtime unavailable",
+        ERR_VERIFY_FAILED,
+        "verify runtime unavailable",
     ))
 }
 
@@ -443,7 +596,7 @@ mod tests {
         let mut failed = crate::checkpoint::initial(&msg);
         failed.state = JobState::Failed;
         failed.failure_code = Some(ERR_PROBE_FAILED.into());
-        failed.failure_reason = Some("pool probe runtime unavailable".into());
+        failed.failure_reason = Some("pool probe unavailable".into());
         let (persist, settlement) = plan_settlement(&msg, &mut failed, Ok(()));
         assert!(!persist);
         match settlement {
@@ -506,5 +659,244 @@ mod tests {
         assert_eq!(cp.state, JobState::Failed);
         assert_eq!(cp.failure_code.as_deref(), Some(ERR_PARSE_FAILED));
         assert!(matches!(settlement, Settlement::Quarantine(_)));
+    }
+
+    // --- Probing driver (pool probe fold / resume policy) ---
+
+    use crate::pool_probe::PoolProbeError;
+    use crate::probe::{ProbeOutcome, ProbeRequest, ProbeTally};
+
+    fn probing_setup() -> (QueueMsg, JobCheckpoint, Vec<Vec<String>>) {
+        let msg = build_upload_dispatch("user_01", crate::fixtures::SMALL_NZB).unwrap();
+        let mut cp = crate::checkpoint::initial(&msg);
+        cp.state = JobState::Probing;
+        let batches = vec![
+            vec!["seg-a@synthetic.invalid".to_string()],
+            vec![
+                "seg-b@synthetic.invalid".to_string(),
+                "seg-c@synthetic.invalid".to_string(),
+            ],
+        ];
+        (msg, cp, batches)
+    }
+
+    /// Drive the probing loop with a scripted synchronous pool fake. The
+    /// fake resolves without yielding, so no executor is needed (same
+    /// pattern as the admission-driver tests in `lib.rs`).
+    fn drive_probing<F>(
+        msg: &QueueMsg,
+        cp: &mut JobCheckpoint,
+        batches: &[Vec<String>],
+        mut call: F,
+    ) -> Result<u32, JobError>
+    where
+        F: FnMut(&ProbeRequest) -> Result<ProbeOutcome, PoolProbeError>,
+    {
+        use futures_util::future::FutureExt as _;
+        run_probing_batches(msg, cp, batches, |req| {
+            let result = call(&req);
+            async move { result }
+        })
+        .now_or_never()
+        .expect("scripted probe resolves without yielding")
+    }
+
+    fn all_present(req: &ProbeRequest) -> Result<ProbeOutcome, PoolProbeError> {
+        Ok(ProbeOutcome {
+            batch_index: req.batch_index,
+            present: req.segment_ids.clone(),
+            missing: vec![],
+        })
+    }
+
+    #[test]
+    fn probing_folds_every_pending_batch_and_advances_to_verifying() {
+        let (msg, mut cp, batches) = probing_setup();
+        let mut asked = Vec::new();
+        let missing = drive_probing(&msg, &mut cp, &batches, |req| {
+            asked.push(req.batch_index);
+            if req.batch_index == 1 {
+                Ok(ProbeOutcome {
+                    batch_index: 1,
+                    present: vec![req.segment_ids[0].clone()],
+                    missing: vec![req.segment_ids[1].clone()],
+                })
+            } else {
+                all_present(req)
+            }
+        })
+        .expect("both batches answer");
+        assert_eq!(asked, vec![0, 1]);
+        assert_eq!(missing, 1);
+        assert_eq!(cp.state, JobState::Verifying);
+        let tally = cp.probe_tally.as_ref().expect("tally retained");
+        assert!(tally.is_complete());
+        assert_eq!(tally.missing_segments(), 1);
+    }
+
+    #[test]
+    fn probing_resumes_skipping_tallied_batches_without_double_counting() {
+        let (msg, mut cp, batches) = probing_setup();
+        let mut tally = ProbeTally::new(2);
+        assert!(tally.record(&ProbeOutcome {
+            batch_index: 0,
+            present: vec![],
+            missing: vec!["seg-a@synthetic.invalid".to_string()],
+        }));
+        cp.probe_tally = Some(tally);
+
+        let mut asked = Vec::new();
+        let missing = drive_probing(&msg, &mut cp, &batches, |req| {
+            asked.push(req.batch_index);
+            all_present(req)
+        })
+        .expect("remaining batch answers");
+        assert_eq!(asked, vec![1], "tallied batch must not be re-asked");
+        assert_eq!(missing, 1, "the earlier gap is counted exactly once");
+        assert_eq!(cp.state, JobState::Verifying);
+    }
+
+    #[test]
+    fn probing_retry_keeps_folded_batches_in_the_checkpoint_to_persist() {
+        let (msg, mut cp, batches) = probing_setup();
+        let err = drive_probing(&msg, &mut cp, &batches, |req| {
+            if req.batch_index == 0 {
+                all_present(req)
+            } else {
+                Err(PoolProbeError::Retry { after_secs: 42 })
+            }
+        })
+        .expect_err("busy pool must surface as a retryable error");
+        assert!(err.transient);
+        assert_eq!(err.code, ERR_PROBE_FAILED);
+        assert_eq!(err.retry_after_secs, Some(42));
+        assert_eq!(cp.state, JobState::Probing);
+        let tally = cp.probe_tally.as_ref().expect("folded batch kept");
+        assert!(tally.missing_by_batch.contains_key(&0));
+        assert!(!tally.missing_by_batch.contains_key(&1));
+
+        // Settlement persists that tally (the delivery's one write) and
+        // retries no sooner than the pool asked, inside the attempt budget.
+        let (persist, settlement) = plan_settlement(&msg, &mut cp, Err(err));
+        assert!(persist);
+        assert_eq!(settlement, Settlement::RetryAfter(42));
+        assert_eq!(cp.attempt, 2);
+        assert!(cp
+            .probe_tally
+            .as_ref()
+            .is_some_and(|t| t.missing_by_batch.contains_key(&0)));
+    }
+
+    #[test]
+    fn probing_rejected_fails_the_job_with_a_generic_reason() {
+        let (msg, mut cp, batches) = probing_setup();
+        let err = drive_probing(&msg, &mut cp, &batches, |_| Err(PoolProbeError::Rejected))
+            .expect_err("a refused envelope cannot be retried");
+        assert!(!err.transient);
+        assert_eq!(err.code, ERR_PROBE_FAILED);
+        assert_eq!(err.detail, "pool probe rejected the request");
+
+        let (persist, settlement) = plan_settlement(&msg, &mut cp, Err(err));
+        assert!(persist);
+        assert_eq!(cp.state, JobState::Failed);
+        assert_eq!(cp.failure_code.as_deref(), Some(ERR_PROBE_FAILED));
+        assert!(matches!(settlement, Settlement::Quarantine(_)));
+    }
+
+    #[test]
+    fn probing_refuses_answers_that_do_not_partition_the_request() {
+        let (msg, mut cp, batches) = probing_setup();
+        let err = drive_probing(&msg, &mut cp, &batches, |req| {
+            Ok(ProbeOutcome {
+                batch_index: req.batch_index,
+                present: vec!["foreign@synthetic.invalid".to_string()],
+                missing: vec![],
+            })
+        })
+        .expect_err("a foreign answer must never move the tally");
+        assert!(!err.transient);
+        assert_eq!(cp.state, JobState::Probing);
+        assert_eq!(
+            cp.probe_tally.as_ref().map(|t| t.missing_segments()),
+            Some(0)
+        );
+        assert!(cp
+            .probe_tally
+            .as_ref()
+            .is_some_and(|t| t.missing_by_batch.is_empty()));
+    }
+
+    #[test]
+    fn probing_with_a_complete_tally_advances_without_calling_the_pool() {
+        let (msg, mut cp, batches) = probing_setup();
+        let mut tally = ProbeTally::new(2);
+        for batch_index in 0..2 {
+            assert!(tally.record(&ProbeOutcome {
+                batch_index,
+                present: vec![],
+                missing: vec![],
+            }));
+        }
+        cp.probe_tally = Some(tally);
+
+        let missing = drive_probing(&msg, &mut cp, &batches, |_| {
+            panic!("a complete tally needs no pool call")
+        })
+        .expect("complete tally finishes probing");
+        assert_eq!(missing, 0);
+        assert_eq!(cp.state, JobState::Verifying);
+    }
+
+    #[test]
+    fn probing_rejects_a_tally_that_disagrees_with_the_parse() {
+        let (msg, mut cp, batches) = probing_setup();
+        cp.probe_tally = Some(ProbeTally::new(3));
+        let err = drive_probing(&msg, &mut cp, &batches, |_| {
+            panic!("an inconsistent tally must stop before any pool call")
+        })
+        .expect_err("tally for a different parse is a contract bug");
+        assert!(!err.transient);
+        assert_eq!(err.code, ERR_PROBE_FAILED);
+        assert_eq!(cp.state, JobState::Probing);
+    }
+
+    #[test]
+    fn probing_refuses_an_empty_batch_list_without_a_pool_call() {
+        let (msg, mut cp, _) = probing_setup();
+        let err = drive_probing(&msg, &mut cp, &[], |_| {
+            panic!("an empty parse needs no pool call")
+        })
+        .expect_err("zero batches can never complete probing");
+        assert!(!err.transient);
+        assert_eq!(err.code, ERR_PARSE_FAILED);
+        assert_eq!(cp.state, JobState::Probing);
+        assert!(cp.probe_tally.is_none());
+    }
+
+    #[test]
+    fn probing_driver_makes_no_pool_call_outside_probing_state() {
+        let (msg, mut cp, batches) = probing_setup();
+        cp.state = JobState::Verifying;
+        let err = drive_probing(&msg, &mut cp, &batches, |_| {
+            panic!("no provider connection may be spent outside Probing")
+        })
+        .expect_err("the driver only runs in Probing");
+        assert!(err.transient);
+        assert_eq!(cp.state, JobState::Verifying);
+        assert!(cp.probe_tally.is_none());
+    }
+
+    #[test]
+    fn probing_rejects_corrupt_tally_entries() {
+        let (msg, mut cp, batches) = probing_setup();
+        let mut tally = ProbeTally::new(2);
+        tally.missing_by_batch.insert(7, 1);
+        cp.probe_tally = Some(tally);
+        let err = drive_probing(&msg, &mut cp, &batches, |_| {
+            panic!("a corrupt tally must stop before any pool call")
+        })
+        .expect_err("out-of-range tally entries are corrupt checkpoint state");
+        assert!(!err.transient);
+        assert_eq!(err.code, ERR_PROBE_FAILED);
     }
 }

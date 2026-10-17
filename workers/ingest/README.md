@@ -177,11 +177,11 @@ stub whose NZB references fixture message-ids.
   key, so a persist colliding with the admission route's write to the same
   key waits out the window and retries that write once in-invocation —
   `retry::decide_checkpoint` settlement, DLQ quarantine that never acks on
-  a failed send, and shared-parser upload validation), but the
-  consumer/workflow entries stay commented out in `wrangler.toml.example`:
-  the search/probe/verify/repair steps are not wired yet, so enabling the
-  consumer now would burn every valid job's retry budget against an
-  unavailable boundary and quarantine it.
+  a failed send, shared-parser upload validation, and the pool-DO segment
+  probe for uploads), but the consumer/workflow entries stay commented
+  out in `wrangler.toml.example`: the search/verify/repair steps are not
+  wired yet, so enabling the consumer now would burn every valid job's
+  retry budget against an unavailable boundary and quarantine it.
 - Request bodies carry self-asserted `user_id` (1..=128 chars) until the
   accounts card authenticates callers; the key format already binds the
   user, so keys stay valid when auth lands.
@@ -196,13 +196,28 @@ stub whose NZB references fixture message-ids.
   intake cross-check + probe batching (`src/parse.rs`), synthetic fixtures
   (`src/fixtures.rs`), pipeline E2E (`tests/pipeline_e2e.rs`): happy path
   reaches `Done` with one library row; the gapped set repairs then finishes.
+- Consumer pool probe (`src/queue_consumer.rs`, client in
+  `src/pool_probe.rs`): an upload in `Probing` re-parses its
+  content-addressed payload, asks the user's `NntpPool` DO about every
+  `parse::probe_batches` batch not yet in the checkpoint tally
+  (`build_probe_request` → `call_pool_probe` → `apply_probe_batch`), and
+  moves to `Verifying` carrying the completed tally's missing-segment
+  count. Folded batches ride the delivery's one checkpoint write (KV
+  allows 1 write/s per key, so there is deliberately no write per batch);
+  a crash before that write re-asks them, which is safe because `STAT`
+  is idempotent and the tally is keyed by batch index. A busy/unavailable
+  pool (`PoolProbeError::Retry`) redelivers no sooner than its
+  `Retry-After` and the shared backoff, inside the same attempt budget;
+  a refused envelope (`Rejected`) fails the job with the generic
+  `probe_failed` reason. Unit tests cover the fold/resume/retry policy
+  against a scripted pool fake; no live Worker runs in CI.
 
 Still blocked for the live half: wiring the consumer's search step to a
-Newznab provider call, its probe step to the pool-DO contract
-(`src/pool_probe.rs`), verify/repair to the Container runtime, and the
-match/write steps to MB + library/metering calls. Until those land the
-consumer stays disabled and no live provider, pool, repair, library, or
-metering invocation is claimed here.
+Newznab provider call (search-sourced jobs therefore cannot reach the
+probe yet), provider settings in the pool DO, verify/repair to the
+Container runtime, and the match/write steps to MB + library/metering
+calls. Until those land the consumer stays disabled and no live
+provider, pool, repair, library, or metering invocation is claimed here.
 
 ## Slice T2 — retry budget + DLQ (this slice)
 

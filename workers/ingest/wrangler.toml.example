@@ -24,14 +24,17 @@ queue = "nntune-ingest-dlq"
 # Consumer: handler exists (`event(queue)` in src/queue_consumer.rs) but
 # stays DISABLED. It validates each message, writes its checkpoint exactly
 # once per delivery (Workers KV allows 1 write/s per key), digest-checks
-# and parses upload payloads with the shared parser, and settles per
-# message via src/retry.rs (`decide_checkpoint`): persist the mutated
-# checkpoint before retry/ack, use `retry_with_options` while budget
-# remains, and persist Failed before DLQ send + ack. Never ack on DLQ-send
-# failure; Failed redelivery retries the send. A send-success/ack-failure
-# may duplicate entries, so DLQ processing must be idempotent by job_id.
-# The search/probe/verify/repair runtime steps are not wired yet, so
-# enabling this now would burn every valid job's retry budget against an
+# and parses upload payloads with the shared parser, probes their segments
+# through the NNTP_POOL binding below (folded batches ride that one
+# checkpoint write; the tally is keyed by batch index, so redelivery
+# resumes without double-counting), and settles per message via
+# src/retry.rs (`decide_checkpoint`): persist the mutated checkpoint
+# before retry/ack, use `retry_with_options` while budget remains, and
+# persist Failed before DLQ send + ack. Never ack on DLQ-send failure;
+# Failed redelivery retries the send. A send-success/ack-failure may
+# duplicate entries, so DLQ processing must be idempotent by job_id.
+# The search/verify/repair runtime steps are not wired yet, so enabling
+# this now would burn every valid job's retry budget against an
 # unavailable boundary and quarantine it. Uncomment only when those steps
 # are executable. E.g.:
 #

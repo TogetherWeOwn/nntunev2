@@ -41,6 +41,10 @@ pub const CONSUMER_MAX_RETRIES: u32 = 4;
 /// Ceiling for [`retry_delay_secs`]: the longest single wait between
 /// redeliveries.
 pub const MAX_RETRY_DELAY_SECS: u32 = 60;
+/// Ceiling for a boundary-supplied retry hint ([`JobError::transient_after`],
+/// e.g. the pool probe's `Retry-After`): a hint may lengthen the shared
+/// backoff up to this, never shorten it.
+pub const MAX_HINTED_RETRY_DELAY_SECS: u32 = 300;
 
 /// Deterministic step failures, classified so the consumer knows whether a
 /// redelivery could ever succeed.
@@ -89,6 +93,11 @@ pub struct JobError {
     pub code: &'static str,
     pub transient: bool,
     pub detail: String,
+    /// Boundary-supplied minimum wait before redelivery (e.g. a busy
+    /// pool's `Retry-After`). [`decide_checkpoint`] honors it only as a
+    /// floor under the shared backoff, clamped to
+    /// [`MAX_HINTED_RETRY_DELAY_SECS`]; `None` is the plain backoff.
+    pub retry_after_secs: Option<u32>,
 }
 
 impl JobError {
@@ -97,6 +106,18 @@ impl JobError {
             code,
             transient: true,
             detail: detail.into(),
+            retry_after_secs: None,
+        }
+    }
+
+    /// A transient failure whose boundary named a minimum wait before the
+    /// next attempt could succeed.
+    pub fn transient_after(code: &'static str, detail: impl Into<String>, after_secs: u32) -> Self {
+        Self {
+            code,
+            transient: true,
+            detail: detail.into(),
+            retry_after_secs: Some(after_secs),
         }
     }
 
@@ -105,6 +126,7 @@ impl JobError {
             code,
             transient: false,
             detail: detail.into(),
+            retry_after_secs: None,
         }
     }
 }
@@ -196,7 +218,11 @@ pub fn decide_checkpoint(
             Disposition::Quarantine(Box::new(quarantine(msg, cp.attempt, &e)))
         }
         Err(e) => match record_redelivery(cp) {
-            Some(delay_secs) => Disposition::Retry { delay_secs },
+            Some(delay_secs) => Disposition::Retry {
+                delay_secs: e.retry_after_secs.map_or(delay_secs, |hint| {
+                    delay_secs.max(hint.clamp(1, MAX_HINTED_RETRY_DELAY_SECS))
+                }),
+            },
             None => {
                 fail_checkpoint(cp, e.code, &e.detail);
                 Disposition::Quarantine(Box::new(quarantine(msg, cp.attempt, &e)))
@@ -674,6 +700,49 @@ mod tests {
         assert_eq!(CONSUMER_MAX_RETRIES, PAYLOAD_RETRY_ATTEMPTS);
         assert_eq!(DLQ_QUEUE_BINDING, "INGEST_DLQ");
         assert_eq!(DLQ_QUEUE_NAME, "nntune-ingest-dlq");
+    }
+
+    #[test]
+    fn hinted_retry_never_shortens_the_backoff_and_honors_a_longer_wait() {
+        // A boundary hint (e.g. the pool's Retry-After) may only lengthen
+        // the shared backoff, never shorten it, and is clamped.
+        let msg = msg_at(1);
+        let mut cp = checkpoint_for(&msg);
+        let short = JobError::transient_after(ERR_PROBE_FAILED, "busy", 2);
+        assert_eq!(short.retry_after_secs, Some(2));
+        match decide_checkpoint(&msg, &mut cp, Err(short)).unwrap() {
+            Disposition::Retry { delay_secs } => assert_eq!(delay_secs, retry_delay_secs(1)),
+            d => panic!("attempt 1 must retry, got {d:?}"),
+        }
+
+        let mut cp = checkpoint_for(&msg);
+        let long = JobError::transient_after(ERR_PROBE_FAILED, "busy", 42);
+        match decide_checkpoint(&msg, &mut cp, Err(long)).unwrap() {
+            Disposition::Retry { delay_secs } => assert_eq!(delay_secs, 42),
+            d => panic!("attempt 1 must retry, got {d:?}"),
+        }
+
+        let mut cp = checkpoint_for(&msg);
+        let huge = JobError::transient_after(ERR_PROBE_FAILED, "busy", u32::MAX);
+        match decide_checkpoint(&msg, &mut cp, Err(huge)).unwrap() {
+            Disposition::Retry { delay_secs } => {
+                assert_eq!(delay_secs, MAX_HINTED_RETRY_DELAY_SECS)
+            }
+            d => panic!("attempt 1 must retry, got {d:?}"),
+        }
+    }
+
+    #[test]
+    fn hinted_retry_still_quarantines_when_the_budget_is_spent() {
+        let msg = msg_at(1);
+        let mut cp = checkpoint_for(&msg);
+        cp.attempt = MAX_ATTEMPTS;
+        let hinted = JobError::transient_after(ERR_PROBE_FAILED, "busy", 42);
+        match decide_checkpoint(&msg, &mut cp, Err(hinted)).unwrap() {
+            Disposition::Quarantine(entry) => assert_eq!(entry.error_code, ERR_PROBE_FAILED),
+            d => panic!("spent budget must quarantine despite the hint, got {d:?}"),
+        }
+        assert_eq!(cp.state, JobState::Failed);
     }
 
     #[test]
