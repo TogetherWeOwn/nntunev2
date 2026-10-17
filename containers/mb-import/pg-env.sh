@@ -7,8 +7,9 @@
 # with no connection argument: host, port, user, database, password and
 # the TLS/timeout options below travel in the PG* environment instead.
 # The parser reads the URL from its own environment (never argv) and
-# prints only shell-quoted PG* assignments; error messages name an
-# offending parameter key, never a value.
+# prints only shell-quoted PG* assignments; error messages never echo
+# input-derived text (a refused parameter is named only when it is a
+# known libpq keyword with no PG* equivalent, fixed below).
 #
 # Precedence otherwise matches the old `psql "$DATABASE_URL"` form,
 # where a URI parameter overrides the corresponding PG* variable and an
@@ -28,6 +29,7 @@ configure_pg_env_from_database_url() {
   local pg_assignments
   if ! pg_assignments="$(python3 - <<'PYEOF'
 import os
+import re
 import shlex
 import sys
 from urllib.parse import unquote, urlsplit
@@ -95,6 +97,35 @@ ENV_FOR_PARAM = {
     "max_protocol_version": "PGMAXPROTOCOLVERSION",
 }
 
+# libpq keywords with no PG* environment equivalent. Only these fixed
+# names may appear in a refusal message: any other input-derived "key"
+# can be misparsed credential text (an unrecognised URI scheme reaches
+# the keyword parser with userinfo still attached; a raw '?' in a
+# password turns its tail into a query string), so its name is withheld
+# rather than printed to the job log.
+KNOWN_UNMAPPABLE = frozenset(
+    [
+        "fallback_application_name",
+        "keepalives",
+        "keepalives_count",
+        "keepalives_idle",
+        "keepalives_interval",
+        "replication",
+        "sslpassword",
+        "tcp_user_timeout",
+    ]
+)
+
+
+def unmappable_message(kind, key):
+    if key in KNOWN_UNMAPPABLE:
+        return "DATABASE_URL %s %r has no PG* environment equivalent" % (kind, key)
+    return (
+        "DATABASE_URL has an unsupported %s (name withheld) "
+        "with no PG* environment equivalent" % kind
+    )
+
+
 def parse_keyword_conninfo(text):
     """libpq keyword/value conninfo -> {parameter: value}.
 
@@ -147,9 +178,7 @@ def parse_keyword_conninfo(text):
         if key == "service":
             fail("DATABASE_URL 'service' parameter is refused: " + SERVICE_REFUSAL)
         if key not in ENV_FOR_PARAM:
-            fail(
-                "DATABASE_URL keyword %r has no PG* environment equivalent" % key
-            )
+            fail(unmappable_message("keyword", key))
         params[key] = "".join(chars)
 
 
@@ -166,16 +195,18 @@ if url.startswith(("postgres://", "postgresql://")):
     # libpq tolerates a raw '#' or '?' in the password, but in URI
     # grammar they cut the authority short, so refuse them with the
     # remedy instead of misparsing. The candidate userinfo is the text
-    # before the last '@' of the authority; a '?' followed (before any
-    # '@') by a key=value pair is a genuine query string on a URL with
-    # no '/' path, not userinfo, and stays accepted.
+    # before the last '@' of the authority. A '?' there is userinfo
+    # unless an earlier '@' precedes it (genuine userinfo, then host,
+    # then a query string on a URL with no '/' path whose value
+    # contains '@'); an '=' after the '?' proves nothing, as a
+    # password can contain one too.
     authority = url.split("://", 1)[1].split("/", 1)[0]
     userinfo_candidate, at_sign, _ = authority.rpartition("@")
     if at_sign and (
         "#" in userinfo_candidate
         or (
             "?" in userinfo_candidate
-            and "=" not in userinfo_candidate.split("?", 1)[1]
+            and "@" not in userinfo_candidate.split("?", 1)[0]
         )
     ):
         fail(
@@ -225,11 +256,16 @@ if url.startswith(("postgres://", "postgresql://")):
         if key == "service":
             fail("DATABASE_URL 'service' parameter is refused: " + SERVICE_REFUSAL)
         if key not in ENV_FOR_PARAM:
-            fail(
-                "DATABASE_URL query parameter %r has no PG* environment equivalent"
-                % key
-            )
+            fail(unmappable_message("query parameter", key))
         params[key] = dec(value)
+elif re.match(r"[A-Za-z][A-Za-z0-9+.-]*://", url):
+    # A URI-shaped input with any other scheme (a driver-specific
+    # scheme, a typo) must not fall through to the keyword parser,
+    # where the text up to the first '=' still contains userinfo.
+    fail(
+        "DATABASE_URL URI scheme is not supported; "
+        "use postgres:// or postgresql://"
+    )
 elif "=" in url:
     params = parse_keyword_conninfo(url)
 elif url:

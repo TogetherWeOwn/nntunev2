@@ -61,6 +61,13 @@ check_err_guidance() { # desc -- refusal just run must name the remedy
     bad "$1: error output does not name the percent-encode remedy"
   fi
 }
+check_err_contains() { # desc fixed-text -- refusal just run must name it
+  if grep -Fq -- "$2" "$err_file"; then
+    ok "$1: error output names $2"
+  else
+    bad "$1: error output does not name $2"
+  fi
+}
 reset_pg() {
   unset PGHOST PGHOSTADDR PGPORT PGUSER PGDATABASE PGPASSWORD PGSSLMODE \
         PGSSLROOTCERT PGCONNECT_TIMEOUT PGAPPNAME PGSERVICE PGPASSFILE \
@@ -221,6 +228,44 @@ reset_pg
 DATABASE_URL='postgres://u:%FF@h/db'
 run_ok "URI with a non-UTF-8 percent-encoded password byte"
 check_eq "%FF reaches PGPASSWORD as byte 0xFF" $'\xff' "${PGPASSWORD-}"
+
+reset_pg
+DATABASE_URL='postgresql+asyncpg://u:SENTINELPW@h/db?ssl=require'
+run_refused "URI with an unsupported scheme" 'SENTINELPW'
+check_err_contains "URI with an unsupported scheme" 'scheme is not supported'
+
+reset_pg
+DATABASE_URL='host=h SENTINELKEY=1'
+run_refused "keyword conninfo with an unknown keyword" 'SENTINELKEY'
+
+reset_pg
+DATABASE_URL='postgres://u:p@h/db?SENTINELKEY=1'
+run_refused "URI with an unknown query parameter" 'SENTINELKEY'
+
+reset_pg
+DATABASE_URL='host=h keepalives=0 password=SENTINELPW'
+run_refused "keyword conninfo with a known unmappable keyword" 'SENTINELPW'
+check_err_contains "keyword conninfo with a known unmappable keyword" "'keepalives'"
+
+reset_pg
+DATABASE_URL='postgres://u:SENTINELPW@h/db?keepalives_idle=10'
+run_refused "URI with a known unmappable query parameter" 'SENTINELPW'
+check_err_contains "URI with a known unmappable query parameter" "'keepalives_idle'"
+
+reset_pg
+DATABASE_URL='postgres://u:123?SENTINELKEY=abc@h/db'
+run_refused "URI with a raw '?' and '=' in the password" 'SENTINELKEY'
+check_err_guidance "URI with a raw '?' and '=' in the password"
+
+reset_pg
+DATABASE_URL='postgres://u:p@h/db#SENTINELFRAG'
+run_refused "URI with a raw '#' in the database name" 'SENTINELFRAG'
+check_err_guidance "URI with a raw '#' in the database name"
+
+reset_pg
+DATABASE_URL='postgres://u:p@h/db?application_name=a#SENTINELFRAG'
+run_refused "URI with a raw '#' in a query value" 'SENTINELFRAG'
+check_err_guidance "URI with a raw '#' in a query value"
 
 echo
 echo "test-pg-env: $passes passed, $failures failed"
