@@ -414,7 +414,7 @@ mod tests {
     fn recordings_url_targets_the_release_listing_route() {
         assert_eq!(
             mb_release_recordings_url(MBID_A),
-            format!("https://mb.internal/v1/mb/release/{MBID_A}/recordings")
+            format!("https://mb-api.invalid/v1/mb/release/{MBID_A}/recordings")
         );
     }
 
