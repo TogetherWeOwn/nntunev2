@@ -27,7 +27,8 @@ SESSION_TTL_SECS = "86400"
 # durable slot store's cap):
 # AUTH_RATE_LIMIT_MAX / AUTH_RATE_LIMIT_WINDOW_SECS /
 # VAULT_TEST_RATE_LIMIT_MAX / VAULT_TEST_RATE_LIMIT_WINDOW_SECS /
-# VAULT_TEST_IP_RATE_LIMIT_MAX.
+# VAULT_TEST_IP_RATE_LIMIT_MAX. Unset, the IP cap defaults to 5x the
+# configured VAULT_TEST_RATE_LIMIT_MAX (clamped to 100).
 
 # Hyperdrive binding for PlanetScale Postgres (ID filled per environment).
 # The binding name must stay HYPERDRIVE (see src/worker_entry.rs).

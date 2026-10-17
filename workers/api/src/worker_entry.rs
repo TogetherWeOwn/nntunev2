@@ -101,7 +101,9 @@ fn config_from_env(env: &Env) -> Option<Config> {
         session_previous_secret,
     )
     .ok()?;
-    Some(config.with_rate_limits(rate_limits_from_env(env)))
+    Some(apply_rate_limit_overlay(config, |name| {
+        env_string(env, name)
+    }))
 }
 
 /// The [vars] names `RateLimitConfig::from_vars` reads. One const
@@ -130,8 +132,14 @@ fn rate_limits_from_lookup(
     crate::rate_limit::RateLimitConfig::from_vars(&vars)
 }
 
-fn rate_limits_from_env(env: &Env) -> crate::rate_limit::RateLimitConfig {
-    rate_limits_from_lookup(|name| env_string(env, name))
+/// Apply the [vars] overlay to a built `Config`: the one place the
+/// operator overrides replace the compiled rate-limit defaults.
+/// Pure over the lookup closure so a native test drives the exact
+/// function `config_from_env` calls with a real `Config` and asserts
+/// the resulting field — dropping the `with_rate_limits` call (or
+/// feeding it defaults) fails behaviorally, not just textually.
+fn apply_rate_limit_overlay(config: Config, get: impl Fn(&str) -> Option<String>) -> Config {
+    config.with_rate_limits(rate_limits_from_lookup(get))
 }
 
 /// Pure Hyperdrive caching attestation decision: `Some("1"/"true"/"TRUE")`
@@ -1663,6 +1671,9 @@ mod tests {
             only("VAULT_TEST_RATE_LIMIT_MAX", "4"),
             RateLimitConfig {
                 vault_test_max_attempts: 4,
+                // The unset IP cap scales at 5x the configured
+                // account cap (see `from_vars`), so it moves too.
+                vault_test_ip_max_attempts: 20,
                 ..defaults
             }
         );
@@ -1687,13 +1698,62 @@ mod tests {
 
     #[test]
     fn config_from_env_applies_the_rate_limit_overlay() {
-        // Source pin for the call site the pure overlay test cannot
-        // reach (it needs a wasm Env): dropping `with_rate_limits`
-        // from `config_from_env` fails here.
+        use crate::rate_limit::RateLimitConfig;
+        // Behavioral half: drive the exact fn `config_from_env` calls
+        // with a real Config and a stub lookup. Dropping the
+        // `with_rate_limits` call inside `apply_rate_limit_overlay`
+        // (or feeding it defaults) leaves `rate_limits` at the
+        // compiled defaults and fails here.
+        let base = Config::new(
+            "example.com",
+            "https://example.com",
+            b"test-session-secret-32-bytes-long!!".to_vec(),
+            [9u8; 32],
+            1,
+            3600,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(base.rate_limits, RateLimitConfig::default());
+        let overlaid = apply_rate_limit_overlay(base, |key| {
+            (key == "AUTH_RATE_LIMIT_MAX").then(|| "3".to_string())
+        });
+        assert_eq!(
+            overlaid.rate_limits,
+            RateLimitConfig {
+                auth_max_attempts: 3,
+                ..RateLimitConfig::default()
+            }
+        );
+        // Call-site half: `config_from_env` itself needs a wasm Env,
+        // so pin that it calls the overlay — but slice ONLY its body
+        // out of the pre-test source. Searching the whole file would
+        // match this test's own string literal and pass vacuously
+        // even with the call dropped.
         let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let body = production
+            .split_once("fn config_from_env(")
+            .expect("config_from_env must exist")
+            .1
+            .split_once("\nfn ")
+            .expect("a following fn must bound the body")
+            .0;
         assert!(
-            source.contains("config.with_rate_limits(rate_limits_from_env(env))"),
+            body.contains("apply_rate_limit_overlay(config"),
             "config_from_env must apply the [vars] rate-limit overlay"
+        );
+        // Forbid the bare-config return outright: an early
+        // `Some(config)` above the overlay call would keep the
+        // substring in place while skipping the overlay.
+        assert!(
+            !body.contains("Some(config)"),
+            "config_from_env must not return the un-overlaid config"
         );
     }
 

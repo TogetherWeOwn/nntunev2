@@ -229,6 +229,11 @@ impl RateLimitConfig {
     /// unlimited, never deny-all).
     pub fn from_vars(vars: &HashMap<String, String>) -> Self {
         let defaults = Self::default();
+        let vault_test_max_attempts = parse_capped_max(
+            vars,
+            "VAULT_TEST_RATE_LIMIT_MAX",
+            defaults.vault_test_max_attempts,
+        );
         Self {
             auth_max_attempts: parse_capped_max(
                 vars,
@@ -240,20 +245,20 @@ impl RateLimitConfig {
                 "AUTH_RATE_LIMIT_WINDOW_SECS",
                 defaults.auth_window_secs,
             ),
-            vault_test_max_attempts: parse_capped_max(
-                vars,
-                "VAULT_TEST_RATE_LIMIT_MAX",
-                defaults.vault_test_max_attempts,
-            ),
+            vault_test_max_attempts,
             vault_test_window_secs: parse_nonzero(
                 vars,
                 "VAULT_TEST_RATE_LIMIT_WINDOW_SECS",
                 defaults.vault_test_window_secs,
             ),
+            // Unset IP cap scales with the CONFIGURED account cap
+            // (5x, clamped), not the compiled one: raising only
+            // VAULT_TEST_RATE_LIMIT_MAX must not strand the IP budget
+            // at 25 below the account budget it is meant to exceed.
             vault_test_ip_max_attempts: parse_capped_max(
                 vars,
                 "VAULT_TEST_IP_RATE_LIMIT_MAX",
-                defaults.vault_test_ip_max_attempts,
+                vault_test_max_attempts.saturating_mul(5),
             ),
         }
     }
@@ -366,6 +371,20 @@ mod tests {
         let cfg = RateLimitConfig::from_vars(&vars(&[("VAULT_TEST_IP_RATE_LIMIT_MAX", "7")]));
         assert_eq!(cfg.vault_test_ip_max_attempts, 7);
         assert_eq!(cfg.vault_test_max_attempts, VAULT_TEST_MAX_ATTEMPTS);
+        // Unset IP cap follows the configured account cap at 5x
+        // (clamped to the store cap): raising only the account var
+        // must not leave the IP budget below it.
+        let cfg = RateLimitConfig::from_vars(&vars(&[("VAULT_TEST_RATE_LIMIT_MAX", "10")]));
+        assert_eq!(cfg.vault_test_max_attempts, 10);
+        assert_eq!(cfg.vault_test_ip_max_attempts, 50);
+        let cfg = RateLimitConfig::from_vars(&vars(&[("VAULT_TEST_RATE_LIMIT_MAX", "30")]));
+        assert_eq!(cfg.vault_test_ip_max_attempts, MAX_BUDGET_SLOTS);
+        // An explicit IP var still wins over the scaled fallback.
+        let cfg = RateLimitConfig::from_vars(&vars(&[
+            ("VAULT_TEST_RATE_LIMIT_MAX", "10"),
+            ("VAULT_TEST_IP_RATE_LIMIT_MAX", "12"),
+        ]));
+        assert_eq!(cfg.vault_test_ip_max_attempts, 12);
     }
 
     #[test]
