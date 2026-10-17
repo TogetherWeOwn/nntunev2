@@ -313,13 +313,28 @@ reset_db
 POISON="$FIX-poison"
 rm -rf "$POISON"
 mkdir -p "$POISON"
-cp "$FIX/mbdump-release.tsv" "$FIX/mbdump-recording.tsv" "$POISON/"
-python3 - "$POISON/mbdump-artist.tsv" <<'EOF'
-import sys
-p = sys.argv[1]
-with open(p, 'w') as f:
+# Release/recording rows carry \N parents on purpose: they are valid rows
+# that do not depend on mb_artist/mb_release. Do NOT copy the FK-linked
+# fixtures here — with an empty mb_artist every copied release would be an
+# FK orphan, so on the rerun the release table would trip its own
+# all-poison guard and refuse for the wrong reason, leaving the artist
+# already-complete-path guard (import.sh refuse before "already complete")
+# unpinned: deleting that call would leave this suite green while the
+# rerun seeds last_packet over an empty mb_artist. With \N parents the
+# rerun can only be refused by that guard.
+python3 - "$POISON" <<'EOF'
+import sys, uuid
+d = sys.argv[1]
+def eid(n): return str(uuid.UUID(int=n))
+with open(f'{d}/mbdump-artist.tsv', 'w') as f:
     for i in range(5):
         f.write(f'not-a-uuid-{i}\tBad {i}\tBad {i}\tGroup\tUS\tnot-a-date\n')
+with open(f'{d}/mbdump-release.tsv', 'w') as f:
+    for i in range(1, 4):
+        f.write(f'{eid(300000+i)}\t\\N\tAlbum {i}\tAlbum\t2024\t\\N\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording.tsv', 'w') as f:
+    for i in range(1, 4):
+        f.write(f'{eid(400000+i)}\t\\N\tTrack {i}\t1\t180000\t2024-05-03T00:00:00Z\n')
 EOF
 if DUMP_SEQ=500 bash "$SELF_DIR/import.sh" "$POISON" >/dev/null 2>&1; then
   echo "FAIL: all-poison dump imported without error" >&2
@@ -337,6 +352,7 @@ else
   echo "ok: all-poison rerun refused on already-complete path"
 fi
 check "poison rerun: still no rows" "0" "$(db -c 'SELECT count(*) FROM mb_artist;')"
+check "poison rerun: downstream tables never loaded" "0" "$(db -c 'SELECT (SELECT count(*) FROM mb_release) + (SELECT count(*) FROM mb_recording);')"
 check "poison rerun: replication state still untouched" "0" "$(db -c 'SELECT last_packet FROM mb_import_state WHERE id = 1;')"
 
 rm -rf "$FIX" "$DUPE" "$NEWER" "$FKDIR" "$POISON"
