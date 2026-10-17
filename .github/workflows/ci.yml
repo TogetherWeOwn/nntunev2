@@ -294,6 +294,8 @@ jobs:
         run: python3 .github/scripts/config_parity_check.py --schema config/schema.json --staging config/staging.json --prod config/prod.json
       - name: Parity checker self-tests (matching + drifted fixtures)
         run: python3 .github/scripts/test_config_parity_check.py
+      - name: Parity checker duplicate-member tests
+        run: python3 .github/scripts/test_config_duplicate_members.py
 
   rust-ingest:
     name: rust (workers/ingest)
