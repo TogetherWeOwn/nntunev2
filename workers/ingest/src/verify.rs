@@ -335,12 +335,15 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
         } else {
             match_set_file(&sets, file, &segments, &mut claimed)
         };
-        let assembled = assemble(&segments, matched.map(|(_, f)| f.length));
-        if assembled.len() as u64 > caps.max_file_bytes {
+        let Some(assembled) = assemble(
+            &segments,
+            matched.map(|(_, f)| f.length),
+            caps.max_file_bytes,
+        ) else {
             return Err(VerifyError::Permanent(
                 "assembled file exceeds the verify size cap".into(),
             ));
-        }
+        };
 
         let (missing_blocks, par2_set_id) = if file.is_par2 {
             (0, None)
@@ -422,40 +425,71 @@ fn decode_segment(segment_id: &str, article: &[u8]) -> Option<Vec<u8>> {
     Some(dst)
 }
 
-/// Assemble a file's bytes from its decoded segments. All-present files
-/// concatenate in order. With gaps, present parts are placed at
-/// `index * part_size` when they prove one uniform part size (see the
-/// module docs); otherwise only the contiguous present prefix is kept.
-/// The buffer is sized from the par2 expected length when known, so the
-/// repair side receives a full-length damaged file.
-fn assemble(segments: &[Seg], expected_len: Option<u64>) -> Vec<u8> {
+/// Assemble a file's bytes from its decoded segments, or `None` when
+/// the implied length exceeds `max_file_bytes`. The implied length is
+/// checked *before* any allocation: it derives from the untrusted par2
+/// length and from part geometry over mostly-missing segments, neither
+/// of which the fetched-bytes caps bound. All-present files concatenate
+/// in order. With gaps, present parts are placed at `index * part_size`
+/// when they prove one uniform part size (see the module docs);
+/// otherwise only the contiguous present prefix is kept. The buffer is
+/// sized from the par2 expected length when known, so the repair side
+/// receives a full-length damaged file.
+fn assemble(segments: &[Seg], expected_len: Option<u64>, max_file_bytes: u64) -> Option<Vec<u8>> {
     if segments.iter().all(|s| matches!(s, Seg::Present { .. })) {
-        let mut out = Vec::new();
+        let total = segments.iter().try_fold(0u64, |acc, s| match s {
+            Seg::Present { bytes, .. } => acc.checked_add(bytes.len() as u64),
+            Seg::Missing => Some(acc),
+        })?;
+        if total > max_file_bytes {
+            return None;
+        }
+        let mut out = Vec::with_capacity(total as usize);
         for seg in segments {
             if let Seg::Present { bytes, .. } = seg {
                 out.extend_from_slice(bytes);
             }
         }
-        return out;
+        return Some(out);
     }
     let part_size = uniform_part_size(segments);
     let Some(part_size) = part_size else {
-        let mut out = Vec::new();
+        let mut total = 0u64;
+        for seg in segments {
+            match seg {
+                Seg::Present { bytes, .. } => {
+                    total = total.checked_add(bytes.len() as u64)?;
+                }
+                Seg::Missing => break,
+            }
+        }
+        if total > max_file_bytes {
+            return None;
+        }
+        let mut out = Vec::with_capacity(total as usize);
         for seg in segments {
             match seg {
                 Seg::Present { bytes, .. } => out.extend_from_slice(bytes),
                 Seg::Missing => break,
             }
         }
-        return out;
+        return Some(out);
     };
-    let total = expected_len.unwrap_or_else(|| {
-        let last_len = match segments.last() {
-            Some(Seg::Present { bytes, .. }) => bytes.len() as u64,
-            _ => part_size,
-        };
-        part_size * (segments.len().saturating_sub(1) as u64) + last_len
-    });
+    let total = match expected_len {
+        Some(len) => len,
+        None => {
+            let last_len = match segments.last() {
+                Some(Seg::Present { bytes, .. }) => bytes.len() as u64,
+                _ => part_size,
+            };
+            part_size
+                .checked_mul(segments.len().saturating_sub(1) as u64)?
+                .checked_add(last_len)?
+        }
+    };
+    if total > max_file_bytes {
+        return None;
+    }
     let mut out = vec![0u8; total as usize];
     for (i, seg) in segments.iter().enumerate() {
         if let Seg::Present { bytes, .. } = seg {
@@ -467,7 +501,7 @@ fn assemble(segments: &[Seg], expected_len: Option<u64>) -> Vec<u8> {
             out[start..start + take].copy_from_slice(&bytes[..take]);
         }
     }
-    out
+    Some(out)
 }
 
 /// The uniform decoded part size a file's present segments prove: every
@@ -488,9 +522,12 @@ fn uniform_part_size(segments: &[Seg]) -> Option<u64> {
 }
 
 /// Parse the staged par2 files into recovery sets, grouped by set id.
-/// A par2 file that does not parse alone is skipped (its recovery slices
-/// are simply absent, which the recoverability check then sees); files
-/// that only parse together are retried as one concatenated group.
+/// A par2 file that does not parse alone (a volume carrying only
+/// recovery slices has no Main packet) is retried concatenated onto each
+/// parsed group and merged into the one whose set id it parses under —
+/// its slices then count toward recovery. Bytes that parse under no
+/// group and not alone are dropped (their slices are simply absent,
+/// which the recoverability check then sees).
 async fn load_sets<S: ScratchStore>(
     files: &[ParsedFile],
     progress: &VerifyProgress,
@@ -521,14 +558,28 @@ async fn load_sets<S: ScratchStore>(
     if !any_par2 {
         return Ok(Vec::new());
     }
+    if !unparsed.is_empty() {
+        let mut merged = false;
+        for (set_id, bytes) in groups.iter_mut() {
+            let mut trial = bytes.clone();
+            trial.extend_from_slice(&unparsed);
+            if let Ok(set) = RecoverySet::parse(&trial) {
+                if set.set_id == *set_id {
+                    *bytes = trial;
+                    merged = true;
+                    break;
+                }
+            }
+        }
+        if !merged {
+            if let Ok(set) = RecoverySet::parse(&unparsed) {
+                groups.entry(set.set_id).or_default().extend(unparsed);
+            }
+        }
+    }
     let mut sets = Vec::new();
     for bytes in groups.into_values() {
         if let Ok(set) = RecoverySet::parse(&bytes) {
-            sets.push(set);
-        }
-    }
-    if sets.is_empty() && !unparsed.is_empty() {
-        if let Ok(set) = RecoverySet::parse(&unparsed) {
             sets.push(set);
         }
     }
@@ -677,7 +728,15 @@ fn count_bad_blocks(set: &RecoverySet, entry: &RecoveryFile, assembled: &[u8]) -
         let mut h = crc32fast::Hasher::new();
         h.update(&assembled[start..end]);
         if end - start < bs {
-            h.update(&vec![0u8; bs - (end - start)]);
+            // Zero-pad in fixed chunks: `bs` is parse-capped only at
+            // 256 MiB, so padding must never allocate proportionally.
+            const ZEROS: [u8; 8192] = [0u8; 8192];
+            let mut pad = bs - (end - start);
+            while pad > 0 {
+                let take = pad.min(ZEROS.len());
+                h.update(&ZEROS[..take]);
+                pad -= take;
+            }
         }
         if h.finalize() != want {
             bad += 1;
@@ -812,7 +871,7 @@ mod tests {
     #[test]
     fn assemble_places_gaps_by_uniform_part_size() {
         let segments = vec![seg(b"aaaa"), Seg::Missing, seg(b"cc")];
-        let out = assemble(&segments, Some(10));
+        let out = assemble(&segments, Some(10), 1024).expect("within cap");
         assert_eq!(out, b"aaaa\0\0\0\0cc");
     }
 
@@ -820,11 +879,25 @@ mod tests {
     fn assemble_without_uniform_proof_keeps_the_present_prefix() {
         let segments = vec![seg(b"aaa"), Seg::Missing, seg(b"ccccc")];
         // Only one present non-last part of size 3 proves the part size.
-        let out = assemble(&segments, None);
+        let out = assemble(&segments, None, 1024).expect("within cap");
         assert_eq!(out.len(), 3 + 3 + 5);
         let segments = vec![Seg::Missing, seg(b"ccccc")];
-        let out = assemble(&segments, None);
+        let out = assemble(&segments, None, 1024).expect("within cap");
         assert!(out.is_empty(), "no proof, no prefix");
+    }
+
+    #[test]
+    fn assemble_refuses_implied_lengths_over_the_cap_before_allocating() {
+        // The par2-declared length is untrusted: a 100 MB declaration with
+        // most segments missing must fail the cap check, not allocate the
+        // implied file first (and never truncate a >4 GiB length into a
+        // short buffer on wasm32).
+        let segments = vec![seg(b"aaaa"), Seg::Missing, Seg::Missing];
+        assert_eq!(assemble(&segments, Some(100 << 20), 1 << 20), None);
+        assert_eq!(assemble(&segments, Some(u64::MAX), 48 << 20), None);
+        // Implied geometry without par2 is capped the same way.
+        let segments = vec![seg(&vec![0u8; 700_000]), Seg::Missing, Seg::Missing];
+        assert_eq!(assemble(&segments, None, 1 << 20), None);
     }
 
     #[test]

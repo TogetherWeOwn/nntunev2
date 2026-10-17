@@ -112,6 +112,25 @@ fn par2_set(name: &str, data: &[u8], recovery_blocks: u32) -> (Vec<u8>, String) 
     (set, hex::encode(set_id))
 }
 
+/// The same set split across an index file (metadata packets only) and a
+/// volume file carrying *only* recovery-slice packets, so the volume does
+/// not parse standalone (no Main packet) and only contributes its slices
+/// when merged with the index.
+fn par2_set_split(name: &str, data: &[u8], recovery_blocks: u32) -> (Vec<u8>, Vec<u8>, String) {
+    let (full, set_hex) = par2_set(name, data, recovery_blocks);
+    let (index, _) = par2_set(name, data, 0);
+    let set_id: [u8; 16] = hex::decode(&set_hex).expect("set hex").try_into().unwrap();
+    let mut vol = Vec::new();
+    for exp in 0..recovery_blocks {
+        let mut body = Vec::new();
+        body.extend_from_slice(&exp.to_le_bytes());
+        body.extend_from_slice(&vec![0x5au8; BLOCK as usize]);
+        vol.extend(packet(&set_id, &ptype(b"RecvSlic"), &body));
+    }
+    debug_assert_eq!(full.len(), index.len() + vol.len());
+    (index, vol, set_hex)
+}
+
 // --- article + NZB construction ----------------------------------------------
 
 fn yenc_article(
@@ -539,6 +558,88 @@ async fn lost_progress_is_rebuilt_from_staged_object_metadata() {
     assert_eq!(outcome, VerifyOutcome::Complete);
     assert_eq!(fetches, ["d1@synthetic.invalid"]);
     assert_eq!(fresh.staged.len(), 2);
+}
+
+#[tokio::test]
+async fn volume_only_recovery_slices_merge_with_the_index_set() {
+    // Data file loses its second 512 B part (2 blocks); the index .par2
+    // carries no recovery slices and the vol file carries only slices
+    // (unparseable alone). The merged set covers the damage.
+    let (articles, _nzb, data) = two_part_case(false, 0);
+    let (index_bytes, vol_bytes, _hex) = par2_set_split(DATA_NAME, &data, 2);
+    let index_params = SegmentParams::single(PAR2_NAME);
+    let vol_name = "track01.vol01+02.par2";
+    let vol_params = SegmentParams::single(vol_name);
+    let mut articles = articles;
+    // Replace the single par2 article from two_part_case with index+vol.
+    articles.retain(|a| a.message_id != "<p1@synthetic.invalid>");
+    articles.push(yenc_article(
+        "p1@synthetic.invalid",
+        3,
+        PAR2_NAME,
+        &index_params,
+        &index_bytes,
+    ));
+    articles.push(yenc_article(
+        "p2@synthetic.invalid",
+        4,
+        vol_name,
+        &vol_params,
+        &vol_bytes,
+    ));
+    let part = |n: u32, begin: u64, end: u64| SegmentParams {
+        name: DATA_NAME.into(),
+        part: n,
+        total: 2,
+        begin,
+        end,
+        file_size: data.len() as u64,
+    };
+    let nzb = nzb_xml(&[
+        ServableFile {
+            name: DATA_NAME.into(),
+            segments: vec![
+                (
+                    "d1@synthetic.invalid".into(),
+                    encoded_len(&part(1, 1, 512), &data[..512]),
+                ),
+                (
+                    "d2@synthetic.invalid".into(),
+                    encoded_len(&part(2, 513, 1024), &data[512..]),
+                ),
+            ],
+        },
+        ServableFile {
+            name: PAR2_NAME.into(),
+            segments: vec![(
+                "p1@synthetic.invalid".into(),
+                encoded_len(&index_params, &index_bytes),
+            )],
+        },
+        ServableFile {
+            name: vol_name.into(),
+            segments: vec![(
+                "p2@synthetic.invalid".into(),
+                encoded_len(&vol_params, &vol_bytes),
+            )],
+        },
+    ]);
+    let server = spawn(articles).await;
+    let scratch = MemoryScratch::default();
+    let mut progress = VerifyProgress::new(0);
+
+    let (outcome, _) = run_step(
+        &server,
+        &nzb,
+        &VerifyCaps::default(),
+        &mut progress,
+        &scratch,
+    )
+    .await;
+    match outcome {
+        VerifyOutcome::RepairNeeded { missing_blocks, .. } => assert_eq!(missing_blocks, 2),
+        other => panic!("expected repair via merged volume slices, got {other:?}"),
+    }
 }
 
 #[tokio::test]

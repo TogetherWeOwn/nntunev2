@@ -484,7 +484,10 @@ async fn run_verifying(
     }
 }
 
-/// [`BodySource`] over the pool's BODY route.
+/// [`BodySource`] over the pool's BODY route. A pool `Retry-After`
+/// collapses into the consumer's shared checkpoint backoff, exactly as
+/// on the probe path (`run_probing`): the settlement contract has one
+/// delay schedule, and the hint only orders retries within it.
 struct PoolBodySource<'a> {
     env: &'a Env,
     msg: &'a QueueMsg,
