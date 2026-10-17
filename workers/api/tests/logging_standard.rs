@@ -30,6 +30,10 @@ const BANNED_KEY_PARTS: &[&str] = &[
     "cvv",
     "email",
     "session",
+    "address",
+    "phone",
+    "payment",
+    "postal",
 ];
 
 fn manifest_dir() -> PathBuf {
@@ -490,6 +494,17 @@ fn golden_line_conforms_to_exact_schema() {
         )),
         "fields values must be flat JSON primitives"
     );
+}
+
+/// The fixture's `fields` must pass the production validator
+/// (`nntune_logging::fields_from_json`), not just this file's hand-copied
+/// list, so the test and the emitter cannot drift apart.
+#[test]
+fn golden_fields_pass_the_shared_validator() {
+    let line = read_artifact(FIXTURE_REL, "golden log-line fixture");
+    let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+    nntune_logging::fields_from_json(parsed["fields"].clone())
+        .expect("fixture fields must pass the production validator");
 }
 
 #[test]

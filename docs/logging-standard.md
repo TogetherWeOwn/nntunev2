@@ -1,6 +1,6 @@
 # Worker logging standard (target contract)
 
-This document defines the target contract for a future worker-logging implementation. It does not claim that current production workers emit these records or propagate trace IDs; existing runtime logging remains unchanged by this documentation slice. The MUST requirements below apply when a worker adopts this standard.
+This document defines the worker-logging contract implemented by `crates/nntune-logging`. The `ingest` and `mb` workers emit these records and propagate trace IDs; the `api` fetch-boundary wiring and `stream` correlation are follow-ups. The MUST requirements below apply to every worker that adopts this standard.
 
 Target worker log records MUST be newline-delimited JSON (one object per line). Each record includes the following shared fields:
 

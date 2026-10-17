@@ -25,6 +25,8 @@ nntune-core = { path = "../../crates/nntune-core", default-features = false }
 # connection string.
 tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
 wasm-bindgen-futures = "0.4"
+# Structured log emitter + trace-ID propagation (docs/logging-standard.md).
+nntune-logging = { path = "../../crates/nntune-logging" }
 
 [dev-dependencies]
 md5 = "0.8"
