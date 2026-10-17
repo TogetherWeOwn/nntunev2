@@ -8,10 +8,11 @@ with Access enabled, and rollback evidence is recorded.
 Re-verified against the `e2e/` tree on 2026-10-17 with the public
 UI-signup case, the browser-playback spec, the player-UI-seek spec, the
 demo-media sessionless spec, the recording-mbids assertion, the
-demo-audio contract spec, and the anonymous-Access change merged:
+demo-audio contract spec, and the anonymous-Access change merged, plus the
+branded-error-page web spec:
 `npm --prefix e2e run e2e:list` lists 233 tests in 14 files, and
-`(cd apps/web && pnpm exec playwright test --list)` lists 88 tests in
-19 files. Line numbers below are from that head; re-verify with the
+`(cd apps/web && pnpm exec playwright test --list)` lists 91 tests in
+20 files. Line numbers below are from that head; re-verify with the
 commands at the end of this document whenever a spec is added, renamed,
 or retitled, and update this matrix in the same PR. CI enforces the file
 and title citations on every PR (the traceability step in the `e2e-lint`
@@ -158,6 +159,11 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   - `apps/web/tests/billing-signed-out.spec.ts` — pins a signed-out
     billing visitor reaching sign-in via the Sign in link, with no
     billing actions shown.
+  - `apps/web/tests/branded-error-page.spec.ts` — pins unknown paths
+    rendering the branded NNTune 404 (404 status, NNTune brand, visible
+    `/library` or `/login` CTA resolving to a live route), no stack
+    trace or default SvelteKit chrome, and no secret, hostname, or
+    binding material in the rendered output.
   - `apps/web/tests/library-duplicate-ids.spec.ts` — pins duplicate-id
     library responses rendering unique rows with no page error, refresh
     still working afterwards, the stale fallback staying unique, and a
