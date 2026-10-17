@@ -24,6 +24,44 @@ export interface TestAccount {
   viaApi: boolean;
 }
 
+/**
+ * Bounded evidence label for which signup path a test's account came from.
+ * M1 exit evidence must distinguish the real public UI signup from the
+ * API test-account seam: a seam-backed run does not prove public signup.
+ * The label is one of exactly these two fixed strings — never an email,
+ * account id, session/token, provider setting or any other account data.
+ */
+export type SignupPathLabel = 'public-ui-signup' | 'api-minted-account';
+
+/**
+ * Label for the branch selected by a tryMintTestAccount result: a minted
+ * (viaApi) account is the seam path; null (seam unconfigured) means the
+ * caller proceeds to the public UI signup form. Call only at that branch
+ * point — a null result elsewhere does not imply a UI signup happened.
+ */
+export function signupPathLabel(minted: TestAccount | null): SignupPathLabel {
+  return minted?.viaApi ? 'api-minted-account' : 'public-ui-signup';
+}
+
+/**
+ * Record the signup-path label as a test annotation so it rides along in
+ * reporter output (the sanitized junit CI artifact) next to the test
+ * result. The list reporter does not print annotations, and green runs
+ * upload no artifacts, so the staging workflow additionally publishes the
+ * label to the run's step summary on every configured run. A passing
+ * test's label is the path that produced its evidence; on failure it names
+ * the path under exercise. The annotation carries only the bounded label
+ * above (names only — no values logged).
+ */
+export function annotateSignupPath(
+  target: { annotations: Array<{ type: string; description?: string }> },
+  minted: TestAccount | null,
+): SignupPathLabel {
+  const label = signupPathLabel(minted);
+  target.annotations.push({ type: 'signup-path', description: label });
+  return label;
+}
+
 /** First value that is a nonblank string, else undefined (value kept as-is). */
 function nonblankString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
@@ -364,4 +402,43 @@ export async function completeByopWizard(page: Page, baseURL: string): Promise<v
   await expect(page, 'BYOP save did not reach the library').toHaveURL(/\/library/, {
     timeout: 30_000,
   });
+}
+
+/**
+ * Submit the public /signup form as a fresh synthetic identity and require
+ * the reachable first step of the real two-step flow: submit starts
+ * registration (`registerStart`) and the page renders the emailed-code form
+ * (`input[name="magic_code"]`, "Finish creating account"). Navigation to the
+ * BYOP wizard happens only after the emailed code plus a passkey finish
+ * (`registerFinish`), which needs a staging-only code-retrieval seam and a
+ * WebAuthn virtual authenticator that do not exist yet — so this helper
+ * must NOT assert the wizard, or every configured run goes red. It never
+ * touches the test-account seam, so it proves public UI form submission even
+ * when the seam is configured. Callers authenticate the page first (a null
+ * identity via applyAccountToPage gives the anonymous, Access-only starting
+ * point). The generated mailbox is returned for callers that track the
+ * identity; it is never interpolated into an assertion message or
+ * diagnostic here.
+ */
+export async function submitPublicUiSignup(page: Page, baseURL: string): Promise<TestAccount> {
+  const email = uniqueTestEmail('e2e-ui');
+  await page.goto(`${baseURL}/signup`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  await expect(page.getByTestId(TESTIDS.signupEmail)).toBeVisible({ timeout: 15_000 });
+  await page.getByTestId(TESTIDS.signupEmail).fill(email);
+  await page.getByTestId(TESTIDS.signupSubmit).click();
+  // Either the code form appears, or an inline error explains why.
+  const codeField = page.locator('input[name="magic_code"]');
+  const error = page.getByTestId(TESTIDS.signupError);
+  await expect(async () => {
+    const onCodeStep = await codeField.isVisible().catch(() => false);
+    const onError = await error.isVisible().catch(() => false);
+    expect(onCodeStep || onError, 'neither signup code form nor signup error appeared').toBe(true);
+  }).toPass({ timeout: 30_000 });
+  expect(await error.isVisible().catch(() => false), 'public UI signup showed an inline error').toBe(
+    false,
+  );
+  await expect(codeField, 'public UI signup did not reach the emailed-code step').toBeVisible({
+    timeout: 15_000,
+  });
+  return { email, viaApi: false };
 }

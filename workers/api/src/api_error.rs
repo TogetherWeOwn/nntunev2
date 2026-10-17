@@ -53,6 +53,11 @@ pub const REGISTRY: &[CodeSpec] = &[
         retryable: false,
     },
     CodeSpec {
+        code: "account_deleting",
+        status: 409,
+        retryable: false,
+    },
+    CodeSpec {
         code: "validation_failed",
         status: 422,
         retryable: false,
@@ -144,6 +149,9 @@ impl ApiError {
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::by_code("not_found", message)
     }
+    pub fn account_deleting(message: impl Into<String>) -> Self {
+        Self::by_code("account_deleting", message)
+    }
     pub fn validation_failed(message: impl Into<String>) -> Self {
         Self::by_code("validation_failed", message)
     }
@@ -171,6 +179,7 @@ impl From<LibraryError> for ApiError {
             LibraryError::Unauthorized => Self::unauthorized(e.to_string()),
             LibraryError::Forbidden => Self::forbidden(e.to_string()),
             LibraryError::NotFound => Self::not_found(e.to_string()),
+            LibraryError::AccountDeleting => Self::account_deleting(e.to_string()),
             LibraryError::Invalid => Self::validation_failed(e.to_string()),
         }
     }
@@ -251,6 +260,17 @@ mod tests {
                 ApiError::from(LibraryError::Invalid).status
             ),
             ("validation_failed", 422)
+        );
+        // The deletion fence is a stable, non-retryable 409 with its own
+        // code: clients must not see it as a retryable 5xx or a 404.
+        let deleting = ApiError::from(LibraryError::AccountDeleting);
+        assert_eq!(
+            (deleting.code, deleting.status, deleting.retryable),
+            ("account_deleting", 409, false)
+        );
+        assert_eq!(
+            body(&deleting),
+            serde_json::json!({"code":"account_deleting","message":"account is being deleted","retryable":false})
         );
         assert_eq!(ApiError::from(AuthError::Invalid).code, "unauthorized");
         let auth_config = ApiError::from(AuthError::Misconfigured);

@@ -67,6 +67,10 @@ pub const ERR_VERIFY_FAILED: &str = "verify_failed";
 pub const ERR_REPAIR_FAILED: &str = "repair_failed";
 pub const ERR_MATCH_FAILED: &str = "match_failed";
 pub const ERR_WRITE_FAILED: &str = "write_failed";
+/// The job owner's account is being deleted, so the library write is
+/// fenced off (ADR 0002 rule 3). Permanent: a fenced writer fails closed
+/// and never queues behind the delete.
+pub const ERR_ACCOUNT_DELETING: &str = "account_deleting";
 
 // Compile-time: the three budgets describe the same 1 + 4 deliveries (see
 // module docs). Breaks the build if MAX_ATTEMPTS or the payload budget moves
