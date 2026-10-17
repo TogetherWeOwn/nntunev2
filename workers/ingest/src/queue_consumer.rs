@@ -11,15 +11,18 @@
 //! second to the same key and returns 429 otherwise, so every state
 //! transition of a delivery is applied to the in-memory checkpoint and
 //! persisted exactly once (see [`plan_settlement`]) just before the
-//! message is settled. A failed persist retries the message without
-//! acking, so no attempt increment or terminal state is ever lost
-//! silently.
+//! message is settled. The admission route is the key's only other
+//! writer and its write can land less than a second before the first
+//! delivery, so a rejected persist waits out the 1 s window and retries
+//! that same write once in-invocation (see [`persist`]); only a second
+//! failure retries the message without acking, so no attempt increment
+//! or terminal state is ever lost silently.
 //!
 //! Terminal replay: a `Done` checkpoint acks without work; a `Failed`
 //! checkpoint re-quarantines the existing failure to the DLQ (this is how
 //! a DLQ-send failure redelivery retries the send). A *fresh* admission
 //! of a failed job is restarted at the route instead
-//! ([`crate::checkpoint::admission_write`]), never here, so redeliveries
+//! ([`crate::checkpoint::admission_plan`]), never here, so redeliveries
 //! of one enqueue cannot resurrect it.
 //!
 //! No live runtime boundary is claimed: indexer search, pool probe,
@@ -254,12 +257,34 @@ fn plan_settlement(
     }
 }
 
+/// In-invocation retry policy for a rejected checkpoint write: exactly one
+/// retry, after waiting out KV's 1 s same-key write window (plus margin).
+/// The colliding write is the admission route's initial/reset checkpoint
+/// (or a duplicate copy's persist), which landed before this attempt, so
+/// one window from the failure is always past it. Pure so the policy is
+/// unit-tested without a KV binding.
+fn persist_retry_delay_ms(failed_attempts: u32) -> Option<u64> {
+    match failed_attempts {
+        1 => Some(crate::checkpoint::KV_SAME_KEY_WRITE_WINDOW_MS + 100),
+        _ => None,
+    }
+}
+
 async fn persist(env: &Env, cp: &JobCheckpoint) -> bool {
-    match crate::checkpoint::put(env, cp).await {
-        Ok(()) => true,
-        Err(error) => {
-            console_log!("ingest checkpoint write failed: {:?}", error);
-            false
+    let mut failed_attempts = 0;
+    loop {
+        match crate::checkpoint::put(env, cp).await {
+            Ok(()) => return true,
+            Err(error) => {
+                failed_attempts += 1;
+                console_log!("ingest checkpoint write failed: {:?}", error);
+                match persist_retry_delay_ms(failed_attempts) {
+                    Some(delay_ms) => {
+                        worker::Delay::from(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                    None => return false,
+                }
+            }
         }
     }
 }
@@ -441,6 +466,18 @@ mod tests {
         assert_eq!(settlement, Settlement::RetryAfter(5));
         assert_eq!(cp.attempt, 2);
         assert_eq!(cp.state, JobState::Searching);
+    }
+
+    #[test]
+    fn persist_retries_once_after_waiting_out_the_kv_write_window() {
+        // The admission route's write to the same key can land <1 s before
+        // the first delivery's persist; the retry must wait strictly past
+        // KV's same-key window, and a second failure gives the delivery
+        // back (RetryAfter) instead of looping in-invocation.
+        let delay = persist_retry_delay_ms(1).expect("first failure retries in-invocation");
+        assert!(delay > crate::checkpoint::KV_SAME_KEY_WRITE_WINDOW_MS);
+        assert_eq!(persist_retry_delay_ms(2), None);
+        assert_eq!(persist_retry_delay_ms(0), None);
     }
 
     #[test]

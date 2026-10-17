@@ -745,12 +745,15 @@ where
 }
 
 /// Write the checkpoint for a real (non-replay) admission, per
-/// [`checkpoint::admission_write`]: a fresh job becomes queryable via
+/// [`checkpoint::admission_plan`]: a fresh job becomes queryable via
 /// `GET /v1/ingest/jobs/:id` immediately, and a re-admitted job's stale
 /// `Failed` checkpoint is reset so the new enqueue runs. Best-effort: the
 /// job is already queued + metered, and the consumer creates the initial
 /// checkpoint on first delivery if this write is lost — failing the 202
-/// here would strand an accepted job, so errors are only logged.
+/// here would strand an accepted job, so errors are only logged. This is
+/// one of the checkpoint key's two writers (see `checkpoint` docs); the
+/// consumer waits out KV's 1 s same-key window if its first persist
+/// collides with this write.
 async fn ensure_admission_checkpoint(env: &Env, msg: &QueueMsg) {
     let existing = match checkpoint::get(env, &msg.job_id).await {
         Ok(existing) => existing,
@@ -759,25 +762,20 @@ async fn ensure_admission_checkpoint(env: &Env, msg: &QueueMsg) {
             return;
         }
     };
-    let was_failed = existing
-        .as_ref()
-        .is_some_and(|cp| checkpoint::is_failed_for(cp, msg));
-    if let Some(cp) = checkpoint::admission_write(existing.as_ref(), msg) {
-        if let Err(e) = checkpoint::put(env, &cp).await {
+    let plan = checkpoint::admission_plan(existing.as_ref(), msg);
+    if let Some(cp) = &plan.write {
+        if let Err(e) = checkpoint::put(env, cp).await {
             console_log!("ingest admission checkpoint write failed: {:?}", e);
             return;
         }
-        if was_failed {
-            // The reset lands after the admission's enqueue, so a first
-            // delivery racing it could still settle against the stale
-            // `Failed` checkpoint and quarantine without running. Send one
-            // more copy now that the reset is persisted: duplicate Queue
-            // messages are harmless by construction (the consumer resumes
-            // from the durable checkpoint), and this copy is guaranteed to
-            // observe `Queued`.
-            if !try_enqueue(env, msg).await {
-                console_log!("ingest re-drive enqueue after checkpoint reset failed");
-            }
+    }
+    if plan.reenqueue_after_write {
+        // `Failed` reset (see `checkpoint::AdmissionPlan`): the reset is
+        // now persisted, so this trailing copy is guaranteed to observe
+        // `Queued`; duplicate Queue messages are harmless by construction
+        // (the consumer resumes from the durable checkpoint).
+        if !try_enqueue(env, msg).await {
+            console_log!("ingest re-drive enqueue after checkpoint reset failed");
         }
     }
 }
@@ -815,7 +813,10 @@ async fn admit_metered_job(
             // the failure from the job status instead. A checkpoint-store
             // failure falls through to the plain replay (logged).
             match checkpoint::get(env, &msg.job_id).await {
-                Ok(Some(cp)) if checkpoint::is_failed_for(&cp, msg) => {
+                Ok(cp)
+                    if checkpoint::replay_decision(cp.as_ref(), msg)
+                        == checkpoint::ReplayDecision::Conflict =>
+                {
                     json_error(ApiError::conflict(
                         "this job previously failed; check its status before re-posting",
                     ))

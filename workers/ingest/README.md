@@ -146,7 +146,9 @@ stub whose NZB references fixture message-ids.
   Success is 202 `queued`; a missing/failing binding or payload store is 503
   with `Retry-After` (never 202). The Queue handler exists
   (`src/queue_consumer.rs`: per-message identity validation, exactly one
-  checkpoint write per delivery — Workers KV allows 1 write/s per key —
+  planned checkpoint write per delivery — Workers KV allows 1 write/s per
+  key, so a persist colliding with the admission route's write to the same
+  key waits out the window and retries that write once in-invocation —
   `retry::decide_checkpoint` settlement, DLQ quarantine that never acks on
   a failed send, and shared-parser upload validation), but the
   consumer/workflow entries stay commented out in `wrangler.toml.example`:
