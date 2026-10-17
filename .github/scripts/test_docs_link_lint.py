@@ -361,6 +361,8 @@ class TestMarkdownFileDiscovery(unittest.TestCase):
                    GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
         env.pop("GIT_DIR", None)
         env.pop("GIT_WORK_TREE", None)
+        env.pop("GIT_INDEX_FILE", None)
+        env.pop("GIT_COMMON_DIR", None)
         return env
 
     def test_untracked_node_modules_are_excluded(self):
@@ -428,6 +430,8 @@ class TestChangedScope(unittest.TestCase):
                        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
             env.pop("GIT_DIR", None)
             env.pop("GIT_WORK_TREE", None)
+            env.pop("GIT_INDEX_FILE", None)
+            env.pop("GIT_COMMON_DIR", None)
             subprocess.run(["git", "init", "-q"], cwd=root, check=True, env=env)
             # A broken file that stays untouched must never fail the run.
             (root / "docs").mkdir()
