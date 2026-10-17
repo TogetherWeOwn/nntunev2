@@ -321,6 +321,13 @@ pub fn encode_segment(w: &mut impl io::Write, p: &SegmentParams, data: &[u8]) ->
 ///
 /// Returns the number of decoded bytes. Errors are [`Error::Malformed`] or
 /// [`Error::CrcMismatch`].
+///
+/// Trailer-size validation in this entry point (both the single-part and
+/// multi-part paths) distinguishes an *absent* `=yend size=` — which stays
+/// optional, as before — from a *present* one: a present value must be a
+/// valid non-negative decimal equal to the decoded payload length, and an
+/// empty, non-numeric, negative, or out-of-range value is rejected as
+/// [`Error::Malformed`] rather than treated as an omission.
 pub fn decode_to(message_id: &str, article: &[u8], dst: &mut [u8]) -> Result<usize> {
     let mut lines = split_lines(article);
 
@@ -447,7 +454,18 @@ pub fn decode_to(message_id: &str, article: &[u8], dst: &mut [u8]) -> Result<usi
             &format!("decoded {written} bytes, header declared size={declared_size}"),
         ));
     }
-    if let Some(trailer_size) = header_int(trailer, "size=") {
+    if let Some(trailer_size_text) = header_value(trailer, "size=") {
+        // A present trailer size is not optional metadata: only its
+        // *absence* may skip this check. `header_int` would collapse a
+        // parse failure (empty, non-numeric, or overflowing value) to
+        // `None` and silently skip validation, so parse the raw token
+        // here and reject anything that is not a non-negative decimal.
+        let Some(trailer_size) = trailer_size_text.parse::<i64>().ok().filter(|&v| v >= 0) else {
+            return Err(malformed(
+                message_id,
+                "=yend declared size= is not a valid non-negative integer",
+            ));
+        };
         if trailer_size != written as i64 {
             return Err(malformed(
                 message_id,
