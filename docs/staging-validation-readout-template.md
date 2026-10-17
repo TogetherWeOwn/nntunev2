@@ -127,7 +127,7 @@ evidence IDs. Rows marked † are must-pass for a `GO`.
 | 4† | Ingest | Synthetic fixture (`e2e/fixtures/synthetic.nzb` or successor) ingests to a playable library item | | |
 | 5† | Play / seek | The ingested item plays and seeks in the web player | | |
 | 6 | Metering | Playback/ingest usage is metered against the synthetic account | | |
-| 7† | Rollback pointer | Last-good staging SHA and its successful deploy run are recorded before promotion | | |
+| 7† | Rollback pointer | Last-good staging SHA and its push-triggered `deploy.yml` run with `staging-web` conclusion `success` (not `skipped`) are recorded before promotion; Workers rollback evidence is recorded separately or listed as not verified | | |
 
 ### 2. User-visible failures
 
@@ -221,20 +221,20 @@ VERDICT: <GO | NO-GO | KILL> — <one sentence naming the deciding evidence IDs>
 
 | # | Step (user-observable) | Expected outcome | Result | Evidence |
 |---|---|---|---|---|
-| 1† | Access gate | Unauthenticated request to staging is challenged; no bypass used during the run | PASS | E1 |
-| 2† | Signup | Synthetic user can create an account and sign in | PASS | E2 |
-| 3† | BYOP configuration | Synthetic provider credentials are accepted, stored encrypted, and never appear in logs or UI after entry | PASS | E2, E3 |
-| 4† | Ingest | Synthetic fixture ingests to a playable library item | PASS | E4 |
-| 5† | Play / seek | The ingested item plays and seeks in the web player | FAIL | E4 |
-| 6 | Metering | Playback/ingest usage is metered against the synthetic account | INCONCLUSIVE | E4 |
-| 7† | Rollback pointer | Last-good staging SHA and its successful deploy run are recorded before promotion | PASS | E5 |
+| 1† | Access gate | Unauthenticated request to staging is challenged; no bypass used during the run | PASS | E1, E2, E3 |
+| 2† | Signup | Synthetic user can create an account and sign in | PASS | E1, E4 |
+| 3† | BYOP configuration | Synthetic provider credentials are accepted, stored encrypted, and never appear in logs or UI after entry | PASS | E1, E5, E6, E7, E8 |
+| 4† | Ingest | Synthetic fixture ingests to a playable library item | PASS | E1, E9 |
+| 5† | Play / seek | The ingested item plays and seeks in the web player | FAIL | E1, E10 |
+| 6 | Metering | Playback/ingest usage is metered against the synthetic account | INCONCLUSIVE | E1, E11 |
+| 7† | Rollback pointer | Last-good staging SHA and its push-triggered `deploy.yml` run with `staging-web` conclusion `success` (not `skipped`) are recorded before promotion; Workers rollback evidence is recorded separately or listed as not verified | PASS | E12, E13 |
 
 ### 2. User-visible failures
 
 | # | Flow step | What the user sees | Severity | Evidence | Disposition |
 |---|---|---|---|---|---|
-| 1 | Play / seek | Player spins indefinitely after seeking past the buffered range; no error message | blocks journey | E4 | fix before GO |
-| 2 | Signup | Confirmation screen shows a raw message key instead of text on one locale | cosmetic | E2 | accepted — follow-up link in synthetic tracker (placeholder) |
+| 1 | Play / seek | Player spins indefinitely after seeking past the buffered range; no error message | blocks journey | E10 | fix before GO |
+| 2 | Signup | Confirmation screen shows a raw message key instead of text on one locale | cosmetic | E14 | accepted — follow-up link in synthetic tracker (placeholder) |
 
 ### 3. Infrastructure cost basis
 
@@ -268,31 +268,43 @@ total is a floor, not an all-in bill.
 
 | ID | Claim proven | Build + environment | Link | Observed | Result | Verified by |
 |---|---|---|---|---|---|---|
-| E1 | Unauthenticated staging request receives an Access challenge | `0123456789ab` · staging | <https://example.invalid/runs/access-check/1> | 2026-01-14 | PASS | QA, 2026-01-15 |
-| E2 | Synthetic signup and BYOP configuration complete end to end | `0123456789ab` · staging | <https://example.invalid/runs/e2e-staging/2> | 2026-01-14 | PASS | QA, 2026-01-15 |
-| E3 | Synthetic provider credential value absent from run logs (names only) | `0123456789ab` · staging | <https://example.invalid/logs/redaction-query/3> | 2026-01-14 | PASS | QA, 2026-01-15 |
-| E4 | Ingest completes; seek past buffer hangs; metering assertion skipped | `0123456789ab` · staging | <https://example.invalid/runs/e2e-staging/4> | 2026-01-15 | FAIL | QA, 2026-01-15 |
-| E5 | Last-good SHA `89abcdef0123` has a successful staging deploy run recorded pre-promotion | `89abcdef0123` · staging | <https://example.invalid/runs/deploy/5> | 2026-01-13 | PASS | QA, 2026-01-15 |
+| E1 | Deployed staging build identity equals the promoted SHA `0123456789ab` in the synthetic health response | `0123456789ab` · staging | <https://example.invalid/runs/build-identity/1> | 2026-01-14 | PASS | QA, 2026-01-15 |
+| E2 | Unauthenticated staging request receives an Access challenge | `0123456789ab` · staging | <https://example.invalid/runs/access-check/2> | 2026-01-14 | PASS | QA, 2026-01-15 |
+| E3 | Access audit for the run window shows no bypass policy was used | `0123456789ab` · staging | <https://example.invalid/logs/access-audit/3> | 2026-01-14 | PASS | QA, 2026-01-15 |
+| E4 | Synthetic user creates an account and signs in end to end | `0123456789ab` · staging | <https://example.invalid/runs/e2e-staging/4> | 2026-01-14 | PASS | QA, 2026-01-15 |
+| E5 | Synthetic provider credentials are accepted by BYOP configuration | `0123456789ab` · staging | <https://example.invalid/runs/e2e-staging/5> | 2026-01-14 | PASS | QA, 2026-01-15 |
+| E6 | Stored BYOP credential record holds ciphertext only, with no plaintext value present | `0123456789ab` · staging | <https://example.invalid/records/byop-storage/6> | 2026-01-14 | PASS | QA, 2026-01-15 |
+| E7 | Synthetic provider credential value is absent from the run logs (names only) | `0123456789ab` · staging | <https://example.invalid/logs/redaction-query/7> | 2026-01-14 | PASS | QA, 2026-01-15 |
+| E8 | Provider credential value is masked and not displayed in the UI after entry | `0123456789ab` · staging | <https://example.invalid/runs/e2e-staging/8> | 2026-01-14 | PASS | QA, 2026-01-15 |
+| E9 | Synthetic fixture ingests to a playable library item | `0123456789ab` · staging | <https://example.invalid/runs/e2e-staging/9> | 2026-01-15 | PASS | QA, 2026-01-15 |
+| E10 | Player spins indefinitely after seeking past the buffered range | `0123456789ab` · staging | <https://example.invalid/runs/e2e-staging/10> | 2026-01-15 | FAIL | QA, 2026-01-15 |
+| E11 | Metering assertion was skipped, so no metering result was produced | `0123456789ab` · staging | <https://example.invalid/runs/e2e-staging/11> | 2026-01-15 | SKIPPED | QA, 2026-01-15 |
+| E12 | Last-good SHA `89abcdef0123` is recorded pre-promotion with a push-triggered `deploy.yml` run whose `staging-web` conclusion is `success` (not `skipped`) | `89abcdef0123` · staging | <https://example.invalid/runs/deploy/12> | 2026-01-13 | PASS | QA, 2026-01-15 |
+| E13 | Workers deployed versions and their rollback targets are recorded separately pre-promotion | `89abcdef0123` · staging | <https://example.invalid/records/workers-rollback/13> | 2026-01-13 | PASS | QA, 2026-01-15 |
+| E14 | Confirmation screen on one locale displays a raw message key instead of localized text | `0123456789ab` · staging | <https://example.invalid/runs/e2e-staging/14> | 2026-01-14 | FAIL | QA, 2026-01-15 |
+| E15 | Previous promoted build has no must-pass `FAIL`, so this is the first consecutive failing promoted build | `89abcdef0123` · staging | <https://example.invalid/records/prior-readout/15> | 2026-01-13 | PASS | QA, 2026-01-15 |
+| E16 | Section 3 line items sum to the $12.03 monthly estimate at the stated usage | `0123456789ab` · staging | <https://example.invalid/records/cost-total/16> | 2026-01-15 | PASS | QA, 2026-01-15 |
+| E17 | Scan of the run logs and evidence artifacts finds no secret value or personal data | `0123456789ab` · staging | <https://example.invalid/logs/secret-scan/17> | 2026-01-15 | PASS | QA, 2026-01-15 |
 
 ### 6. Kill rules and verdict
 
 | ID | Condition (pre-registered) | Source of threshold | Observed value | Evidence | Verdict |
 |---|---|---|---|---|---|
-| K1 | Any must-pass synthetic-flow step `FAIL` on two consecutive promoted builds | Launch-quality bar for the core journey | First failing build (step 5) | E4 | NOT TRIGGERED |
-| K2 | Estimated monthly infra cost at stated usage exceeds $50 | Pre-launch cost ceiling for the validation phase | $12.03 | section 3 | NOT TRIGGERED |
-| K3 | Any secret value or personal data found in staging logs/evidence during the run | "Must never contain" rules in this template | None found | E3 | NOT TRIGGERED |
+| K1 | Any must-pass synthetic-flow step `FAIL` on two consecutive promoted builds | Launch-quality bar for the core journey | 1 consecutive failing build (step 5 on this build; none on the previous promoted build) | E10, E15 | NOT TRIGGERED |
+| K2 | Estimated monthly infra cost at stated usage exceeds $50 | Pre-launch cost ceiling for the validation phase | $12.03 | E16 | NOT TRIGGERED |
+| K3 | Any secret value or personal data found in staging logs/evidence during the run | "Must never contain" rules in this template | None found | E17 | NOT TRIGGERED |
 
 ```text
-VERDICT: NO-GO — must-pass step 5 (play/seek) failed per E4; no kill rule triggered (K1–K3) (product lead, 2026-01-15)
+VERDICT: NO-GO — must-pass step 5 (play/seek) failed per E10; no kill rule triggered (K1–K3) (product lead, 2026-01-15)
 ```
 
 ### 7. Sign-off
 
 - QA: every evidence link in section 5 was opened and proves its claim;
-  the `SKIPPED` metering assertion in E4 is recorded as `INCONCLUSIVE`,
-  not a pass. `QA, 2026-01-15`
+  deployed-build identity was verified against the promoted SHA per E1,
+  and the `SKIPPED` metering assertion in E11 is recorded as
+  `INCONCLUSIVE`, not a pass. `QA, 2026-01-15`
 - Decision owner: verdict above recorded; non-goals in section 4 stand.
   `product lead, 2026-01-15`
-- What could not be verified: deployed-build identity beyond the deploy
-  run record (health response carried no build identity in this synthetic
-  example); egress cost.
+- What could not be verified: egress cost (not metered in this synthetic
+  example).
