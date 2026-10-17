@@ -784,12 +784,11 @@ impl Store for PgStore {
         // while the owner's deleting_at is NULL, holding the user row
         // FOR SHARE through the statement, so saving provider credentials
         // cannot repopulate user-owned state behind the deletion marker.
-        // A fenced (0-row) upsert fails closed as StoreError — the Store
-        // trait's opaque error is what the handler already maps to the
-        // generic vault failure; surfacing the typed 409 for vault
-        // routes needs a typed StoreError, tracked with the deletion
-        // routes. delete_vault below is deliberately not fenced: removal
-        // cannot restore state, and the executor deletes the row anyway.
+        // A fenced (0-row) upsert fails closed as StoreError; the
+        // handler classifies it through `account_deleting` into the
+        // typed 409. delete_vault below is deliberately not fenced:
+        // removal cannot restore state, and the executor deletes the
+        // row anyway.
         let affected = client
             .execute(
                 "INSERT INTO provider_vaults (user_id, kek_version, dek_wrapped_nonce, dek_wrapped, \
@@ -829,6 +828,23 @@ impl Store for PgStore {
             .await
             .map_err(|_| StoreError)?;
         Ok(())
+    }
+
+    async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
+        let client = self.connect().await?;
+        let row = client
+            .query_opt(
+                crate::account_deletion::ACCOUNT_DELETING_PROBE_SQL,
+                &[&user_id],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        match row {
+            Some(row) => row.try_get("deleting").map_err(|_| StoreError),
+            // The user row is gone (erased or reaped): not a fenced
+            // write, so the handler keeps its generic failure.
+            None => Ok(false),
+        }
     }
 
     async fn insert_audit(&self, event: &AuditEvent) -> Result<(), StoreError> {

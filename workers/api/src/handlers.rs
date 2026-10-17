@@ -490,6 +490,19 @@ pub trait Store {
         row: &VaultRow,
     ) -> impl Future<Output = Result<(), StoreError>>;
     fn delete_vault(&self, user_id: &str) -> impl Future<Output = Result<(), StoreError>>;
+    /// Whether the user's account is fenced for deletion
+    /// (`users.deleting_at IS NOT NULL`, ADR 0002 rule 3). Handlers use
+    /// it only to classify a fenced write's failure as the typed 409
+    /// instead of the generic storage error; it is never the fence
+    /// itself (production writes carry the fence in-statement).
+    /// Default `Ok(false)` keeps out-of-tree `Store` impls compiling;
+    /// production and the test fake override it.
+    fn account_deleting(
+        &self,
+        _user_id: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Ok(false) }
+    }
     fn insert_audit(&self, event: &AuditEvent) -> impl Future<Output = Result<(), StoreError>>;
 }
 
@@ -570,6 +583,20 @@ fn generic_auth() -> Response {
 
 fn generic_vault() -> Response {
     json_response(400, serde_json::json!({"error": "vault unavailable"}))
+}
+
+/// The typed account-deletion fence refusal (ADR 0002 rule 3): HTTP 409
+/// with the registered `account_deleting` envelope. The blocking
+/// operation id and retry hint join this body with the deletion routes,
+/// which own the operation lookup.
+fn account_deleting_response() -> Response {
+    let error = crate::api_error::ApiError::account_deleting("account is being deleted");
+    Response {
+        status: error.status,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    }
 }
 
 fn internal() -> Response {
@@ -2079,6 +2106,12 @@ where
         updated_at: ctx.now,
     };
     if ctx.store.upsert_vault(&claims.user_id, &row).await.is_err() {
+        // A fenced upsert (account being deleted) is the typed 409,
+        // never the generic vault failure; anything else stays generic
+        // so a probe failure cannot leak a new shape.
+        if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+            return account_deleting_response();
+        }
         return generic_vault();
     }
     ctx.audit(&claims.user_id, audit_action, true).await;
@@ -2428,6 +2461,9 @@ mod tests {
         rate_limit_slot_probes: RefCell<usize>,
         fail_reauth_revocation: RefCell<bool>,
         fail_reauth_insert: RefCell<bool>,
+        /// Users whose `users.deleting_at` is set (ADR 0002 rule 3):
+        /// fenced writers refuse them, mirroring the production SQL.
+        deleting_users: RefCell<std::collections::HashSet<String>>,
     }
 
     impl Store for FakeStore {
@@ -2811,10 +2847,18 @@ mod tests {
             Ok(self.vaults.borrow().get(user_id).cloned())
         }
         async fn upsert_vault(&self, user_id: &str, row: &VaultRow) -> Result<(), StoreError> {
+            // Mirror the production in-statement fence: a deleting
+            // account's upsert writes nothing and fails.
+            if self.deleting_users.borrow().contains(user_id) {
+                return Err(StoreError);
+            }
             self.vaults
                 .borrow_mut()
                 .insert(user_id.to_string(), row.clone());
             Ok(())
+        }
+        async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
+            Ok(self.deleting_users.borrow().contains(user_id))
         }
         async fn delete_vault(&self, user_id: &str) -> Result<(), StoreError> {
             self.vaults.borrow_mut().remove(user_id);
@@ -3533,6 +3577,57 @@ mod tests {
         let resp = h.call_full("DELETE", "/v1/vault", None, Some(cookie_a), Some(ORIGIN));
         assert!(
             resp.body.contains("\"provider_configured\":false"),
+            "{}",
+            resp.body
+        );
+    }
+
+    #[test]
+    fn vault_put_for_a_deleting_account_is_the_typed_409_and_writes_nothing() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let put_body = serde_json::json!({
+            "provider": {
+                "host": "news.example.com", "port": 563, "tls": true,
+                "username": "synthetic-user", "password": "synthetic-pass",
+                "max_connections": 4
+            },
+            "indexer": null
+        });
+        // Normal write first: fence open, the save lands.
+        let resp = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        // Deletion scheduled: the same save is the typed fence refusal,
+        // never the generic 400, and the stored row is not replaced.
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert("u1".to_string());
+        let resp = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"account_deleting","message":"account is being deleted","retryable":false}"#
+        );
+        // Reads still work during grace (cancel must stay possible),
+        // and the pre-fence row is what they see.
+        let resp = h.call_full("GET", "/v1/vault", None, Some(cookie), None);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(
+            resp.body.contains("\"provider_configured\":true"),
             "{}",
             resp.body
         );
