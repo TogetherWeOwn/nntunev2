@@ -5,10 +5,13 @@ explicit gap. M1 exits when the secure staging user journey
 (signup → BYOP → ingest → play/seek) passes on an exact-head staging deploy
 with Access enabled, and rollback evidence is recorded.
 
-Re-verified against the merged `e2e/` tree on 2026-10-17 with the
-anonymous-Access app-shell probe (#188), the PWA manifest spec (#211), the
-branded-error-page specs (#203), the demo-audio contract plus
-recording-mbids assertions, the player queue-order spec (#202) and the
+Re-verified against the merged tree on 2026-10-17 with the public
+UI-signup case, the browser-playback spec, the player-UI-seek spec, the
+player queue-order spec (#202), the demo-media sessionless spec, the
+recording-mbids assertion, the demo-audio contract spec, the
+anonymous-Access app-shell probe (#188) plus the `/api/health` + `/api/ready`
+anonymous-denial proofs (#185), the branded-error-page specs (#203), the
+PWA manifest spec (#211), the security-headers staging probe and the
 deployed-build identity route (#196) merged:
 `npm --prefix e2e run e2e:list` lists 252 tests in 16 files, and
 `(cd apps/web && pnpm exec playwright test --list)` lists 94 tests in
@@ -16,7 +19,9 @@ deployed-build identity route (#196) merged:
 Line numbers
 below are from that merged tree; re-verify with the commands at the end of
 this document whenever a spec is added, renamed, or retitled, and update
-this matrix in the same PR.
+this matrix in the same PR. CI enforces the file and title citations on
+every PR (the traceability step in the `e2e-lint` job); line numbers stay
+a manual re-verify item.
 
 ## Reading the statuses
 
@@ -43,7 +48,7 @@ configured, the harness fails closed instead of skipping.
 | 5 | Access enforcement | COVERED | With-credentials side: every live spec, e.g. `assertNoAccessWall` in `e2e/tests/health.spec.ts:37`, `:75`, `:124`; anonymous side: `health.spec.ts:90` (`/api/health`) and `:100` (`/api/ready`) via `anonymousApiGet` (`e2e/helpers/accounts.ts:207`) plus `health.spec.ts:148` (anonymous `GET /`, denied not served) via `anonymousGet` (`e2e/helpers/accounts.ts:244`), all classified by `assertAccessWall` on the shared joint predicate (`isAccessWall`, `e2e/helpers/access.ts:68`); fail-closed config in `e2e/playwright.config.ts` (pair validated at load), pinned offline by `e2e/tests/helpers.spec.ts:79` and both job preflights in `e2e/tests/workflows.spec.ts:46`, the anonymous matrix by `helpers.spec.ts:234` (denial shapes), `:359` (cross-predicate agreement) and `:450` (no-credentials/no-follow server proof), plus the credential-free/no-follow pin at `workflows.spec.ts:185` | A green live run proves the journey passes **with Access enabled** and a valid QA service token: any wall response (401/403/302 with Access markers) fails the step by name instead of masquerading as an app failure, and configured staging without the full credential pair fails before any request. It also proves Access **denies anonymous traffic to `/api/health`, `/api/ready` and the app shell `/`**: each is requested with no Access headers or credentials in an isolated request context (no-follow), and only an Access-specific denial passes — an application `ok:true` answer, a served 200 app shell, or a bare app error/redirect without Access markers fails. The credentialed API checks and the app-shell smoke (`health.spec.ts:110`) stay as the authorized controls on the same paths. Diagnostics stay names-only (fixed context + status; no URL, header or body values). Subject to the global caveat: until staging is configured every anonymous spec skips like every live spec, so live denial evidence exists only from a configured-staging run. |
 | 6 | Rollback evidence | GAP | none in `e2e/` | Rollback evidence is procedural, not a spec: `docs/ops.md` "Staging promotion checklist" requires a recorded rollback pointer (last good staging SHA + its push-triggered `deploy.yml` run with `staging-web` conclusion `success`), rollback by re-running all jobs on that run, and a successful `staging-web` rerun plus staging health. Workers are not deployed by that workflow and need their own rollback evidence; the evidence a future Worker lane must retain is defined in `docs/ops.md` "Future Worker deploy lanes: required rollback evidence", but no such lane exists yet, so this row stays GAP and no Worker deploy or rollback is claimed. e2e contributes only the reusable post-rollback health smoke (row 7). |
 | 7 | Exact-head staging deploy (exit wrapper) | PARTIAL | `e2e/tests/health.spec.ts:24` (`/api/health`), `:59` (`/api/ready`), `:110` (app shell behind Access) | The smoke proves the deployed app answers `ok:true` in under 2 s, promotion readiness (200 JSON `{ok:true}` only; 404 and 503 — even with `Retry-After` — fail, pinned offline by `e2e/tests/readiness.spec.ts` via `e2e/helpers/readiness.ts`), and the app shell behind Access. **Gap:** no spec ties the deployed build to the exact commit SHA — the app now exposes its baked build SHA at `/api/build` (`apps/web/src/routes/api/build/+server.ts`, pinned offline by `apps/web/tests/build-identity.spec.ts:26`, `:48`, `:59`), but no e2e spec compares it with the promotion SHA yet; `version` in the smoke above stays a package version, not a build identity. Per `docs/ops.md`, same-build evidence must not be claimed until that comparison lands. Sequencing is established: `e2e-staging.yml` has no push trigger, and `deploy.yml`'s `post-deploy-e2e` job calls it only after the same run's `staging-web` succeeds, so the E2E run cannot race its deploy — but that ordering still does not prove which build is serving. |
-| 8 | E2E evidence pass (exit wrapper) | COVERED as process | `.github/workflows/e2e-staging.yml` (synthetic smoke + full journey jobs), called post-deploy by `.github/workflows/deploy.yml`; verdict format in `e2e/README.md` "Evidence"; sequencing graph pinned offline in `e2e/tests/workflows.spec.ts` "post-deploy sequencing" | Both jobs run the fail-closed preflight and upload sanitized junit-only failure artifacts for 7 days. The full journey runs only on the post-deploy call after a successful same-run `staging-web` deploy — a skipped/failed deploy cannot produce a full-journey PASS — while scheduled/manual runs are synthetic monitoring only. A PASS verdict cites the green post-deploy run URL plus the source head SHA (not a build identity). Subject to the global caveat above: while staging is unconfigured both jobs skip with notice, which does not count as evidence. |
+| 8 | E2E evidence pass (exit wrapper) | COVERED as process | `.github/workflows/e2e-staging.yml` (synthetic smoke + full journey jobs), called post-deploy by `.github/workflows/deploy.yml`; verdict format in `e2e/README.md` "Evidence"; sequencing graph pinned offline in `e2e/tests/workflows.spec.ts` "deploy calls e2e-staging only after a successful push staging-web (evaluated)" and "full journey runs only for the post-deploy call (evaluated)" | Both jobs run the fail-closed preflight and upload sanitized junit-only failure artifacts for 7 days. The full journey runs only on the post-deploy call after a successful same-run `staging-web` deploy — a skipped/failed deploy cannot produce a full-journey PASS — while scheduled/manual runs are synthetic monitoring only. A PASS verdict cites the green post-deploy run URL plus the source head SHA (not a build identity). Subject to the global caveat above: while staging is unconfigured both jobs skip with notice, which does not count as evidence. |
 
 ## Coverage that is not an M1 exit step
 
@@ -66,7 +71,7 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   player-UI-seek test last.
 - Staging demo-audio contract (`e2e/tests/demo-audio-contract.spec.ts:65`
   "default track serves the full vendored body as audio/wav" and `:102`
-  "salted vs default-stream behavior for ?track=") is fixture support for
+  "?track=second-signal is salted; unknown ?track= serves the default stream") is fixture support for
   row 4's pinned synthetic WAV, not an M1 exit step: it proves staging
   serves the vendored deterministic body (never mis-routed R2 or library
   bytes) at the no-auth demo-audio route, with the formula itself pinned
@@ -103,6 +108,26 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
     `{ok:true}` only; 404 and 503 fail), backing the row 7 smoke.
   - `playback.spec.ts` — pins the playback-helper contract backing the
     row 4 play assertion.
+- `e2e/tests/security-headers.spec.ts` is the staging probe that the live
+  app-shell document response still carries the security headers and
+  nonce-bearing CSP (static posture pinned offline by
+  `apps/web/tests/`). Staging hardening, not journey coverage.
+- `e2e/tests/demo-media-sessionless.spec.ts` pins the sessionless invariant
+  live: `e2e/tests/demo-media-sessionless.spec.ts:25` "sessionless GET
+  /api/demo/audio serves synthetic bytes (200; 206 for Range)" plus the
+  same-identity library-gated probes at `/library` and `/api/library`.
+  Demo routes serve synthetic bytes with no app session (Access pair only,
+  never an Authorization bearer or cookies) while the real library surface
+  stays gated. Demo hardening, not journey coverage.
+- `e2e/tests/demo-audio-contract.spec.ts` pins the synthetic demo-audio
+  contract both offline and live: `e2e/tests/demo-audio-contract.spec.ts:24`
+  "default body is a 256 KiB deterministic WAV" plus the sample-formula
+  and track-salt pins (offline, run on every PR via `test:unit` with no
+  staging), and `e2e/tests/demo-audio-contract.spec.ts:65` "default track
+  serves the full vendored body as audio/wav" (staging leg, Access pair
+  only, never an account session), which proves staging serves the exact
+  vendored bytes at the no-auth demo-audio route — never mis-routed R2 or
+  library bytes. Demo hardening, not journey coverage.
 - The `apps/web/tests/` offline specs below run in the `web-e2e` CI job
   on every PR. Backend API calls are intercepted and fulfilled locally,
   while a few specs additionally assert against the real local
@@ -147,6 +172,11 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   - `apps/web/tests/billing-signed-out.spec.ts` — pins a signed-out
     billing visitor reaching sign-in via the Sign in link, with no
     billing actions shown.
+  - `apps/web/tests/branded-error-page.spec.ts` — pins unknown paths
+    rendering the branded NNTune 404 (404 status, NNTune brand, visible
+    `/library` or `/login` CTA resolving to a live route), no stack
+    trace or default SvelteKit chrome, and no secret, hostname, or
+    binding material in the rendered output.
   - `apps/web/tests/library-duplicate-ids.spec.ts` — pins duplicate-id
     library responses rendering unique rows with no page error, refresh
     still working afterwards, the stale fallback staying unique, and a
@@ -209,3 +239,20 @@ Every path and title cited above must appear in that output. If a cited
 spec moves or a new spec closes a PARTIAL/GAP row, update the row in the
 same PR; a stale path here is a failed review, per the matrix's own test
 plan.
+
+CI enforces this on every PR (the traceability step in the `e2e-lint` job,
+offline, no staging credentials): it captures `e2e:list` output and runs
+`python3 .github/scripts/check_traceability.py`, which fails on any spec
+file the matrix does not cite, any cited spec or `e2e/` path that no
+longer exists, and any double-quoted title matching no listed test.
+Reproduce a red run locally with the same two commands:
+
+```sh
+npm --prefix e2e run e2e:list > /tmp/e2e-list.txt 2>&1
+python3 .github/scripts/check_traceability.py --matrix docs/m1-exit-traceability.md --list-output /tmp/e2e-list.txt
+```
+
+Matrix authoring rules for the checker: cite every spec file in backticks
+(including offline self-tests, listed in the section above); reserve
+double quotes for exact test titles; `:line` suffixes are informational
+and are not checked.
