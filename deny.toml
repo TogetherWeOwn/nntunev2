@@ -2,11 +2,12 @@
 #
 # Reviewed dependency/security gate: `cargo deny check` must pass for every
 # committed lockfile (repo root workspace, workers/api, workers/ingest,
-# workers/mb) and is a required CI job wired fail-closed into `ci-ok`.
+# workers/mb, workers/repair) and is a required CI job wired fail-closed
+# into `ci-ok`.
 # Findings are resolved by updating or replacing the dependency, never by
 # weakening this policy to get green.
 #
-# License inventory (verified 2026-10-17 across all four locks): every crate
+# License inventory (verified 2026-10-17 across all five locks): every crate
 # is under a permissive license. The only copyleft text in the graph is an
 # OR-option next to MIT (`r-efi`: MIT OR Apache-2.0 OR LGPL-2.1-or-later,
 # used under MIT), which the allow list below satisfies without LGPL.

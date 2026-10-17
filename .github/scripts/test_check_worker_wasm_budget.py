@@ -61,11 +61,11 @@ class WorkerTableTests(unittest.TestCase):
 
     def test_audited_workers_build_locked(self):
         locked = [spec["worker"] for spec in WORKERS if spec.get("locked")]
-        self.assertEqual(locked, ["api", "ingest", "mb", "stream"])
+        self.assertEqual(locked, ["api", "ingest", "mb", "repair", "stream"])
 
-    def test_repair_builds_unlocked_without_committed_lockfile(self):
+    def test_repair_builds_locked_with_committed_lockfile(self):
         repair = next(s for s in WORKERS if s["worker"] == "repair")
-        self.assertNotIn("--locked", cargo_args(repair))
+        self.assertIn("--locked", cargo_args(repair))
 
     def test_cargo_args_stream_uses_package_locked(self):
         stream = next(s for s in WORKERS if s["worker"] == "stream")

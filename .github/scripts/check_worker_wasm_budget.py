@@ -52,10 +52,10 @@ BUDGET_BYTES = 3_000_000
 
 # One entry per Worker. ``kind`` selects how the crate is addressed:
 # standalone crates (own Cargo.toml, own target dir) vs the stream crate
-# (workspace member, repo-root target dir). Crates with a committed,
-# cargo-deny-audited Cargo.lock build with ``--locked`` so the measured
-# module matches the audited dependency graph; repair has no committed
-# lockfile, so it builds unlocked -- matching the required CI lanes.
+# (workspace member, repo-root target dir). Every crate has a committed,
+# cargo-deny-audited Cargo.lock and builds with ``--locked`` so the
+# measured module matches the audited dependency graph -- matching the
+# required CI lanes.
 WORKERS = (
     {
         "worker": "api",
@@ -85,7 +85,7 @@ WORKERS = (
         "worker": "repair",
         "kind": "manifest",
         "manifest": "workers/repair/Cargo.toml",
-        "locked": False,
+        "locked": True,
         "target_dir": "workers/repair/target",
         "wasm": "nntune_repair.wasm",
     },

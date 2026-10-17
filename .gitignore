@@ -16,6 +16,7 @@ Cargo.lock
 !/Cargo.lock
 !/workers/ingest/Cargo.lock
 !/workers/mb/Cargo.lock
+!/workers/repair/Cargo.lock
 .cargo/
 
 # Rust wasm / workers
