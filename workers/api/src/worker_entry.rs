@@ -551,11 +551,13 @@ impl Store for PgStore {
         Ok(rows.len() == 1)
     }
 
+    // Per-user prune: magic_link_tokens has no expires_at index, so a global sweep would scan.
     async fn insert_magic(&self, record: &MagicLinkRecord) -> Result<(), StoreError> {
         let client = self.connect().await?;
         client
             .execute(
-                "INSERT INTO magic_link_tokens (token_hash, user_id, email, issued_at, expires_at, used) \
+                "WITH pruned AS (DELETE FROM magic_link_tokens WHERE user_id = $2 AND expires_at <= $4) \
+                 INSERT INTO magic_link_tokens (token_hash, user_id, email, issued_at, expires_at, used) \
                  VALUES ($1, $2, $3, $4, $5, FALSE)",
                 &[
                     &record.token_hash,

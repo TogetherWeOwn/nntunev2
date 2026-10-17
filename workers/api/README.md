@@ -186,7 +186,8 @@ config from secrets) is a follow-up slice.
   24 h only when they have no credential, vault, session, unexpired magic
   link, or unexpired registration challenge. In-flight registration
   challenges (including consumed challenges awaiting finish) protect the
-  signup until expiry; expired challenges are pruned. Passkey finishes
+  signup until expiry; expired challenges are pruned. Issuing a magic link
+   prunes that user's expired magic rows, so live accounts stay bounded. Passkey finishes
   reserve 100 lookups per client prefix
   BEFORE any DB read plus 10 attempts per challenge before verification
   (and magic finishes 10 per client prefix, after the exact-Origin pin) per
