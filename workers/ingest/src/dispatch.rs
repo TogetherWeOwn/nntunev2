@@ -35,9 +35,9 @@ pub const PAYLOAD_KEY_PREFIX: &str = "nzb:sha256:";
 pub const PAYLOAD_TTL_SECS: u64 = 30 * 24 * 3_600;
 /// Documented KV read lag the payload retry schedule must absorb: reads are
 /// eventually consistent across locations (up to ~60 s), and a first-read
-/// miss is cached at the edge for the `cacheTtl` window. The consumer reads
-/// with `cacheTtl = 60 s`, the installed KV API's documented minimum, so a
-/// miss expires before later retries instead of hiding bytes already stored.
+/// miss is cached at the edge for the `cacheTtl` window (default 60 s,
+/// minimum 30 s) — a consumer that retries too fast keeps serving the cached
+/// miss and fails a job whose bytes are stored.
 pub const PAYLOAD_KV_READ_LAG_MS: u64 = 60_000;
 
 /// Payload-fetch retries the consumer may spend: must match
@@ -55,7 +55,8 @@ pub const MAX_PAYLOAD_RETRY_DELAY_MS: u64 = 60_000;
 /// itself is edge-cached), so the consumer retries on this schedule instead
 /// of failing the job: 5 s, 15 s, 30 s, 60 s (cumulative 110 s, covering the
 /// documented ~60 s lag). Saturating, so any `u32` attempt maps to a sane
-/// delay. The consumer fetches with `cacheTtl = 60 s` and keeps
+/// delay. The consumer fetches with the minimum `cacheTtl` (30 s) so a
+/// cached miss expires before the later retries, and keeps
 /// `max_retries = PAYLOAD_RETRY_ATTEMPTS` so the full window is usable.
 pub fn payload_retry_delay_ms(attempt: u32) -> u64 {
     match attempt {

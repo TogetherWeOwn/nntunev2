@@ -9,6 +9,26 @@
 //! - [`redact_api_key`] scrubs the key for logs. Log the redacted URL only.
 //! - `http://` indexer URLs are refused: the key would travel in cleartext.
 
+/// Documented worker/API error code for a stale *indexer* API key (S7).
+/// Deliberately distinct from the NNTP provider's `provider_auth_expired`
+/// (`nntune-core`, `workers/api`, `workers/stream`): the two secrets are
+/// fixed through different prompts, and provider rotation preserves the
+/// indexer key verbatim. The web app answers this code with copy asking
+/// for the indexer API key, never the provider password. Safe to log and
+/// to return in error bodies.
+pub const INDEXER_AUTH_EXPIRED_CODE: &str = "indexer_auth_expired";
+
+/// True when an indexer HTTP status means the stored API key was rejected
+/// and the user must re-enter it (S7). Only 401 maps here: 403 from an
+/// indexer is routinely a rate limit, WAF, or blocked account rather than
+/// a bad key, so it must not trigger a credential prompt. Every other
+/// status stays a generic failure. The caller returns
+/// [`INDEXER_AUTH_EXPIRED_CODE`] and MUST NOT include the key, the URL, or
+/// the upstream body.
+pub fn is_indexer_auth_failure(http_status: u16) -> bool {
+    http_status == 401
+}
+
 /// Newznab search caps for one request.
 pub const MAX_LIMIT: u32 = 100;
 /// Music-only search (`t=music`); the pipeline ingests audio releases.

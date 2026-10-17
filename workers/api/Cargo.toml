@@ -11,7 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # Keys and nonces use getrandom below, not aead's optional OsRng backend.
-aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 # Shared unpadded-base64url over this crate (F-HARD-01): one audited
 # implementation for vault/auth/session. Pure Rust, wasm32-compatible.
 base64 = "0.23"
@@ -29,12 +29,12 @@ url = "2"
 subtle = "2"
 # WebAuthn signature verification (pure-Rust, wasm32-compatible):
 # ES256 (COSE alg -7) and EdDSA (COSE alg -8) credential public keys.
-p256 = { version = "0.13", default-features = false, features = ["alloc", "arithmetic", "ecdsa"] }
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+p256 = { version = "0.14", default-features = false, features = ["alloc", "arithmetic", "ecdsa"] }
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc"] }
 # Worker HTTP + Hyperdrive entry (same versions as workers/mb). These
 # compile natively so `cargo test` keeps covering the core handlers;
 # the runtime-only paths live in `worker_entry`.
-worker = { version = "0.3", features = ["http", "tokio-postgres"] }
+worker = { version = "0.8", features = ["http", "tokio-postgres"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
 wasm-bindgen-futures = "0.4"
 # Only for the capped request-body stream read in the Worker entry.

@@ -1,6 +1,6 @@
 # NNTune v2 operations
 
-Provisioned resource metadata for staging + prod, as of 2026-10-13.
+Provisioned resource metadata for staging + prod, as of 2026-10-16.
 **Never commit tokens, passwords, database URLs, or personal login identities.**
 Secret values live in GitHub Actions secrets, Cloudflare, and the host's secure
 credential storage. Resource IDs below are non-credential binding metadata;
@@ -17,7 +17,17 @@ An authorized executor must satisfy the applicable approval/retention gates firs
 - Workers Paid + R2 Paid entitlements: confirmed by the host executor on
   2026-10-13; not independently billing-verified by the operator MCP token.
 
-### R2 buckets (created 2026-10-13)
+### R2 buckets (core buckets created 2026-10-13; scratch metadata verified 2026-10-17)
+
+Read-only Cloudflare R2 metadata GETs on 2026-10-17 confirmed both reported
+scratch buckets exist and each has one enabled object-expiration rule:
+`expire-ingest-scratch-after-7-days`, prefix `ingest-scratch/`, age
+`604800` seconds (seven days), action `deleteObjectsTransition`. The staging
+and production bucket names match the inventory below. No lifecycle rule on
+either bucket expires objects outside that prefix. The observed archive-bucket
+lifecycle is only the enabled `Default Multipart Abort Rule`, age `604800`
+seconds, with no prefix condition; it aborts incomplete multipart uploads and
+does not expire stored objects.
 
 The provisioned layout is **one bucket per concern per environment**, not one
 shared bucket. Object key prefixes describe cache scope *within* those buckets;
@@ -30,14 +40,21 @@ integration prerequisites on sibling branches are:
 |---|---|
 | [#2](https://github.com/TogetherWeOwn/nntunev2/pull/2), cache ADR | Physical audio/art buckets are separate per environment; prefixes live inside them. |
 | [#14](https://github.com/TogetherWeOwn/nntunev2/pull/14), scaffold | Replace placeholders only when activating the correct consumer bindings. |
-| [#8](https://github.com/TogetherWeOwn/nntunev2/pull/8), stream | `workers/stream/wrangler.toml` uses `nntune-audio-cache` without environment sections; bind `AUDIO_CACHE` to `nntunev2-audio-staging` / `nntunev2-audio-prod`. |
-| [#10](https://github.com/TogetherWeOwn/nntunev2/pull/10), ingest | Both producer and consumer in `workers/ingest/wrangler.toml.example` use `nntune-ingest-jobs`; use `nntunev2-ingest-staging` / `nntunev2-ingest-prod`. |
+| [#10](https://github.com/TogetherWeOwn/nntunev2/pull/10), ingest | The checked-in example still uses generic `nntune-ingest-jobs` and unsuffixed `nntune-ingest-dlq`, with its consumer commented out. Align producer/consumer queue names and the DLQ route to the per-environment inventory below before enabling a consumer. |
+| `workers/mb/wrangler.toml.example`, MB art cache | The `ART_CACHE` template names only `nntunev2-art-staging`; the prod deploy must override it with `nntunev2-art-prod` when the binding is activated. |
 | [#11](https://github.com/TogetherWeOwn/nntunev2/pull/11), E2E | Supply the two pending Access client secrets before enabling the staging URL; see the Access section. |
 
 Their owners must coordinate these fixes at the next permitted review round and
 recheck actual bindings before deployment. This runbook does not change those
-branches, certify a deploy, or choose where the cache ADR's `tmp/` scratch prefix
-will live. Archive buckets are not implicitly scratch storage.
+branches or certify a deploy. Scratch storage is separate from archive buckets.
+The two scratch buckets are isolated by environment, and their live lifecycle
+rules were verified on 2026-10-17 as described above. Read-only Worker metadata
+showed no active production NNTune Worker deployment; the active staging
+`nntune-web-staging` version has no R2 bindings, and no ingest Worker is
+currently deployed. Thus neither archive bucket is bound as scratch storage by
+a deployed NNTune Worker. This check inspects Worker configuration only; it did
+not enumerate bucket objects or rule out out-of-band S3/API clients. Do not use
+archive buckets as scratch storage.
 
 | Bucket | Env | Intended consumer |
 |---|---|---|
@@ -47,6 +64,8 @@ will live. Archive buckets are not implicitly scratch storage.
 | `nntunev2-art-prod` | prod | MusicBrainz Worker artwork cache |
 | `nntunev2-archive-staging` | staging | reserved archive capacity; no Worker consumer configured |
 | `nntunev2-archive-prod` | prod | reserved archive capacity; no Worker consumer configured |
+| `nntunev2-ingest-scratch-staging` | staging | ingest repair scratch; live `ingest-scratch/` object expiry verified 2026-10-17 at 604800 seconds |
+| `nntunev2-ingest-scratch-prod` | prod | ingest repair scratch; live `ingest-scratch/` object expiry verified 2026-10-17 at 604800 seconds |
 
 The archive buckets were requested at provisioning time. They are not evidence
 of an implemented archival pipeline and must not be bound to a Worker by default.
@@ -58,12 +77,30 @@ UNDO (decommissioning reference, not an instruction to execute):
 consumer removal and data-retention checks. Never delete cached/archive data as
 part of a documentation fix.
 
-### Queues (created 2026-10-13)
+### Queues (metadata GET-verified 2026-10-17)
 
-| Queue | ID | Env |
-|---|---|---|
-| `nntunev2-ingest-staging` | `c9e6afdea0ca487c8d20f799a052b045` | staging |
-| `nntunev2-ingest-prod` | `2bf7e1a0edd347c9aada2afbc0c24ae5` | prod |
+Read-only Cloudflare Queues API list/get and consumer-list responses on
+2026-10-17 confirmed the reported DLQ names and IDs. Both queues were created
+2026-10-16. The API reported `settings.message_retention_period = 345600`
+seconds (4 days) for each; this is the observed setting, not an assumption from
+the default. Cloudflare documents four days as the default DLQ retention when
+there is no active consumer ([DLQ documentation](https://developers.cloudflare.com/queues/configuration/dead-letter-queues/)); both API responses also reported zero consumers. A consumer-list GET for each queue returned an empty list.
+
+| Queue | ID | Env | Observed retention | Consumers |
+|---|---|---|---|---|
+| `nntunev2-ingest-staging` | `c9e6afdea0ca487c8d20f799a052b045` | staging | 345600 seconds (4 days) | 0 |
+| `nntunev2-ingest-prod` | `2bf7e1a0edd347c9aada2afbc0c24ae5` | prod | 345600 seconds (4 days) | 0 |
+| `nntunev2-ingest-dlq-staging` | `e7ab1d4b284f44f094c5fe62f9bf96a5` | staging DLQ | 345600 seconds (4 days) | 0 |
+| `nntunev2-ingest-dlq-prod` | `e9d0a9f5549249df9eebaa5c00951328` | prod DLQ | 345600 seconds (4 days) | 0 |
+
+**Routing discrepancy; stop before configuration changes.** The only checked-in
+ingest Wrangler configuration is `workers/ingest/wrangler.toml.example`. Its
+producer and commented consumer use `nntune-ingest-jobs`; its DLQ producer and
+commented `dead_letter_queue` use the unsuffixed `nntune-ingest-dlq`. The
+consumer block remains commented, and this example does not distinguish staging
+from production. These values do not match the environment-specific queue names
+in the table above. No queue or message was changed or consumed; do not enable
+or alter routing until the owning integration lane reconciles this discrepancy.
 
 UNDO: API `DELETE /accounts/<acct>/queues/<queue_id>` after authorized
 consumer removal and pending-message checks.
@@ -193,8 +230,28 @@ this documentation update, nor evidence of separate compute/failure domains.
   write denial, and bidirectional cross-database CONNECT denial. The earlier
   seven-role `select 1` probe predates consolidation and is not current proof.
 - MB migrator/runtime/read-only roles were provisioned separately. The latest
-  app-isolation receipt does not prove MB read-only enforcement; verify MB grants
-  before application use. Never copy database URLs into this repo, issues, or logs.
+  app-isolation receipt does not prove MB read-only enforcement. On 2026-10-17,
+  this agent attempted to locate an authorized read-only SQL executor through the
+  Paperclip connection catalog; both searches timed out. No direct SQL session or
+  host-side verification receipt was available in this workspace. Accordingly,
+  **the MB app role's live grants remain unverified**; the older receipt's claim
+  that the MB binding uses a read-only role is host-reported only.
+- Exact checks still required against the MB database using the authorized
+  read-only verification path: establish the database/schema and effective role
+  identity without exposing connection details; run a representative `SELECT`
+  against a required mirror table; inspect effective table/schema privileges and
+  default privileges; and confirm representative `INSERT`/`UPDATE`/`DELETE`,
+  sequence-write, and schema/table DDL privileges are denied. A denial must be
+  established from the effective role's actual privilege result or a safely
+  rolled-back, non-mutating authorization check; do not attempt a write that
+  could change data. No check above was run here, so neither SELECT success nor
+  write/DDL denial is claimed.
+- Authorized follow-up: the Operator should use the existing secure host-side
+  read-only verification path to run and return the checks above, reporting only
+  date, environment/database and role labels, check expressions/categories, and
+  outcomes. Do not send or record URLs, passwords, tokens, hostnames, or personal
+  login identities; do not alter grants or roles. Update this evidence only from
+  that direct result, keeping host-reported statements clearly distinguished.
 
 ### Hyperdrive bindings
 
@@ -238,7 +295,11 @@ traffic; the MB mirror config may stay cached. Deploy checklist (with
 `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID` exported):
 `workers/api/check_hyperdrive_cache.sh --config-id $HYPERDRIVE_ID_STAGING`
 (and prod) must report `caching.disabled=true`. The gate fails closed
-(exit 3) without credentials; `--allow-skip` is only for secret-less CI.
+(exit 3) without credentials; `--allow-skip` is only for secret-less CI
+and MUST NOT be used in real deploys. The Worker additionally refuses to
+serve traffic without `HYPERDRIVE_CACHING_DISABLED=1` for that env — set
+it only after the gate passes for that Hyperdrive config (runtime
+attestation, fail-closed generic 500 otherwise).
 Template and contract:
 `workers/api/wrangler.toml.example`, `workers/api/README.md`.
 
@@ -259,13 +320,33 @@ Binding names are chosen in Worker configs; resource names must match this table
 | R2 audio / stream Worker | `nntunev2-audio-staging` | `nntunev2-audio-prod` |
 | R2 artwork / MB Worker | `nntunev2-art-staging` | `nntunev2-art-prod` |
 | R2 archive / reserved, no consumer | `nntunev2-archive-staging` | `nntunev2-archive-prod` |
+| Ingest scratch (bucket existence and 7-day lifecycle verified 2026-10-17) | `nntunev2-ingest-scratch-staging` (`ingest-scratch/`; 604800-second expiry) | `nntunev2-ingest-scratch-prod` (`ingest-scratch/`; 604800-second expiry) |
 | Ingest Queue | `nntunev2-ingest-staging` | `nntunev2-ingest-prod` |
+| Ingest DLQ / no consumer observed (Cloudflare metadata GET 2026-10-17; 345600 seconds observed, matching documented 4-day default with no active consumer) | `nntunev2-ingest-dlq-staging` (`e7ab1d4b284f44f094c5fe62f9bf96a5`) | `nntunev2-ingest-dlq-prod` (`e9d0a9f5549249df9eebaa5c00951328`) |
 | Config KV | `nntunev2-config-staging` | `nntunev2-config-prod` |
 | Hostname | `v2-staging.nntune.com` (+ Access; deployment pending) | TBD at launch |
 | App Hyperdrive variable | `HYPERDRIVE_ID_STAGING` | `HYPERDRIVE_ID_PROD` |
 | App PlanetScale branch / PostgreSQL database | `nntunev2` / `main` / `nntunev2_staging` | same `main` cluster / currently `postgres`; clean launch DB deferred |
 | MB Hyperdrive variable | `HYPERDRIVE_ID_MB` (shared mirror) | `HYPERDRIVE_ID_MB` (shared mirror) |
 | Migration secret | `PLANETSCALE_MIGRATOR_URL_STAGING` | intentionally deferred to gated workflow |
+
+## Binding parity check
+
+CI job `binding-parity` (part of `ci-ok`) discovers Wrangler TOML, JSON and
+JSONC configs recursively under `workers/` and `apps/`, then diffs mapped TOML
+configs against this inventory for staging and prod. JSON/JSONC configs are
+reported when unmapped and fail closed if mapped until parser support is added.
+Required bindings per Worker are mapped
+in `.github/scripts/binding_manifest.toml`, and
+`python3 .github/scripts/binding_parity.py` fails on a missing binding,
+staging/prod skew, or a resource name absent from the matrix or tables
+above, naming the Worker, environment and binding. Resource-name drift
+that predates the value-alignment work (see the reconciliation table
+near the top of this document) is recorded as exact-match
+`[[known_drift]]` manifest entries; delete each entry when its
+wrangler value is aligned — the check fails on a stale entry. Changing
+the binding values themselves, and KV key parity, are separate lanes
+and out of scope for this check.
 
 ## Worker bindings
 
@@ -288,10 +369,13 @@ this table.
 | `mb` / `ingest` (at activation) | `MB_CACHE` / `INGEST_STATE` / `INGEST_PAYLOADS` | KV | reserved `nntunev2-config-staging` | reserved `nntunev2-config-prod` | staging `1d4f21508a214ebfa8ff7b594989d6f6`; prod `9664ceed71464521bb6baae2d9374006`; assigned at activation, never by default |
 
 Known config drift (tracked in the R2 reconciliation table, fixed by the
-owning lanes, not here): the committed `workers/stream/wrangler.toml` still
-binds `AUDIO_CACHE` to `nntune-audio-cache` with no environment sections,
-and `workers/ingest/wrangler.toml.example` still names the queue
-`nntune-ingest-jobs`.
+owning lanes, not here): `workers/ingest/wrangler.toml.example` still names
+`nntune-ingest-jobs` for the producer and commented consumer, and the unsuffixed
+`nntune-ingest-dlq` for the DLQ producer and commented `dead_letter_queue`.
+Neither environment is represented by these values. Align producer, consumer,
+and DLQ names to the per-environment inventory before enabling the configs. Do
+not add a nested `[[queues.consumers.dead_letter_queue]]` table: Wrangler
+rejects that shape, so it will not configure dead-letter routing.
 
 ## Staging promotion checklist
 

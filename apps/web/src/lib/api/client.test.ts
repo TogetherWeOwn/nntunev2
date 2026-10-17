@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { ApiClient, ApiError, toProviderTestInput, toVaultSaveBody } from './client.js';
+import { onPaywall, type PaywallModel } from '../billing/planLimit.js';
+import { KNOWN_ERROR_CODES } from './errors.js';
+import apiErrorsRaw from '../../../../../docs/api-errors.md?raw';
 // Canonical web/Worker contract, shared with the Rust handlers suite (which
 // asserts every route is served). Change both sides in the same PR.
 import contractRaw from '../../../../../workers/api/tests/fixtures/api-web-contract.json?raw';
@@ -15,6 +18,12 @@ interface ContractRoute {
 }
 
 const contract = JSON.parse(contractRaw) as { version: number; routes: ContractRoute[] };
+const documentedErrorCodes = new Set(
+	apiErrorsRaw.split('\n').flatMap((line) => {
+		const code = line.match(/^\| `([^`]+)` \|/)?.[1];
+		return code ? [code] : [];
+	})
+);
 
 function jsonResponse(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {
@@ -22,6 +31,12 @@ function jsonResponse(body: unknown, status = 200): Response {
 		headers: { 'content-type': 'application/json' }
 	});
 }
+
+describe('API error code registry', () => {
+	it('keeps the web parser codes aligned with docs/api-errors.md', () => {
+		expect([...KNOWN_ERROR_CODES].sort()).toEqual([...documentedErrorCodes].sort());
+	});
+});
 
 describe('toProviderTestInput', () => {
 	it('trims the provider host to match validation and server rules', () => {
@@ -138,6 +153,98 @@ describe('ApiClient', () => {
 		const failure = await client.get('/me').catch((error: unknown) => error);
 		expect(failure).toBeInstanceOf(ApiError);
 		expect((failure as ApiError).status).toBe(500);
+		expect((failure as ApiError).paywall).toBeNull();
+	});
+
+	it('shows 402 paywalls and still reads the original error body', async () => {
+		const models: PaywallModel[] = [];
+		const unsubscribe = onPaywall((model) => models.push(model));
+		const fetchFn = vi.fn(async () => jsonResponse({ code: 'plan_limit_exceeded', error: 'limit reached' }, 402));
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/me').catch((error: unknown) => error);
+		unsubscribe();
+
+		expect(failure).toBeInstanceOf(ApiError);
+		expect((failure as ApiError).message).toBe('limit reached');
+		expect((failure as ApiError).code).toBe('plan_limit_exceeded');
+		expect((failure as ApiError).paywall?.kind).toBe('terminal');
+		expect(models).toHaveLength(1);
+		expect(models[0]?.status).toBe(402);
+	});
+
+	it('shows 429 paywalls with Retry-After timing', async () => {
+		const models: PaywallModel[] = [];
+		const unsubscribe = onPaywall((model) => models.push(model));
+		const fetchFn = vi.fn(
+			async () =>
+				new Response(JSON.stringify({ code: 'rate_limited' }), {
+					status: 429,
+					headers: { 'content-type': 'application/json', 'Retry-After': '45' }
+				})
+		);
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/me').catch((error: unknown) => error);
+		unsubscribe();
+
+		expect(failure).toBeInstanceOf(ApiError);
+		expect((failure as ApiError).paywall?.kind).toBe('retryable');
+		expect(models[0]?.retryAfterSeconds).toBe(45);
+	});
+
+	it('reads code, message, and retryable from the error envelope', async () => {
+		const fetchFn = vi.fn(async () =>
+			jsonResponse({ code: 'rate_limited', message: 'too many requests', retryable: true }, 429)
+		);
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/me').catch((error: unknown) => error);
+		expect(failure).toBeInstanceOf(ApiError);
+		expect((failure as ApiError).code).toBe('rate_limited');
+		expect((failure as ApiError).message).toBe('too many requests');
+		expect((failure as ApiError).retryable).toBe(true);
+	});
+
+	it('exposes the 402 plan-limit envelope as non-retryable', async () => {
+		const fetchFn = vi.fn(async () =>
+			jsonResponse({ code: 'plan_limit_exceeded', message: 'plan limit reached', retryable: false }, 402)
+		);
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/me').catch((error: unknown) => error);
+		expect((failure as ApiError).code).toBe('plan_limit_exceeded');
+		expect((failure as ApiError).retryable).toBe(false);
+	});
+
+	it('preserves server retryable:false on corrupt_content@502 where status fallback would retry', async () => {
+		// `retryableFromStatus(502)` is `true`, so a client that ignored the
+		// server flag and derived retryability from status would retry corrupt
+		// content forever. The server flag (`false`) must win.
+		const fetchFn = vi.fn(async () =>
+			jsonResponse(
+				{ code: 'corrupt_content', message: 'segment could not be decoded', retryable: false },
+				502
+			)
+		);
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/me').catch((error: unknown) => error);
+		expect((failure as ApiError).code).toBe('corrupt_content');
+		expect((failure as ApiError).message).toBe('segment could not be decoded');
+		expect((failure as ApiError).retryable).toBe(false);
+	});
+
+	it('falls back generically for unknown codes and preserves server retryability', async () => {
+		const fetchFn = vi.fn(async () =>
+			jsonResponse({ code: 'future_code', message: 'from a newer server', retryable: false }, 429)
+		);
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/me').catch((error: unknown) => error);
+		expect((failure as ApiError).code).toBe('request_failed');
+		expect((failure as ApiError).message).toBe('from a newer server');
+		expect((failure as ApiError).retryable).toBe(false);
 	});
 
 	it('maps 401 to the unauthorized code', async () => {
@@ -147,6 +254,26 @@ describe('ApiClient', () => {
 		const failure = await client.get('/me').catch((error: unknown) => error);
 		expect(failure).toBeInstanceOf(ApiError);
 		expect((failure as ApiError).code).toBe('unauthorized');
+	});
+
+	it.each([
+		[400, 'invalid_request'],
+		[402, 'plan_limit_exceeded'],
+		[403, 'forbidden'],
+		[404, 'not_found'],
+		[413, 'payload_too_large'],
+		[416, 'range_not_satisfiable'],
+		[422, 'validation_failed'],
+		[429, 'rate_limited'],
+
+		[503, 'service_unavailable'],
+		[502, 'request_failed']
+	])('derives legacy error code for status %i', async (status, code) => {
+		const fetchFn = vi.fn(async () => jsonResponse({ error: 'legacy failure' }, status));
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/me').catch((error: unknown) => error);
+		expect((failure as ApiError).code).toBe(code);
 	});
 
 	it('posts JSON bodies with the right content type', async () => {
@@ -201,6 +328,25 @@ describe('ApiClient', () => {
 		expect(seenUrls).toEqual(['https://api.example.com/v1/auth/magic/start']);
 	});
 
+	it('starts session-bound passkey reauthentication with credentials included', async () => {
+		const seen: { url: unknown; init: RequestInit }[] = [];
+		const fetchFn = (async (url: unknown, init: RequestInit) => {
+			seen.push({ url, init });
+			return jsonResponse({ challenge: 'fresh-challenge', rp_id: 'example.com', allow_credentials: [] });
+		}) as unknown as typeof fetch;
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		await expect(client.reauthenticateStart()).resolves.toEqual({
+			challenge: 'fresh-challenge',
+			rp_id: 'example.com',
+			allow_credentials: []
+		});
+		expect(seen.map(({ url }) => url)).toEqual([
+			'https://api.example.com/v1/session/reauthenticate/start'
+		]);
+		expect(seen[0].init).toEqual(expect.objectContaining({ method: 'POST', credentials: 'include' }));
+	});
+
 	it('signs out through the session endpoint so a swapped user can recover', async () => {
 		const seen: { url: unknown; init: RequestInit }[] = [];
 		const fetchFn = (async (url: unknown, init: RequestInit) => {
@@ -212,6 +358,38 @@ describe('ApiClient', () => {
 		await expect(client.logout()).resolves.toBeUndefined();
 		expect(seen.map(({ url }) => url)).toEqual(['https://api.example.com/v1/session/logout']);
 		expect(seen.map(({ init }) => init.method)).toEqual(['POST']);
+	});
+
+	it('revokes all sessions with an authenticated empty JSON POST', async () => {
+		const seen: { url: unknown; init: RequestInit }[] = [];
+		const fetchFn = (async (url: unknown, init: RequestInit) => {
+			seen.push({ url, init });
+			return jsonResponse({ ok: true });
+		}) as unknown as typeof fetch;
+		const client = new ApiClient({ baseUrl: 'https://api.example.com/', fetchFn });
+
+		await expect(client.revokeAllSessions()).resolves.toEqual({ ok: true });
+		expect(seen).toEqual([
+			{
+				url: 'https://api.example.com/v1/session/revoke-all',
+				init: expect.objectContaining({
+					method: 'POST',
+					body: '{}',
+					credentials: 'include',
+					headers: expect.objectContaining({ 'content-type': 'application/json' })
+				})
+			}
+		]);
+	});
+
+	it.each([401, 500])('preserves the typed ApiError for revoke-all status %i', async (status) => {
+		const fetchFn = vi.fn(async () => jsonResponse({ error: 'revoke failed' }, status));
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.revokeAllSessions().catch((error: unknown) => error);
+		expect(failure).toBeInstanceOf(ApiError);
+		expect((failure as ApiError).status).toBe(status);
+		expect((failure as ApiError).code).toBe(status === 401 ? 'unauthorized' : 'request_failed');
 	});
 
 	it('nests the provider fields under the save envelope', () => {
@@ -388,6 +566,10 @@ describe('ApiClient', () => {
 			} else if (route.web === 'loginFinish') {
 				await client.loginFinish(
 					route.input as unknown as Parameters<typeof client.loginFinish>[0]
+				);
+			} else if (route.web === 'reauthenticateFinish') {
+				await client.reauthenticateFinish(
+					route.input as unknown as Parameters<typeof client.reauthenticateFinish>[0]
 				);
 			} else if (route.web === 'testProviderConnection') {
 				await client.testProviderConnection(

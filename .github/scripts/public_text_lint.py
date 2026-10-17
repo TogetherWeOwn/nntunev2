@@ -110,6 +110,8 @@ HOST_FIXTURE_EXCLUSIONS = frozenset(
         # asserted rejected (DNS-guard fake resolver, dial-prefix validation).
         "workers/api/src/handlers.rs",
         "workers/api/src/vault.rs",
+        # Ingest SSRF tests assert link-local and RFC-1918 addresses rejected.
+        "workers/ingest/tests/nzb_fetch_ssrf_guard.rs",
     }
 )
 

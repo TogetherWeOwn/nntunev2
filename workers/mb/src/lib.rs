@@ -1,6 +1,7 @@
 //! NNTune v2 MusicBrainz mirror read API.
 //!
 //! Routes (all JSON, all read-only):
+//! - `GET /healthz` — unauthenticated Worker health check; no bindings.
 //! - `GET /v1/mb/artist/:mbid` — artist lookup by MBID.
 //! - `GET /v1/mb/release/:mbid` — release lookup by MBID.
 //! - `GET /v1/mb/recording/:mbid` — recording lookup by MBID.
@@ -10,9 +11,10 @@
 //! binding `MB_DB`; successful responses are cached in KV (`MB_CACHE`) and
 //! at the edge via the Cache API / `Cache-Control`. Failures (400/404/500)
 //! are `no-store` and are never written to either cache. Interactive reads
-//! never call musicbrainz.org. Cover art bytes live in the per-environment
-//! R2 art buckets (`nntunev2-art-staging` / `nntunev2-art-prod`); this
-//! worker serves cacheable URLs, never secrets. See `README.md` and
+//! never call musicbrainz.org. Cover art bytes are intended for the
+//! per-environment R2 buckets (`nntunev2-art-staging` / `nntunev2-art-prod`,
+//! see `docs/ops.md`). Public release URLs are deferred until bucket
+//! bindings and public hosts are activated. See `README.md` and
 //! `migrations/0001_mb_mirror.sql`.
 //!
 //! Structure: [`handle_lookup`] / [`handle_search`] are the testable core
@@ -20,6 +22,9 @@
 //! `tokio-postgres` client over the Hyperdrive socket and to the KV binding.
 
 use serde::Serialize;
+
+mod api_error;
+use api_error::ApiError;
 
 /// Cache TTLs: lookups are immutable-ish (long TTL), search is short TTL.
 /// They apply to successful responses only; failures serve `no-store`.
@@ -36,6 +41,36 @@ const MAX_QUERY_CHARS: usize = 100;
 /// Hyperdrive / KV binding names: must match `wrangler.toml.example`.
 const MB_DB_BINDING: &str = "MB_DB";
 const MB_CACHE_BINDING: &str = "MB_CACHE";
+
+/// R2 cover-art buckets per `docs/ops.md` ("R2 buckets", "Environments
+/// matrix"): one bucket per concern per environment. There is no shared
+/// unsuffixed art bucket; always use one of the two names below.
+pub const ART_BUCKET_STAGING: &str = "nntunev2-art-staging";
+pub const ART_BUCKET_PROD: &str = "nntunev2-art-prod";
+
+/// Resolve the cover-art bucket for an environment name: `"staging"` maps
+/// to the staging bucket; `"prod"` and `"production"` (the wrangler env
+/// name) map to the prod bucket. Anything else (including empty) resolves
+/// to `None` so a missing or mistyped env can never silently target prod
+/// art. Release responses do not use this mapping until a public host is
+/// configured.
+pub fn art_bucket_for_env(env: &str) -> Option<&'static str> {
+    match env {
+        "staging" => Some(ART_BUCKET_STAGING),
+        "prod" | "production" => Some(ART_BUCKET_PROD),
+        _ => None,
+    }
+}
+
+/// Build an internal object URI for an art key (for example
+/// `art/ab/cd/<sha>-500`, ADR 0003) in the given bucket. This `r2://` URI
+/// is not a public HTTP URL and must not be sent to clients. This helper is
+/// not used by runtime response handling; release reads pass the stored
+/// `caa_url` through unchanged until a custom domain or r2.dev host is configured.
+pub fn caa_url_for_art(bucket: &str, key: &str) -> String {
+    let key = key.trim_start_matches('/');
+    format!("r2://{bucket}/{key}")
+}
 
 /// Entity selector. The only route into SQL: each variant maps to a
 /// static, parameterized statement (see [`lookup_sql`]/[`search_sql`]), so
@@ -277,11 +312,10 @@ struct ApiResponse {
     cache_ttl: Option<u32>,
 }
 
-fn error_response(message: &str, status: u16) -> ApiResponse {
-    let body = serde_json::json!({ "error": message }).to_string();
+fn error_response(err: ApiError) -> ApiResponse {
     ApiResponse {
-        status,
-        body,
+        status: err.status,
+        body: err.body_json(),
         cache_ttl: None,
     }
 }
@@ -294,6 +328,42 @@ fn success_response(body: String, ttl_s: u32) -> ApiResponse {
     }
 }
 
+fn health_response() -> http::Response<Vec<u8>> {
+    http::Response::builder()
+        .status(http::StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .body(r#"{"ok":true}"#.as_bytes().to_vec())
+        .expect("static health response is valid")
+}
+
+struct HealthResponseParts {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+fn health_response_parts() -> HealthResponseParts {
+    let response = health_response();
+    HealthResponseParts {
+        status: response.status().as_u16(),
+        headers: response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value
+                        .to_str()
+                        .expect("static health header is valid")
+                        .to_owned(),
+                )
+            })
+            .collect(),
+        body: response.into_body(),
+    }
+}
+
 /// Lookup core: validate → KV → DB. Only a found row is written to the
 /// cache; missing rows (404) and read failures (500) never are.
 async fn handle_lookup<R: MbRepo, C: SuccessCache>(
@@ -303,7 +373,7 @@ async fn handle_lookup<R: MbRepo, C: SuccessCache>(
     mbid: &str,
 ) -> ApiResponse {
     if !is_valid_mbid(mbid) {
-        return error_response("invalid mbid (must be UUID)", 400);
+        return error_response(ApiError::invalid_request("invalid mbid (must be UUID)"));
     }
     let key = lookup_cache_key(kind, mbid);
     if let Some(body) = cache.get(&key).await {
@@ -315,8 +385,8 @@ async fn handle_lookup<R: MbRepo, C: SuccessCache>(
             cache.put(&key, &body, LOOKUP_CACHE_TTL_S).await;
             success_response(body, LOOKUP_CACHE_TTL_S)
         }
-        Ok(None) => error_response("not found", 404),
-        Err(_) => error_response("internal error", 500),
+        Ok(None) => error_response(ApiError::not_found("not found")),
+        Err(_) => error_response(ApiError::internal_error()),
     }
 }
 
@@ -332,17 +402,23 @@ async fn handle_search<R: MbRepo, C: SuccessCache>(
     let q = raw_q.trim();
     let q_chars = q.chars().count();
     if q_chars < 2 {
-        return error_response("query too short (min 2 chars)", 400);
+        return error_response(ApiError::invalid_request("query too short (min 2 chars)"));
     }
     if q_chars > MAX_QUERY_CHARS {
-        return error_response("query too long (max 100 chars)", 400);
+        return error_response(ApiError::invalid_request("query too long (max 100 chars)"));
     }
     if q.chars().any(char::is_control) {
-        return error_response("query contains control characters", 400);
+        return error_response(ApiError::invalid_request(
+            "query contains control characters",
+        ));
     }
     let kind = match Kind::parse(raw_kind) {
         Some(kind) => kind,
-        None => return error_response("type must be one of artist|release|recording", 400),
+        None => {
+            return error_response(ApiError::invalid_request(
+                "type must be one of artist|release|recording",
+            ))
+        }
     };
     let key = search_cache_key(kind, q);
     if let Some(body) = cache.get(&key).await {
@@ -366,7 +442,7 @@ async fn handle_search<R: MbRepo, C: SuccessCache>(
             cache.put(&key, &body, SEARCH_CACHE_TTL_S).await;
             success_response(body, SEARCH_CACHE_TTL_S)
         }
-        Err(_) => error_response("internal error", 500),
+        Err(_) => error_response(ApiError::internal_error()),
     }
 }
 
@@ -562,6 +638,17 @@ mod http_layer {
         serve(req.url()?.to_string(), api).await
     }
 
+    pub fn healthz_route() -> WorkerResult<Response> {
+        let health = health_response_parts();
+        let headers = Headers::new();
+        for (name, value) in health.headers {
+            headers.append(&name, &value)?;
+        }
+        Ok(Response::from_body(ResponseBody::Body(health.body))?
+            .with_status(health.status)
+            .with_headers(headers))
+    }
+
     pub async fn search_route(req: &Request, ctx: &RouteContext<()>) -> WorkerResult<Response> {
         if let Some(hit) = edge_hit(req).await {
             return Ok(hit);
@@ -584,7 +671,7 @@ mod http_layer {
     }
 
     pub async fn not_found() -> WorkerResult<Response> {
-        render(&error_response("not found", 404))
+        render(&error_response(ApiError::not_found("not found")))
     }
 }
 
@@ -595,6 +682,7 @@ pub async fn main(
     _ctx: worker::Context,
 ) -> worker::Result<worker::Response> {
     worker::Router::new()
+        .get_async("/healthz", |_, _| async { http_layer::healthz_route() })
         .get_async("/v1/mb/artist/:mbid", |req, ctx| async move {
             http_layer::lookup_route(Kind::Artist, &req, &ctx).await
         })
@@ -702,6 +790,73 @@ mod tests {
     }
 
     #[test]
+    fn health_response_is_uncached_json_without_dependencies() {
+        let response = health_response_parts();
+        assert_eq!(response.status, http::StatusCode::OK.as_u16());
+        assert_eq!(response.headers.len(), 2);
+        assert!(response
+            .headers
+            .contains(&("content-type".to_owned(), "application/json".to_owned())));
+        assert!(response
+            .headers
+            .contains(&("cache-control".to_owned(), "no-store".to_owned())));
+        assert_eq!(response.body, br#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn healthz_route_contract_precedes_the_catchall() {
+        // Worker Response/Headers require wasm-bindgen, so pin the production
+        // route and adapter source while testing the HTTP contract natively.
+        let source = include_str!("lib.rs");
+        let router = source
+            .split_once("\n#[worker::event(fetch)]\npub async fn main")
+            .expect("worker entrypoint must exist")
+            .1
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .expect("test module must follow the worker entrypoint")
+            .0;
+        let route = router
+            .find(".get_async(\"/healthz\", |_, _| async { http_layer::healthz_route() })")
+            .expect("GET /healthz must dispatch to its handler");
+        let catchall = router
+            .find(".or_else_any_method_async")
+            .expect("router must retain its catch-all");
+        assert!(
+            route < catchall,
+            "healthz must be registered before catch-all"
+        );
+        assert_eq!(router.matches("\"/healthz\"").count(), 1);
+
+        let handler = source
+            .split_once("pub fn healthz_route() -> WorkerResult<Response> {")
+            .expect("healthz handler must exist")
+            .1
+            .split_once("\n    }\n")
+            .expect("healthz handler must close")
+            .0;
+        let compact = |text: &str| {
+            text.chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+        };
+        assert_eq!(
+            compact(handler),
+            compact(
+                r#"let health = health_response_parts();
+        let headers = Headers::new();
+        for (name, value) in health.headers {
+            headers.append(&name, &value)?;
+        }
+        Ok(
+            Response::from_body(ResponseBody::Body(health.body))?
+                .with_status(health.status)
+                .with_headers(headers)
+        )"#
+            )
+        );
+    }
+
+    #[test]
     fn lookup_sql_is_parameterized_per_kind() {
         for (kind, table) in [
             (Kind::Artist, "mb_artist"),
@@ -803,6 +958,79 @@ mod tests {
     }
 
     #[test]
+    fn error_routes_return_the_shared_envelope() {
+        // Representative error routes: validation (400), missing (404), and
+        // repository failure (500) all carry {code, message, retryable}.
+        let repo = FakeRepo::default();
+        let cache = FakeCache::default();
+        let bad = block_on(handle_lookup(&repo, &cache, Kind::Artist, "nope"));
+        let body: serde_json::Value = serde_json::from_str(&bad.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"code":"invalid_request","message":"invalid mbid (must be UUID)","retryable":false})
+        );
+        let missing = block_on(handle_lookup(&repo, &cache, Kind::Artist, MBID));
+        let body: serde_json::Value = serde_json::from_str(&missing.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"code":"not_found","message":"not found","retryable":false})
+        );
+        let short_q = block_on(handle_search(
+            &repo,
+            &cache,
+            Some("artist".to_string()),
+            "x",
+        ));
+        let body: serde_json::Value = serde_json::from_str(&short_q.body).unwrap();
+        assert_eq!(body["code"], "invalid_request");
+        assert_eq!(body["retryable"], false);
+    }
+
+    #[test]
+    fn art_bucket_env_matrix_matches_ops_inventory() {
+        assert_eq!(ART_BUCKET_STAGING, "nntunev2-art-staging");
+        assert_eq!(ART_BUCKET_PROD, "nntunev2-art-prod");
+        assert_ne!(ART_BUCKET_STAGING, ART_BUCKET_PROD);
+        assert_eq!(art_bucket_for_env("staging"), Some(ART_BUCKET_STAGING));
+        assert_eq!(art_bucket_for_env("prod"), Some(ART_BUCKET_PROD));
+        assert_eq!(art_bucket_for_env("production"), Some(ART_BUCKET_PROD));
+        // Unknown or missing env resolves to nothing: never silently prod.
+        assert_eq!(art_bucket_for_env(""), None);
+        assert_eq!(art_bucket_for_env("dev"), None);
+    }
+
+    #[test]
+    fn caa_url_builder_embeds_bucket_and_key() {
+        let url = caa_url_for_art(ART_BUCKET_STAGING, "art/ab/cd/0123456789abcdef-500");
+        assert!(url.contains(ART_BUCKET_STAGING), "{url}");
+        assert!(url.contains("art/ab/cd/0123456789abcdef-500"), "{url}");
+        assert!(!url.contains(ART_BUCKET_PROD), "{url}");
+        // Leading slashes do not produce an empty path segment.
+        let slashed = caa_url_for_art(ART_BUCKET_PROD, "/art/ab/cd/key-250");
+        assert_eq!(slashed, "r2://nntunev2-art-prod/art/ab/cd/key-250");
+    }
+
+    #[test]
+    fn lookup_release_preserves_stored_caa_url_until_public_host_is_configured() {
+        let stored = "https://coverartarchive.org/release/abc/front-500";
+        let repo = FakeRepo {
+            entity: Some(Entity::Release(Release {
+                mbid: MBID.to_string(),
+                artist_mbid: None,
+                title: "Blue Monday".to_string(),
+                release_type: Some("Single".to_string()),
+                year: Some(1983),
+                caa_url: Some(stored.to_string()),
+            })),
+            ..Default::default()
+        };
+        let cache = FakeCache::default();
+        let response = block_on(handle_lookup(&repo, &cache, Kind::Release, MBID));
+        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(body["caa_url"], stored);
+    }
+
+    #[test]
     fn lookup_missing_is_404_and_not_cached() {
         let repo = FakeRepo::default();
         let cache = FakeCache::default();
@@ -821,7 +1049,10 @@ mod tests {
         let cache = FakeCache::default();
         let resp = block_on(handle_lookup(&repo, &cache, Kind::Artist, MBID));
         assert_eq!(resp.status, 500);
-        assert_eq!(resp.body, r#"{"error":"internal error"}"#);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"internal_error","message":"unexpected error","retryable":true}"#
+        );
         assert_eq!(resp.cache_ttl, None);
         assert!(cache.puts.borrow().is_empty());
     }
