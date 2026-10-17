@@ -24,10 +24,12 @@ workers/api/
 
 `migrations/0002_auth_vault.sql` plus `0003` (library), `0004` (challenge
 purpose), `0005` (atomic rate-limit slots and test leases), `0006` (account
-deletion), `0007` (registration-challenge user foreign key) and `0008`
+deletion), `0007` (registration-challenge user foreign key), `0008`
 (database-enforced challenge purpose: CHECK plus an immutability trigger)
-define the Postgres schema (PlanetScale via Hyperdrive). CI applies every
-migration to a throwaway Postgres and runs `tests/sql/*.sql` against it
+and `0015_kek_rotation` (vault `rewrapped_at` marker + `kek_version`
+index, see `docs/security/kek-rotation.md` §2) define the Postgres schema
+(PlanetScale via Hyperdrive). CI applies every migration to a throwaway
+Postgres and runs `tests/sql/*.sql` against it
 (`tests/run_migration_tests.sh`). All queries are parameterized;
 single-use claims execute the conditional `UPDATE ... RETURNING` prepared by
 the core and require exactly one row before any response.

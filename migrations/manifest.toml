@@ -67,3 +67,8 @@ sha256 = "848df4805ac18bc1312689f033c86e90417bd9d53bdbfbb0950813b00e9f0d64"
 file = "0014_mb_import_resume_dlq.sql"
 target = "mirror"
 sha256 = "8385253fbddb464361f30678cfb8464b7c3d73f7ae5614f0eced870876dcef88"
+
+[[migration]]
+file = "0015_kek_rotation.sql"
+target = "app"
+sha256 = "c12d9f869611df9d5a4203ba96089aea41c88e3c1e85714dfdcff2e9cf474529"
