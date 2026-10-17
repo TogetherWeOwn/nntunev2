@@ -161,6 +161,7 @@ test.describe('credential scope (static pins)', () => {
       'health.spec.ts',
       'ingest-play-meter.spec.ts',
       'signup-byop.spec.ts',
+      'demo-audio-contract.spec.ts',
       'demo-media-sessionless.spec.ts',
     ]) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
@@ -171,6 +172,7 @@ test.describe('credential scope (static pins)', () => {
     for (const name of [
       'health.spec.ts',
       'ingest-play-meter.spec.ts',
+      'demo-audio-contract.spec.ts',
       'demo-media-sessionless.spec.ts',
     ]) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
