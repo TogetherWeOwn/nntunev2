@@ -456,6 +456,55 @@ jobs:
       - name: Unit-test the guard
         run: python3 .github/scripts/test_check_archive_bindings.py
 
+  # Docs internal-link lint: broken file links/anchors in changed markdown
+  # (roadmap, matrix, ops, ADRs) fail the build. The lint step is scoped to
+  # changed files and the self-test step pins the whole tree clean, so only
+  # a PR that introduces breakage (source or target side) can go red;
+  # external links are out of scope. The fixture pair proves the job goes
+  # red on breakage: `match` must pass, `broken-file` / `broken-anchor`
+  # must fail. Keep this job id in ci-ok's needs.
+  docs-links:
+    name: docs-links
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Compare pushes with their previous tip; comparing main to itself would miss drift.
+    env:
+      DOCS_LINKS_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000' && github.event.before || 'main' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check internal links in changed docs
+        run: python3 .github/scripts/docs_link_lint.py --root . --base-ref "$DOCS_LINKS_BASE_REF"
+      - name: Run docs-link lint self-tests
+        run: python3 .github/scripts/test_docs_link_lint.py
+      - name: Lint whole tree on this repo
+        run: python3 .github/scripts/docs_link_lint.py --root .
+      - name: Lint passes on the matching fixture
+        run: python3 .github/scripts/docs_link_lint.py --root .github/scripts/fixtures/docs-links/match
+      - name: Lint goes red on broken-link fixtures
+        run: |
+          for fixture in broken-file broken-anchor; do
+            expected="target file does not exist"
+            if [ "$fixture" = "broken-anchor" ]; then
+              expected="anchor does not exist"
+            fi
+            rc=0
+            output=$(python3 .github/scripts/docs_link_lint.py \
+              --root ".github/scripts/fixtures/docs-links/$fixture" 2>&1) || rc=$?
+            if [ "$rc" -ne 1 ] || ! printf '%s\n' "$output" | grep -Fq "docs-links: $expected"; then
+              printf '%s\n' "$output" >&2
+              echo "docs-links: $fixture must report '$expected' and exit 1, got $rc" >&2
+              exit 1
+            fi
+            # Neutralise workflow commands: the fixture output holds
+            # ::error lines for fixture-relative paths, which would post
+            # phantom annotations on a green job if echoed raw.
+            printf '%s\n' "$output" | sed 's/^::/ ::/'
+            echo "docs-links: $fixture fixture correctly failed"
+          done
+
   # E2E harness static checks: typecheck + spec discovery with no staging
   # needed, so every PR proves the harness still compiles. The live suite
   # runs in e2e-staging.yml (post-deploy). Keep this job id in ci-ok's needs.
@@ -607,7 +656,7 @@ jobs:
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, mb-import, config-parity, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy]
+    needs: [rust-test, rust-wasm, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, mb-import, config-parity, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
