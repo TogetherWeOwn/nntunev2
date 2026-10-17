@@ -306,7 +306,124 @@ violate it.
   `media-src`/`connect-src` does not cover (browser blocks the calls the
   client tries to make).
 
-## 12. Future Worker deploy-lane rollback: trust assumptions (docs-only)
+## 12. Account-deletion writer fence (fenced writers merged; auth/session bound and stream sink required)
+
+Account deletion first marks `users.deleting_at` and records the
+operation as `scheduled` with a 24-hour cancellable grace window (ADR
+0002 rule 3, normative text in `docs/adr/0002-data-model.md`; persistence
+contract in `workers/api/src/account_deletion.rs`). From the moment the
+marker is set, no writer may create or restore that account's
+user-owned state: every such writer carries the fence **in-statement**,
+selecting through `FROM (SELECT id FROM users WHERE id = $n AND
+deleting_at IS NULL FOR SHARE) AS writer_fence` (`WRITER_FENCE_USER_SQL`).
+`FOR SHARE` conflicts with the scheduling `UPDATE users` (which needs
+the row lock) but not with sibling writers, so the marker either waits
+for an in-flight write or fences every later one — no writer can pass
+the marker check and commit after the marker. A fenced write affects 0
+rows; the caller disambiguates with the lock-free probe
+(`ACCOUNT_DELETING_PROBE_SQL`, never the fence itself) via
+`classify_fenced_write`: 0 rows + marker set is the typed fence
+rejection, 0 rows + fence open (or user gone) stays not-found, and a
+landed write is never reclassified.
+
+Status at this head: the api vault/lease/library fences and the ingest
+upsert fence below are merged; the auth/session `scheduled`-only bound
+and the stream production sink are required by ADR 0002 rule 3 but not
+yet implemented (tracked as F-DEL-01 in §9). Required controls are
+labelled as such throughout — nothing below presents one as merged.
+
+Fenced writers (account-owned creates/restores, api/ingest/stream):
+
+- **api vault credential upsert** (`upsert_vault` in
+  `workers/api/src/worker_entry.rs`): fenced `INSERT ... SELECT`;
+  a 0-row upsert fails closed and the handler classifies it through
+  the `account_deleting` probe into the typed 409. `delete_vault`
+  is deliberately NOT fenced — removal cannot restore state, and the
+  erasure executor deletes the row anyway.
+- **api test-connection lease acquire** (`vault_test_leases` insert in
+  `workers/api/src/worker_entry.rs`): fenced like the upsert, so a
+  deleting account acquires no new lease rows; a fenced lease returns
+  the typed 409 `account_deleting` (probed once), never the boolean
+  collapse.
+- **api library genre/playlist mutations** (`workers/api/src/library.rs`):
+  every create/update/delete statement carries the fence in-statement
+  (user-initiated deletes are deliberately fenced — a 409 during grace);
+  0 affected rows map via `fenced_write_outcome` to
+  `LibraryError::AccountDeleting` (HTTP 409) when the probe shows the
+  marker set, else `NotFound`.
+- **ingest library upsert** (`workers/ingest/src/library.rs`): the write
+  selects through the job owner's `users` row `FOR SHARE`; 0 rows map
+  through `upsert_job_result` to the permanent `account_deleting`
+  failure — never retried behind the delete.
+- **stream usage-ledger / play-event write**
+  (`workers/stream/src/meter.rs`): required, not yet implemented (F-DEL-01)
+  — no production sink exists (`workers/stream/README.md`: metering "is
+  not yet wired into the production `play()` path or production sinks";
+  `UsageLedger` is an in-memory portable-core model, not a live Hyperdrive
+  table). When the sink lands, its INSERT must select through
+  `LEDGER_WRITE_FENCE_SQL`; the portable-core mirror
+  (`UsageLedger::record_fenced`) already reports
+  `RecordOutcome::AccountDeleting` and appends nothing, so a play can
+  never repopulate a deleting account's ledger/event rows. Zero rows is
+  ambiguous under `DO NOTHING` (a duplicate redelivery with an open
+  fence also affects 0 rows), so the production sink must converge with
+  `DO UPDATE` or probe the fence first — healthy duplicates must never
+  read as `account_deleting`.
+
+Exemptions (bounded, ADR 0002 rule 3 — required, not yet implemented,
+F-DEL-01): the auth/session writers needed to cancel during grace (new
+`sessions` login rows, magic-link issue/consume, challenge/assertion,
+sign-count updates, step-up begin/verify/consume, audit writes, rotation,
+cancel-deletion) MUST be exempt ONLY while the account operation is in
+`state = 'scheduled'` (the only state where cancel can win the
+compare-and-set); once it is `running` those writers must be fenced like
+any other. At this head those writers carry no fence in either state
+(plain INSERTs in `workers/api/src/worker_entry.rs`; routes and execution
+are later slices per `workers/api/src/account_deletion.rs`, and nothing
+yet gates on `delete_operations.state`) — the bound lands with the
+cancel-deletion and executor slice. The executor's own cursor/state
+writes are exempt outright. Everything else fails closed.
+
+Stable contract (`docs/api-errors.md` registry,
+`workers/api/src/api_error.rs`): HTTP **409**, `code:
+account_deleting`, **`retryable: false`** — "Nothing was written; do
+not retry unchanged." The api worker owns the wire emission; ingest and
+stream carry the same stable code as a permanent non-retryable
+job/ledger outcome.
+
+**Assumption violations** (each breaks this section; treat as a
+security finding requiring a CISO disposition before merge):
+
+- A create/restore writer without the in-statement fence — e.g. a new
+  writer that skips `writer_fence`, splits the marker check and the
+  write across statements (check-then-write TOCTOU), or gates on the
+  lock-free probe instead of the locked in-statement subquery. Any of
+  these lets a write commit behind the marker and repopulate state the
+  erasure pass already swept.
+- A fence that takes no lock (plain `deleting_at IS NULL` predicate
+  without `FOR SHARE`): reopens the marker race the lock closes.
+- An exemption that outlives its bound (once the F-DEL-01 bound is
+  implemented): auth/session writers exempt while the operation is
+  `running`, any new exemption not tied to the `scheduled` state, or
+  executor writes touching user-owned state beyond cursor/state.
+  Post-grace logins, sessions, or step-up proofs on a doomed account are
+  a takeover/persistence path, not liveness. (The current absence of any
+  auth/session fence is the tracked F-DEL-01 gap, not a new violation of
+  this section.)
+- Fencing a pure removal path (the `delete_vault` inversion):
+  `delete_vault` and the erasure executor's own cleanup must stay
+  unfenced so erasure and cancel cleanup always land.
+  (User-initiated library/playlist UPDATE/DELETE statements are
+  deliberately fenced by design — a 409 during grace — and are not
+  covered by this rule.)
+- Replacing the 409 with any other shape: a retryable 5xx turns the
+  fence into a retry storm behind a delete that never reopens (ingest
+  must keep the permanent-failure mapping); a 404 misleads the client
+  into recreate flows and conflates "fenced" with "not yours / no
+  such row", breaking the §3 no-oracle shape; queuing a fenced write
+  behind the delete violates fail-closed.
+
+## 13. Future Worker deploy-lane rollback: trust assumptions (docs-only)
 
 **Status: no Worker deploy lane exists.** `.github/workflows/deploy.yml`
 deploys `apps/web` only; no tracked workflow deploys the backend Workers
