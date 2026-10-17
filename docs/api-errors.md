@@ -43,7 +43,7 @@ with HTTP status 500. The worker implementations seal 5xx messages to fixed publ
 `code` to `request_failed`, keeping the server `message` and boolean
 `retryable` for display/policy. Legacy `{"error": "..."}` bodies
 (pre-taxonomy) derive their code from unambiguous HTTP statuses (400, 401,
-402, 403, 404, 413, 416, 422, 429, 503); all other statuses use
+402, 403, 404, 409, 413, 416, 422, 429, 503); all other statuses use
 `request_failed`. The web client continues to support these legacy bodies
 during migration. `provider_auth_expired` is also a registered structured code
 so the stream worker can preserve its inline credential-refresh signal in the

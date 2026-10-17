@@ -261,6 +261,7 @@ describe('ApiClient', () => {
 		[402, 'plan_limit_exceeded'],
 		[403, 'forbidden'],
 		[404, 'not_found'],
+		[409, 'conflict'],
 		[413, 'payload_too_large'],
 		[416, 'range_not_satisfiable'],
 		[422, 'validation_failed'],
