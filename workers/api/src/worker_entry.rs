@@ -24,8 +24,8 @@ use crate::auth::{
     SingleUseStore,
 };
 use crate::handlers::{
-    self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, PairAdmission, RateLimitBudget, Store,
-    StoreError, UserRecord, VaultRow,
+    self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, PairAdmission, QaIssuedCode,
+    RateLimitBudget, Store, StoreError, UserRecord, VaultRow,
 };
 use crate::session::SessionRecord;
 use crate::vault::{
@@ -89,7 +89,7 @@ fn config_from_env(env: &Env) -> Option<Config> {
         Ok(previous) => previous,
         Err(()) => return None,
     };
-    let config = Config::new(
+    let mut config = Config::new(
         &rp_id,
         &origin,
         session_secret,
@@ -101,6 +101,17 @@ fn config_from_env(env: &Env) -> Option<Config> {
         session_previous_secret,
     )
     .ok()?;
+    // Staging-only emailed-code retrieval seam (`POST /api/test-codes`):
+    // armed ONLY by the explicit staging flag, and usable only with the
+    // staged QA bearer. Both default off/absent, so production serves the
+    // seam path as a plain 404. The token is read only when the flag is
+    // armed — an unflagged env never holds it in config.
+    if truthy("QA_CODE_SEAM") {
+        config = config.with_qa_code_seam(true);
+        if let Some(token) = env_string(env, "QA_AUTH_TOKEN") {
+            config = config.with_qa_auth_token(&token);
+        }
+    }
     Some(apply_rate_limit_overlay(config, |name| {
         env_string(env, name)
     }))
@@ -590,6 +601,45 @@ impl Store for PgStore {
                 issued_at: u64_of(r.try_get("issued_at").map_err(|_| StoreError)?)?,
                 expires_at: u64_of(r.try_get("expires_at").map_err(|_| StoreError)?)?,
                 used: r.try_get("used").map_err(|_| StoreError)?,
+            })
+        })
+        .transpose()
+    }
+
+    // Staging-only code-seam outbox (migration 0018): one latest-token
+    // row per synthetic mailbox. Read-only retrieval never touches this
+    // table beyond the SELECT below.
+    async fn record_qa_issued_code(
+        &self,
+        email: &str,
+        token: &str,
+        now: u64,
+    ) -> Result<(), StoreError> {
+        let client = self.connect().await?;
+        client
+            .execute(
+                "INSERT INTO qa_issued_codes (email, token, issued_at) VALUES ($1, $2, $3) \
+                 ON CONFLICT (email) DO UPDATE SET token = EXCLUDED.token, issued_at = EXCLUDED.issued_at",
+                &[&email, &token, &i64_of(now)?],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        Ok(())
+    }
+
+    async fn qa_issued_code(&self, email: &str) -> Result<Option<QaIssuedCode>, StoreError> {
+        let client = self.connect().await?;
+        let row = client
+            .query_opt(
+                "SELECT token, issued_at FROM qa_issued_codes WHERE email = $1",
+                &[&email],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        row.map(|r| {
+            Ok(QaIssuedCode {
+                token: r.try_get("token").map_err(|_| StoreError)?,
+                issued_at: u64_of(r.try_get("issued_at").map_err(|_| StoreError)?)?,
             })
         })
         .transpose()
@@ -1508,6 +1558,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         path: req.path(),
         cookie: headers_map.get("cookie").cloned(),
         origin: headers_map.get("origin").cloned(),
+        authorization: headers_map.get("authorization").cloned(),
         // Template only: the gate replaces this with the collected bytes
         // on `Complete` and never dispatches it otherwise.
         body: Vec::new(),
@@ -1946,6 +1997,73 @@ mod tests {
         assert!(
             !body.contains("Some(config)"),
             "config_from_env must not return the un-overlaid config"
+        );
+    }
+
+    #[test]
+    fn config_from_env_arms_qa_seam_only_behind_the_flag() {
+        // The staging-only code seam must never arm by default: slice ONLY
+        // the `config_from_env` body out of the pre-test source (so this
+        // test's own literals cannot satisfy the assertions) and require
+        // the explicit-flag gate plus both builder calls. Dropping the
+        // flag check — or staging the bearer unconditionally — fails here.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let body = production
+            .split_once("fn config_from_env(")
+            .expect("config_from_env must exist")
+            .1
+            .split_once("\nfn ")
+            .expect("a following fn must bound the body")
+            .0;
+        assert!(
+            body.contains("if truthy(\"QA_CODE_SEAM\")"),
+            "config_from_env must gate the seam behind the explicit staging flag"
+        );
+        assert!(
+            body.contains("with_qa_code_seam(true)"),
+            "config_from_env must arm the seam inside the flag gate"
+        );
+        assert!(
+            body.contains("with_qa_auth_token(") && body.contains("\"QA_AUTH_TOKEN\""),
+            "config_from_env must stage the QA bearer from the secret inside the flag gate"
+        );
+    }
+
+    #[test]
+    fn qa_outbox_statements_key_by_email() {
+        // `PgStore` QA methods only compile into the wasm Worker, so pin
+        // their statement text natively: the upsert must target the
+        // migration 0018 table with a per-mailbox conflict key (one
+        // latest-token row per synthetic mailbox), and retrieval must
+        // filter by that same mailbox — never a full-table read.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let fn_body = |name: &str| {
+            production
+                .split_once(name)
+                .unwrap_or_else(|| panic!("{name} must exist"))
+                .1
+                .split_once("\n    async fn ")
+                .expect("a following fn must bound the body")
+                .0
+        };
+        let record = fn_body("async fn record_qa_issued_code(");
+        assert!(
+            record.contains("INSERT INTO qa_issued_codes (email, token, issued_at)")
+                && record.contains("ON CONFLICT (email) DO UPDATE"),
+            "record_qa_issued_code must upsert one latest-token row per mailbox"
+        );
+        let lookup = fn_body("async fn qa_issued_code(");
+        assert!(
+            lookup.contains("SELECT token, issued_at FROM qa_issued_codes WHERE email = $1"),
+            "qa_issued_code must read exactly one mailbox row"
         );
     }
 

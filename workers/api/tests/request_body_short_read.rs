@@ -121,6 +121,7 @@ fn short_read_dispatches_nothing_through_the_gate() {
             path: "/v1/vault/test".to_string(),
             cookie: None,
             origin: None,
+            authorization: None,
             body: b"template".to_vec(),
         },
         move |_request| async move {

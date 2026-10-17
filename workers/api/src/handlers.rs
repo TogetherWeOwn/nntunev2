@@ -34,6 +34,7 @@ use std::net::IpAddr;
 use std::pin::Pin;
 
 use serde::Deserialize;
+use subtle::ConstantTimeEq;
 
 use crate::auth::{
     self, InviteRecord, MagicLinkRecord, PasskeyChallenge, PasskeyCredential, SingleUseStore,
@@ -167,6 +168,18 @@ pub struct Config {
     /// defaults; the Worker entry overlays [vars] via
     /// `RateLimitConfig::from_vars` + [`Config::with_rate_limits`].
     pub rate_limits: crate::rate_limit::RateLimitConfig,
+    /// Staging-only emailed-code retrieval seam (`POST /api/test-codes`):
+    /// false unless the operator explicitly sets the staging flag. The
+    /// constructor keeps it off so existing callers — and production
+    /// builds, which never set the flag — serve the seam path as a plain
+    /// 404. The Worker entry enables it via
+    /// [`Config::with_qa_code_seam`] + [`Config::with_qa_auth_token`].
+    pub qa_code_seam: bool,
+    /// Bearer expected on the seam route (`QA_AUTH_TOKEN` Worker secret).
+    /// `None` (the constructor default) fails the seam closed even when
+    /// the flag is on: with no expected value there is nothing to compare
+    /// against, so every seam request 404s.
+    pub qa_auth_token: Option<String>,
 }
 
 impl Config {
@@ -209,6 +222,8 @@ impl Config {
             invites_required,
             session_previous_secret,
             rate_limits: crate::rate_limit::RateLimitConfig::default(),
+            qa_code_seam: false,
+            qa_auth_token: None,
         })
     }
 
@@ -217,6 +232,22 @@ impl Config {
     /// and tests need no change.
     pub fn with_rate_limits(mut self, rate_limits: crate::rate_limit::RateLimitConfig) -> Self {
         self.rate_limits = rate_limits;
+        self
+    }
+
+    /// Arm the staging-only emailed-code retrieval seam. The constructor
+    /// keeps it off so production builds serve the seam path as a plain
+    /// 404; only an explicit staging flag enables capture + retrieval.
+    pub fn with_qa_code_seam(mut self, enabled: bool) -> Self {
+        self.qa_code_seam = enabled;
+        self
+    }
+
+    /// Stage the bearer the seam route expects (`QA_AUTH_TOKEN`). Without
+    /// it the seam stays fail-closed even when armed: there is no expected
+    /// value to compare against, so every seam request 404s.
+    pub fn with_qa_auth_token(mut self, token: &str) -> Self {
+        self.qa_auth_token = Some(token.to_string());
         self
     }
 
@@ -359,6 +390,37 @@ pub trait Store {
         &self,
         token_hash: &str,
     ) -> impl Future<Output = Result<Option<MagicLinkRecord>, StoreError>>;
+    /// Staging-only emailed-code outbox (migration 0018): remember the raw
+    /// issued token for a synthetic mailbox, replacing any earlier row for
+    /// it. Default no-op keeps out-of-tree `Store` impls compiling;
+    /// production and the test fake override it. Called only when the seam
+    /// flag is armed and the recipient is an `example.test` mailbox, and
+    /// only after the magic row itself was stored — capture can never
+    /// break issuance (callers ignore its result).
+    fn record_qa_issued_code(
+        &self,
+        email: &str,
+        token: &str,
+        now: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async move {
+            let _ = (email, token, now);
+            Ok(())
+        }
+    }
+    /// Latest captured token for a synthetic mailbox, if any. Default
+    /// `Ok(None)` keeps out-of-tree `Store` impls compiling (their seam
+    /// reads 404); production and the test fake override it. Read-only:
+    /// implementations must not create users, challenges, or magic rows.
+    fn qa_issued_code(
+        &self,
+        email: &str,
+    ) -> impl Future<Output = Result<Option<QaIssuedCode>, StoreError>> {
+        async move {
+            let _ = email;
+            Ok(None)
+        }
+    }
     /// Atomically reserve one of `limit` per-key slots until `now + window_secs`.
     /// Expired slots may be reused; concurrent calls must never exceed the cap.
     fn reserve_rate_limit(
@@ -549,6 +611,10 @@ pub struct Request {
     pub cookie: Option<String>,
     /// Raw `Origin` header value, if any.
     pub origin: Option<String>,
+    /// Raw `Authorization` header value, if any. Carried so the
+    /// staging-only QA seam can check its bearer; no other handler reads
+    /// it (account authentication rides the session cookie).
+    pub authorization: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -616,6 +682,55 @@ fn session_error_response(error: session::SessionError) -> Response {
 
 pub(crate) fn invalid_request() -> Response {
     json_response(400, serde_json::json!({"error": "invalid request"}))
+}
+
+// --- Staging-only QA code seam ----------------------------------------------------------
+//
+// `POST /api/test-codes` returns the issued signup code for an
+// `example.test` mailbox without minting an account, so the staging E2E can
+// drive the real `/signup` form to the BYOP wizard. Armed ONLY by the
+// explicit staging flag (`Config::qa_code_seam`, from `QA_CODE_SEAM`) plus
+// the staged bearer (`Config::qa_auth_token`, from the `QA_AUTH_TOKEN`
+// secret); every other posture answers the seam path with the same plain
+// 404 as an unknown route. See `docs/security/threat-model.md`.
+
+/// Seam path, served by the API Worker on staging. The E2E contract pins
+/// the same path (`testCodes` in `e2e/helpers/contract.ts`); a rename must
+/// change both sides together.
+pub const QA_TEST_CODES_PATH: &str = "/api/test-codes";
+
+/// True iff the address is a synthetic test mailbox: exactly one `@` and
+/// the reserved `example.test` domain (RFC 2606, never routable), matched
+/// case-insensitively. Subdomains and suffix lookalikes
+/// (`example.test.evil.com`) do not match.
+fn is_example_test_mailbox(email: &str) -> bool {
+    let mut parts = email.trim().split('@');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(local), Some(domain), None) if !local.is_empty() => {
+            domain.eq_ignore_ascii_case("example.test")
+        }
+        _ => false,
+    }
+}
+
+/// Constant-time bearer comparison for the seam route. Length mismatch
+/// rejects without comparing (only the length leaks, never content).
+fn qa_bearer_ok(presented: Option<&str>, expected: &str) -> bool {
+    match presented {
+        Some(candidate) => {
+            let a = candidate.as_bytes();
+            let b = expected.as_bytes();
+            a.len() == b.len() && a.ct_eq(b).into()
+        }
+        None => false,
+    }
+}
+
+/// One captured issuance for a synthetic mailbox (migration 0018).
+#[derive(Debug, Clone)]
+pub struct QaIssuedCode {
+    pub token: String,
+    pub issued_at: u64,
 }
 
 pub struct Ctx<'a, S, M, D, N>
@@ -969,6 +1084,17 @@ where
         }
         let (token, record) = auth::issue_magic_link(user_id, email, self.now);
         if self.store.insert_magic(&record).await.is_ok() {
+            // Staging-only code seam: remember the raw token for synthetic
+            // mailboxes so `POST /api/test-codes` can return the issued
+            // code. Best-effort and capture-only — a failed capture must
+            // never break issuance or delivery, and non-synthetic mailboxes
+            // never reach the outbox.
+            if self.cfg.qa_code_seam && is_example_test_mailbox(email) {
+                let _ = self
+                    .store
+                    .record_qa_issued_code(email, &token, self.now)
+                    .await;
+            }
             let _ = self.mailer.send_magic_link(email, &token).await;
         }
     }
@@ -2277,6 +2403,62 @@ where
     json_response(200, serde_json::json!({"ok": result}))
 }
 
+/// Staging-only emailed-code retrieval seam (`POST /api/test-codes`).
+/// Returns the issued code for an `example.test` mailbox without minting
+/// an account (read-only: no users, challenges, or magic rows are created
+/// here). Gates run in order — flag armed plus bearer staged (else the
+/// plain unknown-route 404, so the seam's existence is not enumerable
+/// from its posture), then the `Authorization: Bearer <QA_AUTH_TOKEN>`
+/// header present and constant-time equal (else a names-only 401; the
+/// bearer is a secret request header rather than an ambient credential,
+/// so no `Origin` pin is needed as a cross-site forgery cannot present
+/// it), then a well-formed `example.test` mailbox and a captured
+/// unexpired code (else 404). Every failure names only the gate, never
+/// the mailbox, the token, or which check refused.
+async fn qa_test_codes<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let not_found = || json_response(404, serde_json::json!({"error": "not found"}));
+    let Some(expected) = ctx
+        .cfg
+        .qa_auth_token
+        .as_deref()
+        .filter(|_| ctx.cfg.qa_code_seam)
+    else {
+        return not_found();
+    };
+    let presented = req
+        .authorization
+        .as_deref()
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if !qa_bearer_ok(presented, expected) {
+        return json_response(401, serde_json::json!({"error": "unauthorized"}));
+    }
+    let Some(body) = parse_body::<EmailBody>(req) else {
+        return not_found();
+    };
+    let Some(email) = normalize_email(&body.email) else {
+        return not_found();
+    };
+    if !is_example_test_mailbox(&email) {
+        return not_found();
+    }
+    let stored = match ctx.store.qa_issued_code(&email).await {
+        Ok(stored) => stored,
+        Err(_) => return internal(),
+    };
+    match stored {
+        Some(code) if code.issued_at.saturating_add(auth::MAGIC_LINK_TTL_SECS) > ctx.now => {
+            json_response(200, serde_json::json!({"magic_token": code.token}))
+        }
+        _ => not_found(),
+    }
+}
+
 // --- Dispatch ------------------------------------------------------------------------------
 
 /// Every path the router serves. The Worker answers `OPTIONS` on exactly
@@ -2301,6 +2483,7 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/vault"
             | "/v1/vault/test"
             | "/v1/vault/test-connection"
+            | QA_TEST_CODES_PATH
     )
 }
 
@@ -2347,6 +2530,7 @@ where
         ("POST", "/v1/vault/test") | ("POST", "/v1/vault/test-connection") => {
             vault_test_connection(ctx, req).await
         }
+        ("POST", QA_TEST_CODES_PATH) => qa_test_codes(ctx, req).await,
         ("OPTIONS", path) if is_known_path(path) => preflight_response(),
         _ => json_response(404, serde_json::json!({"error": "not found"})),
     }
@@ -2458,6 +2642,9 @@ mod tests {
         challenges: RefCell<HashMap<String, ChallengeRow>>,
         credentials: RefCell<HashMap<String, PasskeyCredential>>,
         magic: RefCell<HashMap<String, MagicLinkRecord>>,
+        /// Staging-only code-seam outbox: latest raw token per synthetic
+        /// mailbox (mirrors the migration 0018 table).
+        qa_codes: RefCell<HashMap<String, QaIssuedCode>>,
         invites: RefCell<HashMap<String, InviteRecord>>,
         sessions: RefCell<HashMap<String, SessionRecord>>,
         vaults: RefCell<HashMap<String, VaultRow>>,
@@ -2593,6 +2780,24 @@ mod tests {
             token_hash: &str,
         ) -> Result<Option<MagicLinkRecord>, StoreError> {
             Ok(self.magic.borrow().get(token_hash).cloned())
+        }
+        async fn record_qa_issued_code(
+            &self,
+            email: &str,
+            token: &str,
+            now: u64,
+        ) -> Result<(), StoreError> {
+            self.qa_codes.borrow_mut().insert(
+                email.to_string(),
+                QaIssuedCode {
+                    token: token.to_string(),
+                    issued_at: now,
+                },
+            );
+            Ok(())
+        }
+        async fn qa_issued_code(&self, email: &str) -> Result<Option<QaIssuedCode>, StoreError> {
+            Ok(self.qa_codes.borrow().get(email).cloned())
         }
         async fn reserve_rate_limit(
             &self,
@@ -3039,6 +3244,7 @@ mod tests {
                 path: path.to_string(),
                 cookie: None,
                 origin: Some(ORIGIN.to_string()),
+                authorization: None,
                 body: body.to_string().into_bytes(),
             };
             block_on(handle(&ctx, &req))
@@ -3057,6 +3263,7 @@ mod tests {
                 path: path.to_string(),
                 cookie,
                 origin: origin.map(str::to_string),
+                authorization: None,
                 body: body.map(|b| b.into_bytes()).unwrap_or_default(),
             };
             block_on(handle(&self.ctx(), &req))
@@ -3085,6 +3292,7 @@ mod tests {
                 path: path.to_string(),
                 cookie,
                 origin: origin.map(str::to_string),
+                authorization: None,
                 body: body.map(|b| b.into_bytes()).unwrap_or_default(),
             };
             block_on(handle(&ctx, &req))
@@ -3120,6 +3328,233 @@ mod tests {
         );
         assert_eq!(resp.status, 200, "{}", resp.body);
         cookie_of(&resp)
+    }
+
+    const QA_TOKEN: &str = "test-qa-bearer-token";
+
+    fn qa_harness() -> Harness {
+        let mut h = harness();
+        h.config = cfg().with_qa_code_seam(true).with_qa_auth_token(QA_TOKEN);
+        h
+    }
+
+    impl Harness {
+        fn call_seam(&self, body: serde_json::Value, bearer: Option<&str>) -> Response {
+            let req = Request {
+                method: "POST".to_string(),
+                path: QA_TEST_CODES_PATH.to_string(),
+                cookie: None,
+                origin: None,
+                authorization: bearer.map(|token| format!("Bearer {token}")),
+                body: body.to_string().into_bytes(),
+            };
+            block_on(handle(&self.ctx(), &req))
+        }
+    }
+
+    #[test]
+    fn qa_mailbox_gate_matches_only_the_reserved_test_domain() {
+        assert!(is_example_test_mailbox(
+            "e2e-wizard+20261017-000001@example.test"
+        ));
+        assert!(is_example_test_mailbox("A@EXAMPLE.TEST"));
+        assert!(is_example_test_mailbox("  a@example.test  "));
+        assert!(!is_example_test_mailbox("a@example.com"));
+        assert!(!is_example_test_mailbox("a@example.test.evil.com"));
+        assert!(!is_example_test_mailbox("a@evil-example.test"));
+        assert!(!is_example_test_mailbox("a@example.test@evil.com"));
+        assert!(!is_example_test_mailbox("@example.test"));
+        assert!(!is_example_test_mailbox("not-an-email"));
+        assert!(!is_example_test_mailbox(""));
+        // Trailing-dot FQDN form is conservatively rejected.
+        assert!(!is_example_test_mailbox("a@example.test."));
+    }
+
+    #[test]
+    fn qa_bearer_compare_accepts_only_the_exact_secret() {
+        assert!(qa_bearer_ok(Some(QA_TOKEN), QA_TOKEN));
+        assert!(!qa_bearer_ok(None, QA_TOKEN));
+        assert!(!qa_bearer_ok(Some(""), QA_TOKEN));
+        assert!(!qa_bearer_ok(Some("wrong-token"), QA_TOKEN));
+        assert!(!qa_bearer_ok(Some("test-qa-bearer-toke"), QA_TOKEN));
+        assert!(!qa_bearer_ok(Some("test-qa-bearer-token!"), QA_TOKEN));
+        assert!(!qa_bearer_ok(Some("TEST-QA-BEARER-TOKEN"), QA_TOKEN));
+    }
+
+    #[test]
+    fn qa_seam_absent_without_the_staging_flag() {
+        // Production posture: the constructor default serves the seam
+        // path as a plain 404 — indistinguishable from an unknown route —
+        // even for a well-formed synthetic mailbox.
+        let h = harness();
+        let resp = h.call(
+            "POST",
+            QA_TEST_CODES_PATH,
+            serde_json::json!({"email": "a@example.test"}),
+        );
+        assert_eq!(resp.status, 404);
+        assert_eq!(resp.body, r#"{"error":"not found"}"#);
+        let unknown = h.call(
+            "POST",
+            "/api/no-such-seam",
+            serde_json::json!({"email": "a@example.test"}),
+        );
+        assert_eq!(unknown.status, 404);
+        assert_eq!(unknown.body, resp.body);
+    }
+
+    #[test]
+    fn qa_seam_fail_closed_without_a_staged_bearer() {
+        // Flag armed but no QA_AUTH_TOKEN staged: there is nothing to
+        // compare against, so every request 404s — arming the flag alone
+        // never opens the seam.
+        let mut h = harness();
+        h.config = cfg().with_qa_code_seam(true);
+        let resp = h.call_seam(
+            serde_json::json!({"email": "a@example.test"}),
+            Some(QA_TOKEN),
+        );
+        assert_eq!(resp.status, 404);
+        assert_eq!(resp.body, r#"{"error":"not found"}"#);
+    }
+
+    #[test]
+    fn qa_seam_rejects_a_bad_bearer_without_detail() {
+        let h = qa_harness();
+        for bearer in [None, Some(""), Some("wrong-token")] {
+            let resp = h.call_seam(serde_json::json!({"email": "a@example.test"}), bearer);
+            assert_eq!(resp.status, 401);
+            assert_eq!(resp.body, r#"{"error":"unauthorized"}"#);
+        }
+        // A non-Bearer scheme is not a bearer either.
+        let req = Request {
+            method: "POST".to_string(),
+            path: QA_TEST_CODES_PATH.to_string(),
+            cookie: None,
+            origin: None,
+            authorization: Some(format!("Token {QA_TOKEN}")),
+            body: serde_json::json!({"email": "a@example.test"})
+                .to_string()
+                .into_bytes(),
+        };
+        let resp = block_on(handle(&h.ctx(), &req));
+        assert_eq!(resp.status, 401);
+        assert_eq!(resp.body, r#"{"error":"unauthorized"}"#);
+    }
+
+    #[test]
+    fn qa_seam_rejects_real_mailboxes_and_captures_nothing_for_them() {
+        let h = qa_harness();
+        // Even a mailbox with a live issuance behind it: the seam only
+        // ever answers example.test.
+        seed_user(&h, "u-real", "a@example.com");
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": "a@example.com"}),
+        );
+        assert_eq!(resp.status, 200);
+        assert_eq!(h.mailer.sent.borrow().len(), 1);
+        let resp = h.call_seam(
+            serde_json::json!({"email": "a@example.com"}),
+            Some(QA_TOKEN),
+        );
+        assert_eq!(resp.status, 404);
+        assert_eq!(resp.body, r#"{"error":"not found"}"#);
+        assert!(h.store.qa_codes.borrow().is_empty());
+    }
+
+    #[test]
+    fn qa_seam_misses_without_an_issuance() {
+        let h = qa_harness();
+        let resp = h.call_seam(
+            serde_json::json!({"email": "fresh@example.test"}),
+            Some(QA_TOKEN),
+        );
+        assert_eq!(resp.status, 404);
+        assert_eq!(resp.body, r#"{"error":"not found"}"#);
+        // Malformed bodies and non-mailboxes miss the same indistinct way.
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"email": "not-an-email"}),
+            serde_json::json!({"email": 1}),
+            serde_json::json!({"email": "a@example.test", "extra": true}),
+        ] {
+            let resp = h.call_seam(body, Some(QA_TOKEN));
+            assert_eq!(resp.status, 404);
+            assert_eq!(resp.body, r#"{"error":"not found"}"#);
+        }
+    }
+
+    #[test]
+    fn qa_seam_returns_the_issued_code_and_never_mints() {
+        let h = qa_harness();
+        // The real issuance path: the signup form's register/start mails
+        // the inbox-proof code for the synthetic mailbox.
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "e2e-wizard@example.test"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let mailed = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let users_before = h.store.users.borrow().len();
+        let magic_before = h.store.magic.borrow().len();
+        // The seam returns exactly the mailed token...
+        let resp = h.call_seam(
+            serde_json::json!({"email": "e2e-wizard@example.test"}),
+            Some(QA_TOKEN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let code: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(
+            code.get("magic_token"),
+            Some(&serde_json::Value::String(mailed.clone()))
+        );
+        // ...without minting anything itself: retrieval is read-only.
+        assert_eq!(h.store.users.borrow().len(), users_before);
+        assert_eq!(h.store.magic.borrow().len(), magic_before);
+        // ...and the returned code is the live credential: the same token
+        // redeems the magic finish, proving the seam hands back a genuinely
+        // issued code rather than a lookalike.
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": mailed}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+    }
+
+    #[test]
+    fn qa_seam_refuses_an_expired_code() {
+        let h = qa_harness();
+        block_on(h.store.record_qa_issued_code(
+            "stale@example.test",
+            "stale-token",
+            NOW.saturating_sub(auth::MAGIC_LINK_TTL_SECS + 1),
+        ))
+        .unwrap();
+        let resp = h.call_seam(
+            serde_json::json!({"email": "stale@example.test"}),
+            Some(QA_TOKEN),
+        );
+        assert_eq!(resp.status, 404);
+        assert_eq!(resp.body, r#"{"error":"not found"}"#);
+    }
+
+    #[test]
+    fn qa_capture_skips_real_mailboxes_at_issuance() {
+        // Belt-and-braces beside the retrieval-side domain pin: issuance
+        // for a real mailbox writes no outbox row in the first place.
+        let h = qa_harness();
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "real@example.com"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(!h.mailer.sent.borrow().is_empty());
+        assert!(h.store.qa_codes.borrow().is_empty());
     }
 
     #[test]
@@ -3397,6 +3832,7 @@ mod tests {
             path: "/v1/vault".to_string(),
             cookie: Some(format!("nameless; {}=token-value", session::COOKIE_NAME)),
             origin: None,
+            authorization: None,
             body: Vec::new(),
         };
         assert_eq!(session_cookie_value(&req).as_deref(), Some("token-value"));
@@ -3585,6 +4021,7 @@ mod tests {
             path: "/v1/vault".to_string(),
             cookie: Some(cookie_a.clone()),
             origin: Some(ORIGIN.to_string()),
+            authorization: None,
             body: put_body.to_string().into_bytes(),
         };
         let resp = block_on(handle(&ctx, &req));
@@ -3725,6 +4162,7 @@ mod tests {
             path: "/v1/vault".to_string(),
             cookie: Some(cookie.clone()),
             origin: Some(ORIGIN.to_string()),
+            authorization: None,
             body: put_body.to_string().into_bytes(),
         };
         let stale_put = block_on(handle(&stale_ctx, &stale_put_req));
@@ -3739,6 +4177,7 @@ mod tests {
             path: "/v1/vault".to_string(),
             cookie: Some(cookie.clone()),
             origin: None,
+            authorization: None,
             body: Vec::new(),
         };
         let stale_get = block_on(handle(&stale_ctx, &stale_get_req));
@@ -3749,6 +4188,7 @@ mod tests {
             path: "/v1/vault".to_string(),
             cookie: Some(cookie),
             origin: Some(ORIGIN.to_string()),
+            authorization: None,
             body: Vec::new(),
         };
         let stale_delete = block_on(handle(&stale_ctx, &stale_delete_req));
@@ -4717,6 +5157,7 @@ mod tests {
             path: path.to_string(),
             cookie: Some(cookie),
             origin: Some(ORIGIN.to_string()),
+            authorization: None,
             body: Vec::new(),
         };
         block_on(handle(&ctx, &req))
@@ -6255,6 +6696,7 @@ mod tests {
                 path: "/v1/vault".to_string(),
                 cookie: Some(cookie.clone()),
                 origin: None,
+                authorization: None,
                 body: Vec::new(),
             };
             block_on(handle(&ctx, &req))
@@ -6276,6 +6718,7 @@ mod tests {
             path: "/v1/session/refresh".to_string(),
             cookie: Some(cookie.clone()),
             origin: Some(ORIGIN.to_string()),
+            authorization: None,
             body: Vec::new(),
         };
         let resp = block_on(handle(&ctx, &req));
