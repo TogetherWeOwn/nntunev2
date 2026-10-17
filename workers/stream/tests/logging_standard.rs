@@ -25,16 +25,29 @@ const BANNED_KEY_PARTS: &[&str] = &[
     "api_key",
     "apikey",
     "token",
+    "credential",
+    "passphrase",
     "cookie",
     "authorization",
     "private_key",
+    "privatekey",
     "mnemonic",
     "ssn",
     "credit_card",
     "card_number",
     "cvv",
+    "payment",
     "email",
     "session",
+    "postal",
+    "address",
+    "street",
+    "postcode",
+    "zip",
+    "body",
+    "header",
+    "query",
+    "nzb",
 ];
 
 fn manifest_dir() -> PathBuf {
@@ -391,24 +404,137 @@ fn has_ipv4_like_value(value: &str) -> bool {
     parts.len() == 4 && parts.iter().all(|part| part.parse::<u8>().is_ok())
 }
 
+fn has_ipv6_like_value(value: &str) -> bool {
+    let mut text = value.trim();
+    if text.len() >= 2 && text.starts_with('[') && text.ends_with(']') {
+        text = &text[1..text.len() - 1];
+    }
+    if let Some(zone) = text.find('%') {
+        text = &text[..zone];
+    }
+    if !text.contains(':') || text.contains(":::") {
+        return false;
+    }
+    if !text
+        .bytes()
+        .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+    {
+        return false;
+    }
+    if text.matches("::").count() > 1 {
+        return false;
+    }
+    let compressed = text.contains("::");
+    let parts: Vec<&str> = text.split(':').collect();
+    if !compressed && parts.iter().any(|part| part.is_empty()) {
+        return false;
+    }
+    let mut groups = 0;
+    for (index, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if part.contains('.') {
+            if index != parts.len() - 1 || !has_ipv4_like_value(part) {
+                return false;
+            }
+            groups += 2;
+            continue;
+        }
+        if part.len() > 4 || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return false;
+        }
+        groups += 1;
+    }
+    if compressed {
+        (1..=7).contains(&groups)
+    } else if text.contains('.') {
+        groups == 8
+    } else {
+        parts.len() == 8
+    }
+}
+
+fn email_token_is_shaped(token: &str) -> bool {
+    let token = token.trim().trim_matches(['.', ',', ';', ':', '!', '?']);
+    let (local, domain) = match token.split_once('@') {
+        Some(pair) => pair,
+        None => return false,
+    };
+    if token.matches('@').count() != 1 || local.is_empty() || domain.is_empty() {
+        return false;
+    }
+    if !local
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'%' | b'+' | b'-'))
+        || local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+    {
+        return false;
+    }
+    if !domain.contains('.')
+        || domain.starts_with(['.', '-'])
+        || domain.ends_with(['.', '-'])
+        || domain.contains("..")
+        || !domain
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
+        return false;
+    }
+    match domain.rsplit('.').next() {
+        Some(tld) if tld.len() >= 2 => true,
+        _ => false,
+    }
+}
+
+fn has_email_like_value(value: &str) -> bool {
+    value
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ',' | ';' | ':' | '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']' | '='
+                )
+        })
+        .any(email_token_is_shaped)
+}
+
 fn has_obvious_secret_value(value: &str) -> bool {
-    let lower = value.trim_start().to_ascii_lowercase();
-    [
-        "bearer ", "token ", "sk-", "sk_live_", "sk_test_", "tok_", "ghp_", "gho_", "ghu_",
-        "xoxb-", "xoxp-",
-    ]
-    .iter()
-    .any(|marker| lower.starts_with(marker))
-        || [
-            "password=",
-            "password:",
-            "secret=",
-            "secret:",
-            "apikey=",
-            "api_key=",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
+    let lower = value.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "bearer ",
+        "bearer=",
+        "bearer:",
+        "token ",
+        "token=",
+        "token:",
+        "sk-",
+        "sk_live_",
+        "sk_test_",
+        "tok_",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "xoxb-",
+        "xoxp-",
+        "password=",
+        "password:",
+        "secret=",
+        "secret:",
+        "apikey=",
+        "api_key=",
+    ];
+    MARKERS.iter().any(|marker| {
+        lower.match_indices(marker).any(|(index, _)| {
+            index == 0
+                || !lower[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric())
+        })
+    })
 }
 
 fn has_banned_key(fields: &BTreeMap<String, JsonValue>) -> Option<String> {
@@ -418,10 +544,12 @@ fn has_banned_key(fields: &BTreeMap<String, JsonValue>) -> Option<String> {
             let lower = key.to_ascii_lowercase();
             let has_ip_component = lower
                 .split(|ch: char| !ch.is_ascii_alphanumeric())
-                .any(|part| part == "ip")
+                .any(|part| part == "ip" || part == "ipv4" || part == "ipv6")
                 || ["clientip", "remoteip", "ipaddress"]
                     .iter()
-                    .any(|part| lower.contains(part));
+                    .any(|part| lower.contains(part))
+                || lower.contains("ipv4")
+                || lower.contains("ipv6");
             let has_name_component = lower == "name"
                 || lower.starts_with("name_")
                 || lower.contains("_name")
@@ -456,6 +584,18 @@ fn has_ipv4_value(fields: &BTreeMap<String, JsonValue>) -> bool {
     fields
         .values()
         .any(|value| matches!(value, JsonValue::String(text) if has_ipv4_like_value(text)))
+}
+
+fn has_ipv6_value(fields: &BTreeMap<String, JsonValue>) -> bool {
+    fields
+        .values()
+        .any(|value| matches!(value, JsonValue::String(text) if has_ipv6_like_value(text)))
+}
+
+fn has_email_value(fields: &BTreeMap<String, JsonValue>) -> bool {
+    fields
+        .values()
+        .any(|value| matches!(value, JsonValue::String(text) if has_email_like_value(text)))
 }
 
 #[test]
@@ -537,11 +677,18 @@ fn golden_line_has_no_prohibited_keys_or_obvious_secret_values() {
         !has_ipv4_value(fields),
         "fields contain a dotted-quad IPv4 address"
     );
+    assert!(!has_ipv6_value(fields), "fields contain an IPv6 address");
+    assert!(!has_email_value(fields), "fields contain an email address");
 
     for key in [
         "contact_email",
         "client_ip",
         "ip_address",
+        "ipv4",
+        "ipv6",
+        "ipv4_address",
+        "ipv6_address",
+        "client_ipv4",
         "session_id",
         "name",
         "display_name",
@@ -549,6 +696,20 @@ fn golden_line_has_no_prohibited_keys_or_obvious_secret_values() {
         "surname",
         "password",
         "grant_token",
+        "user_credentials",
+        "passphrase",
+        "privatekey",
+        "payment_id",
+        "postal_code",
+        "zip_code",
+        "home_address",
+        "street_name",
+        "request_body",
+        "response_body",
+        "complete_headers",
+        "raw_query",
+        "query_string",
+        "nzb_contents",
     ] {
         let bad = BTreeMap::from([(key.to_string(), JsonValue::String("safe".into()))]);
         assert!(
@@ -556,16 +717,19 @@ fn golden_line_has_no_prohibited_keys_or_obvious_secret_values() {
             "did not reject prohibited key {key}"
         );
     }
-    for key in ["ship_id", "zip_code", "filename", "namespace", "trip"] {
+    for key in ["ship_id", "filename", "namespace", "trip"] {
         let acceptable = BTreeMap::from([(key.to_string(), JsonValue::String("safe".into()))]);
         assert!(
             has_banned_key(&acceptable).is_none(),
-            "over-broad IP key match rejected {key}"
+            "over-broad key match rejected {key}"
         );
     }
     for value in [
         "Bearer abc123",
         "Token abc123",
+        "prefix Bearer abc123",
+        "token=abc123",
+        "api_key=abc123",
         "sk-live-example",
         "sk_live_example",
         "tok_example",
@@ -580,6 +744,10 @@ fn golden_line_has_no_prohibited_keys_or_obvious_secret_values() {
         !has_obvious_secret_value("task-queued"),
         "flagged a benign task label as a credential"
     );
+    assert!(
+        !has_obvious_secret_value("tokenizer state"),
+        "flagged a benign tokenizer label as a credential"
+    );
     let ip_value = BTreeMap::from([("host".to_string(), JsonValue::String("192.0.2.1".into()))]);
     assert!(
         has_ipv4_value(&ip_value),
@@ -588,6 +756,43 @@ fn golden_line_has_no_prohibited_keys_or_obvious_secret_values() {
     assert!(
         !has_ipv4_like_value("256.0.2.1"),
         "accepted an invalid IPv4 octet"
+    );
+    for value in ["2001:db8::1", "::1", "fe80::1"] {
+        let bad = BTreeMap::from([("host".to_string(), JsonValue::String(value.into()))]);
+        assert!(has_ipv6_value(&bad), "did not detect an IPv6 value {value}");
+    }
+    for value in ["12:00:00", "task-queued", "v1.2"] {
+        assert!(
+            !has_ipv6_like_value(value),
+            "flagged a benign value as IPv6: {value}"
+        );
+    }
+    for value in ["user@example.com", "admin@mail.io"] {
+        let bad = BTreeMap::from([("contact".to_string(), JsonValue::String(value.into()))]);
+        assert!(
+            has_email_value(&bad),
+            "did not detect an email value {value}"
+        );
+    }
+    for value in ["task-queued", "not-an-email", "v1.2", "user@host"] {
+        assert!(
+            !has_email_like_value(value),
+            "flagged a benign value as email: {value}"
+        );
+    }
+}
+
+#[test]
+fn parser_rejects_duplicate_keys_and_trailing_data() {
+    let duplicate = JsonParser::parse(r#"{"a":1,"a":2}"#).unwrap_err();
+    assert!(
+        duplicate.contains("duplicate object key"),
+        "unexpected duplicate-key error: {duplicate}"
+    );
+    let trailing = JsonParser::parse(r#"{"a":1} trailing"#).unwrap_err();
+    assert!(
+        trailing.contains("trailing data"),
+        "unexpected trailing-data error: {trailing}"
     );
 }
 
