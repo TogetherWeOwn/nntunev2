@@ -19,7 +19,7 @@ native targets (services, Container batch jobs).
 ## Pinned transport proof (NZB fetch)
 
 `nntune_core::pinned_transport` is the fail-closed policy the NZB intake
-wiring consumes (TOG-26211, untouched):
+wiring consumes (separate intake card, untouched here):
 
 - **Allowlist:** `ALLOWED_NNTP_PORTS = [119, 563]` (the NNTP conventions).
   The policy additionally requires TLS-on, so `119` is only valid as a TLS
