@@ -1,5 +1,15 @@
 import { expect, test } from '@playwright/test';
 
+test.beforeEach(async ({ page }) => {
+	await page.route('**/v1/vault', async (route) => {
+		await route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({})
+		});
+	});
+});
+
 test('account security confirms before revoking sessions and redirects after success', async ({
 	page
 }) => {
