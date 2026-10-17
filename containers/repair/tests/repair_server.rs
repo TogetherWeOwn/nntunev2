@@ -259,6 +259,27 @@ fn missing_staged_input_is_a_stable_error() {
 }
 
 #[test]
+fn get_out_rejects_traversing_job_segments() {
+    let f = Fixture::new("exit 0");
+    let key = object_key_for_file_name("track.flac");
+    // A file outside the scratch root at the traversed location must
+    // not be served: GET must reject the job segment, not just 404 on
+    // a missing file.
+    let outside = f.root.join("r1").join("out");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join(&key), b"OUTSIDE").unwrap();
+    let raw = format!("GET /jobs/../r1/out/{key} HTTP/1.1\r\nHost: c\r\n\r\n");
+    let (status, body) = f.request(raw.as_bytes());
+    assert_eq!(status, 404);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+        "not_found"
+    );
+    let raw = format!("PUT /jobs/../r1/in/{key} HTTP/1.1\r\nHost: c\r\nContent-Length: 0\r\n\r\n");
+    assert_eq!(f.request(raw.as_bytes()).0, 400);
+}
+
+#[test]
 fn unknown_routes_and_keys_are_404_with_stable_code() {
     let f = Fixture::new("exit 0");
     let (status, body) = f.get_out(JOB, 1, "nope.flac");

@@ -649,7 +649,10 @@ fn handle(stream: &mut std::net::TcpStream, config: &ServerConfig, gate: &RwLock
             ("GET", path) => {
                 let (job, round, lane, key) =
                     parse_job_path(path).ok_or_else(ApiError::not_found)?;
-                if lane != "out" || !validate_object_key(&key) {
+                if lane != "out"
+                    || !validate_object_key(&key)
+                    || nntune_core::par2::scratch::scratch_prefix(&job, round).is_none()
+                {
                     return Err(ApiError::not_found());
                 }
                 let _guard = gate.read().unwrap_or_else(|e| e.into_inner());
