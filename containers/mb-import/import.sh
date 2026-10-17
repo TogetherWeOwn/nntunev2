@@ -319,7 +319,7 @@ SQL
     valid_table_n="$((valid_table_n + 10#$valid_n))"
     start="$((10#$end + 1))"
   done
-  if (( valid_table_n == 0 )); then
+  if (( 10#$completed == 0 && valid_table_n == 0 )); then
     echo "import: refusing $table dump with no valid rows; replication state remains unchanged" >&2
     exit 1
   fi
