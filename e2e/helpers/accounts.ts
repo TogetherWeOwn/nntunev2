@@ -39,23 +39,47 @@ export function accountHeaders(account: TestAccount | null): Record<string, stri
 }
 
 /**
+ * Fixed, value-free description of a redirect Location header. The header
+ * is untrusted input (userinfo/query/fragment can carry secrets), so only
+ * its state — missing, malformed, present — is ever reported, never its
+ * text. Whitespace/control characters are malformed per RFC 3986; anything
+ * else must parse as an absolute URL or a relative reference.
+ */
+function locationNote(location: string | undefined): string {
+  if (location === undefined || location === '') return 'no location header';
+  try {
+    if (/[\s\u0000-\u001f\u007f]/.test(location)) throw new Error('malformed');
+    // The base is a throwaway placeholder so relative references parse; it
+    // is never emitted.
+    new URL(location, 'https://placeholder.invalid/');
+    return 'location present (redacted)';
+  } catch {
+    return 'location malformed (redacted)';
+  }
+}
+
+/**
  * Throw on a 3xx before any caller can follow it with credentials.
  * Access-login redirects keep the wall remediation (not a generic redirect);
- * any other 3xx fails naming the status + location. Names only, no values.
+ * any other 3xx fails naming the status + location state. Neither the
+ * request URL nor the Location value is ever interpolated: both are
+ * untrusted and can carry userinfo/query/fragment secrets, so diagnostics
+ * carry only the fixed context, category, status and variable names.
  */
-function throwOnRedirect(status: number, headers: Record<string, string>, url: string, context: string): void {
+function throwOnRedirect(status: number, headers: Record<string, string>, context: string): void {
   if (status < 300 || status >= 400) return;
-  const location = headers['location'] ?? headers['Location'] ?? '(no location header)';
-  if (/cloudflareaccess\.com|\/cdn-cgi\/access/i.test(location)) {
+  const location = headers['location'] ?? headers['Location'];
+  const note = locationNote(location);
+  if (location !== undefined && /cloudflareaccess\.com|\/cdn-cgi\/access/i.test(location)) {
     throw new Error(
-      `[${context}] hit the Cloudflare Access wall at ${url} ` +
-        `(HTTP ${status} → ${location}). Set CF_ACCESS_CLIENT_ID + ` +
-        'CF_ACCESS_CLIENT_SECRET for a QA service token with staging access. ' +
-        'See e2e/README.md. No secret values are logged here by design.',
+      `[${context}] hit the Cloudflare Access wall (HTTP ${status}, ${note}). ` +
+        'Set CF_ACCESS_CLIENT_ID + CF_ACCESS_CLIENT_SECRET for a QA service ' +
+        'token with staging access. See e2e/README.md. No secret values are ' +
+        'logged here by design.',
     );
   }
   throw new Error(
-    `[${context}] unexpected redirect (HTTP ${status} → ${location}) at ${url}: ` +
+    `[${context}] unexpected redirect (HTTP ${status}, ${note}): ` +
       'refusing to follow with credentials (names only — no values logged).',
   );
 }
@@ -78,7 +102,7 @@ export async function apiGet(
     timeout: opts?.timeout ?? 30_000,
     maxRedirects: 0,
   });
-  throwOnRedirect(res.status(), res.headers(), url, context);
+  throwOnRedirect(res.status(), res.headers(), context);
   return res;
 }
 
@@ -100,7 +124,7 @@ export async function apiPost(
     timeout: opts?.timeout ?? 30_000,
     maxRedirects: 0,
   });
-  throwOnRedirect(res.status(), res.headers(), url, context);
+  throwOnRedirect(res.status(), res.headers(), context);
   return res;
 }
 
