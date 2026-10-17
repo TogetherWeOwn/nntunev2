@@ -38,7 +38,7 @@ NZB upload ───────────────┘                     
 - Queue/Workflow payloads (`src/queue.rs`): `QueueMsg`, `RepairRequest`,
   `LibraryWrite` — all carry the idempotency key. MB calls target the
   `workers/mb` read API (`/v1/mb/release/:mbid`, `/v1/mb/recording/:mbid`,
-  `/v1/mb/search?type=…`).
+  `/v1/mb/release/:mbid/recordings`, `/v1/mb/search?type=…`).
 - Routes (`src/lib.rs`): `POST /v1/ingest/search` (16 KiB body cap,
   ≤16 categories, paged window), `POST /v1/ingest/nzb` (wire cap accounting
   for JSON escaping, then the versioned intake guard) — malformed JSON is
@@ -295,8 +295,12 @@ The match/write steps are wired in the consumer (`src/matching.rs` +
 `src/queue_consumer.rs`): MB release search through the `MB_API` service
 binding, the idempotent library upsert through `LIBRARY_DB`, and one
 meter event per transition, with the terminal `Done` checkpoint written
-only after the upsert commits. Recording MBIDs stay empty until the MB
-worker grows a release-to-recordings route. Still blocked for the live
+only after the upsert commits. After a release pick the matcher fetches
+the release's recordings to fill `recording_mbids` in album order
+(medium, then track, from the mirror's `mb_track` membership); a
+recordings-fetch failure never loses the release match (transient
+retries the job, permanent writes the release with an empty list).
+Still blocked for the live
 half: wiring the consumer's search step to a Newznab provider call
 (search-sourced jobs therefore cannot reach the probe yet), provider
 settings in the pool DO, verify/repair to the Container runtime, and

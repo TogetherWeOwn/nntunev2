@@ -286,11 +286,28 @@ def main() -> int:
                 if missing_release:
                     raise ValueError(f"recording {missing_release[0]} resolves to missing release {missing_release[1]}")
                 recording_count = insert_select(db, recording_query, output_dir / "mbdump-recording.tsv", updated_at)
+                # Every track appearance becomes one membership row, unlike
+                # the canonical single release on the recording row above:
+                # a recording shared with a reissue/compilation is listed
+                # under each release, and the medium position keeps
+                # multi-medium releases in album order downstream. The
+                # joins are total: bad_track/bad_medium_release above
+                # already rejected orphans.
+                track_query = """
+                    SELECT rel.gid,rec.gid,m.position,t.position
+                    FROM track t
+                    JOIN medium m ON m.id=t.medium
+                    JOIN release rel ON rel.id=m.release
+                    JOIN recording rec ON rec.id=t.recording
+                    ORDER BY rel.id,m.position,t.position,t.id
+                """
+                track_count = insert_select(db, track_query, output_dir / "mbdump-track.tsv", updated_at)
 
                 for table, input_count, output_count in (
                     ("artist", counts["artist"], artist_count),
                     ("release", counts["release"], release_count),
                     ("recording", counts["recording"], recording_count),
+                    ("track", counts["track"], track_count),
                 ):
                     if input_count and output_count == 0:
                         raise ValueError(f"{table} input is non-empty but curated output is empty")
@@ -307,7 +324,7 @@ def main() -> int:
             snapshot_name = f".curated-{timestamp_key}"
             snapshot = dump_dir / snapshot_name
             if snapshot.exists():
-                for table in ("artist", "release", "recording"):
+                for table in ("artist", "release", "recording", "track"):
                     name = f"mbdump-{table}.tsv"
                     if not filecmp.cmp(output_dir / name, snapshot / name, shallow=False):
                         raise ValueError("this DUMP_TS already has different curated output; use a new timestamp")
@@ -317,7 +334,7 @@ def main() -> int:
             os.symlink(snapshot_name, link_tmp)
             os.replace(link_tmp, curated_link)
 
-        print(f"etl: published {snapshot_name} via curated (artist={artist_count}, release={release_count}, recording={recording_count})")
+        print(f"etl: published {snapshot_name} via curated (artist={artist_count}, release={release_count}, recording={recording_count}, track={track_count})")
         return 0
     except (OSError, sqlite3.Error, ValueError) as exc:
         print(f"etl: {exc}", file=sys.stderr)

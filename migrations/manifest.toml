@@ -74,6 +74,11 @@ target = "app"
 sha256 = "c12d9f869611df9d5a4203ba96089aea41c88e3c1e85714dfdcff2e9cf474529"
 
 [[migration]]
-file = "0016_mb_replication_packet_ledger.sql"
+file = "0016_mb_track.sql"
 target = "mirror"
-sha256 = "3e30a2fd36576cb7d062ee141f1d07cffc72e1c142f40bc48bb383ae58db8910"
+sha256 = "4e984b85eb9d62a498402dc2ddf9474ac8297fe988b22cbfc1434bd8c7cbdbaa"
+
+[[migration]]
+file = "0017_mb_replication_packet_ledger.sql"
+target = "mirror"
+sha256 = "62ceb24df9c5ea7032fc3cf4e48e5e10f87d909639fa469ed79b4dfcd92009d6"

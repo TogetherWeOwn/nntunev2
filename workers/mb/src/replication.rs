@@ -1,7 +1,7 @@
 //! Per-packet replication accounting and an in-memory SLO probe.
 //!
 //! The applier persists the same fields in `mb_replication_packet` (migration
-//! 0016); this module keeps the probe deterministic and independently testable.
+//! 0017); this module keeps the probe deterministic and independently testable.
 use serde::Serialize;
 
 /// Replication lag budget promised by ADR 0007.
@@ -40,7 +40,7 @@ impl PacketLedger {
     /// Record a packet with its upstream identifier and sequence number.
     ///
     /// Callers must satisfy the durable schema's constraints (migration
-    /// 0016): `sequence >= 0`, `applied_at >= published_at`, and `packet_id`
+    /// 0017): `sequence >= 0`, `applied_at >= published_at`, and `packet_id`
     /// unique across sequences. This in-memory model does not re-validate
     /// them; in particular clock skew (`applied_at < published_at`) clamps
     /// `lag_secs` to 0 here while the applier's insert is rejected by the

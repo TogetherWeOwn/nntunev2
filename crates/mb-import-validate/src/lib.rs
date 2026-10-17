@@ -10,6 +10,7 @@
 //! - artist:    mbid, name, sort_name, type, country, updated_at
 //! - release:   mbid, artist_mbid, title, release_type, year, caa_url, updated_at
 //! - recording: mbid, release_mbid, title, track_no, duration_ms, updated_at
+//! - track:     release_mbid, recording_mbid, medium_no, track_no, updated_at
 //!
 //! Normalization: empty nullable numeric/uuid/timestamp fields are rewritten
 //! to the `COPY` null marker `\N`, and the 1-based dump line number is
@@ -23,6 +24,7 @@ pub enum Table {
     Artist,
     Release,
     Recording,
+    Track,
 }
 
 impl Table {
@@ -32,6 +34,7 @@ impl Table {
             "artist" => Some(Table::Artist),
             "release" => Some(Table::Release),
             "recording" => Some(Table::Recording),
+            "track" => Some(Table::Track),
             _ => None,
         }
     }
@@ -42,6 +45,7 @@ impl Table {
             Table::Artist => 6,
             Table::Release => 7,
             Table::Recording => 6,
+            Table::Track => 5,
         }
     }
 
@@ -51,6 +55,7 @@ impl Table {
             Table::Artist => "artist",
             Table::Release => "release",
             Table::Recording => "recording",
+            Table::Track => "track",
         }
     }
 }
@@ -67,6 +72,7 @@ pub mod reason {
     pub const NULL_IN_NOT_NULL: &str = "null_in_not_null";
     pub const BAD_COUNTRY: &str = "bad_country";
     pub const NEGATIVE_DURATION: &str = "negative_duration";
+    pub const NEGATIVE_POSITION: &str = "negative_position";
     pub const INVALID_ENCODING: &str = "invalid_encoding";
 }
 
@@ -112,6 +118,13 @@ pub fn validate_line(table: Table, line_no: u64, raw: &str) -> Result<String, (&
             (FieldKind::Text, true),
             (FieldKind::Smallint, false),
             (FieldKind::Duration, false),
+            (FieldKind::Timestamp, true),
+        ],
+        Table::Track => &[
+            (FieldKind::Uuid, true),
+            (FieldKind::Uuid, true),
+            (FieldKind::Position, true),
+            (FieldKind::Position, true),
             (FieldKind::Timestamp, true),
         ],
     };
@@ -169,6 +182,7 @@ enum FieldKind {
     Timestamp,
     Country,
     Duration,
+    Position,
     Text,
 }
 
@@ -200,6 +214,11 @@ impl FieldKind {
                 return match self {
                     FieldKind::Timestamp => Err(reason::BAD_TIMESTAMP),
                     FieldKind::Uuid => Err(reason::BAD_UUID),
+                    // An empty NOT NULL numeric would COPY as "" and abort
+                    // the chunk transaction; poison it like a bad value.
+                    FieldKind::Smallint | FieldKind::Duration | FieldKind::Position => {
+                        Err(reason::BAD_INT)
+                    }
                     _ => Ok(String::new()),
                 };
             }
@@ -237,6 +256,14 @@ impl FieldKind {
             FieldKind::Duration => match value.parse::<i32>() {
                 Ok(n) if n >= 0 => Ok(value.to_string()),
                 Ok(_) => Err(reason::NEGATIVE_DURATION),
+                Err(_) => Err(reason::BAD_INT),
+            },
+            // Medium/track positions: SMALLINT in the schema, and a
+            // negative position would trip the mb_track CHECK inside the
+            // chunk transaction, so it is poison here instead.
+            FieldKind::Position => match value.parse::<i16>() {
+                Ok(n) if n >= 0 => Ok(value.to_string()),
+                Ok(_) => Err(reason::NEGATIVE_POSITION),
                 Err(_) => Err(reason::BAD_INT),
             },
             FieldKind::Text => Ok(value.to_string()),
@@ -562,6 +589,33 @@ mod tests {
         assert!(validate_line(Table::Release, 1, &raw).is_ok());
         let raw = format!("{}\t\\N\tT\tAlbum\t-32768\t\\N\t{}", MBID2, TS);
         assert!(validate_line(Table::Release, 1, &raw).is_ok());
+    }
+
+    #[test]
+    fn valid_track_membership_and_bad_positions() {
+        let raw = format!("{}\t{}\t2\t0\t{}", MBID2, MBID, TS);
+        assert_eq!(
+            validate_line(Table::Track, 4, &raw),
+            Ok(format!("{raw}\t4"))
+        );
+        assert_eq!(Table::parse("track"), Some(Table::Track));
+        assert_eq!(Table::Track.as_str(), "track");
+        let raw = format!("{}\t{}\t-1\t1\t{}", MBID2, MBID, TS);
+        assert_eq!(
+            validate_line(Table::Track, 1, &raw),
+            Err((reason::NEGATIVE_POSITION, 1))
+        );
+        // An empty NOT NULL position must poison, not COPY as "".
+        let raw = format!("{}\t{}\t\t1\t{}", MBID2, MBID, TS);
+        assert_eq!(
+            validate_line(Table::Track, 1, &raw),
+            Err((reason::BAD_INT, 1))
+        );
+        let raw = format!("{}\t\\N\t1\t1\t{}", MBID2, TS);
+        assert_eq!(
+            validate_line(Table::Track, 1, &raw),
+            Err((reason::NULL_IN_NOT_NULL, 1))
+        );
     }
 
     #[test]

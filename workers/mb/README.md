@@ -12,6 +12,7 @@ Decision: `docs/adr/0007-mb-mirror.md`.
 | `GET` | `/v1/mb/artist/:mbid` | Artist lookup over Hyperdrive (`MB_DB`); success `Cache-Control: public, max-age=86400` |
 | `GET` | `/v1/mb/release/:mbid` | Release lookup (includes the stored `caa_url`); same caching as artist |
 | `GET` | `/v1/mb/recording/:mbid` | Recording lookup; same caching as artist |
+| `GET` | `/v1/mb/release/:mbid/recordings` | Recordings of a release in album order (`medium_no`, then `track_no`, then MBID), listed from `mb_track` membership, `LIMIT 1000`; existing release with no recordings is `200` with an empty list, missing release is `404`; same caching as lookups |
 | `GET` | `/v1/mb/search?q=&type=` | `type` in `artist\|release\|recording`; `q` 2-100 chars; trigram (`pg_trgm`) ordered by similarity, `LIMIT 25`; success `Cache-Control: public, max-age=300` |
 
 Errors are JSON (`{"error": "..."}`) with `Cache-Control: no-store`:
@@ -23,13 +24,24 @@ search success is `{"q", "type", "results": [{"mbid", "name"|"title",
 "score"}]}`; release results also carry `artist_mbid`/`artist_name`
 (null when the release has no artist) so callers can verify
 "Artist - Album" queries against the artist instead of the title-only
-score. Interactive reads never call musicbrainz.org.
+score; release-recordings success is `{"release_mbid",
+"recordings": [{"mbid", "release_mbid", "title", "track_no",
+"duration_ms", "medium_no"}]}`. The listing reads `mb_track`
+(`migrations/0016_mb_track.sql`), which stores every track appearance
+with its medium position — unlike `mb_recording.release_mbid`, which
+keeps one canonical release per recording and would drop a reissue's
+shared tracks; a bare recording lookup answers `medium_no: null`.
+Interactive reads never call musicbrainz.org.
 
 ## Caching
 
 - Order per read: edge Cache API, then KV, then Hyperdrive Postgres.
 - Lookups: KV key `mb:lookup:<kind>:<mbid>` (lowercase MBID), 24 h TTL;
   the same TTL is served as `Cache-Control` and stored via the Cache API.
+- Release recordings: KV key `mb:release-recordings:<mbid>` (lowercase
+  MBID), same 24 h TTL and edge treatment as lookups. An existing
+  release with zero recordings is a cacheable success; a missing
+  release (`404`) is not cached.
 - Search: KV key `mb:search:<kind>:<normalized q>` (trimmed, lowercased,
   whitespace collapsed; SQL binds the same normalized value), 5 min TTL.
 - Only successes are cached (a successful search with zero hits counts).
@@ -76,7 +88,7 @@ baseline, and a total stall must not read as healthy.
 `mb_replication_slo_breach` for every evaluation, including `breach_count`
 and its breach details. When the count is non-zero, increment the documented
 counter metric `mb_replication_slo_breach_total` by that count. The durable
-ledger schema is `migrations/0016_mb_replication_packet_ledger.sql`; packet
+ledger schema is `migrations/0017_mb_replication_packet_ledger.sql`; packet
 application remains the separate replication-applier responsibility.
 
 ## Terms
