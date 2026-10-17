@@ -46,6 +46,11 @@ async fn with_timeout<T>(
 
 /// Connects to `config.host:config.port` (implicit TLS when `config.tls`),
 /// applying `config.timeout` to the TCP connect itself.
+///
+/// General entry point: still dials plaintext fixtures/tests when
+/// `config.tls` is false. The NZB fetch path must use [`connect_pinned`],
+/// which enforces the fail-closed [`crate::pinned_transport`] policy before
+/// any TCP dial.
 pub async fn connect(config: &NntpConfig) -> io::Result<NativeTlsTransport> {
     let addr = format!("{}:{}", config.host, config.port);
     let tcp = with_timeout(config.timeout, TcpStream::connect(addr)).await?;
@@ -77,6 +82,25 @@ pub async fn connect(config: &NntpConfig) -> io::Result<NativeTlsTransport> {
         stream,
         timeout: config.timeout,
     })
+}
+
+/// Pinned NZB-fetch entry point: runs the fail-closed
+/// [`crate::pinned_transport`] policy (TLS-first, then port allowlist
+/// `119`/`563`) BEFORE any TCP dial, then delegates to [`connect`].
+///
+/// A TLS-off or off-allowlist config fails here with `InvalidInput` whose
+/// message carries the stable code (`transport_tls_required` /
+/// `transport_port_not_allowed`); the diagnostic is names-only, never
+/// credentials. The NZB intake wiring consumes this (not [`connect`]) plus
+/// [`crate::pinned_transport::with_cancel`] for the fetch itself.
+pub async fn connect_pinned(config: &NntpConfig) -> io::Result<NativeTlsTransport> {
+    if let Err(rejection) = crate::pinned_transport::validate_nntp_endpoint(config) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            rejection.to_string(),
+        ));
+    }
+    connect(config).await
 }
 
 impl Transport for NativeTlsTransport {
