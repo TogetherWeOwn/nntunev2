@@ -41,6 +41,10 @@ export const API = {
   library: '/api/library',
   stream: (id: string) => `/api/stream/${id}`,
   usage: '/api/usage',
+  // Deterministic no-auth WAV (`apps/web/src/routes/api/demo/audio/+server.ts`,
+  // bytes pinned by `helpers/demo-audio.ts`). A renamed path fails the
+  // demo-audio specs with this key named.
+  demoAudio: '/api/demo/audio',
 } as const;
 
 /** HTTP statuses the API uses to signal plan-limit enforcement. */
