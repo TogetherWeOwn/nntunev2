@@ -1,7 +1,8 @@
 name: ci
 
 # `ci-ok` is a required check on main: its NAME must stay `ci-ok`, and every
-# real job id must be listed in its `needs`.
+# gating job id must be listed in its `needs` (report-only jobs such as
+# worker-wasm-sizes are excluded by design).
 
 on:
   pull_request:

@@ -3,15 +3,19 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from report_worker_wasm_sizes import (
+    BUILD_TIMEOUT_SECONDS,
     TARGET,
     WORKERS,
+    build_worker,
     cargo_args,
     collect_rows,
     format_bytes,
@@ -201,6 +205,23 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(len(worker_lines), 1)
         self.assertIn("error: first second", worker_lines[0])
 
+    def test_pipe_status_does_not_split_cells(self):
+        rows = [
+            {"worker": "mb", "raw": None, "compressed": None,
+             "status": "error: build failed (exit 101:    | expected due to this)"},
+        ]
+        table = render_table(rows)
+        header = next(ln for ln in table.splitlines() if ln.startswith("| Worker"))
+        worker_lines = [ln for ln in table.splitlines() if "`mb`" in ln]
+        self.assertEqual(len(worker_lines), 1)
+        self.assertIn("\\|", worker_lines[0])
+        # Escaped pipes are not cell separators: the row must carry the
+        # same number of real pipes as the header.
+        self.assertEqual(
+            worker_lines[0].replace("\\|", "").count("|"),
+            header.count("|"),
+        )
+
     def test_table_marks_report_only(self):
         rows = [
             {"worker": "api", "raw": 2048, "compressed": 1024, "status": "ok"}
@@ -209,6 +230,24 @@ class RenderTests(unittest.TestCase):
         self.assertIn("2.0 KiB", table)
         self.assertIn("1.0 KiB", table)
         self.assertIn("report-only", table.lower())
+
+
+class BuildWorkerTimeoutTests(unittest.TestCase):
+    def test_timeout_fits_inside_ci_job(self):
+        # Five Workers build sequentially; the worst case must stay under
+        # the job's 30-minute timeout.
+        self.assertLessEqual(BUILD_TIMEOUT_SECONDS * len(WORKERS), 25 * 60)
+
+    def test_timeout_becomes_error_detail(self):
+        api = next(s for s in WORKERS if s["worker"] == "api")
+        with patch(
+            "report_worker_wasm_sizes.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["cargo"], timeout=1),
+        ) as run:
+            ok, detail = build_worker(Path("/repo"), api)
+        self.assertFalse(ok)
+        self.assertIn("timed out", detail)
+        self.assertEqual(run.call_args.kwargs["timeout"], BUILD_TIMEOUT_SECONDS)
 
 
 if __name__ == "__main__":

@@ -46,6 +46,12 @@ from pathlib import Path
 
 TARGET = "wasm32-unknown-unknown"
 
+# Per-Worker cargo timeout, in seconds. A hung build must not take the whole
+# report down: five Workers x 300 s = 25 min worst case, inside the CI job's
+# 30-minute timeout. Timeouts become ``error`` rows so collect_rows() keeps
+# measuring the remaining Workers.
+BUILD_TIMEOUT_SECONDS = 300
+
 # One entry per Worker. ``kind`` selects how the crate is addressed:
 # standalone crates (own Cargo.toml, own target dir) vs the stream crate
 # (workspace member, repo-root target dir). Only the api crate has a
@@ -147,7 +153,10 @@ def build_worker(root: Path, spec: dict) -> tuple[bool, str]:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            timeout=BUILD_TIMEOUT_SECONDS,
         )
+    except subprocess.TimeoutExpired:
+        return False, f"build timed out after {BUILD_TIMEOUT_SECONDS}s"
     except OSError as exc:
         return False, f"cargo not runnable: {exc}"
     if proc.returncode != 0:
@@ -182,8 +191,10 @@ def render_table(rows: list[dict]) -> str:
     for row in rows:
         # The status cell must stay on one line or the markdown table
         # breaks; flatten any stray newlines defensively (build summaries
-        # already arrive single-line from summarize_failure).
-        status = row["status"].replace("\n", " ")
+        # already arrive single-line from summarize_failure). Escape pipes
+        # too: rustc diagnostics almost always contain `|` gutter lines, and
+        # an unescaped pipe splits the cell and drops the error detail.
+        status = row["status"].replace("\n", " ").replace("|", "\\|")
         lines.append(
             "| `{worker}` | {raw_h} | {gz_h} | {raw} | {gz} | {status} |".format(
                 worker=row["worker"],
