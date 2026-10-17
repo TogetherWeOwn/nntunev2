@@ -404,8 +404,8 @@ fn has_ipv4_like_value(value: &str) -> bool {
     parts.len() == 4 && parts.iter().all(|part| part.parse::<u8>().is_ok())
 }
 
-fn has_ipv6_like_value(value: &str) -> bool {
-    let mut text = value.trim();
+fn is_ipv6_token(candidate: &str) -> bool {
+    let mut text = candidate.trim();
     if text.len() >= 2 && text.starts_with('[') && text.ends_with(']') {
         text = &text[1..text.len() - 1];
     }
@@ -455,6 +455,28 @@ fn has_ipv6_like_value(value: &str) -> bool {
     }
 }
 
+fn has_ipv6_like_value(value: &str) -> bool {
+    if is_ipv6_token(value) {
+        return true;
+    }
+    // Detect bracketed IPv6 hosts embedded in URL field values,
+    // e.g. `https://[2001:db8::1]/path`.
+    let mut rest = value;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        match after.find(']') {
+            Some(close) => {
+                if is_ipv6_token(&after[..close]) {
+                    return true;
+                }
+                rest = &after[close + 1..];
+            }
+            None => break,
+        }
+    }
+    false
+}
+
 fn email_token_is_shaped(token: &str) -> bool {
     let token = token.trim().trim_matches(['.', ',', ';', ':', '!', '?']);
     let (local, domain) = match token.split_once('@') {
@@ -492,7 +514,7 @@ fn has_email_like_value(value: &str) -> bool {
             c.is_whitespace()
                 || matches!(
                     c,
-                    ',' | ';' | ':' | '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']' | '='
+                    ',' | ';' | ':' | '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']' | '=' | '/'
                 )
         })
         .any(email_token_is_shaped)
@@ -758,13 +780,24 @@ fn golden_line_has_no_prohibited_keys_or_obvious_secret_values() {
         let bad = BTreeMap::from([("host".to_string(), JsonValue::String(value.into()))]);
         assert!(has_ipv6_value(&bad), "did not detect an IPv6 value {value}");
     }
+    for value in ["https://[2001:db8::1]/path", "see http://[fe80::1]/docs"] {
+        let bad = BTreeMap::from([("url".to_string(), JsonValue::String(value.into()))]);
+        assert!(
+            has_ipv6_value(&bad),
+            "did not detect an embedded IPv6 host {value}"
+        );
+    }
     for value in ["12:00:00", "task-queued", "v1.2"] {
         assert!(
             !has_ipv6_like_value(value),
             "flagged a benign value as IPv6: {value}"
         );
     }
-    for value in ["user@example.com", "admin@mail.io"] {
+    for value in [
+        "user@example.com",
+        "admin@mail.io",
+        "see https://example.org/users/alice@example.com",
+    ] {
         let bad = BTreeMap::from([("contact".to_string(), JsonValue::String(value.into()))]);
         assert!(
             has_email_value(&bad),
