@@ -1,7 +1,8 @@
 name: ci
 
 # `ci-ok` is a required check on main: its NAME must stay `ci-ok`, and every
-# real job id must be listed in its `needs`.
+# gating job id must be listed in its `needs` (report-only jobs such as
+# worker-wasm-sizes are excluded by design).
 
 on:
   pull_request:
@@ -76,6 +77,33 @@ jobs:
       # verifies the native-only stampede guard remains cfg'd out.
       - run: cargo check -p nntune-stream --target wasm32-unknown-unknown
       - run: cargo clippy -p nntune-stream --target wasm32-unknown-unknown -- -D warnings
+
+  # Per-Worker compressed Wasm sizes: builds each Worker's release
+  # wasm32 cdylib, measures raw + gzip bytes, and publishes a per-Worker
+  # size table to the job summary. REPORT-ONLY: this job id is
+  # deliberately NOT in ci-ok's needs, the script exits 0 even when a
+  # Worker build fails (failures become error rows), and the job itself
+  # has continue-on-error -- so a size increase (or a broken report step)
+  # can never fail the build. No thresholds, no dependency-gate changes.
+  worker-wasm-sizes:
+    name: worker wasm sizes (report-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
+      # (2026-08-06); re-pin deliberately, never float.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Unit-test the size reporter
+        run: python3 .github/scripts/test_report_worker_wasm_sizes.py
+      - name: Build and report per-Worker compressed Wasm sizes
+        run: python3 .github/scripts/report_worker_wasm_sizes.py
 
   # Public-repo hygiene: fail on internal tracker ids (TOG-<digits>),
   # internal hostnames, instance-UI paths and agent names in tracked text.
