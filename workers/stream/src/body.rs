@@ -23,7 +23,7 @@ use std::cell::RefCell;
 use std::future::Future;
 
 use nntune_core::nntp::NntpClient;
-use nntune_core::transport::Transport;
+use nntune_core::transport::{is_article_limit_error, Transport};
 use serde::{Deserialize, Serialize};
 
 use crate::pool::{CircuitState, Lane, Pool, PoolError};
@@ -127,6 +127,12 @@ enum FetchFail {
     /// Article over [`MAX_BODY_ARTICLE_BYTES`]: connection in sync, provider
     /// healthy — refuse only this fetch (`413`).
     TooLarge,
+    /// Article over the *client's* read limit, hit mid-dot-block: the
+    /// provider is healthy (refuse only this fetch, `413`), but the
+    /// transport has invalidated the connection — the rest of the
+    /// dot-block is still on the wire, so it must be dropped, never
+    /// pooled for reuse.
+    TooLargeUnusable,
     /// The connection died (`Io`): redial once when it was warm.
     Closed,
     /// Auth, protocol or any other provider failure.
@@ -153,6 +159,14 @@ async fn fetch_body<T: Transport>(
         Err(nntune_core::Error::ArticleNotFound(_)) => {
             on_response();
             Ok(BodyOutcome::Missing)
+        }
+        // The client's own article limit, enforced while reading the
+        // dot-block (it can bind below the reply cap when the client is
+        // configured tighter): a request-specific `413`, never a
+        // provider failure against the user's pool.
+        Err(nntune_core::Error::Io(e)) if is_article_limit_error(&e) => {
+            on_response();
+            Err(FetchFail::TooLargeUnusable)
         }
         Err(nntune_core::Error::Io(_)) => Err(FetchFail::Closed),
         Err(_) => Err(FetchFail::Provider),
@@ -218,6 +232,16 @@ where
                 pool.release(lease, Some(client));
                 return Err(ProbeError::TooLarge);
             }
+            // Over the client limit mid-block: provider healthy, so no
+            // quarantine and no redial (the same article would refuse
+            // again) — but the connection is desynced, so release the
+            // lease without pooling it.
+            Err(FetchFail::TooLargeUnusable) => {
+                let mut pool = pool.borrow_mut();
+                pool.record_success_for_if_epoch_matches(lease.id, success_epoch);
+                pool.release(lease, None);
+                return Err(ProbeError::TooLarge);
+            }
             // Closed while idle: drop it and redial once below.
             Err(FetchFail::Closed) => {}
             Err(FetchFail::Provider) => return Err(provider_failed(pool, &tick, lease)),
@@ -248,6 +272,12 @@ where
             let mut pool = pool.borrow_mut();
             pool.record_success_for_if_epoch_matches(lease.id, success_epoch);
             pool.release(lease, Some(client));
+            Err(ProbeError::TooLarge)
+        }
+        Err(FetchFail::TooLargeUnusable) => {
+            let mut pool = pool.borrow_mut();
+            pool.record_success_for_if_epoch_matches(lease.id, success_epoch);
+            pool.release(lease, None);
             Err(ProbeError::TooLarge)
         }
         Err(FetchFail::Closed | FetchFail::Provider) => Err(provider_failed(pool, &tick, lease)),

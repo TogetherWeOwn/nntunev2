@@ -127,6 +127,48 @@ async fn body_reports_a_missing_article_without_failing_the_pool() {
     assert_eq!(dials.get(), 1, "430 must not drop the connection either");
 }
 
+#[tokio::test]
+async fn body_over_the_client_read_limit_is_too_large_not_a_provider_failure() {
+    // The NNTP client enforces its own article limit while reading the
+    // dot-block; when it binds below the route's reply cap, the refusal
+    // must surface as a request-specific TooLarge (`413`), never as a
+    // provider failure that quarantines the user's pool and makes
+    // ingest retry the same article on every delivery.
+    let server = TestNntpServer::spawn_for_test().await;
+    let mut tight = config(server.addr(), "testpass");
+    tight.max_article_bytes = 16;
+    let dials = Cell::new(0);
+    let pool: RefCell<Pool<Client>> = RefCell::new(Pool::new(4));
+
+    let article = &default_corpus()[0];
+    let id = article.message_id.trim_matches(['<', '>']);
+    let err = run_body(
+        &pool,
+        || dial(tight.clone(), &dials),
+        no_tick,
+        &request("user_01", id),
+    )
+    .await
+    .expect_err("article over the client limit must refuse");
+    assert_eq!(err, ProbeError::TooLarge);
+    assert_eq!(dials.get(), 1, "one dial, no provider-failure redial");
+
+    // The pool is not quarantined: a properly configured client still
+    // fetches. The desynced connection was dropped (not pooled), so
+    // this takes a fresh dial.
+    let cfg = config(server.addr(), "testpass");
+    let outcome = run_body(
+        &pool,
+        || dial(cfg.clone(), &dials),
+        no_tick,
+        &request("user_01", id),
+    )
+    .await
+    .expect("pool must still serve after an over-limit refusal");
+    assert!(matches!(outcome, BodyOutcome::Bytes(_)));
+    assert_eq!(dials.get(), 2, "dropped connection is redialed once");
+}
+
 #[test]
 fn body_request_validation_rejects_bad_envelopes() {
     let ok = serde_json::to_vec(&request("user_01", "seg-one@synthetic.invalid")).unwrap();

@@ -2,16 +2,28 @@
 //! scratch for the repair handoff.
 //!
 //! One Queue delivery runs [`run_verifying_step`] over the job's parsed
-//! files. The step is resumable per file: every fetched file is staged to
-//! the scratch bucket and recorded in [`VerifyProgress`] (stored beside
-//! the job checkpoint; see `checkpoint::put_verify`) before the next file
-//! starts, so a redelivery never refetches a file whose staged bytes
-//! still check out. A lost progress record is rebuilt by adopting the
-//! staged objects' own metadata, so scratch is the durable record and
-//! the progress value is its index. Per-delivery caps
-//! ([`VerifyCaps`] plus a deadline callback) bound how much one message
-//! may spend; hitting a cap returns [`VerifyOutcome::Incomplete`] with the
-//! progress so far, and the consumer redelivers to continue.
+//! files. The step is resumable per segment: every decoded segment is
+//! spooled to the scratch bucket as it is fetched and recorded in
+//! [`VerifyProgress`] (stored beside the job checkpoint; see
+//! `checkpoint::put_verify`), so a redelivery resumes a file at the
+//! first unfetched segment instead of refetching it whole, and a staged
+//! file is never refetched while its staged bytes still check out. A
+//! lost progress record is rebuilt by adopting the staged objects' own
+//! metadata, so scratch is the durable record and the progress value is
+//! its index. Per-delivery caps ([`VerifyCaps`] plus a deadline
+//! callback) bound how much one message may spend; hitting a cap
+//! returns [`VerifyOutcome::Incomplete`] with the progress so far, and
+//! the consumer redelivers to continue.
+//!
+//! File size itself is never a failure: a file whose assembled length
+//! fits `max_file_bytes` is assembled, judged and staged as one object;
+//! a larger file is judged by streaming its spooled segments back one
+//! at a time (incremental SHA-256 and per-block CRC32s, so memory stays
+//! O(segment)) and staged *as* its spool — the manifest rows then carry
+//! the segment keys for the repair handoff to concatenate. Staged par2
+//! is restored the same way, packet by packet into a
+//! [`RecoverySetBuilder`], so aggregate par2 size is not capped either;
+//! only one buffered packet is bounded (see `max_par2_bytes`).
 //!
 //! Order inside a step: par2 files first (fetch, stage, parse into
 //! recovery sets grouped by set id), then data files (fetch, yEnc-decode,
@@ -33,8 +45,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 
-use nntune_core::par2::{RecoveryFile, RecoverySet};
+use nntune_core::par2::{peek_set_id, RecoveryFile, RecoverySet, RecoverySetBuilder};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::dispatch::content_sha256_hex;
 use crate::jobs::validate_job_id;
@@ -48,16 +61,18 @@ pub const MAX_VERIFY_FILES: usize = 1024;
 
 /// Per-delivery spend caps for [`run_verifying_step`]. The defaults are
 /// sized against the 128 MB per-isolate Worker memory limit. The live
-/// peaks are sequential, never additive: fetching holds the decoded
-/// segments (≤ `max_file_bytes`) plus one article buffer and its
-/// decode scratch (each ≤ `max_article_bytes`) ≈ 64 MiB; assembly
-/// copies the segments into one
-/// contiguous buffer while dropping each segment as it is copied, so
-/// its formal worst case is 2 × `max_file_bytes` = 64 MiB; restoring
-/// staged par2 in `load_sets` holds ≤ `max_par2_bytes` of groups plus
-/// one trial clone of the same bound = 48 MiB. Each peak stays well
-/// under the isolate limit with the parsed recovery sets (metadata
-/// only) and runtime overhead accounted for.
+/// peaks are sequential, never additive: fetching holds one article
+/// buffer and its decode scratch (each ≤ `max_article_bytes`) plus the
+/// one decoded segment being spooled; assembly of an in-memory file
+/// holds the assembled buffer (≤ `max_file_bytes`) plus one spooled
+/// segment at a time; a larger file is judged streaming, one segment
+/// at a time; restoring staged par2 in `load_sets` holds one staged
+/// object (or one spool segment) plus ≤ `max_par2_bytes` of buffered
+/// packet. Each peak stays well under the isolate limit with the
+/// parsed recovery sets (metadata only) and runtime overhead
+/// accounted for. The size fields bound *memory*, never the job: an
+/// ordinary release larger than any of them is spooled/streamed, not
+/// failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifyCaps {
     /// Files fetched from the provider per delivery.
@@ -66,14 +81,19 @@ pub struct VerifyCaps {
     pub max_segments_per_delivery: usize,
     /// Article bytes fetched from the provider per delivery.
     pub max_bytes_per_delivery: u64,
-    /// Largest assembled file verified in-Worker. Bigger files fail
-    /// permanently instead of pressing isolate memory.
+    /// Largest assembled file held in memory for judging/staging.
+    /// Bigger files are judged by streaming their spooled segments and
+    /// staged as the spool itself (see the module docs) — never failed
+    /// for size alone.
     pub max_file_bytes: u64,
     /// Largest single article body accepted from the pool.
     pub max_article_bytes: usize,
-    /// Largest aggregate staged par2 bytes restored into memory by one
-    /// step (all recovery groups plus not-yet-merged bytes). Enforced
-    /// before any staged bytes are copied or cloned for trial parsing.
+    /// Largest single par2 *packet* buffered while restoring staged
+    /// par2. Staged par2 streams into the set builder packet by packet,
+    /// so the aggregate across files/deliveries is uncapped; a packet
+    /// beyond this bound (which implies a par2 block size beyond it,
+    /// far outside ordinary posts) makes its file's packets unusable
+    /// for in-Worker verification, not the job permanently failed.
     pub max_par2_bytes: u64,
 }
 
@@ -117,6 +137,45 @@ pub struct StagedFile {
     /// Hex set id of the recovery set covering this file, when one does.
     #[serde(default)]
     pub par2_set_id: Option<String>,
+    /// Spool-segment keys when the staged file *is* its segment spool
+    /// (too large to assemble in memory): the manifest then lists these
+    /// in order for the repair handoff to concatenate, and `key` names
+    /// the segment index (see [`VerifyProgress::spool_meta_key`]) rather
+    /// than a byte object. Empty for an ordinarily assembled file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spool: Vec<StagedSpoolSegment>,
+    /// Spool-object role only: for a spooled *segment* object (never a
+    /// staged-file record), the decoded bytes' CRC32, so a lost
+    /// progress write can rebuild the resume cursor from object
+    /// metadata alone. `missing` marks a segment recorded without
+    /// bytes. Both are 0/false on every staged-file record.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub crc32: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub missing: bool,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+/// One spooled segment of an in-flight or spooled-staged file: the
+/// decoded bytes' scratch key plus everything the judgement needs from
+/// them (decode-time CRC32 for the par2 precheck, length for geometry).
+/// A segment the provider no longer has (or that failed yEnc decode)
+/// records `missing` instead — an answered `430` is durable progress
+/// exactly like fetched bytes, and is never refetched pointlessly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedSpoolSegment {
+    pub key: String,
+    pub size: u64,
+    pub crc32: u32,
+    #[serde(default)]
+    pub missing: bool,
 }
 
 /// Per-file resume state for one Verifying round, stored beside the job
@@ -127,6 +186,14 @@ pub struct VerifyProgress {
     pub round: u32,
     /// Staged files by NZB file index.
     pub staged: BTreeMap<usize, StagedFile>,
+    /// Decoded segments spooled so far for files still being fetched, by
+    /// NZB file index: the per-file resume cursor. Entry `k` of a file's
+    /// list is segment `k`'s record in NZB order, so a redelivery
+    /// resumes at the first segment without one. Dropped when the file
+    /// stages as one assembled object; kept (as the file's staged form)
+    /// when the file is too large to assemble in memory.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub spool: BTreeMap<usize, Vec<StagedSpoolSegment>>,
     /// The set the completed step dispatched (or would dispatch) repair
     /// for; `None` until every file is judged.
     #[serde(default)]
@@ -167,6 +234,29 @@ impl VerifyProgress {
     /// Manifest key for one round (next to `in/`, per the scratch contract).
     pub fn manifest_key(job_id: &str, round: u32) -> String {
         format!("{}manifest.json", Self::scratch_prefix(job_id, round))
+    }
+
+    /// Spool key for one decoded segment of one file:
+    /// `ingest-scratch/{job_id}/r{round}/spool/{index:04}/{segment:06}`.
+    /// Deterministic across deliveries, so a redelivery (or a lost
+    /// progress write) finds earlier segments already at their keys.
+    pub fn spool_key(job_id: &str, round: u32, file_index: usize, segment: usize) -> String {
+        format!(
+            "{}spool/{file_index:04}/{segment:06}",
+            Self::scratch_prefix(job_id, round)
+        )
+    }
+
+    /// Segment-index key for a file staged as its spool: carries the
+    /// file's staged judgement (size/sha256/missing blocks/set id) in
+    /// object metadata exactly like an assembled object's, with the
+    /// ordered segment list as the body — so resume-trust and metadata
+    /// adoption work for spooled files just like for assembled ones.
+    pub fn spool_meta_key(job_id: &str, round: u32, file_index: usize) -> String {
+        format!(
+            "{}spool/{file_index:04}/index.json",
+            Self::scratch_prefix(job_id, round)
+        )
     }
 }
 
@@ -229,16 +319,38 @@ pub struct ManifestEntry {
     pub size: u64,
     /// `data` or `par2`.
     pub role: &'static str,
+    /// Spool-segment keys in file order when the file was staged as its
+    /// segment spool (too large to assemble in-Worker): the handoff
+    /// concatenates these (zero-filling each gap named in `missing`)
+    /// instead of reading `key`'s bytes. Empty for an assembled file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub segments: Vec<String>,
+    /// Indexes (into `segments`) whose articles are gone: those byte
+    /// ranges are part of the damage the repair side re-derives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing: Vec<usize>,
 }
 
-/// Decoded segments of one file, in NZB order.
-enum Seg {
-    Present {
-        bytes: Vec<u8>,
-        crc32: u32,
-    },
-    /// Article gone (`430`) or undecodable: no trustworthy bytes.
-    Missing,
+/// What spooling one segment concluded.
+enum SpoolOne {
+    /// The segment is durably recorded: present (bytes in scratch) or
+    /// answered missing/undecodable (record only). Either way the
+    /// cursor advances past it.
+    Fetched(StagedSpoolSegment),
+    /// The article exceeds the per-article cap: unusable like a `430`,
+    /// but nothing is recorded — spooling stops here and the file is
+    /// judged with this and every later segment absent.
+    Oversize,
+}
+
+/// How a fully spooled file's bytes are presented to the judgement.
+enum LoadedFile {
+    /// Assembled file bytes: gaps placed by the proven uniform part
+    /// size and zero-filled, or just the contiguous present prefix when
+    /// no part size is proven (see the module docs).
+    Assembled(Vec<u8>),
+    /// Too large to hold in memory: judged by streaming the spool.
+    Spooled { logical_len: u64 },
 }
 
 struct Spend {
@@ -313,6 +425,12 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
                 }
                 _ => {
                     progress.staged.remove(&idx);
+                    // `claim_staged` claimed this file's par2 entry from
+                    // the record just evicted: recompute the claims
+                    // without it, or the refetch below would find its
+                    // own entry taken and be judged as uncovered.
+                    claimed = HashSet::new();
+                    claim_staged(&sets, files, progress, &mut claimed);
                     dirty = true;
                 }
             }
@@ -331,6 +449,58 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
                     continue;
                 }
             }
+            // A file staged as its spool: adopt the segment index (its
+            // body is the full staged record, its metadata the same
+            // judgement an assembled object carries).
+            let meta_key = VerifyProgress::spool_meta_key(job_id, round, idx);
+            let mut adopted_spooled = false;
+            if let Some(meta) = scratch.head(&meta_key).await? {
+                if meta.key == meta_key {
+                    if let Some(body) = scratch.get(&meta_key).await? {
+                        if let Ok(mut adopted) = serde_json::from_slice::<StagedFile>(&body) {
+                            if adopted.key == meta_key
+                                && adopted.sha256 == meta.sha256
+                                && adopted.size == meta.size
+                            {
+                                adopted.missing_blocks = meta.missing_blocks;
+                                adopted.par2_set_id = meta.par2_set_id.clone();
+                                progress.staged.insert(idx, adopted);
+                                if !file.is_par2 {
+                                    claim_staged(&sets, files, progress, &mut claimed);
+                                }
+                                dirty = true;
+                                adopted_spooled = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if adopted_spooled {
+                continue;
+            }
+            // Adopt a half-spooled file whose progress write was lost:
+            // the cursor is rebuilt by probing the deterministic spool
+            // keys until one is absent.
+            #[allow(clippy::map_entry)]
+            if !progress.spool.contains_key(&idx) {
+                let mut adopted = Vec::new();
+                for n in 0..file.segment_ids.len() {
+                    let key = VerifyProgress::spool_key(job_id, round, idx, n);
+                    match scratch.head(&key).await? {
+                        Some(meta) => adopted.push(StagedSpoolSegment {
+                            key: meta.key,
+                            size: meta.size,
+                            crc32: meta.crc32,
+                            missing: meta.missing,
+                        }),
+                        None => break,
+                    }
+                }
+                if !adopted.is_empty() {
+                    progress.spool.insert(idx, adopted);
+                    dirty = true;
+                }
+            }
         }
 
         if spend.exhausted(caps) || deadline_exceeded() {
@@ -338,58 +508,161 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
             return Ok(VerifyOutcome::Incomplete);
         }
 
-        let segments = fetch_segments(file, source, caps, &mut spend, deadline_exceeded).await?;
-        let Some(segments) = segments else {
-            // Cap or deadline hit mid-file: nothing staged for this
-            // file, the next delivery refetches it whole.
+        // Validate the resume cursor against scratch: a vanished spool
+        // object truncates it, so that segment (and everything after
+        // it) refetches below instead of being trusted sight unseen.
+        if let Some(spool) = progress.spool.get(&idx).cloned() {
+            let mut valid = spool.len();
+            for (n, rec) in spool.iter().enumerate() {
+                if !rec.missing && scratch.head(&rec.key).await?.is_none() {
+                    valid = n;
+                    break;
+                }
+            }
+            if valid < spool.len() {
+                progress
+                    .spool
+                    .get_mut(&idx)
+                    .expect("cursor")
+                    .truncate(valid);
+                dirty = true;
+            }
+        }
+
+        // Spool the remaining segments, resuming at the cursor. A cap
+        // or the deadline stops mid-file with every fetched segment
+        // already durable in scratch and recorded in the cursor.
+        let total_segments = file.segment_ids.len();
+        let mut stopped = false;
+        loop {
+            let have = progress.spool.get(&idx).map_or(0, Vec::len);
+            if have >= total_segments {
+                break;
+            }
+            if spend.segments >= caps.max_segments_per_delivery
+                || spend.bytes >= caps.max_bytes_per_delivery
+                || deadline_exceeded()
+            {
+                stopped = true;
+                break;
+            }
+            match spool_one(
+                job_id,
+                round,
+                idx,
+                have,
+                &file.segment_ids[have],
+                source,
+                scratch,
+                caps,
+                &mut spend,
+            )
+            .await?
+            {
+                SpoolOne::Fetched(rec) => {
+                    progress.spool.entry(idx).or_default().push(rec);
+                    dirty = true;
+                }
+                // An oversize article is unusable like a `430`: stop
+                // spooling and judge the file with this and every later
+                // segment absent (counted in the block judgement).
+                SpoolOne::Oversize => break,
+            }
+        }
+        if stopped {
             write_manifest(job_id, round, files, progress, scratch, dirty).await?;
             return Ok(VerifyOutcome::Incomplete);
-        };
+        }
         spend.files += 1;
+        let segs = progress.spool.get(&idx).cloned().unwrap_or_default();
 
         let matched = if file.is_par2 {
             None
         } else {
-            match_set_file(&sets, file, &segments, &mut claimed)
+            match_set_file(&sets, file, &segs, total_segments, &mut claimed)
         };
-        // Everything the judgement needs from the segments, captured
-        // before assembly consumes (and frees) them.
-        let missing_segments = segments
-            .iter()
-            .filter(|s| matches!(s, Seg::Missing))
-            .count() as u32;
-        let seg_crcs: Vec<(u32, u64)> = segments
-            .iter()
-            .map(|s| match s {
-                Seg::Present { bytes, crc32 } => (*crc32, bytes.len() as u64),
-                Seg::Missing => (0, 0),
-            })
-            .collect();
-        let Some(assembled) = assemble(
-            segments,
-            matched.map(|(_, f)| f.length),
+        let expected_len = matched.map(|(_, f)| f.length);
+        let seg_crcs: Vec<(u32, u64)> = segs.iter().map(seg_crc_len).collect();
+        let missing_segments = {
+            let answered = segs.iter().filter(|s| s.missing).count();
+            let unfetched = total_segments.saturating_sub(segs.len());
+            (answered + unfetched) as u32
+        };
+
+        let load = load_segments(
+            &segs,
+            total_segments,
+            expected_len,
             caps.max_file_bytes,
-        ) else {
-            return Err(VerifyError::Permanent(
-                "assembled file exceeds the verify size cap".into(),
-            ));
+            scratch,
+        )
+        .await?;
+        let Some(load) = load else {
+            // The implied geometry overflows u64: the par2 length and
+            // the part sizes disagree beyond any real file.
+            return Err(VerifyError::Permanent("file geometry out of bounds".into()));
         };
 
-        let (missing_blocks, par2_set_id) = if file.is_par2 {
-            (0, None)
-        } else {
-            judge_file(matched, missing_segments, &seg_crcs, &assembled)
+        let staged = match load {
+            LoadedFile::Assembled(bytes) => {
+                let (missing_blocks, par2_set_id) = if file.is_par2 {
+                    (0, None)
+                } else {
+                    judge_file(matched, missing_segments, &seg_crcs, &bytes)
+                };
+                let key = VerifyProgress::file_key(job_id, round, idx, &file.name);
+                let staged = StagedFile {
+                    size: bytes.len() as u64,
+                    sha256: content_sha256_hex(&bytes),
+                    key: key.clone(),
+                    missing_blocks,
+                    par2_set_id,
+                    spool: Vec::new(),
+                    crc32: 0,
+                    missing: false,
+                };
+                scratch.put(&key, bytes, &staged).await?;
+                // The assembled object supersedes the spool cursor (the
+                // spool objects themselves expire with the bucket).
+                progress.spool.remove(&idx);
+                staged
+            }
+            LoadedFile::Spooled { logical_len } => {
+                let (missing_blocks, par2_set_id, sha256) = if file.is_par2 {
+                    (
+                        0,
+                        None,
+                        spool_sha256(&segs, total_segments, logical_len, scratch).await?,
+                    )
+                } else {
+                    judge_spooled(
+                        matched,
+                        missing_segments,
+                        &seg_crcs,
+                        &segs,
+                        total_segments,
+                        logical_len,
+                        scratch,
+                    )
+                    .await?
+                };
+                let key = VerifyProgress::spool_meta_key(job_id, round, idx);
+                let staged = StagedFile {
+                    size: logical_len,
+                    sha256,
+                    key: key.clone(),
+                    missing_blocks,
+                    par2_set_id,
+                    spool: segs.clone(),
+                    crc32: 0,
+                    missing: false,
+                };
+                let body = serde_json::to_vec(&staged)
+                    .map_err(|_| VerifyError::Transient("spool index encode failed".into()))?;
+                scratch.put(&key, body, &staged).await?;
+                staged
+            }
         };
-
-        let key = VerifyProgress::file_key(job_id, round, idx, &file.name);
-        let staged = StagedFile {
-            size: assembled.len() as u64,
-            sha256: content_sha256_hex(&assembled),
-            key: key.clone(),
-            missing_blocks,
-            par2_set_id,
-        };
-        scratch.put(&key, assembled, &staged).await?;
         progress.staged.insert(idx, staged);
         dirty = true;
     }
@@ -398,50 +671,57 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
     Ok(finalize(files, &sets, progress))
 }
 
-/// Fetch and yEnc-decode every segment of one file. `Ok(None)` means a
-/// cap or the deadline stopped the fetch mid-file.
-async fn fetch_segments<B: BodySource>(
-    file: &ParsedFile,
+/// Fetch, yEnc-decode and spool one segment. Present bytes go to scratch
+/// immediately (with their CRC32 in the object record, so a lost
+/// progress write can rebuild the cursor from metadata alone).
+#[allow(clippy::too_many_arguments)]
+async fn spool_one<B: BodySource, S: ScratchStore>(
+    job_id: &str,
+    round: u32,
+    file_index: usize,
+    segment: usize,
+    segment_id: &str,
     source: &mut B,
+    scratch: &S,
     caps: &VerifyCaps,
     spend: &mut Spend,
-    deadline_exceeded: &dyn Fn() -> bool,
-) -> Result<Option<Vec<Seg>>, VerifyError> {
-    let mut segments = Vec::with_capacity(file.segment_ids.len());
-    let mut decoded_total: u64 = 0;
-    for id in &file.segment_ids {
-        if spend.segments >= caps.max_segments_per_delivery
-            || spend.bytes >= caps.max_bytes_per_delivery
-            || deadline_exceeded()
-        {
-            return Ok(None);
-        }
-        spend.segments += 1;
-        let Some(article) = source.fetch_body(id).await? else {
-            segments.push(Seg::Missing);
-            continue;
-        };
-        spend.bytes = spend.bytes.saturating_add(article.len() as u64);
-        if article.len() > caps.max_article_bytes {
-            return Err(VerifyError::Permanent(
-                "article exceeds the verify size cap".into(),
-            ));
-        }
-        match decode_segment(id, &article) {
-            Some(bytes) => {
-                decoded_total = decoded_total.saturating_add(bytes.len() as u64);
-                if decoded_total > caps.max_file_bytes {
-                    return Err(VerifyError::Permanent(
-                        "assembled file exceeds the verify size cap".into(),
-                    ));
-                }
-                let crc32 = crc32fast::hash(&bytes);
-                segments.push(Seg::Present { bytes, crc32 });
-            }
-            None => segments.push(Seg::Missing),
-        }
+) -> Result<SpoolOne, VerifyError> {
+    spend.segments += 1;
+    let key = VerifyProgress::spool_key(job_id, round, file_index, segment);
+    let missing_rec = StagedSpoolSegment {
+        key: key.clone(),
+        size: 0,
+        crc32: 0,
+        missing: true,
+    };
+    let Some(article) = source.fetch_body(segment_id).await? else {
+        return Ok(SpoolOne::Fetched(missing_rec));
+    };
+    spend.bytes = spend.bytes.saturating_add(article.len() as u64);
+    if article.len() > caps.max_article_bytes {
+        return Ok(SpoolOne::Oversize);
     }
-    Ok(Some(segments))
+    let Some(bytes) = decode_segment(segment_id, &article) else {
+        return Ok(SpoolOne::Fetched(missing_rec));
+    };
+    let rec = StagedSpoolSegment {
+        key: key.clone(),
+        size: bytes.len() as u64,
+        crc32: crc32fast::hash(&bytes),
+        missing: false,
+    };
+    let meta = StagedFile {
+        size: rec.size,
+        sha256: content_sha256_hex(&bytes),
+        key: key.clone(),
+        missing_blocks: 0,
+        par2_set_id: None,
+        spool: Vec::new(),
+        crc32: rec.crc32,
+        missing: false,
+    };
+    scratch.put(&key, bytes, &meta).await?;
+    Ok(SpoolOne::Fetched(rec))
 }
 
 /// Decode one yEnc article. Any decode or CRC failure makes the segment
@@ -455,145 +735,352 @@ fn decode_segment(segment_id: &str, article: &[u8]) -> Option<Vec<u8>> {
     Some(dst)
 }
 
-/// Assemble a file's bytes from its decoded segments, or `None` when
-/// the implied length exceeds `max_file_bytes`. The implied length is
-/// checked *before* any allocation: it derives from the untrusted par2
-/// length and from part geometry over mostly-missing segments, neither
-/// of which the fetched-bytes caps bound. All-present files concatenate
-/// in order. With gaps, present parts are placed at `index * part_size`
-/// when they prove one uniform part size (see the module docs);
-/// otherwise only the contiguous present prefix is kept. The buffer is
-/// sized from the par2 expected length when known, so the repair side
-/// receives a full-length damaged file.
-///
-/// Consumes the segments and drops each decoded buffer as soon as it is
-/// copied, so the segment bytes are never retained alongside the output
-/// through judging and staging. The copy itself is bounded by
-/// `max_file_bytes` (see [`VerifyCaps`] for the isolate budget).
-fn assemble(segments: Vec<Seg>, expected_len: Option<u64>, max_file_bytes: u64) -> Option<Vec<u8>> {
-    if segments.iter().all(|s| matches!(s, Seg::Present { .. })) {
-        let total = segments.iter().try_fold(0u64, |acc, s| match s {
-            Seg::Present { bytes, .. } => acc.checked_add(bytes.len() as u64),
-            Seg::Missing => Some(acc),
-        })?;
-        if total > max_file_bytes {
-            return None;
-        }
-        let mut out = Vec::with_capacity(total as usize);
-        for seg in segments {
-            if let Seg::Present { bytes, .. } = seg {
-                out.extend_from_slice(&bytes);
-            }
-        }
-        return Some(out);
+/// `(crc32, len)` of one spooled segment for the par2 precheck; a
+/// missing segment contributes nothing.
+fn seg_crc_len(seg: &StagedSpoolSegment) -> (u32, u64) {
+    if seg.missing {
+        (0, 0)
+    } else {
+        (seg.crc32, seg.size)
     }
-    let part_size = uniform_part_size(&segments);
-    let Some(part_size) = part_size else {
-        let mut total = 0u64;
-        for seg in &segments {
-            match seg {
-                Seg::Present { bytes, .. } => {
-                    total = total.checked_add(bytes.len() as u64)?;
-                }
-                Seg::Missing => break,
-            }
-        }
-        if total > max_file_bytes {
-            return None;
-        }
-        let mut out = Vec::with_capacity(total as usize);
-        for seg in segments {
-            match seg {
-                Seg::Present { bytes, .. } => out.extend_from_slice(&bytes),
-                Seg::Missing => break,
-            }
-        }
-        return Some(out);
-    };
-    let total = match expected_len {
-        Some(len) => len,
-        None => {
-            let last_len = match segments.last() {
-                Some(Seg::Present { bytes, .. }) => bytes.len() as u64,
-                _ => part_size,
-            };
-            part_size
-                .checked_mul(segments.len().saturating_sub(1) as u64)?
-                .checked_add(last_len)?
-        }
-    };
-    if total > max_file_bytes {
-        return None;
-    }
-    let mut out = vec![0u8; total as usize];
-    for (i, seg) in segments.into_iter().enumerate() {
-        if let Seg::Present { bytes, .. } = seg {
-            let start = (i as u64 * part_size) as usize;
-            if start >= out.len() {
-                break;
-            }
-            let take = bytes.len().min(out.len() - start);
-            out[start..start + take].copy_from_slice(&bytes[..take]);
-        }
-    }
-    Some(out)
 }
 
 /// The uniform decoded part size a file's present segments prove: every
 /// present segment except the file's last must share one length, and at
 /// least one such segment must be present to prove it.
-fn uniform_part_size(segments: &[Seg]) -> Option<u64> {
+fn uniform_part_size(segs: &[StagedSpoolSegment], total_segments: usize) -> Option<u64> {
+    let non_last = total_segments.saturating_sub(1);
     let mut size: Option<u64> = None;
-    for seg in segments.iter().take(segments.len().saturating_sub(1)) {
-        if let Seg::Present { bytes, .. } = seg {
-            match size {
-                None => size = Some(bytes.len() as u64),
-                Some(s) if s != bytes.len() as u64 => return None,
-                _ => {}
-            }
+    for (i, seg) in segs.iter().enumerate() {
+        if i >= non_last {
+            break;
+        }
+        if seg.missing {
+            continue;
+        }
+        match size {
+            None => size = Some(seg.size),
+            Some(s) if s != seg.size => return None,
+            _ => {}
         }
     }
     size.filter(|s| *s > 0)
 }
 
+/// The file's logical length: the par2-declared length when known, else
+/// the geometry the spooled segments imply. `None` only on u64 overflow
+/// (a par2 length and part geometry that cannot describe a real file).
+fn implied_len(
+    segs: &[StagedSpoolSegment],
+    total_segments: usize,
+    expected_len: Option<u64>,
+) -> Option<u64> {
+    if total_segments == 0 {
+        return Some(0);
+    }
+    if let Some(len) = expected_len {
+        return Some(len);
+    }
+    if segs.len() >= total_segments && segs.iter().all(|s| !s.missing) {
+        return segs.iter().try_fold(0u64, |acc, s| acc.checked_add(s.size));
+    }
+    let part_size = uniform_part_size(segs, total_segments)?;
+    let last_len = match segs.get(total_segments - 1) {
+        Some(s) if !s.missing => s.size,
+        _ => part_size,
+    };
+    part_size
+        .checked_mul((total_segments - 1) as u64)?
+        .checked_add(last_len)
+}
+
+/// Present a fully spooled file for judging: assembled in memory when
+/// the implied length fits `max_file_bytes`, spooled (streamed) when it
+/// does not. The implied length is checked *before* any allocation: it
+/// derives from the untrusted par2 length and from part geometry over
+/// mostly-missing segments, neither of which the fetched-bytes caps
+/// bound. A spool object that vanished after cursor validation reads as
+/// zeros here (counted as damage by the block judgement, never as a
+/// pass).
+async fn load_segments<S: ScratchStore>(
+    segs: &[StagedSpoolSegment],
+    total_segments: usize,
+    expected_len: Option<u64>,
+    max_file_bytes: u64,
+    scratch: &S,
+) -> Result<Option<LoadedFile>, VerifyError> {
+    if segs.len() >= total_segments && segs.iter().all(|s| !s.missing) {
+        let Some(total) = segs.iter().try_fold(0u64, |acc, s| acc.checked_add(s.size)) else {
+            return Ok(None);
+        };
+        if total > max_file_bytes {
+            return Ok(Some(LoadedFile::Spooled { logical_len: total }));
+        }
+        let mut out = Vec::with_capacity(total as usize);
+        for seg in segs {
+            match scratch.get(&seg.key).await? {
+                Some(bytes) => out.extend_from_slice(&bytes),
+                None => out.resize(out.len() + seg.size as usize, 0),
+            }
+        }
+        return Ok(Some(LoadedFile::Assembled(out)));
+    }
+    let Some(part_size) = uniform_part_size(segs, total_segments) else {
+        // No proven part size: only the contiguous present prefix can
+        // vouch for blocks, and it is bounded by fetched bytes.
+        let mut out = Vec::new();
+        for seg in segs {
+            if seg.missing {
+                break;
+            }
+            match scratch.get(&seg.key).await? {
+                Some(bytes) => out.extend_from_slice(&bytes),
+                None => break,
+            }
+        }
+        return Ok(Some(LoadedFile::Assembled(out)));
+    };
+    let Some(total) = implied_len(segs, total_segments, expected_len) else {
+        return Ok(None);
+    };
+    if total > max_file_bytes {
+        return Ok(Some(LoadedFile::Spooled { logical_len: total }));
+    }
+    let mut out = vec![0u8; total as usize];
+    for (i, seg) in segs.iter().enumerate() {
+        if seg.missing {
+            continue;
+        }
+        let Some(bytes) = scratch.get(&seg.key).await? else {
+            continue;
+        };
+        let start = (i as u64 * part_size) as usize;
+        if start >= out.len() {
+            break;
+        }
+        let take = bytes.len().min(out.len() - start);
+        out[start..start + take].copy_from_slice(&bytes[..take]);
+    }
+    Ok(Some(LoadedFile::Assembled(out)))
+}
+
+fn feed_zeros(mut n: u64, feed: &mut dyn FnMut(&[u8])) {
+    const ZEROS: [u8; 8192] = [0u8; 8192];
+    while n > 0 {
+        let take = (n as usize).min(ZEROS.len());
+        feed(&ZEROS[..take]);
+        n -= take as u64;
+    }
+}
+
+/// Stream a spooled file's logical bytes in order: present segments at
+/// their part offsets (concatenated when every segment is present),
+/// every gap — missing segment, vanished spool object, tail past the
+/// last spooled segment — as zeros, truncated at `logical_len`. This is
+/// exactly the byte layout [`load_segments`] materializes for an
+/// assembled file, so streaming and in-memory judgements agree.
+async fn stream_logical<S: ScratchStore>(
+    segs: &[StagedSpoolSegment],
+    total_segments: usize,
+    logical_len: u64,
+    scratch: &S,
+    feed: &mut dyn FnMut(&[u8]),
+) -> Result<(), VerifyError> {
+    let all_present = segs.len() >= total_segments && segs.iter().all(|s| !s.missing);
+    let part_size = if all_present {
+        0
+    } else {
+        uniform_part_size(segs, total_segments).unwrap_or(0)
+    };
+    let mut pos: u64 = 0;
+    for (i, seg) in segs.iter().enumerate() {
+        if pos >= logical_len {
+            break;
+        }
+        let start = if all_present {
+            pos
+        } else {
+            i as u64 * part_size
+        };
+        if start > pos {
+            let gap = (start - pos).min(logical_len - pos);
+            feed_zeros(gap, feed);
+            pos += gap;
+            if pos >= logical_len {
+                break;
+            }
+        }
+        if seg.missing {
+            continue;
+        }
+        let Some(bytes) = scratch.get(&seg.key).await? else {
+            continue;
+        };
+        // Overlap guard: bytes before `pos` were already fed (cannot
+        // happen under a proven uniform part size, but keeps every
+        // logical byte fed exactly once by construction).
+        let skip = pos.saturating_sub(start) as usize;
+        if skip >= bytes.len() {
+            continue;
+        }
+        let take = (bytes.len() - skip).min((logical_len - pos) as usize);
+        feed(&bytes[skip..skip + take]);
+        pos += take as u64;
+    }
+    if pos < logical_len {
+        feed_zeros(logical_len - pos, feed);
+    }
+    Ok(())
+}
+
+/// Incremental SHA-256 of a spooled file's logical bytes.
+async fn spool_sha256<S: ScratchStore>(
+    segs: &[StagedSpoolSegment],
+    total_segments: usize,
+    logical_len: u64,
+    scratch: &S,
+) -> Result<String, VerifyError> {
+    let mut hasher = Sha256::new();
+    stream_logical(segs, total_segments, logical_len, scratch, &mut |b| {
+        hasher.update(b)
+    })
+    .await?;
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Streaming counterpart of [`count_bad_blocks`]: par2 blocks are
+/// CRC-checked (zero-padded, per the spec) as their bytes stream past,
+/// so memory never scales with file or block size.
+struct BlockCounter<'a> {
+    block_crc32s: &'a [u32],
+    block_size: u64,
+    hasher: crc32fast::Hasher,
+    in_block: u64,
+    index: usize,
+    bad: u32,
+}
+
+impl BlockCounter<'_> {
+    fn update(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            if self.index >= self.block_crc32s.len() {
+                return;
+            }
+            let room = (self.block_size - self.in_block) as usize;
+            let take = room.min(bytes.len());
+            self.hasher.update(&bytes[..take]);
+            self.in_block += take as u64;
+            bytes = &bytes[take..];
+            if self.in_block == self.block_size {
+                self.finish_block();
+            }
+        }
+    }
+
+    fn finish_block(&mut self) {
+        let want = self.block_crc32s[self.index];
+        let got = std::mem::replace(&mut self.hasher, crc32fast::Hasher::new()).finalize();
+        if got != want {
+            self.bad += 1;
+        }
+        self.index += 1;
+        self.in_block = 0;
+    }
+
+    fn finish(mut self) -> u32 {
+        if self.index < self.block_crc32s.len() && self.in_block > 0 {
+            let pad = self.block_size - self.in_block;
+            feed_zeros(pad, &mut |z| self.hasher.update(z));
+            self.finish_block();
+        }
+        // Blocks the stream never reached count as bad, like blocks past
+        // the assembled bytes in `count_bad_blocks`.
+        self.bad + (self.block_crc32s.len() - self.index) as u32
+    }
+}
+
+/// Streaming counterpart of [`judge_file`] for a file too large to
+/// assemble: same cheapest-proof-first order (segment-CRC precheck,
+/// then per-block CRCs), plus the file's SHA-256 for its staged record.
+#[allow(clippy::too_many_arguments)]
+async fn judge_spooled<S: ScratchStore>(
+    matched: Option<(&RecoverySet, &RecoveryFile)>,
+    missing_segments: u32,
+    seg_crcs: &[(u32, u64)],
+    segs: &[StagedSpoolSegment],
+    total_segments: usize,
+    logical_len: u64,
+    scratch: &S,
+) -> Result<(u32, Option<String>, String), VerifyError> {
+    let mut hasher = Sha256::new();
+    let (missing_blocks, par2_set_id) = match matched {
+        None => {
+            stream_logical(segs, total_segments, logical_len, scratch, &mut |b| {
+                hasher.update(b)
+            })
+            .await?;
+            (missing_segments, None)
+        }
+        Some((set, entry)) => {
+            let set_hex = hex::encode(set.set_id);
+            let healthy = missing_segments == 0
+                && set
+                    .precheck_bytes(&entry.filename_bytes, seg_crcs)
+                    .unwrap_or(false);
+            if healthy {
+                stream_logical(segs, total_segments, logical_len, scratch, &mut |b| {
+                    hasher.update(b)
+                })
+                .await?;
+                (0, Some(set_hex))
+            } else if set.block_size == 0 || logical_len > entry.length {
+                // An over-long file trusts nothing (as in
+                // `count_bad_blocks`): every block counts.
+                stream_logical(segs, total_segments, logical_len, scratch, &mut |b| {
+                    hasher.update(b)
+                })
+                .await?;
+                (entry.block_crc32s.len() as u32, Some(set_hex))
+            } else {
+                let mut counter = BlockCounter {
+                    block_crc32s: &entry.block_crc32s,
+                    block_size: set.block_size,
+                    hasher: crc32fast::Hasher::new(),
+                    in_block: 0,
+                    index: 0,
+                    bad: 0,
+                };
+                stream_logical(segs, total_segments, logical_len, scratch, &mut |b| {
+                    hasher.update(b);
+                    counter.update(b);
+                })
+                .await?;
+                (counter.finish(), Some(set_hex))
+            }
+        }
+    };
+    Ok((missing_blocks, par2_set_id, hex::encode(hasher.finalize())))
+}
+
 /// Parse the staged par2 files into recovery sets, grouped by set id.
-/// A par2 file that does not parse alone (a volume carrying only
-/// recovery slices has no Main packet) is retried concatenated onto each
-/// parsed group and merged into the one whose set id it parses under —
-/// its slices then count toward recovery. Bytes that parse under no
-/// group and not alone are dropped (their slices are simply absent,
-/// which the recoverability check then sees).
-///
-/// The restoration is aggregate-capped (`caps.max_par2_bytes`): staged
-/// par2 accumulated across deliveries must not be copied into `groups`
-/// — or cloned again for a trial parse — beyond that bound, because
-/// the per-delivery fetch caps do not bound scratch reads. An
-/// over-cap set fails permanently rather than being silently
-/// truncated into a false "unrecoverable".
+/// Every staged object's packets stream into its set's
+/// [`RecoverySetBuilder`] (routed by the first packet's set id, fully
+/// validated by the builder), so a volume carrying only recovery slices
+/// contributes them to its set without parsing standalone, and restore
+/// memory is one staged object (or one spooled segment) at a time —
+/// aggregate staged par2 is never capped. A single *packet* beyond
+/// `caps.max_par2_bytes` cannot be buffered for parsing; its object is
+/// then unusable in-Worker and its slices are simply absent, which the
+/// recoverability check sees (never a false "recoverable", and never a
+/// permanent failure of an otherwise judgeable release). Bytes that
+/// fail validation drop their set the same way.
 async fn load_sets<S: ScratchStore>(
     files: &[ParsedFile],
     progress: &VerifyProgress,
     scratch: &S,
     caps: &VerifyCaps,
 ) -> Result<Vec<RecoverySet>, VerifyError> {
-    // Bound the working set from the staged sizes before reading or
-    // copying a single byte.
-    let mut staged_total: u64 = 0;
-    for (idx, file) in files.iter().enumerate() {
-        if file.is_par2 {
-            if let Some(staged) = progress.staged.get(&idx) {
-                staged_total = staged_total.saturating_add(staged.size);
-            }
-        }
-    }
-    if staged_total > caps.max_par2_bytes {
-        return Err(VerifyError::Permanent(
-            "staged par2 exceeds the verify size cap".into(),
-        ));
-    }
-    let mut groups: HashMap<[u8; 16], Vec<u8>> = HashMap::new();
-    let mut unparsed: Vec<u8> = Vec::new();
-    let mut restored_total: u64 = 0;
+    let mut builders: BTreeMap<[u8; 16], RecoverySetBuilder> = BTreeMap::new();
     let mut any_par2 = false;
     for (idx, file) in files.iter().enumerate() {
         if !file.is_par2 {
@@ -603,55 +1090,124 @@ async fn load_sets<S: ScratchStore>(
         let Some(staged) = progress.staged.get(&idx) else {
             continue;
         };
-        let Some(bytes) = scratch.get(&staged.key).await? else {
+        if staged.spool.is_empty() {
+            let Some(bytes) = scratch.get(&staged.key).await? else {
+                continue;
+            };
+            feed_par2_bytes(&mut builders, &bytes, caps.max_par2_bytes);
             continue;
-        };
-        // The bytes actually read outrank the staged record: re-check the
-        // aggregate before copying them into a group or `unparsed`.
-        restored_total = restored_total.saturating_add(bytes.len() as u64);
-        if restored_total > caps.max_par2_bytes {
-            return Err(VerifyError::Permanent(
-                "staged par2 exceeds the verify size cap".into(),
-            ));
         }
-        match RecoverySet::parse(&bytes) {
-            Ok(set) => groups
-                .entry(set.set_id)
-                .or_default()
-                .extend_from_slice(&bytes),
-            Err(_) => unparsed.extend_from_slice(&bytes),
+        // Spooled par2: stream segment by segment, carrying a packet
+        // split across segment boundaries in `pending`.
+        let mut pending: Vec<u8> = Vec::new();
+        let mut usable = true;
+        for seg in &staged.spool {
+            if seg.missing {
+                usable = false;
+                break;
+            }
+            let Some(bytes) = scratch.get(&seg.key).await? else {
+                usable = false;
+                break;
+            };
+            pending.extend_from_slice(&bytes);
+            let complete = complete_packet_prefix(&pending);
+            if complete > 0 {
+                feed_par2_bytes(&mut builders, &pending[..complete], caps.max_par2_bytes);
+                pending.drain(..complete);
+            }
+            if pending.len() as u64 > caps.max_par2_bytes {
+                usable = false;
+                break;
+            }
+        }
+        if usable && !pending.is_empty() {
+            feed_par2_bytes(&mut builders, &pending, caps.max_par2_bytes);
         }
     }
     if !any_par2 {
         return Ok(Vec::new());
     }
-    if !unparsed.is_empty() {
-        let mut merged = false;
-        for (set_id, bytes) in groups.iter_mut() {
-            let mut trial = bytes.clone();
-            trial.extend_from_slice(&unparsed);
-            if let Ok(set) = RecoverySet::parse(&trial) {
-                if set.set_id == *set_id {
-                    *bytes = trial;
-                    merged = true;
-                    break;
-                }
-            }
-        }
-        if !merged {
-            if let Ok(set) = RecoverySet::parse(&unparsed) {
-                groups.entry(set.set_id).or_default().extend(unparsed);
-            }
-        }
-    }
     let mut sets = Vec::new();
-    for bytes in groups.into_values() {
-        if let Ok(set) = RecoverySet::parse(&bytes) {
+    for builder in builders.into_values() {
+        if let Ok(set) = builder.finish() {
             sets.push(set);
         }
     }
     sets.sort_by_key(|s| s.set_id);
     Ok(sets)
+}
+
+/// Route one packet-aligned byte stream into its set's builder. Streams
+/// that do not start with a packet header, contain a packet beyond the
+/// buffered-packet bound, or fail validation are dropped (on a
+/// validation failure the whole builder goes: a stream that starts
+/// well-formed then contradicts earlier packets cannot be partially
+/// trusted, exactly the old all-or-nothing parse).
+fn feed_par2_bytes(
+    builders: &mut BTreeMap<[u8; 16], RecoverySetBuilder>,
+    bytes: &[u8],
+    max_packet: u64,
+) {
+    let Some(set_id) = peek_set_id(bytes) else {
+        return;
+    };
+    if !packets_within_bound(bytes, max_packet) {
+        return;
+    }
+    let builder = builders.entry(set_id).or_default();
+    if builder.add_stream(bytes).is_err() {
+        builders.remove(&set_id);
+    }
+}
+
+/// Length of the longest prefix of `bytes` made of whole par2 packets
+/// (by their declared lengths; the builder validates the contents).
+fn complete_packet_prefix(bytes: &[u8]) -> usize {
+    let mut offset = 0usize;
+    while offset + 16 <= bytes.len() {
+        let len = u64::from_le_bytes(bytes[offset + 8..offset + 16].try_into().unwrap());
+        if len < 64 || len % 4 != 0 {
+            break;
+        }
+        let Ok(len) = usize::try_from(len) else {
+            break;
+        };
+        let Some(next) = offset.checked_add(len) else {
+            break;
+        };
+        if next > bytes.len() {
+            break;
+        }
+        offset = next;
+    }
+    offset
+}
+
+/// Whether `bytes` is a whole number of packets, each within the
+/// buffered-packet bound.
+fn packets_within_bound(bytes: &[u8], max_packet: u64) -> bool {
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        if offset + 16 > bytes.len() {
+            return false;
+        }
+        let len = u64::from_le_bytes(bytes[offset + 8..offset + 16].try_into().unwrap());
+        if len > max_packet || len < 64 || len % 4 != 0 {
+            return false;
+        }
+        let Ok(len) = usize::try_from(len) else {
+            return false;
+        };
+        let Some(next) = offset.checked_add(len) else {
+            return false;
+        };
+        if next > bytes.len() {
+            return false;
+        }
+        offset = next;
+    }
+    true
 }
 
 /// Find the protected recovery-file entry covering one NZB file: exact
@@ -661,7 +1217,8 @@ async fn load_sets<S: ScratchStore>(
 fn match_set_file<'a>(
     sets: &'a [RecoverySet],
     file: &ParsedFile,
-    segments: &[Seg],
+    segs: &[StagedSpoolSegment],
+    total_segments: usize,
     claimed: &mut HashSet<[u8; 16]>,
 ) -> Option<(&'a RecoverySet, &'a RecoveryFile)> {
     for set in sets {
@@ -673,14 +1230,8 @@ fn match_set_file<'a>(
     }
     // Length fallback needs the true assembled length: only meaningful
     // when every segment decoded.
-    if segments.iter().all(|s| matches!(s, Seg::Present { .. })) {
-        let len: u64 = segments
-            .iter()
-            .map(|s| match s {
-                Seg::Present { bytes, .. } => bytes.len() as u64,
-                Seg::Missing => 0,
-            })
-            .sum();
+    if segs.len() >= total_segments && segs.iter().all(|s| !s.missing) {
+        let len: u64 = segs.iter().map(|s| s.size).sum();
         let mut found: Option<(&RecoverySet, &RecoveryFile)> = None;
         for set in sets {
             for entry in set.files.values() {
@@ -722,8 +1273,14 @@ fn claim_staged(
         let Some(set_hex) = &staged.par2_set_id else {
             continue;
         };
+        // A combined dispatch id (`setA+setB`) claims each listed set's
+        // entry for this file the same way a single id does.
+        let mut candidates: Vec<&str> = set_hex.split('+').collect();
+        if candidates.is_empty() {
+            candidates.push(set_hex.as_str());
+        }
         for set in sets {
-            if hex::encode(set.set_id) != *set_hex {
+            if !candidates.contains(&hex::encode(set.set_id).as_str()) {
                 continue;
             }
             if let Some(entry) = set.protected_file_by_name(&file.name) {
@@ -839,21 +1396,35 @@ fn finalize(
             }
         }
     }
-    // Deterministic order (BTreeMap): the first short set is dispatched;
-    // later sets dispatch on later repair rounds.
-    if let Some((set_id, missing)) = missing_by_set.iter().next() {
+    // Judge every damaged set before dispatching any repair: a set
+    // short beyond its recovery dooms the release no matter which set
+    // a repair round would fix first, so a round spent on an earlier
+    // repairable set only delays the same verdict (and with more
+    // damaged sets than MAX_REPAIR_ROUNDS, one-set-per-round dispatch
+    // would fail a fully repairable release).
+    for (set_id, missing) in &missing_by_set {
         let recovery = recovery_by_set.get(set_id).copied().unwrap_or(0);
-        progress.par2_set_id = Some(set_id.clone());
-        progress.missing_blocks = *missing;
         if *missing > recovery {
+            progress.par2_set_id = Some(set_id.clone());
+            progress.missing_blocks = *missing;
             return VerifyOutcome::Unrecoverable {
                 par2_set_id: Some(set_id.clone()),
                 missing_blocks: *missing,
             };
         }
+    }
+    // Every damaged set is individually recoverable: dispatch them
+    // together in one repair round — set ids joined with `+` in
+    // deterministic (BTreeMap) order, blocks summed — instead of one
+    // round per set.
+    if !missing_by_set.is_empty() {
+        let set_id = missing_by_set.keys().cloned().collect::<Vec<_>>().join("+");
+        let missing: u32 = missing_by_set.values().sum();
+        progress.par2_set_id = Some(set_id.clone());
+        progress.missing_blocks = missing;
         return VerifyOutcome::RepairNeeded {
-            par2_set_id: set_id.clone(),
-            missing_blocks: *missing,
+            par2_set_id: set_id,
+            missing_blocks: missing,
         };
     }
     progress.par2_set_id = sets.first().map(|s| hex::encode(s.set_id));
@@ -883,6 +1454,14 @@ async fn write_manifest<S: ScratchStore>(
                 key: staged.key.clone(),
                 size: staged.size,
                 role: if file.is_par2 { "par2" } else { "data" },
+                segments: staged.spool.iter().map(|s| s.key.clone()).collect(),
+                missing: staged
+                    .spool
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.missing)
+                    .map(|(i, _)| i)
+                    .collect(),
             })
         })
         .collect();
@@ -895,6 +1474,9 @@ async fn write_manifest<S: ScratchStore>(
         key: key.clone(),
         missing_blocks: 0,
         par2_set_id: None,
+        spool: Vec::new(),
+        crc32: 0,
+        missing: false,
     };
     scratch.put(&key, json.into_bytes(), &meta).await
 }
@@ -903,10 +1485,19 @@ async fn write_manifest<S: ScratchStore>(
 mod tests {
     use super::*;
 
-    fn seg(bytes: &[u8]) -> Seg {
-        Seg::Present {
-            crc32: crc32fast::hash(bytes),
-            bytes: bytes.to_vec(),
+    fn srec(size: u64) -> StagedSpoolSegment {
+        StagedSpoolSegment {
+            key: "k".into(),
+            size,
+            crc32: 0,
+            missing: false,
+        }
+    }
+
+    fn smissing() -> StagedSpoolSegment {
+        StagedSpoolSegment {
+            missing: true,
+            ..srec(0)
         }
     }
 
@@ -930,38 +1521,113 @@ mod tests {
             VerifyProgress::manifest_key(JOB, 0),
             "ingest-scratch/job_x/r0/manifest.json"
         );
+        assert_eq!(
+            VerifyProgress::spool_key(JOB, 1, 2, 3),
+            "ingest-scratch/job_x/r1/spool/0002/000003"
+        );
+        assert_eq!(
+            VerifyProgress::spool_meta_key(JOB, 1, 2),
+            "ingest-scratch/job_x/r1/spool/0002/index.json"
+        );
     }
 
     #[test]
-    fn assemble_places_gaps_by_uniform_part_size() {
-        let segments = vec![seg(b"aaaa"), Seg::Missing, seg(b"cc")];
-        let out = assemble(segments, Some(10), 1024).expect("within cap");
-        assert_eq!(out, b"aaaa\0\0\0\0cc");
+    fn implied_len_uses_par2_length_then_proven_geometry() {
+        // The par2-declared length is authoritative when known — the
+        // judgement then decides (streaming if large), never an
+        // allocation before the size check.
+        let gapped = vec![srec(4), smissing(), smissing()];
+        assert_eq!(implied_len(&gapped, 3, Some(100 << 20)), Some(100 << 20));
+        assert_eq!(implied_len(&gapped, 3, Some(u64::MAX)), Some(u64::MAX));
+        // Without par2: uniform part size 4 over 3 parts.
+        assert_eq!(implied_len(&gapped, 3, None), Some(12));
+        // All present: the plain sum.
+        assert_eq!(implied_len(&[srec(4), srec(3), srec(2)], 3, None), Some(9));
+        // No proven part size (nothing present before the last part).
+        assert_eq!(implied_len(&[smissing(), srec(5)], 2, None), None);
+    }
+
+    fn parsed(name: &str, is_par2: bool) -> ParsedFile {
+        ParsedFile {
+            name: name.into(),
+            is_par2,
+            segment_ids: vec!["s@x".into()],
+            segment_bytes: vec![None],
+        }
+    }
+
+    fn set(byte: u8, recovery_blocks: usize) -> RecoverySet {
+        RecoverySet {
+            set_id: [byte; 16],
+            block_size: 256,
+            recovery_blocks,
+            files: HashMap::new(),
+        }
+    }
+
+    fn staged(sha: &str, missing_blocks: u32, par2_set_id: Option<String>) -> StagedFile {
+        StagedFile {
+            key: "k".into(),
+            size: 1,
+            sha256: sha.into(),
+            missing_blocks,
+            par2_set_id,
+            spool: Vec::new(),
+            crc32: 0,
+            missing: false,
+        }
     }
 
     #[test]
-    fn assemble_without_uniform_proof_keeps_the_present_prefix() {
-        let segments = vec![seg(b"aaa"), Seg::Missing, seg(b"ccccc")];
-        // Only one present non-last part of size 3 proves the part size.
-        let out = assemble(segments, None, 1024).expect("within cap");
-        assert_eq!(out.len(), 3 + 3 + 5);
-        let segments = vec![Seg::Missing, seg(b"ccccc")];
-        let out = assemble(segments, None, 1024).expect("within cap");
-        assert!(out.is_empty(), "no proof, no prefix");
+    fn finalize_judges_every_damaged_set_before_dispatching_repair() {
+        // Set A (first in BTreeMap order) is repairable; set B is short
+        // beyond recovery. finalize must not spend a repair round on A:
+        // the release is Unrecoverable because of B.
+        let a = set(0x0a, 4);
+        let b = set(0x0b, 1);
+        let a_hex = hex::encode(a.set_id);
+        let b_hex = hex::encode(b.set_id);
+        let files = vec![parsed("a.flac", false), parsed("b.flac", false)];
+        let mut progress = VerifyProgress::new(0);
+        progress.staged.insert(0, staged("sha", 2, Some(a_hex)));
+        progress
+            .staged
+            .insert(1, staged("sha", 3, Some(b_hex.clone())));
+        let outcome = finalize(&files, &[a, b], &mut progress);
+        assert_eq!(
+            outcome,
+            VerifyOutcome::Unrecoverable {
+                par2_set_id: Some(b_hex),
+                missing_blocks: 3,
+            }
+        );
     }
 
     #[test]
-    fn assemble_refuses_implied_lengths_over_the_cap_before_allocating() {
-        // The par2-declared length is untrusted: a 100 MB declaration with
-        // most segments missing must fail the cap check, not allocate the
-        // implied file first (and never truncate a >4 GiB length into a
-        // short buffer on wasm32).
-        let gapped = || vec![seg(b"aaaa"), Seg::Missing, Seg::Missing];
-        assert_eq!(assemble(gapped(), Some(100 << 20), 1 << 20), None);
-        assert_eq!(assemble(gapped(), Some(u64::MAX), 32 << 20), None);
-        // Implied geometry without par2 is capped the same way.
-        let segments = vec![seg(&vec![0u8; 700_000]), Seg::Missing, Seg::Missing];
-        assert_eq!(assemble(segments, None, 1 << 20), None);
+    fn finalize_dispatches_all_recoverable_sets_in_one_round() {
+        // Both sets repairable: one combined dispatch (ids joined with
+        // '+', blocks summed) instead of one round per set.
+        let a = set(0x0a, 4);
+        let b = set(0x0b, 4);
+        let a_hex = hex::encode(a.set_id);
+        let b_hex = hex::encode(b.set_id);
+        let files = vec![parsed("a.flac", false), parsed("b.flac", false)];
+        let mut progress = VerifyProgress::new(0);
+        progress
+            .staged
+            .insert(0, staged("sha", 2, Some(a_hex.clone())));
+        progress
+            .staged
+            .insert(1, staged("sha", 3, Some(b_hex.clone())));
+        let outcome = finalize(&files, &[a, b], &mut progress);
+        assert_eq!(
+            outcome,
+            VerifyOutcome::RepairNeeded {
+                par2_set_id: format!("{a_hex}+{b_hex}"),
+                missing_blocks: 5,
+            }
+        );
+        assert_eq!(progress.missing_blocks, 5);
     }
 
     #[test]
@@ -971,5 +1637,23 @@ mod tests {
         assert_eq!(progress.round, 1);
         assert!(progress.par2_set_id.is_none());
         assert_eq!(progress.missing_blocks, 0);
+        assert!(progress.spool.is_empty());
+    }
+
+    #[test]
+    fn progress_roundtrips_the_spool_cursor() {
+        let mut progress = VerifyProgress::new(0);
+        progress.spool.insert(
+            1,
+            vec![StagedSpoolSegment {
+                key: "k/0".into(),
+                size: 12,
+                crc32: 9,
+                missing: false,
+            }],
+        );
+        let json = serde_json::to_string(&progress).unwrap();
+        let back: VerifyProgress = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, progress);
     }
 }

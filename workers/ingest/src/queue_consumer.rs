@@ -494,7 +494,10 @@ async fn run_step(env: &Env, msg: &QueueMsg, cp: &mut JobCheckpoint) -> Result<(
                 |request| async move { call_pool_probe(env, &request).await },
             )
             .await?;
-            Err(JobError::transient(ERR_VERIFY_FAILED, "verifying pending"))
+            // Probing completed and advanced the checkpoint to
+            // Verifying: continuing to the next state is progress, not
+            // a failure, so it must not spend the attempt budget.
+            Err(JobError::progress(ERR_VERIFY_FAILED, "verifying pending"))
         }
         JobState::Verifying => run_verifying(env, msg, cp, &files).await,
         _ => unreachable!("state filtered above"),
@@ -506,8 +509,9 @@ async fn run_step(env: &Env, msg: &QueueMsg, cp: &mut JobCheckpoint) -> Result<(
 /// step errors are failed by `decide_checkpoint`, which keeps the
 /// settlement persist planner seeing a non-terminal checkpoint). Pure
 /// over the checkpoint so the mapping is unit-tested without bindings.
-/// `made_progress` is whether `progress.staged` grew during this
-/// delivery; it decides if an `Incomplete` step spends retry budget.
+/// `made_progress` is whether the step staged another file or spooled
+/// another segment during this delivery; it decides if an `Incomplete`
+/// step spends retry budget.
 fn apply_verify_outcome(
     msg: &QueueMsg,
     cp: &mut JobCheckpoint,
@@ -573,7 +577,7 @@ fn apply_verify_outcome(
             ERR_VERIFY_FAILED,
             "release is missing blocks beyond par2 recovery",
         )),
-        // A capped step that staged more files is progress, not a
+        // A capped step that staged/spooled more is progress, not a
         // failure: redeliver without spending the retry budget, or a
         // valid large upload would be quarantined while every delivery
         // succeeds. No growth keeps the ordinary transient budget, so a
@@ -629,6 +633,7 @@ async fn run_verifying(
         worker::Date::now().as_millis().saturating_sub(started_ms) > VERIFY_WALL_CLOCK_BUDGET_MS
     };
     let staged_before = progress.staged.len();
+    let spooled_before: usize = progress.spool.values().map(Vec::len).sum();
     let outcome = crate::verify::run_verifying_step(
         &msg.job_id,
         files,
@@ -639,7 +644,12 @@ async fn run_verifying(
         &deadline,
     )
     .await;
-    let made_progress = progress.staged.len() > staged_before;
+    let spooled_after: usize = progress.spool.values().map(Vec::len).sum();
+    // Durable segment-level spool growth is progress exactly like a
+    // newly staged file: a file spanning several deliveries (more
+    // segments than one delivery's budget) must not burn the attempt
+    // budget while every delivery succeeds.
+    let made_progress = progress.staged.len() > staged_before || spooled_after > spooled_before;
     // Persist progress before the checkpoint settlement so a crash
     // between the two writes resumes from the older state with the
     // newer progress (scratch adoption covers a lost progress write).
@@ -697,13 +707,23 @@ fn staged_from_metadata(
 ) -> Option<StagedFile> {
     Some(StagedFile {
         key: key.to_string(),
-        size,
-        sha256: meta.get("sha256")?.clone(),
-        missing_blocks: meta
-            .get("missing_blocks")
+        // The recorded logical size wins over the object size: a spool
+        // index object's bytes are the JSON segment list, not the file.
+        // Objects written before the `size` metadata existed are
+        // assembled files, whose object size is the file size.
+        size: meta
+            .get("size")
             .and_then(|v| v.parse().ok())
-            .unwrap_or(0),
+            .unwrap_or(size),
+        sha256: meta.get("sha256")?.clone(),
+        // An absent/unparseable block count must not read as "intact":
+        // refuse the record (`None`) so the file is fetched and judged
+        // again instead of adopted as healthy sight unseen.
+        missing_blocks: meta.get("missing_blocks")?.parse().ok()?,
         par2_set_id: meta.get("par2_set_id").cloned(),
+        spool: Vec::new(),
+        crc32: meta.get("crc32").and_then(|v| v.parse().ok()).unwrap_or(0),
+        missing: meta.get("missing").is_some_and(|v| v == "1"),
     })
 }
 
@@ -745,6 +765,11 @@ impl ScratchStore for R2Scratch {
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &StagedFile) -> Result<(), VerifyError> {
         let mut md = std::collections::HashMap::new();
         md.insert("sha256".to_string(), meta.sha256.clone());
+        md.insert("size".to_string(), meta.size.to_string());
+        md.insert("crc32".to_string(), meta.crc32.to_string());
+        if meta.missing {
+            md.insert("missing".to_string(), "1".to_string());
+        }
         md.insert(
             "missing_blocks".to_string(),
             meta.missing_blocks.to_string(),

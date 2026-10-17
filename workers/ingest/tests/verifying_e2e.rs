@@ -249,6 +249,9 @@ impl MemoryScratch {
     fn bytes(&self, key: &str) -> Option<Vec<u8>> {
         self.objects.borrow().get(key).map(|(b, _)| b.clone())
     }
+    fn delete(&self, key: &str) {
+        self.objects.borrow_mut().remove(key);
+    }
     fn manifest(&self, job: &str) -> Option<String> {
         let key = format!("ingest-scratch/{job}/r0/manifest.json");
         self.bytes(&key)
@@ -643,39 +646,292 @@ async fn volume_only_recovery_slices_merge_with_the_index_set() {
 }
 
 #[tokio::test]
-async fn staged_par2_over_the_aggregate_cap_fails_permanently() {
-    // Restoration of staged par2 is aggregate-capped before any bytes are
-    // copied into recovery groups: an over-cap set is a permanent error,
-    // never an unbounded in-memory restore across deliveries.
+async fn staged_par2_streams_packet_by_packet_past_any_aggregate_bound() {
+    // Staged par2 streams into the set builder packet by packet, so the
+    // aggregate across files/deliveries is never capped (and never a
+    // permanent failure): here the staged set (~3 KiB over 8 recovery
+    // slices) far exceeds the 1 KiB per-packet bound, yet the corrupt
+    // block is still found and counted.
     let data = payload(43, 1000);
-    let (articles, nzb, _hex) = complete_case(&data, 1);
+    let (mut articles, nzb, _hex) = complete_case(&data, 8);
+    let mut corrupt = data.clone();
+    corrupt[300] ^= 0xff;
+    articles[0] = yenc_article(
+        "d1@synthetic.invalid",
+        1,
+        DATA_NAME,
+        &SegmentParams::single(DATA_NAME),
+        &corrupt,
+    );
     let server = spawn(articles).await;
     let scratch = MemoryScratch::default();
     let mut progress = VerifyProgress::new(0);
 
-    // The step stages the par2 file, then must restore it before judging
-    // data: its staged size alone exceeds the 1-byte aggregate cap.
+    let caps = VerifyCaps {
+        max_par2_bytes: 1024,
+        ..VerifyCaps::default()
+    };
+    let (outcome, _) = run_step(&server, &nzb, &caps, &mut progress, &scratch).await;
+    match outcome {
+        VerifyOutcome::RepairNeeded { missing_blocks, .. } => assert_eq!(missing_blocks, 1),
+        other => panic!("expected repair via streamed par2, got {other:?}"),
+    }
+
+    // With a per-packet bound below every packet, the set is unusable
+    // in-Worker — but a healthy release still verifies (uncovered and
+    // complete) instead of failing permanently for par2 size.
+    let data = payload(47, 1000);
+    let (articles, nzb, _hex) = complete_case(&data, 1);
+    let server = spawn(articles).await;
+    let scratch = MemoryScratch::default();
+    let mut progress = VerifyProgress::new(0);
     let caps = VerifyCaps {
         max_par2_bytes: 1,
         ..VerifyCaps::default()
     };
-    let est = estimate_nzb(&nzb).expect("intake");
-    let files = parse_upload_files(nzb.as_bytes(), &est).expect("parse files");
-    let mut source = NntpSource::connect(&server).await;
-    let err = run_verifying_step(
-        JOB,
-        &files,
+    let (outcome, _) = run_step(&server, &nzb, &caps, &mut progress, &scratch).await;
+    assert_eq!(outcome, VerifyOutcome::Complete);
+}
+
+#[tokio::test]
+async fn evicted_staged_record_releases_its_par2_claim_on_refetch() {
+    // A data file is staged and judged RepairNeeded; its staged object
+    // then disappears. The refetch must be judged against its own par2
+    // entry again — if the evicted record's claim leaked, the file
+    // would be judged "uncovered: healthy iff every segment decoded"
+    // and the corrupt block would pass as Complete.
+    let data = payload(53, 1000);
+    let (mut articles, nzb, _hex) = complete_case(&data, 1);
+    let mut corrupt = data.clone();
+    corrupt[300] ^= 0xff;
+    articles[0] = yenc_article(
+        "d1@synthetic.invalid",
+        1,
+        DATA_NAME,
+        &SegmentParams::single(DATA_NAME),
+        &corrupt,
+    );
+    let server = spawn(articles).await;
+    let scratch = MemoryScratch::default();
+    let mut progress = VerifyProgress::new(0);
+
+    let (outcome, _) = run_step(
+        &server,
+        &nzb,
+        &VerifyCaps::default(),
         &mut progress,
-        &mut source,
         &scratch,
-        &caps,
-        &|| false,
     )
-    .await
-    .expect_err("over-cap staged par2");
+    .await;
     assert!(
-        matches!(&err, VerifyError::Permanent(detail) if detail.contains("par2 exceeds")),
-        "{err:?}"
+        matches!(
+            outcome,
+            VerifyOutcome::RepairNeeded {
+                missing_blocks: 1,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+
+    scratch.delete(&VerifyProgress::file_key(JOB, 0, 0, DATA_NAME));
+    let (outcome, fetches) = run_step(
+        &server,
+        &nzb,
+        &VerifyCaps::default(),
+        &mut progress,
+        &scratch,
+    )
+    .await;
+    assert_eq!(
+        fetches,
+        ["d1@synthetic.invalid"],
+        "only the data file refetches"
+    );
+    assert!(
+        matches!(
+            outcome,
+            VerifyOutcome::RepairNeeded {
+                missing_blocks: 1,
+                ..
+            }
+        ),
+        "refetched file must still be judged against its par2 entry, got {outcome:?}"
+    );
+}
+
+/// Three-part data file (256 B parts) + its par2 file.
+fn three_part_case(data: &[u8]) -> (Vec<Article>, String) {
+    let (set_bytes, _hex) = par2_set(DATA_NAME, data, 1);
+    let part = |n: u32, begin: u64, end: u64| SegmentParams {
+        name: DATA_NAME.into(),
+        part: n,
+        total: 3,
+        begin,
+        end,
+        file_size: data.len() as u64,
+    };
+    let mut articles = Vec::new();
+    let mut segments = Vec::new();
+    for (i, chunk) in data.chunks(256).enumerate() {
+        let n = i as u32 + 1;
+        let begin = (i * 256) as u64 + 1;
+        let end = begin + chunk.len() as u64 - 1;
+        let id = format!("d{n}@synthetic.invalid");
+        articles.push(yenc_article(&id, n, DATA_NAME, &part(n, begin, end), chunk));
+        segments.push((id, encoded_len(&part(n, begin, end), chunk)));
+    }
+    let par2_params = SegmentParams::single(PAR2_NAME);
+    articles.push(yenc_article(
+        "p1@synthetic.invalid",
+        4,
+        PAR2_NAME,
+        &par2_params,
+        &set_bytes,
+    ));
+    let nzb = nzb_xml(&[
+        ServableFile {
+            name: DATA_NAME.into(),
+            segments,
+        },
+        ServableFile {
+            name: PAR2_NAME.into(),
+            segments: vec![(
+                "p1@synthetic.invalid".into(),
+                encoded_len(&par2_params, &set_bytes),
+            )],
+        },
+    ]);
+    (articles, nzb)
+}
+
+#[tokio::test]
+async fn file_spanning_deliveries_resumes_at_the_segment_cursor() {
+    // The data file has more segments than one delivery's budget: the
+    // first delivery durably spools a prefix and stops mid-file, and
+    // the next resumes at the cursor — the already-spooled segment is
+    // never refetched (before the cursor, every delivery refetched the
+    // same prefix, made no staged progress, and burned the attempt
+    // budget until quarantine).
+    let data = payload(59, 768);
+    let (articles, nzb) = three_part_case(&data);
+    let server = spawn(articles).await;
+    let scratch = MemoryScratch::default();
+    let mut progress = VerifyProgress::new(0);
+
+    // Two segments per delivery: par2 (1) + first data segment, then stop.
+    let caps = VerifyCaps {
+        max_segments_per_delivery: 2,
+        ..VerifyCaps::default()
+    };
+    let (outcome, first_fetches) = run_step(&server, &nzb, &caps, &mut progress, &scratch).await;
+    assert_eq!(outcome, VerifyOutcome::Incomplete);
+    assert_eq!(
+        first_fetches,
+        ["p1@synthetic.invalid", "d1@synthetic.invalid"]
+    );
+    assert_eq!(
+        progress.spool.get(&0).map(Vec::len),
+        Some(1),
+        "one data segment durably spooled"
+    );
+    assert!(
+        !progress.staged.contains_key(&0),
+        "data file not staged yet"
+    );
+
+    let (outcome, second_fetches) = run_step(
+        &server,
+        &nzb,
+        &VerifyCaps::default(),
+        &mut progress,
+        &scratch,
+    )
+    .await;
+    assert_eq!(outcome, VerifyOutcome::Complete);
+    assert_eq!(
+        second_fetches,
+        ["d2@synthetic.invalid", "d3@synthetic.invalid"],
+        "resume continues at the cursor, never refetching d1"
+    );
+    assert!(progress.spool.is_empty(), "assembled file drops its cursor");
+}
+
+#[tokio::test]
+async fn file_over_the_in_memory_cap_is_judged_and_staged_from_its_spool() {
+    // A file larger than max_file_bytes is ordinary (a FLAC track), not
+    // a permanent failure: it is judged by streaming its spooled
+    // segments and staged as the spool itself, with the manifest
+    // carrying the segment keys for the repair handoff.
+    let data = payload(61, 1000);
+    let (articles, nzb, _hex) = complete_case(&data, 1);
+    let server = spawn(articles).await;
+    let scratch = MemoryScratch::default();
+    let mut progress = VerifyProgress::new(0);
+    let caps = VerifyCaps {
+        max_file_bytes: 100,
+        ..VerifyCaps::default()
+    };
+    let (outcome, _) = run_step(&server, &nzb, &caps, &mut progress, &scratch).await;
+    assert_eq!(outcome, VerifyOutcome::Complete);
+
+    let staged = progress.staged.get(&0).expect("data staged");
+    assert_eq!(staged.key, VerifyProgress::spool_meta_key(JOB, 0, 0));
+    assert_eq!(staged.size, 1000);
+    assert_eq!(staged.spool.len(), 1);
+    assert!(
+        scratch
+            .bytes(&VerifyProgress::file_key(JOB, 0, 0, DATA_NAME))
+            .is_none(),
+        "no assembled object for a spooled file"
+    );
+    let manifest = scratch.manifest(JOB).expect("manifest staged");
+    let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+    let data_row = manifest
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["file_name"] == DATA_NAME)
+        .expect("data row");
+    assert_eq!(
+        data_row["segments"].as_array().map(Vec::len),
+        Some(1),
+        "manifest carries the spool segments: {data_row}"
+    );
+}
+
+#[tokio::test]
+async fn spooled_file_counts_bad_blocks_by_streaming() {
+    // Same oversize path with a corrupt block: the streaming block
+    // counter finds exactly the one bad block the in-memory path finds.
+    let data = payload(67, 1000);
+    let (mut articles, nzb, _hex) = complete_case(&data, 1);
+    let mut corrupt = data.clone();
+    corrupt[300] ^= 0xff;
+    articles[0] = yenc_article(
+        "d1@synthetic.invalid",
+        1,
+        DATA_NAME,
+        &SegmentParams::single(DATA_NAME),
+        &corrupt,
+    );
+    let server = spawn(articles).await;
+    let scratch = MemoryScratch::default();
+    let mut progress = VerifyProgress::new(0);
+    let caps = VerifyCaps {
+        max_file_bytes: 100,
+        ..VerifyCaps::default()
+    };
+    let (outcome, _) = run_step(&server, &nzb, &caps, &mut progress, &scratch).await;
+    assert!(
+        matches!(
+            outcome,
+            VerifyOutcome::RepairNeeded {
+                missing_blocks: 1,
+                ..
+            }
+        ),
+        "streamed judgement must count the corrupt block, got {outcome:?}"
     );
 }
 
