@@ -36,6 +36,12 @@ export const API = {
   health: '/api/health',
   ready: '/api/ready',
   testAccounts: '/api/test-accounts',
+  // Staging-only emailed-code retrieval seam (paired staging-seam build slice):
+  // returns the issued signup code for an `example.test` mailbox without
+  // minting an account. Fail-closed without the staging flag; absent in
+  // production. A renamed path fails the wizard-arrival spec with this key
+  // named.
+  testCodes: '/api/test-codes',
   ingest: '/api/ingest',
   ingestStatus: (id: string) => `/api/ingest/${id}`,
   library: '/api/library',
