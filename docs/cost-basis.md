@@ -298,3 +298,50 @@ slopes; PlanetScale storage grows linearly with the MusicBrainz mirror
    estimate and update the "checked" dates here if any price changed.
 4. Add the out-of-scope services named at the top before quoting a total
    as a complete infrastructure cost.
+
+## 10. First measured staging bill (2026-10-13 → 2026-10-17)
+
+First measurement against this worksheet, read 2026-10-17 via read-only
+Cloudflare API calls (no environment changed, no secret values read or
+recorded). Period covers the four days since staging provisioning
+(2026-10-13); raw 4-day inputs are shown monthlyized (×7.5) for the
+formulas. Staging-attributable usage only: staging and production share
+one Cloudflare account and one PlanetScale app cluster, so account-wide
+allowances apply once (section 7 rule) — account totals are cited where
+they prove the shared allowance is not exhausted.
+
+Dashboard source links (no IDs, no screenshots):
+[Cloudflare dashboard](https://dash.cloudflare.com/)
+(Workers & Pages → Observability; R2 → bucket metrics; KV → namespace
+details; Queues → queue metrics; Analytics Engine → query),
+[PlanetScale dashboard](https://app.planetscale.com/) (cluster billing:
+provisioned disk, backup, egress). Unit prices are the public list
+prices linked in sections 1–6, unchanged on 2026-10-17.
+
+| Service | Measured staging input (raw 4d → /month) | Arithmetic | $/month |
+|---|---|---|---|
+| Workers | `nntune-web-staging` 17 requests in period (GraphQL `workersInvocationsAdaptive`, `date > 2026-10-13`); the only NNTune script among deployed account Workers. CPU ≈ 17 × p50 8,238 reported units ≈ 140 CPU-ms at µs/request (even at ms/request, ≈ 140k CPU-ms ≈ 0.5% of the 30M allowance). Monthlyized: R ≈ 128, C ≈ 1k–1M CPU-ms — overage 0 under either unit | 5.00 + max(0, ~0 − 10) × 0.30 + max(0, ~0 − 30) × 0.02 | 5.00 |
+| R2 | Staging-attributable G/A/B ≈ 0: the one deployed staging Worker has no R2 bindings (verified 2026-10-17, see `docs/ops.md`), and no stream/mb/api/ingest Worker exists to write. Account-level snapshot for context: 559 Standard objects / ~10.2 GiB published (other ventures' data, not staging's) | 0 (all terms inside allowances) | 0.00 |
+| KV | `nntunev2-config-staging`: 0 keys (API key-list, count 0); no writer deployed, so reads/writes/deletes/lists ≈ 0 | 0 (inside allowances) | 0.00 |
+| Queues (supplemental; not in acceptance rows) | `nntunev2-ingest-staging` + DLQ: backlog 0 messages / 0 bytes (API queue metrics); created 2026-10-16 with 4-day retention, so cumulative delivery ≈ 0 | max(0, 0 − 1) × 0.40 | 0.00 |
+| Analytics Engine (prospective; not billed, excluded from current total) | W ≈ 0, Q ≈ 0: no `stream` Worker deployed, so nothing writes to `nntune_meter` | — | 0.00 |
+| Hyperdrive | No line item beyond the Workers plan (section 1 source); 3 configs exist | — | 0.00 |
+| PlanetScale | Compute 2 × $5.00 (host-reported 2026-10-13 receipt: app PS-5 single-node incl. staging + MB cluster; see `docs/ops.md`). Storage/egress/backup overage $0: staging DB is days old and the ~100 GB MB import has not run, so disk sits inside the 10 GB/instance allowance; egress inside the 10 GB/branch allowance | 5.00 + 5.00 + 0 + 0 + 0 | 10.00 |
+| **Total (currently billed)** | | 5.00 + 10.00 | **15.00** |
+
+Worksheet-variance check (rows >20% off expectation need a named
+follow-up): the worksheet implies base fees plus in-allowance usage, i.e.
+$15.00/mo. Every row above matches that expectation (variance 0%) — **no
+variance follow-ups.**
+
+Measurement notes (not variances): per-bucket R2 dashboard confirmation
+and PlanetScale metered-usage (disk/backup/egress GB) dashboard reads were
+not separately pulled — both sit at $0 by writer-absence/allowance
+evidence above; re-confirm from the dashboards at the next reading.
+Account billing/credit-balance APIs reject the operator token
+(authentication error on `/billing/credits`, `/billable-usage`,
+`/billing/usage`), so plan-allowance coverage is asserted from usage
+volumes, not from a credit-balance read.
+
+Charter check: **yes — metered overage $0.00 for the period; fixed fees
+$15.00/mo ($5.00 Workers Paid + $10.00 PlanetScale compute).**
