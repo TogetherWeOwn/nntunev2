@@ -27,6 +27,8 @@ fn parsed_from(ids: &[&str]) -> ParsedNzb {
         file_count: 1,
         segment_count: ids.len(),
         message_ids: ids.iter().map(|s| s.to_string()).collect(),
+        segment_bytes: vec![None; ids.len()],
+        file_segment_bytes: vec![vec![None; ids.len()]],
     }
 }
 
@@ -141,7 +143,9 @@ fn multi_batch_probe_keeps_middle_gap_to_verify() {
     let parsed = ParsedNzb {
         file_count: 1,
         segment_count: ids.len(),
-        message_ids: ids,
+        message_ids: ids.clone(),
+        segment_bytes: vec![None; ids.len()],
+        file_segment_bytes: vec![vec![None; ids.len()]],
     };
     let batches = probe_batches(&parsed);
     assert_eq!(batches.len(), 2);
