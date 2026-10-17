@@ -241,6 +241,73 @@ describe('SeekController bounded consumption (finite ranges)', () => {
 		expect(body.cancels).toBeGreaterThanOrEqual(1);
 	});
 
+	it('rejects a finite 206 with trailing bytes after an exact chunk boundary', async () => {
+		// The first two chunks fill the 100-byte range exactly on a chunk
+		// boundary, so only a post-fill probe can see the trailing 50 bytes.
+		// The gate keeps the stream open after the trailing chunk so the
+		// rejection's cancellation is observable (a self-closed body has
+		// nothing left to cancel).
+		const body = countedBody(splitChunks(patternBytes(150), [50, 50, 50]), {
+			gateAfterChunks: 3
+		});
+		const controller = new SeekController(
+			'https://audio.example/track',
+			fetchReturning(
+				new Response(body.stream, {
+					status: 206,
+					headers: { 'content-range': 'bytes 0-99/1000' }
+				})
+			)
+		);
+
+		await expect(controller.seek(0, 99)).rejects.toThrow();
+		expect(controller.completed).toBe(0);
+		expect(controller.pending).toBe(false);
+		expect(body.cancels).toBeGreaterThanOrEqual(1);
+	});
+
+	it('accepts a finite 206 that ends with an empty chunk after the exact length', async () => {
+		// An empty chunk carries no bytes; probing past it must not reject
+		// an otherwise exact body, and a cleanly ended body needs no cancel.
+		// Built explicitly: splitChunks stops once the bytes are exhausted,
+		// so it would never emit the trailing empty chunk.
+		const body = countedBody([patternBytes(50), patternBytes(50, 50), new Uint8Array(0)]);
+		const controller = new SeekController(
+			'https://audio.example/track',
+			fetchReturning(
+				new Response(body.stream, {
+					status: 206,
+					headers: { 'content-range': 'bytes 0-99/1000' }
+				})
+			)
+		);
+
+		const result = await controller.seek(0, 99);
+
+		expect(result.bytes).toEqual(patternBytes(100));
+		expect(controller.completed).toBe(1);
+		expect(body.cancels).toBe(0);
+	});
+
+	it('rejects a finite 206 delivered as a single oversized chunk', async () => {
+		// One 150-byte chunk crosses the 100-byte boundary and the stream
+		// then ends, so only the boundary-overflow check can reject it.
+		const body = countedBody([patternBytes(150)]);
+		const controller = new SeekController(
+			'https://audio.example/track',
+			fetchReturning(
+				new Response(body.stream, {
+					status: 206,
+					headers: { 'content-range': 'bytes 0-99/1000' }
+				})
+			)
+		);
+
+		await expect(controller.seek(0, 99)).rejects.toThrow();
+		expect(controller.completed).toBe(0);
+		expect(controller.pending).toBe(false);
+	});
+
 	it('rejects a finite 206 whose body ends before its Content-Range length', async () => {
 		const body = countedBody(uniformChunks(patternBytes(50), 25));
 		const controller = new SeekController(
