@@ -46,10 +46,29 @@ run_refused() { # desc sentinel-value-that-must-not-print
   else
     ok "$1: error output carries no credential value"
   fi
+  # A missing ValueError guard turns a clean refusal into a Python
+  # traceback, whose message can carry a token from the URL.
+  if grep -Fq 'Traceback' "$err_file"; then
+    bad "$1: error output is a Python traceback"
+  else
+    ok "$1: error output is a clean refusal"
+  fi
+}
+check_err_guidance() { # desc -- refusal just run must name the remedy
+  if grep -Fq 'percent-encode' "$err_file"; then
+    ok "$1: error output names the percent-encode remedy"
+  else
+    bad "$1: error output does not name the percent-encode remedy"
+  fi
 }
 reset_pg() {
   unset PGHOST PGHOSTADDR PGPORT PGUSER PGDATABASE PGPASSWORD PGSSLMODE \
-        PGSSLROOTCERT PGCONNECT_TIMEOUT PGAPPNAME PGSERVICE PGPASSFILE
+        PGSSLROOTCERT PGCONNECT_TIMEOUT PGAPPNAME PGSERVICE PGPASSFILE \
+        PGSSLCRL PGSSLCRLDIR PGSSLSNI PGSSLCERTMODE PGSSLNEGOTIATION \
+        PGSSLCOMPRESSION PGSSLMINPROTOCOLVERSION PGSSLMAXPROTOCOLVERSION \
+        PGGSSENCMODE PGGSSLIB PGGSSDELEGATION PGKRBSRVNAME PGREQUIREAUTH \
+        PGREQUIREPEER PGLOADBALANCEHOSTS PGMINPROTOCOLVERSION \
+        PGMAXPROTOCOLVERSION
 }
 
 reset_pg
@@ -120,6 +139,88 @@ check_eq "whitespace name kept verbatim" 'my database' "${PGDATABASE-}"
 reset_pg
 DATABASE_URL=''
 run_refused "empty DATABASE_URL" 'SENTINELVAL'
+
+reset_pg
+DATABASE_URL='postgres://u:p@h/db?sslcrl=/crl.pem&sslcrldir=/crls&sslsni=1&sslcertmode=require&sslnegotiation=direct&sslcompression=0&ssl_min_protocol_version=TLSv1.3&ssl_max_protocol_version=TLSv1.3&gssencmode=disable&gsslib=gssapi&gssdelegation=0&krbsrvname=postgres&require_auth=scram-sha-256&requirepeer=mb&load_balance_hosts=disable&min_protocol_version=3.0&max_protocol_version=3.2'
+run_ok "URI with the extended libpq option set"
+check_eq "sslcrl" '/crl.pem' "${PGSSLCRL-}"
+check_eq "sslcrldir" '/crls' "${PGSSLCRLDIR-}"
+check_eq "sslsni" '1' "${PGSSLSNI-}"
+check_eq "sslcertmode" 'require' "${PGSSLCERTMODE-}"
+check_eq "sslnegotiation" 'direct' "${PGSSLNEGOTIATION-}"
+check_eq "sslcompression" '0' "${PGSSLCOMPRESSION-}"
+check_eq "ssl_min_protocol_version" 'TLSv1.3' "${PGSSLMINPROTOCOLVERSION-}"
+check_eq "ssl_max_protocol_version" 'TLSv1.3' "${PGSSLMAXPROTOCOLVERSION-}"
+check_eq "gssencmode" 'disable' "${PGGSSENCMODE-}"
+check_eq "gsslib" 'gssapi' "${PGGSSLIB-}"
+check_eq "gssdelegation" '0' "${PGGSSDELEGATION-}"
+check_eq "krbsrvname" 'postgres' "${PGKRBSRVNAME-}"
+check_eq "require_auth" 'scram-sha-256' "${PGREQUIREAUTH-}"
+check_eq "requirepeer" 'mb' "${PGREQUIREPEER-}"
+check_eq "load_balance_hosts" 'disable' "${PGLOADBALANCEHOSTS-}"
+check_eq "min_protocol_version" '3.0' "${PGMINPROTOCOLVERSION-}"
+check_eq "max_protocol_version" '3.2' "${PGMAXPROTOCOLVERSION-}"
+
+reset_pg
+DATABASE_URL='postgres://u:SENTINELPW@h/db?service=staging'
+run_refused "URI with a service parameter" 'SENTINELPW'
+
+reset_pg
+DATABASE_URL='host=h service=staging password=SENTINELPW'
+run_refused "keyword conninfo with a service parameter" 'SENTINELPW'
+
+reset_pg
+export PGSERVICE='staging' # inherited means exported, as a container env is
+DATABASE_URL='postgres://u:SENTINELPW@h/db'
+run_refused "inherited PGSERVICE" 'SENTINELPW'
+
+reset_pg
+DATABASE_URL='postgres://u:SENTINELPW@h1,h2/db'
+run_refused "multi-host URI" 'SENTINELPW'
+
+reset_pg
+DATABASE_URL='postgres://u:p@h:SENTINELPORT/db'
+run_refused "URI with an invalid port" 'SENTINELPORT'
+
+reset_pg
+DATABASE_URL='postgres://u:SENTINELPW@[::1/db'
+run_refused "URI with an unterminated IPv6 host" 'SENTINELPW'
+
+reset_pg
+DATABASE_URL='postgres://u:SENTINEL#pw@h/db'
+run_refused "URI with a raw '#' in the password" 'SENTINEL'
+check_err_guidance "URI with a raw '#' in the password"
+
+reset_pg
+DATABASE_URL='postgres://u:SENTINEL?pw@h/db'
+run_refused "URI with a raw '?' in the password" 'SENTINEL'
+check_err_guidance "URI with a raw '?' in the password"
+
+reset_pg
+DATABASE_URL='postgres://u:p+ss@h/db?application_name=mb+import'
+run_ok "URI with literal '+' in password and query value"
+check_eq "literal '+' in password kept" 'p+ss' "${PGPASSWORD-}"
+check_eq "literal '+' in query value kept" 'mb+import' "${PGAPPNAME-}"
+
+reset_pg
+PGUSER='keep-user'
+PGPASSWORD='keep-pw'
+DATABASE_URL='postgres://:@h/db'
+run_ok "URI with empty userinfo"
+check_eq "empty URI user leaves PGUSER untouched" 'keep-user' "${PGUSER-}"
+check_eq "empty URI password leaves PGPASSWORD untouched" 'keep-pw' "${PGPASSWORD-}"
+
+reset_pg
+PGPASSWORD='keep-pw'
+DATABASE_URL='postgres://newuser:@h/db'
+run_ok "URI with empty password only"
+check_eq "URI user still set" 'newuser' "${PGUSER-}"
+check_eq "empty URI password leaves PGPASSWORD untouched" 'keep-pw' "${PGPASSWORD-}"
+
+reset_pg
+DATABASE_URL='postgres://u:%FF@h/db'
+run_ok "URI with a non-UTF-8 percent-encoded password byte"
+check_eq "%FF reaches PGPASSWORD as byte 0xFF" $'\xff' "${PGPASSWORD-}"
 
 echo
 echo "test-pg-env: $passes passed, $failures failed"

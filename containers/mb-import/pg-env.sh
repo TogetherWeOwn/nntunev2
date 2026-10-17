@@ -10,14 +10,19 @@
 # prints only shell-quoted PG* assignments; error messages name an
 # offending parameter key, never a value.
 #
-# Precedence matches the old `psql "$DATABASE_URL"` form, where a URI
-# parameter overrides the corresponding PG* variable and an unspecified
-# parameter falls back to the environment: only parameters the URI
-# actually specifies are (re)set here. A URI query parameter with no PG*
-# equivalent (and multi-host URIs) is refused rather than silently
-# dropped. This restores the "never in argv" contract only; a process
-# environment is not a security boundary against same-UID processes.
-# Requires python3 on PATH.
+# Precedence otherwise matches the old `psql "$DATABASE_URL"` form,
+# where a URI parameter overrides the corresponding PG* variable and an
+# unspecified parameter falls back to the environment: only parameters
+# the URI actually specifies are (re)set here. Service files are the
+# exception: libpq ranks explicit parameters above a service file and
+# a service file above PG* variables, so after translation a service
+# could silently replace the URL's host, database or TLS settings. A
+# `service` parameter, or an inherited PGSERVICE, is therefore refused
+# rather than silently redirected. A URI query parameter with no PG*
+# equivalent (and multi-host URIs) is likewise refused rather than
+# silently dropped. This restores the "never in argv" contract only; a
+# process environment is not a security boundary against same-UID
+# processes. Requires python3 on PATH.
 
 configure_pg_env_from_database_url() {
   local pg_assignments
@@ -33,9 +38,25 @@ def fail(message):
     sys.exit(1)
 
 
-# libpq connection parameter -> PG* environment variable (libpq docs,
-# "Environment Variables"). Query parameters outside this map have no
-# env delivery channel and are refused below.
+# Percent-decoding must preserve non-UTF-8 bytes (e.g. %FF) exactly as
+# libpq delivers them, so decode with surrogateescape and emit the
+# assignments with the same error handler.
+sys.stdout.reconfigure(errors="surrogateescape")
+
+
+def dec(value):
+    return unquote(value, errors="surrogateescape")
+
+
+SERVICE_REFUSAL = (
+    "a libpq service file would override DATABASE_URL settings "
+    "after PG* translation"
+)
+
+# libpq connection parameter -> PG* environment variable: every pair in
+# the libpq docs ("Environment Variables") except `service`, refused
+# above for precedence reasons. Query parameters outside this map have
+# no env delivery channel and are refused below.
 ENV_FOR_PARAM = {
     "host": "PGHOST",
     "hostaddr": "PGHOSTADDR",
@@ -44,7 +65,6 @@ ENV_FOR_PARAM = {
     "password": "PGPASSWORD",
     "passfile": "PGPASSFILE",
     "dbname": "PGDATABASE",
-    "service": "PGSERVICE",
     "options": "PGOPTIONS",
     "application_name": "PGAPPNAME",
     "client_encoding": "PGCLIENTENCODING",
@@ -56,6 +76,23 @@ ENV_FOR_PARAM = {
     "sslkey": "PGSSLKEY",
     "channel_binding": "PGCHANNELBINDING",
     "target_session_attrs": "PGTARGETSESSIONATTRS",
+    "sslcrl": "PGSSLCRL",
+    "sslcrldir": "PGSSLCRLDIR",
+    "sslsni": "PGSSLSNI",
+    "sslcertmode": "PGSSLCERTMODE",
+    "sslnegotiation": "PGSSLNEGOTIATION",
+    "sslcompression": "PGSSLCOMPRESSION",
+    "ssl_min_protocol_version": "PGSSLMINPROTOCOLVERSION",
+    "ssl_max_protocol_version": "PGSSLMAXPROTOCOLVERSION",
+    "gssencmode": "PGGSSENCMODE",
+    "gsslib": "PGGSSLIB",
+    "gssdelegation": "PGGSSDELEGATION",
+    "krbsrvname": "PGKRBSRVNAME",
+    "require_auth": "PGREQUIREAUTH",
+    "requirepeer": "PGREQUIREPEER",
+    "load_balance_hosts": "PGLOADBALANCEHOSTS",
+    "min_protocol_version": "PGMINPROTOCOLVERSION",
+    "max_protocol_version": "PGMAXPROTOCOLVERSION",
 }
 
 def parse_keyword_conninfo(text):
@@ -107,6 +144,8 @@ def parse_keyword_conninfo(text):
                 else:
                     chars.append(text[i])
                     i += 1
+        if key == "service":
+            fail("DATABASE_URL 'service' parameter is refused: " + SERVICE_REFUSAL)
         if key not in ENV_FOR_PARAM:
             fail(
                 "DATABASE_URL keyword %r has no PG* environment equivalent" % key
@@ -116,33 +155,65 @@ def parse_keyword_conninfo(text):
 
 url = os.environ.get("DATABASE_URL", "")
 
+if os.environ.get("PGSERVICE"):
+    fail("PGSERVICE is set and must be unset: " + SERVICE_REFUSAL)
+
 # The old `psql "$DATABASE_URL"` accepted every form libpq expands from
 # a dbname argument: a postgres URI, a keyword/value conninfo string,
 # or a bare database name. Keep all three working.
 params = {}
 if url.startswith(("postgres://", "postgresql://")):
+    # libpq tolerates a raw '#' or '?' in the password, but in URI
+    # grammar they cut the authority short, so refuse them with the
+    # remedy instead of misparsing. The candidate userinfo is the text
+    # before the last '@' of the authority; a '?' followed (before any
+    # '@') by a key=value pair is a genuine query string on a URL with
+    # no '/' path, not userinfo, and stays accepted.
+    authority = url.split("://", 1)[1].split("/", 1)[0]
+    userinfo_candidate, at_sign, _ = authority.rpartition("@")
+    if at_sign and (
+        "#" in userinfo_candidate
+        or (
+            "?" in userinfo_candidate
+            and "=" not in userinfo_candidate.split("?", 1)[1]
+        )
+    ):
+        fail(
+            "DATABASE_URL userinfo contains a raw '#' or '?': "
+            "percent-encode it (%23 / %3F) in the URI"
+        )
     try:
         parts = urlsplit(url)
     except ValueError:
         fail("DATABASE_URL is not a well-formed URI")
+    if parts.fragment:
+        fail(
+            "DATABASE_URL contains a raw '#': "
+            "percent-encode it (%23) in the URI"
+        )
     # urlsplit leaves userinfo percent-encoded; decode exactly once so
-    # special-character credentials reach libpq byte for byte.
-    if parts.username is not None:
-        params["user"] = unquote(parts.username)
-    if parts.password is not None:
-        params["password"] = unquote(parts.password)
-    if parts.hostname is not None:
+    # special-character credentials reach libpq byte for byte. Empty
+    # userinfo parts are skipped: libpq ignores them, so PGUSER /
+    # PGPASSWORD from the environment still apply.
+    if parts.username:
+        params["user"] = dec(parts.username)
+    if parts.password:
+        params["password"] = dec(parts.password)
+    if parts.hostname:
         if "," in parts.hostname:
             fail("multi-host DATABASE_URL URI is not supported; name a single host")
-        params["host"] = unquote(parts.hostname)
+        params["host"] = dec(parts.hostname)
     try:
         port = parts.port
     except ValueError:
-        fail("DATABASE_URL carries an invalid port")
+        fail(
+            "DATABASE_URL carries an invalid port (a raw '#' or '?' in "
+            "the password must be percent-encoded as %23 / %3F)"
+        )
     if port is not None:
         params["port"] = str(port)
     if parts.path not in ("", "/"):
-        params["dbname"] = unquote(parts.path[1:])
+        params["dbname"] = dec(parts.path[1:])
     # Query parameters override the corresponding URI parts (libpq URI
     # semantics). Split manually: form decoding would turn a literal '+'
     # into a space, which libpq does not do.
@@ -150,13 +221,15 @@ if url.startswith(("postgres://", "postgresql://")):
         if not field:
             continue
         key, _, value = field.partition("=")
-        key = unquote(key)
+        key = dec(key)
+        if key == "service":
+            fail("DATABASE_URL 'service' parameter is refused: " + SERVICE_REFUSAL)
         if key not in ENV_FOR_PARAM:
             fail(
                 "DATABASE_URL query parameter %r has no PG* environment equivalent"
                 % key
             )
-        params[key] = unquote(value)
+        params[key] = dec(value)
 elif "=" in url:
     params = parse_keyword_conninfo(url)
 elif url:
