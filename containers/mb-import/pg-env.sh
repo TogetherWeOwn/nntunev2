@@ -58,48 +58,113 @@ ENV_FOR_PARAM = {
     "target_session_attrs": "PGTARGETSESSIONATTRS",
 }
 
+def parse_keyword_conninfo(text):
+    """libpq keyword/value conninfo -> {parameter: value}.
+
+    Pairs are separated by whitespace; a value may be single-quoted,
+    and a backslash escapes the next character in either form.
+    """
+    params = {}
+    i, n = 0, len(text)
+    while True:
+        while i < n and text[i].isspace():
+            i += 1
+        if i >= n:
+            return params
+        start = i
+        while i < n and not text[i].isspace() and text[i] != "=":
+            i += 1
+        key = text[start:i]
+        while i < n and text[i].isspace():
+            i += 1
+        if i >= n or text[i] != "=":
+            fail("DATABASE_URL keyword conninfo is missing '=' after a keyword")
+        i += 1
+        while i < n and text[i].isspace():
+            i += 1
+        chars = []
+        if i < n and text[i] == "'":
+            i += 1
+            closed = False
+            while i < n:
+                if text[i] == "\\" and i + 1 < n:
+                    chars.append(text[i + 1])
+                    i += 2
+                elif text[i] == "'":
+                    closed = True
+                    i += 1
+                    break
+                else:
+                    chars.append(text[i])
+                    i += 1
+            if not closed:
+                fail("DATABASE_URL keyword conninfo has an unterminated quoted value")
+        else:
+            while i < n and not text[i].isspace():
+                if text[i] == "\\" and i + 1 < n:
+                    chars.append(text[i + 1])
+                    i += 2
+                else:
+                    chars.append(text[i])
+                    i += 1
+        if key not in ENV_FOR_PARAM:
+            fail(
+                "DATABASE_URL keyword %r has no PG* environment equivalent" % key
+            )
+        params[key] = "".join(chars)
+
+
 url = os.environ.get("DATABASE_URL", "")
-try:
-    parts = urlsplit(url)
-except ValueError:
-    fail("DATABASE_URL is not a well-formed URI")
-if parts.scheme not in ("postgres", "postgresql"):
-    fail("DATABASE_URL must be a postgres:// or postgresql:// URI")
 
+# The old `psql "$DATABASE_URL"` accepted every form libpq expands from
+# a dbname argument: a postgres URI, a keyword/value conninfo string,
+# or a bare database name. Keep all three working.
 params = {}
-# urlsplit leaves userinfo percent-encoded; decode exactly once so
-# special-character credentials reach libpq byte for byte.
-if parts.username is not None:
-    params["user"] = unquote(parts.username)
-if parts.password is not None:
-    params["password"] = unquote(parts.password)
-if parts.hostname is not None:
-    if "," in parts.hostname:
-        fail("multi-host DATABASE_URL is not supported; name a single host")
-    params["host"] = unquote(parts.hostname)
-try:
-    port = parts.port
-except ValueError:
-    fail("DATABASE_URL carries an invalid port")
-if port is not None:
-    params["port"] = str(port)
-if parts.path not in ("", "/"):
-    params["dbname"] = unquote(parts.path[1:])
-
-# Query parameters override the corresponding URI parts (libpq URI
-# semantics). Split manually: form decoding would turn a literal '+'
-# into a space, which libpq does not do.
-for field in parts.query.split("&"):
-    if not field:
-        continue
-    key, _, value = field.partition("=")
-    key = unquote(key)
-    if key not in ENV_FOR_PARAM:
-        fail(
-            "DATABASE_URL query parameter %r has no PG* environment equivalent"
-            % key
-        )
-    params[key] = unquote(value)
+if url.startswith(("postgres://", "postgresql://")):
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        fail("DATABASE_URL is not a well-formed URI")
+    # urlsplit leaves userinfo percent-encoded; decode exactly once so
+    # special-character credentials reach libpq byte for byte.
+    if parts.username is not None:
+        params["user"] = unquote(parts.username)
+    if parts.password is not None:
+        params["password"] = unquote(parts.password)
+    if parts.hostname is not None:
+        if "," in parts.hostname:
+            fail("multi-host DATABASE_URL URI is not supported; name a single host")
+        params["host"] = unquote(parts.hostname)
+    try:
+        port = parts.port
+    except ValueError:
+        fail("DATABASE_URL carries an invalid port")
+    if port is not None:
+        params["port"] = str(port)
+    if parts.path not in ("", "/"):
+        params["dbname"] = unquote(parts.path[1:])
+    # Query parameters override the corresponding URI parts (libpq URI
+    # semantics). Split manually: form decoding would turn a literal '+'
+    # into a space, which libpq does not do.
+    for field in parts.query.split("&"):
+        if not field:
+            continue
+        key, _, value = field.partition("=")
+        key = unquote(key)
+        if key not in ENV_FOR_PARAM:
+            fail(
+                "DATABASE_URL query parameter %r has no PG* environment equivalent"
+                % key
+            )
+        params[key] = unquote(value)
+elif "=" in url:
+    params = parse_keyword_conninfo(url)
+elif url and not any(c.isspace() for c in url):
+    params["dbname"] = url
+else:
+    fail(
+        "DATABASE_URL must be a postgres:// URI or libpq keyword/value conninfo"
+    )
 
 for key, value in params.items():
     print("export %s=%s" % (ENV_FOR_PARAM[key], shlex.quote(value)))
