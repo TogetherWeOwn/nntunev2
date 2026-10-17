@@ -1474,8 +1474,10 @@ work. Production DB creation/migration remains gated by the ops contract.
   entry-count projection, deletion fencing/executor integration, and the
   corresponding acceptance-test changes. The current `items` column remains the
   temporary source of owner reads and non-owner public-playlist counts until that
-  PR's commit boundary; in the same atomic cutover those reads/counts switch to
-  `playlist_tracks`. There is no dual-write, mixed count, partial backfill, or
+  PR's commit boundary; in the same atomic cutover, only non-owner public-playlist
+  counts and resolvable owner entries switch to `playlist_tracks`. Unresolved
+  legacy refs remain owner-readable from `items` until the later drop migration.
+  There is no dual-write, mixed count, partial backfill, or
   deployable intermediate schema. Preserve `playlists.id BIGSERIAL` as the
   internal FK target and `public_id TEXT` as the only external handle; never
   recreate `playlists`, rewrite `0003_library.sql`, guess unresolved refs, or
@@ -1488,34 +1490,57 @@ work. Production DB creation/migration remains gated by the ops contract.
   the existing exact-SQL and visibility pins and prove migration upgrade behavior
   against the applied 0003 shape. Splitting any of those into a deployed PR would
   break the atomicity contract above. Therefore this plan schedules no partial
-  cutover implementation PR. First land only these independent, at-most-one-day
-  preparations; estimate the single cutover only after they pass. If the atomic
+  cutover implementation PR. First land only these bounded, at-most-one-day
+  preparations; estimate the single cutover only after their prerequisites
+  pass. If the atomic
   cutover still exceeds one day, keep it unscheduled and identify additional
   non-behavioral preparation rather than splitting its PR or weakening atomicity.
 
-  The repository already has `migrations/manifest.toml` plus `migrations-gate`
-  checks for ordering, explicit app/mirror targets, checksums and drift; `api-migrations`
-  applies the current SQL to an empty throwaway database and checks replay safety.
-  These are existing safeguards, not new work. The current migration test does
-  not seed and upgrade a populated applied-0003 playlist shape, so only these
-  independent preparations are safe before the atomic cutover:
+  The repository has `migrations/manifest.toml`, `migrations-gate`, and
+  `api-migrations`, but these are not a per-database applied-history runner:
+  `migrations-gate` checks repository ordering, targets, checksums and drift
+  against the base branch, while `api-migrations` applies SQL to an empty
+  throwaway database and checks replay safety. Neither records files applied to
+  a real database. The current migration test also does not seed and upgrade a
+  populated applied-0003 playlist shape. Therefore the runner is an explicit
+  prerequisite, and these bounded preparations are safe before the atomic
+  cutover. Slice 1 is a prerequisite for slice 2; slice 3 is independent:
 
-  1. **Applied-shape rehearsal fixture and harness (≤1 day; no playlist cutover).**
-     Extend the migration test harness to build a synthetic app database from
-     the app-targeted 0002 auth and 0003 library migrations, seed representative
+  1. **Per-database migration runner (≤1 day; prerequisite, no playlist cutover).**
+     Implement and test the smallest runner that reads each migration's explicit
+     target from `migrations/manifest.toml`, applies app-targeted files only to
+     the app DB and mirror-targeted files only to the mirror DB, and records the
+     applied filename and SHA-256 checksum per database. Refuse checksum drift
+     before applying further files; fail closed for missing/ambiguous targets,
+     and make replay of an already-applied matching file a no-op. Execution-level
+     acceptance: use separate synthetic app and mirror databases plus a
+     mirror-targeted fixture migration; prove it executes against the mirror DB
+     only, never the app DB, and assert the corresponding per-DB applied-file
+     record. Also assert app-targeted routing, matching replay, and altered-file
+     drift refusal. Existing `migrations-gate` and
+     `workers/api/tests/run_migration_tests.sh` remain required source/empty-DB
+     gates, not substitutes for these runner tests. Safeguards: throwaway DBs and
+     synthetic migration inputs only; no staging or production connections, no
+     edits/moves of applied migrations, and no playlist schema or behavior change.
+     If this runner cannot credibly fit in one day, leave it unscheduled and add
+     only non-behavioral preparation; the atomic cutover remains blocked on it.
+
+  2. **Applied-shape rehearsal fixture and harness (≤1 day; no playlist cutover).**
+     Using the runner from slice 1, build a synthetic app database from the
+     app-targeted 0002 auth and 0003 library migrations, seed representative
      playlist rows after 0003, then apply the already-existing later app
-     migrations and assert playlist columns, internal BIGSERIAL ids, external
+     migrations. Assert playlist columns, internal BIGSERIAL ids, external
      `public_id`s, owner, order, `items`, and visibility flags remain unchanged.
-     Include a separate mirror-target assertion against `migrations/manifest.toml`; reuse
-     `migrations-gate` for ordering/checksum/drift checks and run the existing
-     `api-migrations` gate (`workers/api/tests/run_migration_tests.sh`) for the
-     empty-database path. No future playlist migration is introduced in this
-     slice. Safeguards: synthetic data and throwaway DB only; no production or
-     staging DB access, no edit/move of applied migrations, explicit app/mirror
-     manifest targets, and checksum gate remains required. This proves the
-     starting point without releasing a new playlist schema or read path.
+     Carry forward slice 1's execution-level mirror-routing assertion; this
+     rehearsal also reuses `migrations-gate` for repository ordering,
+     target/checksum/drift checks and runs the existing `api-migrations` gate for
+     the empty-database path. No playlist migration is introduced. Safeguards:
+     synthetic data and throwaway DBs only; no production or staging DB access,
+     no edit/move of applied migrations, and explicit app/mirror manifest targets.
+     This proves the starting point without releasing a new playlist schema or
+     read path.
 
-  2. **Legacy-data fixture package (≤1 day; fixtures only, no runtime/schema or
+  3. **Legacy-data fixture package (≤1 day; fixtures only, no runtime/schema or
      acceptance-test edits by the implementation author).** Have the Test Author
      prepare deterministic, non-production fixture inputs representing: an
      owner playlist with all opaque refs resolvable; a mixed resolved/unresolved
@@ -1531,12 +1556,13 @@ work. Production DB creation/migration remains gated by the ops contract.
      Test Author-owned acceptance tests by the implementation author. This slice
      only supplies inputs for the later atomic PR; it does not release reads.
 
-  3. **Single atomic playlist cutover PR (≤1 day, hard ceiling; not yet estimated
-     as fitting).** After both preparations, the implementation owner must either
-     demonstrate a one-day estimate for the complete scope above or leave this
-     implementation unscheduled and add only further safe preparations. Required
-     acceptance fixtures/checks in that PR: the complete fixture package from
-     slice 2; owner/public/private/unknown and unauthenticated read/list cases;
+  4. **Single atomic playlist cutover PR (≤1 day, hard ceiling; not yet estimated
+     as fitting).** This slice is explicitly blocked until slice 1's per-database
+     runner and slices 2–3's rehearsals/fixtures pass. The implementation owner
+     must either demonstrate a one-day estimate for the complete scope above or
+     leave this implementation unscheduled and add only further safe preparations.
+     Required acceptance fixtures/checks in that PR: the complete fixture package
+     from slice 3; owner/public/private/unknown and unauthenticated read/list cases;
      visible public metadata with no non-owner `items`, entries, catalog ids, tags,
      or cover-art ids; owner-only unresolved legacy reads; count equivalence for
      fully resolvable lists at the freeze boundary; migration/backfill idempotence
@@ -1547,14 +1573,15 @@ work. Production DB creation/migration remains gated by the ops contract.
      pins and visibility tests in `workers/api/tests/library_single_row_visibility.rs`
      and `workers/api/tests/library_tests.rs` updated in lockstep. Forward-only
      safeguards: allocate one new unique top-level migration number after 0008,
-     target app DB explicitly, require the runner's per-DB checksum/drift gates,
-     retain all 0003 playlist rows and existing columns until the same PR's
-     coordinated migration/backfill/read-write cutover passes parity checks; add
-     only the specified nullable marker and new entry table, preserve
-     restrictive FKs, and drop legacy `items` only in a later separately reviewed
-     forward migration after verified parity/retention criteria. Never edit an
-     applied migration, `CREATE TABLE playlists`, dual-write, count from both
-     stores, reverse/rollback by destructive DDL, or test against production.
+     target app DB explicitly through the per-database runner, require its
+     applied-file SHA-256/drift refusal and replay gates, retain all 0003 playlist
+     rows and existing columns until the same PR's coordinated migration/backfill/
+     read-write cutover passes parity checks; add only the specified nullable
+     marker and new entry table, preserve restrictive FKs, and drop legacy `items`
+     only in a later separately reviewed forward migration after verified
+     parity/retention criteria. Never edit an applied migration,
+     `CREATE TABLE playlists`, dual-write, count from both stores, reverse/rollback
+     by destructive DDL, or test against production.
 
 - **Ingest manifest producer (new alignment work):** the current parser's flat
   `ParsedNzb.message_ids` and `LibraryWrite.recording_mbids` arrays do not contain
