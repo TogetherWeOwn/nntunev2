@@ -39,6 +39,26 @@ target = "app"
 sha256 = "35508144971de4bdf9919e28a6979963053fa7eb76956df1fd6e98dac004b595"
 
 [[migration]]
-file = "0009_auth_challenge_reauth_purpose.sql"
+file = "0009_metered_admission.sql"
 target = "app"
-sha256 = "bff0c1003e35cf5c92612cf6aff1a2dcf98d2838cb6ba730b0f406efce7f9c86"
+sha256 = "e1f5d25c97c2eeb1e292a7761d34f9aaaed43133ddfb536e609a32f8e322f8d8"
+
+[[migration]]
+file = "0010_metered_admission_claim.sql"
+target = "app"
+sha256 = "007c434790b5d1433dd0e7f3787409afc9e802092b87aad86d7cd47d8dc87184"
+
+[[migration]]
+file = "0011_metered_admission_claim_epoch.sql"
+target = "app"
+sha256 = "50b645b72156218e83ce272c3fdfc97250df422563a2be0d30ad1ecfc72dea02"
+
+[[migration]]
+file = "0012_metered_admission_replay_window.sql"
+target = "app"
+sha256 = "6962f20adab4a64672f7c9a870d0e9e606ba8dc638a5b656e8720b0900134a4a"
+
+[[migration]]
+file = "0013_auth_challenge_reauth_purpose.sql"
+target = "app"
+sha256 = "848df4805ac18bc1312689f033c86e90417bd9d53bdbfbb0950813b00e9f0d64"

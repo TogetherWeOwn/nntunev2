@@ -11,6 +11,7 @@
 | 0007 | [MusicBrainz mirror](0007-mb-mirror.md) |
 | 0008 | [Authentication, vault and sessions](0008-auth-vault-sessions.md) |
 | 0009 | [Serverless Cloudflare stack](0009-stack.md) |
+| 0010 | [Scoped native REST credentials](0010-native-rest-credentials.md) |
 
 ## Numbering and precedence
 

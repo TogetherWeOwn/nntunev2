@@ -1,4 +1,4 @@
--- NNTune v2 migration 0009: allow session-bound reauthentication challenges.
+-- NNTune v2 migration 0013: allow session-bound reauthentication challenges.
 -- Migration 0008 installed the purpose allowlist before the reauth route was
 -- added. Replace the constraint without weakening immutability of live rows.
 -- Idempotent: safe to re-run.
