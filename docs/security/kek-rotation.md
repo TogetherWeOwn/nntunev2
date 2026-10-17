@@ -63,8 +63,8 @@ CREATE TABLE IF NOT EXISTS provider_vaults (
   updated_at         BIGINT NOT NULL,
   rewrapped_at       BIGINT NULL       -- migration 0015: NULL = never re-wrapped
 );
--- Migration 0004 (landed): rewrapped_at + version index.
--- ALTER TABLE provider_vaults ADD COLUMN rewrapped_at BIGINT NULL;
+-- Migration 0015 (landed): rewrapped_at + version index.
+-- ALTER TABLE provider_vaults ADD COLUMN IF NOT EXISTS rewrapped_at BIGINT NULL;
 -- CREATE INDEX IF NOT EXISTS idx_vault_kek_version ON provider_vaults (kek_version);
 ```
 
