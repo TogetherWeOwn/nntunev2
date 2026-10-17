@@ -101,7 +101,7 @@ fn check_base_url(base_url: &str) -> Result<String, &'static str> {
 pub fn build_search_url(params: &SearchParams<'_>) -> Result<String, &'static str> {
     let base = check_base_url(params.base_url)?;
     let q = params.query.trim();
-    if q.is_empty() || q.len() > 200 {
+    if q.is_empty() || q.chars().count() > 200 {
         return Err("query must be 1..=200 chars");
     }
     if params.limit == 0 || params.limit > MAX_LIMIT {

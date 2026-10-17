@@ -344,7 +344,7 @@ fn parse_search(text: &str) -> core::result::Result<SearchRequest, &'static str>
 /// page window, and the category list before anything is built or enqueued.
 fn check_search(req: &SearchRequest) -> core::result::Result<(), &'static str> {
     let q = req.query.trim();
-    if q.is_empty() || q.len() > 200 {
+    if q.is_empty() || q.chars().count() > 200 {
         return Err("query must be 1..=200 chars");
     }
     if !validate_indexer_ref(&req.indexer_ref) {

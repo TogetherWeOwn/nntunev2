@@ -141,7 +141,7 @@ pub fn build_search_dispatch(
     page: u32,
 ) -> Result<QueueMsg, &'static str> {
     let q = query.trim();
-    if q.is_empty() || q.len() > 200 {
+    if q.is_empty() || q.chars().count() > 200 {
         return Err("query must be 1..=200 chars");
     }
     if !validate_indexer_ref(indexer_ref) {
