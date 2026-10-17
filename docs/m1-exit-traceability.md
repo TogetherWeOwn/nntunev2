@@ -7,7 +7,7 @@ with Access enabled, and rollback evidence is recorded.
 
 Re-verified against the `e2e/` tree on 2026-10-17 with the public
 UI-signup case and the browser-playback spec merged:
-`npm --prefix e2e run e2e:list` lists 202 tests in 11 files. Line numbers
+`npm --prefix e2e run e2e:list` lists 203 tests in 12 files. Line numbers
 below are from that head; re-verify with the commands at the end of this
 document whenever a spec is added, renamed, or retitled, and update this
 matrix in the same PR. CI enforces the file and title citations on every
@@ -67,6 +67,10 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   redirect errors never echo URL components or credential values
   (loopback fixtures plus a fake request context). Diagnostic hygiene,
   not journey coverage.
+- `e2e/tests/security-headers.spec.ts` is the staging probe that the live
+  app-shell document response still carries the security headers and
+  nonce-bearing CSP (static posture pinned offline by
+  `apps/web/tests/`). Staging hardening, not journey coverage.
 - The `apps/web/tests/` offline specs below run in the `web-e2e` CI job
   on every PR with all network traffic intercepted and fulfilled locally.
   They pin product behavior outside the M1 exit list and produce no
