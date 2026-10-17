@@ -1,6 +1,8 @@
-# Worker logging standard
+# Worker logging standard (target contract)
 
-Worker logs MUST be newline-delimited JSON (one object per line). Each object includes the following shared fields:
+This document defines the target contract for a future worker-logging implementation. It does not claim that current production workers emit these records or propagate trace IDs; existing runtime logging remains unchanged by this documentation slice. The MUST requirements below apply when a worker adopts this standard.
+
+Target worker log records MUST be newline-delimited JSON (one object per line). Each record includes the following shared fields:
 
 | Field | Type | Requirement |
 | --- | --- | --- |
@@ -11,7 +13,7 @@ Worker logs MUST be newline-delimited JSON (one object per line). Each object in
 | `event` | string | Lowercase dotted event name. New `api`, `ingest`, and `mb` events are namespaced with their worker name (for example, `api.auth.login`). Existing `stream` event names remain unchanged. |
 | `fields` | object | Flat map of string, number, boolean, or `null` values; no nested objects or arrays. |
 
-`api`, `ingest`, and `mb` logs MUST use exactly these six top-level fields. `stream` MUST preserve its existing event and Analytics Engine shape; this standard adds `trace_id` to that shape without changing its event set or other fields.
+When implemented, `api`, `ingest`, and `mb` records MUST use exactly these six top-level fields. This slice makes no change to `stream` production output. A future stream implementation must preserve its actual Analytics Engine payload shape and event set; the synthetic `stream` JSON example below is not an Analytics Engine record and does not assert that `stream.play.start` exists in production.
 
 ## Trace ID propagation
 
