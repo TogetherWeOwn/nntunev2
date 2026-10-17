@@ -1,0 +1,15 @@
+[package]
+name = "mb-import-validate"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Curated mbdump TSV row validator for the mb-import container job (no DB, no deps)"
+license = "MIT"
+
+[[bin]]
+name = "mb-validate"
+path = "src/main.rs"
+
+[lib]
+name = "mb_import_validate"
+path = "src/lib.rs"

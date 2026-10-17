@@ -8,21 +8,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 FROM base AS test
 WORKDIR /job
-COPY etl.sh /job/etl.sh
-COPY etl.py /job/etl.py
-COPY tests /job/tests
+COPY containers/mb-import/etl.sh /job/etl.sh
+COPY containers/mb-import/etl.py /job/etl.py
+COPY containers/mb-import/tests /job/tests
 RUN chmod 0755 /job/etl.sh /job/etl.py /job/tests/test_etl.sh \
  && bash /job/tests/test_etl.sh \
  && touch /tmp/mb-import-tests-passed
 
+FROM rust:1-bookworm AS validator
+WORKDIR /src
+# Cargo.lock is intentionally not tracked for this workspace. Copy the full
+# (dockerignored) workspace so Cargo can resolve all member manifests on a
+# clean checkout, then build the single validator package online.
+COPY . .
+RUN cargo build --release -p mb-import-validate
+
 FROM base AS runtime
 WORKDIR /job
-COPY import.sh /job/import.sh
-COPY etl.sh /job/etl.sh
-COPY etl.py /job/etl.py
-COPY replicate.sh /job/replicate.sh
+COPY containers/mb-import/import.sh /job/import.sh
+COPY containers/mb-import/etl.sh /job/etl.sh
+COPY containers/mb-import/etl.py /job/etl.py
+COPY containers/mb-import/replicate.sh /job/replicate.sh
+COPY --from=validator /src/target/release/mb-validate /usr/local/bin/mb-validate
 RUN chmod 0755 /job/import.sh /job/etl.sh /job/etl.py /job/replicate.sh
-# Keep the test stage in the default build graph without shipping tests/fixtures.
+# Keep the ETL test stage in the default build graph without shipping tests.
 COPY --from=test /tmp/mb-import-tests-passed /tmp/mb-import-tests-passed
 RUN rm /tmp/mb-import-tests-passed
 

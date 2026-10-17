@@ -62,3 +62,8 @@ sha256 = "6962f20adab4a64672f7c9a870d0e9e606ba8dc638a5b656e8720b0900134a4a"
 file = "0013_auth_challenge_reauth_purpose.sql"
 target = "app"
 sha256 = "848df4805ac18bc1312689f033c86e90417bd9d53bdbfbb0950813b00e9f0d64"
+
+[[migration]]
+file = "0014_mb_import_resume_dlq.sql"
+target = "mirror"
+sha256 = "8385253fbddb464361f30678cfb8464b7c3d73f7ae5614f0eced870876dcef88"
