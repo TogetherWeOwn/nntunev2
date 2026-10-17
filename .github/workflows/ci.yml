@@ -574,6 +574,16 @@ jobs:
           cache-dependency-path: apps/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+      # Client-JS bundle budget: fail when the built client output exceeds
+      # the budget pinned in check_web_bundle_budget.py. Runs in
+      # this job so the fresh `pnpm build` output is present; the checker is
+      # fail-closed when the output dir is missing. Absolute script paths
+      # because this job defaults to working-directory apps/web. Keep this
+      # job id in ci-ok's needs (already there via web-build).
+      - name: Enforce client-JS bundle budget
+        run: python3 ${{ github.workspace }}/.github/scripts/check_web_bundle_budget.py
+      - name: Bundle-budget self-tests (pass + breach fixtures)
+        run: python3 ${{ github.workspace }}/.github/scripts/test_check_web_bundle_budget.py
 
   web-e2e:
     name: web-e2e
