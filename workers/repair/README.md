@@ -6,9 +6,14 @@ The no-route Worker that fronts the par2 repair Container
 - **No public surface.** `workers_dev = false`, no routes: the only
   caller is the ingest Worker's `REPAIR_CONTAINER` service binding
   (`POST /repair`). Every other method/path is a 404.
+  (Sources: `wrangler.toml:18` and the `NOT YET DEPLOYED` header;
+  `src/runtime.rs:74-77,132-135`; `workers/ingest/wrangler.toml.example:129-133`;
+  `workers/ingest/src/repair.rs:18-24`.)
 - **One Durable Object per job.** Requests are validated, then routed
   to `RepairContainer` (`id_from_name(job_id)`), so a job's repair
   rounds serialise behind one object and one Container.
+  (Sources: `src/runtime.rs:32,86-89,144-148`;
+  `wrangler.toml:33-39`.)
 - **Idempotent rounds.** If `out/result.json` already exists for
   `(job_id, round)` and carries the current staging's digest, the
   stored verdict is replied without a second paid Container run. The
@@ -26,10 +31,16 @@ The no-route Worker that fronts the par2 repair Container
   `out/result.json` written. Ingest receives a small status reply
   (`{status, exit_code, file_count}`); the full per-file result
   document stays in `out/result.json`.
+  (Sources: `src/contract.rs:209-212,227-251,264-271`;
+  `src/runtime.rs:164-207,228-260`;
+  `crates/nntune-core/src/par2/scratch.rs:17-23`.)
 - **Container isolation.** The Container is started with internet
   access disabled and holds no vault, NNTP or R2 credentials; it sees
   only staged bytes and the manifest. Errors are stable
   machine-readable codes and logs carry job ids only.
+  (Sources: `src/runtime.rs:282-294`;
+  `src/contract.rs:288-311,322-347`;
+  `containers/repair/src/lib.rs:1-16`.)
 
 Scratch layout and validation rules are the shared contract in
 `nntune_core::par2::scratch`; request/manifest/result shapes live in
@@ -37,11 +48,15 @@ Scratch layout and validation rules are the shared contract in
 
 ## Deploy gate
 
-Not deployed yet. Deploying requires Cloudflare Containers enabled on
-the existing plan with no new spend; that confirmation and the deploy
-itself are operator actions. Until then `wrangler.toml` is the deploy
-contract and ingest stays unable to finish a `Repairing` job (its
-consumer also remains disabled).
+Not deployed yet (verified 2026-10-17). Deploying requires Cloudflare
+Containers enabled on the existing plan with no new spend; that
+confirmation and the deploy itself are operator actions. Until then
+`wrangler.toml` is the deploy contract and ingest stays unable to
+finish a `Repairing` job (its consumer also remains disabled).
+(Sources: `wrangler.toml:11-13`;
+`workers/ingest/wrangler.toml.example:30-31,52-56`;
+`workers/ingest/src/repair.rs:105-115` — binding/transport failure
+is `Retry`, never a terminal outcome.)
 
 ## Checks
 
