@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { ApiClient, ApiError, toProviderTestInput, toVaultSaveBody } from './client.js';
+import { onPaywall, type PaywallModel } from '../billing/planLimit.js';
 import { KNOWN_ERROR_CODES } from './errors.js';
 import apiErrorsRaw from '../../../../../docs/api-errors.md?raw';
 // Canonical web/Worker contract, shared with the Rust handlers suite (which
@@ -152,6 +153,44 @@ describe('ApiClient', () => {
 		const failure = await client.get('/me').catch((error: unknown) => error);
 		expect(failure).toBeInstanceOf(ApiError);
 		expect((failure as ApiError).status).toBe(500);
+		expect((failure as ApiError).paywall).toBeNull();
+	});
+
+	it('shows 402 paywalls and still reads the original error body', async () => {
+		const models: PaywallModel[] = [];
+		const unsubscribe = onPaywall((model) => models.push(model));
+		const fetchFn = vi.fn(async () => jsonResponse({ code: 'plan_limit_exceeded', error: 'limit reached' }, 402));
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/me').catch((error: unknown) => error);
+		unsubscribe();
+
+		expect(failure).toBeInstanceOf(ApiError);
+		expect((failure as ApiError).message).toBe('limit reached');
+		expect((failure as ApiError).code).toBe('plan_limit_exceeded');
+		expect((failure as ApiError).paywall?.kind).toBe('terminal');
+		expect(models).toHaveLength(1);
+		expect(models[0]?.status).toBe(402);
+	});
+
+	it('shows 429 paywalls with Retry-After timing', async () => {
+		const models: PaywallModel[] = [];
+		const unsubscribe = onPaywall((model) => models.push(model));
+		const fetchFn = vi.fn(
+			async () =>
+				new Response(JSON.stringify({ code: 'rate_limited' }), {
+					status: 429,
+					headers: { 'content-type': 'application/json', 'Retry-After': '45' }
+				})
+		);
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		const failure = await client.get('/me').catch((error: unknown) => error);
+		unsubscribe();
+
+		expect(failure).toBeInstanceOf(ApiError);
+		expect((failure as ApiError).paywall?.kind).toBe('retryable');
+		expect(models[0]?.retryAfterSeconds).toBe(45);
 	});
 
 	it('reads code, message, and retryable from the error envelope', async () => {

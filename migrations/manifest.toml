@@ -27,3 +27,13 @@ sha256 = "fb61dd289c72b159299e56d0b5a3bfb3734dc5516665a9225c0cce0ffd64bbce"
 file = "0006_account_deletion.sql"
 target = "app"
 sha256 = "6d222588102fbff8bd5096a42e669722262ba84014fc5865bfbf3b8c19894245"
+
+[[migration]]
+file = "0007_auth_challenge_user_fk.sql"
+target = "app"
+sha256 = "ce0350f7d08a251bbfab9a817d1c4c3dc72a7484cb2379869c5e6c11a0fb6791"
+
+[[migration]]
+file = "0008_auth_challenge_purpose_guard.sql"
+target = "app"
+sha256 = "35508144971de4bdf9919e28a6979963053fa7eb76956df1fd6e98dac004b595"

@@ -11,6 +11,7 @@
 /** Every code in the `docs/api-errors.md` registry. */
 export const KNOWN_ERROR_CODES = new Set([
 	'unauthorized',
+	'reauth_required',
 	'provider_auth_expired',
 	'plan_limit_exceeded',
 	'forbidden',
@@ -23,6 +24,7 @@ export const KNOWN_ERROR_CODES = new Set([
 	'internal_error',
 	'corrupt_content',
 	'upstream_unavailable',
+	'upstream_circuit_open',
 	'service_unavailable'
 ]);
 

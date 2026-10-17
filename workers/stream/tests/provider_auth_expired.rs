@@ -141,6 +141,7 @@ fn fake_480_481_replies_drive_play_to_provider_auth_expired_without_quarantine()
             range: None,
             server_addr: server.addr,
             segments: &segments,
+            segment_ranges: None,
             cipher_key: 0,
             now_unix: 1_700_000_000,
             up_next: None,

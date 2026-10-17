@@ -71,6 +71,11 @@ pub const REGISTRY: &[CodeSpec] = &[
         status: 502,
         retryable: true,
     },
+    CodeSpec {
+        code: "upstream_circuit_open",
+        status: 503,
+        retryable: true,
+    },
 ];
 
 /// The documented generic every unknown code falls back to.
@@ -93,6 +98,7 @@ fn message_for_server_error(code: &str) -> &'static str {
     match code {
         "corrupt_content" => "content could not be decoded",
         "upstream_unavailable" => "upstream unavailable",
+        "upstream_circuit_open" => "upstream circuit open",
         _ => "unexpected error",
     }
 }
@@ -159,6 +165,9 @@ impl ApiError {
     }
     pub fn upstream_unavailable() -> Self {
         Self::by_code("upstream_unavailable", "upstream unavailable")
+    }
+    pub fn upstream_circuit_open() -> Self {
+        Self::by_code("upstream_circuit_open", "upstream circuit open")
     }
 
     /// Serialized envelope body.

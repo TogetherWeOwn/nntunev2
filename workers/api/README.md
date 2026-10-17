@@ -23,8 +23,12 @@ workers/api/
 ```
 
 `migrations/0002_auth_vault.sql` plus `0003` (library), `0004` (challenge
-purpose) and `0005` (atomic rate-limit slots and test leases) define the
-Postgres schema (PlanetScale via Hyperdrive). All queries are parameterized;
+purpose), `0005` (atomic rate-limit slots and test leases), `0006` (account
+deletion), `0007` (registration-challenge user foreign key) and `0008`
+(database-enforced challenge purpose: CHECK plus an immutability trigger)
+define the Postgres schema (PlanetScale via Hyperdrive). CI applies every
+migration to a throwaway Postgres and runs `tests/sql/*.sql` against it
+(`tests/run_migration_tests.sh`). All queries are parameterized;
 single-use claims execute the conditional `UPDATE ... RETURNING` prepared by
 the core and require exactly one row before any response.
 
@@ -113,8 +117,20 @@ config from secrets) is a follow-up slice.
   `verify_stored_session` against the current `sessions` row on every
   request: owner, expiry, counter and revocation must match. Refresh must
   conditionally update the matching row/counter and commit before sending
-  the cookie; a superseded cookie then fails. Privilege changes require
-  reauthentication, revoking the old row and issuing a new session id.
+  the cookie; a superseded cookie then fails. Vault credential writes
+  (`PUT /v1/vault`) and deletes (`DELETE /v1/vault`) require a freshness
+  window of 600 seconds (10 minutes) on the immutable authentication time
+  (`created_at`, never `issued_at`, so rotation cannot restore freshness):
+  sessions authenticated outside the window are rejected with the documented
+  `reauth_required` error code (401). Vault summary reads and boolean
+  connection tests retain ordinary session authentication. The pure
+  `reauthenticate_session` helper binds the verified proof identity and
+  prepares a replacement session plus a conditional single-row revocation
+  claim; callers must execute both writes in one transaction and send the
+  cookie only after commit. The current `login_finish` and `magic_finish`
+  routes remain ordinary sign-in and issue independent sessions without
+  revoking existing rows; a proof-bound HTTP reauthentication route is not
+  part of this slice.
 - **Hyperdrive query caching:** the `HYPERDRIVE` binding MUST point to a
   Hyperdrive config with query caching disabled (`--caching-disabled`).
   Session, credential, user, challenge and vault reads are plain
@@ -131,7 +147,11 @@ config from secrets) is a follow-up slice.
   `./check_hyperdrive_cache.sh --config-id <id>` asserts
   `caching.disabled == true` (see `wrangler.toml.example`). The gate
   fails closed without Cloudflare credentials (exit 3); `--allow-skip`
-  is only for secret-less CI.
+  is only for secret-less CI and MUST NOT be used in real deploys.
+  Runtime attestation: the Worker refuses to serve traffic (generic 500,
+  same as any misconfiguration) unless `HYPERDRIVE_CACHING_DISABLED=1`
+  is set for that env — set it only after the gate passes for that
+  Hyperdrive config.
 - **Magic links:** 256-bit random tokens, SHA-256 hash at rest, 15-minute
   expiry. HTTP callers must use `consume_magic_link_atomically`, not the
   pure record-preparation helper. Magic links, passkey challenges and
@@ -143,19 +163,61 @@ config from secrets) is a follow-up slice.
 - **Abuse budgets:** passkey starts, magic-link issuance and test-connection
   attempts reserve fixed slot rows through an atomic `INSERT .. ON CONFLICT`
   before side effects; magic-link and registration inbox-proof sends share
-  one per-email window. Unknown login emails use a keyed stand-in scope,
-  expired challenges are pruned, and login options omit `allow_credentials`
-  to avoid leaking variable-length credential IDs.
+  one per-email window. Every auth start (register, login, magic) reserves
+  one per-IP slot (30/hour, keyed on the client /64 for IPv6 and the full
+  address for IPv4) before any user/challenge row or mail (no
+  global slot at start, so exhaustion cannot block challenge issuance),
+  and every mail send reserves a per-IP (30/hour) plus global (100/5 min)
+  issuance slot in front of the per-email window — distinct-email loops
+  stop with a fixed email-independent `429 {"error":"rate_limited"}` on
+  `register/start` (never an email-derived stand-in, which would oracle
+  taken vs fresh across the denial boundary) and with unchanged response
+  shapes on login/magic starts, while victim-list email-bombing stops with
+  no further mail. Exhausted budgets fast-fail with one `SELECT count(*)`
+  before the slot loop, so denial costs O(1) statements, not one upsert per
+  slot. `register_start` also reaps never-completed signups older than
+  24 h only when they have no credential, vault, session, unexpired magic
+  link, or unexpired registration challenge. In-flight registration
+  challenges (including consumed challenges awaiting finish) protect the
+  signup until expiry; expired challenges are pruned. Passkey finishes
+  reserve 100 lookups per client prefix
+  BEFORE any DB read plus 10 attempts per challenge before verification
+  (and magic finishes 10 per client prefix, after the exact-Origin pin) per
+  5-minute window, so rotating unknown challenge ids cannot fund unbounded
+  Pg reads and forged assertions cannot burn unlimited CPU on one
+  challenge; legitimate single attempts and typo retries are unaffected.
+  Unknown login emails use a keyed stand-in scope, expired challenges are
+  pruned, and login options omit `allow_credentials` to avoid leaking
+  variable-length credential IDs.
 - **Passkeys:** RP ID equals the exact origin host (cross-subdomain RP
   suffixes are intentionally unsupported). Configuration must be a canonical
   serialized origin: https, or http with the host exactly `localhost`,
   `127.0.0.1` or `::1` for development, no userinfo/path/query/fragment.
-  Five-minute challenges must be consumed through
-  `consume_challenge_atomically`, and `webauthn.rs` signature verification
-  (attestation `none`/packed-self, assertion ES256/EdDSA, RP-hash and
-  exact origin/challenge pinning, monotonic `sign_count` clone
-  detection) must finish before authentication. The handlers enforce
-  both, in that order, on every ceremony.
+  The handlers first verify WebAuthn signatures (attestation
+  `none`/packed-self, assertion ES256/EdDSA, RP-hash and exact
+  origin/challenge pinning, monotonic `sign_count` clone detection), then
+  atomically consume the five-minute challenge through
+  `consume_challenge_atomically`, and only then authenticate/create the
+  session. A failed verification never consumes a challenge. RP policy:
+  **user verification
+  is required** (authenticatorData UV flag, plus `userVerification:
+  "required"` requested by the web client) because the passkey is the only
+  primary factor and login is usernameless; a presence-only tap never
+  authenticates, and authenticators without PIN/biometric are refused.
+  The enrollment `sign_count` in a (unauthenticated) `none` attestation is
+  never stored: new credentials start at 0 and the first signed assertion
+  sets the baseline. Backup-eligibility (BE/BS) bits are not recorded:
+  nothing branches on synced-vs-device-bound credentials yet.
+- **Audit `source_ip`:** taken from `cf-connecting-ip` only if it parses as
+  one IP literal (stored in canonical form); anything else, or a missing
+  header, becomes `unknown` (`vault::sanitize_source_ip`, applied at
+  capture and again in `audit_event`), so audit rows and rate-limit keys
+  never carry control characters or markup.
+- **Dependencies:** `Cargo.lock` is committed. CI builds and tests with
+  `--locked`, and the Wrangler build command passes `--locked` through
+  `worker-build`, so deploys resolve the audited dependency set; crypto
+  crates stay caret ranges in `Cargo.toml` and move only via a reviewed
+  lockfile change (Dependabot).
 - **Library (genres/playlists):** missing caller is 401 before any
   existence check; callers see own + public rows only, invisible ids are
   404 (no oracle), visible-but-foreign mutations are 403. Responses carry

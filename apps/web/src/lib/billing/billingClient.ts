@@ -15,7 +15,8 @@
  * helpers only. No Stripe secret ever touches this code.
  */
 
-import { parseErrorResponse } from '../api/errors.js';
+import { paywallFromResponse, type PaywallModel } from './planLimit.js';
+import { parseErrorBody } from '../api/errors.js';
 import type { UsageSnapshot } from './usage';
 
 export interface PlanDTO {
@@ -49,24 +50,45 @@ export interface SubscriptionDTO {
  */
 export class BillingApiError extends Error {
 	readonly status: number;
+	/** Paywall model for 402/429 failures; null for other billing errors. */
+	readonly paywall: PaywallModel | null;
 	/** Registry code from the error envelope (`docs/api-errors.md`). */
 	readonly code: string;
 	/** Whether retrying the same request may succeed (envelope flag). */
 	readonly retryable: boolean;
 
-	constructor(status: number, label: string, hint = '', code = 'request_failed', retryable = false) {
+	constructor(
+		status: number,
+		label: string,
+		hint = '',
+		code = 'request_failed',
+		retryable = false,
+		paywall: PaywallModel | null = null
+	) {
 		super(`${label} failed (${status})${hint}`);
 		this.name = 'BillingApiError';
 		this.status = status;
 		this.code = code;
 		this.retryable = retryable;
+		this.paywall = paywall;
 	}
 }
 
 async function readJson<T>(res: Response, label: string): Promise<T> {
 	if (!res.ok) {
-		const { code, message, retryable } = await parseErrorResponse(res);
-		throw new BillingApiError(res.status, label, `: ${message}`, code, retryable);
+		let body: unknown = null;
+		try {
+			body = await res.json();
+		} catch {
+			/* non-JSON error body: use status-based defaults */
+		}
+		const parsed = parseErrorBody(body, res.status);
+		// Client-side calls surface 402/429 through the layout listener; if it
+		// has not registered yet, the pending model replays on subscription.
+		// During SSR, no model is queued and the typed error remains the fallback.
+		const paywall = paywallFromResponse({ status: res.status, headers: res.headers, body });
+		const hint = parsed.message ? `: ${parsed.message}` : '';
+		throw new BillingApiError(res.status, label, hint, parsed.code, parsed.retryable, paywall);
 	}
 	return (await res.json()) as T;
 }

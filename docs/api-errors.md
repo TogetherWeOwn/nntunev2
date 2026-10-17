@@ -2,11 +2,11 @@
 
 The `api`, `ingest`, `mb`, and `stream` crates define mappings to the same
 JSON error envelope. In this slice, `ingest` and `mb` serialize the envelope
-on their wired HTTP error paths. The `api` and `stream` mappings are pinned for
-future HTTP wiring, not emitted by reachable HTTP paths here; in particular,
-the API session-configuration and storage mappings are not currently reachable
-from handlers. Clients can handle auth, validation, billing limits, and
-upstream failures without per-worker special cases.
+on their wired HTTP error paths. The API emits `reauth_required` from
+privilege-gated vault mutations; other API and stream mappings are pinned for
+future HTTP wiring, not emitted by reachable HTTP paths here. Clients can
+handle auth, validation, billing limits, and upstream failures without
+per-worker special cases.
 
 ## Envelope
 
@@ -59,6 +59,7 @@ emit the code.
 | code | HTTP status | retryable | owning worker | meaning |
 | --- | --- | --- | --- | --- |
 | `unauthorized` | 401 | false | api, stream | Missing, invalid, or expired credentials/session/grant. Deliberately generic: never says which check failed. |
+| `reauth_required` | 401 | false | api | Session is valid for ordinary operations but too old for a vault credential change; complete a fresh authentication proof. |
 | `provider_auth_expired` | 401 | false | api, stream | Provider credentials expired; prompts inline credential refresh rather than signing the user out. |
 | `plan_limit_exceeded` | 402 | false | api, ingest, stream | The plan quota (streams, library, ingest jobs) is exhausted; upgrade or wait for the period reset. Defined ahead of server-side enforcement so clients can build the upgrade path now. |
 | `forbidden` | 403 | false | api, stream | Authenticated, but the resource belongs to someone else (or the grant names a different track). |
@@ -70,7 +71,8 @@ emit the code.
 | `rate_limited` | 429 | true | api, ingest, stream | Too many requests or no pool connection free right now; retry after backoff. |
 | `internal_error` | 500 | true | api, ingest, mb, stream | Generic unexpected failure, including the unknown-code fallback. |
 | `corrupt_content` | 502 | false | stream | A fetched segment could not be decoded; retrying the same bytes will not help. |
-| `upstream_unavailable` | 502 | true | ingest, stream | A provider/indexer connection failed or the pool is quarantined after provider errors. |
+| `upstream_unavailable` | 502 | true | ingest, stream | A provider/indexer connection failed or an upstream request failed. |
+| `upstream_circuit_open` | 503 | true | stream | The user's provider pool circuit breaker is open; retry after the supplied `Retry-After` delay. |
 | `service_unavailable` | 503 | true | api, ingest | A backing binding (queue, payload store) is unavailable; nothing was accepted. |
 
 ## Billing-limit shapes (402 / 429)
