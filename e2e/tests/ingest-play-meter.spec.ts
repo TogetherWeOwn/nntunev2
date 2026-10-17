@@ -10,6 +10,7 @@ import {
   uniqueTestEmail,
 } from '../helpers/contract.js';
 import { assertNoAccessWall, readApiBody, stagingBaseUrl } from '../helpers/access.js';
+import { playbackFailure, type PlaybackEvidence } from '../helpers/playback.js';
 import {
   accountHeaders,
   apiGet,
@@ -150,6 +151,145 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     probeHeaders(seek.status(), seek.headers(), `${baseURL}${API.stream(trackId as string)}`);
     expect(seek.status(), 'mid-track Range seek did not return 206').toBe(206);
     expect((seek.headers()['content-range'] ?? '').startsWith('bytes 9-17/')).toBe(true);
+  });
+
+  test('synthetic audio actually plays in the browser', async ({ page, request }) => {
+    const baseURL = stagingBaseUrl('skip', 'playback');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    // Same identity discipline as Range/meter: playback must run as the
+    // ingesting account, never anonymously or as the generic QA seam.
+    const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    requireApiAccount(account, 'playback');
+
+    // Names only: a page-error message can embed the staging origin or other
+    // values that must stay out of public CI artifacts.
+    const pageErrorNames: string[] = [];
+    page.on('pageerror', (error) => pageErrorNames.push(error.name || 'Error'));
+
+    await applyAccountToPage(page, account, baseURL);
+    await page.goto(`${baseURL}/library`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    const item = page.getByTestId(TESTIDS.libraryItem).first();
+    await expect(item, 'synthetic staged track missing from library — ingest spec must run first').toBeVisible({
+      timeout: 60_000,
+    });
+
+    // User gesture #1: selecting the staged synthetic track in the library.
+    // A player may start on selection or only load the track; both are
+    // handled below, but nothing here calls play() programmatically.
+    await item.click();
+    const audio = page.getByTestId(TESTIDS.audioPlayer);
+    await expect(audio, 'selecting the library track did not show the audio player').toBeVisible({
+      timeout: 15_000,
+    });
+
+    // Record playing/timeupdate evidence on the element itself before any
+    // play gesture: the synthetic WAV is sub-second, so polling alone could
+    // sample only after it has already ended. Booleans/numbers only — the
+    // source URL is never read out of the page.
+    await audio.evaluate((element) => {
+      const player = element as HTMLAudioElement & {
+        __nnPlayback?: { sawPlaying: boolean; maxCurrentTime: number };
+      };
+      const recorder = {
+        sawPlaying: !player.paused && !player.ended,
+        maxCurrentTime: Number.isFinite(player.currentTime) ? player.currentTime : 0,
+      };
+      player.__nnPlayback = recorder;
+      player.addEventListener('playing', () => {
+        recorder.sawPlaying = true;
+        recorder.maxCurrentTime = Math.max(recorder.maxCurrentTime, player.currentTime || 0);
+      });
+      player.addEventListener('timeupdate', () => {
+        recorder.maxCurrentTime = Math.max(recorder.maxCurrentTime, player.currentTime || 0);
+      });
+    });
+    const snapshot = (): Promise<PlaybackEvidence> =>
+      audio.evaluate((element) => {
+        const player = element as HTMLAudioElement & {
+          __nnPlayback?: { sawPlaying: boolean; maxCurrentTime: number };
+        };
+        const recorder = player.__nnPlayback ?? { sawPlaying: false, maxCurrentTime: 0 };
+        return {
+          sawPlaying: recorder.sawPlaying,
+          maxCurrentTime: Math.max(recorder.maxCurrentTime, player.currentTime || 0),
+          paused: player.paused,
+          ended: player.ended,
+          currentTime: player.currentTime,
+          duration: player.duration,
+          readyState: player.readyState,
+          errorCode: player.error ? player.error.code : null,
+          hasSource: Boolean(player.currentSrc),
+        };
+      });
+
+    await expect
+      .poll(async () => (await snapshot()).hasSource, {
+        timeout: 15_000,
+        message: 'audio player never loaded the synthetic track after selection',
+      })
+      .toBe(true);
+
+    let before = await snapshot();
+    if (playbackFailure(before, 0) !== null) {
+      let baseline: number;
+      if (before.paused) {
+        // Reset the recorder so only the gesture below can produce the
+        // evidence (an ended element replays from 0; a paused one resumes
+        // from its baseline). This also covers selection-autoplay of the
+        // sub-second track ending before the recorder above was installed:
+        // the missed first play is discarded and the replay below is the
+        // measured one. Re-install if the player recreated the element
+        // since the recorder was attached (a fresh node has no expando).
+        baseline = await audio.evaluate((element) => {
+          const player = element as HTMLAudioElement & {
+            __nnPlayback?: { sawPlaying: boolean; maxCurrentTime: number };
+          };
+          const start = player.ended ? 0 : player.currentTime || 0;
+          if (!player.__nnPlayback) {
+            const recorder = { sawPlaying: false, maxCurrentTime: start };
+            player.__nnPlayback = recorder;
+            player.addEventListener('playing', () => {
+              recorder.sawPlaying = true;
+              recorder.maxCurrentTime = Math.max(recorder.maxCurrentTime, player.currentTime || 0);
+            });
+            player.addEventListener('timeupdate', () => {
+              recorder.maxCurrentTime = Math.max(recorder.maxCurrentTime, player.currentTime || 0);
+            });
+          } else {
+            player.__nnPlayback.sawPlaying = false;
+            player.__nnPlayback.maxCurrentTime = start;
+          }
+          return start;
+        });
+        // User gesture #2: the player's own visible play control. Native
+        // <audio controls> live in shadow DOM, and in the Desktop Chrome
+        // project the leftmost control is play/pause — clicking the element
+        // centre would hit the seek bar instead. This respects autoplay
+        // policy; no evaluate-driven play() call is made.
+        const box = await audio.boundingBox();
+        expect(box, 'audio player is visible but has no clickable controls').not.toBeNull();
+        await audio.click({ position: { x: 20, y: Math.floor(((box?.height ?? 40) / 2)) } });
+      } else {
+        // Already playing but not yet past 0: require further advancement
+        // rather than toggling it paused with another click.
+        baseline = before.maxCurrentTime;
+      }
+      // The poll value is the named playback failure (or null): a 206, a
+      // loaded element, or a paused element keeps returning its reason
+      // instead of passing. See helpers/playback.ts + tests/playback.spec.ts.
+      await expect
+        .poll(async () => playbackFailure(await snapshot(), baseline), {
+          timeout: 15_000,
+          message: 'synthetic audio did not enter the playing state and advance',
+        })
+        .toBeNull();
+      before = await snapshot();
+    }
+    expect(playbackFailure(before, 0), 'final playback evidence regressed').toBeNull();
+    expect(pageErrorNames, 'page errors during browser playback').toEqual([]);
   });
 
   test('usage meter increases after streaming and shows plan metadata', async ({
