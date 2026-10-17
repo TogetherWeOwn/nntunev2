@@ -161,6 +161,7 @@ test.describe('credential scope (static pins)', () => {
       'health.spec.ts',
       'ingest-play-meter.spec.ts',
       'signup-byop.spec.ts',
+      'signup-wizard-arrival.spec.ts',
       'player-queue-order.spec.ts',
       'demo-audio-contract.spec.ts',
       'demo-media-sessionless.spec.ts',
@@ -255,6 +256,108 @@ test.describe('public UI signup coverage (static pin)', () => {
     expect(helper).not.toContain('tryMintTestAccount');
     expect(helper).not.toContain('API.testAccounts');
     expect(helper).not.toContain('qaAuthHeader');
+  });
+
+  // Wizard-arrival leg: the new spec proves the real form reaches
+  // `/onboarding/byop` via the virtual authenticator + the staging-only code
+  // seam. These pins keep it honest offline: still no mint, still skip-green
+  // pre-deploy, still names-only diagnostics — while the wizard assertion
+  // lives in the NEW helper (the shared helper above must keep asserting the
+  // `magic_code` step only, never the wizard).
+  test('wizard-arrival case reaches the wizard with no account-seam mint', () => {
+    const spec = readFileSync(new URL('../tests/signup-wizard-arrival.spec.ts', import.meta.url), 'utf8');
+    const marker = "test('public UI signup with virtual authenticator reaches the BYOP wizard'";
+    const start = spec.indexOf(marker);
+    expect(start, 'wizard-arrival case is missing').toBeGreaterThan(-1);
+    const rest = spec.slice(start + marker.length);
+    const nextTest = rest.search(/\ntest(?:\(|\.describe)/);
+    const dedicated = nextTest === -1 ? spec.slice(start) : spec.slice(start, start + marker.length + nextTest);
+    // Null identity = Access pair only: the page starts unauthenticated, so
+    // the form is the only account-creation path even with QA_AUTH_TOKEN set.
+    expect(dedicated).toContain('applyAccountToPage(page, null, baseURL)');
+    expect(dedicated).toContain('submitPublicUiSignupToByopWizard(page, request, baseURL)');
+    // Arrival asserted at the spec level too (landed URL + wizard field).
+    expect(dedicated).toContain("'/onboarding/byop'");
+    expect(dedicated).toContain('page.url()');
+    expect(dedicated).toContain('TESTIDS.byopHost');
+    // Never the mint seam: arrival must come from the public form.
+    expect(dedicated).not.toContain('tryMintTestAccount');
+    expect(dedicated).not.toContain('API.testAccounts');
+    // Skip-green pre-deploy (file-level + in-test guards); QA_AUTH_TOKEN
+    // guard skips locally and fails closed on CI.
+    expect(spec).toContain('STAGING_BASE_URL');
+    expect(dedicated).toContain('QA_AUTH_TOKEN');
+    // Provenance label without account data.
+    expect(dedicated).toContain('annotateSignupPath');
+  });
+
+  test('wizard-arrival helper completes the form via the code seam and virtual authenticator', () => {
+    const accounts = readFileSync(new URL('../helpers/accounts.ts', import.meta.url), 'utf8');
+    const helperStart = accounts.indexOf('export async function submitPublicUiSignupToByopWizard');
+    expect(helperStart, 'wizard-arrival helper is missing').toBeGreaterThan(-1);
+    const helperRest = accounts.slice(helperStart + 'export async function submitPublicUiSignupToByopWizard'.length);
+    const nextExport = helperRest.search(/\nexport /);
+    const helper = nextExport === -1 ? accounts.slice(helperStart) : accounts.slice(helperStart, helperStart + 'export async function submitPublicUiSignupToByopWizard'.length + nextExport);
+    // Real form, both steps: email submit then the emailed-code field.
+    expect(helper).toContain('`${baseURL}/signup`');
+    expect(helper).toContain('TESTIDS.signupEmail');
+    expect(helper).toContain('TESTIDS.signupSubmit');
+    expect(helper).toContain('magic_code');
+    // Code comes from the staging-only seam (never minted, never fabricated).
+    // The seam path itself (`API.testCodes`) is pinned on the seam reader
+    // below plus the contract — this helper reaches it via the reader.
+    expect(helper).toContain('retrieveStagedSignupCode');
+    // Passkey finish runs against a virtual authenticator, not hardware
+    // (the CDP call lives in `enableVirtualAuthenticator`, pinned below).
+    expect(helper).toContain('enableVirtualAuthenticator');
+    // Wizard arrival asserted here (unlike the shared helper above).
+    expect(helper).toContain("'/onboarding/byop'");
+    expect(helper).toContain('page.url()');
+    expect(helper).toContain('TESTIDS.byopHost');
+    // Never the mint seam in the arrival path.
+    expect(helper).not.toContain('tryMintTestAccount');
+    expect(helper).not.toContain('API.testAccounts');
+    // Names-only diagnostics: neither the mailbox nor the code value may be
+    // interpolated into an error.
+    expect(helper).toContain('no values logged');
+    expect(helper).not.toContain('${email}');
+    expect(helper).not.toContain('${code}');
+
+    // The seam reader itself: token-gated, fail-closed, names-only.
+    const seamStart = accounts.indexOf('export async function retrieveStagedSignupCode');
+    expect(seamStart, 'staged code-seam reader is missing').toBeGreaterThan(-1);
+    const seamRest = accounts.slice(seamStart + 'export async function retrieveStagedSignupCode'.length);
+    const seamNext = seamRest.search(/\nexport /);
+    const seam = seamNext === -1 ? accounts.slice(seamStart) : accounts.slice(seamStart, seamStart + 'export async function retrieveStagedSignupCode'.length + seamNext);
+    expect(seam).toContain('QA_AUTH_TOKEN');
+    expect(seam).toContain('API.testCodes');
+    expect(seam).toContain('qaAuthHeader');
+    expect(seam).toContain('magic_token');
+    expect(seam).toContain('HTTP ${status}');
+    expect(seam).toContain('no values logged');
+    expect(seam).not.toContain('${email}');
+    expect(seam).not.toContain('tryMintTestAccount');
+    expect(seam).not.toContain('API.testAccounts');
+
+    // The virtual authenticator: CDP WebAuthn domain, resident-key plus
+    // user-verification capable and pre-verified, matching the signup page's
+    // `required` ceremony. Failures stay names-only.
+    const vaStart = accounts.indexOf('export async function enableVirtualAuthenticator');
+    expect(vaStart, 'virtual-authenticator helper is missing').toBeGreaterThan(-1);
+    const vaRest = accounts.slice(vaStart + 'export async function enableVirtualAuthenticator'.length);
+    const vaNext = vaRest.search(/\nexport /);
+    const va = vaNext === -1 ? accounts.slice(vaStart) : accounts.slice(vaStart, vaStart + 'export async function enableVirtualAuthenticator'.length + vaNext);
+    expect(va).toContain('WebAuthn.enable');
+    expect(va).toContain('WebAuthn.addVirtualAuthenticator');
+    expect(va).toContain('hasResidentKey');
+    expect(va).toContain('hasUserVerification');
+    expect(va).toContain('isUserVerified');
+    expect(va).toContain('newCDPSession');
+    expect(va).toContain('no values logged');
+
+    // The contract carries the seam path so a rename fails by name.
+    const contract = readFileSync(new URL('../helpers/contract.ts', import.meta.url), 'utf8');
+    expect(contract).toContain("testCodes: '/api/test-codes'");
   });
 });
 

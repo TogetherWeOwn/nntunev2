@@ -410,6 +410,7 @@ fn template_request(method: &str, path: &str) -> handlers::Request {
         path: path.to_string(),
         cookie: None,
         origin: Some(ORIGIN.to_string()),
+        authorization: None,
         body: TEMPLATE_BODY.to_vec(),
     }
 }
@@ -848,6 +849,7 @@ impl Harness {
             path: path.to_string(),
             cookie,
             origin: Some(ORIGIN.to_string()),
+            authorization: None,
             body: TEMPLATE_BODY.to_vec(),
         };
         let ctx = self.ctx();
