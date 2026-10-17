@@ -475,10 +475,7 @@ fn email_token_is_shaped(token: &str) -> bool {
     {
         return false;
     }
-    match domain.rsplit('.').next() {
-        Some(tld) if tld.len() >= 2 => true,
-        _ => false,
-    }
+    matches!(domain.rsplit('.').next(), Some(tld) if tld.len() >= 2)
 }
 
 fn has_email_like_value(value: &str) -> bool {
