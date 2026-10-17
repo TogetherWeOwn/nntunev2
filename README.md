@@ -49,7 +49,9 @@ below was run verbatim against a clean checkout; expected results are noted.
   rustup target add wasm32-unknown-unknown
   ```
 
-- Node 24 and pnpm 10 (the `apps/web` frontend pins its lockfile for pnpm).
+- Node 24 for `apps/web` (the CI `NODE_VERSION`) and pnpm 10 (the frontend
+  pins its lockfile for pnpm); the `e2e` harness uses Node 26, kept in sync
+  with `@types/node` in `e2e/package.json` (as in the CI `e2e-lint` job).
 - Python 3.11+ (repo lint scripts).
 - No secrets are needed for any local test. Secret *names* are listed under
   [Secrets](#secrets-never-committed); values live in GitHub Actions secrets
@@ -108,7 +110,11 @@ Deploys are push-triggered in CI; there is nothing to deploy from a laptop:
 - Pushing to `main` runs `.github/workflows/deploy.yml`, which deploys
   `apps/web` to staging (`staging-web` job) and then sequences the full
   Playwright journey as `post-deploy-e2e` (same run, only after a successful
-  deploy — a skipped/failed deploy cannot produce a PASS).
+  deploy — a skipped/failed deploy cannot produce a PASS). Only `apps/web`
+  is deployed (no workflow deploys the backend Workers), and staging is
+  secret-gated: without `CLOUDFLARE_API_TOKEN` the `gate` job skips
+  `staging-web` and `post-deploy-e2e`, so fork PRs get neither a deploy
+  nor a staging PASS.
 - The exact-head promotion boxes (CI green, deploy run, E2E result, Access
   intact, data-plane guards, rollback pointer) are defined in the
   [Staging promotion checklist](docs/ops.md#staging-promotion-checklist).
