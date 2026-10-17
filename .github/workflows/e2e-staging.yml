@@ -83,6 +83,7 @@ jobs:
         run: npm run e2e:smoke
 
       - name: Sanitize failure artifacts (strip credential-bearing snapshots)
+        id: sanitize
         if: failure() && steps.staging.outputs.configured == 'true'
         working-directory: e2e
         env:
@@ -102,11 +103,23 @@ jobs:
           # playwright-report/ dir, then scrub secret values from every remaining
           # file under test-results/ (junit.xml) so the uploaded artifact can
           # never carry secrets. Only test-results/ (junit) is uploaded below.
-          find test-results -name 'error-context.md' -delete 2>/dev/null || true
-          rm -rf playwright-report 2>/dev/null || true
+          # Fail closed: any cleanup/read/write failure exits nonzero, and the
+          # upload step gates on steps.sanitize.outcome == 'success', so a
+          # failed, skipped or cancelled sanitizer can never publish.
+          rm -rf playwright-report
+          if [ ! -e test-results ]; then
+            echo "test-results absent: nothing to sanitize or upload"
+            exit 0
+          fi
+          if [ ! -d test-results ]; then
+            echo "::error::test-results exists but is not a directory; failing closed"
+            exit 1
+          fi
           python3 - <<'PY'
           import os
           import pathlib
+          import shutil
+          import sys
           root = pathlib.Path("test-results")
           values = [
               os.environ.get("CF_ACCESS_CLIENT_ID", ""),
@@ -117,22 +130,47 @@ jobs:
               os.environ.get("SYNTHETIC_NNTP_PASS", ""),
           ]
           values = [v for v in values if v]
-          if root.is_dir() and values:
-              for path in root.rglob("*"):
-                  if not path.is_file():
-                      continue
-                  try:
-                      data = path.read_bytes()
-                  except OSError:
-                      continue
-                  for value in values:
-                      data = data.replace(value.encode(), b"***REDACTED***")
+          def fail_closed(action, path, exc):
+              # Names and error codes only — never file contents or secret values.
+              print(f"::error::sanitize {action} failed for {path} ({type(exc).__name__} errno={exc.errno}); failing closed", file=sys.stderr)
+              sys.exit(1)
+          def glob_all(pattern):
+              try:
+                  return list(root.rglob(pattern))
+              except OSError as exc:
+                  fail_closed("scan", root, exc)
+          for path in glob_all("error-context.md"):
+              try:
+                  if path.is_dir() and not path.is_symlink():
+                      shutil.rmtree(path)
+                  else:
+                      path.unlink()
+              except OSError as exc:
+                  fail_closed("cleanup", path, exc)
+          if glob_all("error-context.md"):
+              print("::error::error-context.md remains after cleanup; failing closed", file=sys.stderr)
+              sys.exit(1)
+          if pathlib.Path("playwright-report").exists():
+              print("::error::playwright-report remains after cleanup; failing closed", file=sys.stderr)
+              sys.exit(1)
+          for path in glob_all("*"):
+              if not path.is_file():
+                  continue
+              try:
+                  data = path.read_bytes()
+              except OSError as exc:
+                  fail_closed("read", path, exc)
+              for value in values:
+                  data = data.replace(value.encode(), b"***REDACTED***")
+              try:
                   path.write_bytes(data)
+              except OSError as exc:
+                  fail_closed("write", path, exc)
           PY
           echo "sanitized: error-context.md and playwright-report/ removed, test-results scrubbed"
 
       - name: Upload failure artifacts
-        if: failure() && steps.staging.outputs.configured == 'true'
+        if: failure() && steps.staging.outputs.configured == 'true' && steps.sanitize.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-synthetic-report
@@ -203,6 +241,7 @@ jobs:
         run: npm run e2e:staging
 
       - name: Sanitize failure artifacts (strip credential-bearing snapshots)
+        id: sanitize
         if: failure() && steps.staging.outputs.configured == 'true'
         working-directory: e2e
         env:
@@ -220,11 +259,23 @@ jobs:
           # values. Strip error-context.md plus the whole playwright-report/
           # dir, then scrub secret values from test-results/ (junit.xml)
           # before upload (junit-only evidence in test-results/).
-          find test-results -name 'error-context.md' -delete 2>/dev/null || true
-          rm -rf playwright-report 2>/dev/null || true
+          # Fail closed: any cleanup/read/write failure exits nonzero, and the
+          # upload step gates on steps.sanitize.outcome == 'success', so a
+          # failed, skipped or cancelled sanitizer can never publish.
+          rm -rf playwright-report
+          if [ ! -e test-results ]; then
+            echo "test-results absent: nothing to sanitize or upload"
+            exit 0
+          fi
+          if [ ! -d test-results ]; then
+            echo "::error::test-results exists but is not a directory; failing closed"
+            exit 1
+          fi
           python3 - <<'PY'
           import os
           import pathlib
+          import shutil
+          import sys
           root = pathlib.Path("test-results")
           values = [
               os.environ.get("CF_ACCESS_CLIENT_ID", ""),
@@ -235,22 +286,47 @@ jobs:
               os.environ.get("SYNTHETIC_NNTP_PASS", ""),
           ]
           values = [v for v in values if v]
-          if root.is_dir() and values:
-              for path in root.rglob("*"):
-                  if not path.is_file():
-                      continue
-                  try:
-                      data = path.read_bytes()
-                  except OSError:
-                      continue
-                  for value in values:
-                      data = data.replace(value.encode(), b"***REDACTED***")
+          def fail_closed(action, path, exc):
+              # Names and error codes only — never file contents or secret values.
+              print(f"::error::sanitize {action} failed for {path} ({type(exc).__name__} errno={exc.errno}); failing closed", file=sys.stderr)
+              sys.exit(1)
+          def glob_all(pattern):
+              try:
+                  return list(root.rglob(pattern))
+              except OSError as exc:
+                  fail_closed("scan", root, exc)
+          for path in glob_all("error-context.md"):
+              try:
+                  if path.is_dir() and not path.is_symlink():
+                      shutil.rmtree(path)
+                  else:
+                      path.unlink()
+              except OSError as exc:
+                  fail_closed("cleanup", path, exc)
+          if glob_all("error-context.md"):
+              print("::error::error-context.md remains after cleanup; failing closed", file=sys.stderr)
+              sys.exit(1)
+          if pathlib.Path("playwright-report").exists():
+              print("::error::playwright-report remains after cleanup; failing closed", file=sys.stderr)
+              sys.exit(1)
+          for path in glob_all("*"):
+              if not path.is_file():
+                  continue
+              try:
+                  data = path.read_bytes()
+              except OSError as exc:
+                  fail_closed("read", path, exc)
+              for value in values:
+                  data = data.replace(value.encode(), b"***REDACTED***")
+              try:
                   path.write_bytes(data)
+              except OSError as exc:
+                  fail_closed("write", path, exc)
           PY
           echo "sanitized: error-context.md and playwright-report/ removed, test-results scrubbed"
 
       - name: Upload failure artifacts
-        if: failure() && steps.staging.outputs.configured == 'true'
+        if: failure() && steps.staging.outputs.configured == 'true' && steps.sanitize.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-journey-report
