@@ -2529,9 +2529,11 @@ mod tests {
             }
         }
         async fn insert_magic(&self, record: &MagicLinkRecord) -> Result<(), StoreError> {
-            self.magic
-                .borrow_mut()
-                .insert(record.token_hash.clone(), record.clone());
+            let mut magic = self.magic.borrow_mut();
+            magic.retain(|_, row| {
+                row.user_id != record.user_id || row.expires_at > record.issued_at
+            });
+            magic.insert(record.token_hash.clone(), record.clone());
             Ok(())
         }
         async fn magic_by_hash(
@@ -5237,6 +5239,55 @@ mod tests {
             h.store.magic.borrow().len(),
             MAIL_PER_IP_PER_HOUR as usize,
             "no magic row stored past the per-IP mail cap"
+        );
+    }
+
+    #[test]
+    fn expired_magic_links_are_pruned_per_user_on_issue() {
+        // Live accounts are never reaped, so a victim's expired links must not
+        // accumulate: each issuance drops only that user's expired rows.
+        // Fixtures distinguish both predicates: pruning by user alone would
+        // drop `live_unexpired`, pruning all expired rows would drop
+        // `expired_other`, and not pruning would leave the 50 spaced rows.
+        let h = harness();
+        let spacing = auth::MAGIC_LINK_TTL_SECS + 1;
+        let (_, expired_other) = auth::issue_magic_link("other", "other@example.com", NOW);
+        block_on(h.store.insert_magic(&expired_other)).unwrap();
+        let mut first_live_hash = String::new();
+        for i in 0..50u64 {
+            let (_, record) = auth::issue_magic_link("live", "live@example.com", NOW + i * spacing);
+            if i == 0 {
+                first_live_hash.clone_from(&record.token_hash);
+            }
+            block_on(h.store.insert_magic(&record)).unwrap();
+        }
+        let (_, live_unexpired) =
+            auth::issue_magic_link("live", "live@example.com", NOW + 50 * spacing);
+        block_on(h.store.insert_magic(&live_unexpired)).unwrap();
+        let (_, newest_live) =
+            auth::issue_magic_link("live", "live@example.com", NOW + 50 * spacing + 1);
+        block_on(h.store.insert_magic(&newest_live)).unwrap();
+        let rows = h.store.magic.borrow();
+        assert_eq!(
+            rows.values().filter(|r| r.user_id == "live").count(),
+            2,
+            "only unexpired live links survive issuance"
+        );
+        assert!(
+            !rows.contains_key(&first_live_hash),
+            "the issuing user's expired link is pruned"
+        );
+        assert!(
+            rows.contains_key(&live_unexpired.token_hash),
+            "the issuing user's unexpired link is retained"
+        );
+        assert!(
+            rows.contains_key(&newest_live.token_hash),
+            "the newest live link is inserted"
+        );
+        assert!(
+            rows.contains_key(&expired_other.token_hash),
+            "another user's expired link is untouched"
         );
     }
 
