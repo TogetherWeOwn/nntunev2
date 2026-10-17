@@ -184,6 +184,48 @@ test.describe('credential scope (static pins)', () => {
   });
 });
 
+test.describe('public UI signup coverage (static pin)', () => {
+  // Isolate the dedicated case and the shared form helper by slicing from
+  // their markers to the next top-level test/export (or EOF), so a mint call
+  // added to either segment (the bypass this coverage exists to prevent)
+  // fails here even though other tests in the file legitimately mint.
+  test('dedicated UI-signup case submits the form with no account-seam mint', () => {
+    const spec = readFileSync(new URL('../tests/signup-byop.spec.ts', import.meta.url), 'utf8');
+    const marker = "test('public UI signup succeeds even when the test-account seam is configured'";
+    const start = spec.indexOf(marker);
+    expect(start, 'dedicated public UI signup case is missing').toBeGreaterThan(-1);
+    const rest = spec.slice(start + marker.length);
+    const nextTest = rest.search(/\ntest(?:\(|\.describe)/);
+    const dedicated = nextTest === -1 ? spec.slice(start) : spec.slice(start, start + marker.length + nextTest);
+    // Null identity = Access pair only: the page starts unauthenticated, so
+    // the form is the only account-creation path even with QA_AUTH_TOKEN set.
+    expect(dedicated).toContain('applyAccountToPage(page, null, baseURL)');
+    expect(dedicated).toContain('submitPublicUiSignup(page, baseURL)');
+    expect(dedicated).not.toContain('tryMintTestAccount');
+
+    const accounts = readFileSync(new URL('../helpers/accounts.ts', import.meta.url), 'utf8');
+    const helperStart = accounts.indexOf('export async function submitPublicUiSignup');
+    expect(helperStart, 'shared public UI signup helper is missing').toBeGreaterThan(-1);
+    const helperRest = accounts.slice(helperStart + 'export async function submitPublicUiSignup'.length);
+    const nextExport = helperRest.search(/\nexport /);
+    const helper = nextExport === -1 ? accounts.slice(helperStart) : accounts.slice(helperStart, helperStart + 'export async function submitPublicUiSignup'.length + nextExport);
+    expect(helper).toContain('uniqueTestEmail(');
+    expect(helper).toContain('`${baseURL}/signup`');
+    expect(helper).toContain('TESTIDS.signupEmail');
+    expect(helper).toContain('TESTIDS.signupSubmit');
+    expect(helper).toContain('TESTIDS.signupError');
+    // The real page is two-step: the helper asserts the emailed-code step
+    // (magic_code form), never wizard arrival — asserting the wizard without
+    // the code-retrieval seam reds every configured run.
+    expect(helper).toContain('magic_code');
+    expect(helper).not.toContain('TESTIDS.byopHost');
+    expect(helper).not.toContain("'/onboarding/byop'");
+    expect(helper).not.toContain('tryMintTestAccount');
+    expect(helper).not.toContain('API.testAccounts');
+    expect(helper).not.toContain('qaAuthHeader');
+  });
+});
+
 // Execute the exact checked-in sanitize blocks: Playwright 1.55 writes
 // test-results/**/error-context.md (ARIA snapshots rendering filled input
 // values, including the BYOP password) and the junit reporter embeds failure
@@ -565,4 +607,192 @@ test.describe('fail-closed artifact publication gate', () => {
       }
     });
   }
+});
+
+// Post-deploy sequencing contract: the full journey is promotion evidence,
+// so it may run only after the same run's staging-web deploy succeeds.
+// e2e-staging.yml must not race deploy.yml on push; instead deploy.yml
+// calls it as a reusable workflow from a job that `needs` staging-web,
+// and the journey job additionally requires the caller-only
+// `inputs.post_deploy`. Scheduled/manual runs stay synthetic monitoring.
+const deployWorkflow = readFileSync(new URL('deploy.yml', workflowDir), 'utf8');
+
+function jobSection(workflow: string, job: string): string {
+  const marker = `\n  ${job}:\n`;
+  const start = workflow.indexOf(marker);
+  expect(start, `job ${job} not found`).toBeGreaterThan(-1);
+  const bodyStart = start + marker.length;
+  const next = /\n  [A-Za-z0-9_-]+:\n/.exec(workflow.slice(bodyStart));
+  return workflow.slice(bodyStart, next ? bodyStart + next.index : undefined);
+}
+
+function jobIf(workflow: string, job: string): string | undefined {
+  // Job-level keys sit at 4-space indent; step conditions are deeper.
+  return jobSection(workflow, job).match(/^    if: (.+)$/m)?.[1];
+}
+
+const stagingOnBlock = stagingWorkflow
+  .split('\non:\n')[1]!
+  .split('\npermissions:\n')[0]!;
+
+test.describe('post-deploy sequencing (deploy → full journey)', () => {
+  test('e2e-staging does not trigger on push (no deploy race)', () => {
+    expect(stagingOnBlock).not.toMatch(/^  push:/m);
+    expect(stagingOnBlock).toMatch(/^  workflow_call:/m);
+    // Manual runs exist but define no inputs, so a dispatch cannot set
+    // post_deploy and mint promotion evidence by hand.
+    expect(stagingOnBlock).toContain('  workflow_dispatch:\n  schedule:');
+    expect(stagingOnBlock).toContain('- cron: "17 */6 * * *"');
+  });
+
+  test('post_deploy is a required boolean workflow_call input', () => {
+    const callBlock = stagingOnBlock
+      .split('  workflow_call:\n')[1]!
+      .split('\n  workflow_dispatch:')[0]!;
+    expect(callBlock).toMatch(/ {6}post_deploy:\n(?:.*\n)*? {8}type: boolean\n {8}required: true/);
+  });
+
+  test('full journey runs only for the post-deploy call (evaluated)', () => {
+    const condition = jobIf(stagingWorkflow, 'e2e');
+    expect(condition, 'e2e job must carry a job-level if').toBeDefined();
+    expect(condition).not.toContain('always()');
+    expect(condition).not.toContain('!cancelled()');
+    expect(jobSection(stagingWorkflow, 'e2e')).toContain('needs: [synthetic]');
+
+    const evaluate = (postDeploy: boolean | ''): boolean => {
+      const inner = condition!
+        .replace(/^\$\{\{\s*/, '')
+        .replace(/\s*\}\}$/, '');
+      const expr = inner.replace(
+        /inputs\.post_deploy/g,
+        postDeploy === '' ? 'false' : String(postDeploy),
+      );
+      expect(expr, `unmodelled journey-gate syntax in: ${condition}`).toMatch(
+        /^[\s()!&|truefals]+$/,
+      );
+      return Function(`"use strict"; return (${expr});`)() as boolean;
+    };
+    // workflow_call from deploy.yml passes post_deploy: true.
+    expect(evaluate(true)).toBe(true);
+    // workflow_dispatch/schedule leave the input unset: monitoring only.
+    expect(evaluate('')).toBe(false);
+    expect(evaluate(false)).toBe(false);
+  });
+
+  test('synthetic smoke stays ungated monitoring on every trigger', () => {
+    // No job-level if: scheduled and manual runs execute the smoke (and
+    // step-level skip while staging is unconfigured), distinct from the
+    // gated full journey above.
+    expect(jobIf(stagingWorkflow, 'synthetic')).toBeUndefined();
+  });
+
+  test('deploy calls e2e-staging only after a successful push staging-web (evaluated)', () => {
+    // The deploy being sequenced after is itself push-only and gated on
+    // the Cloudflare token; when it skips, dependents must skip too.
+    expect(jobIf(deployWorkflow, 'staging-web')).toContain("github.event_name == 'push'");
+    expect(jobIf(deployWorkflow, 'staging-web')).toContain("needs.gate.outputs.enabled == 'true'");
+
+    const section = jobSection(deployWorkflow, 'post-deploy-e2e');
+    expect(section).toContain('needs: [staging-web]');
+    expect(section).toContain('uses: ./.github/workflows/e2e-staging.yml');
+    expect(section).toMatch(/post_deploy: true/);
+
+    const condition = jobIf(deployWorkflow, 'post-deploy-e2e');
+    expect(condition, 'post-deploy-e2e must carry a job-level if').toBeDefined();
+    // No status-check function in the condition: GitHub then applies the
+    // implicit success() over `needs`, which is the whole contract — a
+    // skipped/failed/cancelled staging-web can never run this job.
+    for (const statusFn of ['always()', '!cancelled()', 'success()', 'failure()', 'cancelled()']) {
+      expect(condition, `post-deploy-e2e if must not use ${statusFn}`).not.toContain(statusFn);
+    }
+
+    const evaluate = (stagingWebResult: string, eventName: string): boolean => {
+      const inner = condition!
+        .replace(/^\$\{\{\s*/, '')
+        .replace(/\s*\}\}$/, '');
+      const expr = inner.replace(
+        /github\.event_name\s*==\s*'push'/g,
+        String(eventName === 'push'),
+      );
+      expect(expr, `unmodelled post-deploy syntax in: ${condition}`).toMatch(
+        /^[\s()!&|truefals]+$/,
+      );
+      const conditionHolds = Function(`"use strict"; return (${expr});`)() as boolean;
+      // Implicit success() over needs.
+      return stagingWebResult === 'success' && conditionHolds;
+    };
+    expect(evaluate('success', 'push')).toBe(true);
+    for (const result of ['skipped', 'failure', 'cancelled']) {
+      expect(
+        evaluate(result, 'push'),
+        `staging-web ${result} must not produce a full-journey run`,
+      ).toBe(false);
+    }
+    for (const event of ['pull_request', 'workflow_dispatch', 'schedule']) {
+      expect(evaluate('success', event), `${event} must not run post-deploy E2E`).toBe(false);
+    }
+  });
+
+  test('deploy concurrency is job-level so the E2E tail never holds the deploy group', () => {
+    // A workflow-level group is held until every job in the run finishes —
+    // now including up to ~40 min of post-deploy E2E — so queued main
+    // pushes would be cancelled before ever deploying. Job-level groups
+    // release when the deploy finishes; E2E serializes on e2e-staging.
+    expect(deployWorkflow.split('\njobs:\n')[0]!).not.toMatch(/^concurrency:/m);
+    for (const job of ['staging-web', 'preview-web']) {
+      const section = jobSection(deployWorkflow, job);
+      expect(section).toMatch(/^    concurrency:\n      group: .+\n      cancel-in-progress: /m);
+      expect(section).toContain("cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}");
+    }
+    // post-deploy-e2e needs no group of its own: the called workflow
+    // serializes on its e2e-staging group.
+    expect(jobSection(deployWorkflow, 'post-deploy-e2e')).not.toContain('concurrency:');
+    expect(stagingWorkflow.split('\njobs:\n')[0]!).toMatch(
+      /^concurrency:\n  group: e2e-staging\n  cancel-in-progress: false/m,
+    );
+  });
+
+  test('deploy.yml is the only reusable-workflow caller of e2e-staging', () => {
+    for (const name of readdirSync(fileURLToPath(workflowDir)).filter(n => n.endsWith('.yml'))) {
+      const workflow = readFileSync(new URL(name, workflowDir), 'utf8');
+      const calls = workflow.split('uses: ./.github/workflows/e2e-staging.yml').length - 1;
+      expect(calls, `${name} calls e2e-staging.yml`).toBe(name === 'deploy.yml' ? 1 : 0);
+    }
+  });
+
+  test('caller passes exactly the secrets e2e-staging reads, explicitly', () => {
+    expect(deployWorkflow).not.toContain('secrets: inherit');
+    const used = [...new Set(
+      [...stagingWorkflow.matchAll(/secrets\.([A-Z0-9_]+)/g)].map(m => m[1]!),
+    )].sort();
+    const declaredBlock = stagingOnBlock
+      .split('    secrets:\n')[1]!
+      .split('\n  workflow_dispatch:')[0]!;
+    const declared = [...declaredBlock.matchAll(/^      ([A-Z0-9_]+):$/gm)]
+      .map(m => m[1]!)
+      .sort();
+    const passedBlock = jobSection(deployWorkflow, 'post-deploy-e2e').split('    secrets:\n')[1]!;
+    const passed = [...passedBlock.matchAll(/^      ([A-Z0-9_]+): \$\{\{ secrets\.([A-Z0-9_]+) \}\}$/gm)];
+    expect(declared, 'workflow_call secret declarations').toEqual(used);
+    expect(passed.map(m => m[1]!).sort(), 'secrets passed by deploy.yml').toEqual(used);
+    for (const m of passed) expect(m[2], 'secret passed under its own name').toBe(m[1]);
+    // Every declared secret stays optional so the pre-configuration
+    // step-level skip (staging not configured yet) keeps working.
+    for (const m of declaredBlock.matchAll(/required: (\w+)/g)) {
+      expect(m[1]).toBe('false');
+    }
+  });
+
+  test('least permissions and no production deploy path are preserved', () => {
+    for (const workflow of [stagingWorkflow, deployWorkflow]) {
+      expect(workflow).toContain('\npermissions:\n  contents: read\n');
+    }
+    expect(stagingWorkflow).not.toMatch(/:\s*write\b/);
+    const section = jobSection(deployWorkflow, 'post-deploy-e2e');
+    expect(section).toContain('    permissions:\n      contents: read\n');
+    expect(section).not.toMatch(/:\s*write\b/);
+    expect(stagingWorkflow).not.toContain('wrangler');
+    expect(stagingWorkflow).not.toContain('--env production');
+    expect(section).not.toContain('deploy --env');
+  });
 });
