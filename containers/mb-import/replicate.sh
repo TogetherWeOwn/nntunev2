@@ -18,6 +18,14 @@ if [[ ! "$PACKET_SEQ" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
+# Deliver the connection to psql via the PG* environment, never argv:
+# DATABASE_URL is translated by pg-env.sh and then unset.
+command -v python3 >/dev/null || { echo "replicate: python3 not on PATH (pg-env)" >&2; exit 1; }
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=pg-env.sh
+. "$script_dir/pg-env.sh"
+configure_pg_env_from_database_url
+
 started="$(date +%s)"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -25,7 +33,7 @@ trap 'rm -rf "$tmp"' EXIT
 echo "replicate: fetching packet $PACKET_SEQ"
 curl -sSfL -o "$tmp/packet.tar.gz" "$PACKET_URL"
 
-last_packet="$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tAX -c "SELECT last_packet FROM mb_import_state WHERE id = 1;")"
+last_packet="$(psql -v ON_ERROR_STOP=1 -tAX -c "SELECT last_packet FROM mb_import_state WHERE id = 1;")"
 if [[ ! "$last_packet" =~ ^[0-9]+$ ]]; then
   echo "replicate: unexpected last_packet '$last_packet' in mb_import_state" >&2
   exit 1

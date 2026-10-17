@@ -29,8 +29,9 @@ COPY containers/mb-import/import.sh /job/import.sh
 COPY containers/mb-import/etl.sh /job/etl.sh
 COPY containers/mb-import/etl.py /job/etl.py
 COPY containers/mb-import/replicate.sh /job/replicate.sh
+COPY containers/mb-import/pg-env.sh /job/pg-env.sh
 COPY --from=validator /src/target/release/mb-validate /usr/local/bin/mb-validate
-RUN chmod 0755 /job/import.sh /job/etl.sh /job/etl.py /job/replicate.sh
+RUN chmod 0755 /job/import.sh /job/etl.sh /job/etl.py /job/replicate.sh /job/pg-env.sh
 # Keep the ETL test stage in the default build graph without shipping tests.
 COPY --from=test /tmp/mb-import-tests-passed /tmp/mb-import-tests-passed
 RUN rm /tmp/mb-import-tests-passed
