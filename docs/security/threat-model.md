@@ -178,8 +178,8 @@ exact implementation PR head:
    `TtlTooLong` at verify); media playback uses a §5 transport (header player
    or grant cookie, never signed query strings).
 8. KEK retire honors backup/PITR retention (`kek-rotation.md` §5, retire-after
-   date); a KEK-exposure response follows the §10 compromise path, never
-   routine rotation alone.
+   date); a KEK-exposure response follows the `kek-rotation.md` §10
+   compromise path, never routine rotation alone.
 
 ## 9. Findings index
 
@@ -272,24 +272,33 @@ all three of the following at re-run time, not at the original deploy time:
    tampered with since. A green rollback run alone does not prove the prior
    version is serving — the post-rollback health result plus the
    deployed-build identity do.
-2. **Secret versions.** Rollback does NOT restore secrets. It trusts the
-   *current* Worker secrets, KEK versions, Hyperdrive credentials, and
-   Access policies — not the values in force at the old deploy. Old code
-   must tolerate current secret versions (e.g. KEK version-pinned decrypt,
-   `kek-rotation.md`; the `kek_version` column is the only version signal
-   the decrypt path trusts). A forward-incompatible secret change (new KEK
-   generation retired, credential format change) can make a code rollback
-   fail or misbehave even when the rollback run is green.
-3. **Binding state.** Rollback does NOT restore bindings. It trusts the
-   *current* R2 buckets, KV namespaces, Queues/DLQ routing, Hyperdrive
-   configs, Durable Object classes/migrations, routes, and Access gating as
-   inventoried in `docs/ops.md`. If the deploy being rolled back also
-   changed any of these (or schema/stored data), the rollback evidence is
-   incomplete until it states, per change, that the restored version is
-   compatible with the current state or records that change's own
-   rollback. Evidence records carry names, version identifiers, commit
-   SHAs, and run/health-check URLs only — never secret values (CI logs are
-   attacker-readable, §2).
+2. **Secret versions (mechanism-dependent).** A redeploy of the prior
+   known-good source revision keeps the *current* Worker secret values
+   and trusts the current secrets, KEK versions, Hyperdrive credentials,
+   and Access policies — not the values in force at the old deploy.
+   Activation of a prior version instead restores that version's
+   snapshotted secret values, vars, and binding config as a unit (a Worker
+   version snapshots code plus bindings — secrets are a binding type —
+   plus vars and compatibility settings), so it can bring back a
+   pre-rotation `VAULT_KEK_BASE64` / `VAULT_KEK_VERSION` or
+   `SESSION_SECRET_BASE64` (read at `workers/api/src/worker_entry.rs`).
+   Old code must tolerate current secret versions (e.g. KEK version-pinned
+   decrypt, `kek-rotation.md`; the `kek_version` column is the only version
+   signal the decrypt path trusts). A forward-incompatible secret change
+   (new KEK generation retired, credential format change) can make a code
+   rollback fail or misbehave even when the rollback run is green.
+3. **Binding state (mechanism-dependent).** Activation of a prior version
+   restores that version's binding targets, vars, and compatibility
+   settings; a redeploy of an old SHA reapplies that SHA's Wrangler
+   binding, route, and migration declarations. Neither mechanism restores
+   resource state (Hyperdrive config, KV/R2 contents, Durable Object
+   storage, Access policies), which stays current as inventoried in
+   `docs/ops.md`. If the deploy being rolled back also changed any of
+   these (or schema/stored data), the rollback evidence is incomplete until
+   it states, per change, that the restored version is compatible with the
+   current state or records that change's own rollback. Evidence records
+   carry names, version identifiers, commit SHAs, and run/health-check URLs
+   only — never secret values (CI logs are attacker-readable, §2).
 
 **Explicit residual risk (accepted, not mitigated here):**
 
@@ -305,6 +314,12 @@ all three of the following at re-run time, not at the original deploy time:
   prior-known-good recording rule — not this note.
 - Data written by the newer version persists after a code rollback;
   forward-only migrations in particular have no code-rollback path.
+- Activating a pre-rotation version after a secret or KEK compromise
+  rotation (`kek-rotation.md` §10, `session-secret-rotation.md` §6) undoes
+  the rotation by restoring the exposed secret values; such versions are
+  not rollback targets unless re-keyed first (e.g. `wrangler versions
+  secret put`), and the `docs/ops.md` item 4 prior-known-good record must
+  postdate the latest secret rotation.
 - A first deploy has no prior known-good version, so rollback acceptance
   cannot be claimed for it (per `docs/ops.md` item 4); removal/disablement
   is a separate gated action.
