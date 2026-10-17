@@ -431,3 +431,43 @@ lane. Complete every box on the exact head being promoted.
   deploy Workers, which need their own rollback evidence. Staging rollback is
   a redeploy, never a data restore; retain the UNDO blocks and consolidation
   receipt for infrastructure-specific rollback.
+
+## Future Worker deploy lanes: required rollback evidence
+
+This section defines evidence only. It does not create a lane.
+
+**Current claim boundary.** `.github/workflows/deploy.yml` deploys
+`apps/web` only (`staging-web` on push, `preview-web` on pull requests). No
+tracked workflow deploys the backend Workers under `workers/` (`api`,
+`ingest`, `stream`, `mb`, `repair`), and
+`.github/workflows/e2e-staging.yml` exercises the staging web URL, not a
+Worker deploy or rollback. Worker source and Wrangler configs existing in
+the repo are not deployment. Therefore **no backend-Worker deploy,
+rollback, activation, or staging acceptance is currently claimed**, for any
+environment, until a lane for that Worker exists and its gates pass on the
+exact head being promoted. The web-only checklist above is unchanged by
+this section and remains the only staging promotion checklist in force.
+
+**Evidence a future Worker staging lane must retain**, per Worker and per
+environment, linked from that promotion's deploy record before rollback can
+be called accepted:
+
+| # | Retain | Acceptance bar |
+|---|---|---|
+| 1 | Deployed Worker and version | Worker (script) name and the version reported by the deploy tooling for the version now serving, plus the environment deployed to. |
+| 2 | Source revision | The exact commit SHA that version was built from. Where the Worker exposes a deployed-build identity, record it and require it to match this SHA; without one, do not claim same-build evidence (same caveat as the web checklist). |
+| 3 | Deploy run | URL of the workflow run (or equivalent executed deploy record) that produced item 1, with the Worker deploy job's conclusion `success`. A `skipped` job, a skipped gate, or overall workflow success without that job succeeding is not deploy evidence. Any pre-deploy gate the lane requires — for the API Worker, the Hyperdrive cache-disabled check described in `deploy.yml` — records its pass/fail result here, by name and outcome only. |
+| 4 | Prior known-good version | Recorded **before** the new deploy: the previously serving Worker's name, version and source SHA, its own successful deploy run (item 3 bar), and its last passing health result. A first deploy has no prior known-good version, so rollback acceptance cannot be claimed for it; removing or disabling a first deployment is a separate gated action, not defined here. |
+| 5 | Rollback action and run | Which mechanism was used (redeploy of the prior known-good source revision, or activation of the prior version, whichever the lane implements), the target it restored (item 4's version and SHA), and the URL of the rollback run with the rollback/deploy job's conclusion `success` (not `skipped`). |
+| 6 | Post-rollback health result | The lane's health/readiness check for that Worker, run after item 5, with its result and run URL recorded. Where a deployed-build identity exists, it must match the rollback target; a green rollback run or a bare `ok` response without that identity does not by itself prove the prior version is serving. |
+
+A Worker rollback restores Worker code only. If the deploy being rolled
+back also changed bindings, Durable Object migrations, queue consumers or
+routing, database migrations, or stored data, the evidence is incomplete
+until it also states, for each such change, that the restored version is
+compatible with it or records that change's own rollback. Rollback is never
+a data restore.
+
+Evidence records contain names, version identifiers, commit SHAs, and run
+or health-check URLs only. Do not record account IDs, tokens, credentials,
+database URLs, environment values, or personal login identities in them.

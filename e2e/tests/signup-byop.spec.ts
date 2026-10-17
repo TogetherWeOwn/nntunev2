@@ -2,6 +2,7 @@ import { test, expect } from '@playwright/test';
 import { TESTIDS } from '../helpers/contract.js';
 import { stagingBaseUrl } from '../helpers/access.js';
 import {
+  annotateSignupPath,
   applyAccountToPage,
   completeByopWizard,
   submitPublicUiSignup,
@@ -28,13 +29,16 @@ test.skip(
 );
 
 test.describe.serial('signup → BYOP wizard', () => {
-  test('signup creates an account and lands on the BYOP wizard', async ({ page, request }) => {
+  test('signup creates an account and lands on the BYOP wizard', async ({ page, request }, testInfo) => {
     const baseURL = stagingBaseUrl('skip', 'signup');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
     const minted = await tryMintTestAccount(request, baseURL);
+    // Evidence provenance: record which signup path this run exercises
+    // (bounded label only — no account data) before either branch runs.
+    annotateSignupPath(testInfo, minted);
     // Authenticate before the first navigation: the origin-scoped route
     // applies to subsequent loads only, so this must precede every goto.
     await applyAccountToPage(page, minted, baseURL);
