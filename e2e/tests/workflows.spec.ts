@@ -157,13 +157,13 @@ test.describe('credential scope (static pins)', () => {
     // origin WITH the Access pair + bearer. Live specs must go through
     // apiGet/apiPost; helpers.spec.ts may use the raw fixture inside its own
     // no-follow proof (it asserts the wrapper, not staging).
-    for (const name of ['health.spec.ts', 'ingest-play-meter.spec.ts', 'signup-byop.spec.ts']) {
+    for (const name of ['health.spec.ts', 'ingest-play-meter.spec.ts', 'signup-byop.spec.ts', 'demo-audio-contract.spec.ts']) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must not carry credentials on a raw request call`).not.toMatch(
         RAW_API_CALL,
       );
     }
-    for (const name of ['health.spec.ts', 'ingest-play-meter.spec.ts']) {
+    for (const name of ['health.spec.ts', 'ingest-play-meter.spec.ts', 'demo-audio-contract.spec.ts']) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must use the no-follow wrapper`).toContain('apiGet(');
     }
