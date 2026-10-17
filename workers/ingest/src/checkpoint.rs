@@ -47,19 +47,25 @@ pub fn initial(msg: &QueueMsg) -> JobCheckpoint {
 pub fn admission_write(existing: Option<&JobCheckpoint>, msg: &QueueMsg) -> Option<JobCheckpoint> {
     match existing {
         None => Some(initial(msg)),
-        Some(cp)
-            if cp.state == JobState::Failed
-                && cp.job_id == msg.job_id
-                && cp.user_id == msg.user_id
-                && cp.idempotency_key == msg.idempotency_key
-                && cp.source == msg.source =>
-        {
+        Some(cp) if is_failed_for(cp, msg) => {
             let mut reset = cp.clone();
             redrive_checkpoint(&mut reset);
             Some(reset)
         }
         Some(_) => None,
     }
+}
+
+/// True when `cp` is the terminal `Failed` checkpoint of exactly this job
+/// (same deterministic identity). An `AlreadyQueued` admission replay uses
+/// this to refuse the re-post with 409 instead of answering 202 for a job
+/// that will never run again inside the replay window.
+pub fn is_failed_for(cp: &JobCheckpoint, msg: &QueueMsg) -> bool {
+    cp.state == JobState::Failed
+        && cp.job_id == msg.job_id
+        && cp.user_id == msg.user_id
+        && cp.idempotency_key == msg.idempotency_key
+        && cp.source == msg.source
 }
 
 pub async fn get(env: &Env, job_id: &str) -> Result<Option<JobCheckpoint>> {
@@ -131,6 +137,11 @@ mod tests {
         foreign.state = JobState::Failed;
         foreign.user_id = "other_user".into();
         assert!(admission_write(Some(&foreign), &msg).is_none());
+        assert!(!is_failed_for(&foreign, &msg));
+        foreign.user_id = msg.user_id.clone();
+        assert!(is_failed_for(&foreign, &msg));
+        foreign.state = JobState::Done;
+        assert!(!is_failed_for(&foreign, &msg));
     }
 
     #[test]

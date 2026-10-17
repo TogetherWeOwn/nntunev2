@@ -50,7 +50,10 @@ NZB upload ───────────────┘                     
   400, parser bounds 413). Every real admission writes the initial job
   checkpoint (`src/checkpoint.rs`), resetting a stale `Failed` checkpoint
   on re-admission, so `GET /v1/ingest/jobs/:id` reads durable status from
-  `INGEST_STATE` (404 unknown, 503 store failure).
+  `INGEST_STATE` (404 unknown, 503 store failure). Re-posting a job that
+  already failed inside the admission replay window is refused with 409
+  `conflict` (nothing is enqueued then either; the failure stays readable
+  via the job status).
 
 ## Security rules
 

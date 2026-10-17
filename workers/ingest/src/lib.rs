@@ -752,16 +752,32 @@ where
 /// checkpoint on first delivery if this write is lost — failing the 202
 /// here would strand an accepted job, so errors are only logged.
 async fn ensure_admission_checkpoint(env: &Env, msg: &QueueMsg) {
-    let write = match checkpoint::get(env, &msg.job_id).await {
-        Ok(existing) => checkpoint::admission_write(existing.as_ref(), msg),
+    let existing = match checkpoint::get(env, &msg.job_id).await {
+        Ok(existing) => existing,
         Err(e) => {
             console_log!("ingest admission checkpoint read failed: {:?}", e);
-            None
+            return;
         }
     };
-    if let Some(cp) = write {
+    let was_failed = existing
+        .as_ref()
+        .is_some_and(|cp| checkpoint::is_failed_for(cp, msg));
+    if let Some(cp) = checkpoint::admission_write(existing.as_ref(), msg) {
         if let Err(e) = checkpoint::put(env, &cp).await {
             console_log!("ingest admission checkpoint write failed: {:?}", e);
+            return;
+        }
+        if was_failed {
+            // The reset lands after the admission's enqueue, so a first
+            // delivery racing it could still settle against the stale
+            // `Failed` checkpoint and quarantine without running. Send one
+            // more copy now that the reset is persisted: duplicate Queue
+            // messages are harmless by construction (the consumer resumes
+            // from the durable checkpoint), and this copy is guaranteed to
+            // observe `Queued`.
+            if !try_enqueue(env, msg).await {
+                console_log!("ingest re-drive enqueue after checkpoint reset failed");
+            }
         }
     }
 }
@@ -791,7 +807,26 @@ async fn admit_metered_job(
             ensure_admission_checkpoint(env, msg).await;
             queued_envelope(msg, source, true, extra)
         }
-        AdmissionDecision::AlreadyQueued => queued_envelope(msg, source, true, extra),
+        AdmissionDecision::AlreadyQueued => {
+            // Replay window: the ledger will not enqueue again (see the
+            // admission protocol docs). If that earlier run already
+            // terminally failed, answering 202 `queued` would claim work
+            // that will never run — refuse with 409 so the caller reads
+            // the failure from the job status instead. A checkpoint-store
+            // failure falls through to the plain replay (logged).
+            match checkpoint::get(env, &msg.job_id).await {
+                Ok(Some(cp)) if checkpoint::is_failed_for(&cp, msg) => {
+                    json_error(ApiError::conflict(
+                        "this job previously failed; check its status before re-posting",
+                    ))
+                }
+                Ok(_) => queued_envelope(msg, source, true, extra),
+                Err(e) => {
+                    console_log!("ingest replay checkpoint read failed: {:?}", e);
+                    queued_envelope(msg, source, true, extra)
+                }
+            }
+        }
         AdmissionDecision::Busy => service_unavailable("admission is in progress; retry shortly"),
         AdmissionDecision::QueueUnavailable => queued_envelope(msg, source, false, extra),
         AdmissionDecision::MeterUnavailable(e) => meter_failure_response(&e),
