@@ -57,3 +57,8 @@ sha256 = "50b645b72156218e83ce272c3fdfc97250df422563a2be0d30ad1ecfc72dea02"
 file = "0012_metered_admission_replay_window.sql"
 target = "app"
 sha256 = "6962f20adab4a64672f7c9a870d0e9e606ba8dc638a5b656e8720b0900134a4a"
+
+[[migration]]
+file = "0013_auth_challenge_reauth_purpose.sql"
+target = "app"
+sha256 = "848df4805ac18bc1312689f033c86e90417bd9d53bdbfbb0950813b00e9f0d64"
