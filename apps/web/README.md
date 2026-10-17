@@ -28,10 +28,22 @@ system libraries Chromium links against; see `playwright.config.ts`.
 
 ## Deploy
 
-Wrangler config and secrets land with the DevOps provisioning card; until then
-`pnpm preview` serves the production build locally. Never commit secrets —
-`CLOUDFLARE_*` and `HYPERDRIVE_*` values live in GitHub Actions secrets and
-Cloudflare only.
+The tracked Wrangler config is [`wrangler.toml`](wrangler.toml) in this
+directory (staging/production names, no backend bindings or secret values).
+[`.github/workflows/deploy.yml`](../../.github/workflows/deploy.yml) is
+web-only: a push to `main` deploys `apps/web` to staging and pull requests
+get previews, gated on the `CLOUDFLARE_API_TOKEN` and
+`CLOUDFLARE_ACCOUNT_ID` GitHub Actions secrets (names only; the full account
+ID stays private by repo policy). That workflow does not deploy the backend
+Workers under `workers/`; backend binding activation, migrations, health and
+rollback acceptance are still outstanding — see the
+[operations runbook](../../docs/ops.md). Locally,
+`pnpm --dir apps/web preview` serves the production build.
+
+Never commit secrets. `HYPERDRIVE_ID_STAGING`, `HYPERDRIVE_ID_PROD` and
+`HYPERDRIVE_ID_MB` are non-credential GitHub Actions **variables**, not
+secrets or database URLs, and this frontend does not use them; actual
+credentials live in GitHub Actions secrets and Cloudflare only.
 
 ## Structure
 
