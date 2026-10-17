@@ -1,4 +1,4 @@
--- NNTune v2 migration 0007: durable metered admission ledger.
+-- NNTune v2 migration 0008: durable metered admission ledger.
 --
 -- PlanetScale Postgres via Hyperdrive. The ingest edge owns one row per
 -- admitted (job_id, stage): `pending` from first record until the Queue

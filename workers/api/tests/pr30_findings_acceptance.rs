@@ -724,7 +724,7 @@ fn test_signing_key(seed: u8) -> p256::ecdsa::SigningKey {
 }
 
 fn es256_cose(key: &p256::ecdsa::SigningKey) -> Vec<u8> {
-    let point = key.verifying_key().to_encoded_point(false);
+    let point = key.verifying_key().to_sec1_point(false);
     let mut cose = Vec::new();
     cbor_head(5, 5, &mut cose);
     cbor_int(1, &mut cose);

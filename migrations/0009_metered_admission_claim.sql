@@ -1,4 +1,4 @@
--- NNTune v2 migration 0008: lease-based metered admission claim.
+-- NNTune v2 migration 0009: lease-based metered admission claim.
 --
 -- Replaces the earlier session advisory-lock claim, which Hyperdrive cannot
 -- honor: Hyperdrive pools in transaction mode (one origin connection per

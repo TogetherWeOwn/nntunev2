@@ -23,11 +23,13 @@ NZB upload ───────────────┘                     
 - NZB intake guard (`src/nzb_intake.rs`): versioned caps
   (`INTAKE_CONFIG_VERSION` v1: 2 MiB / 5k files / 60k segments / 64 GiB
   declared segment bytes) plus well-formedness validation before anything
-  spends provider connections. Refusals carry stable 4xx codes
-  (`NZB_EMPTY`, `NZB_TOO_LARGE`, `NZB_NOT_NZB`, `NZB_MALFORMED`,
-  `NZB_TOO_MANY_FILES`, `NZB_TOO_MANY_SEGMENTS`,
-  `NZB_DECLARED_BYTES_OVER_CAP`) and the `intake_config_version`; cap refusals
-  also return the measured value and cap (`file_count`/`max_files`,
+  spends provider connections. Refusals use the shared API error envelope:
+  `code` is `invalid_request` or `payload_too_large`, while the stable
+  intake-specific identifier (`NZB_EMPTY`, `NZB_TOO_LARGE`, `NZB_NOT_NZB`,
+  `NZB_MALFORMED`, `NZB_TOO_MANY_FILES`, `NZB_TOO_MANY_SEGMENTS`, or
+  `NZB_DECLARED_BYTES_OVER_CAP`) is in `intake_code`. The response also keeps
+  `error` as an alias of `message` and includes `intake_config_version`; cap
+  refusals return measured values and caps (`file_count`/`max_files`,
   `segment_count`/`max_segments`, `declared_bytes`/`max_declared_bytes`, …)
   so clients can render a reason.
 - Per-plan rate limits (`src/rate_limit.rs`): provisional base/5x/20x
@@ -40,9 +42,9 @@ NZB upload ───────────────┘                     
 - Routes (`src/lib.rs`): `POST /v1/ingest/search` (16 KiB body cap,
   ≤16 categories, paged window), `POST /v1/ingest/nzb` (wire cap accounting
   for JSON escaping, then the versioned intake guard) — malformed JSON is
-  400, intake refusals carry their stable `NZB_*` code (bad input 400,
-  over-cap 413 with measured + cap fields), busy store/queue is 503;
-  success is 202 + enqueue with job id + idempotency key.
+  400, intake refusals use the registered API code plus `intake_code` (bad
+  input 400, over-cap 413 with measured + cap fields), busy store/queue is
+  503; success is 202 + enqueue with job id + idempotency key.
   `GET /v1/ingest/jobs/:id` (checkpoint reads land with the consumer).
 
 ## Security rules
@@ -51,6 +53,67 @@ NZB upload ───────────────┘                     
   never accepted in API bodies, never logged (redacted URLs only), never
   committed. `http://` indexer URLs are refused.
 - Upload bodies are untrusted: capped, shape-checked, never logged.
+
+## NZB URL policy library — no runtime URL fetching
+
+`src/nzb_fetch.rs` is a **library-only policy guard and buffered simulator**,
+not a live SSRF boundary. No ingest route calls it; no runtime resolver or
+HTTPS transport is provided, `NZB_FETCH_ALLOWLIST` is not read from the
+Worker environment, and no block logs are emitted. Exporting `pub mod
+nzb_fetch` does not wire a fetch-from-URL feature. Existing search and NZB
+upload routes are unchanged.
+
+### What the library checks
+
+- `validate_fetch_url` checks HTTPS, no embedded credentials, default/443
+  port, and exact case-insensitive host allowlisting (subdomains are not
+  implied). `FetchConfig::default()` denies every host. The parser accepts
+  a supplied comma-separated string such as `nzb.example,cdn.example`; it
+  does not load environment configuration.
+- Every answer from the supplied resolver is checked for forbidden ranges
+  (loopback, link-local/metadata, private, CGNAT, multicast, reserved and
+  documentation, including IPv6 transition space). IP literals skip DNS,
+  not policy. The result records vetted addresses, not a network binding.
+- `fetch_nzb` models per-hop validation and at most 3 redirects. It checks
+  accumulated reported chunk delays across hops against 10000 ms and the
+  final returned body against the 2 MiB intake cap, returning stable
+  rejection reasons without partial results.
+- `url_host_for_log` extracts a sanitized host. Stable codes/status mappings
+  are library values for future route wiring, not current HTTP responses.
+
+### Limits of the model
+
+`FetchTransport::get(&str)` receives only a URL, **not the validated
+addresses/hostname or a remaining deadline**. It cannot enforce IP-pinned
+dialing, original-host TLS verification or DNS-rebinding resistance. A
+`RawResponse` already contains all body chunks: size and reported-delay
+checks happen **after buffering**, not while streaming. DNS, connection,
+TLS and header durations are not measured; a hung transport cannot be
+cancelled. Do not attach a real HTTPS client to this simulator interface.
+
+The fake DNS/transport tests prove policy behavior only. The original
+runtime-wiring prose in `tests/nzb_fetch_ssrf_guard.rs` is the future end
+state, not delivered functionality; that test file is unchanged. Passing it
+is not evidence of runtime pinning, deadlines, streamed byte bounds,
+route/environment wiring or log emission.
+
+### Tracked runtime follow-up
+
+[Safe pinned HTTPS transport and ingest URL route (#84)](https://github.com/TogetherWeOwn/nntunev2/issues/84)
+owns the remaining work: a transport receiving the validated address/host
+set with original-host SNI/certificate/Host validation and no re-resolution;
+cancellable streaming with one deadline across DNS/connect/TLS/headers/body
+and all redirects; bounded buffering; authenticated route wiring with a
+deny-all `NZB_FETCH_ALLOWLIST`; and host + stable code-only rejection logs.
+The follow-up also owns acceptance tests proving those live properties.
+Keep URL fetching unavailable until a supported transport demonstrates them.
+
+Stable codes: `nzb_fetch_bad_scheme`, `nzb_fetch_malformed_url`,
+`nzb_fetch_embedded_credentials`, `nzb_fetch_host_not_allowlisted`,
+`nzb_fetch_forbidden_address`, `nzb_fetch_unresolvable_host`,
+`nzb_fetch_too_many_redirects`, `nzb_fetch_timeout`, `nzb_fetch_too_large`,
+`nzb_fetch_upstream_status`. HTTP mappings are documented on the module's
+`FetchRejection` type; no route emits them in this slice.
 
 ## E2E contract (synthetic NNTP server card)
 

@@ -29,16 +29,21 @@ target = "app"
 sha256 = "6d222588102fbff8bd5096a42e669722262ba84014fc5865bfbf3b8c19894245"
 
 [[migration]]
-file = "0007_metered_admission.sql"
+file = "0007_auth_challenge_user_fk.sql"
 target = "app"
-sha256 = "efefaf50947415d60ee8898689aa3a6ce6aebcd34f99170ef67fd0c6ec7df0fe"
+sha256 = "ce0350f7d08a251bbfab9a817d1c4c3dc72a7484cb2379869c5e6c11a0fb6791"
 
 [[migration]]
-file = "0008_metered_admission_claim.sql"
+file = "0008_metered_admission.sql"
 target = "app"
-sha256 = "444b967fa312637eb1b3c6b0175a7b52e00e5a4f557aa953ec91c4bac345505c"
+sha256 = "6a4d3f2b2b55f9cb3664a2fdc092b335de278530583b48895df1bcc864a4e717"
 
 [[migration]]
-file = "0009_metered_admission_claim_epoch.sql"
+file = "0009_metered_admission_claim.sql"
 target = "app"
-sha256 = "4075fe12e3658a4b5312460b7839aeb3f42bbf6b7b1a4215115e8a7ac2c40c83"
+sha256 = "50ecd48808f4b448da21816aee76ecdceaaa91b105ecaf18e80d51e52649a233"
+
+[[migration]]
+file = "0010_metered_admission_claim_epoch.sql"
+target = "app"
+sha256 = "7de4fd9f1ae586d3ea8ef7a647a31fbb8d051a16b3407578f13bb50084121bd1"

@@ -35,4 +35,3 @@ bucket_name = "fixture-audio-prod"
 [[env.production.hyperdrive]]
 binding = "DB"
 id = "fixture-hyperdrive-prod"
-

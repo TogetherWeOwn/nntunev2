@@ -21,12 +21,14 @@
 use futures_util::StreamExt;
 use worker::{console_log, Env, Request, Response, Result, RouteContext, Router};
 
+pub mod api_error;
 pub mod dispatch;
 pub mod fixtures;
 pub mod jobs;
 pub mod library;
 pub mod metering;
 pub mod newznab;
+pub mod nzb_fetch;
 pub mod nzb_intake;
 pub mod parse;
 pub mod pool_probe;
@@ -36,6 +38,7 @@ pub mod rate_limit;
 pub mod repair;
 pub mod retry;
 
+use api_error::ApiError;
 use dispatch::validate_user_id;
 use jobs::{validate_job_id, JobSource};
 use metering::{
@@ -54,11 +57,6 @@ pub const MAX_SEARCH_BODY_BYTES: usize = 16 * 1024;
 /// at [`MAX_NZB_BYTES`], but JSON escaping can inflate hostile input ~6x on
 /// the wire, so the wire cap accounts for that before buffering.
 pub const MAX_UPLOAD_BODY_BYTES: usize = 13 * 1024 * 1024;
-
-#[derive(Debug, serde::Serialize)]
-struct ApiError {
-    error: String,
-}
 
 fn health_response() -> http::Response<Vec<u8>> {
     http::Response::builder()
@@ -96,12 +94,9 @@ fn health_response_parts() -> HealthResponseParts {
     }
 }
 
-fn json_error(message: &str, status: u16) -> Result<Response> {
-    let body = serde_json::to_string(&ApiError {
-        error: message.to_string(),
-    })
-    .unwrap_or_else(|_| r#"{"error":"internal"}"#.to_string());
-    Response::from_body(worker::ResponseBody::Body(body.into_bytes())).map(|r| {
+fn json_error(err: ApiError) -> Result<Response> {
+    let status = err.status;
+    Response::from_body(worker::ResponseBody::Body(err.body_json().into_bytes())).map(|r| {
         r.with_status(status)
             .with_headers(headers_json().unwrap_or_default())
     })
@@ -118,12 +113,9 @@ fn accepted(body: serde_json::Value) -> Result<Response> {
 }
 
 fn service_unavailable(message: &str) -> Result<Response> {
-    let body = serde_json::to_string(&ApiError {
-        error: message.to_string(),
-    })
-    .unwrap_or_else(|_| r#"{"error":"internal"}"#.to_string());
     let headers = headers_json().unwrap_or_default();
     headers.append("retry-after", "5")?;
+    let body = ApiError::service_unavailable(message).body_json();
     Response::from_body(worker::ResponseBody::Body(body.into_bytes()))
         .map(|r| r.with_status(503).with_headers(headers))
 }
@@ -174,23 +166,20 @@ fn push_chunk(
 /// unauthenticated route. This reads through `Request::stream()` and bails
 /// with 413 on the chunk that would cross the cap; non-UTF-8 bodies are a
 /// 400, as is an unreadable stream.
-async fn read_capped_text(
-    req: &mut Request,
-    cap: usize,
-) -> core::result::Result<String, (String, u16)> {
+async fn read_capped_text(req: &mut Request, cap: usize) -> core::result::Result<String, ApiError> {
     if let Err(message) = check_declared_len(content_length(req), cap) {
-        return Err((message.to_string(), 413));
+        return Err(ApiError::payload_too_large(message));
     }
     let stream = req
         .stream()
-        .map_err(|_| ("failed to read request body".to_string(), 400))?;
+        .map_err(|_| ApiError::invalid_request("failed to read request body"))?;
     let mut stream = Box::pin(stream);
     let mut buf = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| ("failed to read request body".to_string(), 400))?;
-        push_chunk(&mut buf, &chunk, cap).map_err(|m| (m.to_string(), 413))?;
+        let chunk = chunk.map_err(|_| ApiError::invalid_request("failed to read request body"))?;
+        push_chunk(&mut buf, &chunk, cap).map_err(ApiError::payload_too_large)?;
     }
-    String::from_utf8(buf).map_err(|_| ("request body must be UTF-8".to_string(), 400))
+    String::from_utf8(buf).map_err(|_| ApiError::invalid_request("request body must be UTF-8"))
 }
 
 /// Parse a search body: malformed JSON is a client error (400), never a 500.
@@ -240,14 +229,19 @@ fn check_upload(req: &NzbUploadRequest) -> core::result::Result<(), &'static str
 }
 
 /// Build the status + JSON body for an intake refusal. Pure so the 4xx
-/// taxonomy (stable `code`, measured value + cap fields the client renders)
-/// is unit-tested without a Worker runtime.
+/// taxonomy (registry `code`, stable `intake_code`, measured value + cap fields
+/// the client renders) is unit-tested without a Worker runtime.
 fn intake_rejection_parts(rejection: &IntakeRejection) -> (u16, serde_json::Value) {
+    let error = ApiError::from(*rejection);
+    let status = error.status;
     let mut body = serde_json::json!({
+        "code": error.code,
+        "message": error.message,
+        "retryable": error.retryable,
         "error": rejection.message(),
-        "code": rejection.code(),
-        "intake_config_version": nzb_intake::INTAKE_CONFIG_VERSION,
     });
+    body["intake_code"] = serde_json::Value::String(rejection.code().into());
+    body["intake_config_version"] = nzb_intake::INTAKE_CONFIG_VERSION.into();
     match *rejection {
         IntakeRejection::TooLarge {
             size_bytes,
@@ -270,7 +264,7 @@ fn intake_rejection_parts(rejection: &IntakeRejection) -> (u16, serde_json::Valu
         }
         IntakeRejection::Empty | IntakeRejection::NotNzb | IntakeRejection::Malformed => {}
     }
-    (rejection.http_status(), body)
+    (status, body)
 }
 
 /// Answer an intake refusal with its stable code + reason fields.
@@ -384,7 +378,7 @@ fn try_meter(
 fn meter_failure_response(err: &MeterWriteError) -> Result<Response> {
     match err.http_status() {
         503 => service_unavailable("meter unavailable; nothing was accepted, retry shortly"),
-        status => json_error("unknown meter stage", status),
+        _ => json_error(ApiError::invalid_request("unknown meter stage")),
     }
 }
 
@@ -508,9 +502,9 @@ fn admission_claim_lease_secs() -> u64 {
 }
 
 /// Parameterized statements owned here (execution lives with the ledger
-/// impls); see `migrations/0007_metered_admission.sql`,
-/// `migrations/0008_metered_admission_claim.sql`, and
-/// `migrations/0009_metered_admission_claim_epoch.sql` for the table.
+/// impls); see `migrations/0008_metered_admission.sql`,
+/// `migrations/0009_metered_admission_claim.sql`, and
+/// `migrations/0010_metered_admission_claim_epoch.sql` for the table.
 /// Every statement is single-transaction autocommit with `$1` = job id and
 /// `$2` = stage: no `BEGIN`, no session lock, no temp state, so each one is
 /// safe under Hyperdrive transaction-mode pooling.
@@ -780,12 +774,16 @@ async fn admit_metered_job(
 /// Queue binding is 503 with `Retry-After` — never 202 — so clients, proxies,
 /// and retry middleware do not mistake a lost job for an accepted one.
 /// `status: queued` is only ever sent after a successful `send`.
-fn queued_envelope(
+/// Pure body builder behind [`queued_envelope`]: the 503 `!queued` path must
+/// always carry the shared `{code, message, retryable}` envelope fields
+/// alongside the job correlation fields (see docs/api-errors.md). Split out
+/// so the envelope fields are unit-tested without a `worker::Response`.
+fn queued_body(
     msg: &QueueMsg,
     source: &str,
     queued: bool,
     extra: serde_json::Value,
-) -> Result<Response> {
+) -> serde_json::Value {
     let mut body = serde_json::json!({
         "stage": "queued",
         "source": source,
@@ -794,15 +792,31 @@ fn queued_envelope(
         "idempotency_key": msg.idempotency_key,
     });
     if !queued {
-        body["hint"] = serde_json::Value::String(
+        // Error path: the shared envelope fields ride alongside the job
+        // correlation fields above (extra fields are allowed, see
+        // docs/api-errors.md).
+        body["code"] = serde_json::Value::String("service_unavailable".into());
+        body["message"] = serde_json::Value::String(
             "Queue unavailable; nothing was accepted, retry shortly.".into(),
         );
+        body["retryable"] = serde_json::Value::Bool(true);
+        body["hint"] = body["message"].clone();
     }
     if let serde_json::Value::Object(map) = extra {
         if let serde_json::Value::Object(ref mut body_map) = body {
             body_map.extend(map);
         }
     }
+    body
+}
+
+fn queued_envelope(
+    msg: &QueueMsg,
+    source: &str,
+    queued: bool,
+    extra: serde_json::Value,
+) -> Result<Response> {
+    let body = queued_body(msg, source, queued, extra);
     if !queued {
         let headers = headers_json().unwrap_or_default();
         headers.append("retry-after", "5")?;
@@ -854,14 +868,14 @@ async fn store_upload_payload(env: &Env, payload_ref: &str, nzb_xml: &str) -> bo
 async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
     let text = match read_capped_text(req, MAX_SEARCH_BODY_BYTES).await {
         Ok(text) => text,
-        Err((message, status)) => return json_error(&message, status),
+        Err(err) => return json_error(err),
     };
     let parsed = match parse_search(&text) {
         Ok(parsed) => parsed,
-        Err(message) => return json_error(message, 400),
+        Err(message) => return json_error(ApiError::invalid_request(message)),
     };
     if let Err(message) = check_search(&parsed) {
-        return json_error(message, 400);
+        return json_error(ApiError::invalid_request(message));
     }
     let q = parsed.query.trim().to_string();
     let msg = match dispatch::build_search_dispatch(
@@ -873,7 +887,7 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
         parsed.page,
     ) {
         Ok(msg) => msg,
-        Err(message) => return json_error(message, 400),
+        Err(message) => return json_error(ApiError::invalid_request(message)),
     };
     console_log!("ingest search q_len={} job={}", q.len(), msg.job_id);
     // Durable idempotent admission: the (job_id, stage) ledger owns the
@@ -897,21 +911,21 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
 async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
     let text = match read_capped_text(req, MAX_UPLOAD_BODY_BYTES).await {
         Ok(text) => text,
-        Err((message, status)) => return json_error(&message, status),
+        Err(err) => return json_error(err),
     };
     let parsed = match parse_upload(&text) {
         Ok(parsed) => parsed,
-        Err(message) => return json_error(message, 400),
+        Err(message) => return json_error(ApiError::invalid_request(message)),
     };
     if let Err(message) = check_upload(&parsed) {
-        return json_error(message, 400);
+        return json_error(ApiError::invalid_request(message));
     }
     match estimate_nzb(&parsed.nzb_xml) {
         Err(rejection) => intake_rejection_response(&rejection),
         Ok(est) => {
             let msg = match dispatch::build_upload_dispatch(&parsed.user_id, &parsed.nzb_xml) {
                 Ok(msg) => msg,
-                Err(message) => return json_error(message, 400),
+                Err(message) => return json_error(ApiError::invalid_request(message)),
             };
             // The bytes must be durably stored before the job exists: an
             // enqueued job without retrievable bytes can never run.
@@ -962,7 +976,7 @@ fn healthz() -> Result<Response> {
 async fn job_status(_req: &Request, ctx: &RouteContext<()>) -> Result<Response> {
     let id = ctx.param("id").cloned().unwrap_or_default();
     if !validate_job_id(&id) {
-        return json_error("unknown job id", 404);
+        return json_error(ApiError::not_found("unknown job id"));
     }
     Response::from_json(&serde_json::json!({
         "job_id": id,
@@ -1118,8 +1132,39 @@ mod tests {
     }
 
     #[test]
-    fn intake_corpus_maps_to_stable_4xx_codes_with_reason_fields() {
-        // (body, expected status, expected code)
+    fn unqueued_body_carries_the_error_envelope_with_job_correlation() {
+        // The 503 `!queued` path must always carry the shared
+        // `{code, message, retryable}` envelope fields alongside `job_id`
+        // (docs/api-errors.md): deleting any one of them must fail here.
+        let msg =
+            dispatch::build_search_dispatch("user_01", "dark side", "vault_idx_01-ab", &[], 25, 0)
+                .expect("dispatch");
+        let body = queued_body(&msg, "indexer_search", false, serde_json::json!({}));
+        assert_eq!(
+            body["code"],
+            serde_json::Value::String("service_unavailable".into())
+        );
+        assert_eq!(
+            body["message"],
+            serde_json::Value::String(
+                "Queue unavailable; nothing was accepted, retry shortly.".into()
+            )
+        );
+        assert_eq!(body["retryable"], serde_json::Value::Bool(true));
+        assert_eq!(
+            body["job_id"],
+            serde_json::Value::String(msg.job_id.clone())
+        );
+        assert_eq!(body["status"], serde_json::Value::String("retry".into()));
+
+        let ok = queued_body(&msg, "indexer_search", true, serde_json::json!({}));
+        assert_eq!(ok["status"], serde_json::Value::String("queued".into()));
+        assert_eq!(ok["job_id"], serde_json::Value::String(msg.job_id.clone()));
+    }
+
+    #[test]
+    fn intake_corpus_maps_to_registered_envelopes_with_reason_fields() {
+        // (body, expected status, registry code, stable intake-specific code)
         let over_bytes = r#"<?xml version="1.0"?>
 <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
 <file poster="a@b" date="1" subject="big.iso">
@@ -1141,25 +1186,54 @@ mod tests {
         }
         segment_bomb.push_str("</nzb>");
         assert!(segment_bomb.len() < MAX_NZB_BYTES);
-        let cases: &[(&str, u16, &str)] = &[
-            ("", 400, "NZB_EMPTY"),
-            ("<html><body>hi</body></html>", 400, "NZB_NOT_NZB"),
-            ("<?xml?><nzb><file>", 400, "NZB_MALFORMED"),
-            (over_bytes, 413, "NZB_DECLARED_BYTES_OVER_CAP"),
-            (&file_bomb, 413, "NZB_TOO_MANY_FILES"),
-            (&segment_bomb, 413, "NZB_TOO_MANY_SEGMENTS"),
-            (&"x".repeat(MAX_NZB_BYTES + 1), 413, "NZB_TOO_LARGE"),
+        let cases: &[(&str, u16, &str, &str)] = &[
+            ("", 400, "invalid_request", "NZB_EMPTY"),
+            (
+                "<html><body>hi</body></html>",
+                400,
+                "invalid_request",
+                "NZB_NOT_NZB",
+            ),
+            (
+                "<?xml?><nzb><file>",
+                400,
+                "invalid_request",
+                "NZB_MALFORMED",
+            ),
+            (
+                over_bytes,
+                413,
+                "payload_too_large",
+                "NZB_DECLARED_BYTES_OVER_CAP",
+            ),
+            (&file_bomb, 413, "payload_too_large", "NZB_TOO_MANY_FILES"),
+            (
+                &segment_bomb,
+                413,
+                "payload_too_large",
+                "NZB_TOO_MANY_SEGMENTS",
+            ),
+            (
+                &"x".repeat(MAX_NZB_BYTES + 1),
+                413,
+                "payload_too_large",
+                "NZB_TOO_LARGE",
+            ),
         ];
-        for (body, status, code) in cases {
+        for (body, status, api_code, intake_code) in cases {
             let rejection = estimate_nzb(body).unwrap_err();
             let (actual_status, actual_body) = intake_rejection_parts(&rejection);
-            assert_eq!(actual_status, *status, "status for {code}");
-            assert_eq!(actual_body["code"], *code, "code for {code}");
+            assert_eq!(actual_status, *status, "status for {intake_code}");
+            assert_eq!(actual_body["code"], *api_code, "API code for {intake_code}");
+            assert_eq!(actual_body["intake_code"], *intake_code);
+            assert_eq!(actual_body["message"], ApiError::from(rejection).message);
+            assert_eq!(actual_body["retryable"], false);
+            assert_eq!(actual_body["error"], actual_body["message"]);
+            assert_eq!(actual_status, rejection.http_status());
             assert_eq!(
                 actual_body["intake_config_version"],
                 crate::nzb_intake::INTAKE_CONFIG_VERSION
             );
-            assert!(actual_body["error"].is_string());
         }
         // Reason fields the client renders ride alongside the code.
         let (_, over_bytes_body) = intake_rejection_parts(&estimate_nzb(over_bytes).unwrap_err());
@@ -2033,7 +2107,9 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
         .get_async("/v1/ingest/jobs/:id", |req, ctx| async move {
             job_status(&req, &ctx).await
         })
-        .or_else_any_method_async("/*catchall", |_, _| async { json_error("not found", 404) })
+        .or_else_any_method_async("/*catchall", |_, _| async {
+            json_error(ApiError::not_found("not found"))
+        })
         .run(req, env)
         .await
 }
