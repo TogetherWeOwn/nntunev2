@@ -173,4 +173,9 @@ is absent from every uploaded file including base64-decoded payloads. Do not
 enable traces/screenshots or the html reporter for credential-bearing runs
 without a verified redaction path. A QA PASS verdict cites the green
 `e2e-staging` run URL + deployed head SHA; NEEDS WORK cites the failing
-spec + step.
+spec + step. Every spec that branches on the test-account seam records a
+bounded `signup-path` test annotation — exactly `public-ui-signup` or
+`api-minted-account`, with no email, account id, token or provider data —
+so junit evidence always states which signup path produced it; a
+seam-backed (`api-minted-account`) run never counts as proof of the
+public UI signup.

@@ -12,6 +12,7 @@ import {
 import { assertNoAccessWall, readApiBody, stagingBaseUrl } from '../helpers/access.js';
 import {
   accountHeaders,
+  annotateSignupPath,
   apiGet,
   applyAccountToPage,
   completeByopWizard,
@@ -42,13 +43,16 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
   // and metering run as the same identity. Retries mint a fallback.
   let sharedAccount: TestAccount | null = null;
 
-  test('NZB fixture ingests and appears in the library', async ({ page, request }) => {
+  test('NZB fixture ingests and appears in the library', async ({ page, request }, testInfo) => {
     const baseURL = stagingBaseUrl('skip', 'ingest');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
     const minted = await tryMintTestAccount(request, baseURL);
+    // Evidence provenance: this test duplicates the signup branch, so it
+    // records the same bounded signup-path label (no account data).
+    annotateSignupPath(testInfo, minted);
     await applyAccountToPage(page, minted, baseURL);
     if (minted?.viaApi) {
       sharedAccount = minted;
