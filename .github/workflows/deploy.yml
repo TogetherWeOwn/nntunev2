@@ -44,9 +44,11 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+# No workflow-level concurrency here: it would hold the deploy group for
+# the whole run, now including up to ~40 min of post-deploy E2E, so queued
+# main pushes would be cancelled before ever deploying. The deploy jobs
+# serialize on their own job-level groups below and release them when the
+# deploy finishes; E2E serializes separately on the e2e-staging group.
 
 env:
   NODE_VERSION: "24"
@@ -76,6 +78,11 @@ jobs:
     name: staging-web
     needs: [gate]
     if: ${{ github.event_name == 'push' && needs.gate.outputs.enabled == 'true' }}
+    # Job-level (not workflow-level) so the group releases when the deploy
+    # finishes instead of being held through the post-deploy E2E tail.
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -135,6 +142,11 @@ jobs:
     name: preview-web
     needs: [gate]
     if: ${{ github.event_name == 'pull_request' && needs.gate.outputs.enabled == 'true' }}
+    # Job-level twin of staging-web above: per-PR serialization with
+    # cancel-in-progress on PRs, never held by the E2E tail.
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:

@@ -691,6 +691,25 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     }
   });
 
+  test('deploy concurrency is job-level so the E2E tail never holds the deploy group', () => {
+    // A workflow-level group is held until every job in the run finishes —
+    // now including up to ~40 min of post-deploy E2E — so queued main
+    // pushes would be cancelled before ever deploying. Job-level groups
+    // release when the deploy finishes; E2E serializes on e2e-staging.
+    expect(deployWorkflow.split('\njobs:\n')[0]!).not.toMatch(/^concurrency:/m);
+    for (const job of ['staging-web', 'preview-web']) {
+      const section = jobSection(deployWorkflow, job);
+      expect(section).toMatch(/^    concurrency:\n      group: .+\n      cancel-in-progress: /m);
+      expect(section).toContain("cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}");
+    }
+    // post-deploy-e2e needs no group of its own: the called workflow
+    // serializes on its e2e-staging group.
+    expect(jobSection(deployWorkflow, 'post-deploy-e2e')).not.toContain('concurrency:');
+    expect(stagingWorkflow.split('\njobs:\n')[0]!).toMatch(
+      /^concurrency:\n  group: e2e-staging\n  cancel-in-progress: false/m,
+    );
+  });
+
   test('deploy.yml is the only reusable-workflow caller of e2e-staging', () => {
     for (const name of readdirSync(fileURLToPath(workflowDir)).filter(n => n.endsWith('.yml'))) {
       const workflow = readFileSync(new URL(name, workflowDir), 'utf8');

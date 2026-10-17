@@ -5,8 +5,9 @@ explicit gap. M1 exits when the secure staging user journey
 (signup → BYOP → ingest → play/seek) passes on an exact-head staging deploy
 with Access enabled, and rollback evidence is recorded.
 
-Verified against the `e2e/` tree at `ed54d2a` on 2026-10-17:
-`npm --prefix e2e run e2e:list` lists 81 tests in 5 files. Line numbers
+Verified against the `e2e/` tree at `1ef120d` plus the browser-playback
+spec added on top of it, on 2026-10-17:
+`npm --prefix e2e run e2e:list` lists 187 tests in 11 files. Line numbers
 below are from that head; re-verify with the commands at the end of this
 document whenever a spec is added, renamed, or retitled, and update this
 matrix in the same PR.
@@ -29,10 +30,10 @@ configured, the harness fails closed instead of skipping.
 
 | # | M1 exit step | Status | Covering spec(s) | What is actually asserted |
 |---|---|---|---|---|
-| 1 | Signup | PARTIAL | `e2e/tests/signup-byop.spec.ts:27` "signup creates an account and lands on the BYOP wizard"; same UI flow duplicated as fallback in `e2e/tests/ingest-play-meter.spec.ts:56` | With the test-account seam (`QA_AUTH_TOKEN` set), the account is minted via `POST /api/test-accounts` and the test asserts only that the BYOP wizard is reachable (`signup-byop.spec.ts:38`). The real `/signup` form submission (fill email, submit, no inline error, land on `/onboarding/byop`) runs only when the seam is absent. **Gap:** a seam-backed run does not prove public UI signup; the exit evidence must record which path ran. |
-| 2 | BYOP connect | COVERED | `e2e/tests/signup-byop.spec.ts:70` via `completeByopWizard` (`e2e/helpers/accounts.ts:233`); re-exercised in `ingest-play-meter.spec.ts:84` | Fills host/port/user/password for the synthetic NNTP endpoint, requires test-connection to report success within 60 s, saves, and requires landing on `/library`. Fails closed when `SYNTHETIC_NNTP_PASS` is unset rather than submitting an empty credential. |
-| 3 | Ingest | COVERED | `e2e/tests/ingest-play-meter.spec.ts:45` "NZB fixture ingests and appears in the library" | Uploads `e2e/fixtures/synthetic.nzb` at `/library/import`, requires the import status to reach complete/ready/done within 240 s, then requires the track to be visible in `/library`. The ingesting identity completes the BYOP wizard first, because the ingest worker probes through the user's provider connection. |
-| 4 | Play / seek | PARTIAL | Seek: `e2e/tests/ingest-play-meter.spec.ts:105` "streaming answers byte Ranges with 206 + Content-Range". Play: none | Two API Range GETs (`bytes=0-8`, `bytes=9-17`) must return 206 with `Content-Range` (and length 9 for the first), as the ingesting account. **Gap:** no spec asserts in-browser audio playback or player-UI seek; the meter test treats the player as an optional extra signal and asserts nothing about playback state (`ingest-play-meter.spec.ts:195`). |
+| 1 | Signup | PARTIAL | `e2e/tests/signup-byop.spec.ts:27` "signup creates an account and lands on the BYOP wizard"; same UI flow duplicated as fallback in `e2e/tests/ingest-play-meter.spec.ts:57` | With the test-account seam (`QA_AUTH_TOKEN` set), the account is minted via `POST /api/test-accounts` and the test asserts only that the BYOP wizard is reachable (`signup-byop.spec.ts:38`). The real `/signup` form submission (fill email, submit, no inline error, land on `/onboarding/byop`) runs only when the seam is absent. **Gap:** a seam-backed run does not prove public UI signup; the exit evidence must record which path ran. |
+| 2 | BYOP connect | COVERED | `e2e/tests/signup-byop.spec.ts:70` via `completeByopWizard` (`e2e/helpers/accounts.ts:302`); re-exercised in `ingest-play-meter.spec.ts:85` | Fills host/port/user/password for the synthetic NNTP endpoint, requires test-connection to report success within 60 s, saves, and requires landing on `/library`. Fails closed when `SYNTHETIC_NNTP_PASS` is unset rather than submitting an empty credential. |
+| 3 | Ingest | COVERED | `e2e/tests/ingest-play-meter.spec.ts:46` "NZB fixture ingests and appears in the library" | Uploads `e2e/fixtures/synthetic.nzb` at `/library/import`, requires the import status to reach complete/ready/done within 240 s, then requires the track to be visible in `/library`. The ingesting identity completes the BYOP wizard first, because the ingest worker probes through the user's provider connection. |
+| 4 | Play / seek | PARTIAL | Seek (API): `e2e/tests/ingest-play-meter.spec.ts:106` "streaming answers byte Ranges with 206 + Content-Range". Play: `e2e/tests/ingest-play-meter.spec.ts:311` "synthetic audio actually plays in the browser" | Two API Range GETs (`bytes=0-8`, `bytes=9-17`) must return 206 with `Content-Range` (and length 9 for the first), as the ingesting account. Playback is asserted separately in the browser at the end of the serial chain (after the over-limit test, which mints its own capped account, so a playback failure cannot skip the meter or plan-limit specs): selecting the staged synthetic library track (and the player's own play control when selection only loads it) must put the `<audio>` element into the playing state with an advancing position and no page error — a 206 alone cannot pass (`e2e/helpers/playback.ts`, pinned offline by `e2e/tests/playback.spec.ts`). Subject to the global caveat above: while staging is unconfigured the spec skips, which is not exit evidence, and it will fail by name until the library player is wired to the selected track. **Remaining gap:** no spec asserts a player-UI seek (dragging/keyboard on the seek bar); only API Range seeks are covered. |
 | 5 | Access enforcement | PARTIAL | With-credentials side: every live spec, e.g. `assertNoAccessWall` in `e2e/tests/health.spec.ts:32`, `:70`, `:92`; fail-closed config in `e2e/playwright.config.ts` (pair validated at load), pinned offline by `e2e/tests/helpers.spec.ts:73` and both job preflights in `e2e/tests/workflows.spec.ts:46` | A green live run proves the journey passes **with Access enabled** and a valid QA service token: any wall response (401/403/302 with Access markers) fails the step by name instead of masquerading as an app failure, and configured staging without the full credential pair fails before any request. **Gap:** no spec sends a request *without* Access credentials and asserts Access blocks it, so enforcement against anonymous traffic is not proven by e2e; only wall *detection* is unit-tested, against synthetic responses (`helpers.spec.ts:123`). |
 | 6 | Rollback evidence | GAP | none in `e2e/` | Rollback evidence is procedural, not a spec: `docs/ops.md` "Staging promotion checklist" requires a recorded rollback pointer (last good staging SHA + its push-triggered `deploy.yml` run with `staging-web` conclusion `success`), rollback by re-running all jobs on that run, and a successful `staging-web` rerun plus staging health. Workers are not deployed by that workflow and need their own rollback evidence; the evidence a future Worker lane must retain is defined in `docs/ops.md` "Future Worker deploy lanes: required rollback evidence", but no such lane exists yet, so this row stays GAP and no Worker deploy or rollback is claimed. e2e contributes only the reusable post-rollback health smoke (row 7). |
 | 7 | Exact-head staging deploy (exit wrapper) | PARTIAL | `e2e/tests/health.spec.ts:19` (`/api/health`), `:54` (`/api/ready`), `:78` (app shell behind Access) | The smoke proves the deployed app answers `ok:true` in under 2 s, promotion readiness (200 JSON `{ok:true}` only; 404 and 503 — even with `Retry-After` — fail, pinned offline by `e2e/tests/readiness.spec.ts` via `e2e/helpers/readiness.ts`), and the app shell behind Access. **Gap:** no spec ties the deployed build to the exact commit SHA — `version` is asserted only when the app ships it and is a package version, not a build identity. Per `docs/ops.md`, same-build evidence must not be claimed until a deployed-build identity is exposed and compared with the promotion SHA. Sequencing is established: `e2e-staging.yml` has no push trigger, and `deploy.yml`'s `post-deploy-e2e` job calls it only after the same run's `staging-web` succeeds, so the E2E run cannot race its deploy — but that ordering still does not prove which build is serving. |
@@ -42,21 +43,58 @@ configured, the harness fails closed instead of skipping.
 
 Listed so it is not mistaken for (or double-counted as) M1 coverage:
 
-- Usage meter increase + plan metadata (`ingest-play-meter.spec.ts:155`)
-  and over-limit refusal (`ingest-play-meter.spec.ts:222`, fail-closed on
+- Usage meter increase + plan metadata (`ingest-play-meter.spec.ts:156`)
+  and over-limit refusal (`ingest-play-meter.spec.ts:223`, fail-closed on
   CI when the over-limit seam is unavailable) belong to the metering
   milestone, not the M1 exit list.
 - `e2e/tests/helpers.spec.ts` and `e2e/tests/workflows.spec.ts` are
   offline self-tests (wall detection, credential scope, workflow
   preflights, artifact sanitization). They run in the `e2e-lint` CI job on
   every PR and keep the harness honest, but produce no staging evidence.
+- The `apps/web/tests/` offline specs below run in the `web-e2e` CI job
+  on every PR with all network traffic intercepted and fulfilled locally.
+  They pin product behavior outside the M1 exit list and produce no
+  staging evidence:
+  - `apps/web/tests/player-queue.spec.ts` — pins the 3-track queue
+    play-through (next/prev/track-end), queue panel add/clear/reorder
+    with in-session order persistence, and MediaSession metadata plus OS
+    next/prev handlers following the current track.
+  - `apps/web/tests/player-seek.spec.ts` — pins the demo audio/seek
+    contract: private-cached audio vs public-immutable artwork, byte-Range
+    206 handling, the artwork fallback chain, and 10x rapid seeks never
+    wedging the player.
+  - `apps/web/tests/player-browser-contract.spec.ts` — pins real-browser
+    playback advancing, the seek storm ignoring offset-ignoring and
+    mismatched Content-Range responses, and artwork staying understandable
+    when its image and placeholder both fail.
+  - `apps/web/tests/pricing-selection.spec.ts` — pins `/pricing`
+    plan-selection serialization: at most one checkout POST in flight,
+    re-entry refused while held, ordinary failure restoring choices, and
+    success/401/402/429 routing unchanged.
+  - `apps/web/tests/byop-reauth.spec.ts` — pins stale-session provider
+    save directing the user to sign in again, and successful passkey
+    reauthentication saving once with controls disabled while pending.
+  - `apps/web/tests/auth-magic.spec.ts` — pins the magic-link landing
+    never redeeming on load (explicit confirm redeems once, then names the
+    account), swap-guard sign-out recovery, paywall token preservation,
+    and logout failure/401 handling.
+  - `apps/web/tests/library-cache.spec.ts` — pins the library snapshot
+    cache contract: offline retry rendering the stale snapshot with a
+    badge, 401/auth-transition invalidation, in-flight response discard,
+    last-good preservation, and blocked-storage behavior.
+  - `apps/web/tests/account-security-library-cache.spec.ts` — pins
+    sign-out invalidating library snapshots across tabs (logout, revoke-all,
+    and confirmed 401 clear stored snapshots; 500/transport failure claims
+    nothing and clears nothing).
 
 ## Re-verifying this matrix
 
 ```sh
 find e2e/tests -name '*.spec.ts' | sort
 npm --prefix e2e run e2e:list   # spec files + test titles Playwright sees
-grep -n "test('" e2e/tests/*.spec.ts
+find apps/web/tests -name '*.spec.ts' | sort
+(cd apps/web && pnpm exec playwright test --list)   # web spec files + titles
+grep -n "test('" e2e/tests/*.spec.ts apps/web/tests/*.spec.ts
 ```
 
 Every path and title cited above must appear in that output. If a cited
