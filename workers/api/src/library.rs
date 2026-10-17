@@ -1297,7 +1297,12 @@ mod tests {
         // must stay grouped as one `AND` unit; `OR` would wipe or rename every
         // row of the caller plus a foreign public row.
         for (sql, table, other_table, qualified) in [
-            (genre_update_statement(), "UPDATE genres", "playlists", "genres"),
+            (
+                genre_update_statement(),
+                "UPDATE genres",
+                "playlists",
+                "genres",
+            ),
             (
                 genre_delete_statement(),
                 "DELETE FROM genres",
@@ -1400,7 +1405,10 @@ mod tests {
         // new public id ($1): fencing on $1 would lock a nonexistent user
         // and admit every write.
         for sql in [genre_insert_statement(), playlist_insert_statement()] {
-            assert!(sql.contains("FROM (SELECT id FROM users WHERE id = $2"), "{sql}");
+            assert!(
+                sql.contains("FROM (SELECT id FROM users WHERE id = $2"),
+                "{sql}"
+            );
             assert!(!sql.contains("WHERE id = $1"), "{sql}");
         }
     }

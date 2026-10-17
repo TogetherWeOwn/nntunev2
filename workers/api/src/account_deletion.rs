@@ -207,8 +207,7 @@ mod tests {
         // probe would queue behind the delete it is only classifying.
         let sql = normalize(ACCOUNT_DELETING_PROBE_SQL);
         assert_eq!(
-            sql,
-            "select(deleting_atisnotnull)asdeletingfromuserswhereid=$1",
+            sql, "select(deleting_atisnotnull)asdeletingfromuserswhereid=$1",
             "{sql}"
         );
         assert!(!sql.contains("forshare"), "{sql}");
@@ -231,7 +230,10 @@ mod tests {
             classify_fenced_write(0, Some(true)),
             FencedWriteOutcome::AccountDeleting
         );
-        assert_eq!(classify_fenced_write(0, Some(false)), FencedWriteOutcome::NoRow);
+        assert_eq!(
+            classify_fenced_write(0, Some(false)),
+            FencedWriteOutcome::NoRow
+        );
         assert_eq!(classify_fenced_write(0, None), FencedWriteOutcome::NoRow);
         assert_eq!(ACCOUNT_DELETING_CODE, "account_deleting");
     }

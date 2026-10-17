@@ -496,10 +496,7 @@ pub trait Store {
     /// itself (production writes carry the fence in-statement).
     /// Default `Ok(false)` keeps out-of-tree `Store` impls compiling;
     /// production and the test fake override it.
-    fn account_deleting(
-        &self,
-        _user_id: &str,
-    ) -> impl Future<Output = Result<bool, StoreError>> {
+    fn account_deleting(&self, _user_id: &str) -> impl Future<Output = Result<bool, StoreError>> {
         async { Ok(false) }
     }
     fn insert_audit(&self, event: &AuditEvent) -> impl Future<Output = Result<(), StoreError>>;
@@ -3607,10 +3604,7 @@ mod tests {
         assert_eq!(resp.status, 200, "{}", resp.body);
         // Deletion scheduled: the same save is the typed fence refusal,
         // never the generic 400, and the stored row is not replaced.
-        h.store
-            .deleting_users
-            .borrow_mut()
-            .insert("u1".to_string());
+        h.store.deleting_users.borrow_mut().insert("u1".to_string());
         let resp = h.call_full(
             "PUT",
             "/v1/vault",
@@ -5523,7 +5517,10 @@ mod tests {
                 .insert_challenge(&finishing_challenge, Some("active"), PURPOSE_REGISTER),
         )
         .unwrap();
-        h.store.deleting_users.borrow_mut().insert("deleting".to_string());
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert("deleting".to_string());
 
         let resp = h.call(
             "POST",
