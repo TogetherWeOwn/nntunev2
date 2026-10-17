@@ -67,9 +67,9 @@ in `kek-rotation.md`); DEK per user, never hard-coded; no credential in
 Analytics Engine, KV, R2, Queues payloads, or error bodies. The KEK
 re-wrap follow-up migration (F-VAULT-03, normative design in
 `kek-rotation.md` §§2, 6, 8) adds `rewrapped_at` + a `kek_version`
-index: re-wrap passes stamp `rewrapped_at` per row (until the migration
-lands, progress is tracked in `rotation_runs` with `updated_at` as the
-last-touch signal) and per-version counts drive the retire gate.
+index: re-wrap passes stamp `rewrapped_at` per row (migration 0015;
+`rewrapped_at` is the authoritative re-wrap marker and `updated_at` is
+no longer the re-wrap signal) and per-version counts drive the retire gate.
 
 ## 4. Sessions, passkeys, magic links (STRIDE)
 
