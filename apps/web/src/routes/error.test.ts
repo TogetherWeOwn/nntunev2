@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 /**
- * Branded 404 contract (TOG-28366, test-first): unknown routes must render
+ * Branded 404 contract (test-first): unknown routes must render
  * the NNTune `+error.svelte` page — branded, with a safe-navigation CTA to
  * `/library` and/or `/login` — never a stack trace or default SvelteKit
  * chrome, and never leaking secret, hostname, or binding material.

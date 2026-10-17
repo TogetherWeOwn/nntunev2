@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
 
 /**
- * Branded 404 runtime contract (TOG-28366, test-first): unknown paths must
+ * Branded 404 runtime contract (test-first): unknown paths must
  * serve the NNTune error page — branded 404 with a safe-navigation CTA to
  * `/library` and/or `/login` — with no stack trace, no default SvelteKit
  * chrome, and no secret/hostname/binding material in the rendered output.
