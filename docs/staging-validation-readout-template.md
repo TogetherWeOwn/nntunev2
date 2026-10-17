@@ -53,8 +53,11 @@ redacted, and re-reviewed before any verdict is recorded.
 ## Evidence-link format
 
 Every row in sections 1, 2, and 6 of the readout cites one or more entries
-from the evidence index in section 5 (price sources in section 3 carry
-their own dated links inline). Each index entry has exactly these fields:
+from the evidence index in section 5. In section 3, price sources carry
+their own dated links inline (they prove the price, not the volume), and a
+usage basis labelled `measured` must also cite an evidence entry proving
+the volume; any other volume is labelled `assumed`. Each index entry has
+exactly these fields:
 
 | Field | Rule |
 |---|---|
@@ -93,8 +96,12 @@ VERDICT: GO | NO-GO | KILL — <one sentence naming the deciding evidence IDs> (
 
 - Any `K<n>` `TRIGGERED` ⇒ overall `KILL`. The readout stops there; it does
   not argue around its own kill rule.
-- No kill rule triggered, but any must-pass row `FAIL` or `INCONCLUSIVE`
-  ⇒ `NO-GO` until a new readout on a new build resolves it.
+- No kill rule triggered, but any must-pass row `FAIL` or `INCONCLUSIVE`,
+  or any kill rule `INCONCLUSIVE` ⇒ `NO-GO`. A `FAIL` is resolved only by a
+  new readout on a new build. An `INCONCLUSIVE` caused only by missing or
+  ambiguous evidence may instead be resolved on the same build by adding
+  that evidence and having QA re-verify it; if the evidence cannot be
+  produced for that build, a new build and readout are required.
 - `GO` requires every must-pass row `PASS`, every kill rule
   `NOT TRIGGERED`, and QA sign-off on the evidence index.
 - `GO` in a staging readout means "eligible for the launch decision". It is
@@ -129,6 +136,12 @@ evidence IDs. Rows marked † are must-pass for a `GO`.
 | 6 | Metering | Playback/ingest usage is metered against the synthetic account | | |
 | 7† | Rollback pointer | Last-good staging SHA and its push-triggered `deploy.yml` run with `staging-web` conclusion `success` (not `skipped`) are recorded before promotion; Workers rollback evidence is recorded separately or listed as not verified | | |
 
+Row 7 records the rollback *pointer* before promotion; it does not prove a
+rollback was executed. A readout that claims a rollback was executed or
+tested must cite separate evidence for that claim: the rollback rerun's
+`staging-web` conclusion `success` (not `skipped`) plus staging health, per
+the staging promotion checklist in `docs/ops.md`.
+
 ### 2. User-visible failures
 
 Every failure a user could see during the run, in the user's terms. Empty
@@ -142,12 +155,15 @@ entry; an omitted table is not.
 ### 3. Infrastructure cost basis
 
 Unit prices are public list prices captured on the `Price source` date;
-usage volumes are either measured on staging (say so) or stated assumptions
-(labelled `assumed`). One row per metered resource the staging journey
-touches. Fixed platform fees go in their own rows so the variable
-cost-as-function-of-usage stays visible.
+usage volumes are either measured on staging (labelled `measured`, with the
+evidence ID proving the volume in the usage-basis cell) or stated
+assumptions (labelled `assumed`). A `measured` volume with no evidence ID
+is deleted or marked `INCONCLUSIVE`, like any other unsupported claim. One
+row per metered resource the staging journey touches. Fixed platform fees
+go in their own rows so the variable cost-as-function-of-usage stays
+visible.
 
-| Resource | Unit | Unit price | Price source (link + date) | Usage basis (`measured` / `assumed`, volume) | Formula | Monthly estimate |
+| Resource | Unit | Unit price | Price source (link + date) | Usage basis (`measured` + evidence ID / `assumed`, volume) | Formula | Monthly estimate |
 |---|---|---:|---|---|---|---:|
 | Workers requests + CPU | | | | | | |
 | R2 storage + operations | | | | | | |
@@ -159,8 +175,10 @@ cost-as-function-of-usage stays visible.
 | **Total at stated usage** | | | | | | |
 
 State below the table: what usage the total assumes, which line dominates as
-usage grows, and what was **not** metered. Cost-recovery arithmetic belongs
-to the decision record, not here; this table supplies its input only.
+usage grows, and what was **not** metered — naming every unpriced part of a
+partly priced row (for example operations on a storage-only formula), not
+only wholly unmetered rows. Cost-recovery arithmetic belongs to the
+decision record, not here; this table supplies its input only.
 
 ### 4. Explicit non-goals
 
@@ -243,7 +261,7 @@ All prices and volumes invented for format demonstration.
 | Resource | Unit | Unit price | Price source (link + date) | Usage basis | Formula | Monthly estimate |
 |---|---|---:|---|---|---|---:|
 | Workers requests + CPU | 1M requests | $0.30 | <https://example.invalid/pricing-workers> (2026-01-01) | assumed, 2M requests | 2 × $0.30 | $0.60 |
-| R2 storage + operations | GB-month | $0.015 | <https://example.invalid/pricing-r2> (2026-01-01) | measured on staging, 40 GB | 40 × $0.015 | $0.60 |
+| R2 storage + operations | GB-month | $0.015 | <https://example.invalid/pricing-r2> (2026-01-01) | measured on staging, 40 GB (E15) | 40 × $0.015 | $0.60 |
 | KV reads/writes/storage | 1M reads | $0.50 | <https://example.invalid/pricing-kv> (2026-01-01) | assumed, 1M reads | 1 × $0.50 | $0.50 |
 | Queues operations | 1M operations | $0.40 | <https://example.invalid/pricing-queues> (2026-01-01) | assumed, 0.2M operations | 0.2 × $0.40 | $0.08 |
 | Analytics Engine events | 1M events | $0.25 | <https://example.invalid/pricing-analytics> (2026-01-01) | assumed, 1M events | 1 × $0.25 | $0.25 |
@@ -252,8 +270,11 @@ All prices and volumes invented for format demonstration.
 | **Total at stated usage** | | | | | | **$12.03** |
 
 At the stated (invented) usage the fixed Postgres fee dominates; R2 storage
-is the line that grows with library size. Egress was not metered, so the
-total is a floor, not an all-in bill.
+is the line that grows with library size. Not metered or priced: Workers
+CPU (the Workers formula prices requests only), R2 operations (the R2
+formula prices storage only), KV writes and storage (the KV formula prices
+reads only), Postgres storage, and egress. The total is therefore a floor,
+not an all-in bill.
 
 ### 4. Explicit non-goals
 
@@ -282,17 +303,18 @@ total is a floor, not an all-in bill.
 | E12 | Last-good SHA `89abcdef0123` is recorded pre-promotion with a push-triggered `deploy.yml` run whose `staging-web` conclusion is `success` (not `skipped`) | `89abcdef0123` · staging | <https://example.invalid/runs/deploy/12> | 2026-01-13 | PASS | QA, 2026-01-15 |
 | E13 | Workers deployed versions and their rollback targets are recorded separately pre-promotion | `89abcdef0123` · staging | <https://example.invalid/records/workers-rollback/13> | 2026-01-13 | PASS | QA, 2026-01-15 |
 | E14 | Confirmation screen on one locale displays a raw message key instead of localized text | `0123456789ab` · staging | <https://example.invalid/runs/e2e-staging/14> | 2026-01-14 | FAIL | QA, 2026-01-15 |
-| E15 | Previous promoted build has no must-pass `FAIL`, so this is the first consecutive failing promoted build | `89abcdef0123` · staging | <https://example.invalid/records/prior-readout/15> | 2026-01-13 | PASS | QA, 2026-01-15 |
-| E16 | Section 3 line items sum to the $12.03 monthly estimate at the stated usage | `0123456789ab` · staging | <https://example.invalid/records/cost-total/16> | 2026-01-15 | PASS | QA, 2026-01-15 |
-| E17 | Scan of the run logs and evidence artifacts finds no secret value or personal data | `0123456789ab` · staging | <https://example.invalid/logs/secret-scan/17> | 2026-01-15 | PASS | QA, 2026-01-15 |
+| E15 | Storage metrics query reports 40 GB stored in the staging R2 bucket | `0123456789ab` · staging | <https://example.invalid/metrics/r2-storage/15> | 2026-01-15 | PASS | QA, 2026-01-15 |
+| E16 | Previous promoted build has no must-pass `FAIL`, so this is the first consecutive failing promoted build | `89abcdef0123` · staging | <https://example.invalid/records/prior-readout/16> | 2026-01-13 | PASS | QA, 2026-01-15 |
+| E17 | Section 3 line items sum to the $12.03 monthly estimate at the stated usage | `0123456789ab` · staging | <https://example.invalid/records/cost-total/17> | 2026-01-15 | PASS | QA, 2026-01-15 |
+| E18 | Scan of the run logs and evidence artifacts finds no secret value or personal data | `0123456789ab` · staging | <https://example.invalid/logs/secret-scan/18> | 2026-01-15 | PASS | QA, 2026-01-15 |
 
 ### 6. Kill rules and verdict
 
 | ID | Condition (pre-registered) | Source of threshold | Observed value | Evidence | Verdict |
 |---|---|---|---|---|---|
-| K1 | Any must-pass synthetic-flow step `FAIL` on two consecutive promoted builds | Launch-quality bar for the core journey | 1 consecutive failing build (step 5 on this build; none on the previous promoted build) | E10, E15 | NOT TRIGGERED |
-| K2 | Estimated monthly infra cost at stated usage exceeds $50 | Pre-launch cost ceiling for the validation phase | $12.03 | E16 | NOT TRIGGERED |
-| K3 | Any secret value or personal data found in staging logs/evidence during the run | "Must never contain" rules in this template | None found | E17 | NOT TRIGGERED |
+| K1 | Any must-pass synthetic-flow step `FAIL` on two consecutive promoted builds | Launch-quality bar for the core journey | 1 consecutive failing build (step 5 on this build; none on the previous promoted build) | E10, E16 | NOT TRIGGERED |
+| K2 | Estimated monthly infra cost at stated usage exceeds $50 | Pre-launch cost ceiling for the validation phase | $12.03 | E15, E17 | NOT TRIGGERED |
+| K3 | Any secret value or personal data found in staging logs/evidence during the run | "Must never contain" rules in this template | None found | E18 | NOT TRIGGERED |
 
 ```text
 VERDICT: NO-GO — must-pass step 5 (play/seek) failed per E10; no kill rule triggered (K1–K3) (product lead, 2026-01-15)
@@ -306,5 +328,6 @@ VERDICT: NO-GO — must-pass step 5 (play/seek) failed per E10; no kill rule tri
   `INCONCLUSIVE`, not a pass. `QA, 2026-01-15`
 - Decision owner: verdict above recorded; non-goals in section 4 stand.
   `product lead, 2026-01-15`
-- What could not be verified: egress cost (not metered in this synthetic
-  example).
+- What could not be verified: the unmetered/unpriced costs listed in
+  section 3 (Workers CPU, R2 operations, KV writes and storage, Postgres
+  storage, and egress).
