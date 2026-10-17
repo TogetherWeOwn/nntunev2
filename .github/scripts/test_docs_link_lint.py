@@ -319,6 +319,22 @@ class TestFenceHandling(unittest.TestCase):
             )
             self.assertEqual([], check(root, "docs/a.md"))
 
+    def test_indented_fence_in_list_item_is_ignored(self):
+        # A fenced sample nested in a list item (4+ leading spaces) is
+        # still code: its sample link must never fail the lint.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": "- step\n    - sub\n"
+                                 "        ```md\n"
+                                 "        [gone](gone.md)\n"
+                                 "        ```\n\n"
+                                 "# Title\n\n[ok](#title)\n",
+                },
+            )
+            self.assertEqual([], check(root, "docs/a.md"))
+
     def test_heading_inside_nested_example_is_not_an_anchor(self):
         # strip_fences and code_free_lines must agree: the sample heading
         # is not linkable, so the anchor link fails.
@@ -338,9 +354,14 @@ class TestFenceHandling(unittest.TestCase):
 
 class TestMarkdownFileDiscovery(unittest.TestCase):
     def _git_env(self):
-        return dict(os.environ, GIT_CONFIG_NOSYSTEM="1",
-                    GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
-                    GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        # Drop repository-location variables so git uses the explicit cwd
+        # instead of an inherited repository.
+        env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1",
+                   GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        env.pop("GIT_DIR", None)
+        env.pop("GIT_WORK_TREE", None)
+        return env
 
     def test_untracked_node_modules_are_excluded(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -360,6 +381,26 @@ class TestMarkdownFileDiscovery(unittest.TestCase):
             self.assertEqual([Path("docs/a.md"), Path("docs/b.md")], found)
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(0, main(["--root", str(root)]))
+
+    def test_uppercase_suffix_tracked_file_is_scanned(self):
+        # git pathspecs are case-sensitive: a tracked Guide.MD must still
+        # reach the suffix.lower() filter instead of being dropped early.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = self._git_env()
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True, env=env)
+            make_root(
+                tmp,
+                {
+                    "docs/Guide.MD": "[gone](missing.md)\n",
+                    "docs/b.md": "# B\n",
+                },
+            )
+            subprocess.run(["git", "add", "docs"], cwd=root, check=True, env=env)
+            found = markdown_files(root)
+            self.assertIn(Path("docs/Guide.MD"), found)
+            hits = check(root, "docs/Guide.MD")
+            self.assertEqual(1, len(hits))
 
     def test_walk_fallback_skips_vendor_trees_outside_git(self):
         # Throwaway roots outside git (no `git` repo) still skip vendored
@@ -385,6 +426,8 @@ class TestChangedScope(unittest.TestCase):
             env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1",
                        GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
                        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+            env.pop("GIT_DIR", None)
+            env.pop("GIT_WORK_TREE", None)
             subprocess.run(["git", "init", "-q"], cwd=root, check=True, env=env)
             # A broken file that stays untouched must never fail the run.
             (root / "docs").mkdir()

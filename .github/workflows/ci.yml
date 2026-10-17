@@ -470,7 +470,10 @@ jobs:
               echo "docs-links: $fixture must report '$expected' and exit 1, got $rc" >&2
               exit 1
             fi
-            printf '%s\n' "$output"
+            # Neutralise workflow commands: the fixture output holds
+            # ::error lines for fixture-relative paths, which would post
+            # phantom annotations on a green job if echoed raw.
+            printf '%s\n' "$output" | sed 's/^::/ ::/'
             echo "docs-links: $fixture fixture correctly failed"
           done
 

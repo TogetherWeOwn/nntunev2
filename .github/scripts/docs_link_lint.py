@@ -48,6 +48,7 @@ Usage:
 """
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -61,8 +62,11 @@ MARKDOWN_SUFFIXES = (".md", ".markdown", ".mdown")
 FIXTURE_PREFIX = Path(".github/scripts/fixtures")
 
 _LINK = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
-_FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})")
-_FENCE_CLOSE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
+# Fences may sit inside list items at 4+ leading spaces (CommonMark counts
+# indent relative to the item), so match any leading whitespace here. An
+# indented block is still code: ignoring its sample links is always safe.
+_FENCE_OPEN = re.compile(r"^[ \t]*(`{3,}|~{3,})")
+_FENCE_CLOSE = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*$")
 _INLINE_CODE = re.compile(r"`[^`\n]+`")
 _SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 _HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*(?:#+\s*)?$")
@@ -76,6 +80,18 @@ _ID_ATTR = re.compile(
 
 class LintError(Exception):
     """A usage or repository error (exit 2, fail closed)."""
+
+
+def _clean_git_env():
+    """Environment for git subprocesses, without an inherited repo location.
+
+    A caller-exported GIT_DIR or GIT_WORK_TREE would make git select a
+    repository other than the explicit -C cwd, so drop them here.
+    """
+    env = dict(os.environ)
+    env.pop("GIT_DIR", None)
+    env.pop("GIT_WORK_TREE", None)
+    return env
 
 
 def _escape_annotation_property(value):
@@ -316,15 +332,20 @@ def _tracked_markdown_files(root):
             check=True,
             capture_output=True,
             text=True,
+            env=_clean_git_env(),
         ).stdout.strip()
         out = subprocess.run(
             # --full-name: paths stay relative to the toplevel even when
             # root is a subdirectory (e.g. a fixture root), so the
-            # relative_to(root) scoping below resolves correctly.
-            ["git", "-C", str(root), "ls-files", "-z", "--full-name", "--",
-             "*.md", "*.markdown", "*.mdown"],
+            # relative_to(root) scoping below resolves correctly. No
+            # suffix pathspecs: git pathspecs are case-sensitive, so
+            # "*.md" would skip a tracked Guide.MD that the
+            # suffix.lower() filter below treats as in scope. List
+            # everything and filter suffixes in Python instead.
+            ["git", "-C", str(root), "ls-files", "-z", "--full-name"],
             check=True,
             capture_output=True,
+            env=_clean_git_env(),
         ).stdout
     except (OSError, subprocess.CalledProcessError):
         return None
@@ -390,6 +411,7 @@ def changed_markdown_files(root, base_ref):
             check=True,
             capture_output=True,
             text=True,
+            env=_clean_git_env(),
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         if base_ref != "main":
@@ -400,6 +422,7 @@ def changed_markdown_files(root, base_ref):
                 check=True,
                 capture_output=True,
                 text=True,
+                env=_clean_git_env(),
             ).stdout.strip()
         except (OSError, subprocess.CalledProcessError) as exc:
             raise LintError(f"cannot resolve base ref {base_ref!r}") from exc
@@ -409,6 +432,7 @@ def changed_markdown_files(root, base_ref):
              "--diff-filter=ACMR", base_commit, "--"],
             check=True,
             capture_output=True,
+            env=_clean_git_env(),
         ).stdout
     except (OSError, subprocess.CalledProcessError) as exc:
         raise LintError(f"cannot diff against base {base_ref!r}: {exc}") from exc
