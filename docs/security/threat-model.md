@@ -195,6 +195,7 @@ exact implementation PR head:
 | F-HYG-01 | Dependabot updates config (alerts ≠ updates) | Paperclip child card (see above) |
 | F-HYG-02 | CI lint banning internal ids/hosts/agent names in public text | Paperclip child card (see above) |
 | F-HYG-03 | PR-template secrets affirmation checkbox | Paperclip child card (see above) |
+| F-DEL-01 | Account-deletion fence gaps (required by ADR 0002 rule 3, not yet implemented): auth/session writers carry no fence in either state — the `scheduled`-only bound lands with the cancel-deletion and executor slice; no stream production sink exists (only `LEDGER_WRITE_FENCE_SQL` plus the in-memory `UsageLedger::record_fenced` mirror) | Paperclip child card (mapping in the threat-model card thread, never pasted here) |
 
 V1 lessons carried forward: per-user resource authorization precedes lookup (no
 existence oracles — cf. avatar-oracle fix); every credential-adjacent finding
@@ -305,7 +306,8 @@ violate it.
   on a runtime-only API-base override that the compiled
   `media-src`/`connect-src` does not cover (browser blocks the calls the
   client tries to make).
-## 12. Account-deletion writer fence (implemented in the merged deletion slices)
+
+## 12. Account-deletion writer fence (fenced writers merged; auth/session bound and stream sink required)
 
 Account deletion first marks `users.deleting_at` and records the
 operation as `scheduled` with a 24-hour cancellable grace window (ADR
@@ -325,6 +327,12 @@ rows; the caller disambiguates with the lock-free probe
 rejection, 0 rows + fence open (or user gone) stays not-found, and a
 landed write is never reclassified.
 
+Status at this head: the api vault/lease/library fences and the ingest
+upsert fence below are merged; the auth/session `scheduled`-only bound
+and the stream production sink are required by ADR 0002 rule 3 but not
+yet implemented (tracked as F-DEL-01 in §9). Required controls are
+labelled as such throughout — nothing below presents one as merged.
+
 Fenced writers (account-owned creates/restores, api/ingest/stream):
 
 - **api vault credential upsert** (`upsert_vault` in
@@ -339,8 +347,9 @@ Fenced writers (account-owned creates/restores, api/ingest/stream):
   the typed 409 `account_deleting` (probed once), never the boolean
   collapse.
 - **api library genre/playlist mutations** (`workers/api/src/library.rs`):
-  every create/restore statement carries the fence in-statement; 0
-  affected rows map via `fenced_write_outcome` to
+  every create/update/delete statement carries the fence in-statement
+  (user-initiated deletes are deliberately fenced — a 409 during grace);
+  0 affected rows map via `fenced_write_outcome` to
   `LibraryError::AccountDeleting` (HTTP 409) when the probe shows the
   marker set, else `NotFound`.
 - **ingest library upsert** (`workers/ingest/src/library.rs`): the write
@@ -348,9 +357,13 @@ Fenced writers (account-owned creates/restores, api/ingest/stream):
   through `upsert_job_result` to the permanent `account_deleting`
   failure — never retried behind the delete.
 - **stream usage-ledger / play-event write**
-  (`workers/stream/src/meter.rs`): the production sink selects through
+  (`workers/stream/src/meter.rs`): required, not yet implemented (F-DEL-01)
+  — no production sink exists (`workers/stream/README.md`: metering "is
+  not yet wired into the production `play()` path or production sinks";
+  `UsageLedger` is an in-memory portable-core model, not a live Hyperdrive
+  table). When the sink lands, its INSERT must select through
   `LEDGER_WRITE_FENCE_SQL`; the portable-core mirror
-  (`UsageLedger::record_fenced`) reports
+  (`UsageLedger::record_fenced`) already reports
   `RecordOutcome::AccountDeleting` and appends nothing, so a play can
   never repopulate a deleting account's ledger/event rows. Zero rows is
   ambiguous under `DO NOTHING` (a duplicate redelivery with an open
@@ -358,14 +371,19 @@ Fenced writers (account-owned creates/restores, api/ingest/stream):
   `DO UPDATE` or probe the fence first — healthy duplicates must never
   read as `account_deleting`.
 
-Exemptions (bounded, ADR 0002 rule 3): the auth/session writers needed
-to cancel during grace (new `sessions` login rows, magic-link
-issue/consume, challenge/assertion, sign-count updates, step-up
-begin/verify/consume, audit writes, rotation, cancel-deletion) are
-exempt ONLY while the account operation is in `state = 'scheduled'`
-(the only state where cancel can win the compare-and-set); once it is
-`running` those writers are fenced like any other. The executor's own
-cursor/state writes are exempt outright. Everything else fails closed.
+Exemptions (bounded, ADR 0002 rule 3 — required, not yet implemented,
+F-DEL-01): the auth/session writers needed to cancel during grace (new
+`sessions` login rows, magic-link issue/consume, challenge/assertion,
+sign-count updates, step-up begin/verify/consume, audit writes, rotation,
+cancel-deletion) MUST be exempt ONLY while the account operation is in
+`state = 'scheduled'` (the only state where cancel can win the
+compare-and-set); once it is `running` those writers must be fenced like
+any other. At this head those writers carry no fence in either state
+(plain INSERTs in `workers/api/src/worker_entry.rs`; routes and execution
+are later slices per `workers/api/src/account_deletion.rs`, and nothing
+yet gates on `delete_operations.state`) — the bound lands with the
+cancel-deletion and executor slice. The executor's own cursor/state
+writes are exempt outright. Everything else fails closed.
 
 Stable contract (`docs/api-errors.md` registry,
 `workers/api/src/api_error.rs`): HTTP **409**, `code:
@@ -385,13 +403,20 @@ security finding requiring a CISO disposition before merge):
   erasure pass already swept.
 - A fence that takes no lock (plain `deleting_at IS NULL` predicate
   without `FOR SHARE`): reopens the marker race the lock closes.
-- An exemption that outlives its bound: auth/session writers exempt
-  while the operation is `running`, any new exemption not tied to the
-  `scheduled` state, or executor writes touching user-owned state
-  beyond cursor/state. Post-grace logins, sessions, or step-up proofs
-  on a doomed account are a takeover/persistence path, not liveness.
-- Fencing a pure removal path (the `delete_vault` inversion): removals
-  must stay unfenced so erasure and cancel cleanup always land.
+- An exemption that outlives its bound (once the F-DEL-01 bound is
+  implemented): auth/session writers exempt while the operation is
+  `running`, any new exemption not tied to the `scheduled` state, or
+  executor writes touching user-owned state beyond cursor/state.
+  Post-grace logins, sessions, or step-up proofs on a doomed account are
+  a takeover/persistence path, not liveness. (The current absence of any
+  auth/session fence is the tracked F-DEL-01 gap, not a new violation of
+  this section.)
+- Fencing a pure removal path (the `delete_vault` inversion):
+  `delete_vault` and the erasure executor's own cleanup must stay
+  unfenced so erasure and cancel cleanup always land.
+  (User-initiated library/playlist UPDATE/DELETE statements are
+  deliberately fenced by design — a 409 during grace — and are not
+  covered by this rule.)
 - Replacing the 409 with any other shape: a retryable 5xx turns the
   fence into a retry storm behind a delete that never reopens (ingest
   must keep the permanent-failure mapping); a 404 misleads the client
