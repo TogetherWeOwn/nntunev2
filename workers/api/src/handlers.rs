@@ -3409,8 +3409,7 @@ mod tests {
         let pre = h.call_full("OPTIONS", QA_TEST_CODES_PATH, None, None, Some(ORIGIN));
         assert_eq!(pre.status, 404);
         assert_eq!(pre.body, r#"{"error":"not found"}"#);
-        let pre_unknown =
-            h.call_full("OPTIONS", "/api/no-such-seam", None, None, Some(ORIGIN));
+        let pre_unknown = h.call_full("OPTIONS", "/api/no-such-seam", None, None, Some(ORIGIN));
         assert_eq!(pre_unknown.status, 404);
         assert_eq!(pre_unknown.body, pre.body);
         let pre_no_origin = h.call_full("OPTIONS", QA_TEST_CODES_PATH, None, None, None);

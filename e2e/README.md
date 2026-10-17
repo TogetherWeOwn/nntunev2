@@ -154,11 +154,22 @@ How the suite uses them:
   steps (`requireApiAccount`) refuse to run anonymously. The identity that
   ingests always completes the BYOP wizard first (shared
   `completeByopWizard` helper), because the ingest worker probes through the
-  user's provider connection. The over-limit check needs the seam to support
-  `{plan:"overlimit"}` (metering card); when the capped account's library is
-  empty the harness ingests the fixture as that account, so no pre-seeded
-  track is required. On CI an unavailable over-limit seam fails instead of
-  skipping, so plan-limit enforcement can never pass unexercised.
+  user's provider connection. The over-limit checks need the seam to support
+  `{plan:"overlimit"}` (metering card): the stream leg and the ingest leg
+  each mint their own capped account (never the journey identity, never each
+  other's) and run AFTER the browser legs at the end of the serial chain, so
+  a red-by-design capped-account failure skips no other verdict. The stream
+  leg requires the seam to pre-seed a streamable track on its capped account:
+  ingesting the fixture as the capped account would contradict the
+  ingest-refusal leg (the same ingest must be refused). An unavailable
+  over-limit seam fails instead of skipping — locally and on CI — so
+  plan-limit enforcement can never pass unexercised. Each leg asserts the
+  full refusal verdict (`assertPlanLimitRefusal` in `helpers/contract.ts`):
+  402/429 status, limit + reset headers (429 additionally requires
+  `retry-after`), the status-consistent limit code (`plan_limit_exceeded` on
+  402, `rate_limited` on 429) with a present, status-consistent retryable
+  flag, the upgrade CTA pointer (a matching key whose value points at
+  `/pricing`), and no secret leakage.
 
 ## CI
 

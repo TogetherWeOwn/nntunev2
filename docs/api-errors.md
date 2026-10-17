@@ -98,6 +98,34 @@ with HTTP 429 (and `Retry-After` where the worker knows a delay) for
 short-window throttling. `402` is never retryable: only an upgrade or the
 period reset changes the answer. `429` is always retryable.
 
+### Limit refusal wire (enforcement contract)
+
+When enforcement refuses an over-limit attempt, the refusal carries the
+limit facts a client needs to render the upgrade path instead of a
+dead-end error — asserted end to end by the over-limit e2e legs
+(`assertPlanLimitRefusal` in `e2e/helpers/contract.ts`, pinned offline in
+`e2e/tests/helpers.spec.ts`):
+
+- Headers: a header naming the limit (preferred `x-plan-limit`) and a
+  header naming the reset or retry (preferred `x-plan-reset`; `retry-after`
+  satisfies the retry side and stays required on 429). Both carry values.
+- Body: the envelope above plus an upgrade pointer (preferred
+  `upgrade_url` with value `/pricing`, the client's pricing route), so any
+  client can route the upgrade CTA without hardcoding it:
+
+```json
+{
+  "code": "plan_limit_exceeded",
+  "message": "plan limit reached",
+  "retryable": false,
+  "upgrade_url": "/pricing"
+}
+```
+
+Refusal bodies stay names-only: no account, credential, or provider
+material — the e2e legs fail a refusal that echoes the capped account's
+email/session or carries credential-shaped keys.
+
 ## Adding a code
 
 1. Add a registry row here (code, status, retryable, owning worker).

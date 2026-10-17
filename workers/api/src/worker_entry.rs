@@ -108,8 +108,8 @@ fn config_from_env(env: &Env) -> Option<Config> {
     // armed — an unflagged env never holds it in config.
     if truthy("QA_CODE_SEAM") {
         config = config.with_qa_code_seam(true);
-        if let Some(token) = env_string(env, "QA_AUTH_TOKEN")
-            .filter(|token| !token.trim().is_empty())
+        if let Some(token) =
+            env_string(env, "QA_AUTH_TOKEN").filter(|token| !token.trim().is_empty())
         {
             config = config.with_qa_auth_token(&token);
         }

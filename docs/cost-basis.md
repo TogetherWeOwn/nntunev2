@@ -298,3 +298,59 @@ slopes; PlanetScale storage grows linearly with the MusicBrainz mirror
    estimate and update the "checked" dates here if any price changed.
 4. Add the out-of-scope services named at the top before quoting a total
    as a complete infrastructure cost.
+
+## 10. First measured staging bill (2026-10-13 → 2026-10-17)
+
+First measurement against this worksheet, read 2026-10-17 via read-only
+Cloudflare API calls (no environment changed, no secret values read or
+recorded). Period covers the four days since staging provisioning
+(2026-10-13); raw 4-day inputs are shown monthlyized (×7.5) for the
+formulas. Figures are staging-attributable unless labeled account-level:
+staging and production share one Cloudflare account and one PlanetScale
+app cluster, so account-wide allowances apply once (section 7 rule).
+Account-wide Workers request/CPU and R2 bucket-level usage were not
+pulled in this reading, so shared-allowance exhaustion is not proven
+here — account totals below are context only, except where noted.
+
+Dashboard source links (no IDs, no screenshots):
+[Cloudflare dashboard](https://dash.cloudflare.com/)
+(Workers & Pages → Observability; R2 → bucket metrics; KV → namespace
+details; Queues → queue metrics; Analytics Engine → query),
+[PlanetScale dashboard](https://app.planetscale.com/) (cluster billing:
+provisioned disk, backup, egress). Unit prices are the public list
+prices linked in sections 1–6, unchanged on 2026-10-17.
+
+| Service | Measured staging input (raw 4d → /month) | Arithmetic | $/month |
+|---|---|---|---|
+| Workers | `nntune-web-staging` 17 requests in period (GraphQL `workersInvocationsAdaptive`, `date > 2026-10-13`); the only NNTune script among deployed account Workers — other account Workers outside NNTune were not metered. CPU ≈ 17 × p50 8,238 reported units ≈ 140 CPU-ms at µs/request (even at ms/request, ≈ 140k CPU-ms ≈ 0.5% of the 30M allowance). Monthlyized staging-attributable: R ≈ 128, C ≈ 1k–1M CPU-ms — staging overage 0 under either unit. Account-wide R/C not measured, so account-wide overage is unverified | 5.00 account-level base + max(0, ~0 − 10) × 0.30 + max(0, ~0 − 30) × 0.02 staging overage | 5.00 (account-level; staging-attributable overage 0) |
+| R2 | Staging-attributable G_staging/A/B estimated ~0 (not bucket-measured): the one deployed staging Worker has no R2 bindings (verified 2026-10-17, see `docs/ops.md`), and no stream/mb/api/ingest Worker exists to write. Bucket-level readings for 2026-10-13 → 2026-10-17 were not pulled — this row is estimated and excluded from the variance claim. Account-level context: 559 Standard objects / ~10.2 GiB (~11 billable GB-months after ceil) exceeds the 10 GB-month allowance, so the account storage free tier is already consumed by other ventures' data (account overage ~$0.015/mo, not staging's) | storage: ceil(G_staging) × 0.015 with G_staging ~ 0 (account storage allowance already exhausted); Class A/B inside allowances | 0.00 estimated |
+| KV | `nntunev2-config-staging`: 0 keys (API key-list, count 0); no writer deployed, so reads/writes/deletes/lists ≈ 0 | 0 (inside allowances) | 0.00 |
+| Queues (supplemental; not in acceptance rows) | `nntunev2-ingest-staging` + DLQ: backlog 0 messages / 0 bytes (API queue metrics). Historical billable-operation counts for the window were not pulled — cumulative delivery estimated ~0 from backlog/retention only, so this row is estimated and excluded from the variance claim | max(0, 0 − 1) × 0.40 (backlog-based estimate; ops unmeasured) | 0.00 estimated |
+| Analytics Engine (prospective; not billed, excluded from current total) | W ≈ 0, Q ≈ 0: no `stream` Worker deployed, so nothing writes to `nntune_meter` | — | 0.00 |
+| Hyperdrive | No line item beyond the Workers plan (section 1 source); 3 configs exist | — | 0.00 |
+| PlanetScale | Compute 2 × $5.00 host-reported (2026-10-13 receipt: app PS-5 single-node incl. staging + MB cluster; MB SKU unconfirmed, see `docs/ops.md`). Per-cluster storage/backup/egress meters not read — zero-overage unverified; the metered portion is excluded from the variance claim | 5.00 + 5.00 host-reported compute + unverified metered terms (0 assumed, not measured) | 10.00 host-reported (metered portion unverified) |
+| **Total (currently billed)** | | 5.00 + 10.00 | **15.00** (R2/Queues estimated; PlanetScale meters unverified) |
+
+Worksheet-variance check (rows >20% off expectation need a named
+follow-up): the worksheet implies base fees plus in-allowance usage, i.e.
+$15.00/mo. Measured rows (Workers staging overage, KV, Analytics Engine
+prospective, Hyperdrive) match that expectation (variance 0%). R2,
+Queues, and PlanetScale metered usage are unmeasured/unverified this
+round and excluded from the 0% claim — no >20% variance among measured
+rows, so **no variance follow-ups.** Next-reading follow-ups (not
+variances): pull R2 bucket-level G/A/B; pull Queues historical
+billable-operation metrics; pull PlanetScale per-cluster disk/backup/egress
+meters and confirm the MB SKU; pull account-wide Workers R/C.
+
+Measurement notes (not variances): R2 bucket-level readings, Queues
+historical operation metrics, PlanetScale metered-usage (disk/backup/egress
+GB) dashboard reads, and account-wide Workers R/C were not pulled — R2 and
+Queues sit at $0 by writer-absence/backlog evidence above (estimated, not
+measured); PlanetScale metered terms are assumed $0 from DB age and the
+not-yet-run ~100 GB MB import (unverified); re-confirm all four from the
+dashboards at the next reading. Account billing/credit-balance APIs reject
+the operator token (authentication error on `/billing/credits`,
+`/billable-usage`, `/billing/usage`), so plan-allowance coverage is
+asserted from usage volumes, not from a credit-balance read.
+
+Charter check: **yes — staging-attributable metered overage $0.00 (R2/Queues estimated, PlanetScale meters unverified, account-wide Workers/R2 overage unverified); fixed fees $15.00/mo ($5.00 Workers Paid account-level + $10.00 PlanetScale compute host-reported).**
