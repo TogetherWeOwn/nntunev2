@@ -16,8 +16,10 @@
 //! checkpoint for every real admission. The Queue consumer
 //! (`src/queue_consumer.rs`; Workflow steps in `queue::WORKFLOW_STEPS`)
 //! validates messages and checkpoints and executes the upload
-//! parse + pool-probe steps, but its search/verify/repair boundaries are
-//! not executable yet, so the consumer/workflow entries stay commented
+//! parse + pool-probe steps and the repair step (through the
+//! `REPAIR_CONTAINER` service binding; reachable only once verify can
+//! stage its inputs), but its search/verify boundaries are not
+//! executable yet, so the consumer/workflow entries stay commented
 //! out in `wrangler.toml.example` until they land.
 //! See `README.md`.
 

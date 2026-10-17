@@ -1,0 +1,85 @@
+# NNTune v2 repair Worker + per-job par2 repair Container.
+#
+# No public surface: `workers_dev = false` and no routes. The only
+# caller is the ingest Worker's `REPAIR_CONTAINER` service binding,
+# which must name this Worker's per-environment service name
+# (`nntune-repair` in production, `nntune-repair-staging` in staging).
+# One Durable Object per ingest job (`RepairContainer`, id = job id)
+# owns the Container, streams staged scratch objects in and repaired
+# outputs back, and is the only path to the Container's port.
+#
+# NOT YET DEPLOYED: shipping this config requires Cloudflare Containers
+# enabled on the existing plan (no new spend); deploy is an operator
+# action after that confirmation.
+
+name = "nntune-repair"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+workers_dev = false
+
+[build]
+command = "cargo install -q worker-build --locked && worker-build --release"
+
+[[containers]]
+class_name = "RepairContainer"
+image = "../../containers/repair/Dockerfile"
+# Sized to the repair budgets, not the default lite instance
+# (1/16 vCPU, 256 MiB, 2 GB): up to 8 GiB staged per round with one
+# working copy needs 20 GB disk; par2 gets 512 MiB address space and
+# 60 CPU-seconds inside a 120 s wall clock, which takes a full vCPU.
+instance_type = { vcpu = 1, memory_mib = 3072, disk_mb = 20000 }
+max_instances = 5
+
+[[durable_objects.bindings]]
+name = "REPAIR_JOBS"
+class_name = "RepairContainer"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RepairContainer"]
+
+# Top-level target is the default `wrangler deploy` (production). Named
+# environments below restate their own bindings (Cloudflare does not
+# inherit them); production keeps the top-level worker name so the
+# ingest service-binding contract resolves.
+[[r2_buckets]]
+binding = "INGEST_SCRATCH"
+bucket_name = "nntunev2-ingest-scratch-prod"
+
+[env.staging]
+name = "nntune-repair-staging"
+workers_dev = false
+[[env.staging.containers]]
+class_name = "RepairContainer"
+image = "../../containers/repair/Dockerfile"
+# Sized to the repair budgets, not the default lite instance
+# (1/16 vCPU, 256 MiB, 2 GB): up to 8 GiB staged per round with one
+# working copy needs 20 GB disk; par2 gets 512 MiB address space and
+# 60 CPU-seconds inside a 120 s wall clock, which takes a full vCPU.
+instance_type = { vcpu = 1, memory_mib = 3072, disk_mb = 20000 }
+max_instances = 5
+[[env.staging.durable_objects.bindings]]
+name = "REPAIR_JOBS"
+class_name = "RepairContainer"
+[[env.staging.r2_buckets]]
+binding = "INGEST_SCRATCH"
+bucket_name = "nntunev2-ingest-scratch-staging"
+
+[env.production]
+name = "nntune-repair"
+workers_dev = false
+[[env.production.containers]]
+class_name = "RepairContainer"
+image = "../../containers/repair/Dockerfile"
+# Sized to the repair budgets, not the default lite instance
+# (1/16 vCPU, 256 MiB, 2 GB): up to 8 GiB staged per round with one
+# working copy needs 20 GB disk; par2 gets 512 MiB address space and
+# 60 CPU-seconds inside a 120 s wall clock, which takes a full vCPU.
+instance_type = { vcpu = 1, memory_mib = 3072, disk_mb = 20000 }
+max_instances = 5
+[[env.production.durable_objects.bindings]]
+name = "REPAIR_JOBS"
+class_name = "RepairContainer"
+[[env.production.r2_buckets]]
+binding = "INGEST_SCRATCH"
+bucket_name = "nntunev2-ingest-scratch-prod"

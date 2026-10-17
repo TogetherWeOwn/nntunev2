@@ -42,6 +42,8 @@ fn checkpoint_for(msg: &QueueMsg) -> JobCheckpoint {
         attempt: 1,
         repair_rounds: msg.repair_rounds,
         probe_tally: None,
+        par2_set_id: None,
+        missing_blocks: 0,
         failure_code: None,
         failure_reason: None,
     }

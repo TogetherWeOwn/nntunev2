@@ -64,7 +64,11 @@ pub struct QueueMsg {
     pub payload_ref: Option<String>,
 }
 
-/// Native par2 repair dispatched to the Container batch job.
+/// Native par2 repair dispatched to the Container batch job via the
+/// no-route repair Worker. `scratch_prefix` must be exactly
+/// `ingest-scratch/{job_id}/r{round}/` (see
+/// `nntune_core::par2::scratch`); the repair Worker rebuilds it from
+/// `(job_id, round)` and rejects anything else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepairRequest {
     pub job_id: String,
@@ -72,6 +76,12 @@ pub struct RepairRequest {
     pub idempotency_key: String,
     pub par2_set_id: String,
     pub missing_blocks: u32,
+    /// 1-based repair round, bounded by `jobs::MAX_REPAIR_ROUNDS`.
+    #[serde(default)]
+    pub round: u32,
+    /// Canonical scratch prefix the staged inputs live under.
+    #[serde(default)]
+    pub scratch_prefix: String,
 }
 
 /// Final library write after tag/fingerprint + MusicBrainz match.

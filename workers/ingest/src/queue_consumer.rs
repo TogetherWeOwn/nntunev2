@@ -57,12 +57,15 @@
 //! cap-sized job finishes in ~30 continuations, each asking only the
 //! batches its tally has not yet recorded.
 //!
-//! No other live runtime boundary is claimed: indexer search (hence
-//! probing for search-sourced jobs), verify and repair
-//! steps have no executable consumer wiring yet, so those states settle
-//! as transient failures through the shared retry budget. The consumer
-//! therefore stays disabled in `wrangler.toml.example` until those
-//! boundaries land.
+//! `Repairing` is also executable (it calls the repair Worker through
+//! the `REPAIR_CONTAINER` service binding and returns to `Verifying`),
+//! but it is only reachable once verify can stage its inputs, and
+//! `Matching`/`Writing` run for real. No other live runtime boundary
+//! is claimed: indexer search (hence probing for search-sourced jobs)
+//! and the verify step have no executable consumer wiring yet, so
+//! those states settle as transient failures through the shared retry
+//! budget. The consumer therefore stays disabled in
+//! `wrangler.toml.example` until those boundaries land.
 
 use futures_util::StreamExt;
 use worker::{console_log, Date, Env, MessageBuilder, MessageExt, QueueRetryOptionsBuilder};
@@ -222,6 +225,63 @@ fn unavailable_code(state: JobState) -> &'static str {
         JobState::Matching => ERR_MATCH_FAILED,
         JobState::Writing => ERR_WRITE_FAILED,
         _ => ERR_PROBE_FAILED,
+    }
+}
+
+/// Run the `Repairing` step: dispatch the recorded repair request to
+/// the repair Worker, then return to `Verifying` on success. Verify has
+/// no executable wiring yet, so a repaired job then settles as a
+/// transient verify-boundary failure (same posture as `Parsing`).
+/// A checkpoint in `Repairing` without recorded verify inputs is a
+/// permanent failure: there is nothing a redelivery could add.
+async fn run_repair_step(env: &Env, cp: &mut JobCheckpoint) -> Result<(), JobError> {
+    use crate::repair::RepairCall;
+
+    let Some(par2_set_id) = cp.par2_set_id.clone() else {
+        return Err(JobError::permanent(
+            ERR_REPAIR_FAILED,
+            "repair inputs missing from checkpoint",
+        ));
+    };
+    let req = match crate::repair::decide_repair(
+        &cp.job_id,
+        &cp.user_id,
+        &cp.idempotency_key,
+        &par2_set_id,
+        cp.missing_blocks,
+        cp.repair_rounds,
+    ) {
+        Ok(Some(req)) => req,
+        Ok(None) => {
+            advance_checkpoint(cp, false);
+            return Err(JobError::transient(
+                ERR_VERIFY_FAILED,
+                "ingest runtime boundary unavailable",
+            ));
+        }
+        Err(_) => {
+            return Err(JobError::permanent(
+                ERR_REPAIR_FAILED,
+                "repair request cannot be built from checkpoint",
+            ))
+        }
+    };
+    match crate::repair::call_repair(env, &req).await {
+        RepairCall::Repaired => {
+            advance_checkpoint(cp, false);
+            Err(JobError::transient(
+                ERR_VERIFY_FAILED,
+                "ingest runtime boundary unavailable",
+            ))
+        }
+        RepairCall::Unrepairable => Err(JobError::permanent(
+            ERR_REPAIR_FAILED,
+            "par2 repair reported the set unrepairable",
+        )),
+        RepairCall::Retry => Err(JobError::transient(
+            ERR_REPAIR_FAILED,
+            "repair runtime unavailable",
+        )),
     }
 }
 
@@ -449,14 +509,18 @@ async fn load_parsed_upload(env: &Env, msg: &QueueMsg) -> Result<ParsedNzb, JobE
 /// delivery resumes probing. Completed probing advances to
 /// `Verifying` and then still reports that (not yet wired) boundary as a
 /// transient failure, so the delivery settles through the shared retry
-/// budget instead of claiming progress it cannot finish.
+/// budget instead of claiming progress it cannot finish. `Repairing`
+/// dispatches to the repair Worker (see [`run_repair_step`]).
 /// `Matching`/`Writing` run for real ([`run_match_write`]). Every other
-/// non-terminal state (including `Probing` for search-sourced jobs, whose
-/// NZB bytes do not exist until the search step is wired) is a transient
-/// boundary failure today.
+/// non-terminal state (including `Probing` for search-sourced jobs,
+/// whose NZB bytes do not exist until the search step is wired) is a
+/// transient boundary failure today.
 async fn run_step(env: &Env, msg: &QueueMsg, cp: &mut JobCheckpoint) -> Result<(), JobError> {
     if cp.state == JobState::Queued {
         advance_checkpoint(cp, false);
+    }
+    if cp.state == JobState::Repairing {
+        return run_repair_step(env, cp).await;
     }
     if matches!(cp.state, JobState::Matching | JobState::Writing) {
         return run_match_write(env, msg, cp).await;
