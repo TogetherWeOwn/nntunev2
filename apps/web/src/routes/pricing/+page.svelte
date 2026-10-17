@@ -12,6 +12,10 @@
 	let pendingPlan: string | null = $state(null);
 
 	async function choose(planId: string) {
+		// Serialize plan selections: ignore any activation while a checkout
+		// request is already in flight (defense in depth alongside the
+		// disabled buttons below).
+		if (pendingPlan !== null) return;
 		checkoutError = null;
 		pendingPlan = planId;
 		try {
@@ -77,7 +81,7 @@
 						{#if plan.id === 'free'}
 							<a href="/signup?plan=free">Start trial</a>
 						{:else}
-							<button disabled={pendingPlan === plan.id} onclick={() => choose(plan.id)}>
+							<button disabled={pendingPlan !== null} onclick={() => choose(plan.id)}>
 								{pendingPlan === plan.id ? 'Starting…' : 'Choose'}
 							</button>
 						{/if}
