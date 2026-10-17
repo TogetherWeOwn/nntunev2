@@ -32,4 +32,4 @@ nntune-core = { path = "../../crates/nntune-core", features = ["native-tls"] }
 nntune-test-nntp = { path = "../../crates/nntune-test-nntp" }
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 quote = "1"
-syn = { version = "2", features = ["full"] }
+syn = { version = "3", features = ["full"] }
