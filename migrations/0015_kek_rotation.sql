@@ -1,4 +1,4 @@
--- NNTune v2 migration 0004: KEK re-wrap follow-up (docs/security/kek-rotation.md §2/§8).
+-- NNTune v2 migration 0015: KEK re-wrap follow-up (docs/security/kek-rotation.md §2/§8).
 --
 -- PlanetScale Postgres via Hyperdrive. Adds the authoritative re-wrap
 -- marker and the version index the re-wrap pass (§6) scans by. Before this
@@ -13,5 +13,5 @@
 -- (`WHERE kek_version < $1 ...`) and the per-version progress counts
 -- documented in §6, without a sequential scan of the vault table.
 
-ALTER TABLE provider_vaults ADD COLUMN rewrapped_at BIGINT NULL;
+ALTER TABLE provider_vaults ADD COLUMN IF NOT EXISTS rewrapped_at BIGINT NULL;
 CREATE INDEX IF NOT EXISTS idx_vault_kek_version ON provider_vaults (kek_version);

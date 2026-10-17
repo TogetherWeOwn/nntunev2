@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
-	import { ApiClient } from '#lib/api/client.js';
+	import { invalidateLibraryCache } from '#lib/library/cache.js';
+	import { ApiClient, ApiError } from '#lib/api/client.js';
 	import { stashSignedInEmail } from '#lib/signed-in-email.js';
 	import { serializePublicKeyCredential, toRequestOptions } from '#lib/webauthn.js';
 
@@ -22,8 +23,8 @@
 			await client.requestMagicLink(email.trim());
 			// Generic either way: the API never reveals which emails exist.
 			status = 'sent';
-		} catch {
-			status = 'error';
+		} catch (error) {
+			status = error instanceof ApiError && error.paywall ? 'idle' : 'error';
 		}
 	}
 
@@ -75,10 +76,11 @@
 				signature
 			});
 			stashSignedInEmail(email.trim());
+			invalidateLibraryCache();
 			window.location.href = '/onboarding/provider';
-		} catch {
+		} catch (error) {
 			// Generic: login errors stay non-enumerating, like the API.
-			passkeyStatus = 'error';
+			passkeyStatus = error instanceof ApiError && error.paywall ? 'idle' : 'error';
 		}
 	}
 </script>

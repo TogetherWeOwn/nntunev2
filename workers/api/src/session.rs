@@ -18,6 +18,20 @@ type HmacSha256 = Hmac<Sha256>;
 pub const CLOCK_SKEW_SECS: u64 = 60;
 /// Absolute lifetime from authentication, not refreshed by rotation (one day).
 pub const MAX_SESSION_SECS: u64 = 86_400;
+/// Freshness window for privilege-gated operations (10 minutes). A session
+/// whose authentication age (`now - created_at`) exceeds this window must
+/// re-authenticate before a privilege change, even though the session itself
+/// is still valid for ordinary operations. Measured from the immutable
+/// `created_at`, never from `issued_at`: rotation must not restore freshness.
+pub const PRIVILEGE_REAUTH_WINDOW_SECS: u64 = 600;
+/// Stable, user-facing error code the HTTP layer returns (in the structured
+/// error envelope) when a privilege-gated op needs fresh authentication.
+/// Reused by every privilege gate; do not invent a second code.
+pub const REAUTH_REQUIRED_CODE: &str = "reauth_required";
+/// Stable code for a dead session (bad signature, revoked, expired, ...).
+/// Never equal to [`REAUTH_REQUIRED_CODE`]: a dead session must not be
+/// reported as merely stale.
+pub const INVALID_SESSION_CODE: &str = "invalid_session";
 /// Cookie name for the web session.
 ///
 /// The `__Host-` prefix locks out `Domain=` overrides by construction:
@@ -73,6 +87,14 @@ fn new_session_id() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
     Invalid,
+    /// The session is valid for ordinary operations but was authenticated
+    /// outside [`PRIVILEGE_REAUTH_WINDOW_SECS`]: the caller must complete a
+    /// fresh authentication proof before a privilege change. Distinct from
+    /// [`SessionError::Invalid`] so the client prompts for re-auth instead
+    /// of treating the session as dead.
+    ReauthRequired,
+    /// The session verifier is not correctly configured (for example, key too short).
+    Misconfigured,
     /// The revoke did not commit (storage failure). The handler must NOT
     /// clear the session cookie: return a retryable 5xx so the caller keeps
     /// the only credential that can authenticate a retry. Carries the
@@ -82,14 +104,47 @@ pub enum SessionError {
     },
 }
 
+/// Stable code for a storage failure (revoke did not commit). Never equal
+/// to [`INVALID_SESSION_CODE`]: the caller's cookie is still live and must
+/// be kept for a retry, so a store failure must not be reported as a dead
+/// session.
+pub const STORE_UNAVAILABLE_CODE: &str = "store_unavailable";
+
+impl SessionError {
+    /// Stable code for the structured error envelope.
+    pub fn code(&self) -> &'static str {
+        match self {
+            SessionError::Invalid => INVALID_SESSION_CODE,
+            SessionError::ReauthRequired => REAUTH_REQUIRED_CODE,
+            SessionError::Misconfigured => "internal_error",
+            SessionError::Storage { .. } => STORE_UNAVAILABLE_CODE,
+        }
+    }
+
+    /// HTTP status for the envelope (mirrors `LibraryError::http_status`).
+    /// Store failures are a retryable 5xx: the revoke did not commit, so
+    /// the handler must NOT clear the cookie.
+    pub fn http_status(&self) -> u16 {
+        match self {
+            SessionError::Invalid => 401,
+            SessionError::ReauthRequired => 401,
+            SessionError::Misconfigured | SessionError::Storage { .. } => 500,
+        }
+    }
+}
+
 impl std::fmt::Display for SessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Generic: never leak why verification failed.
         match self {
-            // Generic: never leak why verification failed.
             Self::Invalid => write!(f, "invalid session"),
+            Self::Misconfigured => write!(f, "session service unavailable"),
             // Distinct from Invalid so the handler can return a retryable
             // 5xx without clearing the cookie; carries no secret material.
             Self::Storage { .. } => write!(f, "session store unavailable"),
+            // Distinct from Invalid so the handler prompts for re-auth
+            // instead of treating the session as dead; carries no reason.
+            Self::ReauthRequired => write!(f, "reauth required"),
         }
     }
 }
@@ -101,12 +156,12 @@ impl std::fmt::Display for SessionError {
 /// Minimum HMAC secret length (32 bytes / 256 bits). Every signing and
 /// verification entry point enforces it and fails closed: an unset env var
 /// that decodes to an empty slice, or any truncated secret, is
-/// [`SessionError::Invalid`] — never a working weak key.
+/// [`SessionError::Misconfigured`] — never a working weak key.
 pub const MIN_SECRET_LEN: usize = 32;
 
 fn check_secret_len(secret: &[u8]) -> Result<(), SessionError> {
     if secret.len() < MIN_SECRET_LEN {
-        return Err(SessionError::Invalid);
+        return Err(SessionError::Misconfigured);
     }
     Ok(())
 }
@@ -173,6 +228,9 @@ pub fn issue_session(
     now: u64,
     ttl_secs: u64,
 ) -> Result<String, SessionError> {
+    if ttl_secs == 0 {
+        return Err(SessionError::Invalid);
+    }
     let claims = SessionClaims {
         session_id: new_session_id(),
         user_id: user_id.to_string(),
@@ -225,9 +283,9 @@ pub fn verify_session(secret: &[u8], token: &str, now: u64) -> Result<SessionCla
 /// callers pass [`SessionKeys::single`] — a standing second secret would
 /// needlessly broaden the signing scope. Both secrets are length-checked
 /// up front, so a misconfigured short `previous` fails the whole call
-/// closed instead of silently narrowing the window. Both failures map to
-/// the same generic [`SessionError::Invalid`]; there is no oracle for
-/// which secret matched.
+/// closed instead of silently narrowing the window. A bad token maps to
+/// [`SessionError::Invalid`]; a short configured secret maps to
+/// [`SessionError::Misconfigured`] before token verification.
 pub fn verify_session_dual(
     keys: &SessionKeys<'_>,
     token: &str,
@@ -282,14 +340,18 @@ pub fn verify_stored_session(
 /// WHERE id/user_id/counter match AND revoked = FALSE, persisting the next
 /// counter and expiry. Require exactly one row and commit before Set-Cookie.
 /// Once committed, the previous token fails [`verify_stored_session`].
-/// For privilege changes, revoke the old row and use [`issue_session`] after
-/// reauthentication to create a NEW session id; never use refresh for that.
+/// For privilege changes, use [`reauthenticate_session`] after a fresh proof
+/// to prepare a NEW session id and conditional old-row revoke; never use
+/// refresh for that.
 pub fn rotate_session(
     keys: &SessionKeys<'_>,
     token: &str,
     now: u64,
     ttl_secs: u64,
 ) -> Result<String, SessionError> {
+    if ttl_secs == 0 {
+        return Err(SessionError::Invalid);
+    }
     // Dual path: a pre-cutover token verifies here and is re-signed below
     // with the primary, so rotation migrates sessions onto the new secret.
     let claims = verify_session_dual(keys, token, now)?;
@@ -312,6 +374,123 @@ pub fn rotate_session(
     // under the previous secret.
     let sig = sign(keys.primary, &payload_b64)?;
     Ok(format!("{}.{}", payload_b64, crate::b64::encode(&sig)))
+}
+
+/// Privilege gate: like [`verify_stored_session`], plus a freshness check
+/// on the immutable authentication time.
+///
+/// Runs the full stored-session check first (signature, row, counter,
+/// revocation, expiry) and maps ANY failure to [`SessionError::Invalid`]:
+/// an unauthenticated or revoked caller never receives the re-auth code
+/// (no oracle). Only a session that is otherwise valid but whose
+/// authentication age `now.saturating_sub(created_at)` exceeds
+/// [`PRIVILEGE_REAUTH_WINDOW_SECS`] returns
+/// [`SessionError::ReauthRequired`]. The boundary is inclusive: an age
+/// exactly equal to the window passes.
+///
+/// Privilege-gated handlers call this instead of
+/// [`verify_stored_session`]; ordinary handlers are unchanged.
+pub fn require_fresh_session(
+    keys: &SessionKeys<'_>,
+    token: &str,
+    now: u64,
+    record: &SessionRecord,
+) -> Result<SessionClaims, SessionError> {
+    let claims =
+        verify_stored_session(keys, token, now, record).map_err(|_| SessionError::Invalid)?;
+    if now.saturating_sub(claims.created_at) > PRIVILEGE_REAUTH_WINDOW_SECS {
+        return Err(SessionError::ReauthRequired);
+    }
+    Ok(claims)
+}
+
+/// Prepared replacement session from [`reauthenticate_session`]: the token
+/// and row to insert, plus the one old session id to revoke. Pure data —
+/// the caller MUST atomically INSERT `new_record` and revoke exactly the
+/// old row using [`ReauthenticatedSession::revocation_claim`] in the SAME
+/// transaction as the INSERT. The conditional UPDATE must return exactly one
+/// row before the replacement is inserted; otherwise roll back and return
+/// [`SessionError::Invalid`]. Commit before sending the new cookie. This is a
+/// single-session revoke, never a logout-everywhere.
+#[derive(Debug, Clone)]
+pub struct ReauthenticatedSession {
+    pub token: String,
+    pub new_record: SessionRecord,
+    pub revoked_session_id: String,
+    pub revoked_user_id: String,
+    pub revoked_rotation_counter: u64,
+}
+
+impl ReauthenticatedSession {
+    /// Conditional claim for the old row. A concurrent revoke-all or
+    /// reauthentication makes this claim return no rows, preventing a new
+    /// session from surviving the concurrent revocation.
+    pub fn revocation_claim(&self) -> SessionRevokeClaim<'_> {
+        SessionRevokeClaim::Reauthentication {
+            session_id: &self.revoked_session_id,
+            user_id: &self.revoked_user_id,
+            rotation_counter: self.revoked_rotation_counter,
+        }
+    }
+}
+
+/// Mint a replacement session after a fresh authentication proof.
+///
+/// The caller must pass the user id returned by the verified fresh proof.
+/// Verifies the old token against its row first — any failure is
+/// [`SessionError::Invalid`] and nothing is minted — then rejects an empty
+/// or mismatched proof user before minting. The replacement uses a NEW
+/// session id under `keys.primary` only (never the rotation-window previous
+/// secret), with `created_at == issued_at == now`, `rotation_counter == 0`,
+/// and the expiry rules of [`issue_session`].
+///
+/// This is a pure prepare step, like [`rotate_session`]: the caller must
+/// execute the conditional revocation claim and INSERT in one transaction.
+pub fn reauthenticate_session(
+    keys: &SessionKeys<'_>,
+    old_token: &str,
+    now: u64,
+    old_record: &SessionRecord,
+    proven_user_id: &str,
+    ttl_secs: u64,
+) -> Result<ReauthenticatedSession, SessionError> {
+    if ttl_secs == 0 || proven_user_id.is_empty() {
+        return Err(SessionError::Invalid);
+    }
+    let old_claims = verify_stored_session(keys, old_token, now, old_record)
+        .map_err(|_| SessionError::Invalid)?;
+    if proven_user_id != old_claims.user_id {
+        return Err(SessionError::Invalid);
+    }
+    let next = SessionClaims {
+        session_id: new_session_id(),
+        user_id: old_claims.user_id.clone(),
+        created_at: now,
+        issued_at: now,
+        expires_at: now.saturating_add(ttl_secs.min(MAX_SESSION_SECS)),
+        rotation_counter: 0,
+    };
+    let payload = serde_json::to_vec(&next).expect("claims serialize");
+    let payload_b64 = crate::b64::encode(&payload);
+    // Always mint under the primary: re-auth migrates off the previous
+    // secret, never mints under it.
+    let sig = sign(keys.primary, &payload_b64)?;
+    let token = format!("{}.{}", payload_b64, crate::b64::encode(&sig));
+    let new_record = SessionRecord {
+        id: next.session_id.clone(),
+        user_id: next.user_id.clone(),
+        created_at: next.created_at,
+        expires_at: next.expires_at,
+        rotation_counter: 0,
+        revoked: false,
+    };
+    Ok(ReauthenticatedSession {
+        token,
+        new_record,
+        revoked_session_id: old_record.id.clone(),
+        revoked_user_id: old_claims.user_id,
+        revoked_rotation_counter: u64::from(old_claims.rotation_counter),
+    })
 }
 
 /// `Set-Cookie` header value. Always HttpOnly + Secure + SameSite=Lax,
@@ -380,8 +559,16 @@ pub enum SessionRevokeClaim<'a> {
         session_id: &'a str,
         user_id: &'a str,
     },
-    /// Parameter: user_id (from the verified token, never the request).
+    /// Parameters: user_id (from the verified token, never the request).
     AllForUser { user_id: &'a str },
+    /// Parameters: id, user_id, rotation_counter from the verified old row.
+    /// Reauthentication requires the old row to still be active and at the
+    /// verified counter, so concurrent logout-all or reauthentication wins.
+    Reauthentication {
+        session_id: &'a str,
+        user_id: &'a str,
+        rotation_counter: u64,
+    },
 }
 
 impl SessionRevokeClaim<'_> {
@@ -392,28 +579,48 @@ impl SessionRevokeClaim<'_> {
         match self {
             Self::Single { .. } => "UPDATE sessions SET revoked = TRUE WHERE id = $1 AND user_id = $2 AND revoked = FALSE RETURNING id",
             Self::AllForUser { .. } => "UPDATE sessions SET revoked = TRUE WHERE user_id = $1 AND revoked = FALSE RETURNING id",
+            Self::Reauthentication { .. } => "UPDATE sessions SET revoked = TRUE WHERE id = $1 AND user_id = $2 AND rotation_counter = $3 AND revoked = FALSE RETURNING id",
         }
     }
 
-    /// Values to bind, in `$1, $2` order. The Worker adapter binds from this
-    /// method so the statement text and the bound values cannot drift apart;
-    /// tests assert these values with a `session_id` that differs from the
-    /// `user_id` so a swapped bind fails.
+    /// Text values to bind for the leading placeholders (`$1`, then `$2`)
+    /// in statement order. For a reauthentication claim, bind
+    /// [`Self::rotation_counter`] as `$3` after these values.
     pub fn params(&self) -> Vec<&str> {
         match self {
             Self::Single {
                 session_id,
                 user_id,
+            }
+            | Self::Reauthentication {
+                session_id,
+                user_id,
+                ..
             } => vec![*session_id, *user_id],
             Self::AllForUser { user_id } => vec![*user_id],
+        }
+    }
+
+    /// Rotation counter to bind as `$3` for reauthentication claims, if any.
+    /// The value is the verified claim counter represented as `u64`; adapters
+    /// targeting the Postgres `INTEGER` column must use a checked conversion
+    /// (for example, `i32::try_from`) and fail closed on overflow.
+    pub fn rotation_counter(&self) -> Option<u64> {
+        match self {
+            Self::Reauthentication {
+                rotation_counter, ..
+            } => Some(*rotation_counter),
+            Self::Single { .. } | Self::AllForUser { .. } => None,
         }
     }
 }
 
 /// Worker/Hyperdrive boundary. Implementations must execute the conditional
-/// UPDATE from [`SessionRevokeClaim::statement`], binding
-/// [`SessionRevokeClaim::params`] in order, and return the number of rows it
-/// returned, NOT perform SELECT + unconditional UPDATE. Return
+/// UPDATE from [`SessionRevokeClaim::statement`], binding the text values from
+/// [`SessionRevokeClaim::params`] in order; for a reauthentication claim, bind
+/// [`SessionRevokeClaim::rotation_counter`] as `$3` (using a checked conversion
+/// to the database integer type). Return the number of rows returned, NOT
+/// perform SELECT + unconditional UPDATE. Return
 /// [`SessionError::Storage`] (with the claim's `user_id`) on storage
 /// failure. Revocation is effective only after the transaction commits; the
 /// response (including [`clear_cookie_header`]) may be sent only after
@@ -531,8 +738,8 @@ mod tests {
         // fail under the primary with no oracle for which secret matched.
         assert!(verify_session(primary, &old_token, now + 60).is_err());
         let wrong = SessionKeys::rotation(
-            b"wrong-1-00000000000000000000000",
-            b"wrong-2-00000000000000000000000",
+            b"wrong-1-000000000000000000000000",
+            b"wrong-2-000000000000000000000000",
         );
         assert_eq!(
             verify_session_dual(&wrong, &new_token, now + 60),
@@ -585,16 +792,145 @@ mod tests {
         let primary = b"primary-secret-00000000000000000000";
         let now = 1_700_000_000u64;
         // Minting under a weak key is refused, never issued.
-        assert!(issue_session(b"", "victim", now, 3600).is_err());
-        assert!(issue_session(b"short", "victim", now, 3600).is_err());
-        assert!(verify_session(b"", "x.y", now).is_err());
-        // An unset previous secret (empty slice) fails the whole call:
-        // a token minted under the empty key never verifies.
+        assert_eq!(
+            issue_session(b"", "victim", now, 3600),
+            Err(SessionError::Misconfigured)
+        );
+        assert_eq!(
+            issue_session(b"short", "victim", now, 3600),
+            Err(SessionError::Misconfigured)
+        );
+        assert_eq!(
+            verify_session(b"", "x.y", now),
+            Err(SessionError::Misconfigured)
+        );
+        // An unset previous secret (empty slice) fails the whole call
+        // before token verification.
         let empty_prev = SessionKeys::rotation(primary, b"");
-        assert!(verify_session_dual(&empty_prev, "x.y", now).is_err());
+        assert_eq!(
+            verify_session_dual(&empty_prev, "x.y", now),
+            Err(SessionError::Misconfigured)
+        );
         // The primary itself is length-checked even when a previous exists.
         let short_primary = SessionKeys::rotation(b"short", b"");
-        assert!(verify_session_dual(&short_primary, "x.y", now).is_err());
+        assert_eq!(
+            verify_session_dual(&short_primary, "x.y", now),
+            Err(SessionError::Misconfigured)
+        );
+    }
+
+    #[test]
+    fn reauthenticate_session_caps_ttl_at_absolute_lifetime() {
+        // Pins the `ttl_secs.min(MAX_SESSION_SECS)` cap in
+        // `reauthenticate_session`: uncapped, a ttl > MAX_SESSION_SECS
+        // mints a token `verify_session` rejects
+        // (`expires_at > created_at + MAX`) while the old row is already
+        // slated for revoke — a dead replacement and a lockout.
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let keys = SessionKeys::single(secret);
+        let now = 1_700_000_000u64;
+        // Stale for privilege ops, but the session itself is still valid.
+        let reauth_at = now + 1200;
+        let old_token = issue_session(secret, "user-1", now, 3600).expect("issue");
+        let old_record = record_for(&verify_session(secret, &old_token, now).expect("verify"));
+
+        let reauthed = reauthenticate_session(
+            &keys,
+            &old_token,
+            reauth_at,
+            &old_record,
+            "user-1",
+            MAX_SESSION_SECS * 3,
+        )
+        .expect("re-auth mints a capped replacement");
+        assert_eq!(reauthed.revoked_session_id, old_record.id);
+        assert_eq!(
+            reauthed.new_record.expires_at,
+            reauth_at.saturating_add(MAX_SESSION_SECS),
+            "re-auth TTL is capped at the absolute session lifetime"
+        );
+        let claims =
+            verify_session(secret, &reauthed.token, reauth_at).expect("capped token verifies");
+        assert_eq!(claims.expires_at, reauth_at + MAX_SESSION_SECS);
+        assert_eq!(claims.created_at, reauth_at);
+        assert_eq!(reauthed.new_record.expires_at, claims.expires_at);
+        // The replacement is live and fresh at the privilege gate.
+        assert!(
+            verify_stored_session(&keys, &reauthed.token, reauth_at, &reauthed.new_record).is_ok()
+        );
+        assert!(
+            require_fresh_session(&keys, &reauthed.token, reauth_at, &reauthed.new_record).is_ok()
+        );
+    }
+
+    #[test]
+    fn reauthentication_requires_matching_proof_identity_and_conditional_revoke() {
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let keys = SessionKeys::single(secret);
+        let now = 1_700_000_000u64;
+        let old_token = issue_session(secret, "user-a", now, 3600).expect("issue");
+        let old_record = record_for(&verify_session(secret, &old_token, now).expect("verify"));
+
+        assert_eq!(
+            reauthenticate_session(&keys, &old_token, now + 60, &old_record, "", 3600).unwrap_err(),
+            SessionError::Invalid,
+            "empty proof identity cannot mint a replacement"
+        );
+        assert_eq!(
+            reauthenticate_session(&keys, &old_token, now + 60, &old_record, "user-b", 3600)
+                .unwrap_err(),
+            SessionError::Invalid,
+            "a proof for another user cannot replace this session"
+        );
+
+        let replacement =
+            reauthenticate_session(&keys, &old_token, now + 60, &old_record, "user-a", 3600)
+                .expect("matching proof identity reauthenticates");
+        let claim = replacement.revocation_claim();
+        assert_eq!(
+            claim.statement(),
+            "UPDATE sessions SET revoked = TRUE WHERE id = $1 AND user_id = $2 AND rotation_counter = $3 AND revoked = FALSE RETURNING id"
+        );
+        assert_eq!(claim.params(), vec![old_record.id.as_str(), "user-a"]);
+        assert_eq!(
+            claim.rotation_counter(),
+            Some(u64::from(old_record.rotation_counter))
+        );
+        let store = RecordingRevokeStore {
+            outcome: Ok(1),
+            calls: std::cell::RefCell::new(Vec::new()),
+        };
+        assert_eq!(ready(store.revoke(claim)), Ok(1));
+        assert_eq!(
+            store.calls.borrow()[0].2,
+            Some(u64::from(old_record.rotation_counter)),
+            "the storage boundary must retain the third placeholder value"
+        );
+    }
+
+    #[test]
+    fn session_issuers_reject_zero_ttl() {
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let keys = SessionKeys::single(secret);
+        let now = 1_700_000_000u64;
+        let old_token = issue_session(secret, "user-1", now, 3600).expect("issue");
+        let old_record = record_for(&verify_session(secret, &old_token, now).expect("verify"));
+        assert_eq!(
+            reauthenticate_session(&keys, &old_token, now + 60, &old_record, "user-1", 0)
+                .unwrap_err(),
+            SessionError::Invalid,
+            "reauthentication must not return a dead replacement or slate the live row for revoke"
+        );
+        assert_eq!(
+            rotate_session(&keys, &old_token, now + 60, 0).unwrap_err(),
+            SessionError::Invalid,
+            "rotation must not return a dead token for a caller to persist"
+        );
+        assert_eq!(
+            issue_session(secret, "user-1", now, 0).unwrap_err(),
+            SessionError::Invalid,
+            "initial issuance must not mint a token that is invalid immediately"
+        );
     }
 
     #[test]
@@ -667,9 +1003,11 @@ mod tests {
         }
     }
 
+    type RecordedRevokeCall = (&'static str, Vec<String>, Option<u64>);
+
     struct RecordingRevokeStore {
         outcome: Result<u64, SessionError>,
-        calls: std::cell::RefCell<Vec<(&'static str, Vec<String>)>>,
+        calls: std::cell::RefCell<Vec<RecordedRevokeCall>>,
     }
 
     impl SessionRevokeStore for RecordingRevokeStore {
@@ -677,6 +1015,7 @@ mod tests {
             self.calls.borrow_mut().push((
                 claim.statement(),
                 claim.params().into_iter().map(str::to_owned).collect(),
+                claim.rotation_counter(),
             ));
             self.outcome.clone()
         }

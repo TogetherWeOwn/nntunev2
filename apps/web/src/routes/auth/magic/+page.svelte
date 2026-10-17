@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { ApiClient, ApiError } from '#lib/api/client.js';
+	import { invalidateLibraryCache } from '#lib/library/cache.js';
 	import {
 		clearSignedInEmail,
 		readSignedInEmail,
@@ -44,13 +45,20 @@
 		status = 'working';
 		try {
 			const result = await client.finishMagicLink(token);
+			invalidateLibraryCache();
 			// Show which account this is on the next screen, before any
 			// provider credential is typed.
 			if (typeof result.email === 'string' && result.email.length > 0) {
 				stashSignedInEmail(result.email);
 			}
 			window.location.href = '/onboarding/provider';
-		} catch {
+		} catch (error) {
+			if (error instanceof ApiError && error.paywall) {
+				// The token remains available; keep the explicit confirmation
+				// action so the user can retry once the global paywall clears.
+				status = 'confirm';
+				return;
+			}
 			// Generic: expired, already used, unknown and swap-guarded
 			// tokens all read the same, like the API. The token is left
 			// unspent, so its owner can still redeem it after signing out.
@@ -76,6 +84,7 @@
 			}
 			// A generic 401 means there is no live session to revoke.
 		}
+		invalidateLibraryCache();
 		clearSignedInEmail();
 		signedInEmail = null;
 		signingOut = false;

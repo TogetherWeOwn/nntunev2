@@ -8,7 +8,9 @@
  * sites, because all requests flow through {@link ApiClient}.
  */
 
+import { paywallFromResponse, type PaywallModel } from '../billing/planLimit.js';
 import type { ProviderForm } from '../vault-validation.js';
+import { parseErrorBody } from './errors.js';
 
 export type FetchFn = typeof fetch;
 
@@ -19,15 +21,39 @@ export interface ApiClientOptions {
 
 export class ApiError extends Error {
 	readonly status: number;
+	/** Registry code from the error envelope (`docs/api-errors.md`). */
 	readonly code: string;
+	/**
+	 * Paywall model for 402/429 plan-limit responses (already shown via the
+	 * layout listener); null for every other failure. Callers that also
+	 * render an inline error can use this to avoid duplicating the paywall.
+	 */
+	readonly paywall: PaywallModel | null;
+	/** Whether retrying the same request may succeed (envelope flag). */
+	readonly retryable: boolean;
 
-	constructor(status: number, code: string, message: string) {
+	constructor(
+		status: number,
+		code: string,
+		message: string,
+		paywall: PaywallModel | null = null,
+		retryable = false
+	) {
 		super(message);
 		this.name = 'ApiError';
 		this.status = status;
 		this.code = code;
+		this.paywall = paywall;
+		this.retryable = retryable;
 	}
 }
+
+/** Documented re-auth code (S7): stale provider credential. */
+export const PROVIDER_AUTH_EXPIRED_CODE = 'provider_auth_expired';
+
+/** Documented re-key code (S7): stale indexer API key. Distinct from the
+ * provider code: the web app names the API key (never the password) for it. */
+export const INDEXER_AUTH_EXPIRED_CODE = 'indexer_auth_expired';
 
 export interface MagicLinkResult {
 	ok: true;
@@ -232,6 +258,11 @@ export class ApiClient {
 		await this.post<unknown>('/v1/session/logout', {});
 	}
 
+	/** Revoke every session for the authenticated account. */
+	async revokeAllSessions(): Promise<{ ok: true }> {
+		return this.post<{ ok: true }>('/v1/session/revoke-all', {});
+	}
+
 	/** Start passkey enrollment; the API also mails the inbox-proof code. */
 	async registerStart(email: string): Promise<RegisterStartResponse> {
 		return this.post<RegisterStartResponse>('/v1/auth/passkey/register/start', { email });
@@ -254,6 +285,19 @@ export class ApiClient {
 	async loginFinish(input: LoginFinishInput): Promise<MagicLinkResult> {
 		return this.post<MagicLinkResult>(
 			'/v1/auth/passkey/login/finish',
+			toLoginFinishBody(input)
+		);
+	}
+
+	/** Start a passkey proof bound to the currently authenticated session. */
+	async reauthenticateStart(): Promise<LoginStartResponse> {
+		return this.post<LoginStartResponse>('/v1/session/reauthenticate/start', {});
+	}
+
+	/** Complete proof-bound reauthentication without affecting ordinary login. */
+	async reauthenticateFinish(input: LoginFinishInput): Promise<MagicLinkResult> {
+		return this.post<MagicLinkResult>(
+			'/v1/session/reauthenticate/finish',
 			toLoginFinishBody(input)
 		);
 	}
@@ -289,26 +333,17 @@ export class ApiClient {
 			credentials: 'include'
 		});
 		if (!response.ok) {
-			throw new ApiError(response.status, this.errorCode(response.status), await this.message(response));
+			// Read once so the paywall and typed error share the structured contract.
+			let body: unknown = null;
+			try {
+				body = await response.json();
+			} catch {
+				/* non-JSON error body: use status-based defaults */
+			}
+			const parsed = parseErrorBody(body, response.status);
+			const paywall = paywallFromResponse({ status: response.status, headers: response.headers, body });
+			throw new ApiError(response.status, parsed.code, parsed.message, paywall, parsed.retryable);
 		}
 		return (await response.json()) as T;
-	}
-
-	private errorCode(status: number): string {
-		if (status === 401) return 'unauthorized';
-		if (status === 403) return 'forbidden';
-		if (status === 404) return 'not_found';
-		if (status === 429) return 'rate_limited';
-		return 'request_failed';
-	}
-
-	private async message(response: Response): Promise<string> {
-		try {
-			const body = (await response.json()) as { error?: unknown };
-			if (typeof body.error === 'string' && body.error.length > 0) return body.error;
-		} catch {
-			// Fall through to the status-based message below.
-		}
-		return `request failed with status ${response.status}`;
 	}
 }

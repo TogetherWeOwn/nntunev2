@@ -61,14 +61,21 @@ jobs:
       # (2026-08-06); re-pin deliberately, never float.
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
+          components: clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Scalar core (no transport features) and the Workers transport build.
       - run: cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
       - run: cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features --features worker-transport
+      - run: cargo check -p nntune-config --target wasm32-unknown-unknown
       # The simd128 yEnc fast path must keep compiling (Workers run V8 with
       # Wasm SIMD; the deploy enables it via this RUSTFLAGS).
       - run: RUSTFLAGS="-C target-feature=+simd128" cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
+      # The stream Worker entry (NntpPool Durable Object) only compiles on
+      # wasm32: check and lint it on the target it deploys to. This also
+      # verifies the native-only stampede guard remains cfg'd out.
+      - run: cargo check -p nntune-stream --target wasm32-unknown-unknown
+      - run: cargo clippy -p nntune-stream --target wasm32-unknown-unknown -- -D warnings
 
   # Public-repo hygiene: fail on internal tracker ids (TOG-<digits>),
   # internal hostnames, instance-UI paths and agent names in tracked text.
@@ -86,6 +93,60 @@ jobs:
         run: python3 .github/scripts/public_text_lint.py
       - name: Unit-test the lint
         run: python3 .github/scripts/test_public_text_lint.py
+
+  # Wrangler binding parity: every worker config's required bindings
+  # (R2, KV, Queues, Hyperdrive, Analytics Engine, ...) must be present
+  # in both staging and prod and match the docs/ops.md inventory. The
+  # fixture pair proves the job goes red on drift: `match` must pass,
+  # `drift-missing` / `drift-skew` must fail.
+  binding-parity:
+    name: binding-parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Unit-test the parity check
+        run: python3 .github/scripts/test_binding_parity.py
+      - name: Parity check on this repo
+        run: python3 .github/scripts/binding_parity.py
+      - name: Parity check passes on the matching fixture
+        run: >-
+          python3 .github/scripts/binding_parity.py
+          --root .github/scripts/fixtures/binding-parity/match
+      - name: Parity check goes red on drift fixtures
+        run: |
+          for fixture in drift-missing drift-skew; do
+            if python3 .github/scripts/binding_parity.py \
+              --root ".github/scripts/fixtures/binding-parity/$fixture"; then
+              echo "binding-parity: $fixture fixture must fail but passed" >&2
+              exit 1
+            fi
+            echo "binding-parity: $fixture fixture correctly failed"
+          done
+
+  migrations-gate:
+    name: migrations-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Compare pushes with their previous tip; comparing main to itself would miss drift.
+    env:
+      MIGRATIONS_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000' && github.event.before || 'main' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify Python version
+        run: python3 -c "import sys, tomllib; assert sys.version_info >= (3, 11), sys.version"
+      - name: Check migration manifest and drift
+        run: python3 .github/scripts/migrations_gate.py --root . --base-ref "$MIGRATIONS_BASE_REF"
+      - name: Run migration gate self-tests
+        run: |
+          python3 .github/scripts/test_migrations_gate.py
+          python3 .github/scripts/test_migrations_gate_regressions.py
 
   test-nntp:
     name: test-nntp
@@ -117,15 +178,61 @@ jobs:
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
-      - run: cargo test --manifest-path workers/api/Cargo.toml --all-targets
-      - run: cargo clippy --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
+      # `--locked`: the committed workers/api/Cargo.lock is the audited
+      # dependency set for the auth/vault crypto crates. A missing or stale
+      # lockfile fails the build instead of silently re-resolving.
+      - run: cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets
+      - run: cargo clippy --locked --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/api/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate must check on that target
       # (native-only CI once missed a getrandom/RNG breakage there).
-      - run: cargo check --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo check --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
       # The Hyperdrive cache gate fails closed without credentials; pin its
       # exit codes with the built-in shim self-test (no network, no secrets).
       - run: bash workers/api/check_hyperdrive_cache.sh --self-test
+
+  mb-import-etl:
+    name: mb-import-etl
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run mb-import ETL fixture tests
+        run: bash containers/mb-import/tests/test_etl.sh
+
+  # Real-Postgres migration tests: applies every migrations/*.sql, in order,
+  # to an empty throwaway database (twice, to prove idempotency) and runs
+  # workers/api/tests/sql/*.sql against it. The database is an ephemeral
+  # service container; its password is a throwaway, not a secret.
+  api-migrations:
+    name: api-migrations
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        # Pinned by digest (`17` as of 2026-10-16); re-pin deliberately.
+        image: postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
+        env:
+          POSTGRES_PASSWORD: ci-throwaway
+          POSTGRES_DB: nntune_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d nntune_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Ensure psql client
+        run: command -v psql >/dev/null || (sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client)
+      - run: bash workers/api/tests/run_migration_tests.sh
+        env:
+          DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
 
   rust-mb:
     name: rust (workers/mb)
@@ -149,6 +256,23 @@ jobs:
       # (native-only CI once missed a getrandom/RNG breakage there).
       - run: cargo check --manifest-path workers/mb/Cargo.toml --target wasm32-unknown-unknown
 
+  # KV config staging/prod parity: both env fixtures must validate against
+  # config/schema.json with identical key sets (values may differ). Also runs
+  # the checker's self-tests over matching + drifted fixtures. Keep this job
+  # id in ci-ok's needs.
+  config-parity:
+    name: config-parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check staging/prod parity against schema
+        run: python3 .github/scripts/config_parity_check.py --schema config/schema.json --staging config/staging.json --prod config/prod.json
+      - name: Parity checker self-tests (matching + drifted fixtures)
+        run: python3 .github/scripts/test_config_parity_check.py
+
   rust-ingest:
     name: rust (workers/ingest)
     runs-on: ubuntu-latest
@@ -171,13 +295,69 @@ jobs:
       # (native-only CI once missed a getrandom/RNG breakage there).
       - run: cargo check --manifest-path workers/ingest/Cargo.toml --target wasm32-unknown-unknown
 
+  # mb-import container job: unit tests ride the workspace `rust-test` job
+  # (mb-import-validate is a member); this job runs the migrations plus the
+  # shell integration suite (chunked import, kill-resume, dupe-rerun, DLQ,
+  # refusal guards) against an ephemeral postgres service. Trust auth keeps
+  # passwords out of the workflow file. Keep this job id in ci-ok's needs.
+  mb-import:
+    name: mb-import integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18-bookworm
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build importer image from clean checkout
+        run: docker build -f containers/mb-import/Dockerfile -t mb-import:ci .
+      # Apply only the mirror-target migrations (base 0001 + importer 0014);
+      # app migrations need the full app schema and run in api-migrations.
+      - name: Apply mirror migrations
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_mb_mirror.sql -f migrations/0014_mb_import_resume_dlq.sql
+        env:
+          DATABASE_URL: host=localhost port=5432 user=postgres dbname=postgres
+      - name: Run import integration suite in the shipped image
+        run: >-
+          docker run --rm --network host
+          -e DATABASE_URL='host=localhost port=5432 user=postgres dbname=postgres'
+          -e ALLOW_TEST_TRUNCATE=1
+          -v "$GITHUB_WORKSPACE/containers/mb-import/test-import.sh:/job/test-import.sh:ro"
+          mb-import:ci bash /job/test-import.sh
+
+  # Cache policy: archive reservation guard (docs/cache-policy.md). Fails
+  # any Worker R2 binding that targets a reserved archive bucket.
+  # Keep this job id in ci-ok's needs.
+  cache-policy:
+    name: cache-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Archive reservation guard
+        run: python3 .github/scripts/check_archive_bindings.py
+      - name: Unit-test the guard
+        run: python3 .github/scripts/test_check_archive_bindings.py
+
   # E2E harness static checks: typecheck + spec discovery with no staging
   # needed, so every PR proves the harness still compiles. The live suite
   # runs in e2e-staging.yml (post-deploy). Keep this job id in ci-ok's needs.
   e2e-lint:
     name: e2e-lint
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -296,14 +476,23 @@ jobs:
           cache: pnpm
           cache-dependency-path: apps/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
-      - run: pnpm exec playwright install --with-deps chromium
-      - run: pnpm test:e2e
+      - name: Install Playwright chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Run apps/web Playwright suite
+        run: pnpm test:e2e
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-e2e-report
+          path: apps/web/test-results/
+          retention-days: 7
 
   # Aggregate required check: every dependency must succeed, including
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, test-nntp, api, rust-mb, rust-ingest, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text]
+    needs: [rust-test, rust-wasm, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, mb-import, config-parity, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

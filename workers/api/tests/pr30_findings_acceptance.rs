@@ -63,7 +63,7 @@
 //! literals (rejected-address pins use loopback, documentation ranges, or
 //! malformed hosts instead).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::IpAddr;
@@ -116,6 +116,7 @@ struct FakeStore {
     sessions: RefCell<HashMap<String, session::SessionRecord>>,
     vaults: RefCell<HashMap<String, handlers::VaultRow>>,
     audits: RefCell<Vec<vault::AuditEvent>>,
+    race_next_sign_count_advance: Cell<bool>,
     rate_limit_slots: RefCell<HashMap<(String, String, u32), u64>>,
     test_connection_leases: RefCell<HashMap<(String, u32), (String, u64)>>,
 }
@@ -234,6 +235,16 @@ impl handlers::Store for FakeStore {
         new: u32,
     ) -> Result<bool, handlers::StoreError> {
         let mut credentials = self.credentials.borrow_mut();
+        if self.race_next_sign_count_advance.replace(false) {
+            if let Some(credential) = credentials.get_mut(cred_id_b64url) {
+                if credential.sign_count == expected {
+                    // Model a concurrent conditional update winning after this
+                    // request read its snapshot but before its own CAS.
+                    credential.sign_count = new;
+                }
+            }
+            return Ok(false);
+        }
         match credentials.get_mut(cred_id_b64url) {
             Some(credential) if credential.sign_count == expected => {
                 credential.sign_count = new;
@@ -724,7 +735,7 @@ fn test_signing_key(seed: u8) -> p256::ecdsa::SigningKey {
 }
 
 fn es256_cose(key: &p256::ecdsa::SigningKey) -> Vec<u8> {
-    let point = key.verifying_key().to_encoded_point(false);
+    let point = key.verifying_key().to_sec1_point(false);
     let mut cose = Vec::new();
     cbor_head(5, 5, &mut cose);
     cbor_int(1, &mut cose);
@@ -851,7 +862,7 @@ fn register_flow(
 
     let key = test_signing_key(key_seed);
     let cred_id = format!("synthetic-cred-{key_seed}-{email}").into_bytes();
-    let auth_data = authenticator_data(RP, 0x41, 0, Some((&cred_id, &es256_cose(&key))));
+    let auth_data = authenticator_data(RP, 0x45, 0, Some((&cred_id, &es256_cose(&key))));
     let client_data = client_json("webauthn.create", &challenge, ORIGIN);
     let response = harness.call(
         "POST",
@@ -887,7 +898,7 @@ fn login_flow(
     let challenge = start["challenge"].as_str().expect("challenge").to_string();
 
     let key = test_signing_key(key_seed);
-    let auth_data = authenticator_data(RP, 0x01, sign_count, None);
+    let auth_data = authenticator_data(RP, 0x05, sign_count, None);
     let client_data = client_json("webauthn.get", &challenge, ORIGIN);
     let signature = es256_sign(&key, &auth_data, &client_data);
     let response = harness.call(
@@ -1158,7 +1169,7 @@ fn invite_budget_denies_eleventh_attempt_with_generic_error() {
     let challenge = start["challenge"].as_str().expect("challenge").to_string();
     let key = test_signing_key(12);
     let cred_id = b"throttled-cred".to_vec();
-    let auth_data = authenticator_data(RP, 0x41, 0, Some((&cred_id, &es256_cose(&key))));
+    let auth_data = authenticator_data(RP, 0x45, 0, Some((&cred_id, &es256_cose(&key))));
     let client_data = client_json("webauthn.create", &challenge, ORIGIN);
     let response = harness.call(
         "POST",
@@ -1322,7 +1333,7 @@ fn register_finish_rejects_login_purpose_challenge() {
 
     let key = test_signing_key(21);
     let cred_id = b"attacker-cred".to_vec();
-    let auth_data = authenticator_data(RP, 0x41, 0, Some((&cred_id, &es256_cose(&key))));
+    let auth_data = authenticator_data(RP, 0x45, 0, Some((&cred_id, &es256_cose(&key))));
     let client_data = client_json("webauthn.create", &login_challenge, ORIGIN);
     let response = harness.call(
         "POST",
@@ -1372,7 +1383,7 @@ fn login_finish_rejects_register_purpose_challenge() {
     .expect("rogue challenge stored");
 
     let key = test_signing_key(22);
-    let auth_data = authenticator_data(RP, 0x01, 1, None);
+    let auth_data = authenticator_data(RP, 0x05, 1, None);
     let client_data = client_json("webauthn.get", &rogue_id, ORIGIN);
     let signature = es256_sign(&key, &auth_data, &client_data);
     let response = harness.call(
@@ -1417,7 +1428,7 @@ fn register_finish_without_inbox_proof_enrolls_nothing() {
 
     let key = test_signing_key(23);
     let cred_id = b"fresh-cred".to_vec();
-    let auth_data = authenticator_data(RP, 0x41, 0, Some((&cred_id, &es256_cose(&key))));
+    let auth_data = authenticator_data(RP, 0x45, 0, Some((&cred_id, &es256_cose(&key))));
     let client_data = client_json("webauthn.create", &challenge, ORIGIN);
     let response = harness.call(
         "POST",
@@ -1578,7 +1589,7 @@ fn register_finish_rejects_replayed_challenge() {
 
     let key = test_signing_key(25);
     let cred_id = b"double-cred".to_vec();
-    let auth_data = authenticator_data(RP, 0x41, 0, Some((&cred_id, &es256_cose(&key))));
+    let auth_data = authenticator_data(RP, 0x45, 0, Some((&cred_id, &es256_cose(&key))));
     let client_data = client_json("webauthn.create", &challenge, ORIGIN);
     let finish = serde_json::json!({
         "challenge": challenge,
@@ -1615,7 +1626,7 @@ fn login_finish_rejects_replayed_assertion_clone() {
     let body: serde_json::Value = serde_json::from_str(&start.body).expect("JSON");
     let challenge = body["challenge"].as_str().expect("challenge").to_string();
     let key = test_signing_key(26);
-    let auth_data = authenticator_data(RP, 0x01, 1, None);
+    let auth_data = authenticator_data(RP, 0x05, 1, None);
     let client_data = client_json("webauthn.get", &challenge, ORIGIN);
     let signature = es256_sign(&key, &auth_data, &client_data);
     let replay = harness.call(
@@ -1802,7 +1813,7 @@ fn fixture_registration(key_seed: u8) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let key = test_signing_key(key_seed);
     let cred_id = format!("fixture-cred-{key_seed}").into_bytes();
     let cose = es256_cose(&key);
-    let auth_data = authenticator_data(RP, 0x41, 0, Some((&cred_id, &cose)));
+    let auth_data = authenticator_data(RP, 0x45, 0, Some((&cred_id, &cose)));
     (cred_id, cose, auth_data)
 }
 
@@ -1974,7 +1985,7 @@ fn attestation_rejects_oversized_and_truncated_inputs() {
 
     // Empty credential id is rejected.
     let empty_cred =
-        authenticator_data(RP, 0x41, 0, Some((&[], &es256_cose(&test_signing_key(36)))));
+        authenticator_data(RP, 0x45, 0, Some((&[], &es256_cose(&test_signing_key(36)))));
     let empty_object = none_attestation(&empty_cred);
     assert_eq!(
         webauthn::verify_attestation(&empty_object, &client_data, &expect),
@@ -1990,7 +2001,7 @@ fn assertion_enforces_clone_detection_and_counterless() {
     let expect = ceremony_expect(FIXTURE_CHALLENGE);
 
     let assert_with = |stored: u32, presented: u32| {
-        let auth_data = authenticator_data(RP, 0x01, presented, None);
+        let auth_data = authenticator_data(RP, 0x05, presented, None);
         let client_data = client_json("webauthn.get", FIXTURE_CHALLENGE, ORIGIN);
         let signature = es256_sign(&key, &auth_data, &client_data);
         webauthn::verify_assertion(&cose, stored, &auth_data, &client_data, &signature, &expect)
@@ -2012,7 +2023,7 @@ fn assertion_enforces_clone_detection_and_counterless() {
     );
 
     // Wrong challenge never verifies, even with a valid signature shape.
-    let auth_data = authenticator_data(RP, 0x01, 2, None);
+    let auth_data = authenticator_data(RP, 0x05, 2, None);
     let bad_client = client_json("webauthn.get", "another-challenge", ORIGIN);
     let signature = es256_sign(&key, &auth_data, &bad_client);
     assert_eq!(
@@ -2020,4 +2031,322 @@ fn assertion_enforces_clone_detection_and_counterless() {
         Err(webauthn::WebAuthnError::Invalid),
         "wrong challenge must be rejected"
     );
+}
+
+// --- PR #88 auth verification and challenge-purpose guard -------------------
+
+#[test]
+fn registration_requires_user_verification_and_keeps_failed_challenge_retryable() {
+    let harness = harness();
+    let email = "uv-register@example.com";
+    let start = harness.call(
+        "POST",
+        "/v1/auth/passkey/register/start",
+        serde_json::json!({"email": email}),
+    );
+    assert_eq!(start.status, 200, "{}", start.body);
+    let start: serde_json::Value = serde_json::from_str(&start.body).expect("JSON start");
+    let challenge = start["challenge"].as_str().expect("challenge").to_string();
+    let user_id = start["user_id"].as_str().expect("user id").to_string();
+    let magic_token = harness
+        .mailer
+        .sent
+        .borrow()
+        .iter()
+        .rev()
+        .find(|(address, _)| address == email)
+        .expect("signup proof was mailed")
+        .1
+        .clone();
+
+    let key = test_signing_key(41);
+    let cred_id = b"uv-register-credential";
+    let cose = es256_cose(&key);
+    let client_data = client_json("webauthn.create", &challenge, ORIGIN);
+    let presence_only = authenticator_data(RP, 0x41, 0, Some((cred_id, &cose)));
+    let rejected = harness.call(
+        "POST",
+        "/v1/auth/passkey/register/finish",
+        serde_json::json!({
+            "challenge": challenge,
+            "credential_id": b64::encode(cred_id),
+            "attestation_object": b64::encode(&none_attestation(&presence_only)),
+            "client_data_json": b64::encode(&client_data),
+            "magic_token": magic_token,
+            "invite_code": null,
+        }),
+    );
+    assert_eq!(rejected.status, 401, "presence-only enrollment must fail");
+    assert_eq!(rejected.body, GENERIC_AUTH_BODY);
+    assert!(rejected.set_cookie.is_none());
+    assert!(
+        block_on(harness.store.credentials_for_user(&user_id))
+            .expect("credential lookup")
+            .is_empty(),
+        "a presence-only ceremony must enroll no credential"
+    );
+
+    // Verification failure occurs before either single-use claim, so the
+    // same valid challenge and inbox proof can be retried with UV set.
+    let user_verified = authenticator_data(RP, 0x45, 0, Some((cred_id, &cose)));
+    let accepted = harness.call(
+        "POST",
+        "/v1/auth/passkey/register/finish",
+        serde_json::json!({
+            "challenge": challenge,
+            "credential_id": b64::encode(cred_id),
+            "attestation_object": b64::encode(&none_attestation(&user_verified)),
+            "client_data_json": b64::encode(&client_data),
+            "magic_token": magic_token,
+            "invite_code": null,
+        }),
+    );
+    assert_eq!(
+        accepted.status, 200,
+        "UV enrollment should work: {}",
+        accepted.body
+    );
+}
+
+#[test]
+fn login_requires_user_verification_before_consuming_the_challenge() {
+    let harness = harness();
+    let email = "uv-login@example.com";
+    let (_registration_cookie, credential_id) = register_flow(&harness, email, 42, None);
+    let sessions_before = harness.store.sessions.borrow().len();
+    let start = harness.call(
+        "POST",
+        "/v1/auth/passkey/login/start",
+        serde_json::json!({"email": email}),
+    );
+    assert_eq!(start.status, 200, "{}", start.body);
+    let start: serde_json::Value = serde_json::from_str(&start.body).expect("JSON start");
+    let challenge = start["challenge"].as_str().expect("challenge").to_string();
+    let key = test_signing_key(42);
+
+    let presence_only = authenticator_data(RP, 0x01, 1, None);
+    let client_data = client_json("webauthn.get", &challenge, ORIGIN);
+    let rejected = harness.call(
+        "POST",
+        "/v1/auth/passkey/login/finish",
+        serde_json::json!({
+            "challenge": challenge,
+            "credential_id": credential_id,
+            "authenticator_data": b64::encode(&presence_only),
+            "client_data_json": b64::encode(&client_data),
+            "signature": b64::encode(&es256_sign(&key, &presence_only, &client_data)),
+        }),
+    );
+    assert_eq!(rejected.status, 401, "presence-only login must fail");
+    assert_eq!(rejected.body, GENERIC_AUTH_BODY);
+    assert!(rejected.set_cookie.is_none());
+    assert_eq!(harness.store.sessions.borrow().len(), sessions_before);
+    let row = block_on(harness.store.challenge_by_id(&challenge))
+        .expect("challenge lookup")
+        .expect("challenge remains available");
+    assert!(
+        !row.challenge.consumed,
+        "failed UV verification must not burn the challenge"
+    );
+
+    let user_verified = authenticator_data(RP, 0x05, 1, None);
+    let accepted = harness.call(
+        "POST",
+        "/v1/auth/passkey/login/finish",
+        serde_json::json!({
+            "challenge": challenge,
+            "credential_id": credential_id,
+            "authenticator_data": b64::encode(&user_verified),
+            "client_data_json": b64::encode(&client_data),
+            "signature": b64::encode(&es256_sign(&key, &user_verified, &client_data)),
+        }),
+    );
+    assert_eq!(
+        accepted.status, 200,
+        "UV login should work: {}",
+        accepted.body
+    );
+    let credential = block_on(harness.store.credential_by_id(&credential_id))
+        .expect("credential lookup")
+        .expect("credential remains stored");
+    assert_eq!(credential.sign_count, 1);
+}
+
+#[test]
+fn enrollment_ignores_untrusted_attestation_counter_and_first_assertion_advances_it() {
+    let harness = harness();
+    let email = "counter-enrollment@example.com";
+    let start = harness.call(
+        "POST",
+        "/v1/auth/passkey/register/start",
+        serde_json::json!({"email": email}),
+    );
+    assert_eq!(start.status, 200, "{}", start.body);
+    let start: serde_json::Value = serde_json::from_str(&start.body).expect("JSON start");
+    let challenge = start["challenge"].as_str().expect("challenge").to_string();
+    let magic_token = harness
+        .mailer
+        .sent
+        .borrow()
+        .iter()
+        .rev()
+        .find(|(address, _)| address == email)
+        .expect("signup proof was mailed")
+        .1
+        .clone();
+
+    let key = test_signing_key(43);
+    let cred_id = b"counter-enrollment-credential";
+    let cose = es256_cose(&key);
+    let auth_data = authenticator_data(RP, 0x45, u32::MAX, Some((cred_id, &cose)));
+    let client_data = client_json("webauthn.create", &challenge, ORIGIN);
+    let registered = harness.call(
+        "POST",
+        "/v1/auth/passkey/register/finish",
+        serde_json::json!({
+            "challenge": challenge,
+            "credential_id": b64::encode(cred_id),
+            "attestation_object": b64::encode(&none_attestation(&auth_data)),
+            "client_data_json": b64::encode(&client_data),
+            "magic_token": magic_token,
+            "invite_code": null,
+        }),
+    );
+    assert_eq!(registered.status, 200, "{}", registered.body);
+
+    let credential_id = b64::encode(cred_id);
+    let credential = block_on(harness.store.credential_by_id(&credential_id))
+        .expect("credential lookup")
+        .expect("credential stored");
+    assert_eq!(
+        credential.sign_count, 0,
+        "attestation counter is unauthenticated"
+    );
+
+    let start = harness.call(
+        "POST",
+        "/v1/auth/passkey/login/start",
+        serde_json::json!({"email": email}),
+    );
+    assert_eq!(start.status, 200, "{}", start.body);
+    let start: serde_json::Value = serde_json::from_str(&start.body).expect("JSON start");
+    let login_challenge = start["challenge"].as_str().expect("challenge").to_string();
+    let assertion_data = authenticator_data(RP, 0x05, 1, None);
+    let assertion_client = client_json("webauthn.get", &login_challenge, ORIGIN);
+    let logged_in = harness.call(
+        "POST",
+        "/v1/auth/passkey/login/finish",
+        serde_json::json!({
+            "challenge": login_challenge,
+            "credential_id": credential_id,
+            "authenticator_data": b64::encode(&assertion_data),
+            "client_data_json": b64::encode(&assertion_client),
+            "signature": b64::encode(&es256_sign(&key, &assertion_data, &assertion_client)),
+        }),
+    );
+    assert_eq!(
+        logged_in.status, 200,
+        "first signed assertion should establish count: {}",
+        logged_in.body
+    );
+    let credential = block_on(harness.store.credential_by_id(&credential_id))
+        .expect("credential lookup")
+        .expect("credential stored");
+    assert_eq!(credential.sign_count, 1);
+}
+
+#[test]
+fn login_rejects_a_losing_sign_count_race_without_issuing_a_session() {
+    let harness = harness();
+    let email = "counter-race@example.com";
+    let (_registration_cookie, credential_id) = register_flow(&harness, email, 44, None);
+    let sessions_before = harness.store.sessions.borrow().len();
+    let start = harness.call(
+        "POST",
+        "/v1/auth/passkey/login/start",
+        serde_json::json!({"email": email}),
+    );
+    assert_eq!(start.status, 200, "{}", start.body);
+    let start: serde_json::Value = serde_json::from_str(&start.body).expect("JSON start");
+    let challenge = start["challenge"].as_str().expect("challenge").to_string();
+    let key = test_signing_key(44);
+    let auth_data = authenticator_data(RP, 0x05, 1, None);
+    let client_data = client_json("webauthn.get", &challenge, ORIGIN);
+    harness.store.race_next_sign_count_advance.set(true);
+
+    let response = harness.call(
+        "POST",
+        "/v1/auth/passkey/login/finish",
+        serde_json::json!({
+            "challenge": challenge,
+            "credential_id": credential_id.clone(),
+            "authenticator_data": b64::encode(&auth_data),
+            "client_data_json": b64::encode(&client_data),
+            "signature": b64::encode(&es256_sign(&key, &auth_data, &client_data)),
+        }),
+    );
+    assert_eq!(
+        response.status, 401,
+        "lost counter CAS must fail generically"
+    );
+    assert_eq!(response.body, GENERIC_AUTH_BODY);
+    assert!(response.set_cookie.is_none());
+    assert_eq!(harness.store.sessions.borrow().len(), sessions_before);
+    assert_eq!(harness.store.audits_with("auth.login"), 0);
+    let credential = block_on(harness.store.credential_by_id(&credential_id))
+        .expect("credential lookup")
+        .expect("credential stored");
+    assert_eq!(
+        credential.sign_count, 1,
+        "the concurrent winner advanced it"
+    );
+}
+
+#[test]
+fn audit_source_ip_is_a_canonical_single_ip_or_unknown() {
+    let clean = vault::audit_event("user", "auth.login", true, SOURCE_IP, NOW);
+    assert_eq!(clean.source_ip, SOURCE_IP);
+
+    let hostile = format!("{SOURCE_IP}\nFORGED ok=true");
+    let rejected = vault::audit_event("user", "auth.login", true, &hostile, NOW);
+    assert_eq!(rejected.source_ip, "unknown");
+}
+
+#[test]
+fn purpose_guard_migration_keeps_the_constraint_creation_strategy_pinned() {
+    let migration_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../migrations/0008_auth_challenge_purpose_guard.sql");
+    assert!(
+        migration_path.is_file(),
+        "purpose-guard migration must be present; this test does not apply it"
+    );
+    let migration = std::fs::read_to_string(&migration_path).expect("read purpose-guard migration");
+    let normalized = migration
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let expected_constraint_guard = format!(
+        concat!(
+            "do $$ begin if not exists ( ",
+            "select 1 from pg_constraint where ",
+            "conrelid = 'auth_challenges'::regclass and ",
+            "conname = 'auth_challenges_purpose_check' ) then ",
+            "alter table auth_challenges add constraint ",
+            "auth_challenges_purpose_check check (purpose in ('', '{}', '{}')); ",
+            "end if; end $$;"
+        ),
+        handlers::PURPOSE_REGISTER,
+        handlers::PURPOSE_LOGIN
+    );
+    assert!(normalized.contains(&expected_constraint_guard));
+    assert!(normalized.contains(
+        "if new.purpose is distinct from old.purpose then raise exception 'auth_challenges.purpose is immutable'"
+    ));
+    assert!(normalized
+        .contains("drop trigger if exists auth_challenges_purpose_immutable on auth_challenges"));
+    assert!(normalized.contains(
+        "create trigger auth_challenges_purpose_immutable before update of purpose on auth_challenges"
+    ));
+    assert!(normalized.contains("execute function auth_challenges_purpose_immutable()"));
 }

@@ -1,7 +1,9 @@
 //! Worker runtime wiring: env config, Hyperdrive Postgres store,
 //! DNS-over-HTTPS resolution, pinned-address socket probing, and the
-//! magic-link mailer webhook. Everything here adapts `handlers` traits
-//! to Cloudflare bindings; no security decisions live in this module.
+//! magic-link mailer webhook. Request security decisions live in
+//! `handlers`; startup fail-closed gates (env config plus the Hyperdrive
+//! caching-disabled attestation below) live here and refuse to serve
+//! traffic when the operator has not attested a cache-disabled config.
 //!
 //! Failures are opaque by construction: driver/DB errors map to
 //! [`handlers::StoreError`] without detail, and nothing in this module
@@ -45,6 +47,17 @@ fn env_string(env: &Env, name: &str) -> Option<String> {
 }
 
 fn config_from_env(env: &Env) -> Option<Config> {
+    // Runtime fail-closed gate for the Hyperdrive caching finding: auth
+    // reads are plain SELECTs through the HYPERDRIVE binding, so a
+    // caching-enabled config would serve stale sessions/credentials for
+    // up to ~75s. The Worker cannot inspect the Hyperdrive config at
+    // runtime, so the operator attests `HYPERDRIVE_CACHING_DISABLED=1`
+    // (set only after `check_hyperdrive_cache.sh` passes for that env).
+    // Without the attestation the Worker answers the same generic 500 as
+    // any other misconfiguration and serves no auth traffic.
+    if !hyperdrive_caching_disabled_attested(env_string(env, "HYPERDRIVE_CACHING_DISABLED")) {
+        return None;
+    }
     let rp_id = env_string(env, "RP_ID")?;
     let origin = env_string(env, "RP_ORIGIN")?;
     // Strict unpadded base64url for both secrets (`crate::b64`, F-HARD-01):
@@ -87,6 +100,15 @@ fn config_from_env(env: &Env) -> Option<Config> {
         session_previous_secret,
     )
     .ok()
+}
+
+/// Pure Hyperdrive caching attestation decision: `Some("1"/"true"/"TRUE")`
+/// in `HYPERDRIVE_CACHING_DISABLED` means the operator verified that env's
+/// Hyperdrive config has query caching disabled; anything else (missing,
+/// empty, any other value) refuses to start. Unit-tested below; the same
+/// truthy spelling as the other feature flags.
+fn hyperdrive_caching_disabled_attested(raw: Option<String>) -> bool {
+    matches!(raw.as_deref(), Some("1") | Some("true") | Some("TRUE"))
 }
 
 /// Pure rotation-matrix decision: the staged `SESSION_SECRET_PREVIOUS_BASE64`
@@ -515,6 +537,53 @@ impl Store for PgStore {
         Ok(rows.len() == 1)
     }
 
+    async fn replace_session_after_reauthentication(
+        &self,
+        replacement: &crate::session::ReauthenticatedSession,
+    ) -> Result<bool, StoreError> {
+        let claim = replacement.revocation_claim();
+        let params = claim.params();
+        let rotation_counter =
+            i32::try_from(claim.rotation_counter().ok_or(StoreError)?).map_err(|_| StoreError)?;
+        let created_at = i64_of(replacement.new_record.created_at)?;
+        let expires_at = i64_of(replacement.new_record.expires_at)?;
+        let new_counter =
+            i32::try_from(replacement.new_record.rotation_counter).map_err(|_| StoreError)?;
+        let mut client = self.connect().await?;
+        let transaction = client.transaction().await.map_err(|_| StoreError)?;
+        let rows = transaction
+            .query(
+                claim.statement(),
+                &[&params[0], &params[1], &rotation_counter],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        if rows.len() != 1 {
+            transaction.rollback().await.map_err(|_| StoreError)?;
+            return Ok(false);
+        }
+        if transaction
+            .execute(
+                "INSERT INTO sessions (id, user_id, created_at, expires_at, rotation_counter, revoked) \
+                 VALUES ($1, $2, $3, $4, $5, FALSE)",
+                &[
+                    &replacement.new_record.id,
+                    &replacement.new_record.user_id,
+                    &created_at,
+                    &expires_at,
+                    &new_counter,
+                ],
+            )
+            .await
+            .is_err()
+        {
+            transaction.rollback().await.map_err(|_| StoreError)?;
+            return Err(StoreError);
+        }
+        transaction.commit().await.map_err(|_| StoreError)?;
+        Ok(true)
+    }
+
     async fn revoke_session(&self, id: &str) -> Result<(), StoreError> {
         let client = self.connect().await?;
         client
@@ -643,6 +712,24 @@ impl Store for PgStore {
             )
             .await
             .map_err(|_| StoreError)?;
+        // O(1) fast-fail on the exhausted path (single source of truth:
+        // `handlers::RATE_LIMIT_EXHAUSTED_SQL`, pinned by statement-shape
+        // test): without this guard every denied request pays one DELETE
+        // plus `limit` conflicting upserts (~101 statements with 100 row
+        // locks for the 100-slot finish lookup budget). The slot loop below
+        // still claims atomically, so a concurrent race that passes this
+        // snapshot simply fails closed there.
+        let exhausted = client
+            .query_one(
+                handlers::RATE_LIMIT_EXHAUSTED_SQL,
+                &[&scope_key, &action, &now],
+            )
+            .await
+            .map_err(|_| StoreError)?
+            .get::<_, i64>(0);
+        if exhausted >= i64::try_from(limit).map_err(|_| StoreError)? {
+            return Ok(false);
+        }
         for slot in 0..limit {
             let slot = i32::try_from(slot).map_err(|_| StoreError)?;
             let rows = client
@@ -670,6 +757,29 @@ impl Store for PgStore {
             .execute(
                 "DELETE FROM auth_challenges WHERE expires_at <= $1",
                 &[&i64_of(now)?],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        Ok(())
+    }
+
+    async fn reap_unverified_users(
+        &self,
+        now: u64,
+        ttl_secs: u64,
+        protected_user_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        // Single source of truth lives in `handlers` (statement-shape test
+        // pins the purpose literal and the vault/session/magic exemptions):
+        // magic-only accounts and vault owners are never reaped, so a vault
+        // saved under a magic session cannot cascade-delete 24h later.
+        let cutoff = i64_of(now.saturating_sub(ttl_secs))?;
+        let now = i64_of(now)?;
+        let client = self.connect().await?;
+        client
+            .execute(
+                &handlers::reap_unverified_users_sql(),
+                &[&cutoff, &protected_user_id, &now],
             )
             .await
             .map_err(|_| StoreError)?;
@@ -797,7 +907,7 @@ async fn doh_query(host: &str, rrtype: &str) -> Vec<IpAddr> {
     url.query_pairs_mut()
         .append_pair("name", host)
         .append_pair("type", rrtype);
-    let mut headers = Headers::new();
+    let headers = Headers::new();
     if headers.set("accept", "application/dns-json").is_err() {
         return Vec::new();
     }
@@ -925,7 +1035,7 @@ impl Mailer for WebhookMailer {
             return Err(StoreError);
         }
         let body = magic_link_payload(&self.origin, email, token).to_string();
-        let mut headers = Headers::new();
+        let headers = Headers::new();
         headers
             .set("content-type", "application/json")
             .map_err(|_| StoreError)?;
@@ -953,22 +1063,39 @@ impl Mailer for WebhookMailer {
 
 // --- Fetch dispatch ------------------------------------------------------------------------------------
 
-fn render(
+fn render_header_pairs(
     response: &handlers::Response,
     cors: &[(&'static str, String)],
-) -> WorkerResult<Response> {
-    let mut headers = Headers::new();
-    headers.append("content-type", "application/json; charset=utf-8")?;
-    headers.append("cache-control", "no-store")?;
-    headers.append("x-content-type-options", "nosniff")?;
+) -> Vec<(&'static str, String)> {
+    let mut pairs = vec![
+        (
+            "content-type",
+            "application/json; charset=utf-8".to_string(),
+        ),
+        (
+            "content-security-policy",
+            "default-src 'none'; frame-ancestors 'none'".to_string(),
+        ),
+        ("cache-control", "no-store".to_string()),
+        ("x-content-type-options", "nosniff".to_string()),
+    ];
     if let Some(cookie) = &response.set_cookie {
-        headers.append("set-cookie", cookie)?;
+        pairs.push(("set-cookie", cookie.clone()));
     }
     // Credentialed CORS for the configured origin only: the exact header
     // set is decided by the unit-tested `cors_headers`; render only
     // appends it.
-    for (name, value) in cors {
-        headers.append(name, value)?;
+    pairs.extend(cors.iter().cloned());
+    pairs
+}
+
+fn render(
+    response: &handlers::Response,
+    cors: &[(&'static str, String)],
+) -> WorkerResult<Response> {
+    let headers = Headers::new();
+    for (name, value) in render_header_pairs(response, cors) {
+        headers.append(name, &value)?;
     }
     Ok(
         Response::from_body(ResponseBody::Body(response.body.clone().into_bytes()))?
@@ -1054,10 +1181,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         dialer: &SocketDialer,
         dns: &DohDns,
         now: worker::Date::now().as_millis() / 1000,
-        source_ip: headers_map
-            .get("cf-connecting-ip")
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string()),
+        source_ip: client_source_ip(&headers_map),
     };
     let response = handlers::handle(&ctx, &request).await;
     // Exact match only: the configured origin is the one frontend origin
@@ -1072,13 +1196,152 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     render(&response, &cors)
 }
 
+/// Client address for audit rows and rate-limit keys. Header data is not
+/// trusted: only a canonical IP literal survives, else `unknown`
+/// (`vault::sanitize_source_ip`). `headers` keys are lowercased.
+fn client_source_ip(headers: &HashMap<String, String>) -> String {
+    crate::vault::sanitize_source_ip(headers.get("cf-connecting-ip").map(String::as_str))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn client_source_ip_takes_only_a_clean_cf_connecting_ip() {
+        let headers = |value: Option<&str>| -> HashMap<String, String> {
+            value
+                .map(|v| ("cf-connecting-ip".to_string(), v.to_string()))
+                .into_iter()
+                .collect()
+        };
+        assert_eq!(
+            client_source_ip(&headers(Some("203.0.113.7"))),
+            "203.0.113.7"
+        );
+        assert_eq!(client_source_ip(&headers(None)), "unknown");
+        assert_eq!(
+            client_source_ip(&headers(Some("203.0.113.7\nINJECTED"))),
+            "unknown"
+        );
+        // Only the Cloudflare-set header counts, never a client-forgeable one.
+        let mut forged = HashMap::new();
+        forged.insert("x-forwarded-for".to_string(), "203.0.113.7".to_string());
+        assert_eq!(client_source_ip(&forged), "unknown");
+    }
+
     fn previous_43() -> String {
         // 32 bytes as unpadded base64url (43 chars), like the template.
         crate::b64::encode(&[7u8; 32])
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn assert_render_security_headers(response: &handlers::Response) {
+        let rendered = render(response, &[]).expect("response renders");
+        let headers = rendered.headers();
+        assert_eq!(rendered.status_code(), response.status);
+        assert_eq!(
+            headers
+                .get("content-type")
+                .expect("content-type header is readable")
+                .as_deref(),
+            Some("application/json; charset=utf-8")
+        );
+        assert_eq!(
+            headers
+                .get("content-security-policy")
+                .expect("CSP header is readable")
+                .as_deref(),
+            Some("default-src 'none'; frame-ancestors 'none'")
+        );
+        assert_eq!(
+            headers
+                .get("x-content-type-options")
+                .expect("nosniff header is readable")
+                .as_deref(),
+            Some("nosniff")
+        );
+        assert_eq!(
+            headers
+                .get("cache-control")
+                .expect("cache-control header is readable")
+                .as_deref(),
+            Some("no-store")
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn assert_render_security_headers(response: &handlers::Response) {
+        // wasm-bindgen Response accessors cannot run on native targets.
+        let headers = render_header_pairs(response, &[]);
+        assert!(headers.contains(&(
+            "content-security-policy",
+            "default-src 'none'; frame-ancestors 'none'".to_string()
+        )));
+        assert!(headers.contains(&("x-content-type-options", "nosniff".to_string())));
+        assert!(headers.contains(&("cache-control", "no-store".to_string())));
+    }
+
+    #[test]
+    fn render_adds_security_headers_to_successful_json() {
+        let response = handlers::Response {
+            status: 200,
+            body: r#"{"ok":true}"#.to_string(),
+            set_cookie: None,
+        };
+        let headers = render_header_pairs(&response, &[]);
+
+        assert!(headers.contains(&(
+            "content-type",
+            "application/json; charset=utf-8".to_string()
+        )));
+        assert_render_security_headers(&response);
+    }
+
+    #[test]
+    fn render_adds_security_headers_to_json_errors() {
+        let response = handlers::Response {
+            status: 400,
+            body: r#"{"error":"invalid request"}"#.to_string(),
+            set_cookie: None,
+        };
+
+        assert_render_security_headers(&response);
+    }
+
+    #[test]
+    fn render_preserves_empty_preflight_response() {
+        // OPTIONS preflight is an empty 204, not a JSON body. It shares
+        // render by design, so its response headers remain consistent too.
+        let response = handlers::Response {
+            status: 204,
+            body: String::new(),
+            set_cookie: None,
+        };
+        assert!(response.body.is_empty());
+        assert_render_security_headers(&response);
+    }
+
+    #[test]
+    fn hyperdrive_attestation_fails_closed_without_explicit_opt_in() {
+        // The Worker must not serve auth reads unless the operator
+        // attested a cache-disabled Hyperdrive config for that env.
+        assert!(hyperdrive_caching_disabled_attested(Some("1".to_string())));
+        assert!(hyperdrive_caching_disabled_attested(Some(
+            "true".to_string()
+        )));
+        assert!(hyperdrive_caching_disabled_attested(Some(
+            "TRUE".to_string()
+        )));
+        for raw in [
+            None,
+            Some(String::new()),
+            Some("0".to_string()),
+            Some("false".to_string()),
+            Some("yes".to_string()),
+        ] {
+            assert!(!hyperdrive_caching_disabled_attested(raw));
+        }
     }
 
     #[test]

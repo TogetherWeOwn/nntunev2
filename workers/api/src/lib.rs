@@ -3,6 +3,8 @@
 //! framework-agnostic HTTP handlers (`handlers`, native-tested against
 //! fake stores), and the Worker + Hyperdrive entry (`worker_entry`).
 
+pub mod account_deletion;
+pub mod api_error;
 pub mod auth;
 pub mod b64;
 pub mod handlers;

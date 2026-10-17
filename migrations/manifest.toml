@@ -1,0 +1,74 @@
+[[migration]]
+file = "0001_mb_mirror.sql"
+target = "mirror"
+sha256 = "47309207c2e87761477e4b74884454afd5c68916477be64a9c3bbc2d105723c3"
+
+[[migration]]
+file = "0002_auth_vault.sql"
+target = "app"
+sha256 = "e8833add4082e4e9951f63af28c37c0d82c50737a60dc572ce86334f565b8587"
+
+[[migration]]
+file = "0003_library.sql"
+target = "app"
+sha256 = "d0f04ec912e6e8de47a976d021f3ca3c02aee7f5a18d498cb75d6dff5a90e172"
+
+[[migration]]
+file = "0004_auth_challenge_purpose.sql"
+target = "app"
+sha256 = "835b78b01f0d181ea2e6e472bde00e33d19055fa12dfdefeb53782b515a3362e"
+
+[[migration]]
+file = "0005_atomic_rate_limits_and_leases.sql"
+target = "app"
+sha256 = "fb61dd289c72b159299e56d0b5a3bfb3734dc5516665a9225c0cce0ffd64bbce"
+
+[[migration]]
+file = "0006_account_deletion.sql"
+target = "app"
+sha256 = "6d222588102fbff8bd5096a42e669722262ba84014fc5865bfbf3b8c19894245"
+
+[[migration]]
+file = "0007_auth_challenge_user_fk.sql"
+target = "app"
+sha256 = "ce0350f7d08a251bbfab9a817d1c4c3dc72a7484cb2379869c5e6c11a0fb6791"
+
+[[migration]]
+file = "0008_auth_challenge_purpose_guard.sql"
+target = "app"
+sha256 = "35508144971de4bdf9919e28a6979963053fa7eb76956df1fd6e98dac004b595"
+
+[[migration]]
+file = "0009_metered_admission.sql"
+target = "app"
+sha256 = "e1f5d25c97c2eeb1e292a7761d34f9aaaed43133ddfb536e609a32f8e322f8d8"
+
+[[migration]]
+file = "0010_metered_admission_claim.sql"
+target = "app"
+sha256 = "007c434790b5d1433dd0e7f3787409afc9e802092b87aad86d7cd47d8dc87184"
+
+[[migration]]
+file = "0011_metered_admission_claim_epoch.sql"
+target = "app"
+sha256 = "50b645b72156218e83ce272c3fdfc97250df422563a2be0d30ad1ecfc72dea02"
+
+[[migration]]
+file = "0012_metered_admission_replay_window.sql"
+target = "app"
+sha256 = "6962f20adab4a64672f7c9a870d0e9e606ba8dc638a5b656e8720b0900134a4a"
+
+[[migration]]
+file = "0013_auth_challenge_reauth_purpose.sql"
+target = "app"
+sha256 = "848df4805ac18bc1312689f033c86e90417bd9d53bdbfbb0950813b00e9f0d64"
+
+[[migration]]
+file = "0014_mb_import_resume_dlq.sql"
+target = "mirror"
+sha256 = "8385253fbddb464361f30678cfb8464b7c3d73f7ae5614f0eced870876dcef88"
+
+[[migration]]
+file = "0015_kek_rotation.sql"
+target = "app"
+sha256 = "c12d9f869611df9d5a4203ba96089aea41c88e3c1e85714dfdcff2e9cf474529"

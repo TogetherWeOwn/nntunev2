@@ -2,12 +2,18 @@
 	import { onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { readSignedInEmail } from '#lib/signed-in-email.js';
+	import { serializePublicKeyCredential, toRequestOptions } from '#lib/webauthn.js';
 	import {
 		ApiClient,
 		ApiError,
 		toProviderTestInput,
 		type ProviderTestResult
 	} from '#lib/api/client.js';
+	import {
+		isIndexerAuthExpired,
+		isProviderAuthExpired,
+		reauthPromptFor
+	} from '#lib/provider-reauth.js';
 	import { validateIndexerUrl, validateProviderConfig } from '#lib/vault-validation.js';
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
@@ -38,6 +44,10 @@
 	let errors = $state<string[]>([]);
 	let testState = $state<'idle' | 'testing' | 'ok' | 'failed'>('idle');
 	let testDetail = $state('');
+	let reauthRequired = $state(false);
+	let reauthPasswordInput = $state<HTMLInputElement | null>(null);
+	let saveReauthRequired = $state(false);
+	let reauthState = $state<'idle' | 'working' | 'failed'>('idle');
 	let saveState = $state<'idle' | 'saving' | 'saved' | 'failed'>('idle');
 	let testedConfigKey = $state<string | null>(null);
 	let testRunId = 0;
@@ -48,6 +58,10 @@
 		if (tls && allowInsecurePlaintext) {
 			allowInsecurePlaintext = false;
 		}
+	});
+
+	$effect(() => {
+		if (reauthRequired) reauthPasswordInput?.focus();
 	});
 
 	function providerInput() {
@@ -67,6 +81,9 @@
 		testedConfigKey = null;
 		testState = 'idle';
 		testDetail = '';
+		reauthRequired = false;
+		saveReauthRequired = false;
+		reauthState = 'idle';
 		saveState = 'idle';
 	}
 
@@ -106,6 +123,7 @@
 		testedConfigKey = null;
 		testState = 'testing';
 		testDetail = '';
+		reauthRequired = false;
 		try {
 			const result: ProviderTestResult = await client.testProviderConnection(input);
 			if (runId !== testRunId || inputKey !== currentTestKey()) return;
@@ -123,12 +141,86 @@
 			}
 		} catch (error) {
 			if (runId !== testRunId || inputKey !== currentTestKey()) return;
+			if (error instanceof ApiError && error.paywall) {
+				// The global paywall owns the limit response; avoid a duplicate
+				// inline failure state beneath the modal.
+				testState = 'idle';
+				testDetail = '';
+				return;
+			}
 			testState = 'failed';
-			testDetail =
-				error instanceof ApiError && error.status === 404
-					? 'The API is not deployed yet — try again later.'
-					: 'Connection test failed. Check the details and try again.';
+			// Stale stored credential: inline re-auth prompt (S7), never a
+			// generic error page. The step-3 prompt renders its own password
+			// field (the step-1 form is unmounted by now) so the user re-enters
+			// the password in place; the session stays signed in.
+			if (error instanceof ApiError && isIndexerAuthExpired(error)) {
+				// Wrong secret for the password prompt: name the API key and
+				// point at the indexer step; never mount the password field.
+				testDetail =
+					reauthPromptFor(error.code) ??
+					'Your indexer rejected its API key. Go back to the indexer step and re-enter it.';
+			} else if (error instanceof ApiError && isProviderAuthExpired(error)) {
+				reauthRequired = true;
+				testDetail = reauthPromptFor(error.code) ?? 'Your provider password has expired.';
+			} else {
+				testDetail =
+					error instanceof ApiError && error.status === 404
+						? 'The API is not deployed yet — try again later.'
+						: 'Connection test failed. Check the details and try again.';
+			}
 		}
+	}
+
+	async function reauthenticateAndSave() {
+		if (reauthState === 'working') return;
+		const inputKey = currentTestKey();
+		if (testState !== 'ok' || testedConfigKey !== inputKey) return;
+		if (typeof PublicKeyCredential === 'undefined') {
+			reauthState = 'failed';
+			return;
+		}
+		reauthState = 'working';
+		try {
+			const options = await client.reauthenticateStart();
+			const assertion = await navigator.credentials.get({
+				publicKey: toRequestOptions({
+					challenge: options.challenge,
+					rpId: options.rp_id,
+					allowCredentials: []
+				})
+			});
+			if (!(assertion instanceof PublicKeyCredential)) throw new Error('no public-key credential');
+			const serialized = serializePublicKeyCredential(assertion);
+			const response = serialized.response as Record<string, unknown>;
+			const authenticatorData = response.authenticatorData;
+			const clientDataJson = response.clientDataJSON;
+			const signature = response.signature;
+			if (
+				typeof authenticatorData !== 'string' ||
+				typeof clientDataJson !== 'string' ||
+				typeof signature !== 'string' ||
+				typeof serialized.id !== 'string'
+			) {
+				throw new Error('credential missing assertion fields');
+			}
+			await client.reauthenticateFinish({
+				challenge: options.challenge,
+				credentialId: serialized.id,
+				authenticatorData,
+				clientDataJson,
+				signature
+			});
+			if (currentTestKey() !== inputKey || testedConfigKey !== inputKey) {
+				throw new Error('provider configuration changed after testing');
+			}
+		} catch {
+			reauthState = 'failed';
+			return;
+		}
+
+		// Reuse the normal save path so the in-flight state, tested-input guard,
+		// and paywall/error handling stay identical after reauthentication.
+		await save();
 	}
 
 	async function save() {
@@ -140,6 +232,8 @@
 		}
 
 		const runId = testRunId;
+		saveReauthRequired = false;
+		reauthState = 'idle';
 		saveState = 'saving';
 		try {
 			await client.saveProviderConfig(input);
@@ -147,8 +241,14 @@
 				saveState = 'saved';
 				window.location.href = '/library';
 			}
-		} catch {
-			if (runId === testRunId && inputKey === currentTestKey()) saveState = 'failed';
+		} catch (error) {
+			if (runId !== testRunId || inputKey !== currentTestKey()) return;
+			if (error instanceof ApiError && error.paywall) {
+				saveState = 'idle';
+				return;
+			}
+			saveReauthRequired = error instanceof ApiError && error.code === 'reauth_required';
+			saveState = 'failed';
 		}
 	}
 </script>
@@ -257,7 +357,7 @@
 				class="nt-button nt-button--ghost"
 				type="button"
 				onclick={() => backTo(2)}
-				disabled={saveState === 'saving'}
+				disabled={saveState === 'saving' || reauthState === 'working'}
 			>
 				Back
 			</button>
@@ -277,7 +377,7 @@
 					type="button"
 					onclick={save}
 						data-testid="byop-save"
-					disabled={saveState === 'saving' || saveState === 'saved'}
+					disabled={saveState === 'saving' || saveState === 'saved' || reauthState === 'working'}
 				>
 					{saveState === 'saved'
 						? 'Saved'
@@ -286,10 +386,54 @@
 							: 'Save provider'}
 				</button>
 			{:else if testState === 'failed'}
-				<p data-testid="byop-status" role="alert">{testDetail}</p>
+				{#if reauthRequired}
+					<div data-testid="byop-status" role="alert" aria-labelledby="reauth-heading">
+						<h3 id="reauth-heading">Provider credentials expired</h3>
+						<p>{testDetail}</p>
+						<p>
+							Re-enter your password below and test again — your session stays
+							signed in, and the new password is tested before it is saved.
+						</p>
+						<label>
+							Password
+							<input
+								name="reauthPassword"
+								bind:this={reauthPasswordInput}
+								type="password"
+								required
+								autocomplete="current-password"
+								bind:value={password}
+								oninput={() => {
+									// A changed password voids any earlier test result,
+									// but typing must not dismiss this prompt.
+									testedConfigKey = null;
+									saveState = 'idle';
+								}}
+							/>
+						</label>
+						<button class="nt-button" type="button" onclick={runTest}>Test again</button>
+					</div>
+				{:else}
+					<p data-testid="byop-status" role="alert">{testDetail}</p>
+				{/if}
 			{/if}
 			{#if saveState === 'saved'}
 				<p role="status">Saved. Your credentials are sealed in the encrypted vault.</p>
+			{:else if saveState === 'failed' && saveReauthRequired}
+				<div role="alert">
+					<p>Your session is too old to save provider details. Reauthenticate with your passkey to continue.</p>
+					<button
+						class="nt-button"
+						type="button"
+						onclick={reauthenticateAndSave}
+						disabled={reauthState === 'working'}
+					>
+						{reauthState === 'working' ? 'Verifying…' : 'Reauthenticate and save'}
+					</button>
+					{#if reauthState === 'failed'}
+						<p role="status">Reauthentication failed. <a href="/login">Sign in again</a> to continue.</p>
+					{/if}
+				</div>
 			{:else if saveState === 'failed'}
 				<p role="alert">Could not save. Your details were not stored — try again.</p>
 			{/if}
