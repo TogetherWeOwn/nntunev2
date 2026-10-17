@@ -175,7 +175,6 @@
 		if (reauthState === 'working') return;
 		const inputKey = currentTestKey();
 		if (testState !== 'ok' || testedConfigKey !== inputKey) return;
-		const input = currentTestInput();
 		if (typeof PublicKeyCredential === 'undefined') {
 			reauthState = 'failed';
 			return;
@@ -219,16 +218,9 @@
 			return;
 		}
 
-		reauthState = 'idle';
-		try {
-			await client.saveProviderConfig(input);
-			saveReauthRequired = false;
-			saveState = 'saved';
-			window.location.href = '/library';
-		} catch (error) {
-			saveReauthRequired = error instanceof ApiError && error.code === 'reauth_required';
-			saveState = 'failed';
-		}
+		// Reuse the normal save path so the in-flight state, tested-input guard,
+		// and paywall/error handling stay identical after reauthentication.
+		await save();
 	}
 
 	async function save() {
