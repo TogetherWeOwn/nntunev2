@@ -288,6 +288,12 @@ fn tag_u64(line: &[u8], key: &[u8]) -> Option<u64> {
 /// when it is present but empty, non-hex, non-UTF-8, or out of `u32` range.
 fn tag_hex_u32(line: &[u8], key: &[u8]) -> Option<Result<u32, YencError>> {
     let raw = tag_value(line, key)?;
+    // Pure ASCII hex digits only: rejects non-UTF-8 and empty values, and
+    // also the leading `+` that `from_str_radix` would otherwise accept.
+    // The radix parse then only fails on `u32` overflow.
+    if raw.is_empty() || !raw.iter().all(u8::is_ascii_hexdigit) {
+        return Some(Err(YencError::BadChecksum));
+    }
     let text = std::str::from_utf8(raw).map_err(|_| YencError::BadChecksum);
     Some(text.and_then(|t| u32::from_str_radix(t, 16).map_err(|_| YencError::BadChecksum)))
 }
