@@ -34,6 +34,32 @@ pub fn upsert_library_sql() -> &'static str {
      recording_mbids = EXCLUDED.recording_mbids"
 }
 
+/// One upsert's bound values, in [`UPSERT_PARAM_ORDER`] (`$1`..=`$5`)
+/// order. The edge executor binds exactly these values in field order;
+/// keeping the projection here lets the order be unit-tested without a
+/// database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpsertParams<'a> {
+    pub job_id: &'a str,
+    pub user_id: &'a str,
+    pub idempotency_key: &'a str,
+    pub release_mbid: Option<&'a str>,
+    pub recording_mbids: &'a [String],
+}
+
+/// Project a validated [`LibraryWrite`] into its bound parameters.
+/// Replaying the same write always yields the same parameters, which is
+/// what makes the `ON CONFLICT DO UPDATE` replay a no-op.
+pub fn upsert_params(write: &LibraryWrite) -> UpsertParams<'_> {
+    UpsertParams {
+        job_id: &write.job_id,
+        user_id: &write.user_id,
+        idempotency_key: &write.idempotency_key,
+        release_mbid: write.release_mbid.as_deref(),
+        recording_mbids: &write.recording_mbids,
+    }
+}
+
 /// Check a [`LibraryWrite`] before it touches the database.
 pub fn validate_library_write(write: &LibraryWrite) -> Result<(), &'static str> {
     if !validate_job_id(&write.job_id) {
@@ -114,6 +140,52 @@ mod tests {
         w = write();
         w.job_id.clear();
         assert!(validate_library_write(&w).is_err());
+    }
+
+    #[test]
+    fn upsert_params_follow_the_declared_order() {
+        let w = write();
+        let params = upsert_params(&w);
+        // Field order is the `$n` binding order in UPSERT_PARAM_ORDER.
+        let bound = [
+            params.job_id,
+            params.user_id,
+            params.idempotency_key,
+            params.release_mbid.unwrap(),
+        ];
+        assert_eq!(
+            bound,
+            [
+                w.job_id.as_str(),
+                w.user_id.as_str(),
+                w.idempotency_key.as_str(),
+                w.release_mbid.as_deref().unwrap(),
+            ]
+        );
+        assert_eq!(params.recording_mbids, w.recording_mbids.as_slice());
+        assert_eq!(
+            UPSERT_PARAM_ORDER,
+            [
+                "job_id",
+                "user_id",
+                "idempotency_key",
+                "release_mbid",
+                "recording_mbids"
+            ]
+        );
+        // An unmatched write binds NULL release and an empty recording list.
+        let mut unmatched = write();
+        unmatched.release_mbid = None;
+        unmatched.recording_mbids.clear();
+        let params = upsert_params(&unmatched);
+        assert_eq!(params.release_mbid, None);
+        assert!(params.recording_mbids.is_empty());
+    }
+
+    #[test]
+    fn upsert_params_replay_is_identical() {
+        let w = write();
+        assert_eq!(upsert_params(&w), upsert_params(&w.clone()));
     }
 
     #[test]
