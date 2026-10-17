@@ -8,6 +8,7 @@ pub mod api_error;
 pub mod auth;
 pub mod b64;
 pub mod handlers;
+pub mod legacy_playlist_fixtures;
 pub mod library;
 pub mod session;
 pub mod vault;
