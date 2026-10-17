@@ -311,6 +311,14 @@ No resize, split, role change, branch recreation, deletion, or credential rotati
 is authorized here. Decommissioning would require consumer removal and the
 applicable data-retention gate before deleting configs, roles, or databases.
 
+## Cost basis
+
+Public list prices and cost-as-function-of-usage formulas for Workers,
+R2, KV, Queues, Analytics Engine and PlanetScale Postgres are in
+[`docs/cost-basis.md`](cost-basis.md) (checked 2026-10-17). Plug measured
+staging volumes into those formulas for a monthly estimate; that document
+is a worksheet, not a measured bill.
+
 ## Environments matrix
 
 Binding names are chosen in Worker configs; resource names must match this table.
