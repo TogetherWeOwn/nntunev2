@@ -80,10 +80,6 @@ ADR 0006; default issuance is `library:read` only:
   model §5 (cost-bearing: drives provider egress and metering like any other grant).
 - `ingest:submit` — ingest job submission (cost-bearing: plan-capped per
   ADR 0004).
-- `providers:manage` — all BYOP provider-vault operations, including
-  create/update/delete and test-connection operations (custodial: touches
-  user-owned provider secrets; highest-risk scope). It never returns provider
-  secret material.
 
 **Route map is exhaustive and default-deny.** A bearer key is accepted only
 for the operation/scope pairs declared here: `/v1/library`, `/v1/artists`,
@@ -91,12 +87,15 @@ for the operation/scope pairs declared here: `/v1/library`, `/v1/artists`,
 `/v1/playlists` require `library:read`; playlist create/edit/delete require
 `playlists:write`; play-event writes on `/v1/plays` require `plays:write`;
 playback on `/v1/stream` requires `stream:read`; ingest submission requires
-`ingest:submit`; all provider-vault operations, including test-connection,
-require `providers:manage`. Every other operation, including an unlisted method
-on a listed route, is denied to bearer keys and must use session auth. In
+`ingest:submit`. Every other operation, including an unlisted method on a
+listed route, is denied to bearer keys and must use session auth. In
 particular, `/v1/me`, `/v1/indexers`,
-`GET /v1/operations/{operation_id}`, library membership writes and
-`DELETE /v1/libraries/{id}` are session-only. An endpoint or operation added
+`GET /v1/operations/{operation_id}`, library membership writes,
+`DELETE /v1/libraries/{id}`, and every provider-vault operation (including
+test-connection) are session-only. Provider-vault mutations retain the
+600 s fresh-session gate; test-connection requires a session but does not
+use that privileged-action freshness gate. No bearer credential can
+provide or extend the mutation step-up. An endpoint or operation added
 after this ADR is also denied to bearer keys until this map is explicitly
 updated; no implementation may infer a scope from a resource name or a
 similar operation.
@@ -104,8 +103,11 @@ similar operation.
 **Never grantable to a bearer key (session-only, enforced by the auth
 layer, not by scope strings):** account deletion / cancel-deletion,
 email change, passkey add/remove, issuance or revocation of any
-credential (native or Subsonic), billing operations, and step-up
-proof begin/complete. A bearer key also cannot mint stream grants for
+credential (native or Subsonic), provider-vault create/update/delete and
+test-connection operations, billing operations, and step-up proof
+begin/complete. Provider-vault mutations keep their 600 s fresh-session
+gate; test-connection requires a session but not that privileged-action
+gate. A bearer key also cannot mint stream grants for
 another user or read another user's vault rows — owner checks apply
 inside every path (threat-model §6 defense in depth).
 
@@ -170,7 +172,8 @@ New asset: **native REST bearer secrets** (client-held) alongside A3
 (session tokens). STRIDE coverage reuses existing mitigations:
 
 - **Spoofing** (stolen key): blast radius bounded by scopes + expiry;
-  `providers:manage` keys are the crown jewels and default-off.
+  provider-vault operations cannot be performed by bearer keys, and
+  mutations remain behind the session's 600 s freshness gate.
 - **Tampering** (credential row changed): the HMAC verifies the presented
   secret, not row metadata such as owner or scopes. A database writer could
   alter that metadata; preventing unauthorized database writes is a
