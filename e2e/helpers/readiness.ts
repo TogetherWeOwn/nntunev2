@@ -22,9 +22,12 @@ import type { WallProbe } from './access.js';
  * object whose `ok` is strictly boolean `true`.
  */
 export function assertPromotionReady(probe: WallProbe, context: string): void {
+  // Never interpolate probe.url: the message lands in uploaded test
+  // artifacts, so it carries only fixed context, status and reason —
+  // never the staging origin or path.
   const fail = (reason: string): Error =>
     new Error(
-      `[${context}] promotion-readiness failed at ${probe.url} ` +
+      `[${context}] promotion-readiness failed ` +
         `(HTTP ${probe.status}): ${reason} ` +
         'Promotion requires HTTP 200 JSON {ok:true}. See e2e/README.md.',
     );
