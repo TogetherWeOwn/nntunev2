@@ -16,7 +16,8 @@ line item beyond the Workers plan per the Workers pricing page, but the
 database behind it is priced in the PlanetScale section.
 
 All amounts are USD per month unless stated otherwise. `max(0, x)` means
-"zero when usage is inside the included allowance".
+"zero when usage is inside the included allowance", and `ceil(x)` means
+"x rounded up to the next whole unit".
 
 ## 1. Cloudflare Workers (Paid plan)
 
@@ -59,12 +60,17 @@ Infrequent Access (not currently used; no free tier): $0.01 / GB-month,
 Class A $9.00 / million, Class B $0.90 / million, data retrieval
 $0.01 / GB, egress $0.
 
+Cloudflare rounds usage up to the next whole billing unit before billing
+(for example, one million and one operations are billed as two million,
+and 1.1 GB-month as 2 GB-month), so each usage figure is rounded up with
+`ceil` before the included allowance is subtracted.
+
 Formula (`G` = Standard GB-months, `A`, `B` = Class A/B operations):
 
 ```text
-r2 = max(0, G - 10) * 0.015
-   + max(0, A/1e6 - 1) * 4.50
-   + max(0, B/1e6 - 10) * 0.36
+r2 = max(0, ceil(G) - 10) * 0.015
+   + max(0, ceil(A/1e6) - 1) * 4.50
+   + max(0, ceil(B/1e6) - 10) * 0.36
 ```
 
 GB-months are time-weighted: an object stored for half the month counts
@@ -115,8 +121,9 @@ checked 2026-10-17 (Paid plan).
 An operation is counted per 64 KB chunk written, read or deleted (KB =
 1,000 bytes, ~100 bytes internal metadata per message; operations are per
 message, not per batch). A normal delivery of a ≤64 KB message costs 3
-operations (write + read + delete); each retry redelivery adds read/delete
-operations, and a dead-letter write adds another write.
+operations (write + read + delete); each retry redelivery adds one read
+operation per 64 KB chunk (the delete happens once), and a dead-letter
+write adds another write.
 
 Formula (`M` = messages delivered once, `chunks` = ceil of message size
 per 64 KB, `Ops` = total operations when retries/DLQ traffic are known):
@@ -132,8 +139,12 @@ environments); count retries separately where the metrics expose them.
 ## 5. Cloudflare Analytics Engine
 
 Source: [Analytics Engine pricing](https://developers.cloudflare.com/analytics/analytics-engine/pricing/),
-checked 2026-10-17 (Workers Paid). Priced on two metrics: data points
-written and read queries.
+checked 2026-10-17 (Workers Paid). As of that date Cloudflare states
+"Currently, you will not be billed for your use of Workers Analytics
+Engine"; the prices below are published so future costs can be estimated.
+Treat this section as **prospective**: it is excluded from the current-cost
+total in section 7 and shown separately. Priced on two metrics: data
+points written and read queries.
 
 | Item | Included / month | Overage unit price |
 |---|---|---|
@@ -143,8 +154,8 @@ written and read queries.
 Formula (`W` = data points written, `Q` = read queries):
 
 ```text
-analytics_engine = max(0, W/1e6 - 10) * 0.25
-                 + max(0, Q/1e6 - 1) * 1.00
+analytics_engine_prospective = max(0, W/1e6 - 10) * 0.25
+                             + max(0, Q/1e6 - 1) * 1.00
 ```
 
 The `stream` Worker writes metering points to the `nntune_meter` dataset
@@ -178,7 +189,7 @@ Metered add-ons per cluster:
 
 | Item | Included | Unit price (us-east) |
 |---|---|---|
-| Disk storage (gp3, network-attached) | First 10 GB per cluster | $0.125 / GB-month over 10 GB |
+| Disk storage (gp3, network-attached) | First 10 GB per included instance | $0.125 / GB-month over 10 GB, per included instance |
 | Provisioned IOPS / throughput | 3,000 IOPS and 125 MiB/s baseline (AWS gp3) | Only provisioned amounts above baseline are charged; rates shown in the PlanetScale dashboard, not on the public page — treat as $0 only while at baseline |
 | Backup + WAL storage | 2× disk size | $0.023 / GB-month over the included amount (compressed size) |
 | Public egress | 100 GB / month per production branch; 10 GB / month for PS-5 non-HA and PS-DEV branches | $0.06 / GB over the allowance |
@@ -186,26 +197,29 @@ Metered add-ons per cluster:
 | Extra replicas | No 10 GB storage allowance for additional replicas beyond the HA set | Same storage rate, billed per instance |
 
 Storage is billed per database instance, so an HA cluster pays the
-storage line for the primary and each replica volume; the 10 GB allowance
-is per cluster, not per replica. Resizes are prorated.
+storage line for the primary and each replica volume. Per PlanetScale's
+documented formulas, each *included* instance gets the 10 GB allowance
+(`max(average storage GB - 10 GB, 0) × volume rate × included
+instances`), while *additional* replicas beyond the included set get no
+allowance (`average storage GB × volume rate × additional replicas`).
+Resizes are prorated.
 
 Formula per cluster (`SKU` = monthly cluster price from the table,
-`D` = provisioned disk GB, `N` = instance count (1 single-node, 3 HA),
+`D` = provisioned disk GB, `N` = included instance count (1 single-node,
+3 HA), `X` = additional replicas beyond the included set,
 `Bak` = compressed backup+WAL GB-months, `E` = public egress GB,
 `EA` = the branch egress allowance from the table):
 
 ```text
 planetscale_cluster = SKU
-  + max(0, N*D - 10) * 0.125
+  + max(0, D - 10) * 0.125 * N      # N = included instances (1 single-node, 3 HA)
+  + D * 0.125 * X                    # X = additional replicas, no allowance
   + max(0, Bak - 2*D) * 0.023
   + max(0, E - EA) * 0.06
 ```
 
-For the common single-node case (`N = 1`) the storage term reduces to
-`max(0, D - 10) * 0.125`. Before using the HA form, confirm against the
-current invoice how the 10 GB allowance nets against replica volumes;
-the public docs state per-instance billing and no allowance for *extra*
-replicas, and this worksheet does not guess beyond that.
+For the common single-node case (`N = 1`, `X = 0`) the storage term
+reduces to `max(0, D - 10) * 0.125`.
 
 Current shape to price at staging time (from `docs/ops.md`, host-reported
 there): two clusters — the app cluster (PS-5 single-node, staging +
@@ -223,8 +237,12 @@ price formula directly; they drive SKU size and egress.
 ## 7. Total
 
 ```text
-monthly_total = workers + r2 + kv + queues + analytics_engine
-              + sum(planetscale_cluster over app + MusicBrainz clusters)
+monthly_total_current = workers + r2 + kv + queues
+                      + sum(planetscale_cluster over app + MusicBrainz clusters)
+
+# Analytics Engine is not billed yet (section 5); quote it separately:
+monthly_total_with_prospective_ae = monthly_total_current
+                                  + analytics_engine_prospective
 ```
 
 Staging and production share one Cloudflare account and one PlanetScale
@@ -253,11 +271,12 @@ inside 2× disk, egress `E` = 30 GB (app) + 100 GB (MusicBrainz) against
 | R2 | (500−10)×0.015 + (2−1)×4.50 + (20−10)×0.36 = 7.35 + 4.50 + 3.60 | 15.45 |
 | KV | (15−10)×0.50 + (2−1)×0.50 | 3.00 |
 | Queues | (6−1)×0.40 | 2.00 |
-| Analytics Engine | (12−10)×0.25 | 0.50 |
+| Analytics Engine (prospective; not billed yet, excluded from current total) | (12−10)×0.25 | 0.50 |
 | PlanetScale compute | 2 × 5.00 | 10.00 |
 | PlanetScale storage | (20−10)×0.125 + (110−10)×0.125 = 1.25 + 12.50 | 13.75 |
 | PlanetScale egress | [(30−10) + (100−10)] × 0.06 | 6.60 |
-| **Total** | | **57.30** |
+| **Total (currently billed)** | 57.30 − 0.50 prospective Analytics Engine | **56.80** |
+| Total including prospective Analytics Engine | 56.80 + 0.50 | 57.30 |
 
 Spot-check (R2, by hand): 490 billable GB-months × $0.015 = $7.35;
 1M billable Class A × $4.50/M = $4.50; 10M billable Class B ×
