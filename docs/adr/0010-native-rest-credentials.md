@@ -52,17 +52,19 @@ applies to the implementation PR).
 ### Additive schema (target; implementation work remains)
 
 ```text
-native_rest_credentials  id PK, user_id FK, label TEXT, key_prefix TEXT,
-                         key_hmac TEXT NOT NULL, pepper_version INTEGER NOT NULL,
+native_rest_credentials  id UUID PK, user_id TEXT NOT NULL FK → users(id),
+                         label TEXT, key_prefix TEXT, key_hmac TEXT NOT NULL,
+                         pepper_version INTEGER NOT NULL,
                          UNIQUE (pepper_version, key_hmac),
-                         scopes TEXT[] NOT NULL, expires_at NOT NULL,
-                         created_at, last_used_at NULL, revoked_at NULL,
-                         created_from_ip TEXT NOT NULL
+                         scopes TEXT[] NOT NULL, expires_at timestamptz NOT NULL,
+                         created_at timestamptz NOT NULL, last_used_at timestamptz NULL,
+                         revoked_at timestamptz NULL, created_from_ip TEXT NOT NULL
 ```
 
 New table only. No applied migration is edited; no Subsonic, session, or
-vault row changes. Unless stated otherwise, ids are UUID and timestamps
-are `timestamptz`, per ADR 0002 conventions.
+vault row changes. The `user_id` type follows the retained auth schema's
+`users.id TEXT`; new ids are UUID and timestamps are `timestamptz`, per
+ADR 0002 conventions.
 
 ### Scopes (allowlist, checked before handler access)
 
@@ -74,12 +76,18 @@ ADR 0006; default issuance is `library:read` only:
 - `playlists:write` — playlist create/edit/delete (dormant-tombstone and
   restore rules in ADR 0006 apply unchanged).
 - `plays:write` — scrobble / play events.
-- `stream:read` — playback via the §5 grant transport (cost-bearing:
-  drives provider egress and metering like any other grant).
+- `stream:read` — playback via the signed-grant transport in the threat
+  model §5 (cost-bearing: drives provider egress and metering like any other grant).
 - `ingest:submit` — ingest job submission (cost-bearing: plan-capped per
   ADR 0004).
 - `providers:manage` — BYOP vault writes (custodial: touches user-owned
   provider secrets; highest-risk scope).
+
+No permission is inferred for an operation not listed above. In particular,
+bearer keys cannot read `/v1/me`, manage `/v1/indexers`, perform library
+membership writes, or read provider credentials; those operations remain
+session-only unless a later ADR adds an explicit scope. `providers:manage`
+never returns provider secret material.
 
 **Never grantable to a bearer key (session-only, enforced by the auth
 layer, not by scope strings):** account deletion / cancel-deletion,
@@ -92,9 +100,10 @@ inside every path (threat-model §6 defense in depth).
 ### Issuance, expiry, revocation
 
 - Issuance requires an authenticated session passing the privilege-freshness
-  gate (immutable auth age within 600 s, F-SESS-01 contract): stale
-  sessions get `reauth_required`, not a key. Issuance writes an `audit_log`
-  row (ids only) and records `created_from_ip`.
+  gate (immutable auth age within 600 s, F-SESS-01 contract): stale sessions
+  are denied without issuing a key. The implementation PR must pin the
+  CISO-approved stale-session response in `docs/api-errors.md` before clients
+  depend on it. Issuance writes an `audit_log` row and records `created_from_ip`.
 - Expiry is mandatory: user-chosen up to a **365-day maximum**; no
   never-expiring keys. Expired keys fail closed with the generic
   unauthenticated response (no existence oracle).
@@ -102,8 +111,9 @@ inside every path (threat-model §6 defense in depth).
   request alongside expiry and scope). Users can list (prefix, label,
   scopes, expiry, `last_used_at` — never secret material) and revoke
   their own keys from a session-authenticated endpoint.
-- Per-credential rate limits apply (same caps family as ADR 0004; no
-  bypass of plan limits), and `last_used_at` anomalies (burst from a new
+- Per-credential rate limits apply; requests also use the same plan
+  entitlements and usage caps as session calls under ADR 0004, with no
+  bearer-key bypass. `last_used_at` anomalies (such as a burst from a new
   IP/ASN) alert, mirroring the Subsonic rule.
 
 ### Step-up
@@ -116,10 +126,12 @@ scope creep by code change is denied.
 
 ### Audit
 
-`audit_log` rows for create, revoke, failed-auth spikes, and anomaly
-alerts carry credential id, user, timestamp, source IP, and result —
-never secret material (threat-model §§3–4 logging rules). Account
-completion pseudonymizes these rows under the existing rule 3 sentinels.
+`audit_log` rows for create and revoke carry the credential id in the
+existing `action` text field (for example, `native_credential_created:<id>`),
+plus user, timestamp, source IP, and result — never secret material. Successful
+use updates `last_used_at`; failed-auth spikes are aggregated/rate-limited in
+the shared store before an audit alert is emitted, not written once per request.
+Account completion pseudonymizes retained rows under ADR 0002 rule 3.
 
 ### Client transport requirements
 
@@ -140,10 +152,13 @@ New asset: **native REST bearer secrets** (client-held) alongside A3
 
 - **Spoofing** (stolen key): blast radius bounded by scopes + expiry;
   `providers:manage` keys are the crown jewels and default-off.
-- **Tampering** (HMAC swapped between rows): composite unique lookup;
-  a copied HMAC is unusable without the key, and cross-row swaps fail
-  authentication (cf. ADR 0002 envelope-swap tests).
-- **Repudiation**: issuance/use/revocation audit rows (above).
+- **Tampering** (credential row changed): the HMAC verifies the presented
+  secret, not row metadata such as owner or scopes. A database writer could
+  alter that metadata; preventing unauthorized database writes is a
+  deployment boundary, not a property of this credential hash. Composite
+  uniqueness prevents duplicate lookup identities.
+- **Repudiation**: issuance and revocation audit rows; `last_used_at` and
+  anomaly alerts record use without logging every request.
 - **Information disclosure** (SQL dump, log leak): HMAC-only at rest;
   one-time display; header-only transport; generic failures.
 - **Denial of service**: per-credential rate limits; shared-store
@@ -152,13 +167,15 @@ New asset: **native REST bearer secrets** (client-held) alongside A3
   on every path; no existence oracles (non-owner/non-member reads stay
   404/70-shaped per ADR 0006).
 
-The implementation PR updates `threat-model.md` §§2/4–5 findings table
+The implementation PR updates `docs/security/threat-model.md` §§2/4–5
 and re-requests CISO review; this ADR alone changes no code or model text.
 
 ## Migration compatibility
 
 - Additive table; existing sessions, Subsonic credentials, and vault rows
-  are untouched and keep working. No backfill, no plaintext handling.
+  are untouched and keep working. Account erasure deletes native credential
+  rows before deleting the user, alongside Subsonic credentials, in the
+  forward migration's user-FK child order. No backfill or plaintext handling.
 - Cross-surface use is denied in both directions: Subsonic credentials
   cannot authenticate `/v1` (ADR 0006, unchanged), native keys cannot
   authenticate `/rest/*` (this ADR). Rotation on either keyring never
