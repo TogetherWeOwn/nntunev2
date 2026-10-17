@@ -306,4 +306,170 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
       `expected a plan-limit status (${PLAN_LIMIT_STATUSES.join('/')}), got HTTP ${res.status()}`,
     ).toBe(true);
   });
+
+  // Player-UI seek, as distinct from the API Range control above: that test
+  // proves the stream endpoint answers byte ranges; this one proves the
+  // user-visible player actually moves the active track's playback position
+  // when a person seeks, and can play from there. The seek is a click on the
+  // native controls timeline (the contract markup is `<audio controls>`),
+  // never a `currentTime` assignment and never a test-issued Range GET.
+  //
+  // Last in the serial chain on purpose: the library player is still a
+  // contract placeholder, so on configured staging this test fails by name
+  // until the player slice lands — placing it last keeps that expected red
+  // from suppressing the meter/plan-limit evidence above it.
+  //
+  // The seek is performed while PAUSED. That is what makes the assertion
+  // non-vacuous: a paused position cannot drift into the seeked region by
+  // natural playback advance, so arriving there while still paused can only
+  // be the seek. It also works with the pinned 210 ms synthetic WAV
+  // (crates/nntune-test-nntp fixtures), where seek-while-playing would race
+  // the end of the track.
+  test('player UI seek moves the active audio position and playback continues', async ({
+    page,
+    request,
+  }) => {
+    const baseURL = stagingBaseUrl('skip', 'player-seek');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    // Fail closed instead of driving the player anonymously when neither a
+    // minted session nor the QA seam token exists.
+    requireApiAccount(account, 'player-seek');
+
+    const pageErrors: string[] = [];
+    page.on('pageerror', (error) => pageErrors.push(error.message));
+
+    await applyAccountToPage(page, account, baseURL);
+    await page.goto(`${baseURL}/library`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    const firstTrack = page.getByTestId(TESTIDS.libraryItem).first();
+    await expect(
+      firstTrack,
+      'ingested track missing from library — ingest spec must run first',
+    ).toBeVisible({ timeout: 60_000 });
+    await firstTrack.click();
+
+    const player = page.getByTestId(TESTIDS.audioPlayer);
+    await expect(
+      player,
+      'clicking the ingested track did not surface the audio player',
+    ).toBeVisible({ timeout: 15_000 });
+
+    const audioState = (): Promise<{
+      currentTime: number;
+      duration: number;
+      paused: boolean;
+      ended: boolean;
+      errorCode: number | null;
+      hasSource: boolean;
+      hasControls: boolean;
+    }> =>
+      player.evaluate((element) => {
+        const audio = element as HTMLAudioElement;
+        return {
+          currentTime: audio.currentTime,
+          duration: audio.duration,
+          paused: audio.paused,
+          ended: audio.ended,
+          errorCode: audio.error?.code ?? null,
+          hasSource: audio.currentSrc !== '',
+          hasControls: audio.controls,
+        };
+      });
+
+    // Metadata must load and give a finite, seekable duration. NaN (no
+    // metadata yet) and Infinity (unbounded stream) are reported as not
+    // ready; any positive finite duration works, including the 210 ms
+    // fixture, because the seek below happens while paused.
+    await expect
+      .poll(
+        async () => {
+          const { duration } = await audioState();
+          return Number.isFinite(duration) ? duration : 0;
+        },
+        {
+          timeout: 30_000,
+          message: 'player never reported a finite duration for the ingested track',
+        },
+      )
+      .toBeGreaterThan(0);
+    const ready = await audioState();
+    expect(ready.hasSource, 'player has no media source for the selected track').toBe(true);
+    expect(ready.errorCode, 'player reported a media error before seeking').toBeNull();
+    expect(
+      ready.hasControls,
+      'player no longer exposes native controls — update this UI seek to the new controls',
+    ).toBe(true);
+
+    const box = await player.boundingBox();
+    expect(box, 'player has no layout box to click').not.toBeNull();
+    const { width, height } = box as { width: number; height: number };
+    // The native play/pause toggle sits at the left edge of the control bar.
+    const togglePosition = { x: 16, y: Math.round(height / 2) };
+
+    // Reach a paused state through the UI: selecting the track may autoplay
+    // (the 210 ms fixture can also have already ended, which reads paused).
+    if (!ready.paused) {
+      await player.click({ position: togglePosition });
+    }
+    await expect
+      .poll(async () => (await audioState()).paused, {
+        timeout: 15_000,
+        message: 'player did not reach a paused state before the seek',
+      })
+      .toBe(true);
+    const beforeSeek = await audioState();
+
+    // User-visible seek: click the timeline a little past its middle. The
+    // timeline does not span the full element width (play button and time
+    // labels flank it), so assert the requested REGION — well past the
+    // opening stretch, short of the end — rather than an exact timestamp.
+    // `currentTime` is the position the native timeline renders; there is
+    // no separate visible-position hook.
+    await player.click({
+      position: { x: Math.round(width * 0.55), y: Math.round(height / 2) },
+    });
+
+    const regionLow = beforeSeek.duration * 0.3;
+    const regionHigh = beforeSeek.duration * 0.95;
+    const minMove = beforeSeek.duration * 0.1;
+    await expect
+      .poll(
+        async () => {
+          const state = await audioState();
+          // Still-paused is part of the match: while paused, only the seek
+          // itself can have moved the position into the region.
+          return (
+            state.paused &&
+            state.currentTime >= regionLow &&
+            state.currentTime <= regionHigh &&
+            Math.abs(state.currentTime - beforeSeek.currentTime) > minMove
+          );
+        },
+        {
+          timeout: 15_000,
+          message: 'seeking via the player UI did not move the paused audio position',
+        },
+      )
+      .toBe(true);
+    const afterSeek = await audioState();
+    expect(afterSeek.errorCode, 'player reported a media error after seeking').toBeNull();
+
+    // Playback can continue from the seeked position: resume through the UI
+    // toggle and require the position to advance past where the seek left
+    // it (on the 210 ms fixture this is satisfied by playing out to the
+    // end, where currentTime reaches duration).
+    await player.click({ position: togglePosition });
+    await expect
+      .poll(async () => (await audioState()).currentTime, {
+        timeout: 15_000,
+        message: 'playback did not continue from the seeked position',
+      })
+      .toBeGreaterThan(afterSeek.currentTime);
+    const continued = await audioState();
+    expect(continued.errorCode, 'player reported a media error after resuming').toBeNull();
+    expect(pageErrors, `page errors during player seek: ${pageErrors.join('; ')}`).toEqual([]);
+  });
 });
