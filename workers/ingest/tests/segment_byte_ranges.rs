@@ -284,7 +284,8 @@ fn range_scanner_ignores_comments_and_matches_prefixed_segment_names() {
 
 #[test]
 fn invalid_or_unbounded_ranges_are_unknown_or_rejected() {
-    let xml = r#"<nzb><file><segment bytes="18446744073709551615" number="1">x@y</segment></file></nzb>"#;
+    let xml =
+        r#"<nzb><file><segment bytes="18446744073709551615" number="1">x@y</segment></file></nzb>"#;
     let (flat, _) = parse_segment_byte_ranges(xml);
     assert_eq!(flat, vec![None]);
 

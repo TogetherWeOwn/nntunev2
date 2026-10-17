@@ -63,13 +63,14 @@ pub fn check_parsed(estimate: &IntakeEstimate, parsed: &ParsedNzb) -> Result<(),
     }
     // Missing metadata is explicit-unknown (None). Keep known ranges within
     // the core parser's per-segment and document-wide encoded-byte limits.
-    let total_bytes = parsed.segment_bytes.iter().try_fold(0u64, |total, bytes| {
-        match bytes {
+    let total_bytes = parsed
+        .segment_bytes
+        .iter()
+        .try_fold(0u64, |total, bytes| match bytes {
             Some(n) if *n == 0 || *n > MAX_SEGMENT_BYTES => None,
             Some(n) => total.checked_add(*n),
             None => Some(total),
-        }
-    });
+        });
     let Some(total_bytes) = total_bytes else {
         return Err("segment byte ranges exceed their valid bounds");
     };
