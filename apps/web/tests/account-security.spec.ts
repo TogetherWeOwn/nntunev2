@@ -78,3 +78,30 @@ test('account security reports a revoke-all failure without success navigation',
 	expect(revokePosts).toBe(1);
 	expect(new URL(page.url()).pathname).toBe('/account/security');
 });
+
+test('account security keeps a revoke-all 401 on the page with an expired-session notice', async ({
+	page
+}) => {
+	let revokePosts = 0;
+	await page.route('**/v1/session/revoke-all', async (route) => {
+		revokePosts += 1;
+		await route.fulfill({
+			status: 401,
+			contentType: 'application/json',
+			body: JSON.stringify({ error: 'unauthorized' })
+		});
+	});
+
+	await page.goto('/account/security');
+	page.on('dialog', (dialog) => dialog.accept());
+	await page.getByRole('button', { name: /sign out everywhere/i }).click();
+
+	// A 401 means the request was rejected before any session was revoked,
+	// so the page must not look like the success path (navigation to /login).
+	const alert = page.getByRole('alert');
+	await expect(alert).toBeVisible();
+	await expect(alert).toContainText(/session expired before other devices were signed out/i);
+	await expect(alert.getByRole('link', { name: /sign in again/i })).toHaveAttribute('href', '/login');
+	expect(revokePosts).toBe(1);
+	expect(new URL(page.url()).pathname).toBe('/account/security');
+});
