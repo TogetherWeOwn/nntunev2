@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { readFileSync, readdirSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -367,4 +367,202 @@ test.describe('failure-artifact sanitization', () => {
       rmSync(probe, { recursive: true, force: true });
     }
   });
+});
+
+// Fail-closed publication gate (acceptance contract for the Builder):
+// Today both upload steps run on `failure() && configured` alone and the
+// sanitize blocks swallow cleanup failures (`|| true`, stderr discarded)
+// and per-file read errors (`except OSError: continue`), so a sanitizer
+// that failed, was skipped, or silently left a file unscrubbed still
+// publishes. The contract pinned below:
+//   1. Each sanitize step carries an `id:` and its job's upload step adds
+//      `steps.<sanitize-id>.outcome == 'success'` to its existing
+//      `failure() && steps.staging.outputs.configured == 'true'`
+//      condition. Skipped / failed / cancelled sanitize => no upload.
+//   2. The sanitize blocks exit nonzero (names-only reporting, never file
+//      contents) on any read or write failure of a file under the upload
+//      path, instead of leaving it eligible.
+//   3. A sanitize run may only report success when no `error-context.md`
+//      path remains under test-results/ and playwright-report/ is gone:
+//      a cleanup that could not remove them must fail, not pass silently.
+//   4. A legitimately absent test-results/ is handled explicitly: success
+//      (nothing is eligible) with an output notice stating it was absent,
+//      not a generic "sanitized" claim and not a crash/traceback.
+//   5. Uploads stay junit-only test-results/ with 7-day retention.
+// The tests execute the exact checked-in sanitize blocks (extracted
+// above) against synthetic fixtures. Failure injection is deterministic
+// and root-proof (no chmod): /proc/self/mem reads raise EIO and
+// /proc/version writes raise EACCES even for root, and a non-empty
+// directory named error-context.md cannot be removed by file deletion.
+const uploadSections = [...stagingWorkflow.matchAll(
+  /      - name: Upload failure artifacts\n        if: ([^\n]+)\n([\s\S]*?)retention-days: (\d+)/g,
+)];
+
+function evaluateUploadGate(
+  condition: string,
+  scenario: { jobFailed: boolean; configured: boolean; sanitizeOutcome: string },
+): boolean {
+  const expr = condition
+    .replace(/failure\(\)/g, String(scenario.jobFailed))
+    .replace(
+      /steps\.staging\.outputs\.configured\s*==\s*'true'/g,
+      String(scenario.configured),
+    )
+    .replace(
+      /steps\.([A-Za-z0-9_-]+)\.outcome\s*==\s*'success'/g,
+      String(scenario.sanitizeOutcome === 'success'),
+    );
+  // Anything the evaluator does not understand stays visible as a failure
+  // here rather than being silently treated as either true or false.
+  expect(expr, `unmodelled upload-gate syntax in: ${condition}`).toMatch(
+    /^[\s()!&|truefals]+$/,
+  );
+  return Function(`"use strict"; return (${expr});`)() as boolean;
+}
+
+function makeProbe(): string {
+  return mkdtempSync(
+    join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'artifact-gate-'),
+  );
+}
+
+const GATE_MARKER = 'SENTINEL-SECRET-VALUE-GATE';
+
+test.describe('fail-closed artifact publication gate', () => {
+  test('both uploads require a successful sanitizer outcome (evaluated)', () => {
+    expect(uploadSections).toHaveLength(2);
+    expect(sanitizeSections).toHaveLength(2);
+    for (const [index, upload] of uploadSections.entries()) {
+      const condition = upload[1]!;
+      const sanitizeId = sanitizeSections[index]![1]!.match(/^\s+id:\s*(\S+)/m)?.[1];
+      expect(
+        sanitizeId,
+        `sanitize step ${index} must carry an id so the upload can gate on its outcome`,
+      ).toBeDefined();
+      expect(condition).toContain('failure()');
+      expect(condition).toContain(`steps.staging.outputs.configured == 'true'`);
+      expect(condition).toContain(`steps.${sanitizeId!}.outcome == 'success'`);
+
+      const base = { jobFailed: true, configured: true };
+      expect(evaluateUploadGate(condition, { ...base, sanitizeOutcome: 'success' })).toBe(true);
+      for (const outcome of ['failure', 'skipped', 'cancelled']) {
+        expect(
+          evaluateUploadGate(condition, { ...base, sanitizeOutcome: outcome }),
+          `upload ${index} must not publish when sanitize outcome is ${outcome}`,
+        ).toBe(false);
+      }
+      expect(evaluateUploadGate(condition, { jobFailed: false, configured: true, sanitizeOutcome: 'success' })).toBe(false);
+      expect(evaluateUploadGate(condition, { jobFailed: true, configured: false, sanitizeOutcome: 'success' })).toBe(false);
+    }
+  });
+
+  test('uploads keep junit-only path and 7-day retention', () => {
+    expect(uploadSections).toHaveLength(2);
+    for (const upload of uploadSections) {
+      expect(upload[2]).toContain('e2e/test-results/');
+      expect(upload[2]).not.toContain('playwright-report');
+      expect(upload[2]).not.toContain('trace');
+      expect(upload[2]).not.toContain('screenshot');
+      expect(upload[3]).toBe('7');
+    }
+  });
+
+  for (const [index, block] of sanitizeBlocks.entries()) {
+    const script = block.replace(/^ {10}/gm, '');
+    const job = index === 0 ? 'synthetic' : 'journey';
+
+    test(`${job} sanitizer: positive control publishes only scrubbed junit`, () => {
+      const probe = makeProbe();
+      try {
+        mkdirSync(join(probe, 'test-results', 'case-1'), { recursive: true });
+        mkdirSync(join(probe, 'playwright-report'), { recursive: true });
+        writeFileSync(join(probe, 'test-results', 'junit.xml'), `<x>${GATE_MARKER}</x>`);
+        writeFileSync(join(probe, 'test-results', 'case-1', 'error-context.md'), GATE_MARKER);
+        writeFileSync(join(probe, 'playwright-report', 'index.html'), GATE_MARKER);
+        const result = runShell(script, { SYNTHETIC_NNTP_PASS: GATE_MARKER }, probe);
+        expect(result.status).toBe(0);
+        expect(result.output).not.toContain(GATE_MARKER);
+        expect(existsSync(join(probe, 'playwright-report'))).toBe(false);
+        const remaining = listFilesRecursive(join(probe, 'test-results'));
+        expect(remaining.some((f) => f.endsWith('error-context.md'))).toBe(false);
+        for (const file of remaining) {
+          expect(fileContainsMarker(file, GATE_MARKER), file).toBe(false);
+        }
+        expect(readFileSync(join(probe, 'test-results', 'junit.xml'), 'utf8')).toContain('***REDACTED***');
+      } finally {
+        rmSync(probe, { recursive: true, force: true });
+      }
+    });
+
+    test(`${job} sanitizer: unreadable file fails closed without leaking contents`, () => {
+      const probe = makeProbe();
+      try {
+        mkdirSync(join(probe, 'test-results'), { recursive: true });
+        writeFileSync(join(probe, 'test-results', 'junit.xml'), `<x>${GATE_MARKER}</x>`);
+        // Regular file whose reads deterministically raise EIO (root too).
+        symlinkSync('/proc/self/mem', join(probe, 'test-results', 'unreadable.xml'));
+        const result = runShell(script, { SYNTHETIC_NNTP_PASS: GATE_MARKER }, probe);
+        expect(
+          result.status,
+          'a file the scrub could not read must fail the sanitizer, not stay upload-eligible',
+        ).not.toBe(0);
+        expect(result.output).not.toContain(GATE_MARKER);
+      } finally {
+        rmSync(probe, { recursive: true, force: true });
+      }
+    });
+
+    test(`${job} sanitizer: unwritable file fails closed without leaking contents`, () => {
+      const probe = makeProbe();
+      try {
+        mkdirSync(join(probe, 'test-results'), { recursive: true });
+        // Readable regular file whose writes deterministically raise EACCES.
+        symlinkSync('/proc/version', join(probe, 'test-results', 'junit.xml'));
+        const result = runShell(script, { SYNTHETIC_NNTP_PASS: GATE_MARKER }, probe);
+        expect(result.status).not.toBe(0);
+        expect(result.output).not.toContain(GATE_MARKER);
+      } finally {
+        rmSync(probe, { recursive: true, force: true });
+      }
+    });
+
+    test(`${job} sanitizer: undeletable error-context cannot report success`, () => {
+      const probe = makeProbe();
+      try {
+        // A non-empty DIRECTORY named error-context.md: file deletion
+        // (`find -delete`, unlink) fails deterministically even for root.
+        // Success is acceptable only if the path is actually gone
+        // afterwards (a recursive remove is a legitimate stronger cleanup).
+        const ctxDir = join(probe, 'test-results', 'case-1', 'error-context.md');
+        mkdirSync(ctxDir, { recursive: true });
+        writeFileSync(join(ctxDir, 'inner.txt'), GATE_MARKER);
+        writeFileSync(join(probe, 'test-results', 'junit.xml'), '<x>ok</x>');
+        const result = runShell(script, { SYNTHETIC_NNTP_PASS: GATE_MARKER }, probe);
+        if (result.status === 0) {
+          expect(
+            existsSync(ctxDir),
+            'sanitizer reported success while error-context.md remains upload-eligible',
+          ).toBe(false);
+        }
+        expect(result.output).not.toContain(GATE_MARKER);
+      } finally {
+        rmSync(probe, { recursive: true, force: true });
+      }
+    });
+
+    test(`${job} sanitizer: absent test-results is explicit, not a generic success claim`, () => {
+      const probe = makeProbe();
+      try {
+        const result = runShell(script, { SYNTHETIC_NNTP_PASS: GATE_MARKER }, probe);
+        expect(result.status).toBe(0);
+        expect(result.output).toMatch(
+          /absent|missing|no test-results|nothing to (sanitize|upload)/i,
+        );
+        expect(result.output).not.toContain(GATE_MARKER);
+        expect(existsSync(join(probe, 'test-results'))).toBe(false);
+      } finally {
+        rmSync(probe, { recursive: true, force: true });
+      }
+    });
+  }
 });
