@@ -13,7 +13,7 @@ sessionless spec, the PWA manifest spec (#211), the anonymous-Access
 denial specs (#185, #188), the branded-error-page specs (#203), the
 security-headers staging probe, and the deployed-build identity route
 (#196) merged:
-`npm --prefix e2e run e2e:list` lists 265 tests in 17 files, and
+`npm --prefix e2e run e2e:list` lists 269 tests in 18 files, and
 `(cd apps/web && pnpm exec playwright test --list)` lists 94 tests in
 21 files (91 in 20 files plus #196's 3-test build-identity spec). Line numbers
 below are from that head; re-verify with the commands at the end of this
@@ -71,6 +71,24 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   playback, FIXMEd so it can never fail or skip a later step, with the
 
   Media Session test last.
+- Mirror-seed verification (`e2e/tests/mb-mirror-seed.spec.ts`): the
+  seed-verification slice for the synthetic fixture (TOG-28772; the seed
+  itself is TOG-28778, staging apply follows TOG-27560 grants). Offline
+  pins run on every PR via `test:unit` with no staging:
+  "fixture MBIDs are canonical (isMbid)" (the three seed MBIDs pass
+  `isMbid`), "seeded release title equals the NZB-derived match query"
+  (the checked-in `synthetic.nzb` subject derives to the seeded release
+  title through the `derive_upload_query` port), and
+  "fixture library track carries non-empty recording_mbids (extractRecordingMbids)"
+  (the matched-release track shape extracts a non-empty canonical list).
+  The staging leg "staging mirror serves the synthetic-fixture release" is
+  `test.fixme` until the staging mirror is seeded: on configured staging
+  it asserts the ingested fixture track's `release_mbid` equals the
+  fixture release plus a non-empty `recording_mbids` containing the
+  fixture recording (a missing/wrong seed fails by name), and it skips
+  green while `STAGING_BASE_URL` is unset. The local-DB side of the same
+  verification is `workers/mb/tests/sql/mirror_seed_synthetic_fixture_verify.sql`
+  (empty DB fails, seeded DB passes; read-only, rolled back).
 - Staging demo-audio contract (`e2e/tests/demo-audio-contract.spec.ts:65`
   "default track serves the full vendored body as audio/wav" and `:102`
   "?track=second-signal is salted; unknown ?track= serves the default stream") is fixture support for
