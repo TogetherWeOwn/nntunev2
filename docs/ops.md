@@ -17,13 +17,17 @@ An authorized executor must satisfy the applicable approval/retention gates firs
 - Workers Paid + R2 Paid entitlements: confirmed by the host executor on
   2026-10-13; not independently billing-verified by the operator MCP token.
 
-### R2 buckets (core buckets created 2026-10-13; scratch details unverified)
+### R2 buckets (core buckets created 2026-10-13; scratch metadata verified 2026-10-17)
 
-The scratch-bucket names, seven-day lifecycle rule, provisioning status, and
-creation date are unverified by this documentation update; the repository has
-no independent provisioning receipt for them. Treat these details as reported
-inventory, not GET-verified Cloudflare state, until an authorized executor
-checks the bucket and lifecycle metadata.
+Read-only Cloudflare R2 metadata GETs on 2026-10-17 confirmed both reported
+scratch buckets exist and each has one enabled object-expiration rule:
+`expire-ingest-scratch-after-7-days`, prefix `ingest-scratch/`, age
+`604800` seconds (seven days), action `deleteObjectsTransition`. The staging
+and production bucket names match the inventory below. No lifecycle rule on
+either bucket expires objects outside that prefix. The observed archive-bucket
+lifecycle is only the enabled `Default Multipart Abort Rule`, age `604800`
+seconds, with no prefix condition; it aborts incomplete multipart uploads and
+does not expire stored objects.
 
 The provisioned layout is **one bucket per concern per environment**, not one
 shared bucket. Object key prefixes describe cache scope *within* those buckets;
@@ -42,11 +46,15 @@ integration prerequisites on sibling branches are:
 
 Their owners must coordinate these fixes at the next permitted review round and
 recheck actual bindings before deployment. This runbook does not change those
-branches or certify a deploy. Scratch storage is intended to be separate from archive buckets. The reported
-ingest scratch buckets are isolated by environment and are intended to expire
-objects under `ingest-scratch/` after seven days; do not use archive buckets as
-scratch storage. Provisioning and lifecycle settings are unverified as noted
-above.
+branches or certify a deploy. Scratch storage is separate from archive buckets.
+The two scratch buckets are isolated by environment, and their live lifecycle
+rules were verified on 2026-10-17 as described above. Read-only Worker metadata
+showed no active production NNTune Worker deployment; the active staging
+`nntune-web-staging` version has no R2 bindings, and no ingest Worker is
+currently deployed. Thus neither archive bucket is bound as scratch storage by
+a deployed NNTune Worker. This check inspects Worker configuration only; it did
+not enumerate bucket objects or rule out out-of-band S3/API clients. Do not use
+archive buckets as scratch storage.
 
 | Bucket | Env | Intended consumer |
 |---|---|---|
@@ -56,8 +64,8 @@ above.
 | `nntunev2-art-prod` | prod | MusicBrainz Worker artwork cache |
 | `nntunev2-archive-staging` | staging | reserved archive capacity; no Worker consumer configured |
 | `nntunev2-archive-prod` | prod | reserved archive capacity; no Worker consumer configured |
-| `nntunev2-ingest-scratch-staging` | staging | reported ingest repair scratch; `ingest-scratch/` 7-day expiry intended, unverified |
-| `nntunev2-ingest-scratch-prod` | prod | reported ingest repair scratch; `ingest-scratch/` 7-day expiry intended, unverified |
+| `nntunev2-ingest-scratch-staging` | staging | ingest repair scratch; live `ingest-scratch/` object expiry verified 2026-10-17 at 604800 seconds |
+| `nntunev2-ingest-scratch-prod` | prod | ingest repair scratch; live `ingest-scratch/` object expiry verified 2026-10-17 at 604800 seconds |
 
 The archive buckets were requested at provisioning time. They are not evidence
 of an implemented archival pipeline and must not be bound to a Worker by default.
@@ -289,7 +297,7 @@ Binding names are chosen in Worker configs; resource names must match this table
 | R2 audio / stream Worker | `nntunev2-audio-staging` | `nntunev2-audio-prod` |
 | R2 artwork / MB Worker | `nntunev2-art-staging` | `nntunev2-art-prod` |
 | R2 archive / reserved, no consumer | `nntunev2-archive-staging` | `nntunev2-archive-prod` |
-| Ingest scratch (reported; names and 7-day lifecycle unverified) | `nntunev2-ingest-scratch-staging` (`ingest-scratch/`; intended 7 days) | `nntunev2-ingest-scratch-prod` (`ingest-scratch/`; intended 7 days) |
+| Ingest scratch (bucket existence and 7-day lifecycle verified 2026-10-17) | `nntunev2-ingest-scratch-staging` (`ingest-scratch/`; 604800-second expiry) | `nntunev2-ingest-scratch-prod` (`ingest-scratch/`; 604800-second expiry) |
 | Ingest Queue | `nntunev2-ingest-staging` | `nntunev2-ingest-prod` |
 | Ingest DLQ / no active consumer (reported names/IDs; live existence and retention unverified) | `nntunev2-ingest-dlq-staging` (default 4-day retention while no active consumer) | `nntunev2-ingest-dlq-prod` (default 4-day retention while no active consumer) |
 | Config KV | `nntunev2-config-staging` | `nntunev2-config-prod` |
