@@ -639,24 +639,42 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     // opening stretch, short of the end — rather than an exact timestamp.
     // `currentTime` is the position the native timeline renders; there is
     // no separate visible-position hook.
+    //
+    // Movement is proven by a `seeked` event (counted by a listener installed
+    // before the click), not by distance from the pre-seek position: with
+    // selection-autoplay the pause can land arbitrarily close to where the
+    // timeline click lands, so a distance predicate can never become true
+    // even when the seek worked.
+    await player.evaluate((element) => {
+      const audio = element as HTMLAudioElement & { __seeked?: number };
+      audio.__seeked = 0;
+      audio.addEventListener('seeked', () => {
+        audio.__seeked = (audio.__seeked ?? 0) + 1;
+      });
+    });
     await player.click({
       position: { x: Math.round(width * 0.55), y: Math.round(height / 2) },
     });
 
     const regionLow = beforeSeek.duration * 0.3;
     const regionHigh = beforeSeek.duration * 0.95;
-    const minMove = beforeSeek.duration * 0.1;
     await expect
       .poll(
         async () => {
           const state = await audioState();
+          const seeked = await player.evaluate(
+            (element) =>
+              (element as HTMLAudioElement & { __seeked?: number }).__seeked ?? 0,
+          );
           // Still-paused is part of the match: while paused, only the seek
-          // itself can have moved the position into the region.
+          // itself can have moved the position into the region, and the
+          // `seeked` event proves a seek completed rather than the position
+          // having started there.
           return (
             state.paused &&
             state.currentTime >= regionLow &&
             state.currentTime <= regionHigh &&
-            Math.abs(state.currentTime - beforeSeek.currentTime) > minMove
+            seeked > 0
           );
         },
         {
@@ -676,23 +694,45 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     // end would also pass — so track the lowest position observed during
     // resumed playback and require playback never to have dropped back
     // toward the start.
+    //
+    // The floor is seeded with the paused seek position and then takes the
+    // minimum over both the browser's `timeupdate` events and every poll
+    // sample, so the check always has a finite sample: an `Infinity`
+    // initial value would pass the floor comparison vacuously when the
+    // clip ends before any `timeupdate` fires.
     await player.evaluate((element) => {
       const audio = element as HTMLAudioElement & { __resumeMin?: number };
-      audio.__resumeMin = Infinity;
+      audio.__resumeMin = audio.currentTime;
       audio.addEventListener('timeupdate', () => {
         audio.__resumeMin = Math.min(audio.__resumeMin ?? Infinity, audio.currentTime);
       });
     });
     await player.click({ position: togglePosition });
+    let polledMin = Infinity;
     await expect
-      .poll(async () => (await audioState()).currentTime, {
-        timeout: 15_000,
-        message: 'playback did not continue from the seeked position',
-      })
+      .poll(
+        async () => {
+          const { currentTime } = await audioState();
+          if (Number.isFinite(currentTime)) {
+            polledMin = Math.min(polledMin, currentTime);
+          }
+          return currentTime;
+        },
+        {
+          timeout: 15_000,
+          message: 'playback did not continue from the seeked position',
+        },
+      )
       .toBeGreaterThan(afterSeek.currentTime);
-    const resumeMin = await player.evaluate(
-      (element) => (element as HTMLAudioElement & { __resumeMin?: number }).__resumeMin,
+    const eventMin = await player.evaluate(
+      (element) =>
+        (element as HTMLAudioElement & { __resumeMin?: number }).__resumeMin,
     );
+    const resumeMin = Math.min(eventMin ?? Infinity, polledMin);
+    expect(
+      Number.isFinite(resumeMin),
+      'no playback position was sampled during resumed playback',
+    ).toBe(true);
     expect(
       resumeMin,
       'playback restarted instead of continuing from the seek',
