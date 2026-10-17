@@ -21,15 +21,22 @@
 		try {
 			const url = await startCheckout(planId);
 			window.location.href = url;
+			// Keep pendingPlan set on success: assigning location.href only
+			// starts the cross-origin navigation, and the page stays
+			// interactive until the checkout host responds. Clearing the
+			// lock here would let a second activation issue another
+			// checkout whose navigation replaces this one.
 		} catch (err) {
-			// Signed-out visitors have no session cookie: send them to signup
-			// with the plan carried along instead of a raw 401 alert.
-			const signup = signupUrlForCheckoutFailure(planId, err);
-			if (signup) await goto(signup);
-			else if (!(err instanceof BillingApiError && err.paywall))
-				checkoutError = err instanceof Error ? err.message : 'Checkout failed';
-		} finally {
-			pendingPlan = null;
+			try {
+				// Signed-out visitors have no session cookie: send them to signup
+				// with the plan carried along instead of a raw 401 alert.
+				const signup = signupUrlForCheckoutFailure(planId, err);
+				if (signup) await goto(signup);
+				else if (!(err instanceof BillingApiError && err.paywall))
+					checkoutError = err instanceof Error ? err.message : 'Checkout failed';
+			} finally {
+				pendingPlan = null;
+			}
 		}
 	}
 </script>

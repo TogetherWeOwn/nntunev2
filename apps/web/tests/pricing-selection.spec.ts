@@ -20,6 +20,10 @@ import { expect, test, type Locator, type Page, type Route } from '@playwright/t
  *   /signup?plan=<planId>, and 402/429 show the paywall dialog instead
  *   of an inline alert. The endpoint and the { planId } payload do not
  *   change.
+ * - Success keeps the selection locked until the page leaves: assigning
+ *   `window.location.href` only starts the cross-origin navigation, so
+ *   while a slow checkout host has not responded yet the buttons stay
+ *   disabled and another activation issues no second request.
  */
 
 const CHECKOUT_ROUTE = '**/v1/billing/checkout';
@@ -108,6 +112,40 @@ async function holdCheckout(page: Page) {
 			await expect
 				.poll(() => requests.length, { message: `expected ${count} checkout request(s)` })
 				.toBe(count);
+		}
+	};
+}
+
+/**
+ * Hold the (mocked) external checkout destination until released, so a
+ * test can attempt another selection after checkout has succeeded but
+ * before the cross-origin navigation commits.
+ */
+async function holdCheckoutDestination(page: Page) {
+	let arrivals = 0;
+	let openGate!: () => void;
+	const gate = new Promise<void>((resolve) => {
+		openGate = resolve;
+	});
+
+	await page.route('https://checkout.example.test/**', async (route) => {
+		arrivals += 1;
+		await gate;
+		await route.fulfill({
+			status: 200,
+			headers: { 'content-type': 'text/html' },
+			body: '<h1>Mocked checkout</h1>'
+		});
+	});
+
+	return {
+		async waitForArrival() {
+			await expect
+				.poll(() => arrivals, { message: 'expected checkout destination request' })
+				.toBe(1);
+		},
+		release() {
+			openGate();
 		}
 	};
 }
@@ -288,6 +326,43 @@ test('successful selection navigates to the returned checkout URL with one exact
 	await expect(page.getByRole('heading', { name: 'Mocked checkout' })).toBeVisible();
 	expect(stub.requests).toEqual([
 		{ method: 'POST', pathname: '/v1/billing/checkout', body: { planId: 'pro-20x' } }
+	]);
+});
+
+test('held checkout destination: success keeps the lock until navigation commits', async ({
+	page
+}) => {
+	const destination = await holdCheckoutDestination(page);
+	const stub = await stubCheckout(page, SUCCESS);
+	const buttons = paidPlanButtons(page);
+
+	await page.goto('/pricing');
+	// Capture the other plan's click point up front: once the redirect
+	// starts, locator and evaluate calls block on the pending navigation,
+	// but raw mouse input still reaches the still-interactive page —
+	// exactly like a real user's click in that window.
+	const pro5xBox = await buttons.pro5x.boundingBox();
+	expect(pro5xBox, 'Pro 5x button is laid out before selection').not.toBeNull();
+	await buttons.plus.click();
+
+	// Checkout succeeded and `window.location.href` has started the
+	// cross-origin navigation, but the (held) checkout host has not
+	// responded, so this page is still interactive. A further real
+	// activation must not start a second checkout whose navigation
+	// would replace the first.
+	await destination.waitForArrival();
+	await page.mouse.click(pro5xBox!.x + pro5xBox!.width / 2, pro5xBox!.y + pro5xBox!.height / 2);
+	// Give any wrongly-issued second request a chance to arrive, then
+	// count. (A test-process delay: the page itself is mid-navigation.)
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	expect(stub.requests, 'exactly one checkout request may be issued').toHaveLength(1);
+	expect(stub.requests[0]?.body).toEqual({ planId: 'plus' });
+
+	destination.release();
+	await expect(page).toHaveURL(MOCKED_CHECKOUT_URL);
+	await expect(page.getByRole('heading', { name: 'Mocked checkout' })).toBeVisible();
+	expect(stub.requests).toEqual([
+		{ method: 'POST', pathname: '/v1/billing/checkout', body: { planId: 'plus' } }
 	]);
 });
 
