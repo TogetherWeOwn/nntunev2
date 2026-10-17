@@ -239,6 +239,8 @@ pub fn redrive_checkpoint(cp: &mut JobCheckpoint) {
     cp.failure_code = None;
     cp.failure_reason = None;
     cp.probe_tally = None;
+    cp.par2_set_id = None;
+    cp.missing_blocks = 0;
 }
 
 /// Decide one message's fate from its durable checkpoint and step result.
@@ -470,6 +472,8 @@ mod tests {
             attempt: msg.attempt,
             repair_rounds: msg.repair_rounds,
             probe_tally: None,
+            par2_set_id: None,
+            missing_blocks: 0,
             failure_code: None,
             failure_reason: None,
         }

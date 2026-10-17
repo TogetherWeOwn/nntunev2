@@ -36,13 +36,23 @@ function probe(overrides: {
   status: number;
   bodyText: string;
   headers?: Record<string, string>;
+  url?: string;
 }): { status: number; headers: Record<string, string>; bodyText: string; url: string } {
   return {
     status: overrides.status,
     headers: overrides.headers ?? { 'content-type': 'application/json' },
     bodyText: overrides.bodyText,
-    url: READY_URL,
+    url: overrides.url ?? READY_URL,
   };
+}
+
+function failureMessage(p: ReturnType<typeof probe>): string {
+  try {
+    assertPromotionReady(p, 'ready');
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  throw new Error('expected assertPromotionReady to throw');
 }
 
 test.describe('assertPromotionReady (promotion readiness, offline fixtures)', () => {
@@ -134,5 +144,28 @@ test.describe('assertPromotionReady (promotion readiness, offline fixtures)', ()
     expect(() =>
       assertPromotionReady(probe({ status: 404, bodyText: '{"error":"not found"}' }), 'ready'),
     ).toThrow(/\[ready\]/);
+  });
+
+  test('failure messages never echo the probe URL (host or path)', () => {
+    const sentinelUrl = 'https://sentinel-staging-host.example/api/ready';
+    const cases = [
+      probe({ status: 404, bodyText: '{"error":"not found"}', url: sentinelUrl }),
+      probe({ status: 503, bodyText: '{"ok":false}', url: sentinelUrl }),
+      probe({
+        status: 200,
+        bodyText: '<!doctype html><html><body>shell</body></html>',
+        headers: { 'content-type': 'text/html; charset=utf-8' },
+        url: sentinelUrl,
+      }),
+    ];
+    for (const p of cases) {
+      const message = failureMessage(p);
+      expect(message).toContain('[ready]');
+      expect(message).toContain('promotion-readiness');
+      expect(message).toContain(`HTTP ${p.status}`);
+      expect(message).not.toContain('sentinel-staging-host.example');
+      expect(message).not.toContain('/api/ready');
+      expect(message).not.toContain(sentinelUrl);
+    }
   });
 });

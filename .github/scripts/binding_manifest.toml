@@ -71,6 +71,10 @@ type = "service"
 binding = "INGEST_SCRATCH"
 type = "r2"
 
+[[worker.binding]]
+binding = "MB_API"
+type = "service"
+
 [[worker]]
 name = "mb"
 config = "workers/mb/wrangler.toml.example"
@@ -110,6 +114,20 @@ prod = "nntunev2-audio-prod"
 [[worker.binding]]
 binding = "METER"
 type = "analytics_engine"
+
+[[worker]]
+name = "repair"
+config = "workers/repair/wrangler.toml"
+
+[[worker.binding]]
+binding = "REPAIR_JOBS"
+type = "durable_object"
+
+[[worker.binding]]
+binding = "INGEST_SCRATCH"
+type = "r2"
+staging = "nntunev2-ingest-scratch-staging"
+prod = "nntunev2-ingest-scratch-prod"
 
 [[worker]]
 name = "web"

@@ -261,7 +261,7 @@ impl MemoryScratch {
         self.objects.borrow_mut().remove(key);
     }
     fn manifest(&self, job: &str) -> Option<String> {
-        let key = format!("ingest-scratch/{job}/r0/manifest.json");
+        let key = format!("ingest-scratch/{job}/r0/in/manifest.json");
         self.bytes(&key)
             .map(|b| String::from_utf8(b).expect("manifest is UTF-8"))
     }
@@ -359,7 +359,12 @@ async fn complete_set_verifies_stages_and_writes_the_manifest() {
     assert_eq!(scratch.bytes(&data_key).expect("staged data"), data);
     let manifest = scratch.manifest(JOB).expect("manifest staged");
     let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
-    let entries = manifest.as_array().expect("manifest is a list");
+    assert_eq!(
+        manifest["staging_id"].as_str().map(str::len),
+        Some(64),
+        "manifest carries the per-staging id"
+    );
+    let entries = manifest["files"].as_array().expect("manifest files list");
     assert_eq!(entries.len(), 2);
     assert!(entries.iter().any(|e| e["file_name"] == DATA_NAME
         && e["role"] == "data"
@@ -895,7 +900,7 @@ async fn file_over_the_in_memory_cap_is_judged_and_staged_from_its_spool() {
     );
     let manifest = scratch.manifest(JOB).expect("manifest staged");
     let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
-    let data_row = manifest
+    let data_row = manifest["files"]
         .as_array()
         .unwrap()
         .iter()

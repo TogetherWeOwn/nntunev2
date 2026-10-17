@@ -16,9 +16,11 @@
 //! checkpoint for every real admission. The Queue consumer
 //! (`src/queue_consumer.rs`; Workflow steps in `queue::WORKFLOW_STEPS`)
 //! validates messages and checkpoints and executes the upload
-//! parse + pool-probe + verify steps, but its search/repair/match/write
-//! boundaries are not executable yet, so the consumer/workflow entries
-//! stay commented out in `wrangler.toml.example` until they land.
+//! parse + pool-probe + verify steps, the repair step (through the
+//! `REPAIR_CONTAINER` service binding, fed by verify's staged inputs)
+//! and match/write, but its search boundary is not executable yet, so
+//! the consumer/workflow entries stay commented out in
+//! `wrangler.toml.example` until it lands.
 //! See `README.md`.
 
 use futures_util::StreamExt;
@@ -31,6 +33,7 @@ pub mod fixtures;
 pub mod indexer_fetch;
 pub mod jobs;
 pub mod library;
+pub mod matching;
 pub mod metering;
 pub mod newznab;
 pub mod nzb_fetch;
@@ -493,7 +496,7 @@ impl MeterSink for EdgeMeterSink<'_> {
 /// 202-and-dropped). An unknown stage is returned before the binding is
 /// touched. The unused `_body_hint` keeps the shape-ownership link explicit:
 /// the wire body is always [`meter_write_body`], via [`emit_meter`].
-fn try_meter(
+pub(crate) fn try_meter(
     env: &Env,
     msg: &QueueMsg,
     stage: &str,
@@ -693,6 +696,36 @@ struct PgAdmissionLedger {
     claim_epoch: Option<i64>,
 }
 
+/// Open one short-lived client on the `LIBRARY_DB` Hyperdrive database.
+///
+/// Shared by the admission ledger and the consumer's library upsert: the
+/// caller drops the client before awaiting anything else, so no session
+/// state crosses an await. The error is deliberately detail-free —
+/// connection strings, hosts, and driver messages never reach logs or
+/// responses.
+pub(crate) async fn library_db_client(env: &Env) -> Result<tokio_postgres::Client, ()> {
+    let hyperdrive = env
+        .hyperdrive(crate::library::LIBRARY_DB_BINDING)
+        .map_err(|e| {
+            console_log!("library db binding missing: {:?}", e);
+        })?;
+    let socket = worker::Socket::builder()
+        .secure_transport(worker::SecureTransport::StartTls)
+        .connect(hyperdrive.host(), hyperdrive.port())
+        .map_err(|_| ())?;
+    let config: tokio_postgres::Config = hyperdrive.connection_string().parse().map_err(|_| ())?;
+    let (client, connection) = config
+        .connect_raw(socket, worker::postgres_tls::PassthroughTls)
+        .await
+        .map_err(|_| ())?;
+    wasm_bindgen_futures::spawn_local(async move {
+        if connection.await.is_err() {
+            console_log!("library db connection error");
+        }
+    });
+    Ok(client)
+}
+
 impl PgAdmissionLedger {
     fn from_env(env: &Env) -> Self {
         Self {
@@ -702,32 +735,9 @@ impl PgAdmissionLedger {
     }
 
     async fn client(&self) -> Result<tokio_postgres::Client, MeterWriteError> {
-        let unavailable = || MeterWriteError::Transport("admission ledger unavailable".to_string());
-        let hyperdrive = self
-            .env
-            .hyperdrive(crate::library::LIBRARY_DB_BINDING)
-            .map_err(|e| {
-                console_log!("admission ledger binding missing: {:?}", e);
-                unavailable()
-            })?;
-        let socket = worker::Socket::builder()
-            .secure_transport(worker::SecureTransport::StartTls)
-            .connect(hyperdrive.host(), hyperdrive.port())
-            .map_err(|_| unavailable())?;
-        let config: tokio_postgres::Config = hyperdrive
-            .connection_string()
-            .parse()
-            .map_err(|_| unavailable())?;
-        let (client, connection) = config
-            .connect_raw(socket, worker::postgres_tls::PassthroughTls)
+        library_db_client(&self.env)
             .await
-            .map_err(|_| unavailable())?;
-        wasm_bindgen_futures::spawn_local(async move {
-            if connection.await.is_err() {
-                console_log!("admission ledger connection error");
-            }
-        });
-        Ok(client)
+            .map_err(|()| MeterWriteError::Transport("admission ledger unavailable".to_string()))
     }
 }
 

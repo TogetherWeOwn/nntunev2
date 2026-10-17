@@ -212,6 +212,20 @@ pub struct VerifyProgress {
     pub missing_blocks: u32,
 }
 
+/// The staged `in/manifest.json` document: the repair handoff's index
+/// of one round's staged inputs. `staging_id` identifies this exact
+/// staging of the round's bytes (repair idempotency binds to it — see
+/// the core scratch contract): it is derived from every staged file's
+/// content hash, so rewriting the manifest over identical bytes keeps
+/// the id, while any byte change (a refetched file, a new delivery's
+/// damage) mints a different one. Deterministic derivation needs no
+/// stored state or RNG and can never reuse an id for other bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchManifest {
+    pub staging_id: String,
+    pub files: Vec<ManifestEntry>,
+}
+
 impl VerifyProgress {
     pub fn new(round: u32) -> Self {
         Self {
@@ -242,7 +256,7 @@ impl VerifyProgress {
 
     /// Manifest key for one round (next to `in/`, per the scratch contract).
     pub fn manifest_key(job_id: &str, round: u32) -> String {
-        format!("{}manifest.json", Self::scratch_prefix(job_id, round))
+        format!("{}in/manifest.json", Self::scratch_prefix(job_id, round))
     }
 
     /// Spool key for one decoded segment of one file:
@@ -337,7 +351,7 @@ pub struct ManifestEntry {
     pub key: String,
     pub size: u64,
     /// `data` or `par2`.
-    pub role: &'static str,
+    pub role: String,
     /// Spool-segment keys in file order when the file was staged as its
     /// segment spool (too large to assemble in-Worker): the handoff
     /// concatenates these (zero-filling each gap named in `missing`)
@@ -1647,7 +1661,7 @@ async fn write_manifest<S: ScratchStore>(
                 file_name: file.name.clone(),
                 key: staged.key.clone(),
                 size: staged.size,
-                role: if file.is_par2 { "par2" } else { "data" },
+                role: if file.is_par2 { "par2" } else { "data" }.to_string(),
                 segments: staged.spool.iter().map(|s| s.key.clone()).collect(),
                 missing: staged
                     .spool
@@ -1659,7 +1673,22 @@ async fn write_manifest<S: ScratchStore>(
             })
         })
         .collect();
-    let json = serde_json::to_string(&entries)
+    // The staging id binds repair idempotency to these exact bytes:
+    // derive it from every staged file's content hash (in NZB order),
+    // so identical bytes keep the id and any byte change mints another.
+    let mut staging_hasher = Sha256::new();
+    for idx in 0..files.len() {
+        if let Some(staged) = progress.staged.get(&idx) {
+            staging_hasher.update(idx.to_le_bytes());
+            staging_hasher.update(staged.sha256.as_bytes());
+            staging_hasher.update(staged.size.to_le_bytes());
+        }
+    }
+    let manifest = ScratchManifest {
+        staging_id: hex::encode(staging_hasher.finalize()),
+        files: entries,
+    };
+    let json = serde_json::to_string(&manifest)
         .map_err(|_| VerifyError::Transient("manifest encode failed".into()))?;
     let key = VerifyProgress::manifest_key(job_id, round);
     let meta = StagedFile {
@@ -1713,7 +1742,7 @@ mod tests {
         );
         assert_eq!(
             VerifyProgress::manifest_key(JOB, 0),
-            "ingest-scratch/job_x/r0/manifest.json"
+            "ingest-scratch/job_x/r0/in/manifest.json"
         );
         assert_eq!(
             VerifyProgress::spool_key(JOB, 1, 2, 3),

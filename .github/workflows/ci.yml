@@ -93,6 +93,8 @@ jobs:
         run: python3 .github/scripts/public_text_lint.py
       - name: Unit-test the lint
         run: python3 .github/scripts/test_public_text_lint.py
+      - name: Acceptance-test unreadable-input handling
+        run: python3 .github/scripts/test_public_text_read_errors.py
 
   # Wrangler binding parity: every worker config's required bindings
   # (R2, KV, Queues, Hyperdrive, Analytics Engine, ...) must be present
@@ -315,6 +317,54 @@ jobs:
       # (native-only CI once missed a getrandom/RNG breakage there).
       - run: cargo check --manifest-path workers/ingest/Cargo.toml --target wasm32-unknown-unknown
 
+  rust-repair:
+    name: rust (workers/repair)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Pinned SHA: `stable` branch HEAD (2026-10-09); re-pin deliberately,
+      # never float.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo test --manifest-path workers/repair/Cargo.toml --all-targets
+      - run: cargo clippy --manifest-path workers/repair/Cargo.toml --all-targets -- -D warnings
+      - run: cargo fmt --manifest-path workers/repair/Cargo.toml -- --check
+      # The Worker deploys to wasm32: the crate (including the Container
+      # Durable Object runtime) must check and lint on that target.
+      - run: cargo check --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo clippy --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+
+  # Repair container image: the server's native tests ride the workspace
+  # `rust-test` job (containers/repair is a member); this job proves the
+  # shipped image (pinned par2cmdline-turbo build + server) builds from a
+  # clean checkout. Keep this job id in ci-ok's needs.
+  repair-container:
+    name: repair-container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build repair image from clean checkout
+        run: docker build -f containers/repair/Dockerfile -t nntune-repair:ci .
+      - name: Smoke the shipped server and pinned par2 binary
+        run: |
+          docker run -d --name repair-smoke -p 18080:8080 nntune-repair:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/health; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18080/health | grep -q '"ok":true'
+          docker exec repair-smoke /usr/local/bin/par2 --version | head -1
+          docker rm -f repair-smoke
+
   # mb-import container job: unit tests ride the workspace `rust-test` job
   # (mb-import-validate is a member); this job runs the migrations plus the
   # shell integration suite (chunked import, kill-resume, dupe-rerun, DLQ,
@@ -512,7 +562,7 @@ jobs:
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, mb-import, config-parity, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy]
+    needs: [rust-test, rust-wasm, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, mb-import, config-parity, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
