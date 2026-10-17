@@ -15,11 +15,13 @@
 
 	let busy = $state<'local' | 'everywhere' | null>(null);
 	let actionError = $state<string | null>(null);
+	let revokeIncomplete = $state(false);
 
 	async function signOut() {
 		if (busy !== null) return;
 		busy = 'local';
 		actionError = null;
+		revokeIncomplete = false;
 		try {
 			await client.logout();
 		} catch (error) {
@@ -38,11 +40,20 @@
 		if (busy !== null || !window.confirm('Sign out on every device?')) return;
 		busy = 'everywhere';
 		actionError = null;
+		revokeIncomplete = false;
 		try {
 			await client.revokeAllSessions();
 		} catch (error) {
 			if (error instanceof ApiError && error.status === 401) {
-				redirectToLogin();
+				// A 401 means this request was rejected before any session
+				// was revoked, so staying here with an explicit message keeps
+				// the failure distinguishable from a successful revocation
+				// (which navigates to /login with no message).
+				clearSignedInEmail();
+				actionError =
+					'Your session expired before other devices were signed out. Sign in again and repeat Sign out everywhere.';
+				revokeIncomplete = true;
+				busy = null;
 				return;
 			}
 			actionError = 'Could not confirm sign out everywhere. Please try again.';
@@ -67,7 +78,12 @@
 	{/if}
 
 	{#if actionError}
-		<p role="alert">{actionError}</p>
+		<p role="alert">
+			{actionError}
+			{#if revokeIncomplete}
+				<a href="/login">Sign in again</a>
+			{/if}
+		</p>
 	{/if}
 
 	<div class="actions">
