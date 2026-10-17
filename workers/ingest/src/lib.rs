@@ -344,7 +344,7 @@ fn parse_search(text: &str) -> core::result::Result<SearchRequest, &'static str>
 /// page window, and the category list before anything is built or enqueued.
 fn check_search(req: &SearchRequest) -> core::result::Result<(), &'static str> {
     let q = req.query.trim();
-    if q.is_empty() || q.len() > 200 {
+    if q.is_empty() || q.chars().count() > 200 {
         return Err("query must be 1..=200 chars");
     }
     if !validate_indexer_ref(&req.indexer_ref) {
@@ -1551,6 +1551,34 @@ mod tests {
         let many: Vec<u32> = (0..(MAX_CATEGORIES as u32 + 1)).collect();
         let bad_cats = search_body("x", "vault_idx_01-ab", &many, 25, 0);
         assert!(check_search(&parse_search(&bad_cats).unwrap()).is_err());
+    }
+
+    #[test]
+    fn search_validation_counts_query_scalars_not_utf8_bytes() {
+        // The contract is `1..=200 chars`: U+00E9 is one Unicode scalar
+        // but two UTF-8 bytes, so 200 of them (400 bytes) must pass and
+        // 201 must fail. A byte-length check rejects the 200 case.
+        let exact = "\u{e9}".repeat(200);
+        let over = "\u{e9}".repeat(201);
+        assert_eq!(exact.chars().count(), 200);
+        assert_eq!(exact.len(), 400);
+        assert_eq!(over.chars().count(), 201);
+        let check = |q: &str| {
+            check_search(&parse_search(&search_body(q, "vault_idx_01-ab", &[], 25, 0)).unwrap())
+        };
+        assert_eq!(check(&exact), Ok(()));
+        assert_eq!(check(&over), Err("query must be 1..=200 chars"));
+        // The ASCII boundary is unchanged (scalars == bytes).
+        assert_eq!(check(&"x".repeat(200)), Ok(()));
+        assert_eq!(check(&"x".repeat(201)), Err("query must be 1..=200 chars"));
+        // Trimming happens before counting: padding does not count, and a
+        // padded over-limit query still fails.
+        assert_eq!(check(&format!("  {exact}  ")), Ok(()));
+        assert_eq!(
+            check(&format!("  {over}  ")),
+            Err("query must be 1..=200 chars")
+        );
+        assert_eq!(check("   "), Err("query must be 1..=200 chars"));
     }
 
     #[test]
