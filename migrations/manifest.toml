@@ -39,6 +39,26 @@ target = "app"
 sha256 = "35508144971de4bdf9919e28a6979963053fa7eb76956df1fd6e98dac004b595"
 
 [[migration]]
-file = "0009_mb_import_resume_dlq.sql"
+file = "0009_metered_admission.sql"
+target = "app"
+sha256 = "e1f5d25c97c2eeb1e292a7761d34f9aaaed43133ddfb536e609a32f8e322f8d8"
+
+[[migration]]
+file = "0010_metered_admission_claim.sql"
+target = "app"
+sha256 = "007c434790b5d1433dd0e7f3787409afc9e802092b87aad86d7cd47d8dc87184"
+
+[[migration]]
+file = "0011_metered_admission_claim_epoch.sql"
+target = "app"
+sha256 = "50b645b72156218e83ce272c3fdfc97250df422563a2be0d30ad1ecfc72dea02"
+
+[[migration]]
+file = "0012_metered_admission_replay_window.sql"
+target = "app"
+sha256 = "6962f20adab4a64672f7c9a870d0e9e606ba8dc638a5b656e8720b0900134a4a"
+
+[[migration]]
+file = "0013_mb_import_resume_dlq.sql"
 target = "mirror"
-sha256 = "38b22c3f6c6a1978d26c66ad8420ffb2d1e6c07e91cabdf2be7f502fb6c58dbb"
+sha256 = "21fdf7a4b11e416470afd4476c7f21f50d7112b7cec9d714e02029eb07160dcb"

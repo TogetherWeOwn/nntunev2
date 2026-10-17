@@ -323,7 +323,7 @@ jobs:
       # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
       # (2026-08-06); re-pin deliberately, never float.
       - name: Apply mirror migrations
-        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_mb_mirror.sql -f migrations/0009_mb_import_resume_dlq.sql
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_mb_mirror.sql -f migrations/0013_mb_import_resume_dlq.sql
         env:
           DATABASE_URL: host=localhost port=5432 user=postgres dbname=postgres
       - name: Run import integration suite in the shipped image
