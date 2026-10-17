@@ -108,8 +108,10 @@ pub enum LogError {
     BannedField(String),
     /// A `fields` string value looks like a credential.
     SecretValue,
-    /// A `fields` string value looks like an IPv4 address.
-    Ipv4Value,
+    /// A `fields` string value looks like personal data (email shape).
+    PiiValue,
+    /// A `fields` string value looks like an IP address (v4 or v6).
+    IpAddressValue,
     /// Entropy source unavailable for ID generation.
     NoEntropy,
 }
@@ -123,7 +125,8 @@ impl fmt::Display for LogError {
             LogError::NestedField(key) => write!(f, "nested fields value: {key}"),
             LogError::BannedField(key) => write!(f, "banned fields key: {key}"),
             LogError::SecretValue => write!(f, "fields value looks like a credential"),
-            LogError::Ipv4Value => write!(f, "fields value looks like an IPv4 address"),
+            LogError::PiiValue => write!(f, "fields value looks like personal data"),
+            LogError::IpAddressValue => write!(f, "fields value looks like an IP address"),
             LogError::NoEntropy => write!(f, "trace-id randomness unavailable"),
         }
     }
@@ -240,7 +243,14 @@ pub fn is_valid_event_for_worker(worker: Worker, event: &str) -> bool {
     }
     match worker {
         Worker::Stream => true,
-        _ => event.starts_with(worker.as_str()) && event.as_bytes()[worker.as_str().len()] == b'.',
+        _ => {
+            // Length-guard before indexing: an exact-prefix event (`api`) is
+            // invalid, not a panic — the constructor stays fail-closed.
+            let prefix = worker.as_str();
+            event.len() > prefix.len()
+                && event.starts_with(prefix)
+                && event.as_bytes()[prefix.len()] == b'.'
+        }
     }
 }
 
@@ -261,6 +271,10 @@ const BANNED_KEY_PARTS: &[&str] = &[
     "cvv",
     "email",
     "session",
+    "address",
+    "phone",
+    "payment",
+    "postal",
 ];
 
 const BANNED_NAME_PARTS: &[&str] = &[
@@ -333,6 +347,33 @@ pub fn looks_like_ipv4_value(value: &str) -> bool {
     parts.len() == 4 && parts.iter().all(|part| part.parse::<u8>().is_ok())
 }
 
+/// An `addr@domain.tld` shape is treated as an email address and rejected.
+/// The bar is deliberately structural (one `@`, non-empty local part, a dot
+/// in the domain): operational field values are IDs, counters, and fixed
+/// labels, so `@` in one is already a smell worth dropping the line for.
+#[must_use]
+pub fn looks_like_email_value(value: &str) -> bool {
+    let mut parts = value.split('@');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(local), Some(domain), None) => {
+            !local.is_empty() && !domain.is_empty() && domain.contains('.')
+        }
+        _ => false,
+    }
+}
+
+/// A hex-colon IP literal (`::1`, `2001:db8::1`, full 8-group form) is
+/// treated as an IP address and rejected. The charset gate keeps
+/// colon-joined operational refs (`nzb:sha256:…`, `12:00:00`) passing:
+/// they carry non-hex letters or too few groups.
+#[must_use]
+pub fn looks_like_ipv6_value(value: &str) -> bool {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_hexdigit() || b == b':') {
+        return false;
+    }
+    value.contains("::") || value.split(':').count() == 8
+}
+
 fn validate_fields(fields: &BTreeMap<String, Value>) -> Result<(), LogError> {
     for (key, value) in fields {
         if is_banned_field_key(key) {
@@ -343,8 +384,11 @@ fn validate_fields(fields: &BTreeMap<String, Value>) -> Result<(), LogError> {
                 if looks_like_secret_value(text) {
                     return Err(LogError::SecretValue);
                 }
-                if looks_like_ipv4_value(text) {
-                    return Err(LogError::Ipv4Value);
+                if looks_like_email_value(text) {
+                    return Err(LogError::PiiValue);
+                }
+                if looks_like_ipv4_value(text) || looks_like_ipv6_value(text) {
+                    return Err(LogError::IpAddressValue);
                 }
             }
             Value::Number(_) | Value::Bool(_) | Value::Null => {}
@@ -532,7 +576,9 @@ mod tests {
         assert!(!is_valid_event_for_worker(Worker::Api, "ingest.job.queued"));
         // `api..x` is ugly but satisfies the documented contract (only
         // leading/trailing separators are banned), so it stays accepted.
-        for bad in ["", "nodot", "API.AUTH.LOGIN", ".api.x", "api.x_"] {
+        // An exact-prefix event (`api`) is invalid — and must return false,
+        // never panic on the namespace index.
+        for bad in ["", "nodot", "API.AUTH.LOGIN", ".api.x", "api.x_", "api"] {
             assert!(
                 !is_valid_event_for_worker(Worker::Api, bad),
                 "accepted {bad}"
@@ -624,6 +670,10 @@ mod tests {
             "password",
             "grant_token",
             "api_key",
+            "home_address",
+            "phone_number",
+            "payment_method",
+            "postal_code",
         ] {
             assert!(
                 fields_from_json(serde_json::json!({key: "safe"})).is_err(),
@@ -654,6 +704,37 @@ mod tests {
         assert!(fields_from_json(serde_json::json!({"stage": "task-queued"})).is_ok());
         assert!(fields_from_json(serde_json::json!({"host": "192.0.2.1"})).is_err());
         assert!(fields_from_json(serde_json::json!({"host": "256.0.2.1"})).is_ok());
+        // Email-shaped values are personal data, not just keys.
+        for value in ["a@example.com", "user+tag@mail.example.co"] {
+            assert!(
+                fields_from_json(serde_json::json!({"contact": value})).is_err(),
+                "accepted email value {value}"
+            );
+        }
+        assert!(fields_from_json(serde_json::json!({"contact": "not-an-email"})).is_ok());
+        // IPv6 literals are IP addresses too; colon-joined operational refs
+        // (`nzb:sha256:…`) and clock fragments still pass.
+        for value in [
+            "::1",
+            "2001:db8::1",
+            "2001:0db8:0000:0000:0000:0000:0000:0001",
+        ] {
+            assert!(
+                fields_from_json(serde_json::json!({"host": value})).is_err(),
+                "accepted IPv6 value {value}"
+            );
+        }
+        for value in [
+            "nzb:sha256:abc123",
+            "12:00:00",
+            "task-queued",
+            "ingest:u1:abc:upload",
+        ] {
+            assert!(
+                fields_from_json(serde_json::json!({"detail": value})).is_ok(),
+                "rejected operational value {value}"
+            );
+        }
         // Nested values and non-objects are rejected.
         assert!(fields_from_json(serde_json::json!({"a": {"b": 1}})).is_err());
         assert!(fields_from_json(serde_json::json!({"a": [1]})).is_err());

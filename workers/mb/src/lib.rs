@@ -610,10 +610,19 @@ mod http_layer {
         req: &Request,
         ctx: &RouteContext<()>,
     ) -> WorkerResult<Response> {
-        if let Some(hit) = edge_hit(req).await {
-            return Ok(hit);
-        }
+        // Resolve before the edge lookup: cache hits are the hot path, and
+        // they still echo the trace and log one line. The cached copy itself
+        // stays untraced (wrapping only mutates the served clone).
         let trace_id = inbound_trace_id(req);
+        if let Some(hit) = edge_hit(req).await {
+            emit(
+                Level::Info,
+                &trace_id,
+                "mb.lookup.completed",
+                serde_json::json!({"kind": kind.as_str(), "status_code": 200, "cache": "edge"}),
+            );
+            return Ok(with_trace(hit, &trace_id));
+        }
         let mbid = ctx.param("mbid").map(String::as_str).unwrap_or("");
         let repo = PgRepo {
             env: ctx.env.clone(),
@@ -633,10 +642,28 @@ mod http_layer {
     }
 
     pub async fn search_route(req: &Request, ctx: &RouteContext<()>) -> WorkerResult<Response> {
-        if let Some(hit) = edge_hit(req).await {
-            return Ok(hit);
-        }
         let trace_id = inbound_trace_id(req);
+        // Parsed-or-unknown: the raw `type` query value is untrusted input
+        // and never reaches a log line verbatim.
+        let kind_label = |query: &std::collections::HashMap<String, String>| {
+            query
+                .get("type")
+                .and_then(|raw| Kind::parse(Some(raw.clone())))
+                .map(|kind| kind.as_str())
+                .unwrap_or("unknown")
+        };
+        if let Some(hit) = edge_hit(req).await {
+            let url = req.url()?;
+            let query: std::collections::HashMap<String, String> =
+                url.query_pairs().into_owned().collect();
+            emit(
+                Level::Info,
+                &trace_id,
+                "mb.search.completed",
+                serde_json::json!({"kind": kind_label(&query), "status_code": 200, "cache": "edge"}),
+            );
+            return Ok(with_trace(hit, &trace_id));
+        }
         let url = req.url()?;
         let query: std::collections::HashMap<String, String> =
             url.query_pairs().into_owned().collect();
@@ -653,13 +680,12 @@ mod http_layer {
         )
         .await;
         // The raw query text never logs (free-form user input); the line
-        // carries the kind plus the outcome status only.
-        let kind_label = query.get("type").map(String::as_str).unwrap_or("unknown");
+        // carries the parsed kind plus the outcome status only.
         emit(
             outcome_level(api.status),
             &trace_id,
             "mb.search.completed",
-            serde_json::json!({"kind": kind_label, "status_code": api.status}),
+            serde_json::json!({"kind": kind_label(&query), "status_code": api.status}),
         );
         serve(url.to_string(), api, &trace_id).await
     }
