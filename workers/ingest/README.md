@@ -207,10 +207,17 @@ recordings-fetch failure never loses the release match (transient
 retries the job, permanent writes the release with an empty list).
 Still blocked for the live
 half: wiring the consumer's search step to a Newznab provider call, its
-probe step to the pool-DO contract (`src/pool_probe.rs`), and
-verify/repair to the Container runtime. Until those land the consumer
-stays disabled and no live provider, pool, or repair invocation is
-claimed here.
+probe step to the pool-DO contract (`src/pool_probe.rs`), verify/repair
+to the Container runtime, and the library schema itself — no migration
+creates the upsert's `library` table or its `UNIQUE(idempotency_key)`
+(`migrations/0003_library.sql` defines only `genres`/`playlists`), and
+per ADR 0002 the follow-up adds normalized tables and changes the
+post-match writer after inspecting staging rather than assuming the
+flat table exists. Enabling the consumer before that lands would fail
+every `Writing` delivery (deterministic SQLSTATEs such as 42P01/42P10
+are mapped to a permanent failure so they quarantine at once). Until
+those land the consumer stays disabled and no live provider, pool, or
+repair invocation is claimed here.
 
 ## Slice T2 — retry budget + DLQ (this slice)
 

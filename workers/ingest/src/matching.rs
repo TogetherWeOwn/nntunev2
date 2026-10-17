@@ -30,12 +30,21 @@ pub const MB_API_BINDING: &str = "MB_API";
 /// not by host; the name only needs to be a valid absolute URL.
 const MB_SERVICE_HOST: &str = "https://mb-api.invalid";
 
-/// Minimum trigram similarity accepted as a release match. This mirrors
-/// the `pg_trgm` default `similarity_threshold` (0.3) that the MB worker's
-/// `%` predicate already applies server-side; re-checking it here means a
-/// future MB-side contract change cannot silently start accepting weaker
-/// hits as library matches.
-pub const MIN_MATCH_SCORE: f32 = 0.3;
+/// Minimum trigram similarity accepted as a release match. This is
+/// deliberately well above the `pg_trgm` default `similarity_threshold`
+/// (0.3) that the MB worker's `%` predicate applies server-side: that
+/// search ranks on release title only, so for an "Artist - Album" query a
+/// release merely titled "Artist" can outscore the real album at the 0.3
+/// floor. Until the MB lookup is artist-aware, only a strong title hit is
+/// accepted (see also [`MIN_MATCH_MARGIN`]); anything weaker is written
+/// unmatched rather than guessed at.
+pub const MIN_MATCH_SCORE: f32 = 0.6;
+
+/// Minimum lead the top hit must hold over the runner-up. Two releases
+/// with the same title (by any artist) score identically under the
+/// title-only search, so a tie — or a near-tie within this margin — is
+/// ambiguous and yields no match instead of an arbitrary MBID pick.
+pub const MIN_MATCH_MARGIN: f32 = 0.1;
 
 /// Upper bound on `recording_mbids` carried into a library write. Mirrors
 /// the 10k validation cap in `library::validate_library_write`:
@@ -204,20 +213,31 @@ pub fn recording_mbids_or_fallback(
     }
 }
 
-/// Deterministic release pick: the highest score at or above
-/// [`MIN_MATCH_SCORE`] with a canonical MBID, ties broken by the
-/// lexicographically smallest MBID. The MB worker already orders hits
-/// this way, but the pick does not trust wire order.
+/// Deterministic, ambiguity-rejecting release pick: the highest score at or
+/// above [`MIN_MATCH_SCORE`] with a canonical MBID, accepted only when it
+/// leads the runner-up by more than [`MIN_MATCH_MARGIN`]. An exact tie or
+/// a near-tie returns `None` (unmatched) — the title-only search cannot
+/// distinguish same-title releases, and persisting an arbitrary one of
+/// them would be a guessed match. The MB worker already orders hits by
+/// score, but the pick does not trust wire order.
 pub fn pick_release_mbid(hits: &[MbSearchHit]) -> Option<String> {
-    hits.iter()
+    let mut candidates: Vec<&MbSearchHit> = hits
+        .iter()
         .filter(|hit| hit.score >= MIN_MATCH_SCORE && validate_mbid(&hit.mbid))
-        .min_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(core::cmp::Ordering::Equal)
-                .then_with(|| a.mbid.cmp(&b.mbid))
-        })
-        .map(|hit| hit.mbid.clone())
+        .collect();
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(core::cmp::Ordering::Equal)
+            .then_with(|| a.mbid.cmp(&b.mbid))
+    });
+    let top = candidates.first()?;
+    if let Some(runner_up) = candidates.get(1) {
+        if top.score - runner_up.score <= MIN_MATCH_MARGIN {
+            return None;
+        }
+    }
+    Some(top.mbid.clone())
 }
 
 /// Derive a candidate release query from NZB file subjects.
@@ -367,17 +387,52 @@ mod tests {
     #[test]
     fn pick_is_deterministic_and_thresholded() {
         assert_eq!(pick_release_mbid(&[]), None);
-        // Highest score wins regardless of wire order.
-        let hits = vec![hit(MBID_B, 0.5), hit(MBID_A, 0.9)];
+        // A clear winner above the bar wins regardless of wire order.
+        let hits = vec![hit(MBID_B, 0.65), hit(MBID_A, 0.9)];
         assert_eq!(pick_release_mbid(&hits).as_deref(), Some(MBID_A));
-        // Ties go to the smallest MBID, in either order.
-        let ties = vec![hit(MBID_B, 0.8), hit(MBID_A, 0.8)];
-        assert_eq!(pick_release_mbid(&ties).as_deref(), Some(MBID_A));
-        let ties_rev = vec![hit(MBID_A, 0.8), hit(MBID_B, 0.8)];
-        assert_eq!(pick_release_mbid(&ties_rev).as_deref(), Some(MBID_A));
-        // Below threshold or malformed MBIDs never match.
-        assert_eq!(pick_release_mbid(&[hit(MBID_A, 0.29)]), None);
+        let hits_rev = vec![hit(MBID_A, 0.9), hit(MBID_B, 0.65)];
+        assert_eq!(pick_release_mbid(&hits_rev).as_deref(), Some(MBID_A));
+        // A lone strong hit matches.
+        assert_eq!(
+            pick_release_mbid(&[hit(MBID_A, 0.9)]).as_deref(),
+            Some(MBID_A)
+        );
+        // Below the raised bar or malformed MBIDs never match — including
+        // scores the server-side 0.3 `%` floor would have returned.
+        assert_eq!(pick_release_mbid(&[hit(MBID_A, 0.59)]), None);
+        assert_eq!(pick_release_mbid(&[hit(MBID_A, 0.35)]), None);
         assert_eq!(pick_release_mbid(&[hit("not-an-mbid", 1.0)]), None);
+    }
+
+    #[test]
+    fn pick_rejects_ambiguous_same_title_and_artist_named_hits() {
+        // Two same-title releases tie exactly: title-only search cannot
+        // tell them apart, so the pick is unmatched in either wire order
+        // rather than the lexicographically smallest MBID.
+        let ties = vec![hit(MBID_B, 0.9), hit(MBID_A, 0.9)];
+        assert_eq!(pick_release_mbid(&ties), None);
+        let ties_rev = vec![hit(MBID_A, 0.9), hit(MBID_B, 0.9)];
+        assert_eq!(pick_release_mbid(&ties_rev), None);
+        // A near-tie within the margin is likewise ambiguous.
+        let near_tie = vec![hit(MBID_A, 0.9), hit(MBID_B, 0.85)];
+        assert_eq!(pick_release_mbid(&near_tie), None);
+        // "Artist - Album" query under title-only trigram scoring: a
+        // release titled just "Pink Floyd" (0.579) outscores the real
+        // album "Animals" (0.421). Both sit below the raised bar, so the
+        // artist-named release is not attached by mistake.
+        let artist_named = vec![
+            MbSearchHit {
+                mbid: MBID_B.to_string(),
+                title: "Pink Floyd".to_string(),
+                score: 0.579,
+            },
+            MbSearchHit {
+                mbid: MBID_A.to_string(),
+                title: "Animals".to_string(),
+                score: 0.421,
+            },
+        ];
+        assert_eq!(pick_release_mbid(&artist_named), None);
     }
 
     #[test]
