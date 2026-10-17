@@ -262,20 +262,35 @@ const BANNED_KEY_PARTS: &[&str] = &[
     "api_key",
     "apikey",
     "token",
+    "credential",
+    "passphrase",
     "cookie",
     "authorization",
     "private_key",
+    "privatekey",
     "mnemonic",
     "ssn",
     "credit_card",
     "card_number",
     "cvv",
+    "payment_details",
+    "payment_method",
     "email",
     "session",
+    "postal",
     "address",
     "phone",
-    "payment",
-    "postal",
+    // NOTE: no bare "payment" — payment_id must stay loggable.
+    "street",
+    "postcode",
+    "zip_code",
+    "request_body",
+    "response_body",
+    "headers",
+    "raw_query",
+    "query_string",
+    "nzb_contents",
+    "nzb_xml",
 ];
 
 const BANNED_NAME_PARTS: &[&str] = &[
@@ -299,10 +314,12 @@ pub fn is_banned_field_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     let has_ip_component = lower
         .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|part| part == "ip")
+        .any(|part| part == "ip" || part == "ipv4" || part == "ipv6")
         || ["clientip", "remoteip", "ipaddress"]
             .iter()
-            .any(|part| lower.contains(part));
+            .any(|part| lower.contains(part))
+        || lower.contains("ipv4")
+        || lower.contains("ipv6");
     let has_name_component = lower == "name"
         || lower.starts_with("name_")
         || lower.contains("_name")
@@ -665,24 +682,52 @@ mod tests {
             "contact_email",
             "client_ip",
             "ip_address",
+            "ipv4",
+            "ipv6",
+            "client_ipv4",
             "session_id",
             "name",
             "display_name",
             "password",
             "grant_token",
             "api_key",
+            "user_credentials",
+            "passphrase",
+            "privatekey",
             "home_address",
             "phone_number",
+            "payment_details",
             "payment_method",
             "postal_code",
+            "zip_code",
+            "street_name",
+            "request_body",
+            "response_body",
+            "complete_headers",
+            "raw_query",
+            "query_string",
+            "nzb_contents",
+            "nzb_xml",
         ] {
             assert!(
                 fields_from_json(serde_json::json!({key: "safe"})).is_err(),
                 "accepted banned key {key}"
             );
         }
-        // Over-broad matches stay allowed.
-        for key in ["ship_id", "zip_code", "filename", "namespace", "trip"] {
+        // Over-broad matches stay allowed (`payment_id` is an opaque internal
+        // identifier, not payment details).
+        for key in [
+            "ship_id",
+            "filename",
+            "namespace",
+            "trip",
+            "nzb_id",
+            "query_ms",
+            "body_bytes",
+            "header_count",
+            "payment_id",
+            "gzip_ratio",
+        ] {
             assert!(
                 fields_from_json(serde_json::json!({key: "safe"})).is_ok(),
                 "rejected safe key {key}"
