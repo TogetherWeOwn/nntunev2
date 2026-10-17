@@ -60,11 +60,9 @@ pub fn parse(header: Option<&str>, len: u64) -> RangeOutcome {
             Err(_) => return RangeOutcome::Full,
         };
         if len == 0 || n == 0 {
-            return if len == 0 {
-                RangeOutcome::Unsatisfiable
-            } else {
-                RangeOutcome::Full
-            };
+            // A zero-length suffix (`bytes=-0`) requests no bytes, so it is
+            // unsatisfiable on any body, not a full-body delivery.
+            return RangeOutcome::Unsatisfiable;
         }
         let n = n.min(len);
         RangeOutcome::Partial(ByteRange {
