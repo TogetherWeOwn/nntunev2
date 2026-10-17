@@ -1,7 +1,7 @@
 //! Acceptance tests: rate limits and abuse guards on Newznab search.
 //!
-//! TDD RED for [TOG-25181](/TOG/issues/TOG-25181) (roadmap R6 from
-//! [TOG-25148](/TOG/issues/TOG-25148)). These tests FAIL until
+//! Failing-first acceptance tests for the rate-limit build (roadmap R6).
+//! These tests FAIL until
 //! `nntune_ingest::rate_limit` implements the search-throttle contract below.
 //!
 //! Builder: extend `workers/ingest/src/rate_limit.rs` (keep `TokenBucket` +
@@ -9,10 +9,8 @@
 //! Auth + vault test-connection throttling lives in `workers/api` — see
 //! `workers/api/tests/rate_limits_acceptance.rs` on the same branch.
 //!
-//! Failing command (this card):
+//! Failing command:
 //!   `cd workers/ingest && cargo test --test search_rate_limits_acceptance`
-//! Branch:
-//!   `TOG-25191-acceptance-tests-rate-limits-and-abuse-guards-on-auth-vault-and-search`
 //!
 //! Contract under test (implement exactly these items; `TokenBucket` keeps its
 //! existing `new` / `per_window` / `take` semantics — take only on success):
