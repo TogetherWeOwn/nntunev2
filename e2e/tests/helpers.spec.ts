@@ -9,7 +9,7 @@ import {
   stagingBaseUrl,
   syntheticNntpEndpoint,
 } from '../helpers/access.js';
-import { extractPlanMeta, extractUsageBytes } from '../helpers/contract.js';
+import { extractLibraryItems, extractPlanMeta, extractRecordingMbids, extractUsageBytes, isMbid } from '../helpers/contract.js';
 import {
   apiGet,
   apiPost,
@@ -748,5 +748,81 @@ test.describe('redirect location-state diagnostics (value-free)', () => {
     expect(message).toMatch(/location present/i);
     expect(message).not.toMatch(/malformed/i);
     expect(message).not.toContain('sentinel-rel-query');
+  });
+});
+
+test.describe('isMbid', () => {
+  test('accepts canonical lowercase and uppercase hex', () => {
+    expect(isMbid('f5c2d4b1-3a7e-4d1c-9e2f-0a1b2c3d4e5f')).toBe(true);
+    expect(isMbid('F5C2D4B1-3A7E-4D1C-9E2F-0A1B2C3D4E5F')).toBe(true);
+  });
+
+  test('rejects non-MBID shapes', () => {
+    for (const bad of [
+      '',
+      'not-an-mbid',
+      'f5c2d4b1-3a7e-4d1c-9e2f',
+      'f5c2d4b1-3a7e-4d1c-9e2f-0a1b2c3d4e5g',
+      'f5c2d4b13a7e4d1c9e2f0a1b2c3d4e5f',
+      42,
+      null,
+    ]) {
+      expect(isMbid(bad)).toBe(false);
+    }
+  });
+});
+
+test.describe('extractLibraryItems', () => {
+  test('reads a bare array', () => {
+    expect(extractLibraryItems('[{"id":"a"},{"id":"b","title":"T"}]')).toEqual([
+      { id: 'a' },
+      { id: 'b', title: 'T' },
+    ]);
+  });
+
+  test('reads the { items: [...] } shape', () => {
+    expect(extractLibraryItems('{"items":[{"id":"a"}]}')).toEqual([{ id: 'a' }]);
+  });
+
+  test('drops rows without a string id', () => {
+    expect(extractLibraryItems('[{"id":"a"},{},{"id":42}]')).toEqual([{ id: 'a' }]);
+  });
+
+  test('throws by name on non-JSON and reshaped payloads', () => {
+    expect(() => extractLibraryItems('not json')).toThrow(/\[library\]/);
+    expect(() => extractLibraryItems('{"tracks":[]}')).toThrow(/tracks/);
+  });
+});
+
+test.describe('extractRecordingMbids', () => {
+  const MBID = 'f5c2d4b1-3a7e-4d1c-9e2f-0a1b2c3d4e5f';
+
+  test('reads the canonical field', () => {
+    expect(extractRecordingMbids({ id: 't', recording_mbids: [MBID] })).toEqual([MBID]);
+  });
+
+  test('reads the camelCase alias', () => {
+    expect(extractRecordingMbids({ id: 't', recordingMbids: [MBID] })).toEqual([MBID]);
+  });
+
+  test('names the actual keys when the field is absent', () => {
+    expect(() => extractRecordingMbids({ id: 't', title: 'x' })).toThrow(/title/);
+  });
+
+  test('an empty list fails naming the release state', () => {
+    expect(() => extractRecordingMbids({ id: 't', recording_mbids: [] })).toThrow(
+      /no release_mbid/,
+    );
+    expect(() =>
+      extractRecordingMbids({ id: 't', release_mbid: 'r', recording_mbids: [] }),
+    ).toThrow(/release_mbid r/);
+  });
+
+  test('a non-array and malformed entries fail by name', () => {
+    expect(() => extractRecordingMbids({ id: 't', recording_mbids: 'x' })).toThrow(/array/);
+    expect(() => extractRecordingMbids({ id: 't', recording_mbids: ['zzz'] })).toThrow(
+      /recording_mbids\[0\]/,
+    );
+    expect(() => extractRecordingMbids(null)).toThrow(/object/);
   });
 });

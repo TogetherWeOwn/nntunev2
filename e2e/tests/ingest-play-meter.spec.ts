@@ -5,7 +5,9 @@ import {
   API,
   PLAN_LIMIT_STATUSES,
   TESTIDS,
+  extractLibraryItems,
   extractPlanMeta,
+  extractRecordingMbids,
   extractUsageBytes,
   uniqueTestEmail,
 } from '../helpers/contract.js';
@@ -305,5 +307,36 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
       (PLAN_LIMIT_STATUSES as readonly number[]).includes(res.status()),
       `expected a plan-limit status (${PLAN_LIMIT_STATUSES.join('/')}), got HTTP ${res.status()}`,
     ).toBe(true);
+  });
+
+  test('ingested track carries recording_mbids', async ({ request }) => {
+    const baseURL = stagingBaseUrl('skip', 'recording-mbids');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    // Fail closed instead of asserting anonymously when neither the
+    // ingesting session nor the QA seam token exists.
+    requireApiAccount(account, 'recording-mbids');
+    const headers = accountHeaders(account);
+    const libraryUrl = `${baseURL}${API.library}`;
+    // The MB match + library write settle after the import status flips,
+    // so poll the listing until the ingested track carries its recording
+    // MBIDs. Every failure names the gap: transport/list shape, an empty
+    // library, or the missing/empty/malformed fill itself (see
+    // extractRecordingMbids in e2e/helpers/contract.ts).
+    await expect(async () => {
+      const library = await apiGet(request, libraryUrl, headers, 'recording-mbids');
+      const libraryBody = await readApiBody(library, libraryUrl, 'recording-mbids');
+      expect(library.ok(), `library listing failed: HTTP ${library.status()}`).toBe(true);
+      const items = extractLibraryItems(libraryBody);
+      expect(items.length, 'library is empty — ingest spec must run first').toBeGreaterThan(0);
+      const mbids = extractRecordingMbids(items[0]);
+      expect(
+        mbids.length,
+        '[recording-mbids] ingested track carries an empty recording_mbids list',
+      ).toBeGreaterThan(0);
+    }).toPass({ timeout: 60_000 });
   });
 });
