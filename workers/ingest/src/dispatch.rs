@@ -279,6 +279,40 @@ mod tests {
     }
 
     #[test]
+    fn search_dispatch_counts_query_scalars_not_utf8_bytes() {
+        // The contract is `1..=200 chars`: U+00E9 is one Unicode scalar
+        // but two UTF-8 bytes, so 200 of them (400 bytes) must build a
+        // dispatch and 201 must fail. A byte-length check rejects 200.
+        let exact = "\u{e9}".repeat(200);
+        let over = "\u{e9}".repeat(201);
+        assert_eq!(exact.chars().count(), 200);
+        assert_eq!(exact.len(), 400);
+        assert_eq!(over.chars().count(), 201);
+        let msg = build_search_dispatch(USER, &exact, INDEXER, &[], 10, 0)
+            .expect("200 scalars must be accepted");
+        assert_eq!(msg.query.as_deref(), Some(exact.as_str()));
+        assert_eq!(
+            build_search_dispatch(USER, &over, INDEXER, &[], 10, 0).err(),
+            Some("query must be 1..=200 chars")
+        );
+        // The ASCII boundary is unchanged (scalars == bytes).
+        assert!(build_search_dispatch(USER, &"x".repeat(200), INDEXER, &[], 10, 0).is_ok());
+        assert_eq!(
+            build_search_dispatch(USER, &"x".repeat(201), INDEXER, &[], 10, 0).err(),
+            Some("query must be 1..=200 chars")
+        );
+        // Trimming happens before counting and the stored query is the
+        // trimmed one; a padded over-limit query still fails.
+        let padded = build_search_dispatch(USER, &format!("  {exact}  "), INDEXER, &[], 10, 0)
+            .expect("padding must not count toward the limit");
+        assert_eq!(padded.query.as_deref(), Some(exact.as_str()));
+        assert_eq!(
+            build_search_dispatch(USER, &format!("  {over}  "), INDEXER, &[], 10, 0).err(),
+            Some("query must be 1..=200 chars")
+        );
+    }
+
+    #[test]
     fn upload_dispatch_binds_nzb_bytes() {
         let nzb = crate::fixtures::SMALL_NZB;
         let a = build_upload_dispatch(USER, nzb).unwrap();
