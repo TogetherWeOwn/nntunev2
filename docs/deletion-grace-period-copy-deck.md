@@ -28,8 +28,8 @@ the ADR wins and the deck is wrong.
 | Placeholder | Meaning | Example rendering |
 | --- | --- | --- |
 | `{{grace_duration}}` | Length of the cancellable grace period, in words | `24 hours` |
-| `{{erase_after}}` | Local date and time erasure can start, from the operation's `erase_after` | `3 May at 14:20` |
-| `{{time_remaining}}` | Time left to cancel, rounded down | `about 6 hours` |
+| `{{erase_after}}` | Date and time erasure can start, from the operation's `erase_after`; timezone handling differs by surface (below) | `3 May at 14:20` (signed-in web, browser-local); `3 May at 14:20 UTC` (email) |
+| `{{time_remaining}}` | Time until erasure can start (until `erase_after`), rounded down; never rendered at or past the deadline (below) | `about 6 hours` |
 | `{{email}}` | The account email address | `you@example.com` |
 | `{{support_contact}}` | How to reach support | *(undecided — §11)* |
 | `{{retained_records_sentence}}` | Approved disclosure of any records kept after erasure; omitted until approved | *(undecided — §11)* |
@@ -37,9 +37,27 @@ the ADR wins and the deck is wrong.
 
 Rules: `{{time_remaining}}` always rounds **down** (never promise more
 time than is left), and when less than one hour remains it renders in
-minutes. `{{erase_after}}` renders in the viewer's local timezone and is
-always paired with the words "can start", never "will start" — the exact
-start time after the deadline is not promised.
+minutes. `{{erase_after}}` is always paired with the words "can start",
+never "will start" — the exact start time after the deadline is not
+promised.
+
+Timezones: only signed-in web surfaces render `{{erase_after}}` in the
+browser's local timezone. Emails are built on the server and no user
+timezone is stored, so in email `{{erase_after}}` always carries an
+explicit zone (for example `3 May at 14:20 UTC`) and is paired with
+`{{grace_duration}}`, so the deadline is clear even if the zone is
+unfamiliar. Never render a bare local-looking time in email: a reader who
+takes it for their own timezone can miss the only cancel window.
+
+At or past the deadline: erasure starts only when the deletion sweep next
+runs, so the operation can stay `scheduled` — and cancellable — for a
+short time after `erase_after`. In that window, never render
+`{{time_remaining}}` (no "0 minutes left to cancel"), never hide or
+disable **Cancel deletion**, and use the past-deadline wording given in
+§5.3 (banner) and §6.1 (cancel dialog) instead: erasure can start at any
+time now, and the user can still
+cancel. The too-late wording in §6.3 appears only once erasure has
+actually started.
 
 ## 3. State: before the request (account settings)
 
@@ -59,7 +77,7 @@ Surface: confirmation dialog, shown before the step-up check.
 - **Heading:** Delete your account?
 - **Body:** If you go ahead, your deletion is **scheduled** — nothing is
   erased yet. You then have {{grace_duration}} to cancel. If you do not
-  cancel, erasure can start after {{erase_after}}. Once erasure is
+  cancel, erasure can start once that time has passed. Once erasure is
   finished, your account, library and listening history cannot be
   restored. To confirm this is you, we will ask you to verify your
   identity on the next step.
@@ -82,8 +100,8 @@ This is the state for the whole grace window (operation `scheduled`).
 - **Heading:** Deletion scheduled
 - **Body:** We have **not** erased anything yet. Your account is
   scheduled for deletion, and erasure can start after {{erase_after}}.
-  Changed your mind? You can cancel any time before then and keep your
-  account as it is. We have sent a confirmation email to {{email}}. If
+  Changed your mind? You can cancel any time before erasure starts and
+  keep your account as it is. We have sent a confirmation email to {{email}}. If
   this was not you, sign in and cancel straight away.
 - **Primary action:** Cancel deletion
 - **Secondary action:** Sign out
@@ -92,15 +110,27 @@ This is the state for the whole grace window (operation `scheduled`).
 
 - **Subject:** Your account deletion is scheduled
 - **Body:** You asked us to delete your account. Nothing has been erased
-  yet. Erasure can start after {{erase_after}}. To keep your account,
-  sign in before then and cancel the deletion. If you did not ask for
+  yet. You have {{grace_duration}} to change your mind: erasure can start
+  after {{erase_after}}. To keep your account, sign in before erasure
+  starts and cancel the deletion. If you did not ask for
   this, sign in and cancel now, then contact {{support_contact}}.
+
+Per §2, the `{{erase_after}}` in this email carries an explicit timezone
+(for example `3 May at 14:20 UTC`); it is not rendered in the reader's
+local time.
 
 ### 5.3 Status banner (shown while signed in during grace)
 
 - **Body:** Your account is scheduled for deletion. Nothing has been
   erased yet. Erasure can start after {{erase_after}} ({{time_remaining}}
   left to cancel).
+- **Primary action:** Cancel deletion
+
+Past-deadline variant (`erase_after` has passed, operation still
+`scheduled` — §2): omit the countdown, keep the same primary action.
+
+- **Body:** Your account is scheduled for deletion. Nothing has been
+  erased yet. Erasure can start at any time now. You can still cancel.
 - **Primary action:** Cancel deletion
 
 ### 5.4 Status page (status during grace)
@@ -115,11 +145,23 @@ branch this page on the `pending` operation state.
   is scheduled, some changes to your account are paused.
 - **Primary action:** Cancel deletion
 
-### 5.5 Blocked change (a write refused while deletion is pending)
+### 5.5 Blocked change (a write refused while deletion is scheduled)
 
-- **Body:** You cannot make changes while your account is scheduled for
-  deletion. Cancel the deletion first if you want to keep using your
-  account.
+A refused write returns `409 account_deleting` in both `scheduled` and
+`running`, and the error does not say which state the operation is in.
+The client must read the operation state from
+`GET /v1/operations/{operation_id}` and branch: the body below applies
+**only** while the operation is `scheduled`. Once erasure is `running`,
+cancelling is no longer possible, so never offer it — use the running
+variant instead (see also §7).
+
+- **Body (scheduled):** You cannot make changes while your account is
+  scheduled for deletion. Nothing has been erased yet; erasure can start
+  after {{erase_after}}. Cancel the deletion first if you want to keep
+  using your account — you can cancel any time before erasure starts.
+- **Body (running):** Erasure of your account has started, so changes
+  are no longer possible. This can no longer be cancelled. We will email
+  {{email}} when erasure is complete.
 
 ## 6. State: cancel the deletion
 
@@ -137,6 +179,12 @@ the copy must say so up front, not after a failure.
   have {{time_remaining}} to cancel.
 - **Primary action:** Keep my account
 - **Secondary action:** Go back
+
+Past the deadline (`erase_after` has passed, operation still
+`scheduled` — §2): replace the last sentence with "If you have been
+signed out, sign in again first — erasure can start at any time now, and
+you can still cancel." Do not render a zero or negative countdown, and
+do not switch to §6.3: cancelling still works until erasure starts.
 
 ### 6.2 Cancel succeeded
 
@@ -220,8 +268,10 @@ Do not give a new date unless engineering can stand behind it.
    required, not banned.
 2. **Explain the grace period every time it matters.** Any surface that
    mentions the request also states, in plain words: nothing is erased
-   yet, you have {{grace_duration}}, and you can cancel. Do not rely on
-   the user having seen an earlier screen.
+   yet, the timing ({{grace_duration}} before the request is made; once
+   scheduled, {{erase_after}} or {{time_remaining}} may stand in for it),
+   and that you can cancel. Do not rely on the user having seen an
+   earlier screen.
 3. **No dark patterns.** Cancel-deletion is never hidden, shrunk, or
    labelled with guilt wording ("No, I love my data"). The destructive
    path and the cancel path get equally plain labels.
@@ -232,7 +282,10 @@ Do not give a new date unless engineering can stand behind it.
    "execute", "tombstone", "compare-and-set" or any internal term. Read
    each string aloud; if it sounds like a contract, rewrite it.
 6. **Time honesty.** Deadlines are "can start after", remaining time
-   rounds down (§2), and completion is announced only by the §8.1 email.
+   rounds down (§2), email deadlines always carry an explicit timezone
+   (§2), the countdown is never shown at or past the deadline while
+   cancelling still works (§2, §5.3), and completion is announced only
+   by the §8.1 email.
 
 ## 11. Decisions deferred to the approving (web-journey) change
 
@@ -260,5 +313,13 @@ Do not give a new date unless engineering can stand behind it.
   just this deck, and confirm every pre-completion hit is a negation.
 - [ ] Placeholders filled from live operation data (`erase_after`),
   remaining time rounded down.
+- [ ] Email deadlines carry an explicit timezone and are paired with
+  `{{grace_duration}}` (§2, §5.2); only signed-in web surfaces use the
+  browser's local timezone.
+- [ ] Past-deadline `scheduled` rendering checked: no countdown, Cancel
+  still offered, §5.3 past-deadline wording used (§2).
+- [ ] Blocked-change handling branches on the operation state read from
+  `GET /v1/operations/{operation_id}`; the cancel offer appears only
+  while `scheduled`, never while `running` (§5.5).
 - [ ] Plain-language pass by a reader outside the deletion work.
 - [ ] Data-rights/policy review signs off §11 before any string renders.
