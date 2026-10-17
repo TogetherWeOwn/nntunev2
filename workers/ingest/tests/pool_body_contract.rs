@@ -93,9 +93,11 @@ fn refused_and_oversize_replies_are_rejected() {
         classify_body_reply(400, None, br#"{"error":"bad_request"}"#),
         Err(PoolBodyError::Rejected)
     );
+    // `413` is per-article data (the segment is judged absent), never
+    // a rejected fetch that would permanently fail the whole job.
     assert_eq!(
         classify_body_reply(413, None, br#"{"error":"too_large"}"#),
-        Err(PoolBodyError::Rejected)
+        Ok(BodyFetch::TooLarge)
     );
     let oversize = vec![0u8; MAX_BODY_REPLY_BYTES + 1];
     assert_eq!(

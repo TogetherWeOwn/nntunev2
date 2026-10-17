@@ -677,12 +677,18 @@ struct PoolBodySource<'a> {
 }
 
 impl BodySource for PoolBodySource<'_> {
-    async fn fetch_body(&mut self, segment_id: &str) -> Result<Option<Vec<u8>>, VerifyError> {
+    async fn fetch_body(
+        &mut self,
+        segment_id: &str,
+    ) -> Result<crate::verify::ArticleFetch, VerifyError> {
         let req = build_body_request(self.msg, segment_id)
             .map_err(|_| VerifyError::Permanent("invalid segment id".into()))?;
         match call_pool_body(self.env, &req).await {
-            Ok(BodyFetch::Bytes(bytes)) => Ok(Some(bytes)),
-            Ok(BodyFetch::Missing) => Ok(None),
+            Ok(BodyFetch::Bytes(bytes)) => Ok(crate::verify::ArticleFetch::Present(bytes)),
+            Ok(BodyFetch::Missing) => Ok(crate::verify::ArticleFetch::Missing),
+            // `413` is per-article data: the segment is judged absent,
+            // never a permanent job failure.
+            Ok(BodyFetch::TooLarge) => Ok(crate::verify::ArticleFetch::TooLarge),
             Err(PoolBodyError::Retry { .. }) => {
                 Err(VerifyError::Transient("pool body fetch unavailable".into()))
             }

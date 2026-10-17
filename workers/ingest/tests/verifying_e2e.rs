@@ -13,8 +13,8 @@ use nntune_core::yenc::{encode_segment, SegmentParams};
 use nntune_ingest::nzb_intake::estimate_nzb;
 use nntune_ingest::parse::parse_upload_files;
 use nntune_ingest::verify::{
-    run_verifying_step, BodySource, ScratchStore, StagedFile, VerifyCaps, VerifyError,
-    VerifyOutcome, VerifyProgress,
+    run_verifying_step, ArticleFetch, BodySource, ScratchStore, StagedFile, VerifyCaps,
+    VerifyError, VerifyOutcome, VerifyProgress,
 };
 use nntune_test_nntp::{Article, ServerConfig, TestNntpServer};
 
@@ -229,12 +229,20 @@ impl NntpSource {
 }
 
 impl BodySource for NntpSource {
-    async fn fetch_body(&mut self, segment_id: &str) -> Result<Option<Vec<u8>>, VerifyError> {
+    async fn fetch_body(&mut self, segment_id: &str) -> Result<ArticleFetch, VerifyError> {
         self.fetches.push(segment_id.to_string());
         let mut out = Vec::new();
         match self.client.body_to(segment_id, &mut out).await {
-            Ok(()) => Ok(Some(out)),
-            Err(nntune_core::Error::ArticleNotFound(_)) => Ok(None),
+            Ok(()) => Ok(ArticleFetch::Present(out)),
+            Err(nntune_core::Error::ArticleNotFound(_)) => Ok(ArticleFetch::Missing),
+            // The client's own read limit: per-article data (judged
+            // absent), mirroring the pool route's `413` — never a
+            // transient that redelivers the same article forever.
+            Err(nntune_core::Error::Io(e))
+                if nntune_core::transport::is_article_limit_error(&e) =>
+            {
+                Ok(ArticleFetch::TooLarge)
+            }
             Err(e) => Err(VerifyError::Transient(format!("nntp fetch failed: {e}"))),
         }
     }

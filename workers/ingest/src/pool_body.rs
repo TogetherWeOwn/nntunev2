@@ -61,6 +61,10 @@ pub enum BodyFetch {
     Bytes(Vec<u8>),
     /// The provider answered `430`: the article is gone.
     Missing,
+    /// The article exceeds the fetch cap (`413`): a per-article answer,
+    /// not a job failure. The caller judges the segment absent (data
+    /// for the par2 block count), exactly like a `430`.
+    TooLarge,
 }
 
 /// Why a body call produced no usable fetch.
@@ -69,9 +73,8 @@ pub enum PoolBodyError {
     /// Pool busy or quarantined, provider down or not loaded, or the
     /// call itself failed: redeliver after `after_secs`.
     Retry { after_secs: u32 },
-    /// The pool refused the envelope (`400`), the article is over the
-    /// fetch cap (`413`), or a `200` broke the size contract. Retrying
-    /// the same fetch cannot help.
+    /// The pool refused the envelope (`400`), or a `200` broke the size
+    /// contract. Retrying the same fetch cannot help.
     Rejected,
 }
 
@@ -96,7 +99,8 @@ pub fn classify_body_reply(
         404 => Err(PoolBodyError::Retry {
             after_secs: DEFAULT_RETRY_SECS,
         }),
-        400 | 413 => Err(PoolBodyError::Rejected),
+        413 => Ok(BodyFetch::TooLarge),
+        400 => Err(PoolBodyError::Rejected),
         _ => Err(PoolBodyError::Retry {
             after_secs: retry_after
                 .and_then(|v| v.trim().parse::<u32>().ok())

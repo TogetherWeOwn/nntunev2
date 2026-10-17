@@ -109,7 +109,7 @@ pub struct RecoverySet {
 /// restore a large set from storage object by object instead of holding
 /// every staged byte at once; only the parsed metadata (plus per-packet
 /// digests for duplicate validation) is retained.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct RecoverySetBuilder {
     set: RecoverySet,
     members: HashMap<[u8; 16], ()>,
