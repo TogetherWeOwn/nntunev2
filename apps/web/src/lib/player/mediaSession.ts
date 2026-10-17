@@ -4,7 +4,7 @@
  * the placeholder fallback is reused here, never reimplemented — and is
  * absolutized, since MediaSession artwork is resolved outside the page.
  */
-import { resolveArtwork } from './artwork.js';
+import { ARTWORK_PLACEHOLDER_SRC, resolveArtwork } from './artwork.js';
 import type { Track } from './queue.js';
 
 export interface MediaArtworkInit {
@@ -44,9 +44,24 @@ export interface ApplyMediaSessionOptions {
 
 const ARTWORK_SIZES = '512x512';
 
+function absolutizeArtworkSrc(src: string, baseUrl: string): string {
+	try {
+		return new URL(src, baseUrl).toString();
+	} catch {
+		// `resolveArtwork` only prefix-checks, so a malformed URL such as
+		// `https://[` reaches here. Fall back to the placeholder rather
+		// than throwing out of metadata construction.
+		try {
+			return new URL(ARTWORK_PLACEHOLDER_SRC, baseUrl).toString();
+		} catch {
+			return ARTWORK_PLACEHOLDER_SRC;
+		}
+	}
+}
+
 export function buildMediaMetadataInit(track: Track, baseUrl: string): MediaMetadataInit {
 	const resolved = resolveArtwork(track.artworkUrl ?? null, { alt: `${track.title} artwork` });
-	const src = new URL(resolved.src, baseUrl).toString();
+	const src = absolutizeArtworkSrc(resolved.src, baseUrl);
 	return {
 		title: track.title,
 		artist: track.artist,
@@ -109,15 +124,28 @@ export function applyMediaSession(
 		return true;
 	}
 
-	const MetadataCtor = options.MetadataCtor ?? defaultMetadataCtor();
-	if (MetadataCtor !== null) {
-		const baseUrl =
-			options.baseUrl ?? (typeof location === 'undefined' ? 'http://localhost' : location.origin);
-		session.metadata = new MetadataCtor(buildMediaMetadataInit(track, baseUrl));
-	}
+	// Handlers first: a metadata failure below must never leave the
+	// previous track's callbacks wired to the OS controls.
 	setHandler(session, 'nexttrack', handlers.onNext);
 	setHandler(session, 'previoustrack', handlers.onPrevious);
 	setHandler(session, 'play', handlers.onPlay);
 	setHandler(session, 'pause', handlers.onPause);
+	const MetadataCtor = options.MetadataCtor ?? defaultMetadataCtor();
+	if (MetadataCtor !== null) {
+		const baseUrl =
+			options.baseUrl ?? (typeof location === 'undefined' ? 'http://localhost' : location.origin);
+		try {
+			session.metadata = new MetadataCtor(buildMediaMetadataInit(track, baseUrl));
+		} catch {
+			// Metadata is decorative next to working transport controls.
+			// Drop any stale metadata so the OS does not keep showing the
+			// previous track; the next good track repopulates it.
+			try {
+				session.metadata = null;
+			} catch {
+				// Best effort only; handlers above are already current.
+			}
+		}
+	}
 	return true;
 }
