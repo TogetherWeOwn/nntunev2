@@ -198,19 +198,28 @@ stub whose NZB references fixture message-ids.
   reaches `Done` with one library row; the gapped set repairs then finishes.
 - Consumer pool probe (`src/queue_consumer.rs`, client in
   `src/pool_probe.rs`): an upload in `Probing` re-parses its
-  content-addressed payload, asks the user's `NntpPool` DO about every
-  `parse::probe_batches` batch not yet in the checkpoint tally
+  content-addressed payload, asks the user's `NntpPool` DO about
+  `parse::probe_batches` batches not yet in the checkpoint tally
   (`build_probe_request` → `call_pool_probe` → `apply_probe_batch`), and
   moves to `Verifying` carrying the completed tally's missing-segment
   count. Folded batches ride the delivery's one checkpoint write (KV
   allows 1 write/s per key, so there is deliberately no write per batch);
   a crash before that write re-asks them, which is safe because `STAT`
-  is idempotent and the tally is keyed by batch index. A busy/unavailable
-  pool (`PoolProbeError::Retry`) redelivers no sooner than its
-  `Retry-After` and the shared backoff, inside the same attempt budget;
-  a refused envelope (`Rejected`) fails the job with the generic
-  `probe_failed` reason. Unit tests cover the fold/resume/retry policy
-  against a scripted pool fake; no live Worker runs in CI.
+  is idempotent and the tally is keyed by batch index. Probing is
+  budget-capped per delivery (at most 4 batches and 30 s of wall time),
+  because a cap-sized NZB (~120 batches × 500 sequential `STAT`s) would
+  otherwise run into the 15-minute consumer invocation limit before
+  ever persisting, and every redelivery would restart at batch 0. A
+  budget stop persists the partial tally and *continues*: a fresh copy
+  of the message is enqueued (5 s delay) and the original acked,
+  spending neither the checkpoint attempt budget nor a native
+  `max_retries` slot; a failed continuation enqueue falls back to a
+  native retry. A busy/unavailable pool (`PoolProbeError::Retry`)
+  redelivers no sooner than its `Retry-After` and the shared backoff,
+  inside the same attempt budget; a refused envelope (`Rejected`) fails
+  the job with the generic `probe_failed` reason. Unit tests cover the
+  fold/resume/retry/budget policy against a scripted pool fake; no live
+  Worker runs in CI.
 
 Still blocked for the live half: wiring the consumer's search step to a
 Newznab provider call (search-sourced jobs therefore cannot reach the
@@ -228,6 +237,11 @@ provider, pool, repair, library, or metering invocation is claimed here.
   redelivers the unchanged Queue body. `decide_checkpoint` increments the
   checkpoint before returning Retry; the handler must persist it before calling
   `retry_with_options`. Backoff is derived from the payload-fetch schedule.
+  One settlement is exempt from the budget: a progress continuation
+  (`JobError::progress` → `Disposition::Continue`, today only the probe
+  budget stop above) persists new checkpoint progress, enqueues a fresh
+  message copy, and acks — no attempt increment, no native retry slot —
+  because each continuation must carry new progress toward a finite total.
   The consumer settles **per message**, so one poison job costs retries but
   does not head-of-line block valid jobs. Permanent failures skip the budget
   and quarantine at once; quarantine marks the checkpoint Failed before ack. If a DLQ send fails, the consumer must call `retry_with_options` with a delay

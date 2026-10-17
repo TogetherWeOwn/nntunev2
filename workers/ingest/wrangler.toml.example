@@ -33,6 +33,14 @@ queue = "nntune-ingest-dlq"
 # persist Failed before DLQ send + ack. Never ack on DLQ-send failure;
 # Failed redelivery retries the send. A send-success/ack-failure may
 # duplicate entries, so DLQ processing must be idempotent by job_id.
+# Probing is capped per delivery (4 batches / 30 s in
+# src/queue_consumer.rs, sized against max_batch_size = 10 below and the
+# 15-minute consumer invocation limit): a budget stop persists the
+# partial tally, enqueues a fresh copy of the message via the
+# INGEST_QUEUE producer above (5 s delay), and acks the original, so a
+# progressing job spends neither its attempt budget nor the max_retries
+# slots below. If that enqueue fails the handler falls back to a native
+# retry, which does spend a slot.
 # The search/verify/repair runtime steps are not wired yet, so enabling
 # this now would burn every valid job's retry budget against an
 # unavailable boundary and quarantine it. Uncomment only when those steps

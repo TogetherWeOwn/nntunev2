@@ -20,6 +20,17 @@
 //! original message plus machine-readable `error_code` and `attempts` body
 //! fields — to [`DLQ_QUEUE_NAME`]; the operator redrives with [`redrive`]
 //! (see README).
+//!
+//! One settlement sits outside that budget on purpose: a *progress
+//! continuation* ([`JobError::progress`] -> [`Disposition::Continue`]). A
+//! step that folded new durable progress into the checkpoint but stopped
+//! on its own per-delivery budget (the probe driver in
+//! `queue_consumer`) has not failed, so it spends neither the checkpoint
+//! attempt nor a native `max_retries` slot: the handler persists, sends
+//! a fresh copy of the message, and acks the original. Continuations
+//! terminate because each one must carry new progress toward a finite
+//! total; a step that stops without progress is an ordinary transient
+//! failure and burns the budget as above.
 
 use serde::{Deserialize, Serialize};
 
@@ -98,6 +109,15 @@ pub struct JobError {
     /// floor under the shared backoff, clamped to
     /// [`MAX_HINTED_RETRY_DELAY_SECS`]; `None` is the plain backoff.
     pub retry_after_secs: Option<u32>,
+    /// The step stopped *on purpose* after folding new durable progress
+    /// into the checkpoint (a budget-capped probe delivery), not because
+    /// anything failed. [`decide_checkpoint`] maps it to
+    /// [`Disposition::Continue`]: no attempt is spent and the budget can
+    /// never quarantine it. Only construct via [`JobError::progress`],
+    /// and only when the checkpoint about to be persisted really carries
+    /// new progress, so every continuation strictly shrinks the work
+    /// that remains and the job still terminates.
+    pub made_progress: bool,
 }
 
 impl JobError {
@@ -107,6 +127,7 @@ impl JobError {
             transient: true,
             detail: detail.into(),
             retry_after_secs: None,
+            made_progress: false,
         }
     }
 
@@ -118,6 +139,21 @@ impl JobError {
             transient: true,
             detail: detail.into(),
             retry_after_secs: Some(after_secs),
+            made_progress: false,
+        }
+    }
+
+    /// A deliberate, progress-carrying stop: the step folded new durable
+    /// progress into the checkpoint and stopped on a budget so the
+    /// delivery finishes well inside the consumer invocation limit.
+    /// Settles as [`Disposition::Continue`], never as a spent attempt.
+    pub fn progress(code: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            transient: true,
+            detail: detail.into(),
+            retry_after_secs: None,
+            made_progress: true,
         }
     }
 
@@ -127,6 +163,7 @@ impl JobError {
             transient: false,
             detail: detail.into(),
             retry_after_secs: None,
+            made_progress: false,
         }
     }
 }
@@ -137,6 +174,15 @@ impl JobError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Disposition {
     Ack,
+    /// Progress continuation ([`JobError::progress`]): the handler
+    /// persists the checkpoint, enqueues a *fresh* copy of the message,
+    /// and acks the original. The fresh body restarts the native
+    /// `max_retries` count — a native retry instead would still bound a
+    /// progressing job to 1 + 4 deliveries — and the checkpoint's
+    /// attempt counter is untouched. If the enqueue fails, the handler
+    /// falls back to a native retry so the persisted progress is still
+    /// picked up by a redelivery.
+    Continue,
     Retry {
         delay_secs: u32,
     },
@@ -217,6 +263,11 @@ pub fn decide_checkpoint(
             fail_checkpoint(cp, e.code, &e.detail);
             Disposition::Quarantine(Box::new(quarantine(msg, cp.attempt, &e)))
         }
+        // Deliberate progress stop: no attempt is recorded, so a job
+        // that keeps advancing can never quarantine mid-step. Checked
+        // after the permanent arm, so a hand-built permanent error can
+        // never smuggle itself into a continuation.
+        Err(e) if e.made_progress => Disposition::Continue,
         Err(e) => match record_redelivery(cp) {
             Some(delay_secs) => Disposition::Retry {
                 delay_secs: e.retry_after_secs.map_or(delay_secs, |hint| {
@@ -356,7 +407,9 @@ where
             .expect("checkpoint pairing was validated before batch processing");
         match disposition {
             Disposition::Ack => report.acked += 1,
-            Disposition::Retry { .. } => report.retried += 1,
+            // A continuation redelivers the job on a fresh message copy,
+            // so the batch report counts it with the retries.
+            Disposition::Continue | Disposition::Retry { .. } => report.retried += 1,
             Disposition::Quarantine(entry) => report.quarantined.push(*entry),
         }
     }
@@ -743,6 +796,27 @@ mod tests {
             d => panic!("spent budget must quarantine despite the hint, got {d:?}"),
         }
         assert_eq!(cp.state, JobState::Failed);
+    }
+
+    #[test]
+    fn progress_error_continues_without_spending_the_attempt_budget() {
+        // A step that persisted new progress but deliberately stopped
+        // (probe budget) is not a failure: it continues with the attempt
+        // counter untouched, even on the last budgeted attempt, because
+        // the remaining work shrinks with every continuation.
+        for attempt in [1, MAX_ATTEMPTS] {
+            let msg = msg_at(1);
+            let mut cp = checkpoint_for(&msg);
+            cp.attempt = attempt;
+            let progress = JobError::progress(ERR_PROBE_FAILED, "pool probe continuing");
+            assert!(progress.transient);
+            assert!(progress.made_progress);
+            let disposition = decide_checkpoint(&msg, &mut cp, Err(progress)).unwrap();
+            assert_eq!(disposition, Disposition::Continue);
+            assert_eq!(cp.attempt, attempt, "progress spends no attempt");
+            assert_ne!(cp.state, JobState::Failed);
+            assert!(cp.failure_code.is_none());
+        }
     }
 
     #[test]
