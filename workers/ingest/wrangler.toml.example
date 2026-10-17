@@ -118,3 +118,10 @@ dataset = "nntune_ingest_meter"
 [[services]]
 binding = "REPAIR_CONTAINER"
 service = "<REPAIR_CONTAINER_SERVICE>"
+
+# MusicBrainz read API for the Matching step (code: src/matching.rs,
+# src/queue_consumer.rs). The service is the workers/mb Worker
+# (`name = "nntune-mb"` in its wrangler example); deploy it before this one.
+[[services]]
+binding = "MB_API"
+service = "nntune-mb"
