@@ -586,7 +586,7 @@ async fn fetch_release_match(env: &Env, query: &str) -> Result<Option<String>, J
                 }
             },
         )?;
-    Ok(crate::matching::pick_release_mbid(&hits))
+    Ok(crate::matching::pick_release_mbid(query, &hits))
 }
 
 /// Resolve the job's library write: MB lookup when a query exists, an
