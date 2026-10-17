@@ -335,6 +335,52 @@ class TestFenceHandling(unittest.TestCase):
             )
             self.assertEqual([], check(root, "docs/a.md"))
 
+    def test_unclosed_indented_fence_does_not_swallow_rest(self):
+        # An indented code block holding a lone fence line is not a fence:
+        # without a matching closer it must not swallow the real link below.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": "Intro\n\n    ```\n    sample\n\n"
+                                 "[gone](missing.md)\n",
+                },
+            )
+            hits = check(root, "docs/a.md")
+            self.assertEqual(1, len(hits))
+            self.assertIn("does not exist", hits[0][2])
+
+    def test_indented_fence_line_does_not_close_column_zero_fence(self):
+        # A 4-space-indented fence line cannot close a column-0 fence, so
+        # the sample link stays inside the outer block and passes.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": "```md\n- item\n\n"
+                                 "    ```\n"
+                                 "    [gone](gone.md)\n"
+                                 "    ```\n"
+                                 "```\n\n"
+                                 "# Title\n\n[ok](#title)\n",
+                },
+            )
+            self.assertEqual([], check(root, "docs/a.md"))
+
+    def test_inline_triple_backtick_line_is_not_a_fence(self):
+        # A backtick fence info string cannot contain a backtick: a line
+        # like ```text``` starts inline code, so the real link below is
+        # still checked.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": "```text```\n\n[gone](missing.md)\n",
+                },
+            )
+            hits = check(root, "docs/a.md")
+            self.assertEqual(1, len(hits))
+
     def test_heading_inside_nested_example_is_not_an_anchor(self):
         # strip_fences and code_free_lines must agree: the sample heading
         # is not linkable, so the anchor link fails.

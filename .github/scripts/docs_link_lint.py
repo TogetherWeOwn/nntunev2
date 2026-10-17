@@ -63,10 +63,14 @@ FIXTURE_PREFIX = Path(".github/scripts/fixtures")
 
 _LINK = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 # Fences may sit inside list items at 4+ leading spaces (CommonMark counts
-# indent relative to the item), so match any leading whitespace here. An
-# indented block is still code: ignoring its sample links is always safe.
-_FENCE_OPEN = re.compile(r"^[ \t]*(`{3,}|~{3,})")
-_FENCE_CLOSE = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*$")
+# indent relative to the item), so match any leading whitespace here. The
+# opener's indent is recorded: a closer only counts when its indent is below
+# opener_indent + 4 (a 4-space-indented line cannot close a column-0 fence),
+# and an opener indented 4+ only counts when a matching closer exists later
+# (otherwise it is an indented code block, and opening would swallow the
+# rest of the file past the block).
+_FENCE_OPEN = re.compile(r"^([ \t]*)(`{3,}|~{3,})(.*)$")
+_FENCE_CLOSE = re.compile(r"^([ \t]*)(`{3,}|~{3,})[ \t]*$")
 _INLINE_CODE = re.compile(r"`[^`\n]+`")
 _SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 _HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*(?:#+\s*)?$")
@@ -115,28 +119,69 @@ def _escape_annotation_property(value):
     return "".join(escaped)
 
 
+def _indent_width(indent):
+    """Width of a leading-whitespace run (a tab advances to a multiple of 4)."""
+    return len(indent.expandtabs(4))
+
+
+def _has_matching_closer(lines, start, marker, opener_indent):
+    """True when a valid closer for an indented opener appears later."""
+    for future in lines[start:]:
+        close = _FENCE_CLOSE.match(future)
+        if not close:
+            continue
+        if close.group(2)[0] != marker[0]:
+            continue
+        if len(close.group(2)) < len(marker):
+            continue
+        if _indent_width(close.group(1)) >= opener_indent + 4:
+            continue
+        return True
+    return False
+
+
 def lines_outside_fences(text):
     """Yield (lineno, line) for lines outside CommonMark fenced code blocks.
 
     A closing fence must use the opener's character, be at least as long,
-    and carry only whitespace after the marker — so a ````` ``` ````` line
-    inside a ```` ````md ```` block, or a ```` ```python ```` info-string
-    line, is content, not a closer.
+    carry only whitespace after the marker, and sit at an indent below
+    opener_indent + 4 — so a ````` ``` ````` line inside a ```` ````md ````
+    block, a ```` ```python ```` info-string line, or a 4-space-indented
+    line inside a column-0 sample is content, not a closer. An opener
+    indented 4+ only opens when a matching closer exists later; otherwise
+    it is an indented code block and must not swallow the rest of the file.
     """
+    lines = text.split("\n")
     fence = None
-    for lineno, line in enumerate(text.split("\n"), start=1):
+    fence_indent = 0
+    for idx, line in enumerate(lines):
+        lineno = idx + 1
         if fence is not None:
             close = _FENCE_CLOSE.match(line)
             if (
                 close
-                and close.group(1)[0] == fence[0]
-                and len(close.group(1)) >= len(fence)
+                and close.group(2)[0] == fence[0]
+                and len(close.group(2)) >= len(fence)
+                and _indent_width(close.group(1)) < fence_indent + 4
             ):
                 fence = None
             continue
         opened = _FENCE_OPEN.match(line)
         if opened:
-            fence = opened.group(1)
+            indent_str, marker, rest = opened.group(1), opened.group(2), opened.group(3)
+            # A backtick fence's info string cannot contain a backtick:
+            # such a line starts inline code, not a fenced block.
+            if marker[0] == "`" and "`" in rest:
+                yield lineno, line
+                continue
+            indent = _indent_width(indent_str)
+            if indent >= 4 and not _has_matching_closer(
+                lines, idx + 1, marker, indent
+            ):
+                yield lineno, line
+                continue
+            fence = marker
+            fence_indent = indent
             continue
         yield lineno, line
 

@@ -568,8 +568,10 @@ jobs:
             fi
             # Neutralise workflow commands: the fixture output holds
             # ::error lines for fixture-relative paths, which would post
-            # phantom annotations on a green job if echoed raw.
-            printf '%s\n' "$output" | sed 's/^::/ ::/'
+            # phantom annotations on a green job if echoed raw. The
+            # runner strips leading whitespace before matching "::"
+            # (TrimStart), so prefix with "| " instead of a space.
+            printf '%s\n' "$output" | sed 's/^/| /'
             echo "docs-links: $fixture fixture correctly failed"
           done
 
