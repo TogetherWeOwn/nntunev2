@@ -474,6 +474,16 @@ fn has_ipv6_like_value(value: &str) -> bool {
             None => break,
         }
     }
+    // Detect unbracketed addresses embedded in delimited text,
+    // e.g. `connected to 2001:db8::1`.
+    if value.split(|c: char| c.is_whitespace()).any(|token| {
+        let token = token.trim().trim_matches([
+            '.', ',', ';', '!', '?', '"', '\'', '(', ')', '[', ']', '<', '>', '=',
+        ]);
+        !token.is_empty() && is_ipv6_token(token)
+    }) {
+        return true;
+    }
     false
 }
 
@@ -514,7 +524,7 @@ fn has_email_like_value(value: &str) -> bool {
             c.is_whitespace()
                 || matches!(
                     c,
-                    ',' | ';' | ':' | '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']' | '=' | '/'
+                    ',' | ';' | ':' | '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']' | '=' | '/' | '?'
                 )
         })
         .any(email_token_is_shaped)
@@ -780,7 +790,11 @@ fn golden_line_has_no_prohibited_keys_or_obvious_secret_values() {
         let bad = BTreeMap::from([("host".to_string(), JsonValue::String(value.into()))]);
         assert!(has_ipv6_value(&bad), "did not detect an IPv6 value {value}");
     }
-    for value in ["https://[2001:db8::1]/path", "see http://[fe80::1]/docs"] {
+    for value in [
+        "https://[2001:db8::1]/path",
+        "see http://[fe80::1]/docs",
+        "connected to 2001:db8::1",
+    ] {
         let bad = BTreeMap::from([("url".to_string(), JsonValue::String(value.into()))]);
         assert!(
             has_ipv6_value(&bad),
@@ -797,6 +811,7 @@ fn golden_line_has_no_prohibited_keys_or_obvious_secret_values() {
         "user@example.com",
         "admin@mail.io",
         "see https://example.org/users/alice@example.com",
+        "https://example.org/users/alice@example.com?mode=full",
     ] {
         let bad = BTreeMap::from([("contact".to_string(), JsonValue::String(value.into()))]);
         assert!(
