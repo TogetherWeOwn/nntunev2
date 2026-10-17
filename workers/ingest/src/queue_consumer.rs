@@ -175,7 +175,7 @@ fn validate_queue_msg(msg: &QueueMsg) -> Result<(), &'static str> {
             {
                 return Err("invalid search input");
             }
-            let expected = crate::dispatch::build_search_dispatch(
+            let mut expected = crate::dispatch::build_search_dispatch(
                 &msg.user_id,
                 query,
                 indexer_ref,
@@ -184,6 +184,10 @@ fn validate_queue_msg(msg: &QueueMsg) -> Result<(), &'static str> {
                 page,
             )
             .map_err(|_| "invalid search input")?;
+            // Trace IDs are observability metadata, not job identity: the
+            // route stamps them after building, and the consumer re-stamps
+            // every delivery, so they stay out of the identity comparison.
+            expected.trace_id = msg.trace_id.clone();
             if expected != *msg {
                 return Err("search fields do not match job identity");
             }
@@ -1467,6 +1471,30 @@ mod tests {
             build_upload_dispatch("user_01", crate::fixtures::SMALL_NZB).unwrap();
         incomplete_upload.payload_ref = None;
         assert!(validate_queue_msg(&incomplete_upload).is_err());
+    }
+
+    #[test]
+    fn traced_search_messages_keep_their_identity() {
+        // The route stamps the resolved inbound trace after building, and the
+        // consumer re-stamps every delivery: the trace must not affect the
+        // identity comparison, or no search job ever runs.
+        let mut traced = search_message();
+        traced.trace_id = Some("9f3a1b2c4d5e6f708192a3b4c5d64e6f".into());
+        assert!(validate_queue_msg(&traced).is_ok());
+
+        // A tampered search still fails with a trace present: leaving the
+        // trace out of the comparison must not mask an identity mismatch.
+        let mut tampered = traced.clone();
+        tampered.query = Some("other query".into());
+        assert!(validate_queue_msg(&tampered).is_err());
+
+        // A legacy untraced message, stamped on delivery the way
+        // `process_raw_message` does, validates too.
+        let mut legacy = search_message();
+        assert!(legacy.trace_id.is_none());
+        let trace_id = nntune_logging::resolve_trace_id(legacy.trace_id.as_deref());
+        legacy.trace_id = Some(trace_id);
+        assert!(validate_queue_msg(&legacy).is_ok());
     }
 
     #[test]
