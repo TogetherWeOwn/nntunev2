@@ -140,6 +140,16 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   only, never an account session), which proves staging serves the exact
   vendored bytes at the no-auth demo-audio route — never mis-routed R2 or
   library bytes. Demo hardening, not journey coverage.
+- `e2e/tests/cost-basis.spec.ts` pins the cost-basis worksheet arithmetic
+  offline (run on every PR via `test:unit` with no staging):
+  `e2e/tests/cost-basis.spec.ts:95` "§8 illustrative volumes total $6.00"
+  plus the sibling §8 row totals ($15.45 R2, $3.00 KV, $2.00 Queues, $0.50
+  prospective Analytics Engine, $13.75 PlanetScale storage, $6.60 egress,
+  $56.80 current total / $57.30 with prospective) and the
+  allowance-boundary cases, with `e2e/tests/cost-basis.spec.ts:340`
+  "expected totals cover §8 services only — no §10 measured rows" pinning
+  that the §10 measured bill stays evidence, not asserted arithmetic. Cost
+  documentation, not journey coverage.
 - The `apps/web/tests/` offline specs below run in the `web-e2e` CI job
   on every PR. Backend API calls are intercepted and fulfilled locally,
   while a few specs additionally assert against the real local
