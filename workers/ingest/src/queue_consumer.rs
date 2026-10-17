@@ -89,8 +89,8 @@ use crate::probe::{
 use crate::queue::{validate_indexer_ref, QueueMsg};
 use crate::retry::{
     decide_checkpoint, Disposition, DlqEntry, JobError, DLQ_QUEUE_BINDING, ERR_MATCH_FAILED,
-    ERR_PARSE_FAILED, ERR_PAYLOAD_MISSING, ERR_PROBE_FAILED, ERR_REPAIR_FAILED,
-    ERR_SEARCH_FAILED, ERR_VERIFY_FAILED, ERR_WRITE_FAILED,
+    ERR_PARSE_FAILED, ERR_PAYLOAD_MISSING, ERR_PROBE_FAILED, ERR_REPAIR_FAILED, ERR_SEARCH_FAILED,
+    ERR_VERIFY_FAILED, ERR_WRITE_FAILED,
 };
 use crate::verify::{
     BodySource, ScratchStore, StagedFile, VerifyCaps, VerifyError, VerifyOutcome, VerifyProgress,
