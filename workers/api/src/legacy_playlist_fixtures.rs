@@ -386,13 +386,18 @@ fn validate_case_inner(case: &Value) -> Result<()> {
         } else {
             if entry_obj
                 .keys()
-                .any(|k| !["position", "legacy_ref", "status"].contains(&k.as_str()))
+                .any(|k| TRACK_SHAPED_KEYS.contains(&k.as_str()))
             {
                 return Err(err(
                     FixtureErrorKind::GuessedResolution,
                     format!("entry {index}: unresolved ref carries track-shaped data"),
                 ));
             }
+            require_exact_keys(
+                entry_obj,
+                &["position", "legacy_ref", "status"],
+                "unresolved entry",
+            )?;
             None
         };
         match by_ref.get(legacy_ref) {
@@ -558,11 +563,62 @@ fn validate_case_inner(case: &Value) -> Result<()> {
                  resolved-only entry count",
             ));
         }
-    } else if non_owner.len() != 1 || non_owner["visibility"].as_str() != Some("not_found") {
+    } else if non_owner.len() != 1
+        || non_owner.get("visibility").and_then(Value::as_str) != Some("not_found")
+    {
         return Err(err(
             FixtureErrorKind::BadVisibility,
             "private non-owner read must be exactly visibility:not_found",
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CORPUS: &str = include_str!("../tests/fixtures/legacy-playlists-v1.json");
+
+    fn case_by_id(id: &str) -> Value {
+        let corpus: Value = serde_json::from_str(CORPUS).expect("corpus parses");
+        corpus["cases"]
+            .as_array()
+            .expect("cases is an array")
+            .iter()
+            .find(|case| case["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("case `{id}` exists"))
+            .clone()
+    }
+
+    /// A private case whose non-owner read has exactly one key, but the
+    /// wrong one, must be `BadVisibility` — never a panic from indexing a
+    /// missing `visibility` key on the map.
+    #[test]
+    fn private_non_owner_single_wrong_key_is_bad_visibility() {
+        let mut case = case_by_id("fully-resolved");
+        case["expected"]["non_owner_read"] = serde_json::json!({ "visible": "not_found" });
+        let error = validate_case(&case).expect_err("single wrong key is rejected");
+        assert_eq!(error.kind, FixtureErrorKind::BadVisibility);
+    }
+
+    /// A non-track-shaped extra key on an unresolved entry is a schema
+    /// error, matching the unresolved-remainder classification; only
+    /// track-shaped keys mean a guessed resolution.
+    #[test]
+    fn unresolved_entry_unknown_key_is_malformed_not_guessed() {
+        let mut case = case_by_id("mixed-resolved-unresolved");
+        let entry = case["entries"]
+            .as_array_mut()
+            .expect("entries is an array")
+            .iter_mut()
+            .find(|entry| entry["status"].as_str() == Some("unresolved"))
+            .expect("case has an unresolved entry");
+        entry
+            .as_object_mut()
+            .expect("entry is an object")
+            .insert("note".to_owned(), Value::from("stray"));
+        let error = validate_case(&case).expect_err("unknown key is rejected");
+        assert_eq!(error.kind, FixtureErrorKind::MalformedSchema);
+    }
 }
