@@ -1,14 +1,16 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type APIRequestContext } from '@playwright/test';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   API,
-  PLAN_LIMIT_STATUSES,
   TESTIDS,
+  assertPlanLimitRefusal,
   extractLibraryItems,
   extractPlanMeta,
   extractRecordingMbids,
   extractUsageBytes,
+  type NamedSecret,
 } from '../helpers/contract.js';
 import { assertNoAccessWall, readApiBody, stagingBaseUrl } from '../helpers/access.js';
 import { playbackFailure, type PlaybackEvidence } from '../helpers/playback.js';
@@ -21,6 +23,7 @@ import {
   accountHeaders,
   annotateSignupPath,
   apiGet,
+  apiPost,
   applyAccountToPage,
   completeByopWizard,
   requireApiAccount,
@@ -33,8 +36,9 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE_NZB = path.resolve(here, '../fixtures/synthetic.nzb');
 
 // Golden path part 2: ingest the NZB fixture → stream with Range seeks →
-// usage meter moves → plan metadata stays consistent → over-limit staging
-// account is refused with the documented plan-limit status.
+// usage meter moves → plan metadata stays consistent → separately minted
+// over-limit staging accounts are refused on stream and on ingest with the
+// documented plan-limit status (headers, code, upgrade CTA, no leaks).
 //
 // File-level skip: pre-deploy (no STAGING_BASE_URL) the whole file skips
 // without launching a browser. See health.spec.ts.
@@ -283,45 +287,62 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     await expect(page.getByTestId(TESTIDS.usageMeter).first()).toBeVisible({ timeout: 15_000 });
   });
 
-  test('over-limit staging account is refused with a plan-limit status', async ({
-    page,
-    request,
-  }) => {
-    const baseURL = stagingBaseUrl('skip', 'plan-limit');
-    if (!baseURL) {
-      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
-      return;
-    }
-    // Deterministic enforcement needs a capped plan on a throwaway account —
-    // a staging-only test seam owned by the metering card. Never hammer a
-    // real account into over-limit: that would probe a mutating path.
-    // Fail-closed on CI: a skip here would leave plan-limit enforcement (an
-    // acceptance criterion) never exercised while the job stays green.
+  // A capped plan on a throwaway account — a staging-only test seam owned
+  // by the metering card. Never hammer a real account into over-limit: that
+  // would probe a mutating path. Fail-closed everywhere (locally and on CI):
+  // a skip here would leave plan-limit enforcement (an acceptance criterion)
+  // never exercised while the job stays green.
+  async function mintCappedAccount(
+    request: APIRequestContext,
+    baseURL: string,
+    context: string,
+  ): Promise<TestAccount> {
     let capped: TestAccount | null;
     try {
       capped = await tryMintTestAccount(request, baseURL, 'overlimit');
     } catch (error) {
-      if (!process.env.CI) {
-        test.skip(true, `over-limit seam errored locally: ${(error as Error).message}`);
-        return;
-      }
-      throw error;
+      throw new Error(
+        `[${context}] over-limit seam errored: ${(error as Error).message} — ` +
+          'the metering card\'s POST /api/test-accounts {plan:"overlimit"} must be ' +
+          'reachable; refusing to pass silently.',
+      );
     }
     if (!capped) {
-      const reason =
-        'over-limit seed seam unavailable (needs QA_AUTH_TOKEN + POST /api/test-accounts ' +
-        '{plan:"overlimit"} from the metering card) — refusing to pass silently on CI.';
-      if (process.env.CI) throw new Error(`[plan-limit] ${reason}`);
-      test.skip(true, `${reason} Usage/plan metadata above still verified.`);
+      throw new Error(
+        `[${context}] over-limit seed seam unavailable (needs QA_AUTH_TOKEN + ` +
+          'POST /api/test-accounts {plan:"overlimit"} from the metering card) — ' +
+          'refusing to pass silently.',
+      );
+    }
+    requireApiAccount(capped, context);
+    return capped;
+  }
+
+  // Values that must never appear in a 402/429 body (names only in
+  // diagnostics — see secretLeak in helpers/contract.ts).
+  function cappedSecrets(capped: TestAccount): NamedSecret[] {
+    const secrets: NamedSecret[] = [{ name: 'account email', value: capped.email }];
+    if (capped.session) secrets.push({ name: 'account session', value: capped.session });
+    return secrets;
+  }
+
+  test('over-limit staging account is refused with a plan-limit status', async ({
+    page,
+    request,
+  }) => {
+    const baseURL = stagingBaseUrl('skip', 'plan-limit-stream');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
+    const capped = await mintCappedAccount(request, baseURL, 'plan-limit-stream');
     // Stream AS the capped account: its session (not the default identity)
     // must be the credential on these calls, or a 206 would falsely pass.
     const headers = accountHeaders(capped);
     const libraryUrl = `${baseURL}${API.library}`;
     const readTrackId = async (): Promise<string | undefined> => {
-      const library = await apiGet(request, libraryUrl, headers, 'plan-limit');
-      const libraryBody = await readApiBody(library, libraryUrl, 'plan-limit');
+      const library = await apiGet(request, libraryUrl, headers, 'plan-limit-stream');
+      const libraryBody = await readApiBody(library, libraryUrl, 'plan-limit-stream');
       let items: Array<Record<string, unknown>>;
       try {
         items = extractLibraryItems(libraryBody);
@@ -360,16 +381,62 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
         'account (the overlimit seam must allow ingest or pre-seed a streamable track)',
     ).toBeTruthy();
     const streamUrl = `${baseURL}${API.stream(trackId as string)}`;
-    const res = await apiGet(request, streamUrl, { ...headers, Range: 'bytes=0-8' }, 'plan-limit');
-    if (!((PLAN_LIMIT_STATUSES as readonly number[]).includes(res.status()))) {
-      // Only read the body on the unexpected path: a wall here must name
-      // itself instead of surfacing as a bare status mismatch below.
-      await readApiBody(res, streamUrl, 'plan-limit');
+    const res = await apiGet(
+      request,
+      streamUrl,
+      { ...headers, Range: 'bytes=0-8' },
+      'plan-limit-stream',
+    );
+    // The Range is 9 bytes, so reading the refusal body never buffers media.
+    const bodyText = await readApiBody(res, streamUrl, 'plan-limit-stream');
+    // The full refusal verdict: status, limit + reset headers, limit code
+    // with a status-consistent retryable flag, the upgrade CTA pointer, and
+    // no secret leakage. Without enforcement this fails naming the 206 (and
+    // the missing headers); with enforcement it passes.
+    assertPlanLimitRefusal({
+      status: res.status(),
+      headers: res.headers(),
+      bodyText,
+      secrets: cappedSecrets(capped),
+      context: 'plan-limit-stream',
+    });
+  });
+
+  test('over-limit staging account is refused on ingest with a plan-limit status', async ({
+    request,
+  }) => {
+    const baseURL = stagingBaseUrl('skip', 'plan-limit-ingest');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
     }
-    expect(
-      (PLAN_LIMIT_STATUSES as readonly number[]).includes(res.status()),
-      `expected a plan-limit status (${PLAN_LIMIT_STATUSES.join('/')}), got HTTP ${res.status()}`,
-    ).toBe(true);
+    // A separately minted capped account (never the journey identity): an
+    // ingest-leg failure cannot implicate the stream leg's account or skip
+    // the browser verdicts below it.
+    const capped = await mintCappedAccount(request, baseURL, 'plan-limit-ingest');
+    const headers = accountHeaders(capped);
+    // The fixture bytes are a valid NZB document, posted raw: the cap check
+    // is a guard on the ingest-write path, so a capped account is refused
+    // 402/429 rather than accepted for processing.
+    const ingestUrl = `${baseURL}${API.ingest}`;
+    const res = await apiPost(
+      request,
+      ingestUrl,
+      { ...headers, 'Content-Type': 'application/octet-stream' },
+      readFileSync(FIXTURE_NZB),
+      'plan-limit-ingest',
+    );
+    const bodyText = await readApiBody(res, ingestUrl, 'plan-limit-ingest');
+    // Same refusal verdict as the stream leg: without enforcement this fails
+    // naming the missing status (accepted, or no route yet); with
+    // enforcement it passes.
+    assertPlanLimitRefusal({
+      status: res.status(),
+      headers: res.headers(),
+      bodyText,
+      secrets: cappedSecrets(capped),
+      context: 'plan-limit-ingest',
+    });
   });
 
   test('synthetic audio actually plays in the browser', async ({ page, request }) => {

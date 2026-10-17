@@ -55,10 +55,16 @@ configured, the harness fails closed instead of skipping.
 
 Listed so it is not mistaken for (or double-counted as) M1 coverage:
 
-- Usage meter increase + plan metadata (`ingest-play-meter.spec.ts:219`)
-  and over-limit refusal (`ingest-play-meter.spec.ts:286`, fail-closed on
-  CI when the over-limit seam is unavailable) belong to the metering
-  milestone, not the M1 exit list.
+- Usage meter increase + plan metadata (`ingest-play-meter.spec.ts:223`)
+  and over-limit refusal — stream (`ingest-play-meter.spec.ts:329`) and
+  ingest (`ingest-play-meter.spec.ts:405`), each on a separately minted
+  capped account ahead of the browser legs — belong to the metering
+  milestone, not the M1 exit list. Both legs fail closed (locally and on
+  CI) when the over-limit seam is unavailable, and each asserts the full
+  refusal verdict: 402/429 status, limit + reset headers, a limit code with
+  a status-consistent retryable flag, the upgrade CTA pointer, and no
+  secret leakage — pinned offline by `e2e/tests/helpers.spec.ts:1184`
+  (plan-limit refusal verdict).
 - Ingested-track recording MBIDs (`ingest-play-meter.spec.ts:523`
   "ingested track carries recording_mbids", currently `test.fixme`) belong
   to the MB-match milestone, not the M1 exit list: after the journey
