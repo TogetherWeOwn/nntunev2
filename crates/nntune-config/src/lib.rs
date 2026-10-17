@@ -706,8 +706,11 @@ mod tests {
             }
         }
 
-        // Intentional staging/production differences: only the identity keys
-        // diverge; everything else ships identical values.
+        // Intentional staging/production identity divergence. Per
+        // config/README.md, values may otherwise differ (per-env tuning is
+        // the point) and the parity checker stays green on value-only drift,
+        // so this test pins only the identity values plus literal spot
+        // values — it must not require cross-env sameness.
         let staging = Config::load(&fixture_kv("staging")).expect("staging loads");
         let prod = Config::load(&fixture_kv("prod")).expect("prod loads");
         assert_eq!(staging.get_str("auth.rp_id"), Some("v2-staging.nntune.com"));
@@ -717,30 +720,32 @@ mod tests {
             Some("https://v2-staging.nntune.com")
         );
         assert_eq!(prod.get_str("auth.rp_origin"), Some("https://nntune.com"));
-        for spec in KEYS {
-            if matches!(spec.name, "auth.rp_id" | "auth.rp_origin") {
-                continue;
-            }
-            match spec.ty {
-                ConfigType::U64 => assert_eq!(
-                    staging.get_u64(spec.name),
-                    prod.get_u64(spec.name),
-                    "{} must match across envs",
-                    spec.name
-                ),
-                ConfigType::Str => assert_eq!(
-                    staging.get_str(spec.name),
-                    prod.get_str(spec.name),
-                    "{} must match across envs",
-                    spec.name
-                ),
-                ConfigType::Bool => assert_eq!(
-                    staging.get_bool(spec.name),
-                    prod.get_bool(spec.name),
-                    "{} must match across envs",
-                    spec.name
-                ),
-            }
+        // Literal anchors (not derived from `spec.parse`): a parser mutant
+        // returning n+1 must fail here. Both envs currently share these
+        // tuning values; if per-env tuning intentionally diverges, split the
+        // pins per env rather than reintroducing a blanket sameness loop.
+        const EXPECTED_U64: &[(&str, u64)] = &[
+            ("auth.challenge_ttl_secs", 300),
+            ("auth.invite_redemption_max_attempts", 10),
+            ("auth.invite_redemption_window_secs", 300),
+            ("auth.magic_link_ttl_secs", 900),
+            ("ingest.max_nzb_bytes", 2097152),
+            ("ingest.payload_retry_attempts", 4),
+            ("ingest.payload_ttl_secs", 2592000),
+            ("mb.lookup_cache_ttl_s", 86400),
+            ("mb.max_query_chars", 100),
+            ("mb.search_cache_ttl_s", 300),
+            ("mb.search_limit", 25),
+            ("session.ttl_secs", 86400),
+            ("stream.r2_min_part_bytes", 5242880),
+        ];
+        for (key, expected) in EXPECTED_U64 {
+            assert_eq!(
+                staging.get_u64(key),
+                Some(*expected),
+                "staging fixture {key}"
+            );
+            assert_eq!(prod.get_u64(key), Some(*expected), "prod fixture {key}");
         }
     }
 
