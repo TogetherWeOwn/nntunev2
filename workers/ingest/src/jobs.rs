@@ -63,9 +63,11 @@ pub struct JobCheckpoint {
     #[serde(default)]
     pub repair_rounds: u32,
     /// Probe answers collected while `Probing`, keyed by batch index (see
-    /// [`ProbeTally`](crate::probe::ProbeTally)). `None` outside `Probing`;
-    /// `#[serde(default)]` keeps pre-tally checkpoints readable (a crash
-    /// before this field existed resumes probing from batch zero).
+    /// [`ProbeTally`](crate::probe::ProbeTally)). The completed tally is
+    /// retained into `Verifying` (its missing-segment total is that step's
+    /// input) and cleared on redrive; `None` before `Probing` is first
+    /// entered. `#[serde(default)]` keeps pre-tally checkpoints readable
+    /// (a crash before this field existed resumes probing from batch zero).
     #[serde(default)]
     pub probe_tally: Option<ProbeTally>,
     /// PAR2 set covering the damaged files, recorded by `Verifying`
