@@ -40,7 +40,10 @@ pub mod retry;
 
 use api_error::ApiError;
 use dispatch::validate_user_id;
-use jobs::validate_job_id;
+use jobs::{validate_job_id, JobSource};
+use metering::{
+    emit_meter, MeterOutcome, MeterSink, MeterWriteError, METER_DATASET, METER_DATASET_BINDING,
+};
 use newznab::{MAX_CATEGORIES, MAX_LIMIT, MAX_PAGE};
 use nzb_intake::{estimate_nzb, IntakeRejection};
 use queue::{validate_indexer_ref, NzbUploadRequest, QueueMsg, SearchRequest};
@@ -292,6 +295,481 @@ async fn try_enqueue(env: &Env, msg: &QueueMsg) -> bool {
     }
 }
 
+/// Entry workflow stage metered at enqueue, by job source.
+///
+/// Search jobs enter at `search`; upload jobs skip search and enter at
+/// `parse` (see `jobs::advance` from `Queued`). Both are in
+/// `queue::WORKFLOW_STEPS`, so the meter write never hits `UnknownStage` here.
+fn meter_entry_stage(source: JobSource) -> &'static str {
+    match source {
+        JobSource::IndexerSearch => "search",
+        JobSource::NzbUpload => "parse",
+    }
+}
+
+/// [`MeterSink`] backed by the `INGEST_METER` Analytics Engine binding.
+///
+/// A native binding success maps to 200; a binding call failure maps to
+/// `Err` (transport failure before any status existed). The event shape stays
+/// owned by `metering.rs`: the full [`meter_write_body`] JSON rides in blob1,
+/// with the stage as the single index and the attempt as double1 for queries.
+struct EdgeMeterSink<'a> {
+    dataset: &'a worker::AnalyticsEngineDataset,
+}
+
+impl MeterSink for EdgeMeterSink<'_> {
+    fn send(&mut self, dataset: &str, body: serde_json::Value) -> Result<u16, String> {
+        debug_assert_eq!(dataset, METER_DATASET);
+        let stage = body.get("stage").and_then(|v| v.as_str()).unwrap_or("");
+        let attempt = body.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0) as f64;
+        let job_id = body.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+        let user_id = body.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
+        let outcome = body.get("outcome").and_then(|v| v.as_str()).unwrap_or("");
+        let event_json = body.to_string();
+        let point = worker::AnalyticsEngineDataPointBuilder::new()
+            .indexes([stage])
+            .blobs([event_json.as_str(), job_id, user_id, outcome])
+            .doubles([attempt])
+            .build();
+        match self.dataset.write_data_point(&point) {
+            Ok(()) => Ok(200),
+            Err(e) => Err(format!("{e:?}")),
+        }
+    }
+}
+
+/// Write one stage-transition meter event through the `INGEST_METER` binding.
+///
+/// A missing binding or a failing write returns a retryable
+/// [`MeterWriteError`] (the route answers 503 + `Retry-After`, never
+/// 202-and-dropped). An unknown stage is returned before the binding is
+/// touched. The unused `_body_hint` keeps the shape-ownership link explicit:
+/// the wire body is always [`meter_write_body`], via [`emit_meter`].
+fn try_meter(
+    env: &Env,
+    msg: &QueueMsg,
+    stage: &str,
+    outcome: MeterOutcome,
+) -> Result<(), MeterWriteError> {
+    let dataset = match env.analytics_engine(METER_DATASET_BINDING) {
+        Ok(dataset) => dataset,
+        Err(e) => {
+            console_log!("ingest meter binding missing: {:?}", e);
+            return Err(MeterWriteError::Transport(format!(
+                "meter binding {METER_DATASET_BINDING} missing: {e:?}"
+            )));
+        }
+    };
+    let mut sink = EdgeMeterSink { dataset: &dataset };
+    match emit_meter(&mut sink, msg, stage, outcome) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            console_log!("ingest meter write failed: {}", e);
+            Err(e)
+        }
+    }
+}
+
+/// Answer a meter-write failure. The status is derived from
+/// [`MeterWriteError::http_status`] — the single source of truth — so the
+/// route mapping can never drift from the tested error mapping: retryable
+/// failures (missing/failing binding or ledger) surface 503 + `Retry-After`,
+/// never 202-and-dropped; an unknown stage is a caller bug and surfaces 400.
+fn meter_failure_response(err: &MeterWriteError) -> Result<Response> {
+    match err.http_status() {
+        503 => service_unavailable("meter unavailable; nothing was accepted, retry shortly"),
+        _ => json_error(ApiError::invalid_request("unknown meter stage")),
+    }
+}
+
+/// Durable metered admission: the (`job_id`, `stage`) ledger owns the
+/// enqueue + meter outbox.
+///
+/// Background: the entry-stage meter used to be written before the Queue
+/// send. When the send failed, the route answered 503 and the client
+/// retried; the retry rebuilt the same deterministic `job_id`
+/// (`dispatch::make_job_id`, `attempt` always 1) and wrote a second
+/// identical `Ok` meter event. The dataset then held an event for a job
+/// that was never accepted and overcounted the accepted stage, against
+/// `metering.rs` ("one event per stage transition"). Analytics Engine is
+/// an append-only projection with no query path in this repo, so it can
+/// never be the authority behind the idempotency: the ledger below is.
+///
+/// Protocol per admission (`drive_metered_admission`):
+/// 1. `record_stage_once` ensures the row exists (`pending`), then runs one
+///    atomic `UPDATE ... WHERE (pending OR claimed-but-expired) RETURNING`
+///    as the claim. Postgres serializes concurrent UPDATEs on the same row
+///    (row lock + predicate re-check), so exactly one claimant wins; every
+///    statement is single-transaction autocommit with no session state held
+///    across awaits, which is what makes it Hyperdrive-safe (transaction
+///    mode pools one origin connection per transaction; session advisory
+///    locks cannot survive that). A loser gets `Busy` and answers 503 +
+///    Retry-After without queue/meter side effects. A storage failure also
+///    answers 503 (fail-closed). Lease bound, stated honestly: the claim is
+///    single-flight only while the owner is live within its 30s lease. An
+///    owner stalled past the lease (isolate stall, not just death) lets a
+///    retry reclaim and re-drive concurrently, so a pathological >30s stall
+///    can still double-drive queue + meter. A monotonically increasing claim
+///    epoch fences stale commit/release writes, so only the current owner can
+///    transition the row. It cannot retract an already-written meter event or
+///    Queue send; those side effects remain part of the lease/crash-window
+///    bound. Normal admissions complete in milliseconds, making the window
+///    narrow by construction.
+/// 2. An existing recent `queued` mark means a previous attempt finished the
+///    whole outbox (Queue accepted AND meter written): replay 202 without
+///    re-queueing or re-metering. This closes the ordinary retry race. After
+///    15 days, queued rows can be claimed again: Cloudflare Queue retention is
+///    at most 14 days, so any message from that admission has expired before
+///    the replay window opens. Re-admission emits a fresh stage event; bounded
+///    replay can therefore produce a later event for the same deterministic
+///    job id, but prevents a permanently acknowledged message loss.
+/// 3. Otherwise the Queue send runs first, so the meter outcome below is
+///    truthful: a failed send answers 503 with no meter event at all (the
+///    claim is released back to `pending`; the retry resumes here and still
+///    owes exactly one `Ok`).
+/// 4. On a successful send exactly one `Ok` meter event is written. A
+///    meter failure answers 503 with the claim released to `pending`: the
+///    Queue already holds one message (an orphan), so the retry re-queues
+///    and re-meters. The duplicate Queue message is harmless by
+///    construction (the consumer converges on `idempotency_key` —
+///    `library.rs` `UNIQUE(idempotency_key)` — plus `jobs::JobCheckpoint`
+///    resume and Queue redelivery), while the meter count stays exact.
+///    Marking first and metering second would risk a silent drop instead;
+///    this order risks at most a wasted queue slot, never a lost event.
+/// 5. `mark_queued` commits `claimed -> queued`; only then is 202 answered.
+///    Crash-window honesty: the dataset write and the ledger commit are
+///    two systems with no shared transaction, so an isolate that dies
+///    between them can leave `claimed` behind a written event; lease expiry
+///    (30s) lets the retry reclaim and re-drive (at most a duplicate `Ok`
+///    in that narrow window, never a silent drop — this slice forbids
+///    drops).
+///
+/// Production uses the `metered_admission` table in the existing
+/// `LIBRARY_DB` Hyperdrive database (`migrations/0009_*` through `0012_*`) for
+/// durable marks. The cross-isolate atomic claim is the single-statement
+/// `UPDATE ... RETURNING` in `admission_claim_sql`; no connection, lock,
+/// transaction, or temp state is held across the queue/meter awaits.
+///
+/// Outbox mark for one (`job_id`, `stage`) admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AdmissionMark {
+    /// Intent recorded; the Queue has not observably accepted the job and
+    /// no `Ok` meter event is owed yet.
+    Pending,
+    /// Another request currently owns the admission attempt; not persisted.
+    Busy,
+    /// Queue accepted AND the entry `Ok` meter event was written: the
+    /// admission is complete and replays as 202 with no further writes.
+    Queued,
+}
+
+/// Authoritative durable ledger keyed by (`job_id`, `stage`).
+///
+/// Production: [`PgAdmissionLedger`] over Hyperdrive Postgres. Atomic
+/// ownership comes from the single-statement `UPDATE ... RETURNING` claim
+/// plus the table primary key for durable identity — never from session
+/// state. Tests drive the same seam with in-memory and file-backed
+/// doubles (see `mod tests`).
+trait AdmissionLedger {
+    /// Atomically claim (`job_id`, `stage`) before reading or creating the
+    /// durable mark. A competing request returns `Busy` without side effects.
+    async fn record_stage_once(
+        &mut self,
+        job_id: &str,
+        stage: &str,
+    ) -> Result<AdmissionMark, MeterWriteError>;
+    /// Commit a `claimed` admission to `queued` after the Queue send was
+    /// accepted and the `Ok` meter event was written.
+    async fn mark_queued(&mut self, job_id: &str, stage: &str) -> Result<(), MeterWriteError>;
+    /// Release a `claimed` admission back to `pending` after a failed
+    /// attempt; an expired lease also lets the next retry reclaim it, so a
+    /// lost isolate never blocks admission forever. Best-effort: ignored
+    /// errors still converge via lease expiry.
+    async fn release_claim(&mut self, job_id: &str, stage: &str);
+}
+
+/// Seconds a `claimed` admission stays owned before the next retry may
+/// reclaim it. Must match the `INTERVAL` in [`admission_claim_sql`]; the
+/// SQL test below pins both to the same value.
+const ADMISSION_CLAIM_LEASE_SECS: u64 = 30;
+
+#[allow(dead_code)]
+fn admission_claim_lease_secs() -> u64 {
+    ADMISSION_CLAIM_LEASE_SECS
+}
+
+/// Parameterized statements owned here (execution lives with the ledger
+/// impls); see migrations `0009`–`0012` for the table and replay window.
+/// Every statement is single-transaction autocommit with `$1` = job id and
+/// `$2` = stage: no `BEGIN`, no session lock, no temp state, so each one is
+/// safe under Hyperdrive transaction-mode pooling.
+fn admission_ensure_sql() -> &'static str {
+    "INSERT INTO metered_admission (job_id, stage, state) VALUES ($1, $2, 'pending') \
+     ON CONFLICT (job_id, stage) DO NOTHING"
+}
+
+fn admission_claim_sql() -> &'static str {
+    "UPDATE metered_admission SET state = 'claimed', claimed_at = now(), claim_epoch = claim_epoch + 1 \
+     WHERE job_id = $1 AND stage = $2 \
+     AND (state = 'pending' \
+       OR (state = 'claimed' AND claimed_at < now() - INTERVAL '30 seconds') \
+       OR (state = 'queued' AND queued_at < now() - INTERVAL '15 days')) \
+     RETURNING claim_epoch"
+}
+
+fn admission_read_mark_sql() -> &'static str {
+    // UPDATE ... RETURNING is not cacheable by Hyperdrive. A no-op assignment
+    // gives a fresh conflict-state read after a failed claim.
+    "UPDATE metered_admission SET state = state WHERE job_id = $1 AND stage = $2 RETURNING state"
+}
+
+fn admission_mark_queued_sql() -> &'static str {
+    "UPDATE metered_admission SET state = 'queued', claimed_at = NULL, queued_at = now() \
+     WHERE job_id = $1 AND stage = $2 AND state = 'claimed' AND claim_epoch = $3"
+}
+
+fn admission_release_sql() -> &'static str {
+    "UPDATE metered_admission SET state = 'pending', claimed_at = NULL \
+     WHERE job_id = $1 AND stage = $2 AND state = 'claimed' AND claim_epoch = $3"
+}
+
+/// [`AdmissionLedger`] over the `LIBRARY_DB` Hyperdrive database.
+///
+/// Every method opens a short-lived connection, runs one autocommit
+/// statement batch, and drops it before returning — nothing is held across
+/// the queue/meter awaits. A connection hiccup fails closed as 503, never
+/// the isolate. Connection detail never reaches logs or errors.
+struct PgAdmissionLedger {
+    env: Env,
+    claim_epoch: Option<i64>,
+}
+
+impl PgAdmissionLedger {
+    fn from_env(env: &Env) -> Self {
+        Self {
+            env: env.clone(),
+            claim_epoch: None,
+        }
+    }
+
+    async fn client(&self) -> Result<tokio_postgres::Client, MeterWriteError> {
+        let unavailable = || MeterWriteError::Transport("admission ledger unavailable".to_string());
+        let hyperdrive = self
+            .env
+            .hyperdrive(crate::library::LIBRARY_DB_BINDING)
+            .map_err(|e| {
+                console_log!("admission ledger binding missing: {:?}", e);
+                unavailable()
+            })?;
+        let socket = worker::Socket::builder()
+            .secure_transport(worker::SecureTransport::StartTls)
+            .connect(hyperdrive.host(), hyperdrive.port())
+            .map_err(|_| unavailable())?;
+        let config: tokio_postgres::Config = hyperdrive
+            .connection_string()
+            .parse()
+            .map_err(|_| unavailable())?;
+        let (client, connection) = config
+            .connect_raw(socket, worker::postgres_tls::PassthroughTls)
+            .await
+            .map_err(|_| unavailable())?;
+        wasm_bindgen_futures::spawn_local(async move {
+            if connection.await.is_err() {
+                console_log!("admission ledger connection error");
+            }
+        });
+        Ok(client)
+    }
+}
+
+impl AdmissionLedger for PgAdmissionLedger {
+    async fn record_stage_once(
+        &mut self,
+        job_id: &str,
+        stage: &str,
+    ) -> Result<AdmissionMark, MeterWriteError> {
+        let unavailable = || MeterWriteError::Transport("admission ledger unavailable".to_string());
+        // One short-lived connection for the whole claim sequence; it is
+        // dropped before the queue/meter awaits, so no session state ever
+        // crosses them. Atomicity comes from the single UPDATE claim below,
+        // not from holding a connection.
+        let client = self.client().await?;
+        client
+            .execute(admission_ensure_sql(), &[&job_id, &stage])
+            .await
+            .map_err(|_| unavailable())?;
+        let claimed = client
+            .query_opt(admission_claim_sql(), &[&job_id, &stage])
+            .await
+            .map_err(|_| unavailable())?;
+        if let Some(row) = claimed {
+            self.claim_epoch = Some(row.get(0));
+            return Ok(AdmissionMark::Pending);
+        }
+        let row = client
+            .query_opt(admission_read_mark_sql(), &[&job_id, &stage])
+            .await
+            .map_err(|_| unavailable())?;
+        match row {
+            Some(row) => {
+                let state: String = row.get(0);
+                if state == "queued" {
+                    Ok(AdmissionMark::Queued)
+                } else {
+                    // `pending` here means our claim lost the race after the
+                    // ensure; `claimed` means a live owner or an unexpired
+                    // lease. Either way this request must not send or meter.
+                    Ok(AdmissionMark::Busy)
+                }
+            }
+            None => Err(unavailable()),
+        }
+    }
+
+    async fn mark_queued(&mut self, job_id: &str, stage: &str) -> Result<(), MeterWriteError> {
+        let claim_epoch = self.claim_epoch.ok_or_else(|| {
+            MeterWriteError::Transport("admission ledger unavailable".to_string())
+        })?;
+        let client = self
+            .client()
+            .await
+            .map_err(|_| MeterWriteError::Transport("admission ledger unavailable".to_string()))?;
+        let updated = client
+            .execute(
+                admission_mark_queued_sql(),
+                &[&job_id, &stage, &claim_epoch],
+            )
+            .await
+            .map_err(|e| {
+                console_log!("admission ledger commit failed: {:?}", e);
+                MeterWriteError::Transport("admission ledger unavailable".to_string())
+            })?;
+        if updated != 1 {
+            // Lost the claim (lease expired and someone else reclaimed) or
+            // already committed: fail closed so the retry converges instead
+            // of answering 202-and-unmarked.
+            return Err(MeterWriteError::Transport(
+                "admission ledger unavailable".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn release_claim(&mut self, job_id: &str, stage: &str) {
+        // Best-effort `claimed -> pending` so the immediate retry can
+        // reclaim without waiting out the lease; ignored errors still
+        // converge via lease expiry. Fresh short-lived connection: never
+        // held across the queue/meter awaits.
+        let Some(claim_epoch) = self.claim_epoch else {
+            return;
+        };
+        let Ok(client) = self.client().await else {
+            return;
+        };
+        let _ = client
+            .execute(admission_release_sql(), &[&job_id, &stage, &claim_epoch])
+            .await;
+    }
+}
+
+/// Outcome of one `drive_metered_admission` pass. Rendering to HTTP lives
+/// in `admit_metered_job`, so this stays free of `worker::Response` and
+/// unit-testable on the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AdmissionDecision {
+    /// Ledger already `queued`: replay 202 with no queue/meter writes.
+    AlreadyQueued,
+    /// Another request owns the durable admission claim; retry shortly.
+    Busy,
+    /// Queue accepted, `Ok` metered, ledger committed: answer 202.
+    Admitted,
+    /// Queue unavailable: nothing queued or metered, ledger `pending`.
+    QueueUnavailable,
+    /// Ledger or meter unavailable (retryable), or caller bug (unknown
+    /// stage): rendered by `meter_failure_response`.
+    MeterUnavailable(MeterWriteError),
+}
+
+/// Run one durable metered admission against injected queue/meter
+/// operations (the routes pass the real edge operations; tests pass
+/// scripted fakes). See the ledger docs above for the protocol.
+async fn drive_metered_admission<L, Q, QF, M, MF>(
+    ledger: &mut L,
+    msg: &QueueMsg,
+    stage: &str,
+    mut queue_send: Q,
+    mut meter_emit: M,
+) -> AdmissionDecision
+where
+    L: AdmissionLedger,
+    Q: FnMut() -> QF,
+    QF: core::future::Future<Output = bool>,
+    M: FnMut(MeterOutcome) -> MF,
+    MF: core::future::Future<Output = Result<(), MeterWriteError>>,
+{
+    // Caller bug first, before the ledger is touched (mirrors
+    // `emit_meter`: an unknown stage never causes a write).
+    if !crate::queue::WORKFLOW_STEPS.contains(&stage) {
+        return AdmissionDecision::MeterUnavailable(MeterWriteError::UnknownStage(
+            "stage must be a pipeline workflow step",
+        ));
+    }
+    let mark = match ledger.record_stage_once(&msg.job_id, stage).await {
+        Ok(mark) => mark,
+        Err(e) => return AdmissionDecision::MeterUnavailable(e),
+    };
+    if mark == AdmissionMark::Queued {
+        return AdmissionDecision::AlreadyQueued;
+    }
+    if mark == AdmissionMark::Busy {
+        return AdmissionDecision::Busy;
+    }
+    if !queue_send().await {
+        ledger.release_claim(&msg.job_id, stage).await;
+        return AdmissionDecision::QueueUnavailable;
+    }
+    if let Err(e) = meter_emit(MeterOutcome::Ok).await {
+        ledger.release_claim(&msg.job_id, stage).await;
+        return AdmissionDecision::MeterUnavailable(e);
+    }
+    if let Err(e) = ledger.mark_queued(&msg.job_id, stage).await {
+        ledger.release_claim(&msg.job_id, stage).await;
+        return AdmissionDecision::MeterUnavailable(e);
+    }
+    AdmissionDecision::Admitted
+}
+
+/// Durable idempotent admission for both ingest routes: the (`job_id`,
+/// `stage`) ledger owns the enqueue + meter outbox, fail-closed. A 503
+/// here means nothing was accepted with its meter; the client retry
+/// converges on exactly one `Ok` meter event and one accepted job.
+async fn admit_metered_job(
+    env: &Env,
+    ledger: &mut impl AdmissionLedger,
+    msg: &QueueMsg,
+    stage: &str,
+    source: &str,
+    extra: serde_json::Value,
+) -> Result<Response> {
+    match drive_metered_admission(
+        ledger,
+        msg,
+        stage,
+        || try_enqueue(env, msg),
+        |outcome| async move { try_meter(env, msg, stage, outcome) },
+    )
+    .await
+    {
+        AdmissionDecision::AlreadyQueued | AdmissionDecision::Admitted => {
+            queued_envelope(msg, source, true, extra)
+        }
+        AdmissionDecision::Busy => service_unavailable("admission is in progress; retry shortly"),
+        AdmissionDecision::QueueUnavailable => queued_envelope(msg, source, false, extra),
+        AdmissionDecision::MeterUnavailable(e) => meter_failure_response(&e),
+    }
+}
+
 /// Answer an enqueue result. Success is 202 `queued`; a missing or failing
 /// Queue binding is 503 with `Retry-After` — never 202 — so clients, proxies,
 /// and retry middleware do not mistake a lost job for an accepted one.
@@ -412,8 +890,20 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
         Err(message) => return json_error(ApiError::invalid_request(message)),
     };
     console_log!("ingest search q_len={} job={}", q.len(), msg.job_id);
-    let queued = try_enqueue(&ctx.env, &msg).await;
-    queued_envelope(&msg, "indexer_search", queued, serde_json::json!({}))
+    // Durable idempotent admission: the (job_id, stage) ledger owns the
+    // enqueue + meter outbox, fail-closed. A 503 here means nothing was
+    // accepted with its meter; the client retry converges on one `Ok`
+    // meter event for one accepted job.
+    let mut ledger = PgAdmissionLedger::from_env(&ctx.env);
+    return admit_metered_job(
+        &ctx.env,
+        &mut ledger,
+        &msg,
+        meter_entry_stage(msg.source),
+        "indexer_search",
+        serde_json::json!({}),
+    )
+    .await;
 }
 
 /// Validate an NZB upload and enqueue it; the consumer parses with
@@ -451,16 +941,23 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Respons
                 est.segment_count,
                 msg.job_id
             );
-            let queued = try_enqueue(&ctx.env, &msg).await;
-            queued_envelope(
+            // Durable idempotent admission after the payload store (bytes are
+            // TTL-expired on failure): the (job_id, stage) ledger owns the
+            // enqueue + meter outbox, fail-closed, so a retry converges on
+            // one `Ok` meter event for one accepted job.
+            let mut ledger = PgAdmissionLedger::from_env(&ctx.env);
+            return admit_metered_job(
+                &ctx.env,
+                &mut ledger,
                 &msg,
+                meter_entry_stage(msg.source),
                 "nzb_upload",
-                queued,
                 serde_json::json!({
                     "file_count": est.file_count,
                     "segment_count": est.segment_count,
                 }),
             )
+            .await;
         }
     }
 }
@@ -780,6 +1277,827 @@ mod tests {
             assert!(MAX_SEARCH_BODY_BYTES <= 16 * 1024);
             assert!(MAX_UPLOAD_BODY_BYTES >= MAX_NZB_BYTES);
         }
+    }
+
+    // --- Durable metered admission seam ---------------------------------
+    //
+    // Production uses single-statement autocommit UPDATE claims plus the
+    // primary key for durable marks — no session state, so it stays correct
+    // under Hyperdrive transaction-mode pooling. These doubles prove the
+    // admission state machine at the `AdmissionLedger` seam under reload,
+    // concurrency, and failure — no Worker runtime needed.
+
+    /// In-memory ledger double for durable marks. Models the production
+    /// pending/claimed/queued machine: `record_stage_once` claims (Busy on a
+    /// live claim), `mark_queued` requires the claim, `release_claim` drops
+    /// it back to pending. Injected `fail_*` flags model ledger outages.
+    struct MemLedger {
+        marks: std::collections::BTreeMap<(String, String), AdmissionMark>,
+        claimed: std::collections::BTreeSet<(String, String)>,
+        fail_record: bool,
+        fail_commit: bool,
+        record_calls: usize,
+    }
+
+    impl MemLedger {
+        fn new() -> Self {
+            Self {
+                marks: std::collections::BTreeMap::new(),
+                claimed: std::collections::BTreeSet::new(),
+                fail_record: false,
+                fail_commit: false,
+                record_calls: 0,
+            }
+        }
+
+        fn mark_of(&self, job_id: &str, stage: &str) -> Option<AdmissionMark> {
+            self.marks
+                .get(&(job_id.to_string(), stage.to_string()))
+                .copied()
+        }
+    }
+
+    impl AdmissionLedger for MemLedger {
+        async fn record_stage_once(
+            &mut self,
+            job_id: &str,
+            stage: &str,
+        ) -> Result<AdmissionMark, MeterWriteError> {
+            self.record_calls += 1;
+            if self.fail_record {
+                return Err(MeterWriteError::Transport(
+                    "injected commit_failure".to_string(),
+                ));
+            }
+            let key = (job_id.to_string(), stage.to_string());
+            if self.marks.get(&key) == Some(&AdmissionMark::Queued) {
+                return Ok(AdmissionMark::Queued);
+            }
+            if self.claimed.contains(&key) {
+                return Ok(AdmissionMark::Busy);
+            }
+            self.claimed.insert(key.clone());
+            self.marks.entry(key).or_insert(AdmissionMark::Pending);
+            Ok(AdmissionMark::Pending)
+        }
+
+        async fn mark_queued(&mut self, job_id: &str, stage: &str) -> Result<(), MeterWriteError> {
+            if self.fail_commit {
+                return Err(MeterWriteError::Transport(
+                    "injected commit_failure".to_string(),
+                ));
+            }
+            let key = (job_id.to_string(), stage.to_string());
+            if !self.claimed.remove(&key) {
+                return Err(MeterWriteError::Transport(
+                    "ledger commit without a claim".to_string(),
+                ));
+            }
+            self.marks.insert(key, AdmissionMark::Queued);
+            Ok(())
+        }
+
+        async fn release_claim(&mut self, job_id: &str, stage: &str) {
+            self.claimed
+                .remove(&(job_id.to_string(), stage.to_string()));
+        }
+    }
+
+    /// File-backed ledger double: every operation reads and writes one
+    /// JSON document, so dropping the handle and opening a fresh one on
+    /// the same directory models a process restart (`reload`).
+    struct FileLedger {
+        dir: std::path::PathBuf,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct LedgerRow {
+        job_id: String,
+        stage: String,
+        state: AdmissionMark,
+    }
+
+    impl FileLedger {
+        fn new(dir: std::path::PathBuf) -> Self {
+            Self { dir }
+        }
+
+        fn path(&self) -> std::path::PathBuf {
+            self.dir.join("metered_admission.json")
+        }
+
+        fn load(&self) -> Vec<LedgerRow> {
+            match std::fs::read_to_string(self.path()) {
+                Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+                Err(_) => Vec::new(),
+            }
+        }
+
+        fn store(&self, rows: &[LedgerRow]) {
+            std::fs::create_dir_all(&self.dir).expect("ledger dir");
+            // Crash honesty: write temp + rename so a torn write never
+            // leaves half a document behind.
+            let tmp = self.dir.join("metered_admission.json.tmp");
+            std::fs::write(
+                &tmp,
+                serde_json::to_string(rows).expect("ledger serializes"),
+            )
+            .expect("ledger write");
+            std::fs::rename(&tmp, self.path()).expect("ledger commit");
+        }
+    }
+
+    impl AdmissionLedger for FileLedger {
+        async fn record_stage_once(
+            &mut self,
+            job_id: &str,
+            stage: &str,
+        ) -> Result<AdmissionMark, MeterWriteError> {
+            let rows = self.load();
+            if let Some(row) = rows
+                .iter()
+                .find(|row| row.job_id == job_id && row.stage == stage)
+            {
+                // File double is sequential (one handle drives one attempt):
+                // a persisted `queued` replays, anything else is reclaimable
+                // pending. Concurrent claims are covered by ClaimLedger.
+                if row.state == AdmissionMark::Queued {
+                    return Ok(AdmissionMark::Queued);
+                }
+                return Ok(AdmissionMark::Pending);
+            }
+            let mut rows = rows;
+            rows.push(LedgerRow {
+                job_id: job_id.to_string(),
+                stage: stage.to_string(),
+                state: AdmissionMark::Pending,
+            });
+            self.store(&rows);
+            Ok(AdmissionMark::Pending)
+        }
+
+        async fn mark_queued(&mut self, job_id: &str, stage: &str) -> Result<(), MeterWriteError> {
+            let mut rows = self.load();
+            match rows
+                .iter_mut()
+                .find(|row| row.job_id == job_id && row.stage == stage)
+            {
+                Some(row) => {
+                    row.state = AdmissionMark::Queued;
+                    self.store(&rows);
+                    Ok(())
+                }
+                None => Err(MeterWriteError::Transport(
+                    "ledger commit without a recorded intent".to_string(),
+                )),
+            }
+        }
+
+        async fn release_claim(&mut self, _job_id: &str, _stage: &str) {}
+    }
+
+    fn admission_msg() -> QueueMsg {
+        crate::dispatch::build_upload_dispatch("user_01", crate::fixtures::SMALL_NZB)
+            .expect("fixture dispatch")
+    }
+
+    /// Drive one admission with scripted queue/meter operations. The
+    /// fakes resolve without yielding, so the future is ready on first
+    /// poll — no executor needed.
+    fn drive_once(
+        ledger: &mut impl AdmissionLedger,
+        msg: &QueueMsg,
+        stage: &str,
+        queue_ok: bool,
+        meter_fail: bool,
+        queue_calls: &mut usize,
+        meter_calls: &mut usize,
+    ) -> AdmissionDecision {
+        use futures_util::future::FutureExt as _;
+        drive_metered_admission(
+            ledger,
+            msg,
+            stage,
+            || {
+                *queue_calls += 1;
+                async move { queue_ok }
+            },
+            |outcome| {
+                assert_eq!(outcome, MeterOutcome::Ok);
+                *meter_calls += 1;
+                async move {
+                    if meter_fail {
+                        Err(MeterWriteError::Rejected { status: 500 })
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .now_or_never()
+        .expect("scripted admission resolves without yielding")
+    }
+
+    #[test]
+    fn meter_entry_stage_maps_sources_to_workflow_steps() {
+        // The swap mutant (search<->parse) must fail here: each source maps
+        // to its own entry step, and both steps are pipeline steps.
+        assert_eq!(meter_entry_stage(JobSource::IndexerSearch), "search");
+        assert_eq!(meter_entry_stage(JobSource::NzbUpload), "parse");
+        for stage in [
+            meter_entry_stage(JobSource::IndexerSearch),
+            meter_entry_stage(JobSource::NzbUpload),
+        ] {
+            assert!(
+                crate::queue::WORKFLOW_STEPS.contains(&stage),
+                "{stage} must be a pipeline workflow step"
+            );
+        }
+    }
+
+    #[test]
+    fn meter_failure_status_mapping_is_single_sourced() {
+        // `meter_failure_response` derives from `http_status` (pinned by
+        // the admission acceptance contract); the mapping itself:
+        assert_eq!(
+            MeterWriteError::Transport("down".to_string()).http_status(),
+            503
+        );
+        assert_eq!(MeterWriteError::Rejected { status: 500 }.http_status(), 503);
+        assert_eq!(MeterWriteError::UnknownStage("s").http_status(), 400);
+        assert!(MeterWriteError::Transport("down".to_string()).is_retryable());
+        assert!(MeterWriteError::Rejected { status: 500 }.is_retryable());
+        assert!(!MeterWriteError::UnknownStage("s").is_retryable());
+    }
+
+    #[test]
+    fn admission_sql_owns_concurrency_clauses() {
+        for sql in [
+            admission_ensure_sql(),
+            admission_claim_sql(),
+            admission_read_mark_sql(),
+            admission_mark_queued_sql(),
+            admission_release_sql(),
+        ] {
+            assert!(
+                sql.contains("job_id") && sql.contains("stage"),
+                "ledger statements are keyed by (job_id, stage): {sql}"
+            );
+        }
+        // Hyperdrive transaction-mode pooling returns the origin connection
+        // per transaction, so no statement may rely on session state held
+        // across awaits: no advisory locks, no BEGIN, no temp state.
+        for sql in [
+            admission_ensure_sql(),
+            admission_claim_sql(),
+            admission_read_mark_sql(),
+            admission_mark_queued_sql(),
+            admission_release_sql(),
+        ] {
+            let lower = sql.to_lowercase();
+            assert!(
+                !lower.contains("pg_try_advisory")
+                    && !lower.contains("pg_advisory")
+                    && !lower.contains("begin")
+                    && !lower.contains("savepoint"),
+                "ledger statements must be single-statement autocommit: {sql}"
+            );
+        }
+        assert!(
+            admission_ensure_sql().contains("ON CONFLICT (job_id, stage) DO NOTHING"),
+            "retries must converge on one durable row"
+        );
+        assert!(admission_ensure_sql().contains("pending"));
+        // The atomic claim: one UPDATE whose WHERE admits pending rows,
+        // expired claimed leases, or queued rows past the replay window.
+        // RETURNING identifies the winner. Concurrent UPDATEs
+        // on the same row serialize in Postgres (row lock + predicate
+        // re-check), so exactly one claimant wins with no session lock.
+        let claim = admission_claim_sql();
+        assert!(claim.contains("UPDATE metered_admission"));
+        assert!(claim.contains("SET state = 'claimed'"));
+        assert!(claim.contains("state = 'pending'"));
+        assert!(claim.contains("state = 'queued' AND queued_at"));
+        assert!(claim.contains("15 days"));
+        assert!(claim.contains("claimed_at"));
+        assert!(claim.contains("claim_epoch = claim_epoch + 1"));
+        assert!(claim.contains("RETURNING claim_epoch"));
+        assert_eq!(admission_claim_lease_secs(), 30);
+        assert!(claim.contains("30 seconds"));
+        let read_mark = admission_read_mark_sql().to_lowercase();
+        assert!(read_mark.starts_with("update metered_admission"));
+        assert!(read_mark.contains("returning state"));
+        assert!(admission_mark_queued_sql().contains("queued_at = now()"));
+        assert!(admission_mark_queued_sql().contains("state = 'claimed'"));
+        assert!(admission_mark_queued_sql().contains("claim_epoch = $3"));
+        assert!(admission_mark_queued_sql().contains("'queued'"));
+        assert!(admission_release_sql().contains("state = 'claimed'"));
+        assert!(admission_release_sql().contains("claim_epoch = $3"));
+        assert!(admission_release_sql().contains("'pending'"));
+    }
+
+    #[test]
+    fn admission_queue_failure_leaves_pending_without_meter() {
+        // The reported bug, scripted: the Queue send fails, so no `Ok`
+        // meter event is owed yet and the ledger stays pending.
+        let msg = admission_msg();
+        let mut ledger = MemLedger::new();
+        let (mut queue_calls, mut meter_calls) = (0usize, 0usize);
+        let decision = drive_once(
+            &mut ledger,
+            &msg,
+            "parse",
+            false,
+            false,
+            &mut queue_calls,
+            &mut meter_calls,
+        );
+        assert_eq!(decision, AdmissionDecision::QueueUnavailable);
+        assert_eq!((queue_calls, meter_calls), (1, 0));
+        assert_eq!(
+            ledger.mark_of(&msg.job_id, "parse"),
+            Some(AdmissionMark::Pending)
+        );
+        // The client retry resumes the same intent and owes exactly one `Ok`.
+        let decision = drive_once(
+            &mut ledger,
+            &msg,
+            "parse",
+            true,
+            false,
+            &mut queue_calls,
+            &mut meter_calls,
+        );
+        assert_eq!(decision, AdmissionDecision::Admitted);
+        assert_eq!((queue_calls, meter_calls), (2, 1));
+        assert_eq!(
+            ledger.mark_of(&msg.job_id, "parse"),
+            Some(AdmissionMark::Queued)
+        );
+    }
+
+    #[test]
+    fn admission_already_queued_replays_without_side_effects() {
+        let msg = admission_msg();
+        let mut ledger = MemLedger::new();
+        let (mut queue_calls, mut meter_calls) = (0usize, 0usize);
+        assert_eq!(
+            drive_once(
+                &mut ledger,
+                &msg,
+                "parse",
+                true,
+                false,
+                &mut queue_calls,
+                &mut meter_calls
+            ),
+            AdmissionDecision::Admitted
+        );
+        assert_eq!((queue_calls, meter_calls), (1, 1));
+        // A duplicate delivery (redelivery, double-clicked retry) replays
+        // 202 with no further queue or meter writes.
+        assert_eq!(
+            drive_once(
+                &mut ledger,
+                &msg,
+                "parse",
+                true,
+                false,
+                &mut queue_calls,
+                &mut meter_calls
+            ),
+            AdmissionDecision::AlreadyQueued
+        );
+        assert_eq!((queue_calls, meter_calls), (1, 1));
+    }
+
+    #[test]
+    fn admission_commit_failure_is_fail_closed_without_side_effects() {
+        // The ledger itself is down: 503 before anything is queued or
+        // metered, and the status the route answers is 503.
+        let msg = admission_msg();
+        let mut ledger = MemLedger::new();
+        ledger.fail_record = true;
+        let (mut queue_calls, mut meter_calls) = (0usize, 0usize);
+        let decision = drive_once(
+            &mut ledger,
+            &msg,
+            "parse",
+            true,
+            false,
+            &mut queue_calls,
+            &mut meter_calls,
+        );
+        match &decision {
+            AdmissionDecision::MeterUnavailable(e) => {
+                assert!(e.is_retryable());
+                assert_eq!(e.http_status(), 503);
+            }
+            other => panic!("ledger outage must be fail-closed, got {other:?}"),
+        }
+        assert_eq!((queue_calls, meter_calls), (0, 0));
+    }
+
+    #[test]
+    fn admission_mark_commit_failure_stays_retryable() {
+        // Record + queue + meter succeed, but the commit fails: the route
+        // answers 503 (never 202-and-unmarked) and the retry re-drives
+        // from `pending`.
+        let msg = admission_msg();
+        let mut ledger = MemLedger::new();
+        ledger.fail_commit = true;
+        let (mut queue_calls, mut meter_calls) = (0usize, 0usize);
+        let decision = drive_once(
+            &mut ledger,
+            &msg,
+            "parse",
+            true,
+            false,
+            &mut queue_calls,
+            &mut meter_calls,
+        );
+        match &decision {
+            AdmissionDecision::MeterUnavailable(e) => assert_eq!(e.http_status(), 503),
+            other => panic!("commit failure must stay retryable, got {other:?}"),
+        }
+        // Meter ran before the commit, so the retry re-meters; the count
+        // stays exact per completed admission, not per attempt.
+        assert_eq!((queue_calls, meter_calls), (1, 1));
+        assert_eq!(
+            ledger.mark_of(&msg.job_id, "parse"),
+            Some(AdmissionMark::Pending)
+        );
+    }
+
+    #[test]
+    fn admission_meter_failure_leaves_pending_for_retry() {
+        // Queue accepted but the meter write failed: 503 with the ledger
+        // still pending (the orphan queue message is deduplicated by the
+        // consumer via idempotency_key); the retry meters exactly once.
+        let msg = admission_msg();
+        let mut ledger = MemLedger::new();
+        let (mut queue_calls, mut meter_calls) = (0usize, 0usize);
+        let decision = drive_once(
+            &mut ledger,
+            &msg,
+            "parse",
+            true,
+            true,
+            &mut queue_calls,
+            &mut meter_calls,
+        );
+        match &decision {
+            AdmissionDecision::MeterUnavailable(e) => assert_eq!(e.http_status(), 503),
+            other => panic!("meter failure must stay retryable, got {other:?}"),
+        }
+        assert_eq!((queue_calls, meter_calls), (1, 1));
+        assert_eq!(
+            ledger.mark_of(&msg.job_id, "parse"),
+            Some(AdmissionMark::Pending)
+        );
+    }
+
+    #[test]
+    fn admission_unknown_stage_never_touches_ledger_or_queue() {
+        let msg = admission_msg();
+        let mut ledger = MemLedger::new();
+        let (mut queue_calls, mut meter_calls) = (0usize, 0usize);
+        let decision = drive_once(
+            &mut ledger,
+            &msg,
+            "teleport",
+            true,
+            false,
+            &mut queue_calls,
+            &mut meter_calls,
+        );
+        match &decision {
+            AdmissionDecision::MeterUnavailable(MeterWriteError::UnknownStage(_)) => {}
+            other => panic!("unknown stage is a caller bug, got {other:?}"),
+        }
+        assert_eq!(ledger.record_calls, 0);
+        assert_eq!((queue_calls, meter_calls), (0, 0));
+    }
+
+    #[test]
+    fn admission_reload_recovers_pending_without_double_meter() {
+        // A `pending` intent survives the loss of the isolate: a fresh
+        // handle on the same directory recovers it, and the retried
+        // admission still owes exactly one `Ok` meter event.
+        let dir =
+            std::env::temp_dir().join(format!("ingest-admission-reload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let msg = admission_msg();
+        let (mut queue_calls, mut meter_calls) = (0usize, 0usize);
+        {
+            let mut ledger = FileLedger::new(dir.clone());
+            let decision = drive_once(
+                &mut ledger,
+                &msg,
+                "parse",
+                false,
+                false,
+                &mut queue_calls,
+                &mut meter_calls,
+            );
+            assert_eq!(decision, AdmissionDecision::QueueUnavailable);
+            assert_eq!(meter_calls, 0);
+        } // Handle dropped: models the loss of the isolate.
+        {
+            let mut ledger = FileLedger::new(dir.clone());
+            let decision = drive_once(
+                &mut ledger,
+                &msg,
+                "parse",
+                true,
+                false,
+                &mut queue_calls,
+                &mut meter_calls,
+            );
+            assert_eq!(decision, AdmissionDecision::Admitted);
+            assert_eq!(meter_calls, 1);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lock-free claim double with Postgres UPDATE semantics: the claim is
+    /// a single atomic compare-exchange (row predicate re-check), never a
+    /// mutex held across the queue/meter awaits. Competitors interleave
+    /// freely after the first claim — exactly one wins.
+    struct ClaimLedger {
+        /// 0 = pending, 1 = queued (persisted mark).
+        mark: std::sync::Arc<std::sync::atomic::AtomicU8>,
+        /// false = unclaimed, true = claimed (lease owner).
+        claimed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// Monotonic generation shared by requests over this row.
+        claim_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        /// Generation owned by this ledger handle.
+        own_epoch: Option<u64>,
+    }
+
+    impl ClaimLedger {
+        fn new_shared(
+            mark: std::sync::Arc<std::sync::atomic::AtomicU8>,
+            claimed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            claim_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        ) -> Self {
+            Self {
+                mark,
+                claimed,
+                claim_epoch,
+                own_epoch: None,
+            }
+        }
+    }
+
+    impl AdmissionLedger for ClaimLedger {
+        async fn record_stage_once(
+            &mut self,
+            _job_id: &str,
+            _stage: &str,
+        ) -> Result<AdmissionMark, MeterWriteError> {
+            use std::sync::atomic::Ordering;
+            if self.mark.load(Ordering::SeqCst) == 1 {
+                return Ok(AdmissionMark::Queued);
+            }
+            // Atomic claim: mirrors
+            // `UPDATE ... WHERE (pending OR expired) RETURNING`. No lock is
+            // held here — losers observe the winner's claim immediately.
+            match self
+                .claimed
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => {
+                    self.own_epoch = Some(self.claim_epoch.fetch_add(1, Ordering::SeqCst) + 1);
+                    Ok(AdmissionMark::Pending)
+                }
+                Err(_) => {
+                    if self.mark.load(Ordering::SeqCst) == 1 {
+                        Ok(AdmissionMark::Queued)
+                    } else {
+                        Ok(AdmissionMark::Busy)
+                    }
+                }
+            }
+        }
+
+        async fn mark_queued(
+            &mut self,
+            _job_id: &str,
+            _stage: &str,
+        ) -> Result<(), MeterWriteError> {
+            use std::sync::atomic::Ordering;
+            // Commit requires the current generation, like
+            // `WHERE state = 'claimed' AND claim_epoch = $3`.
+            if self.own_epoch != Some(self.claim_epoch.load(Ordering::SeqCst))
+                || !self.claimed.swap(false, Ordering::SeqCst)
+            {
+                return Err(MeterWriteError::Transport(
+                    "ledger commit without the current claim".to_string(),
+                ));
+            }
+            self.mark.store(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn release_claim(&mut self, _job_id: &str, _stage: &str) {
+            use std::sync::atomic::Ordering;
+            if self.own_epoch == Some(self.claim_epoch.load(Ordering::SeqCst)) {
+                self.claimed.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[test]
+    fn admission_competing_requests_claim_before_queue_or_meter() {
+        // Each request has its own ledger handle over shared atomics, just
+        // like production isolates over one row. No mutex is held across
+        // the queue/meter awaits: the queue delay lets competitors
+        // interleave after the first claim, and the atomic claim admits
+        // exactly one sender+meter.
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+            Arc, Barrier,
+        };
+        let mark = Arc::new(AtomicU8::new(0));
+        let claimed = Arc::new(AtomicBool::new(false));
+        let claim_epoch = Arc::new(AtomicU64::new(0));
+        let start = Arc::new(Barrier::new(8));
+        let meter_calls = Arc::new(AtomicUsize::new(0));
+        let queued_calls = Arc::new(AtomicUsize::new(0));
+        let msg = admission_msg();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let mark = Arc::clone(&mark);
+                let claimed = Arc::clone(&claimed);
+                let claim_epoch = Arc::clone(&claim_epoch);
+                let start = Arc::clone(&start);
+                let meter_calls = Arc::clone(&meter_calls);
+                let queued_calls = Arc::clone(&queued_calls);
+                let msg = msg.clone();
+                std::thread::spawn(move || {
+                    use futures_util::future::FutureExt as _;
+                    let mut ledger = ClaimLedger::new_shared(mark, claimed, claim_epoch);
+                    start.wait();
+                    drive_metered_admission(
+                        &mut ledger,
+                        &msg,
+                        "parse",
+                        || {
+                            queued_calls.fetch_add(1, Ordering::SeqCst);
+                            async {
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                                true
+                            }
+                        },
+                        |outcome| {
+                            assert_eq!(outcome, MeterOutcome::Ok);
+                            meter_calls.fetch_add(1, Ordering::SeqCst);
+                            async move { Ok(()) }
+                        },
+                    )
+                    .now_or_never()
+                    .expect("scripted admission resolves without yielding")
+                })
+            })
+            .collect();
+        let decisions: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("admission thread"))
+            .collect();
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|d| **d == AdmissionDecision::Admitted)
+                .count(),
+            1
+        );
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|d| matches!(
+                    d,
+                    AdmissionDecision::Busy | AdmissionDecision::AlreadyQueued
+                ))
+                .count(),
+            7
+        );
+        assert_eq!(queued_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(meter_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(mark.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stale_admission_claim_cannot_commit_or_release_newer_claim() {
+        use futures_util::future::FutureExt as _;
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+            Arc,
+        };
+
+        let mark = Arc::new(AtomicU8::new(0));
+        let claimed = Arc::new(AtomicBool::new(false));
+        let claim_epoch = Arc::new(AtomicU64::new(0));
+        let mut stale = ClaimLedger::new_shared(
+            Arc::clone(&mark),
+            Arc::clone(&claimed),
+            Arc::clone(&claim_epoch),
+        );
+        assert_eq!(
+            stale
+                .record_stage_once("job", "parse")
+                .now_or_never()
+                .unwrap()
+                .unwrap(),
+            AdmissionMark::Pending
+        );
+
+        // Model the first lease expiring, then a second request reclaiming it.
+        claimed.store(false, Ordering::SeqCst);
+        let mut current = ClaimLedger::new_shared(
+            Arc::clone(&mark),
+            Arc::clone(&claimed),
+            Arc::clone(&claim_epoch),
+        );
+        assert_eq!(
+            current
+                .record_stage_once("job", "parse")
+                .now_or_never()
+                .unwrap()
+                .unwrap(),
+            AdmissionMark::Pending
+        );
+
+        assert!(stale
+            .mark_queued("job", "parse")
+            .now_or_never()
+            .unwrap()
+            .is_err());
+        stale.release_claim("job", "parse").now_or_never().unwrap();
+
+        let mut competitor = ClaimLedger::new_shared(
+            Arc::clone(&mark),
+            Arc::clone(&claimed),
+            Arc::clone(&claim_epoch),
+        );
+        assert_eq!(
+            competitor
+                .record_stage_once("job", "parse")
+                .now_or_never()
+                .unwrap()
+                .unwrap(),
+            AdmissionMark::Busy
+        );
+        assert!(current
+            .mark_queued("job", "parse")
+            .now_or_never()
+            .unwrap()
+            .is_ok());
+        assert_eq!(mark.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn admission_claim_without_busy_winner_releases_for_retry() {
+        // Queue failure releases the atomic claim (production: claimed ->
+        // pending or lease expiry), so the immediate retry reclaims and
+        // still owes exactly one `Ok` — no Busy deadlock, no double meter.
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU64, AtomicU8},
+            Arc,
+        };
+        let msg = admission_msg();
+        let mut ledger = ClaimLedger::new_shared(
+            Arc::new(AtomicU8::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let (mut queue_calls, mut meter_calls) = (0usize, 0usize);
+        assert_eq!(
+            drive_once(
+                &mut ledger,
+                &msg,
+                "parse",
+                false,
+                false,
+                &mut queue_calls,
+                &mut meter_calls,
+            ),
+            AdmissionDecision::QueueUnavailable
+        );
+        assert_eq!((queue_calls, meter_calls), (1, 0));
+        assert_eq!(
+            drive_once(
+                &mut ledger,
+                &msg,
+                "parse",
+                true,
+                false,
+                &mut queue_calls,
+                &mut meter_calls,
+            ),
+            AdmissionDecision::Admitted
+        );
+        assert_eq!((queue_calls, meter_calls), (2, 1));
     }
 }
 
