@@ -50,6 +50,14 @@ pub struct QueueMsg {
     pub limit: Option<u32>,
     #[serde(default)]
     pub page: Option<u32>,
+    /// Request trace for structured logging (`docs/logging-standard.md`):
+    /// the validated inbound `x-trace-id` (32 lowercase hex), carried from
+    /// the HTTP route through the consumer and any downstream worker call. A
+    /// consumer receiving a valid ID MUST NOT replace it. `#[serde(default)]`
+    /// so messages enqueued before this field existed still decode (as
+    /// untraced); the consumer then generates one and treats it as the root.
+    #[serde(default)]
+    pub trace_id: Option<String>,
     /// Content-addressed handle (`nzb:sha256:<hex>`) for the uploaded NZB
     /// bytes of `NzbUpload` jobs, as stored in the payload KV under a
     /// [`PAYLOAD_TTL_SECS`](crate::dispatch::PAYLOAD_TTL_SECS) expiry. The
@@ -153,6 +161,7 @@ mod tests {
             state: JobState::Queued,
             attempt: 1,
             repair_rounds: 0,
+            trace_id: Some("9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c".into()),
             query: None,
             indexer_ref: None,
             categories: vec![],
@@ -162,6 +171,26 @@ mod tests {
         };
         let back: QueueMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
         assert_eq!(msg, back);
+        assert_eq!(
+            back.trace_id.as_deref(),
+            Some("9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c")
+        );
+    }
+
+    #[test]
+    fn queue_msg_reads_pre_trace_messages_as_untraced() {
+        // Messages enqueued before `trace_id` existed still decode; the
+        // consumer generates a root trace for them instead of failing.
+        let legacy = serde_json::json!({
+            "job_id": "job_1",
+            "user_id": "u1",
+            "idempotency_key": "ingest:u1:abc:upload",
+            "source": "nzb_upload",
+            "state": "queued",
+            "attempt": 1,
+        });
+        let msg: QueueMsg = serde_json::from_value(legacy).unwrap();
+        assert_eq!(msg.trace_id, None);
     }
 
     #[test]

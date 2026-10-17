@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/nntune-core", "crates/nntune-test-nntp", "workers/stream"]
+members = ["crates/nntune-core", "crates/nntune-logging", "crates/nntune-test-nntp", "workers/stream"]
 # workers/api, workers/ingest and workers/mb are standalone crates (no
 # [workspace] table): exclude them so this parent workspace never swallows
 # them. Revisit if the scaffold card unifies the workspace.

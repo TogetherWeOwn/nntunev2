@@ -18,6 +18,7 @@
 //! over the [`MbRepo`] and [`SuccessCache`] traits. The HTTP layer at the bottom wires them to a per-request
 //! `tokio-postgres` client over the Hyperdrive socket and to the KV binding.
 
+use nntune_logging::{Level, LogRecord, Worker as LogWorker};
 use serde::Serialize;
 
 /// Cache TTLs: lookups are immutable-ish (long TTL), search is short TTL.
@@ -379,6 +380,57 @@ mod http_layer {
         RouteContext,
     };
 
+    /// Resolve the request trace from the inbound `x-trace-id` header: a
+    /// valid 128-bit ID is kept, anything else is replaced with a fresh
+    /// random ID. The invalid value is never logged.
+    fn inbound_trace_id(req: &Request) -> String {
+        let header = req
+            .headers()
+            .get(nntune_logging::TRACE_HEADER)
+            .ok()
+            .flatten();
+        nntune_logging::resolve_trace_id(header.as_deref())
+    }
+
+    /// Emit one structured log line for this request
+    /// (`docs/logging-standard.md`). Field validation runs at construction:
+    /// a banned key or secret-like value drops the line instead of leaking
+    /// it. All call-site fields are constants plus opaque kinds and status
+    /// codes, so the drop branch only fires on a code bug.
+    fn emit(level: Level, trace_id: &str, event: &str, fields: serde_json::Value) {
+        let ts_millis = worker::Date::now().as_millis();
+        let Ok(field_map) = nntune_logging::fields_from_json(fields) else {
+            return;
+        };
+        let Ok(record) =
+            LogRecord::new(LogWorker::Mb, level, trace_id, event, field_map, ts_millis)
+        else {
+            return;
+        };
+        console_log!("{}", record.to_json_line());
+    }
+
+    /// Outcome severity: successes are info, client errors warn, server
+    /// errors are errors — so the trace stream stays signal, not noise.
+    pub(crate) fn outcome_level(status: u16) -> Level {
+        match status {
+            200 => Level::Info,
+            400 | 404 => Level::Warn,
+            _ => Level::Error,
+        }
+    }
+
+    /// Echo the request trace on a live response so callers can correlate.
+    /// The edge-cache copy stays untraced: a cached trace would replay one
+    /// request's ID to later clients. Best-effort: a header failure must not
+    /// fail the request itself.
+    fn with_trace(mut response: Response, trace_id: &str) -> Response {
+        let _ = response
+            .headers_mut()
+            .append(nntune_logging::TRACE_HEADER, trace_id);
+        response
+    }
+
     /// KV-backed [`SuccessCache`]; degrades to no-op when the binding is
     /// absent so a misconfigured cache never blocks DB reads.
     enum EdgeCache {
@@ -416,9 +468,11 @@ mod http_layer {
 
     /// [`MbRepo`] over Hyperdrive. Lazy: the Postgres connection is opened
     /// per query (Hyperdrive pools underneath), so a KV/edge cache hit
-    /// never connects.
+    /// never connects. Carries the request trace so the detached
+    /// connection-error log still correlates.
     struct PgRepo {
         env: Env,
+        trace_id: String,
     }
 
     impl PgRepo {
@@ -436,11 +490,17 @@ mod http_layer {
                 .connect_raw(socket, worker::postgres_tls::PassthroughTls)
                 .await
                 .map_err(|_| RepoError)?;
+            let trace_id = self.trace_id.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 // Detail stays out of logs: driver errors can carry
                 // host/role strings that are not needed to triage.
                 if connection.await.is_err() {
-                    console_log!("mb db connection error");
+                    emit(
+                        Level::Error,
+                        &trace_id,
+                        "mb.db.connect_failed",
+                        serde_json::json!({"stage": "connect"}),
+                    );
                 }
             });
             Ok(client)
@@ -528,9 +588,10 @@ mod http_layer {
     }
 
     /// Render a core result and, for successes only, store a copy in
-    /// the edge Cache API keyed by the request URL.
-    async fn serve(req_url: String, api: ApiResponse) -> WorkerResult<Response> {
-        let response = render(&api)?;
+    /// the edge Cache API keyed by the request URL. Only the served copy
+    /// carries the `x-trace-id` echo (see [`with_trace`]).
+    async fn serve(req_url: String, api: ApiResponse, trace_id: &str) -> WorkerResult<Response> {
+        let response = with_trace(render(&api)?, trace_id);
         if api.cache_ttl.is_some() {
             let edge_copy = render(&api)?;
             // Best-effort: an edge-cache failure must not fail the read.
@@ -552,24 +613,36 @@ mod http_layer {
         if let Some(hit) = edge_hit(req).await {
             return Ok(hit);
         }
+        let trace_id = inbound_trace_id(req);
         let mbid = ctx.param("mbid").map(String::as_str).unwrap_or("");
         let repo = PgRepo {
             env: ctx.env.clone(),
+            trace_id: trace_id.clone(),
         };
         let cache = EdgeCache::from_env(&ctx.env);
         let api = handle_lookup(&repo, &cache, kind, mbid).await;
-        serve(req.url()?.to_string(), api).await
+        // Entity fields never log (names/titles are personal data); the line
+        // carries the entity kind plus the outcome status only.
+        emit(
+            outcome_level(api.status),
+            &trace_id,
+            "mb.lookup.completed",
+            serde_json::json!({"kind": kind.as_str(), "status_code": api.status}),
+        );
+        serve(req.url()?.to_string(), api, &trace_id).await
     }
 
     pub async fn search_route(req: &Request, ctx: &RouteContext<()>) -> WorkerResult<Response> {
         if let Some(hit) = edge_hit(req).await {
             return Ok(hit);
         }
+        let trace_id = inbound_trace_id(req);
         let url = req.url()?;
         let query: std::collections::HashMap<String, String> =
             url.query_pairs().into_owned().collect();
         let repo = PgRepo {
             env: ctx.env.clone(),
+            trace_id: trace_id.clone(),
         };
         let cache = EdgeCache::from_env(&ctx.env);
         let api = handle_search(
@@ -579,11 +652,30 @@ mod http_layer {
             query.get("q").map(String::as_str).unwrap_or(""),
         )
         .await;
-        serve(url.to_string(), api).await
+        // The raw query text never logs (free-form user input); the line
+        // carries the kind plus the outcome status only.
+        let kind_label = query.get("type").map(String::as_str).unwrap_or("unknown");
+        emit(
+            outcome_level(api.status),
+            &trace_id,
+            "mb.search.completed",
+            serde_json::json!({"kind": kind_label, "status_code": api.status}),
+        );
+        serve(url.to_string(), api, &trace_id).await
     }
 
-    pub async fn not_found() -> WorkerResult<Response> {
-        render(&error_response("not found", 404))
+    pub async fn not_found(req: &Request) -> WorkerResult<Response> {
+        let trace_id = inbound_trace_id(req);
+        emit(
+            Level::Warn,
+            &trace_id,
+            "mb.request.not_found",
+            serde_json::json!({"status_code": 404}),
+        );
+        Ok(with_trace(
+            render(&error_response("not found", 404))?,
+            &trace_id,
+        ))
     }
 }
 
@@ -606,7 +698,9 @@ pub async fn main(
         .get_async("/v1/mb/search", |req, ctx| async move {
             http_layer::search_route(&req, &ctx).await
         })
-        .or_else_any_method_async("/*catchall", |_, _| async { http_layer::not_found().await })
+        .or_else_any_method_async("/*catchall", |req, _| async move {
+            http_layer::not_found(&req).await
+        })
         .run(req, env)
         .await
 }
@@ -1000,5 +1094,78 @@ mod tests {
         assert!(!is_valid_mbid("123e4567-e89b-12d3-a456-4266141740000"));
         assert!(!is_valid_mbid("123e4567_e89b_12d3_a456_426614174000"));
         assert!(!is_valid_mbid("gggggggg-hhhh-iiii-jjjj-kkkkkkkkkkkk"));
+    }
+
+    const TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
+
+    #[test]
+    fn outcome_levels_favour_signal_over_noise() {
+        assert_eq!(super::http_layer::outcome_level(200), Level::Info);
+        assert_eq!(super::http_layer::outcome_level(400), Level::Warn);
+        assert_eq!(super::http_layer::outcome_level(404), Level::Warn);
+        assert_eq!(super::http_layer::outcome_level(500), Level::Error);
+        assert_eq!(super::http_layer::outcome_level(503), Level::Error);
+    }
+
+    /// The route's `completed` line goes through the REAL emitter, not a
+    /// hand-written fixture: same constructor and renderer production uses.
+    #[test]
+    fn structured_completed_lines_conform_to_the_standard() {
+        for (event, kind) in [
+            ("mb.lookup.completed", "artist"),
+            ("mb.search.completed", "release"),
+        ] {
+            let fields = nntune_logging::fields_from_json(
+                serde_json::json!({"kind": kind, "status_code": 200}),
+            )
+            .unwrap();
+            let record = LogRecord::new(
+                LogWorker::Mb,
+                Level::Info,
+                TRACE,
+                event,
+                fields,
+                1_792_094_400_123,
+            )
+            .unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&record.to_json_line()).unwrap();
+            let object = parsed.as_object().unwrap();
+            assert_eq!(object.len(), 6);
+            assert_eq!(object["worker"], "mb");
+            assert_eq!(object["trace_id"], TRACE);
+            assert_eq!(object["event"], event);
+            assert_eq!(object["ts"], "2026-10-15T20:00:00.123Z");
+            assert_eq!(record.trace_id(), TRACE);
+        }
+    }
+
+    /// Negative privacy coverage: the only shapes routes emit are kinds and
+    /// status codes — entity content (names, titles) and raw query text never
+    /// reach the emitter, and identity/credential/network shapes are rejected
+    /// outright when they do.
+    #[test]
+    fn completed_lines_carry_no_entity_content() {
+        for value in [
+            serde_json::json!({"kind": "artist", "status_code": 200}),
+            serde_json::json!({"kind": "unknown", "status_code": 400}),
+            serde_json::json!({"status_code": 404}),
+        ] {
+            let fields = nntune_logging::fields_from_json(value).unwrap();
+            assert!(
+                fields.keys().all(|k| k == "kind" || k == "status_code"),
+                "route shape carries more than kind + status"
+            );
+        }
+        for value in [
+            serde_json::json!({"name": "Test Artist"}),
+            serde_json::json!({"email": "a@example.com"}),
+            serde_json::json!({"client_ip": "192.0.2.1"}),
+            serde_json::json!({"token": "tok_abc"}),
+        ] {
+            assert!(
+                nntune_logging::fields_from_json(value).is_err(),
+                "emitter accepted identity content"
+            );
+        }
     }
 }
