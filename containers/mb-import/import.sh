@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # mbdump dumps -> Postgres COPY into nntunev2-mb (idempotent, resumable).
 # Usage: DATABASE_URL=<url> [DUMP_SEQ=<n>] [MB_IMPORT_CHUNK_LINES=<n>] ./import.sh <dump-dir>
-# Never echo $DATABASE_URL; pass it only via env/secret store.
+# Never echo $DATABASE_URL; it arrives only via env/secret store and is
+# translated into libpq PG* environment variables (pg-env.sh), so psql
+# is invoked with no connection string in its argv.
 #
 # Kill-safe chunking: the not-yet-loaded tail of each content-addressed
 # dump file is streamed once into fixed-size part files (default 2000
@@ -84,6 +86,12 @@ command -v uniq >/dev/null || { echo "import: uniq not on PATH" >&2; exit 1; }
 command -v sha256sum >/dev/null || { echo "import: sha256sum not on PATH" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "import: python3 not on PATH (FK orphan split)" >&2; exit 1; }
 
+# Deliver the connection to psql via the PG* environment, never argv.
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=pg-env.sh
+. "$script_dir/pg-env.sh"
+configure_pg_env_from_database_url
+
 # Chunk scratch lives here for the whole run (one rm at the end). A kill -9
 # skips the EXIT trap and leaks this directory; chunk files are disposable
 # (the cursor is the resume state, never these files) and the platform GCs
@@ -93,7 +101,7 @@ trap 'rm -rf "$work"' EXIT
 
 refuse_all_poison_dump() {
   local table="$1" dump_id="$2" total="$3" poison_n
-  poison_n="$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tAX -c "SELECT count(*) FROM mb_import_dlq WHERE table_name = '$table' AND dump_id = '$dump_id';")"
+  poison_n="$(psql -v ON_ERROR_STOP=1 -tAX -c "SELECT count(*) FROM mb_import_dlq WHERE table_name = '$table' AND dump_id = '$dump_id';")"
   if [[ ! "$poison_n" =~ ^[0-9]+$ ]]; then
     echo "import: unexpected poison count '$poison_n' for $table dump $dump_id" >&2
     exit 1
@@ -140,7 +148,7 @@ for table in artist release recording track; do
     exit 1
   fi
   dump_id="$(sha256sum "$tsv" | cut -d ' ' -f 1)"
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "INSERT INTO mb_import_cursor (table_name, dump_id, lines_done) VALUES ('$table', '$dump_id', 0) ON CONFLICT (table_name, dump_id) DO NOTHING;" >/dev/null
+  psql -v ON_ERROR_STOP=1 -c "INSERT INTO mb_import_cursor (table_name, dump_id, lines_done) VALUES ('$table', '$dump_id', 0) ON CONFLICT (table_name, dump_id) DO NOTHING;" >/dev/null
   # Duplicate-key pre-check. Entity tables key on the MBID in column 1;
   # track keys on the membership tuple (release, medium, track,
   # recording), where column 1 legitimately repeats per release.
@@ -159,7 +167,7 @@ for table in artist release recording track; do
     head -n 5 "$work/mbids.duplicates" >&2
     exit 1
   fi
-  completed="$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tAX -c "SELECT lines_done FROM mb_import_cursor WHERE table_name = '$table' AND dump_id = '$dump_id';")"
+  completed="$(psql -v ON_ERROR_STOP=1 -tAX -c "SELECT lines_done FROM mb_import_cursor WHERE table_name = '$table' AND dump_id = '$dump_id';")"
   if [[ ! "$completed" =~ ^[0-9]+$ ]]; then
     echo "import: unexpected lines_done '$completed' for $table in mb_import_cursor (migration 0014_mb_import_resume_dlq missing?)" >&2
     exit 1
@@ -264,7 +272,7 @@ for table in artist release recording track; do
       # No explicit transaction here, so no ON COMMIT DROP: each statement
       # autocommits, which would drop the temp table before COPY runs. The
       # table dies with the session instead.
-      fk_bad="$(psql "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -tAX <<SQL
+      fk_bad="$(psql -q -v ON_ERROR_STOP=1 -tAX <<SQL
 CREATE TEMP TABLE want_parent (parent_mbid uuid, line_no bigint);
 \copy want_parent FROM '$work/parents.tsv' WITH (FORMAT text)
 SELECT coalesce(string_agg(line_no::text, ' ' ORDER BY line_no), '') FROM want_parent w WHERE NOT EXISTS (SELECT 1 FROM ${parent_table} p WHERE p.mbid = w.parent_mbid);
@@ -338,7 +346,7 @@ EOF
     # -q keeps stdout to just the RETURNING value: without it every command
     # tag (BEGIN/COPY/INSERT/...) lands in the capture and the cursor check
     # below misfires.
-    advanced="$(psql "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -tAX <<SQL
+    advanced="$(psql -q -v ON_ERROR_STOP=1 -tAX <<SQL
 BEGIN;
 CREATE TEMP TABLE stage (LIKE mb_${table}) ON COMMIT DROP;
 \copy stage ($columns, line_no) FROM '$work/valid.tsv' WITH (FORMAT text)
@@ -379,7 +387,7 @@ if [[ -n "${DUMP_SEQ:-}" ]]; then
     echo "import: refusing non-integer DUMP_SEQ '$DUMP_SEQ'" >&2
     exit 1
   fi
-  current_last_packet="$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tAX -c "SELECT last_packet FROM mb_import_state WHERE id = 1;")"
+  current_last_packet="$(psql -v ON_ERROR_STOP=1 -tAX -c "SELECT last_packet FROM mb_import_state WHERE id = 1;")"
   if [[ ! "$current_last_packet" =~ ^[0-9]+$ ]]; then
     echo "import: unexpected last_packet '$current_last_packet' in mb_import_state" >&2
     exit 1
@@ -387,7 +395,7 @@ if [[ -n "${DUMP_SEQ:-}" ]]; then
   if (( 10#$DUMP_SEQ <= 10#$current_last_packet )); then
     echo "import: DUMP_SEQ=$DUMP_SEQ <= current last_packet=$current_last_packet; leaving state untouched (older dump never rewinds the replication cursor)" >&2
   else
-    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "UPDATE mb_import_state SET last_packet = $DUMP_SEQ, updated_at = now() WHERE id = 1 AND last_packet < $DUMP_SEQ;"
+    psql -v ON_ERROR_STOP=1 -c "UPDATE mb_import_state SET last_packet = $DUMP_SEQ, updated_at = now() WHERE id = 1 AND last_packet < $DUMP_SEQ;"
     echo "import: seeded mb_import_state.last_packet=$DUMP_SEQ"
   fi
 else

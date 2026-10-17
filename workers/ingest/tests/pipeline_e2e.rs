@@ -55,7 +55,7 @@ fn happy_path_reaches_done_with_one_library_row() {
 
     // No repair: walk the state machine to Done.
     assert!(
-        decide_repair(&msg.job_id, &msg.user_id, &msg.idempotency_key, "", 0)
+        decide_repair(&msg.job_id, &msg.user_id, &msg.idempotency_key, "", 0, 1)
             .unwrap()
             .is_none()
     );
@@ -105,6 +105,7 @@ fn gapped_set_repairs_then_reaches_done() {
         &msg.idempotency_key,
         GAPPED_PAR2_SET,
         missing,
+        1,
     )
     .unwrap()
     .expect("gapped set must dispatch repair");

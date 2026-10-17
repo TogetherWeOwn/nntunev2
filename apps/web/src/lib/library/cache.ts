@@ -83,10 +83,27 @@ export function isLibraryItem(value: unknown): value is LibraryItem {
 }
 
 /**
+ * Keep the first valid occurrence of each `id`, in original order. Later
+ * rows sharing an `id` are dropped whole — their fields are never merged
+ * into the kept row — so the result satisfies the library view's keyed
+ * list (`{#each … (track.id)}`) uniqueness requirement. IDs are compared
+ * exactly (case-sensitive), matching Svelte's key comparison.
+ */
+function dedupeById(items: LibraryItem[]): LibraryItem[] {
+	const seen = new Set<string>();
+	return items.filter((item) => {
+		if (seen.has(item.id)) return false;
+		seen.add(item.id);
+		return true;
+	});
+}
+
+/**
  * Normalize an unknown API payload into a list of items. Accepts either a
  * bare array (the documented `/api/library` shape) or `{ items: [...] }`
  * and drops entries without a string `id` so one malformed row can never
- * blank the list.
+ * blank the list. Rows are also deduplicated by `id` (first occurrence
+ * wins) so duplicate API rows can never reach keyed rendering.
  */
 export function toLibraryItems(payload: unknown): LibraryItem[] | null {
 	const raw = Array.isArray(payload)
@@ -95,7 +112,7 @@ export function toLibraryItems(payload: unknown): LibraryItem[] | null {
 			? (payload as Record<string, unknown>).items
 			: undefined;
 	if (!Array.isArray(raw)) return null;
-	const items = raw.filter(isLibraryItem);
+	const items = dedupeById(raw.filter(isLibraryItem));
 	return raw.length > 0 && items.length === 0 ? null : items;
 }
 
@@ -147,7 +164,11 @@ export function decodeSnapshot(raw: string | null): LibrarySnapshot | null {
 			return null;
 		}
 		if (!Array.isArray(parsed.items)) return null;
-		const items = parsed.items.filter(isLibraryItem);
+		// Deduplicate before capping: a repeated row must not consume count
+		// or byte budget that a unique row behind it would otherwise get,
+		// and restored rows must satisfy the same keyed-list uniqueness
+		// rule as freshly normalized API rows.
+		const items = dedupeById(parsed.items.filter(isLibraryItem));
 		if (parsed.items.length > 0 && items.length === 0) return null;
 		return { savedAt: parsed.savedAt, items: evictToCap(items) };
 	} catch {

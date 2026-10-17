@@ -32,7 +32,7 @@ metering primitives below are built to support them from day one.
 ```text
 crates/nntune-core   # NNTP client, SIMD yEnc, NZB, decrypt, par2-verify (wasm32 + native)
 workers/             # Rust workers-rs backends incl. Durable Objects
-web/                 # SvelteKit frontend (adapter-cloudflare)
+apps/web/            # SvelteKit frontend (adapter-cloudflare)
 ```
 
 ## Secrets (never committed)

@@ -47,10 +47,11 @@ queue = "nntune-ingest-dlq"
 # progressing job spends neither its attempt budget nor the max_retries
 # slots below. If that enqueue fails the handler falls back to a native
 # retry, which does spend a slot.
-# The search/verify/repair runtime steps are not wired yet, so enabling
-# this now would burn every valid job's retry budget against an
-# unavailable boundary and quarantine it. Uncomment only when those steps
-# are executable. E.g.:
+# The search/verify runtime steps are not wired yet (repair is wired
+# through REPAIR_CONTAINER below but only reachable once verify stages
+# its inputs), so enabling this now would burn every valid job's retry
+# budget against an unavailable boundary and quarantine it. Uncomment
+# only when those steps are executable. E.g.:
 #
 # [[queues.consumers]]
 # queue = "nntune-ingest-jobs"
@@ -113,11 +114,11 @@ script_name = "nntune-stream"
 binding = "INGEST_METER"
 dataset = "nntune_ingest_meter"
 
-# Slice 2: repair dispatch target (code: src/repair.rs). The Container service
-# name lands with the repair runtime; until then this stays a placeholder.
+# Repair dispatch target (code: src/repair.rs): the no-route repair
+# Worker in workers/repair, which fronts the par2 Container.
 [[services]]
 binding = "REPAIR_CONTAINER"
-service = "<REPAIR_CONTAINER_SERVICE>"
+service = "nntune-repair"
 
 # MusicBrainz read API for the Matching step (code: src/matching.rs,
 # src/queue_consumer.rs). The service is the workers/mb Worker

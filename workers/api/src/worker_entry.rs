@@ -1267,6 +1267,163 @@ fn internal_render() -> WorkerResult<Response> {
     )
 }
 
+// --- Request-body collection & dispatch gate --------------------------------
+//
+// A body *transport* failure (stream setup or a chunk read) must never be
+// converted into an empty or truncated body the handlers then act on: an
+// empty body is meaningful downstream (stored-credential vault testing
+// dials the saved provider for an empty `POST /v1/vault/test` body), so a
+// swallowed failure could invoke the handler, store writes, the mailer or
+// the vault dialer on input the client never successfully sent. Collection
+// therefore returns an explicit decision and only `Complete` may dispatch.
+
+/// Opaque chunk-read failure. Carries no message by construction, so no
+/// internal/runtime error detail can ever reach a response body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyReadError;
+
+/// One pollable source of body chunks (std-only so fake streams are
+/// native-testable; the Worker adapter wraps the runtime byte stream
+/// and maps every runtime chunk error to `BodyReadError`).
+pub trait BodyChunkStream {
+    fn poll_next_chunk(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Vec<u8>, BodyReadError>>>;
+}
+
+/// Where the body comes from, classified by the Worker entry using the
+/// actual workers-rs contract:
+/// - `Bodyless`: the edge request has no body at all
+///   (`req.inner().body().is_none()`) — a legitimate bodyless request
+///   (e.g. GET/DELETE, or a POST sent without a body). `req.stream()`
+///   errors for such requests too, so this check must come first.
+/// - `SetupFailed`: a body IS present but obtaining its stream failed
+///   (`req.stream()` returned `Err`).
+/// - `Stream(s)`: a body is present and its stream was obtained.
+pub enum BodySource<S> {
+    Bodyless,
+    SetupFailed,
+    Stream(S),
+}
+
+/// The collection decision. Only `Complete` may reach the handlers.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CollectedBody {
+    Complete(Vec<u8>),
+    Oversized,
+    TransportFailure,
+}
+
+/// Adapter from the runtime byte stream to [`BodyChunkStream`]: every
+/// runtime chunk error becomes the opaque [`BodyReadError`].
+struct WorkerBodyStream<S> {
+    inner: std::pin::Pin<Box<S>>,
+}
+
+impl<S> BodyChunkStream for WorkerBodyStream<S>
+where
+    S: futures_util::Stream<Item = WorkerResult<Vec<u8>>>,
+{
+    fn poll_next_chunk(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Vec<u8>, BodyReadError>>> {
+        match self.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(chunk))) => std::task::Poll::Ready(Some(Ok(chunk))),
+            std::task::Poll::Ready(Some(Err(_))) => {
+                std::task::Poll::Ready(Some(Err(BodyReadError)))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// Collect one request body with the existing hard cap
+/// (`handlers::MAX_BODY_BYTES`, the single source of truth — no second
+/// size constant). Rules:
+/// - `declared_len` is the parsed `Content-Length` (`None` when absent
+///   or unparsable). `Some(len) if len > MAX` is `Oversized` and the
+///   stream is not polled at all.
+/// - `Bodyless` is `Complete(vec![])`; an empty stream is too when no
+///   positive length was declared (an explicitly sent empty body stays
+///   valid vault-test input).
+/// - `SetupFailed` is `TransportFailure`.
+/// - Any chunk `Err` is `TransportFailure`, however many valid bytes
+///   (even a complete valid JSON document) arrived before it. Partial
+///   bytes are dropped, never returned.
+/// - A stream that ends after fewer bytes than `declared_len` is
+///   `TransportFailure`: the runtime adapter maps a client abort to a
+///   clean end-of-stream below this seam, so the declared length is the
+///   only abort signal available here. With no declared length
+///   (chunked), such an abort is undetectable at this seam — a runtime
+///   limit, not a case this function can distinguish from a body that
+///   legitimately ends where it ends.
+/// - Buffering is bounded: once the cap would be exceeded the result is
+///   `Oversized` and collection stops pulling chunks.
+/// - `Poll::Pending` is awaited, never treated as end-of-body.
+pub async fn collect_body<S: BodyChunkStream>(
+    declared_len: Option<usize>,
+    source: BodySource<S>,
+) -> CollectedBody {
+    if declared_len.is_some_and(|len| len > handlers::MAX_BODY_BYTES) {
+        return CollectedBody::Oversized;
+    }
+    let mut stream = match source {
+        BodySource::Bodyless => return CollectedBody::Complete(Vec::new()),
+        BodySource::SetupFailed => return CollectedBody::TransportFailure,
+        BodySource::Stream(stream) => stream,
+    };
+    let mut body = Vec::new();
+    loop {
+        let next = std::future::poll_fn(|cx| stream.poll_next_chunk(cx)).await;
+        match next {
+            None => {
+                if declared_len.is_some_and(|len| body.len() < len) {
+                    return CollectedBody::TransportFailure;
+                }
+                return CollectedBody::Complete(body);
+            }
+            Some(Err(BodyReadError)) => return CollectedBody::TransportFailure,
+            Some(Ok(chunk)) => {
+                // `body.len() <= MAX` is invariant, so this never overflows
+                // and never buffers past the cap.
+                if chunk.len() > handlers::MAX_BODY_BYTES - body.len() {
+                    return CollectedBody::Oversized;
+                }
+                body.extend_from_slice(&chunk);
+            }
+        }
+    }
+}
+
+/// The dispatch gate. `Complete(bytes)` replaces `request.body` with
+/// exactly `bytes` and invokes `handler` once. `Oversized` and
+/// `TransportFailure` invoke NOTHING and answer the handlers' existing
+/// uniform pre-routing rejection (`handlers::invalid_request`: status
+/// 400, body `{"error":"invalid request"}`, no `set_cookie`), so the
+/// gate can never drift from it. The Worker entry passes a handler that
+/// calls `handlers::handle`, so a rejected body can cause no store,
+/// mailer, DNS, or dialer side effect.
+pub async fn dispatch_collected<F, Fut>(
+    collected: CollectedBody,
+    mut request: handlers::Request,
+    handler: F,
+) -> handlers::Response
+where
+    F: FnOnce(handlers::Request) -> Fut,
+    Fut: std::future::Future<Output = handlers::Response>,
+{
+    match collected {
+        CollectedBody::Complete(bytes) => {
+            request.body = bytes;
+            handler(request).await
+        }
+        CollectedBody::Oversized | CollectedBody::TransportFailure => handlers::invalid_request(),
+    }
+}
+
 /// Worker `fetch` entry: adapts the runtime request into the handlers'
 /// framework-agnostic shape. Misconfiguration (missing/invalid env)
 /// answers the same generic 500 as any store outage.
@@ -1277,40 +1434,34 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         console_log!("api worker misconfigured");
         return internal_render();
     };
-    // Bound the body read: an oversized declared length short-circuits
-    // into the handler's uniform size rejection without buffering it.
+    // Classify the body source from the actual runtime request, then
+    // collect through the tested seam: a legitimate bodyless request
+    // (`inner().body()` is `None`; `stream()` would error for it too) is
+    // dispatchable empty input, while a present body whose stream cannot
+    // be obtained — or whose chunks fail mid-read — is a transport
+    // failure that the gate below rejects before any handler runs. The
+    // declared length short-circuits oversized bodies and exposes a
+    // short read (the runtime adapter hides a client abort as a clean
+    // end-of-stream); chunked (length-less) oversized bodies stop
+    // buffering at the same cap, and a chunked abort the adapter hides
+    // is undetectable at this seam.
     let declared_len = req
         .headers()
         .get("content-length")
         .ok()
         .flatten()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    let body = if declared_len > handlers::MAX_BODY_BYTES {
-        vec![0u8; handlers::MAX_BODY_BYTES + 1]
+        .and_then(|v| v.parse::<usize>().ok());
+    let source = if req.inner().body().is_none() {
+        BodySource::Bodyless
     } else {
-        // Stream with a hard cap: a chunked (length-less) oversized body
-        // stops buffering one byte past the limit and the handler's
-        // uniform size rejection takes it from there.
-        let mut body = Vec::new();
-        if let Ok(mut stream) = req.stream() {
-            use futures_util::StreamExt;
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(chunk) => {
-                        let room = handlers::MAX_BODY_BYTES + 1
-                            - body.len().min(handlers::MAX_BODY_BYTES + 1);
-                        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
-                        if body.len() > handlers::MAX_BODY_BYTES {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
+        match req.stream() {
+            Ok(stream) => BodySource::Stream(WorkerBodyStream {
+                inner: Box::pin(stream),
+            }),
+            Err(_) => BodySource::SetupFailed,
         }
-        body
     };
+    let collected = collect_body(declared_len, source).await;
     let headers_map: HashMap<String, String> = req
         .headers()
         .entries()
@@ -1321,7 +1472,9 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         path: req.path(),
         cookie: headers_map.get("cookie").cloned(),
         origin: headers_map.get("origin").cloned(),
-        body,
+        // Template only: the gate replaces this with the collected bytes
+        // on `Complete` and never dispatches it otherwise.
+        body: Vec::new(),
     };
     let ctx = handlers::Ctx {
         cfg: &config,
@@ -1335,7 +1488,10 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         now: worker::Date::now().as_millis() / 1000,
         source_ip: client_source_ip(&headers_map),
     };
-    let response = handlers::handle(&ctx, &request).await;
+    let response = dispatch_collected(collected, request, |collected_request| async move {
+        handlers::handle(&ctx, &collected_request).await
+    })
+    .await;
     // Exact match only: the configured origin is the one frontend origin
     // this Worker trusts with credentialed cross-origin calls. The raw
     // request Origin goes into the tested `cors_headers` decision — never

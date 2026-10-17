@@ -46,6 +46,15 @@ export const API = {
 /** HTTP statuses the API uses to signal plan-limit enforcement. */
 export const PLAN_LIMIT_STATUSES = [402, 429] as const;
 
+/**
+ * Ports the BYOP UI offers; the fixture transport must stay inside this
+ * allowlist. Lives here (not access.ts, which reads `process.env`) so the
+ * web contract test can pin it against ALLOWED_NNTP_PORTS
+ * (vault-validation.ts, itself mirroring vault.rs) without dragging Node
+ * types into the web tsconfig — see apps/web/src/lib/contract.test.ts.
+ */
+export const SUPPORTED_NNTP_PORTS: readonly number[] = [119, 563];
+
 /** A fresh, collision-free test mailbox per run (example.test never routes). */
 export function uniqueTestEmail(prefix = 'e2e'): string {
   const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '');

@@ -119,7 +119,7 @@
 	}
 	small {
 		font-weight: normal;
-		color: #444;
+		color: var(--nt-fg-muted);
 	}
 	.visually-hidden {
 		position: absolute;
