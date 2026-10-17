@@ -117,6 +117,12 @@ How the suite uses them:
   offline checks remain usable with no staging URL and no Access pair. An Access wall (wall status + Access markers, including
   302s to the Access login) fails closed with a remediation message instead
   of masquerading as an app failure; plain app 4xx responses pass through.
+  The smoke also proves the inverse for `/api/health` and `/api/ready`:
+  `anonymousApiGet` requests both with no Access headers or credentials in
+  a fresh, isolated request context (no-follow) and `assertAccessWall`
+  passes only on an Access-specific denial — an application `ok:true`
+  answer to an anonymous request fails the smoke. Diagnostics stay
+  names-only (fixed context + status; no URL, header or body values).
 - Test-account sessions minted by the seam travel as
   `Authorization: Bearer <session>` (contract owned by the auth card —
   `helpers/accounts.ts` names it; cookie sessions would update the helper +

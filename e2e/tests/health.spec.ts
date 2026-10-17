@@ -1,7 +1,12 @@
 import { test, expect } from '@playwright/test';
 import { API, TESTIDS } from '../helpers/contract.js';
-import { accessHeaders, assertNoAccessWall, stagingBaseUrl } from '../helpers/access.js';
-import { apiGet, applyAccountToPage } from '../helpers/accounts.js';
+import {
+  accessHeaders,
+  assertAccessWall,
+  assertNoAccessWall,
+  stagingBaseUrl,
+} from '../helpers/access.js';
+import { anonymousApiGet, apiGet, applyAccountToPage } from '../helpers/accounts.js';
 import { assertPromotionReady } from '../helpers/readiness.js';
 
 // Fast synthetic smoke: runs post-deploy AND on a schedule. Must stay under
@@ -73,6 +78,33 @@ test.describe('staging synthetic smoke', () => {
     // JSON or {ok:false} must fail this smoke — never green it. The shared
     // helper is pinned offline by tests/readiness.spec.ts.
     assertPromotionReady(readyProbe, 'ready');
+  });
+
+  // Anonymous denial (the other side of the authorized checks above, which
+  // stay unchanged): a request with no Access headers or credentials, in an
+  // isolated request context, must be denied BY Access. An application
+  // ok:true answer here means anonymous traffic reached the app — a failure,
+  // not a pass. The probe helper attaches no headers regardless of the
+  // configured pair, and the assertion requires Access-specific markers,
+  // so an ordinary app error cannot masquerade as enforcement.
+  test('GET /api/health without Access credentials is denied by Access', async () => {
+    const baseURL = stagingBaseUrl('skip', 'health-anonymous');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    const probe = await anonymousApiGet(`${baseURL}${API.health}`, 'health-anonymous');
+    assertAccessWall(probe, 'health-anonymous');
+  });
+
+  test('GET /api/ready without Access credentials is denied by Access', async () => {
+    const baseURL = stagingBaseUrl('skip', 'ready-anonymous');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    const probe = await anonymousApiGet(`${baseURL}${API.ready}`, 'ready-anonymous');
+    assertAccessWall(probe, 'ready-anonymous');
   });
 
   test('GET / serves the app shell behind Access', async ({ page }) => {
