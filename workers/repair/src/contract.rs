@@ -10,8 +10,8 @@
 use std::collections::HashSet;
 
 use nntune_core::par2::scratch::{
-    object_key_for_file_name, validate_file_name, validate_object_key, validate_scratch_prefix,
-    MAX_SCRATCH_FILES, MAX_SCRATCH_TOTAL_BYTES,
+    object_key_for_file_name, sha256_hex, validate_file_name, validate_object_key,
+    validate_scratch_prefix, MAX_SCRATCH_FILES, MAX_SCRATCH_TOTAL_BYTES,
 };
 use serde::{Deserialize, Serialize};
 
@@ -173,26 +173,53 @@ pub struct OutputFile {
     pub size: u64,
 }
 
-/// One round's terminal result (Container output == `out/result.json`
-/// == the reply to ingest).
+/// One round's terminal result, persisted as `out/result.json`. The
+/// Container's own output lacks `manifest_digest`; this Worker stamps
+/// it before persisting (serde defaults it to empty on parse).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepairResult {
     pub status: RepairStatus,
     pub exit_code: Option<i32>,
     pub files: Vec<OutputFile>,
+    /// [`manifest_digest`] of the staged inputs this result was
+    /// produced from. Idempotency is keyed on the manifest, not just
+    /// `(job_id, round)`: a redrive resets the round to 1, so a result
+    /// from a previous generation's inputs must not replay.
+    #[serde(default)]
+    pub manifest_digest: String,
+}
+
+/// Canonical digest of one staged manifest: sha256 of its compact
+/// JSON file list (struct field order and list order are the
+/// canonical form, so two serialisations of the same staging agree).
+pub fn manifest_digest(manifest: &ScratchManifest) -> String {
+    let canonical = serde_json::to_vec(&manifest.files).unwrap_or_default();
+    sha256_hex(&canonical)
 }
 
 /// Whether this request must run the Container or already finished.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {
+    /// No stored result: run the Container.
     Run,
+    /// A stored result exists but was produced from a different
+    /// manifest (a redriven job reusing this round): clear the
+    /// Container's stale round state and run again.
+    Rerun,
     AlreadyDone(RepairResult),
 }
 
-/// Idempotency decision from the stored `result.json`, if any. A
-/// corrupt stored result is a server fault: silently re-running would
-/// spend a second paid repair on a round that may have completed.
-pub fn plan(_req: &RepairRequest, existing_result: Option<&[u8]>) -> Result<Plan, ApiFault> {
+/// Idempotency decision from the stored `result.json`, if any. Only a
+/// result stamped with the *current* manifest's digest short-circuits
+/// the paid run; an unstamped (legacy) or mismatched result is a
+/// previous generation's verdict and reruns. A corrupt stored result
+/// is a server fault: silently re-running would spend a second paid
+/// repair on a round that may have completed.
+pub fn plan(
+    _req: &RepairRequest,
+    existing_result: Option<&[u8]>,
+    current_manifest_digest: &str,
+) -> Result<Plan, ApiFault> {
     let Some(bytes) = existing_result else {
         return Ok(Plan::Run);
     };
@@ -201,7 +228,31 @@ pub fn plan(_req: &RepairRequest, existing_result: Option<&[u8]>) -> Result<Plan
     }
     let result: RepairResult =
         serde_json::from_slice(bytes).map_err(|_| ApiFault::new(500, "repair_unavailable"))?;
-    Ok(Plan::AlreadyDone(result))
+    if !current_manifest_digest.is_empty() && result.manifest_digest == current_manifest_digest {
+        Ok(Plan::AlreadyDone(result))
+    } else {
+        Ok(Plan::Rerun)
+    }
+}
+
+/// The status document replied to ingest. The full `RepairResult`
+/// (one entry per data file, up to `MAX_SCRATCH_FILES`) lives in
+/// `out/result.json`; the wire reply is a few dozen bytes so it
+/// always fits ingest's reply cap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairReply {
+    pub status: RepairStatus,
+    pub exit_code: Option<i32>,
+    pub file_count: usize,
+}
+
+pub fn ingest_reply_body(result: &RepairResult) -> Vec<u8> {
+    let reply = RepairReply {
+        status: result.status,
+        exit_code: result.exit_code,
+        file_count: result.files.len(),
+    };
+    serde_json::to_vec(&reply).unwrap_or_default()
 }
 
 // Scratch object keys for one round. `prefix` has already been

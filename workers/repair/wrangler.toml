@@ -23,6 +23,11 @@ command = "cargo install -q worker-build --locked && worker-build --release"
 [[containers]]
 class_name = "RepairContainer"
 image = "../../containers/repair/Dockerfile"
+# Sized to the repair budgets, not the default lite instance
+# (1/16 vCPU, 256 MiB, 2 GB): up to 8 GiB staged per round with one
+# working copy needs 20 GB disk; par2 gets 512 MiB address space and
+# 60 CPU-seconds inside a 120 s wall clock, which takes a full vCPU.
+instance_type = { vcpu = 1, memory_mib = 3072, disk_mb = 20000 }
 max_instances = 5
 
 [[durable_objects.bindings]]
@@ -47,6 +52,11 @@ workers_dev = false
 [[env.staging.containers]]
 class_name = "RepairContainer"
 image = "../../containers/repair/Dockerfile"
+# Sized to the repair budgets, not the default lite instance
+# (1/16 vCPU, 256 MiB, 2 GB): up to 8 GiB staged per round with one
+# working copy needs 20 GB disk; par2 gets 512 MiB address space and
+# 60 CPU-seconds inside a 120 s wall clock, which takes a full vCPU.
+instance_type = { vcpu = 1, memory_mib = 3072, disk_mb = 20000 }
 max_instances = 5
 [[env.staging.durable_objects.bindings]]
 name = "REPAIR_JOBS"
@@ -61,6 +71,11 @@ workers_dev = false
 [[env.production.containers]]
 class_name = "RepairContainer"
 image = "../../containers/repair/Dockerfile"
+# Sized to the repair budgets, not the default lite instance
+# (1/16 vCPU, 256 MiB, 2 GB): up to 8 GiB staged per round with one
+# working copy needs 20 GB disk; par2 gets 512 MiB address space and
+# 60 CPU-seconds inside a 120 s wall clock, which takes a full vCPU.
+instance_type = { vcpu = 1, memory_mib = 3072, disk_mb = 20000 }
 max_instances = 5
 [[env.production.durable_objects.bindings]]
 name = "REPAIR_JOBS"

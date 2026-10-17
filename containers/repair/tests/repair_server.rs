@@ -207,6 +207,31 @@ fn unrepairable_set_reports_unrepairable() {
 }
 
 #[test]
+fn exit_6_with_recovery_impossible_line_is_unrepairable() {
+    let f = Fixture::new(
+        "printf 'Recovery will not be possible because the target file is corrupt.\\n'\nexit 6",
+    );
+    let req = f.staged_request(JOB, 1);
+    let (status, result) = f.post_repair(&req);
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(result["status"], "unrepairable");
+    assert_eq!(result["exit_code"], 6);
+}
+
+#[test]
+fn exit_6_without_recovery_line_is_retryable() {
+    // Exit 6 also covers ENOSPC and other I/O failures while par2
+    // writes the repaired file; without the corrupt-set line it must
+    // not become a permanent, replayed verdict (core RepairReport
+    // contract).
+    let f = Fixture::new("exit 6");
+    let req = f.staged_request(JOB, 1);
+    let (status, body) = f.post_repair(&req);
+    assert_eq!(status, 503);
+    assert_eq!(body["error"], "repair_failed");
+}
+
+#[test]
 fn timeout_maps_to_stable_retryable_code() {
     let f = Fixture::new("sleep 10");
     let mut req = f.staged_request(JOB, 1);

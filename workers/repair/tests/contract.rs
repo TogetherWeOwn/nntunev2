@@ -3,8 +3,9 @@
 
 use nntune_core::par2::scratch::object_key_for_file_name;
 use nntune_repair::contract::{
-    classify_container_reply, container_repair_body, in_key, manifest_key, out_key, parse_manifest,
-    parse_request, plan, result_key, ContainerOutcome, Plan,
+    classify_container_reply, container_repair_body, in_key, ingest_reply_body, manifest_digest,
+    manifest_key, out_key, parse_manifest, parse_request, plan, result_key, ContainerOutcome,
+    OutputFile, Plan, RepairResult, RepairStatus,
 };
 
 const JOB: &str = "job_0123456789abcdef";
@@ -106,17 +107,71 @@ fn manifest_validation_mirrors_the_container_rules() {
 #[test]
 fn existing_result_short_circuits_the_paid_run() {
     let req = parse_request(&request_json()).unwrap();
-    assert_eq!(plan(&req, None).unwrap(), Plan::Run);
+    let manifest = parse_manifest(&manifest_json()).unwrap();
+    let digest = manifest_digest(&manifest);
+    assert_eq!(plan(&req, None, &digest).unwrap(), Plan::Run);
 
-    let stored = br#"{"status":"repaired","exit_code":0,"files":[]}"#;
-    match plan(&req, Some(stored)).unwrap() {
+    let stored = serde_json::to_vec(&serde_json::json!({
+        "status": "repaired",
+        "exit_code": 0,
+        "files": [],
+        "manifest_digest": digest,
+    }))
+    .unwrap();
+    match plan(&req, Some(&stored), &digest).unwrap() {
         Plan::AlreadyDone(result) => assert_eq!(result.status.as_str(), "repaired"),
-        Plan::Run => panic!("stored result must short-circuit"),
+        other => panic!("stored result for the same manifest must short-circuit, got {other:?}"),
     }
 
     // A corrupt stored result is a server fault, never a silent re-run.
-    let err = plan(&req, Some(b"not json")).unwrap_err();
+    let err = plan(&req, Some(b"not json"), &digest).unwrap_err();
     assert_eq!(err.status, 500);
+}
+
+#[test]
+fn stored_result_for_a_different_manifest_reruns() {
+    // Redrive resets repair rounds to 1, so (job_id, round) repeats;
+    // a result recorded against the previous generation's manifest
+    // must not short-circuit the new run.
+    let req = parse_request(&request_json()).unwrap();
+    let stored = br#"{"status":"unrepairable","exit_code":1,"files":[],"manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+    let digest = manifest_digest(&parse_manifest(&manifest_json()).unwrap());
+    assert_eq!(plan(&req, Some(stored), &digest).unwrap(), Plan::Rerun);
+
+    // A legacy stored result with no digest cannot be proven to
+    // belong to the current manifest either.
+    let legacy = br#"{"status":"unrepairable","exit_code":1,"files":[]}"#;
+    assert_eq!(plan(&req, Some(legacy), &digest).unwrap(), Plan::Rerun);
+}
+
+#[test]
+fn ingest_reply_is_status_only_even_for_max_file_count() {
+    // The full RepairResult for MAX_SCRATCH_FILES (1024) outputs
+    // exceeds ingest's 64 KiB reply cap; the wire reply to ingest
+    // carries status only, the full document stays in out/result.json.
+    let files = (0..1024)
+        .map(|i| {
+            let file_name = format!("Artist - Album (2024) [FLAC].part{i:03}.rar");
+            OutputFile {
+                key: object_key_for_file_name(&file_name),
+                file_name,
+                size: 1234,
+            }
+        })
+        .collect();
+    let result = RepairResult {
+        status: RepairStatus::Repaired,
+        exit_code: Some(0),
+        files,
+        manifest_digest: "b".repeat(64),
+    };
+    let body = ingest_reply_body(&result);
+    assert!(body.len() < 1024, "reply body is {} bytes", body.len());
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "repaired");
+    assert_eq!(value["exit_code"], 0);
+    assert_eq!(value["file_count"], 1024);
+    assert!(value.get("files").is_none());
 }
 
 #[test]

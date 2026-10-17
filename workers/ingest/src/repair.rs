@@ -22,8 +22,10 @@ pub const REPAIR_ENDPOINT: &str = "/repair";
 /// Internal URL for the service-binding fetch (host is a placeholder;
 /// the binding routes it).
 pub const REPAIR_URL: &str = "https://repair-worker/repair";
-/// The result body is a small status document; anything larger is not
-/// a repair reply we can trust.
+/// The repair Worker replies with a small status document
+/// (`{status, exit_code, file_count}`; the full per-file result stays
+/// in `out/result.json`), so anything larger is not a repair reply
+/// we can trust.
 const MAX_REPAIR_REPLY_BYTES: usize = 64 << 10;
 
 /// Decide the `Verifying` handoff: `Ok(Some(_))` dispatches to the repair
@@ -214,6 +216,26 @@ mod tests {
             RepairCall::Retry
         );
         assert_eq!(classify_repair_reply(500, b""), RepairCall::Retry);
+    }
+
+    #[test]
+    fn status_only_reply_for_max_file_count_classifies() {
+        // The repair Worker's wire reply carries no per-file list, so
+        // a 1024-file repair still fits the reply cap.
+        assert_eq!(
+            classify_repair_reply(
+                200,
+                br#"{"status":"repaired","exit_code":0,"file_count":1024}"#
+            ),
+            RepairCall::Repaired
+        );
+        assert_eq!(
+            classify_repair_reply(
+                200,
+                br#"{"status":"unrepairable","exit_code":6,"file_count":0}"#
+            ),
+            RepairCall::Unrepairable
+        );
     }
 
     #[test]

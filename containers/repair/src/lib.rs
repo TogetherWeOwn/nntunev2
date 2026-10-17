@@ -200,8 +200,12 @@ pub fn run_repair(
     }
 
     // Materialise staged inputs under their real names in a fresh work
-    // dir. `fs::copy` (never a hardlink): the bounded runner rejects
-    // multiply-linked files in its workspace accounting.
+    // dir by rename, keeping exactly one copy on disk (never a
+    // hardlink: the bounded runner rejects multiply-linked files in
+    // its workspace accounting). Moving the staged copies is safe:
+    // the Worker re-stages every input from R2 before each /repair
+    // call, and a completed round short-circuits on result.json
+    // above before anything is materialised.
     let work = dir.join("work");
     let _ = fs::remove_dir_all(&work);
     fs::create_dir_all(&work)?;
@@ -213,7 +217,7 @@ pub fn run_repair(
                 if !meta.is_file() || meta.len() != file.size {
                     return Err(ApiError::new(400, "scratch_input_mismatch"));
                 }
-                fs::copy(&staged, work.join(&file.file_name))?;
+                fs::rename(&staged, work.join(&file.file_name))?;
             }
             Err(_) if file.role == FileRole::Data && file.size == 0 => {
                 // Missing target: par2 recreates it from recovery blocks.
@@ -254,7 +258,9 @@ pub fn run_repair(
                 .map_err(|_| ApiError::new(500, "repair_output_missing"))?
                 .len();
             let out_key = object_key_for_file_name(&file.file_name);
-            fs::copy(&repaired, out_dir.join(&out_key))?;
+            // Move, don't copy: the work dir is recreated fresh on
+            // the next run and out/ is only read back out.
+            fs::rename(&repaired, out_dir.join(&out_key))?;
             outputs.push(OutputFile {
                 file_name: file.file_name.clone(),
                 key: out_key,
@@ -268,8 +274,18 @@ pub fn run_repair(
         }
     } else {
         match report.exit_code {
-            // Permanently unusable for this set (see RepairReport docs).
-            Some(1 | 2 | 4 | 6) => RepairJobResult {
+            // Permanently unusable for this set (see RepairReport
+            // docs). Exit 6 is permanent only with the corrupt-set
+            // line; without it, 6 also covers I/O failures (e.g.
+            // ENOSPC while writing the repaired file), which must
+            // stay retryable instead of becoming a stored, replayed
+            // verdict.
+            Some(1 | 2 | 4) => RepairJobResult {
+                status: RepairStatus::Unrepairable,
+                exit_code: report.exit_code,
+                files: Vec::new(),
+            },
+            Some(6) if report.tail.contains("Recovery will not be possible") => RepairJobResult {
                 status: RepairStatus::Unrepairable,
                 exit_code: report.exit_code,
                 files: Vec::new(),

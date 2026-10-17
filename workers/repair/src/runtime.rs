@@ -22,9 +22,10 @@ use worker::{
 };
 
 use crate::contract::{
-    classify_container_reply, container_repair_body, in_key, manifest_key, out_key, parse_manifest,
-    parse_request, plan, result_key, ApiFault, ContainerOutcome, FileRole, Plan, RepairRequest,
-    RepairStatus, MAX_REQUEST_BYTES, MAX_RESULT_BYTES,
+    classify_container_reply, container_repair_body, in_key, ingest_reply_body, manifest_digest,
+    manifest_key, out_key, parse_manifest, parse_request, plan, result_key, ApiFault,
+    ContainerOutcome, FileRole, Plan, RepairRequest, RepairStatus, MAX_REQUEST_BYTES,
+    MAX_RESULT_BYTES,
 };
 
 /// Durable Object binding + class fronting the Container.
@@ -160,17 +161,10 @@ impl RepairContainer {
             .map_err(|_| ApiFault::new(503, "scratch_unavailable"))?;
         let prefix = &req.scratch_prefix;
 
-        // Idempotency: a stored result means this round already ran
-        // and its outputs were persisted (result is written last).
-        if let Some(existing) =
-            read_object_capped(&bucket, &result_key(prefix), MAX_RESULT_BYTES).await?
-        {
-            if let Plan::AlreadyDone(result) = plan(req, Some(&existing))? {
-                return serde_json::to_vec(&result)
-                    .map_err(|_| ApiFault::new(500, "repair_unavailable"));
-            }
-        }
-
+        // Read the manifest first: idempotency is keyed on it. A
+        // stored result only short-circuits when it was produced
+        // from exactly this manifest (a redrive reuses the round
+        // number with freshly staged inputs).
         let manifest_bytes = read_object_capped(
             &bucket,
             &manifest_key(prefix),
@@ -179,8 +173,24 @@ impl RepairContainer {
         .await?
         .ok_or_else(|| ApiFault::new(404, "scratch_missing"))?;
         let manifest = parse_manifest(&manifest_bytes)?;
+        let digest = manifest_digest(&manifest);
+        let existing = read_object_capped(&bucket, &result_key(prefix), MAX_RESULT_BYTES).await?;
+        let stale_generation = match plan(req, existing.as_deref(), &digest)? {
+            Plan::AlreadyDone(result) => return Ok(ingest_reply_body(&result)),
+            Plan::Rerun => true,
+            Plan::Run => false,
+        };
 
         let container = self.container_port().await?;
+        if stale_generation {
+            // The Container still holds the previous generation's
+            // request/result for this (job, round); clear it before
+            // staging or it rightly 409s the new manifest.
+            let cleanup =
+                serde_json::to_vec(&serde_json::json!({"job_id": req.job_id, "round": req.round}))
+                    .unwrap_or_default();
+            container_json(&container, Method::Post, "/cleanup", Some(cleanup)).await?;
+        }
 
         // Stage inputs. Data files with size 0 are missing targets the
         // Container recreates from recovery blocks; they have no input.
@@ -195,12 +205,15 @@ impl RepairContainer {
             .map_err(|_| ApiFault::new(500, "repair_unavailable"))?;
         let (status, reply) =
             container_json(&container, Method::Post, "/repair", Some(body)).await?;
-        let result = match classify_container_reply(status, &reply) {
+        let mut result = match classify_container_reply(status, &reply) {
             ContainerOutcome::Done(result) => result,
             ContainerOutcome::Forward(status, code) => {
                 return Err(ApiFault::new(status, leak_code(code)));
             }
         };
+        // Stamp the inputs this verdict belongs to before it becomes
+        // the idempotency marker in `out/result.json`.
+        result.manifest_digest = digest;
 
         if result.status == RepairStatus::Repaired {
             let data_names: std::collections::HashSet<&str> = manifest
@@ -221,13 +234,16 @@ impl RepairContainer {
         }
 
         // The result marker lands only after every output is durable.
+        // The full document stays in scratch; ingest gets the small
+        // status reply (see `ingest_reply_body`).
         let result_body =
             serde_json::to_vec(&result).map_err(|_| ApiFault::new(500, "repair_unavailable"))?;
         bucket
-            .put(result_key(prefix), result_body.clone())
+            .put(result_key(prefix), result_body)
             .execute()
             .await
             .map_err(|_| ApiFault::new(503, "scratch_unavailable"))?;
+        let reply_body = ingest_reply_body(&result);
 
         // Free the Container's disk for the next round; failure here is
         // not fatal (the Container is per-job and ephemeral).
@@ -246,7 +262,7 @@ impl RepairContainer {
             req.round,
             result.status.as_str()
         );
-        Ok(result_body)
+        Ok(reply_body)
     }
 
     /// Start the Container if needed (internet disabled: it needs no

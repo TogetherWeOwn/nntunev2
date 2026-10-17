@@ -65,15 +65,20 @@ pub fn validate_file_name(name: &str) -> bool {
             .all(|b| b != b'/' && b != b'\\' && b != 0 && !b.is_ascii_control())
 }
 
-/// Scratch object key for a staged file: lowercase hex sha256 of the
-/// file name, so object keys never carry untrusted name bytes.
-pub fn object_key_for_file_name(file_name: &str) -> String {
-    let digest = Sha256::digest(file_name.as_bytes());
+/// Lowercase hex sha256 of `bytes` (64 chars).
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(64);
     for byte in digest {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+/// Scratch object key for a staged file: lowercase hex sha256 of the
+/// file name, so object keys never carry untrusted name bytes.
+pub fn object_key_for_file_name(file_name: &str) -> String {
+    sha256_hex(file_name.as_bytes())
 }
 
 /// True for a 64-char lowercase hex object key.
