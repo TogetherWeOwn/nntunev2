@@ -89,6 +89,19 @@ command -v python3 >/dev/null || { echo "import: python3 not on PATH (FK orphan 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
+refuse_all_poison_dump() {
+  local table="$1" dump_id="$2" total="$3" poison_n
+  poison_n="$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tAX -c "SELECT count(*) FROM mb_import_dlq WHERE table_name = '$table' AND dump_id = '$dump_id';")"
+  if [[ ! "$poison_n" =~ ^[0-9]+$ ]]; then
+    echo "import: unexpected poison count '$poison_n' for $table dump $dump_id" >&2
+    exit 1
+  fi
+  if (( 10#$poison_n == 10#$total )); then
+    echo "import: refusing $table dump with no valid rows; replication state remains unchanged" >&2
+    exit 1
+  fi
+}
+
 for table in artist release recording; do
   tsv="$dump_dir/mbdump-$table.tsv"
   if [[ ! -f "$tsv" ]]; then
@@ -136,10 +149,10 @@ for table in artist release recording; do
     exit 1
   fi
   if (( 10#$completed == 10#$total )); then
+    refuse_all_poison_dump "$table" "$dump_id" "$total"
     echo "import: $table already complete ($total/$total lines); skipping"
     continue
   fi
-  valid_table_n=0
   echo "import: loading $table from $tsv (resuming at line $((10#$completed + 1)) of $total)"
   # One linear pass over the not-yet-loaded tail: stream it into fixed-size
   # part files. (A per-chunk `sed -n start,endp` re-scans the dump from line
@@ -316,13 +329,9 @@ SQL
       exit 1
     fi
     echo "import: $table lines $start-$end committed ($valid_n rows, $poison_n poison)"
-    valid_table_n="$((valid_table_n + 10#$valid_n))"
     start="$((10#$end + 1))"
   done
-  if (( 10#$completed == 0 && valid_table_n == 0 )); then
-    echo "import: refusing $table dump with no valid rows; replication state remains unchanged" >&2
-    exit 1
-  fi
+  refuse_all_poison_dump "$table" "$dump_id" "$total"
 done
 
 # Record the dump's replication sequence so replicate.sh accepts the first

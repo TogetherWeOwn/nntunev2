@@ -11,6 +11,7 @@ fn request() -> ProbeRequest {
             "segment-a@synthetic.invalid".to_owned(),
             "segment-b@synthetic.invalid".to_owned(),
         ],
+        segment_bytes: vec![None, None],
     }
 }
 
