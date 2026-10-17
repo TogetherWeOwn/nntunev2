@@ -278,7 +278,6 @@ async fn run_repair_step(env: &Env, cp: &mut JobCheckpoint) -> Result<(), JobErr
     }
 }
 
-
 /// Map a pool probe refusal/failure onto the job's error contract. The
 /// detail stays generic: pool/provider internals never reach job status
 /// or the DLQ reason.
