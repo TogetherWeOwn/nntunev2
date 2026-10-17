@@ -80,9 +80,10 @@ ADR 0006; default issuance is `library:read` only:
   model §5 (cost-bearing: drives provider egress and metering like any other grant).
 - `ingest:submit` — ingest job submission (cost-bearing: plan-capped per
   ADR 0004).
-- `providers:manage` — BYOP provider-vault create/update/delete and test
-  connection operations only (custodial: touches user-owned provider
-  secrets; highest-risk scope). It never returns provider secret material.
+- `providers:manage` — all BYOP provider-vault operations, including
+  create/update/delete and test-connection operations (custodial: touches
+  user-owned provider secrets; highest-risk scope). It never returns provider
+  secret material.
 
 **Route map is exhaustive and default-deny.** A bearer key is accepted only
 for the operation/scope pairs declared here: `/v1/library`, `/v1/artists`,
@@ -90,9 +91,10 @@ for the operation/scope pairs declared here: `/v1/library`, `/v1/artists`,
 `/v1/playlists` require `library:read`; playlist create/edit/delete require
 `playlists:write`; play-event writes on `/v1/plays` require `plays:write`;
 playback on `/v1/stream` requires `stream:read`; ingest submission requires
-`ingest:submit`; provider-vault mutations require `providers:manage`. Every
-other operation, including an unlisted method on a listed route, is denied to
-bearer keys and must use session auth. In particular, `/v1/me`, `/v1/indexers`,
+`ingest:submit`; all provider-vault operations, including test-connection,
+require `providers:manage`. Every other operation, including an unlisted method
+on a listed route, is denied to bearer keys and must use session auth. In
+particular, `/v1/me`, `/v1/indexers`,
 `GET /v1/operations/{operation_id}`, library membership writes and
 `DELETE /v1/libraries/{id}` are session-only. An endpoint or operation added
 after this ADR is also denied to bearer keys until this map is explicitly
@@ -184,8 +186,9 @@ New asset: **native REST bearer secrets** (client-held) alongside A3
   on every path; no existence oracles (non-owner/non-member reads stay
   404/70-shaped per ADR 0006).
 
-The implementation PR updates `docs/security/threat-model.md` §§2/4–5
-and re-requests CISO review; this ADR alone changes no code or model text.
+The implementation PR updates `docs/security/threat-model.md` §§2/4–5,
+adds a row to its §9 findings index, and re-requests CISO review; this ADR
+alone changes no code or model text.
 
 ## Migration compatibility
 
