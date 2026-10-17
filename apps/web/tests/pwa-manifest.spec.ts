@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test';
 
-// Paired acceptance spec for TOG-28448 (build card). The Builder builds on
+// Paired acceptance spec for the build card. The Builder builds on
 // this branch and never edits this file. Contract pinned here:
 // - GET /manifest.webmanifest serves application/manifest+json with name,
 //   short_name, start_url, display: standalone, theme_color, and reachable
