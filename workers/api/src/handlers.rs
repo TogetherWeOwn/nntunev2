@@ -103,10 +103,16 @@ const GLOBAL_SCOPE_KEY: &str = "global";
 /// `PURPOSE_REGISTER` (`'register'`): reaping on `'login'` would delete
 /// never-completed signups on the wrong ceremony. Exemptions (credentials,
 /// unexpired register challenges, vaults, sessions, unexpired magic links)
-/// must stay in sync with the `FakeStore` mirror.
+/// must stay in sync with the `FakeStore` mirror. Accounts with a
+/// scheduled deletion (`deleting_at IS NOT NULL`) are also exempt: they
+/// are owned by the deletion executor, and their `delete_operations`
+/// row's `ON DELETE RESTRICT` FK would otherwise abort the whole reap
+/// (the `FakeStore` cannot model the column — it has no deleting state —
+/// so the SQL pin below is the only mirror for this one predicate).
 pub fn reap_unverified_users_sql() -> String {
     format!(
         "DELETE FROM users WHERE created_at <= $1 \
+         AND deleting_at IS NULL \
          AND ($2::TEXT IS NULL OR users.id <> $2) \
          AND NOT EXISTS (SELECT 1 FROM webauthn_credentials \
                          WHERE webauthn_credentials.user_id = users.id) \
@@ -5451,6 +5457,11 @@ mod tests {
         assert!(
             sql.contains("users.id <> $2"),
             "reap must preserve the current user"
+        );
+        assert!(
+            sql.contains("deleting_at IS NULL"),
+            "reap must never delete an account already scheduled for \
+             deletion (its delete_operations RESTRICT FK owns it)"
         );
         assert!(sql.contains("auth_challenges.purpose = 'register'"));
         assert!(sql.contains("auth_challenges.expires_at > $3"));

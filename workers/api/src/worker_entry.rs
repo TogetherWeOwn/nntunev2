@@ -780,11 +780,22 @@ impl Store for PgStore {
 
     async fn upsert_vault(&self, user_id: &str, row: &VaultRow) -> Result<(), StoreError> {
         let client = self.connect().await?;
-        client
+        // Account-deletion fence (ADR 0002 rule 3): the upsert only lands
+        // while the owner's deleting_at is NULL, holding the user row
+        // FOR SHARE through the statement, so saving provider credentials
+        // cannot repopulate user-owned state behind the deletion marker.
+        // A fenced (0-row) upsert fails closed as StoreError — the Store
+        // trait's opaque error is what the handler already maps to the
+        // generic vault failure; surfacing the typed 409 for vault
+        // routes needs a typed StoreError, tracked with the deletion
+        // routes. delete_vault below is deliberately not fenced: removal
+        // cannot restore state, and the executor deletes the row anyway.
+        let affected = client
             .execute(
                 "INSERT INTO provider_vaults (user_id, kek_version, dek_wrapped_nonce, dek_wrapped, \
                  payload_nonce, payload, indexer_configured, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 SELECT $1, $2, $3, $4, $5, $6, $7, $8 \
+                 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence \
                  ON CONFLICT (user_id) DO UPDATE SET kek_version = EXCLUDED.kek_version, \
                  dek_wrapped_nonce = EXCLUDED.dek_wrapped_nonce, dek_wrapped = EXCLUDED.dek_wrapped, \
                  payload_nonce = EXCLUDED.payload_nonce, payload = EXCLUDED.payload, \
@@ -802,6 +813,9 @@ impl Store for PgStore {
             )
             .await
             .map_err(|_| StoreError)?;
+        if affected == 0 {
+            return Err(StoreError);
+        }
         Ok(())
     }
 
@@ -955,10 +969,14 @@ impl Store for PgStore {
             .map_err(|_| StoreError)?;
         for slot in 0..max_concurrency {
             let slot = i16::try_from(slot).map_err(|_| StoreError)?;
+            // Fenced like the vault upsert (ADR 0002 rule 3): a deleting
+            // account acquires no new lease rows; every slot probe then
+            // returns no row and the lease is simply denied.
             let rows = client
                 .query(
                     "INSERT INTO vault_test_leases (user_id, slot, token, expires_at) \
-                     VALUES ($1, $2, $3, FLOOR(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT + $4) \
+                     SELECT $1, $2, $3, FLOOR(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT + $4 \
+                     FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence \
                      ON CONFLICT (user_id, slot) DO UPDATE \
                      SET token = EXCLUDED.token, expires_at = EXCLUDED.expires_at \
                      WHERE vault_test_leases.expires_at <= FLOOR(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT \

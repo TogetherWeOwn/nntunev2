@@ -108,3 +108,131 @@ pub const fn cancel_outcome(affected_rows: u64) -> CancelOutcome {
         CancelOutcome::Cancelled
     }
 }
+
+// --- Writer fence (ADR 0002 rule 3) --------------------------------------------
+//
+// Every writer that can create or restore user-owned state takes
+// `SELECT ... FOR SHARE` on the owner's `users` row and rejects a non-NULL
+// `deleting_at`, inside the same statement/transaction as its write, so the
+// scheduling `UPDATE users SET deleting_at = ...` (which needs the row lock)
+// either waits for an in-flight writer or fences every later one. Auth/session
+// writers needed to cancel during grace are exempt only while the account
+// operation is `state = 'scheduled'`; the executor's own cursor/state writes
+// are exempt outright. Everything else fails closed with the stable
+// `account_deleting` code (HTTP 409) and never queues behind the delete.
+
+/// Stable wire/job code for a write rejected by the account-deletion fence.
+pub const ACCOUNT_DELETING_CODE: &str = "account_deleting";
+
+/// Probe the fence state of one user (`$1` TEXT user id) without locking.
+///
+/// Writers use this only to classify a fenced write that affected zero rows
+/// (row vanished vs. fence closed); it is never the fence itself. Zero rows
+/// means the user no longer exists.
+pub const ACCOUNT_DELETING_PROBE_SQL: &str = r#"
+SELECT (deleting_at IS NOT NULL) AS deleting FROM users WHERE id = $1
+"#;
+
+/// Lock a non-deleting user row `FOR SHARE` for the rest of the transaction.
+///
+/// `$1` is the TEXT user id. Returns one row only when the fence is open;
+/// zero rows means the user is deleting (or gone) and the writer must fail
+/// with [`ACCOUNT_DELETING_CODE`]. Single-statement writers embed the same
+/// subquery (`FROM (SELECT id FROM users WHERE id = $n AND deleting_at IS
+/// NULL FOR SHARE) AS writer_fence`) instead of running this separately, so
+/// the fence and the write stay atomic under transaction-mode pooling.
+pub const WRITER_FENCE_USER_SQL: &str = r#"
+SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE
+"#;
+
+/// Outcome of a fenced write after combining the write's affected-row count
+/// with an [`ACCOUNT_DELETING_PROBE_SQL`] classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FencedWriteOutcome {
+    /// The write landed; the fence was open for its whole statement.
+    Written,
+    /// The fence is closed: deletion is scheduled for this account.
+    AccountDeleting,
+    /// No row was written and the fence is open (target row vanished or
+    /// never existed); callers map this to their usual not-found outcome.
+    NoRow,
+}
+
+/// Classify a fenced write. `account_deleting` is the probe result
+/// (`None` when the user row no longer exists); it is consulted only when
+/// the write affected zero rows, so a landed write is never reclassified.
+pub const fn classify_fenced_write(
+    affected_rows: u64,
+    account_deleting: Option<bool>,
+) -> FencedWriteOutcome {
+    if affected_rows > 0 {
+        FencedWriteOutcome::Written
+    } else if matches!(account_deleting, Some(true)) {
+        FencedWriteOutcome::AccountDeleting
+    } else {
+        FencedWriteOutcome::NoRow
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn normalize(value: &str) -> String {
+        value
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+
+    #[test]
+    fn writer_fence_locks_only_a_non_deleting_user_row() {
+        // The fence must take FOR SHARE (conflicts with the scheduling
+        // UPDATE, not with sibling writers) and must return no row once
+        // deleting_at is set; either weakening lets a write commit behind
+        // the marker.
+        let sql = normalize(WRITER_FENCE_USER_SQL);
+        assert_eq!(
+            sql, "selectidfromuserswhereid=$1anddeleting_atisnullforshare",
+            "{sql}"
+        );
+        assert!(!sql.contains("forupdate"), "{sql}");
+        assert!(!sql.contains("nowait"), "{sql}");
+    }
+
+    #[test]
+    fn probe_reads_the_marker_without_locking() {
+        // The classifier probe must never take the fence itself: a locking
+        // probe would queue behind the delete it is only classifying.
+        let sql = normalize(ACCOUNT_DELETING_PROBE_SQL);
+        assert_eq!(
+            sql,
+            "select(deleting_atisnotnull)asdeletingfromuserswhereid=$1",
+            "{sql}"
+        );
+        assert!(!sql.contains("forshare"), "{sql}");
+        assert!(!sql.contains("forupdate"), "{sql}");
+    }
+
+    #[test]
+    fn fenced_write_classification_is_stable() {
+        // A landed write is never reclassified by a later probe.
+        for probe in [Some(true), Some(false), None] {
+            assert_eq!(
+                classify_fenced_write(1, probe),
+                FencedWriteOutcome::Written,
+                "{probe:?}"
+            );
+        }
+        // Zero rows + a set marker is the typed fence rejection; zero rows
+        // with the fence open (or the user gone) stays not-found.
+        assert_eq!(
+            classify_fenced_write(0, Some(true)),
+            FencedWriteOutcome::AccountDeleting
+        );
+        assert_eq!(classify_fenced_write(0, Some(false)), FencedWriteOutcome::NoRow);
+        assert_eq!(classify_fenced_write(0, None), FencedWriteOutcome::NoRow);
+        assert_eq!(ACCOUNT_DELETING_CODE, "account_deleting");
+    }
+}

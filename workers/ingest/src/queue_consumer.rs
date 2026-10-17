@@ -88,9 +88,9 @@ use crate::probe::{
 };
 use crate::queue::{validate_indexer_ref, QueueMsg};
 use crate::retry::{
-    decide_checkpoint, Disposition, DlqEntry, JobError, DLQ_QUEUE_BINDING, ERR_MATCH_FAILED,
-    ERR_PARSE_FAILED, ERR_PAYLOAD_MISSING, ERR_PROBE_FAILED, ERR_REPAIR_FAILED, ERR_SEARCH_FAILED,
-    ERR_VERIFY_FAILED, ERR_WRITE_FAILED,
+    decide_checkpoint, Disposition, DlqEntry, JobError, DLQ_QUEUE_BINDING, ERR_ACCOUNT_DELETING,
+    ERR_MATCH_FAILED, ERR_PARSE_FAILED, ERR_PAYLOAD_MISSING, ERR_PROBE_FAILED, ERR_REPAIR_FAILED,
+    ERR_SEARCH_FAILED, ERR_VERIFY_FAILED, ERR_WRITE_FAILED,
 };
 use crate::verify::{
     BodySource, ScratchStore, StagedFile, VerifyCaps, VerifyError, VerifyOutcome, VerifyProgress,
@@ -1118,7 +1118,7 @@ impl MatchWriteRuntime for EdgeMatchWrite<'_> {
             .await
             .map_err(|()| JobError::transient(ERR_WRITE_FAILED, "library database unavailable"))?;
         let params = crate::library::upsert_params(write);
-        client
+        let affected = client
             .execute(
                 crate::library::upsert_library_sql(),
                 &[
@@ -1147,7 +1147,18 @@ impl MatchWriteRuntime for EdgeMatchWrite<'_> {
                     JobError::transient(ERR_WRITE_FAILED, "library database unavailable")
                 }
             })?;
-        Ok(())
+        // The statement is fenced on the owner's users row: 0 affected
+        // rows means the account is being deleted. Fail permanently with
+        // the stable code — a fenced writer never queues behind the
+        // delete, and the (already-metered) match work must not settle
+        // as a phantom Done for a row that was never written.
+        match crate::library::upsert_outcome(affected) {
+            crate::library::UpsertOutcome::Written => Ok(()),
+            crate::library::UpsertOutcome::AccountDeleting => Err(JobError::permanent(
+                ERR_ACCOUNT_DELETING,
+                "account is being deleted",
+            )),
+        }
     }
 }
 
