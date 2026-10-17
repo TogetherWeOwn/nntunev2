@@ -5,7 +5,7 @@
  * `MEDIA_BYTES`, `TRACK_SALT`). This copy is intentionally vendored — not
  * imported — so the staging spec proves the deployed app still serves the
  * pinned generator output instead of sharing its implementation. If the app
- * changes the generator (or the range parser, both pinned by TOG-28373),
+ * changes the generator (or the range parser, both covered by the existing pin tests),
  * update both files together; a mismatch here fails the live spec by name.
  *
  * No staging, no credentials, no Playwright dependency: pure functions pinned
