@@ -24,7 +24,8 @@ use crate::auth::{
     SingleUseStore,
 };
 use crate::handlers::{
-    self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, Store, StoreError, UserRecord, VaultRow,
+    self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, PairAdmission, RateLimitBudget, Store,
+    StoreError, UserRecord, VaultRow,
 };
 use crate::session::SessionRecord;
 use crate::vault::{
@@ -88,7 +89,7 @@ fn config_from_env(env: &Env) -> Option<Config> {
         Ok(previous) => previous,
         Err(()) => return None,
     };
-    Config::new(
+    let config = Config::new(
         &rp_id,
         &origin,
         session_secret,
@@ -99,7 +100,46 @@ fn config_from_env(env: &Env) -> Option<Config> {
         truthy("ALLOW_LOOPBACK_DEV"),
         session_previous_secret,
     )
-    .ok()
+    .ok()?;
+    Some(apply_rate_limit_overlay(config, |name| {
+        env_string(env, name)
+    }))
+}
+
+/// The [vars] names `RateLimitConfig::from_vars` reads. One const
+/// list so the overlay test can pin every name against its field.
+const RATE_LIMIT_VAR_NAMES: [&str; 5] = [
+    "AUTH_RATE_LIMIT_MAX",
+    "AUTH_RATE_LIMIT_WINDOW_SECS",
+    "VAULT_TEST_RATE_LIMIT_MAX",
+    "VAULT_TEST_RATE_LIMIT_WINDOW_SECS",
+    "VAULT_TEST_IP_RATE_LIMIT_MAX",
+];
+
+/// Pure [vars] overlay: collect whichever of [`RATE_LIMIT_VAR_NAMES`]
+/// the lookup resolves and hand them to `from_vars`, which fails safe
+/// to the documented defaults on anything missing or invalid, so a
+/// typo'd override keeps limiting on (never unlimited, never
+/// deny-all). Unit-tested below; the wasm wrapper only supplies the
+/// `env_string` closure.
+fn rate_limits_from_lookup(
+    get: impl Fn(&str) -> Option<String>,
+) -> crate::rate_limit::RateLimitConfig {
+    let vars: HashMap<String, String> = RATE_LIMIT_VAR_NAMES
+        .iter()
+        .filter_map(|name| get(name).map(|v| ((*name).to_string(), v)))
+        .collect();
+    crate::rate_limit::RateLimitConfig::from_vars(&vars)
+}
+
+/// Apply the [vars] overlay to a built `Config`: the one place the
+/// operator overrides replace the compiled rate-limit defaults.
+/// Pure over the lookup closure so a native test drives the exact
+/// function `config_from_env` calls with a real `Config` and asserts
+/// the resulting field — dropping the `with_rate_limits` call (or
+/// feeding it defaults) fails behaviorally, not just textually.
+fn apply_rate_limit_overlay(config: Config, get: impl Fn(&str) -> Option<String>) -> Config {
+    config.with_rate_limits(rate_limits_from_lookup(get))
 }
 
 /// Pure Hyperdrive caching attestation decision: `Some("1"/"true"/"TRUE")`
@@ -209,6 +249,108 @@ fn u64_of(v: i64) -> Result<u64, StoreError> {
 
 fn u32_of(v: i64) -> Result<u32, StoreError> {
     u32::try_from(v).map_err(|_| StoreError)
+}
+
+/// Durable-slot budgets are bounded: a zero limit/window admits
+/// nothing, and the slot scan is capped at
+/// [`crate::rate_limit::MAX_BUDGET_SLOTS`] (the largest in-tree
+/// budget). Configured maxima clamp to that cap in `from_vars`, so
+/// this gate only refuses hand-built budgets, never operator config.
+fn rate_limit_budget_admissible(budget: &RateLimitBudget<'_>) -> bool {
+    budget.limit != 0
+        && budget.window_secs != 0
+        && budget.limit <= u64::from(crate::rate_limit::MAX_BUDGET_SLOTS)
+}
+
+async fn delete_expired_rate_limit_slots(
+    client: &tokio_postgres::Client,
+    now: i64,
+) -> Result<(), StoreError> {
+    client
+        .execute(
+            "DELETE FROM auth_rate_limit_slots WHERE expires_at <= $1",
+            &[&now],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    Ok(())
+}
+
+/// Claim one slot of `budget` on `client`; `Ok(Some(slot))` is the
+/// claimed slot index (the pair path needs it for its compensating
+/// release), `Ok(None)` is an exhausted budget. Caller has already
+/// deleted expired rows for `now_i`.
+async fn claim_rate_limit_slot(
+    client: &tokio_postgres::Client,
+    budget: &RateLimitBudget<'_>,
+    now: u64,
+    now_i: i64,
+) -> Result<Option<i32>, StoreError> {
+    let expires_at = i64_of(now.saturating_add(budget.window_secs))?;
+    // O(1) fast-fail on the exhausted path (single source of truth:
+    // `handlers::RATE_LIMIT_EXHAUSTED_SQL`, pinned by statement-shape
+    // test): without this guard every denied request pays one DELETE
+    // plus `limit` conflicting upserts (~101 statements with 100 row
+    // locks for the 100-slot finish lookup budget). The slot loop below
+    // still claims atomically, so a concurrent race that passes this
+    // snapshot simply fails closed there.
+    let exhausted = client
+        .query_one(
+            handlers::RATE_LIMIT_EXHAUSTED_SQL,
+            &[&budget.scope_key, &budget.action, &now_i],
+        )
+        .await
+        .map_err(|_| StoreError)?
+        .get::<_, i64>(0);
+    if exhausted >= i64::try_from(budget.limit).map_err(|_| StoreError)? {
+        return Ok(None);
+    }
+    for slot in 0..budget.limit {
+        let slot = i32::try_from(slot).map_err(|_| StoreError)?;
+        let rows = client
+            .query(
+                "INSERT INTO auth_rate_limit_slots (scope_key, action, slot, expires_at) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (scope_key, action, slot) DO UPDATE \
+                 SET expires_at = EXCLUDED.expires_at \
+                 WHERE auth_rate_limit_slots.expires_at <= $5 \
+                 RETURNING slot",
+                &[
+                    &budget.scope_key,
+                    &budget.action,
+                    &slot,
+                    &expires_at,
+                    &now_i,
+                ],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        if !rows.is_empty() {
+            return Ok(Some(slot));
+        }
+    }
+    Ok(None)
+}
+
+/// Release the exact slot `claim_rate_limit_slot` took for `budget`
+/// at `now` (same scope, action, slot and expiry), so the pair
+/// path's compensation can never free another request's slot.
+async fn release_rate_limit_slot(
+    client: &tokio_postgres::Client,
+    budget: &RateLimitBudget<'_>,
+    slot: i32,
+    now: u64,
+) -> Result<(), StoreError> {
+    let expires_at = i64_of(now.saturating_add(budget.window_secs))?;
+    client
+        .execute(
+            "DELETE FROM auth_rate_limit_slots \
+             WHERE scope_key = $1 AND action = $2 AND slot = $3 AND expires_at = $4",
+            &[&budget.scope_key, &budget.action, &slot, &expires_at],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    Ok(())
 }
 
 struct PgStore {
@@ -699,56 +841,59 @@ impl Store for PgStore {
         now: u64,
         window_secs: u64,
     ) -> Result<bool, StoreError> {
-        if limit == 0 || window_secs == 0 || limit > 100 {
+        let budget = RateLimitBudget {
+            scope_key,
+            action,
+            limit,
+            window_secs,
+        };
+        if !rate_limit_budget_admissible(&budget) {
             return Ok(false);
         }
         let client = self.connect().await?;
-        let expires_at = i64_of(now.saturating_add(window_secs))?;
-        let now = i64_of(now)?;
-        client
-            .execute(
-                "DELETE FROM auth_rate_limit_slots WHERE expires_at <= $1",
-                &[&now],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        // O(1) fast-fail on the exhausted path (single source of truth:
-        // `handlers::RATE_LIMIT_EXHAUSTED_SQL`, pinned by statement-shape
-        // test): without this guard every denied request pays one DELETE
-        // plus `limit` conflicting upserts (~101 statements with 100 row
-        // locks for the 100-slot finish lookup budget). The slot loop below
-        // still claims atomically, so a concurrent race that passes this
-        // snapshot simply fails closed there.
-        let exhausted = client
-            .query_one(
-                handlers::RATE_LIMIT_EXHAUSTED_SQL,
-                &[&scope_key, &action, &now],
-            )
-            .await
-            .map_err(|_| StoreError)?
-            .get::<_, i64>(0);
-        if exhausted >= i64::try_from(limit).map_err(|_| StoreError)? {
-            return Ok(false);
+        let now_i = i64_of(now)?;
+        delete_expired_rate_limit_slots(&client, now_i).await?;
+        Ok(claim_rate_limit_slot(&client, &budget, now, now_i)
+            .await?
+            .is_some())
+    }
+
+    async fn reserve_rate_limit_pair(
+        &self,
+        first: RateLimitBudget<'_>,
+        second: RateLimitBudget<'_>,
+        now: u64,
+    ) -> Result<PairAdmission, StoreError> {
+        if !rate_limit_budget_admissible(&first) {
+            return Ok(PairAdmission::DeniedFirst);
         }
-        for slot in 0..limit {
-            let slot = i32::try_from(slot).map_err(|_| StoreError)?;
-            let rows = client
-                .query(
-                    "INSERT INTO auth_rate_limit_slots (scope_key, action, slot, expires_at) \
-                     VALUES ($1, $2, $3, $4) \
-                     ON CONFLICT (scope_key, action, slot) DO UPDATE \
-                     SET expires_at = EXCLUDED.expires_at \
-                     WHERE auth_rate_limit_slots.expires_at <= $5 \
-                     RETURNING slot",
-                    &[&scope_key, &action, &slot, &expires_at, &now],
-                )
-                .await
-                .map_err(|_| StoreError)?;
-            if !rows.is_empty() {
-                return Ok(true);
+        if !rate_limit_budget_admissible(&second) {
+            return Ok(PairAdmission::DeniedSecond);
+        }
+        // All-or-none on one connection: claim the first slot, then the
+        // second; if the second does not admit, release the first by
+        // its exact identity (scope, action, slot, expiry). A live
+        // slot cannot be overwritten by another claim (reuse requires
+        // an expired row), so the compensating DELETE can only remove
+        // the slot this call just took — a denied attempt ends up
+        // consuming neither budget.
+        let client = self.connect().await?;
+        let now_i = i64_of(now)?;
+        delete_expired_rate_limit_slots(&client, now_i).await?;
+        let Some(first_slot) = claim_rate_limit_slot(&client, &first, now, now_i).await? else {
+            return Ok(PairAdmission::DeniedFirst);
+        };
+        match claim_rate_limit_slot(&client, &second, now, now_i).await {
+            Ok(Some(_)) => Ok(PairAdmission::Allowed),
+            Ok(None) => {
+                release_rate_limit_slot(&client, &first, first_slot, now).await?;
+                Ok(PairAdmission::DeniedSecond)
+            }
+            Err(err) => {
+                let _ = release_rate_limit_slot(&client, &first, first_slot, now).await;
+                Err(err)
             }
         }
-        Ok(false)
     }
 
     async fn prune_expired_challenges(&self, now: u64) -> Result<(), StoreError> {
@@ -1082,6 +1227,12 @@ fn render_header_pairs(
     if let Some(cookie) = &response.set_cookie {
         pairs.push(("set-cookie", cookie.clone()));
     }
+    if let Some(retry_after) = response.retry_after {
+        pairs.push((
+            crate::rate_limit::RETRY_AFTER_HEADER,
+            crate::rate_limit::retry_after_header_value(retry_after),
+        ));
+    }
     // Credentialed CORS for the configured origin only: the exact header
     // set is decided by the unit-tested `cors_headers`; render only
     // appends it.
@@ -1110,6 +1261,7 @@ fn internal_render() -> WorkerResult<Response> {
             status: 500,
             body: r#"{"error":"internal error"}"#.to_string(),
             set_cookie: None,
+            retry_after: None,
         },
         &[],
     )
@@ -1288,6 +1440,7 @@ mod tests {
             status: 200,
             body: r#"{"ok":true}"#.to_string(),
             set_cookie: None,
+            retry_after: None,
         };
         let headers = render_header_pairs(&response, &[]);
 
@@ -1304,6 +1457,7 @@ mod tests {
             status: 400,
             body: r#"{"error":"invalid request"}"#.to_string(),
             set_cookie: None,
+            retry_after: None,
         };
 
         assert_render_security_headers(&response);
@@ -1317,9 +1471,32 @@ mod tests {
             status: 204,
             body: String::new(),
             set_cookie: None,
+            retry_after: None,
         };
         assert!(response.body.is_empty());
         assert_render_security_headers(&response);
+    }
+
+    #[test]
+    fn render_includes_retry_after_only_when_set() {
+        let throttled = handlers::Response {
+            status: crate::rate_limit::RATE_LIMIT_STATUS,
+            body: r#"{"error":"rate_limited"}"#.to_string(),
+            set_cookie: None,
+            retry_after: Some(3600),
+        };
+        let headers = render_header_pairs(&throttled, &[]);
+        assert!(headers.contains(&(crate::rate_limit::RETRY_AFTER_HEADER, "3600".to_string())));
+        let plain = handlers::Response {
+            status: 200,
+            body: r#"{"ok":true}"#.to_string(),
+            set_cookie: None,
+            retry_after: None,
+        };
+        let headers = render_header_pairs(&plain, &[]);
+        assert!(!headers
+            .iter()
+            .any(|(name, _)| *name == crate::rate_limit::RETRY_AFTER_HEADER));
     }
 
     #[test]
@@ -1463,6 +1640,121 @@ mod tests {
             assert!(cors_headers(200, origin, cfg).is_empty(), "{origin:?}");
             assert!(cors_headers(204, origin, cfg).is_empty(), "{origin:?}");
         }
+    }
+
+    #[test]
+    fn rate_limit_overlay_maps_each_var_name_to_its_field() {
+        // The overlay is the only link between operator [vars] and the
+        // live budgets: a renamed or typo'd key must fail here, not
+        // silently revert operators to defaults.
+        use crate::rate_limit::RateLimitConfig;
+        let only = |name: &'static str, value: &'static str| {
+            rate_limits_from_lookup(|key| (key == name).then(|| value.to_string()))
+        };
+        let defaults = RateLimitConfig::default();
+        assert_eq!(rate_limits_from_lookup(|_| None), defaults);
+        assert_eq!(
+            only("AUTH_RATE_LIMIT_MAX", "3"),
+            RateLimitConfig {
+                auth_max_attempts: 3,
+                ..defaults
+            }
+        );
+        assert_eq!(
+            only("AUTH_RATE_LIMIT_WINDOW_SECS", "120"),
+            RateLimitConfig {
+                auth_window_secs: 120,
+                ..defaults
+            }
+        );
+        assert_eq!(
+            only("VAULT_TEST_RATE_LIMIT_MAX", "4"),
+            RateLimitConfig {
+                vault_test_max_attempts: 4,
+                // The unset IP cap scales at 5x the configured
+                // account cap (see `from_vars`), so it moves too.
+                vault_test_ip_max_attempts: 20,
+                ..defaults
+            }
+        );
+        assert_eq!(
+            only("VAULT_TEST_RATE_LIMIT_WINDOW_SECS", "90"),
+            RateLimitConfig {
+                vault_test_window_secs: 90,
+                ..defaults
+            }
+        );
+        assert_eq!(
+            only("VAULT_TEST_IP_RATE_LIMIT_MAX", "40"),
+            RateLimitConfig {
+                vault_test_ip_max_attempts: 40,
+                ..defaults
+            }
+        );
+        // Every name in the const list is one of the five pinned above:
+        // growing the list without a field pin fails this count.
+        assert_eq!(RATE_LIMIT_VAR_NAMES.len(), 5);
+    }
+
+    #[test]
+    fn config_from_env_applies_the_rate_limit_overlay() {
+        use crate::rate_limit::RateLimitConfig;
+        // Behavioral half: drive the exact fn `config_from_env` calls
+        // with a real Config and a stub lookup. Dropping the
+        // `with_rate_limits` call inside `apply_rate_limit_overlay`
+        // (or feeding it defaults) leaves `rate_limits` at the
+        // compiled defaults and fails here.
+        let base = Config::new(
+            "example.com",
+            "https://example.com",
+            b"test-session-secret-32-bytes-long!!".to_vec(),
+            [9u8; 32],
+            1,
+            3600,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(base.rate_limits, RateLimitConfig::default());
+        let overlaid = apply_rate_limit_overlay(base, |key| {
+            (key == "AUTH_RATE_LIMIT_MAX").then(|| "3".to_string())
+        });
+        assert_eq!(
+            overlaid.rate_limits,
+            RateLimitConfig {
+                auth_max_attempts: 3,
+                ..RateLimitConfig::default()
+            }
+        );
+        // Call-site half: `config_from_env` itself needs a wasm Env,
+        // so pin that it calls the overlay — but slice ONLY its body
+        // out of the pre-test source. Searching the whole file would
+        // match this test's own string literal and pass vacuously
+        // even with the call dropped.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let body = production
+            .split_once("fn config_from_env(")
+            .expect("config_from_env must exist")
+            .1
+            .split_once("\nfn ")
+            .expect("a following fn must bound the body")
+            .0;
+        assert!(
+            body.contains("apply_rate_limit_overlay(config"),
+            "config_from_env must apply the [vars] rate-limit overlay"
+        );
+        // Forbid the bare-config return outright: an early
+        // `Some(config)` above the overlay call would keep the
+        // substring in place while skipping the overlay.
+        assert!(
+            !body.contains("Some(config)"),
+            "config_from_env must not return the un-overlaid config"
+        );
     }
 
     #[test]

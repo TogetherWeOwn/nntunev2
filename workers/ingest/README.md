@@ -61,33 +61,103 @@ NZB upload ───────────────┘                     
   never accepted in API bodies, never logged (redacted URLs only), never
   committed. `http://` indexer URLs are refused.
 - Upload bodies are untrusted: capped, shape-checked, never logged.
-- Outbound indexer fetch SSRF guard (`src/indexer_fetch.rs`, same ranges
-  as the `workers/api` vault guard — keep the two lists in sync): https
-  only, no embedded credentials, 443-only port allowlist (any other
-  explicit port is refused before any dial, so the fetch can never be
-  aimed at another port as a scan primitive). Every fetch resolves ALL
-  DNS records and rejects loopback / link-local (incl. the cloud metadata
-  endpoint) / private / unique-local / CGNAT / multicast / broadcast /
-  documentation / reserved space (v4+v6, incl. IPv6 transition space with
-  a public-looking payload); one private record poisons the whole answer.
-  DNS-pin invariant: each hop's host is resolved exactly once and the
-  transport dials only that vetted address set on 443, retaining the
-  hostname for TLS SNI / certificate checks and the Host header — the
-  transport never re-resolves, so a changed second DNS answer (rebinding)
-  is never consulted. Every redirect hop (301/302/303/307/308, absolute /
-  protocol-relative / path-absolute) is re-validated from scratch and at
-  most 3 hops are followed; the `apikey=` value is never forwarded to a
-  redirect target. Dial timeout 5000 ms per hop, total fetch timeout
-  15000 ms (the vault outbound numbers, reused); at the deadline counts
-  as expired. Guard blocks answer a stable 4xx, timeouts 504, upstream
-  failures 502, with stable codes for the shared taxonomy envelope:
+- Outbound indexer fetch: `src/indexer_fetch.rs` is a **policy/model
+  library, not a live SSRF boundary** (see next section). No ingest route
+  or queue step calls it, no live resolver or HTTPS transport implements
+  its traits in this tree, and no HTTP response or decision log emitted by
+  a running Worker comes from it. Its fake-DNS/fake-transport tests prove
+  model behavior only. The separate `workers/api` vault validator
+  (`IndexerConfig::validate`) still checks the indexer URL at
+  save/validate time; it is not an indexer fetch transport either.
+
+## Indexer fetch policy library — no runtime indexer fetching
+
+`src/indexer_fetch.rs` is a **library-only policy guard and buffered
+model**, not delivered outbound fetching. It is exported as
+`pub mod indexer_fetch`, but nothing outside its unit tests and
+`tests/indexer_fetch_ssrf_guard.rs` calls `fetch_indexer` or
+`validate_indexer_url`: there is no route, queue-consumer or search-step
+call site, no non-test `DnsResolver` or `IndexerTransport` implementation
+for this module, no live DNS/TCP/TLS dial, no cancellation, no emitted
+HTTP response and no emitted decision log. Existing search and NZB upload
+routes are unchanged.
+
+### What the model checks
+
+- `validate_indexer_url` checks https only, no embedded credentials, and
+  a 443-only port allowlist (any other explicit port is refused in the
+  model before the transport trait would be called, so the modeled fetch
+  cannot be aimed at another port as a scan primitive). Address ranges
+  mirror the `workers/api` vault guard — keep the two lists in sync.
+- Every answer from the supplied `DnsResolver` is checked for forbidden
+  ranges: loopback / link-local (incl. the cloud metadata endpoint) /
+  private / unique-local / CGNAT / multicast / broadcast / documentation
+  / reserved space (v4+v6, incl. IPv6 transition space with a
+  public-looking payload); one forbidden record poisons the whole answer.
+  IP literals skip DNS, not policy.
+- The intended DNS-pin contract shape: `fetch_indexer` validates each hop
+  before calling the transport and hands it a `PinnedRequest` carrying
+  the vetted addresses, the original hostname as `sni_host` (for TLS
+  SNI/certificate checks and the Host header), port 443 and
+  `dial_timeout_ms`. In the model the host is resolved exactly once per
+  hop, so a changed second DNS answer (rebinding) is never consulted by
+  `fetch_indexer` itself.
+- Every redirect hop (301/302/303/307/308, absolute / protocol-relative /
+  path-absolute) is re-validated from scratch and at most 3 hops are
+  followed; the original URL's `apikey=` value is not re-injected onto a
+  redirect target. See the unresolved redirect-policy discrepancy below.
+- Modeled deadlines: a supplied `connect_delay_ms` reaching the 5000 ms
+  dial timeout returns the dial-timeout rejection, and supplied connect +
+  chunk delays accumulated across all hops reaching the 15000 ms total
+  timeout (the vault outbound numbers, reused) return the total-timeout
+  rejection; at the deadline counts as expired, and partial bytes are not
+  returned on a model rejection.
+- `url_host_for_log` extracts a sanitized host for a future host + code
+  decision log. Stable codes and their `http_status()` mappings (guard
+  blocks 4xx, timeouts 504, upstream failures 502) are library values for
+  the shared taxonomy envelope, not current HTTP responses:
   `indexer_fetch_bad_scheme`, `indexer_fetch_malformed_url`,
   `indexer_fetch_embedded_credentials`, `indexer_fetch_port_not_allowed`,
   `indexer_fetch_forbidden_address`, `indexer_fetch_unresolvable_host`,
   `indexer_fetch_too_many_redirects`, `indexer_fetch_dial_timeout`,
-  `indexer_fetch_timeout`, `indexer_fetch_upstream_status`. Decision logs
-  record host + code only (`url_host_for_log`); full URLs go through
-  `newznab::redact_api_key` before any other log line.
+  `indexer_fetch_timeout`, `indexer_fetch_upstream_status`. Full URLs
+  must go through `newznab::redact_api_key` before any future log line;
+  no such log is emitted today.
+
+### Limits of the model
+
+`IndexerTransport::get(&PinnedRequest)` is synchronous and returns a
+fully buffered `RawResponse` that already contains every body chunk.
+The delay checks run **after** that call returns, on simulated/reported
+`connect_delay_ms` and chunk `delay_ms` values — they are not wall-clock
+measurements. A hung transport cannot be cancelled, DNS/connect/TLS/header
+durations are not measured, and the body is assembled from the buffered
+chunks with no streaming bound. Whether a real transport would actually
+dial only `PinnedRequest.addresses` on 443, never re-resolve, and verify
+TLS against `sni_host` is a property of a future implementation, not
+something this module enforces or its tests prove.
+
+The fake DNS/transport tests therefore prove policy/model behavior only:
+URL/port/range rejection, one-resolve-per-hop ordering inside
+`fetch_indexer`, redirect re-validation with the model cap, and
+deadline arithmetic over supplied delays. Passing
+`indexer_fetch_ssrf_guard` is not evidence of runtime pinning, TLS/DNS
+enforcement, wall-clock cancellation, streamed byte bounds, route or
+queue wiring, emitted HTTP statuses, log emission, or a safe live-network
+or deployment boundary.
+
+### Unresolved: redirect policy
+
+The required security policy still forbids redirects for indexer fetch:
+`docs/security/threat-model.md` (F-INGEST-01) requires forbidden
+redirects, and the vault side encodes `INDEXER_ALLOW_REDIRECTS = false`.
+This model instead follows up to 3 re-validated redirects
+(`MAX_REDIRECTS = 3`). That discrepancy is **unresolved**: this README
+does not relax the required policy, does not approve live redirect
+following, and does not authorize deployment of an indexer fetch
+transport. Changing the required policy needs an independent CISO
+disposition; until then the model's redirect-following behavior must not
+be wired to a live transport as if it were approved policy.
 
 ## NZB URL policy library — no runtime URL fetching
 
@@ -177,11 +247,11 @@ stub whose NZB references fixture message-ids.
   key, so a persist colliding with the admission route's write to the same
   key waits out the window and retries that write once in-invocation —
   `retry::decide_checkpoint` settlement, DLQ quarantine that never acks on
-  a failed send, and shared-parser upload validation), but the
-  consumer/workflow entries stay commented out in `wrangler.toml.example`:
-  the search/probe/verify/repair steps are not wired yet, so enabling the
-  consumer now would burn every valid job's retry budget against an
-  unavailable boundary and quarantine it.
+  a failed send, shared-parser upload validation, and the pool-DO segment
+  probe for uploads), but the consumer/workflow entries stay commented
+  out in `wrangler.toml.example`: the search/verify/repair steps are not
+  wired yet, so enabling the consumer now would burn every valid job's
+  retry budget against an unavailable boundary and quarantine it.
 - Request bodies carry self-asserted `user_id` (1..=128 chars) until the
   accounts card authenticates callers; the key format already binds the
   user, so keys stay valid when auth lands.
@@ -196,13 +266,37 @@ stub whose NZB references fixture message-ids.
   intake cross-check + probe batching (`src/parse.rs`), synthetic fixtures
   (`src/fixtures.rs`), pipeline E2E (`tests/pipeline_e2e.rs`): happy path
   reaches `Done` with one library row; the gapped set repairs then finishes.
+- Consumer pool probe (`src/queue_consumer.rs`, client in
+  `src/pool_probe.rs`): an upload in `Probing` re-parses its
+  content-addressed payload, asks the user's `NntpPool` DO about
+  `parse::probe_batches` batches not yet in the checkpoint tally
+  (`build_probe_request` → `call_pool_probe` → `apply_probe_batch`), and
+  moves to `Verifying` carrying the completed tally's missing-segment
+  count. Folded batches ride the delivery's one checkpoint write (KV
+  allows 1 write/s per key, so there is deliberately no write per batch);
+  a crash before that write re-asks them, which is safe because `STAT`
+  is idempotent and the tally is keyed by batch index. Probing is
+  budget-capped per delivery (at most 4 batches and 30 s of wall time),
+  because a cap-sized NZB (~120 batches × 500 sequential `STAT`s) would
+  otherwise run into the 15-minute consumer invocation limit before
+  ever persisting, and every redelivery would restart at batch 0. A
+  budget stop persists the partial tally and *continues*: a fresh copy
+  of the message is enqueued (5 s delay) and the original acked,
+  spending neither the checkpoint attempt budget nor a native
+  `max_retries` slot; a failed continuation enqueue falls back to a
+  native retry. A busy/unavailable pool (`PoolProbeError::Retry`)
+  redelivers no sooner than its `Retry-After` and the shared backoff,
+  inside the same attempt budget; a refused envelope (`Rejected`) fails
+  the job with the generic `probe_failed` reason. Unit tests cover the
+  fold/resume/retry/budget policy against a scripted pool fake; no live
+  Worker runs in CI.
 
 Still blocked for the live half: wiring the consumer's search step to a
-Newznab provider call, its probe step to the pool-DO contract
-(`src/pool_probe.rs`), verify/repair to the Container runtime, and the
-match/write steps to MB + library/metering calls. Until those land the
-consumer stays disabled and no live provider, pool, repair, library, or
-metering invocation is claimed here.
+Newznab provider call (search-sourced jobs therefore cannot reach the
+probe yet), provider settings in the pool DO, verify/repair to the
+Container runtime, and the match/write steps to MB + library/metering
+calls. Until those land the consumer stays disabled and no live
+provider, pool, repair, library, or metering invocation is claimed here.
 
 ## Slice T2 — retry budget + DLQ (this slice)
 
@@ -213,6 +307,11 @@ metering invocation is claimed here.
   redelivers the unchanged Queue body. `decide_checkpoint` increments the
   checkpoint before returning Retry; the handler must persist it before calling
   `retry_with_options`. Backoff is derived from the payload-fetch schedule.
+  One settlement is exempt from the budget: a progress continuation
+  (`JobError::progress` → `Disposition::Continue`, today only the probe
+  budget stop above) persists new checkpoint progress, enqueues a fresh
+  message copy, and acks — no attempt increment, no native retry slot —
+  because each continuation must carry new progress toward a finite total.
   The consumer settles **per message**, so one poison job costs retries but
   does not head-of-line block valid jobs. Permanent failures skip the budget
   and quarantine at once; quarantine marks the checkpoint Failed before ack. If a DLQ send fails, the consumer must call `retry_with_options` with a delay
