@@ -3,8 +3,9 @@
 The `api`, `ingest`, `mb`, and `stream` crates define mappings to the same
 JSON error envelope. In this slice, `ingest` and `mb` serialize the envelope
 on their wired HTTP error paths. The API emits `reauth_required` from
-privilege-gated vault mutations; other API and stream mappings are pinned for
-future HTTP wiring, not emitted by reachable HTTP paths here. Clients can
+privilege-gated vault mutations and `account_deleting` when a vault save is
+refused by the account-deletion fence; other API and stream mappings are pinned
+for future HTTP wiring, not emitted by reachable HTTP paths here. Clients can
 handle auth, validation, billing limits, and upstream failures without
 per-worker special cases.
 
@@ -65,6 +66,7 @@ emit the code.
 | `forbidden` | 403 | false | api, stream | Authenticated, but the resource belongs to someone else (or the grant names a different track). |
 | `not_found` | 404 | false | api, ingest, mb, stream | No such (visible) resource. Invisible private rows are 404, never 403. |
 | `conflict` | 409 | false | ingest | The request is valid but the resource already exists in a state that refuses it (for example re-posting an ingest job whose previous run failed inside its replay window). Nothing was accepted; inspect the existing resource instead of retrying unchanged. |
+| `account_deleting` | 409 | false | api | The caller's account is being deleted (`users.deleting_at` is set), so the write is fenced off (ADR 0002 rule 3). Nothing was written; do not retry unchanged. |
 | `invalid_request` | 400 | false | ingest, mb, stream | Malformed body, bad identifier shape, or out-of-range parameter. |
 | `payload_too_large` | 413 | false | ingest | Body, NZB, or element counts exceed the intake caps. |
 | `range_not_satisfiable` | 416 | false | stream | The requested byte range lies outside the track. |

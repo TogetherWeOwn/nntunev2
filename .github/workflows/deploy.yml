@@ -2,7 +2,11 @@ name: deploy
 
 # Staging deploys + per-PR web previews (apps/web only).
 #
-# - Push to `main` deploys apps/web to its `staging` env.
+# - Push to `main` deploys apps/web to its `staging` env, then the
+#   `post-deploy-e2e` job calls e2e-staging.yml in the same run/revision.
+#   That call is the only path to the full-journey staging E2E: it
+#   `needs` `staging-web` with no always()/!cancelled(), so a skipped or
+#   failed deploy cannot produce a full-journey PASS.
 # - Pull requests get a live preview of apps/web (`wrangler preview`).
 # - Both paths need the repo Actions secrets CLOUDFLARE_API_TOKEN and
 #   CLOUDFLARE_ACCOUNT_ID (names only; the full account ID stays private).
@@ -40,9 +44,11 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+# No workflow-level concurrency here: it would hold the deploy group for
+# the whole run, now including up to ~40 min of post-deploy E2E, so queued
+# main pushes would be cancelled before ever deploying. The deploy jobs
+# serialize on their own job-level groups below and release them when the
+# deploy finishes; E2E serializes separately on the e2e-staging group.
 
 env:
   NODE_VERSION: "24"
@@ -72,6 +78,11 @@ jobs:
     name: staging-web
     needs: [gate]
     if: ${{ github.event_name == 'push' && needs.gate.outputs.enabled == 'true' }}
+    # Job-level (not workflow-level) so the group releases when the deploy
+    # finishes instead of being held through the post-deploy E2E tail.
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -101,10 +112,41 @@ jobs:
           workingDirectory: apps/web
           command: deploy --env staging
 
+  # Post-deploy staging E2E (same run, same revision as the deploy above).
+  # No always()/!cancelled(): with the implicit success() gate, this job is
+  # skipped whenever `staging-web` is skipped (gate disabled / non-push) or
+  # fails, so it can never report a full-journey PASS without a successful
+  # deploy first. Secrets are passed explicitly (never `inherit`) and match
+  # exactly the names e2e-staging.yml reads.
+  post-deploy-e2e:
+    name: post-deploy-e2e
+    needs: [staging-web]
+    if: ${{ github.event_name == 'push' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/e2e-staging.yml
+    with:
+      post_deploy: true
+    secrets:
+      STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+      QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
+      SYNTHETIC_NNTP_HOST: ${{ secrets.SYNTHETIC_NNTP_HOST }}
+      SYNTHETIC_NNTP_PORT: ${{ secrets.SYNTHETIC_NNTP_PORT }}
+      SYNTHETIC_NNTP_USER: ${{ secrets.SYNTHETIC_NNTP_USER }}
+      SYNTHETIC_NNTP_TLS: ${{ secrets.SYNTHETIC_NNTP_TLS }}
+      SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
+
   preview-web:
     name: preview-web
     needs: [gate]
     if: ${{ github.event_name == 'pull_request' && needs.gate.outputs.enabled == 'true' }}
+    # Job-level twin of staging-web above: per-PR serialization with
+    # cancel-in-progress on PRs, never held by the E2E tail.
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:

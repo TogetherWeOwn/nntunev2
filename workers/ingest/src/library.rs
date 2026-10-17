@@ -18,6 +18,7 @@
 
 use crate::jobs::validate_job_id;
 use crate::queue::{validate_mbid, LibraryWrite};
+use crate::retry::{JobError, ERR_ACCOUNT_DELETING};
 
 /// Hyperdrive binding name: must match `[hyperdrive]` in
 /// `wrangler.toml.example`.
@@ -36,13 +37,68 @@ pub const UPSERT_PARAM_ORDER: [&str; 5] = [
 /// refined the MusicBrainz match converges on the latest match instead of
 /// keeping the first write; same-key/same-content replays are no-ops by
 /// construction. `$4` is nullable text, `$5` is `text[]`.
+///
+/// Account-deletion fence (ADR 0002 rule 3): the row is selected through
+/// `writer_fence`, which takes the job owner's `users` row `FOR SHARE`
+/// only while `deleting_at IS NULL`. The write therefore cannot
+/// (re)populate library state after deletion is scheduled, and the
+/// scheduling `UPDATE users` either waits for this statement or fences
+/// it. A fenced write affects 0 rows; the consumer maps that through
+/// [`upsert_outcome`] to the permanent `account_deleting` failure. The
+/// fence joins the same `LIBRARY_DB` database that owns `users` (the
+/// fence takes no stance on the still-missing `library` table: with the
+/// table absent the statement still fails deterministically before any
+/// row is produced).
 pub fn upsert_library_sql() -> &'static str {
     "INSERT INTO library (job_id, user_id, idempotency_key, release_mbid, recording_mbids) \
-     VALUES ($1, $2, $3, $4, $5) \
+     SELECT $1, $2, $3, $4, $5 \
+     FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence \
      ON CONFLICT (idempotency_key) DO UPDATE SET \
      job_id = EXCLUDED.job_id, \
      release_mbid = EXCLUDED.release_mbid, \
      recording_mbids = EXCLUDED.recording_mbids"
+}
+
+/// Outcome of a fenced [`upsert_library_sql`] write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpsertOutcome {
+    /// The row landed (inserted or converged onto the idempotency key)
+    /// while the owner's fence was open.
+    Written,
+    /// The write affected 0 rows: the owner's account is being deleted
+    /// (or the user row is gone), so the fence refused it.
+    AccountDeleting,
+}
+
+/// Classify a library upsert by its affected-row count.
+///
+/// The statement only ever affects 0 rows through the fence: the
+/// conflict path is `DO UPDATE` (a converged replay still reports 1),
+/// and `$2` is the already-validated job owner, so a missing fence row
+/// means `deleting_at` is set (or the account was erased between job
+/// acceptance and write). Both are the same permanent outcome.
+pub const fn upsert_outcome(affected_rows: u64) -> UpsertOutcome {
+    if affected_rows == 0 {
+        UpsertOutcome::AccountDeleting
+    } else {
+        UpsertOutcome::Written
+    }
+}
+
+/// Map a fenced [`upsert_library_sql`] affected-row count to the consumer
+/// result: 0 rows is the permanent `account_deleting` failure, anything
+/// else is the committed write. Pure so the 0-row to permanent-code
+/// mapping is pinned without a live Env; the edge executor just forwards
+/// this (replacing the arm with `Ok(())` — the phantom `Done` — must fail
+/// the pin test below).
+pub fn upsert_job_result(affected_rows: u64) -> Result<(), JobError> {
+    match upsert_outcome(affected_rows) {
+        UpsertOutcome::Written => Ok(()),
+        UpsertOutcome::AccountDeleting => Err(JobError::permanent(
+            ERR_ACCOUNT_DELETING,
+            "account is being deleted",
+        )),
+    }
 }
 
 /// One upsert's bound values, in [`UPSERT_PARAM_ORDER`] (`$1`..=`$5`)
@@ -138,6 +194,56 @@ mod tests {
             assert!(sql.contains(&format!("${i}")), "missing placeholder ${i}");
         }
         assert_eq!(UPSERT_PARAM_ORDER.len(), 5);
+    }
+
+    #[test]
+    fn upsert_is_fenced_on_the_owner_row_in_statement() {
+        // ADR 0002 rule 3: the write selects its row through a FOR SHARE
+        // fence on the owner's users row. Naming the fence parts so
+        // dropping the marker check, the lock, or the in-statement join
+        // (e.g. degenerating to WHERE EXISTS without locking, which the
+        // scheduling UPDATE could slip behind) fails here.
+        let sql = upsert_library_sql();
+        assert!(
+            sql.contains(
+                "SELECT $1, $2, $3, $4, $5 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence"
+            ),
+            "{sql}"
+        );
+        // The fence binds the owner parameter ($2), never the job id ($1).
+        assert!(!sql.contains("FROM users WHERE id = $1"), "{sql}");
+        assert!(!sql.contains("WHERE id = $1 AND deleting_at"), "{sql}");
+        // FOR SHARE only: FOR UPDATE would serialize sibling ingest
+        // writers for one user; NOWAIT/SKIP could read as "not deleting".
+        assert!(!sql.contains("FOR UPDATE"), "{sql}");
+        assert!(!sql.contains("NOWAIT"), "{sql}");
+        assert!(!sql.contains("SKIP LOCKED"), "{sql}");
+        assert!(!sql.contains("deleting_at IS NOT NULL"), "{sql}");
+        // Convergence survives the fence: the conflict clause still
+        // follows the fenced SELECT, keyed on the idempotency key.
+        let fence_at = sql.find("writer_fence").unwrap();
+        let conflict_at = sql.find("ON CONFLICT (idempotency_key)").unwrap();
+        assert!(fence_at < conflict_at, "{sql}");
+    }
+
+    #[test]
+    fn upsert_outcome_only_zero_rows_is_the_fence_refusal() {
+        assert_eq!(upsert_outcome(0), UpsertOutcome::AccountDeleting);
+        assert_eq!(upsert_outcome(1), UpsertOutcome::Written);
+    }
+
+    #[test]
+    fn upsert_job_result_pins_the_fenced_zero_row_to_permanent_account_deleting() {
+        // The edge arm maps through this function, so weakening it to
+        // `Ok(())` (the phantom `Done`) must fail here.
+        assert!(upsert_job_result(1).is_ok());
+        assert!(upsert_job_result(u64::MAX).is_ok());
+        let err = upsert_job_result(0).expect_err("0 rows is the fence refusal");
+        assert_eq!(err.code, ERR_ACCOUNT_DELETING);
+        assert!(
+            !err.transient,
+            "a fenced writer never queues behind the delete"
+        );
     }
 
     #[test]
