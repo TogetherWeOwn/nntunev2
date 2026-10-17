@@ -365,3 +365,36 @@ export async function completeByopWizard(page: Page, baseURL: string): Promise<v
     timeout: 30_000,
   });
 }
+
+/**
+ * Submit the public /signup form as a fresh synthetic identity and require
+ * the BYOP wizard. This is the real browser signup path — it never touches
+ * the test-account seam, so it proves public UI signup even when the seam
+ * is configured. Callers authenticate the page first (a null identity via
+ * applyAccountToPage gives the anonymous, Access-only starting point).
+ * The generated mailbox is returned for callers that track the identity;
+ * it is never interpolated into an assertion message or diagnostic here.
+ */
+export async function submitPublicUiSignup(page: Page, baseURL: string): Promise<TestAccount> {
+  const email = uniqueTestEmail('e2e-ui');
+  await page.goto(`${baseURL}/signup`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  await expect(page.getByTestId(TESTIDS.signupEmail)).toBeVisible({ timeout: 15_000 });
+  await page.getByTestId(TESTIDS.signupEmail).fill(email);
+  await page.getByTestId(TESTIDS.signupSubmit).click();
+  // Either we land on the wizard, or an inline error explains why.
+  const wizard = page.getByTestId(TESTIDS.byopHost);
+  const error = page.getByTestId(TESTIDS.signupError);
+  await expect(async () => {
+    const onWizard = await wizard.isVisible().catch(() => false);
+    const onError = await error.isVisible().catch(() => false);
+    expect(onWizard || onError, 'neither BYOP wizard nor signup error appeared').toBe(true);
+  }).toPass({ timeout: 30_000 });
+  expect(await error.isVisible().catch(() => false), 'public UI signup showed an inline error').toBe(
+    false,
+  );
+  await expect(wizard, 'public UI signup did not reach the BYOP wizard').toBeVisible({
+    timeout: 15_000,
+  });
+  expect(page.url()).toContain('/onboarding/byop');
+  return { email, viaApi: false };
+}
