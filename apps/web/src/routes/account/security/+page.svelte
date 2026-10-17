@@ -1,8 +1,17 @@
 <script lang="ts">
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
-	import { ApiClient } from '#lib/api/client.js';
+	import type { PageProps } from './$types';
+	import { ApiClient, ApiError } from '#lib/api/client.js';
+	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 
+	type Props = { data?: Partial<PageProps['data']> | void };
+	let { data = { sessionCheckFailed: false } }: Props = $props();
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
+
+	function redirectToLogin() {
+		clearSignedInEmail();
+		window.location.href = '/login';
+	}
 
 	let busy = $state<'local' | 'everywhere' | null>(null);
 	let actionError = $state<string | null>(null);
@@ -13,12 +22,16 @@
 		actionError = null;
 		try {
 			await client.logout();
-		} catch {
+		} catch (error) {
+			if (error instanceof ApiError && error.status === 401) {
+				redirectToLogin();
+				return;
+			}
 			actionError = 'Could not sign out. Please try again.';
 			busy = null;
 			return;
 		}
-		window.location.href = '/login';
+		redirectToLogin();
 	}
 
 	async function signOutEverywhere() {
@@ -27,12 +40,16 @@
 		actionError = null;
 		try {
 			await client.revokeAllSessions();
-		} catch {
+		} catch (error) {
+			if (error instanceof ApiError && error.status === 401) {
+				redirectToLogin();
+				return;
+			}
 			actionError = 'Could not confirm sign out everywhere. Please try again.';
 			busy = null;
 			return;
 		}
-		window.location.href = '/login';
+		redirectToLogin();
 	}
 </script>
 
@@ -44,6 +61,10 @@
 <main>
 	<h1>Account security</h1>
 	<p>Sign out of this browser or end every active session on your account.</p>
+
+	{#if data.sessionCheckFailed}
+		<p role="status">Could not verify your sign-in status. Sign-out actions may fail until the API is reachable.</p>
+	{/if}
 
 	{#if actionError}
 		<p role="alert">{actionError}</p>
