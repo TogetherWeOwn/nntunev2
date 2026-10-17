@@ -125,16 +125,30 @@ def _indent_width(indent):
 
 
 def _has_matching_closer(lines, start, marker, opener_indent):
-    """True when a valid closer for an indented opener appears later."""
+    """True when the opener's own closer appears before any other fence.
+
+    The first later fence-marker line decides: when it sits at a similar
+    indent (opener_indent - 3 <= width < opener_indent + 4) and is a valid
+    bare closer (same character, at least as long), the opener is a real
+    fence. Any other fence first — a column-0 block's opener/closer, an
+    info-string opener of another block — means the indented line is an
+    indented code block, not a fence. Lines at a similar indent that cannot
+    close (info strings, other characters, shorter markers) are block
+    content and are skipped.
+    """
     for future in lines[start:]:
+        opened = _FENCE_OPEN.match(future)
+        if not opened:
+            continue
+        width = _indent_width(opened.group(1))
+        if not opener_indent - 3 <= width < opener_indent + 4:
+            return False
         close = _FENCE_CLOSE.match(future)
         if not close:
             continue
         if close.group(2)[0] != marker[0]:
             continue
         if len(close.group(2)) < len(marker):
-            continue
-        if _indent_width(close.group(1)) >= opener_indent + 4:
             continue
         return True
     return False

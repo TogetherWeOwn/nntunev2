@@ -367,6 +367,42 @@ class TestFenceHandling(unittest.TestCase):
             )
             self.assertEqual([], check(root, "docs/a.md"))
 
+    def test_indented_fence_line_with_later_block_does_not_swallow_link(self):
+        # An indented code block holding a lone fence line is not a fence
+        # even when a fenced block appears further down: the first later
+        # fence line belongs to that block, so the broken link between
+        # them must still fail.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": "Intro\n\n    ```\n    sample\n\n"
+                                 "[gone](missing.md)\n\n"
+                                 "More prose.\n\n"
+                                 "```bash\necho hi\n```\n",
+                },
+            )
+            hits = check(root, "docs/a.md")
+            self.assertEqual(1, len(hits))
+            self.assertIn("does not exist", hits[0][2])
+
+    def test_indented_fence_ignores_info_string_content(self):
+        # An info-string line at the same indent inside a real list-item
+        # fence is content: the block still closes at its own bare fence.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": "- step\n"
+                                 "        ```md\n"
+                                 "        ```python\n"
+                                 "        [gone](gone.md)\n"
+                                 "        ```\n\n"
+                                 "# Title\n\n[ok](#title)\n",
+                },
+            )
+            self.assertEqual([], check(root, "docs/a.md"))
+
     def test_inline_triple_backtick_line_is_not_a_fence(self):
         # A backtick fence info string cannot contain a backtick: a line
         # like ```text``` starts inline code, so the real link below is
