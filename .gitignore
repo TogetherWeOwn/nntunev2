@@ -9,6 +9,14 @@ Cargo.lock
 # The API Worker deploys auth/vault crypto: its lockfile is committed so CI
 # and deploys resolve the exact audited dependency set (built with --locked).
 !/workers/api/Cargo.lock
+# The dependency/security gate audits exact resolved sets, so the workspace
+# root and the remaining standalone Worker lockfiles are committed too.
+# Every lock below is verified fresh in CI (`cargo metadata --locked`) and
+# audited by the cargo-deny job; update them with cargo, never by hand.
+!/Cargo.lock
+!/workers/ingest/Cargo.lock
+!/workers/mb/Cargo.lock
+!/workers/repair/Cargo.lock
 .cargo/
 
 # Rust wasm / workers

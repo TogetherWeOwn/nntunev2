@@ -1,4 +1,10 @@
-import { expect, type APIRequestContext, type APIResponse, type Page } from '@playwright/test';
+import {
+  expect,
+  request as playwrightRequest,
+  type APIRequestContext,
+  type APIResponse,
+  type Page,
+} from '@playwright/test';
 import { API, TESTIDS, uniqueTestEmail } from './contract.js';
 import {
   accessHeaders,
@@ -6,6 +12,7 @@ import {
   isStagingOrigin,
   qaAuthHeader,
   syntheticNntpEndpoint,
+  type WallProbe,
 } from './access.js';
 
 export interface TestAccount {
@@ -184,6 +191,40 @@ export async function apiPost(
   });
   throwOnRedirect(res.status(), res.headers(), context);
   return res;
+}
+
+/**
+ * Anonymous GET in a fresh, isolated request context: no Access pair, no
+ * bearer, no cookies or storage state — the context is created here, not
+ * borrowed from a test fixture or browser context, and no headers are
+ * attached regardless of what the environment holds. Fetches with
+ * maxRedirects: 0 and returns the response as a WallProbe WITHOUT
+ * throwOnRedirect: a 302 to the Access login is the expected denial
+ * evidence here, and no-follow guarantees it is reported, not chased.
+ * Pair with `assertAccessWall` (helpers/access.ts). Transport failures
+ * throw names-only — neither the URL nor any credential value is logged.
+ */
+export async function anonymousApiGet(
+  url: string,
+  context: string,
+  opts?: { timeout?: number },
+): Promise<WallProbe> {
+  const anon = await playwrightRequest.newContext();
+  try {
+    let res: APIResponse;
+    try {
+      res = await anon.get(url, { timeout: opts?.timeout ?? 30_000, maxRedirects: 0 });
+    } catch {
+      throw new Error(
+        `[${context}] anonymous request transport failed (names only — no values logged). ` +
+          'Refusing to treat a transport failure as an Access denial.',
+      );
+    }
+    const bodyText = await res.text().catch(() => '');
+    return { status: res.status(), headers: res.headers(), bodyText, url };
+  } finally {
+    await anon.dispose().catch(() => {});
+  }
 }
 
 /**
