@@ -113,9 +113,9 @@ export function assertNoAccessWall(probe: WallProbe, context: string): void {
 /**
  * The inverse check for anonymous requests: fail unless the response IS
  * an Access-specific denial. An application answer without Access — an
- * `ok:true` 200, an app 403, an app redirect — means anonymous traffic
- * reached (or may have reached) the app, which is exactly the failure
- * this assertion exists to catch. Same diagnostics contract as
+ * `ok:true` 200, an app 403, an app redirect, a served app shell — means
+ * anonymous traffic reached (or may have reached) the app, which is exactly
+ * the failure this assertion exists to catch. Same diagnostics contract as
  * assertNoAccessWall: fixed context and status only, never the probe
  * URL, headers or body (all untrusted and potentially sensitive).
  */

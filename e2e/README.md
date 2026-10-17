@@ -123,6 +123,14 @@ How the suite uses them:
   passes only on an Access-specific denial — an application `ok:true`
   answer to an anonymous request fails the smoke. Diagnostics stay
   names-only (fixed context + status; no URL, header or body values).
+- The smoke also proves the inverse for the app shell: an anonymous `GET /`
+  from a fresh, isolated request context (no Access pair, no cookies,
+  redirects never followed — `anonymousGet` in `helpers/accounts.ts`) must
+  be denied by the Access wall under the same joint status+markers predicate
+  (`assertAccessWall`, `helpers/access.ts`) and must not return the 200 app
+  shell. The credentialed app-shell test in the same file is the authorized
+  control. The anonymous probe changes no Access policy, needs no
+  credential, and never emits response bodies, headers or cookies.
 - Test-account sessions minted by the seam travel as
   `Authorization: Bearer <session>` (contract owned by the auth card —
   `helpers/accounts.ts` names it; cookie sessions would update the helper +

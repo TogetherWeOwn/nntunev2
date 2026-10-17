@@ -14,6 +14,7 @@ import {
 import { extractLibraryItems, extractPlanMeta, extractRecordingMbids, extractUsageBytes, isMbid } from '../helpers/contract.js';
 import {
   anonymousApiGet,
+  anonymousGet,
   annotateSignupPath,
   apiGet,
   apiPost,
@@ -355,6 +356,23 @@ test.describe('isAccessWall / assertAccessWall (anonymous denial)', () => {
       ),
     ).toThrow(/expected Cloudflare Access denial/);
   });
+  test('isAccessWall agrees with assertNoAccessWall on the shared fixtures', () => {
+    // Cross-predicate pin from main #188: the same fixtures must read as the
+    // wall under both directions of the check, using the hardened
+    // header-names-only predicate (generic edge markers alone never count).
+    const appShell200 = {
+      status: 200,
+      headers: { 'content-type': 'text/html' },
+      bodyText: '<html><h1>sentinel-app-shell-heading</h1></html>',
+      url: 'https://staging.example/',
+    };
+    for (const probe of [wall302, wall403]) {
+      expect(isAccessWall(probe)).toBe(true);
+      expect(() => assertNoAccessWall(probe, 'agree')).toThrow(/Access wall/);
+    }
+    expect(isAccessWall(appShell200)).toBe(false);
+    expect(() => assertNoAccessWall(appShell200, 'agree')).not.toThrow();
+  });
 });
 
 test.describe('anonymousApiGet (isolated, credential-free, no-follow)', () => {
@@ -366,7 +384,6 @@ test.describe('anonymousApiGet (isolated, credential-free, no-follow)', () => {
       });
     const close = (server: Server): Promise<void> =>
       new Promise((resolve) => server.close(() => resolve()));
-
     const hits: Array<Record<string, string | string[] | undefined>> = [];
     const staging = createServer((req: IncomingMessage, res) => {
       hits.push({ ...req.headers });
@@ -425,6 +442,67 @@ test.describe('anonymousApiGet (isolated, credential-free, no-follow)', () => {
       expect(dumped).not.toContain('dummy-qa-token-anon-probe');
     } finally {
       await close(staging).catch(() => {});
+    }
+  });
+});
+
+
+test.describe('anonymousGet (no credentials, no follow)', () => {
+  // The anonymous probe must send NO header material even when the QA Access
+  // pair is present in the environment, and must return a 3xx as-is (never
+  // follow it) so the caller can classify the wall response itself.
+  test('sends no Access/Authorization/Cookie headers and returns the 302 unfollowed', async ({
+    request,
+  }) => {
+    const listen = (server: Server): Promise<number> =>
+      new Promise((resolve, reject) => {
+        server.on('error', reject);
+        server.listen(0, '127.0.0.1', () => resolve((server.address() as AddressInfo).port));
+      });
+    const close = (server: Server): Promise<void> =>
+      new Promise((resolve) => server.close(() => resolve()));
+    const foreignHits: Array<Record<string, string | string[] | undefined>> = [];
+    const foreign = createServer((req: IncomingMessage, res) => {
+      foreignHits.push({ ...req.headers });
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('landed');
+    });
+    const foreignOrigin = `http://127.0.0.1:${await listen(foreign)}`;
+
+    const stagingHits: Array<Record<string, string | string[] | undefined>> = [];
+    const staging = createServer((req: IncomingMessage, res) => {
+      stagingHits.push({ ...req.headers });
+      if (req.url === '/redir') {
+        res.writeHead(302, { location: `${foreignOrigin}/landed` });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('<html>shell</html>');
+    });
+    const stagingOrigin = `http://127.0.0.1:${await listen(staging)}`;
+
+    try {
+      await withEnvAsync(dummyAccessPair, async () => {
+        const res = await anonymousGet(request, `${stagingOrigin}/redir`);
+        expect(res.status(), 'anonymousGet must return the 3xx, not follow or throw').toBe(302);
+        const ok = await anonymousGet(request, `${stagingOrigin}/`);
+        expect(ok.status()).toBe(200);
+      });
+      expect(foreignHits, 'anonymous probe followed a redirect to a foreign origin').toHaveLength(0);
+      expect(stagingHits).toHaveLength(2);
+      for (const headers of stagingHits) {
+        expect(headers['cf-access-client-id']).toBeUndefined();
+        expect(headers['cf-access-client-secret']).toBeUndefined();
+        expect(headers.authorization).toBeUndefined();
+        expect(headers.cookie).toBeUndefined();
+      }
+      const dumped = JSON.stringify(stagingHits);
+      expect(dumped).not.toContain(dummyAccessPair.CF_ACCESS_CLIENT_ID);
+      expect(dumped).not.toContain(dummyAccessPair.CF_ACCESS_CLIENT_SECRET);
+    } finally {
+      await close(staging).catch(() => {});
+      await close(foreign).catch(() => {});
     }
   });
 });
