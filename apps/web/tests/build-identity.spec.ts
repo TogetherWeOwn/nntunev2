@@ -14,6 +14,15 @@ import { expect, test } from '@playwright/test';
 const SHA40 = /^[0-9a-f]{40}$/;
 const FORBIDDEN = /secret|token|password|api[_-]?key|private[_-]?key|begin private|bearer |localhost|\.internal|\.local\b|hostname|binding|kv_|r2_|d1_|assets/i;
 
+// Exact-head guard (review): when the test environment carries the expected
+// build SHA, the endpoint must report exactly that SHA — otherwise a missing
+// bake would serve "unknown" forever with every suite green. Runs without
+// one keep the "unknown" allowance (local dev, preview without env). Same
+// env chain as vite.config.ts; this package has no node types.
+const testEnv = (globalThis as { process?: { env?: Record<string, string | undefined> } })
+	.process?.env;
+const expectedSha = testEnv?.BUILD_SHA || testEnv?.GITHUB_SHA || undefined;
+
 test('build endpoint exposes exactly { sha } with a 40-hex sha or explicit unknown', async ({
 	request
 }) => {
@@ -26,10 +35,14 @@ test('build endpoint exposes exactly { sha } with a 40-hex sha or explicit unkno
 	const { sha } = body;
 	expect(typeof sha, 'sha is always present, never null/missing').toBe('string');
 	expect((sha as string).length).toBeGreaterThan(0);
-	expect(
-		sha === 'unknown' || (typeof sha === 'string' && SHA40.test(sha)),
-		`sha must be 40-hex or explicit "unknown", got ${JSON.stringify(sha)}`
-	).toBe(true);
+	if (expectedSha) {
+		expect(sha, `sha must equal the baked build SHA ${expectedSha}`).toBe(expectedSha);
+	} else {
+		expect(
+			sha === 'unknown' || (typeof sha === 'string' && SHA40.test(sha)),
+			`sha must be 40-hex or explicit "unknown", got ${JSON.stringify(sha)}`
+		).toBe(true);
+	}
 });
 
 test('build endpoint never leaks secrets, hostnames, or binding material', async ({

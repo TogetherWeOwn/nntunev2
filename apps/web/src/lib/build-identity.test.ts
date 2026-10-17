@@ -145,5 +145,17 @@ describe('build-identity wiring (Builder implements)', () => {
 		expect(mod.isBuildShaKnown('b'.repeat(40))).toBe(true);
 		expect(mod.isBuildShaKnown('unknown')).toBe(false);
 		expect(mod.BUILD_SHA === 'unknown' || SHA40.test(mod.BUILD_SHA)).toBe(true);
+		// Exact-head guard (review): when the test environment carries a
+		// build SHA, the baked BUILD_SHA must equal it — otherwise a dropped
+		// `__BUILD_SHA__` define would stay green while staging serves
+		// "unknown". Same env chain as vite.config.ts; no node types.
+		const testEnv = (globalThis as { process?: { env?: Record<string, string | undefined> } })
+			.process?.env;
+		const expectedSha = testEnv?.BUILD_SHA || testEnv?.GITHUB_SHA || undefined;
+		if (expectedSha) {
+			expect(mod.BUILD_SHA, `BUILD_SHA must equal the baked build SHA ${expectedSha}`).toBe(
+				expectedSha
+			);
+		}
 	});
 });
