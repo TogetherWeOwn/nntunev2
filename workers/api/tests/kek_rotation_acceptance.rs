@@ -1,10 +1,12 @@
 use nntune_api::vault::{decrypt_vault, encrypt_vault, rewrap_dek, VaultBlob};
 use rand::RngCore;
 use rusqlite::{params, Connection};
+use std::fs;
 use std::path::PathBuf;
 
 const CURRENT_VERSION: u32 = 2;
 const PER_VERSION_PROGRESS_QUERY: &str = "SELECT kek_version, COUNT(*) AS row_count\n  FROM provider_vaults\n GROUP BY kek_version\n ORDER BY kek_version;";
+const CONDITIONAL_REWRAP_UPDATE: &str = "UPDATE provider_vaults\n      SET kek_version = $new, dek_wrapped = $w,\n          dek_wrapped_nonce = $n, updated_at = $now,\n          rewrapped_at = $now\n    WHERE user_id = $u AND kek_version = $old;";
 
 fn random_test_key() -> [u8; 32] {
     let mut key = [0; 32];
@@ -25,10 +27,38 @@ fn test_only_kek_by_version(
     }
 }
 
+fn migrations_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations")
+}
+
 fn migration_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../migrations")
-        .join(name)
+    migrations_dir().join(name)
+}
+
+fn kek_rotation_migration_sql() -> String {
+    // Discover by suffix, not number, so a renumber (e.g. resolving a
+    // duplicate migration number) does not break this file; the migration
+    // order acceptance test pins numbering and manifest placement.
+    let dir = migrations_dir();
+    let mut matches = fs::read_dir(&dir)
+        .unwrap_or_else(|error| panic!("could not read {}: {error}", dir.display()))
+        .map(|entry| entry.expect("migration directory entry").path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("_kek_rotation.sql"))
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one *_kek_rotation.sql migration in {}, found {matches:?}",
+        dir.display()
+    );
+    fs::read_to_string(&matches[0]).expect("read KEK rotation follow-up migration")
 }
 
 fn fixture_db() -> Connection {
@@ -39,9 +69,16 @@ fn fixture_db() -> Connection {
     db.execute_batch(&initial)
         .expect("apply initial vault migration");
 
-    let follow_up = std::fs::read_to_string(migration_path("0004_kek_rotation.sql"))
-        .expect("read KEK rotation follow-up migration");
-    db.execute_batch(&follow_up)
+    let follow_up = kek_rotation_migration_sql();
+    assert!(
+        follow_up.contains("ADD COLUMN IF NOT EXISTS rewrapped_at"),
+        "the raw migration must use ADD COLUMN IF NOT EXISTS rewrapped_at \
+         so Postgres replay of the migration is idempotent"
+    );
+    // SQLite rejects `ADD COLUMN IF NOT EXISTS`; strip it for this fixture
+    // only. The assertion above keeps the raw Postgres text pinned.
+    let sqlite_follow_up = follow_up.replace("ADD COLUMN IF NOT EXISTS ", "ADD COLUMN ");
+    db.execute_batch(&sqlite_follow_up)
         .expect("apply KEK rotation follow-up migration");
     db
 }
@@ -252,5 +289,10 @@ fn rotation_runbook_documents_per_version_progress_counts() {
     assert!(
         runbook.contains(PER_VERSION_PROGRESS_QUERY),
         "the runbook must show an executable count grouped by kek_version"
+    );
+    assert!(
+        runbook.contains(CONDITIONAL_REWRAP_UPDATE),
+        "the runbook §6 conditional UPDATE must set rewrapped_at = $now \
+         alongside kek_version, guarded by the old kek_version"
     );
 }
