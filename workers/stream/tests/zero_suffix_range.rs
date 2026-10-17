@@ -150,6 +150,7 @@ impl Rig {
         let token = grant::issue("u1", track, EXP_UNIX, SECRET);
         let addr: SocketAddr = "127.0.0.1:119".parse().expect("dummy addr");
         let input = PlayInput {
+            trace_id: None,
             token: &token,
             track_id: track,
             range,

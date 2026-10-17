@@ -211,6 +211,7 @@ fn malformed_tokens_are_still_malformed() {
 
 fn play_input<'a>(token: &'a str, track_id: &'a str) -> PlayInput<'a> {
     PlayInput {
+        trace_id: None,
         token,
         track_id,
         range: None,

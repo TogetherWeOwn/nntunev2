@@ -24,15 +24,6 @@ pub mod worker_entry;
 /// the tests below.
 pub use nntune_logging as logging;
 
-#[worker::event(fetch)]
-pub async fn main(
-    req: worker::Request,
-    env: worker::Env,
-    _ctx: worker::Context,
-) -> worker::Result<worker::Response> {
-    worker_entry::dispatch(req, env).await
-}
-
 #[cfg(test)]
 mod logging_tests {
     use super::logging::{fields_from_json, Level, LogRecord, Worker};
@@ -97,4 +88,13 @@ mod logging_tests {
             );
         }
     }
+}
+
+#[worker::event(fetch)]
+pub async fn main(
+    req: worker::Request,
+    env: worker::Env,
+    _ctx: worker::Context,
+) -> worker::Result<worker::Response> {
+    worker_entry::dispatch(req, env).await
 }

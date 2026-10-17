@@ -864,8 +864,8 @@ mod http_layer {
         req: &Request,
         ctx: &RouteContext<()>,
     ) -> WorkerResult<Response> {
-        // Same trace contract as [`lookup_route`]: cache hits still echo the
-        // trace and log one line; the cached copy itself stays untraced.
+        // Same trace contract as the other routes: resolve before the edge
+        // lookup so cache hits still echo the trace and log one line.
         let trace_id = inbound_trace_id(req);
         if let Some(hit) = edge_hit(req).await {
             emit(
@@ -883,8 +883,8 @@ mod http_layer {
         };
         let cache = EdgeCache::from_env(&ctx.env);
         let api = handle_release_recordings(&repo, &cache, mbid).await;
-        // Entity fields never log (names/titles are personal data); the line
-        // carries the outcome status only.
+        // The mbid is an opaque UUID, but the line stays minimal (kind plus
+        // outcome status) like the sibling routes.
         emit(
             outcome_level(api.status),
             &trace_id,

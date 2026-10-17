@@ -106,6 +106,20 @@ fn health_response_parts() -> HealthResponseParts {
     }
 }
 
+fn json_error(err: ApiError) -> Result<Response> {
+    let status = err.status;
+    Response::from_body(worker::ResponseBody::Body(err.body_json().into_bytes())).map(|r| {
+        r.with_status(status)
+            .with_headers(headers_json().unwrap_or_default())
+    })
+}
+
+fn headers_json() -> Result<worker::Headers> {
+    let headers = worker::Headers::new();
+    headers.append("content-type", "application/json; charset=utf-8")?;
+    Ok(headers)
+}
+
 /// Resolve the request trace from the inbound `x-trace-id` header: a valid
 /// 128-bit ID is kept, anything else (absent, malformed, untrusted) is
 /// replaced with a fresh random ID. The invalid value is never logged.
@@ -122,7 +136,7 @@ fn inbound_trace_id(req: &Request) -> String {
 /// Field validation runs at construction: a banned key or secret-like value
 /// drops the line instead of leaking it. All call-site fields are constants
 /// plus opaque IDs and counters, so the drop branch only fires on a code bug.
-fn emit(level: Level, trace_id: &str, event: &str, fields: serde_json::Value) {
+pub(crate) fn emit(level: Level, trace_id: &str, event: &str, fields: serde_json::Value) {
     let ts_millis = worker::Date::now().as_millis();
     let Ok(field_map) = nntune_logging::fields_from_json(fields) else {
         return;
@@ -149,36 +163,16 @@ fn with_trace(mut response: Response, trace_id: &str) -> Response {
     response
 }
 
-fn json_error(err: ApiError, trace_id: &str) -> Result<Response> {
-    let status = err.status;
-    Response::from_body(worker::ResponseBody::Body(err.body_json().into_bytes())).map(|r| {
-        with_trace(
-            r.with_status(status)
-                .with_headers(headers_json().unwrap_or_default()),
-            trace_id,
-        )
-    })
+fn accepted(body: serde_json::Value) -> Result<Response> {
+    Ok(Response::from_json(&body)?.with_status(202))
 }
 
-fn headers_json() -> Result<worker::Headers> {
-    let headers = worker::Headers::new();
-    headers.append("content-type", "application/json; charset=utf-8")?;
-    Ok(headers)
-}
-
-fn accepted(body: serde_json::Value, trace_id: &str) -> Result<Response> {
-    Ok(with_trace(
-        Response::from_json(&body)?.with_status(202),
-        trace_id,
-    ))
-}
-
-fn service_unavailable(message: &str, trace_id: &str) -> Result<Response> {
+fn service_unavailable(message: &str) -> Result<Response> {
     let headers = headers_json().unwrap_or_default();
     headers.append("retry-after", "5")?;
     let body = ApiError::service_unavailable(message).body_json();
     Response::from_body(worker::ResponseBody::Body(body.into_bytes()))
-        .map(|r| with_trace(r.with_status(503).with_headers(headers), trace_id))
+        .map(|r| r.with_status(503).with_headers(headers))
 }
 
 // --- Search abuse guard (roadmap R6) -------------------------------------------
@@ -480,24 +474,20 @@ fn intake_rejection_response(rejection: &IntakeRejection) -> Result<Response> {
 /// Send one dispatch message. Returns true when the Queue accepted it; a
 /// missing or failing binding returns false and the route answers 503 (see
 /// [`queued_envelope`]), so the job is retried instead of silently lost.
-/// Queue errors stay out of the log line (driver strings can carry binding
-/// detail); the line carries the trace plus opaque routing facts only.
-async fn try_enqueue(env: &Env, msg: &QueueMsg, trace_id: &str, source: &str) -> bool {
-    // The message already carries `trace_id` (stamped by the route), so the
-    // consumer and any downstream worker call share this request's trace.
-    let accepted = match env.queue(dispatch::INGEST_QUEUE_BINDING) {
-        Ok(queue) => queue.send(msg.clone()).await.is_ok(),
-        Err(_) => false,
-    };
-    if !accepted {
-        emit(
-            Level::Error,
-            trace_id,
-            "ingest.queue.enqueue_failed",
-            serde_json::json!({"job_id": msg.job_id, "source": source}),
-        );
+async fn try_enqueue(env: &Env, msg: &QueueMsg) -> bool {
+    match env.queue(dispatch::INGEST_QUEUE_BINDING) {
+        Ok(queue) => match queue.send(msg.clone()).await {
+            Ok(()) => true,
+            Err(e) => {
+                console_log!("ingest enqueue failed: {:?}", e);
+                false
+            }
+        },
+        Err(e) => {
+            console_log!("ingest queue binding missing: {:?}", e);
+            false
+        }
     }
-    accepted
 }
 
 /// Entry workflow stage metered at enqueue, by job source.
@@ -580,13 +570,10 @@ pub(crate) fn try_meter(
 /// route mapping can never drift from the tested error mapping: retryable
 /// failures (missing/failing binding or ledger) surface 503 + `Retry-After`,
 /// never 202-and-dropped; an unknown stage is a caller bug and surfaces 400.
-fn meter_failure_response(err: &MeterWriteError, trace_id: &str) -> Result<Response> {
+fn meter_failure_response(err: &MeterWriteError) -> Result<Response> {
     match err.http_status() {
-        503 => service_unavailable(
-            "meter unavailable; nothing was accepted, retry shortly",
-            trace_id,
-        ),
-        _ => json_error(ApiError::invalid_request("unknown meter stage"), trace_id),
+        503 => service_unavailable("meter unavailable; nothing was accepted, retry shortly"),
+        _ => json_error(ApiError::invalid_request("unknown meter stage")),
     }
 }
 
@@ -965,7 +952,7 @@ where
 /// one of the checkpoint key's two writers (see `checkpoint` docs); the
 /// consumer waits out KV's 1 s same-key window if its first persist
 /// collides with this write.
-async fn ensure_admission_checkpoint(env: &Env, msg: &QueueMsg, trace_id: &str, source: &str) {
+async fn ensure_admission_checkpoint(env: &Env, msg: &QueueMsg) {
     let existing = match checkpoint::get(env, &msg.job_id).await {
         Ok(existing) => existing,
         Err(e) => {
@@ -985,7 +972,7 @@ async fn ensure_admission_checkpoint(env: &Env, msg: &QueueMsg, trace_id: &str, 
         // now persisted, so this trailing copy is guaranteed to observe
         // `Queued`; duplicate Queue messages are harmless by construction
         // (the consumer resumes from the durable checkpoint).
-        if !try_enqueue(env, msg, trace_id, source).await {
+        if !try_enqueue(env, msg).await {
             console_log!("ingest re-drive enqueue after checkpoint reset failed");
         }
     }
@@ -1002,20 +989,19 @@ async fn admit_metered_job(
     stage: &str,
     source: &str,
     extra: serde_json::Value,
-    trace_id: &str,
 ) -> Result<Response> {
     match drive_metered_admission(
         ledger,
         msg,
         stage,
-        || try_enqueue(env, msg, trace_id, source),
+        || try_enqueue(env, msg),
         |outcome| async move { try_meter(env, msg, stage, outcome) },
     )
     .await
     {
         AdmissionDecision::Admitted => {
-            ensure_admission_checkpoint(env, msg, trace_id, source).await;
-            queued_envelope(msg, source, true, extra, trace_id)
+            ensure_admission_checkpoint(env, msg).await;
+            queued_envelope(msg, source, true, extra)
         }
         AdmissionDecision::AlreadyQueued => {
             // Replay window: the ledger will not enqueue again (see the
@@ -1029,25 +1015,20 @@ async fn admit_metered_job(
                     if checkpoint::replay_decision(cp.as_ref(), msg)
                         == checkpoint::ReplayDecision::Conflict =>
                 {
-                    json_error(
-                        ApiError::conflict(
-                            "this job previously failed; check its status before re-posting",
-                        ),
-                        trace_id,
-                    )
+                    json_error(ApiError::conflict(
+                        "this job previously failed; check its status before re-posting",
+                    ))
                 }
-                Ok(_) => queued_envelope(msg, source, true, extra, trace_id),
+                Ok(_) => queued_envelope(msg, source, true, extra),
                 Err(e) => {
                     console_log!("ingest replay checkpoint read failed: {:?}", e);
-                    queued_envelope(msg, source, true, extra, trace_id)
+                    queued_envelope(msg, source, true, extra)
                 }
             }
         }
-        AdmissionDecision::Busy => {
-            service_unavailable("admission is in progress; retry shortly", trace_id)
-        }
-        AdmissionDecision::QueueUnavailable => queued_envelope(msg, source, false, extra, trace_id),
-        AdmissionDecision::MeterUnavailable(e) => meter_failure_response(&e, trace_id),
+        AdmissionDecision::Busy => service_unavailable("admission is in progress; retry shortly"),
+        AdmissionDecision::QueueUnavailable => queued_envelope(msg, source, false, extra),
+        AdmissionDecision::MeterUnavailable(e) => meter_failure_response(&e),
     }
 }
 
@@ -1096,16 +1077,14 @@ fn queued_envelope(
     source: &str,
     queued: bool,
     extra: serde_json::Value,
-    trace_id: &str,
 ) -> Result<Response> {
     let body = queued_body(msg, source, queued, extra);
     if !queued {
         let headers = headers_json().unwrap_or_default();
         headers.append("retry-after", "5")?;
-        return Response::from_json(&body)
-            .map(|r| with_trace(r.with_status(503).with_headers(headers), trace_id));
+        return Response::from_json(&body).map(|r| r.with_status(503).with_headers(headers));
     }
-    accepted(body, trace_id)
+    accepted(body)
 }
 
 /// Persist upload bytes under their content-addressed key before enqueue, so
@@ -1120,17 +1099,7 @@ fn queued_envelope(
 /// the key is the content hash, so a client retry inside a second — or a
 /// retry racing its own first write — can 429 even though the bytes are
 /// already stored. Bytes present means the job can run.
-async fn store_upload_payload(env: &Env, payload_ref: &str, nzb_xml: &str, trace_id: &str) -> bool {
-    // KV/driver errors stay out of the line (they can carry binding detail);
-    // the line carries the trace plus the fact of the failed stage only.
-    let failed = || {
-        emit(
-            Level::Error,
-            trace_id,
-            "ingest.payload.store_failed",
-            serde_json::json!({"source": "nzb_upload"}),
-        );
-    };
+async fn store_upload_payload(env: &Env, payload_ref: &str, nzb_xml: &str) -> bool {
     match env.kv(dispatch::PAYLOAD_KV_BINDING) {
         Ok(store) => match store.put(payload_ref, nzb_xml.to_string()) {
             Ok(put) => match put
@@ -1139,21 +1108,18 @@ async fn store_upload_payload(env: &Env, payload_ref: &str, nzb_xml: &str, trace
                 .await
             {
                 Ok(()) => true,
-                Err(_) => {
-                    let present = matches!(store.get(payload_ref).text().await, Ok(Some(_)));
-                    if !present {
-                        failed();
-                    }
-                    present
+                Err(e) => {
+                    console_log!("ingest payload write failed: {:?}", e);
+                    matches!(store.get(payload_ref).text().await, Ok(Some(_)))
                 }
             },
-            Err(_) => {
-                failed();
+            Err(e) => {
+                console_log!("ingest payload put failed: {:?}", e);
                 false
             }
         },
-        Err(_) => {
-            failed();
+        Err(e) => {
+            console_log!("ingest payload KV missing: {:?}", e);
             false
         }
     }
@@ -1163,18 +1129,17 @@ async fn store_upload_payload(env: &Env, payload_ref: &str, nzb_xml: &str, trace
 /// search → parse → probe → verify → match → write workflow. The resolved
 /// trace travels in every log line, in the `x-trace-id` response header, and
 /// in the queued message for the consumer.
-async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
-    let trace_id = inbound_trace_id(req);
+async fn search(req: &mut Request, ctx: &RouteContext<()>, trace_id: &str) -> Result<Response> {
     let text = match read_capped_text(req, MAX_SEARCH_BODY_BYTES).await {
         Ok(text) => text,
-        Err(err) => return json_error(err, &trace_id),
+        Err(err) => return json_error(err),
     };
     let parsed = match parse_search(&text) {
         Ok(parsed) => parsed,
-        Err(message) => return json_error(ApiError::invalid_request(message), &trace_id),
+        Err(message) => return json_error(ApiError::invalid_request(message)),
     };
     if let Err(message) = check_search(&parsed) {
-        return json_error(ApiError::invalid_request(message), &trace_id);
+        return json_error(ApiError::invalid_request(message));
     }
     // Abuse guard before any dispatch is built or metered (roadmap R6):
     // per-IP AND per-account token buckets; a denied attempt consumes
@@ -1194,14 +1159,14 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
         parsed.page,
     ) {
         Ok(msg) => msg,
-        Err(message) => return json_error(ApiError::invalid_request(message), &trace_id),
+        Err(message) => return json_error(ApiError::invalid_request(message)),
     };
-    msg.trace_id = Some(trace_id.clone());
+    msg.trace_id = Some(trace_id.to_string());
     // Operational facts only: opaque job ID plus the query length. The query
     // text, user handle, and indexer handle never enter a log line.
     emit(
         Level::Info,
-        &trace_id,
+        trace_id,
         "ingest.search.received",
         serde_json::json!({"job_id": msg.job_id, "q_len": q.len()}),
     );
@@ -1217,7 +1182,6 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
         meter_entry_stage(msg.source),
         "indexer_search",
         serde_json::json!({}),
-        &trace_id,
     )
     .await;
 }
@@ -1225,18 +1189,17 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
 /// Validate an NZB upload and enqueue it; the consumer parses with
 /// `nntune-core`, probes the pool DO, and verifies before matching. Same
 /// trace contract as [`search`]: log lines, response header, queued message.
-async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
-    let trace_id = inbound_trace_id(req);
+async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>, trace_id: &str) -> Result<Response> {
     let text = match read_capped_text(req, MAX_UPLOAD_BODY_BYTES).await {
         Ok(text) => text,
-        Err(err) => return json_error(err, &trace_id),
+        Err(err) => return json_error(err),
     };
     let parsed = match parse_upload(&text) {
         Ok(parsed) => parsed,
-        Err(message) => return json_error(ApiError::invalid_request(message), &trace_id),
+        Err(message) => return json_error(ApiError::invalid_request(message)),
     };
     if let Err(message) = check_upload(&parsed) {
-        return json_error(ApiError::invalid_request(message), &trace_id);
+        return json_error(ApiError::invalid_request(message));
     }
     match estimate_nzb(&parsed.nzb_xml) {
         Err(rejection) => intake_rejection_response(&rejection),
@@ -1247,37 +1210,39 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Respons
             match crate::parse::parse_upload(parsed.nzb_xml.as_bytes(), &est) {
                 Ok(_) => {}
                 Err(crate::parse::ParseRejection::Invalid(message)) => {
-                    return json_error(ApiError::invalid_request(message), &trace_id)
+                    return json_error(ApiError::invalid_request(message))
                 }
                 Err(crate::parse::ParseRejection::TooLarge) => {
-                    return json_error(
-                        ApiError::payload_too_large("nzb exceeds shared parser limits"),
-                        &trace_id,
-                    )
+                    return json_error(ApiError::payload_too_large(
+                        "nzb exceeds shared parser limits",
+                    ))
                 }
             }
             let mut msg = match dispatch::build_upload_dispatch(&parsed.user_id, &parsed.nzb_xml) {
                 Ok(msg) => msg,
-                Err(message) => {
-                    return json_error(ApiError::invalid_request(message), &trace_id)
-                }
+                Err(message) => return json_error(ApiError::invalid_request(message)),
             };
-            msg.trace_id = Some(trace_id.clone());
+            msg.trace_id = Some(trace_id.to_string());
             // The bytes must be durably stored before the job exists: an
             // enqueued job without retrievable bytes can never run.
             let payload_ref = msg.payload_ref.clone().unwrap_or_default();
             if payload_ref.is_empty()
-                || !store_upload_payload(&ctx.env, &payload_ref, &parsed.nzb_xml, &trace_id).await
+                || !store_upload_payload(&ctx.env, &payload_ref, &parsed.nzb_xml).await
             {
-                return service_unavailable(
-                    "payload store unavailable; nothing was accepted",
-                    &trace_id,
+                // KV/driver detail stays out of the line; the trace plus the
+                // failed stage is enough to correlate.
+                emit(
+                    Level::Error,
+                    trace_id,
+                    "ingest.payload.store_failed",
+                    serde_json::json!({"source": "nzb_upload"}),
                 );
+                return service_unavailable("payload store unavailable; nothing was accepted");
             }
             // Counts plus the opaque job ID; filenames and NZB bytes never log.
             emit(
                 Level::Info,
-                &trace_id,
+                trace_id,
                 "ingest.upload.received",
                 serde_json::json!({
                     "job_id": msg.job_id,
@@ -1300,7 +1265,6 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Respons
                     "file_count": est.file_count,
                     "segment_count": est.segment_count,
                 }),
-                &trace_id,
             )
             .await;
         }
@@ -1322,22 +1286,21 @@ fn healthz() -> Result<Response> {
 /// checkpoint-store failure is 503 (never a fabricated status).
 /// Malformed IDs answer 404 without a log line (scanner noise stays out of
 /// the logs); valid IDs log one `status_checked` line under the trace.
-async fn job_status(req: &Request, ctx: &RouteContext<()>) -> Result<Response> {
-    let trace_id = inbound_trace_id(req);
+async fn job_status(ctx: &RouteContext<()>, trace_id: &str) -> Result<Response> {
     let id = ctx.param("id").cloned().unwrap_or_default();
     if !validate_job_id(&id) {
-        return json_error(ApiError::not_found("unknown job id"), &trace_id);
+        return json_error(ApiError::not_found("unknown job id"));
     }
     emit(
         Level::Info,
-        &trace_id,
+        trace_id,
         "ingest.job.status_checked",
         serde_json::json!({"job_id": id}),
     );
     match checkpoint::get(&ctx.env, &id).await {
-        Ok(Some(cp)) => Response::from_json(&cp).map(|r| with_trace(r, &trace_id)),
-        Ok(None) => json_error(ApiError::not_found("unknown job id"), &trace_id),
-        Err(_) => service_unavailable("checkpoint store unavailable", &trace_id),
+        Ok(Some(cp)) => Response::from_json(&cp),
+        Ok(None) => json_error(ApiError::not_found("unknown job id")),
+        Err(_) => service_unavailable("checkpoint store unavailable"),
     }
 }
 
@@ -2701,6 +2664,45 @@ mod tests {
         );
         assert_eq!((queue_calls, meter_calls), (2, 1));
     }
+}
+
+#[worker::event(fetch)]
+pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Response> {
+    Router::new()
+        .get_async("/healthz", |_, _| async { healthz() })
+        .post_async("/v1/ingest/search", |mut req, ctx| async move {
+            // Resolve once per request: the same trace rides the log lines,
+            // the `x-trace-id` response echo, and the queued message. Every
+            // response below passes through `with_trace`, so error shapes
+            // from the admission/meter paths stay byte-identical.
+            let trace_id = inbound_trace_id(&req);
+            search(&mut req, &ctx, &trace_id)
+                .await
+                .map(|r| with_trace(r, &trace_id))
+        })
+        .post_async("/v1/ingest/nzb", |mut req, ctx| async move {
+            let trace_id = inbound_trace_id(&req);
+            upload_nzb(&mut req, &ctx, &trace_id)
+                .await
+                .map(|r| with_trace(r, &trace_id))
+        })
+        .get_async("/v1/ingest/jobs/:id", |req, ctx| async move {
+            let trace_id = inbound_trace_id(&req);
+            job_status(&ctx, &trace_id)
+                .await
+                .map(|r| with_trace(r, &trace_id))
+        })
+        .or_else_any_method_async("/*catchall", |req, _| async move {
+            let trace_id = inbound_trace_id(&req);
+            json_error(ApiError::not_found("not found")).map(|r| with_trace(r, &trace_id))
+        })
+        .run(req, env)
+        .await
+}
+
+#[cfg(test)]
+mod logging_trace_tests {
+    use super::*;
 
     const TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
 
@@ -2824,25 +2826,4 @@ mod tests {
             );
         }
     }
-}
-
-#[worker::event(fetch)]
-pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Response> {
-    Router::new()
-        .get_async("/healthz", |_, _| async { healthz() })
-        .post_async("/v1/ingest/search", |mut req, ctx| async move {
-            search(&mut req, &ctx).await
-        })
-        .post_async("/v1/ingest/nzb", |mut req, ctx| async move {
-            upload_nzb(&mut req, &ctx).await
-        })
-        .get_async("/v1/ingest/jobs/:id", |req, ctx| async move {
-            job_status(&req, &ctx).await
-        })
-        .or_else_any_method_async("/*catchall", |req, _| async move {
-            let trace_id = inbound_trace_id(&req);
-            json_error(ApiError::not_found("not found"), &trace_id)
-        })
-        .run(req, env)
-        .await
 }

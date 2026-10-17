@@ -91,6 +91,7 @@ const REJECTION_KINDS: [MeterKind; 3] = [
 
 fn play_input<'a>(token: &'a str, track_id: &'a str) -> PlayInput<'a> {
     PlayInput {
+        trace_id: None,
         token,
         track_id,
         range: None,

@@ -20,7 +20,6 @@ fn msg() -> QueueMsg {
         limit: None,
         page: None,
         payload_ref: Some("nzb:sha256:abc".to_owned()),
-        // Builders stay trace-free; the route stamps the request trace.
         trace_id: None,
     }
 }

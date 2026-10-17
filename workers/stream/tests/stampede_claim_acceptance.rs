@@ -47,6 +47,7 @@ fn stale_serve(
     let token = grant::issue("u", "track-swr", now_unix + 60, SECRET);
     let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
     let input = PlayInput {
+        trace_id: None,
         token: &token,
         track_id: "track-swr",
         range: None,

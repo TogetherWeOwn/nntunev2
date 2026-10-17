@@ -193,6 +193,12 @@ pub struct PlayInput<'a> {
     pub now_unix: u64,
     /// Next track in the queue, for prefetch.
     pub up_next: Option<&'a str>,
+    /// Optional inbound `x-trace-id` for log correlation. Accepted only when
+    /// it is 32 lowercase hex chars; anything else is dropped (never trusted
+    /// or logged) and the play runs untraced. Never affects authorization,
+    /// pooling, caching, or metering decisions — and never enters the
+    /// Analytics Engine row.
+    pub trace_id: Option<&'a str>,
 }
 
 /// A servable play: status line, headers and a chunk stream.
@@ -220,6 +226,10 @@ pub struct PlayResponse {
     /// reader.
     pub needs_revalidate: bool,
     pub stream: PlayStream,
+    /// Normalized request trace for log correlation (`None` when the play
+    /// carried no valid trace). The transport stamps this ID in every
+    /// six-key log line for the play; it never enters the AE row.
+    pub trace_id: Option<String>,
 }
 
 impl PlayResponse {
@@ -270,6 +280,10 @@ pub struct PlayStream {
     pos: u64,
     end: u64,
     served: u64,
+    /// Normalized request trace for log correlation. Carried alongside the
+    /// lease so `finalize`/`abort`/`Drop` meter the same play's bytes under
+    /// the same trace; never enters the AE row.
+    trace_id: Option<String>,
     /// `None` once `finalize`/`abort` consumed the stream (or it was dropped).
     source: Option<Source>,
     /// Pool-level orphan queue: `Drop` pushes an [`OrphanedPlay`] here when
@@ -284,13 +298,14 @@ impl Drop for PlayStream {
         // discarded with `live` (its buffered position is untrustworthy, so
         // it is never re-parked warm). Served bytes ride the pool-level
         // orphan queue so the pool owner can still meter them — for `Live`
-        // and `Cached` alike.
+        // and `Cached` alike. The trace rides along for log correlation.
         if self.source.take().is_some() && self.served > 0 {
             if let Ok(mut orphaned) = self.orphans.lock() {
                 orphaned.push(OrphanedPlay {
                     user_id: self.user_id.clone(),
                     track_id: self.track_id.clone(),
                     bytes: self.served,
+                    trace_id: self.trace_id.clone(),
                 });
             }
         }
@@ -465,6 +480,10 @@ fn play_authorized(
     user: &str,
     timeouts: UpstreamTimeouts,
 ) -> Result<PlayResponse, PlayError> {
+    // Normalize first: an invalid trace is dropped before pool, cache, or
+    // meter can observe it. The trace never affects those decisions; it only
+    // rides along for log correlation.
+    let trace_id = crate::trace::normalize_trace_id(input.trace_id);
     flush_orphaned(pool, meter);
     meter.emit(ev(MeterKind::PlayStart, user, input.track_id, 0));
 
@@ -489,6 +508,7 @@ fn play_authorized(
             input.track_id,
             Source::Cached(full),
             pool.orphan_sink(),
+            trace_id,
         ));
     }
 
@@ -644,6 +664,7 @@ fn play_authorized(
         input.track_id,
         Source::Live(Box::new(live)),
         pool.orphan_sink(),
+        trace_id,
     ))
 }
 
@@ -960,6 +981,7 @@ fn respond(
     track: &str,
     source: Source,
     orphans: Arc<Mutex<Vec<OrphanedPlay>>>,
+    trace_id: Option<String>,
 ) -> PlayResponse {
     let (cache_status, age_secs) = match serve {
         Some(serve) => (serve.cache_status(), serve.age_secs()),
@@ -978,6 +1000,7 @@ fn respond(
         content_range,
         body_len: end - start,
         cache_hit,
+        trace_id: trace_id.clone(),
         cache_status,
         age_secs,
         needs_revalidate,
@@ -988,6 +1011,7 @@ fn respond(
             pos: start,
             end,
             served: 0,
+            trace_id,
             source: Some(source),
             orphans,
         },
@@ -1031,6 +1055,14 @@ impl PlayStream {
     /// True on the miss path (chunks feed a staged multipart upload).
     pub fn is_writeback(&self) -> bool {
         matches!(self.source, Some(Source::Live(_)))
+    }
+
+    /// Normalized request trace for log correlation (`None` when the play
+    /// carried no valid trace). The transport stamps this ID in the six-key
+    /// log envelope; it never enters the Analytics Engine row.
+    #[must_use]
+    pub fn trace_id(&self) -> Option<&str> {
+        self.trace_id.as_deref()
     }
 
     /// Bytes served to the client so far.
@@ -1150,6 +1182,7 @@ impl PlayStream {
                 user_id: self.user_id.clone(),
                 track_id: self.track_id.clone(),
                 bytes: self.served,
+                trace_id: self.trace_id.clone(),
             });
         }
         if let Some(Source::Live(live)) = source {
@@ -1325,6 +1358,7 @@ mod tests {
         segments: &'a [String],
     ) -> PlayInput<'a> {
         PlayInput {
+            trace_id: None,
             token,
             track_id,
             range: None,
@@ -1434,6 +1468,7 @@ mod tests {
             cipher_key: 0,
             now_unix: 1,
             up_next: None,
+            trace_id: None,
         };
         assert!(matches!(
             play(&mut pool, &mut cache, &mut meter, secret, &input),
@@ -1481,6 +1516,7 @@ mod tests {
         pool.release(lease, Some(warm_client));
         let segments = vec!["missing@synthetic.test".to_string()];
         let input = PlayInput {
+            trace_id: None,
             token: "unused by first-segment fetch",
             track_id: "track",
             range: None,
@@ -1580,6 +1616,7 @@ mod tests {
 
         let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
         let input = PlayInput {
+            trace_id: None,
             token: &token,
             track_id: "track-swr",
             range: None,
@@ -1632,6 +1669,7 @@ mod tests {
 
         let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
         let input = PlayInput {
+            trace_id: None,
             token: &token,
             track_id: "track-swr",
             range: Some("bytes=2-5"),
@@ -1670,6 +1708,7 @@ mod tests {
 
         let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
         let input = PlayInput {
+            trace_id: None,
             token: &token,
             track_id: "track-swr",
             range: None,
@@ -1715,6 +1754,7 @@ mod tests {
 
         let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
         let input = PlayInput {
+            trace_id: None,
             token: &token,
             track_id: "track-swr",
             range: None,
@@ -1754,6 +1794,7 @@ mod tests {
 
         let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
         let input = PlayInput {
+            trace_id: None,
             token: &token,
             track_id: "track-swr",
             range: None,
@@ -1830,6 +1871,7 @@ mod tests {
         let mut meter = crate::meter::MemoryMeter::default();
         let segments = ["t1-seg0@unit.test".to_string()];
         let input = PlayInput {
+            trace_id: None,
             token: &token,
             track_id: "track-t1",
             range: None,
@@ -1890,6 +1932,7 @@ mod tests {
             let mut meter = crate::meter::MemoryMeter::default();
             let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
             let input = PlayInput {
+                trace_id: None,
                 token,
                 track_id: "t",
                 range: None,
@@ -2225,6 +2268,7 @@ mod tests {
             cipher_key: 0,
             now_unix: 1,
             up_next: None,
+            trace_id: None,
         };
         let mut response = play(&mut pool, &mut cache, &mut meter, secret, &input).unwrap();
         assert!(response.cache_hit);
@@ -2258,6 +2302,7 @@ mod tests {
         let mut meter = crate::meter::MemoryMeter::default();
         let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
         let input = PlayInput {
+            trace_id: None,
             token: &token,
             track_id: "track-swr",
             range: None,
@@ -2305,6 +2350,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
         let segments = vec!["a-seg0@synthetic.test".to_string()];
         let input = PlayInput {
+            trace_id: None,
             token: &token,
             track_id: "track-a",
             range: None,
@@ -2411,5 +2457,132 @@ mod tests {
         assert_eq!(covering_segment(&ranges, 9), 0);
         assert_eq!(covering_segment(&ranges, 10), 1);
         assert_eq!(covering_segment(&ranges, 29), 2);
+    }
+
+    const TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
+
+    fn traced_input<'a>(
+        token: &'a str,
+        track_id: &'a str,
+        addr: SocketAddr,
+        segments: &'a [String],
+        trace_id: Option<&'a str>,
+    ) -> PlayInput<'a> {
+        PlayInput {
+            token,
+            track_id,
+            range: None,
+            server_addr: addr,
+            segments,
+            segment_ranges: None,
+            cipher_key: 0,
+            now_unix: 1,
+            up_next: None,
+            trace_id,
+        }
+    }
+
+    #[test]
+    fn trace_id_threads_through_the_cache_hit_path() {
+        let secret = b"s";
+        let token = grant::issue("u", "track-a", 1 + grant::MAX_GRANT_TTL, secret);
+        let mut pool = Pool::new(1);
+        let mut cache = ContentCache::new();
+        cache.put_track("track-a", vec![1, 2, 3, 4]);
+        let mut meter = crate::meter::MemoryMeter::default();
+        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+        let input = traced_input(&token, "track-a", addr, &[], Some(TRACE));
+        let resp = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("hit play");
+        assert!(resp.cache_hit);
+        assert_eq!(resp.trace_id.as_deref(), Some(TRACE));
+        assert_eq!(resp.stream.trace_id(), Some(TRACE));
+        // AE rows are unchanged: no trace field, legacy event set intact.
+        assert!(meter.has_kind(MeterKind::PlayStart));
+        assert!(meter.has_kind(MeterKind::CacheHit));
+        let row = &meter.events[0];
+        assert_eq!(row.user_id, "u");
+        assert_eq!(row.track_id, "track-a");
+        assert_eq!(row.bytes, 0);
+    }
+
+    #[test]
+    fn invalid_trace_is_dropped_never_logged() {
+        let secret = b"s";
+        let token = grant::issue("u", "track-a", 1 + grant::MAX_GRANT_TTL, secret);
+        let mut pool = Pool::new(1);
+        let mut cache = ContentCache::new();
+        cache.put_track("track-a", vec![1, 2, 3, 4]);
+        let mut meter = crate::meter::MemoryMeter::default();
+        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+        for bad in [
+            Some("too-short"),
+            Some("9F3A4C2E1B5D4F6A8C7E9D0B1A2F4E6C"),
+            Some("Bearer abc123"),
+        ] {
+            let input = traced_input(&token, "track-a", addr, &[], bad);
+            let resp = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("hit play");
+            assert_eq!(resp.trace_id, None, "invalid trace must not survive");
+            assert_eq!(resp.stream.trace_id(), None);
+            // The invalid value never reaches a renderable envelope.
+            assert!(
+                crate::trace::normalize_trace_id(bad).is_none(),
+                "invalid trace must not normalize"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_trace_runs_untraced() {
+        let secret = b"s";
+        let token = grant::issue("u", "track-a", 1 + grant::MAX_GRANT_TTL, secret);
+        let mut pool = Pool::new(1);
+        let mut cache = ContentCache::new();
+        cache.put_track("track-a", vec![1, 2, 3, 4]);
+        let mut meter = crate::meter::MemoryMeter::default();
+        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+        let input = traced_input(&token, "track-a", addr, &[], None);
+        let resp = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("hit play");
+        assert_eq!(resp.trace_id, None);
+        assert_eq!(resp.stream.trace_id(), None);
+    }
+
+    #[test]
+    fn aborted_hit_stream_keeps_its_trace_in_the_orphan() {
+        let secret = b"s";
+        let token = grant::issue("u", "track-a", 1 + grant::MAX_GRANT_TTL, secret);
+        let mut pool = Pool::new(1);
+        let mut cache = ContentCache::new();
+        cache.put_track("track-a", vec![0u8; 40_000]);
+        let mut meter = crate::meter::MemoryMeter::default();
+        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+        let input = traced_input(&token, "track-a", addr, &[], Some(TRACE));
+        let resp = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("hit play");
+        let mut stream = resp.stream;
+        assert!(stream.next().is_some(), "serve at least one chunk");
+        stream.abort(&mut pool);
+        let orphaned = pool.take_orphaned();
+        assert_eq!(orphaned.len(), 1);
+        assert_eq!(orphaned[0].track_id, "track-a");
+        assert_eq!(orphaned[0].trace_id.as_deref(), Some(TRACE));
+        assert!(orphaned[0].bytes > 0);
+    }
+
+    #[test]
+    fn trace_never_changes_authorization_or_pool_decisions() {
+        // Same rejected grant with and without a trace: identical outcome,
+        // and a rejected play never touches the pool.
+        let secret = b"s";
+        let mut pool = Pool::new(1);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+        for trace in [None, Some(TRACE)] {
+            let input = traced_input("not-a-token", "t", addr, &[], trace);
+            assert!(matches!(
+                play(&mut pool, &mut cache, &mut meter, secret, &input),
+                Err(PlayError::Unauthorized(GrantError::Malformed))
+            ));
+        }
+        assert_eq!(pool.connects(), 0);
     }
 }

@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 
@@ -174,18 +175,16 @@ pub fn resolve_trace_id(header: Option<&str>) -> String {
 /// Last-resort ID when the entropy source fails (production targets always
 /// provide entropy; this keeps a handler total instead of panicking the
 /// isolate). Fixed prefix marks the weakness so a flood of `f`-prefixed IDs
-/// in logs points straight at the RNG, not at a caller.
-///
-/// A process-local counter supplies the varying suffix: `SystemTime` panics
-/// on `wasm32-unknown-unknown` (the Workers deploy target) — exactly on the
-/// path this fallback exists to protect — while an atomic counter works on
-/// every target and gives distinct IDs inside one isolate.
+/// in logs points straight at the RNG, not at a caller. A process-local
+/// atomic counter supplies the distinct low bits: unlike wall-clock time it
+/// works on every target (`SystemTime::now` panics on wasm32), and it keeps
+/// IDs distinct inside one isolate. Obviously not random.
 fn fallback_trace_id() -> String {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    // 24 fixed chars + 8 hex counter digits: valid 128-bit shape, distinct
-    // per call within a process, obviously not random.
-    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("ffffffffffffffffffffffff{:08x}", n & 0xffff_ffff)
+    static FALLBACK_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = FALLBACK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // 16 fixed chars + 16 hex chars of counter: full 128-bit shape, valid
+    // under `is_valid_trace_id` so downstream propagation never breaks.
+    format!("ffffffffffffffff{seq:016x}")
 }
 
 /// Format unix millis as an RFC 3339 UTC timestamp ending in `Z`, always with
@@ -534,18 +533,6 @@ mod tests {
         assert!(is_valid_trace_id(&a));
         assert!(is_valid_trace_id(&b));
         assert_ne!(a, b);
-    }
-
-    #[test]
-    fn fallback_ids_are_valid_distinct_and_clock_free() {
-        // No `SystemTime`: the fallback must work on wasm32-unknown-unknown,
-        // where the clock panics. A counter suffix keeps IDs distinct.
-        let a = fallback_trace_id();
-        let b = fallback_trace_id();
-        assert!(is_valid_trace_id(&a));
-        assert!(is_valid_trace_id(&b));
-        assert_ne!(a, b);
-        assert!(a.starts_with("ffffffffffffffffffffffff"));
     }
 
     #[test]

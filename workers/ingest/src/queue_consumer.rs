@@ -1387,13 +1387,25 @@ async fn process_raw_message(env: &Env, raw: worker::RawMessage) {
             return;
         }
     };
-    let msg = match serde_json::from_value::<QueueMsg>(value) {
+    let mut msg = match serde_json::from_value::<QueueMsg>(value) {
         Ok(msg) => msg,
         Err(_) => {
             retry_raw(&raw, UNPERSISTED_RETRY_SECS);
             return;
         }
     };
+    // The route stamped this job's trace on the message; keep a valid ID so
+    // the consumer's line correlates with the intake lines, and hand a valid
+    // ID to any continuation this delivery enqueues. An invalid value is
+    // replaced, never trusted or logged. Only opaque job facts enter the line.
+    let trace_id = nntune_logging::resolve_trace_id(msg.trace_id.as_deref());
+    msg.trace_id = Some(trace_id.clone());
+    crate::emit(
+        nntune_logging::Level::Info,
+        &trace_id,
+        "ingest.job.consumed",
+        serde_json::json!({"job_id": msg.job_id}),
+    );
     match process_message(env, &msg).await {
         Settlement::Ack => raw.ack(),
         // `process_message` resolves a continuation into Ack (fresh copy
