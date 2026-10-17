@@ -74,8 +74,12 @@ export function isAccessWall(probe: WallProbe): boolean {
     probe.status === 302 && /cloudflareaccess\.com|\/cdn-cgi\/access/i.test(location);
   const wallStatus =
     probe.status === 401 || probe.status === 403 || probe.status === 302 || redirectToAccess;
+  // Access-specific response markers only. Generic edge-challenge
+  // markers (`cf-mitigated`, `cf_clearance`) are deliberately excluded: a
+  // bot-management/WAF challenge is not proof of Access enforcement, and
+  // accepting it would let anonymous checks pass without Access in play.
   const hasMarkers =
-    /cf-access|cf_authorization|cf-mitigated|cf_clearance/i.test(headerDump) ||
+    /cf-access|cf_authorization/i.test(headerDump) ||
     /cloudflare.?access/i.test(headerDump) ||
     /cloudflare.?access/i.test(probe.bodyText) ||
     /<title>\s*Access/i.test(probe.bodyText) ||

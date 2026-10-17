@@ -292,6 +292,22 @@ test.describe('isAccessWall / assertAccessWall (anonymous denial)', () => {
     ).toThrow(/expected Cloudflare Access denial/);
   });
 
+  test('a generic Cloudflare challenge without Access markers is NOT an Access denial', () => {
+    // Regression pin: `cf-mitigated` / `cf_clearance` are generic
+    // edge-challenge markers, not Access-specific. A 403 carrying only
+    // them must not pass as proof of Access enforcement.
+    const probe = {
+      status: 403,
+      headers: { 'cf-mitigated': 'challenge' },
+      bodyText: '<title>Just a moment...</title>',
+      url: 'https://staging.example/api/health',
+    };
+    expect(isAccessWall(probe)).toBe(false);
+    expect(() => assertAccessWall(probe, 'health-anonymous')).toThrow(
+      /expected Cloudflare Access denial/,
+    );
+  });
+
   test('a plain app 302 without markers is NOT Access-specific denial', () => {
     expect(() =>
       assertAccessWall(
