@@ -28,13 +28,13 @@ metering primitives below are built to support them from day one.
 | Config | **KV** |
 | Usage enforcement (designed) | **Postgres** daily flow ledger and live cache-grant gauge; pool Durable Object leases for concurrency (`docs/adr/0009-stack.md:30`, pool semantics in `docs/adr/0004-plan-matrix.md`) |
 | Observability | **Analytics Engine**, sampled telemetry only — never a billing/cap authority (`docs/adr/0009-stack.md:31`) |
+| Batch only | **Containers** — MusicBrainz import, par2 repair (everything interactive stays serverless) |
 
 This is the accepted design (`docs/adr/0009-stack.md:3`), not deployed
 billing evidence: plan prices are launch proposals, not permission to
 activate live billing (`docs/adr/0004-plan-matrix.md:12-13`). The decided
 subscription mechanism lives in `docs/adr/0005-billing.md`; no vendor is
 chosen or changed here.
-| Batch only | **Containers** — MusicBrainz import, par2 repair (everything interactive stays serverless) |
 
 ```text
 crates/nntune-core   # NNTP client, SIMD yEnc, NZB, decrypt, par2-verify (wasm32 + native)
@@ -89,11 +89,11 @@ cargo test --workspace
 # carries a committed lockfile: Cargo.lock plus workers/{api,ingest,mb,
 # repair}/Cargo.lock, apps/web/pnpm-lock.yaml, e2e/package-lock.json).
 # Committed lockfiles are not the same as --locked enforcement: the
-# cargo-deny lane proves all five Cargo lockfiles fresh
-# (.github/workflows/ci.yml:114-118), but only the api lane passes --locked
-# to test/clippy/check (.github/workflows/ci.yml:282-287); the mb, ingest
-# and repair lanes resolve without --locked (.github/workflows/ci.yml:374,
-# 415, 437).
+# cargo-deny job's `Prove committed lockfiles are fresh` step proves all
+# five Cargo lockfiles fresh (.github/workflows/ci.yml), but only the api
+# job passes --locked to test/clippy/check (.github/workflows/ci.yml);
+# the rust (workers/mb), rust (workers/ingest) and rust (workers/repair)
+# jobs resolve without --locked (.github/workflows/ci.yml).
 cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets
 cargo test --manifest-path workers/mb/Cargo.toml --all-targets
 cargo test --manifest-path workers/ingest/Cargo.toml --all-targets
