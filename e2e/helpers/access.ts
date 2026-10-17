@@ -70,7 +70,13 @@ export function isStagingOrigin(requestUrl: string, baseURL: string): boolean {
  * scrubbed from public artifacts, and URLs can carry secret-bearing
  * components), matching the redirect diagnostics in accounts.ts.
  */
-export function assertNoAccessWall(probe: WallProbe, context: string): void {
+/**
+ * The shared Access-wall predicate: a wall-status code (401/403/302)
+ * TOGETHER WITH Access markers. Status and markers are checked jointly so a
+ * legitimate app 401/403, a plain app redirect, or a 200 app shell is never
+ * classified as the wall (and a wall is never classified as the app).
+ */
+export function isAccessWall(probe: WallProbe): boolean {
   const headerDump = Object.entries(probe.headers)
     .map(([k, v]) => `${k}: ${v}`)
     .join('\n');
@@ -85,12 +91,38 @@ export function assertNoAccessWall(probe: WallProbe, context: string): void {
     /cloudflare.?access/i.test(probe.bodyText) ||
     /<title>\s*Access/i.test(probe.bodyText) ||
     redirectToAccess;
-  if (wallStatus && hasMarkers) {
+  return wallStatus && hasMarkers;
+}
+
+export function assertNoAccessWall(probe: WallProbe, context: string): void {
+  if (isAccessWall(probe)) {
     throw new Error(
       `[${context}] hit the Cloudflare Access wall ` +
         `(HTTP ${probe.status}). Set CF_ACCESS_CLIENT_ID + ` +
         'CF_ACCESS_CLIENT_SECRET for a QA service token with staging access. ' +
         'See e2e/README.md. No secret values are logged here by design.',
+    );
+  }
+}
+
+/**
+ * Inverse of assertNoAccessWall, for the anonymous (no-credentials) probe:
+ * passes ONLY when the response IS the Access wall under the same joint
+ * predicate, proving Access denies unauthenticated traffic. Anything else —
+ * a 200 app shell, a plain app 401/403, a plain app redirect — is NOT denial
+ * proof and throws. Like assertNoAccessWall, the error names only the fixed
+ * context and status: the probe URL, headers and body are never
+ * interpolated, so no origin, cookie or response content can leak into CI
+ * output from an unauthenticated response.
+ */
+export function assertAccessWall(probe: WallProbe, context: string): void {
+  if (!isAccessWall(probe)) {
+    throw new Error(
+      `[${context}] anonymous request was NOT denied by the Cloudflare Access wall ` +
+        `(HTTP ${probe.status} without joint Access status+markers): the response ` +
+        'may be the application itself — Access enforcement against ' +
+        'unauthenticated traffic is not proven. No URL, headers, cookies or ' +
+        'body are logged here by design. See e2e/README.md.',
     );
   }
 }
