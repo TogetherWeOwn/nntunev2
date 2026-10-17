@@ -13,6 +13,9 @@
   step-up complete lock-then-verify so failed attempts increment to the cap;
   fix delete-ops container typing, public-playlist metadata rule, merged playlist
   SQL rework list, and passkey-uv assertion verification.
+- **Revised:** 2026-10-17 — bound playlist migration work to safe pre-cutover
+  preparations and one atomic migration/backfill/read-write cutover PR; state the
+  one-day limit and required fixtures/checks without permitting partial cutovers.
 - **Baseline inspected:** main `553902652cc8f5bea149c3a1bfbc55725ce5f757`
   (includes `migrations/0001_mb_mirror.sql`, `0002_auth_vault.sql` and
   `0003_library.sql` via #28 plus `workers/api/src/library.rs` playlist
@@ -1463,6 +1466,96 @@ work. Production DB creation/migration remains gated by the ops contract.
   visibility, mutation-lookup shape, delete path) in lockstep — the narrowed
   projection and fenced delete are breaking changes against those tests, not
   silent drift.
+- **Playlist migration slice boundary (implementation plan):** the cutover is one
+  indivisible implementation PR, not separate schema, backfill, read, or write
+  deployments. It must carry the forward migration (`deleting_at` plus
+  `playlist_tracks` only), the opaque-reference resolution/backfill, legacy
+  `items` write freeze, owner-only legacy reads, `/v1` read/write/delete paths,
+  entry-count projection, deletion fencing/executor integration, and the
+  corresponding acceptance-test changes. The current `items` column remains the
+  temporary source of owner reads and non-owner public-playlist counts until that
+  PR's commit boundary; in the same atomic cutover those reads/counts switch to
+  `playlist_tracks`. There is no dual-write, mixed count, partial backfill, or
+  deployable intermediate schema. Preserve `playlists.id BIGSERIAL` as the
+  internal FK target and `public_id TEXT` as the only external handle; never
+  recreate `playlists`, rewrite `0003_library.sql`, guess unresolved refs, or
+  expose legacy `items`/track metadata to non-owners.
+
+  **One-day limit:** the complete cutover cannot currently be credibly bounded to
+  one implementation day. It changes existing write statements and API routing,
+  read projections, the restrictive-FK delete path, the owner/container fences,
+  and a data-dependent backfill in one coordinated cutover boundary; it must also update
+  the existing exact-SQL and visibility pins and prove migration upgrade behavior
+  against the applied 0003 shape. Splitting any of those into a deployed PR would
+  break the atomicity contract above. Therefore this plan schedules no partial
+  cutover implementation PR. First land only these independent, at-most-one-day
+  preparations; estimate the single cutover only after they pass. If the atomic
+  cutover still exceeds one day, keep it unscheduled and identify additional
+  non-behavioral preparation rather than splitting its PR or weakening atomicity.
+
+  The repository already has `migrations/manifest.toml` plus `migrations-gate`
+  checks for ordering, explicit app/mirror targets, checksums and drift; `api-migrations`
+  applies the current SQL to an empty throwaway database and checks replay safety.
+  These are existing safeguards, not new work. The current migration test does
+  not seed and upgrade a populated applied-0003 playlist shape, so only these
+  independent preparations are safe before the atomic cutover:
+
+  1. **Applied-shape rehearsal fixture and harness (≤1 day; no playlist cutover).**
+     Extend the migration test harness to build a synthetic app database from
+     the app-targeted 0002 auth and 0003 library migrations, seed representative
+     playlist rows after 0003, then apply the already-existing later app
+     migrations and assert playlist columns, internal BIGSERIAL ids, external
+     `public_id`s, owner, order, `items`, and visibility flags remain unchanged.
+     Include a separate mirror-target assertion against `migrations/manifest.toml`; reuse
+     `migrations-gate` for ordering/checksum/drift checks and run the existing
+     `api-migrations` gate (`workers/api/tests/run_migration_tests.sh`) for the
+     empty-database path. No future playlist migration is introduced in this
+     slice. Safeguards: synthetic data and throwaway DB only; no production or
+     staging DB access, no edit/move of applied migrations, explicit app/mirror
+     manifest targets, and checksum gate remains required. This proves the
+     starting point without releasing a new playlist schema or read path.
+
+  2. **Legacy-data fixture package (≤1 day; fixtures only, no runtime/schema or
+     acceptance-test edits by the implementation author).** Have the Test Author
+     prepare deterministic, non-production fixture inputs representing: an
+     owner playlist with all opaque refs resolvable; a mixed resolved/unresolved
+     `items` array; an all-unresolved array; empty items; a public playlist with
+     owner-local tracks; repeated refs/order; and distinct internal BIGSERIAL ids
+     versus 22-character `public_id`s. The fixture must encode expected owner
+     reads, non-owner metadata/count only, resolvable entry order, and unresolved
+     owner-only legacy remainder without asserting guessed tracks. Acceptance
+     checks are fixture-schema validation plus the existing
+     `library_single_row_visibility.rs` and `library_tests.rs` baseline unchanged.
+     Safeguards: synthetic identifiers/data only; no staging or production dump,
+     SQL execution, data mutation, schema change, behavior change, or edits to
+     Test Author-owned acceptance tests by the implementation author. This slice
+     only supplies inputs for the later atomic PR; it does not release reads.
+
+  3. **Single atomic playlist cutover PR (≤1 day, hard ceiling; not yet estimated
+     as fitting).** After both preparations, the implementation owner must either
+     demonstrate a one-day estimate for the complete scope above or leave this
+     implementation unscheduled and add only further safe preparations. Required
+     acceptance fixtures/checks in that PR: the complete fixture package from
+     slice 2; owner/public/private/unknown and unauthenticated read/list cases;
+     visible public metadata with no non-owner `items`, entries, catalog ids, tags,
+     or cover-art ids; owner-only unresolved legacy reads; count equivalence for
+     fully resolvable lists at the freeze boundary; migration/backfill idempotence
+     and before/after row-count/order reconciliation; duplicate and unresolved ref
+     handling; write rejection or canonical route for legacy `items`; concurrent
+     writer-versus-delete fence; DELETE returning 202 and resuming through the
+     durable executor; RESTRICT FK/source cleanup; plus the existing exact SQL
+     pins and visibility tests in `workers/api/tests/library_single_row_visibility.rs`
+     and `workers/api/tests/library_tests.rs` updated in lockstep. Forward-only
+     safeguards: allocate one new unique top-level migration number after 0008,
+     target app DB explicitly, require the runner's per-DB checksum/drift gates,
+     retain all 0003 playlist rows and existing columns until the same PR's
+     coordinated migration/backfill/read-write cutover passes parity checks; add
+     only the specified nullable marker and new entry table, preserve
+     restrictive FKs, and drop legacy `items` only in a later separately reviewed
+     forward migration after verified parity/retention criteria. Never edit an
+     applied migration, `CREATE TABLE playlists`, dual-write, count from both
+     stores, reverse/rollback by destructive DDL, or test against production.
+
 - **Ingest manifest producer (new alignment work):** the current parser's flat
   `ParsedNzb.message_ids` and `LibraryWrite.recording_mbids` arrays do not contain
   the per-file selection, grouping or occurrence data above. Preserve NZB file
