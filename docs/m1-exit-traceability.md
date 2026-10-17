@@ -5,12 +5,12 @@ explicit gap. M1 exits when the secure staging user journey
 (signup → BYOP → ingest → play/seek) passes on an exact-head staging deploy
 with Access enabled, and rollback evidence is recorded.
 
-Verified against the `e2e/` tree at `1ef120d` plus the browser-playback
-spec added on top of it, on 2026-10-17:
-`npm --prefix e2e run e2e:list` lists 187 tests in 11 files. Line numbers
-below are from that head; re-verify with the commands at the end of this
-document whenever a spec is added, renamed, or retitled, and update this
-matrix in the same PR.
+Verified against the tree at `17c061c`, on 2026-10-17:
+`npm --prefix e2e run e2e:list` lists 200 tests in 11 files, and
+`(cd apps/web && pnpm exec playwright test --list)` lists 86 tests in
+18 files. Line numbers below are from that head; re-verify with the
+commands at the end of this document whenever a spec is added, renamed,
+or retitled, and update this matrix in the same PR.
 
 ## Reading the statuses
 
@@ -51,6 +51,29 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   offline self-tests (wall detection, credential scope, workflow
   preflights, artifact sanitization). They run in the `e2e-lint` CI job on
   every PR and keep the harness honest, but produce no staging evidence.
+  The offline `e2e/tests/account-identity.spec.ts`,
+  `e2e/tests/byop-tls-setting.spec.ts`,
+  `e2e/tests/byop-transport.spec.ts`, and
+  `e2e/tests/redirect-diagnostics.spec.ts` specs likewise pin harness
+  contracts and produce no staging evidence:
+  - `account-identity.spec.ts` — pins the account-identity contract:
+    seam mint validation (no fabricated email, names-only errors), the
+    account guard passing only on a nonblank minted session (the QA seam
+    token alone never satisfies it), and per-account bearer headers with
+    no cross-account or QA-token leakage.
+  - `byop-tls-setting.spec.ts` — pins malformed `SYNTHETIC_NNTP_TLS`
+    spellings (`false`/`0`/`no`/`true`/`yes`/`maybe`/blank) rejected with
+    a names-only diagnostic instead of silently treated as TLS-on.
+  - `byop-transport.spec.ts` — pins BYOP transport fidelity: the port
+    allowlist (119/563), TLS-off fixture config rejected before any page
+    interaction, the TLS checkbox explicitly set and verified (a missing,
+    unusable, or unsettable control fails before any test/save
+    submission), and the supported TLS-on transports keep working.
+  - `redirect-diagnostics.spec.ts` — pins credentialed redirect
+    diagnostics never echoing request/Location URL components or
+    credential values, staying actionable (caller context, category,
+    status, secret names only), with no-follow unchanged
+    (`maxRedirects: 0`, no foreign-origin follow).
 - The `apps/web/tests/` offline specs below run in the `web-e2e` CI job
   on every PR with all network traffic intercepted and fulfilled locally.
   They pin product behavior outside the M1 exit list and produce no
@@ -86,6 +109,44 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
     sign-out invalidating library snapshots across tabs (logout, revoke-all,
     and confirmed 401 clear stored snapshots; 500/transport failure claims
     nothing and clears nothing).
+  - `apps/web/tests/account-security.spec.ts` — pins revoke-all asking
+    for confirmation before revoking and redirecting after success,
+    per-session sign-out, and failure/401 handling staying on the page
+    with a notice.
+  - `apps/web/tests/billing-signed-out.spec.ts` — pins a signed-out
+    billing visitor reaching sign-in via the Sign in link, with no
+    billing actions shown.
+  - `apps/web/tests/library-duplicate-ids.spec.ts` — pins duplicate-id
+    library responses rendering unique rows with no page error, refresh
+    still working afterwards, the stale fallback staying unique, and a
+    seeded duplicate snapshot never rendering before session
+    verification.
+  - `apps/web/tests/media-session-artwork-errors.spec.ts` — pins a
+    MediaMetadata construction failure not stranding Media Session
+    controls, surfacing no page error, and leaving the queue healthy
+    (plus a no-failure positive control).
+  - `apps/web/tests/paywall.spec.ts` — pins 402/429 limit responses
+    showing the paywall modal with an upgrade CTA (no dead-end error, no
+    duplicate inline alert) and firing the `usage_limit_paywall_shown`
+    analytics event with no PII; the upgrade CTA closes the modal before
+    navigating.
+  - `apps/web/tests/plan-limit-paywall-smoke.spec.ts` — pins mocked 402
+    and 429 checkouts keeping the pricing trial-signup and current-usage
+    actions resolving to real routes.
+  - `apps/web/tests/pricing-blurb-contrast.spec.ts` — pins pricing plan
+    blurbs meeting 4.5:1 contrast in light and dark modes, computed from
+    rendered colors rather than source hex values.
+  - `apps/web/tests/security-headers.spec.ts` — pins public pages sending
+    HSTS/nosniff/DENY/no-referrer plus permissions-policy with no CSP
+    violations.
+  - `apps/web/tests/signup-paywall.spec.ts` — pins the signup start limit
+    showing the paywall without a duplicate inline alert, and the finish
+    limit preserving the code and challenge for retry.
+  - `apps/web/tests/smoke.spec.ts` — pins the landing BYOP copy with
+    working signup/pricing CTAs, the health/readiness endpoints,
+    contract routes rendering their e2e hooks, signup/login/magic-link
+    basics, and the provider wizard steps (allowlist ports, TLS-off
+    acknowledgement, save gated on a passing connection test).
 
 ## Re-verifying this matrix
 
