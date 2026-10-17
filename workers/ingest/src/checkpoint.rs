@@ -153,11 +153,11 @@ pub async fn get(env: &Env, job_id: &str) -> Result<Option<JobCheckpoint>> {
 pub async fn put(env: &Env, checkpoint: &JobCheckpoint) -> Result<()> {
     let key = checkpoint_key(&checkpoint.job_id)
         .ok_or_else(|| worker::Error::RustError("invalid job id".into()))?;
-    put_json(env, &key, &serde_json::to_string(checkpoint)?).await
+    put_json(env, key, &serde_json::to_string(checkpoint)?).await
 }
 
 /// The one KV write helper behind every key this module stores.
-async fn put_json(env: &Env, key: &str, json: &str) -> Result<()> {
+async fn put_json(env: &Env, key: String, json: &str) -> Result<()> {
     let store = env.kv(STATE_KV_BINDING)?;
     store
         .put(&key, json.to_string())?
@@ -189,7 +189,7 @@ pub async fn get_verify(env: &Env, job_id: &str) -> Result<Option<VerifyProgress
 pub async fn put_verify(env: &Env, job_id: &str, progress: &VerifyProgress) -> Result<()> {
     let key =
         verify_key(job_id).ok_or_else(|| worker::Error::RustError("invalid job id".into()))?;
-    put_json(env, &key, &serde_json::to_string(progress)?).await
+    put_json(env, key, &serde_json::to_string(progress)?).await
 }
 
 #[cfg(test)]

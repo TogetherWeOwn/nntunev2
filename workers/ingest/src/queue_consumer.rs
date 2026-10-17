@@ -25,11 +25,14 @@
 //! ([`crate::checkpoint::admission_plan`]), never here, so redeliveries
 //! of one enqueue cannot resurrect it.
 //!
-//! No live runtime boundary is claimed: indexer search, pool probe,
-//! verify, repair, match and write steps have no executable consumer
-//! wiring yet, so those states settle as transient failures through the
-//! shared retry budget. The consumer therefore stays disabled in
-//! `wrangler.toml.example` until those boundaries land.
+//! Runtime boundaries: the pool probe (`Probing`, via
+//! [`crate::pool_probe`]) and the Verifying step (`Verifying`, via
+//! [`crate::verify`] over [`crate::pool_body`] and the scratch bucket)
+//! are executable for upload jobs. Indexer search, repair, match and
+//! write still have no executable consumer wiring, so those states
+//! settle as transient failures through the shared retry budget. The
+//! consumer therefore stays disabled in `wrangler.toml.example` until
+//! those boundaries land.
 
 use worker::{console_log, Env, MessageExt, QueueRetryOptionsBuilder};
 
@@ -41,11 +44,19 @@ use crate::jobs::{
     MAX_REPAIR_ROUNDS,
 };
 use crate::newznab::{MAX_CATEGORIES, MAX_LIMIT, MAX_PAGE};
+use crate::parse::{ParsedFile, ParsedNzb};
+use crate::pool_body::{build_body_request, call_pool_body, BodyFetch, PoolBodyError};
+use crate::pool_probe::{call_pool_probe, PoolProbeError};
+use crate::probe::{build_probe_request_with_ranges, ProbeTally};
 use crate::queue::{validate_indexer_ref, QueueMsg};
 use crate::retry::{
     decide_checkpoint, Disposition, DlqEntry, JobError, DLQ_QUEUE_BINDING, ERR_MATCH_FAILED,
     ERR_PARSE_FAILED, ERR_PAYLOAD_MISSING, ERR_PROBE_FAILED, ERR_REPAIR_FAILED, ERR_SEARCH_FAILED,
     ERR_VERIFY_FAILED, ERR_WRITE_FAILED,
+};
+use crate::verify::{
+    BodySource, ScratchStore, StagedFile, VerifyCaps, VerifyError, VerifyOutcome, VerifyProgress,
+    SCRATCH_BINDING,
 };
 
 /// Payload reads use KV's minimum `cacheTtl` (30 s) so an edge-cached miss
@@ -54,6 +65,14 @@ const PAYLOAD_CACHE_TTL_SECS: u64 = 30;
 /// Delay for settlements that could not be persisted or quarantined: the
 /// next delivery redoes the (idempotent) step with the checkpoint as-is.
 const UNPERSISTED_RETRY_SECS: u32 = 5;
+
+/// Probe batches called per delivery; the tally in the checkpoint makes
+/// the rest resumable on the next delivery.
+const MAX_PROBE_BATCHES_PER_DELIVERY: usize = 4;
+
+/// Wall-clock budget for one Verifying delivery; the step checkpoints
+/// per file and resumes on redelivery past this.
+const VERIFY_WALL_CLOCK_BUDGET_MS: u64 = 20_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Settlement {
@@ -151,28 +170,63 @@ fn unavailable_code(state: JobState) -> &'static str {
 
 /// Run the executable part of one delivery, mutating `cp` in memory only.
 ///
-/// Uploads in `Parsing` fetch and digest-check the payload, run the intake
-/// guard and the shared parser, and advance to `Probing` on success — then
-/// still report the (not yet wired) probe boundary as a transient failure,
-/// so the delivery settles through the shared retry budget instead of
-/// claiming progress it cannot finish. Every other non-terminal state is
-/// a transient boundary failure today.
+/// Upload jobs run `Parsing` (digest-check + shared parser), `Probing`
+/// (pool STAT batches folded into the checkpoint tally) and `Verifying`
+/// (pool BODY fetch + par2 verify + scratch staging). A step that
+/// advances the state still settles transiently, so the next delivery
+/// runs the next state — progress is only ever claimed through the
+/// persisted checkpoint. Every other non-terminal state (and every
+/// search-source state past `Queued`) is a transient boundary failure
+/// today.
 async fn run_step(env: &Env, msg: &QueueMsg, cp: &mut JobCheckpoint) -> Result<(), JobError> {
     if cp.state == JobState::Queued {
         advance_checkpoint(cp, false);
     }
-    if !(cp.state == JobState::Parsing && cp.source == JobSource::NzbUpload) {
+    if cp.source != JobSource::NzbUpload
+        || !matches!(
+            cp.state,
+            JobState::Parsing | JobState::Probing | JobState::Verifying
+        )
+    {
         return Err(JobError::transient(
             unavailable_code(cp.state),
             "ingest runtime boundary unavailable",
         ));
     }
+    let (parsed, files) = load_upload_parse(env, msg).await?;
+    match cp.state {
+        JobState::Parsing => {
+            if crate::parse::probe_batches(&parsed).is_empty() {
+                return Err(JobError::permanent(
+                    ERR_PARSE_FAILED,
+                    "NZB has no segments to probe",
+                ));
+            }
+            advance_checkpoint(cp, false);
+            Err(JobError::transient(ERR_PROBE_FAILED, "probing pending"))
+        }
+        JobState::Probing => run_probing(env, msg, cp, &parsed).await,
+        JobState::Verifying => run_verifying(env, msg, cp, &files).await,
+        _ => unreachable!("state filtered above"),
+    }
+}
+
+/// Fetch and digest-check the upload payload, then run the intake guard
+/// and both shared-parser projections (flat for the probe, per-file for
+/// Verifying). Nothing is persisted: every delivery re-derives the parse
+/// from the payload KV, so the parse can never disagree with the bytes
+/// the digest pins.
+async fn load_upload_parse(
+    env: &Env,
+    msg: &QueueMsg,
+) -> Result<(ParsedNzb, Vec<ParsedFile>), JobError> {
     let Some(payload_ref) = msg.payload_ref.as_deref() else {
         return Err(JobError::permanent(
             ERR_PAYLOAD_MISSING,
             "upload payload handle missing",
         ));
     };
+    let unavailable = || JobError::transient(ERR_PAYLOAD_MISSING, "upload payload unavailable");
     let payload = match env.kv(PAYLOAD_KV_BINDING) {
         Ok(store) => match store
             .get(payload_ref)
@@ -181,26 +235,15 @@ async fn run_step(env: &Env, msg: &QueueMsg, cp: &mut JobCheckpoint) -> Result<(
             .await
         {
             Ok(Some(payload)) => payload,
-            Ok(None) => {
-                return Err(JobError::transient(
-                    ERR_PAYLOAD_MISSING,
-                    "upload payload unavailable",
-                ))
-            }
+            Ok(None) => return Err(unavailable()),
             Err(error) => {
                 console_log!("ingest payload read failed: {:?}", error);
-                return Err(JobError::transient(
-                    ERR_PAYLOAD_MISSING,
-                    "upload payload unavailable",
-                ));
+                return Err(unavailable());
             }
         },
         Err(error) => {
             console_log!("ingest payload binding unavailable: {:?}", error);
-            return Err(JobError::transient(
-                ERR_PAYLOAD_MISSING,
-                "upload payload unavailable",
-            ));
+            return Err(unavailable());
         }
     };
     if payload_ref
@@ -219,17 +262,328 @@ async fn run_step(env: &Env, msg: &QueueMsg, cp: &mut JobCheckpoint) -> Result<(
     })?;
     let parsed = crate::parse::parse_upload(payload.as_bytes(), &estimate)
         .map_err(|_| JobError::permanent(ERR_PARSE_FAILED, "shared NZB parser rejected payload"))?;
-    if crate::parse::probe_batches(&parsed).is_empty() {
+    let files = crate::parse::parse_upload_files(payload.as_bytes(), &estimate)
+        .map_err(|_| JobError::permanent(ERR_PARSE_FAILED, "shared NZB parser rejected payload"))?;
+    Ok((parsed, files))
+}
+
+/// `Probing`: call the pool for the next unreported batches (bounded per
+/// delivery) and fold answers into the checkpoint tally. The completed
+/// tally stays on the checkpoint into `Verifying` (the gap count is the
+/// probe's evidence; Verifying re-derives exact blocks from the bodies).
+async fn run_probing(
+    env: &Env,
+    msg: &QueueMsg,
+    cp: &mut JobCheckpoint,
+    parsed: &ParsedNzb,
+) -> Result<(), JobError> {
+    let batches = crate::parse::probe_batches_with_ranges(parsed);
+    if batches.is_empty() {
         return Err(JobError::permanent(
             ERR_PARSE_FAILED,
             "NZB has no segments to probe",
         ));
     }
-    advance_checkpoint(cp, false);
-    Err(JobError::transient(
-        ERR_PROBE_FAILED,
-        "pool probe runtime unavailable",
-    ))
+    let mut tally = cp
+        .probe_tally
+        .take()
+        .filter(|t| t.total_batches == batches.len())
+        .unwrap_or_else(|| ProbeTally::new(batches.len()));
+    let mut called = 0usize;
+    for (index, batch) in batches.iter().enumerate() {
+        if tally.missing_by_batch.contains_key(&index) {
+            continue;
+        }
+        if called >= MAX_PROBE_BATCHES_PER_DELIVERY {
+            break;
+        }
+        called += 1;
+        let pairs: Vec<(&str, Option<u64>)> = batch
+            .iter()
+            .map(|(id, bytes)| (id.as_str(), *bytes))
+            .collect();
+        let req = match build_probe_request_with_ranges(msg, index, &pairs) {
+            Ok(req) => req,
+            Err(_) => {
+                cp.probe_tally = Some(tally);
+                return Err(JobError::permanent(
+                    ERR_PROBE_FAILED,
+                    "probe envelope invalid",
+                ));
+            }
+        };
+        match call_pool_probe(env, &req).await {
+            Ok(outcome) => {
+                tally.record(&outcome);
+            }
+            Err(PoolProbeError::Retry { .. }) => {
+                cp.probe_tally = Some(tally);
+                return Err(JobError::transient(
+                    ERR_PROBE_FAILED,
+                    "pool probe unavailable",
+                ));
+            }
+            Err(PoolProbeError::Rejected) => {
+                cp.probe_tally = Some(tally);
+                return Err(JobError::permanent(
+                    ERR_PROBE_FAILED,
+                    "pool probe rejected the envelope",
+                ));
+            }
+        }
+    }
+    let complete = tally.is_complete();
+    cp.probe_tally = Some(tally);
+    if complete {
+        advance_checkpoint(cp, false);
+        Err(JobError::transient(ERR_VERIFY_FAILED, "verifying pending"))
+    } else {
+        Err(JobError::transient(ERR_PROBE_FAILED, "probing in progress"))
+    }
+}
+
+/// Map one verify outcome onto the checkpoint: advance on `Complete` and
+/// on a dispatched repair, never move the state otherwise (permanent
+/// step errors are failed by `decide_checkpoint`, which keeps the
+/// settlement persist planner seeing a non-terminal checkpoint). Pure
+/// over the checkpoint so the mapping is unit-tested without bindings.
+fn apply_verify_outcome(
+    msg: &QueueMsg,
+    cp: &mut JobCheckpoint,
+    outcome: VerifyOutcome,
+) -> Result<(), JobError> {
+    match outcome {
+        VerifyOutcome::Complete => {
+            // decide_repair is the single dispatch authority: zero
+            // missing blocks must come back `Ok(None)`.
+            match crate::repair::decide_repair(
+                &msg.job_id,
+                &msg.user_id,
+                &msg.idempotency_key,
+                "",
+                0,
+            ) {
+                Ok(None) => {}
+                _ => {
+                    return Err(JobError::permanent(
+                        ERR_VERIFY_FAILED,
+                        "repair decision rejected a complete verify",
+                    ))
+                }
+            }
+            cp.probe_tally = None;
+            advance_checkpoint(cp, false);
+            Err(JobError::transient(ERR_MATCH_FAILED, "matching pending"))
+        }
+        VerifyOutcome::RepairNeeded {
+            par2_set_id,
+            missing_blocks,
+        } => {
+            match crate::repair::decide_repair(
+                &msg.job_id,
+                &msg.user_id,
+                &msg.idempotency_key,
+                &par2_set_id,
+                missing_blocks,
+            ) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(JobError::permanent(
+                        ERR_VERIFY_FAILED,
+                        "repair decision skipped missing blocks",
+                    ))
+                }
+                Err(detail) => {
+                    return Err(JobError::permanent(ERR_VERIFY_FAILED, detail));
+                }
+            }
+            if cp.repair_rounds >= MAX_REPAIR_ROUNDS {
+                return Err(JobError::permanent(
+                    ERR_REPAIR_FAILED,
+                    "repair budget exhausted",
+                ));
+            }
+            cp.probe_tally = None;
+            advance_checkpoint(cp, true);
+            Err(JobError::transient(ERR_REPAIR_FAILED, "repair pending"))
+        }
+        VerifyOutcome::Unrecoverable { .. } => Err(JobError::permanent(
+            ERR_VERIFY_FAILED,
+            "release is missing blocks beyond par2 recovery",
+        )),
+        VerifyOutcome::Incomplete => Err(JobError::transient(
+            ERR_VERIFY_FAILED,
+            "verifying in progress",
+        )),
+    }
+}
+
+/// `Verifying`: run the verify driver over the pool body route and the
+/// scratch bucket, persist the per-file progress beside the checkpoint,
+/// then map the outcome onto the state machine.
+async fn run_verifying(
+    env: &Env,
+    msg: &QueueMsg,
+    cp: &mut JobCheckpoint,
+    files: &[ParsedFile],
+) -> Result<(), JobError> {
+    let loaded = match crate::checkpoint::get_verify(env, &msg.job_id).await {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            console_log!("ingest verify progress read failed: {:?}", error);
+            return Err(JobError::transient(
+                ERR_VERIFY_FAILED,
+                "verify progress unavailable",
+            ));
+        }
+    };
+    let mut progress = match loaded {
+        Some(progress) if progress.round == cp.repair_rounds => progress,
+        _ => VerifyProgress::new(cp.repair_rounds),
+    };
+    let bucket = match env.bucket(SCRATCH_BINDING) {
+        Ok(bucket) => bucket,
+        Err(error) => {
+            console_log!("ingest scratch binding unavailable: {:?}", error);
+            return Err(JobError::transient(
+                ERR_VERIFY_FAILED,
+                "scratch storage unavailable",
+            ));
+        }
+    };
+    let scratch = R2Scratch { bucket };
+    let mut source = PoolBodySource { env, msg };
+    let started_ms = worker::Date::now().as_millis();
+    let deadline = move || {
+        worker::Date::now().as_millis().saturating_sub(started_ms) > VERIFY_WALL_CLOCK_BUDGET_MS
+    };
+    let outcome = crate::verify::run_verifying_step(
+        &msg.job_id,
+        files,
+        &mut progress,
+        &mut source,
+        &scratch,
+        &VerifyCaps::default(),
+        &deadline,
+    )
+    .await;
+    // Persist progress before the checkpoint settlement so a crash
+    // between the two writes resumes from the older state with the
+    // newer progress (scratch adoption covers a lost progress write).
+    if let Err(error) = crate::checkpoint::put_verify(env, &msg.job_id, &progress).await {
+        console_log!("ingest verify progress write failed: {:?}", error);
+        return Err(JobError::transient(
+            ERR_VERIFY_FAILED,
+            "verify progress unavailable",
+        ));
+    }
+    match outcome {
+        Ok(outcome) => apply_verify_outcome(msg, cp, outcome),
+        Err(VerifyError::Transient(detail)) => Err(JobError::transient(ERR_VERIFY_FAILED, detail)),
+        Err(VerifyError::Permanent(detail)) => Err(JobError::permanent(ERR_VERIFY_FAILED, detail)),
+    }
+}
+
+/// [`BodySource`] over the pool's BODY route.
+struct PoolBodySource<'a> {
+    env: &'a Env,
+    msg: &'a QueueMsg,
+}
+
+impl BodySource for PoolBodySource<'_> {
+    async fn fetch_body(&mut self, segment_id: &str) -> Result<Option<Vec<u8>>, VerifyError> {
+        let req = build_body_request(self.msg, segment_id)
+            .map_err(|_| VerifyError::Permanent("invalid segment id".into()))?;
+        match call_pool_body(self.env, &req).await {
+            Ok(BodyFetch::Bytes(bytes)) => Ok(Some(bytes)),
+            Ok(BodyFetch::Missing) => Ok(None),
+            Err(PoolBodyError::Retry { .. }) => {
+                Err(VerifyError::Transient("pool body fetch unavailable".into()))
+            }
+            Err(PoolBodyError::Rejected) => {
+                Err(VerifyError::Permanent("pool body fetch rejected".into()))
+            }
+        }
+    }
+}
+
+/// [`ScratchStore`] over the `INGEST_SCRATCH` R2 bucket. The staged
+/// judgement rides the object's custom metadata, so a resume can adopt
+/// a staged file without re-reading its bytes.
+struct R2Scratch {
+    bucket: worker::Bucket,
+}
+
+fn staged_from_metadata(
+    key: &str,
+    size: u64,
+    meta: &std::collections::HashMap<String, String>,
+) -> Option<StagedFile> {
+    Some(StagedFile {
+        key: key.to_string(),
+        size,
+        sha256: meta.get("sha256")?.clone(),
+        missing_blocks: meta
+            .get("missing_blocks")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        par2_set_id: meta.get("par2_set_id").cloned(),
+    })
+}
+
+impl ScratchStore for R2Scratch {
+    async fn head(&self, key: &str) -> Result<Option<StagedFile>, VerifyError> {
+        let object = self
+            .bucket
+            .head(key.to_string())
+            .await
+            .map_err(|_| VerifyError::Transient("scratch head failed".into()))?;
+        let Some(object) = object else {
+            return Ok(None);
+        };
+        let meta = object
+            .custom_metadata()
+            .map_err(|_| VerifyError::Transient("scratch metadata unreadable".into()))?;
+        Ok(staged_from_metadata(key, object.size(), &meta))
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, VerifyError> {
+        let object = self
+            .bucket
+            .get(key.to_string())
+            .execute()
+            .await
+            .map_err(|_| VerifyError::Transient("scratch read failed".into()))?;
+        let Some(object) = object else {
+            return Ok(None);
+        };
+        let Some(body) = object.body() else {
+            return Ok(None);
+        };
+        body.bytes()
+            .await
+            .map(Some)
+            .map_err(|_| VerifyError::Transient("scratch read failed".into()))
+    }
+
+    async fn put(&self, key: &str, bytes: Vec<u8>, meta: &StagedFile) -> Result<(), VerifyError> {
+        let mut md = std::collections::HashMap::new();
+        md.insert("sha256".to_string(), meta.sha256.clone());
+        md.insert(
+            "missing_blocks".to_string(),
+            meta.missing_blocks.to_string(),
+        );
+        if let Some(set_id) = &meta.par2_set_id {
+            md.insert("par2_set_id".to_string(), set_id.clone());
+        }
+        self.bucket
+            .put(key.to_string(), bytes)
+            .custom_metadata(md)
+            .execute()
+            .await
+            .map_err(|_| VerifyError::Transient("scratch write failed".into()))?;
+        Ok(())
+    }
 }
 
 /// Decide one delivery's settlement and whether the mutated checkpoint
@@ -466,6 +820,93 @@ mod tests {
         assert_eq!(settlement, Settlement::RetryAfter(5));
         assert_eq!(cp.attempt, 2);
         assert_eq!(cp.state, JobState::Searching);
+    }
+
+    fn verifying_checkpoint(msg: &QueueMsg) -> JobCheckpoint {
+        let mut cp = crate::checkpoint::initial(msg);
+        cp.state = JobState::Verifying;
+        cp
+    }
+
+    #[test]
+    fn verify_complete_advances_to_matching_and_clears_the_tally() {
+        let msg = search_message();
+        let mut cp = verifying_checkpoint(&msg);
+        cp.probe_tally = Some(crate::probe::ProbeTally::new(1));
+        let step = apply_verify_outcome(&msg, &mut cp, crate::verify::VerifyOutcome::Complete);
+        // The next state has no executable step in this delivery: settle
+        // transiently so the redelivery runs it (the Parsing pattern).
+        let err = step.expect_err("matching runs on the next delivery");
+        assert!(err.transient);
+        assert_eq!(err.code, ERR_MATCH_FAILED);
+        assert_eq!(cp.state, JobState::Matching);
+        assert!(cp.probe_tally.is_none());
+    }
+
+    #[test]
+    fn verify_repair_needed_dispatches_through_decide_repair() {
+        let msg = search_message();
+        let mut cp = verifying_checkpoint(&msg);
+        let step = apply_verify_outcome(
+            &msg,
+            &mut cp,
+            crate::verify::VerifyOutcome::RepairNeeded {
+                par2_set_id: "ab".repeat(16),
+                missing_blocks: 2,
+            },
+        );
+        let err = step.expect_err("repair runs on the next delivery");
+        assert!(err.transient);
+        assert_eq!(err.code, ERR_REPAIR_FAILED);
+        assert_eq!(cp.state, JobState::Repairing);
+        assert_eq!(cp.repair_rounds, 1);
+    }
+
+    #[test]
+    fn verify_repair_at_the_round_cap_fails_permanently_without_advancing() {
+        // advance_checkpoint would set Failed in-memory, which the
+        // settlement planner must never see (it would skip the persist):
+        // the exhausted budget is a permanent step error instead, and
+        // decide_checkpoint marks the job Failed.
+        let msg = search_message();
+        let mut cp = verifying_checkpoint(&msg);
+        cp.repair_rounds = MAX_REPAIR_ROUNDS;
+        let step = apply_verify_outcome(
+            &msg,
+            &mut cp,
+            crate::verify::VerifyOutcome::RepairNeeded {
+                par2_set_id: "ab".repeat(16),
+                missing_blocks: 1,
+            },
+        );
+        let err = step.expect_err("budget spent");
+        assert!(!err.transient);
+        assert_eq!(err.code, ERR_REPAIR_FAILED);
+        assert_eq!(cp.state, JobState::Verifying);
+    }
+
+    #[test]
+    fn verify_unrecoverable_and_incomplete_never_advance() {
+        let msg = search_message();
+        let mut cp = verifying_checkpoint(&msg);
+        let err = apply_verify_outcome(
+            &msg,
+            &mut cp,
+            crate::verify::VerifyOutcome::Unrecoverable {
+                par2_set_id: None,
+                missing_blocks: 3,
+            },
+        )
+        .expect_err("unrecoverable");
+        assert!(!err.transient);
+        assert_eq!(err.code, ERR_VERIFY_FAILED);
+        assert_eq!(cp.state, JobState::Verifying);
+
+        let err = apply_verify_outcome(&msg, &mut cp, crate::verify::VerifyOutcome::Incomplete)
+            .expect_err("incomplete");
+        assert!(err.transient);
+        assert_eq!(err.code, ERR_VERIFY_FAILED);
+        assert_eq!(cp.state, JobState::Verifying);
     }
 
     #[test]

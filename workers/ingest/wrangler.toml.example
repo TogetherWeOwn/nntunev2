@@ -30,10 +30,10 @@ queue = "nntune-ingest-dlq"
 # remains, and persist Failed before DLQ send + ack. Never ack on DLQ-send
 # failure; Failed redelivery retries the send. A send-success/ack-failure
 # may duplicate entries, so DLQ processing must be idempotent by job_id.
-# The search/probe/verify/repair runtime steps are not wired yet, so
-# enabling this now would burn every valid job's retry budget against an
-# unavailable boundary and quarantine it. Uncomment only when those steps
-# are executable. E.g.:
+# The probe and verify runtime steps are wired for upload jobs, but the
+# search/repair/match/write steps are not, so enabling this now would
+# burn every valid job's retry budget against an unavailable boundary and
+# quarantine it. Uncomment only when those steps are executable. E.g.:
 #
 # [[queues.consumers]]
 # queue = "nntune-ingest-jobs"
@@ -90,6 +90,16 @@ id = "<KV_NAMESPACE_ID_FOR_PAYLOADS>"
 name = "NNTP_POOL"
 class_name = "NntpPool"
 script_name = "nntune-stream"
+
+# Verifying scratch staging (code: src/verify.rs, src/queue_consumer.rs).
+# Fetched files are staged under `ingest-scratch/{job_id}/r{round}/in/…`
+# plus a `manifest.json` as the repair handoff; the provisioned bucket's
+# 7-day lifecycle rule on the `ingest-scratch/` prefix is the cleanup
+# backstop (see docs/ops.md). Never bind the archive or audio-cache
+# buckets here.
+[[r2_buckets]]
+binding = "INGEST_SCRATCH"
+bucket_name = "<INGEST_SCRATCH_BUCKET>"
 
 # Slice 2: usage metering (code: src/metering.rs).
 [[analytics_engine_datasets]]

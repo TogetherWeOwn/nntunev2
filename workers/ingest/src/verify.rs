@@ -723,7 +723,7 @@ fn finalize(
     }
     // Deterministic order (BTreeMap): the first short set is dispatched;
     // later sets dispatch on later repair rounds.
-    for (set_id, missing) in &missing_by_set {
+    if let Some((set_id, missing)) = missing_by_set.iter().next() {
         let recovery = recovery_by_set.get(set_id).copied().unwrap_or(0);
         progress.par2_set_id = Some(set_id.clone());
         progress.missing_blocks = *missing;

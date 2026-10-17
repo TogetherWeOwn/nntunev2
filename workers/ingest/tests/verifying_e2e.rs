@@ -41,7 +41,7 @@ fn payload(seed: u64, len: usize) -> Vec<u8> {
 
 fn packet(set_id: &[u8; 16], kind: &[u8; 16], body: &[u8]) -> Vec<u8> {
     let mut aligned = body.to_vec();
-    while aligned.len() % 4 != 0 {
+    while !aligned.len().is_multiple_of(4) {
         aligned.push(0);
     }
     let mut p = Vec::new();
@@ -210,18 +210,13 @@ impl NntpSource {
 }
 
 impl BodySource for NntpSource {
-    fn fetch_body<'a>(
-        &'a mut self,
-        segment_id: &'a str,
-    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, VerifyError>> + 'a {
-        async move {
-            self.fetches.push(segment_id.to_string());
-            let mut out = Vec::new();
-            match self.client.body_to(segment_id, &mut out).await {
-                Ok(()) => Ok(Some(out)),
-                Err(nntune_core::Error::ArticleNotFound(_)) => Ok(None),
-                Err(e) => Err(VerifyError::Transient(format!("nntp fetch failed: {e}"))),
-            }
+    async fn fetch_body(&mut self, segment_id: &str) -> Result<Option<Vec<u8>>, VerifyError> {
+        self.fetches.push(segment_id.to_string());
+        let mut out = Vec::new();
+        match self.client.body_to(segment_id, &mut out).await {
+            Ok(()) => Ok(Some(out)),
+            Err(nntune_core::Error::ArticleNotFound(_)) => Ok(None),
+            Err(e) => Err(VerifyError::Transient(format!("nntp fetch failed: {e}"))),
         }
     }
 }
@@ -243,32 +238,19 @@ impl MemoryScratch {
 }
 
 impl ScratchStore for MemoryScratch {
-    fn head<'a>(
-        &'a self,
-        key: &'a str,
-    ) -> impl std::future::Future<Output = Result<Option<StagedFile>, VerifyError>> + 'a {
-        async move { Ok(self.objects.borrow().get(key).map(|(_, m)| m.clone())) }
+    async fn head(&self, key: &str) -> Result<Option<StagedFile>, VerifyError> {
+        Ok(self.objects.borrow().get(key).map(|(_, m)| m.clone()))
     }
 
-    fn get<'a>(
-        &'a self,
-        key: &'a str,
-    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, VerifyError>> + 'a {
-        async move { Ok(self.bytes(key)) }
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, VerifyError> {
+        Ok(self.bytes(key))
     }
 
-    fn put<'a>(
-        &'a self,
-        key: &'a str,
-        bytes: Vec<u8>,
-        meta: &'a StagedFile,
-    ) -> impl std::future::Future<Output = Result<(), VerifyError>> + 'a {
-        async move {
-            self.objects
-                .borrow_mut()
-                .insert(key.to_string(), (bytes, meta.clone()));
-            Ok(())
-        }
+    async fn put(&self, key: &str, bytes: Vec<u8>, meta: &StagedFile) -> Result<(), VerifyError> {
+        self.objects
+            .borrow_mut()
+            .insert(key.to_string(), (bytes, meta.clone()));
+        Ok(())
     }
 }
 
@@ -512,8 +494,10 @@ async fn capped_step_resumes_without_refetching_staged_files() {
     let mut progress = VerifyProgress::new(0);
 
     // One file per delivery: the par2 file is fetched and staged first.
-    let mut caps = VerifyCaps::default();
-    caps.max_files_per_delivery = 1;
+    let caps = VerifyCaps {
+        max_files_per_delivery: 1,
+        ..VerifyCaps::default()
+    };
     let (outcome, first_fetches) = run_step(&server, &nzb, &caps, &mut progress, &scratch).await;
     assert_eq!(outcome, VerifyOutcome::Incomplete);
     assert_eq!(first_fetches, ["p1@synthetic.invalid"]);
@@ -540,8 +524,10 @@ async fn lost_progress_is_rebuilt_from_staged_object_metadata() {
     let scratch = MemoryScratch::default();
     let mut progress = VerifyProgress::new(0);
 
-    let mut caps = VerifyCaps::default();
-    caps.max_files_per_delivery = 1;
+    let caps = VerifyCaps {
+        max_files_per_delivery: 1,
+        ..VerifyCaps::default()
+    };
     let (outcome, _) = run_step(&server, &nzb, &caps, &mut progress, &scratch).await;
     assert_eq!(outcome, VerifyOutcome::Incomplete);
 
