@@ -212,8 +212,10 @@ jobs:
     timeout-minutes: 10
     services:
       postgres:
-        # Pinned by digest (`17` as of 2026-10-16); re-pin deliberately.
-        image: postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
+        # Pinned by digest (`18` = PostgreSQL 18.6, the app-cluster major in
+        # docs/ops.md; official Docker Hub `library/postgres` manifest digest
+        # verified 2026-10-17); re-pin deliberately.
+        image: postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
         env:
           POSTGRES_PASSWORD: ci-throwaway
           POSTGRES_DB: nntune_ci
@@ -230,6 +232,24 @@ jobs:
           persist-credentials: false
       - name: Ensure psql client
         run: command -v psql >/dev/null || (sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client)
+      # Prove the running server is the documented major before any
+      # migration/replay/SQL check; never infer it from the image tag alone.
+      - name: Assert PostgreSQL server major is 18
+        run: |
+          version_num="$(psql "$DATABASE_URL" -X -At -v ON_ERROR_STOP=1 -c 'SHOW server_version_num')"
+          echo "server_version_num=$version_num"
+          case "$version_num" in
+            ''|*[!0-9]*)
+              echo "api-migrations: server_version_num is not numeric: '$version_num'" >&2
+              exit 1
+              ;;
+          esac
+          if [ "$((version_num / 10000))" -ne 18 ]; then
+            echo "api-migrations: expected PostgreSQL major 18, got server_version_num=$version_num" >&2
+            exit 1
+          fi
+        env:
+          DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
       - run: bash workers/api/tests/run_migration_tests.sh
         env:
           DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
