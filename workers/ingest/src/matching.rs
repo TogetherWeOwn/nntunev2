@@ -25,7 +25,7 @@ pub const MB_API_BINDING: &str = "MB_API";
 
 /// Host used for service-binding fetches. The binding routes by service,
 /// not by host; the name only needs to be a valid absolute URL.
-const MB_SERVICE_HOST: &str = "https://mb.internal";
+const MB_SERVICE_HOST: &str = "https://mb-api.invalid";
 
 /// Minimum trigram similarity accepted as a release match. This mirrors
 /// the `pg_trgm` default `similarity_threshold` (0.3) that the MB worker's
@@ -219,7 +219,7 @@ mod tests {
     fn search_url_encodes_query_and_pins_release_type() {
         let url = mb_search_url("dark side & more?");
         assert!(
-            url.starts_with("https://mb.internal/v1/mb/search?type=release&q="),
+            url.starts_with("https://mb-api.invalid/v1/mb/search?type=release&q="),
             "{url}"
         );
         assert!(url.ends_with("dark%20side%20%26%20more%3F"), "{url}");
