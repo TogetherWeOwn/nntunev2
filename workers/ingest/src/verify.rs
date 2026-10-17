@@ -27,7 +27,11 @@
 //! vouched for by the decode-time segment CRCs plus one spool listing
 //! (no read-back walk at all), and a damaged file's block counter
 //! streams only the present bytes, fast-forwarding zero gaps with
-//! CRC32 combine (see `judge_spooled`). A spooled file's staged
+//! CRC32 combine (see `judge_spooled`). That walk persists its
+//! segment-boundary state in a [`JudgeCursor`] in the progress
+//! record, so a deadline stop resumes mid-file instead of
+//! re-reading every present segment on the next delivery. A
+//! spooled file's staged
 //! `sha256` is a digest of its segment records, not of a byte walk.
 //! Staged par2 is restored packet by packet into a
 //! [`RecoverySetBuilder`], so aggregate par2 size is not capped either;
@@ -197,6 +201,35 @@ pub struct StagedSpoolSegment {
     pub missing: bool,
 }
 
+/// Resume cursor for one spooled file's streaming block judgement:
+/// the block counter's state at a segment boundary (see
+/// `judge_spooled`). Judging a damaged oversize file reads back every
+/// present segment, which can exceed one delivery's read budget;
+/// persisting this cursor lets each delivery advance the walk instead
+/// of restarting it, and that advance counts as progress. The cursor
+/// is trusted only while its `fingerprint` — the staged spool digest
+/// plus the covering set id — still matches the file being judged,
+/// and its counters are internally consistent (see `valid_cursor`);
+/// anything else restarts the walk, never misjudges.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JudgeCursor {
+    /// Next segment index the walk has yet to feed.
+    pub segment: usize,
+    /// Logical bytes fed to the block counter so far.
+    pub pos: u64,
+    /// Index of the block currently being accumulated.
+    pub block_index: usize,
+    /// Bytes accumulated into that block (the running hasher's length).
+    pub in_block: u64,
+    /// The running block hasher's CRC32 at the boundary.
+    pub crc32: u32,
+    /// Blocks already counted bad.
+    pub bad: u32,
+    /// `{spool_digest}:{set_id_hex}:{block_size}:{block_count}` for
+    /// the judgement this cursor belongs to; a mismatch discards it.
+    pub fingerprint: String,
+}
+
 /// Per-file resume state for one Verifying round, stored beside the job
 /// checkpoint under its own KV key (see `checkpoint::put_verify`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +246,11 @@ pub struct VerifyProgress {
     /// when the file is too large to assemble in memory.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub spool: BTreeMap<usize, Vec<StagedSpoolSegment>>,
+    /// Streaming-judgement resume cursors by NZB file index, for
+    /// spooled files whose block walk a deadline stopped mid-way.
+    /// Removed when the file's judgement lands.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub judging: BTreeMap<usize, JudgeCursor>,
     /// The set the completed step dispatched (or would dispatch) repair
     /// for; `None` until every file is judged. When several sets are
     /// dispatched together this is a bounded digest of their ids (see
@@ -767,16 +805,22 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
                 // The assembled object supersedes the spool cursor (the
                 // spool objects themselves expire with the bucket).
                 progress.spool.remove(&idx);
+                progress.judging.remove(&idx);
                 Some(staged)
             }
             LoadedFile::Spooled { logical_len } => {
+                // Take the file's judging cursor (if a previous
+                // delivery's walk stopped mid-file): `judge_spooled`
+                // resumes from it, writes back its advance on a
+                // deadline stop, and clears it once judged.
+                let mut cursor = progress.judging.remove(&idx);
                 let judged = if file.is_par2 {
                     // No byte walk: the staged record's digest is over
                     // the segment records (see `spool_digest`), and
                     // `load_sets` reads back what it can — a vanished
                     // spool segment makes that volume unusable there,
                     // never a false pass here.
-                    Some((0, None, spool_digest(&segs, logical_len)))
+                    Ok(Some((0, None, spool_digest(&segs, logical_len))))
                 } else {
                     judge_spooled(
                         matched,
@@ -788,9 +832,17 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
                         &VerifyProgress::spool_prefix(job_id, round, idx),
                         scratch,
                         deadline_exceeded,
+                        &mut cursor,
                     )
-                    .await?
+                    .await
                 };
+                // Reinstate the cursor before propagating any error,
+                // so a transient scratch failure mid-walk keeps the
+                // walk's advance instead of restarting it.
+                if let Some(cursor) = cursor {
+                    progress.judging.insert(idx, cursor);
+                }
+                let judged = judged?;
                 match judged {
                     None => None,
                     Some((missing_blocks, par2_set_id, sha256)) => {
@@ -819,6 +871,7 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
             return Ok(VerifyOutcome::Incomplete);
         };
         progress.staged.insert(idx, staged);
+        progress.judging.remove(&idx);
         dirty = true;
     }
 
@@ -934,19 +987,13 @@ fn uniform_part_size(segs: &[StagedSpoolSegment], total_segments: usize) -> Opti
     size.filter(|s| *s > 0)
 }
 
-/// The file's logical length: the par2-declared length when known, else
-/// the geometry the spooled segments imply. `None` only on u64 overflow
-/// (a par2 length and part geometry that cannot describe a real file).
-fn implied_len(
-    segs: &[StagedSpoolSegment],
-    total_segments: usize,
-    expected_len: Option<u64>,
-) -> Option<u64> {
+/// The file's logical length from the geometry the spooled segments
+/// prove. `None` only on u64 overflow (part geometry that cannot
+/// describe a real file). The par2-declared length is applied by the
+/// caller, capped to this geometry — never trusted on its own.
+fn implied_len(segs: &[StagedSpoolSegment], total_segments: usize) -> Option<u64> {
     if total_segments == 0 {
         return Some(0);
-    }
-    if let Some(len) = expected_len {
-        return Some(len);
     }
     if segs.len() >= total_segments && segs.iter().all(|s| !s.missing) {
         return segs.iter().try_fold(0u64, |acc, s| acc.checked_add(s.size));
@@ -1038,7 +1085,7 @@ async fn load_segments<S: ScratchStore>(
             vanished,
         }));
     };
-    let Some(geometry) = implied_len(segs, total_segments, None) else {
+    let Some(geometry) = implied_len(segs, total_segments) else {
         return Ok(None);
     };
     // The par2 length is authoritative only where the file's own
@@ -1113,6 +1160,12 @@ fn crc32_zeros(hasher: &mut crc32fast::Hasher, n: u64) {
 trait LogicalSink {
     fn bytes(&mut self, bytes: &[u8]);
     fn zeros(&mut self, n: u64);
+    /// The walk is about to feed segment `segment` (or the tail past
+    /// the last segment, `segment == total`) having fed exactly `pos`
+    /// logical bytes: a resumable consumer snapshots its state here,
+    /// so a deadline stop anywhere later in the segment resumes from
+    /// this boundary.
+    fn boundary(&mut self, _segment: usize, _pos: u64) {}
 }
 
 /// What one [`stream_logical`] walk did.
@@ -1122,8 +1175,8 @@ enum Streamed {
     /// counter counts its blocks as damage — the only caller streams
     /// into the block counter, never into a record-based proof.
     Done,
-    /// The delivery deadline stopped the walk; judge again next
-    /// delivery (streaming progress itself is not resumable).
+    /// The delivery deadline stopped the walk; the sink's last
+    /// segment-boundary snapshot resumes it next delivery.
     Stopped,
 }
 
@@ -1156,11 +1209,17 @@ fn feed_zeros_polled(
 /// `logical_len` arrives already bounded by the NZB's declared bytes
 /// and the proven part geometry (see `load_segments`), zero runs go
 /// through [`LogicalSink::zeros`], and the deadline is still polled
-/// between segments and inside zero runs.
+/// between segments and inside zero runs. `start_segment`/`start_pos`
+/// resume a stopped walk at a segment boundary the sink snapshotted
+/// (both 0 for a fresh walk): the segments before the boundary —
+/// and the scratch reads they cost — are not repeated.
+#[allow(clippy::too_many_arguments)]
 async fn stream_logical<S: ScratchStore>(
     segs: &[StagedSpoolSegment],
     total_segments: usize,
     logical_len: u64,
+    start_segment: usize,
+    start_pos: u64,
     scratch: &S,
     deadline_exceeded: &dyn Fn() -> bool,
     feed: &mut dyn LogicalSink,
@@ -1171,11 +1230,12 @@ async fn stream_logical<S: ScratchStore>(
     } else {
         uniform_part_size(segs, total_segments).unwrap_or(0)
     };
-    let mut pos: u64 = 0;
-    for (i, seg) in segs.iter().enumerate() {
+    let mut pos: u64 = start_pos;
+    for (i, seg) in segs.iter().enumerate().skip(start_segment) {
         if pos >= logical_len {
             break;
         }
+        feed.boundary(i, pos);
         if deadline_exceeded() {
             return Ok(Streamed::Stopped);
         }
@@ -1223,8 +1283,11 @@ async fn stream_logical<S: ScratchStore>(
         feed.bytes(&bytes[skip..skip + take]);
         pos += take as u64;
     }
-    if pos < logical_len && !feed_zeros_polled(logical_len - pos, feed, deadline_exceeded) {
-        return Ok(Streamed::Stopped);
+    if pos < logical_len {
+        feed.boundary(segs.len(), pos);
+        if !feed_zeros_polled(logical_len - pos, feed, deadline_exceeded) {
+            return Ok(Streamed::Stopped);
+        }
     }
     Ok(Streamed::Done)
 }
@@ -1280,6 +1343,96 @@ struct BlockCounter<'a> {
     in_block: u64,
     index: usize,
     bad: u32,
+    /// Identifies the judgement (spool digest + set id) boundary
+    /// snapshots belong to.
+    fingerprint: String,
+    /// State at the last segment boundary fed: where a deadline
+    /// stop resumes.
+    boundary: Option<JudgeCursor>,
+}
+
+impl<'a> BlockCounter<'a> {
+    fn new(block_crc32s: &'a [u32], block_size: u64, fingerprint: String) -> Self {
+        Self {
+            block_crc32s,
+            block_size,
+            hasher: crc32fast::Hasher::new(),
+            in_block: 0,
+            index: 0,
+            bad: 0,
+            fingerprint,
+            boundary: None,
+        }
+    }
+
+    /// Resume from a validated cursor. The hasher's accumulated
+    /// length is exactly `in_block` (it resets per block, and zero
+    /// runs combine with their length tracked), so
+    /// `new_with_initial_len` rebuilds it from the stored CRC.
+    fn resume(block_crc32s: &'a [u32], block_size: u64, cursor: &JudgeCursor) -> Self {
+        Self {
+            block_crc32s,
+            block_size,
+            hasher: crc32fast::Hasher::new_with_initial_len(cursor.crc32, cursor.in_block),
+            in_block: cursor.in_block,
+            index: cursor.block_index,
+            bad: cursor.bad,
+            fingerprint: cursor.fingerprint.clone(),
+            boundary: Some(cursor.clone()),
+        }
+    }
+
+    fn snapshot(&self, segment: usize, pos: u64) -> JudgeCursor {
+        JudgeCursor {
+            segment,
+            pos,
+            block_index: self.index,
+            in_block: self.in_block,
+            crc32: self.hasher.clone().finalize(),
+            bad: self.bad,
+            fingerprint: self.fingerprint.clone(),
+        }
+    }
+}
+
+/// Whether a stored judging cursor may resume this judgement: same
+/// spool digest and set, in-range indexes, and counters that agree
+/// with each other (`pos` is exactly the bytes the block state
+/// accounts for while blocks remain). Anything else — a changed
+/// spool, a different set, a corrupt or tampered record — restarts
+/// the walk from zero instead of judging from a state the bytes did
+/// not produce.
+fn valid_cursor(
+    cursor: &JudgeCursor,
+    fingerprint: &str,
+    segments: usize,
+    logical_len: u64,
+    block_size: u64,
+    block_count: usize,
+) -> bool {
+    if cursor.fingerprint != fingerprint
+        || cursor.segment > segments
+        || cursor.pos > logical_len
+        || cursor.block_index > block_count
+        || cursor.bad as usize > cursor.block_index
+    {
+        return false;
+    }
+    if cursor.block_index >= block_count {
+        // Every block finished: `pos` must have covered them all (it
+        // may run past once the counter stops accumulating).
+        return cursor.in_block == 0
+            && (block_count as u64)
+                .checked_mul(block_size)
+                .is_some_and(|covered| cursor.pos >= covered);
+    }
+    if cursor.in_block >= block_size {
+        return false;
+    }
+    (cursor.block_index as u64)
+        .checked_mul(block_size)
+        .and_then(|bytes| bytes.checked_add(cursor.in_block))
+        == Some(cursor.pos)
 }
 
 impl BlockCounter<'_> {
@@ -1348,6 +1501,10 @@ impl LogicalSink for BlockCounter<'_> {
     fn zeros(&mut self, n: u64) {
         BlockCounter::zeros(self, n);
     }
+
+    fn boundary(&mut self, segment: usize, pos: u64) {
+        self.boundary = Some(self.snapshot(segment, pos));
+    }
 }
 
 /// Streaming counterpart of [`judge_file`] for a file too large to
@@ -1360,8 +1517,12 @@ impl LogicalSink for BlockCounter<'_> {
 /// staged. Only a damaged file streams, and then only its present
 /// bytes (zero gaps fast-forward through CRC32 combine), over a
 /// logical length `load_segments` already bounded by the NZB's
-/// declared bytes and the proven part geometry. `None` when the
-/// deadline stopped that walk (judge again next delivery).
+/// declared bytes and the proven part geometry. That walk is
+/// resumable across deliveries through `cursor`: a deadline stop
+/// returns `None` with the walk's segment-boundary state written
+/// back, so the next delivery continues where this one stopped
+/// instead of re-reading every present segment; a completed
+/// judgement clears it.
 #[allow(clippy::too_many_arguments)]
 async fn judge_spooled<S: ScratchStore>(
     matched: Option<(&RecoverySet, &RecoveryFile)>,
@@ -1373,6 +1534,7 @@ async fn judge_spooled<S: ScratchStore>(
     spool_prefix: &str,
     scratch: &S,
     deadline_exceeded: &dyn Fn() -> bool,
+    cursor: &mut Option<JudgeCursor>,
 ) -> Result<Option<(u32, Option<String>, String)>, VerifyError> {
     let digest = spool_digest(segs, logical_len);
     let (missing_blocks, par2_set_id) = match matched {
@@ -1404,31 +1566,65 @@ async fn judge_spooled<S: ScratchStore>(
                 // Damaged (or a spool object vanished after the
                 // precheck inputs were recorded): count blocks over
                 // the bytes actually staged — vanished/missing ranges
-                // stream as zeros.
-                let mut counter = BlockCounter {
-                    block_crc32s: &entry.block_crc32s,
-                    block_size: set.block_size,
-                    hasher: crc32fast::Hasher::new(),
-                    in_block: 0,
-                    index: 0,
-                    bad: 0,
+                // stream as zeros. A stored cursor resumes the walk
+                // at its segment boundary when it still describes
+                // this exact spool and set.
+                let fingerprint = format!(
+                    "{digest}:{set_hex}:{}:{}",
+                    set.block_size,
+                    entry.block_crc32s.len()
+                );
+                let resume = cursor.take().filter(|saved| {
+                    valid_cursor(
+                        saved,
+                        &fingerprint,
+                        segs.len(),
+                        logical_len,
+                        set.block_size,
+                        entry.block_crc32s.len(),
+                    )
+                });
+                let (mut counter, start_segment, start_pos) = match &resume {
+                    Some(saved) => (
+                        BlockCounter::resume(&entry.block_crc32s, set.block_size, saved),
+                        saved.segment,
+                        saved.pos,
+                    ),
+                    None => (
+                        BlockCounter::new(&entry.block_crc32s, set.block_size, fingerprint),
+                        0,
+                        0,
+                    ),
                 };
-                let streamed = stream_logical(
+                let streamed = match stream_logical(
                     segs,
                     total_segments,
                     logical_len,
+                    start_segment,
+                    start_pos,
                     scratch,
                     deadline_exceeded,
                     &mut counter,
                 )
-                .await?;
+                .await
+                {
+                    Ok(streamed) => streamed,
+                    Err(error) => {
+                        *cursor = counter.boundary;
+                        return Err(error);
+                    }
+                };
                 match streamed {
                     Streamed::Done => (counter.finish(), Some(set_hex)),
-                    Streamed::Stopped => return Ok(None),
+                    Streamed::Stopped => {
+                        *cursor = counter.boundary;
+                        return Ok(None);
+                    }
                 }
             }
         }
     };
+    *cursor = None;
     Ok(Some((missing_blocks, par2_set_id, digest)))
 }
 
@@ -1954,20 +2150,18 @@ mod tests {
     }
 
     #[test]
-    fn implied_len_uses_par2_length_then_proven_geometry() {
-        // The helper reports the par2-declared length verbatim;
-        // `load_segments` caps it by the proven geometry and the NZB
-        // bound before anything allocates or streams (see
-        // `lying_par2_length_is_capped_by_geometry_and_the_nzb_bound`).
+    fn implied_len_uses_only_proven_geometry() {
+        // The helper knows nothing of the par2-declared length;
+        // `load_segments` caps that length by this proven geometry
+        // and the NZB bound before anything allocates or streams
+        // (see `lying_par2_length_is_capped_by_geometry_and_the_nzb_bound`).
         let gapped = vec![srec(4), smissing(), smissing()];
-        assert_eq!(implied_len(&gapped, 3, Some(100 << 20)), Some(100 << 20));
-        assert_eq!(implied_len(&gapped, 3, Some(u64::MAX)), Some(u64::MAX));
-        // Without par2: uniform part size 4 over 3 parts.
-        assert_eq!(implied_len(&gapped, 3, None), Some(12));
+        // Uniform part size 4 over 3 parts.
+        assert_eq!(implied_len(&gapped, 3), Some(12));
         // All present: the plain sum.
-        assert_eq!(implied_len(&[srec(4), srec(3), srec(2)], 3, None), Some(9));
+        assert_eq!(implied_len(&[srec(4), srec(3), srec(2)], 3), Some(9));
         // No proven part size (nothing present before the last part).
-        assert_eq!(implied_len(&[smissing(), srec(5)], 2, None), None);
+        assert_eq!(implied_len(&[smissing(), srec(5)], 2), None);
     }
 
     fn parsed(name: &str, is_par2: bool) -> ParsedFile {
@@ -2140,17 +2334,111 @@ mod tests {
         // 8 zeros (want differs), block 2 = 4 zeros padded (good).
         let crc = |bytes: &[u8]| crc32fast::hash(bytes);
         let wants = [crc(b"abcd\0\0\0\0"), crc(b"not-zero"), crc(&[0u8; 8])];
-        let mut counter = BlockCounter {
-            block_crc32s: &wants,
-            block_size: 8,
-            hasher: crc32fast::Hasher::new(),
-            in_block: 0,
-            index: 0,
-            bad: 0,
-        };
+        let mut counter = BlockCounter::new(&wants, 8, "fp".into());
         counter.bytes(b"abcd");
         counter.zeros(16);
         assert_eq!(counter.finish(), 1);
+    }
+
+    #[test]
+    fn block_counter_resumes_from_a_boundary_snapshot() {
+        // Same stream as above, split at a snapshot taken mid-block:
+        // the resumed counter must reach the uninterrupted verdict,
+        // which pins the snapshot -> `new_with_initial_len` rebuild.
+        let crc = |bytes: &[u8]| crc32fast::hash(bytes);
+        let wants = [crc(b"abcd\0\0\0\0"), crc(b"not-zero"), crc(&[0u8; 8])];
+        let mut first = BlockCounter::new(&wants, 8, "fp".into());
+        first.bytes(b"abc");
+        first.boundary(1, 3);
+        let cursor = first.boundary.expect("snapshot");
+        assert!(valid_cursor(&cursor, "fp", 4, 20, 8, wants.len()));
+        let mut resumed = BlockCounter::resume(&wants, 8, &cursor);
+        resumed.bytes(b"d");
+        resumed.zeros(16);
+        assert_eq!(resumed.finish(), 1);
+    }
+
+    #[test]
+    fn valid_cursor_rejects_foreign_or_inconsistent_state() {
+        let base = JudgeCursor {
+            segment: 1,
+            pos: 10,
+            block_index: 1,
+            in_block: 2,
+            crc32: 7,
+            bad: 1,
+            fingerprint: "fp".into(),
+        };
+        assert!(valid_cursor(&base, "fp", 4, 64, 8, 8));
+        assert!(!valid_cursor(&base, "other", 4, 64, 8, 8), "foreign");
+        assert!(
+            !valid_cursor(
+                &JudgeCursor {
+                    pos: 11,
+                    ..base.clone()
+                },
+                "fp",
+                4,
+                64,
+                8,
+                8
+            ),
+            "pos disagrees with the block state"
+        );
+        assert!(
+            !valid_cursor(
+                &JudgeCursor {
+                    bad: 2,
+                    ..base.clone()
+                },
+                "fp",
+                4,
+                64,
+                8,
+                8
+            ),
+            "more bad blocks than finished blocks"
+        );
+        assert!(
+            !valid_cursor(
+                &JudgeCursor {
+                    in_block: 8,
+                    pos: 16,
+                    ..base.clone()
+                },
+                "fp",
+                4,
+                64,
+                8,
+                8
+            ),
+            "a full block would have finished"
+        );
+        assert!(
+            !valid_cursor(
+                &JudgeCursor {
+                    segment: 5,
+                    ..base.clone()
+                },
+                "fp",
+                4,
+                64,
+                8,
+                8
+            ),
+            "segment out of range"
+        );
+        // All blocks finished: pos may run past the covered bytes.
+        let done = JudgeCursor {
+            segment: 4,
+            pos: 70,
+            block_index: 8,
+            in_block: 0,
+            crc32: 0,
+            bad: 3,
+            fingerprint: "fp".into(),
+        };
+        assert!(valid_cursor(&done, "fp", 4, 80, 8, 8));
     }
 
     #[test]
@@ -2274,18 +2562,59 @@ mod tests {
         let segs = vec![krec("a", 4)];
         let scratch = MapScratch(HashMap::from([("a".to_string(), vec![7u8; 4])]));
         let wants = [crc32fast::hash(&[7u8; 4])];
-        let mut counter = BlockCounter {
-            block_crc32s: &wants,
-            block_size: 4,
-            hasher: crc32fast::Hasher::new(),
-            in_block: 0,
-            index: 0,
-            bad: 0,
-        };
-        let stopped = stream_logical(&segs, 1, 4, &scratch, &|| true, &mut counter)
+        let mut counter = BlockCounter::new(&wants, 4, "fp".into());
+        let stopped = stream_logical(&segs, 1, 4, 0, 0, &scratch, &|| true, &mut counter)
             .await
             .expect("stream");
         assert!(matches!(stopped, Streamed::Stopped));
+    }
+
+    #[tokio::test]
+    async fn stream_logical_resumes_at_a_segment_boundary() {
+        // Walk three 4-byte segments as one 12-byte block; stop after
+        // the first, resume from the boundary snapshot, and the
+        // verdict matches an uninterrupted walk without re-reading
+        // segment 0 (it is gone from scratch by resume time).
+        let segs = vec![krec("a", 4), krec("b", 4), krec("c", 4)];
+        let logical: Vec<u8> = (0u8..12).collect();
+        let wants = [crc32fast::hash(&logical)];
+        let scratch = MapScratch(HashMap::from([
+            ("a".to_string(), logical[0..4].to_vec()),
+            ("b".to_string(), logical[4..8].to_vec()),
+            ("c".to_string(), logical[8..12].to_vec()),
+        ]));
+        let polls = std::cell::Cell::new(0u32);
+        let deadline = || {
+            polls.set(polls.get() + 1);
+            polls.get() > 1
+        };
+        let mut first = BlockCounter::new(&wants, 12, "fp".into());
+        let stopped = stream_logical(&segs, 3, 12, 0, 0, &scratch, &deadline, &mut first)
+            .await
+            .expect("stream");
+        assert!(matches!(stopped, Streamed::Stopped));
+        let cursor = first.boundary.expect("boundary snapshot");
+        assert_eq!((cursor.segment, cursor.pos), (1, 4));
+
+        let scratch = MapScratch(HashMap::from([
+            ("b".to_string(), logical[4..8].to_vec()),
+            ("c".to_string(), logical[8..12].to_vec()),
+        ]));
+        let mut resumed = BlockCounter::resume(&wants, 12, &cursor);
+        let done = stream_logical(
+            &segs,
+            3,
+            12,
+            cursor.segment,
+            cursor.pos,
+            &scratch,
+            &|| false,
+            &mut resumed,
+        )
+        .await
+        .expect("stream");
+        assert!(matches!(done, Streamed::Done));
+        assert_eq!(resumed.finish(), 0);
     }
 
     #[test]
@@ -2309,6 +2638,18 @@ mod tests {
                 crc32: 9,
                 missing: false,
             }],
+        );
+        progress.judging.insert(
+            1,
+            JudgeCursor {
+                segment: 2,
+                pos: 24,
+                block_index: 1,
+                in_block: 8,
+                crc32: 5,
+                bad: 1,
+                fingerprint: "fp".into(),
+            },
         );
         let json = serde_json::to_string(&progress).unwrap();
         let back: VerifyProgress = serde_json::from_str(&json).unwrap();

@@ -586,9 +586,9 @@ async fn run_step(env: &Env, msg: &QueueMsg, cp: &mut JobCheckpoint) -> Result<(
 /// step errors are failed by `decide_checkpoint`, which keeps the
 /// settlement persist planner seeing a non-terminal checkpoint). Pure
 /// over the checkpoint so the mapping is unit-tested without bindings.
-/// `made_progress` is whether the step staged another file or spooled
-/// another segment during this delivery; it decides if an `Incomplete`
-/// step spends retry budget.
+/// `made_progress` is whether the step staged another file, spooled
+/// another segment, or advanced a streaming judgement during this
+/// delivery; it decides if an `Incomplete` step spends retry budget.
 fn apply_verify_outcome(
     msg: &QueueMsg,
     cp: &mut JobCheckpoint,
@@ -736,6 +736,7 @@ async fn run_verifying(
     };
     let staged_before = progress.staged.len();
     let spooled_before: usize = progress.spool.values().map(Vec::len).sum();
+    let judged_before: u64 = progress.judging.values().map(|c| c.pos).sum();
     let outcome = crate::verify::run_verifying_step(
         &msg.job_id,
         files,
@@ -747,11 +748,17 @@ async fn run_verifying(
     )
     .await;
     let spooled_after: usize = progress.spool.values().map(Vec::len).sum();
+    let judged_after: u64 = progress.judging.values().map(|c| c.pos).sum();
     // Durable segment-level spool growth is progress exactly like a
     // newly staged file: a file spanning several deliveries (more
     // segments than one delivery's budget) must not burn the attempt
-    // budget while every delivery succeeds.
-    let made_progress = progress.staged.len() > staged_before || spooled_after > spooled_before;
+    // budget while every delivery succeeds. The same holds for a
+    // streaming judgement whose walk advanced before the deadline
+    // stopped it: the persisted judging cursor makes that advance
+    // durable.
+    let made_progress = progress.staged.len() > staged_before
+        || spooled_after > spooled_before
+        || judged_after > judged_before;
     // Persist progress before the checkpoint settlement so a crash
     // between the two writes resumes from the older state with the
     // newer progress (scratch adoption covers a lost progress write).

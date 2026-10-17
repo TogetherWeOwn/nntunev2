@@ -1284,6 +1284,76 @@ async fn deadline_during_spooled_judging_restops_as_incomplete() {
 }
 
 #[tokio::test]
+async fn deadline_stopped_judging_resumes_and_finishes() {
+    // Same damaged oversize file, but every delivery gets the same
+    // one-segment read budget that stopped the walk above. With the
+    // persisted judging cursor each delivery advances the walk one
+    // more segment (cursor `pos` strictly grows — the progress the
+    // consumer settles on), and the file is judged within a few
+    // deliveries instead of restarting until the attempt budget
+    // runs out.
+    let data = payload(83, 768);
+    let (mut articles, nzb) = three_part_case(&data);
+    let mut corrupt_chunk = data[..256].to_vec();
+    corrupt_chunk[10] ^= 0xff;
+    let part1 = SegmentParams {
+        name: DATA_NAME.into(),
+        part: 1,
+        total: 3,
+        begin: 1,
+        end: 256,
+        file_size: data.len() as u64,
+    };
+    articles[0] = yenc_article("d1@synthetic.invalid", 1, DATA_NAME, &part1, &corrupt_chunk);
+    let server = spawn(articles).await;
+    let scratch = MemoryScratch::default();
+    let mut progress = VerifyProgress::new(0);
+    let spool_some = VerifyCaps {
+        max_segments_per_delivery: 3,
+        max_file_bytes: 100,
+        ..VerifyCaps::default()
+    };
+    let (outcome, _) = run_step(&server, &nzb, &spool_some, &mut progress, &scratch).await;
+    assert_eq!(outcome, VerifyOutcome::Incomplete);
+    let caps = VerifyCaps {
+        max_file_bytes: 100,
+        ..VerifyCaps::default()
+    };
+    let mut last_pos = 0u64;
+    let mut final_outcome = None;
+    for _ in 0..6 {
+        let gets_before = scratch.get_count();
+        // Par2 restore reads once per delivery; the walk then gets
+        // exactly one more segment read before the deadline trips.
+        let deadline = || scratch.get_count() >= gets_before + 2;
+        let (outcome, _) =
+            run_step_with_deadline(&server, &nzb, &caps, &mut progress, &scratch, &deadline).await;
+        if outcome != VerifyOutcome::Incomplete {
+            final_outcome = Some(outcome);
+            break;
+        }
+        let pos = progress
+            .judging
+            .get(&0)
+            .map(|c| c.pos)
+            .expect("a stopped walk persists its cursor");
+        assert!(pos > last_pos, "cursor advanced: {last_pos} -> {pos}");
+        last_pos = pos;
+    }
+    assert!(
+        matches!(
+            final_outcome,
+            Some(VerifyOutcome::RepairNeeded {
+                missing_blocks: 1,
+                ..
+            })
+        ),
+        "the resumed walk finishes and counts the corrupt block, got {final_outcome:?}"
+    );
+    assert!(progress.judging.is_empty(), "cursor cleared once judged");
+}
+
+#[tokio::test]
 async fn too_large_article_counts_only_its_own_segment() {
     // Middle article refused as too large: it records missing, the
     // cursor advances, and the other two segments still fetch and
