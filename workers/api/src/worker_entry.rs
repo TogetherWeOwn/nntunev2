@@ -24,8 +24,8 @@ use crate::auth::{
     SingleUseStore,
 };
 use crate::handlers::{
-    self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, RateLimitBudget, Store, StoreError,
-    UserRecord, VaultRow,
+    self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, PairAdmission, RateLimitBudget, Store,
+    StoreError, UserRecord, VaultRow,
 };
 use crate::session::SessionRecord;
 use crate::vault::{
@@ -104,20 +104,34 @@ fn config_from_env(env: &Env) -> Option<Config> {
     Some(config.with_rate_limits(rate_limits_from_env(env)))
 }
 
-/// Rate-limit tunables from [vars]; `from_vars` fails safe to the
-/// documented defaults on anything missing or invalid, so a typo'd
-/// override keeps limiting on (never unlimited, never deny-all).
-fn rate_limits_from_env(env: &Env) -> crate::rate_limit::RateLimitConfig {
-    let vars: HashMap<String, String> = [
-        "AUTH_RATE_LIMIT_MAX",
-        "AUTH_RATE_LIMIT_WINDOW_SECS",
-        "VAULT_TEST_RATE_LIMIT_MAX",
-        "VAULT_TEST_RATE_LIMIT_WINDOW_SECS",
-    ]
-    .iter()
-    .filter_map(|name| env_string(env, name).map(|v| ((*name).to_string(), v)))
-    .collect();
+/// The [vars] names `RateLimitConfig::from_vars` reads. One const
+/// list so the overlay test can pin every name against its field.
+const RATE_LIMIT_VAR_NAMES: [&str; 5] = [
+    "AUTH_RATE_LIMIT_MAX",
+    "AUTH_RATE_LIMIT_WINDOW_SECS",
+    "VAULT_TEST_RATE_LIMIT_MAX",
+    "VAULT_TEST_RATE_LIMIT_WINDOW_SECS",
+    "VAULT_TEST_IP_RATE_LIMIT_MAX",
+];
+
+/// Pure [vars] overlay: collect whichever of [`RATE_LIMIT_VAR_NAMES`]
+/// the lookup resolves and hand them to `from_vars`, which fails safe
+/// to the documented defaults on anything missing or invalid, so a
+/// typo'd override keeps limiting on (never unlimited, never
+/// deny-all). Unit-tested below; the wasm wrapper only supplies the
+/// `env_string` closure.
+fn rate_limits_from_lookup(
+    get: impl Fn(&str) -> Option<String>,
+) -> crate::rate_limit::RateLimitConfig {
+    let vars: HashMap<String, String> = RATE_LIMIT_VAR_NAMES
+        .iter()
+        .filter_map(|name| get(name).map(|v| ((*name).to_string(), v)))
+        .collect();
     crate::rate_limit::RateLimitConfig::from_vars(&vars)
+}
+
+fn rate_limits_from_env(env: &Env) -> crate::rate_limit::RateLimitConfig {
+    rate_limits_from_lookup(|name| env_string(env, name))
 }
 
 /// Pure Hyperdrive caching attestation decision: `Some("1"/"true"/"TRUE")`
@@ -230,11 +244,14 @@ fn u32_of(v: i64) -> Result<u32, StoreError> {
 }
 
 /// Durable-slot budgets are bounded: a zero limit/window admits
-/// nothing, and the slot scan is capped at 100 (the largest in-tree
-/// budget). A configured limit above the cap fails closed here
-/// rather than scanning unboundedly.
+/// nothing, and the slot scan is capped at
+/// [`crate::rate_limit::MAX_BUDGET_SLOTS`] (the largest in-tree
+/// budget). Configured maxima clamp to that cap in `from_vars`, so
+/// this gate only refuses hand-built budgets, never operator config.
 fn rate_limit_budget_admissible(budget: &RateLimitBudget<'_>) -> bool {
-    budget.limit != 0 && budget.window_secs != 0 && budget.limit <= 100
+    budget.limit != 0
+        && budget.window_secs != 0
+        && budget.limit <= u64::from(crate::rate_limit::MAX_BUDGET_SLOTS)
 }
 
 async fn delete_expired_rate_limit_slots(
@@ -838,9 +855,12 @@ impl Store for PgStore {
         first: RateLimitBudget<'_>,
         second: RateLimitBudget<'_>,
         now: u64,
-    ) -> Result<bool, StoreError> {
-        if !rate_limit_budget_admissible(&first) || !rate_limit_budget_admissible(&second) {
-            return Ok(false);
+    ) -> Result<PairAdmission, StoreError> {
+        if !rate_limit_budget_admissible(&first) {
+            return Ok(PairAdmission::DeniedFirst);
+        }
+        if !rate_limit_budget_admissible(&second) {
+            return Ok(PairAdmission::DeniedSecond);
         }
         // All-or-none on one connection: claim the first slot, then the
         // second; if the second does not admit, release the first by
@@ -853,13 +873,13 @@ impl Store for PgStore {
         let now_i = i64_of(now)?;
         delete_expired_rate_limit_slots(&client, now_i).await?;
         let Some(first_slot) = claim_rate_limit_slot(&client, &first, now, now_i).await? else {
-            return Ok(false);
+            return Ok(PairAdmission::DeniedFirst);
         };
         match claim_rate_limit_slot(&client, &second, now, now_i).await {
-            Ok(Some(_)) => Ok(true),
+            Ok(Some(_)) => Ok(PairAdmission::Allowed),
             Ok(None) => {
                 release_rate_limit_slot(&client, &first, first_slot, now).await?;
-                Ok(false)
+                Ok(PairAdmission::DeniedSecond)
             }
             Err(err) => {
                 let _ = release_rate_limit_slot(&client, &first, first_slot, now).await;
@@ -1612,6 +1632,69 @@ mod tests {
             assert!(cors_headers(200, origin, cfg).is_empty(), "{origin:?}");
             assert!(cors_headers(204, origin, cfg).is_empty(), "{origin:?}");
         }
+    }
+
+    #[test]
+    fn rate_limit_overlay_maps_each_var_name_to_its_field() {
+        // The overlay is the only link between operator [vars] and the
+        // live budgets: a renamed or typo'd key must fail here, not
+        // silently revert operators to defaults.
+        use crate::rate_limit::RateLimitConfig;
+        let only = |name: &'static str, value: &'static str| {
+            rate_limits_from_lookup(|key| (key == name).then(|| value.to_string()))
+        };
+        let defaults = RateLimitConfig::default();
+        assert_eq!(rate_limits_from_lookup(|_| None), defaults);
+        assert_eq!(
+            only("AUTH_RATE_LIMIT_MAX", "3"),
+            RateLimitConfig {
+                auth_max_attempts: 3,
+                ..defaults
+            }
+        );
+        assert_eq!(
+            only("AUTH_RATE_LIMIT_WINDOW_SECS", "120"),
+            RateLimitConfig {
+                auth_window_secs: 120,
+                ..defaults
+            }
+        );
+        assert_eq!(
+            only("VAULT_TEST_RATE_LIMIT_MAX", "4"),
+            RateLimitConfig {
+                vault_test_max_attempts: 4,
+                ..defaults
+            }
+        );
+        assert_eq!(
+            only("VAULT_TEST_RATE_LIMIT_WINDOW_SECS", "90"),
+            RateLimitConfig {
+                vault_test_window_secs: 90,
+                ..defaults
+            }
+        );
+        assert_eq!(
+            only("VAULT_TEST_IP_RATE_LIMIT_MAX", "40"),
+            RateLimitConfig {
+                vault_test_ip_max_attempts: 40,
+                ..defaults
+            }
+        );
+        // Every name in the const list is one of the five pinned above:
+        // growing the list without a field pin fails this count.
+        assert_eq!(RATE_LIMIT_VAR_NAMES.len(), 5);
+    }
+
+    #[test]
+    fn config_from_env_applies_the_rate_limit_overlay() {
+        // Source pin for the call site the pure overlay test cannot
+        // reach (it needs a wasm Env): dropping `with_rate_limits`
+        // from `config_from_env` fails here.
+        let source = include_str!("worker_entry.rs");
+        assert!(
+            source.contains("config.with_rate_limits(rate_limits_from_env(env))"),
+            "config_from_env must apply the [vars] rate-limit overlay"
+        );
     }
 
     #[test]

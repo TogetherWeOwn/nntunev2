@@ -8,26 +8,36 @@
 //!
 //! Documented defaults (provisional launch tunables; override via [vars],
 //! never hardcoded at the call site):
-//! | surface    | max | window | vars                                                      |
-//! |------------|-----|--------|-----------------------------------------------------------|
-//! | auth       | 10  | 60s    | AUTH_RATE_LIMIT_MAX / AUTH_RATE_LIMIT_WINDOW_SECS         |
-//! | vault test | 5   | 60s    | VAULT_TEST_RATE_LIMIT_MAX / VAULT_TEST_RATE_LIMIT_WINDOW_SECS |
+//! | surface        | max | window | vars                                                      |
+//! |----------------|-----|--------|-----------------------------------------------------------|
+//! | auth           | 10  | 60s    | AUTH_RATE_LIMIT_MAX / AUTH_RATE_LIMIT_WINDOW_SECS         |
+//! | vault test     | 5   | 60s    | VAULT_TEST_RATE_LIMIT_MAX / VAULT_TEST_RATE_LIMIT_WINDOW_SECS |
+//! | vault test, IP | 25  | 60s    | VAULT_TEST_IP_RATE_LIMIT_MAX (window shared with vault test) |
 //!
 //! `VAULT_TEST_*` are the `vault::TEST_CONNECTION_*` consts under their
-//! rate-limit names (one source, no drift). [`RateLimitConfig::from_vars`]
-//! falls back to these defaults on missing, unparseable, or zero values:
-//! invalid config keeps limiting on (never unlimited, never deny-all).
+//! rate-limit names (one source, no drift). The per-IP vault budget is
+//! sized above the per-account one (NAT-shared addresses serve many
+//! accounts), mirroring the auth-start budgets in `handlers`.
+//! [`RateLimitConfig::from_vars`] falls back to these defaults on
+//! missing, unparseable, or zero values, and clamps any max to
+//! [`MAX_BUDGET_SLOTS`]: invalid config keeps limiting on (never
+//! unlimited, never deny-all).
 //!
 //! Live enforcement: the Worker entry overlays [vars] through
 //! [`RateLimitConfig::from_vars`] into `handlers::Config`, and the
 //! handler layer's durable slot budgets (`Store::reserve_rate_limit` /
-//! `Store::reserve_rate_limit_pair`) remain the cross-isolate
-//! authority: the auth config bounds auth-start bursts per IP
-//! alongside the pre-existing hourly budgets, and the vault config
-//! drives the test-connection dual (per-IP + per-account) claim. The
-//! durable store caps any single budget at 100 slots, so a configured
-//! max above 100 fails closed there. This module supplies the shared
-//! config, bucket math and 429/`Retry-After` shape.
+//! `Store::reserve_rate_limit_pair`) are the cross-isolate authority:
+//! the auth config bounds auth-start bursts per IP alongside the
+//! pre-existing hourly budgets, and the vault config drives the
+//! test-connection dual (per-IP + per-account) claim. This module
+//! supplies the shared config and the 429/`Retry-After` shape.
+//!
+//! Reference model, not live behavior: [`TokenBucket`],
+//! [`check_dual_throttle`], [`ThrottleKey`] and [`rate_limited_body`]
+//! are the pure model the acceptance tests pin the budget semantics
+//! against; no production path calls them. Live denials render in
+//! `handlers` (register/start gets a real 429; vault test-connection
+//! deliberately collapses to `200 {"ok":false}`).
 //!
 //! No credential or IP in cleartext: [`rate_limited_body`] takes ZERO args
 //! (per-request data cannot leak into it) and [`ThrottleKey`]'s `Debug`
@@ -43,6 +53,16 @@ pub const AUTH_WINDOW_SECS: u64 = 60;
 pub const VAULT_TEST_MAX_ATTEMPTS: u32 = crate::vault::TEST_CONNECTION_MAX_ATTEMPTS;
 /// Vault test-connection window, seconds (single-sourced with `vault`).
 pub const VAULT_TEST_WINDOW_SECS: u64 = crate::vault::TEST_CONNECTION_WINDOW_SECS;
+/// Per-IP vault test-connection burst: 5x the per-account cap, so one
+/// account's allowed probes cannot consume the whole budget of a
+/// NAT-shared address (same sizing rule as the auth-start IP budget).
+pub const VAULT_TEST_IP_MAX_ATTEMPTS: u32 = VAULT_TEST_MAX_ATTEMPTS * 5;
+
+/// Largest budget the durable slot store will scan/claim. Configured
+/// maxima clamp to this at parse time ([`RateLimitConfig::from_vars`])
+/// so an over-large operator value can never turn into a deny-all at
+/// the store's admissibility gate.
+pub const MAX_BUDGET_SLOTS: u32 = 100;
 
 /// HTTP status for a throttled response.
 pub const RATE_LIMIT_STATUS: u16 = 429;
@@ -166,6 +186,9 @@ pub struct RateLimitConfig {
     pub auth_window_secs: u64,
     pub vault_test_max_attempts: u32,
     pub vault_test_window_secs: u64,
+    /// Per-IP vault test-connection cap (own var, larger default; the
+    /// window stays `vault_test_window_secs`).
+    pub vault_test_ip_max_attempts: u32,
 }
 
 impl Default for RateLimitConfig {
@@ -175,6 +198,7 @@ impl Default for RateLimitConfig {
             auth_window_secs: AUTH_WINDOW_SECS,
             vault_test_max_attempts: VAULT_TEST_MAX_ATTEMPTS,
             vault_test_window_secs: VAULT_TEST_WINDOW_SECS,
+            vault_test_ip_max_attempts: VAULT_TEST_IP_MAX_ATTEMPTS,
         }
     }
 }
@@ -190,14 +214,23 @@ fn parse_nonzero<T: std::str::FromStr + Default + PartialEq>(
     }
 }
 
+/// Parse a `*_MAX` var: nonzero values apply but clamp to
+/// [`MAX_BUDGET_SLOTS`], the largest budget the durable slot store
+/// admits — an over-large configured max must relax to the cap, never
+/// silently deny every request at the store gate.
+fn parse_capped_max(vars: &HashMap<String, String>, key: &str, fallback: u32) -> u32 {
+    parse_nonzero::<u32>(vars, key, fallback).min(MAX_BUDGET_SLOTS)
+}
+
 impl RateLimitConfig {
     /// Build from worker [vars]. Missing, unparseable, or zero values fall
-    /// back per-field to the documented defaults: invalid config keeps
-    /// limiting on (never unlimited, never deny-all).
+    /// back per-field to the documented defaults, and maxima clamp to
+    /// [`MAX_BUDGET_SLOTS`]: invalid config keeps limiting on (never
+    /// unlimited, never deny-all).
     pub fn from_vars(vars: &HashMap<String, String>) -> Self {
         let defaults = Self::default();
         Self {
-            auth_max_attempts: parse_nonzero(
+            auth_max_attempts: parse_capped_max(
                 vars,
                 "AUTH_RATE_LIMIT_MAX",
                 defaults.auth_max_attempts,
@@ -207,7 +240,7 @@ impl RateLimitConfig {
                 "AUTH_RATE_LIMIT_WINDOW_SECS",
                 defaults.auth_window_secs,
             ),
-            vault_test_max_attempts: parse_nonzero(
+            vault_test_max_attempts: parse_capped_max(
                 vars,
                 "VAULT_TEST_RATE_LIMIT_MAX",
                 defaults.vault_test_max_attempts,
@@ -216,6 +249,11 @@ impl RateLimitConfig {
                 vars,
                 "VAULT_TEST_RATE_LIMIT_WINDOW_SECS",
                 defaults.vault_test_window_secs,
+            ),
+            vault_test_ip_max_attempts: parse_capped_max(
+                vars,
+                "VAULT_TEST_IP_RATE_LIMIT_MAX",
+                defaults.vault_test_ip_max_attempts,
             ),
         }
     }
@@ -285,6 +323,49 @@ mod tests {
             VAULT_TEST_WINDOW_SECS,
             crate::vault::TEST_CONNECTION_WINDOW_SECS
         );
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn configured_max_above_store_cap_clamps_instead_of_denying_all() {
+        // The durable slot store rejects budgets over MAX_BUDGET_SLOTS,
+        // so an unclamped 200 here would make every auth start and
+        // vault test a silent deny. from_vars must clamp to the cap.
+        for raw in ["101", "200", &u32::MAX.to_string()] {
+            let cfg = RateLimitConfig::from_vars(&vars(&[
+                ("AUTH_RATE_LIMIT_MAX", raw),
+                ("VAULT_TEST_RATE_LIMIT_MAX", raw),
+                ("VAULT_TEST_IP_RATE_LIMIT_MAX", raw),
+            ]));
+            assert_eq!(cfg.auth_max_attempts, MAX_BUDGET_SLOTS, "{raw}");
+            assert_eq!(cfg.vault_test_max_attempts, MAX_BUDGET_SLOTS, "{raw}");
+            assert_eq!(cfg.vault_test_ip_max_attempts, MAX_BUDGET_SLOTS, "{raw}");
+        }
+        // At-or-under values pass through untouched.
+        let cfg = RateLimitConfig::from_vars(&vars(&[("AUTH_RATE_LIMIT_MAX", "100")]));
+        assert_eq!(cfg.auth_max_attempts, 100);
+    }
+
+    #[test]
+    fn vault_ip_cap_defaults_above_account_cap_and_has_own_var() {
+        let defaults = RateLimitConfig::default();
+        assert_eq!(
+            defaults.vault_test_ip_max_attempts,
+            VAULT_TEST_IP_MAX_ATTEMPTS
+        );
+        assert!(
+            defaults.vault_test_ip_max_attempts > defaults.vault_test_max_attempts,
+            "NAT-shared IP budget must exceed the per-account budget"
+        );
+        let cfg = RateLimitConfig::from_vars(&vars(&[("VAULT_TEST_IP_RATE_LIMIT_MAX", "7")]));
+        assert_eq!(cfg.vault_test_ip_max_attempts, 7);
+        assert_eq!(cfg.vault_test_max_attempts, VAULT_TEST_MAX_ATTEMPTS);
     }
 
     #[test]

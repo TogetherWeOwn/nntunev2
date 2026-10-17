@@ -295,6 +295,16 @@ pub struct RateLimitBudget<'a> {
     pub window_secs: u64,
 }
 
+/// Outcome of [`Store::reserve_rate_limit_pair`]. The denial variants
+/// name WHICH budget refused so callers can report that budget's
+/// window (a burst denial must not carry the hourly `Retry-After`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairAdmission {
+    Allowed,
+    DeniedFirst,
+    DeniedSecond,
+}
+
 /// Persistence over migration-0002 tables. Implementations must use
 /// parameterized statements only, and conditional single-row updates for
 /// the rotation/sign-count advances. `Store` implementors also implement
@@ -369,7 +379,7 @@ pub trait Store {
         first: RateLimitBudget<'_>,
         second: RateLimitBudget<'_>,
         now: u64,
-    ) -> impl Future<Output = Result<bool, StoreError>> {
+    ) -> impl Future<Output = Result<PairAdmission, StoreError>> {
         async move {
             if !self
                 .reserve_rate_limit(
@@ -381,16 +391,22 @@ pub trait Store {
                 )
                 .await?
             {
-                return Ok(false);
+                return Ok(PairAdmission::DeniedFirst);
             }
-            self.reserve_rate_limit(
-                second.scope_key,
-                second.action,
-                second.limit,
-                now,
-                second.window_secs,
-            )
-            .await
+            if self
+                .reserve_rate_limit(
+                    second.scope_key,
+                    second.action,
+                    second.limit,
+                    now,
+                    second.window_secs,
+                )
+                .await?
+            {
+                Ok(PairAdmission::Allowed)
+            } else {
+                Ok(PairAdmission::DeniedSecond)
+            }
         }
     }
     /// Remove challenges that can no longer be redeemed.
@@ -833,14 +849,17 @@ where
     /// cannot prevent users from obtaining an authentication challenge.
     /// The scope key is the client /64 (IPv6) or full address (IPv4), so
     /// rotation inside one prefix cannot mint fresh budgets; audit logs keep
-    /// the full `source_ip`.
-    async fn admit_auth_start(&self) -> bool {
+    /// the full `source_ip`. Denial is `Err(retry_after_secs)` carrying
+    /// the DENIED budget's window, so a burst denial back-off hint is
+    /// the burst window, never the hourly one.
+    async fn admit_auth_start(&self) -> Result<(), u64> {
         // Hourly budget AND the configured short-window burst budget
         // (`AUTH_RATE_LIMIT_*`, default 10/60s), claimed as one
         // all-or-none decision: a burst-denied start must not burn an
         // hourly slot, and vice versa.
         let ip_key = rate_limit_ip_key(&self.source_ip);
-        self.store
+        match self
+            .store
             .reserve_rate_limit_pair(
                 RateLimitBudget {
                     scope_key: &ip_key,
@@ -857,7 +876,15 @@ where
                 self.now,
             )
             .await
-            .unwrap_or(false)
+        {
+            Ok(PairAdmission::Allowed) => Ok(()),
+            Ok(PairAdmission::DeniedFirst) => Err(AUTH_START_WINDOW_SECS),
+            Ok(PairAdmission::DeniedSecond) => Err(self.cfg.rate_limits.auth_window_secs),
+            // Store failure fails closed with the longer window: the
+            // denying budget is unknown, and understating the wait
+            // would invite a hot retry loop against a sick store.
+            Err(_) => Err(AUTH_START_WINDOW_SECS),
+        }
     }
 
     async fn send_magic_link_if_allowed(&self, user_id: &str, email: &str) {
@@ -1014,8 +1041,8 @@ where
     };
     // Per-IP admission before user lookup or maintenance. The global budget
     // applies to outbound mail only, never to auth challenge issuance.
-    if !ctx.admit_auth_start().await {
-        return throttled(AUTH_START_WINDOW_SECS);
+    if let Err(retry_after) = ctx.admit_auth_start().await {
+        return throttled(retry_after);
     }
     let existing = match ctx.store.user_by_email(&email).await {
         Ok(user) => user,
@@ -1383,7 +1410,7 @@ where
     // Per-IP admission before maintenance or lookup: unknown emails would
     // otherwise mint unbounded unbound challenge rows. Denial returns the
     // same fixed-shape 200 with an unstored challenge.
-    if !ctx.admit_auth_start().await {
+    if ctx.admit_auth_start().await.is_err() {
         return json_response(
             200,
             serde_json::json!({
@@ -1762,7 +1789,7 @@ where
     // identical response (the mail-budget denial inside
     // `send_magic_link_if_allowed` likewise sends nothing and stores no
     // magic row on the same shape).
-    if !ctx.admit_auth_start().await {
+    if ctx.admit_auth_start().await.is_err() {
         return json_response(200, serde_json::json!({"ok": true}));
     }
     // Identical response whether or not the account exists or the atomic
@@ -2085,37 +2112,41 @@ where
     // host verdict or vault-existence signal).
     let fail = || json_response(200, serde_json::json!({"ok": false}));
     // Dual budget (per-IP AND per-account; roadmap R6): the limits come
-    // from `ctx.cfg.rate_limits` (`VAULT_TEST_RATE_LIMIT_*` [vars]
-    // overlaid by the Worker entry), whose defaults ARE
+    // from `ctx.cfg.rate_limits` (`VAULT_TEST_*_RATE_LIMIT_*` [vars]
+    // overlaid by the Worker entry), whose per-account default IS
     // `vault::TEST_CONNECTION_MAX_ATTEMPTS` per
     // `vault::TEST_CONNECTION_WINDOW_SECS` — one source, see
-    // rate_limit.rs. Both slots are claimed as one all-or-none pair
-    // before any lookup or dial, so one host cannot burn probes across
-    // accounts, one account cannot burn them across hosts, and a
-    // denied attempt consumes neither budget. Denial keeps the same
-    // boolean collapse as every other failure on this route (never a
-    // 429 oracle here).
+    // rate_limit.rs. The per-IP budget has its own larger default
+    // (5x the account cap): NAT-shared addresses serve many accounts,
+    // so one account's allowed probes must not consume the whole IP
+    // budget and lock out its neighbours. Both slots are claimed as
+    // one all-or-none pair before any lookup or dial, so one host
+    // cannot burn probes across accounts, one account cannot burn
+    // them across hosts, and a denied attempt consumes neither
+    // budget. Denial keeps the same boolean collapse as every other
+    // failure on this route (never a 429 oracle here).
     let limits = ctx.cfg.rate_limits;
     let ip_key = rate_limit_ip_key(&ctx.source_ip);
-    let admitted = ctx
-        .store
-        .reserve_rate_limit_pair(
-            RateLimitBudget {
-                scope_key: &ip_key,
-                action: "vault.test_ip",
-                limit: u64::from(limits.vault_test_max_attempts),
-                window_secs: limits.vault_test_window_secs,
-            },
-            RateLimitBudget {
-                scope_key: &claims.user_id,
-                action: "vault.test",
-                limit: u64::from(limits.vault_test_max_attempts),
-                window_secs: limits.vault_test_window_secs,
-            },
-            ctx.now,
-        )
-        .await
-        .unwrap_or(false);
+    let admitted = matches!(
+        ctx.store
+            .reserve_rate_limit_pair(
+                RateLimitBudget {
+                    scope_key: &ip_key,
+                    action: "vault.test_ip",
+                    limit: u64::from(limits.vault_test_ip_max_attempts),
+                    window_secs: limits.vault_test_window_secs,
+                },
+                RateLimitBudget {
+                    scope_key: &claims.user_id,
+                    action: "vault.test",
+                    limit: u64::from(limits.vault_test_max_attempts),
+                    window_secs: limits.vault_test_window_secs,
+                },
+                ctx.now,
+            )
+            .await,
+        Ok(PairAdmission::Allowed)
+    );
     if !admitted {
         return fail();
     }
@@ -2551,16 +2582,15 @@ mod tests {
             first: RateLimitBudget<'_>,
             second: RateLimitBudget<'_>,
             now: u64,
-        ) -> Result<bool, StoreError> {
+        ) -> Result<PairAdmission, StoreError> {
             // All-or-none under the single slot-map borrow: count and
             // locate a free slot in BOTH budgets first, insert only
             // when both admit.
-            if first.limit == 0
-                || first.window_secs == 0
-                || second.limit == 0
-                || second.window_secs == 0
-            {
-                return Ok(false);
+            if first.limit == 0 || first.window_secs == 0 {
+                return Ok(PairAdmission::DeniedFirst);
+            }
+            if second.limit == 0 || second.window_secs == 0 {
+                return Ok(PairAdmission::DeniedSecond);
             }
             let mut slots = self.rate_limit_slots.borrow_mut();
             slots.retain(|_, expires| *expires > now);
@@ -2586,10 +2616,11 @@ mod tests {
                     (!slots.contains_key(&key)).then_some(slot)
                 })
             };
-            let (Some(first_slot), Some(second_slot)) =
-                (free_slot(&first, &slots), free_slot(&second, &slots))
-            else {
-                return Ok(false);
+            let (first_slot, second_slot) = (free_slot(&first, &slots), free_slot(&second, &slots));
+            let (first_slot, second_slot) = match (first_slot, second_slot) {
+                (Some(first_slot), Some(second_slot)) => (first_slot, second_slot),
+                (None, _) => return Ok(PairAdmission::DeniedFirst),
+                (_, None) => return Ok(PairAdmission::DeniedSecond),
             };
             *self.rate_limit_slot_probes.borrow_mut() += 2;
             slots.insert(
@@ -2608,7 +2639,7 @@ mod tests {
                 ),
                 now.saturating_add(second.window_secs),
             );
-            Ok(true)
+            Ok(PairAdmission::Allowed)
         }
         async fn prune_expired_challenges(&self, now: u64) -> Result<(), StoreError> {
             self.challenges
@@ -4745,6 +4776,12 @@ mod tests {
         );
         assert_eq!(taken_denied.status, 429, "{}", taken_denied.body);
         assert_eq!(fresh_denied.status, 429, "{}", fresh_denied.body);
+        // This harness raises the burst cap (see `cfg()`), so the
+        // HOURLY budget is the denier here and Retry-After must report
+        // its window — the mirror of the burst-denial pin in
+        // `auth_start_burst_budget_binds_before_hourly`.
+        assert_eq!(taken_denied.retry_after, Some(AUTH_START_WINDOW_SECS));
+        assert_eq!(fresh_denied.retry_after, Some(AUTH_START_WINDOW_SECS));
         assert_eq!(
             taken_denied.body, fresh_denied.body,
             "throttled bodies must be identical across emails"
@@ -4778,9 +4815,17 @@ mod tests {
         );
         assert_eq!(denied.status, 429, "{}", denied.body);
         assert_eq!(denied.body, r#"{"error":"rate_limited"}"#);
-        // Handler-level Retry-After pin: the denied register/start must
-        // carry the throttle window, not just a hand-built Response.
-        assert_eq!(denied.retry_after, Some(AUTH_START_WINDOW_SECS));
+        // Handler-level Retry-After pin: a BURST denial reports the
+        // burst window (60s default), not the hourly window — clients
+        // must not back off for an hour over a one-minute budget. The
+        // hourly-denial case reports AUTH_START_WINDOW_SECS and is
+        // pinned in `register_start_ip_throttle_is_email_independent`
+        // (where cfg() raises the burst so the hourly cap binds).
+        assert_eq!(
+            denied.retry_after,
+            Some(h.config.rate_limits.auth_window_secs)
+        );
+        assert_ne!(denied.retry_after, Some(AUTH_START_WINDOW_SECS));
         assert_eq!(
             h.store.users.borrow().len(),
             burst,
@@ -4817,7 +4862,11 @@ mod tests {
         ))
         .unwrap());
         for _ in 0..3 {
-            assert!(!block_on(store.reserve_rate_limit_pair(first, second, NOW)).unwrap());
+            assert_eq!(
+                block_on(store.reserve_rate_limit_pair(first, second, NOW)).unwrap(),
+                PairAdmission::DeniedSecond,
+                "the exhausted second budget must be named as the denier"
+            );
         }
         // Both first-budget slots are still available to single claims.
         assert!(block_on(store.reserve_rate_limit(
@@ -5702,41 +5751,80 @@ mod tests {
 
     #[test]
     fn vault_test_ip_budget_blocks_other_account_at_handler() {
-        // Per-IP gate isolated at the handler: account A exhausts the
-        // shared per-IP vault-test budget from the harness IP, then
-        // account B — whose own per-account budget is untouched — is
-        // denied on its FIRST probe with the usual boolean collapse
-        // and no dial. Removing the handler's admission check lets B
-        // dial and answer ok:true, failing this test.
+        // Per-IP gate isolated at the handler, NAT-sized: the per-IP
+        // cap sits ABOVE the per-account cap, so account A exhausting
+        // its own budget must NOT lock out neighbour B on the same
+        // address (first probe still admitted). Only once enough
+        // accounts together exhaust the larger per-IP budget is a
+        // fresh account denied on its FIRST probe with the usual
+        // boolean collapse and no dial. Shrinking the IP cap back to
+        // the account cap fails the neighbour probe; removing the
+        // handler's admission check fails the final denial.
         let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        seed_user(&h, "u2", "b@example.com");
-        let cookie_a = magic_login(&h, "a@example.com");
-        let cookie_b = magic_login(&h, "b@example.com");
-        put_test_vault(&h, &cookie_a);
-        put_test_vault(&h, &cookie_b);
-
-        let ip_cap = h.config.rate_limits.vault_test_max_attempts;
-        for i in 0..ip_cap {
-            let resp = h.call_full(
+        let account_cap = h.config.rate_limits.vault_test_max_attempts;
+        let ip_cap = h.config.rate_limits.vault_test_ip_max_attempts;
+        assert!(
+            ip_cap > account_cap,
+            "per-IP cap must exceed the per-account cap"
+        );
+        assert_eq!(
+            ip_cap % account_cap,
+            0,
+            "test arithmetic assumes whole account budgets fill the IP budget"
+        );
+        let fillers = (ip_cap / account_cap) as usize;
+        // fillers accounts to exhaust the IP budget, plus one victim.
+        let mut cookies = Vec::new();
+        for i in 0..=fillers {
+            let user_id = format!("u{i}");
+            let email = format!("nat{i}@example.com");
+            seed_user(&h, &user_id, &email);
+            let cookie = magic_login(&h, &email);
+            put_test_vault(&h, &cookie);
+            cookies.push(cookie);
+        }
+        let probe = |cookie: &str| {
+            h.call_full(
                 "POST",
                 "/v1/vault/test-connection",
                 None,
-                Some(cookie_a.clone()),
+                Some(cookie.to_string()),
                 Some(ORIGIN),
-            );
-            assert_eq!(resp.body, r#"{"ok":true}"#, "probe {i} by A");
+            )
+        };
+
+        // A exhausts its own per-account budget...
+        for i in 0..account_cap {
+            assert_eq!(probe(&cookies[0]).body, r#"{"ok":true}"#, "probe {i} by A");
         }
+        // ...and neighbour B's first probe is still admitted: one
+        // account alone cannot consume the NAT-shared IP budget.
+        assert_eq!(
+            probe(&cookies[1]).body,
+            r#"{"ok":true}"#,
+            "neighbour behind the same IP must not be locked out by A alone"
+        );
+        // Fill the remaining per-IP slots across the other accounts.
+        let mut dialled = usize::try_from(account_cap).unwrap() + 1;
+        for (idx, cookie) in cookies.iter().enumerate().take(fillers).skip(1) {
+            let probes = if idx == 1 {
+                // B already used one of its account slots above.
+                account_cap - 1
+            } else {
+                account_cap
+            };
+            for i in 0..probes {
+                assert_eq!(probe(cookie).body, r#"{"ok":true}"#, "probe {i} by u{idx}");
+                dialled += 1;
+            }
+        }
+        assert_eq!(dialled, ip_cap as usize);
         let dials = h.dialer.seen.borrow().len();
         assert_eq!(dials, ip_cap as usize);
 
-        let resp = h.call_full(
-            "POST",
-            "/v1/vault/test-connection",
-            None,
-            Some(cookie_b),
-            Some(ORIGIN),
-        );
+        // The victim's per-account budget is untouched, but the shared
+        // per-IP budget is exhausted: denied before any dial.
+        let resp = probe(&cookies[fillers]);
         assert_eq!(resp.body, r#"{"ok":false}"#);
         assert_eq!(
             h.dialer.seen.borrow().len(),
