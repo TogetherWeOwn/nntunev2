@@ -457,10 +457,21 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     const afterSeek = await audioState();
     expect(afterSeek.errorCode, 'player reported a media error after seeking').toBeNull();
 
-    // Playback can continue from the seeked position: resume through the UI
+    // Playback must continue from the seeked position: resume through the UI
     // toggle and require the position to advance past where the seek left
     // it (on the 210 ms fixture this is satisfied by playing out to the
-    // end, where currentTime reaches duration).
+    // end, where currentTime reaches duration). Advancing past the seek
+    // alone is not enough — restarting the track from 0 and playing to the
+    // end would also pass — so track the lowest position observed during
+    // resumed playback and require playback never to have dropped back
+    // toward the start.
+    await player.evaluate((element) => {
+      const audio = element as HTMLAudioElement & { __resumeMin?: number };
+      audio.__resumeMin = Infinity;
+      audio.addEventListener('timeupdate', () => {
+        audio.__resumeMin = Math.min(audio.__resumeMin ?? Infinity, audio.currentTime);
+      });
+    });
     await player.click({ position: togglePosition });
     await expect
       .poll(async () => (await audioState()).currentTime, {
@@ -468,6 +479,13 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
         message: 'playback did not continue from the seeked position',
       })
       .toBeGreaterThan(afterSeek.currentTime);
+    const resumeMin = await player.evaluate(
+      (element) => (element as HTMLAudioElement & { __resumeMin?: number }).__resumeMin,
+    );
+    expect(
+      resumeMin,
+      'playback restarted instead of continuing from the seek',
+    ).toBeGreaterThanOrEqual(afterSeek.currentTime - beforeSeek.duration * 0.05);
     const continued = await audioState();
     expect(continued.errorCode, 'player reported a media error after resuming').toBeNull();
     expect(pageErrors, `page errors during player seek: ${pageErrors.join('; ')}`).toEqual([]);
