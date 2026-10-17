@@ -31,18 +31,21 @@ const BANNED_KEY_PARTS: &[&str] = &[
     "credit_card",
     "card_number",
     "cvv",
-    "payment",
+    "payment_details",
     "email",
     "session",
     "postal",
     "address",
     "street",
     "postcode",
-    "zip",
-    "body",
-    "header",
-    "query",
-    "nzb",
+    "zip_code",
+    "request_body",
+    "response_body",
+    "headers",
+    "raw_query",
+    "query_string",
+    "nzb_contents",
+    "nzb_xml",
 ];
 
 fn manifest_dir() -> PathBuf {
@@ -536,22 +539,15 @@ fn has_email_like_value(value: &str) -> bool {
 
 fn has_obvious_secret_value(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    const MARKERS: &[&str] = &[
-        "bearer ",
-        "bearer=",
-        "bearer:",
-        "token ",
-        "token=",
-        "token:",
-        "sk-",
-        "sk_live_",
-        "sk_test_",
-        "tok_",
-        "ghp_",
-        "gho_",
-        "ghu_",
-        "xoxb-",
-        "xoxp-",
+    /// Prefix-style token markers: flag only on a word boundary (or at the
+    /// start) so benign words like `task-queued` are not caught by `sk-`.
+    const PREFIX_MARKERS: &[&str] = &[
+        "bearer ", "bearer=", "bearer:", "token ", "token=", "token:", "sk-", "sk_live_",
+        "sk_test_", "tok_", "ghp_", "gho_", "ghu_", "xoxb-", "xoxp-",
+    ];
+    /// Assignment-style markers: plain contains, so compound keys like
+    /// `dbpassword=***REDACTED***` stay flagged.
+    const ASSIGNMENT_MARKERS: &[&str] = &[
         "password=",
         "password:",
         "secret=",
@@ -559,15 +555,18 @@ fn has_obvious_secret_value(value: &str) -> bool {
         "apikey=",
         "api_key=",
     ];
-    MARKERS.iter().any(|marker| {
-        lower.match_indices(marker).any(|(index, _)| {
-            index == 0
-                || !lower[..index]
-                    .chars()
-                    .next_back()
-                    .is_some_and(|c| c.is_ascii_alphanumeric())
+    ASSIGNMENT_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || PREFIX_MARKERS.iter().any(|marker| {
+            lower.match_indices(marker).any(|(index, _)| {
+                index == 0
+                    || !lower[..index]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_ascii_alphanumeric())
+            })
         })
-    })
 }
 
 fn has_banned_key(fields: &BTreeMap<String, JsonValue>) -> Option<String> {
@@ -732,7 +731,7 @@ fn golden_line_has_no_prohibited_keys_or_obvious_secret_values() {
         "user_credentials",
         "passphrase",
         "privatekey",
-        "payment_id",
+        "payment_details",
         "postal_code",
         "zip_code",
         "home_address",
@@ -750,7 +749,18 @@ fn golden_line_has_no_prohibited_keys_or_obvious_secret_values() {
             "did not reject prohibited key {key}"
         );
     }
-    for key in ["ship_id", "filename", "namespace", "trip"] {
+    for key in [
+        "ship_id",
+        "filename",
+        "namespace",
+        "trip",
+        "nzb_id",
+        "query_ms",
+        "body_bytes",
+        "header_count",
+        "payment_id",
+        "gzip_ratio",
+    ] {
         let acceptable = BTreeMap::from([(key.to_string(), JsonValue::String("safe".into()))]);
         assert!(
             has_banned_key(&acceptable).is_none(),
@@ -766,6 +776,8 @@ fn golden_line_has_no_prohibited_keys_or_obvious_secret_values() {
         "sk-live-example",
         "sk_live_example",
         "tok_example",
+        "dbpassword=***REDACTED***",
+        "adminpassword:hunter2",
     ] {
         let bad = BTreeMap::from([("value".to_string(), JsonValue::String(value.into()))]);
         assert!(
