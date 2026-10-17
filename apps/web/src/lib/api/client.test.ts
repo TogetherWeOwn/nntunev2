@@ -328,6 +328,25 @@ describe('ApiClient', () => {
 		expect(seenUrls).toEqual(['https://api.example.com/v1/auth/magic/start']);
 	});
 
+	it('starts session-bound passkey reauthentication with credentials included', async () => {
+		const seen: { url: unknown; init: RequestInit }[] = [];
+		const fetchFn = (async (url: unknown, init: RequestInit) => {
+			seen.push({ url, init });
+			return jsonResponse({ challenge: 'fresh-challenge', rp_id: 'example.com', allow_credentials: [] });
+		}) as unknown as typeof fetch;
+		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
+
+		await expect(client.reauthenticateStart()).resolves.toEqual({
+			challenge: 'fresh-challenge',
+			rp_id: 'example.com',
+			allow_credentials: []
+		});
+		expect(seen.map(({ url }) => url)).toEqual([
+			'https://api.example.com/v1/session/reauthenticate/start'
+		]);
+		expect(seen[0].init).toEqual(expect.objectContaining({ method: 'POST', credentials: 'include' }));
+	});
+
 	it('signs out through the session endpoint so a swapped user can recover', async () => {
 		const seen: { url: unknown; init: RequestInit }[] = [];
 		const fetchFn = (async (url: unknown, init: RequestInit) => {
@@ -515,6 +534,10 @@ describe('ApiClient', () => {
 			} else if (route.web === 'loginFinish') {
 				await client.loginFinish(
 					route.input as unknown as Parameters<typeof client.loginFinish>[0]
+				);
+			} else if (route.web === 'reauthenticateFinish') {
+				await client.reauthenticateFinish(
+					route.input as unknown as Parameters<typeof client.reauthenticateFinish>[0]
 				);
 			} else if (route.web === 'testProviderConnection') {
 				await client.testProviderConnection(

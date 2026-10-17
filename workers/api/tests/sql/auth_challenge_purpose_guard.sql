@@ -11,6 +11,7 @@ BEGIN
     INSERT INTO auth_challenges (id, rp_id, origin, expires_at, purpose)
     VALUES ('c-register', 'example.com', 'https://example.com', 9999999999, 'register'),
            ('c-login',    'example.com', 'https://example.com', 9999999999, 'login'),
+           ('c-reauth',   'example.com', 'https://example.com', 9999999999, 'reauth'),
            ('c-legacy',   'example.com', 'https://example.com', 9999999999, '');
     INSERT INTO auth_challenges (id, rp_id, origin, expires_at)
     VALUES ('c-default', 'example.com', 'https://example.com', 9999999999);
@@ -50,6 +51,14 @@ BEGIN
         NULL;
     END;
 
+    -- Trigger: a reauth challenge cannot be repurposed as a login challenge.
+    BEGIN
+        UPDATE auth_challenges SET purpose = 'login' WHERE id = 'c-reauth';
+        RAISE EXCEPTION 'reauth challenge was re-purposed to login';
+    EXCEPTION WHEN restrict_violation THEN
+        NULL;
+    END;
+
     -- Trigger: a legacy ('') challenge cannot be upgraded to a usable one.
     BEGIN
         UPDATE auth_challenges SET purpose = 'register' WHERE id = 'c-legacy';
@@ -68,7 +77,7 @@ BEGIN
 
     -- The purposes are unchanged after all the rejected attempts.
     IF (SELECT array_agg(purpose ORDER BY id) FROM auth_challenges)
-       IS DISTINCT FROM ARRAY['', '', 'login', 'register']::text[] THEN
+       IS DISTINCT FROM ARRAY['', '', 'login', 'reauth', 'register']::text[] THEN
         RAISE EXCEPTION 'purposes changed by rejected updates';
     END IF;
 

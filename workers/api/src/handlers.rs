@@ -246,6 +246,7 @@ pub struct UserRecord {
 /// account) rejects before any verification or claim.
 pub const PURPOSE_REGISTER: &str = "register";
 pub const PURPOSE_LOGIN: &str = "login";
+pub const PURPOSE_REAUTH: &str = "reauth";
 
 /// Counter stored for a new credential, whatever the attestation said.
 /// `none` attestation is unauthenticated, so its enrollment counter is
@@ -382,6 +383,15 @@ pub trait Store {
         new_counter: u32,
         new_expires_at: u64,
     ) -> impl Future<Output = Result<bool, StoreError>>;
+    /// Atomically claim the old session for reauthentication and insert its
+    /// replacement. A false result means the conditional revoke lost a race;
+    /// errors must leave both rows unchanged.
+    fn replace_session_after_reauthentication(
+        &self,
+        _replacement: &session::ReauthenticatedSession,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
     fn revoke_session(&self, id: &str) -> impl Future<Output = Result<(), StoreError>>;
     fn revoke_all_sessions(&self, user_id: &str) -> impl Future<Output = Result<(), StoreError>>;
     fn vault_by_user(
@@ -1342,6 +1352,55 @@ where
     )
 }
 
+async fn session_reauth_start<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _) = match ctx.authenticate(req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let challenge = match auth::new_registration_challenge(&ctx.cfg.rp_id, &ctx.cfg.origin, ctx.now)
+    {
+        Ok(challenge) => challenge,
+        Err(_) => return internal(),
+    };
+    let admitted = ctx
+        .store
+        .reserve_rate_limit(
+            &claims.user_id,
+            "auth.reauth_start",
+            AUTH_STARTS_PER_HOUR,
+            ctx.now,
+            AUTH_START_WINDOW_SECS,
+        )
+        .await
+        .unwrap_or(false);
+    if !admitted {
+        return generic_auth();
+    }
+    if ctx.store.prune_expired_challenges(ctx.now).await.is_err()
+        || ctx
+            .store
+            .insert_challenge(&challenge, Some(&claims.user_id), PURPOSE_REAUTH)
+            .await
+            .is_err()
+    {
+        return internal();
+    }
+    json_response(
+        200,
+        serde_json::json!({
+            "challenge": challenge.id,
+            "allow_credentials": [],
+            "rp_id": ctx.cfg.rp_id,
+        }),
+    )
+}
+
 async fn login_finish<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -1454,6 +1513,147 @@ where
         Ok(resp) => resp,
         Err(resp) => resp,
     }
+}
+
+async fn session_reauth_finish<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, old_token) = match ctx.authenticate(req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let Some(body) = parse_body::<LoginFinishBody>(req) else {
+        return generic_auth();
+    };
+    if !valid_challenge_id(&body.challenge) {
+        return generic_auth();
+    }
+    let lookup_admitted = ctx
+        .store
+        .reserve_rate_limit(
+            &rate_limit_ip_key(&ctx.source_ip),
+            "auth.reauth_finish_ip",
+            FINISH_LOOKUP_ATTEMPTS_PER_IP,
+            ctx.now,
+            FINISH_ATTEMPT_WINDOW_SECS,
+        )
+        .await
+        .unwrap_or(false);
+    if !lookup_admitted {
+        return generic_auth();
+    }
+    let row = match ctx.store.challenge_by_id(&body.challenge).await {
+        Ok(Some(row))
+            if row.purpose == PURPOSE_REAUTH
+                && row.user_id.as_deref() == Some(claims.user_id.as_str()) =>
+        {
+            row
+        }
+        Ok(_) => return generic_auth(),
+        Err(_) => return internal(),
+    };
+    let (Ok(authenticator_data), Ok(client_data_json), Ok(signature)) = (
+        b64url_decode(&body.authenticator_data),
+        b64url_decode(&body.client_data_json),
+        b64url_decode(&body.signature),
+    ) else {
+        return generic_auth();
+    };
+    let admitted = ctx
+        .store
+        .reserve_rate_limit(
+            &body.challenge,
+            "auth.reauth_finish",
+            LOGIN_FINISH_ATTEMPTS_PER_CHALLENGE,
+            ctx.now,
+            FINISH_ATTEMPT_WINDOW_SECS,
+        )
+        .await
+        .unwrap_or(false);
+    if !admitted {
+        return generic_auth();
+    }
+    let credential = match ctx.store.credential_by_id(&body.credential_id).await {
+        Ok(Some(credential)) if credential.user_id == claims.user_id => credential,
+        Ok(_) => return generic_auth(),
+        Err(_) => return internal(),
+    };
+    let new_sign_count = match webauthn::verify_assertion(
+        &credential.public_key,
+        credential.sign_count,
+        &authenticator_data,
+        &client_data_json,
+        &signature,
+        &ctx.cfg.expect(&row.challenge.id),
+    ) {
+        Ok(count) => count,
+        Err(_) => return generic_auth(),
+    };
+    if auth::consume_challenge_atomically(
+        row.challenge,
+        &ctx.cfg.rp_id,
+        &ctx.cfg.origin,
+        ctx.now,
+        ctx.store,
+    )
+    .await
+    .is_err()
+    {
+        return generic_auth();
+    }
+    match ctx
+        .store
+        .advance_sign_count(
+            &credential.cred_id_b64url,
+            credential.sign_count,
+            new_sign_count,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return generic_auth(),
+        Err(_) => return internal(),
+    }
+    let keys = ctx.cfg.session_keys();
+    let replacement = match session::reauthenticate_session(
+        &keys,
+        &old_token,
+        ctx.now,
+        &SessionRecord {
+            id: claims.session_id.clone(),
+            user_id: claims.user_id.clone(),
+            created_at: claims.created_at,
+            expires_at: claims.expires_at,
+            rotation_counter: claims.rotation_counter,
+            revoked: false,
+        },
+        &credential.user_id,
+        ctx.cfg.session_ttl_secs,
+    ) {
+        Ok(replacement) => replacement,
+        Err(error) => return session_error_response(error),
+    };
+    match ctx
+        .store
+        .replace_session_after_reauthentication(&replacement)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return generic_auth(),
+        Err(_) => return internal(),
+    }
+    ctx.audit(&claims.user_id, "auth.reauthenticate", true)
+        .await;
+    let mut response = json_response(200, serde_json::json!({"ok": true}));
+    response.set_cookie = Some(session::set_cookie_header(
+        &replacement.token,
+        replacement.new_record.expires_at.saturating_sub(ctx.now),
+    ));
+    response
 }
 
 async fn magic_start<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
@@ -1904,6 +2104,8 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/auth/passkey/register/finish"
             | "/v1/auth/passkey/login/start"
             | "/v1/auth/passkey/login/finish"
+            | "/v1/session/reauthenticate/start"
+            | "/v1/session/reauthenticate/finish"
             | "/v1/auth/magic/start"
             | "/v1/auth/magic/finish"
             | "/v1/session/refresh"
@@ -1944,6 +2146,8 @@ where
         ("POST", "/v1/auth/passkey/register/finish") => register_finish(ctx, req).await,
         ("POST", "/v1/auth/passkey/login/start") => login_start(ctx, req).await,
         ("POST", "/v1/auth/passkey/login/finish") => login_finish(ctx, req).await,
+        ("POST", "/v1/session/reauthenticate/start") => session_reauth_start(ctx, req).await,
+        ("POST", "/v1/session/reauthenticate/finish") => session_reauth_finish(ctx, req).await,
         ("POST", "/v1/auth/magic/start") => magic_start(ctx, req).await,
         ("POST", "/v1/auth/magic/finish") => magic_finish(ctx, req).await,
         ("POST", "/v1/session/refresh") => session_refresh(ctx, req).await,
@@ -2068,6 +2272,8 @@ mod tests {
         orphan_user_after_next_challenge: RefCell<Option<String>>,
         challenge_reads: RefCell<usize>,
         rate_limit_slot_probes: RefCell<usize>,
+        fail_reauth_revocation: RefCell<bool>,
+        fail_reauth_insert: RefCell<bool>,
     }
 
     impl Store for FakeStore {
@@ -2336,6 +2542,36 @@ mod tests {
                 }
                 _ => Ok(false),
             }
+        }
+        async fn replace_session_after_reauthentication(
+            &self,
+            replacement: &session::ReauthenticatedSession,
+        ) -> Result<bool, StoreError> {
+            if *self.fail_reauth_revocation.borrow() {
+                return Ok(false);
+            }
+            let mut sessions = self.sessions.borrow_mut();
+            let old_id = &replacement.revoked_session_id;
+            let Some(old) = sessions.get(old_id) else {
+                return Ok(false);
+            };
+            if old.user_id != replacement.revoked_user_id
+                || u64::from(old.rotation_counter) != replacement.revoked_rotation_counter
+                || old.revoked
+                || sessions.contains_key(&replacement.new_record.id)
+            {
+                return Ok(false);
+            }
+            sessions.get_mut(old_id).expect("row checked").revoked = true;
+            if *self.fail_reauth_insert.borrow() {
+                sessions.get_mut(old_id).expect("row checked").revoked = false;
+                return Err(StoreError);
+            }
+            sessions.insert(
+                replacement.new_record.id.clone(),
+                replacement.new_record.clone(),
+            );
+            Ok(true)
         }
         async fn revoke_session(&self, id: &str) -> Result<(), StoreError> {
             if let Some(row) = self.sessions.borrow_mut().get_mut(id) {
@@ -3260,6 +3496,262 @@ mod tests {
             r#"{{"type":"{}","challenge":"{}","origin":"{}","crossOrigin":false}}"#,
             type_, challenge, ORIGIN
         )
+    }
+
+    fn fx_reauth_assertion(
+        challenge: &str,
+        credential_id: &[u8],
+        secret: u8,
+        sign_count: u32,
+    ) -> serde_json::Value {
+        use p256::ecdsa::{signature::Signer, Signature as EsSignature, SigningKey};
+        use sha2::Digest;
+
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
+        auth_data.push(0x05); // User presence and user verification are required.
+        auth_data.extend_from_slice(&sign_count.to_be_bytes());
+        let client_data = fx_client_json("webauthn.get", challenge);
+        let mut message = auth_data.clone();
+        message.extend_from_slice(&sha2::Sha256::digest(client_data.as_bytes()));
+        let signing_key = SigningKey::from_slice(&[secret; 32]).unwrap();
+        let signature: EsSignature = signing_key.sign(&message);
+        serde_json::json!({
+            "challenge": challenge,
+            "credential_id": b64url_encode(credential_id),
+            "authenticator_data": b64url_encode(&auth_data),
+            "client_data_json": b64url_encode(client_data.as_bytes()),
+            "signature": b64url_encode(signature.to_der().as_bytes()),
+        })
+    }
+
+    fn start_reauthentication(h: &Harness, cookie: &str) -> String {
+        let response = h.call_full(
+            "POST",
+            "/v1/session/reauthenticate/start",
+            None,
+            Some(cookie.to_string()),
+            Some(ORIGIN),
+        );
+        assert_eq!(response.status, 200, "{}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        body["challenge"].as_str().unwrap().to_string()
+    }
+
+    fn add_test_passkey(h: &Harness, user_id: &str, credential_id: &[u8], secret: u8) {
+        block_on(h.store.insert_credential(&PasskeyCredential {
+            cred_id_b64url: b64url_encode(credential_id),
+            user_id: user_id.to_string(),
+            public_key: fx_es256_cose(secret),
+            sign_count: 0,
+            registered_at: NOW,
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn passkey_reauthentication_replaces_only_the_authenticated_session() {
+        let h = harness();
+        seed_user(&h, "reauth-user", "reauth@example.com");
+        let old_cookie = magic_login(&h, "reauth@example.com");
+        let old_token = old_cookie.split_once('=').unwrap().1;
+        let old_claims = session::verify_session(&h.config.session_secret, old_token, NOW).unwrap();
+        let old_record = h
+            .store
+            .sessions
+            .borrow()
+            .get(&old_claims.session_id)
+            .unwrap()
+            .clone();
+        let credential_id = b"reauth-credential";
+        add_test_passkey(&h, &old_claims.user_id, credential_id, 73);
+
+        let challenge = start_reauthentication(&h, &old_cookie);
+        let response = h.call_full(
+            "POST",
+            "/v1/session/reauthenticate/finish",
+            Some(fx_reauth_assertion(&challenge, credential_id, 73, 1).to_string()),
+            Some(old_cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(response.status, 200, "{}", response.body);
+        let replacement_cookie = cookie_of(&response);
+        let replacement_token = replacement_cookie.split_once('=').unwrap().1;
+        let replacement_claims =
+            session::verify_session(&h.config.session_secret, replacement_token, NOW).unwrap();
+        assert_ne!(replacement_claims.session_id, old_record.id);
+        assert_eq!(replacement_claims.user_id, old_record.user_id);
+        let sessions = h.store.sessions.borrow();
+        assert!(sessions.get(&old_record.id).unwrap().revoked);
+        assert!(session::verify_stored_session(
+            &h.config.session_keys(),
+            replacement_token,
+            NOW,
+            sessions.get(&replacement_claims.session_id).unwrap(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn reauthentication_rejects_a_credential_for_another_account() {
+        let h = harness();
+        seed_user(&h, "reauth-owner", "reauth-owner@example.com");
+        let old_cookie = magic_login(&h, "reauth-owner@example.com");
+        let old_token = old_cookie.split_once('=').unwrap().1;
+        let old_claims = session::verify_session(&h.config.session_secret, old_token, NOW).unwrap();
+        let old_record = h
+            .store
+            .sessions
+            .borrow()
+            .get(&old_claims.session_id)
+            .unwrap()
+            .clone();
+        seed_user(&h, "other-account", "other@example.com");
+        let credential_id = b"other-account-credential";
+        add_test_passkey(&h, "other-account", credential_id, 74);
+
+        let challenge = start_reauthentication(&h, &old_cookie);
+        let response = h.call_full(
+            "POST",
+            "/v1/session/reauthenticate/finish",
+            Some(fx_reauth_assertion(&challenge, credential_id, 74, 1).to_string()),
+            Some(old_cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(response.status, 401);
+        assert!(response.set_cookie.is_none());
+        assert!(
+            !h.store
+                .sessions
+                .borrow()
+                .get(&old_record.id)
+                .unwrap()
+                .revoked
+        );
+        assert!(
+            !h.store
+                .challenges
+                .borrow()
+                .get(&challenge)
+                .unwrap()
+                .challenge
+                .consumed
+        );
+    }
+
+    #[test]
+    fn atomic_reauthentication_race_and_failures_leave_no_partial_replacement() {
+        let h = harness();
+        seed_user(&h, "atomic-reauth", "atomic-reauth@example.com");
+        let old_cookie = magic_login(&h, "atomic-reauth@example.com");
+        let old_token = old_cookie.split_once('=').unwrap().1;
+        let old_claims = session::verify_session(&h.config.session_secret, old_token, NOW).unwrap();
+        let old_record = h
+            .store
+            .sessions
+            .borrow()
+            .get(&old_claims.session_id)
+            .unwrap()
+            .clone();
+        let keys = h.config.session_keys();
+        let prepared = session::reauthenticate_session(
+            &keys,
+            old_token,
+            NOW + 1200,
+            &old_record,
+            &old_claims.user_id,
+            h.config.session_ttl_secs,
+        )
+        .unwrap();
+        assert!(block_on(h.store.replace_session_after_reauthentication(&prepared)).unwrap());
+        let loser = session::reauthenticate_session(
+            &keys,
+            old_token,
+            NOW + 1200,
+            &old_record,
+            &old_claims.user_id,
+            h.config.session_ttl_secs,
+        )
+        .unwrap();
+        assert!(!block_on(h.store.replace_session_after_reauthentication(&loser)).unwrap());
+        assert_eq!(h.store.sessions.borrow().len(), 2);
+
+        for fail_insert in [false, true] {
+            let h = harness();
+            seed_user(&h, "rollback-reauth", "rollback-reauth@example.com");
+            let old_cookie = magic_login(&h, "rollback-reauth@example.com");
+            let old_token = old_cookie.split_once('=').unwrap().1;
+            let old_claims =
+                session::verify_session(&h.config.session_secret, old_token, NOW).unwrap();
+            let old_record = h
+                .store
+                .sessions
+                .borrow()
+                .get(&old_claims.session_id)
+                .unwrap()
+                .clone();
+            let credential_id = b"rollback-credential";
+            add_test_passkey(&h, &old_claims.user_id, credential_id, 75);
+            if fail_insert {
+                *h.store.fail_reauth_insert.borrow_mut() = true;
+            } else {
+                *h.store.fail_reauth_revocation.borrow_mut() = true;
+            }
+            let challenge = start_reauthentication(&h, &old_cookie);
+            let response = h.call_full(
+                "POST",
+                "/v1/session/reauthenticate/finish",
+                Some(fx_reauth_assertion(&challenge, credential_id, 75, 1).to_string()),
+                Some(old_cookie),
+                Some(ORIGIN),
+            );
+            assert!(response.status >= 400);
+            assert!(response.set_cookie.is_none());
+            let sessions = h.store.sessions.borrow();
+            assert_eq!(sessions.len(), 1, "failed replacement must insert no row");
+            assert!(!sessions.get(&old_record.id).unwrap().revoked);
+        }
+    }
+
+    #[test]
+    fn ordinary_magic_login_does_not_revoke_existing_sessions() {
+        let h = harness();
+        seed_user(&h, "ordinary-login", "ordinary-login@example.com");
+        let existing_cookie = magic_login(&h, "ordinary-login@example.com");
+        let existing_token = existing_cookie.split_once('=').unwrap().1;
+        let existing_claims =
+            session::verify_session(&h.config.session_secret, existing_token, NOW).unwrap();
+        let existing_record = h
+            .store
+            .sessions
+            .borrow()
+            .get(&existing_claims.session_id)
+            .unwrap()
+            .clone();
+
+        let start = h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": "ordinary-login@example.com"}),
+        );
+        assert_eq!(start.status, 200);
+        let token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let finish = h.call_full(
+            "POST",
+            "/v1/auth/magic/finish",
+            Some(serde_json::json!({"token": token}).to_string()),
+            Some(existing_cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(finish.status, 200, "{}", finish.body);
+        assert!(
+            !h.store
+                .sessions
+                .borrow()
+                .get(&existing_record.id)
+                .unwrap()
+                .revoked
+        );
     }
 
     #[test]
@@ -5490,7 +5982,7 @@ mod tests {
                 "register-finish" | "register-finish-invite" => {
                     serde_json::from_value::<RegisterFinishBody>(wire.clone()).map(|_| ())
                 }
-                "login-finish" => {
+                "login-finish" | "session-reauthenticate-finish" => {
                     serde_json::from_value::<LoginFinishBody>(wire.clone()).map(|_| ())
                 }
                 "magic-finish" => {
@@ -5512,7 +6004,7 @@ mod tests {
             pinned += 1;
         }
         assert_eq!(
-            pinned, 9,
+            pinned, 10,
             "every body-bearing route (incl. the invite variant) is pinned"
         );
     }

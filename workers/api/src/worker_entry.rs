@@ -537,6 +537,53 @@ impl Store for PgStore {
         Ok(rows.len() == 1)
     }
 
+    async fn replace_session_after_reauthentication(
+        &self,
+        replacement: &crate::session::ReauthenticatedSession,
+    ) -> Result<bool, StoreError> {
+        let claim = replacement.revocation_claim();
+        let params = claim.params();
+        let rotation_counter =
+            i32::try_from(claim.rotation_counter().ok_or(StoreError)?).map_err(|_| StoreError)?;
+        let created_at = i64_of(replacement.new_record.created_at)?;
+        let expires_at = i64_of(replacement.new_record.expires_at)?;
+        let new_counter =
+            i32::try_from(replacement.new_record.rotation_counter).map_err(|_| StoreError)?;
+        let mut client = self.connect().await?;
+        let transaction = client.transaction().await.map_err(|_| StoreError)?;
+        let rows = transaction
+            .query(
+                claim.statement(),
+                &[&params[0], &params[1], &rotation_counter],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        if rows.len() != 1 {
+            transaction.rollback().await.map_err(|_| StoreError)?;
+            return Ok(false);
+        }
+        if transaction
+            .execute(
+                "INSERT INTO sessions (id, user_id, created_at, expires_at, rotation_counter, revoked) \
+                 VALUES ($1, $2, $3, $4, $5, FALSE)",
+                &[
+                    &replacement.new_record.id,
+                    &replacement.new_record.user_id,
+                    &created_at,
+                    &expires_at,
+                    &new_counter,
+                ],
+            )
+            .await
+            .is_err()
+        {
+            transaction.rollback().await.map_err(|_| StoreError)?;
+            return Err(StoreError);
+        }
+        transaction.commit().await.map_err(|_| StoreError)?;
+        Ok(true)
+    }
+
     async fn revoke_session(&self, id: &str) -> Result<(), StoreError> {
         let client = self.connect().await?;
         client

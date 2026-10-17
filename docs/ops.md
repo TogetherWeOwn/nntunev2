@@ -230,8 +230,28 @@ this documentation update, nor evidence of separate compute/failure domains.
   write denial, and bidirectional cross-database CONNECT denial. The earlier
   seven-role `select 1` probe predates consolidation and is not current proof.
 - MB migrator/runtime/read-only roles were provisioned separately. The latest
-  app-isolation receipt does not prove MB read-only enforcement; verify MB grants
-  before application use. Never copy database URLs into this repo, issues, or logs.
+  app-isolation receipt does not prove MB read-only enforcement. On 2026-10-17,
+  this agent attempted to locate an authorized read-only SQL executor through the
+  Paperclip connection catalog; both searches timed out. No direct SQL session or
+  host-side verification receipt was available in this workspace. Accordingly,
+  **the MB app role's live grants remain unverified**; the older receipt's claim
+  that the MB binding uses a read-only role is host-reported only.
+- Exact checks still required against the MB database using the authorized
+  read-only verification path: establish the database/schema and effective role
+  identity without exposing connection details; run a representative `SELECT`
+  against a required mirror table; inspect effective table/schema privileges and
+  default privileges; and confirm representative `INSERT`/`UPDATE`/`DELETE`,
+  sequence-write, and schema/table DDL privileges are denied. A denial must be
+  established from the effective role's actual privilege result or a safely
+  rolled-back, non-mutating authorization check; do not attempt a write that
+  could change data. No check above was run here, so neither SELECT success nor
+  write/DDL denial is claimed.
+- Authorized follow-up: the Operator should use the existing secure host-side
+  read-only verification path to run and return the checks above, reporting only
+  date, environment/database and role labels, check expressions/categories, and
+  outcomes. Do not send or record URLs, passwords, tokens, hostnames, or personal
+  login identities; do not alter grants or roles. Update this evidence only from
+  that direct result, keeping host-reported statements clearly distinguished.
 
 ### Hyperdrive bindings
 
