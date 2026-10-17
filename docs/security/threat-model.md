@@ -316,9 +316,13 @@ decided stack (§1) nor the standing review gate (§8).
 
 It is the trust companion to the procedure in `docs/ops.md` ("Future
 Worker deploy lanes: required rollback evidence", items 1–6). Procedure
-and trust boundary agree: a Worker rollback restores Worker code only —
-never bindings, migrations, routing, or data (cf. `docs/ops.md`: "Rollback
-is never a data restore"). Where they overlap, the evidence rule governs
+and trust boundary agree: a Worker rollback never restores data or the
+state of connected resources (Hyperdrive config, KV/R2/Durable Object
+contents, Access policies; cf. `docs/ops.md`: "Rollback is never a data
+restore"). Whether it also restores secrets, vars, and binding/route/
+migration declarations depends on the mechanism (items 2–3); the
+`docs/ops.md` "code only" wording is that evidence rule's shorthand for
+this boundary. Where they overlap, the evidence rule governs
 what must be retained and this section governs what must be trusted.
 
 **Rollback actor(s).** The only actor this note contemplates is the
