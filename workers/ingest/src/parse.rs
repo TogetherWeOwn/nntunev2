@@ -208,6 +208,8 @@ fn opening_tag_end(tag: &str) -> Option<usize> {
 /// `<segment>` opens, ignoring comments and other markup.
 fn segment_bytes_in(slice: &str) -> Vec<Option<u64>> {
     let mut out = Vec::new();
+    let mut root_name = None;
+    let mut element_stack: Vec<&str> = Vec::new();
     let mut rest = slice;
     while let Some(i) = rest.find('<') {
         rest = &rest[i..];
@@ -236,14 +238,36 @@ fn segment_bytes_in(slice: &str) -> Vec<Option<u64>> {
             break;
         };
         let tag = &rest[..end];
-        let name = tag
-            .strip_prefix('<')
-            .unwrap_or_default()
+        let raw_name = tag.strip_prefix('<').unwrap_or_default();
+        let closing = raw_name.starts_with('/');
+        let name = raw_name
+            .trim_start_matches('/')
             .split(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>')
             .next()
             .unwrap_or_default();
-        if !name.starts_with('/') && name.rsplit(':').next() == Some("segment") {
-            out.push(bytes_attr(tag));
+        let local_name = name.rsplit(':').next().unwrap_or_default();
+        let self_closing = tag.trim_end().ends_with('/');
+        if closing {
+            element_stack.pop();
+        } else {
+            if element_stack.is_empty() {
+                root_name = Some(local_name);
+            }
+            let file_depth = root_name.map(|root| if root == "file" { 0 } else { 1 });
+            let parent_is_file = file_depth.is_some_and(|depth| {
+                element_stack.len() == depth + 1 && element_stack[depth] == "file"
+            });
+            let parent_is_file_segments = file_depth.is_some_and(|depth| {
+                element_stack.len() == depth + 2
+                    && element_stack[depth] == "file"
+                    && element_stack[depth + 1] == "segments"
+            });
+            if local_name == "segment" && (parent_is_file || parent_is_file_segments) {
+                out.push(bytes_attr(tag));
+            }
+            if !self_closing {
+                element_stack.push(local_name);
+            }
         }
         rest = &rest[end + 1..];
     }
@@ -256,6 +280,8 @@ fn file_blocks(doc: &str) -> Vec<&str> {
     let mut rest = doc;
     let mut offset = 0;
     let mut file_start = None;
+    let mut root_name = None;
+    let mut element_stack: Vec<&str> = Vec::new();
     while let Some(i) = rest.find('<') {
         offset += i;
         rest = &rest[i..];
@@ -297,17 +323,35 @@ fn file_blocks(doc: &str) -> Vec<&str> {
             .split(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>')
             .next()
             .unwrap_or_default();
-        let local_name = name.rsplit(':').next();
+        let local_name = name.rsplit(':').next().unwrap_or_default();
         let self_closing = tag[..end].trim_end().ends_with('/');
-        if local_name == Some("file") {
-            if closing {
+        if closing {
+            let is_top_level_file = local_name == "file"
+                && element_stack.len() == 2
+                && Some(element_stack[0]) == root_name
+                && element_stack[1] == "file";
+            if is_top_level_file {
                 if let Some(start) = file_start.take() {
                     blocks.push(&doc[start..offset + end + 1]);
                 }
-            } else if self_closing {
-                blocks.push(&doc[offset..offset + end + 1]);
-            } else {
-                file_start = Some(offset);
+            }
+            element_stack.pop();
+        } else {
+            if element_stack.is_empty() {
+                root_name = Some(local_name);
+            }
+            let is_top_level_file = local_name == "file"
+                && element_stack.len() == 1
+                && Some(element_stack[0]) == root_name;
+            if is_top_level_file {
+                if self_closing {
+                    blocks.push(&doc[offset..offset + end + 1]);
+                } else {
+                    file_start = Some(offset);
+                }
+            }
+            if !self_closing {
+                element_stack.push(local_name);
             }
         }
         let next = end + 1;
@@ -389,6 +433,17 @@ mod tests {
         wrong_groups.segment_bytes = vec![Some(100), Some(200)];
         wrong_groups.file_segment_bytes = vec![vec![Some(100)], vec![Some(200)]];
         assert!(check_parsed(&est, &wrong_groups).is_err());
+    }
+
+    #[test]
+    fn segment_ranges_ignore_nested_metadata_files_and_segments() {
+        let doc = r#"<nzb><head><meta><file><segments>
+<segment bytes="999" number="1">metadata@synthetic.invalid</segment>
+</segments></file><segment bytes="888">metadata@synthetic.invalid</segment></meta></head>
+<file><segments><segment bytes="42" number="1">real@synthetic.invalid</segment></segments></file></nzb>"#;
+        let (flat, per_file) = parse_segment_byte_ranges(doc);
+        assert_eq!(flat, vec![Some(42)]);
+        assert_eq!(per_file, vec![vec![Some(42)]]);
     }
 
     #[test]
