@@ -310,6 +310,22 @@ test.describe('isAccessWall / assertAccessWall (anonymous denial)', () => {
     );
   });
 
+  test('an app 403 whose header VALUE mentions Access is NOT an Access denial', () => {
+    // Regression pin: markers match header names only. An ordinary app 403
+    // echoing `CF-Access-Client-Id` in a header value (e.g. CORS
+    // allow-headers) must not pass as proof of Access enforcement.
+    const probe = {
+      status: 403,
+      headers: { 'access-control-allow-headers': 'CF-Access-Client-Id' },
+      bodyText: '{"error":"forbidden"}',
+      url: 'https://staging.example/api/health',
+    };
+    expect(isAccessWall(probe)).toBe(false);
+    expect(() => assertAccessWall(probe, 'health-anonymous')).toThrow(
+      /expected Cloudflare Access denial/,
+    );
+  });
+
   test('a plain app 302 without markers is NOT Access-specific denial', () => {
     expect(() =>
       assertAccessWall(

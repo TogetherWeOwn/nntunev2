@@ -66,9 +66,11 @@ export function isStagingOrigin(requestUrl: string, baseURL: string): boolean {
  * is never classified as Access, and an app 200 never is either.
  */
 export function isAccessWall(probe: WallProbe): boolean {
-  const headerDump = Object.entries(probe.headers)
-    .map(([k, v]) => `${k}: ${v}`)
-    .join('\n');
+  // Match Access markers against header NAMES only. Header values can echo
+  // Access identifiers back (e.g. `Access-Control-Allow-Headers:
+  // CF-Access-Client-Id` on an ordinary app 403), which must never classify
+  // an application response as an Access wall.
+  const headerNames = Object.keys(probe.headers).join('\n');
   const location = probe.headers['location'] ?? probe.headers['Location'] ?? '';
   const redirectToAccess =
     probe.status === 302 && /cloudflareaccess\.com|\/cdn-cgi\/access/i.test(location);
@@ -79,8 +81,8 @@ export function isAccessWall(probe: WallProbe): boolean {
   // bot-management/WAF challenge is not proof of Access enforcement, and
   // accepting it would let anonymous checks pass without Access in play.
   const hasMarkers =
-    /cf-access|cf_authorization/i.test(headerDump) ||
-    /cloudflare.?access/i.test(headerDump) ||
+    /cf-access|cf_authorization/i.test(headerNames) ||
+    /cloudflare.?access/i.test(headerNames) ||
     /cloudflare.?access/i.test(probe.bodyText) ||
     /<title>\s*Access/i.test(probe.bodyText) ||
     redirectToAccess;
