@@ -157,16 +157,48 @@ test.describe('credential scope (static pins)', () => {
     // origin WITH the Access pair + bearer. Live specs must go through
     // apiGet/apiPost; helpers.spec.ts may use the raw fixture inside its own
     // no-follow proof (it asserts the wrapper, not staging).
-    for (const name of ['health.spec.ts', 'ingest-play-meter.spec.ts', 'signup-byop.spec.ts']) {
+    for (const name of [
+      'health.spec.ts',
+      'ingest-play-meter.spec.ts',
+      'signup-byop.spec.ts',
+      'player-queue-order.spec.ts',
+      'demo-audio-contract.spec.ts',
+      'demo-media-sessionless.spec.ts',
+    ]) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must not carry credentials on a raw request call`).not.toMatch(
         RAW_API_CALL,
       );
     }
-    for (const name of ['health.spec.ts', 'ingest-play-meter.spec.ts']) {
+    for (const name of [
+      'health.spec.ts',
+      'ingest-play-meter.spec.ts',
+      'player-queue-order.spec.ts',
+      'demo-audio-contract.spec.ts',
+      'demo-media-sessionless.spec.ts',
+    ]) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must use the no-follow wrapper`).toContain('apiGet(');
     }
+  });
+
+  test('anonymous denial probe stays credential-free and no-follow', () => {
+    // The anonymous app-shell check must go through anonymousGet (no headers
+    // parameter, maxRedirects: 0) and the inverse wall assertion. Pin both
+    // so it cannot silently regress to a credentialed apiGet (which would
+    // prove the with-token side again) or to a raw call.
+    const accounts = readFileSync(new URL('../helpers/accounts.ts', import.meta.url), 'utf8');
+    expect(accounts).toContain('export async function anonymousGet');
+    const health = readFileSync(new URL(`../tests/health.spec.ts`, import.meta.url), 'utf8');
+    expect(health, 'health.spec.ts must probe anonymously via anonymousGet').toContain(
+      'anonymousGet(',
+    );
+    expect(health, 'health.spec.ts must assert the Access wall for the anonymous probe').toContain(
+      'assertAccessWall(',
+    );
+    expect(health, 'anonymous probe must use an isolated request context').toContain(
+      'playwrightRequest.newContext(',
+    );
   });
 
   test('no-follow pin catches nested-paren and fetch mutants', () => {
@@ -181,6 +213,48 @@ test.describe('credential scope (static pins)', () => {
     expect(fetchCall).toMatch(RAW_API_CALL);
     expect(pageScoped).toMatch(RAW_API_CALL);
     expect("await apiGet(request, url, headers, 'range')").not.toMatch(RAW_API_CALL);
+  });
+});
+
+test.describe('public UI signup coverage (static pin)', () => {
+  // Isolate the dedicated case and the shared form helper by slicing from
+  // their markers to the next top-level test/export (or EOF), so a mint call
+  // added to either segment (the bypass this coverage exists to prevent)
+  // fails here even though other tests in the file legitimately mint.
+  test('dedicated UI-signup case submits the form with no account-seam mint', () => {
+    const spec = readFileSync(new URL('../tests/signup-byop.spec.ts', import.meta.url), 'utf8');
+    const marker = "test('public UI signup succeeds even when the test-account seam is configured'";
+    const start = spec.indexOf(marker);
+    expect(start, 'dedicated public UI signup case is missing').toBeGreaterThan(-1);
+    const rest = spec.slice(start + marker.length);
+    const nextTest = rest.search(/\ntest(?:\(|\.describe)/);
+    const dedicated = nextTest === -1 ? spec.slice(start) : spec.slice(start, start + marker.length + nextTest);
+    // Null identity = Access pair only: the page starts unauthenticated, so
+    // the form is the only account-creation path even with QA_AUTH_TOKEN set.
+    expect(dedicated).toContain('applyAccountToPage(page, null, baseURL)');
+    expect(dedicated).toContain('submitPublicUiSignup(page, baseURL)');
+    expect(dedicated).not.toContain('tryMintTestAccount');
+
+    const accounts = readFileSync(new URL('../helpers/accounts.ts', import.meta.url), 'utf8');
+    const helperStart = accounts.indexOf('export async function submitPublicUiSignup');
+    expect(helperStart, 'shared public UI signup helper is missing').toBeGreaterThan(-1);
+    const helperRest = accounts.slice(helperStart + 'export async function submitPublicUiSignup'.length);
+    const nextExport = helperRest.search(/\nexport /);
+    const helper = nextExport === -1 ? accounts.slice(helperStart) : accounts.slice(helperStart, helperStart + 'export async function submitPublicUiSignup'.length + nextExport);
+    expect(helper).toContain('uniqueTestEmail(');
+    expect(helper).toContain('`${baseURL}/signup`');
+    expect(helper).toContain('TESTIDS.signupEmail');
+    expect(helper).toContain('TESTIDS.signupSubmit');
+    expect(helper).toContain('TESTIDS.signupError');
+    // The real page is two-step: the helper asserts the emailed-code step
+    // (magic_code form), never wizard arrival — asserting the wizard without
+    // the code-retrieval seam reds every configured run.
+    expect(helper).toContain('magic_code');
+    expect(helper).not.toContain('TESTIDS.byopHost');
+    expect(helper).not.toContain("'/onboarding/byop'");
+    expect(helper).not.toContain('tryMintTestAccount');
+    expect(helper).not.toContain('API.testAccounts');
+    expect(helper).not.toContain('qaAuthHeader');
   });
 });
 

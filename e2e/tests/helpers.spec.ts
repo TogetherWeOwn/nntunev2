@@ -3,14 +3,17 @@ import { createServer, type IncomingMessage, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
   accessHeaders,
+  assertAccessWall,
   assertNoAccessWall,
+  isAccessWall,
   isStagingOrigin,
   readApiBody,
   stagingBaseUrl,
   syntheticNntpEndpoint,
 } from '../helpers/access.js';
-import { extractPlanMeta, extractUsageBytes } from '../helpers/contract.js';
+import { extractLibraryItems, extractPlanMeta, extractRecordingMbids, extractUsageBytes, isMbid } from '../helpers/contract.js';
 import {
+  anonymousGet,
   annotateSignupPath,
   apiGet,
   apiPost,
@@ -224,6 +227,147 @@ test.describe('assertNoAccessWall', () => {
         'app-shell',
       ),
     ).not.toThrow();
+  });
+});
+
+test.describe('assertAccessWall / isAccessWall (anonymous denial)', () => {
+  // The inverse of assertNoAccessWall, for the no-credentials probe: it must
+  // pass ONLY on the same joint wall predicate (wall status + Access
+  // markers) and fail on anything that could be the application — a 200 app
+  // shell, a plain app 403, or a plain app redirect are all NOT denial proof.
+  const wall302 = {
+    status: 302,
+    headers: { location: 'https://example.cloudflareaccess.com/cdn-cgi/access/login' },
+    bodyText: '',
+    url: 'https://staging.example/',
+  };
+  const wall403 = {
+    status: 403,
+    headers: { 'cf-mitigated': 'challenge' },
+    bodyText: '<title>Access | Cloudflare</title>',
+    url: 'https://staging.example/',
+  };
+  const appShell200 = {
+    status: 200,
+    headers: { 'content-type': 'text/html' },
+    bodyText: '<html><h1>sentinel-app-shell-heading</h1></html>',
+    url: 'https://sentinel-staging-host.example/sentinel-shell-path?q=sentinel-shell-query',
+  };
+
+  test('passes on a 302 to the Access login and on a 403 with Access markers', () => {
+    expect(() => assertAccessWall(wall302, 'access-anonymous')).not.toThrow();
+    expect(() => assertAccessWall(wall403, 'access-anonymous')).not.toThrow();
+    expect(isAccessWall(wall302)).toBe(true);
+    expect(isAccessWall(wall403)).toBe(true);
+  });
+
+  test('throws on a 200 app shell — anonymous access is NOT denied', () => {
+    expect(() => assertAccessWall(appShell200, 'access-anonymous')).toThrow(/not denied/i);
+    expect(isAccessWall(appShell200)).toBe(false);
+  });
+
+  test('throws on a plain app 403 without markers and a plain app 302', () => {
+    expect(() =>
+      assertAccessWall(
+        { status: 403, headers: { 'content-type': 'application/json' }, bodyText: '{"error":"x"}', url: 'x' },
+        'access-anonymous',
+      ),
+    ).toThrow(/not denied/i);
+    expect(() =>
+      assertAccessWall(
+        { status: 302, headers: { location: '/login' }, bodyText: '', url: 'x' },
+        'access-anonymous',
+      ),
+    ).toThrow(/not denied/i);
+  });
+
+  test('denial-failure error never echoes the probe URL or body', () => {
+    let message = '';
+    try {
+      assertAccessWall(appShell200, 'access-anonymous');
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain('access-anonymous');
+    expect(message).toContain('200');
+    for (const sentinel of [
+      'sentinel-staging-host.example',
+      'sentinel-shell-path',
+      'sentinel-shell-query',
+      'sentinel-app-shell-heading',
+    ]) {
+      expect(message, `anonymous-denial diagnostic leaked "${sentinel}"`).not.toContain(sentinel);
+    }
+  });
+
+  test('isAccessWall agrees with assertNoAccessWall on the shared fixtures', () => {
+    for (const probe of [wall302, wall403]) {
+      expect(isAccessWall(probe)).toBe(true);
+      expect(() => assertNoAccessWall(probe, 'agree')).toThrow(/Access wall/);
+    }
+    expect(isAccessWall(appShell200)).toBe(false);
+    expect(() => assertNoAccessWall(appShell200, 'agree')).not.toThrow();
+  });
+});
+
+test.describe('anonymousGet (no credentials, no follow)', () => {
+  // The anonymous probe must send NO header material even when the QA Access
+  // pair is present in the environment, and must return a 3xx as-is (never
+  // follow it) so the caller can classify the wall response itself.
+  test('sends no Access/Authorization/Cookie headers and returns the 302 unfollowed', async ({
+    request,
+  }) => {
+    const listen = (server: Server): Promise<number> =>
+      new Promise((resolve, reject) => {
+        server.on('error', reject);
+        server.listen(0, '127.0.0.1', () => resolve((server.address() as AddressInfo).port));
+      });
+    const close = (server: Server): Promise<void> =>
+      new Promise((resolve) => server.close(() => resolve()));
+
+    const foreignHits: Array<Record<string, string | string[] | undefined>> = [];
+    const foreign = createServer((req: IncomingMessage, res) => {
+      foreignHits.push({ ...req.headers });
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('landed');
+    });
+    const foreignOrigin = `http://127.0.0.1:${await listen(foreign)}`;
+
+    const stagingHits: Array<Record<string, string | string[] | undefined>> = [];
+    const staging = createServer((req: IncomingMessage, res) => {
+      stagingHits.push({ ...req.headers });
+      if (req.url === '/redir') {
+        res.writeHead(302, { location: `${foreignOrigin}/landed` });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('<html>shell</html>');
+    });
+    const stagingOrigin = `http://127.0.0.1:${await listen(staging)}`;
+
+    try {
+      await withEnvAsync(dummyAccessPair, async () => {
+        const res = await anonymousGet(request, `${stagingOrigin}/redir`);
+        expect(res.status(), 'anonymousGet must return the 3xx, not follow or throw').toBe(302);
+        const ok = await anonymousGet(request, `${stagingOrigin}/`);
+        expect(ok.status()).toBe(200);
+      });
+      expect(foreignHits, 'anonymous probe followed a redirect to a foreign origin').toHaveLength(0);
+      expect(stagingHits).toHaveLength(2);
+      for (const headers of stagingHits) {
+        expect(headers['cf-access-client-id']).toBeUndefined();
+        expect(headers['cf-access-client-secret']).toBeUndefined();
+        expect(headers.authorization).toBeUndefined();
+        expect(headers.cookie).toBeUndefined();
+      }
+      const dumped = JSON.stringify(stagingHits);
+      expect(dumped).not.toContain(dummyAccessPair.CF_ACCESS_CLIENT_ID);
+      expect(dumped).not.toContain(dummyAccessPair.CF_ACCESS_CLIENT_SECRET);
+    } finally {
+      await close(staging).catch(() => {});
+      await close(foreign).catch(() => {});
+    }
   });
 });
 
@@ -822,5 +966,81 @@ test.describe('redirect location-state diagnostics (value-free)', () => {
     expect(message).toMatch(/location present/i);
     expect(message).not.toMatch(/malformed/i);
     expect(message).not.toContain('sentinel-rel-query');
+  });
+});
+
+test.describe('isMbid', () => {
+  test('accepts canonical lowercase and uppercase hex', () => {
+    expect(isMbid('f5c2d4b1-3a7e-4d1c-9e2f-0a1b2c3d4e5f')).toBe(true);
+    expect(isMbid('F5C2D4B1-3A7E-4D1C-9E2F-0A1B2C3D4E5F')).toBe(true);
+  });
+
+  test('rejects non-MBID shapes', () => {
+    for (const bad of [
+      '',
+      'not-an-mbid',
+      'f5c2d4b1-3a7e-4d1c-9e2f',
+      'f5c2d4b1-3a7e-4d1c-9e2f-0a1b2c3d4e5g',
+      'f5c2d4b13a7e4d1c9e2f0a1b2c3d4e5f',
+      42,
+      null,
+    ]) {
+      expect(isMbid(bad)).toBe(false);
+    }
+  });
+});
+
+test.describe('extractLibraryItems', () => {
+  test('reads a bare array', () => {
+    expect(extractLibraryItems('[{"id":"a"},{"id":"b","title":"T"}]')).toEqual([
+      { id: 'a' },
+      { id: 'b', title: 'T' },
+    ]);
+  });
+
+  test('reads the { items: [...] } shape', () => {
+    expect(extractLibraryItems('{"items":[{"id":"a"}]}')).toEqual([{ id: 'a' }]);
+  });
+
+  test('drops rows without a string id', () => {
+    expect(extractLibraryItems('[{"id":"a"},{},{"id":42}]')).toEqual([{ id: 'a' }]);
+  });
+
+  test('throws by name on non-JSON and reshaped payloads', () => {
+    expect(() => extractLibraryItems('not json')).toThrow(/\[library\]/);
+    expect(() => extractLibraryItems('{"tracks":[]}')).toThrow(/tracks/);
+  });
+});
+
+test.describe('extractRecordingMbids', () => {
+  const MBID = 'f5c2d4b1-3a7e-4d1c-9e2f-0a1b2c3d4e5f';
+
+  test('reads the canonical field', () => {
+    expect(extractRecordingMbids({ id: 't', recording_mbids: [MBID] })).toEqual([MBID]);
+  });
+
+  test('reads the camelCase alias', () => {
+    expect(extractRecordingMbids({ id: 't', recordingMbids: [MBID] })).toEqual([MBID]);
+  });
+
+  test('names the actual keys when the field is absent', () => {
+    expect(() => extractRecordingMbids({ id: 't', title: 'x' })).toThrow(/title/);
+  });
+
+  test('an empty list fails naming the release state', () => {
+    expect(() => extractRecordingMbids({ id: 't', recording_mbids: [] })).toThrow(
+      /no release_mbid/,
+    );
+    expect(() =>
+      extractRecordingMbids({ id: 't', release_mbid: 'r', recording_mbids: [] }),
+    ).toThrow(/release_mbid r/);
+  });
+
+  test('a non-array and malformed entries fail by name', () => {
+    expect(() => extractRecordingMbids({ id: 't', recording_mbids: 'x' })).toThrow(/array/);
+    expect(() => extractRecordingMbids({ id: 't', recording_mbids: ['zzz'] })).toThrow(
+      /recording_mbids\[0\]/,
+    );
+    expect(() => extractRecordingMbids(null)).toThrow(/object/);
   });
 });

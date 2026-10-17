@@ -187,6 +187,32 @@ export async function apiPost(
 }
 
 /**
+ * Anonymous GET: NO Access pair, NO Authorization, NO cookies — by
+ * construction, not by passing empty credentials through a credentialed
+ * wrapper. This helper never reads the environment and takes no headers
+ * parameter, so no caller can accidentally credential it. The caller MUST
+ * pass a fresh, isolated APIRequestContext (a new Playwright request
+ * context with no storageState or context-level headers) so no ambient
+ * session can ride along.
+ *
+ * Unlike apiGet it does NOT throw on 3xx: it fetches with maxRedirects: 0
+ * and returns the response as-is so the caller can classify it with
+ * assertAccessWall. Nothing is followed, so a redirect target (Access login
+ * or otherwise) receives zero follow-up requests from this probe.
+ */
+export async function anonymousGet(
+  request: APIRequestContext,
+  url: string,
+  opts?: { timeout?: number },
+): Promise<APIResponse> {
+  return request.get(url, {
+    headers: {},
+    timeout: opts?.timeout ?? 30_000,
+    maxRedirects: 0,
+  });
+}
+
+/**
  * Authenticate a browser page as a minted account. Call BEFORE the first
  * navigation: the route applies to subsequent loads, never past ones.
  *
@@ -402,4 +428,43 @@ export async function completeByopWizard(page: Page, baseURL: string): Promise<v
   await expect(page, 'BYOP save did not reach the library').toHaveURL(/\/library/, {
     timeout: 30_000,
   });
+}
+
+/**
+ * Submit the public /signup form as a fresh synthetic identity and require
+ * the reachable first step of the real two-step flow: submit starts
+ * registration (`registerStart`) and the page renders the emailed-code form
+ * (`input[name="magic_code"]`, "Finish creating account"). Navigation to the
+ * BYOP wizard happens only after the emailed code plus a passkey finish
+ * (`registerFinish`), which needs a staging-only code-retrieval seam and a
+ * WebAuthn virtual authenticator that do not exist yet — so this helper
+ * must NOT assert the wizard, or every configured run goes red. It never
+ * touches the test-account seam, so it proves public UI form submission even
+ * when the seam is configured. Callers authenticate the page first (a null
+ * identity via applyAccountToPage gives the anonymous, Access-only starting
+ * point). The generated mailbox is returned for callers that track the
+ * identity; it is never interpolated into an assertion message or
+ * diagnostic here.
+ */
+export async function submitPublicUiSignup(page: Page, baseURL: string): Promise<TestAccount> {
+  const email = uniqueTestEmail('e2e-ui');
+  await page.goto(`${baseURL}/signup`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  await expect(page.getByTestId(TESTIDS.signupEmail)).toBeVisible({ timeout: 15_000 });
+  await page.getByTestId(TESTIDS.signupEmail).fill(email);
+  await page.getByTestId(TESTIDS.signupSubmit).click();
+  // Either the code form appears, or an inline error explains why.
+  const codeField = page.locator('input[name="magic_code"]');
+  const error = page.getByTestId(TESTIDS.signupError);
+  await expect(async () => {
+    const onCodeStep = await codeField.isVisible().catch(() => false);
+    const onError = await error.isVisible().catch(() => false);
+    expect(onCodeStep || onError, 'neither signup code form nor signup error appeared').toBe(true);
+  }).toPass({ timeout: 30_000 });
+  expect(await error.isVisible().catch(() => false), 'public UI signup showed an inline error').toBe(
+    false,
+  );
+  await expect(codeField, 'public UI signup did not reach the emailed-code step').toBeVisible({
+    timeout: 15_000,
+  });
+  return { email, viaApi: false };
 }
