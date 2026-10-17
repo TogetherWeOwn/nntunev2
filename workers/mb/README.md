@@ -12,6 +12,7 @@ Decision: `docs/adr/0007-mb-mirror.md`.
 | `GET` | `/v1/mb/artist/:mbid` | Artist lookup over Hyperdrive (`MB_DB`); success `Cache-Control: public, max-age=86400` |
 | `GET` | `/v1/mb/release/:mbid` | Release lookup (includes the stored `caa_url`); same caching as artist |
 | `GET` | `/v1/mb/recording/:mbid` | Recording lookup; same caching as artist |
+| `GET` | `/v1/mb/release/:mbid/recordings` | Recordings of a release ordered by `track_no` (nulls last), then MBID, `LIMIT 1000`; existing release with no recordings is `200` with an empty list, missing release is `404`; same caching as lookups |
 | `GET` | `/v1/mb/search?q=&type=` | `type` in `artist\|release\|recording`; `q` 2-100 chars; trigram (`pg_trgm`) ordered by similarity, `LIMIT 25`; success `Cache-Control: public, max-age=300` |
 
 Errors are JSON (`{"error": "..."}`) with `Cache-Control: no-store`:
@@ -20,13 +21,19 @@ are `400`; a well-formed MBID with no row and unknown routes are `404`;
 mirror read failures are a generic `500` (no DB detail leaves the
 worker). Lookup success is the flat entity fields plus `"kind"`;
 search success is `{"q", "type", "results": [{"mbid", "name"|"title",
-"score"}]}`. Interactive reads never call musicbrainz.org.
+"score"}]}`; release-recordings success is `{"release_mbid",
+"recordings": [{"mbid", "release_mbid", "title", "track_no",
+"duration_ms"}]}`. Interactive reads never call musicbrainz.org.
 
 ## Caching
 
 - Order per read: edge Cache API, then KV, then Hyperdrive Postgres.
 - Lookups: KV key `mb:lookup:<kind>:<mbid>` (lowercase MBID), 24 h TTL;
   the same TTL is served as `Cache-Control` and stored via the Cache API.
+- Release recordings: KV key `mb:release-recordings:<mbid>` (lowercase
+  MBID), same 24 h TTL and edge treatment as lookups. An existing
+  release with zero recordings is a cacheable success; a missing
+  release (`404`) is not cached.
 - Search: KV key `mb:search:<kind>:<normalized q>` (trimmed, lowercased,
   whitespace collapsed; SQL binds the same normalized value), 5 min TTL.
 - Only successes are cached (a successful search with zero hits counts).
