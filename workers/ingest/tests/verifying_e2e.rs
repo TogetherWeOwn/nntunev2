@@ -251,6 +251,11 @@ impl BodySource for NntpSource {
 #[derive(Default)]
 struct MemoryScratch {
     objects: RefCell<HashMap<String, (Vec<u8>, StagedFile)>>,
+    heads: RefCell<usize>,
+    gets: RefCell<usize>,
+    /// Objects that vanish at the next `get` (the mid-walk race a real
+    /// bucket can present between cursor validation and read-back).
+    vanish_on_get: RefCell<Vec<String>>,
 }
 
 impl MemoryScratch {
@@ -259,6 +264,15 @@ impl MemoryScratch {
     }
     fn delete(&self, key: &str) {
         self.objects.borrow_mut().remove(key);
+    }
+    fn head_count(&self) -> usize {
+        *self.heads.borrow()
+    }
+    fn get_count(&self) -> usize {
+        *self.gets.borrow()
+    }
+    fn vanish_next_get(&self, key: &str) {
+        self.vanish_on_get.borrow_mut().push(key.to_string());
     }
     fn manifest(&self, job: &str) -> Option<String> {
         let key = format!("ingest-scratch/{job}/r0/in/manifest.json");
@@ -269,11 +283,35 @@ impl MemoryScratch {
 
 impl ScratchStore for MemoryScratch {
     async fn head(&self, key: &str) -> Result<Option<StagedFile>, VerifyError> {
+        *self.heads.borrow_mut() += 1;
         Ok(self.objects.borrow().get(key).map(|(_, m)| m.clone()))
     }
 
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, VerifyError> {
+        *self.gets.borrow_mut() += 1;
+        if self
+            .vanish_on_get
+            .borrow()
+            .iter()
+            .any(|k| k.as_str() == key)
+        {
+            self.vanish_on_get
+                .borrow_mut()
+                .retain(|k| k.as_str() != key);
+            self.objects.borrow_mut().remove(key);
+            return Ok(None);
+        }
         Ok(self.bytes(key))
+    }
+
+    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, VerifyError> {
+        Ok(self
+            .objects
+            .borrow()
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect())
     }
 
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &StagedFile) -> Result<(), VerifyError> {
@@ -291,13 +329,40 @@ async fn run_step(
     progress: &mut VerifyProgress,
     scratch: &MemoryScratch,
 ) -> (VerifyOutcome, Vec<String>) {
+    run_step_with_deadline(server, nzb, caps, progress, scratch, &|| false).await
+}
+
+async fn run_step_with_deadline(
+    server: &TestNntpServer,
+    nzb: &str,
+    caps: &VerifyCaps,
+    progress: &mut VerifyProgress,
+    scratch: &MemoryScratch,
+    deadline: &dyn Fn() -> bool,
+) -> (VerifyOutcome, Vec<String>) {
     let est = estimate_nzb(nzb).expect("intake");
     let files = parse_upload_files(nzb.as_bytes(), &est).expect("parse files");
     let mut source = NntpSource::connect(server).await;
-    let outcome = run_verifying_step(JOB, &files, progress, &mut source, scratch, caps, &|| false)
+    let outcome = run_verifying_step(JOB, &files, progress, &mut source, scratch, caps, deadline)
         .await
         .expect("verify step");
     (outcome, source.fetches)
+}
+
+/// A canned body source for behaviors the synthetic server cannot
+/// produce (a specific article refused as too large).
+struct StubSource {
+    too_large: Vec<String>,
+}
+
+impl BodySource for StubSource {
+    async fn fetch_body(&mut self, segment_id: &str) -> Result<ArticleFetch, VerifyError> {
+        if self.too_large.iter().any(|id| id.as_str() == segment_id) {
+            Ok(ArticleFetch::TooLarge)
+        } else {
+            Ok(ArticleFetch::Missing)
+        }
+    }
 }
 
 /// Single-part data file + its par2 file, both servable.
@@ -1036,5 +1101,495 @@ async fn without_par2_a_missing_segment_is_unrecoverable() {
     assert!(
         matches!(outcome, VerifyOutcome::Unrecoverable { .. }),
         "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn spooled_healthy_file_is_not_read_back() {
+    // A healthy oversize file is judged from its segment records plus
+    // one spool listing: no segment read-back walk.
+    let data = payload(71, 1000);
+    let (articles, nzb, _hex) = complete_case(&data, 1);
+    let server = spawn(articles).await;
+    let scratch = MemoryScratch::default();
+    let mut progress = VerifyProgress::new(0);
+    let caps = VerifyCaps {
+        max_file_bytes: 100,
+        ..VerifyCaps::default()
+    };
+    let (outcome, _) = run_step(&server, &nzb, &caps, &mut progress, &scratch).await;
+    assert_eq!(outcome, VerifyOutcome::Complete);
+    assert_eq!(
+        scratch.get_count(),
+        1,
+        "only the par2 restores, no data read-back walk"
+    );
+}
+
+#[tokio::test]
+async fn cursor_validation_lists_and_truncates_at_a_vanished_object() {
+    // Segment 2's spool object is deleted between deliveries: cursor
+    // validation truncates at it via one listing (no per-segment
+    // HEADs), it refetches, and the file completes healthy.
+    let data = payload(73, 768);
+    let (articles, nzb) = three_part_case(&data);
+    let server = spawn(articles).await;
+    let scratch = MemoryScratch::default();
+    let mut progress = VerifyProgress::new(0);
+    let spool_caps = VerifyCaps {
+        max_segments_per_delivery: 3,
+        max_file_bytes: 100,
+        ..VerifyCaps::default()
+    };
+    let (outcome, _) = run_step(&server, &nzb, &spool_caps, &mut progress, &scratch).await;
+    assert_eq!(outcome, VerifyOutcome::Incomplete);
+    assert_eq!(progress.spool.get(&0).map(Vec::len), Some(2));
+    scratch.delete(&VerifyProgress::spool_key(JOB, 0, 0, 1));
+    let heads_before = scratch.head_count();
+    let caps = VerifyCaps {
+        max_file_bytes: 100,
+        ..VerifyCaps::default()
+    };
+    let (outcome, fetches) = run_step(&server, &nzb, &caps, &mut progress, &scratch).await;
+    assert_eq!(outcome, VerifyOutcome::Complete);
+    assert_eq!(
+        fetches,
+        ["d2@synthetic.invalid", "d3@synthetic.invalid"],
+        "truncation refetches from the vanished segment"
+    );
+    assert_eq!(
+        scratch.head_count() - heads_before,
+        3,
+        "staged-trust + two adoption probes only; cursor validation lists"
+    );
+}
+
+#[tokio::test]
+async fn spooled_counter_counts_a_range_that_vanishes_mid_walk() {
+    // Corrupt first block forces the block-counter walk; segment 2's
+    // spool object vanishes at its read during that walk and counts
+    // as a second bad block (2 missing > 1 recovery slice).
+    let data = payload(101, 768);
+    let (mut articles, nzb) = three_part_case(&data);
+    let mut corrupt_chunk = data[..256].to_vec();
+    corrupt_chunk[10] ^= 0xff;
+    let part1 = SegmentParams {
+        name: DATA_NAME.into(),
+        part: 1,
+        total: 3,
+        begin: 1,
+        end: 256,
+        file_size: data.len() as u64,
+    };
+    articles[0] = yenc_article("d1@synthetic.invalid", 1, DATA_NAME, &part1, &corrupt_chunk);
+    let server = spawn(articles).await;
+    let scratch = MemoryScratch::default();
+    let mut progress = VerifyProgress::new(0);
+    scratch.vanish_next_get(&VerifyProgress::spool_key(JOB, 0, 0, 1));
+    let caps = VerifyCaps {
+        max_file_bytes: 100,
+        ..VerifyCaps::default()
+    };
+    let (outcome, _) = run_step(&server, &nzb, &caps, &mut progress, &scratch).await;
+    assert!(
+        matches!(
+            outcome,
+            VerifyOutcome::Unrecoverable {
+                missing_blocks: 2,
+                ..
+            }
+        ),
+        "corrupt block + vanished block, got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn assembled_file_with_a_vanished_spool_object_is_damaged() {
+    // Symmetric assembled-path case: segment 2 vanishes at assembly
+    // read-back, zero-fills, and the block counter (not the decode-time
+    // precheck) judges it.
+    let data = payload(79, 768);
+    let (articles, nzb) = three_part_case(&data);
+    let server = spawn(articles).await;
+    let scratch = MemoryScratch::default();
+    let mut progress = VerifyProgress::new(0);
+    scratch.vanish_next_get(&VerifyProgress::spool_key(JOB, 0, 0, 1));
+    let (outcome, _) = run_step(
+        &server,
+        &nzb,
+        &VerifyCaps::default(),
+        &mut progress,
+        &scratch,
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            VerifyOutcome::RepairNeeded {
+                missing_blocks: 1,
+                ..
+            }
+        ),
+        "zero-filled bytes must not pass as healthy, got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn deadline_during_spooled_judging_restops_as_incomplete() {
+    // Damaged oversize file: the block-counter walk polls the deadline
+    // between segment reads. Tripping it after the walk's first
+    // read-back stops as Incomplete with nothing judged.
+    let data = payload(83, 768);
+    let (mut articles, nzb) = three_part_case(&data);
+    let mut corrupt_chunk = data[..256].to_vec();
+    corrupt_chunk[10] ^= 0xff;
+    let part1 = SegmentParams {
+        name: DATA_NAME.into(),
+        part: 1,
+        total: 3,
+        begin: 1,
+        end: 256,
+        file_size: data.len() as u64,
+    };
+    articles[0] = yenc_article("d1@synthetic.invalid", 1, DATA_NAME, &part1, &corrupt_chunk);
+    let server = spawn(articles).await;
+    let scratch = MemoryScratch::default();
+    let mut progress = VerifyProgress::new(0);
+    // Spool the par2 and first two data segments.
+    let spool_some = VerifyCaps {
+        max_segments_per_delivery: 3,
+        max_file_bytes: 100,
+        ..VerifyCaps::default()
+    };
+    let (outcome, _) = run_step(&server, &nzb, &spool_some, &mut progress, &scratch).await;
+    assert_eq!(outcome, VerifyOutcome::Incomplete);
+    let caps = VerifyCaps {
+        max_file_bytes: 100,
+        ..VerifyCaps::default()
+    };
+    let gets_before = scratch.get_count();
+    // Trip once the walk has done its first segment read: par2 restore
+    // is the first get of this delivery, the walk's first segment the
+    // second.
+    let deadline = || scratch.get_count() >= gets_before + 2;
+    let (outcome, _) =
+        run_step_with_deadline(&server, &nzb, &caps, &mut progress, &scratch, &deadline).await;
+    assert_eq!(outcome, VerifyOutcome::Incomplete);
+    assert!(!progress.staged.contains_key(&0), "nothing judged yet");
+    assert_eq!(
+        scratch.get_count(),
+        gets_before + 2,
+        "the walk stopped at its second segment boundary"
+    );
+}
+
+#[tokio::test]
+async fn too_large_article_counts_only_its_own_segment() {
+    // Middle article refused as too large: it records missing, the
+    // cursor advances, and the other two segments still fetch and
+    // vouch for their blocks.
+    let data = payload(89, 768);
+    let (articles, nzb) = three_part_case(&data);
+    let server = spawn(articles).await;
+    let scratch = MemoryScratch::default();
+    let mut progress = VerifyProgress::new(0);
+    let est = estimate_nzb(&nzb).expect("intake");
+    let files = parse_upload_files(nzb.as_bytes(), &est).expect("parse files");
+
+    // Spool the par2 and first data segment through the real server.
+    let caps = VerifyCaps {
+        max_segments_per_delivery: 2,
+        ..VerifyCaps::default()
+    };
+    let (outcome, _) = run_step(&server, &nzb, &caps, &mut progress, &scratch).await;
+    assert_eq!(outcome, VerifyOutcome::Incomplete);
+
+    // Middle article refuses as too large; the third fetches for real
+    // via a fresh server-backed source on the last delivery.
+    let mut stub = StubSource {
+        too_large: vec!["d2@synthetic.invalid".into()],
+    };
+    let outcome = run_verifying_step(
+        JOB,
+        &files,
+        &mut progress,
+        &mut stub,
+        &scratch,
+        &VerifyCaps {
+            max_segments_per_delivery: 1,
+            ..VerifyCaps::default()
+        },
+        &|| false,
+    )
+    .await
+    .expect("verify step");
+    assert_eq!(outcome, VerifyOutcome::Incomplete);
+    assert_eq!(progress.spool.get(&0).map(Vec::len), Some(2));
+
+    let (outcome, fetches) = run_step(
+        &server,
+        &nzb,
+        &VerifyCaps::default(),
+        &mut progress,
+        &scratch,
+    )
+    .await;
+    assert_eq!(fetches, ["d3@synthetic.invalid"]);
+    assert!(
+        matches!(
+            outcome,
+            VerifyOutcome::RepairNeeded {
+                missing_blocks: 1,
+                ..
+            }
+        ),
+        "only the refused segment's block counts, got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn corrupt_par2_stream_does_not_silence_the_set() {
+    // A second par2 file of the same set is served with a corrupt
+    // recovery packet (fails builder validation); only that stream
+    // drops — the index file's own slice still covers the corrupt
+    // data block.
+    let data = payload(97, 1000);
+    let (mut articles, _nzb, _hex) = complete_case(&data, 1);
+    let mut corrupt = data.clone();
+    corrupt[300] ^= 0xff;
+    articles[0] = yenc_article(
+        "d1@synthetic.invalid",
+        1,
+        DATA_NAME,
+        &SegmentParams::single(DATA_NAME),
+        &corrupt,
+    );
+    let (_index_bytes, mut vol_bytes, _hex) = par2_set_split(DATA_NAME, &data, 1);
+    let last = vol_bytes.len() - 10;
+    vol_bytes[last] ^= 0xff; // breaks the packet's own MD5
+    let vol_name = "track01.vol01+01.par2";
+    let vol_params = SegmentParams::single(vol_name);
+    articles.push(yenc_article(
+        "p2@synthetic.invalid",
+        3,
+        vol_name,
+        &vol_params,
+        &vol_bytes,
+    ));
+    let (full_set, _h) = par2_set(DATA_NAME, &data, 1);
+    let index_params = SegmentParams::single(PAR2_NAME);
+    let nzb = nzb_xml(&[
+        ServableFile {
+            name: DATA_NAME.into(),
+            segments: vec![(
+                "d1@synthetic.invalid".into(),
+                encoded_len(&SegmentParams::single(DATA_NAME), &corrupt),
+            )],
+        },
+        ServableFile {
+            name: PAR2_NAME.into(),
+            segments: vec![(
+                "p1@synthetic.invalid".into(),
+                encoded_len(&index_params, &full_set),
+            )],
+        },
+        ServableFile {
+            name: vol_name.into(),
+            segments: vec![(
+                "p2@synthetic.invalid".into(),
+                encoded_len(&vol_params, &vol_bytes),
+            )],
+        },
+    ]);
+    let server = spawn(articles).await;
+    let scratch = MemoryScratch::default();
+    let mut progress = VerifyProgress::new(0);
+    let (outcome, _) = run_step(
+        &server,
+        &nzb,
+        &VerifyCaps::default(),
+        &mut progress,
+        &scratch,
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            VerifyOutcome::RepairNeeded {
+                missing_blocks: 1,
+                ..
+            }
+        ),
+        "the good index slice must still cover, got {outcome:?}"
+    );
+}
+
+fn two_part_par2_case() -> (Vec<Article>, String) {
+    // Data loses its second part (2 blocks). The par2 set is split
+    // index (metadata only) + volume (2 slices), and the volume is
+    // served in two parts with the second part missing: its assembled
+    // bytes are zero-filled past the gap.
+    let (articles, _nzb, data) = two_part_case(false, 0);
+    let (index_bytes, vol_bytes, _hex) = par2_set_split(DATA_NAME, &data, 2);
+    let mid = vol_bytes.len() / 2;
+    let split = (mid / 4) * 4;
+    let index_params = SegmentParams::single(PAR2_NAME);
+    let vol_name = "track01.vol01+02.par2";
+    let vpart = |n: u32, begin: u64, end: u64| SegmentParams {
+        name: vol_name.into(),
+        part: n,
+        total: 2,
+        begin,
+        end,
+        file_size: vol_bytes.len() as u64,
+    };
+    let mut articles = articles;
+    articles.retain(|a| a.message_id != "<p1@synthetic.invalid>");
+    articles.push(yenc_article(
+        "p1@synthetic.invalid",
+        3,
+        PAR2_NAME,
+        &index_params,
+        &index_bytes,
+    ));
+    articles.push(yenc_article(
+        "v1@synthetic.invalid",
+        4,
+        vol_name,
+        &vpart(1, 1, split as u64),
+        &vol_bytes[..split],
+    ));
+    // v2 is never served: the volume's second half is a 430.
+    let part = |n: u32, begin: u64, end: u64| SegmentParams {
+        name: DATA_NAME.into(),
+        part: n,
+        total: 2,
+        begin,
+        end,
+        file_size: data.len() as u64,
+    };
+    let nzb = nzb_xml(&[
+        ServableFile {
+            name: DATA_NAME.into(),
+            segments: vec![
+                (
+                    "d1@synthetic.invalid".into(),
+                    encoded_len(&part(1, 1, 512), &data[..512]),
+                ),
+                (
+                    "d2@synthetic.invalid".into(),
+                    encoded_len(&part(2, 513, 1024), &data[512..]),
+                ),
+            ],
+        },
+        ServableFile {
+            name: PAR2_NAME.into(),
+            segments: vec![(
+                "p1@synthetic.invalid".into(),
+                encoded_len(&index_params, &index_bytes),
+            )],
+        },
+        ServableFile {
+            name: vol_name.into(),
+            segments: vec![
+                (
+                    "v1@synthetic.invalid".into(),
+                    encoded_len(&vpart(1, 1, split as u64), &vol_bytes[..split]),
+                ),
+                (
+                    "v2@synthetic.invalid".into(),
+                    encoded_len(
+                        &vpart(2, split as u64 + 1, vol_bytes.len() as u64),
+                        &vol_bytes[split..],
+                    ),
+                ),
+            ],
+        },
+    ]);
+    (articles, nzb)
+}
+
+#[tokio::test]
+async fn damaged_assembled_par2_volume_keeps_its_leading_slices() {
+    // Only two slices exist (both in the volume) and the volume's
+    // second part is missing. The complete-packet prefix keeps slice
+    // 1: the set then joins and counts 1 recovery block, so the
+    // verdict is Unrecoverable (2 missing > 1) rather than the
+    // set-absent path.
+    let (articles, nzb) = two_part_par2_case();
+    let server = spawn(articles).await;
+    let scratch = MemoryScratch::default();
+    let mut progress = VerifyProgress::new(0);
+    let (outcome, _) = run_step(
+        &server,
+        &nzb,
+        &VerifyCaps::default(),
+        &mut progress,
+        &scratch,
+    )
+    .await;
+    match outcome {
+        VerifyOutcome::Unrecoverable {
+            par2_set_id: Some(_),
+            missing_blocks: 2,
+        } => {}
+        other => panic!("leading slice must keep the set joined, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn staged_spooled_record_is_rechecked_against_its_spool() {
+    // A healthy spooled staging is trusted by its index record alone
+    // until a segment object vanishes: the resume listing then evicts
+    // the record and the segment refetches instead of the manifest
+    // shipping a dangling key.
+    let data = payload(103, 1000);
+    let (articles, nzb, _hex) = complete_case(&data, 1);
+    let server = spawn(articles).await;
+    let scratch = MemoryScratch::default();
+    let mut progress = VerifyProgress::new(0);
+    let caps = VerifyCaps {
+        max_file_bytes: 100,
+        ..VerifyCaps::default()
+    };
+    let (outcome, _) = run_step(&server, &nzb, &caps, &mut progress, &scratch).await;
+    assert_eq!(outcome, VerifyOutcome::Complete);
+
+    scratch.delete(&VerifyProgress::spool_key(JOB, 0, 0, 0));
+    let (outcome, fetches) = run_step(&server, &nzb, &caps, &mut progress, &scratch).await;
+    assert_eq!(outcome, VerifyOutcome::Complete);
+    assert_eq!(
+        fetches,
+        ["d1@synthetic.invalid"],
+        "the vanished spool segment refetches"
+    );
+}
+
+#[tokio::test]
+async fn spooled_adoption_is_refused_when_a_spool_object_vanished() {
+    // Lost-progress twin of the resume re-check: with a fresh progress
+    // value, the staged spool index is only adopted while its segment
+    // objects still exist; a vanished one refuses adoption and the
+    // segment refetches through the cursor path.
+    let data = payload(107, 1000);
+    let (articles, nzb, _hex) = complete_case(&data, 1);
+    let server = spawn(articles).await;
+    let scratch = MemoryScratch::default();
+    let mut progress = VerifyProgress::new(0);
+    let caps = VerifyCaps {
+        max_file_bytes: 100,
+        ..VerifyCaps::default()
+    };
+    let (outcome, _) = run_step(&server, &nzb, &caps, &mut progress, &scratch).await;
+    assert_eq!(outcome, VerifyOutcome::Complete);
+
+    scratch.delete(&VerifyProgress::spool_key(JOB, 0, 0, 0));
+    let mut fresh = VerifyProgress::new(0);
+    let (outcome, fetches) = run_step(&server, &nzb, &caps, &mut fresh, &scratch).await;
+    assert_eq!(outcome, VerifyOutcome::Complete);
+    assert_eq!(
+        fetches,
+        ["d1@synthetic.invalid"],
+        "adoption refused: the vanished segment refetches"
     );
 }

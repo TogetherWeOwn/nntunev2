@@ -267,7 +267,7 @@ async fn run_repair_step(env: &Env, cp: &mut JobCheckpoint) -> Result<(), JobErr
         Ok(Some(req)) => req,
         Ok(None) => {
             advance_checkpoint(cp, false);
-            return Err(JobError::transient(
+            return Err(JobError::progress(
                 ERR_VERIFY_FAILED,
                 "ingest runtime boundary unavailable",
             ));
@@ -282,7 +282,7 @@ async fn run_repair_step(env: &Env, cp: &mut JobCheckpoint) -> Result<(), JobErr
     match crate::repair::call_repair(env, &req).await {
         RepairCall::Repaired => {
             advance_checkpoint(cp, false);
-            Err(JobError::transient(
+            Err(JobError::progress(
                 ERR_VERIFY_FAILED,
                 "ingest runtime boundary unavailable",
             ))
@@ -618,7 +618,12 @@ fn apply_verify_outcome(
             }
             cp.probe_tally = None;
             advance_checkpoint(cp, false);
-            Err(JobError::transient(ERR_MATCH_FAILED, "matching pending"))
+            // The checkpoint state advanced: this transition is
+            // progress, not a failure. Settling it transient would
+            // spend an attempt per state boundary, so a job needing
+            // repair rounds could exhaust MAX_ATTEMPTS on transitions
+            // alone (and a Complete at the attempt cap would fail).
+            Err(JobError::progress(ERR_MATCH_FAILED, "matching pending"))
         }
         VerifyOutcome::RepairNeeded {
             par2_set_id,
@@ -662,7 +667,7 @@ fn apply_verify_outcome(
             cp.missing_blocks = missing_blocks;
             cp.probe_tally = None;
             advance_checkpoint(cp, true);
-            Err(JobError::transient(ERR_REPAIR_FAILED, "repair pending"))
+            Err(JobError::progress(ERR_REPAIR_FAILED, "repair pending"))
         }
         VerifyOutcome::Unrecoverable { .. } => Err(JobError::permanent(
             ERR_VERIFY_FAILED,
@@ -887,6 +892,31 @@ impl ScratchStore for R2Scratch {
             .await
             .map_err(|_| VerifyError::Transient("scratch write failed".into()))?;
         Ok(())
+    }
+
+    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, VerifyError> {
+        // Follow the listing cursor until the prefix is exhausted:
+        // one R2 operation per 1,000-key page.
+        let mut keys = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut list = self.bucket.list().prefix(prefix.to_string());
+            if let Some(cursor) = cursor {
+                list = list.cursor(cursor);
+            }
+            let page = list
+                .execute()
+                .await
+                .map_err(|_| VerifyError::Transient("scratch list failed".into()))?;
+            keys.extend(page.objects().iter().map(|object| object.key()));
+            if !page.truncated() {
+                return Ok(keys);
+            }
+            let Some(next) = page.cursor() else {
+                return Err(VerifyError::Transient("scratch list failed".into()));
+            };
+            cursor = Some(next);
+        }
     }
 }
 
@@ -1423,10 +1453,12 @@ mod tests {
         cp.probe_tally = Some(crate::probe::ProbeTally::new(1));
         let step =
             apply_verify_outcome(&msg, &mut cp, crate::verify::VerifyOutcome::Complete, true);
-        // The next state has no executable step in this delivery: settle
-        // transiently so the redelivery runs it (the Parsing pattern).
+        // The next state runs on the next delivery: the advanced
+        // checkpoint settles as progress, spending no attempt (a
+        // transition is not a failure).
         let err = step.expect_err("matching runs on the next delivery");
         assert!(err.transient);
+        assert!(err.made_progress);
         assert_eq!(err.code, ERR_MATCH_FAILED);
         assert_eq!(cp.state, JobState::Matching);
         assert!(cp.probe_tally.is_none());
@@ -1447,6 +1479,7 @@ mod tests {
         );
         let err = step.expect_err("repair runs on the next delivery");
         assert!(err.transient);
+        assert!(err.made_progress);
         assert_eq!(err.code, ERR_REPAIR_FAILED);
         assert_eq!(cp.state, JobState::Repairing);
         assert_eq!(cp.repair_rounds, 1);
