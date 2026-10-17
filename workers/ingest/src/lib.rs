@@ -4,24 +4,27 @@
 //! - `GET /healthz` — unauthenticated Worker health check; no bindings.
 //! - `POST /v1/ingest/search` — Newznab search with the user's own indexer
 //!   (`indexer_ref` vault handle; raw keys are never accepted here).
-//! - `POST /v1/ingest/nzb` — NZB upload; guarded by intake caps, then
-//!   parsed by `nntune-core` in the next slice.
+//! - `POST /v1/ingest/nzb` — NZB upload; guarded by intake caps and parsed
+//!   with the bounded `nntune-core` parser before enqueue.
 //! - `GET /v1/ingest/jobs/:id` — job checkpoint status (idempotent resume).
 //!
 //! Pipeline: search/upload → parse (`nntune-core`) → segment availability
 //! probe through the user's pool DO → par2 verify (Container batch repair
 //! when needed) → tag/fingerprint + MusicBrainz match (`workers/mb`) →
 //! library rows. Routes validate the contract, persist upload bytes to the
-//! payload KV, and enqueue to `nntune-ingest-jobs`; the Queue consumer
-//! (Workflow steps in `queue::WORKFLOW_STEPS`) runs parse → probe → verify →
-//! repair → match → write once its handler lands (the consumer/workflow
-//! entries stay commented out in `wrangler.toml.example` until then).
+//! payload KV, enqueue to `nntune-ingest-jobs`, and write the initial job
+//! checkpoint for every real admission. The Queue consumer
+//! (`src/queue_consumer.rs`; Workflow steps in `queue::WORKFLOW_STEPS`)
+//! validates messages and checkpoints, but its search/probe/verify/repair
+//! boundaries are not executable yet, so the consumer/workflow entries stay
+//! commented out in `wrangler.toml.example` until they land.
 //! See `README.md`.
 
 use futures_util::StreamExt;
 use worker::{console_log, Env, Request, Response, Result, RouteContext, Router};
 
 pub mod api_error;
+pub mod checkpoint;
 pub mod dispatch;
 pub mod fixtures;
 pub mod indexer_fetch;
@@ -35,6 +38,7 @@ pub mod parse;
 pub mod pool_probe;
 pub mod probe;
 pub mod queue;
+pub mod queue_consumer;
 pub mod rate_limit;
 pub mod repair;
 pub mod retry;
@@ -741,6 +745,42 @@ where
     AdmissionDecision::Admitted
 }
 
+/// Write the checkpoint for a real (non-replay) admission, per
+/// [`checkpoint::admission_plan`]: a fresh job becomes queryable via
+/// `GET /v1/ingest/jobs/:id` immediately, and a re-admitted job's stale
+/// `Failed` checkpoint is reset so the new enqueue runs. Best-effort: the
+/// job is already queued + metered, and the consumer creates the initial
+/// checkpoint on first delivery if this write is lost — failing the 202
+/// here would strand an accepted job, so errors are only logged. This is
+/// one of the checkpoint key's two writers (see `checkpoint` docs); the
+/// consumer waits out KV's 1 s same-key window if its first persist
+/// collides with this write.
+async fn ensure_admission_checkpoint(env: &Env, msg: &QueueMsg) {
+    let existing = match checkpoint::get(env, &msg.job_id).await {
+        Ok(existing) => existing,
+        Err(e) => {
+            console_log!("ingest admission checkpoint read failed: {:?}", e);
+            return;
+        }
+    };
+    let plan = checkpoint::admission_plan(existing.as_ref(), msg);
+    if let Some(cp) = &plan.write {
+        if let Err(e) = checkpoint::put(env, cp).await {
+            console_log!("ingest admission checkpoint write failed: {:?}", e);
+            return;
+        }
+    }
+    if plan.reenqueue_after_write {
+        // `Failed` reset (see `checkpoint::AdmissionPlan`): the reset is
+        // now persisted, so this trailing copy is guaranteed to observe
+        // `Queued`; duplicate Queue messages are harmless by construction
+        // (the consumer resumes from the durable checkpoint).
+        if !try_enqueue(env, msg).await {
+            console_log!("ingest re-drive enqueue after checkpoint reset failed");
+        }
+    }
+}
+
 /// Durable idempotent admission for both ingest routes: the (`job_id`,
 /// `stage`) ledger owns the enqueue + meter outbox, fail-closed. A 503
 /// here means nothing was accepted with its meter; the client retry
@@ -762,8 +802,32 @@ async fn admit_metered_job(
     )
     .await
     {
-        AdmissionDecision::AlreadyQueued | AdmissionDecision::Admitted => {
+        AdmissionDecision::Admitted => {
+            ensure_admission_checkpoint(env, msg).await;
             queued_envelope(msg, source, true, extra)
+        }
+        AdmissionDecision::AlreadyQueued => {
+            // Replay window: the ledger will not enqueue again (see the
+            // admission protocol docs). If that earlier run already
+            // terminally failed, answering 202 `queued` would claim work
+            // that will never run — refuse with 409 so the caller reads
+            // the failure from the job status instead. A checkpoint-store
+            // failure falls through to the plain replay (logged).
+            match checkpoint::get(env, &msg.job_id).await {
+                Ok(cp)
+                    if checkpoint::replay_decision(cp.as_ref(), msg)
+                        == checkpoint::ReplayDecision::Conflict =>
+                {
+                    json_error(ApiError::conflict(
+                        "this job previously failed; check its status before re-posting",
+                    ))
+                }
+                Ok(_) => queued_envelope(msg, source, true, extra),
+                Err(e) => {
+                    console_log!("ingest replay checkpoint read failed: {:?}", e);
+                    queued_envelope(msg, source, true, extra)
+                }
+            }
         }
         AdmissionDecision::Busy => service_unavailable("admission is in progress; retry shortly"),
         AdmissionDecision::QueueUnavailable => queued_envelope(msg, source, false, extra),
@@ -924,6 +988,20 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Respons
     match estimate_nzb(&parsed.nzb_xml) {
         Err(rejection) => intake_rejection_response(&rejection),
         Ok(est) => {
+            // Shared-parser validation before anything is stored or queued:
+            // an NZB the bounded `nntune-core` parser rejects (or whose
+            // counts disagree with the intake guard) never becomes a job.
+            match crate::parse::parse_upload(parsed.nzb_xml.as_bytes(), &est) {
+                Ok(_) => {}
+                Err(crate::parse::ParseRejection::Invalid(message)) => {
+                    return json_error(ApiError::invalid_request(message))
+                }
+                Err(crate::parse::ParseRejection::TooLarge) => {
+                    return json_error(ApiError::payload_too_large(
+                        "nzb exceeds shared parser limits",
+                    ))
+                }
+            }
             let msg = match dispatch::build_upload_dispatch(&parsed.user_id, &parsed.nzb_xml) {
                 Ok(msg) => msg,
                 Err(message) => return json_error(ApiError::invalid_request(message)),
@@ -973,17 +1051,19 @@ fn healthz() -> Result<Response> {
         .map(|response| response.with_status(health.status).with_headers(headers))
 }
 
-/// Job checkpoint status: validates the id shape before DB wiring lands.
+/// Job checkpoint status: read the durable checkpoint written at
+/// admission and advanced by the Queue consumer. Unknown ids are 404; a
+/// checkpoint-store failure is 503 (never a fabricated status).
 async fn job_status(_req: &Request, ctx: &RouteContext<()>) -> Result<Response> {
     let id = ctx.param("id").cloned().unwrap_or_default();
     if !validate_job_id(&id) {
         return json_error(ApiError::not_found("unknown job id"));
     }
-    Response::from_json(&serde_json::json!({
-        "job_id": id,
-        "status": "not_wired",
-        "hint": "Checkpoint reads land with the Queue consumer; enqueue is live.",
-    }))
+    match checkpoint::get(&ctx.env, &id).await {
+        Ok(Some(cp)) => Response::from_json(&cp),
+        Ok(None) => json_error(ApiError::not_found("unknown job id")),
+        Err(_) => service_unavailable("checkpoint store unavailable"),
+    }
 }
 
 #[cfg(test)]

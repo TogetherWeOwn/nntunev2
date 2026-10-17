@@ -43,7 +43,7 @@ with HTTP status 500. The worker implementations seal 5xx messages to fixed publ
 `code` to `request_failed`, keeping the server `message` and boolean
 `retryable` for display/policy. Legacy `{"error": "..."}` bodies
 (pre-taxonomy) derive their code from unambiguous HTTP statuses (400, 401,
-402, 403, 404, 413, 416, 422, 429, 503); all other statuses use
+402, 403, 404, 409, 413, 416, 422, 429, 503); all other statuses use
 `request_failed`. The web client continues to support these legacy bodies
 during migration. `provider_auth_expired` is also a registered structured code
 so the stream worker can preserve its inline credential-refresh signal in the
@@ -64,6 +64,7 @@ emit the code.
 | `plan_limit_exceeded` | 402 | false | api, ingest, stream | The plan quota (streams, library, ingest jobs) is exhausted; upgrade or wait for the period reset. Defined ahead of server-side enforcement so clients can build the upgrade path now. |
 | `forbidden` | 403 | false | api, stream | Authenticated, but the resource belongs to someone else (or the grant names a different track). |
 | `not_found` | 404 | false | api, ingest, mb, stream | No such (visible) resource. Invisible private rows are 404, never 403. |
+| `conflict` | 409 | false | ingest | The request is valid but the resource already exists in a state that refuses it (for example re-posting an ingest job whose previous run failed inside its replay window). Nothing was accepted; inspect the existing resource instead of retrying unchanged. |
 | `invalid_request` | 400 | false | ingest, mb, stream | Malformed body, bad identifier shape, or out-of-range parameter. |
 | `payload_too_large` | 413 | false | ingest | Body, NZB, or element counts exceed the intake caps. |
 | `range_not_satisfiable` | 416 | false | stream | The requested byte range lies outside the track. |

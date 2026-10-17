@@ -20,8 +20,8 @@ use crate::queue::{validate_indexer_ref, QueueMsg};
 /// `wrangler.toml.example`.
 pub const INGEST_QUEUE_BINDING: &str = "INGEST_QUEUE";
 /// Queue name: must match `[[queues.producers]]` in `wrangler.toml.example`.
-/// (The consumer entry stays commented out there until the Queue handler and
-/// its dead-letter queue land.)
+/// (The consumer entry stays commented out until all runtime boundaries are
+/// executable; see `src/queue_consumer.rs` and `wrangler.toml.example`.)
 pub const INGEST_QUEUE_NAME: &str = "nntune-ingest-jobs";
 /// KV binding holding uploaded NZB bytes keyed by [`payload_ref`](QueueMsg::payload_ref).
 pub const PAYLOAD_KV_BINDING: &str = "INGEST_PAYLOADS";
@@ -55,8 +55,8 @@ pub const MAX_PAYLOAD_RETRY_DELAY_MS: u64 = 60_000;
 /// itself is edge-cached), so the consumer retries on this schedule instead
 /// of failing the job: 5 s, 15 s, 30 s, 60 s (cumulative 110 s, covering the
 /// documented ~60 s lag). Saturating, so any `u32` attempt maps to a sane
-/// delay. Contract for the consumer card: fetch with the minimum `cacheTtl`
-/// (30 s) so a cached miss expires before the later retries, and keep
+/// delay. The consumer fetches with the minimum `cacheTtl` (30 s) so a
+/// cached miss expires before the later retries, and keeps
 /// `max_retries = PAYLOAD_RETRY_ATTEMPTS` so the full window is usable.
 pub fn payload_retry_delay_ms(attempt: u32) -> u64 {
     match attempt {

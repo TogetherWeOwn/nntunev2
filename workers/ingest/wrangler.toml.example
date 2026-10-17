@@ -6,8 +6,8 @@ main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
 
 # Slice 2: Queue producer (code: src/dispatch.rs, src/queue.rs). The routes
-# only produce; nothing consumes yet (see below), so every accepted enqueue
-# waits in the queue until the consumer ships.
+# produce; the consumer below stays disabled, so every accepted enqueue
+# waits in the queue until it is enabled.
 [[queues.producers]]
 binding = "INGEST_QUEUE"
 queue = "nntune-ingest-jobs"
@@ -21,15 +21,19 @@ queue = "nntune-ingest-jobs"
 binding = "INGEST_DLQ"
 queue = "nntune-ingest-dlq"
 
-# Consumer: NOT YET. This crate has only `event(fetch)` — no `event(queue)`
-# handler — so declaring this worker a consumer would deliver every message
-# to a handler that does not exist (retried `max_retries` times, then
-# dropped, while callers saw 202 queued). Uncomment together with the Queue
-# handler, which settles per message via src/retry.rs (`decide_checkpoint`):
-# persist the mutated checkpoint before retry/ack, use `retry_with_options`
-# while budget remains, and persist Failed before DLQ send + ack. Never ack on DLQ-send failure; Failed
-# redelivery retries the send. A send-success/ack-failure may duplicate entries,
-# so DLQ processing must be idempotent by job_id. E.g.:
+# Consumer: handler exists (`event(queue)` in src/queue_consumer.rs) but
+# stays DISABLED. It validates each message, writes its checkpoint exactly
+# once per delivery (Workers KV allows 1 write/s per key), digest-checks
+# and parses upload payloads with the shared parser, and settles per
+# message via src/retry.rs (`decide_checkpoint`): persist the mutated
+# checkpoint before retry/ack, use `retry_with_options` while budget
+# remains, and persist Failed before DLQ send + ack. Never ack on DLQ-send
+# failure; Failed redelivery retries the send. A send-success/ack-failure
+# may duplicate entries, so DLQ processing must be idempotent by job_id.
+# The search/probe/verify/repair runtime steps are not wired yet, so
+# enabling this now would burn every valid job's retry budget against an
+# unavailable boundary and quarantine it. Uncomment only when those steps
+# are executable. E.g.:
 #
 # [[queues.consumers]]
 # queue = "nntune-ingest-jobs"
@@ -53,8 +57,8 @@ queue = "nntune-ingest-dlq"
 # see README "Redrive" for raw bodies whose checkpoint is nonterminal.
 # dead_letter_queue = "nntune-ingest-dlq"
 
-# Workflows: NOT YET. workers-rs 0.3 has no Workflow client and this crate
-# exports no Workflow class, and `[[workflows]]` requires a `class_name`, so
+# Workflows: NOT YET. This crate exports no Workflow class, and
+# `[[workflows]]` requires a `class_name`, so
 # any entry here is rejected at deploy. Orchestration until then is Queue
 # redelivery + job checkpoints (src/jobs.rs). Re-add with `class_name` when
 # the Workflow class ships.

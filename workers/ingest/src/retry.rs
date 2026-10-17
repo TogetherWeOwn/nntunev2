@@ -44,6 +44,7 @@ pub const MAX_RETRY_DELAY_SECS: u32 = 60;
 
 /// Deterministic step failures, classified so the consumer knows whether a
 /// redelivery could ever succeed.
+pub const ERR_SEARCH_FAILED: &str = "search_failed";
 pub const ERR_PAYLOAD_MISSING: &str = "payload_missing";
 pub const ERR_PARSE_FAILED: &str = "parse_failed";
 pub const ERR_PROBE_FAILED: &str = "probe_failed";

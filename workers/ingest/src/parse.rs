@@ -1,10 +1,11 @@
-//! Parse glue: the parsed shape the checkpoint stores.
+//! Parse glue: project bounded `nntune-core` parser output into the shape
+//! the checkpoint stores.
 //!
-//! Full NZB parsing (subject decoding, yEnc segment maps) is owned by the
-//! nntune-core card; this module owns the ingest side: the [`ParsedNzb`]
-//! shape the `Parsing` step must produce, the cross-check that keeps a parse
-//! disagreeing with the intake guard from spending provider connections, and
-//! the batching into probe-sized envelopes.
+//! Full NZB parsing is delegated to `nntune-core` ([`parse_upload`]); this
+//! module owns the ingest side: the [`ParsedNzb`] projection, the
+//! cross-check that keeps a parse disagreeing with the intake guard from
+//! spending provider connections, and the batching into probe-sized
+//! envelopes.
 
 use serde::{Deserialize, Serialize};
 
@@ -15,8 +16,7 @@ use crate::probe::{validate_message_id, MAX_PROBE_SEGMENTS, MAX_SEGMENT_BYTES};
 const MAX_ENCODED_BYTES: u64 = 64 << 30;
 
 /// What the `Parsing` step stores in the checkpoint: the segment map the
-/// pool probe walks. Produced by `nntune-core` once that card lands; until
-/// then tests and the synthetic E2E construct it from fixtures.
+/// pool probe walks, projected from `nntune-core` output by [`parse_upload`].
 ///
 /// `segment_bytes` runs flat in document order, parallel to `message_ids`;
 /// `file_segment_bytes` runs per-file in NZB order. Values are the NZB's
@@ -29,6 +29,51 @@ pub struct ParsedNzb {
     pub message_ids: Vec<String>,
     pub segment_bytes: Vec<Option<u64>>,
     pub file_segment_bytes: Vec<Vec<Option<u64>>>,
+}
+
+/// Why an uploaded NZB failed the shared-parser validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseRejection {
+    Invalid(&'static str),
+    TooLarge,
+}
+
+/// Parse uploaded NZB bytes with the shared bounded `nntune-core` parser,
+/// project the document into [`ParsedNzb`], then verify it against the
+/// intake guard's estimate ([`check_parsed`]). Segment byte ranges come
+/// from the parser's validated `bytes=` values (`>= 1` and within the
+/// per-segment cap by construction), so they are always `Some` here; the
+/// `None` explicit-unknown case only arises for fixture-built values.
+pub fn parse_upload(xml: &[u8], estimate: &IntakeEstimate) -> Result<ParsedNzb, ParseRejection> {
+    let document = nntune_core::nzb::parse(xml).map_err(|error| match error {
+        nntune_core::Error::Bounds { .. } => ParseRejection::TooLarge,
+        _ => ParseRejection::Invalid("nntune-core rejected NZB"),
+    })?;
+    let file_count = document.files.len();
+    let mut message_ids = Vec::new();
+    let mut segment_bytes = Vec::new();
+    let mut file_segment_bytes = Vec::new();
+    for file in document.files {
+        let mut per_file = Vec::with_capacity(file.segments.len());
+        for segment in file.segments {
+            let bytes = u64::try_from(segment.encoded_bytes)
+                .ok()
+                .filter(|n| *n >= 1);
+            message_ids.push(segment.message_id);
+            segment_bytes.push(bytes);
+            per_file.push(bytes);
+        }
+        file_segment_bytes.push(per_file);
+    }
+    let parsed = ParsedNzb {
+        file_count,
+        segment_count: message_ids.len(),
+        message_ids,
+        segment_bytes,
+        file_segment_bytes,
+    };
+    check_parsed(estimate, &parsed).map_err(ParseRejection::Invalid)?;
+    Ok(parsed)
 }
 
 /// Cross-check a parse against the intake guard's estimate. Any disagreement
@@ -445,6 +490,43 @@ mod tests {
             segment_bytes: vec![None, None],
             file_segment_bytes: vec![vec![None, None]],
         }
+    }
+
+    #[test]
+    fn upload_parse_projects_core_document_with_byte_ranges() {
+        let est = estimate_nzb(SMALL_NZB).unwrap();
+        let parsed = parse_upload(SMALL_NZB.as_bytes(), &est).unwrap();
+        assert_eq!(parsed.file_count, 1);
+        assert_eq!(parsed.segment_count, 2);
+        assert_eq!(parsed.message_ids, parsed_small().message_ids);
+        // SMALL_NZB declares bytes="100" per segment.
+        assert_eq!(parsed.segment_bytes, vec![Some(100), Some(100)]);
+        assert_eq!(parsed.file_segment_bytes, vec![vec![Some(100), Some(100)]]);
+    }
+
+    #[test]
+    fn upload_parse_rejects_malformed_xml_as_invalid() {
+        let est = estimate_nzb(SMALL_NZB).unwrap();
+        assert!(matches!(
+            parse_upload(b"<nzb><file>", &est),
+            Err(ParseRejection::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn shared_parser_bounds_are_reported_as_too_large() {
+        // One segment declaring more than the core parser's per-segment cap:
+        // intake (which bounds counts/document size) accepts the shape, the
+        // shared parser's Bounds error must surface as TooLarge, not Invalid.
+        let xml = SMALL_NZB.replace(
+            "bytes=\"100\" number=\"1\"",
+            "bytes=\"3000000000\" number=\"1\"",
+        );
+        let est = estimate_nzb(&xml).unwrap();
+        assert_eq!(
+            parse_upload(xml.as_bytes(), &est),
+            Err(ParseRejection::TooLarge)
+        );
     }
 
     #[test]

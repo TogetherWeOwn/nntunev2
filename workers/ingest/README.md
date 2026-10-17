@@ -44,8 +44,16 @@ NZB upload ───────────────┘                     
   for JSON escaping, then the versioned intake guard) — malformed JSON is
   400, intake refusals use the registered API code plus `intake_code` (bad
   input 400, over-cap 413 with measured + cap fields), busy store/queue is
-  503; success is 202 + enqueue with job id + idempotency key.
-  `GET /v1/ingest/jobs/:id` (checkpoint reads land with the consumer).
+  503; success is 202 + enqueue with job id + idempotency key. NZB uploads
+  are also parsed by the shared bounded `nntune-core` parser and
+  cross-checked against the intake guard before enqueue (parser rejection
+  400, parser bounds 413). Every real admission writes the initial job
+  checkpoint (`src/checkpoint.rs`), resetting a stale `Failed` checkpoint
+  on re-admission, so `GET /v1/ingest/jobs/:id` reads durable status from
+  `INGEST_STATE` (404 unknown, 503 store failure). Re-posting a job that
+  already failed inside the admission replay window is refused with 409
+  `conflict` (nothing is enqueued then either; the failure stays readable
+  via the job status).
 
 ## Security rules
 
@@ -142,17 +150,17 @@ Stable codes: `nzb_fetch_bad_scheme`, `nzb_fetch_malformed_url`,
 `nzb_fetch_upstream_status`. HTTP mappings are documented on the module's
 `FetchRejection` type; no route emits them in this slice.
 
-## E2E contract (synthetic NNTP server card)
+## Synthetic NNTP CI coverage
 
-End-to-end acceptance runs against the synthetic server in CI (no real
-Usenet in CI). Ingest needs from that card:
-
-1. Fixture articles: yEnc single/multi-part, obfuscated subjects, one
-   intentionally gapped set (430s) + matching par2 set for the repair path.
-2. Newznab stub: `t=music` search returning a GUID whose NZB references
-   fixture message-ids.
-3. Connection caps per credential + slow-link/mid-disconnect modes for the
-   resume test (kill mid-`Probing`, redeliver, expect one library row).
+`tests/synthetic_nntp.rs` runs the shared `nntune-core` NZB parser and
+NNTP client against the merged `nntune-test-nntp` fixture server, fetches
+the parsed Message-ID, and verifies shared yEnc decoding (no real Usenet
+in CI). This validates parser and server interoperability only — not the
+Worker bindings, Newznab provider, pool DO, repair Container, or
+end-to-end library write path. Still wanted from the synthetic corpus:
+obfuscated subjects, slow-link/mid-disconnect modes for the resume test
+(kill mid-`Probing`, redeliver, expect one library row), and a Newznab
+stub whose NZB references fixture message-ids.
 
 ## Slice 2 (this slice)
 
@@ -163,9 +171,17 @@ Usenet in CI). Ingest needs from that card:
   feature; bindings in `wrangler.toml.example`). Search keys bind query +
   indexer + categories + limit + page, so no request is silently dropped.
   Success is 202 `queued`; a missing/failing binding or payload store is 503
-  with `Retry-After` (never 202). The consumer/workflow entries stay
-  commented out in `wrangler.toml.example` until the Queue handler (with DLQ)
-  and the Workflow class ship — declaring them now would drop every message.
+  with `Retry-After` (never 202). The Queue handler exists
+  (`src/queue_consumer.rs`: per-message identity validation, exactly one
+  planned checkpoint write per delivery — Workers KV allows 1 write/s per
+  key, so a persist colliding with the admission route's write to the same
+  key waits out the window and retries that write once in-invocation —
+  `retry::decide_checkpoint` settlement, DLQ quarantine that never acks on
+  a failed send, and shared-parser upload validation), but the
+  consumer/workflow entries stay commented out in `wrangler.toml.example`:
+  the search/probe/verify/repair steps are not wired yet, so enabling the
+  consumer now would burn every valid job's retry budget against an
+  unavailable boundary and quarantine it.
 - Request bodies carry self-asserted `user_id` (1..=128 chars) until the
   accounts card authenticates callers; the key format already binds the
   user, so keys stay valid when auth lands.
@@ -181,9 +197,12 @@ Usenet in CI). Ingest needs from that card:
   (`src/fixtures.rs`), pipeline E2E (`tests/pipeline_e2e.rs`): happy path
   reaches `Done` with one library row; the gapped set repairs then finishes.
 
-Blocked on siblings for the live half: pool-DO wire contract, `nntune-core`
-parse output, synthetic NNTP fixture server + CI E2E against it, checkpoint
-KV reads in `GET /v1/ingest/jobs/:id`, and the repair Container runtime.
+Still blocked for the live half: wiring the consumer's search step to a
+Newznab provider call, its probe step to the pool-DO contract
+(`src/pool_probe.rs`), verify/repair to the Container runtime, and the
+match/write steps to MB + library/metering calls. Until those land the
+consumer stays disabled and no live provider, pool, repair, library, or
+metering invocation is claimed here.
 
 ## Slice T2 — retry budget + DLQ (this slice)
 

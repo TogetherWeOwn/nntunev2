@@ -16,6 +16,7 @@ export const KNOWN_ERROR_CODES = new Set([
 	'plan_limit_exceeded',
 	'forbidden',
 	'not_found',
+	'conflict',
 	'invalid_request',
 	'payload_too_large',
 	'range_not_satisfiable',
@@ -41,6 +42,7 @@ export function codeFromStatus(status: number): string {
 	if (status === 402) return 'plan_limit_exceeded';
 	if (status === 403) return 'forbidden';
 	if (status === 404) return 'not_found';
+	if (status === 409) return 'conflict';
 	if (status === 413) return 'payload_too_large';
 	if (status === 416) return 'range_not_satisfiable';
 	if (status === 422) return 'validation_failed';
