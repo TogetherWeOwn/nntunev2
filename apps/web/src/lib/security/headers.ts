@@ -30,16 +30,29 @@ export const SECURITY_HEADERS: Readonly<Record<string, string>> = Object.freeze(
  * SvelteKit's `csp` option is evaluated at build time, so
  * `PUBLIC_API_BASE_URL` must be set in the build environment — a runtime-only
  * override would leave the CSP narrower than the client.
+ *
+ * `allowHttpLoopback` exists for local development only: `workers/api`
+ * permits `http` on `localhost`/`127.0.0.1`/`::1`, and `vite.config.ts`
+ * passes `true` for every non-production load so `vitest`, `vite dev` and
+ * `svelte-check` do not abort at startup against a local API worker.
+ * Production builds always pass `false`, so any `http:` API base —
+ * loopback included — still throws and fails the build.
  */
-export function cspSources(apiBaseUrl: string): string[] {
+export function cspSources(apiBaseUrl: string, options?: { allowHttpLoopback?: boolean }): string[] {
 	const trimmed = apiBaseUrl.trim();
 	if (trimmed === '') {
 		return ["'self'"];
 	}
 
 	const url = new URL(trimmed);
-	if (url.protocol !== 'https:') {
-		throw new Error(`API base URL must use https: for CSP sources, got ${url.protocol}`);
+	if (url.protocol === 'https:') {
+		return ["'self'", url.origin];
 	}
-	return ["'self'", url.origin];
+	if (options?.allowHttpLoopback === true && url.protocol === 'http:') {
+		const host = url.hostname.replace(/^\[|\]$/g, '');
+		if (host === 'localhost' || host === '127.0.0.1' || host === '::1') {
+			return ["'self'", url.origin];
+		}
+	}
+	throw new Error(`API base URL must use https: for CSP sources, got ${url.protocol}`);
 }

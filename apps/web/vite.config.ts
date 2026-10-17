@@ -5,14 +5,28 @@ import { defineConfig, loadEnv } from 'vite';
 
 import { cspSources } from './src/lib/security/headers.js';
 
-export default defineConfig(({ mode }) => {
+export default defineConfig(({ command, mode }) => {
 	// SvelteKit's `csp` option is baked in at build time, so the API origin
 	// must come from the build environment (process env or an `.env` file),
 	// not a platform runtime var. `cspSources` returns header-ready quoted
 	// keywords (`'self'`); the `csp` option takes bare keywords and adds the
 	// quotes (and per-request nonces) itself, so strip them here.
-	const envDir = new URL('.', import.meta.url).pathname;
-	const apiSources = cspSources(loadEnv(mode, envDir, '').PUBLIC_API_BASE_URL ?? '').map(
+	// `URL.pathname` is percent-encoded (`My%20Projects`) and carries a
+	// leading slash before drive letters on Windows (`/C:/...`), so
+	// `loadEnv` silently misses `.env` while SvelteKit loads it with the
+	// real path — the client then uses the API origin while the compiled
+	// CSP stays `'self'`-only. Decode here (this package has no node
+	// types, so `fileURLToPath` from `node:url` is unavailable).
+	const rawEnvDir = decodeURIComponent(new URL('.', import.meta.url).pathname);
+	const envDir = rawEnvDir.replace(/^\/([A-Za-z]:\/)/, '$1');
+	// Production builds stay strict-https; dev/test/serve allow http
+	// loopback so `workers/api` local development
+	// (`http://localhost|127.0.0.1|::1`, see its README) does not abort
+	// `vitest`, `vite dev` or `svelte-check` at startup.
+	const isProductionBuild = command === 'build' || mode === 'production';
+	const apiSources = cspSources(loadEnv(mode, envDir, '').PUBLIC_API_BASE_URL ?? '', {
+		allowHttpLoopback: !isProductionBuild
+	}).map(
 		(source) => source.replaceAll("'", '') as 'self' | `${string}://${string}.${string}`
 	);
 
