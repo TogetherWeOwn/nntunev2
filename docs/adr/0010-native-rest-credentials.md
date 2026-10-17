@@ -80,14 +80,24 @@ ADR 0006; default issuance is `library:read` only:
   model §5 (cost-bearing: drives provider egress and metering like any other grant).
 - `ingest:submit` — ingest job submission (cost-bearing: plan-capped per
   ADR 0004).
-- `providers:manage` — BYOP vault writes (custodial: touches user-owned
-  provider secrets; highest-risk scope).
+- `providers:manage` — BYOP provider-vault create/update/delete and test
+  connection operations only (custodial: touches user-owned provider
+  secrets; highest-risk scope). It never returns provider secret material.
 
-No permission is inferred for an operation not listed above. In particular,
-bearer keys cannot read `/v1/me`, manage `/v1/indexers`, perform library
-membership writes, or read provider credentials; those operations remain
-session-only unless a later ADR adds an explicit scope. `providers:manage`
-never returns provider secret material.
+**Route map is exhaustive and default-deny.** A bearer key is accepted only
+for the operation/scope pairs declared here: `/v1/library`, `/v1/artists`,
+`/v1/releases`, `/v1/tracks`, `/v1/search`, and read operations on
+`/v1/playlists` require `library:read`; playlist create/edit/delete require
+`playlists:write`; play-event writes on `/v1/plays` require `plays:write`;
+playback on `/v1/stream` requires `stream:read`; ingest submission requires
+`ingest:submit`; provider-vault mutations require `providers:manage`. Every
+other operation, including an unlisted method on a listed route, is denied to
+bearer keys and must use session auth. In particular, `/v1/me`, `/v1/indexers`,
+`GET /v1/operations/{operation_id}`, library membership writes and
+`DELETE /v1/libraries/{id}` are session-only. An endpoint or operation added
+after this ADR is also denied to bearer keys until this map is explicitly
+updated; no implementation may infer a scope from a resource name or a
+similar operation.
 
 **Never grantable to a bearer key (session-only, enforced by the auth
 layer, not by scope strings):** account deletion / cancel-deletion,
@@ -110,7 +120,14 @@ inside every path (threat-model §6 defense in depth).
 - Revocation is immediate (`revoked_at` timestamp; checked on every
   request alongside expiry and scope). Users can list (prefix, label,
   scopes, expiry, `last_used_at` — never secret material) and revoke
-  their own keys from a session-authenticated endpoint.
+  their own keys from a session-authenticated endpoint. Every account
+  recovery/revoke-all event also revokes all of that user's unrevoked native
+  REST credentials in the same transaction: email change or revert,
+  passkey add/remove, and the §6 session-compromise response in
+  `docs/security/session-secret-rotation.md`. On email change, notify the
+  old address that native REST credentials were revoked, in addition to
+  the existing change/revert notification. These bulk revocations are
+  audited without recording key material.
 - Per-credential rate limits apply; requests also use the same plan
   entitlements and usage caps as session calls under ADR 0004, with no
   bearer-key bypass. `last_used_at` anomalies (such as a burst from a new
@@ -196,8 +213,12 @@ widening of the Subsonic subset, no implementation in this card.
   PR is reviewed against.
 - Fuzz/contract tests for the implementation PR cover: header-only
   transport (query-string bearer rejected), unknown/revoked/expired key
-  vectors, scope allowlist/deny checks, session-only action denials,
-  dual-pepper lookup, dormant-key retirement refusal, redaction of bearer
-  material in emitted logs, and rate-limit/anomaly behavior.
+  vectors, every declared route/scope pair plus default-deny for unmapped
+  routes and methods, session-only action denials, dual-pepper lookup,
+  dormant-key retirement refusal, redaction of bearer material in emitted
+  logs, and rate-limit/anomaly behavior. Recovery-path tests must prove
+  that email change/revert, passkey add/remove, and the §6 session-compromise
+  response atomically revoke every unrevoked native REST credential, and
+  that email change sends the revocation notice to the old address.
 - Widening scopes, raising the 365-day cap, or granting bearer keys any
   session-only action needs a new ADR.
