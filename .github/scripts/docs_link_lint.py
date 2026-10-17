@@ -85,12 +85,15 @@ class LintError(Exception):
 def _clean_git_env():
     """Environment for git subprocesses, without an inherited repo location.
 
-    A caller-exported GIT_DIR or GIT_WORK_TREE would make git select a
-    repository other than the explicit -C cwd, so drop them here.
+    A caller-exported GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE or
+    GIT_COMMON_DIR would make git select a repository other than the
+    explicit -C cwd, so drop them here.
     """
     env = dict(os.environ)
     env.pop("GIT_DIR", None)
     env.pop("GIT_WORK_TREE", None)
+    env.pop("GIT_INDEX_FILE", None)
+    env.pop("GIT_COMMON_DIR", None)
     return env
 
 
