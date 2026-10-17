@@ -13,6 +13,7 @@ import {
 } from '../helpers/access.js';
 import { extractLibraryItems, extractPlanMeta, extractRecordingMbids, extractUsageBytes, isMbid } from '../helpers/contract.js';
 import {
+  anonymousApiGet,
   anonymousGet,
   annotateSignupPath,
   apiGet,
@@ -132,7 +133,7 @@ test.describe('assertNoAccessWall', () => {
         {
           status: 403,
           headers: { 'cf-mitigated': 'challenge' },
-          bodyText: '<title>Access | Cloudflare</title>',
+          bodyText: '<title>Access | Cloudflare Access</title>',
           url: 'https://staging.example/api/health',
         },
         'health',
@@ -149,7 +150,7 @@ test.describe('assertNoAccessWall', () => {
         {
           status: 403,
           headers: { 'cf-mitigated': 'challenge' },
-          bodyText: '<title>Access | Cloudflare</title>',
+          bodyText: '<title>Access | Cloudflare Access</title>',
           url,
         },
         'health',
@@ -230,77 +231,141 @@ test.describe('assertNoAccessWall', () => {
   });
 });
 
-test.describe('assertAccessWall / isAccessWall (anonymous denial)', () => {
-  // The inverse of assertNoAccessWall, for the no-credentials probe: it must
-  // pass ONLY on the same joint wall predicate (wall status + Access
-  // markers) and fail on anything that could be the application — a 200 app
-  // shell, a plain app 403, or a plain app redirect are all NOT denial proof.
+test.describe('isAccessWall / assertAccessWall (anonymous denial)', () => {
+  const wall403 = {
+    status: 403,
+    headers: { 'cf-mitigated': 'challenge' },
+    bodyText: '<title>Access | Cloudflare Access</title>',
+    url: 'https://staging.example/api/health',
+  };
   const wall302 = {
     status: 302,
     headers: { location: 'https://example.cloudflareaccess.com/cdn-cgi/access/login' },
     bodyText: '',
-    url: 'https://staging.example/',
-  };
-  const wall403 = {
-    status: 403,
-    headers: { 'cf-mitigated': 'challenge' },
-    bodyText: '<title>Access | Cloudflare</title>',
-    url: 'https://staging.example/',
-  };
-  const appShell200 = {
-    status: 200,
-    headers: { 'content-type': 'text/html' },
-    bodyText: '<html><h1>sentinel-app-shell-heading</h1></html>',
-    url: 'https://sentinel-staging-host.example/sentinel-shell-path?q=sentinel-shell-query',
+    url: 'https://staging.example/api/ready',
   };
 
-  test('passes on a 302 to the Access login and on a 403 with Access markers', () => {
-    expect(() => assertAccessWall(wall302, 'access-anonymous')).not.toThrow();
-    expect(() => assertAccessWall(wall403, 'access-anonymous')).not.toThrow();
-    expect(isAccessWall(wall302)).toBe(true);
+  test('recognises Access-specific denials (403 wall and Access-login 302)', () => {
     expect(isAccessWall(wall403)).toBe(true);
+    expect(isAccessWall(wall302)).toBe(true);
+    expect(() => assertAccessWall(wall403, 'health-anonymous')).not.toThrow();
+    expect(() => assertAccessWall(wall302, 'ready-anonymous')).not.toThrow();
   });
 
-  test('throws on a 200 app shell — anonymous access is NOT denied', () => {
-    expect(() => assertAccessWall(appShell200, 'access-anonymous')).toThrow(/not denied/i);
-    expect(isAccessWall(appShell200)).toBe(false);
-  });
-
-  test('throws on a plain app 403 without markers and a plain app 302', () => {
-    expect(() =>
-      assertAccessWall(
-        { status: 403, headers: { 'content-type': 'application/json' }, bodyText: '{"error":"x"}', url: 'x' },
-        'access-anonymous',
-      ),
-    ).toThrow(/not denied/i);
-    expect(() =>
-      assertAccessWall(
-        { status: 302, headers: { location: '/login' }, bodyText: '', url: 'x' },
-        'access-anonymous',
-      ),
-    ).toThrow(/not denied/i);
-  });
-
-  test('denial-failure error never echoes the probe URL or body', () => {
+  test('an app ok:true answer without Access is a failure, reported without echoing url or body', () => {
+    const probe = {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+      bodyText: '{"ok":true,"note":"sentinel-body"}',
+      url: 'https://sentinel-staging-host.example/sentinel-path?token=sentinel-query#sentinel-frag',
+    };
+    expect(isAccessWall(probe)).toBe(false);
     let message = '';
     try {
-      assertAccessWall(appShell200, 'access-anonymous');
+      assertAccessWall(probe, 'health-anonymous');
     } catch (error) {
       message = (error as Error).message;
     }
-    expect(message).toContain('access-anonymous');
+    expect(message).toContain('health-anonymous');
     expect(message).toContain('200');
+    expect(message).toMatch(/expected Cloudflare Access denial/);
     for (const sentinel of [
+      probe.url,
       'sentinel-staging-host.example',
-      'sentinel-shell-path',
-      'sentinel-shell-query',
-      'sentinel-app-shell-heading',
+      'sentinel-path',
+      'sentinel-query',
+      'sentinel-frag',
+      'sentinel-body',
     ]) {
       expect(message, `anonymous-denial diagnostic leaked "${sentinel}"`).not.toContain(sentinel);
     }
   });
 
+  test('a plain app 403 without markers is NOT Access-specific denial', () => {
+    expect(() =>
+      assertAccessWall(
+        {
+          status: 403,
+          headers: { 'content-type': 'application/json' },
+          bodyText: '{"error":"plan_limit_exceeded"}',
+          url: 'https://staging.example/api/health',
+        },
+        'health-anonymous',
+      ),
+    ).toThrow(/expected Cloudflare Access denial/);
+  });
+
+  test('a generic Cloudflare challenge without Access markers is NOT an Access denial', () => {
+    // Regression pin: `cf-mitigated` / `cf_clearance` are generic
+    // edge-challenge markers, not Access-specific. A 403 carrying only
+    // them must not pass as proof of Access enforcement.
+    const probe = {
+      status: 403,
+      headers: { 'cf-mitigated': 'challenge' },
+      bodyText: '<title>Just a moment...</title>',
+      url: 'https://staging.example/api/health',
+    };
+    expect(isAccessWall(probe)).toBe(false);
+    expect(() => assertAccessWall(probe, 'health-anonymous')).toThrow(
+      /expected Cloudflare Access denial/,
+    );
+  });
+
+  test('an app 403 whose header VALUE mentions Access is NOT an Access denial', () => {
+    // Regression pin: markers match header names only. An ordinary app 403
+    // echoing `CF-Access-Client-Id` in a header value (e.g. CORS
+    // allow-headers) must not pass as proof of Access enforcement.
+    const probe = {
+      status: 403,
+      headers: { 'access-control-allow-headers': 'CF-Access-Client-Id' },
+      bodyText: '{"error":"forbidden"}',
+      url: 'https://staging.example/api/health',
+    };
+    expect(isAccessWall(probe)).toBe(false);
+    expect(() => assertAccessWall(probe, 'health-anonymous')).toThrow(
+      /expected Cloudflare Access denial/,
+    );
+  });
+
+  test('a generic 403 title without an Access marker is NOT an Access denial', () => {
+    // Regression pin: a generic `<title>Access denied...` page proves
+    // nothing about Cloudflare Access. Only an explicit `Cloudflare
+    // Access` marker passes as proof of enforcement.
+    const probe = {
+      status: 403,
+      headers: { 'content-type': 'text/html' },
+      bodyText: '<title>Access denied | example.com</title>',
+      url: 'https://staging.example/api/health',
+    };
+    expect(isAccessWall(probe)).toBe(false);
+    expect(() => assertAccessWall(probe, 'health-anonymous')).toThrow(
+      /expected Cloudflare Access denial/,
+    );
+  });
+
+  test('a plain app 302 without markers is NOT Access-specific denial', () => {
+    expect(() =>
+      assertAccessWall(
+        {
+          status: 302,
+          headers: { location: '/login' },
+          bodyText: '',
+          url: 'https://staging.example/api/ready',
+        },
+        'ready-anonymous',
+      ),
+    ).toThrow(/expected Cloudflare Access denial/);
+  });
   test('isAccessWall agrees with assertNoAccessWall on the shared fixtures', () => {
+    // Cross-predicate pin from main #188: the same fixtures must read as the
+    // wall under both directions of the check, using the hardened
+    // header-names-only predicate (generic edge markers alone never count).
+    const appShell200 = {
+      status: 200,
+      headers: { 'content-type': 'text/html' },
+      bodyText: '<html><h1>sentinel-app-shell-heading</h1></html>',
+      url: 'https://staging.example/',
+    };
     for (const probe of [wall302, wall403]) {
       expect(isAccessWall(probe)).toBe(true);
       expect(() => assertNoAccessWall(probe, 'agree')).toThrow(/Access wall/);
@@ -309,6 +374,78 @@ test.describe('assertAccessWall / isAccessWall (anonymous denial)', () => {
     expect(() => assertNoAccessWall(appShell200, 'agree')).not.toThrow();
   });
 });
+
+test.describe('anonymousApiGet (isolated, credential-free, no-follow)', () => {
+  test('sends no Access/bearer/cookie headers and returns wall probes unfollowed', async () => {
+    const listen = (server: Server): Promise<number> =>
+      new Promise((resolve, reject) => {
+        server.on('error', reject);
+        server.listen(0, '127.0.0.1', () => resolve((server.address() as AddressInfo).port));
+      });
+    const close = (server: Server): Promise<void> =>
+      new Promise((resolve) => server.close(() => resolve()));
+    const hits: Array<Record<string, string | string[] | undefined>> = [];
+    const staging = createServer((req: IncomingMessage, res) => {
+      hits.push({ ...req.headers });
+      if (req.url === '/walled') {
+        res.writeHead(403, { 'cf-mitigated': 'challenge', 'content-type': 'text/html' });
+        res.end('<title>Access | Cloudflare Access</title>');
+        return;
+      }
+      if (req.url === '/redir-access') {
+        res.writeHead(302, {
+          location: 'https://example.cloudflareaccess.com/cdn-cgi/access/login',
+        });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    });
+    const port = await listen(staging);
+    const origin = `http://127.0.0.1:${port}`;
+
+    try {
+      // Even with a complete pair and seam token in the environment, the
+      // anonymous probe must attach none of them.
+      await withEnvAsync(
+        { ...dummyAccessPair, QA_AUTH_TOKEN: 'dummy-qa-token-anon-probe' },
+        async () => {
+          const walled = await anonymousApiGet(`${origin}/walled`, 'health-anonymous');
+          expect(walled.status).toBe(403);
+          expect(() => assertAccessWall(walled, 'health-anonymous')).not.toThrow();
+
+          // Returned as the 302 itself: a followed Access login could not
+          // surface as this probe.
+          const redir = await anonymousApiGet(`${origin}/redir-access`, 'ready-anonymous');
+          expect(redir.status).toBe(302);
+          expect(() => assertAccessWall(redir, 'ready-anonymous')).not.toThrow();
+
+          const ok = await anonymousApiGet(`${origin}/ok`, 'health-anonymous');
+          expect(ok.status).toBe(200);
+          expect(() => assertAccessWall(ok, 'health-anonymous')).toThrow(
+            /expected Cloudflare Access denial/,
+          );
+        },
+      );
+
+      expect(hits).toHaveLength(3);
+      for (const headers of hits) {
+        expect(headers['cf-access-client-id']).toBeUndefined();
+        expect(headers['cf-access-client-secret']).toBeUndefined();
+        expect(headers.authorization).toBeUndefined();
+        expect(headers.cookie).toBeUndefined();
+      }
+      const dumped = JSON.stringify(hits);
+      expect(dumped).not.toContain('dummy-client-id');
+      expect(dumped).not.toContain('dummy-client-secret');
+      expect(dumped).not.toContain('dummy-qa-token-anon-probe');
+    } finally {
+      await close(staging).catch(() => {});
+    }
+  });
+});
+
 
 test.describe('anonymousGet (no credentials, no follow)', () => {
   // The anonymous probe must send NO header material even when the QA Access
@@ -324,7 +461,6 @@ test.describe('anonymousGet (no credentials, no follow)', () => {
       });
     const close = (server: Server): Promise<void> =>
       new Promise((resolve) => server.close(() => resolve()));
-
     const foreignHits: Array<Record<string, string | string[] | undefined>> = [];
     const foreign = createServer((req: IncomingMessage, res) => {
       foreignHits.push({ ...req.headers });
@@ -391,7 +527,7 @@ test.describe('readApiBody', () => {
         {
           status: () => 403,
           headers: () => ({ 'cf-mitigated': 'challenge' }),
-          text: async () => '<title>Access | Cloudflare</title>',
+          text: async () => '<title>Access | Cloudflare Access</title>',
         },
         'https://staging.example/api/library',
         'range',
@@ -779,7 +915,7 @@ test.describe('tryMintTestAccount fail-closed seam', () => {
       await expect(
         tryMintTestAccount(
           fakeRequest(
-            async () => fakeResponse(403, { 'cf-mitigated': 'challenge' }, '<title>Access</title>'),
+            async () => fakeResponse(403, { 'cf-mitigated': 'challenge' }, '<title>Access</title><p>Cloudflare Access</p>'),
           ),
           base,
         ),
@@ -793,7 +929,7 @@ test.describe('tryMintTestAccount fail-closed seam', () => {
       try {
         await tryMintTestAccount(
           fakeRequest(
-            async () => fakeResponse(403, { 'cf-mitigated': 'challenge' }, '<title>Access</title>'),
+            async () => fakeResponse(403, { 'cf-mitigated': 'challenge' }, '<title>Access</title><p>Cloudflare Access</p>'),
           ),
           'https://sentinel-staging-host.example',
         );
