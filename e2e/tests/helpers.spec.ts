@@ -14,10 +14,12 @@ import {
 import { extractPlanMeta, extractUsageBytes } from '../helpers/contract.js';
 import {
   anonymousApiGet,
+  annotateSignupPath,
   apiGet,
   apiPost,
   applyAccountToPage,
   requireApiAccount,
+  signupPathLabel,
   tryMintTestAccount,
 } from '../helpers/accounts.js';
 
@@ -852,6 +854,78 @@ test.describe('tryMintTestAccount fail-closed seam', () => {
         ),
       ).resolves.toEqual({ email: 'a@b', session: 't', viaApi: true });
     });
+  });
+});
+
+test.describe('signup path evidence label', () => {
+  const base = 'https://staging.example';
+  const seamEnv = {
+    STAGING_BASE_URL: base,
+    QA_AUTH_TOKEN: 'dummy-qa-token',
+    ...dummyAccessPair,
+  };
+  const permitted = ['public-ui-signup', 'api-minted-account'];
+
+  test('seam-minted account is labelled api-minted-account, leaking no account data', async () => {
+    await withEnvAsync(seamEnv, async () => {
+      const minted = await tryMintTestAccount(
+        {
+          post: async () => ({
+            status: () => 200,
+            headers: () => ({}),
+            text: async () =>
+              '{"email":"sentinel-email@example.test","session":"sentinel-session-value"}',
+          }),
+        } as unknown as APIRequestContext,
+        base,
+      );
+      const target = { annotations: [] as Array<{ type: string; description?: string }> };
+      const label = annotateSignupPath(target, minted);
+      expect(label).toBe('api-minted-account');
+      expect(target.annotations).toEqual([{ type: 'signup-path', description: 'api-minted-account' }]);
+      const dumped = JSON.stringify(target.annotations);
+      expect(dumped).not.toContain('sentinel-email@example.test');
+      expect(dumped).not.toContain('sentinel-session-value');
+      expect(dumped).not.toContain('dummy-qa-token');
+    });
+  });
+
+  test('unconfigured seam (UI signup fallback) is labelled public-ui-signup', async () => {
+    await withEnvAsync({ QA_AUTH_TOKEN: undefined }, async () => {
+      const minted = await tryMintTestAccount(
+        {
+          post: async () => {
+            throw new Error('must not be called without a token');
+          },
+        } as unknown as APIRequestContext,
+        base,
+      );
+      expect(minted).toBeNull();
+      const target = { annotations: [] as Array<{ type: string; description?: string }> };
+      expect(annotateSignupPath(target, minted)).toBe('public-ui-signup');
+      expect(target.annotations).toEqual([{ type: 'signup-path', description: 'public-ui-signup' }]);
+    });
+  });
+
+  test('label is always one of the two bounded values and carries no fixture data', () => {
+    const fixtures = [
+      null,
+      { email: 'sentinel-ui@example.test', viaApi: false },
+      { email: 'sentinel-api@example.test', session: 'sentinel-s2', viaApi: true },
+      { email: 'sentinel-api@example.test', viaApi: true },
+    ] as const;
+    for (const fixture of fixtures) {
+      const label = signupPathLabel(fixture);
+      expect(permitted).toContain(label);
+      expect(label).not.toContain('sentinel');
+      expect(label).not.toContain('@');
+    }
+    expect(signupPathLabel({ email: 'sentinel-ui@example.test', viaApi: false })).toBe(
+      'public-ui-signup',
+    );
+    expect(signupPathLabel({ email: 'sentinel-api@example.test', viaApi: true })).toBe(
+      'api-minted-account',
+    );
   });
 });
 
