@@ -121,7 +121,7 @@ config from secrets) is a follow-up slice.
   (`created_at`, never `issued_at`, so rotation cannot restore freshness):
   sessions authenticated outside the window are rejected with the documented
   `reauth_required` error code (401). Vault summary reads and boolean
-  connection tests retain ordinary session authentication. The pure
+  connection tests retain ordinary session authentication.
   `POST /v1/session/reauthenticate/start` authenticates the existing cookie
   with exact-Origin CSRF protection and stores a `reauth` passkey challenge
   bound to that session's user. `/finish` requires the same active session,

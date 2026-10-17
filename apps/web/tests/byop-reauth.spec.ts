@@ -19,6 +19,13 @@ test('stale session on provider save directs the user to sign in again', async (
 			})
 		})
 	);
+	await page.route('**/v1/session/reauthenticate/start', (route) =>
+		route.fulfill({
+			status: 401,
+			contentType: 'application/json',
+			body: JSON.stringify({ error: 'check your email and try again' })
+		})
+	);
 
 	await page.goto('/onboarding/byop');
 	await page.getByLabel('Hostname').fill('news.example.test');
@@ -32,7 +39,8 @@ test('stale session on provider save directs the user to sign in again', async (
 
 	const recovery = page.getByRole('alert');
 	await expect(recovery).toContainText('Your session is too old to save provider details.');
-	await expect(recovery).toContainText('then enter your provider details and test the connection');
+	await expect(recovery).toContainText('Reauthenticate with your passkey to continue.');
+	await recovery.getByRole('button', { name: 'Reauthenticate and save' }).click();
 	await expect(recovery.getByRole('link', { name: 'Sign in again' })).toHaveAttribute(
 		'href',
 		'/login'

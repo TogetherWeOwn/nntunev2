@@ -83,6 +83,7 @@
 		testDetail = '';
 		reauthRequired = false;
 		saveReauthRequired = false;
+		reauthState = 'idle';
 		saveState = 'idle';
 	}
 
@@ -213,13 +214,20 @@
 			if (currentTestKey() !== inputKey || testedConfigKey !== inputKey) {
 				throw new Error('provider configuration changed after testing');
 			}
+		} catch {
+			reauthState = 'failed';
+			return;
+		}
+
+		reauthState = 'idle';
+		try {
 			await client.saveProviderConfig(input);
-			reauthState = 'idle';
 			saveReauthRequired = false;
 			saveState = 'saved';
 			window.location.href = '/library';
-		} catch {
-			reauthState = 'failed';
+		} catch (error) {
+			saveReauthRequired = error instanceof ApiError && error.code === 'reauth_required';
+			saveState = 'failed';
 		}
 	}
 
@@ -233,6 +241,7 @@
 
 		const runId = testRunId;
 		saveReauthRequired = false;
+		reauthState = 'idle';
 		saveState = 'saving';
 		try {
 			await client.saveProviderConfig(input);
