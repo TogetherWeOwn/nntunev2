@@ -200,7 +200,37 @@ V1 lessons carried forward: per-user resource authorization precedes lookup (no
 existence oracles — cf. avatar-oracle fix); every credential-adjacent finding
 gets a card with exact head, never a bare comment.
 
-## 10. Future Worker deploy-lane rollback: trust assumptions (docs-only)
+## 10. Demo-media surfaces (no auth by design)
+
+`apps/web` serves `/demo/player` and `/api/demo/{audio,artwork}` (plus
+`/api/demo/` 404-probe paths used only as broken-image fixtures) with
+explicitly no auth. This is intentional, not an auth gap, and holds ONLY
+while every bullet below stays true:
+
+- Synthetic bytes only: the audio handler serves deterministic PCM WAV
+  bytes synthesized in `demoMedia.ts` (`?track=<id>` selects among
+  allowlisted salts; unknown ids serve the default stream); the artwork
+  handler serves a constant placeholder SVG (the R2 object is
+  "missing"). No provider dial, no R2/cache read, no vault, session,
+  or grant lookup.
+- No credential or identity surface: the routes accept no session,
+  token, grant, or credential input and emit no authenticated bytes.
+  Range handling slices the synthetic body; nothing reflects free-form
+  request input into bodies or headers.
+- Smoke-test scope only: the player page exists for seek-storm and
+  artwork-fallback smoke tests. Real playback must use the §5 grant
+  transport (header player or grant cookie, never signed query strings)
+  and must never be pointed at these routes.
+
+**Invariant violations** (treat as security findings requiring a CISO
+disposition before merge): serving library, cache, or R2 bytes from a
+demo route; reading or forwarding credentials, sessions, or grants
+there; reflecting request input beyond the allowlisted `track` salt
+selector and byte-range slicing; or wiring real user playback through
+these routes. Any such change moves the route out of this section and
+under §§4–6.
+
+## 11. Future Worker deploy-lane rollback: trust assumptions (docs-only)
 
 **Status: no Worker deploy lane exists.** `.github/workflows/deploy.yml`
 deploys `apps/web` only; no tracked workflow deploys the backend Workers
