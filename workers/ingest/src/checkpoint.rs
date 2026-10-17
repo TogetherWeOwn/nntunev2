@@ -12,12 +12,21 @@
 //! land less than a second before writer 2's first delivery, so the
 //! consumer waits out [`KV_SAME_KEY_WRITE_WINDOW_MS`] and retries its one
 //! write once in-invocation before giving the delivery back unpersisted.
+//!
+//! Verifying keeps its per-file resume state under a separate key
+//! (`ingest:verify:<job_id>`, [`get_verify`]/[`put_verify`]) with a single
+//! writer (the consumer's Verifying step). It is deliberately not a
+//! checkpoint field: the scratch objects it indexes carry the same
+//! judgement in their metadata, so a lost progress write only costs a
+//! re-adoption scan, never correctness — while the checkpoint key keeps
+//! its exactly-one-write-per-delivery discipline.
 
 use worker::{Env, Result};
 
 use crate::jobs::{validate_job_id, JobCheckpoint, JobState};
 use crate::queue::QueueMsg;
 use crate::retry::redrive_checkpoint;
+use crate::verify::VerifyProgress;
 
 pub const STATE_KV_BINDING: &str = "INGEST_STATE";
 pub const CHECKPOINT_TTL_SECS: u64 = 60 * 60 * 24 * 30;
@@ -144,13 +153,43 @@ pub async fn get(env: &Env, job_id: &str) -> Result<Option<JobCheckpoint>> {
 pub async fn put(env: &Env, checkpoint: &JobCheckpoint) -> Result<()> {
     let key = checkpoint_key(&checkpoint.job_id)
         .ok_or_else(|| worker::Error::RustError("invalid job id".into()))?;
+    put_json(env, &key, &serde_json::to_string(checkpoint)?).await
+}
+
+/// The one KV write helper behind every key this module stores.
+async fn put_json(env: &Env, key: &str, json: &str) -> Result<()> {
     let store = env.kv(STATE_KV_BINDING)?;
     store
-        .put(&key, serde_json::to_string(checkpoint)?)?
+        .put(&key, json.to_string())?
         .expiration_ttl(CHECKPOINT_TTL_SECS)
         .execute()
         .await
         .map_err(|e| worker::Error::RustError(e.to_string()))
+}
+
+fn verify_key(job_id: &str) -> Option<String> {
+    validate_job_id(job_id).then(|| format!("ingest:verify:{job_id}"))
+}
+
+/// Load one job's Verifying resume state (see the module docs).
+pub async fn get_verify(env: &Env, job_id: &str) -> Result<Option<VerifyProgress>> {
+    let key =
+        verify_key(job_id).ok_or_else(|| worker::Error::RustError("invalid job id".into()))?;
+    let store = env.kv(STATE_KV_BINDING)?;
+    store
+        .get(&key)
+        .json::<VerifyProgress>()
+        .await
+        .map_err(|e| worker::Error::RustError(e.to_string()))
+}
+
+/// Store one job's Verifying resume state. The consumer's Verifying step
+/// is the only writer, at most once per delivery, before the checkpoint
+/// persist of the same delivery.
+pub async fn put_verify(env: &Env, job_id: &str, progress: &VerifyProgress) -> Result<()> {
+    let key =
+        verify_key(job_id).ok_or_else(|| worker::Error::RustError("invalid job id".into()))?;
+    put_json(env, &key, &serde_json::to_string(progress)?).await
 }
 
 #[cfg(test)]
@@ -276,5 +315,10 @@ mod tests {
         );
         assert!(checkpoint_key("../secret").is_none());
         assert!(checkpoint_key("").is_none());
+        assert_eq!(
+            verify_key("job_01-a").as_deref(),
+            Some("ingest:verify:job_01-a")
+        );
+        assert!(verify_key("../secret").is_none());
     }
 }

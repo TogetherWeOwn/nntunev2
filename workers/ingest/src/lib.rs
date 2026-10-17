@@ -35,6 +35,7 @@ pub mod newznab;
 pub mod nzb_fetch;
 pub mod nzb_intake;
 pub mod parse;
+pub mod pool_body;
 pub mod pool_probe;
 pub mod probe;
 pub mod queue;
@@ -42,6 +43,7 @@ pub mod queue_consumer;
 pub mod rate_limit;
 pub mod repair;
 pub mod retry;
+pub mod verify;
 
 use api_error::ApiError;
 use dispatch::validate_user_id;
