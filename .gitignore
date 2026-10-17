@@ -19,7 +19,9 @@ Cargo.lock
 # Node / SvelteKit
 node_modules/
 .svelte-kit/
-build/
+# Rooted: a bare `build/` would also swallow source dirs named `build`
+# (e.g. `apps/web/src/routes/api/build/`).
+/build/
 dist/
 package-lock.json
 yarn.lock
