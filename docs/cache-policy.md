@@ -69,6 +69,22 @@ fails when either bucket name contains
 guard is name-based on purpose: renaming a bucket to dodge it breaks the
 exact names in `docs/ops.md` first.
 
+## Prescribed-versus-wired status (verified 2026-10-17)
+
+Each row pins what this policy prescribes against what the edge serves
+today. "Unwired" means no code path sets the header — it is a status
+fact, not a request to change behavior. Bucket binding and
+physical-bucket alignment stay with their owner lanes; this table records
+header status only. This section changes no cache semantics, bucket
+wiring, expiry, GC, or refill behavior.
+
+| Bucket(s) | Prescribed edge `Cache-Control` | Wired behavior today | Evidence |
+|---|---|---|---|
+| `nntunev2-audio-staging`, `nntunev2-audio-prod` | `no-store` (this table above; deltas below) | **Unwired.** No `Cache-Control` string exists anywhere in `workers/stream/src`. The Worker fetch entry answers `404` until the play adapters land (`routes::decide_public_fetch`), and the `respond`/`respond_body` adapters set only `content-type` (plus `retry-after` when carried). The portable play core emits only `Cache-Status` (`HIT`/`MISS`/`STALE`) + `Age` via `PlayResponse::cache_headers` — freshness telemetry, not a browser/CDN directive. | `workers/stream/src/play.rs` (`PlayResponse::cache_headers`), `workers/stream/src/cache.rs` (`CacheStatus::header_value`), `workers/stream/src/routes.rs` (`PUBLIC_FETCH_STATUS`, `decide_public_fetch`), `workers/stream/src/runtime.rs` (`fetch`, `respond`, `respond_body`) |
+| `nntunev2-art-staging`, `nntunev2-art-prod` (lookup/search JSON) | `public, max-age=86400` (lookup), `public, max-age=300` (search), failures `no-store` | **Wired — matches this table.** Success responses carry `Cache-Control: public, max-age=<ttl>` via `cache_control(ttl)`; failures carry `no-store` and are written to neither cache. | `workers/mb/src/lib.rs` (`cache_control`, the header-append sites, and the `no-store` test assertion) |
+| `nntunev2-art-staging`, `nntunev2-art-prod` (art bytes) | `public, max-age=86400, immutable` wherever serving lands | **Unwired.** No art-byte serving code path exists yet: the MusicBrainz Worker returns artwork URLs (e.g. `caa_url` on its entities) and never proxies full images inline, so there is nowhere to set the header. | `workers/mb/src/lib.rs` (entities carry `caa_url`; no image-body response path), deltas below |
+| `nntunev2-archive-staging`, `nntunev2-archive-prod` | n/a (no reads) | **n/a — no reads, no binding.** No Worker in this repository may bind an archive bucket (CI-enforced); neither stream nor MusicBrainz manifests target one. | `.github/scripts/check_archive_bindings.py`, `workers/stream/wrangler.toml`, `workers/mb/wrangler.toml.example` |
+
 ## Header-consistency deltas (verified 2026-10-16)
 
 - MusicBrainz JSON headers match this table exactly (lookup 86400,
