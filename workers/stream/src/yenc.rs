@@ -13,6 +13,10 @@ pub enum YencError {
     BadEscape,
     /// Missing/inconsistent `=ypart` placement on a multipart article.
     BadPart,
+    /// Duplicate or out-of-order `=ybegin`/`=ypart`/`=yend` framing: one
+    /// article has exactly one framing sequence, and a later record must
+    /// not replace already-accepted size, placement, or checksum state.
+    BadFraming,
     SizeMismatch {
         expected: u64,
         actual: usize,
@@ -154,6 +158,8 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
     let mut in_body = false;
     let mut seen_begin = false;
     let mut seen_trailer = false;
+    // A non-empty body line has been decoded; `=ypart` is only valid before it.
+    let mut seen_body = false;
     let mut file_size: Option<u64> = None;
     let mut multipart = false;
     let mut part_range: Option<(u64, u64)> = None;
@@ -163,6 +169,9 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
     for raw_line in text.split(|&b| b == b'\n') {
         let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
         if line.starts_with(b"=ybegin") {
+            if seen_begin {
+                return Err(YencError::BadFraming);
+            }
             in_body = true;
             seen_begin = true;
             // Byte-based: the line carries `name=<poster bytes>`, which is
@@ -173,6 +182,9 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
             continue;
         }
         if line.starts_with(b"=ypart") {
+            if !seen_begin || seen_trailer || seen_body || part_range.is_some() {
+                return Err(YencError::BadFraming);
+            }
             part_range = match (tag_u64(line, b"begin"), tag_u64(line, b"end")) {
                 (Some(b), Some(e)) if b >= 1 && e >= b => Some((b, e)),
                 _ => return Err(YencError::BadPart),
@@ -180,6 +192,9 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
             continue;
         }
         if line.starts_with(b"=yend") {
+            if !seen_begin || seen_trailer {
+                return Err(YencError::BadFraming);
+            }
             in_body = false;
             seen_trailer = true;
             yend_size = tag_u64(line, b"size");
@@ -190,6 +205,7 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
         if !in_body || line.is_empty() {
             continue;
         }
+        seen_body = true;
         let mut i = 0;
         while i < line.len() {
             if line[i] == b'=' {
