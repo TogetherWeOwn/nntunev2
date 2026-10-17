@@ -106,7 +106,21 @@ case "$sql" in
   *"SELECT lines_done FROM mb_import_cursor"*) printf '%s\n' "${FAKE_LINES_DONE:-0}" ;;
   *"SELECT count(*) FROM mb_import_dlq"*) printf '%s\n' "${FAKE_POISON_COUNT:-0}" ;;
   *"SELECT last_packet FROM mb_import_state"*) printf '%s\n' "${FAKE_LAST_PACKET:-0}" ;;
-  *"CREATE TEMP TABLE want_parent"*) [[ -n "${FAKE_FK_BAD:-}" ]] && printf '%s\n' "$FAKE_FK_BAD"; : ;;
+  *"CREATE TEMP TABLE want_parent"*)
+    # Only report the orphan while its line_no is still among the queried
+    # parents: track probes twice (one per parent) and a row split out by
+    # the first probe is no longer in the second probe's parents file.
+    if [[ -n "${FAKE_FK_BAD:-}" ]]; then
+      parents_file="$(printf '%s' "$sql" | grep -o "FROM '[^']*'" | head -n 1 | sed "s/FROM '//; s/'$//")"
+      if [[ -n "$parents_file" && -f "$parents_file" ]]; then
+        if awk -F'\t' -v bad="$FAKE_FK_BAD" '$2 == bad { f = 1 } END { exit !f }' "$parents_file"; then
+          printf '%s\n' "$FAKE_FK_BAD"
+        fi
+      else
+        printf '%s\n' "$FAKE_FK_BAD"
+      fi
+    fi
+    : ;;
   *"RETURNING lines_done"*)
     end="$(printf '%s' "$sql" | grep -o 'SET lines_done = [0-9]*' | grep -o '[0-9]*$' | head -n 1)"
     [[ "$end" =~ ^[0-9]+$ ]] || { echo "fake-psql: cannot parse chunk end" >&2; exit 3; }
@@ -359,6 +373,7 @@ make_dump() { # dump-dir : 2 valid rows per table
   printf '00000000-0000-0000-0000-000000000001\tBand 1\t1, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n00000000-0000-0000-0000-000000000002\tBand 2\t2, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n' >"$d/mbdump-artist.tsv"
   printf '00000000-0000-0000-0000-000000010001\t00000000-0000-0000-0000-000000000001\tAlbum 1\tAlbum\t2024\t\\N\t2024-05-02T00:00:00Z\n00000000-0000-0000-0000-000000010002\t00000000-0000-0000-0000-000000000002\tAlbum 2\tAlbum\t2024\t\\N\t2024-05-02T00:00:00Z\n' >"$d/mbdump-release.tsv"
   printf '00000000-0000-0000-0000-000000020001\t00000000-0000-0000-0000-000000010001\tTrack 1\t1\t180000\t2024-05-03T00:00:00Z\n00000000-0000-0000-0000-000000020002\t00000000-0000-0000-0000-000000010002\tTrack 2\t1\t180000\t2024-05-03T00:00:00Z\n' >"$d/mbdump-recording.tsv"
+  printf '00000000-0000-0000-0000-000000010001\t00000000-0000-0000-0000-000000020001\t1\t1\t2024-05-03T00:00:00Z\n00000000-0000-0000-0000-000000010002\t00000000-0000-0000-0000-000000020002\t1\t1\t2024-05-03T00:00:00Z\n' >"$d/mbdump-track.tsv"
 }
 
 # run_import <name> ; scenario knobs via FAKE_* / DUMP_SEQ in the caller env
@@ -422,11 +437,11 @@ for case_name in plain encoded; do
   check_eq "import full [$case_name]: exit" "0" "$run_exit"
   check_file_contains "import full [$case_name]: completes" "$scenario_dir/stdout" "import: done"
   check_file_contains "import full [$case_name]: seeds replication state" "$scenario_dir/stdout" "seeded mb_import_state.last_packet=500"
-  check_sql_at_least "import full [$case_name]: cursor insert ran per table" "$capture_dir" "INSERT INTO mb_import_cursor" 3
-  check_sql_at_least "import full [$case_name]: cursor read ran per table" "$capture_dir" "SELECT lines_done FROM mb_import_cursor" 3
-  check_sql_at_least "import full [$case_name]: FK parent probe ran for release+recording" "$capture_dir" "CREATE TEMP TABLE want_parent" 2
-  check_sql_at_least "import full [$case_name]: chunk transaction ran per table" "$capture_dir" "RETURNING lines_done" 3
-  check_sql_at_least "import full [$case_name]: DLQ poison count ran per table" "$capture_dir" "SELECT count(*) FROM mb_import_dlq" 3
+  check_sql_at_least "import full [$case_name]: cursor insert ran per table" "$capture_dir" "INSERT INTO mb_import_cursor" 4
+  check_sql_at_least "import full [$case_name]: cursor read ran per table" "$capture_dir" "SELECT lines_done FROM mb_import_cursor" 4
+  check_sql_at_least "import full [$case_name]: FK parent probe ran for release+recording+track(x2)" "$capture_dir" "CREATE TEMP TABLE want_parent" 4
+  check_sql_at_least "import full [$case_name]: chunk transaction ran per table" "$capture_dir" "RETURNING lines_done" 4
+  check_sql_at_least "import full [$case_name]: DLQ poison count ran per table" "$capture_dir" "SELECT count(*) FROM mb_import_dlq" 4
   check_sql_at_least "import full [$case_name]: replication state read ran" "$capture_dir" "SELECT last_packet FROM mb_import_state" 1
   check_sql_at_least "import full [$case_name]: replication state seed ran" "$capture_dir" "UPDATE mb_import_state SET last_packet" 1
   if [[ -s "$capture_dir/validate.count" ]]; then ok "import full [$case_name]: validator child ran"; else bad "import full [$case_name]: validator child never ran"; fi
@@ -453,7 +468,7 @@ check_file_contains "import complete: skip reported" "$scenario_dir/stdout" "alr
 check_file_contains "import complete: older seed leaves state untouched" "$scenario_dir/stderr" "leaving state untouched"
 check_eq "import complete: no chunk transaction" "0" "$(count_sql "$capture_dir" "RETURNING lines_done")"
 check_eq "import complete: no state seed" "0" "$(count_sql "$capture_dir" "UPDATE mb_import_state SET last_packet")"
-check_sql_at_least "import complete: all-poison guard still consulted DLQ" "$capture_dir" "SELECT count(*) FROM mb_import_dlq" 3
+check_sql_at_least "import complete: all-poison guard still consulted DLQ" "$capture_dir" "SELECT count(*) FROM mb_import_dlq" 4
 if [[ -e "$capture_dir/validate.count" ]]; then bad "import complete: validator ran on the skip path"; else ok "import complete: validator not run on the skip path"; fi
 common_post_checks
 
