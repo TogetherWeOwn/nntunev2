@@ -78,6 +78,74 @@ jobs:
       - run: cargo check -p nntune-stream --target wasm32-unknown-unknown
       - run: cargo clippy -p nntune-stream --target wasm32-unknown-unknown -- -D warnings
 
+  # Dependency/security gate: the reviewed deny.toml policy must pass for
+  # every committed lockfile (workspace root, workers/api, workers/ingest,
+  # workers/mb). Findings are fixed by updating the dependency, never by
+  # weakening the policy. Keep this job id in ci-ok's needs.
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Pinned SHA: `stable` branch HEAD (2026-10-09); re-pin deliberately,
+      # never float.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - name: Install pinned cargo-deny 0.20.2
+        run: |
+          set -euo pipefail
+          deny_version="0.20.2"
+          asset="cargo-deny-${deny_version}-x86_64-unknown-linux-musl.tar.gz"
+          base="https://github.com/EmbarkStudios/cargo-deny/releases/download/${deny_version}"
+          # Pinned digest recorded in-repo so a replaced release artifact
+          # fails closed instead of executing. Re-pin deliberately when the
+          # version above changes, verifying the digest out-of-band first.
+          expected_sha256="9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+          curl -sSL --retry 3 -o "/tmp/${asset}" "${base}/${asset}"
+          echo "${expected_sha256}  /tmp/${asset}" | (cd /tmp && sha256sum -c -)
+          mkdir -p "$HOME/.cargo/bin"
+          tar -xzf "/tmp/${asset}" -C /tmp
+          install -m 755 "/tmp/cargo-deny-${deny_version}-x86_64-unknown-linux-musl/cargo-deny" "$HOME/.cargo/bin/cargo-deny"
+          cargo-deny --version
+      # Fail-closed freshness: each committed lockfile must match its
+      # manifests, or the audit below would check a stale dependency set.
+      - name: Prove committed lockfiles are fresh
+        run: |
+          for manifest in Cargo.toml workers/api/Cargo.toml workers/ingest/Cargo.toml workers/mb/Cargo.toml workers/repair/Cargo.toml; do
+            cargo metadata --locked --format-version 1 --manifest-path "$manifest" > /dev/null
+          done
+      - name: Audit advisories, bans, licenses, sources
+        run: |
+          for manifest in Cargo.toml workers/api/Cargo.toml workers/ingest/Cargo.toml workers/mb/Cargo.toml workers/repair/Cargo.toml; do
+            cargo-deny --manifest-path "$manifest" check
+          done
+
+  # Compressed-size budget: every backend Worker release module must gzip
+  # to at most 3,000,000 bytes (see BUDGET_BYTES in the script). A missing,
+  # unbuildable, or over-budget module fails this job, and the job is a
+  # required member of ci-ok, so the budget fails the build fail-closed.
+  # Keep this job id in ci-ok's needs.
+  worker-wasm-budget:
+    name: worker wasm budget (enforcing)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
+      # (2026-08-06); re-pin deliberately, never float.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Unit-test the budget check
+        run: python3 .github/scripts/test_check_worker_wasm_budget.py
+      - name: Build Workers and enforce the compressed-size budget
+        run: python3 .github/scripts/check_worker_wasm_budget.py
+
   # Per-Worker compressed Wasm sizes: builds each Worker's release
   # wasm32 cdylib, measures raw + gzip bytes, and publishes a per-Worker
   # size table to the job summary. REPORT-ONLY: this job id is
@@ -607,7 +675,7 @@ jobs:
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, mb-import, config-parity, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy]
+    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, mb-import, config-parity, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
