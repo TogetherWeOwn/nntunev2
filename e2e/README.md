@@ -175,7 +175,9 @@ without a verified redaction path. A QA PASS verdict cites the green
 `e2e-staging` run URL + deployed head SHA; NEEDS WORK cites the failing
 spec + step. Every spec that branches on the test-account seam records a
 bounded `signup-path` test annotation — exactly `public-ui-signup` or
-`api-minted-account`, with no email, account id, token or provider data —
-so junit evidence always states which signup path produced it; a
-seam-backed (`api-minted-account`) run never counts as proof of the
-public UI signup.
+`api-minted-account`, with no email, account id, token or provider data.
+Both staging jobs publish those labels to the run's step summary on every
+configured run (pass or fail), because green runs upload no artifacts and
+the list reporter does not print annotations; the sanitized junit upload
+stays failure-only (7 days). A seam-backed (`api-minted-account`) run
+never counts as proof of the public UI signup.

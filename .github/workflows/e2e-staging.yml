@@ -82,6 +82,49 @@ jobs:
           QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
         run: npm run e2e:smoke
 
+      - name: Publish signup-path evidence summary
+        id: signup-path-summary
+        if: always() && steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        run: |
+          set -euo pipefail
+          # Green runs upload nothing, and the list reporter does not print
+          # test annotations, so without this step a passing run would retain
+          # no record of which signup path produced it. Publish only the
+          # bounded signup-path labels (fixed values, never account data) plus
+          # static test names to the run summary. Whitelist-only output: even
+          # though this reads pre-sanitize junit.xml, no other file content
+          # (and no secret) can pass through. Never fails the job.
+          {
+            echo "## Signup-path evidence"
+            echo ""
+            if [ ! -f test-results/junit.xml ]; then
+              echo "No junit evidence (test-results/junit.xml absent) — no signup-path label recorded."
+            else
+              python3 - <<'PY' || echo "Could not parse junit evidence — no signup-path label recorded."
+          import xml.etree.ElementTree as ET
+          allowed = {'public-ui-signup', 'api-minted-account'}
+          rows = []
+          for case in ET.parse('test-results/junit.xml').getroot().iter('testcase'):
+              name = case.get('name', '(unnamed test)')
+              label = None
+              props = case.find('properties')
+              if props is not None:
+                  for prop in props.findall('property'):
+                      if prop.get('name') == 'signup-path' and prop.get('value') in allowed:
+                          label = prop.get('value')
+              rows.append(f"- {name}: `{label}`" if label else f"- {name}: (no signup-path label)")
+          if rows:
+              print('Signup-path labels recorded at the test-account seam branch (fixed values only):')
+              print()
+              for row in rows:
+                  print(row)
+          else:
+              print('No test cases in junit evidence — no signup-path label recorded.')
+          PY
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Sanitize failure artifacts (strip credential-bearing snapshots)
         id: sanitize
         if: failure() && steps.staging.outputs.configured == 'true'
@@ -239,6 +282,49 @@ jobs:
           SYNTHETIC_NNTP_TLS: ${{ secrets.SYNTHETIC_NNTP_TLS }}
           SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
         run: npm run e2e:staging
+
+      - name: Publish signup-path evidence summary
+        id: signup-path-summary
+        if: always() && steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        run: |
+          set -euo pipefail
+          # Green runs upload nothing, and the list reporter does not print
+          # test annotations, so without this step a passing run would retain
+          # no record of which signup path produced it. Publish only the
+          # bounded signup-path labels (fixed values, never account data) plus
+          # static test names to the run summary. Whitelist-only output: even
+          # though this reads pre-sanitize junit.xml, no other file content
+          # (and no secret) can pass through. Never fails the job.
+          {
+            echo "## Signup-path evidence"
+            echo ""
+            if [ ! -f test-results/junit.xml ]; then
+              echo "No junit evidence (test-results/junit.xml absent) — no signup-path label recorded."
+            else
+              python3 - <<'PY' || echo "Could not parse junit evidence — no signup-path label recorded."
+          import xml.etree.ElementTree as ET
+          allowed = {'public-ui-signup', 'api-minted-account'}
+          rows = []
+          for case in ET.parse('test-results/junit.xml').getroot().iter('testcase'):
+              name = case.get('name', '(unnamed test)')
+              label = None
+              props = case.find('properties')
+              if props is not None:
+                  for prop in props.findall('property'):
+                      if prop.get('name') == 'signup-path' and prop.get('value') in allowed:
+                          label = prop.get('value')
+              rows.append(f"- {name}: `{label}`" if label else f"- {name}: (no signup-path label)")
+          if rows:
+              print('Signup-path labels recorded at the test-account seam branch (fixed values only):')
+              print()
+              for row in rows:
+                  print(row)
+          else:
+              print('No test cases in junit evidence — no signup-path label recorded.')
+          PY
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Sanitize failure artifacts (strip credential-bearing snapshots)
         id: sanitize

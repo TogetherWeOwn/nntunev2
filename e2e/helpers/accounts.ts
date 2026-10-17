@@ -45,10 +45,13 @@ export function signupPathLabel(minted: TestAccount | null): SignupPathLabel {
 
 /**
  * Record the signup-path label as a test annotation so it rides along in
- * reporter output (list + the sanitized junit CI artifact) next to the
- * test result. A passing test's label is the path that produced its
- * evidence; on failure it names the path under exercise. The annotation
- * carries only the bounded label above (names only — no values logged).
+ * reporter output (the sanitized junit CI artifact) next to the test
+ * result. The list reporter does not print annotations, and green runs
+ * upload no artifacts, so the staging workflow additionally publishes the
+ * label to the run's step summary on every configured run. A passing
+ * test's label is the path that produced its evidence; on failure it names
+ * the path under exercise. The annotation carries only the bounded label
+ * above (names only — no values logged).
  */
 export function annotateSignupPath(
   target: { annotations: Array<{ type: string; description?: string }> },
