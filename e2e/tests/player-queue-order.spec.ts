@@ -1,14 +1,16 @@
 import { test, expect } from '@playwright/test';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { API, TESTIDS, uniqueTestEmail } from '../helpers/contract.js';
+import { API, TESTIDS } from '../helpers/contract.js';
 import { readApiBody, stagingBaseUrl } from '../helpers/access.js';
 import {
   accountHeaders,
+  annotateSignupPath,
   apiGet,
   applyAccountToPage,
   completeByopWizard,
   requireApiAccount,
+  submitPublicUiSignup,
   tryMintTestAccount,
   type TestAccount,
 } from '../helpers/accounts.js';
@@ -48,37 +50,27 @@ test.describe.serial('player queue follows library-selection order', () => {
   // selection runs as the ingesting identity. Retries mint a fallback.
   let sharedAccount: TestAccount | null = null;
 
-  test('NZB fixture ingests and appears in the library', async ({ page, request }) => {
+  test('NZB fixture ingests and appears in the library', async ({ page, request }, testInfo) => {
     const baseURL = stagingBaseUrl('skip', 'queue-order-ingest');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
     const minted = await tryMintTestAccount(request, baseURL);
+    // Evidence provenance: this test duplicates the signup branch, so it
+    // records the same bounded signup-path label (no account data).
+    annotateSignupPath(testInfo, minted);
     await applyAccountToPage(page, minted, baseURL);
     if (minted?.viaApi) {
       sharedAccount = minted;
       await page.goto(baseURL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     } else {
-      // Real UI signup fallback (not a bare navigation): fill the form and
-      // require the wizard, mirroring ingest-play-meter.spec.ts.
-      const email = uniqueTestEmail();
-      await page.goto(`${baseURL}/signup`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-      await expect(page.getByTestId(TESTIDS.signupEmail)).toBeVisible({ timeout: 15_000 });
-      await page.getByTestId(TESTIDS.signupEmail).fill(email);
-      await page.getByTestId(TESTIDS.signupSubmit).click();
-      const wizard = page.getByTestId(TESTIDS.byopHost);
-      const error = page.getByTestId(TESTIDS.signupError);
-      await expect(async () => {
-        const onWizard = await wizard.isVisible().catch(() => false);
-        const onError = await error.isVisible().catch(() => false);
-        expect(onWizard || onError, 'neither BYOP wizard nor signup error appeared').toBe(true);
-      }).toPass({ timeout: 30_000 });
-      expect(await error.isVisible().catch(() => false), 'signup rejected the test mailbox').toBe(
-        false,
-      );
-      expect(page.url()).toContain('/onboarding/byop');
-      sharedAccount = { email, viaApi: false };
+      // Real UI signup fallback (not a bare navigation): shared helper with
+      // the signup spec. It asserts the emailed-code step — the
+      // code-plus-passkey finish needs a staging code-retrieval seam that
+      // does not exist yet, so this path cannot enroll an account. API-driven
+      // steps below additionally require the seam — see requireApiAccount.
+      sharedAccount = await submitPublicUiSignup(page, baseURL);
     }
 
     // The ingest worker probes through the user's authenticated provider
@@ -106,7 +98,17 @@ test.describe.serial('player queue follows library-selection order', () => {
     ).toBeVisible({ timeout: 60_000 });
   });
 
-  test('player queue advances in library-selection order', async ({ page, request }) => {
+  // FIXMEd until the player slice lands queue order on staging: the
+  // synthetic fixture ingests a single track (so the ≥2-track precondition
+  // below fails before any UI step), library rows are plain `<li>` elements
+  // with no click handler
+  // (`apps/web/src/routes/library/+page.svelte`), and `/library` has no
+  // `queue-item`/`now-playing`/`player-next` hooks (`currentTrack` is fixed
+  // at `null`). Below playback and FIXMEd, so it can never fail or skip a
+  // later step. Un-fixme paths: (a) grow the corpus to a multi-track
+  // fixture, (b) make library rows selectable, and (c) wire the queue hooks
+  // on `/library` with it.
+  test.fixme('player queue advances in library-selection order', async ({ page, request }) => {
     const baseURL = stagingBaseUrl('skip', 'queue-order');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
