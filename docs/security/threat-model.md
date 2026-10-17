@@ -195,6 +195,7 @@ exact implementation PR head:
 | F-HYG-01 | Dependabot updates config (alerts ≠ updates) | Paperclip child card (see above) |
 | F-HYG-02 | CI lint banning internal ids/hosts/agent names in public text | Paperclip child card (see above) |
 | F-HYG-03 | PR-template secrets affirmation checkbox | Paperclip child card (see above) |
+| F-DEL-01 | Account-deletion fence gaps (required by ADR 0002 rule 3, not yet implemented): auth/session writers carry no fence in either state — the `scheduled`-only bound lands with the cancel-deletion and executor slice; no stream production sink exists (only `LEDGER_WRITE_FENCE_SQL` plus the in-memory `UsageLedger::record_fenced` mirror) | Paperclip child card (mapping in the threat-model card thread, never pasted here) |
 
 V1 lessons carried forward: per-user resource authorization precedes lookup (no
 existence oracles — cf. avatar-oracle fix); every credential-adjacent finding
