@@ -15,9 +15,10 @@
 //! payload KV, enqueue to `nntune-ingest-jobs`, and write the initial job
 //! checkpoint for every real admission. The Queue consumer
 //! (`src/queue_consumer.rs`; Workflow steps in `queue::WORKFLOW_STEPS`)
-//! validates messages and checkpoints, but its search/probe/verify/repair
-//! boundaries are not executable yet, so the consumer/workflow entries stay
-//! commented out in `wrangler.toml.example` until they land.
+//! validates messages and checkpoints and executes the upload
+//! parse + pool-probe steps, but its search/verify/repair boundaries are
+//! not executable yet, so the consumer/workflow entries stay commented
+//! out in `wrangler.toml.example` until they land.
 //! See `README.md`.
 
 use futures_util::StreamExt;
