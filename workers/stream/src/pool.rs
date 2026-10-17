@@ -45,11 +45,16 @@ pub struct Lease {
 /// `abort`, on either the miss or the hit path). The play path pushes these
 /// into pool-level shared state; the pool owner drains them via
 /// [`Pool::take_orphaned`] and emits one `BytesServed` event each.
+///
+/// `trace_id` is the normalized request trace for log correlation only: it
+/// never enters the Analytics Engine row (see `MeterEvent`, which is
+/// unchanged). `None` means the play carried no valid trace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrphanedPlay {
     pub user_id: String,
     pub track_id: String,
     pub bytes: u64,
+    pub trace_id: Option<String>,
 }
 
 /// Slot bookkeeping shared between the pool and outstanding leases, so a
@@ -450,6 +455,7 @@ mod tests {
             user_id: "u".into(),
             track_id: "t".into(),
             bytes: 7,
+            trace_id: None,
         });
         // Streams record through the shared sink without holding the pool
         // (this is how `Drop` meters a lease-less cache-hit stream).
@@ -460,6 +466,7 @@ mod tests {
                 user_id: "u".into(),
                 track_id: "t".into(),
                 bytes: 8,
+                trace_id: None,
             });
         let drained = pool.take_orphaned();
         assert_eq!(

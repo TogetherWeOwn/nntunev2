@@ -31,4 +31,5 @@ pub mod play;
 pub mod pool;
 pub mod prefetch;
 pub mod range;
+pub mod trace;
 pub mod yenc;
