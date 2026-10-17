@@ -1,8 +1,12 @@
 //! Acceptance tests: per-worker structured logging standard with trace IDs.
 //!
-//! Slice contract for the `stream` worker. The fixture event is illustrative,
-//! not a claim about deployed Analytics Engine output; this test validates only
-//! the normalized envelope and obvious privacy hazards.
+//! Slice contract for the `stream` worker. Unlike api/ingest/mb, `stream`
+//! keeps its legacy Analytics Engine shape and event vocabulary and only adds
+//! `trace_id`: the six shared fields must be present as a SUPERSET (legacy
+//! extras allowed) and the event name only needs lowercase `[a-z0-9_.]` with
+//! no dot requirement. This test validates that superset envelope plus the
+//! shared timestamp/privacy checks. The fixture event is illustrative, not a
+//! claim about deployed Analytics Engine output.
 //!
 //! Static fixtures only: no live Cloudflare tail, no network, and no new deps.
 
@@ -368,10 +372,13 @@ fn timestamp_is_valid_utc(value: &str) -> bool {
     pos == bytes.len() - 1
 }
 
+/// Stream keeps its legacy Analytics Engine shape and event vocabulary:
+/// lowercase `[a-z0-9_.]`, non-empty, no leading/trailing separator. A dot is
+/// NOT required (e.g. `play_start` stays valid); `docs/logging-standard.md`
+/// scopes the exact six-key envelope and dotted names to api/ingest/mb.
 fn valid_event(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 96
-        && value.contains('.')
         && !value.starts_with(['.', '_'])
         && !value.ends_with(['.', '_'])
         && value
@@ -452,14 +459,14 @@ fn has_ipv4_value(fields: &BTreeMap<String, JsonValue>) -> bool {
 }
 
 #[test]
-fn golden_line_conforms_to_exact_schema() {
+fn golden_line_conforms_to_schema() {
     let line = read_artifact(FIXTURE_REL, "golden log-line fixture");
     let object = parse_line(&line);
     let expected: BTreeSet<_> = REQUIRED_FIELDS.iter().copied().collect();
     let actual: BTreeSet<_> = object.keys().map(String::as_str).collect();
-    assert_eq!(
-        actual, expected,
-        "fixture must have exactly the six schema keys"
+    assert!(
+        expected.is_subset(&actual),
+        "fixture must carry the six schema keys (stream may keep legacy extras)"
     );
     assert!(
         matches!(object.get("ts"), Some(JsonValue::String(ts)) if timestamp_is_valid_utc(ts)),
@@ -479,7 +486,7 @@ fn golden_line_conforms_to_exact_schema() {
     );
     assert!(
         matches!(object.get("event"), Some(JsonValue::String(event)) if valid_event(event)),
-        "event must use the normalized lowercase identifier syntax"
+        "event must use the legacy lowercase [a-z0-9_.] vocabulary"
     );
     let Some(JsonValue::Object(fields)) = object.get("fields") else {
         panic!("fields must be a JSON object");
