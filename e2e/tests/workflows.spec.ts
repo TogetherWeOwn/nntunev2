@@ -169,6 +169,25 @@ test.describe('credential scope (static pins)', () => {
     }
   });
 
+  test('anonymous denial probe stays credential-free and no-follow', () => {
+    // The anonymous app-shell check must go through anonymousGet (no headers
+    // parameter, maxRedirects: 0) and the inverse wall assertion. Pin both
+    // so it cannot silently regress to a credentialed apiGet (which would
+    // prove the with-token side again) or to a raw call.
+    const accounts = readFileSync(new URL('../helpers/accounts.ts', import.meta.url), 'utf8');
+    expect(accounts).toContain('export async function anonymousGet');
+    const health = readFileSync(new URL(`../tests/health.spec.ts`, import.meta.url), 'utf8');
+    expect(health, 'health.spec.ts must probe anonymously via anonymousGet').toContain(
+      'anonymousGet(',
+    );
+    expect(health, 'health.spec.ts must assert the Access wall for the anonymous probe').toContain(
+      'assertAccessWall(',
+    );
+    expect(health, 'anonymous probe must use an isolated request context').toContain(
+      'playwrightRequest.newContext(',
+    );
+  });
+
   test('no-follow pin catches nested-paren and fetch mutants', () => {
     // Regression proof for the pin above: the reviewer's bypass mutants must
     // match (fail the pin), while the approved wrapper call must not.

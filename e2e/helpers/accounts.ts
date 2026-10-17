@@ -149,6 +149,32 @@ export async function apiPost(
 }
 
 /**
+ * Anonymous GET: NO Access pair, NO Authorization, NO cookies — by
+ * construction, not by passing empty credentials through a credentialed
+ * wrapper. This helper never reads the environment and takes no headers
+ * parameter, so no caller can accidentally credential it. The caller MUST
+ * pass a fresh, isolated APIRequestContext (a new Playwright request
+ * context with no storageState or context-level headers) so no ambient
+ * session can ride along.
+ *
+ * Unlike apiGet it does NOT throw on 3xx: it fetches with maxRedirects: 0
+ * and returns the response as-is so the caller can classify it with
+ * assertAccessWall. Nothing is followed, so a redirect target (Access login
+ * or otherwise) receives zero follow-up requests from this probe.
+ */
+export async function anonymousGet(
+  request: APIRequestContext,
+  url: string,
+  opts?: { timeout?: number },
+): Promise<APIResponse> {
+  return request.get(url, {
+    headers: {},
+    timeout: opts?.timeout ?? 30_000,
+    maxRedirects: 0,
+  });
+}
+
+/**
  * Authenticate a browser page as a minted account. Call BEFORE the first
  * navigation: the route applies to subsequent loads, never past ones.
  *
