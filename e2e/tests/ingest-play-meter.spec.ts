@@ -102,6 +102,73 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     ).toBeVisible({ timeout: 60_000 });
   });
 
+  test('ingested library persists across reload without re-import', async ({ page, request }) => {
+    const baseURL = stagingBaseUrl('skip', 'reload');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    // Fail closed instead of asserting anonymously when neither a minted
+    // session nor the QA seam token exists.
+    requireApiAccount(account, 'reload');
+    const headers = accountHeaders(account);
+    const libraryUrl = `${baseURL}${API.library}`;
+    const library = await apiGet(request, libraryUrl, headers, 'reload');
+    const libraryBody = await readApiBody(library, libraryUrl, 'reload');
+    expect(library.ok(), `library listing failed: HTTP ${library.status()}`).toBe(true);
+    const items = JSON.parse(libraryBody) as Array<{ id?: string }>;
+    const trackId = Array.isArray(items) ? items[0]?.id : undefined;
+    expect(trackId, 'library is empty — ingest spec must run first').toBeTruthy();
+
+    await applyAccountToPage(page, account, baseURL);
+    await page.goto(`${baseURL}/library`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    const libraryItems = page.getByTestId(TESTIDS.libraryItem);
+    await expect(
+      libraryItems.first(),
+      'ingested track missing from library before reload',
+    ).toBeVisible({ timeout: 60_000 });
+    const before = await libraryItems.evaluateAll((els) =>
+      els.map((el) => ({
+        id: el.getAttribute('data-id'),
+        text: (el.textContent ?? '').trim(),
+      })),
+    );
+    const beforeEntry = before.find((entry) => entry.id === trackId);
+    expect(
+      beforeEntry,
+      `ingested track ${trackId} missing from library before reload`,
+    ).toBeTruthy();
+    expect(
+      beforeEntry?.text.length ?? 0,
+      `ingested track ${trackId} has no visible title before reload`,
+    ).toBeGreaterThan(0);
+
+    // No re-import step here by design: no /library/import visit, no
+    // setInputFiles — a plain reload must keep the ingested track.
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
+    const reloadedItems = page.getByTestId(TESTIDS.libraryItem);
+    await expect(
+      reloadedItems.first(),
+      `ingested track ${trackId} missing after reload without re-import`,
+    ).toBeVisible({ timeout: 60_000 });
+    const after = await reloadedItems.evaluateAll((els) =>
+      els.map((el) => ({
+        id: el.getAttribute('data-id'),
+        text: (el.textContent ?? '').trim(),
+      })),
+    );
+    const afterEntry = after.find((entry) => entry.id === trackId);
+    expect(
+      afterEntry,
+      `ingested track ${trackId} missing after reload without re-import`,
+    ).toBeTruthy();
+    expect(
+      afterEntry?.text,
+      `ingested track ${trackId} text changed across reload`,
+    ).toBe(beforeEntry?.text);
+  });
+
   test('streaming answers byte Ranges with 206 + Content-Range', async ({ request }) => {
     const baseURL = stagingBaseUrl('skip', 'range');
     if (!baseURL) {
