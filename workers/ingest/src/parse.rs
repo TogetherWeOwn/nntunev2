@@ -76,6 +76,72 @@ pub fn parse_upload(xml: &[u8], estimate: &IntakeEstimate) -> Result<ParsedNzb, 
     Ok(parsed)
 }
 
+/// One NZB file as Verifying walks it: the name par2 matching keys on, the
+/// par2 role, and exactly this file's segments (ids + declared encoded
+/// ranges) in NZB order. [`ParsedNzb`] deliberately stays flat for the
+/// probe; this projection carries what fetching and verifying need.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParsedFile {
+    /// The core parser's extracted filename (the quoted span of the
+    /// subject), or the whole subject when it extracts none. Display/match
+    /// only — never a storage key (scratch keys hash it).
+    pub name: String,
+    /// True when the core parser classified the file as a par2 object.
+    pub is_par2: bool,
+    pub segment_ids: Vec<String>,
+    /// Declared encoded `bytes=` per segment, parallel to `segment_ids`;
+    /// `None` is explicit-unknown (same rule as [`ParsedNzb`]).
+    pub segment_bytes: Vec<Option<u64>>,
+}
+
+/// Project the shared-parser document per file (see [`ParsedFile`]).
+///
+/// Runs the same bounded parser and estimate cross-check as
+/// [`parse_upload`]: the file/segment counts must agree with the intake
+/// guard and every message-id must pass the strict rule before any of
+/// them may reach a provider connection.
+pub fn parse_upload_files(
+    xml: &[u8],
+    estimate: &IntakeEstimate,
+) -> Result<Vec<ParsedFile>, ParseRejection> {
+    let document = nntune_core::nzb::parse(xml).map_err(|error| match error {
+        nntune_core::Error::Bounds { .. } => ParseRejection::TooLarge,
+        _ => ParseRejection::Invalid("nntune-core rejected NZB"),
+    })?;
+    let mut files = Vec::with_capacity(document.files.len());
+    let mut segment_count = 0usize;
+    for file in document.files {
+        let mut segment_ids = Vec::with_capacity(file.segments.len());
+        let mut segment_bytes = Vec::with_capacity(file.segments.len());
+        for segment in file.segments {
+            if !validate_message_id(&segment.message_id) {
+                return Err(ParseRejection::Invalid(
+                    "message-ids must be valid msg-ids (printable ASCII, one @)",
+                ));
+            }
+            segment_count += 1;
+            segment_bytes.push(
+                u64::try_from(segment.encoded_bytes)
+                    .ok()
+                    .filter(|n| *n >= 1),
+            );
+            segment_ids.push(segment.message_id);
+        }
+        files.push(ParsedFile {
+            name: file.filename.unwrap_or(file.subject),
+            is_par2: file.role == "par2" || file.container == "par2",
+            segment_ids,
+            segment_bytes,
+        });
+    }
+    if files.len() != estimate.file_count || segment_count != estimate.segment_count {
+        return Err(ParseRejection::Invalid(
+            "parse disagrees with the intake guard",
+        ));
+    }
+    Ok(files)
+}
+
 /// Cross-check a parse against the intake guard's estimate. Any disagreement
 /// fails the job before a single provider connection is spent.
 pub fn check_parsed(estimate: &IntakeEstimate, parsed: &ParsedNzb) -> Result<(), &'static str> {
@@ -527,6 +593,43 @@ mod tests {
             parse_upload(xml.as_bytes(), &est),
             Err(ParseRejection::TooLarge)
         );
+    }
+
+    #[test]
+    fn upload_files_projection_carries_names_roles_and_per_file_segments() {
+        // Verifying needs what the flat projection drops: each file's name
+        // (to match par2 FileDesc entries), its par2 role, and exactly its
+        // own segments in order.
+        let xml = r#"<?xml version="1.0"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+<file poster="a@b" date="1" subject="rel [01/03] - &quot;track01.flac&quot; yEnc (1/2)">
+<groups><group>alt.binaries.music</group></groups>
+<segments>
+<segment bytes="100" number="1">seg-one@synthetic.invalid</segment>
+<segment bytes="100" number="2">seg-two@synthetic.invalid</segment>
+</segments>
+</file>
+<file poster="a@b" date="1" subject="rel [02/03] - &quot;track01.par2&quot; yEnc (1/1)">
+<groups><group>alt.binaries.music</group></groups>
+<segments>
+<segment bytes="100" number="1">par2-one@synthetic.invalid</segment>
+</segments>
+</file>
+</nzb>"#;
+        let est = estimate_nzb(xml).unwrap();
+        let files = parse_upload_files(xml.as_bytes(), &est).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].name, "track01.flac");
+        assert!(!files[0].is_par2);
+        assert_eq!(files[0].segment_ids, SMALL_NZB_SEGMENTS);
+        assert_eq!(files[0].segment_bytes, vec![Some(100), Some(100)]);
+        assert_eq!(files[1].name, "track01.par2");
+        assert!(files[1].is_par2);
+        assert_eq!(files[1].segment_ids, ["par2-one@synthetic.invalid"]);
+        // The two projections must describe the same document.
+        let flat = parse_upload(xml.as_bytes(), &est).unwrap();
+        let joined: Vec<String> = files.iter().flat_map(|f| f.segment_ids.clone()).collect();
+        assert_eq!(joined, flat.message_ids);
     }
 
     #[test]

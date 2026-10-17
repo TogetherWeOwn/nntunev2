@@ -98,7 +98,11 @@ fn bounded_redacted_detail(detail: &str) -> String {
 /// One failed step run. `transient` failures may succeed on redelivery (pool
 /// 430s, KV lag, Container 500s); permanent ones never will (bytes that fail
 /// the intake guard, an unparseable NZB), so they skip the budget and go
-/// straight to the DLQ.
+/// straight to the DLQ. A `made_progress` transient is not a failure at
+/// all: the step durably advanced its resumable state and only needs the
+/// next delivery to continue, so it must not spend the retry budget — a
+/// large valid job whose step is capped per delivery would otherwise be
+/// quarantined while every delivery succeeds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobError {
     pub code: &'static str,
@@ -266,10 +270,20 @@ pub fn decide_checkpoint(
             Disposition::Quarantine(Box::new(quarantine(msg, cp.attempt, &e)))
         }
         // Deliberate progress stop: no attempt is recorded, so a job
-        // that keeps advancing can never quarantine mid-step. Checked
-        // after the permanent arm, so a hand-built permanent error can
-        // never smuggle itself into a continuation.
-        Err(e) if e.made_progress => Disposition::Continue,
+        // that keeps advancing can never quarantine mid-step — even at
+        // the budget ceiling, where a genuine transient failure would.
+        // Checked after the permanent arm, so a hand-built permanent
+        // error can never smuggle itself into a continuation. A corrupt
+        // attempt 0 still quarantines (it would loop with no accountable
+        // delivery count).
+        Err(e) if e.made_progress => {
+            if cp.attempt == 0 {
+                fail_checkpoint(cp, e.code, &e.detail);
+                Disposition::Quarantine(Box::new(quarantine(msg, cp.attempt, &e)))
+            } else {
+                Disposition::Continue
+            }
+        }
         Err(e) => match record_redelivery(cp) {
             Some(delay_secs) => Disposition::Retry {
                 delay_secs: e.retry_after_secs.map_or(delay_secs, |hint| {
@@ -532,6 +546,46 @@ mod tests {
             }
             d => panic!("spent budget must quarantine, got {d:?}"),
         }
+    }
+
+    #[test]
+    fn progress_continues_without_spending_the_attempt_budget() {
+        let msg = msg_at(1);
+        let mut cp = checkpoint_for(&msg);
+        let progress = || {
+            Err(JobError::progress(
+                ERR_VERIFY_FAILED,
+                "verifying in progress",
+            ))
+        };
+        // More progress deliveries than the whole budget: never an
+        // increment, never a quarantine, state untouched. The fresh-copy
+        // continuation (not a native retry) is what lets a capped step
+        // run past the queue's native max_retries as well.
+        for _ in 0..MAX_ATTEMPTS + 2 {
+            match decide_checkpoint(&msg, &mut cp, progress()).unwrap() {
+                Disposition::Continue => {
+                    assert_eq!(cp.attempt, 1);
+                    assert_ne!(cp.state, JobState::Failed);
+                }
+                d => panic!("progress must continue, got {d:?}"),
+            }
+        }
+        // Even at the ceiling, progress continues where a plain transient
+        // failure would quarantine.
+        cp.attempt = MAX_ATTEMPTS;
+        assert!(matches!(
+            decide_checkpoint(&msg, &mut cp, progress()).unwrap(),
+            Disposition::Continue
+        ));
+        assert_eq!(cp.attempt, MAX_ATTEMPTS);
+        // A corrupt attempt 0 still quarantines instead of looping.
+        let msg0 = msg_at(0);
+        let mut cp0 = checkpoint_for(&msg0);
+        assert!(matches!(
+            decide_checkpoint(&msg0, &mut cp0, progress()).unwrap(),
+            Disposition::Quarantine(_)
+        ));
     }
 
     #[test]

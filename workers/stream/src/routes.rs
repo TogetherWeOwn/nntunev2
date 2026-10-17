@@ -17,6 +17,8 @@ pub const DO_CLASS_NAME: &str = "NntpPool";
 pub const PROBE_METHOD: &str = "POST";
 /// Probe route: method and path the pool Durable Object serves.
 pub const PROBE_PATH: &str = "/probe";
+/// Body route: path the pool Durable Object serves (same `POST` method).
+pub const BODY_PATH: &str = "/body";
 
 /// Public Worker fetch decision until the play adapters are wired.
 pub const PUBLIC_FETCH_STATUS: u16 = 404;
@@ -73,6 +75,34 @@ impl ProbeDecision {
             ProbeDecision::OwnerMissing => OWNER_MISSING_BODY,
             ProbeDecision::ProviderUnavailable => PROVIDER_UNAVAILABLE_BODY,
         }
+    }
+}
+
+/// Adapter action for one Durable Object request, across both pool routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolAction {
+    /// Return the supplied portable route decision without running anything.
+    Respond(ProbeDecision),
+    /// Run request validation and probe execution (`POST /probe`).
+    RunProbe,
+    /// Run request validation and body execution (`POST /body`).
+    RunBody,
+}
+
+/// Decide what one Durable Object request runs: the probe route, the body
+/// route, or a portable refusal. Exact method+path only, and a right-route
+/// request on an owner-less instance is refused before any dial.
+pub fn decide_pool_action(method: &str, path: &str, has_owner_name: bool) -> PoolAction {
+    if method != PROBE_METHOD || (path != PROBE_PATH && path != BODY_PATH) {
+        return PoolAction::Respond(ProbeDecision::NotFound);
+    }
+    if !has_owner_name {
+        return PoolAction::Respond(ProbeDecision::OwnerMissing);
+    }
+    if path == BODY_PATH {
+        PoolAction::RunBody
+    } else {
+        PoolAction::RunProbe
     }
 }
 
@@ -201,6 +231,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pool_action_routes_probe_and_body_and_nothing_else() {
+        assert_eq!(
+            decide_pool_action("POST", "/probe", true),
+            PoolAction::RunProbe
+        );
+        assert_eq!(
+            decide_pool_action("POST", "/body", true),
+            PoolAction::RunBody
+        );
+        for (method, path) in [
+            ("GET", "/body"),
+            ("POST", "/body/"),
+            ("POST", "/BODY"),
+            ("POST", "/other"),
+        ] {
+            assert_eq!(
+                decide_pool_action(method, path, true),
+                PoolAction::Respond(ProbeDecision::NotFound),
+                "{method} {path}"
+            );
+        }
+        assert_eq!(
+            decide_pool_action("POST", "/body", false),
+            PoolAction::Respond(ProbeDecision::OwnerMissing)
+        );
+        assert_eq!(BODY_PATH, "/body");
+    }
+
     #[tokio::test]
     async fn dispatch_runs_the_selected_response_or_probe_handler() {
         let render = |decision: ProbeDecision| (decision.status(), decision.body());
@@ -314,7 +373,7 @@ mod tests {
             "Durable Object fetch handler must not carry cfg/other attributes"
         );
         let expected_durable_object_fetch = syn::parse_str::<syn::ImplItemFn>(
-            "async fn fetch(&self, mut req: Request) -> Result<Response> {\n                let has_owner_name = self.state.id().name().is_some();\n                routes::dispatch_probe(\n                    routes::decide_probe_action(req.method().as_ref(), &req.path(), has_owner_name),\n                    |decision| match decision {\n                        ProbeDecision::NotFound => Response::error(decision.body(), decision.status()),\n                        _ => respond(route_reply(decision)),\n                    },\n                    || async { respond(self.probe(&mut req).await) },\n                )\n                .await\n            }",
+            "async fn fetch(&self, mut req: Request) -> Result<Response> {\n                let has_owner_name = self.state.id().name().is_some();\n                match routes::decide_pool_action(req.method().as_ref(), &req.path(), has_owner_name) {\n                    PoolAction::Respond(ProbeDecision::NotFound) => Response::error(ProbeDecision::NotFound.body(), ProbeDecision::NotFound.status(),),\n                    PoolAction::Respond(decision) => respond(route_reply(decision)),\n                    PoolAction::RunProbe => respond(self.probe(&mut req).await),\n                    PoolAction::RunBody => respond_body(self.body(&mut req).await),\n                }\n            }",
         )
         .expect("parse expected Durable Object handler");
         assert_eq!(

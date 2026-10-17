@@ -16,11 +16,11 @@
 //! checkpoint for every real admission. The Queue consumer
 //! (`src/queue_consumer.rs`; Workflow steps in `queue::WORKFLOW_STEPS`)
 //! validates messages and checkpoints and executes the upload
-//! parse + pool-probe steps and the repair step (through the
-//! `REPAIR_CONTAINER` service binding; reachable only once verify can
-//! stage its inputs), but its search/verify boundaries are not
-//! executable yet, so the consumer/workflow entries stay commented
-//! out in `wrangler.toml.example` until they land.
+//! parse + pool-probe + verify steps, the repair step (through the
+//! `REPAIR_CONTAINER` service binding, fed by verify's staged inputs)
+//! and match/write, but its search boundary is not executable yet, so
+//! the consumer/workflow entries stay commented out in
+//! `wrangler.toml.example` until it lands.
 //! See `README.md`.
 
 use futures_util::StreamExt;
@@ -39,6 +39,7 @@ pub mod newznab;
 pub mod nzb_fetch;
 pub mod nzb_intake;
 pub mod parse;
+pub mod pool_body;
 pub mod pool_probe;
 pub mod probe;
 pub mod queue;
@@ -46,6 +47,7 @@ pub mod queue_consumer;
 pub mod rate_limit;
 pub mod repair;
 pub mod retry;
+pub mod verify;
 
 use api_error::ApiError;
 use dispatch::validate_user_id;

@@ -68,6 +68,12 @@ binding = "REPAIR_CONTAINER"
 type = "service"
 
 [[worker.binding]]
+binding = "INGEST_SCRATCH"
+type = "r2"
+staging = "nntunev2-ingest-scratch-staging"
+prod = "nntunev2-ingest-scratch-prod"
+
+[[worker.binding]]
 binding = "MB_API"
 type = "service"
 
