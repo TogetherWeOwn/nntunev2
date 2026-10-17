@@ -121,6 +121,92 @@ fn service_unavailable(message: &str) -> Result<Response> {
         .map(|r| r.with_status(503).with_headers(headers))
 }
 
+// --- Search abuse guard (roadmap R6) -------------------------------------------
+
+thread_local! {
+    /// Per-isolate search buckets. Scope is deliberately honest: this
+    /// bounds bursts per isolate, complementing the durable per-plan
+    /// metering downstream (see `rate_limit::SearchThrottleStore`).
+    static SEARCH_THROTTLE: std::cell::RefCell<rate_limit::SearchThrottleStore> =
+        std::cell::RefCell::new(rate_limit::SearchThrottleStore::new());
+}
+
+/// Canonical source-IP scope for the search throttle: only a clean IP
+/// literal from the Cloudflare-set header survives, else `unknown` (all
+/// unidentified callers share one bucket — fail-closed, never a fresh
+/// budget per forged header). IPv6 is keyed by its /64 (IPv4-mapped by the
+/// embedded IPv4), mirroring the API worker's `rate_limit_ip_key`, so
+/// rotation inside one prefix cannot mint fresh budgets. The value keys
+/// buckets in memory only; it is never logged.
+fn search_source_ip(raw: Option<String>) -> String {
+    use std::net::IpAddr;
+    match raw {
+        Some(value) => match value.trim().parse::<IpAddr>() {
+            Ok(IpAddr::V4(v4)) => v4.to_string(),
+            Ok(IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+                Some(v4) => v4.to_string(),
+                None => {
+                    let segments = v6.segments();
+                    std::net::Ipv6Addr::new(
+                        segments[0],
+                        segments[1],
+                        segments[2],
+                        segments[3],
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                    .to_string()
+                }
+            },
+            Err(_) => "unknown".to_string(),
+        },
+        None => "unknown".to_string(),
+    }
+}
+
+/// Search throttle tunables from [vars]; `from_vars` fails safe to the
+/// documented defaults on anything missing or invalid.
+fn search_throttle_config(env: &Env) -> rate_limit::SearchRateLimitConfig {
+    let vars: std::collections::HashMap<String, String> =
+        ["SEARCH_RATE_LIMIT_MAX", "SEARCH_RATE_LIMIT_WINDOW_SECS"]
+            .iter()
+            .filter_map(|name| {
+                env.var(name)
+                    .ok()
+                    .map(|v| ((*name).to_string(), v.to_string()))
+            })
+            .collect();
+    rate_limit::SearchRateLimitConfig::from_vars(&vars)
+}
+
+/// Run the dual (per-IP + per-account) search gate for one attempt.
+fn check_search_attempt(req: &Request, env: &Env, user_id: &str) -> rate_limit::SearchDecision {
+    let ip = search_source_ip(req.headers().get("cf-connecting-ip").ok().flatten());
+    let key = rate_limit::SearchThrottleKey::new(&ip, user_id);
+    let cfg = search_throttle_config(env);
+    let now_s = worker::Date::now().as_millis() / 1000;
+    SEARCH_THROTTLE.with(|store| store.borrow_mut().check(&key, &cfg, now_s))
+}
+
+/// 429 for a throttled search: generic zero-arg body (no query, key or
+/// caller identity can leak into it) plus `Retry-After`.
+fn search_rate_limited_response(retry_after_secs: u64) -> Result<Response> {
+    let headers = headers_json().unwrap_or_default();
+    headers.append(
+        rate_limit::RETRY_AFTER_HEADER,
+        &rate_limit::search_retry_after_header(retry_after_secs),
+    )?;
+    Response::from_body(worker::ResponseBody::Body(
+        rate_limit::search_rate_limited_body().into_bytes(),
+    ))
+    .map(|r| {
+        r.with_status(rate_limit::SEARCH_RATE_LIMIT_STATUS)
+            .with_headers(headers)
+    })
+}
+
 /// Declared `Content-Length`, if the caller sent one.
 fn content_length(req: &Request) -> Option<usize> {
     req.headers()
@@ -878,6 +964,14 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
     if let Err(message) = check_search(&parsed) {
         return json_error(ApiError::invalid_request(message));
     }
+    // Abuse guard before any dispatch is built or metered (roadmap R6):
+    // per-IP AND per-account token buckets; a denied attempt consumes
+    // nothing and answers the generic 429 + Retry-After.
+    if let rate_limit::SearchDecision::Deny { retry_after_secs } =
+        check_search_attempt(req, &ctx.env, &parsed.user_id)
+    {
+        return search_rate_limited_response(retry_after_secs);
+    }
     let q = parsed.query.trim().to_string();
     let msg = match dispatch::build_search_dispatch(
         &parsed.user_id,
@@ -1067,6 +1161,29 @@ mod tests {
     Response::from_body(worker::ResponseBody::Body(health.body))
         .map(|response| response.with_status(health.status).with_headers(headers))"#
             )
+        );
+    }
+
+    #[test]
+    fn search_source_ip_takes_only_a_clean_ip_literal() {
+        assert_eq!(
+            search_source_ip(Some("203.0.113.9".to_string())),
+            "203.0.113.9"
+        );
+        assert_eq!(search_source_ip(None), "unknown");
+        assert_eq!(
+            search_source_ip(Some("203.0.113.9\nINJECTED".to_string())),
+            "unknown"
+        );
+        assert_eq!(search_source_ip(Some("not-an-ip".to_string())), "unknown");
+        // IPv6 scopes to the /64: rotating the interface id stays one budget.
+        assert_eq!(
+            search_source_ip(Some("2001:db8:1:2:3:4:5:6".to_string())),
+            search_source_ip(Some("2001:db8:1:2:ffff:ffff:ffff:ffff".to_string()))
+        );
+        assert_ne!(
+            search_source_ip(Some("2001:db8:1:2::1".to_string())),
+            search_source_ip(Some("2001:db8:1:3::1".to_string()))
         );
     }
 

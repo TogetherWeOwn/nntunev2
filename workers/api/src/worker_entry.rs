@@ -1082,6 +1082,12 @@ fn render_header_pairs(
     if let Some(cookie) = &response.set_cookie {
         pairs.push(("set-cookie", cookie.clone()));
     }
+    if let Some(retry_after) = response.retry_after {
+        pairs.push((
+            crate::rate_limit::RETRY_AFTER_HEADER,
+            crate::rate_limit::retry_after_header_value(retry_after),
+        ));
+    }
     // Credentialed CORS for the configured origin only: the exact header
     // set is decided by the unit-tested `cors_headers`; render only
     // appends it.
@@ -1110,6 +1116,7 @@ fn internal_render() -> WorkerResult<Response> {
             status: 500,
             body: r#"{"error":"internal error"}"#.to_string(),
             set_cookie: None,
+            retry_after: None,
         },
         &[],
     )
@@ -1288,6 +1295,7 @@ mod tests {
             status: 200,
             body: r#"{"ok":true}"#.to_string(),
             set_cookie: None,
+            retry_after: None,
         };
         let headers = render_header_pairs(&response, &[]);
 
@@ -1304,6 +1312,7 @@ mod tests {
             status: 400,
             body: r#"{"error":"invalid request"}"#.to_string(),
             set_cookie: None,
+            retry_after: None,
         };
 
         assert_render_security_headers(&response);
@@ -1317,9 +1326,32 @@ mod tests {
             status: 204,
             body: String::new(),
             set_cookie: None,
+            retry_after: None,
         };
         assert!(response.body.is_empty());
         assert_render_security_headers(&response);
+    }
+
+    #[test]
+    fn render_includes_retry_after_only_when_set() {
+        let throttled = handlers::Response {
+            status: crate::rate_limit::RATE_LIMIT_STATUS,
+            body: r#"{"error":"rate_limited"}"#.to_string(),
+            set_cookie: None,
+            retry_after: Some(3600),
+        };
+        let headers = render_header_pairs(&throttled, &[]);
+        assert!(headers.contains(&(crate::rate_limit::RETRY_AFTER_HEADER, "3600".to_string())));
+        let plain = handlers::Response {
+            status: 200,
+            body: r#"{"ok":true}"#.to_string(),
+            set_cookie: None,
+            retry_after: None,
+        };
+        let headers = render_header_pairs(&plain, &[]);
+        assert!(!headers
+            .iter()
+            .any(|(name, _)| *name == crate::rate_limit::RETRY_AFTER_HEADER));
     }
 
     #[test]

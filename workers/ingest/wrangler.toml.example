@@ -5,6 +5,12 @@ name = "nntune-ingest"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
 
+[vars]
+# Search rate-limit tunables (src/rate_limit.rs). Unset/invalid values
+# keep the documented defaults: 10 searches per 60s (base plan quota).
+# SEARCH_RATE_LIMIT_MAX = "10"
+# SEARCH_RATE_LIMIT_WINDOW_SECS = "60"
+
 # Slice 2: Queue producer (code: src/dispatch.rs, src/queue.rs). The routes
 # only produce; nothing consumes yet (see below), so every accepted enqueue
 # waits in the queue until the consumer ships.

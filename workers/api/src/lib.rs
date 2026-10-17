@@ -9,6 +9,7 @@ pub mod auth;
 pub mod b64;
 pub mod handlers;
 pub mod library;
+pub mod rate_limit;
 pub mod session;
 pub mod vault;
 pub mod webauthn;

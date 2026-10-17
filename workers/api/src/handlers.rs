@@ -462,6 +462,8 @@ pub struct Response {
     pub status: u16,
     pub body: String,
     pub set_cookie: Option<String>,
+    /// `Retry-After` seconds for a 429; the entry renders the header.
+    pub retry_after: Option<u64>,
 }
 
 fn json_response(status: u16, body: serde_json::Value) -> Response {
@@ -469,6 +471,7 @@ fn json_response(status: u16, body: serde_json::Value) -> Response {
         status,
         body: body.to_string(),
         set_cookie: None,
+        retry_after: None,
     }
 }
 
@@ -496,6 +499,7 @@ fn session_error_response(error: session::SessionError) -> Response {
                 status: error.status,
                 body: error.body_json(),
                 set_cookie: None,
+                retry_after: None,
             }
         }
     }
@@ -599,8 +603,15 @@ fn rate_limit_ip_key(source_ip: &str) -> String {
 /// request email, because the budget is keyed only on the client prefix.
 /// Callers must not return email-derived stand-ins on this path (that would
 /// be an account-existence oracle across the denial boundary).
-fn throttled() -> Response {
-    json_response(429, serde_json::json!({"error":"rate_limited"}))
+/// `retry_after_secs` is the budget window: slot expiries are staggered, so
+/// the next slot frees no later than one full window out.
+fn throttled(retry_after_secs: u64) -> Response {
+    let mut resp = json_response(
+        crate::rate_limit::RATE_LIMIT_STATUS,
+        serde_json::json!({"error":"rate_limited"}),
+    );
+    resp.retry_after = Some(retry_after_secs);
+    resp
 }
 
 /// Register/login challenge inserts allowed per account per hour.
@@ -927,7 +938,7 @@ where
     // Per-IP admission before user lookup or maintenance. The global budget
     // applies to outbound mail only, never to auth challenge issuance.
     if !ctx.admit_auth_start().await {
-        return throttled();
+        return throttled(AUTH_START_WINDOW_SECS);
     }
     let existing = match ctx.store.user_by_email(&email).await {
         Ok(user) => user,
@@ -1996,16 +2007,38 @@ where
     // Every failure below collapses to the same boolean (never a banner,
     // host verdict or vault-existence signal).
     let fail = || json_response(200, serde_json::json!({"ok": false}));
-    // One shared budget with the documenting module: `vault::TEST_CONNECTION_MAX_ATTEMPTS`
-    // per `vault::TEST_CONNECTION_WINDOW_SECS`, reserved atomically before any lookup or dial.
+    // Dual budget (per-IP AND per-account; roadmap R6): the limits come
+    // from `rate_limit::RateLimitConfig`, whose vault-test defaults ARE
+    // `vault::TEST_CONNECTION_MAX_ATTEMPTS` per
+    // `vault::TEST_CONNECTION_WINDOW_SECS` — one source, see rate_limit.rs
+    // (`from_vars` is the [vars] overlay seam for callers that carry env).
+    // Both slots are reserved atomically before any lookup or dial, so one
+    // host cannot burn probes across accounts and one account cannot burn
+    // them across hosts. Denial keeps the same boolean collapse as every
+    // other failure on this route (never a 429 oracle here).
+    let limits = crate::rate_limit::RateLimitConfig::default();
+    let ip_admitted = ctx
+        .store
+        .reserve_rate_limit(
+            &rate_limit_ip_key(&ctx.source_ip),
+            "vault.test_ip",
+            u64::from(limits.vault_test_max_attempts),
+            ctx.now,
+            limits.vault_test_window_secs,
+        )
+        .await
+        .unwrap_or(false);
+    if !ip_admitted {
+        return fail();
+    }
     let admitted = ctx
         .store
         .reserve_rate_limit(
             &claims.user_id,
             "vault.test",
-            u64::from(vault::TEST_CONNECTION_MAX_ATTEMPTS),
+            u64::from(limits.vault_test_max_attempts),
             ctx.now,
-            vault::TEST_CONNECTION_WINDOW_SECS,
+            limits.vault_test_window_secs,
         )
         .await
         .unwrap_or(false);
@@ -2125,6 +2158,7 @@ fn preflight_response() -> Response {
         status: 204,
         body: String::new(),
         set_cookie: None,
+        retry_after: None,
     }
 }
 

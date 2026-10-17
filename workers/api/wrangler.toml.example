@@ -19,6 +19,11 @@ SESSION_TTL_SECS = "86400"
 # INVITES_REQUIRED = "true"
 # ALLOW_LOOPBACK_DEV = "true"          # local dev only, never staging/prod
 # EMAIL_WEBHOOK_URL = "https://<mail-provider-webhook>"  # magic-link delivery
+# Rate-limit defaults live in src/rate_limit.rs (documented there: auth
+# 10/60s, vault test-connection 5/60s, single-sourced with src/vault.rs).
+# RateLimitConfig::from_vars is the tested overlay seam for these keys:
+# AUTH_RATE_LIMIT_MAX / AUTH_RATE_LIMIT_WINDOW_SECS /
+# VAULT_TEST_RATE_LIMIT_MAX / VAULT_TEST_RATE_LIMIT_WINDOW_SECS.
 
 # Hyperdrive binding for PlanetScale Postgres (ID filled per environment).
 # The binding name must stay HYPERDRIVE (see src/worker_entry.rs).
