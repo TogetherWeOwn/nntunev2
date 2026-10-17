@@ -61,7 +61,9 @@ NON_TEST_QUOTES = frozenset(
 )
 
 # `  [staging] › health.spec.ts:19:3 › describe chain › test title`
-LIST_LINE = re.compile(r"^.*›\s*([\w][\w.-]*\.spec\.ts):\d+:\d+\s*›\s*(.+?)\s*$")
+# Playwright may emit the path relative to the e2e root with a `tests/`
+# prefix (`tests/health.spec.ts:19:3`); accept both, capture the filename.
+LIST_LINE = re.compile(r"^.*›\s*(?:tests/)?([\w][\w.-]*\.spec\.ts):\d+:\d+\s*›\s*(.+?)\s*$")
 TOTAL_LINE = re.compile(r"^Total:\s*(\d+) tests? in (\d+) files?\s*$")
 
 BACKTICK_SPAN = re.compile(r"`([^`]+)`")

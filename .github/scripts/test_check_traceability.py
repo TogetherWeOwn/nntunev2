@@ -66,6 +66,15 @@ class CheckTraceabilityTest(unittest.TestCase):
             self.run_check(MATRIX_COVERING_BOTH, LIST_TWO_FILES), []
         )
 
+    def test_tests_prefix_parses_to_same_spec(self):
+        # Playwright may emit paths relative to the e2e root with a
+        # `tests/` prefix; both forms must map to the same spec file.
+        prefixed = LIST_TWO_FILES.replace("› alpha.spec.ts", "› tests/alpha.spec.ts")
+        prefixed = prefixed.replace("› beta.spec.ts", "› tests/beta.spec.ts")
+        self.assertEqual(
+            self.run_check(MATRIX_COVERING_BOTH, prefixed), []
+        )
+
     def test_missing_spec_fails_naming_file_and_title(self):
         listed = LIST_TWO_FILES.replace(
             "Total: 3 tests in 2 files", "Total: 4 tests in 3 files"
