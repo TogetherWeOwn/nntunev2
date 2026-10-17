@@ -13,6 +13,11 @@ import {
 import { assertNoAccessWall, readApiBody, stagingBaseUrl } from '../helpers/access.js';
 import { playbackFailure, type PlaybackEvidence } from '../helpers/playback.js';
 import {
+  mediaSessionFailure,
+  type ExpectedTrack,
+  type MediaSessionSnapshot,
+} from '../helpers/media-session.js';
+import {
   accountHeaders,
   annotateSignupPath,
   apiGet,
@@ -553,10 +558,13 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
   // native controls timeline (the contract markup is `<audio controls>`),
   // never a `currentTime` assignment and never a test-issued Range GET.
   //
-  // Last in the serial chain on purpose: the library player is still a
+  // After the meter/plan-limit specs on purpose: the library player is still a
   // contract placeholder, so on configured staging this test fails by name
-  // until the player slice lands — placing it last keeps that expected red
-  // from suppressing the meter/plan-limit evidence above it.
+  // until the player slice lands — placing it after them keeps that expected
+  // red from suppressing the meter/plan-limit evidence above it. Media Session
+  // closes the chain after this test (it needs everything this test needs
+  // plus applyMediaSession), so a Media Session failure cannot skip this
+  // seek verdict.
   //
   // The seek is performed while PAUSED. That is what makes the assertion
   // non-vacuous: a paused position cannot drift into the seeked region by
@@ -768,5 +776,143 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     const continued = await audioState();
     expect(continued.errorCode, 'player reported a media error after resuming').toBeNull();
     expect(pageErrors, `page errors during player seek: ${pageErrors.join('; ')}`).toEqual([]);
+  });
+
+  // Last in the serial chain: Media Session needs everything the seek test
+  // needs plus applyMediaSession on the library page, so it runs after seek —
+  // a Media Session failure cannot skip the M1 seek verdict above it.
+  test('Media Session metadata reflects the playing ingested track', async ({ page, request }) => {
+    const baseURL = stagingBaseUrl('skip', 'media-session');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    // Same identity discipline as Range/meter/playback: the metadata must be
+    // read as the ingesting account, never anonymously or as the generic QA
+    // seam. Full playback proof stays with the playback spec — here a light
+    // playing gate precedes the metadata read so the assertion runs during
+    // browser playback, not against an idle element.
+    const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    requireApiAccount(account, 'media-session');
+
+    // Names only: a page-error message can embed the staging origin or other
+    // values that must stay out of public CI artifacts.
+    const pageErrorNames: string[] = [];
+    page.on('pageerror', (error) => pageErrorNames.push(error.name || 'Error'));
+
+    // Expected identity comes from the library API (deterministic), never
+    // from the page: metadata must match the ingested track itself.
+    const headers = accountHeaders(account);
+    const libraryUrl = `${baseURL}${API.library}`;
+    const library = await apiGet(request, libraryUrl, headers, 'media-session');
+    const libraryBody = await readApiBody(library, libraryUrl, 'media-session');
+    expect(library.ok(), `library listing failed: HTTP ${library.status()}`).toBe(true);
+    let libraryItems: unknown;
+    try {
+      libraryItems = JSON.parse(libraryBody) as unknown;
+    } catch {
+      libraryItems = [];
+    }
+    const first = (Array.isArray(libraryItems) ? libraryItems : [])[0] as Record<string, unknown>;
+    const titleOf = (value: unknown): string | null =>
+      typeof value === 'string' && value.trim() !== '' ? value : null;
+    const expectedTitle =
+      titleOf(first?.title) ?? titleOf(first?.name) ?? titleOf(first?.track_title);
+    expect(
+      expectedTitle,
+      'library API returned no usable track title (keys: ' +
+        `${Object.keys((first as object) ?? {}).join(', ') || '(empty)'}) — ` +
+        'the contract drifted; update the title keys + this spec together',
+    ).toBeTruthy();
+    const expected: ExpectedTrack = {
+      title: expectedTitle as string,
+      artist: titleOf(first?.artist) ?? titleOf(first?.artist_name),
+    };
+
+    await applyAccountToPage(page, account, baseURL);
+    await page.goto(`${baseURL}/library`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    const item = page.getByTestId(TESTIDS.libraryItem).first();
+    await expect(
+      item,
+      'ingested track missing from library — ingest spec must run first',
+    ).toBeVisible({ timeout: 60_000 });
+    await item.click();
+    const audio = page.getByTestId(TESTIDS.audioPlayer);
+    await expect(
+      audio,
+      'selecting the library track did not show the audio player (player slice must land first)',
+    ).toBeVisible({ timeout: 15_000 });
+
+    // Light playing gate (booleans/numbers only — the source URL is never
+    // read out of the page): record playing/timeupdate evidence, use the
+    // player's own visible play control as the gesture, then require an
+    // advancing element. The synthetic track is sub-second, so ended with
+    // recorded advancement counts — ended with none does not.
+    await audio.evaluate((element) => {
+      const player = element as HTMLAudioElement & {
+        __nnMediaSession?: { sawPlaying: boolean; maxTime: number };
+      };
+      const recorder = {
+        sawPlaying: !player.paused && !player.ended,
+        maxTime: Number.isFinite(player.currentTime) ? player.currentTime : 0,
+      };
+      player.__nnMediaSession = recorder;
+      player.addEventListener('playing', () => {
+        recorder.sawPlaying = true;
+        recorder.maxTime = Math.max(recorder.maxTime, player.currentTime || 0);
+      });
+      player.addEventListener('timeupdate', () => {
+        recorder.maxTime = Math.max(recorder.maxTime, player.currentTime || 0);
+      });
+    });
+    const box = await audio.boundingBox();
+    expect(box, 'audio player is visible but has no clickable controls').not.toBeNull();
+    await audio.click({ position: { x: 20, y: Math.floor((box?.height ?? 40) / 2) } });
+    await expect
+      .poll(
+        async () =>
+          audio.evaluate((element) => {
+            const player = element as HTMLAudioElement & {
+              __nnMediaSession?: { sawPlaying: boolean; maxTime: number };
+            };
+            const recorder = player.__nnMediaSession ?? { sawPlaying: false, maxTime: 0 };
+            const maxTime = Math.max(recorder.maxTime, player.currentTime || 0);
+            const errored = player.error !== null;
+            const advancing =
+              recorder.sawPlaying || !player.paused || player.ended ? maxTime > 0 : false;
+            return !errored && advancing && Number.isFinite(player.duration) && player.duration > 0;
+          }),
+        {
+          timeout: 15_000,
+          message:
+            'audio element never entered an advancing playing state for the Media Session read',
+        },
+      )
+      .toBe(true);
+
+    // Metadata is applied by a client effect after hydration: poll the pure
+    // verdict (null = reflects the playing track). Titles/artists/artwork
+    // URLs are never interpolated — the failure names the field, not values.
+    const readMetadata = (): Promise<MediaSessionSnapshot | null> =>
+      page.evaluate(() => {
+        const metadata = navigator.mediaSession?.metadata;
+        if (!metadata) return null;
+        return {
+          title: typeof metadata.title === 'string' ? metadata.title : null,
+          artist: typeof metadata.artist === 'string' ? metadata.artist : null,
+          artworkSrcs: (metadata.artwork ?? []).map((entry) => entry.src),
+        };
+      });
+    await expect
+      .poll(async () => mediaSessionFailure(await readMetadata(), expected), {
+        timeout: 15_000,
+        message: 'Media Session metadata does not reflect the playing ingested track',
+      })
+      .toBeNull();
+    expect(
+      mediaSessionFailure(await readMetadata(), expected),
+      'final Media Session metadata regressed',
+    ).toBeNull();
+    expect(pageErrorNames, 'page errors during Media Session playback').toEqual([]);
   });
 });
