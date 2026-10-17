@@ -34,13 +34,26 @@ export default defineConfig(({ mode }) => {
 				// nor 'unsafe-eval'. `style-src-attr 'unsafe-inline'` covers
 				// style attributes (the app.html wrapper, Svelte `style:`
 				// directives), which nonces cannot; style *elements* stay
-				// nonce-only. `data:`/`blob:` on img-src match the artwork
+				// nonce-only. `script-src-attr` allows exactly one inline
+				// handler: Svelte 5 SSR emits `onerror="this.__e=event"`
+				// capture attributes for non-delegatable events (the artwork
+				// `<img>` fallback in `src/lib/player/Artwork.svelte`), and
+				// the browser blocks them without `unsafe-hashes` plus their
+				// hash — the image error is then silently lost and the
+				// fallback never runs. Recompute after a Svelte upgrade if
+				// the artwork e2e tests fail:
+				// echo -n 'this.__e=event' | openssl dgst -sha256 -binary | openssl base64 -A
+				// `data:`/`blob:` on img-src match the artwork
 				// sources `src/lib/player/artwork.ts` accepts.
 				csp: {
 					mode: 'nonce',
 					directives: {
 						'default-src': ['self'],
 						'script-src': ['self'],
+						'script-src-attr': [
+							'unsafe-hashes',
+							'sha256-7dQwUgLau1NFCCGjfn9FsYptB6ZtWxJin6VohGIu20I='
+						],
 						'style-src': ['self'],
 						'style-src-attr': ['unsafe-inline'],
 						'img-src': ['self', 'data:', 'blob:'],
