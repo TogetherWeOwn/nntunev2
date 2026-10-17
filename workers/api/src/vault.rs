@@ -812,6 +812,24 @@ pub struct AuditEvent {
     pub at: u64,
 }
 
+/// Placeholder for the audit `source_ip` when the client address is
+/// missing or not a literal IP address.
+pub const UNKNOWN_SOURCE_IP: &str = "unknown";
+
+/// Normalize a client address (the `cf-connecting-ip` header) to its
+/// canonical IP literal, or [`UNKNOWN_SOURCE_IP`] when absent or not
+/// exactly one IP address. The value is request-header data that is stored
+/// in `audit_log.source_ip` and used in rate-limit keys, so anything with
+/// control characters, separators, markup or oversize collapses to
+/// `unknown` instead of being persisted. Parsing is strict (no trimming,
+/// no zone ids, no lists), and the canonical form is what is stored, so one
+/// address always maps to one string. Idempotent.
+pub fn sanitize_source_ip(raw: Option<&str>) -> String {
+    raw.and_then(|value| value.parse::<std::net::IpAddr>().ok())
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| UNKNOWN_SOURCE_IP.to_string())
+}
+
 /// Audit log event. By construction there is no field for secret material:
 /// callers pass ids and results only. `now` is Unix epoch seconds — the
 /// audit row's ordering depends on it, so it is a required parameter.
@@ -820,7 +838,7 @@ pub fn audit_event(user_id: &str, action: &str, ok: bool, source_ip: &str, now: 
         user_id: user_id.to_string(),
         action: action.to_string(),
         ok,
-        source_ip: source_ip.to_string(),
+        source_ip: sanitize_source_ip(Some(source_ip)),
         at: now,
     }
 }
@@ -828,6 +846,53 @@ pub fn audit_event(user_id: &str, action: &str, ok: bool, source_ip: &str, now: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cf-connecting-ip` is request-header data
+    /// that lands in `audit_log.source_ip`. Anything that is not a literal
+    /// IP address (control characters, separators, markup, oversize) must
+    /// collapse to `unknown` so a log/CSV/HTML consumer never sees it.
+    #[test]
+    fn source_ip_sanitizer_keeps_only_canonical_ip_literals() {
+        assert_eq!(sanitize_source_ip(Some("198.51.100.9")), "198.51.100.9");
+        assert_eq!(sanitize_source_ip(Some("2001:db8::1")), "2001:db8::1");
+        // Canonicalized: same address, same stored string (stable rate keys).
+        assert_eq!(
+            sanitize_source_ip(Some("2001:DB8:0:0:0:0:0:1")),
+            "2001:db8::1"
+        );
+        assert_eq!(
+            sanitize_source_ip(Some("::ffff:198.51.100.9")),
+            "::ffff:198.51.100.9"
+        );
+        let hostile = [
+            "198.51.100.9\nFORGED ok=true",
+            "198.51.100.9\r\n",
+            "198.51.100.9\0",
+            "198.51.100.9, 203.0.113.1",
+            " 198.51.100.9",
+            "198.51.100.9 ",
+            "fe80::1%eth0",
+            "999.1.1.1",
+            "<script>alert(1)</script>",
+            "'; DROP TABLE audit_log;--",
+            "\u{202e}198.51.100.9",
+            "",
+            "unknown",
+        ];
+        for raw in hostile {
+            assert_eq!(sanitize_source_ip(Some(raw)), "unknown", "{raw:?}");
+        }
+        assert_eq!(sanitize_source_ip(Some(&"1".repeat(4096))), "unknown");
+        assert_eq!(sanitize_source_ip(None), "unknown");
+    }
+
+    #[test]
+    fn audit_event_never_stores_a_hostile_source_ip() {
+        let ev = audit_event("u1", "vault.update", true, "203.0.113.7\nINJECTED", 7);
+        assert_eq!(ev.source_ip, "unknown");
+        let ev = audit_event("u1", "vault.update", true, "203.0.113.7", 7);
+        assert_eq!(ev.source_ip, "203.0.113.7");
+    }
 
     struct EmptyDns;
     impl DnsResolver for EmptyDns {

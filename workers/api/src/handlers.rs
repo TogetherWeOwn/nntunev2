@@ -247,6 +247,13 @@ pub struct UserRecord {
 pub const PURPOSE_REGISTER: &str = "register";
 pub const PURPOSE_LOGIN: &str = "login";
 
+/// Counter stored for a new credential, whatever the attestation said.
+/// `none` attestation is unauthenticated, so its enrollment counter is
+/// attacker-chosen: persisting `u32::MAX` would make every later
+/// (strictly-increasing) assertion fail. The first assertion's signed
+/// counter becomes the baseline; counterless authenticators stay at 0.
+const ENROLLMENT_SIGN_COUNT: u32 = 0;
+
 #[derive(Debug, Clone)]
 pub struct ChallengeRow {
     pub challenge: PasskeyChallenge,
@@ -1242,7 +1249,7 @@ where
         cred_id_b64url: body.credential_id.clone(),
         user_id: user_id.clone(),
         public_key: credential.public_key_cose.clone(),
-        sign_count: credential.sign_count,
+        sign_count: ENROLLMENT_SIGN_COUNT,
         registered_at: ctx.now,
     };
     match ctx.store.insert_credential(&stored).await {
@@ -3226,11 +3233,14 @@ mod tests {
         cose
     }
     fn fx_none_attestation(cred_id: &[u8], cose: &[u8]) -> Vec<u8> {
+        fx_none_attestation_with_count(cred_id, cose, 1)
+    }
+    fn fx_none_attestation_with_count(cred_id: &[u8], cose: &[u8], sign_count: u32) -> Vec<u8> {
         use sha2::Digest;
         let mut auth = Vec::new();
         auth.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
-        auth.push(0x41);
-        auth.extend_from_slice(&1u32.to_be_bytes());
+        auth.push(0x45);
+        auth.extend_from_slice(&sign_count.to_be_bytes());
         auth.extend_from_slice(&[0u8; 16]);
         auth.extend_from_slice(&(cred_id.len() as u16).to_be_bytes());
         auth.extend_from_slice(cred_id);
@@ -3317,7 +3327,7 @@ mod tests {
         let cred_id = b"synthetic-cred";
         let mut auth = Vec::new();
         auth.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
-        auth.push(0x41);
+        auth.push(0x45);
         auth.extend_from_slice(&1u32.to_be_bytes());
         auth.extend_from_slice(&[0u8; 16]);
         auth.extend_from_slice(&(cred_id.len() as u16).to_be_bytes());
@@ -3367,7 +3377,7 @@ mod tests {
         assert_eq!(start["allow_credentials"], serde_json::json!([]));
         let mut auth = Vec::new();
         auth.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
-        auth.push(0x01);
+        auth.push(0x05);
         auth.extend_from_slice(&2u32.to_be_bytes());
         let cd_get = format!(
             r#"{{"type":"webauthn.get","challenge":"{}","origin":"{}","crossOrigin":false}}"#,
@@ -3388,6 +3398,101 @@ mod tests {
         // Replaying the same assertion/challenge fails generically.
         let resp = h.call("POST", "/v1/auth/passkey/login/finish", finish);
         assert_eq!(resp.status, 401);
+    }
+
+    /// The database CHECK (migration 0008) must list exactly the purposes
+    /// the handlers mint. Adding a purpose constant without updating the
+    /// migration would make every such insert fail at runtime.
+    #[test]
+    fn purpose_constants_match_the_migration_check() {
+        let sql = include_str!("../../../migrations/0008_auth_challenge_purpose_guard.sql");
+        let expected = format!("CHECK (purpose IN ('', '{PURPOSE_REGISTER}', '{PURPOSE_LOGIN}'))");
+        assert!(
+            sql.contains(&expected),
+            "0008 CHECK must be exactly: {expected}"
+        );
+    }
+
+    /// `none` attestation is unauthenticated, so
+    /// the enrollment counter is attacker-chosen: a crafted attestation
+    /// carrying `u32::MAX` used to be stored verbatim and then rejected
+    /// every legitimate assertion (strict-increase rule) forever. The
+    /// enrollment counter must never be persisted; the first assertion's
+    /// signed counter establishes the baseline.
+    #[test]
+    fn register_ignores_attestation_supplied_sign_count() {
+        use p256::ecdsa::{signature::Signer, Signature as EsSignature, SigningKey};
+        use sha2::Digest;
+
+        let h = harness();
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "pinned@example.com"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let start: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let challenge = start["challenge"].as_str().unwrap().to_string();
+        let magic_token = h.mailer.sent.borrow().last().unwrap().1.clone();
+
+        let cred_id = b"pinned-counter-cred";
+        let att = fx_none_attestation_with_count(cred_id, &fx_es256_cose(11), u32::MAX);
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/finish",
+            serde_json::json!({
+                "challenge": challenge,
+                "credential_id": b64url_encode(cred_id),
+                "attestation_object": b64url_encode(&att),
+                "client_data_json": b64url_encode(
+                    fx_client_json("webauthn.create", &challenge).as_bytes()
+                ),
+                "magic_token": magic_token,
+                "invite_code": null,
+            }),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+
+        let user = block_on(h.store.user_by_email("pinned@example.com"))
+            .unwrap()
+            .unwrap();
+        let creds = block_on(h.store.credentials_for_user(&user.id)).unwrap();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(
+            creds[0].sign_count, 0,
+            "attestation-supplied counter must not be stored"
+        );
+
+        // A legitimate first assertion (counter 1) still logs in.
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/login/start",
+            serde_json::json!({"email": "pinned@example.com"}),
+        );
+        let start: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let challenge = start["challenge"].as_str().unwrap().to_string();
+        let mut auth = Vec::new();
+        auth.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
+        auth.push(0x05);
+        auth.extend_from_slice(&1u32.to_be_bytes());
+        let cd_get = fx_client_json("webauthn.get", &challenge);
+        let mut msg = auth.clone();
+        msg.extend_from_slice(&sha2::Sha256::digest(cd_get.as_bytes()));
+        let sig: EsSignature = SigningKey::from_slice(&[11u8; 32]).unwrap().sign(&msg);
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/login/finish",
+            serde_json::json!({
+                "challenge": challenge,
+                "credential_id": b64url_encode(cred_id),
+                "authenticator_data": b64url_encode(&auth),
+                "client_data_json": b64url_encode(cd_get.as_bytes()),
+                "signature": b64url_encode(sig.to_der().as_bytes()),
+            }),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let creds = block_on(h.store.credentials_for_user(&user.id)).unwrap();
+        assert_eq!(creds[0].sign_count, 1);
     }
 
     #[test]

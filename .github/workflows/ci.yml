@@ -178,15 +178,50 @@ jobs:
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
-      - run: cargo test --manifest-path workers/api/Cargo.toml --all-targets
-      - run: cargo clippy --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
+      # `--locked`: the committed workers/api/Cargo.lock is the audited
+      # dependency set for the auth/vault crypto crates. A missing or stale
+      # lockfile fails the build instead of silently re-resolving.
+      - run: cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets
+      - run: cargo clippy --locked --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/api/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate must check on that target
       # (native-only CI once missed a getrandom/RNG breakage there).
-      - run: cargo check --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo check --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
       # The Hyperdrive cache gate fails closed without credentials; pin its
       # exit codes with the built-in shim self-test (no network, no secrets).
       - run: bash workers/api/check_hyperdrive_cache.sh --self-test
+
+  # Real-Postgres migration tests: applies every migrations/*.sql, in order,
+  # to an empty throwaway database (twice, to prove idempotency) and runs
+  # workers/api/tests/sql/*.sql against it. The database is an ephemeral
+  # service container; its password is a throwaway, not a secret.
+  api-migrations:
+    name: api-migrations
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        # Pinned by digest (`17` as of 2026-10-16); re-pin deliberately.
+        image: postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
+        env:
+          POSTGRES_PASSWORD: ci-throwaway
+          POSTGRES_DB: nntune_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d nntune_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Ensure psql client
+        run: command -v psql >/dev/null || (sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client)
+      - run: bash workers/api/tests/run_migration_tests.sh
+        env:
+          DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
 
   rust-mb:
     name: rust (workers/mb)
@@ -407,7 +442,7 @@ jobs:
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, test-nntp, api, rust-mb, rust-ingest, config-parity, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy]
+    needs: [rust-test, rust-wasm, test-nntp, api, api-migrations, rust-mb, rust-ingest, config-parity, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
