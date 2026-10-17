@@ -13,7 +13,7 @@ sessionless spec, the PWA manifest spec (#211), the anonymous-Access
 denial specs (#185, #188), the branded-error-page specs (#203), the
 security-headers staging probe, and the deployed-build identity route
 (#196) merged:
-`npm --prefix e2e run e2e:list` lists 268 tests in 18 files, and
+`npm --prefix e2e run e2e:list` lists 287 tests in 18 files, and
 `(cd apps/web && pnpm exec playwright test --list)` lists 94 tests in
 21 files (91 in 20 files plus #196's 3-test build-identity spec). Line numbers
 below are from that head; re-verify with the commands at the end of this
