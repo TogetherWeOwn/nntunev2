@@ -501,7 +501,7 @@ fn session_error_response(error: session::SessionError) -> Response {
     }
 }
 
-fn invalid_request() -> Response {
+pub(crate) fn invalid_request() -> Response {
     json_response(400, serde_json::json!({"error": "invalid request"}))
 }
 

@@ -1194,12 +1194,20 @@ where
 /// - `declared_len` is the parsed `Content-Length` (`None` when absent
 ///   or unparsable). `Some(len) if len > MAX` is `Oversized` and the
 ///   stream is not polled at all.
-/// - `Bodyless` is `Complete(vec![])`; an empty stream is too (an
-///   explicitly sent empty body stays valid vault-test input).
+/// - `Bodyless` is `Complete(vec![])`; an empty stream is too when no
+///   positive length was declared (an explicitly sent empty body stays
+///   valid vault-test input).
 /// - `SetupFailed` is `TransportFailure`.
 /// - Any chunk `Err` is `TransportFailure`, however many valid bytes
 ///   (even a complete valid JSON document) arrived before it. Partial
 ///   bytes are dropped, never returned.
+/// - A stream that ends after fewer bytes than `declared_len` is
+///   `TransportFailure`: the runtime adapter maps a client abort to a
+///   clean end-of-stream below this seam, so the declared length is the
+///   only abort signal available here. With no declared length
+///   (chunked), such an abort is undetectable at this seam — a runtime
+///   limit, not a case this function can distinguish from a body that
+///   legitimately ends where it ends.
 /// - Buffering is bounded: once the cap would be exceeded the result is
 ///   `Oversized` and collection stops pulling chunks.
 /// - `Poll::Pending` is awaited, never treated as end-of-body.
@@ -1219,7 +1227,12 @@ pub async fn collect_body<S: BodyChunkStream>(
     loop {
         let next = std::future::poll_fn(|cx| stream.poll_next_chunk(cx)).await;
         match next {
-            None => return CollectedBody::Complete(body),
+            None => {
+                if declared_len.is_some_and(|len| body.len() < len) {
+                    return CollectedBody::TransportFailure;
+                }
+                return CollectedBody::Complete(body);
+            }
             Some(Err(BodyReadError)) => return CollectedBody::TransportFailure,
             Some(Ok(chunk)) => {
                 // `body.len() <= MAX` is invariant, so this never overflows
@@ -1236,10 +1249,11 @@ pub async fn collect_body<S: BodyChunkStream>(
 /// The dispatch gate. `Complete(bytes)` replaces `request.body` with
 /// exactly `bytes` and invokes `handler` once. `Oversized` and
 /// `TransportFailure` invoke NOTHING and answer the handlers' existing
-/// uniform pre-routing rejection: status 400, body
-/// `{"error":"invalid request"}`, no `set_cookie`. The Worker entry
-/// passes a handler that calls `handlers::handle`, so a rejected body
-/// can cause no store, mailer, DNS, or dialer side effect.
+/// uniform pre-routing rejection (`handlers::invalid_request`: status
+/// 400, body `{"error":"invalid request"}`, no `set_cookie`), so the
+/// gate can never drift from it. The Worker entry passes a handler that
+/// calls `handlers::handle`, so a rejected body can cause no store,
+/// mailer, DNS, or dialer side effect.
 pub async fn dispatch_collected<F, Fut>(
     collected: CollectedBody,
     mut request: handlers::Request,
@@ -1254,11 +1268,7 @@ where
             request.body = bytes;
             handler(request).await
         }
-        CollectedBody::Oversized | CollectedBody::TransportFailure => handlers::Response {
-            status: 400,
-            body: r#"{"error":"invalid request"}"#.to_string(),
-            set_cookie: None,
-        },
+        CollectedBody::Oversized | CollectedBody::TransportFailure => handlers::invalid_request(),
     }
 }
 
@@ -1278,8 +1288,11 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // dispatchable empty input, while a present body whose stream cannot
     // be obtained — or whose chunks fail mid-read — is a transport
     // failure that the gate below rejects before any handler runs. The
-    // declared length only short-circuits oversized bodies; chunked
-    // (length-less) oversized bodies stop buffering at the same cap.
+    // declared length short-circuits oversized bodies and exposes a
+    // short read (the runtime adapter hides a client abort as a clean
+    // end-of-stream); chunked (length-less) oversized bodies stop
+    // buffering at the same cap, and a chunked abort the adapter hides
+    // is undetectable at this seam.
     let declared_len = req
         .headers()
         .get("content-length")
