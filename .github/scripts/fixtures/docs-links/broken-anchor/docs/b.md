@@ -1,0 +1,3 @@
+# Fixture B
+
+## Only section
