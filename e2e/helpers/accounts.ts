@@ -269,19 +269,16 @@ export async function completeByopWizard(page: Page, baseURL: string): Promise<v
         'requested TLS state; refusing to test or save (names only — no values logged).',
     );
   }
+  // endpoint.tls is always true (TLS-off is rejected in syntheticNntpEndpoint),
+  // so the requested state is unconditionally checked.
   try {
-    if (endpoint.tls) {
-      await tlsToggle.check();
-      await expect(tlsToggle).toBeChecked();
-    } else {
-      await tlsToggle.uncheck();
-      await expect(tlsToggle).not.toBeChecked();
-    }
+    await tlsToggle.check();
+    await expect(tlsToggle).toBeChecked();
   } catch {
     // The underlying Playwright error can carry page detail; replace it with
     // a names-only diagnostic instead of letting it propagate.
     throw new Error(
-      `[byop] could not set and verify the BYOP TLS checkbox to ${endpoint.tls ? 'checked' : 'unchecked'}: ` +
+      '[byop] could not set and verify the BYOP TLS checkbox to checked: ' +
         'refusing to test or save with an unverified transport (names only — no values logged).',
     );
   }

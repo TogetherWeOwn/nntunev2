@@ -142,11 +142,17 @@ export interface NntpEndpoint {
   host: string;
   port: number;
   user: string;
-  tls: boolean;
+  // The fixture harness only supports TLS-on: syntheticNntpEndpoint rejects
+  // TLS-off outright, so no endpoint with tls=false can exist here.
+  tls: true;
 }
 
-/** Ports the BYOP UI offers; the fixture transport must stay inside this allowlist. */
-const SUPPORTED_NNTP_PORTS: readonly number[] = [119, 563];
+/**
+ * Ports the BYOP UI offers; the fixture transport must stay inside this
+ * allowlist. Pinned against ALLOWED_NNTP_PORTS (vault-validation.ts, itself
+ * mirroring vault.rs) by apps/web/src/lib/contract.test.ts.
+ */
+export const SUPPORTED_NNTP_PORTS: readonly number[] = [119, 563];
 
 /**
  * NNTP endpoint config. Host/user have fixture defaults (not secrets); the
