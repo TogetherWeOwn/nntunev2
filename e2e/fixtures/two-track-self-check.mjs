@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Offline self-check for `synthetic-two-track.nzb` (builder card TOG-28784).
+ * Offline self-check for `synthetic-two-track.nzb` (paired fixture build).
  *
  * Not a Playwright spec (so `e2e:list` and the traceability gate ignore it):
  * run with `node e2e/fixtures/two-track-self-check.mjs` from the repo root.

@@ -5,10 +5,10 @@
  * player-queue-order.spec.ts needs ≥2 ingested tracks, but the synthetic
  * NZB fixture (e2e/fixtures/synthetic.nzb) ingests exactly one — so its
  * ≥2-track precondition fails before any UI step. This helper is the
- * test-first half of that un-fixme path (second half is the player hooks in
- * TOG-26160): it defines what "the two-track fixture ran" means and turns
+ * test-first half of that un-fixme path (second half is the player hooks
+ * follow-up): it defines what "the two-track fixture ran" means and turns
  * the staged library id list into either "staged" (null) or a named
- * failure. The paired build card TOG-28784 fulfills the fixture side on
+ * failure. The paired fixture build fulfills the fixture side on
  * this branch without editing the acceptance files.
  *
  * Fixture resolution: when the two-track NZB exists it is staged alone;
@@ -63,7 +63,7 @@ export function resolveTwoTrackFixture(
   }
   throw new Error(
     '[two-track-fixture] no ingest fixture found: expected ' +
-      `${candidates.twoTrack} (two-track, TOG-28784) or ` +
+      `${candidates.twoTrack} (two-track) or ` +
       `${candidates.singleTrack} (single-track fallback).`,
   );
 }

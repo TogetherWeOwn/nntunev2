@@ -2,7 +2,7 @@
 <!--
   Two-track synthetic NZB fixture for the queue-order un-fixme path
   (paired acceptance: e2e/helpers/two-track-fixture.ts,
-  e2e/tests/two-track-fixture.spec.ts; builder card TOG-28784).
+  e2e/tests/two-track-fixture.spec.ts; paired fixture build).
 
   Staging leg stages THIS file alone through the ingest path
   (NZB → ingest → library) as a fresh test account and requires ≥2
