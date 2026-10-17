@@ -140,16 +140,22 @@ export function assertPlanLimitHeaders(
 /** Key fragment that points the client at the upgrade path (`/pricing`). */
 const UPGRADE_KEY_RE = /upgrade|pricing|cta/i;
 
-/** Value fragment that points the client at the upgrade path (`/pricing`). */
-const UPGRADE_VALUE_RE = /upgrade|\/pricing/i;
+/**
+ * Value fragment that points the client at the upgrade path: the `/pricing`
+ * route itself. A bare word like "upgrade" with no route is marketing
+ * prose, not a pointer, and does not satisfy the check.
+ */
+const UPGRADE_VALUE_RE = /\/pricing/i;
 
 /**
  * Require the upgrade CTA pointer in a 402/429 body: a key naming the
- * upgrade path (preferred: an `upgrade_url` pointing at `/pricing`, the
- * client's PRICING_HREF) or a string value naming it. The paywall client
- * renders its CTA from this pointer — a bare code with no upgrade path is
- * a dead-end error, not the contracted refusal. Throws naming the actual
- * top-level keys.
+ * upgrade path (preferred: `upgrade_url`, see the limit-refusal wire in
+ * docs/api-errors.md) or a string value carrying the `/pricing` route. The
+ * web paywall client hardcodes its CTA href today (PRICING_HREF in
+ * apps/web/src/lib/billing/planLimit.ts); this pointer is the
+ * server-advertised half, so any client can route the upgrade without
+ * hardcoding it. A bare code with no upgrade path is a dead-end error, not
+ * the contracted refusal. Throws naming the actual top-level keys.
  */
 export function extractUpgradeCta(body: unknown, context: string): string {
   const seen: string[] = [];

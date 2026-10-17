@@ -1280,7 +1280,15 @@ test.describe('plan-limit refusal verdict (offline pins)', () => {
 
   test('extractUpgradeCta accepts a key or a /pricing value', () => {
     expect(extractUpgradeCta({ code: 'x', upgrade_url: '/pricing' }, 'c')).toBe("key 'upgrade_url'");
-    expect(extractUpgradeCta({ code: 'x', note: 'Upgrade now' }, 'c')).toMatch(/value/);
+    expect(extractUpgradeCta({ code: 'x', note: 'see /pricing to continue' }, 'c')).toMatch(
+      /value/,
+    );
+  });
+
+  test('prose without the /pricing route is not a CTA pointer', () => {
+    expect(() => extractUpgradeCta({ code: 'x', note: 'Upgrade now' }, 'c')).toThrow(
+      /no upgrade CTA pointer/,
+    );
   });
 
   test('a body without the CTA pointer fails naming its keys', () => {

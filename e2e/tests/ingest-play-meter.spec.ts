@@ -7,6 +7,7 @@ import {
   TESTIDS,
   assertPlanLimitRefusal,
   extractLibraryItems,
+  extractLimitCode,
   extractPlanMeta,
   extractRecordingMbids,
   extractUsageBytes,
@@ -347,6 +348,22 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
       try {
         items = extractLibraryItems(libraryBody);
       } catch {
+        // Fail fast when the listing itself is a limit refusal: falling
+        // through to the browser ingest path would burn 240 s before
+        // failing with a misleading empty-library message.
+        let code: string | null = null;
+        try {
+          code = extractLimitCode(libraryBody, 'plan-limit-stream');
+        } catch {
+          code = null;
+        }
+        if (code) {
+          throw new Error(
+            `[plan-limit-stream] library listing for the capped account is itself refused ` +
+              `with limit code '${code}': the stream leg cannot reach a track — ` +
+              `the overlimit seam must pre-seed a streamable track when listing is capped.`,
+          );
+        }
         items = [];
       }
       const trackId = items[0]?.id;
