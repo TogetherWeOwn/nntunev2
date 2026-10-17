@@ -129,6 +129,7 @@ fn short_read_dispatches_nothing_through_the_gate() {
                 status: 200,
                 body: "{}".to_string(),
                 set_cookie: None,
+                retry_after: None,
             }
         },
     ));

@@ -428,6 +428,7 @@ fn transport_failure_never_invokes_the_handler() {
                     status: 200,
                     body: "HANDLER-RAN".to_string(),
                     set_cookie: None,
+                    retry_after: None,
                 }
             }
         },
@@ -455,6 +456,7 @@ fn oversized_never_invokes_the_handler() {
                     status: 200,
                     body: "HANDLER-RAN".to_string(),
                     set_cookie: None,
+                    retry_after: None,
                 }
             }
         },
@@ -483,6 +485,7 @@ fn complete_invokes_the_handler_once_with_exactly_the_collected_bytes() {
                     status: 299,
                     body: "from-handler".to_string(),
                     set_cookie: Some("cookie".to_string()),
+                    retry_after: None,
                 }
             }
         },
@@ -516,6 +519,7 @@ fn complete_empty_invokes_the_handler_with_an_empty_body() {
                     status: 200,
                     body: "ok".to_string(),
                     set_cookie: None,
+                    retry_after: None,
                 }
             }
         },
