@@ -671,6 +671,17 @@ fn parse_segment<R: BufRead>(
             ))
         })?;
 
+    // The reader trims each Text event independently, which would silently
+    // delete whitespace adjacent to a reference or CDATA section from the
+    // middle of the ID; the embedded-whitespace rejection must see the true
+    // resolved text. Accumulate untrimmed and let `normalize_message_id`
+    // trim the edges. Error returns abort the whole parse, so the saved
+    // settings only need restoring on the success path below.
+    let saved_trim = (
+        reader.config().trim_text_start,
+        reader.config().trim_text_end,
+    );
+    reader.config_mut().trim_text(false);
     let mut text = String::new();
     loop {
         match reader.read_event_into(buf) {
@@ -724,6 +735,8 @@ fn parse_segment<R: BufRead>(
         }
         buf.clear();
     }
+    reader.config_mut().trim_text_start = saved_trim.0;
+    reader.config_mut().trim_text_end = saved_trim.1;
     Ok(Segment {
         ordinal,
         number,
