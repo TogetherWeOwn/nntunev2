@@ -90,7 +90,7 @@ dependencies this harness needs.
 |---|---|---|
 | `STAGING_BASE_URL` | yes (post-deploy) | `https://` staging origin. Unset → skip with notice. |
 | `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | whenever staging is configured | QA service-token pair. Both absent or either absent → fail closed before requests. |
-| `QA_AUTH_TOKEN` | optional | Bearer for `POST /api/test-accounts` (staging-only seam). Absent → UI signup fallback. |
+| `QA_AUTH_TOKEN` | optional | Bearer for `POST /api/test-accounts` (staging-only seam). Absent → UI signup fallback. The dedicated public UI-signup case ignores the seam either way. |
 | `SYNTHETIC_NNTP_HOST` / `_PORT` / `_USER` / `_TLS` | for BYOP spec | Hosted fixture server or test provider (defaults: `synthetic-nntp`, `563`, `e2e`, TLS on). The port must be in the BYOP allowlist (`119` or `563`) and TLS-off is rejected — the harness fails closed on a fixture transport the wizard cannot represent. |
 | `SYNTHETIC_NNTP_PASS` | for BYOP spec | No default — fail closed when missing. |
 
@@ -122,9 +122,17 @@ How the suite uses them:
   `helpers/accounts.ts` names it; cookie sessions would update the helper +
   specs together).
 - Test accounts are throwaway (`e2e+<stamp>@example.test`); the API seam is
-  tried first, a fully-implemented UI signup second (each journey file signs
+  tried first, a form-submission UI signup (emailed-code step) second (each journey file signs
   up its own identity — Playwright isolates module state per file, so there
-  is no cross-file account sharing). Once `QA_AUTH_TOKEN` is set the seam is
+  is no cross-file account sharing). Independently of that choice,
+  `signup-byop.spec.ts` carries a dedicated public UI-signup case
+  (`submitPublicUiSignup`, null identity): it always submits the real
+  `/signup` form with a unique synthetic mailbox and requires the
+  emailed-code step with no inline error, even when `QA_AUTH_TOKEN`
+  is set, so a seam-backed run still proves public UI form submission.
+  Wizard arrival via the form is not asserted: the code-plus-passkey
+  finish needs a staging code-retrieval seam that does not exist yet
+  (see row 1 of `docs/m1-exit-traceability.md`). Once `QA_AUTH_TOKEN` is set the seam is
   required infrastructure: transport errors, non-2xx and non-JSON mint
   responses throw instead of collapsing into a silent skip, and API-driven
   steps (`requireApiAccount`) refuse to run anonymously. The identity that
