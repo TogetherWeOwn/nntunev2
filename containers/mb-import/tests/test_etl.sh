@@ -55,4 +55,12 @@ if DUMP_TS= "$container_dir/etl.sh" "$temp_dir/mbdump" 2>"$temp_dir/timestamp.er
 fi
 grep -q 'DUMP_TS must be an ISO-8601 timestamp' "$temp_dir/timestamp.err"
 
+cp -R "$fixtures/mbdump" "$temp_dir/unknown-country-missing"
+rm "$temp_dir/unknown-country-missing/release_unknown_country"
+if DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/unknown-country-missing" 2>"$temp_dir/unknown-country-missing.err"; then
+  echo 'expected missing release_unknown_country failure' >&2
+  exit 1
+fi
+grep -q 'missing input file: .*release_unknown_country' "$temp_dir/unknown-country-missing.err"
+
 echo 'mb-import ETL fixture tests: PASS'

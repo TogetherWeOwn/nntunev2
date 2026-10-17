@@ -34,7 +34,7 @@ field order; use an extract from the matching schema revision. Derivations:
   for the release's artist credit. `release_type` resolves
   `release_group.type` through `release_group_primary_type.name` (otherwise
   NULL). `year` is the minimum non-NULL `release_country.date_year` across
-  release countries (otherwise NULL).
+  release events across `release_country` and `release_unknown_country` (otherwise NULL).
 - `caa_url` is emitted as
   `https://coverartarchive.org/release/<release-mbid>/front-250`; it is a
   deterministic Cover Art Archive endpoint, not proof artwork exists.

@@ -28,6 +28,7 @@ RELEASE_CREDIT_ID, RELEASE_GROUP_ID = 4, 5
 GROUP_ID, GROUP_TYPE_ID = 1, 5
 PRIMARY_TYPE_ID, PRIMARY_TYPE_NAME = 1, 2
 RELEASE_COUNTRY_RELEASE_ID, RELEASE_COUNTRY_YEAR = 1, 3
+RELEASE_UNKNOWN_COUNTRY_RELEASE_ID, RELEASE_UNKNOWN_COUNTRY_YEAR = 1, 2
 RECORDING_ID, RECORDING_GID, RECORDING_NAME, RECORDING_LENGTH = 1, 2, 3, 5
 MEDIUM_ID, MEDIUM_RELEASE_ID, MEDIUM_POSITION = 1, 2, 3
 TRACK_ID, TRACK_RECORDING_ID, TRACK_MEDIUM_ID, TRACK_POSITION = 1, 3, 4, 5
@@ -42,6 +43,7 @@ FIELD_COUNTS = {
     "release_group": 8,
     "release_group_primary_type": 6,
     "release_country": 5,
+    "release_unknown_country": 4,
     "recording": 9,
     "medium": 9,
     "track": 12,
@@ -168,6 +170,8 @@ def main() -> int:
                     CREATE TABLE release_group (id INTEGER PRIMARY KEY, type_id INTEGER);
                     CREATE TABLE release_country (release INTEGER NOT NULL, year INTEGER);
                     CREATE INDEX release_country_id ON release_country(release);
+                    CREATE TABLE release_unknown_country (release INTEGER NOT NULL, year INTEGER);
+                    CREATE INDEX release_unknown_country_id ON release_unknown_country(release);
                     CREATE TABLE release (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL, credit INTEGER NOT NULL, group_id INTEGER NOT NULL);
                     CREATE TABLE recording (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL, length INTEGER);
                     CREATE TABLE medium (id INTEGER PRIMARY KEY, release INTEGER NOT NULL, position INTEGER NOT NULL);
@@ -184,6 +188,7 @@ def main() -> int:
                 counts["release_group_primary_type"] = load(db, dump_dir / "release_group_primary_type", FIELD_COUNTS["release_group_primary_type"], (PRIMARY_TYPE_ID, PRIMARY_TYPE_NAME), "release_group_primary_type", "id,name", as_ints("release_group_primary_type.id", (0,)))
                 counts["release_group"] = load(db, dump_dir / "release_group", FIELD_COUNTS["release_group"], (GROUP_ID, GROUP_TYPE_ID), "release_group", "id,type_id", as_ints("release_group.id", (0, 1), (1,)))
                 counts["release_country"] = load(db, dump_dir / "release_country", FIELD_COUNTS["release_country"], (RELEASE_COUNTRY_RELEASE_ID, RELEASE_COUNTRY_YEAR), "release_country", "release,year", as_ints("release_country", (0, 1), (1,)))
+                counts["release_unknown_country"] = load(db, dump_dir / "release_unknown_country", FIELD_COUNTS["release_unknown_country"], (RELEASE_UNKNOWN_COUNTRY_RELEASE_ID, RELEASE_UNKNOWN_COUNTRY_YEAR), "release_unknown_country", "release,year", as_ints("release_unknown_country", (0, 1), (1,)))
                 counts["release"] = load(db, dump_dir / "release", FIELD_COUNTS["release"], (RELEASE_ID, RELEASE_GID, RELEASE_NAME, RELEASE_CREDIT_ID, RELEASE_GROUP_ID), "release", "id,gid,name,credit,group_id", as_ints("release.id", (0, 3, 4)))
                 counts["recording"] = load(db, dump_dir / "recording", FIELD_COUNTS["recording"], (RECORDING_ID, RECORDING_GID, RECORDING_NAME, RECORDING_LENGTH), "recording", "id,gid,name,length", as_ints("recording.id", (0, 3), (3,)))
                 counts["medium"] = load(db, dump_dir / "medium", FIELD_COUNTS["medium"], (MEDIUM_ID, MEDIUM_RELEASE_ID, MEDIUM_POSITION), "medium", "id,release,position", as_ints("medium.id", (0, 1, 2)))
@@ -216,6 +221,9 @@ def main() -> int:
                 bad_year = db.execute("SELECT c.release FROM release_country c LEFT JOIN release r ON r.id=c.release WHERE r.id IS NULL LIMIT 1").fetchone()
                 if bad_year:
                     raise ValueError(f"release_country references missing release {bad_year[0]}")
+                bad_unknown_country = db.execute("SELECT c.release FROM release_unknown_country c LEFT JOIN release r ON r.id=c.release WHERE r.id IS NULL LIMIT 1").fetchone()
+                if bad_unknown_country:
+                    raise ValueError(f"release_unknown_country references missing release {bad_unknown_country[0]}")
                 bad_track = db.execute("SELECT t.id FROM track t LEFT JOIN medium m ON m.id=t.medium LEFT JOIN recording r ON r.id=t.recording WHERE m.id IS NULL OR r.id IS NULL LIMIT 1").fetchone()
                 if bad_track:
                     raise ValueError(f"track {bad_track[0]} references a missing medium or recording")
@@ -234,7 +242,7 @@ def main() -> int:
                 artist_count = insert_select(db, artist_query, output_dir / "mbdump-artist.tsv", updated_at)
                 release_query = """
                     SELECT r.gid,a.gid,r.name,pt.name,
-                           (SELECT MIN(rc.year) FROM release_country rc WHERE rc.release=r.id AND rc.year IS NOT NULL)
+                           (SELECT MIN(year) FROM (SELECT rc.year FROM release_country rc WHERE rc.release=r.id UNION ALL SELECT ruc.year FROM release_unknown_country ruc WHERE ruc.release=r.id) WHERE year IS NOT NULL)
                     FROM release r
                     JOIN release_group g ON g.id=r.group_id
                     LEFT JOIN release_group_primary_type pt ON pt.id=g.type_id
