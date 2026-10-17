@@ -1515,11 +1515,25 @@ work. Production DB creation/migration remains gated by the ops contract.
      and make replay of an already-applied matching file a no-op. Add an explicit,
      opt-in adoption path for an existing database with no runner history: build
      canonical schema snapshots by applying each target's manifest migrations in
-     order to throwaway databases, then compare the existing database's
+     order to throwaway databases running the same Postgres major version as the
+     target, then compare the existing database's
      migration-owned catalog state (columns, types, nullability, defaults,
      constraints, indexes, sequences, foreign keys, function definitions, and
      trigger definitions and enabled states) against those exact post-migration
-     snapshots. Adopt
+     snapshots. CI's `api-migrations` throwaway database is currently pinned to
+     Postgres 17 while `docs/ops.md` records the app clusters at Postgres 18.6,
+     so slice 1 must re-pin that service, or add a target-major job, before its
+     snapshots are trusted; the target major is read from the target server
+     itself, not hardcoded. Record the server major version (from
+     `server_version_num`) in every snapshot, and refuse adoption — as a distinct
+     version-mismatch refusal, leaving history untouched — when the snapshot
+     major differs from the target database's major, rather than matching loosely
+     or failing as unexplained drift. The comparison uses normalized, version-
+     and OID-independent catalog facts only: it excludes internal foreign-key
+     triggers and server-generated constraint names, and reads nullability from
+     the column attribute rather than version-specific constraint rows (Postgres
+     18 also stores NOT NULL specifications as `pg_constraint` rows; 17 does
+     not). Adopt
      only one exact match for a contiguous target-specific manifest prefix;
      atomically record the matched manifest filenames and their trusted SHA-256
      values without executing historical SQL. Do not infer history from a maximum
@@ -1534,7 +1548,9 @@ work. Production DB creation/migration remains gated by the ops contract.
      or with the expected trigger definition present but disabled, or otherwise
      not matching a completed contiguous manifest prefix, unknown
      schema, and post-adoption schema drift all refuse without applying SQL or
-     recording guessed history. Also assert app-targeted
+     recording guessed history; also verify a snapshot built on a different
+     Postgres major than the throwaway target refuses as a version mismatch
+     without recording history. Also assert app-targeted
      routing, matching replay and altered-file checksum drift refusal. Existing
      `migrations-gate` and `workers/api/tests/run_migration_tests.sh` remain
      required source/empty-DB gates, not substitutes for these runner tests.
@@ -1545,7 +1561,8 @@ work. Production DB creation/migration remains gated by the ops contract.
      preparation; the atomic cutover remains blocked on it.
 
   2. **Applied-shape rehearsal fixture and harness (≤1 day; no playlist cutover).**
-     Build a synthetic app database that emulates a pre-runner deployment by
+     Build a synthetic app database, on the target Postgres major required by
+     slice 1, that emulates a pre-runner deployment by
      applying app-targeted 0002 and 0003 without runner history, seed
      representative playlist rows after 0003, and exercise slice 1's explicit
      adoption path. Assert adoption matches and records the validated 0002/0003
@@ -1605,7 +1622,9 @@ work. Production DB creation/migration remains gated by the ops contract.
      history, adoption is a one-time bootstrap before the first runner-managed
      migration; empty databases use the runner's empty-database path. Under the
      existing ops contract, verify the intended staging app database has the
-     expected adopted/applied history and no drift before cutover. If it is still
+     expected adopted/applied history and no drift before cutover; adoption
+     there uses only snapshots whose recorded Postgres major equals the staging
+     server's major, per slice 1's version-mismatch refusal. If it is still
      unadopted, complete adoption before any normalized-catalog or playlist
      migration; never rerun adoption after runner-managed history exists. The
      runner must refuse to proceed if adoption does not match one exact known
