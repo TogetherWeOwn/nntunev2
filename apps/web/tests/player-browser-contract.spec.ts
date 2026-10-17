@@ -1,9 +1,9 @@
 import { expect, test, type Page } from '@playwright/test';
 
 const MEDIA_BYTES = 256 * 1024;
-// Seek-storm requests are bounded; earlier offsets abort, so inject on the final one.
+// Earlier storm offsets are aborted; inject on the final, non-superseded request.
 const RANGE_REQUEST_PATTERN = /^bytes=(\d+)-(\d+)$/;
-const SEEK_STORM_REQUESTS = 10;
+const FINAL_STORM_RANGE = 'bytes=9000-9099';
 
 function mismatchedRange(start: number, end: number) {
 	const mismatchedStart = start + 1;
@@ -11,19 +11,11 @@ function mismatchedRange(start: number, end: number) {
 }
 
 async function runSeekStormWithInjectedResponse(page: Page, status: 200 | 206) {
-	let boundedRangeRequests = 0;
-
 	await page.goto('/demo/player');
 	await page.route(/\/api\/demo\/audio(?:\?.*)?$/, async (route) => {
 		const range = route.request().headers()['range'];
 		const match = range?.match(RANGE_REQUEST_PATTERN);
-		if (!range || !match) {
-			await route.continue();
-			return;
-		}
-
-		boundedRangeRequests += 1;
-		if (boundedRangeRequests !== SEEK_STORM_REQUESTS) {
+		if (range !== FINAL_STORM_RANGE || !match) {
 			await route.continue();
 			return;
 		}
@@ -162,5 +154,7 @@ test('artwork remains understandable when its image and placeholder both fail', 
 
 	expect((await sourceFailure).status()).toBe(404);
 	expect((await placeholderFailure).status()).toBe(404);
-	await expect(page.getByTestId('broken-artwork').getByText('Artwork unavailable')).toBeVisible();
+	await expect(
+		page.getByTestId('broken-artwork').getByText('Broken demo artwork', { exact: true })
+	).toBeVisible();
 });
