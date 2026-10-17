@@ -101,12 +101,20 @@ async function readFiniteBody(
 		if (options.exact) {
 			if (overflow) throw new Error(options.lengthMessage);
 			if (!streamDone) {
-				// Exactly full: one probe read distinguishes an exact body
-				// from one with an unrequested remainder.
-				const probe = await reader.read();
-				if (signal.aborted) throw abortError();
-				if (!probe.done) throw new Error(options.lengthMessage);
-				streamDone = true;
+				// Exactly full: probe reads distinguish an exact body from
+				// one with an unrequested remainder. Empty chunks carry no
+				// bytes, so probe past them like the main loop does.
+				for (;;) {
+					const probe = await reader.read();
+					if (signal.aborted) throw abortError();
+					if (probe.done) {
+						streamDone = true;
+						break;
+					}
+					if (probe.value !== undefined && probe.value.byteLength > 0) {
+						throw new Error(options.lengthMessage);
+					}
+				}
 			}
 		}
 		const bytes = new Uint8Array(expectedLength);
