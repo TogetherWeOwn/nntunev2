@@ -97,7 +97,8 @@ export function extractUsageBytes(body: unknown): number {
   );
 }
 
-/** Pull plan-limit metadata ({ limit, used, tier }) tolerating key drift. */export function extractPlanMeta(body: unknown): { limit: number; used: number; tier: string } {
+/** Pull plan-limit metadata ({ limit, used, tier }) tolerating key drift. */
+export function extractPlanMeta(body: unknown): { limit: number; used: number; tier: string } {
   if (typeof body !== 'object' || body === null) {
     throw new Error(`[usage] expected a JSON object for plan metadata, got ${typeof body}.`);
   }
