@@ -1291,6 +1291,22 @@ test.describe('plan-limit refusal verdict (offline pins)', () => {
     );
   });
 
+  test('a matching key with a non-route value is not a CTA pointer', () => {
+    expect(() => extractUpgradeCta({ code: 'x', upgrade_available: false }, 'c')).toThrow(
+      /no upgrade CTA pointer/,
+    );
+    expect(() => extractUpgradeCta({ code: 'x', upgrade_url: '' }, 'c')).toThrow(
+      /no upgrade CTA pointer/,
+    );
+    expect(() =>
+      extractUpgradeCta({ code: 'x', upgrade_url: 'Upgrade now, no route' }, 'c'),
+    ).toThrow(/no upgrade CTA pointer/);
+  });
+
+  test('a nested /pricing route behind a matching key still counts', () => {
+    expect(extractUpgradeCta({ code: 'x', cta: { href: '/pricing' } }, 'c')).toMatch(/cta/);
+  });
+
   test('a body without the CTA pointer fails naming its keys', () => {
     expect(() =>
       extractUpgradeCta({ code: 'plan_limit_exceeded', message: 'nope' }, 'plan-limit-stream'),
@@ -1341,5 +1357,77 @@ test.describe('plan-limit refusal verdict (offline pins)', () => {
     expect(() =>
       assertPlanLimitHeaders({ 'X-Plan-Limit': '', 'Retry-After': '5' }, 'plan-limit-stream'),
     ).toThrow(/present but empty/);
+  });
+
+  test('a 429 without retry-after fails even with another reset header', () => {
+    expect(() =>
+      assertPlanLimitHeaders(
+        { 'x-plan-limit': '50', 'x-plan-reset': '45' },
+        'plan-limit-ingest',
+        429,
+      ),
+    ).toThrow(/retry-after/);
+    expect(() =>
+      assertPlanLimitHeaders({ 'x-plan-limit': '50', 'retry-after': '' }, 'plan-limit-ingest', 429),
+    ).toThrow(/retry-after|present but empty/);
+    expect(() =>
+      assertPlanLimitRefusal({
+        status: 429,
+        headers: { 'ratelimit-limit': '50', 'ratelimit-reset': '45' },
+        bodyText: JSON.stringify({
+          code: 'rate_limited',
+          message: 'too many requests',
+          retryable: true,
+          upgrade_url: '/pricing',
+        }),
+        secrets,
+        context: 'plan-limit-ingest',
+      }),
+    ).toThrow(/retry-after/);
+  });
+
+  test('a status-inconsistent limit code fails', () => {
+    expect(() =>
+      assertPlanLimitRefusal({
+        ...clean402,
+        bodyText: JSON.stringify({
+          code: 'rate_limited',
+          message: 'too many requests',
+          retryable: false,
+          upgrade_url: '/pricing',
+        }),
+        secrets,
+        context: 'plan-limit-stream',
+      }),
+    ).toThrow(/code 'rate_limited' disagrees with the status/);
+    expect(() =>
+      assertPlanLimitRefusal({
+        status: 429,
+        headers: { 'ratelimit-limit': '50', 'retry-after': '45' },
+        bodyText: JSON.stringify({
+          code: 'plan_limit_exceeded',
+          message: 'plan limit reached',
+          retryable: true,
+          upgrade_url: '/pricing',
+        }),
+        secrets,
+        context: 'plan-limit-ingest',
+      }),
+    ).toThrow(/code 'plan_limit_exceeded' disagrees with the status/);
+  });
+
+  test('a missing retryable flag fails', () => {
+    expect(() =>
+      assertPlanLimitRefusal({
+        ...clean402,
+        bodyText: JSON.stringify({
+          code: 'plan_limit_exceeded',
+          message: 'plan limit reached',
+          upgrade_url: '/pricing',
+        }),
+        secrets,
+        context: 'plan-limit-stream',
+      }),
+    ).toThrow(/retryable flag disagrees/);
   });
 });

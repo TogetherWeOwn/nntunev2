@@ -109,13 +109,15 @@ export function extractLimitCode(bodyText: string, context: string): string {
  * deliberately tolerant (any header naming a limit, any naming a reset or
  * retry) so the enforcement card owns the exact wire names; the preferred
  * names are `x-plan-limit` + `x-plan-reset` (402) with `retry-after` already
- * the repo convention for 429 (workers/api/src/rate_limit.rs). Throws
- * listing the received header names (never values) so a missing header
- * fails by name.
+ * the repo convention for 429 (workers/api/src/rate_limit.rs). A 429 must
+ * additionally carry a non-empty `retry-after` even when another reset
+ * header is present (docs/api-errors.md). Throws listing the received
+ * header names (never values) so a missing header fails by name.
  */
 export function assertPlanLimitHeaders(
   headers: Record<string, string>,
   context: string,
+  status?: number,
 ): void {
   const lowered: Record<string, string> = {};
   for (const [name, value] of Object.entries(headers)) lowered[name.toLowerCase()] = value;
@@ -135,6 +137,16 @@ export function assertPlanLimitHeaders(
         `'${limitHeader}' + '${resetHeader}' must carry values (names only — no values logged).`,
     );
   }
+  if (status === 429) {
+    const retryAfter = names.find((name) => name === 'retry-after');
+    if (!retryAfter || !lowered[retryAfter]?.trim()) {
+      throw new Error(
+        `[${context}] 429 refusal is missing a non-empty retry-after header ` +
+          `(docs/api-errors.md: 429 always carries Retry-After): ` +
+          `got headers: ${names.join(', ') || '(none)'}.`,
+      );
+    }
+  }
 }
 
 /** Key fragment that points the client at the upgrade path (`/pricing`). */
@@ -149,9 +161,12 @@ const UPGRADE_VALUE_RE = /\/pricing/i;
 
 /**
  * Require the upgrade CTA pointer in a 402/429 body: a key naming the
- * upgrade path (preferred: `upgrade_url`, see the limit-refusal wire in
- * docs/api-errors.md) or a string value carrying the `/pricing` route. The
- * web paywall client hardcodes its CTA href today (PRICING_HREF in
+ * upgrade path whose value points at the `/pricing` route (preferred:
+ * `upgrade_url: "/pricing"`, see the limit-refusal wire in
+ * docs/api-errors.md) or a string value carrying the `/pricing` route. A
+ * matching key with a non-route value (`false`, `""`, marketing prose) is
+ * not a pointer — the nested value is searched instead. The web paywall
+ * client hardcodes its CTA href today (PRICING_HREF in
  * apps/web/src/lib/billing/planLimit.ts); this pointer is the
  * server-advertised half, so any client can route the upgrade without
  * hardcoding it. A bare code with no upgrade path is a dead-end error, not
@@ -166,7 +181,12 @@ export function extractUpgradeCta(body: unknown, context: string): string {
     }
     for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
       if (depth === 0) seen.push(key);
-      if (UPGRADE_KEY_RE.test(key)) return `key '${key}'`;
+      if (UPGRADE_KEY_RE.test(key)) {
+        if (typeof entry === 'string' && UPGRADE_VALUE_RE.test(entry)) return `key '${key}'`;
+        const nested = visit(entry, depth + 1);
+        if (nested) return `key '${key}' -> ${nested}`;
+        continue;
+      }
       const hit = visit(entry, depth + 1);
       if (hit) return hit;
     }
@@ -226,10 +246,12 @@ export function secretLeak(
 
 /**
  * The full plan-limit refusal verdict for one capped-account attempt:
- * status is 402/429, limit + reset headers are present, the body names a
- * limit code with a status-consistent retryable flag, carries the upgrade
- * CTA pointer, and leaks no secrets. Every failure names the gap (expected
- * vs actual status, missing header names, body keys) so a run without
+ * status is 402/429, limit + reset headers are present (429 additionally
+ * requires `retry-after`), the body names the status-consistent limit code
+ * (`plan_limit_exceeded` on 402, `rate_limited` on 429) with a present,
+ * boolean, status-consistent retryable flag, carries the upgrade CTA
+ * pointer, and leaks no secrets. Every failure names the gap (expected vs
+ * actual status, missing header names, body keys) so a run without
  * enforcement fails with the missing piece named — never a bare mismatch
  * and never a skip.
  */
@@ -247,8 +269,16 @@ export function assertPlanLimitRefusal(args: {
         'Without enforcement the capped account streams/ingests as normal; with enforcement it is refused.',
     );
   }
-  assertPlanLimitHeaders(headers, context);
+  assertPlanLimitHeaders(headers, context, status);
   const code = extractLimitCode(bodyText, context);
+  const expectedCode = status === 429 ? 'rate_limited' : 'plan_limit_exceeded';
+  if (code !== expectedCode) {
+    throw new Error(
+      `[${context}] plan-limit body code '${code}' disagrees with the status: ` +
+        `HTTP ${status} requires code '${expectedCode}' ` +
+        `(docs/api-errors.md: 402 is plan_limit_exceeded, 429 is rate_limited).`,
+    );
+  }
   let parsed: unknown = null;
   try {
     parsed = JSON.parse(bodyText) as unknown;
@@ -259,7 +289,7 @@ export function assertPlanLimitRefusal(args: {
     typeof parsed === 'object' && parsed !== null
       ? (parsed as Record<string, unknown>).retryable
       : undefined;
-  if (flag !== undefined) {
+  {
     const expected = status === 429;
     if (typeof flag !== 'boolean' || flag !== expected) {
       throw new Error(
