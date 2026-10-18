@@ -66,7 +66,7 @@ the activation checklist is accurate:
 ```sh
 cd e2e
 npm ci
-npx playwright install chromium
+npx playwright install --with-deps chromium
 STAGING_BASE_URL=https://staging.example \
   CF_ACCESS_CLIENT_ID='<from ~/secure-drop>' \
   CF_ACCESS_CLIENT_SECRET='<from ~/secure-drop>' \
@@ -83,6 +83,13 @@ Smoke only: `npm run e2e:smoke`. Validate without staging: `npm run typecheck`,
 If `NODE_ENV=production` is exported in your shell, install with
 `npm install --include=dev` — otherwise npm silently omits the dev
 dependencies this harness needs.
+
+Toolchain: CI runs Node 26 for this harness (both jobs in
+`.github/workflows/e2e-staging.yml` and the `e2e-lint` job in `ci.yml`,
+kept in sync with the `@types/node` major in `e2e/package.json`;
+Playwright `1.64.0` there too). The app itself uses Node 24 + pnpm
+(`NODE_VERSION`/`PNPM_VERSION` in `ci.yml`) and is unrelated to this
+npm-based harness (`e2e/package-lock.json`).
 
 ## Environment
 
@@ -185,7 +192,8 @@ How the suite uses them:
   Both jobs require the Access pair in preflight before activating tests;
   configured staging never skips for missing credentials. Failure artifacts
   are kept 7 days.
-- `e2e-lint` inside `ci.yml` (part of `ci-ok`) — `npm ci`, `tsc --noEmit`,
+- `e2e-lint` inside `ci.yml` (part of `ci-ok`) — `npm ci`, Playwright
+  chromium install (`--with-deps`), `tsc --noEmit`,
   helper/workflow self-tests, `playwright test --list`, and the
   traceability-matrix check (`docs/m1-exit-traceability.md` must cite every
   listed spec). Runs on every PR
@@ -209,7 +217,8 @@ headers/bodies and screenshots can expose account/provider information. CI
 uses the junit reporter only — the html reporter embeds step fill values
 (including the BYOP password) as a base64 zip in
 `playwright-report/index.html`, so it is never published. Sanitization is
-still required with traces off: Playwright 1.55 writes
+still required with traces off: Playwright (`1.64.0` in
+`e2e/package.json`) writes
 `test-results/**/error-context.md` (an ARIA snapshot rendering filled input
 values, including the BYOP password) — the workflow deletes
 error-context.md plus the whole `playwright-report/` dir before upload, and
