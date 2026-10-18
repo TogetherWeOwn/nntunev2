@@ -570,6 +570,8 @@ jobs:
         run: python3 .github/scripts/test_docs_link_directories.py
       - name: Run docs-link diff-failure self-tests
         run: python3 .github/scripts/test_docs_link_diff_failure.py
+      - name: Pin explicit-file root confinement
+        run: python3 .github/scripts/test_docs_link_explicit_root.py
       - name: Lint whole tree on this repo
         run: python3 .github/scripts/docs_link_lint.py --root .
       - name: Lint passes on the matching fixture
