@@ -359,7 +359,7 @@ and `reconcile` does not currently emit to Analytics Engine or call
 - Planned metering sinks: Analytics Engine dataset `nntune_meter` (point
   shape in `src/meter.rs`: blobs `[kind, user_id, track_id]`, doubles
   `[bytes, seconds]`) and the Hyperdrive per-play table
-  (`migrations/0019_stream_play_ledger.sql`, `stream_play_ledger` — not the
+  (`migrations/0020_stream_play_ledger.sql`, `stream_play_ledger` — not the
   ADR daily `usage_ledger`; row intents and statements owned by
   the api worker's `src/ledger.rs`, with the same `play:` key derivation and
   select+classify replay flow, fenced through the play owner's `users` row).

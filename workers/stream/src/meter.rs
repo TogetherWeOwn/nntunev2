@@ -8,7 +8,7 @@
 //!   the same key; a genuine second listen carries a different `play_id`
 //!   and bills separately.
 //! - [`UsageLedger`] is the portable-core model of the Hyperdrive
-//!   `stream_play_ledger` table (`migrations/0019_stream_play_ledger.sql`,
+//!   `stream_play_ledger` table (`migrations/0020_stream_play_ledger.sql`,
 //!   NOT the ADR daily `usage_ledger`), which in production must key
 //!   `UNIQUE(idempotency_key)` exactly as the ingest library upsert
 //!   converges `ON CONFLICT (idempotency_key)`. [`UsageLedger::record`]

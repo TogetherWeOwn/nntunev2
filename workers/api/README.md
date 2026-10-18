@@ -32,7 +32,7 @@ fencing, queued replay window), `0013` (session-bound reauth purpose),
 `0015_kek_rotation` (vault `rewrapped_at` marker + `kek_version`
 index, see `docs/security/kek-rotation.md` §2), `0018`
 (staging-only `qa_issued_codes` outbox for the test-code seam below), and
-`0019_stream_play_ledger.sql` (per-play stream ledger: validated row intents,
+`0020_stream_play_ledger.sql` (per-play stream ledger: validated row intents,
 monthly folds, replay-safe parameterized SQL; NOT the ADR daily `usage_ledger`)
 define the app-target Postgres schema (PlanetScale via Hyperdrive;
 targets per `migrations/manifest.toml`). The mirror-target `0001`
@@ -402,9 +402,15 @@ behavior changes here.
 ## Test
 
 ```sh
-cargo test --manifest-path workers/api/Cargo.toml
-cargo clippy --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets
+cargo clippy --locked --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
 cargo fmt --manifest-path workers/api/Cargo.toml -- --check
+cargo check --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
+bash workers/api/check_hyperdrive_cache.sh --self-test
 ```
+
+(Mirrors CI job `api`; `fmt` takes no `--locked` (it resolves no
+dependencies), so the asymmetry is intentional.
+Sources: `.github/workflows/ci.yml:271-296`.)
 
 Fixtures use synthetic credentials only (`news.example.com`, `203.0.113.7`).

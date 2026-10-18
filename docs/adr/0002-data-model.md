@@ -16,7 +16,7 @@
 - **Revised:** 2026-10-17 — bound playlist migration work to safe pre-cutover
   preparations and one atomic migration/backfill/read-write cutover PR; state the
   one-day limit and required fixtures/checks without permitting partial cutovers.
-- **Revised:** 2026-10-18 — slice-1 per-play precursor: `migrations/0019_stream_play_ledger.sql`
+- **Revised:** 2026-10-18 — slice-1 per-play precursor: `migrations/0020_stream_play_ledger.sql`
   creates `stream_play_ledger` (one row per billed play window, `play:` idempotency keys,
   monthly `period_month` folds). It does NOT replace the daily `usage_ledger` defined below
   (`period DATE`, `ingest_jobs`, `UNIQUE (user_id, period)`); a later slice folds these windows
@@ -421,7 +421,7 @@ operation/outbox must make DB acceptance and enqueue retryable without counting
 a job twice. An accepted job is not evidence that normalized library tables
 or media already exist.
 
-Slice-1 precursor (`stream_play_ledger`, migration `0019`): per-play billed windows with
+Slice-1 precursor (`stream_play_ledger`, migration `0020`): per-play billed windows with
 deterministic `play:{user}:{track}:{play}` idempotency keys (128/512/512 limits, alphabet
 `[A-Za-z0-9_:-]`) and monthly `period_month` folds feed the rule-5 daily `usage_ledger`
 in a later slice; until then no daily `usage_ledger` table exists and no writer assumes its

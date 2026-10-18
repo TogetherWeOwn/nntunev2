@@ -14,7 +14,7 @@
 //! accepts). To keep the future `CREATE TABLE IF NOT EXISTS usage_ledger`
 //! from silently no-op'ing on a colliding name and then failing its
 //! `ON CONFLICT (user_id, period)`, this slice's per-play table is named
-//! `stream_play_ledger` (`migrations/0019_stream_play_ledger.sql`). See the
+//! `stream_play_ledger` (`migrations/0020_stream_play_ledger.sql`). See the
 //! amendment notes in `docs/adr/0002-data-model.md`, `0004-plan-matrix.md`
 //! and `0005-billing.md`.
 //!
