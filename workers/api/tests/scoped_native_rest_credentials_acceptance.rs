@@ -1,7 +1,7 @@
-//! Acceptance tests: scoped native REST credentials (TOG-28776).
+//! Acceptance tests: scoped native REST credentials (paired acceptance card).
 //!
 //! TDD RED: these tests FAIL (compile error, E0432) until the paired build
-//! ([TOG-28783](/TOG/issues/TOG-28783)) implements the contract below in
+//! card implements the contract below in
 //! `workers/api/src/native_rest.rs` and exports it from `lib.rs`
 //! (`pub mod native_rest;`). The builder must NEVER edit this file.
 //!

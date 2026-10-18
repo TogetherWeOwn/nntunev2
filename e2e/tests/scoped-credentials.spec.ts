@@ -8,8 +8,8 @@ import {
   tryMintTestAccount,
 } from '../helpers/accounts.js';
 
-// Scoped native REST credentials (ADR 0010, acceptance [TOG-28776](/TOG/issues/TOG-28776),
-// paired build [TOG-28783](/TOG/issues/TOG-28783)): mint → scoped route 200
+// Scoped native REST credentials (ADR 0010, paired acceptance card,
+// paired build card): mint → scoped route 200
 // → revoke → 401/403, scope-matrix denials by name, header-only transport,
 // names-only diagnostics.
 //
