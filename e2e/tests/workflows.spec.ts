@@ -932,6 +932,113 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
   });
 });
 
+// Locked-dependency coverage builds (static pin): coverage.yml builds
+// `--locked` for every standalone crate with a committed workers/<crate>/
+// Cargo.lock plus the root workspace (covering stream), and fails closed on
+// missing reports — but nothing stops a future edit from dropping a
+// `--locked` flag or adding an uncovered standalone crate. These cases pin
+// the mapping offline so such an edit reds test:unit.
+// Commented-out steps are inactive: strip full-line `#` comments once at load
+// so a commented-out llvm-cov command cannot satisfy the pins below.
+const coverageWorkflow = readFileSync(new URL('coverage.yml', workflowDir), 'utf8').replace(
+  /^[ \t]*#.*$/gm,
+  '',
+);
+
+// Join backslash continuations so multi-line invocations read as one command.
+const coverageCommands = coverageWorkflow
+  .replace(/\\\n/g, '')
+  .split('\n')
+  .filter((line) => line.includes('cargo llvm-cov'));
+
+// `for crate in ingest mb; do cargo llvm-cov --locked --manifest-path
+// "workers/${crate}/Cargo.toml" ...` covers a set of crates with one generic
+// locked step: resolve the loop word lists whose OWN body is such a step.
+// The body scope matters: the summary loop below (`for crate in root api
+// ingest mb repair`) never runs llvm-cov, so testing the whole file would
+// wrongly credit its word list.
+function loopCoveredCrates(): Set<string> {
+  const covered = new Set<string>();
+  for (const match of coverageWorkflow.matchAll(/for (\w+) in ([^;]+); do([\s\S]*?)done/g)) {
+    const variable = match[1]!;
+    const words = match[2]!.trim().split(/\s+/);
+    const body = match[3]!;
+    const generic = new RegExp(
+      `cargo llvm-cov --locked --manifest-path\\s+"?workers/\\$\\{${variable}\\}/Cargo\\.toml"?`,
+    );
+    if (generic.test(body)) {
+      for (const word of words) covered.add(word);
+    }
+  }
+  return covered;
+}
+
+function crateHasLockedCoverageStep(crate: string, loopCovered: Set<string>): boolean {
+  // Accept the manifest path quoted or unquoted: both are valid shell.
+  const direct = new RegExp(
+    `cargo llvm-cov --locked --manifest-path\\s+"?workers/${crate}/Cargo\\.toml"?`,
+  );
+  return direct.test(coverageWorkflow) || loopCovered.has(crate);
+}
+
+test.describe('locked-dependency coverage builds (static pin)', () => {
+  test('every committed workers lockfile has a --locked llvm-cov step', () => {
+    // Enumerated from the tree (not a hardcoded list) so a newly added
+    // standalone crate with a committed Cargo.lock fails until coverage.yml
+    // gains a locked step for it.
+    const workersDir = fileURLToPath(new URL('../../workers/', import.meta.url));
+    const lockCrates = readdirSync(workersDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .filter((name) => existsSync(join(workersDir, name, 'Cargo.lock')))
+      .sort();
+    expect(lockCrates.length).toBeGreaterThan(0);
+    const loopCovered = loopCoveredCrates();
+    for (const crate of lockCrates) {
+      expect(
+        crateHasLockedCoverageStep(crate, loopCovered),
+        `workers/${crate}/Cargo.lock has no --locked llvm-cov step in coverage.yml`,
+      ).toBe(true);
+    }
+  });
+
+  test('no manifest-pinned llvm-cov step drops its --locked flag', () => {
+    expect(coverageCommands.length).toBeGreaterThan(0);
+    for (const command of coverageCommands) {
+      if (command.includes('--manifest-path')) {
+        expect(command, `llvm-cov step lost its --locked flag: ${command.trim()}`).toContain(
+          '--locked',
+        );
+      }
+    }
+  });
+
+  test('stream stays covered by the root workspace step while a member, locked step if extracted', () => {
+    const rootManifest = readFileSync(new URL('../../Cargo.toml', import.meta.url), 'utf8');
+    const members = rootManifest.match(/members = \[([^\]]*)\]/)?.[1] ?? '';
+    // Compare complete member values: a substring match would let e.g.
+    // `workers/stream-tools` select the workspace branch and bypass the
+    // locked stream-step assertion.
+    const memberValues = [...members.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    if (memberValues.includes('workers/stream')) {
+      expect(
+        coverageCommands.some(
+          (command) =>
+            command.includes('--workspace') &&
+            !command.includes('--manifest-path') &&
+            !/--exclude|--package|\s-p\s/.test(command),
+        ),
+        'root workspace llvm-cov step covering workers/stream is missing',
+      ).toBe(true);
+    } else {
+      expect(
+        crateHasLockedCoverageStep('stream', loopCoveredCrates()),
+        'workers/stream left the root workspace without a --locked llvm-cov step',
+      ).toBe(true);
+    }
+  });
+});
+
 test.describe('deploy.yml carries no backend Worker deploy job', () => {
   // Backend Worker deploys are intentionally NOT wired in deploy.yml (see its
   // header): this workflow deploys apps/web only, and each backend lane must
