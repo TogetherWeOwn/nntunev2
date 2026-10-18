@@ -76,8 +76,8 @@ passes on identical fixtures or fixtures that differ in values only.
   (getters), `:238-251` (key-names-only errors); cross-checks `:558-638`
   and `:664-750`. `env_var`-exactly-when-overridable per
   `config_parity_check.py:144-148` and `lib.rs:43-44`.
-- CI: `.github/workflows/ci.yml:391-404` (three run steps); `ci-ok` is
-  required (`:3`) with `config-parity` in needs (`:753`); `cargo test
+- CI: `.github/workflows/ci.yml:393-406` (three run steps); `ci-ok` is
+  required (`:3`) with `config-parity` in needs (`:755`); `cargo test
   --workspace` in `rust-test` (`:47-51`) covers `crates/nntune-config`
   (workspace member per `Cargo.toml:2`).
 - Indexer redirect example: `workers/api/src/vault.rs:46-47`
