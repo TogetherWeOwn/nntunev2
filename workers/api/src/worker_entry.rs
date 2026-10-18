@@ -873,11 +873,19 @@ impl Store for PgStore {
             .map(|scope| scope.as_str().to_string())
             .collect();
         let client = self.connect().await?;
-        client
+        // Account-deletion fence (ADR 0002 rule 3): the insert only lands
+        // while the owner's deleting_at is NULL, holding the user row
+        // FOR SHARE through the statement, so a fresh session during the
+        // 24 h grace cannot mint a new long-lived bearer path behind the
+        // marker. A fenced (0-row) insert fails closed as StoreError; the
+        // handler classifies it through `account_deleting` into the typed
+        // 409. The owner binds $2 (the user_id column), never a value.
+        let affected = client
             .execute(
                 "INSERT INTO native_rest_credentials (id, user_id, label, key_prefix, key_hmac, \
                  pepper_version, scopes, created_at, expires_at, created_from_ip) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10 \
+                 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence",
                 &[
                     &row.record.id,
                     &row.record.user_id,
@@ -893,6 +901,9 @@ impl Store for PgStore {
             )
             .await
             .map_err(|_| StoreError)?;
+        if affected == 0 {
+            return Err(StoreError);
+        }
         Ok(())
     }
 

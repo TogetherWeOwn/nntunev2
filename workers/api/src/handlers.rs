@@ -75,6 +75,22 @@ const LOGIN_FINISH_ATTEMPTS_PER_CHALLENGE: u64 = 10;
 const MAGIC_FINISH_ATTEMPTS_PER_IP: u64 = 10;
 const FINISH_LOOKUP_ATTEMPTS_PER_IP: u64 = 100;
 const FINISH_ATTEMPT_WINDOW_SECS: u64 = crate::auth::CHALLENGE_TTL_SECS;
+/// Bearer-lookup budgets (ADR 0010 DoS): a well-formed random `ntk_` token
+/// still costs an HMAC plus up to two Postgres lookups (one per pepper),
+/// so bearer attempts share one per-client pool keyed on the client /64
+/// (IPv6) or full address (IPv4) BEFORE any credential DB work — the same
+/// two-layer shape as the finish-route lookup budget above. Denial answers
+/// the same generic 401 as any other bearer failure (no throttle oracle).
+/// 300 per minute admits legitimate API polling while capping a single
+/// client's DB amplification; 3000 per hour bounds sustained floods while
+/// admitting NAT-shared bursts. Both slots are claimed as one all-or-none
+/// pair, so a burst-denied attempt burns neither budget. Per-credential
+/// rate limits and plan entitlements (ADR 0010) follow with the data
+/// routes; this pool only bounds unauthenticated lookup work.
+const BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_MIN: u64 = 300;
+const BEARER_LOOKUP_WINDOW_SECS: u64 = 60;
+const BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_HOUR: u64 = 3000;
+const BEARER_LOOKUP_HOUR_WINDOW_SECS: u64 = 3600;
 /// Per-IP auth-start admission: 30/hour admits legitimate multi-user NAT
 /// while cutting distinct-email loops. Global capacity is reserved only for
 /// outbound mail, so exhaustion cannot block auth challenge issuance.
@@ -2680,6 +2696,15 @@ where
         last_used_at: None,
     };
     if ctx.store.insert_native_credential(&row).await.is_err() {
+        // A fenced insert (account being deleted) is the typed 409,
+        // never the generic 500; anything else stays generic so a probe
+        // failure cannot leak a new shape. Mirrors `vault_put` (ADR 0002
+        // rule 3): the production statement only lands while the owner's
+        // `deleting_at` is NULL, so a fresh session during the 24 h grace
+        // cannot mint a new long-lived bearer path behind the marker.
+        if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+            return account_deleting_response();
+        }
         return internal();
     }
     // Audit names the id only — never the secret, the HMAC, or the IP.
@@ -2792,6 +2817,14 @@ where
 /// there is intentionally no query-string credential reader (query
 /// strings land in logs).
 ///
+/// Gates run in order: header shape, display-form shape, per-IP lookup
+/// budget, then the HMAC/DB lookup. A malformed shape fails before any
+/// HMAC or database work (unauthenticated bearer routes were plain 404s
+/// with no DB work before this credential class, so junk tokens must not
+/// buy Postgres connections). The lookup budget is claimed before the
+/// first query and its denial collapses to the same generic 401 (no
+/// throttle oracle), mirroring the finish-route lookup budget.
+///
 /// Failures map exactly like the core: unknown/tampered/revoked/expired
 /// (or an unprovisioned keyring) is the generic 401; a valid credential
 /// lacking the route's scope is the names-only 403. Successful use
@@ -2808,11 +2841,47 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    use crate::native_rest::{authorize, credential_hmac, extract_bearer_key, CredentialError};
+    use crate::native_rest::{
+        authorize, credential_hmac, extract_bearer_key, is_plausible_credential_shape,
+        CredentialError,
+    };
     let token = match extract_bearer_key(authorization) {
         Ok(token) => token,
         Err(_) => return Err(credential_unauthorized()),
     };
+    // Shape before HMAC/DB: random Authorization values cost no crypto
+    // beyond the parse and no store work at all.
+    if !is_plausible_credential_shape(token) {
+        return Err(credential_unauthorized());
+    }
+    // Per-IP lookup budget BEFORE any credential DB work: a flood of
+    // well-formed random `ntk_` tokens shares one pool (client /64 or
+    // full address), claimed as one all-or-none pair so a burst-denied
+    // attempt burns neither budget. Denial is the generic 401.
+    let ip_key = rate_limit_ip_key(&ctx.source_ip);
+    let admitted = matches!(
+        ctx.store
+            .reserve_rate_limit_pair(
+                RateLimitBudget {
+                    scope_key: &ip_key,
+                    action: "native_rest.bearer_lookup_ip_min",
+                    limit: BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_MIN,
+                    window_secs: BEARER_LOOKUP_WINDOW_SECS,
+                },
+                RateLimitBudget {
+                    scope_key: &ip_key,
+                    action: "native_rest.bearer_lookup_ip_hour",
+                    limit: BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_HOUR,
+                    window_secs: BEARER_LOOKUP_HOUR_WINDOW_SECS,
+                },
+                ctx.now,
+            )
+            .await,
+        Ok(PairAdmission::Allowed)
+    );
+    if !admitted {
+        return Err(credential_unauthorized());
+    }
     let peppers = ctx.cfg.native_rest_peppers();
     // Dual-pepper lookup: the presented secret is HMACed under each listed
     // version and looked up by the composite identity, so a transitioning
@@ -2959,11 +3028,14 @@ fn preflight_response() -> Response {
 
 /// Route one request. Unknown routes are a plain 404; known routes map
 /// every domain failure through their surface's single generic body.
-/// Bearer-only routes authenticate here off `req.authorization` and never
-/// consult cookies or sessions (no session-cookie fallback); session-only
-/// and denied shapes fall through to the dispatch below. Data routes for
-/// the bearer scopes do not exist yet, so an authorized bearer still lands
-/// on the 404 below — default-deny holds until those routes land.
+/// A PRESENTED bearer token is authenticated here off `req.authorization`
+/// and never rescued by a session cookie (no session-cookie fallback for
+/// a presented credential); a request with NO `Authorization` header skips
+/// the bearer gate and falls through to the dispatch below, so session
+/// cookie holders see no behavior change (ADR 0010). Data routes for the
+/// bearer scopes do not exist yet, so both an authorized bearer and a
+/// cookie-only caller land on the 404 below — default-deny holds until
+/// those routes land with their session-or-bearer dispatch.
 pub async fn handle<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -2977,8 +3049,17 @@ where
     if let crate::native_rest::RouteDecision::Bearer(required) =
         crate::native_rest::scope_for_operation(&req.method, &req.path)
     {
-        if let Err(resp) = authorize_bearer(ctx, req.authorization.as_deref(), required).await {
-            return resp;
+        // Only a presented Authorization header enters the bearer gate:
+        // header-absent callers (session cookies, anonymous) fall through
+        // to the dispatch below (plain 404 until the data routes land).
+        // A presented-but-invalid bearer still fails closed here and is
+        // never rescued by a cookie.
+        if req.authorization.is_some() {
+            if let Err(resp) =
+                authorize_bearer(ctx, req.authorization.as_deref(), required).await
+            {
+                return resp;
+            }
         }
     }
     match (req.method.as_str(), req.path.as_str()) {
@@ -3559,6 +3640,15 @@ mod tests {
             &self,
             row: &NativeCredentialRow,
         ) -> Result<(), StoreError> {
+            // Mirror the production in-statement fence: a deleting
+            // account's insert writes nothing and fails (ADR 0002 rule 3).
+            if self
+                .deleting_users
+                .borrow()
+                .contains(&row.record.user_id)
+            {
+                return Err(StoreError);
+            }
             let mut rows = self.native_credentials.borrow_mut();
             // Mirror the migration 0019 composite UNIQUE: neither the id
             // nor the (pepper_version, key_hmac) identity may repeat.
@@ -5149,10 +5239,12 @@ mod tests {
             r#"{"code":"forbidden","message":"insufficient scope","retryable":false}"#
         );
 
-        // Unknown, malformed, and missing headers are the generic 401.
+        // Presented-but-invalid bearers are the generic 401 — including
+        // malformed shapes (rejected before any HMAC/DB work) and a
+        // well-formed unknown key (fails closed after the lookup).
         for header in [
-            None,
             Some("Bearer ntk_no-such-credential-000000000000000000".to_string()),
+            Some(format!("Bearer ntk_{}", "0".repeat(43))),
             Some("Bearer".to_string()),
             Some("Basic abc123".to_string()),
             Some("__Host-nntune-session=abc123".to_string()),
@@ -5165,8 +5257,16 @@ mod tests {
             );
         }
 
-        // A valid session cookie with no bearer header is still 401 on a
-        // bearer route: cookies never authenticate as bearer credentials.
+        // No Authorization header skips the bearer gate entirely (ADR 0010:
+        // session-cookie holders see no behavior change). With no data
+        // routes yet this is the plain 404 — the same posture as before
+        // this credential class existed — never a 401.
+        let missing = h.call_bearer("GET", "/v1/search", None);
+        assert_eq!(missing.status, 404, "{}", missing.body);
+
+        // A valid session cookie with no bearer header likewise falls
+        // through to the dispatch (plain 404 until the data routes land
+        // with their session-or-bearer dispatch), never the bearer 401.
         let cookie_only = h.call_full(
             "GET",
             "/v1/search",
@@ -5174,7 +5274,21 @@ mod tests {
             Some(cookie.clone()),
             Some(ORIGIN),
         );
-        assert_eq!(cookie_only.status, 401, "{}", cookie_only.body);
+        assert_eq!(cookie_only.status, 404, "{}", cookie_only.body);
+        assert_eq!(cookie_only.body, r#"{"error":"not found"}"#);
+
+        // A presented bearer is never rescued by a session cookie: a valid
+        // cookie plus an invalid bearer is still the bearer 401.
+        let no_rescue = Request {
+            method: "GET".to_string(),
+            path: "/v1/search".to_string(),
+            cookie: Some(cookie.clone()),
+            origin: Some(ORIGIN.to_string()),
+            authorization: Some("Bearer ntk_definitely-not-a-key".to_string()),
+            body: Vec::new(),
+        };
+        let no_rescue = block_on(handle(&h.ctx(), &no_rescue));
+        assert_eq!(no_rescue.status, 401, "{}", no_rescue.body);
 
         // And a valid bearer can never mint: issuance stays session-only.
         let bearer_mint_req = Request {
@@ -5191,6 +5305,95 @@ mod tests {
         assert_eq!(bearer_mint.status, 401, "{}", bearer_mint.body);
         let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
         assert_eq!(rows.len(), 2, "bearer mint attempt stores nothing");
+    }
+
+    #[test]
+    fn bearer_lookup_budget_denial_collapses_to_the_generic_401() {
+        // ADR 0010 DoS: a flood of well-formed random `ntk_` tokens shares
+        // one per-IP pool claimed before any credential DB work. Exhausting
+        // it denies with the SAME generic 401 as an unknown key (no
+        // throttle oracle), and even a valid credential is denied while
+        // the budget is exhausted.
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let minted = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 3600}),
+        );
+        assert_eq!(minted.status, 201, "{}", minted.body);
+        let secret = mint_secret(&serde_json::from_str(&minted.body).unwrap());
+
+        // A valid bearer passes before exhaustion (404: gate passed, no
+        // data routes yet).
+        let ok = h.call_bearer(
+            "GET",
+            "/v1/search",
+            Some(format!("Bearer {secret}")),
+        );
+        assert_eq!(ok.status, 404, "{}", ok.body);
+
+        // Exhaust the per-minute pool directly (same key/action the gate
+        // claims). The passing call above already holds one slot, so fill
+        // the remaining limit - 1.
+        let ip_key = rate_limit_ip_key("198.51.100.9");
+        for _ in 0..(BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_MIN - 1) {
+            let admitted = block_on(h.store.reserve_rate_limit(
+                &ip_key,
+                "native_rest.bearer_lookup_ip_min",
+                BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_MIN,
+                NOW,
+                BEARER_LOOKUP_WINDOW_SECS,
+            ))
+            .unwrap();
+            assert!(admitted);
+        }
+
+        // Now even the valid credential is denied — with the generic 401,
+        // never a 429 or any other shape.
+        let denied = h.call_bearer(
+            "GET",
+            "/v1/search",
+            Some(format!("Bearer {secret}")),
+        );
+        assert_eq!(denied.status, 401, "{}", denied.body);
+        assert_eq!(
+            denied.body,
+            r#"{"code":"unauthorized","message":"invalid credential","retryable":false}"#
+        );
+    }
+
+    #[test]
+    fn credentials_mint_for_a_deleting_account_is_the_typed_409() {
+        // ADR 0002 rule 3: issuance is a fenced writer like `vault_put`, so
+        // a fresh session during the 24 h deletion grace cannot mint a new
+        // long-lived bearer path behind the marker.
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let first = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(first.status, 201, "{}", first.body);
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert("u1".to_string());
+        let fenced = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(fenced.status, 409, "{}", fenced.body);
+        assert_eq!(
+            fenced.body,
+            r#"{"code":"account_deleting","message":"account is being deleted","retryable":false}"#
+        );
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert_eq!(rows.len(), 1, "fenced mint stores nothing");
     }
 
     #[test]

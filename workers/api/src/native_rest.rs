@@ -397,6 +397,24 @@ pub fn extract_bearer_key(authorization: Option<&str>) -> Result<&str, Credentia
     Ok(token)
 }
 
+/// Display-form shape gate: `ntk_` plus exactly 43 base62 characters
+/// (`SECRET_ENTROPY_BASE62_LEN`). The HTTP bearer gate calls this BEFORE
+/// any HMAC or database work, so random `Authorization` values cost no
+/// Postgres connection or query (ADR 0010 DoS: unauthenticated bearer
+/// routes were plain 404s with no DB work before this credential class).
+/// A well-formed random token still reaches the HMAC lookup and fails
+/// closed with the generic 401; shape alone never authenticates.
+pub fn is_plausible_credential_shape(token: &str) -> bool {
+    let Some(rest) = token.strip_prefix(CREDENTIAL_PREFIX) else {
+        return false;
+    };
+    if rest.len() != SECRET_ENTROPY_BASE62_LEN {
+        return false;
+    }
+    rest.bytes().all(|b| matches!(b,
+        b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z'))
+}
+
 /// What a (method, path) needs. `Bearer` routes accept the named scope;
 /// `SessionOnly` routes are never reachable by bearer (enforced by the
 /// auth layer, not by scope strings); `Deny` is everything else —
