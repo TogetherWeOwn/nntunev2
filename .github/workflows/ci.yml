@@ -532,7 +532,9 @@ jobs:
       - name: Archive reservation guard
         run: python3 .github/scripts/check_archive_bindings.py
       - name: Unit-test the guard
-        run: python3 .github/scripts/test_check_archive_bindings.py
+        run: |
+          python3 .github/scripts/test_check_archive_bindings.py
+          python3 .github/scripts/test_archive_json_inspection_errors.py
 
   # Docs internal-link lint: broken file links/anchors in changed markdown
   # (roadmap, matrix, ops, ADRs) fail the build. The lint step is scoped to
