@@ -258,26 +258,92 @@ fn cache_control(ttl_s: u32) -> String {
     format!("public, max-age={ttl_s}")
 }
 
+/// A cached lookup body is servable only when it matches exactly the shape
+/// a fresh lookup emits for the requested kind: the `kind` tag, the
+/// requested MBID (case-insensitive — keys and repo reads are lowercased),
+/// and every always-emitted field present and correctly typed. Extra
+/// unknown fields are ignored so forward-compatible writes still hit;
+/// anything else (truncated/non-JSON, non-object, wrong identity, missing
+/// or mistyped fields) is a miss so the poisoned entry is overwritten by
+/// the success-only cache path.
+fn cached_lookup_body_is_fresh_shape(kind: Kind, mbid: &str, body: &str) -> bool {
+    let value: serde_json::Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let obj = match value.as_object() {
+        Some(obj) => obj,
+        None => return false,
+    };
+    match obj.get("kind") {
+        Some(serde_json::Value::String(cached)) if cached == kind.as_str() => {}
+        _ => return false,
+    }
+    match obj.get("mbid") {
+        Some(serde_json::Value::String(cached)) if cached.to_lowercase() == mbid.to_lowercase() => {
+        }
+        _ => return false,
+    }
+    fn required_str(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+        matches!(obj.get(key), Some(serde_json::Value::String(_)))
+    }
+    fn optional_str(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+        matches!(
+            obj.get(key),
+            Some(serde_json::Value::String(_)) | Some(serde_json::Value::Null)
+        )
+    }
+    fn optional_int(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+        match obj.get(key) {
+            Some(serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => true,
+            Some(serde_json::Value::Null) => true,
+            _ => false,
+        }
+    }
+    match kind {
+        Kind::Artist => {
+            required_str(obj, "name")
+                && required_str(obj, "sort_name")
+                && optional_str(obj, "type")
+                && optional_str(obj, "country")
+        }
+        Kind::Release => {
+            required_str(obj, "title")
+                && optional_str(obj, "artist_mbid")
+                && optional_str(obj, "release_type")
+                && optional_int(obj, "year")
+                && optional_str(obj, "caa_url")
+        }
+        Kind::Recording => {
+            required_str(obj, "title")
+                && optional_str(obj, "release_mbid")
+                && optional_int(obj, "track_no")
+                && optional_int(obj, "duration_ms")
+                && optional_int(obj, "medium_no")
+        }
+    }
+}
+
 // --- JSON entities --------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Artist {
-    mbid: String,
-    name: String,
-    sort_name: String,
+    pub mbid: String,
+    pub name: String,
+    pub sort_name: String,
     #[serde(rename = "type")]
-    artist_type: Option<String>,
-    country: Option<String>,
+    pub artist_type: Option<String>,
+    pub country: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Release {
-    mbid: String,
-    artist_mbid: Option<String>,
-    title: String,
-    release_type: Option<String>,
-    year: Option<i16>,
-    caa_url: Option<String>,
+    pub mbid: String,
+    pub artist_mbid: Option<String>,
+    pub title: String,
+    pub release_type: Option<String>,
+    pub year: Option<i16>,
+    pub caa_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -470,7 +536,9 @@ fn health_response_parts() -> HealthResponseParts {
 
 /// Lookup core: validate → KV → DB. Only a found row is written to the
 /// cache; missing rows (404) and read failures (500) never are.
-async fn handle_lookup<R: MbRepo, C: SuccessCache>(
+/// `pub` for the `tests/` integration pin (`lookup_cache_validation`):
+/// the validation and cache contract below is what the pin covers.
+pub async fn handle_lookup<R: MbRepo, C: SuccessCache>(
     repo: &R,
     cache: &C,
     kind: Kind,
@@ -481,7 +549,9 @@ async fn handle_lookup<R: MbRepo, C: SuccessCache>(
     }
     let key = lookup_cache_key(kind, mbid);
     if let Some(body) = cache.get(&key).await {
-        return success_response(body, LOOKUP_CACHE_TTL_S);
+        if cached_lookup_body_is_fresh_shape(kind, mbid, &body) {
+            return success_response(body, LOOKUP_CACHE_TTL_S);
+        }
     }
     match repo.lookup(kind, &mbid.to_lowercase()).await {
         Ok(Some(entity)) => {
@@ -1542,7 +1612,7 @@ mod tests {
         let cache = FakeCache::default();
         cache.stored.borrow_mut().insert(
             lookup_cache_key(Kind::Artist, MBID),
-            r#"{"kind":"artist","cached":true}"#.to_string(),
+            r#"{"mbid":"123e4567-e89b-12d3-a456-426614174000","name":"cached artist","sort_name":"Artist, Cached","type":"Group","country":"US","kind":"artist"}"#.to_string(),
         );
         let repo = FakeRepo::default();
         let resp = block_on(handle_lookup(&repo, &cache, Kind::Artist, MBID));
