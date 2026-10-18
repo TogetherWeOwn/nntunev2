@@ -22,7 +22,7 @@
 //! - lowering `CONCURRENT_RETRY_AFTER_SECS` shortens the 429 retry hint,
 //!   failing `concurrent_429_carries_30s_retry_after`.
 //!
-//! Boundary: enforcement behavior stays pinned by TOG-28774; this suite pins
+//! Boundary: enforcement behavior stays covered by the existing enforcement-behavior suite; this suite pins
 //! only the documented wire literals, not the caps matrix.
 //!
 //! Run only this file:
