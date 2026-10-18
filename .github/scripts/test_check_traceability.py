@@ -161,6 +161,77 @@ class CheckTraceabilityTest(unittest.TestCase):
         matrix = MATRIX_COVERING_BOTH + '```\n"not a title" `e2e/tests/ghost.spec.ts`\n```\n'
         self.assertEqual(self.run_check(matrix, LIST_TWO_FILES), [])
 
+    def test_uncited_spec_with_seven_titles_truncates(self):
+        titles = [f"gamma title {i}" for i in range(1, 8)]
+        lines = "".join(
+            f"  [staging] › gamma.spec.ts:{i}:3 › group › {t}\n"
+            for i, t in enumerate(titles, start=1)
+        )
+        listed = LIST_TWO_FILES.replace(
+            "Total: 3 tests in 2 files", "Total: 10 tests in 3 files"
+        ) + lines
+        drifts = self.run_check(MATRIX_COVERING_BOTH, listed)
+        self.assertEqual(len(drifts), 1)
+        self.assertIn("e2e/tests/gamma.spec.ts", drifts[0])
+        self.assertIn("7 tests", drifts[0])
+        for t in titles[:5]:
+            self.assertIn(repr(t), drifts[0])
+        self.assertIn("(+2 more)", drifts[0])
+        for t in titles[5:]:
+            self.assertNotIn(repr(t), drifts[0])
+
+    def test_list_without_total_returns_none(self):
+        listed = "\n".join(
+            line for line in LIST_TWO_FILES.splitlines() if not line.startswith("Total:")
+        ) + "\n"
+        files, total = parse_list_output(listed)
+        self.assertIsNone(total)
+        self.assertEqual(
+            files,
+            {
+                "e2e/tests/alpha.spec.ts": ["first title", "second title"],
+                "e2e/tests/beta.spec.ts": ["solo title"],
+            },
+        )
+        # A Total-less pair still checks: fully cited passes.
+        self.assertEqual(self.run_check(MATRIX_COVERING_BOTH, listed), [])
+
+    def test_singular_total_parses(self):
+        listed = "  [staging] › solo.spec.ts:5:3 › only title\nTotal: 1 test in 1 file\n"
+        files, total = parse_list_output(listed)
+        self.assertEqual(total, (1, 1))
+        self.assertEqual(files, {"e2e/tests/solo.spec.ts": ["only title"]})
+
+    def test_prose_backtick_and_blank_quote_ignored(self):
+        specs, paths, titles = parse_matrix(
+            "Run `npm run e2e:list` then read \"   \" aloud.\n"
+        )
+        self.assertEqual(specs, set())
+        self.assertEqual(paths, set())
+        self.assertEqual(titles, set())
+
+    def test_evidence_title_matches_listed_title_first(self):
+        # "Evidence" is also a NON_TEST_QUOTES entry, so the matrix keeps
+        # it as a cited title and check() must pass via the listed-title
+        # arm, not the allowlist arm.
+        _, _, cited = parse_matrix('"Evidence"\n')
+        self.assertIn("Evidence", cited)
+        listed = (
+            "  [staging] › alpha.spec.ts:10:3 › group › first title\n"
+            "  [staging] › alpha.spec.ts:20:3 › group › second title\n"
+            "  [staging] › beta.spec.ts:5:3 › Evidence\n"
+            "Total: 3 tests in 2 files\n"
+        )
+        matrix = MATRIX_COVERING_BOTH + '"Evidence"\n'
+        self.assertEqual(self.run_check(matrix, listed), [])
+
+    def test_unclosed_fence_swallows_rest_of_file(self):
+        matrix = (
+            MATRIX_COVERING_BOTH
+            + '```\n"renamed away title" `e2e/tests/ghost.spec.ts`\n'
+        )
+        self.assertEqual(self.run_check(matrix, LIST_TWO_FILES), [])
+
     def test_parse_matrix_skips_globs_and_dirs(self):
         _, paths, _ = parse_matrix("`e2e/tests/*.spec.ts` and `e2e/`\n")
         self.assertEqual(paths, set())
