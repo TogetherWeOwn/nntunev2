@@ -1,12 +1,13 @@
 //! Stream trace correlation: optional 128-bit trace IDs threaded through the
-//! play path, plus the dependency-free six-key JSON log envelope.
+//! play path, plus a hand-written six-key JSON log envelope.
 //!
-//! This crate stays dependency-free (no `serde`, no `nntune-logging`) so
-//! `cargo test` runs anywhere. Trace IDs are therefore validated and rendered
-//! by hand here; the production Worker transport (which already depends on
-//! `worker` + `nntune-logging`) reuses the same IDs by constructing
-//! `nntune_logging::LogRecord::new(Worker::Stream, ...)` with the trace ID
-//! this module normalizes. The two renderers agree on the contract in
+//! This module renders the envelope by hand (no `serde`, no `nntune-logging`
+//! in `trace.rs`). The `stream` crate itself already uses `serde`/`serde_json`
+//! for the pool-probe and body JSON (`probe.rs`, `body.rs`) but does not
+//! depend on `nntune-logging`. Trace IDs are therefore validated and rendered
+//! by hand here; a future production Worker transport would reuse the same IDs
+//! by constructing `nntune_logging::LogRecord::new(Worker::Stream, ...)` with
+//! the trace ID this module normalizes. The two renderers agree on the contract in
 //! `docs/logging-standard.md`: `stream` records carry the six shared fields
 //! (`ts`, `level`, `worker`, `trace_id`, `event`, `fields`) as a superset —
 //! legacy extras allowed — with the legacy lowercase `[a-z0-9_.]` event
