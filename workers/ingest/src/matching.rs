@@ -303,7 +303,11 @@ fn split_artist_album(query: &str) -> Option<(String, String)> {
 /// - Plain-title queries keep the scored pick, tightened to hits whose
 ///   normalized title is exactly the normalized query: the highest
 ///   score at or above [`MIN_MATCH_SCORE`], leading the runner-up by
-///   more than [`MIN_MATCH_MARGIN`]. Fuzzy near-misses write unmatched.
+///   more than [`MIN_MATCH_MARGIN`]. The floor gates the winner only:
+///   the runner-up is the next distinct MBID with a matching
+///   normalized title even when it scores below the floor, so a
+///   below-floor near-tie stays ambiguous instead of looking like a
+///   lone winner. Fuzzy near-misses write unmatched.
 ///
 /// Anything else — extra words in the query, edition suffixes, a
 /// featured-artist credit — yields `None` (unmatched) rather than a
@@ -333,19 +337,20 @@ pub fn pick_release_mbid(query: &str, hits: &[MbSearchHit]) -> Option<String> {
     if normalized_query.is_empty() {
         return None;
     }
-    let mut candidates: Vec<&MbSearchHit> = valid
-        .filter(|hit| {
-            hit.score >= MIN_MATCH_SCORE && normalize_match_text(&hit.title) == normalized_query
-        })
+    let mut matching: Vec<&MbSearchHit> = valid
+        .filter(|hit| normalize_match_text(&hit.title) == normalized_query)
         .collect();
-    candidates.sort_by(|a, b| {
+    matching.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(core::cmp::Ordering::Equal)
             .then_with(|| a.mbid.cmp(&b.mbid))
     });
-    let top = candidates.first()?;
-    if let Some(runner_up) = candidates.get(1) {
+    let top = matching.first()?;
+    if top.score < MIN_MATCH_SCORE {
+        return None;
+    }
+    if let Some(runner_up) = matching.iter().skip(1).find(|hit| hit.mbid != top.mbid) {
         if top.score - runner_up.score <= MIN_MATCH_MARGIN {
             return None;
         }
