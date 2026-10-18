@@ -333,6 +333,13 @@ Binding names are chosen in Worker configs; resource names must match this table
 | Ingest Queue | `nntunev2-ingest-staging` | `nntunev2-ingest-prod` |
 | Ingest DLQ / no consumer observed (Cloudflare metadata GET 2026-10-17; 345600 seconds observed, matching documented 4-day default with no active consumer) | `nntunev2-ingest-dlq-staging` (`e7ab1d4b284f44f094c5fe62f9bf96a5`) | `nntunev2-ingest-dlq-prod` (`e9d0a9f5549249df9eebaa5c00951328`) |
 | Config KV | `nntunev2-config-staging` | `nntunev2-config-prod` |
+| Stream NNTP pool (DO class) | `NntpPool` | `NntpPool` |
+| Repair jobs (DO class) | `RepairContainer` | `RepairContainer` |
+| Stream meter (AE dataset) | `nntune_meter` | `nntune_meter` |
+| Ingest meter (AE dataset) | `nntune_ingest_meter` | `nntune_ingest_meter` |
+| Stream service (ingest `NNTP_POOL` cross-script target) | `nntune-stream-staging` | `nntune-stream` |
+| Repair service (ingest `REPAIR_CONTAINER` target) | `nntune-repair-staging` | `nntune-repair` |
+| MB service (ingest `MB_API` target; Wrangler default-suffixed, no per-env `name` committed) | `nntune-mb-staging` | `nntune-mb-production` |
 | Hostname | `v2-staging.nntune.com` (+ Access; deployment pending) | TBD at launch |
 | App Hyperdrive variable | `HYPERDRIVE_ID_STAGING` | `HYPERDRIVE_ID_PROD` |
 | App PlanetScale branch / PostgreSQL database | `nntunev2` / `main` / `nntunev2_staging` | same `main` cluster / currently `postgres`; clean launch DB deferred |
@@ -364,8 +371,9 @@ tables above. Where a committed config still carries a stale name, the
 reconciliation table in the R2 section governs: align the config to this
 table, never the reverse. IDs below are non-credential binding metadata;
 no database URLs or secret values are recorded here. Non-storage bindings
-(Durable Object, Analytics Engine, Container service) are out of scope of
-this table.
+(Durable Object, Analytics Engine, service) are out of scope of
+this table; they are inventoried with per-environment values and committed
+config sources in the Non-storage bindings inventory below.
 
 | Worker (config source) | Binding | Type | staging | prod | ID / variable |
 |---|---|---|---|---|---|
@@ -385,6 +393,54 @@ Neither environment is represented by these values. Align producer, consumer,
 and DLQ names to the per-environment inventory before enabling the configs. Do
 not add a nested `[[queues.consumers.dead_letter_queue]]` table: Wrangler
 rejects that shape, so it will not configure dead-letter routing.
+
+### Non-storage bindings inventory (DO, Analytics Engine, service)
+
+Every non-storage binding with its owning worker, per-environment value,
+and committed config source (file with line ranges; code constants where
+they pin the name). No secret values and no uncommitted IDs are recorded
+here: Analytics Engine datasets and service/DO names below are all
+committed in the cited Wrangler configs. The Environments matrix above
+carries the same per-environment values; this table adds the owning
+worker and the exact config source for each row.
+
+| Binding | Type | Owning worker | staging | prod | Committed config source |
+|---|---|---|---|---|---|
+| `NNTP_POOL` (class declaration) | Durable Object | `stream` | class `NntpPool` | class `NntpPool` | `workers/stream/wrangler.toml:22-24` (top-level), `:44-46` (staging), `:56-58` (production); migration tag `v1` `:26-28`; code `workers/stream/src/runtime.rs:44`, `workers/stream/src/routes.rs:14` |
+| `NNTP_POOL` (cross-script use) | Durable Object | `ingest` → `stream` | script `nntune-stream-staging` | script `nntune-stream` | `workers/ingest/wrangler.toml.example:105-112` (pins the prod `script_name`; per-env resolution follows the stream worker names in `workers/stream/wrangler.toml:43,55`) |
+| `METER` | Analytics Engine | `stream` | dataset `nntune_meter` | dataset `nntune_meter` | `workers/stream/wrangler.toml:38-40` (top-level), `:50-52` (staging), `:62-64` (production); code `workers/stream/src/observability.rs:23` |
+| `INGEST_METER` | Analytics Engine | `ingest` | dataset `nntune_ingest_meter` | dataset `nntune_ingest_meter` | `workers/ingest/wrangler.toml.example:124-127`; code `workers/ingest/src/metering.rs:16-18` |
+| `REPAIR_CONTAINER` | service | `ingest` → `repair` | service `nntune-repair-staging` | service `nntune-repair` | `workers/ingest/wrangler.toml.example:129-133` (pins the prod service name); target names `workers/repair/wrangler.toml:15` (prod default), `:50` (staging), `:69` (prod); contract note `:3-6`; code `workers/ingest/src/repair.rs:19` |
+| `MB_API` | service | `ingest` → `mb` | service `nntune-mb-staging` | service `nntune-mb-production` | `workers/ingest/wrangler.toml.example:135-140` (single `service = "nntune-mb"`, needs env split); target top-level `name = "nntune-mb"` `workers/mb/wrangler.toml.example:3` with no per-env `name` in `:28-39` (staging) or `:41-52` (production), so Wrangler publishes `nntune-mb-staging` / `nntune-mb-production`; code `workers/ingest/src/matching.rs:27` |
+| `REPAIR_JOBS` | Durable Object | `repair` | class `RepairContainer` | class `RepairContainer` | `workers/repair/wrangler.toml:33-35` (top-level), `:61-63` (staging), `:80-82` (production); migration tag `v1` `:37-39`; Container class/image/sizing `:23-31`, `:52-60`, `:71-79`; code `workers/repair/src/runtime.rs:122` |
+
+Notes, all referencing (not changing) owning-lane state:
+
+- The committed ingest example carries single (non-env-split) values for
+  its cross-script and service targets (`script_name = "nntune-stream"`,
+  `service = "nntune-repair"`, `service = "nntune-mb"`). Stream and repair
+  have explicit per-env `name` overrides committed in their configs, so
+  their per-environment resolution follows the target workers' committed
+  names above; mb has no per-env `name` (`workers/mb/wrangler.toml.example:3`
+  only, none in `:28-39` or `:41-52`), so its per-environment values above
+  are the Wrangler default-suffixed names and ingest's single
+  `service = "nntune-mb"` needs the same env split. Wiring the env split is
+  owned by the integration lane, like the ingest queue-name drift recorded
+  in the R2 reconciliation table and the paragraph above.
+- The repair Worker is not yet deployed: its config header
+  (`workers/repair/wrangler.toml:11-13`) requires Cloudflare Containers on
+  the existing plan (no new spend) with deploy as a later operator action.
+  Until then the `REPAIR_CONTAINER` target names are reserved, not live —
+  and ingest cannot deploy with the committed example until the repair
+  target exists, because Cloudflare fails a deploy whose service-binding
+  target does not exist.
+- Deploy order is stream, mb, and repair (once Containers are enabled)
+  before ingest. Ingest reaches the per-user `NntpPool` object through the
+  cross-script `NNTP_POOL` binding (`workers/stream/wrangler.toml:4-8`),
+  and it declares unconditional `[[services]]` bindings to `nntune-repair`
+  and `nntune-mb` (`workers/ingest/wrangler.toml.example:129-140`; mb-first
+  is also stated at `:135-137`). Ingest cannot deploy with the committed
+  example until those service targets exist.
 
 ## Staging promotion checklist
 
