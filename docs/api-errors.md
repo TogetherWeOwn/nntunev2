@@ -213,7 +213,8 @@ code, status, or retryable drift):
   `spec`/`FALLBACK`), pinned by each module's
   `envelope_is_exactly_code_message_retryable`,
   `server_error_messages_are_sealed_to_public_text` (stream:
-  `registered_server_errors_use_fixed_public_messages`), and
+  `registered_server_errors_use_fixed_public_messages`; mb: sealing is
+  asserted inside `envelope_is_exactly_code_message_retryable`), and
   `unknown_code_falls_back_to_the_documented_generic` tests.
 - Intake refusals and ingest extras: `workers/ingest/src/nzb_intake.rs`
   (intake codes and caps), `intake_rejection_parts` and `queued_body` in
