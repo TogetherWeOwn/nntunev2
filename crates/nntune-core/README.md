@@ -6,7 +6,7 @@ native targets (services, Container batch jobs).
 
 | Module | What |
 |---|---|
-| `nntp` | NNTP client (RFC 3977): greeting, `MODE READER`, `AUTHINFO`, `GROUP`, `STAT`, `ARTICLE`, `BODY`, `QUIT`, pipelined `fetch_many`; `430`/`481`/`502` mapped to typed errors |
+| `nntp` | NNTP client (RFC 3977): greeting, `MODE READER`, `AUTHINFO`, `GROUP`, `STAT`, `ARTICLE`, `BODY`, `QUIT`, pipelined `fetch_many`; `430`/`480`/`481`/`502` (plus `482` on `AUTHINFO`) mapped to typed errors |
 | `transport` | Portable `Transport` byte-pipe trait + CRLF/dot-block framing; every impl enforces per-op timeouts as `TimedOut` |
 | `transports::tokio_tls` | Native transport: tokio TCP with optional rustls (Mozilla roots), feature `native-tls` |
 | `transports::worker_socket` | Workers transport over `connect()`, timeouts via `worker::Delay`, feature `worker-transport` (wasm32) |
