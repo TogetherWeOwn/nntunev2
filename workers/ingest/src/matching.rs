@@ -139,10 +139,19 @@ fn encode_query_value(value: &str) -> String {
 }
 
 /// Absolute MB release-search URL for the `MB_API` service binding.
+///
+/// The `q=` value is the album-title retrieval text (see
+/// [`album_retrieval_query`]): for an "Artist - Album" query the album
+/// side alone, otherwise the query unchanged. Verification still uses
+/// the original query in [`pick_release_mbid`] — the queue caller
+/// passes the same query to both — so retrieval widens while the pick
+/// stays exact and nothing is ever accepted on title alone.
 pub fn mb_search_url(query: &str) -> String {
+    let retrieval = album_retrieval_query(query);
+    let text = retrieval.as_deref().unwrap_or(query);
     format!(
         "{MB_SERVICE_HOST}/v1/mb/search?type=release&q={}",
-        encode_query_value(query)
+        encode_query_value(text)
     )
 }
 
@@ -266,19 +275,25 @@ fn normalize_match_text(raw: &str) -> String {
         .join(" ")
 }
 
+/// Fold separator dashes (en/em dash, minus sign — as pasted from the
+/// web) to the ASCII hyphen so they count as the " - " separator.
+fn fold_separator_dashes(query: &str) -> String {
+    query
+        .chars()
+        .map(|c| match c {
+            '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
+            _ => c,
+        })
+        .collect()
+}
+
 /// Split an "Artist - Album" query into its normalized parts, when it
 /// has that shape (the shape [`derive_upload_query`] produces).
 /// Typographic dashes (en/em dash, minus sign — as pasted from the web)
 /// count as the separator hyphen. A query without " - ", or with an
 /// empty side, has no artist part.
 fn split_artist_album(query: &str) -> Option<(String, String)> {
-    let folded: String = query
-        .chars()
-        .map(|c| match c {
-            '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
-            _ => c,
-        })
-        .collect();
+    let folded = fold_separator_dashes(query);
     let (artist, album) = folded.split_once(" - ")?;
     let artist = normalize_match_text(artist);
     let album = normalize_match_text(album);
@@ -286,6 +301,32 @@ fn split_artist_album(query: &str) -> Option<(String, String)> {
         return None;
     }
     Some((artist, album))
+}
+
+/// Album-title retrieval text for an "Artist - Album" query.
+///
+/// The MB release search is a title-only predicate (`workers/mb`
+/// `Kind::Release`: `WHERE r.title % $1`, scored by
+/// `similarity(r.title, $1)`), so sending the whole `Artist - Album`
+/// identity lets a long artist push a short correct title below the
+/// retrieval bar before verification ever runs. For the shape
+/// [`split_artist_album`] already recognizes — the shape the pick
+/// verifies — send the album side alone, edition text such as `(Live)`
+/// / `[Remastered]` included, while the caller keeps passing the
+/// original identity to [`pick_release_mbid`].
+///
+/// Returns `None` when the query has no recognized shape (plain titles
+/// are sent unchanged) or when the album side would by itself be an
+/// invalid MB query (see [`validate_match_query`], e.g. a
+/// one-character title); the caller then sends the original query it
+/// already validated. Query limits are not widened and no SQL changes.
+fn album_retrieval_query(query: &str) -> Option<String> {
+    // Only the shape the pick verifies as Artist - Album: a query the
+    // pick treats as a plain title stays on the plain-title path.
+    split_artist_album(query)?;
+    let folded = fold_separator_dashes(query);
+    let album = folded.split_once(" - ")?.1;
+    validate_match_query(album)
 }
 
 /// Deterministic, ambiguity-rejecting release pick. What it can and
