@@ -19,13 +19,16 @@
 //! - **Stable codes:** [`TransportRejection::code`] returns
 //!   `transport_tls_required`, `transport_port_not_allowed`
 //!   (port payload never changes the code), `transport_cancelled`. The
-//!   native [`crate::transports::tokio_tls::connect_pinned`] entry point runs
-//!   the same validation before any TCP dial and embeds the same codes in
-//!   its `io::Error` message. The general
-//!   [`crate::transports::tokio_tls::connect`] stays permissive on purpose:
-//!   the stream/ingest fixture harnesses and the client unit tests dial
-//!   plaintext loopback servers through it (pool/stream changes are out of
-//!   scope); the NZB fetch path must use `connect_pinned`.
+//!   pinned entry points run the same validation before any dial and embed
+//!   the same codes: native `connect_pinned` (`io::Error`, `InvalidInput`)
+//!   and wasm32 `WorkerTransport::connect_pinned`
+//!   (`worker::Error::RustError`). The general `connect` entry points stay
+//!   permissive on purpose: the stream/ingest fixture harnesses and the
+//!   client unit tests dial plaintext loopback servers through them
+//!   (pool/stream call-site changes are out of scope); the NZB fetch path
+//!   must use the pinned entry point for its target (native or Workers).
+//!   This is an NNTP dial policy for NZB fetch, not the HTTPS pinned-443
+//!   contract.
 //! - **Diagnostics are names-only:** `Display`/`Debug` render host, port and
 //!   code material only — never the configured username or password.
 //!

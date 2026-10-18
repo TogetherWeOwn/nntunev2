@@ -43,15 +43,19 @@ wiring consumes (separate intake card, untouched here):
   resolves the fetch unless `cancel` resolves first (fetch wins ties). A
   cancelled session has unknown wire state: discard the client and
   reconnect, never reuse it. The fetch future is dropped at cancel. The
-  native `transports::tokio_tls::connect_pinned` entry point runs the same
-  validation before any TCP dial (the general `connect` stays permissive for
-  the plaintext loopback fixtures used by the stream/ingest harnesses and
-  client unit tests; NZB fetch must use `connect_pinned`).
+  pinned entry points run the same validation before any dial — native
+  `transports::tokio_tls::connect_pinned` and wasm32
+  `WorkerTransport::connect_pinned` (the general `connect` entry points stay
+  permissive for the plaintext loopback fixtures used by the stream/ingest
+  harnesses and client unit tests; NZB fetch must use the pinned entry point
+  for its target). This is an NNTP dial policy for NZB fetch, not the HTTPS
+  pinned-443 contract.
 - **Stable codes:** `TransportRejection::code()` returns
   `transport_tls_required` (`TlsRequired`), `transport_port_not_allowed`
   (`PortNotAllowed(port)` — the payload never changes the code), and
   `transport_cancelled` (`Cancelled`). The native connect error embeds the
-  same code in its `io::Error` message (`InvalidInput`).
+  same code in its `io::Error` message (`InvalidInput`); the Workers
+  `connect_pinned` error carries it in `worker::Error::RustError`.
 - **Names-only diagnostics:** `Display`/`Debug` for `TransportRejection` and
   `ValidatedEndpoint` render host, port and code material only — never the
   configured username or password. Shared path is `std`-only (cancellation
