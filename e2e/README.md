@@ -203,11 +203,12 @@ How the suite uses them:
 - **Prod promotion gate (required integration):** the deployment lane must
   require the post-deploy full-journey result (the `post-deploy-e2e` job in
   the same `deploy.yml` run as the successful `staging-web` deploy) and
-  block promotion on failure. Sequencing after the deploy is wired;
-  blocking a later production promotion on that result, and live
-  enforcement, are still acceptance prerequisites of that later lane. A
-  source SHA is not deployed-build identity, so the result is not
-  same-build evidence until build identity is separately proven.
+  block promotion on failure. Sequencing after the deploy is wired, and the
+  full journey now carries same-build evidence: `build-identity.spec.ts`
+  compares `GET /api/build` (baked at build time) with the promotion SHA
+  `deploy.yml` passes as `expected_sha` from `github.sha` — never a source
+  checkout. Blocking a later production promotion on that result, and live
+  enforcement, are still acceptance prerequisites of that later lane.
 
 ## Evidence
 
@@ -228,9 +229,10 @@ is absent from every uploaded file including base64-decoded payloads. Do not
 enable traces/screenshots or the html reporter for credential-bearing runs
 without a verified redaction path. A QA PASS verdict cites the green
 post-deploy run URL (the `deploy.yml` run whose `staging-web` succeeded
-and whose `post-deploy-e2e` full journey passed) + the source head SHA —
-never a scheduled/manual synthetic run, which is monitoring only; NEEDS
-WORK cites the failing spec + step. Every spec that branches on the test-account seam records a
+and whose `post-deploy-e2e` full journey passed) + the deployed head SHA
+(the promotion SHA proven equal to `GET /api/build` by
+`build-identity.spec.ts`) — never a scheduled/manual synthetic run, which
+is monitoring only; NEEDS WORK cites the failing spec + step. Every spec that branches on the test-account seam records a
 bounded `signup-path` test annotation — exactly `public-ui-signup` or
 `api-minted-account`, with no email, account id, token or provider data.
 Both staging jobs publish those labels to the run's step summary on every

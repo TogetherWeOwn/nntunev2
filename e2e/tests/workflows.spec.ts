@@ -165,6 +165,7 @@ test.describe('credential scope (static pins)', () => {
       'player-queue-order.spec.ts',
       'demo-audio-contract.spec.ts',
       'demo-media-sessionless.spec.ts',
+      'build-identity.spec.ts',
     ]) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must not carry credentials on a raw request call`).not.toMatch(
@@ -177,6 +178,7 @@ test.describe('credential scope (static pins)', () => {
       'player-queue-order.spec.ts',
       'demo-audio-contract.spec.ts',
       'demo-media-sessionless.spec.ts',
+      'build-identity.spec.ts',
     ]) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must use the no-follow wrapper`).toContain('apiGet(');
@@ -1191,5 +1193,81 @@ test.describe('deploy.yml carries no backend Worker deploy job', () => {
     expect(() => assertDeployBody(flagFirstMutant)).toThrow();
     expect(() => assertNoBackendPath(envMappingMutant)).toThrow();
     expect(() => assertNoBackendPath(quotedEnvMutant)).toThrow();
+  });
+});
+
+test.describe('deployed-build identity wiring (static pin)', () => {
+  // Same-build evidence: the full journey proves the serving build is the
+  // promoted one by comparing GET /api/build with the promotion SHA from the
+  // push-triggered deploy run — never a source checkout. These pins keep the
+  // chain (deploy expected_sha -> e2e-staging input -> EXPECTED_BUILD_SHA env
+  // -> build-identity spec) honest offline.
+  test('e2e-staging declares the expected_sha promotion input', () => {
+    expect(stagingWorkflow).toContain('expected_sha:');
+    expect(stagingWorkflow).toContain('Promotion SHA from the push-triggered deploy run');
+  });
+
+  test('deploy passes expected_sha from github.sha (never a checkout)', () => {
+    const section = jobSection(deployWorkflow, 'post-deploy-e2e');
+    expect(section).toContain('expected_sha: ${{ github.sha }}');
+    expect(section).not.toContain('rev-parse');
+  });
+
+  test('the e2e job exposes EXPECTED_BUILD_SHA from inputs.expected_sha', () => {
+    const section = jobSection(stagingWorkflow, 'e2e');
+    expect(section).toContain('EXPECTED_BUILD_SHA: ${{ inputs.expected_sha }}');
+  });
+
+  test('contract carries the build identity path', () => {
+    const contract = readFileSync(new URL('../helpers/contract.ts', import.meta.url), 'utf8');
+    expect(contract).toContain("build: '/api/build'");
+  });
+
+  test('build-identity helper exposes the promotion/verdict contract', () => {
+    const helper = readFileSync(
+      new URL('../helpers/build-identity.ts', import.meta.url),
+      'utf8',
+    );
+    expect(helper).toContain('export function expectedPromotionSha');
+    expect(helper).toContain('export function extractDeployedSha');
+    expect(helper).toContain('export function assertDeployedBuildMatchesPromotion');
+    expect(helper).toContain('EXPECTED_BUILD_SHA');
+    // Never a source checkout: the helper reads the run-provided env and
+    // performs pure string comparison — no shell-out to git, no checkout read.
+    // It never gates on staging itself (skip ownership stays with the spec).
+    expect(helper).not.toContain('child_process');
+    expect(helper).not.toContain('spawnSync');
+    expect(helper).not.toContain('execSync');
+    expect(helper).not.toContain('process.env.STAGING_BASE_URL');
+    expect(helper).not.toContain('stagingBaseUrl(');
+  });
+
+  test('build-identity spec compares the serving build with the promotion SHA', () => {
+    const spec = readFileSync(new URL('../tests/build-identity.spec.ts', import.meta.url), 'utf8');
+    expect(spec).toContain(
+      'deployed build matches the promotion SHA (exact-head staging evidence)',
+    );
+    expect(spec).toContain('API.build');
+    expect(spec).toContain('expectedPromotionSha(');
+    expect(spec).toContain('extractDeployedSha(');
+    expect(spec).toContain('assertDeployedBuildMatchesPromotion(');
+    expect(spec).toContain('assertNoAccessWall(');
+    expect(spec).toContain('apiGet(');
+    // Fail-closed: unknown and mismatch paths are pinned in the offline
+    // describe of the same file (not restated here).
+    expect(spec).toContain("'unknown'");
+    // Pre-deploy skip is in-test on STAGING_BASE_URL only — no file-level
+    // skip, so the offline verdict pins still run via test:unit.
+    expect(spec).toContain('STAGING_BASE_URL not configured (pre-deploy)');
+    expect(spec).not.toMatch(/^test\.skip\(\s*\n?\s*!process\.env\.STAGING_BASE_URL/m);
+  });
+
+  test('synthetic smoke stays health-only (monitoring cannot mint same-build evidence)', () => {
+    const pkg = JSON.parse(
+      readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+    ) as { scripts: Record<string, string> };
+    expect(pkg.scripts['e2e:smoke']).toContain('tests/health.spec.ts');
+    expect(pkg.scripts['e2e:smoke']).not.toContain('build-identity');
+    expect(pkg.scripts['test:unit']).toContain('tests/build-identity.spec.ts');
   });
 });

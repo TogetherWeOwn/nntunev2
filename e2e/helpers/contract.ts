@@ -35,6 +35,10 @@ export const TESTIDS = {
 export const API = {
   health: '/api/health',
   ready: '/api/ready',
+  // Deployed-build identity surface (`apps/web/src/routes/api/build/+server.ts`,
+  // baked SHA from `src/lib/build.ts`). A renamed path fails the
+  // build-identity spec with this key named.
+  build: '/api/build',
   testAccounts: '/api/test-accounts',
   // Staging-only emailed-code retrieval seam (paired staging-seam build slice):
   // returns the issued signup code for an `example.test` mailbox without
