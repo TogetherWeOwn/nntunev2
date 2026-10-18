@@ -111,8 +111,14 @@ missing or unparseable code, or a status outside that list, becomes 502
 `container_unavailable`. Six of the listed codes
 (`invalid_manifest`, `repair_manifest_conflict`, `repair_timeout`,
 `repair_resource`, `repair_failed`, `scratch_input_mismatch`) are
-repair-only with no registry row — the unregistered repair taxonomy
-this section records.
+container-origin repair-only codes with no registry row (two of the
+six — `invalid_manifest` and `scratch_input_mismatch` — are also
+emitted directly by the repair worker itself:
+`workers/repair/src/contract.rs:121,127` and
+`workers/repair/src/runtime.rs:325,356`). The repair worker also emits
+`container_unavailable` (502), `scratch_unavailable` (503),
+`repair_unavailable` (500/503), and `scratch_missing` (404) directly
+(not through `leak_code`); those have no registry row either.
 
 This registry currently carries no repair rows: every row in the table
 above names an owning worker drawn from api, ingest, mb, and stream,
