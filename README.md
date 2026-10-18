@@ -90,10 +90,12 @@ cargo test --workspace
 # repair}/Cargo.lock, apps/web/pnpm-lock.yaml, e2e/package-lock.json).
 # Committed lockfiles are not the same as --locked enforcement: the
 # cargo-deny job's `Prove committed lockfiles are fresh` step proves all
-# five Cargo lockfiles fresh (.github/workflows/ci.yml), but only the api
-# job passes --locked to test/clippy/check (.github/workflows/ci.yml);
-# the rust (workers/mb), rust (workers/ingest) and rust (workers/repair)
-# jobs resolve without --locked (.github/workflows/ci.yml).
+# five Cargo lockfiles fresh (.github/workflows/ci.yml), but of the Worker
+# jobs only the api job passes --locked to test/clippy/check
+# (.github/workflows/ci.yml); the rust (workers/mb), rust (workers/ingest)
+# and rust (workers/repair) jobs resolve without --locked
+# (.github/workflows/ci.yml). (The workspace rust-test job separately pins
+# one --locked probe: nntune-core --no-default-features.)
 cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets
 cargo test --manifest-path workers/mb/Cargo.toml --all-targets
 cargo test --manifest-path workers/ingest/Cargo.toml --all-targets
@@ -108,9 +110,9 @@ npm run e2e:list
 ```
 
 `npm run e2e:list` compiles the suite and lists the specs with no staging
-needed. Discovery snapshot, verified 2026-10-17 via
-`npm --prefix e2e run e2e:list` (with dev dependencies installed): 265
-tests in 17 files. Totals drift as specs land — re-run the command for a
+needed. Discovery snapshot, verified 2026-10-18 via
+`npm --prefix e2e run e2e:list` (with dev dependencies installed): 339
+tests in 20 files. Totals drift as specs land — re-run the command for a
 fresh count rather than quoting this one. Live staging runs stay in
 CI — see below.
 
