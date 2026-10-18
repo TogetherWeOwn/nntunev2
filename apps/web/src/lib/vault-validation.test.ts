@@ -73,6 +73,25 @@ describe('validateProviderConfig', () => {
 		}
 	});
 
+	it('pins the exact provider port diagnostic string', () => {
+		expect(validateProviderConfig({ ...good, port: 80 })).toContain('Port must be 119 or 563.');
+		expect(validateProviderConfig({ ...good, port: 119 })).toEqual([]);
+		expect(validateProviderConfig({ ...good, port: 563 })).toEqual([]);
+	});
+
+	it('pins the exact connections diagnostic string', () => {
+		// Sensitivity: the 0/1 and 50/51 boundary pairs catch an off-by-one in
+		// MAX_CONNECTIONS_LIMIT (50); either side going clean/rejected flips this test.
+		expect(validateProviderConfig({ ...good, maxConnections: 0 })).toContain(
+			'Connections must be between 1 and 50.'
+		);
+		expect(validateProviderConfig({ ...good, maxConnections: 51 })).toContain(
+			'Connections must be between 1 and 50.'
+		);
+		expect(validateProviderConfig({ ...good, maxConnections: 1 })).toEqual([]);
+		expect(validateProviderConfig({ ...good, maxConnections: 50 })).toEqual([]);
+	});
+
 	it('requires an explicit acknowledgement for plaintext auth', () => {
 		expect(
 			validateProviderConfig({ ...good, tls: false, allowInsecurePlaintext: false }).length
