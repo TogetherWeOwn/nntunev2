@@ -885,6 +885,61 @@ prod = "fx-jobs"
             self.assertIn("::error::binding-parity:", output.getvalue())
             self.assertNotIn("Traceback", output.getvalue())
 
+    def assert_queues_shape_fails_closed(self, wrangler, pattern):
+        # Fail-closed pin for the queues not-a-table family
+        # (binding_parity.py:158-170): exit 2 with the exact diagnostic on
+        # the ::error::binding-parity: annotation, never exit 1 and never
+        # an uncaught traceback. Synthetic fixture ids must never leak.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp, wrangler=wrangler)
+            with self.assertRaisesRegex(ParityError, pattern):
+                run_check(root)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
+                stderr
+            ):
+                code = main(["--root", str(root)])
+            self.assertEqual(2, code)
+            self.assertNotEqual(1, code)
+            combined = stdout.getvalue() + stderr.getvalue()
+            self.assertIn("::error::binding-parity:", stdout.getvalue())
+            self.assertRegex(combined, pattern)
+            self.assertNotIn("Traceback", combined)
+            self.assertNotIn("fx-", combined)
+
+    def test_queues_not_a_table_fails_closed_with_exit_two(self):
+        # Non-table [env.staging.queues] is malformed, not absent: it must
+        # fail closed instead of being silently ignored.
+        wrangler = MATCHING_WRANGLER.replace(
+            "[env.staging]\n", '[env.staging]\nqueues = "oops"\n', 1
+        )
+        self.assert_queues_shape_fails_closed(
+            wrangler, r"queues: not a table"
+        )
+
+    def test_queues_consumer_entry_not_a_table_fails_closed_with_exit_two(self):
+        # A queues.consumers list entry that is not a table is malformed,
+        # not absent: it must fail closed.
+        wrangler = MATCHING_WRANGLER + (
+            "\n[env.staging.queues]\nconsumers = [\"oops\"]\n"
+        )
+        self.assert_queues_shape_fails_closed(
+            wrangler, r"queues\.consumers: entry is not a table"
+        )
+
+    def test_queues_consumer_entry_without_queue_fails_closed_with_exit_two(self):
+        # A consumer entry with an empty queue names no queue: it must fail
+        # closed with the entry-without-queue diagnostic (a missing key hits
+        # the adjacent 'queue' must be a string arm instead).
+        wrangler = MATCHING_WRANGLER + (
+            "\n[env.staging.queues]\n"
+            "[[env.staging.queues.consumers]]\nqueue = \"\"\n"
+        )
+        self.assert_queues_shape_fails_closed(
+            wrangler, r"queues\.consumers: entry without 'queue'"
+        )
+
     def test_non_string_binding_fails_closed_with_exit_two(self):
         wrangler = MATCHING_WRANGLER.replace(
             "[[env.staging.hyperdrive]]",
