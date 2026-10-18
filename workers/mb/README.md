@@ -30,7 +30,7 @@ are `400` (`invalid_request`); a well-formed MBID with no row and unknown routes
 (`not_found`); mirror read failures are a generic `500` (`internal_error`, fixed
 `"unexpected error"` message — no DB detail leaves the worker).
 (Sources: `workers/mb/src/api_error.rs:17-33,55-102`;
-`docs/api-errors.md:67-75`; unknown-route handler `lib.rs:957-969`.)
+`docs/api-errors.md:74-82`; unknown-route handler `lib.rs:957-969`.)
 Lookup success is the flat entity fields plus `"kind"`;
 search success is `{"q", "type", "results": [{"mbid", "name"|"title",
 "score"}]}`; release results also carry `artist_mbid`/`artist_name`
