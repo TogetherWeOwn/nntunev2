@@ -2,13 +2,12 @@
 --
 -- What: inserts the one release the staging E2E ingests
 -- (`e2e/fixtures/synthetic.nzb`, 660 Hz sine track) into the mirror schema
--- (`migrations/0001_mb_mirror.sql` + `0016_mb_track.sql`). The paired
--- seed-verification test
--- (`workers/mb/tests/sql/mirror_seed_synthetic_fixture_verify.sql`)
--- owns the expected rows; this file owns inserting them.
+-- (`migrations/0001_mb_mirror.sql` + `0016_mb_track.sql`). Expected rows
+-- are pinned by the paired acceptance-test change (separate from this PR);
+-- this file owns inserting them.
 --
 -- Fixture rows (the builder contract; do not drift without updating the
--- verification and `e2e/tests/mb-mirror-seed.spec.ts`):
+-- paired verification):
 --   mb_artist    11111111-1111-1111-1111-111111111111  'NNTune Fixture Artist'
 --   mb_release   22222222-2222-2222-2222-222222222222  'NNTune-Fixture sine-660'
 --   mb_recording 33333333-3333-3333-3333-333333333333  same title, track 1, 210 ms
@@ -27,9 +26,11 @@
 --
 -- No credentials in this file: the caller supplies the connection via the
 -- DATABASE_URL environment variable only (see workers/mb/seed/README.md).
--- Never point this at production. The staging apply is out of scope here:
--- an authorized host executor applies it under the existing mirror access
--- grant and re-runs the verification read-only as evidence.
+-- Target is the single shared `nntunev2-mb` mirror, also read by prod:
+-- synthetic rows become visible to prod reads. Apply only with explicit
+-- mirror-owner approval via an authorized host executor under the
+-- existing mirror access grant. The staging apply itself is out of scope
+-- here.
 
 -- 1. Fixture artist.
 INSERT INTO mb_artist (mbid, name, sort_name)
