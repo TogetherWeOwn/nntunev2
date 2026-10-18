@@ -26,7 +26,7 @@ makes drift fail CI.
   stringly KV lookups on config paths in new code. Ordinary tuning constants
   may migrate to the accessor incrementally; security invariants are not
   configuration knobs and remain enforced in code (for example, the vault
-  indexer must never follow redirects per F-VAULT-01).
+  indexer must never follow redirects per F-INGEST-01).
 - **Precedence is KV first, environment second.** `apply_env` only consults
   keys declared `env_overridable`, and only through their documented
   `env_var` name. Everything else in the environment is ignored.
@@ -51,7 +51,7 @@ makes drift fail CI.
 ## CI
 
 The `config-parity` job (part of the required `ci-ok` gate) runs the parity
-check on the shipped fixtures, the script's self-tests, and the
+check on the shipped schema and environment files, the script's self-tests, and the
 duplicate-member tests. It fails on a missing required key, a type
 mismatch, an undeclared key, or a staging/prod key-set asymmetry, and
 passes on identical fixtures or fixtures that differ in values only.
@@ -80,6 +80,9 @@ passes on identical fixtures or fixtures that differ in values only.
   required (`:3`) with `config-parity` in needs (`:753`); `cargo test
   --workspace` in `rust-test` (`:47-51`) covers `crates/nntune-config`
   (workspace member per `Cargo.toml:2`).
-- Vault redirect example: `workers/api/src/vault.rs:46`,
-  `docs/security/threat-model.md:60` (F-VAULT-01 forbids redirects);
-  rejected-as-unknown-key pin at `lib.rs:417-425`.
+- Indexer redirect example: `workers/api/src/vault.rs:46-47`
+  (`INDEXER_ALLOW_REDIRECTS = false`),
+  `docs/security/threat-model.md:61` (F-INGEST-01 requires redirects to be
+  forbidden; the fetch-policy model follows up to 3 re-validated redirects —
+  unresolved discrepancy, see also `:193`); rejected-as-unknown-key pin at
+  `lib.rs:417-425`.
