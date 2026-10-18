@@ -216,6 +216,18 @@ class TestMigrationGateContract(MigrationsGateTestCase):
 
         self.assert_cli_error(result)
 
+    def test_directory_manifest_is_a_read_error(self):
+        self.write_migration("0001_first.sql")
+        (self.migrations / "manifest.toml").mkdir()
+
+        result = self.run_gate()
+
+        output = result.stdout + result.stderr
+        self.assertEqual(2, result.returncode, output)
+        self.assertEqual("", result.stdout, output)
+        self.assertIn("cannot read", result.stderr, output)
+        self.assertNotIn("Traceback", output)
+
     def test_repository_manifest_and_migrations_pass(self):
         manifest_path = REPO_ROOT / "migrations" / "manifest.toml"
         self.assertTrue(manifest_path.is_file(), "migrations/manifest.toml is required")
