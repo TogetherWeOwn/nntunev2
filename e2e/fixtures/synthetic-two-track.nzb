@@ -8,9 +8,13 @@
   (NZB → ingest → library) as a fresh test account and requires ≥2
   distinct synthetic tracks in the library. On current ingest one upload
   is one job and one library row per idempotency key (per-file manifest
-  pending, see ADR 0002 accepted-audio-manifest), so ≥2 rows also needs
-  that manifest or two single-file uploads — until then the leg keeps
-  failing with the precondition by name (red is the signal, never a timeout).
+  pending, see ADR 0002 accepted-audio-manifest), so THIS file alone
+  still yields a single row: the passing path is two single-file uploads
+  (synthetic.nzb plus synthetic-second-track.nzb) through the existing
+  staged loop — two jobs, two rows, valid under the current writer and
+  the future manifest alike. That staging-leg switch is the paired Test
+  Author follow-up on this branch; until it lands the leg keeps failing
+  with the precondition by name (red is the signal, never a timeout).
 
   Contract (checked by e2e/fixtures/two-track-self-check.mjs; keep the
   pinned values there in sync with any edit here):

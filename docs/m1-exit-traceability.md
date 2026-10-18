@@ -156,9 +156,13 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   `synthetic-two-track.nzb` has landed in `e2e/fixtures/`, the leg stages it
   alone — on current ingest one upload is one job and one library row per
   idempotency key, so two rows also needs the per-file manifest (ADR 0002
-  accepted-audio-manifest) or two single-file uploads; until then the leg
-  keeps failing with the documented single-track signature (red is the
-  signal, never a timeout). Fixture support for the row 4 queue-order leg, not
+  accepted-audio-manifest) or two single-file uploads (`synthetic.nzb` plus
+  the new `synthetic-second-track.nzb`, both covered by the same self-check
+  gate with exact segment IDs, corpus bytes, group and distinct queries);
+  the staging-leg switch to that two-upload path is the paired Test Author
+  follow-up, and until it lands the leg keeps failing with the documented
+  single-track signature (red is the signal, never a timeout). Fixture support
+  for the row 4 queue-order leg, not
   an M1 exit step — and never the no-auth demo-audio route or its
   `second-signal` track ids.
 - `e2e/tests/cost-basis.spec.ts` pins the cost-basis worksheet arithmetic

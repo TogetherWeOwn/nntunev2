@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 /**
- * Offline self-check for `synthetic-two-track.nzb` (paired fixture build).
+ * Offline self-check for the two-track fixture NZBs (paired fixture build).
+ *
+ * Covers `synthetic-two-track.nzb` (two files, one upload) and
+ * `synthetic-second-track.nzb` (the 440 Hz tone as its own single-file
+ * upload, for the two-upload staging path that passes under the current
+ * one-row-per-upload ingest writer).
  *
  * Not a Playwright spec (so `e2e:list` and the traceability gate ignore it):
  * run with `node e2e/fixtures/two-track-self-check.mjs` from the repo root.
- * Exit 0 prints the two staged tracks; exit 1 names the missing/broken
- * track — a partial failure (e.g. file 2 edited to an unserved ID) fails
+ * Exit 0 prints the staged tracks; exit 1 names the missing/broken
+ * file — a partial failure (e.g. file 2 edited to an unserved ID) fails
  * HERE by track name instead of surfacing later as a staging timeout.
  *
  * Pinned values are vendored from `crates/nntune-test-nntp/src/fixtures.rs`
@@ -58,6 +63,18 @@ const CORPUS_GROUP = 'alt.binaries.nntune.test';
 
 /** Single-track match query the first file's subject must still derive. */
 const SINGLE_TRACK_QUERY = 'NNTune-Fixture sine-660';
+
+const SECOND_NZB_PATH = path.resolve(here, 'synthetic-second-track.nzb');
+
+/**
+ * Second single-file upload: exact segment IDs, verbatim subject and the
+ * distinct match query it must derive (never the 660 Hz query, so the two
+ * single-file uploads cannot share a match query).
+ */
+const SECOND_TRACK_SEGMENTS = ['<single-yenc-001@nntune.test>'];
+const SECOND_TRACK_SUBJECT = 'NNTune-Fixture sine-440 [01/01] - "sine-440.wav" yEnc (1/1)';
+const SECOND_TRACK_QUERY = 'NNTune-Fixture sine-440';
+const SECOND_LABEL = 'second-track single-file (sine-440)';
 
 function unescape(s) {
   return s
@@ -156,10 +173,7 @@ if (files.length !== 2) {
   fail(`fixture carries ${files.length} <file> entr(y/ies), expected exactly 2 distinct tracks`);
 }
 
-const subjects = [];
-files.forEach((file, fi) => {
-  const label = TRACK_LABELS[fi] ?? `track ${fi + 1} (unexpected extra file)`;
-  subjects.push(file.subject);
+function checkFile(file, label, expectedIds) {
   if (file.segments.length === 0) {
     fail(`${label} declares no <segment>s — ingest would reject the file`);
     return;
@@ -169,7 +183,6 @@ files.forEach((file, fi) => {
   if (JSON.stringify(numbers) !== JSON.stringify(expected)) {
     fail(`${label} segment numbers [${numbers}] are not contiguous 1..=N in order`);
   }
-  const expectedIds = EXPECTED_TRACK_SEGMENTS[fi];
   const actualIds = file.segments.map((s) => s.id);
   if (expectedIds !== undefined && JSON.stringify(actualIds) !== JSON.stringify(expectedIds)) {
     fail(
@@ -196,6 +209,13 @@ files.forEach((file, fi) => {
   if (!file.groups.includes(CORPUS_GROUP)) {
     fail(`${label} does not list group ${CORPUS_GROUP} (groups: ${file.groups.join(', ') || '(none)'})`);
   }
+}
+
+const subjects = [];
+files.forEach((file, fi) => {
+  const label = TRACK_LABELS[fi] ?? `track ${fi + 1} (unexpected extra file)`;
+  subjects.push(file.subject);
+  checkFile(file, label, EXPECTED_TRACK_SEGMENTS[fi]);
 });
 
 if (files.length === 2 && files[0].subject === files[1].subject) {
@@ -212,6 +232,46 @@ if (query !== SINGLE_TRACK_QUERY) {
   );
 }
 
+let secondText;
+try {
+  secondText = readFileSync(SECOND_NZB_PATH, 'utf8');
+} catch {
+  fail(
+    `second-track fixture missing at e2e/fixtures/synthetic-second-track.nzb — ` +
+      `the two-single-file staging path has no second upload`,
+  );
+  console.error(failures.join('\n'));
+  process.exit(1);
+}
+
+if (secondText.includes('<!DOCTYPE')) {
+  fail(`${SECOND_LABEL} carries a DOCTYPE — the production NZB parser refuses every DOCTYPE (XXE hardening)`);
+}
+
+const secondFiles = parseNzb(secondText);
+if (secondFiles.length !== 1) {
+  fail(`${SECOND_LABEL} carries ${secondFiles.length} <file> entr(y/ies), expected exactly 1 single-file upload`);
+} else {
+  const secondFile = secondFiles[0];
+  checkFile(secondFile, SECOND_LABEL, SECOND_TRACK_SEGMENTS);
+  if (secondFile.subject !== SECOND_TRACK_SUBJECT) {
+    fail(
+      `${SECOND_LABEL} subject is ${JSON.stringify(secondFile.subject)}, expected ` +
+        `${JSON.stringify(SECOND_TRACK_SUBJECT)}`,
+    );
+  }
+  const secondQuery = deriveUploadQuery([secondFile.subject]);
+  if (secondQuery !== SECOND_TRACK_QUERY) {
+    fail(
+      `${SECOND_LABEL} subject derives query ${JSON.stringify(secondQuery)}, expected distinct query ` +
+        `${JSON.stringify(SECOND_TRACK_QUERY)} — the two single-file uploads would share a match query`,
+    );
+  }
+  if (files.length === 2 && secondFile.subject === files[0].subject) {
+    fail(`${SECOND_LABEL} shares file 1's subject — the two single-file uploads would share a match query`);
+  }
+}
+
 if (failures.length > 0) {
   console.error(failures.join('\n'));
   process.exit(1);
@@ -220,5 +280,6 @@ if (failures.length > 0) {
 console.log(
   `[two-track-self-check] OK: 2 tracks staged through the ingest path\n` +
     `- ${TRACK_LABELS[0]}: 3 segments, query ${JSON.stringify(query)}\n` +
-    `- ${TRACK_LABELS[1]}: 1 segment, distinct subject`,
+    `- ${TRACK_LABELS[1]}: 1 segment, distinct subject\n` +
+    `- ${SECOND_LABEL}: 1 segment, query ${JSON.stringify(SECOND_TRACK_QUERY)}`,
 );
