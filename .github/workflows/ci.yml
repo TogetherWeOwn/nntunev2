@@ -580,6 +580,7 @@ jobs:
         run: |
           python3 .github/scripts/test_docs_link_lint.py
           python3 .github/scripts/test_docs_link_diff_path_bytes.py
+          python3 .github/scripts/test_docs_link_annotation_strings.py
       - name: Run docs-link directory-anchor self-tests
         run: python3 .github/scripts/test_docs_link_directories.py
       - name: Run docs-link diff-failure self-tests
