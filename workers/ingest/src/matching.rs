@@ -339,7 +339,11 @@ pub fn pick_release_mbid(query: &str, hits: &[MbSearchHit]) -> Option<String> {
 /// A recognized numeric part counter is exactly `digits/digits` with no
 /// extra characters: the documented `[01/05]` / `(1/3)` scene forms.
 /// Anything else (`[aa/bb]`, `[01/]`, `[1/2/3]`, `[01/05 Live]`,
-/// `(Live)`, `(2024)`, `(Disc 1)`) is release identity and is preserved.
+/// `(Live)`, `(2024)`, `(Disc 1)`, format/bitrate tags such as `[FLAC]`,
+/// `(MP3)` or `[320]`) is release identity and is preserved. This is
+/// deliberately conservative: non-counter trailing groups fail closed to
+/// unmatched (see [`derive_upload_query`]) rather than risk a wrong
+/// studio-release pick.
 fn is_part_counter_content(inner: &str) -> bool {
     let Some((numerator, denominator)) = inner.split_once('/') else {
         return false;
@@ -418,6 +422,16 @@ fn strip_trailing_counter(trimmed: &str) -> Option<&str> {
 /// token is dropped for bare-filename subjects. Anything that does not
 /// survive [`validate_match_query`] yields `None` (the job is then written
 /// unmatched rather than guessed at).
+///
+/// Intended narrowing: every other trailing bracket
+/// group is kept as identity, not just editions — format/bitrate tags
+/// (`[FLAC]`, `(MP3)`, `[320]`), years (`(2024)`), disc markers and
+/// malformed counter look-alikes all survive, so such subjects fail
+/// closed to unmatched (`None`) where the old strip-everything behavior
+/// matched the studio release. That is the accepted tradeoff: an
+/// unmatched write converges cleanly on replay (the library upsert is
+/// `DO UPDATE` on the idempotency key and re-resolves deterministically),
+/// while a wrong studio MBID would persist as a false match.
 pub fn derive_upload_query(subjects: &[String]) -> Option<String> {
     let first = subjects.first()?;
     let before_quote = first.split('"').next().unwrap_or(first);
@@ -690,6 +704,45 @@ mod tests {
             derive_upload_query(&["\"only.flac\" yEnc".to_string()]),
             None
         );
+    }
+
+    #[test]
+    fn upload_query_preserves_format_and_year_tags_fail_closed() {
+        // Pinned tradeoff: non-counter trailing groups are identity, so
+        // these subjects keep the tag and fail closed to unmatched rather
+        // than matching the studio release as strip-everything did.
+        for (subject, expected) in [
+            (
+                r#"Artist - Album [FLAC] [01/05] - "01.flac" yEnc (1/3)"#,
+                "Artist - Album [FLAC]",
+            ),
+            (
+                r#"Artist - Album (2024) [01/05] - "01.flac""#,
+                "Artist - Album (2024)",
+            ),
+            (
+                r#"Artist - Album [320] [01/05] - "01.flac""#,
+                "Artist - Album [320]",
+            ),
+            (
+                r#"Artist - Album (MP3) [01/05] - "01.flac""#,
+                "Artist - Album (MP3)",
+            ),
+            (
+                r#"Artist - Album [01/05] [FLAC] - "01.flac""#,
+                "Artist - Album [01/05] [FLAC]",
+            ),
+        ] {
+            let query = derive_upload_query(&[subject.to_string()])
+                .expect("tagged subject must still derive its tagged query");
+            assert_eq!(query.as_str(), expected, "subject {subject:?}");
+            let studio_only = vec![hit_by(MBID_A, "Album", Some("Artist"), 0.99)];
+            assert_eq!(
+                pick_release_mbid(&query, &studio_only),
+                None,
+                "query {query:?} must stay unmatched, never pick studio"
+            );
+        }
     }
 
     #[test]
