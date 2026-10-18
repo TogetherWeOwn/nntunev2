@@ -336,12 +336,85 @@ pub fn pick_release_mbid(query: &str, hits: &[MbSearchHit]) -> Option<String> {
     Some(top.mbid.clone())
 }
 
+/// A recognized numeric part counter is exactly `digits/digits` with no
+/// extra characters: the documented `[01/05]` / `(1/3)` scene forms.
+/// Anything else (`[aa/bb]`, `[01/]`, `[1/2/3]`, `[01/05 Live]`,
+/// `(Live)`, `(2024)`, `(Disc 1)`) is release identity and is preserved.
+fn is_part_counter_content(inner: &str) -> bool {
+    let Some((numerator, denominator)) = inner.split_once('/') else {
+        return false;
+    };
+    if denominator.contains('/') {
+        return false;
+    }
+    !numerator.is_empty()
+        && !denominator.is_empty()
+        && numerator.bytes().all(|b| b.is_ascii_digit())
+        && denominator.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Index of the bracket that matches the trailing close bracket,
+/// scanning backwards so nested same-form pairs (`[[01/05]]`) resolve
+/// to the outer opener. Other bracket forms are ignored at this level.
+fn find_matching_open(text: &str, open: u8, close: u8) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0;
+    for (index, &byte) in bytes.iter().enumerate().rev() {
+        if byte == close {
+            depth += 1;
+        } else if byte == open {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+            if depth < 0 {
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// Strip one trailing recognized counter (`[01/05]`, `(1/3)`, or one of
+/// those wrapped in a single extra bracket pair such as `[(1/3)]` or
+/// `[[01/05]]`). Returns the text before the counter, or `None` when
+/// the trailing bracketed group is identity and stripping must stop.
+fn strip_trailing_counter(trimmed: &str) -> Option<&str> {
+    let (open, close) = if trimmed.ends_with(']') {
+        (b'[', b']')
+    } else if trimmed.ends_with(')') {
+        (b'(', b')')
+    } else {
+        return None;
+    };
+    let open_index = find_matching_open(trimmed, open, close)?;
+    let inner = &trimmed[open_index + 1..trimmed.len() - 1];
+    if is_part_counter_content(inner) {
+        return Some(&trimmed[..open_index]);
+    }
+    // One extra wrapping pair: the outer content is itself a bracketed
+    // counter in either form.
+    if inner.len() >= 2
+        && ((inner.starts_with('[') && inner.ends_with(']'))
+            || (inner.starts_with('(') && inner.ends_with(')')))
+    {
+        let wrapped = &inner[1..inner.len() - 1];
+        if is_part_counter_content(wrapped) {
+            return Some(&trimmed[..open_index]);
+        }
+    }
+    None
+}
+
 /// Derive a candidate release query from NZB file subjects.
 ///
 /// Scene-style subjects look like
 /// `Artist - Album [01/05] - "01 track.flac" yEnc (1/3)`: the release
-/// title is the text before the quoted file name, minus trailing part
-/// counters. Dots/underscores become spaces and one trailing file-type
+/// title is the text before the quoted file name, minus trailing numeric
+/// part counters. Only recognized `digits/digits` counters (repeated,
+/// stacked across bracket forms, or wrapped in one extra bracket pair)
+/// and a trailing `yEnc` token strip; edition suffixes are preserved.
+/// Dots/underscores become spaces and one trailing file-type
 /// token is dropped for bare-filename subjects. Anything that does not
 /// survive [`validate_match_query`] yields `None` (the job is then written
 /// unmatched rather than guessed at).
@@ -353,21 +426,21 @@ pub fn derive_upload_query(subjects: &[String]) -> Option<String> {
         .map(|c| if c == '.' || c == '_' { ' ' } else { c })
         .collect();
     let mut candidate = spaced.trim().trim_end_matches('-').trim().to_string();
-    // Drop trailing "[01/05]" / "(1/3)" / "yEnc" groups, repeatedly.
+    // Drop trailing recognized counters and "yEnc", repeatedly, stopping
+    // at the first trailing bracketed group that is not a counter.
     loop {
-        let trimmed = candidate.trim_end();
-        let stripped = match trimmed.chars().last() {
-            Some(']') => trimmed.rfind('[').map(|i| &trimmed[..i]),
-            Some(')') => trimmed.rfind('(').map(|i| &trimmed[..i]),
-            _ if trimmed
+        let trimmed = candidate.trim_end().to_string();
+        let stripped: Option<String> = if let Some(head) = strip_trailing_counter(&trimmed) {
+            Some(head.to_string())
+        } else if trimmed
+            .rsplit_once(char::is_whitespace)
+            .is_some_and(|(_, tail)| tail.eq_ignore_ascii_case("yenc"))
+        {
+            trimmed
                 .rsplit_once(char::is_whitespace)
-                .is_some_and(|(_, tail)| tail.eq_ignore_ascii_case("yenc")) =>
-            {
-                trimmed
-                    .rsplit_once(char::is_whitespace)
-                    .map(|(head, _)| head)
-            }
-            _ => None,
+                .map(|(head, _)| head.to_string())
+        } else {
+            None
         };
         let Some(head) = stripped else { break };
         let next = head.trim().trim_end_matches('-').trim().to_string();
