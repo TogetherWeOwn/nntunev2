@@ -11,7 +11,8 @@
 //!   port to [`VaultError::Invalid`] without touching the network.
 //!
 //! Boundary vs siblings: dial-time SSRF guard behavior (host shape,
-//! resolve-ALL, non-public rejection) is owned by TOG-26339; dial ceilings
+//! resolve-ALL, non-public rejection) is covered by the sibling dial-guard
+//! suite; dial ceilings
 //! (`MAX_DIAL_ADDRESSES`, `MAX_CONNECTIONS_CEILING`) are pinned in
 //! `vault_dial_ceiling.rs`. This file pins only the allowlist literal, the
 //! predicate, and the off-list rejection wiring. Tests only; no production
