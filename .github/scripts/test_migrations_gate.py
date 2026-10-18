@@ -88,12 +88,26 @@ class TestMigrationViolations(MigrationsGateTestCase):
         self.write_migration("0002_unlisted.sql")
         self.write_manifest([self.manifest_entry("0001_first.sql")])
 
-        self.assert_violation(self.run_gate(), "unlisted", "0002_unlisted.sql")
+        result = self.run_gate()
+
+        self.assert_violation(result, "unlisted", "0002_unlisted.sql")
+        self.assertIn(
+            "migrations-gate: unlisted: 0002_unlisted.sql: "
+            "SQL migration is missing from the manifest",
+            result.stdout,
+        )
 
     def test_missing_manifest_file_is_reported(self):
         self.write_manifest([("0001_missing.sql", "app", "0" * 64)])
 
-        self.assert_violation(self.run_gate(), "missing-file", "0001_missing.sql")
+        result = self.run_gate()
+
+        self.assert_violation(result, "missing-file", "0001_missing.sql")
+        self.assertIn(
+            "migrations-gate: missing-file: 0001_missing.sql: "
+            "manifest entry has no matching SQL file",
+            result.stdout,
+        )
 
     def test_duplicate_number_is_reported(self):
         self.write_migration("0001_first.sql")
@@ -152,7 +166,28 @@ class TestMigrationViolations(MigrationsGateTestCase):
         self.write_migration("0001_first.sql")
         self.write_manifest([("0001_first.sql", "app", "0" * 64)])
 
-        self.assert_violation(self.run_gate(), "checksum", "0001_first.sql")
+        result = self.run_gate()
+
+        self.assert_violation(result, "checksum", "0001_first.sql")
+        self.assertIn(
+            "migrations-gate: checksum: 0001_first.sql: "
+            "sha256 does not match the migration contents",
+            result.stdout,
+        )
+
+    def test_symlinked_migration_is_reported(self):
+        target = self.write_migration("0001_first.sql")
+        self.write_manifest([self.manifest_entry("0001_first.sql")])
+        (self.migrations / "0002_second.sql").symlink_to(target)
+
+        result = self.run_gate()
+
+        self.assert_violation(result, "symlink", "0002_second.sql")
+        self.assertIn(
+            "migrations-gate: symlink: 0002_second.sql: "
+            "migration files must not be symlinks",
+            result.stdout,
+        )
 
 
 class TestMigrationDrift(MigrationsGateTestCase):
