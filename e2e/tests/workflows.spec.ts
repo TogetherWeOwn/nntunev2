@@ -972,10 +972,13 @@ test.describe('deploy.yml carries no backend Worker deploy job', () => {
       `wrangler commands stay exactly the evidenced web lanes (got ${JSON.stringify(commands)})`,
     ).toEqual(['deploy --env staging', 'preview']);
     // Raw-CLI pin: no `run:` step may invoke a wrangler deploy, even split
-    // across lines (`wrangler \` + newline + `deploy`). A contiguous
-    // `wrangler deploy` substring check misses continuations, so match
-    // across whitespace and line-continuation backslashes.
-    expect(body).not.toMatch(/wrangler[\s\\]+deploy/);
+    // across lines (`wrangler \` + newline + `deploy`), version-pinned
+    // (`wrangler@<ver> deploy`), or flag-first (`wrangler --config x
+    // deploy`). Join continuations, then match `wrangler` (excluding
+    // `wrangler-action` and `wranglerVersion`) followed anywhere on the
+    // same logical line by `deploy`.
+    const flat = body.replace(/\\\r?\n\s*/g, ' ');
+    expect(flat).not.toMatch(/\bwrangler\b(?!-action)[^\n]*\bdeploy\b/);
     for (const line of body.split('\n')) {
       if (line.includes('workingDirectory:') || line.includes('working-directory:')) {
         expect(line, `deploy working directory stays apps/web (${line.trim()})`).toContain(
@@ -990,15 +993,18 @@ test.describe('deploy.yml carries no backend Worker deploy job', () => {
     // future Hyperdrive gate; the jobs body itself stays web-only with no
     // production path. Case-sensitive: the preview job carries a `Workers
     // preview deployment` comment (no path), which must keep passing.
-    // Production is pinned by deployment form only (`--env production` /
-    // `environment: production`), ignoring full-line comments so a harmless
-    // comment mentioning production never trips the guard.
+    // Production pin: the jobs body carries no `production` word at all in
+    // code (comments stripped). That covers `--env production`,
+    // `--env=production`, `environment: production`, the mapping form
+    // (`environment:\n  name: production`), quoted values, and
+    // `CLOUDFLARE_ENV: production` — while a harmless full-line comment
+    // mentioning production still passes.
     expect(body).not.toContain('workers/');
     const code = body
       .split('\n')
       .filter((l) => !/^\s*#/.test(l))
       .join('\n');
-    expect(code).not.toMatch(/--env\s+production|environment:\s*production/i);
+    expect(code.toLowerCase()).not.toContain('production');
   };
 
   const assertDeployGuard = (body: string) => {
@@ -1038,8 +1044,32 @@ test.describe('deploy.yml carries no backend Worker deploy job', () => {
     // Multiline raw-CLI deploy: `wrangler \` + newline + `deploy` evades a
     // contiguous `wrangler deploy` substring check but still deploys.
     const multilineMutant = `${jobsBody}\n      - run: pnpm exec wrangler \\\n        deploy --env staging\n`;
+    // Version-pinned raw-CLI deploy (the workflow's own WRANGLER_VERSION
+    // spelling): `@<ver>` sits between the tokens, so a
+    // `wrangler\s+deploy` check misses it.
+    const versionPinnedMutant = `${jobsBody}\n      - run: npx wrangler@\${{ env.WRANGLER_VERSION }} deploy\n`;
+    // Flag-first raw-CLI deploy: a flag before the subcommand evades a
+    // `wrangler deploy` adjacency check.
+    const flagFirstMutant = `${jobsBody}\n      - run: pnpm exec wrangler --config wrangler.toml deploy\n`;
+    // Production GitHub environment mapping form on a PR-triggered job:
+    // resolves production-scoped secrets and protection rules.
+    const envMappingMutant = jobsBody.replace(
+      '    needs: [gate]\n    if: ${{ github.event_name == ',
+      '    needs: [gate]\n    environment:\n      name: production\n    if: ${{ github.event_name == ',
+    );
+    // Quoted production environment value.
+    const quotedEnvMutant = `${jobsBody}\n    environment: "production"\n`;
 
-    for (const mutant of [workerMutant, prodMutant, bareDeployMutant, multilineMutant]) {
+    for (const mutant of [
+      workerMutant,
+      prodMutant,
+      bareDeployMutant,
+      multilineMutant,
+      versionPinnedMutant,
+      flagFirstMutant,
+      envMappingMutant,
+      quotedEnvMutant,
+    ]) {
       expect(() => assertDeployGuard(mutant), 'mutant must violate the deploy guard').toThrow();
     }
     // Targeted evidence for which pin each mutant trips.
@@ -1050,5 +1080,9 @@ test.describe('deploy.yml carries no backend Worker deploy job', () => {
     expect(() => assertNoBackendPath(prodMutant)).toThrow();
     expect(() => assertDeployBody(bareDeployMutant)).toThrow();
     expect(() => assertDeployBody(multilineMutant)).toThrow();
+    expect(() => assertDeployBody(versionPinnedMutant)).toThrow();
+    expect(() => assertDeployBody(flagFirstMutant)).toThrow();
+    expect(() => assertNoBackendPath(envMappingMutant)).toThrow();
+    expect(() => assertNoBackendPath(quotedEnvMutant)).toThrow();
   });
 });
