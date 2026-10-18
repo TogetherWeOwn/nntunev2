@@ -190,7 +190,7 @@ fn plain_body_wraps_at_exact_128_boundaries() {
 #[test]
 fn escape_introducer_counts_as_one_column() {
     // 64 all-escaping bytes are exactly 128 columns (2 each): one full line.
-    let body = encode(&vec![ESCAPABLE_RAW[3]; 64]);
+    let body = encode(&[ESCAPABLE_RAW[3]; 64]);
     let lines = body_lines(&body);
     assert_eq!(
         lines.iter().map(|l| l.len()).collect::<Vec<_>>(),
@@ -200,7 +200,7 @@ fn escape_introducer_counts_as_one_column() {
     assert_width_and_no_stranded_escape(&lines, "64 escapes");
 
     // One more escape needs a second line: 65 * 2 = 130 columns.
-    let body = encode(&vec![ESCAPABLE_RAW[3]; 65]);
+    let body = encode(&[ESCAPABLE_RAW[3]; 65]);
     let lines = body_lines(&body);
     assert_eq!(
         lines.iter().map(|l| l.len()).collect::<Vec<_>>(),
@@ -211,7 +211,7 @@ fn escape_introducer_counts_as_one_column() {
 
     // If `=` did not count as a column, 100 escapes (200 bytes) would fit
     // in far fewer byte-lines; the width pin forces every byte to count.
-    let body = encode(&vec![ESCAPABLE_RAW[3]; 100]);
+    let body = encode(&[ESCAPABLE_RAW[3]; 100]);
     let lines = body_lines(&body);
     assert!(
         lines.iter().all(|l| l.len() <= 128),
