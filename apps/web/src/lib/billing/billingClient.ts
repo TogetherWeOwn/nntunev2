@@ -104,6 +104,19 @@ function isValidUsagePayload(data: unknown): data is UsageSnapshot & { period: s
 	return true;
 }
 
+/**
+ * Successful GET /v1/plans DTO guard. The body must be an object whose
+ * `plans` field is an array (possibly empty). Unknown extra envelope
+ * fields are allowed and entries pass through verbatim; per-plan field
+ * validation is out of scope. Anything else rejects into the existing
+ * recoverable loader path instead of reaching pricing rendering as
+ * `undefined`, a string, or any other non-array value.
+ */
+function isValidPlansPayload(data: unknown): data is { plans: PlanDTO[] } {
+	if (typeof data !== 'object' || data === null || Array.isArray(data)) return false;
+	return Array.isArray((data as Record<string, unknown>).plans);
+}
+
 async function readJson<T>(res: Response, label: string): Promise<T> {
 	if (!res.ok) {
 		let body: unknown = null;
@@ -139,7 +152,8 @@ async function readJson<T>(res: Response, label: string): Promise<T> {
 
 export async function fetchPlans(fetchFn: typeof fetch = fetch): Promise<PlanDTO[]> {
 	const res = await fetchFn('/v1/plans', { credentials: 'include' });
-	const data = await readJson<{ plans: PlanDTO[] }>(res, 'Load plans');
+	const data = await readJson<unknown>(res, 'Load plans');
+	if (!isValidPlansPayload(data)) throw new Error('Invalid plans payload');
 	return data.plans;
 }
 
