@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -176,6 +177,54 @@ def test_failure_reports_exactly_five_largest_in_order() -> None:
     ], report
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent.parent
+
+
+def _parse_byte_number(text: str) -> int:
+    return int(text.replace(",", "").replace("_", "").strip())
+
+
+def test_readme_budget_matches_pinned_constant() -> None:
+    """README budget number must equal BUDGET_CLIENT_JS_BYTES."""
+    readme = _repo_root().joinpath("apps", "web", "README.md").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r"exceeds\s+\*\*([\d,]+)\s*B", readme)
+    assert match is not None, "README budget figure not found"
+    readme_budget = _parse_byte_number(match.group(1))
+    assert readme_budget == BUDGET_CLIENT_JS_BYTES, (
+        f"README budget {readme_budget} B != "
+        f"BUDGET_CLIENT_JS_BYTES {BUDGET_CLIENT_JS_BYTES} B"
+    )
+
+
+def test_readme_baseline_matches_script_measured_figure() -> None:
+    """README baseline must equal the script's measured figure."""
+    readme = _repo_root().joinpath("apps", "web", "README.md").read_text(
+        encoding="utf-8"
+    )
+    readme_match = re.search(r"Baseline was\s+([\d,]+)\s*B", readme)
+    assert readme_match is not None, "README baseline figure not found"
+    readme_baseline = _parse_byte_number(readme_match.group(1))
+    script_text = (
+        _repo_root()
+        .joinpath(".github", "scripts", "check_web_bundle_budget.py")
+        .read_text(encoding="utf-8")
+    )
+    measured = re.findall(r"[Mm]easured\s+([\d,]+)\s*B", script_text)
+    assert measured, "script measured figure not found"
+    script_figures = {_parse_byte_number(item) for item in measured}
+    assert len(script_figures) == 1, (
+        f"script measured figures disagree: {sorted(script_figures)}"
+    )
+    script_baseline = next(iter(script_figures))
+    assert readme_baseline == script_baseline, (
+        f"README baseline {readme_baseline} B != "
+        f"script measured {script_baseline} B"
+    )
+
+
 def main_test() -> int:
     cases = (
         test_under_budget_passes,
@@ -189,6 +238,8 @@ def main_test() -> int:
         test_only_js_counts_toward_total,
         test_equal_size_files_sort_by_full_path,
         test_failure_reports_exactly_five_largest_in_order,
+        test_readme_budget_matches_pinned_constant,
+        test_readme_baseline_matches_script_measured_figure,
     )
     for case in cases:
         case()
