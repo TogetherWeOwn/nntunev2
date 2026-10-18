@@ -1810,9 +1810,9 @@ fn match_set_file<'a>(
     // when every segment decoded. The sum is checked: overflowing part
     // sizes prove no length, so there is no match (fail closed, no panic).
     if segs.len() >= total_segments && segs.iter().all(|s| !s.missing) {
-        let Some(len) = segs.iter().try_fold(0u64, |acc, s| acc.checked_add(s.size)) else {
-            return None;
-        };
+        let len = segs
+            .iter()
+            .try_fold(0u64, |acc, s| acc.checked_add(s.size))?;
         let mut found: Option<(&RecoverySet, &RecoveryFile)> = None;
         for set in sets {
             for entry in set.files.values() {
