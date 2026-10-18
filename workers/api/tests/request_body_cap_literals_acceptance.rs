@@ -21,7 +21,7 @@
 //! - Renaming or moving the cap without updating this suite fails the
 //!   `max_body_bytes_is_exactly_32768` literal pin.
 //!
-//! Out of scope: ingest route envelopes (TOG-30757, different worker);
+//! Out of scope: ingest route envelopes (different worker);
 //! short-read transport mode; any route behavior change. Fixtures are
 //! synthetic only; no DB, provider, or network is touched.
 //!
