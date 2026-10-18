@@ -109,6 +109,27 @@ class TestMigrationViolations(MigrationsGateTestCase):
             self.run_gate(), "duplicate-number", "0001_second.sql"
         )
 
+    def test_duplicate_entry_is_reported_once(self):
+        self.write_migration("0001_first.sql")
+        entry = self.manifest_entry("0001_first.sql")
+        self.write_manifest([entry, entry])
+
+        result = self.run_gate()
+
+        self.assert_violation(result, "duplicate-entry", "0001_first.sql")
+        self.assertIn("migration is listed more than once", result.stdout)
+
+    def test_unshaped_filename_is_out_of_order_not_missing(self):
+        self.write_migration("notes.sql")
+        self.write_manifest([self.manifest_entry("notes.sql")])
+
+        result = self.run_gate()
+
+        self.assert_violation(result, "out-of-order", "notes.sql")
+        self.assertIn(
+            "filename must start with a four-digit number", result.stdout
+        )
+
     def test_manifest_order_must_increase_by_four_digit_prefix(self):
         self.write_migration("0001_first.sql")
         self.write_migration("0002_second.sql")
@@ -215,6 +236,18 @@ class TestMigrationGateContract(MigrationsGateTestCase):
         result = self.run_gate()
 
         self.assert_cli_error(result)
+
+    def test_nested_manifest_path_is_a_usage_error(self):
+        self.write_manifest([("sub/0001_x.sql", "app", "0" * 64)])
+
+        result = self.run_gate()
+
+        output = result.stdout + result.stderr
+        self.assertEqual(2, result.returncode, output)
+        self.assertEqual("", result.stdout, output)
+        self.assertIn("migrations/manifest.toml", result.stderr, output)
+        self.assertIn("file must be a migration filename", result.stderr, output)
+        self.assertNotIn("Traceback", output)
 
     def test_directory_manifest_is_a_read_error(self):
         self.write_migration("0001_first.sql")
