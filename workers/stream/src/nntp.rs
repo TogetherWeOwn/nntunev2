@@ -58,6 +58,29 @@ impl NntpError {
     }
 }
 
+/// Parse a three-ASCII-digit NNTP status token with permitted
+/// separator/framing: the first three bytes must be ASCII digits and the
+/// fourth byte must be end-of-line or a single space before reply text.
+/// `2000`, `2220`, `4800` and friends merely start with a known code and
+/// are malformed frames, never truncated to their prefix. Returns `None`
+/// for a malformed frame; callers map that to a bounded generic
+/// [`NntpError::UnexpectedResponse`] without echoing the untrusted line.
+fn parse_status_code(line: &str) -> Option<u16> {
+    let stripped = line.trim_end_matches(['\r', '\n']);
+    let bytes = stripped.as_bytes();
+    if bytes.len() < 3 || !bytes[..3].iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    match bytes.get(3) {
+        None | Some(b' ') => {}
+        Some(_) => return None,
+    }
+    let code = u16::from(bytes[0] - b'0') * 100
+        + u16::from(bytes[1] - b'0') * 10
+        + u16::from(bytes[2] - b'0');
+    Some(code)
+}
+
 /// Whether `mid` (outer whitespace / `<>` already stripped) is safe to put
 /// on the wire inside `BODY <…>`: RFC 5536 msg-id characters only, so a
 /// hostile NZB cannot smuggle CR/LF (extra NNTP commands) or desynchronize
@@ -145,12 +168,16 @@ impl NntpClient {
             read_timeout: timeouts.read,
         };
         let greeting = client.read_line_with_deadline(deadline)?;
-        if greeting.starts_with("200") || greeting.starts_with("201") {
-            Ok(client)
-        } else {
-            Err(NntpError::UnexpectedResponse(
+        match parse_status_code(&greeting) {
+            Some(200) | Some(201) => Ok(client),
+            Some(_) => Err(NntpError::UnexpectedResponse(
                 greeting.trim_end().to_string(),
-            ))
+            )),
+            // Generic and bounded: the greeting line is untrusted and must
+            // not be echoed, and a malformed prefix must never connect.
+            None => Err(NntpError::UnexpectedResponse(
+                "malformed NNTP greeting".into(),
+            )),
         }
     }
 
@@ -198,38 +225,43 @@ impl NntpClient {
         self.reader.get_mut().write_all(cmd.as_bytes())?;
         self.reader.get_mut().flush()?;
         let status = self.read_line_with_deadline(deadline)?;
-        if status.starts_with("222") {
-            let mut body = Vec::new();
-            loop {
-                let mut line = Vec::new();
-                self.read_until_with_deadline(b'\n', &mut line, deadline)?;
-                if line.is_empty() {
-                    return Err(NntpError::UnexpectedResponse("eof inside article".into()));
+        match parse_status_code(&status) {
+            Some(222) => {
+                let mut body = Vec::new();
+                loop {
+                    let mut line = Vec::new();
+                    self.read_until_with_deadline(b'\n', &mut line, deadline)?;
+                    if line.is_empty() {
+                        return Err(NntpError::UnexpectedResponse("eof inside article".into()));
+                    }
+                    if line.ends_with(b"\n") {
+                        line.pop();
+                    }
+                    if line.ends_with(b"\r") {
+                        line.pop();
+                    }
+                    if line == b"." {
+                        break;
+                    }
+                    body.extend_from_slice(unstuff(&line));
+                    body.push(b'\n');
                 }
-                if line.ends_with(b"\n") {
-                    line.pop();
-                }
-                if line.ends_with(b"\r") {
-                    line.pop();
-                }
-                if line == b"." {
-                    break;
-                }
-                body.extend_from_slice(unstuff(&line));
-                body.push(b'\n');
+                Ok(body)
             }
-            Ok(body)
-        } else if status.starts_with("480") || status.starts_with("481") {
-            // Session no longer authenticated (480, the standard BODY
-            // reply) or credentials rejected (481): re-auth signal, never
-            // a missing article. 482 here is out-of-sequence and stays a
-            // generic protocol error below. No credential material is
-            // retained: the status line is dropped.
-            Err(NntpError::AuthExpired)
-        } else if status.starts_with("430") || status.starts_with("423") {
-            Err(NntpError::NoSuchArticle(message_id.to_string()))
-        } else {
-            Err(NntpError::UnexpectedResponse(status.trim_end().to_string()))
+            Some(480) | Some(481) => {
+                // Session no longer authenticated (480, the standard BODY
+                // reply) or credentials rejected (481): re-auth signal, never
+                // a missing article. 482 here is out-of-sequence and stays a
+                // generic protocol error below. No credential material is
+                // retained: the status line is dropped.
+                Err(NntpError::AuthExpired)
+            }
+            Some(430) | Some(423) => Err(NntpError::NoSuchArticle(message_id.to_string())),
+            Some(_) => Err(NntpError::UnexpectedResponse(status.trim_end().to_string())),
+            // Generic and bounded: the status line is untrusted and must not
+            // be echoed. A malformed prefix never continues a body read and
+            // never prompts credential re-entry.
+            None => Err(NntpError::UnexpectedResponse("malformed NNTP reply".into())),
         }
     }
 
