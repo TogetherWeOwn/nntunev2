@@ -34,7 +34,9 @@ fn email_shaped_values_yield_exactly_pii_value() {
 
 #[test]
 fn ip_shaped_values_yield_exactly_ip_value() {
-    for value in ["192.0.2.1", "10.0.0.1", "127.0.0.1"] {
+    // TEST-NET documentation ranges only: the public-text lint bans
+    // RFC-1918 addresses (e.g. 10/8) in tracked files.
+    for value in ["192.0.2.1", "198.51.100.23", "203.0.113.45"] {
         let mut fields = LogFields::new();
         let err = fields
             .insert_str("host", value)
