@@ -5,9 +5,13 @@
 //! `issued_at` tolerance:
 //!
 //! 1. `issued_at = NOW + 61` is rejected with `Err(SessionError::Invalid)`.
-//! 2. A far-future `issued_at` is rejected with `Err(Invalid)` and no panic
-//!    (all clock arithmetic is saturating).
+//! 2. A far-future `issued_at` is rejected with `Err(Invalid)` and no panic:
+//!    the skew-isolating case satisfies every earlier bound so only the skew
+//!    check can reject it, while the extreme `u64::MAX` case fails closed via
+//!    the independent `expires_at` bound.
 //! 3. Boundary control: `issued_at = NOW + 60` verifies.
+//! 4. Near-`u64::MAX` verification succeeds, proving clock arithmetic is
+//!    saturating (a plain `+` would panic on overflow).
 //!
 //! Fixtures are signed by an independent HMAC-SHA256 signer defined here —
 //! never by `issue_session`, which cannot mint future-issued tokens — so the
@@ -57,16 +61,39 @@ fn future_issued_beyond_skew_is_rejected() {
 
 #[test]
 fn far_future_issued_is_rejected_without_panic() {
-    // Far-future issuance must fail closed with the generic error, never
-    // panic on clock arithmetic (all bounds use saturating_add).
-    for issued_at in [NOW + 1_000_000, u64::MAX] {
-        let token = signed_session(NOW, issued_at, NOW + 3600);
-        assert_eq!(
-            session::verify_session(SECRET, &token, NOW),
-            Err(session::SessionError::Invalid),
-            "far-future issued_at {issued_at} must be rejected without panic"
-        );
-    }
+    // Isolating case: created_at == issued_at == far with an expires_at inside
+    // the session lifetime satisfies every earlier bound, so only the
+    // future-issued-at skew check can reject this token. Deleting the skew
+    // check turns this assertion into Ok.
+    let far = NOW + 1_000_000;
+    let token = signed_session(far, far, far + 3600);
+    assert_eq!(
+        session::verify_session(SECRET, &token, NOW),
+        Err(session::SessionError::Invalid),
+        "far-future issued_at {far} must be rejected by the skew check"
+    );
+
+    // Extreme value: u64::MAX cannot satisfy `expires_at > issued_at`, so it
+    // is rejected by that independent bound — still fail-closed with the
+    // generic error and no panic.
+    let token = signed_session(NOW, u64::MAX, NOW + 3600);
+    assert_eq!(
+        session::verify_session(SECRET, &token, NOW),
+        Err(session::SessionError::Invalid),
+        "u64::MAX issued_at must be rejected without panic"
+    );
+}
+
+#[test]
+fn near_max_clock_arithmetic_does_not_panic() {
+    // With `now` near u64::MAX, `now + CLOCK_SKEW_SECS` would overflow a plain
+    // `+` (panic in debug). The implementation uses saturating_add, so this
+    // in-window token verifies instead of panicking.
+    let now = u64::MAX - 10;
+    let token = signed_session(u64::MAX - 100, now, u64::MAX - 5);
+    let claims = session::verify_session(SECRET, &token, now)
+        .expect("near-max in-window token must verify without overflow panic");
+    assert_eq!(claims.issued_at, now);
 }
 
 #[test]
