@@ -24,8 +24,8 @@ use crate::auth::{
     SingleUseStore,
 };
 use crate::handlers::{
-    self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, PairAdmission, QaIssuedCode,
-    RateLimitBudget, Store, StoreError, UserRecord, VaultRow,
+    self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, NativeCredentialRow, PairAdmission,
+    QaIssuedCode, RateLimitBudget, Store, StoreError, UserRecord, VaultRow,
 };
 use crate::session::SessionRecord;
 use crate::vault::{
@@ -114,6 +114,25 @@ fn config_from_env(env: &Env) -> Option<Config> {
             config = config.with_qa_auth_token(&token);
         }
     }
+    // Dedicated native-REST bearer keyring (ADR 0010, migration 0019):
+    // both halves present and valid, or neither (endpoints fail closed
+    // per-request). A half-configured keyring refuses to start, like the
+    // stray session-secret previous.
+    let config = match (
+        env_string(env, "NATIVE_REST_PEPPER_BASE64"),
+        env_string(env, "NATIVE_REST_PEPPER_VERSION"),
+    ) {
+        (None, None) => config,
+        (Some(raw), Some(version)) => {
+            let bytes = crate::b64::decode(&raw).ok()?;
+            if bytes.len() < crate::session::MIN_SECRET_LEN {
+                return None;
+            }
+            let version: u32 = version.parse().ok()?;
+            config.with_native_rest_pepper(bytes, version)
+        }
+        (None, Some(_)) | (Some(_), None) => return None,
+    };
     Some(apply_rate_limit_overlay(config, |name| {
         env_string(env, name)
     }))
@@ -423,6 +442,45 @@ fn credential_from_row(row: &tokio_postgres::Row) -> Result<PasskeyCredential, S
 }
 
 const CREDENTIAL_COLUMNS: &str = "cred_id, user_id, public_key, sign_count, registered_at";
+
+const NATIVE_REST_COLUMNS: &str = "id, user_id, label, key_prefix, key_hmac, pepper_version, \
+     scopes, created_at, expires_at, last_used_at, revoked_at, created_from_ip";
+
+/// Map a `native_rest_credentials` row (migration 0019). Stored scopes
+/// that no longer parse are a data-corruption signal: the row fails
+/// closed (`StoreError`, never an authenticated caller) rather than
+/// authorizing a narrowed or widened set.
+fn native_credential_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<NativeCredentialRow, StoreError> {
+    let scopes: Vec<String> = row.try_get("scopes").map_err(|_| StoreError)?;
+    let mut parsed = Vec::with_capacity(scopes.len());
+    for scope in &scopes {
+        parsed.push(crate::native_rest::Scope::parse(scope).ok_or(StoreError)?);
+    }
+    let revoked_at: Option<i64> = row.try_get("revoked_at").map_err(|_| StoreError)?;
+    let last_used_at: Option<i64> = row.try_get("last_used_at").map_err(|_| StoreError)?;
+    Ok(NativeCredentialRow {
+        record: crate::native_rest::NativeRestRecord {
+            id: row.try_get("id").map_err(|_| StoreError)?,
+            user_id: row.try_get("user_id").map_err(|_| StoreError)?,
+            key_prefix: row.try_get("key_prefix").map_err(|_| StoreError)?,
+            key_hmac: row.try_get("key_hmac").map_err(|_| StoreError)?,
+            pepper_version: u32::try_from(
+                row.try_get::<_, i32>("pepper_version")
+                    .map_err(|_| StoreError)?,
+            )
+            .map_err(|_| StoreError)?,
+            scopes: parsed,
+            created_at: u64_of(row.try_get("created_at").map_err(|_| StoreError)?)?,
+            expires_at: u64_of(row.try_get("expires_at").map_err(|_| StoreError)?)?,
+            revoked_at: revoked_at.map(u64_of).transpose()?,
+        },
+        label: row.try_get("label").map_err(|_| StoreError)?,
+        created_from_ip: row.try_get("created_from_ip").map_err(|_| StoreError)?,
+        last_used_at: last_used_at.map(u64_of).transpose()?,
+    })
+}
 
 impl Store for PgStore {
     async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
@@ -801,6 +859,159 @@ impl Store for PgStore {
             .execute(
                 "UPDATE sessions SET revoked = TRUE WHERE user_id = $1",
                 &[&user_id],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        Ok(())
+    }
+
+    // --- Native REST credentials (ADR 0010, migration 0019) -------------------------------
+    //
+    // Every statement is parameterized; the secret itself never reaches the
+    // database (only its HMAC plus the non-secret listing prefix). The
+    // composite UNIQUE (pepper_version, key_hmac) is the lookup identity.
+
+    async fn insert_native_credential(&self, row: &NativeCredentialRow) -> Result<(), StoreError> {
+        let scopes: Vec<String> = row
+            .record
+            .scopes
+            .iter()
+            .map(|scope| scope.as_str().to_string())
+            .collect();
+        let client = self.connect().await?;
+        // Account-deletion fence (ADR 0002 rule 3): the insert only lands
+        // while the owner's deleting_at is NULL, holding the user row
+        // FOR SHARE through the statement, so a fresh session during the
+        // 24 h grace cannot mint a new long-lived bearer path behind the
+        // marker. A fenced (0-row) insert fails closed as StoreError; the
+        // handler classifies it through `account_deleting` into the typed
+        // 409. The owner binds $2 (the user_id column), never a value.
+        let affected = client
+            .execute(
+                "INSERT INTO native_rest_credentials (id, user_id, label, key_prefix, key_hmac, \
+                 pepper_version, scopes, created_at, expires_at, created_from_ip) \
+                 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10 \
+                 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence",
+                &[
+                    &row.record.id,
+                    &row.record.user_id,
+                    &row.label,
+                    &row.record.key_prefix,
+                    &row.record.key_hmac,
+                    &i32::try_from(row.record.pepper_version).map_err(|_| StoreError)?,
+                    &scopes,
+                    &i64_of(row.record.created_at)?,
+                    &i64_of(row.record.expires_at)?,
+                    &row.created_from_ip,
+                ],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        if affected == 0 {
+            return Err(StoreError);
+        }
+        Ok(())
+    }
+
+    async fn native_credentials_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<NativeCredentialRow>, StoreError> {
+        let client = self.connect().await?;
+        let sql = format!(
+            "SELECT {NATIVE_REST_COLUMNS} FROM native_rest_credentials \
+             WHERE user_id = $1 ORDER BY created_at, id"
+        );
+        let rows = client
+            .query(&sql, &[&user_id])
+            .await
+            .map_err(|_| StoreError)?;
+        rows.iter().map(native_credential_from_row).collect()
+    }
+
+    async fn native_credential_by_hmac(
+        &self,
+        pepper_version: u32,
+        key_hmac: &str,
+    ) -> Result<Option<NativeCredentialRow>, StoreError> {
+        let client = self.connect().await?;
+        let sql = format!(
+            "SELECT {NATIVE_REST_COLUMNS} FROM native_rest_credentials \
+             WHERE pepper_version = $1 AND key_hmac = $2"
+        );
+        let row = client
+            .query_opt(
+                &sql,
+                &[
+                    &i32::try_from(pepper_version).map_err(|_| StoreError)?,
+                    &key_hmac,
+                ],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        row.map(|row| native_credential_from_row(&row)).transpose()
+    }
+
+    async fn revoke_native_credential(
+        &self,
+        id: &str,
+        user_id: &str,
+        now: u64,
+    ) -> Result<bool, StoreError> {
+        let client = self.connect().await?;
+        // Owner-scoped and sticky: only a live row of this user
+        // transitions; an already-revoked row keeps its timestamp.
+        let transitioned = client
+            .execute(
+                "UPDATE native_rest_credentials SET revoked_at = $3 \
+                 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
+                &[&id, &user_id, &i64_of(now)?],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        if transitioned == 1 {
+            return Ok(true);
+        }
+        // No transition: report whether the row exists at all (unknown
+        // and foreign ids both report false — no existence oracle).
+        let exists = client
+            .query_opt(
+                "SELECT id FROM native_rest_credentials WHERE id = $1 AND user_id = $2",
+                &[&id, &user_id],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        Ok(exists.is_some())
+    }
+
+    async fn revoke_all_native_credentials(
+        &self,
+        user_id: &str,
+        now: u64,
+    ) -> Result<u64, StoreError> {
+        // An empty user id (upstream bug) must never become a mass
+        // revocation: revoke nothing without a database round trip.
+        if user_id.is_empty() {
+            return Ok(0);
+        }
+        let client = self.connect().await?;
+        let revoked = client
+            .execute(
+                "UPDATE native_rest_credentials SET revoked_at = $2 \
+                 WHERE user_id = $1 AND revoked_at IS NULL",
+                &[&user_id, &i64_of(now)?],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        Ok(revoked)
+    }
+
+    async fn record_native_credential_use(&self, id: &str, now: u64) -> Result<(), StoreError> {
+        let client = self.connect().await?;
+        client
+            .execute(
+                "UPDATE native_rest_credentials SET last_used_at = $2 WHERE id = $1",
+                &[&id, &i64_of(now)?],
             )
             .await
             .map_err(|_| StoreError)?;
@@ -1657,6 +1868,12 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         .entries()
         .map(|(k, v)| (k.to_lowercase(), v))
         .collect();
+    // Header-only bearer transports (ADR 0010 native keys, the QA seam
+    // bearer): the raw `Authorization` value rides the request's
+    // `authorization` field only, never the cookie or query shapes (which
+    // the gates never read). Server logs redact this header the way
+    // `/rest/*` logging redacts `u/p/t/s` material — nothing in this
+    // module logs header values.
     let request = handlers::Request {
         method: req.method().to_string(),
         path: req.path(),
@@ -2022,6 +2239,53 @@ mod tests {
     }
 
     #[test]
+    fn native_rest_pepper_matrix_is_both_or_neither() {
+        // `config_from_env` needs a wasm Env, so pin its keyring matrix
+        // the same way the overlay test pins its call site: slice ONLY
+        // the fn body out of the pre-test source, so this test's own
+        // literals cannot satisfy the assertions. Unset means the
+        // endpoints fail closed per-request (never a startup refusal, so
+        // provisioning is never a flag-day); half-set (one half without
+        // the other) refuses to start like the stray session-secret
+        // previous; a short pepper refuses to start like every other
+        // secret codec.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let body = production
+            .split_once("fn config_from_env(")
+            .expect("config_from_env must exist")
+            .1
+            .split_once("\nfn ")
+            .expect("a following fn must bound the body")
+            .0;
+        assert!(
+            body.contains("NATIVE_REST_PEPPER_BASE64"),
+            "config_from_env must read the native REST pepper"
+        );
+        assert!(
+            body.contains("NATIVE_REST_PEPPER_VERSION"),
+            "config_from_env must read the native REST pepper version"
+        );
+        assert!(
+            body.contains("with_native_rest_pepper("),
+            "config_from_env must provision the keyring when both halves validate"
+        );
+        assert!(
+            body.contains("MIN_SECRET_LEN"),
+            "the pepper must meet the same minimum as every other secret"
+        );
+        // The half-configured refusal: one half present without the other
+        // must fail startup, never serve half-keyed.
+        assert!(
+            body.contains("(None, Some(_)) | (Some(_), None)"),
+            "a half-configured keyring must refuse to start"
+        );
+    }
+
+    #[test]
     fn cors_allow_list_is_exact_match_only() {
         let cfg = "https://app.example.com";
         assert_eq!(
@@ -2332,13 +2596,14 @@ mod tests {
     #[test]
     fn fenced_vault_statements_pin_the_owner_fence_and_zero_row_guard() {
         // ADR 0002 rule 3: PUT /v1/vault is reachable today, and the vault
-        // upsert fence, its zero-row guard, and the test-lease fence are the
-        // only things stopping credential writes behind the deletion marker.
+        // upsert fence, its zero-row guard, the test-lease fence, and the
+        // native-credential mint fence are the only things stopping
+        // credential writes behind the deletion marker.
         // Pin them the same way `insert_magic_prune_is_per_user_and_expired_only`
         // pins its statement: slice ONLY each fn body out of the pre-test
         // source, so this test's own literals cannot satisfy the assertions.
-        // Dropping `AND deleting_at IS NULL` from either statement, or the
-        // `affected == 0` guard from the upsert, must fail here.
+        // Dropping `AND deleting_at IS NULL` from any statement, or the
+        // `affected == 0` guard from a fenced write, must fail here.
         let source = include_str!("worker_entry.rs");
         let production = source
             .split_once("#[cfg(test)]")
@@ -2397,6 +2662,35 @@ mod tests {
         assert!(
             lease.contains("if !rows.is_empty()"),
             "lease must deny when the fence returns no row"
+        );
+        // Native-credential mint: the same deletion fence on the owner
+        // parameter, so a fresh session during the 24 h grace cannot mint
+        // a new long-lived bearer path behind the marker. The credential
+        // id binds $1, so the owner fence binds $2 here (not $1 as in the
+        // vault upsert above).
+        const NATIVE_FENCE: &str = "FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence";
+        let mint = fn_body("async fn insert_native_credential(");
+        assert!(
+            mint.contains(NATIVE_FENCE),
+            "insert_native_credential must select its row through the owner fence"
+        );
+        assert!(
+            !mint.contains("WHERE id = $1"),
+            "insert_native_credential fence binds the owner ($2), never $1"
+        );
+        assert!(
+            mint.contains("SELECT $1, $2"),
+            "insert_native_credential must keep SELECT $1 bound to the credential id and $2 to the owner"
+        );
+        let mint_guard = mint
+            .find("if affected == 0")
+            .expect("insert_native_credential must fail closed on 0 rows");
+        let mint_ok = mint
+            .find("Ok(())")
+            .expect("insert_native_credential must return Ok on the write path");
+        assert!(
+            mint_guard < mint_ok,
+            "the zero-row guard must precede the success return"
         );
     }
 

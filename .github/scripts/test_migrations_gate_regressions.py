@@ -116,6 +116,33 @@ class MigrationGateRegressionTests(unittest.TestCase):
         self.assertEqual(2, result.returncode, result.stdout + result.stderr)
         self.assertIn("cannot parse base migrations/manifest.toml", result.stderr)
 
+    def test_unknown_base_ref_is_a_git_error(self):
+        self.make_base(["0001_first.sql"])
+
+        result = self.run_gate("--base-ref", "does-not-exist-xyz")
+
+        output = result.stdout + result.stderr
+        self.assertEqual(2, result.returncode, output)
+        self.assertEqual("", result.stdout, output)
+        self.assertIn(
+            "git rev-parse --verify does-not-exist-xyz^{commit} failed",
+            result.stderr,
+            output,
+        )
+        self.assertNotIn("Traceback", output)
+
+    def test_base_ref_outside_git_is_a_gate_error(self):
+        self.write_migration("0001_first.sql")
+        self.write_manifest([("0001_first.sql", "app")])
+
+        result = self.run_gate("--base-ref", "HEAD")
+
+        output = result.stdout + result.stderr
+        self.assertEqual(2, result.returncode, output)
+        self.assertEqual("", result.stdout, output)
+        self.assertIn("git rev-parse", result.stderr, output)
+        self.assertNotIn("Traceback", output)
+
     def test_non_ascii_base_migration_drift_is_detected(self):
         filename = "0001_café.sql"
         base_ref = self.make_base([filename])

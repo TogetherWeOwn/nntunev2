@@ -16,23 +16,25 @@ Decision: `docs/adr/0007-mb-mirror.md`.
 | `GET` | `/v1/mb/release/:mbid` | Release lookup (includes the stored `caa_url`); same caching as artist |
 | `GET` | `/v1/mb/recording/:mbid` | Recording lookup; same caching as artist |
 | `GET` | `/v1/mb/release/:mbid/recordings` | Recordings of a release in album order (`medium_no`, then `track_no`, then MBID), listed from `mb_track` membership, `LIMIT 1000`; existing release with no recordings is `200` with an empty list, missing release is `404`; same caching as lookups |
-| `GET` | `/v1/mb/search?q=&type=` | `type` in `artist\|release\|recording`; `q` 2-100 chars; trigram (`pg_trgm`) ordered by similarity, `LIMIT 25`; success `Cache-Control: public, max-age=300` |
+| `GET` | `/v1/mb/search?q=&type=&limit=&offset=` | `type` in `artist\|release\|recording`; `q` 2-100 chars; trigram (`pg_trgm`) ordered by similarity; paged: `limit` defaults to `MAX_PAGE_SIZE` (25), over-limit clamped (never rejected), `limit=0` is `400`, `offset` defaults to 0, past-the-end is a 200 with `"results": []`; success `Cache-Control: public, max-age=300` |
 
-(Table sources: routes `workers/mb/src/lib.rs:978-1000`; healthz
-`lib.rs:411-418,897-906`; lookup SQL/TTL `lib.rs:36-37,124-145`;
-recordings SQL `lib.rs:150-166` plus repo `lib.rs:722-743`; search
-validation/SQL `lib.rs:509-535,175-194`; `Cache-Control` rendering
-`lib.rs:791-820`.)
+(Table sources: routes `workers/mb/src/lib.rs:1035-1062`; healthz
+`lib.rs:423-430,952-961`; lookup SQL/TTL `lib.rs:38-39,128-150`;
+recordings SQL `lib.rs:154-170` plus repo `lib.rs:777-798`; search
+validation/SQL `lib.rs:544-612,183-206`; `Cache-Control` rendering
+`lib.rs:846-875`.)
 
 Errors are JSON (`{"code", "message", "retryable"}`) with `Cache-Control: no-store`:
 malformed `:mbid` (must be UUID), unknown `type`, and short/long/control-character queries
-are `400` (`invalid_request`); a well-formed MBID with no row and unknown routes are `404`
+are `400` (`invalid_request`); empty/whitespace `q` is a stable coded `400`
+(`MB_SEARCH_EMPTY_QUERY`, registry: `docs/api-errors.md`), never a scan;
+a well-formed MBID with no row and unknown routes are `404`
 (`not_found`); mirror read failures are a generic `500` (`internal_error`, fixed
 `"unexpected error"` message — no DB detail leaves the worker).
-(Sources: `workers/mb/src/api_error.rs:17-33,55-102`;
-`docs/api-errors.md:67-75`; unknown-route handler `lib.rs:957-969`.)
+(Sources: `workers/mb/src/api_error.rs:17-41,66-110`;
+`docs/api-errors.md:74-83`; unknown-route handler `lib.rs:1019-1031`.)
 Lookup success is the flat entity fields plus `"kind"`;
-search success is `{"q", "type", "results": [{"mbid", "name"|"title",
+search success is `{"q", "type", "limit", "offset", "results": [{"mbid", "name"|"title",
 "score"}]}`; release results also carry `artist_mbid`/`artist_name`
 (null when the release has no artist) so callers can verify
 "Artist - Album" queries against the artist instead of the title-only
@@ -44,54 +46,56 @@ with its medium position — unlike `mb_recording.release_mbid`, which
 keeps one canonical release per recording and would drop a reissue's
 shared tracks; a bare recording lookup answers `medium_no: null`.
 Interactive reads never call musicbrainz.org.
-(Sources: `"kind"` tag `workers/mb/src/lib.rs:298-313`; search hits
-`lib.rs:317-355`; recordings envelope `lib.rs:491-496`; null medium on
-bare lookups `lib.rs:136-143`; `mb_track` rationale
-`migrations/0016_mb_track.sql:1-21,23-31` and `lib.rs:152-160`;
-Hyperdrive-only reads `lib.rs:668-720`.)
+(Sources: `"kind"` tag `workers/mb/src/lib.rs:293-318`; search hits
+`lib.rs:321-359`; recordings envelope `lib.rs:489-516`; null medium on
+bare lookups `lib.rs:139-146`; `mb_track` rationale
+`migrations/0016_mb_track.sql:1-21,23-31` and `lib.rs:156-170`;
+Hyperdrive-only reads `lib.rs:719-798`.)
 
 ## Caching
 
 - Order per read: edge Cache API, then KV, then Hyperdrive Postgres.
-  (Sources: edge check `workers/mb/src/lib.rs:822-844`; KV-then-DB cores
-  `lib.rs:449-471,477-504,509-560`; edge store `lib.rs:809-820`.)
+  (Sources: edge check `workers/mb/src/lib.rs:877-880`; KV-then-DB cores
+  `lib.rs:461-483,489-516,544-612`; edge store `lib.rs:864-875`.)
 - Lookups: KV key `mb:lookup:<kind>:<mbid>` (lowercase MBID), 24 h TTL;
   the same TTL is served as `Cache-Control` and stored via the Cache API.
-  (Sources: key `lib.rs:233-236`; TTL `lib.rs:36`; headers `lib.rs:791-807`.)
+  (Sources: key `lib.rs:243-245`; TTL `lib.rs:38`; headers `lib.rs:846-854`.)
 - Release recordings: KV key `mb:release-recordings:<mbid>` (lowercase
   MBID), same 24 h TTL and edge treatment as lookups. An existing
   release with zero recordings is a cacheable success; a missing
   release (`404`) is not cached.
-  (Sources: key `lib.rs:238-242`; core `lib.rs:477-504`.)
-- Search: KV key `mb:search:<kind>:<normalized q>` (trimmed, lowercased,
-  whitespace collapsed; SQL binds the same normalized value), 5 min TTL.
-  (Sources: normalizer `lib.rs:223-231`; key `lib.rs:244-247`;
-  TTL `lib.rs:37`; core `lib.rs:540-556`.)
+  (Sources: key `lib.rs:249-251`; core `lib.rs:489-516`.)
+- Search: KV key `mb:search:<kind>:<normalized q>:<limit>:<offset>`
+  (query trimmed, lowercased, whitespace collapsed; SQL binds the same
+  normalized value), 5 min TTL, so one page can never serve another
+  page's cached body.
+  (Sources: normalizer `lib.rs:235-240`; keys `lib.rs:243-251,530-535`;
+  TTL `lib.rs:39`; core `lib.rs:544-612`.)
 - Only successes are cached (a successful search with zero hits counts).
   400/404/500 responses are `no-store` and written to neither cache.
   KV failures degrade to plain DB reads; a missing `MB_CACHE` binding
   disables KV, a missing/unreachable `MB_DB` yields the generic `500`.
-  (Sources: success-only envelope `lib.rs:385-409`; KV degrade/no-op
-  `lib.rs:623-656`; connect/query errors map to the generic 500
-  `lib.rs:668-720` and `src/api_error.rs:93-95`.)
+  (Sources: success-only envelope `lib.rs:397-421`; KV degrade/no-op
+  `lib.rs:675-708`; connect/query errors map to the generic 500
+  `lib.rs:719-775` and `src/api_error.rs:101-103`.)
 - Release responses currently preserve the stored `caa_url` unchanged, so
   lookup cache keys remain environment-independent. When public R2 hosts are
   activated and URLs become environment-specific, include the environment in
   lookup cache keys before rewriting `caa_url`.
-  (Sources: `caa_url` read through unchanged `lib.rs:757-764`; rewrite
-  helper unused by responses `lib.rs:77-85`; env-free keys `lib.rs:233-247`.)
+  (Sources: `caa_url` read through unchanged `lib.rs:812-819`; rewrite
+  helper unused by responses `lib.rs:81-89`; env-free keys `lib.rs:243-251,530-535`.)
 - Cover art bytes are intended for the per-environment R2 art buckets
   (`nntunev2-art-staging` / `nntunev2-art-prod`, `docs/ops.md` inventory;
   key form `art/{hh}/{hh}/{sha}-{size}` per `docs/cache-policy.md:17` and
   the `caa_url_for_art` helper doc example `art/ab/cd/<sha>-500`
-  `lib.rs:77-83`; ADR 0003 shows only the base hash layout without the
+  `lib.rs:81-88`; ADR 0003 shows only the base hash layout without the
   `art/` prefix and `-{size}` suffix). Public release `caa_url`
   generation remains deferred until bucket bindings and public hosts are
   activated; this worker never proxies full images inline.
-  (Sources: buckets `workers/mb/src/lib.rs:57-75`;
+  (Sources: buckets `workers/mb/src/lib.rs:61-65`;
   `workers/mb/wrangler.toml.example:21-26,38-52`;
   `docs/ops.md:63-64,330,373`;
-  `docs/adr/0003-cache-scope.md:37-42`; JSON-only routes `lib.rs:978-1000`.)
+  `docs/adr/0003-cache-scope.md:37-42`; JSON-only routes `lib.rs:1035-1062`.)
 
 ## p95 methodology (acceptance input)
 
