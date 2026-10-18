@@ -251,6 +251,67 @@ class TestCheckSource(unittest.TestCase):
             self.assertEqual([], check(root, "docs/a.md"))
 
 
+class TestAnchorMissingDiagnosticPin(unittest.TestCase):
+    """Pin the cross-file anchor-missing diagnostic (docs_link_lint.py:369-372).
+
+    Contract under test: a link ``b.md#no-such-heading`` into a target file
+    that only defines ``# Real Heading`` yields exactly one violation with
+    reason exactly ``anchor does not exist in target file``, rendered by
+    main() as
+    ``::error file=<rel>,line=<n>::docs-links: <reason>: <target>``; a link
+    to the existing ``#real-heading`` stays clean.
+
+    Sensitivity (verified with temporary mutants, restored after): changing
+    the reason string fails the exact-reason test, and dropping ``line=``
+    from the annotation fails the annotation test.
+    """
+
+    BAD_FILES = {
+        "docs/a.md": "[bad](b.md#no-such-heading)\n",
+        "docs/b.md": "# Real Heading\n",
+    }
+    GOOD_FILES = {
+        "docs/a.md": "[good](b.md#real-heading)\n",
+        "docs/b.md": "# Real Heading\n",
+    }
+
+    def _run(self, *argv):
+        buf = io.StringIO()
+        err = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            rc = main(list(argv))
+        return rc, buf.getvalue() + err.getvalue()
+
+    def test_cross_file_anchor_missing_reason_is_exact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp, self.BAD_FILES)
+            hits = check(root, "docs/a.md")
+        self.assertEqual(
+            [(1, "b.md#no-such-heading", "anchor does not exist in target file")],
+            hits,
+        )
+
+    def test_cross_file_anchor_missing_annotation_is_exact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp, self.BAD_FILES)
+            rc, out = self._run("--root", str(root), "--files", "docs/a.md")
+        self.assertEqual(1, rc)
+        self.assertIn(
+            "::error file=docs/a.md,line=1::docs-links: "
+            "anchor does not exist in target file: b.md#no-such-heading",
+            out,
+        )
+        self.assertNotIn("Traceback", out)
+
+    def test_valid_cross_file_anchor_stays_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(tmp, self.GOOD_FILES)
+            self.assertEqual([], check(root, "docs/a.md"))
+            rc, out = self._run("--root", str(root), "--files", "docs/a.md")
+        self.assertEqual(0, rc)
+        self.assertIn("0 violations", out)
+
+
 class TestAnchors(unittest.TestCase):
     def test_heading_slugs_and_duplicates(self):
         anchors = anchors_in_markdown("# Dup\n\n## Dup\n\n### `code` head\n")
