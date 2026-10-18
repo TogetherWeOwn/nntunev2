@@ -149,10 +149,15 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   name via the `e2e/helpers/two-track-fixture.ts` verdict, never by timeout
   — with the contract itself pinned offline in the same file
   (`e2e/tests/two-track-fixture.spec.ts:82` "single-track library fails naming the missing second track",
-  run on every PR via `test:unit` with no staging). Until
-  `synthetic-two-track.nzb` lands in `e2e/fixtures/` (paired build card), the leg
-  stages the single-track fallback and fails with the documented
-  single-track signature. Fixture support for the row 4 queue-order leg, not
+  run on every PR via `test:unit` with no staging, plus the offline
+  `e2e/fixtures/two-track-self-check.mjs` gate in the same `e2e-lint` job
+  with exact per-track segment IDs, corpus bytes, group and query parity). Now that
+  `synthetic-two-track.nzb` has landed in `e2e/fixtures/`, the leg stages it
+  alone — on current ingest one upload is one job and one library row per
+  idempotency key, so two rows also needs the per-file manifest (ADR 0002
+  accepted-audio-manifest) or two single-file uploads; until then the leg
+  keeps failing with the documented single-track signature (red is the
+  signal, never a timeout). Fixture support for the row 4 queue-order leg, not
   an M1 exit step — and never the no-auth demo-audio route or its
   `second-signal` track ids.
 - The `apps/web/tests/` offline specs below run in the `web-e2e` CI job

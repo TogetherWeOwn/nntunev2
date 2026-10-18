@@ -38,6 +38,22 @@ const CORPUS_SEGMENTS = new Map([
   ['<single-yenc-001@nntune.test>', 1004],
 ]);
 
+/**
+ * Exact ordered segment IDs per track. The per-segment loop below only
+ * checks that each ID is corpus-served, so without this a truncated file 1
+ * (e.g. part 3 deleted) or a file 2 retargeted at a 660 Hz part still prints
+ * OK — both mutants exited 0 before this pin existed. Each file's IDs must
+ * equal its entry here, otherwise the failure names the broken track.
+ */
+const EXPECTED_TRACK_SEGMENTS = [
+  [
+    '<multi-660-part1-of-3@nntune.test>',
+    '<multi-660-part2-of-3@nntune.test>',
+    '<multi-660-part3-of-3@nntune.test>',
+  ],
+  ['<single-yenc-001@nntune.test>'],
+];
+
 const CORPUS_GROUP = 'alt.binaries.nntune.test';
 
 /** Single-track match query the first file's subject must still derive. */
@@ -152,6 +168,14 @@ files.forEach((file, fi) => {
   const expected = file.segments.map((_, i) => i + 1);
   if (JSON.stringify(numbers) !== JSON.stringify(expected)) {
     fail(`${label} segment numbers [${numbers}] are not contiguous 1..=N in order`);
+  }
+  const expectedIds = EXPECTED_TRACK_SEGMENTS[fi];
+  const actualIds = file.segments.map((s) => s.id);
+  if (expectedIds !== undefined && JSON.stringify(actualIds) !== JSON.stringify(expectedIds)) {
+    fail(
+      `${label} carries segment IDs [${actualIds.join(', ') || '(none)'}], expected ` +
+        `[${expectedIds.join(', ')}] for this track — truncated or cross-track IDs fail here by track name`,
+    );
   }
   for (const seg of file.segments) {
     const corpusBytes = CORPUS_SEGMENTS.get(seg.id);

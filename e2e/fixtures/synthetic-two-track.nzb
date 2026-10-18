@@ -6,7 +6,11 @@
 
   Staging leg stages THIS file alone through the ingest path
   (NZB → ingest → library) as a fresh test account and requires ≥2
-  distinct synthetic tracks in the library.
+  distinct synthetic tracks in the library. On current ingest one upload
+  is one job and one library row per idempotency key (per-file manifest
+  pending, see ADR 0002 accepted-audio-manifest), so ≥2 rows also needs
+  that manifest or two single-file uploads — until then the leg keeps
+  failing with the precondition by name (red is the signal, never a timeout).
 
   Contract (checked by e2e/fixtures/two-track-self-check.mjs; keep the
   pinned values there in sync with any edit here):
@@ -27,7 +31,8 @@
     bytes=, fixed group (alt.binaries.nntune.test), fixed poster/date —
     no generated values anywhere.
   - Idempotent re-run: static bytes → the upload's content sha (and its
-    ingest idempotency key) converges, so re-import upserts the same row.
+    ingest idempotency key) converges, so re-import upserts the same
+    single row on current ingest (two rows once the per-file manifest lands).
   - No interference with the single-track meter fixture: synthetic.nzb is
     untouched, and these bytes differ from it, so the meter job keeps its
     own content-addressed idempotency key. Each spec mints a fresh test
