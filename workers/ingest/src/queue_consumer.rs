@@ -1037,14 +1037,39 @@ async fn match_query(env: &Env, msg: &QueueMsg) -> Result<Option<String>, JobErr
 /// as transient, matching the retry-budget split in `matching`.
 async fn fetch_mb_body(env: &Env, url: String, max_bytes: usize) -> Result<(u16, String), ()> {
     // Arm the total deadline BEFORE issuing the fetch so slow headers
-    // count against the same budget as a stalled body.
-    let deadline = Box::pin(worker::Delay::from(std::time::Duration::from_millis(
+    // count against the same budget as a stalled body. `worker::Delay`
+    // only registers its `setTimeout` on the first `poll`, so merely
+    // constructing it before the service-binding fetch is issued would
+    // leave the headers wait unbounded; racing both futures here polls
+    // (arms) the deadline from the start and reuses the same deadline
+    // for the body drain below, so one 15 s budget spans headers plus
+    // body.
+    let mut deadline = Box::pin(worker::Delay::from(std::time::Duration::from_millis(
         MB_FETCH_DEADLINE_MS,
     )));
     let fetcher = env
         .service(crate::matching::MB_API_BINDING)
         .map_err(|_| ())?;
-    let response = fetcher.fetch(url, None).await.map_err(|_| ())?;
+    let mut fetch = Box::pin(fetcher.fetch(url, None));
+    let response = std::future::poll_fn(|cx| {
+        use std::task::Poll;
+        // Deadline first: an already-fired deadline aborts even when
+        // headers are also ready, matching `collect_mb_body` below.
+        // (Fully qualified: `Future` is not imported in this module, the
+        // same reason `collect_mb_body` calls `Stream::poll_next` by path.)
+        if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        match std::future::Future::poll(fetch.as_mut(), cx) {
+            Poll::Ready(response) => Poll::Ready(Some(response)),
+            Poll::Pending => Poll::Pending,
+        }
+    })
+    .await;
+    let response = match response {
+        Some(Ok(response)) => response,
+        Some(Err(_)) | None => return Err(()),
+    };
     let status = response.status().as_u16();
     let body = response
         .into_body()
