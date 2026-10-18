@@ -221,8 +221,8 @@ planetscale_cluster = SKU
 For the common single-node case (`N = 1`, `X = 0`) the storage term
 reduces to `max(0, D - 10) * 0.125`.
 
-Current shape to price at staging time (from `docs/ops.md`, host-reported
-there): two clusters — the app cluster (PS-5 single-node, staging +
+Current shape to price at staging time (from `docs/ops.md` § PlanetScale Postgres,
+host-reported there; verified 2026-10-18 against ops.md as of 2026-10-16): two clusters — the app cluster (PS-5 single-node, staging +
 future prod databases on one branch) and the separate MusicBrainz mirror
 cluster (reported $5/month compute; final SKU not specified there, so
 confirm the SKU before pricing it as PS-5). The ~100 GB MusicBrainz
