@@ -12,11 +12,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from docs_link_lint import (
+    LintError,
     anchors_in_markdown,
     changed_markdown_files,
     check_source,
@@ -559,6 +561,110 @@ class TestMainExitCodes(unittest.TestCase):
                 self.assertEqual(
                     2, main(["--root", str(Path(tmp) / "nope")])
                 )
+
+
+class TestReadFailures(unittest.TestCase):
+    """Pin read-failure exits: unreadable inputs fail closed, never clean.
+
+    Covers check_source source reads and anchor-target reads
+    (docs_link_lint.py check_source): OSError and invalid-UTF8 bytes both
+    surface as LintError, and main() maps them to exit 1 naming the file
+    with no traceback and no clean-scan summary.
+    """
+
+    def _run_files(self, root, *files):
+        buf = io.StringIO()
+        err = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            rc = main(["--root", str(root), "--files", *files])
+        return rc, buf.getvalue() + err.getvalue()
+
+    def test_source_directory_raises_oserror(self):
+        # Directory-as-input where the OS permits: reading a directory as
+        # UTF-8 text raises OSError (IsADirectoryError on Linux).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs" / "a.md").mkdir(parents=True)
+            with self.assertRaises(LintError) as ctx:
+                check(root, "docs/a.md")
+            self.assertIn("docs/a.md", str(ctx.exception))
+            self.assertIsInstance(ctx.exception.__cause__, OSError)
+
+    def test_source_oserror_exit_names_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp, {"docs/a.md": "[b](b.md)\n", "docs/b.md": "# B\n"}
+            )
+
+            def boom(self, *args, **kwargs):
+                raise OSError("boom")
+
+            with mock.patch.object(Path, "read_text", new=boom):
+                with self.assertRaises(LintError) as ctx:
+                    check(root, "docs/a.md")
+                self.assertIn("docs/a.md", str(ctx.exception))
+                rc, out = self._run_files(root, "docs/a.md")
+            self.assertEqual(1, rc)
+            self.assertIn("docs/a.md", out)
+            self.assertNotIn("Traceback", out)
+            self.assertNotIn("scanned", out)
+
+    def test_source_invalid_utf8_exit_names_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs").mkdir(parents=True)
+            (root / "docs" / "a.md").write_bytes(b"# Title\n\xff\xfe bad\n")
+            with self.assertRaises(LintError) as ctx:
+                check(root, "docs/a.md")
+            self.assertIn("docs/a.md", str(ctx.exception))
+            rc, out = self._run_files(root, "docs/a.md")
+            self.assertEqual(1, rc)
+            self.assertIn("docs/a.md", out)
+            self.assertNotIn("Traceback", out)
+            self.assertNotIn("scanned", out)
+
+    def test_anchor_target_invalid_utf8_names_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs").mkdir(parents=True)
+            (root / "docs" / "a.md").write_text(
+                "[x](b.md#sec)\n", encoding="utf-8"
+            )
+            (root / "docs" / "b.md").write_bytes(b"# Sec\n\xff bad\n")
+            with self.assertRaises(LintError) as ctx:
+                check(root, "docs/a.md")
+            self.assertIn("docs/b.md", str(ctx.exception))
+            rc, out = self._run_files(root, "docs/a.md")
+            self.assertEqual(1, rc)
+            self.assertIn("docs/b.md", out)
+            self.assertNotIn("Traceback", out)
+            self.assertNotIn("scanned", out)
+
+    def test_anchor_target_oserror_names_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": "[x](b.md#sec)\n",
+                    "docs/b.md": "# Sec\n",
+                },
+            )
+            real_read = Path.read_text
+
+            def selective(self, *args, **kwargs):
+                if self.name == "b.md":
+                    raise OSError("disk gone")
+                return real_read(self, *args, **kwargs)
+
+            with mock.patch.object(Path, "read_text", new=selective):
+                with self.assertRaises(LintError) as ctx:
+                    check(root, "docs/a.md")
+                self.assertIn("docs/b.md", str(ctx.exception))
+                rc, out = self._run_files(root, "docs/a.md")
+            self.assertEqual(1, rc)
+            self.assertIn("docs/b.md", out)
+            self.assertNotIn("Traceback", out)
+            self.assertNotIn("scanned", out)
 
 
 class TestFixtureRepos(unittest.TestCase):

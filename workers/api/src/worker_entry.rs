@@ -15,7 +15,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use worker::{
-    console_log, Delay, Env, Fetch, Headers, Method, Request, RequestInit, Response, ResponseBody,
+    Delay, Env, Fetch, Headers, Method, Request, RequestInit, Response, ResponseBody,
     Result as WorkerResult,
 };
 
@@ -409,8 +409,14 @@ impl PgStore {
             .map_err(|_| StoreError)?;
         wasm_bindgen_futures::spawn_local(async move {
             // No detail in logs: driver errors can carry host/role strings.
+            // A background task has no inbound trace, so it roots a fresh one.
             if connection.await.is_err() {
-                console_log!("api db connection error");
+                let _ = emit_record(
+                    crate::logging::Level::Error,
+                    "api.db.connection_error",
+                    &crate::logging::resolve_trace_id(None),
+                    serde_json::json!({"error_class": "service_unavailable"}),
+                );
             }
         });
         Ok(client)
@@ -1723,14 +1729,110 @@ where
     }
 }
 
+/// Registry code for an error response: the envelope `code` when the body
+/// carries one, else the status-implied code for statuses this worker owns
+/// unambiguously (429 is only ever `rate_limited`, 404 only `not_found`,
+/// and 500 falls back to `internal_error` per the taxonomy's unknown-code
+/// rule in `docs/api-errors.md`). Other statuses stay unmapped: 400 has no
+/// api-owned registry code and 401/403 each map to several codes, so
+/// guessing would mislabel the group. Success bodies are never inspected:
+/// callers only ask for 4xx/5xx responses.
+fn response_error_code(status: u16, body: &str) -> Option<String> {
+    let from_body = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("code")?.as_str().map(str::to_string));
+    if from_body.is_some() {
+        return from_body;
+    }
+    match status {
+        429 => Some("rate_limited".to_string()),
+        404 => Some("not_found".to_string()),
+        500 => Some("internal_error".to_string()),
+        _ => None,
+    }
+}
+
+/// Log-safe display path: the bare path for served routes, a fixed
+/// `unknown` sentinel otherwise. Raw request paths must never reach the
+/// log: the catch-all 404 arm serves arbitrary probe paths that can carry
+/// addresses or tokens, and unbounded distinct values would break log
+/// grouping. Query strings are stripped before the known-path check for
+/// the same reason.
+fn served_display_path(path: &str) -> String {
+    let bare = path.split('?').next().unwrap_or("");
+    if handlers::is_known_path(bare) {
+        bare.to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+/// Wall-clock milliseconds for record timestamps.
+#[cfg(target_arch = "wasm32")]
+fn now_millis() -> u64 {
+    worker::Date::now().as_millis()
+}
+
+/// Wall-clock milliseconds for record timestamps (native test builds).
+#[cfg(not(target_arch = "wasm32"))]
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Emit one structured record through the shared emitter
+/// (`docs/logging-standard.md` six-key envelope). Construction is
+/// fail-closed: a rejected record (banned key, secret-like value, invalid
+/// event) is dropped and `None` returned, never logged half-built. Every
+/// value passed here is a code-controlled constant or a validated route
+/// label, so a drop indicates a programming error. Returns the rendered
+/// line so native tests can pin the shape without a Worker console.
+fn emit_record(
+    level: crate::logging::Level,
+    event: &str,
+    trace_id: &str,
+    fields: serde_json::Value,
+) -> Option<String> {
+    let field_map = crate::logging::fields_from_json(fields).ok()?;
+    let record = crate::logging::LogRecord::new(
+        crate::logging::Worker::Api,
+        level,
+        trace_id,
+        event,
+        field_map,
+        now_millis(),
+    )
+    .ok()?;
+    let line = record.to_json_line();
+    #[cfg(target_arch = "wasm32")]
+    worker::console_log!("{line}");
+    Some(line)
+}
+
 /// Worker `fetch` entry: adapts the runtime request into the handlers'
 /// framework-agnostic shape. Misconfiguration (missing/invalid env)
 /// answers the same generic 500 as any store outage.
 pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
+    // Trace ID first: every record below carries it, including the
+    // fail-closed paths. An invalid inbound value is dropped, never logged.
+    let incoming_trace = req
+        .headers()
+        .get(crate::logging::TRACE_HEADER)
+        .ok()
+        .flatten();
+    let trace_id = crate::logging::resolve_trace_id(incoming_trace.as_deref());
+    let start_ms = now_millis();
     let Some(config) = config_from_env(&env) else {
         // Misconfiguration is an operator problem; clients only ever see
         // the generic internal error (never which variable is wrong).
-        console_log!("api worker misconfigured");
+        let _ = emit_record(
+            crate::logging::Level::Error,
+            "api.start.misconfigured",
+            &trace_id,
+            serde_json::json!({"error_class": "internal_error"}),
+        );
         return internal_render();
     };
     // Classify the body source from the actual runtime request, then
@@ -1794,10 +1896,30 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         now: worker::Date::now().as_millis() / 1000,
         source_ip: client_source_ip(&headers_map),
     };
+    let served_method = request.method.clone();
+    let served_path = served_display_path(&request.path);
     let response = dispatch_collected(collected, request, |collected_request| async move {
         handlers::handle(&ctx, &collected_request).await
     })
     .await;
+    // One structured line per served request: route, status, latency, and
+    // the error registry code when the response maps to one.
+    let level = if response.status >= 500 {
+        crate::logging::Level::Error
+    } else {
+        crate::logging::Level::Info
+    };
+    let mut fields = serde_json::json!({
+        "route": format!("{served_method} {served_path}"),
+        "status_code": response.status,
+        "duration_ms": now_millis().saturating_sub(start_ms),
+    });
+    if response.status >= 400 {
+        if let Some(code) = response_error_code(response.status, &response.body) {
+            fields["error_class"] = serde_json::Value::String(code);
+        }
+    }
+    let _ = emit_record(level, "api.request.served", &trace_id, fields);
     // Exact match only: the configured origin is the one frontend origin
     // this Worker trusts with credentialed cross-origin calls. The raw
     // request Origin goes into the tested `cors_headers` decision — never
@@ -1842,6 +1964,100 @@ mod tests {
         let mut forged = HashMap::new();
         forged.insert("x-forwarded-for".to_string(), "203.0.113.7".to_string());
         assert_eq!(client_source_ip(&forged), "unknown");
+    }
+
+    #[test]
+    fn response_error_code_prefers_the_envelope_then_status() {
+        assert_eq!(
+            response_error_code(
+                500,
+                r#"{"code":"rate_limited","message":"x","retryable":true}"#
+            ),
+            Some("rate_limited".to_string())
+        );
+        // Legacy fixed bodies with no `code`: the status-implied mapping.
+        assert_eq!(
+            response_error_code(429, r#"{"error":"rate_limited"}"#),
+            Some("rate_limited".to_string())
+        );
+        assert_eq!(
+            response_error_code(404, r#"{"error":"not found"}"#),
+            Some("not_found".to_string())
+        );
+        assert_eq!(
+            response_error_code(500, r#"{"error":"internal error"}"#),
+            Some("internal_error".to_string())
+        );
+        assert_eq!(
+            response_error_code(500, "not json"),
+            Some("internal_error".to_string())
+        );
+        assert_eq!(
+            response_error_code(500, r#"{"code":42}"#),
+            Some("internal_error".to_string())
+        );
+        // Ambiguous or unowned statuses stay unmapped rather than guessed.
+        assert_eq!(
+            response_error_code(400, r#"{"error":"invalid request"}"#),
+            None
+        );
+        assert_eq!(response_error_code(401, r#"{"error":"x"}"#), None);
+        assert_eq!(response_error_code(200, r#"{"ok":true}"#), None);
+    }
+
+    #[test]
+    fn served_display_path_hides_unknown_paths_and_queries() {
+        assert_eq!(served_display_path("/v1/vault"), "/v1/vault");
+        assert_eq!(served_display_path("/healthz"), "/healthz");
+        // A probe path carrying an address collapses to the sentinel ...
+        assert_eq!(
+            served_display_path("/v1/vault/victim@example.com"),
+            "unknown"
+        );
+        assert_eq!(served_display_path("/probe/anything"), "unknown");
+        // ... and query strings never reach the log either.
+        assert_eq!(served_display_path("/v1/vault?token=abc"), "/v1/vault");
+        assert_eq!(served_display_path("/probe/x?token=abc"), "unknown");
+    }
+
+    #[test]
+    fn emit_record_renders_the_served_line_and_drops_rejected_fields() {
+        let line = emit_record(
+            crate::logging::Level::Info,
+            "api.request.served",
+            "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c",
+            serde_json::json!({
+                "route": "POST /v1/auth/magic/start",
+                "status_code": 200,
+                "duration_ms": 12,
+            }),
+        )
+        .expect("served line must render");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&line).expect("record must be one JSON object");
+        let object = parsed.as_object().expect("record must be an object");
+        assert_eq!(object.len(), 6, "exactly the six envelope keys");
+        assert_eq!(object["worker"], "api");
+        assert_eq!(object["event"], "api.request.served");
+        assert_eq!(object["fields"]["route"], "POST /v1/auth/magic/start");
+        // Fail-closed: a banned key or secret-like value drops the line.
+        assert!(emit_record(
+            crate::logging::Level::Info,
+            "api.request.served",
+            "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c",
+            serde_json::json!({"route": "GET unknown", "session_id": "s"}),
+        )
+        .is_none());
+        assert!(
+            emit_record(
+                crate::logging::Level::Info,
+                "api.request.served",
+                "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c",
+                serde_json::json!({"route": "GET /v1/vault/victim@example.com"}),
+            )
+            .is_none(),
+            "address-carrying route value must not become a log line"
+        );
     }
 
     fn previous_43() -> String {

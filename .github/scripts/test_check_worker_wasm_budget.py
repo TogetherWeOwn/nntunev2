@@ -20,6 +20,7 @@ from check_worker_wasm_budget import (
     gzip_size,
     main,
     measure_worker,
+    publish,
     render_table,
     summarize_failure,
     wasm_path,
@@ -263,6 +264,163 @@ class MainTests(unittest.TestCase):
             rows = collect_rows(Path(tmp), skip_build=True)
             self.assertEqual(len(rows), len(WORKERS))
             self.assertTrue(all("status" in row for row in rows))
+
+
+class SummarizeFailureEdgeTests(unittest.TestCase):
+    def test_empty_output_is_bare_exit(self):
+        self.assertEqual(summarize_failure("", 1), "exit 1")
+
+    def test_whitespace_only_output_is_bare_exit(self):
+        self.assertEqual(summarize_failure("   \n\t\n  ", 2), "exit 2")
+
+    def test_fewer_than_five_lines_are_joined(self):
+        self.assertEqual(summarize_failure("a\nb", 3), "exit 3: a; b")
+        self.assertEqual(summarize_failure("only", 4), "exit 4: only")
+
+    def test_blank_line_gaps_are_skipped(self):
+        summary = summarize_failure("line1\n\nline2\n\nline3", 1)
+        self.assertEqual(summary, "exit 1: line1; line2; line3")
+        self.assertNotIn(";;", summary)
+
+    def test_tail_longer_than_300_chars_is_truncated(self):
+        summary = summarize_failure("y" * 350, 9)
+        tail = summary.partition(": ")[2]
+        self.assertTrue(summary.startswith("exit 9: "))
+        self.assertEqual(len(tail), 300)
+        self.assertTrue(tail.endswith("..."))
+        self.assertEqual(tail, "y" * 297 + "...")
+        self.assertNotIn("\n", summary)
+
+
+class PublishTests(unittest.TestCase):
+    def test_appends_table_bytes_to_summary_file(self):
+        import io
+        import os
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+
+        table = "| `api` | 1 B |\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = Path(tmp) / "summary.md"
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    publish(table)
+            self.assertEqual(buf.getvalue(), table)
+            self.assertEqual(summary.read_text(encoding="utf-8"), table)
+
+    def test_unwritable_summary_warns_and_preserves_verdict(self):
+        import io
+        import os
+        import tempfile
+        from contextlib import redirect_stderr, redirect_stdout
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # Pointing GITHUB_STEP_SUMMARY at a directory makes the
+            # append open() raise IsADirectoryError (an OSError).
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": tmp}):
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    publish("TABLE\n")
+                self.assertEqual(out.getvalue(), "TABLE\n")
+                self.assertIn("warning:", err.getvalue())
+
+                # The warning must not mask the budget verdict: an empty
+                # root still fails closed with exit 1.
+                out2, err2 = io.StringIO(), io.StringIO()
+                with redirect_stdout(out2), redirect_stderr(err2):
+                    code = main(["--root", tmp, "--skip-build"])
+                self.assertEqual(code, 1)
+                self.assertIn("FAIL", out2.getvalue())
+                self.assertIn("warning:", err2.getvalue())
+
+
+class MeasureWorkerErrorTests(unittest.TestCase):
+    def test_directory_artifact_is_unreadable(self):
+        import tempfile
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            api = next(s for s in WORKERS if s["worker"] == "api")
+            path = wasm_path(root, api)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.mkdir()
+            # A directory is not a file, so is_file() would report
+            # "missing artifact" before the read is attempted. Force the
+            # read path to prove directory bytes surface as unreadable
+            # (read_bytes on a directory raises IsADirectoryError, an
+            # OSError) via the OSError arm.
+            with patch.object(Path, "is_file", return_value=True):
+                raw, compressed, detail = measure_worker(root, api)
+            self.assertIsNone(raw)
+            self.assertIsNone(compressed)
+            self.assertIn("unreadable artifact", detail)
+
+    def test_absolute_path_outside_root_falls_back(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = {
+                "worker": "api",
+                "target_dir": "/definitely/outside",
+                "wasm": "x.wasm",
+            }
+            raw, compressed, detail = measure_worker(root, spec)
+            self.assertIsNone(raw)
+            self.assertIsNone(compressed)
+            self.assertIn("missing artifact", detail)
+            # relative_to(root) raises ValueError for this absolute path,
+            # so the fallback shows the absolute path itself.
+            self.assertIn("/definitely/outside", detail)
+
+
+class EvaluateNoneSizeTests(unittest.TestCase):
+    def test_ok_status_with_none_size_passes_current_behavior(self):
+        # Pinned hole: ("ok", None) silently passes today. This test pins
+        # the current verdict without changing it.
+        rows = [{"worker": "api", "raw": None, "compressed": None, "status": "ok"}]
+        self.assertEqual(evaluate(rows, 3_000_000), [])
+
+
+class RenderNewlineTests(unittest.TestCase):
+    def test_newlines_are_flattened_to_single_line_row(self):
+        rows = [
+            {
+                "worker": "api",
+                "raw": None,
+                "compressed": None,
+                "status": "error: foo\nbar\nbaz",
+            },
+        ]
+        table = render_table(rows, 3_000_000, ["api: boom"])
+        api_lines = [line for line in table.splitlines() if line.startswith("| `api`")]
+        self.assertEqual(len(api_lines), 1)
+        self.assertIn("foo bar baz", api_lines[0])
+        self.assertNotIn("foo\nbar", table.split("| `api` |")[1].split("|")[5])
+        self.assertEqual(api_lines[0].replace("\\|", "").count("|"), 7)
+
+
+class CargoArgsUnlockedTests(unittest.TestCase):
+    def test_manifest_spec_without_locked_omits_flag(self):
+        spec = {
+            "kind": "manifest",
+            "manifest": "workers/api/Cargo.toml",
+            "locked": False,
+        }
+        args = cargo_args(spec)
+        self.assertNotIn("--locked", args)
+        self.assertIn("--manifest-path", args)
+        self.assertIn("workers/api/Cargo.toml", args)
+
+    def test_package_spec_without_locked_omits_flag(self):
+        spec = {"kind": "package", "package": "nntune-stream", "locked": False}
+        args = cargo_args(spec)
+        self.assertNotIn("--locked", args)
+        self.assertIn("-p", args)
 
 
 if __name__ == "__main__":
