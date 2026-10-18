@@ -644,6 +644,29 @@ mod http_layer {
         nntune_logging::resolve_trace_id(header.as_deref())
     }
 
+    /// Read a deploy-time plain var, ignoring empty values. `BUILD_SHA` is
+    /// public build identity (see `wrangler.toml.example`): a secret binding
+    /// is tried first so an operator-supplied value wins, then a plain var,
+    /// mirroring the api/ingest workers' reader.
+    fn env_string(env: &Env, name: &str) -> Option<String> {
+        env.secret(name)
+            .ok()
+            .map(|s| s.to_string())
+            .or_else(|| env.var(name).ok().map(|s| s.to_string()))
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Build identity for log lines: the 40-char lowercase hex commit supplied
+    /// at deploy time by the deploy lane via the public `BUILD_SHA` var (no
+    /// workflow wires it for the mb Worker yet), or the explicit
+    /// `"unknown"` marker when absent or invalid (dev, preview without env,
+    /// unwired lane). Normalized through the shared validator, never logged
+    /// raw; never fail-closed, so a missing identity degrades the line instead
+    /// of the request.
+    fn build_sha_from_env(env: &Env) -> String {
+        nntune_logging::parse_build_sha(env_string(env, "BUILD_SHA").as_deref())
+    }
+
     /// Emit one structured log line for this request
     /// (`docs/logging-standard.md`). Field validation runs at construction:
     /// a banned key or secret-like value drops the line instead of leaking
@@ -743,6 +766,10 @@ mod http_layer {
                 .await
                 .map_err(|_| RepoError)?;
             let trace_id = self.trace_id.clone();
+            // Build identity rides the detached line too (mirrors the api
+            // worker): the deploy lane's public BUILD_SHA var, or explicit
+            // "unknown" when unwired.
+            let build_sha = build_sha_from_env(&self.env);
             wasm_bindgen_futures::spawn_local(async move {
                 // Detail stays out of logs: driver errors can carry
                 // host/role strings that are not needed to triage.
@@ -751,7 +778,7 @@ mod http_layer {
                         Level::Error,
                         &trace_id,
                         "mb.db.connect_failed",
-                        serde_json::json!({"stage": "connect"}),
+                        serde_json::json!({"stage": "connect", "build_sha": build_sha}),
                     );
                 }
             });
@@ -899,12 +926,15 @@ mod http_layer {
         // they still echo the trace and log one line. The cached copy itself
         // stays untraced (wrapping only mutates the served clone).
         let trace_id = inbound_trace_id(req);
+        // Build identity rides every line (mirrors the api worker): the deploy
+        // lane's public BUILD_SHA var, or explicit "unknown" when unwired.
+        let build_sha = build_sha_from_env(&ctx.env);
         if let Some(hit) = edge_hit(req).await {
             emit(
                 Level::Info,
                 &trace_id,
                 "mb.lookup.completed",
-                serde_json::json!({"kind": kind.as_str(), "status_code": 200, "cache": "edge"}),
+                serde_json::json!({"kind": kind.as_str(), "status_code": 200, "cache": "edge", "build_sha": build_sha}),
             );
             return Ok(with_trace(hit, &trace_id));
         }
@@ -921,7 +951,7 @@ mod http_layer {
             outcome_level(api.status),
             &trace_id,
             "mb.lookup.completed",
-            serde_json::json!({"kind": kind.as_str(), "status_code": api.status}),
+            serde_json::json!({"kind": kind.as_str(), "status_code": api.status, "build_sha": build_sha}),
         );
         serve(req.url()?.to_string(), api, &trace_id).await
     }
@@ -933,12 +963,15 @@ mod http_layer {
         // Same trace contract as the other routes: resolve before the edge
         // lookup so cache hits still echo the trace and log one line.
         let trace_id = inbound_trace_id(req);
+        // Build identity rides every line (mirrors the api worker): the deploy
+        // lane's public BUILD_SHA var, or explicit "unknown" when unwired.
+        let build_sha = build_sha_from_env(&ctx.env);
         if let Some(hit) = edge_hit(req).await {
             emit(
                 Level::Info,
                 &trace_id,
                 "mb.release_recordings.completed",
-                serde_json::json!({"status_code": 200, "cache": "edge"}),
+                serde_json::json!({"status_code": 200, "cache": "edge", "build_sha": build_sha}),
             );
             return Ok(with_trace(hit, &trace_id));
         }
@@ -955,7 +988,7 @@ mod http_layer {
             outcome_level(api.status),
             &trace_id,
             "mb.release_recordings.completed",
-            serde_json::json!({"status_code": api.status}),
+            serde_json::json!({"status_code": api.status, "build_sha": build_sha}),
         );
         serve(req.url()?.to_string(), api, &trace_id).await
     }
@@ -973,6 +1006,9 @@ mod http_layer {
 
     pub async fn search_route(req: &Request, ctx: &RouteContext<()>) -> WorkerResult<Response> {
         let trace_id = inbound_trace_id(req);
+        // Build identity rides every line (mirrors the api worker): the deploy
+        // lane's public BUILD_SHA var, or explicit "unknown" when unwired.
+        let build_sha = build_sha_from_env(&ctx.env);
         // Parsed-or-unknown: the raw `type` query value is untrusted input
         // and never reaches a log line verbatim.
         let kind_label = |query: &std::collections::HashMap<String, String>| {
@@ -990,7 +1026,7 @@ mod http_layer {
                 Level::Info,
                 &trace_id,
                 "mb.search.completed",
-                serde_json::json!({"kind": kind_label(&query), "status_code": 200, "cache": "edge"}),
+                serde_json::json!({"kind": kind_label(&query), "status_code": 200, "cache": "edge", "build_sha": build_sha}),
             );
             return Ok(with_trace(hit, &trace_id));
         }
@@ -1022,18 +1058,21 @@ mod http_layer {
             outcome_level(api.status),
             &trace_id,
             "mb.search.completed",
-            serde_json::json!({"kind": kind_label(&query), "status_code": api.status}),
+            serde_json::json!({"kind": kind_label(&query), "status_code": api.status, "build_sha": build_sha}),
         );
         serve(url.to_string(), api, &trace_id).await
     }
 
-    pub async fn not_found(req: &Request) -> WorkerResult<Response> {
+    pub async fn not_found(req: &Request, env: &Env) -> WorkerResult<Response> {
         let trace_id = inbound_trace_id(req);
+        // The catch-all still carries build identity: the router passes the
+        // request env so scanner-noise 404s stay attributable to a release.
+        let build_sha = build_sha_from_env(env);
         emit(
             Level::Warn,
             &trace_id,
             "mb.request.not_found",
-            serde_json::json!({"status_code": 404}),
+            serde_json::json!({"status_code": 404, "build_sha": build_sha}),
         );
         Ok(with_trace(
             render(&error_response(ApiError::not_found("not found")))?,
@@ -1065,8 +1104,8 @@ pub async fn main(
         .get_async("/v1/mb/search", |req, ctx| async move {
             http_layer::search_route(&req, &ctx).await
         })
-        .or_else_any_method_async("/*catchall", |req, _| async move {
-            http_layer::not_found(&req).await
+        .or_else_any_method_async("/*catchall", |req, ctx| async move {
+            http_layer::not_found(&req, &ctx.env).await
         })
         .run(req, env)
         .await
@@ -1920,20 +1959,22 @@ mod tests {
     }
 
     /// Negative privacy coverage: the only shapes routes emit are kinds and
-    /// status codes — entity content (names, titles) and raw query text never
-    /// reach the emitter, and identity/credential/network shapes are rejected
-    /// outright when they do.
+    /// status codes plus the build identity — entity content (names, titles)
+    /// and raw query text never reach the emitter, and
+    /// identity/credential/network shapes are rejected outright when they do.
     #[test]
     fn completed_lines_carry_no_entity_content() {
         for value in [
-            serde_json::json!({"kind": "artist", "status_code": 200}),
-            serde_json::json!({"kind": "unknown", "status_code": 400}),
-            serde_json::json!({"status_code": 404}),
+            serde_json::json!({"kind": "artist", "status_code": 200, "build_sha": "unknown"}),
+            serde_json::json!({"kind": "unknown", "status_code": 400, "build_sha": "unknown"}),
+            serde_json::json!({"status_code": 404, "build_sha": "unknown"}),
         ] {
             let fields = nntune_logging::fields_from_json(value).unwrap();
             assert!(
-                fields.keys().all(|k| k == "kind" || k == "status_code"),
-                "route shape carries more than kind + status"
+                fields
+                    .keys()
+                    .all(|k| k == "kind" || k == "status_code" || k == "build_sha"),
+                "route shape carries more than kind + status + build_sha"
             );
         }
         for value in [
@@ -1947,5 +1988,84 @@ mod tests {
                 "emitter accepted identity content"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod build_sha_tests {
+    use super::*;
+
+    const TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// Every mb line carries the normalized build identity through the
+    /// REAL emitter (`nntune-logging`), not a hand-written fixture: a known
+    /// SHA and the explicit unknown marker both survive validation and keep
+    /// the six-key envelope.
+    #[test]
+    fn emitted_lines_carry_build_sha_known_or_unknown() {
+        for sha in [SHA, nntune_logging::BUILD_SHA_UNKNOWN] {
+            let normalized = nntune_logging::parse_build_sha(Some(sha));
+            let record = LogRecord::new(
+                LogWorker::Mb,
+                Level::Info,
+                TRACE,
+                "mb.lookup.completed",
+                nntune_logging::fields_from_json(serde_json::json!({
+                    "kind": "artist",
+                    "status_code": 200,
+                    "build_sha": normalized,
+                }))
+                .unwrap(),
+                1_792_094_400_123,
+            )
+            .expect("mb line with build_sha must render");
+            let parsed: serde_json::Value = serde_json::from_str(&record.to_json_line())
+                .expect("record must be one JSON object");
+            let object = parsed.as_object().expect("record must be an object");
+            assert_eq!(object.len(), 6, "exactly the six envelope keys");
+            assert_eq!(object["fields"]["build_sha"], sha);
+        }
+    }
+
+    #[test]
+    fn every_emit_site_wires_build_sha() {
+        // `build_sha_from_env` needs a wasm Env, so pin the call sites in
+        // source the way the healthz test pins the route shape: slice the
+        // pre-test source so this test's own literals cannot satisfy it.
+        // All eight emit sites (three routes x2, detached connect failure,
+        // catch-all 404) must carry the normalized key — never a missing
+        // key or a raw var.
+        let source = include_str!("lib.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        assert!(
+            production.contains("fn build_sha_from_env("),
+            "the BUILD_SHA reader must exist"
+        );
+        assert!(
+            production.contains("nntune_logging::parse_build_sha"),
+            "the reader must normalize through the shared validator"
+        );
+        for event in [
+            "mb.lookup.completed",
+            "mb.release_recordings.completed",
+            "mb.search.completed",
+            "mb.db.connect_failed",
+            "mb.request.not_found",
+        ] {
+            assert!(production.contains(event), "mb entry must emit {event}");
+        }
+        // Match the key literal inside the `json!` fields, not the bare
+        // substring: `let build_sha = …` alone must never satisfy this.
+        // Eight emit sites carry the key, so a dropped key at any one of
+        // them drops the count below eight.
+        assert_eq!(
+            production.matches("\"build_sha\": build_sha").count(),
+            8,
+            "all eight mb lines must carry the build_sha key"
+        );
     }
 }
