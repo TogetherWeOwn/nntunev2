@@ -938,7 +938,12 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
 // missing reports — but nothing stops a future edit from dropping a
 // `--locked` flag or adding an uncovered standalone crate. These cases pin
 // the mapping offline so such an edit reds test:unit.
-const coverageWorkflow = readFileSync(new URL('coverage.yml', workflowDir), 'utf8');
+// Commented-out steps are inactive: strip full-line `#` comments once at load
+// so a commented-out llvm-cov command cannot satisfy the pins below.
+const coverageWorkflow = readFileSync(new URL('coverage.yml', workflowDir), 'utf8').replace(
+  /^[ \t]*#.*$/gm,
+  '',
+);
 
 // Join backslash continuations so multi-line invocations read as one command.
 const coverageCommands = coverageWorkflow
@@ -969,11 +974,11 @@ function loopCoveredCrates(): Set<string> {
 }
 
 function crateHasLockedCoverageStep(crate: string, loopCovered: Set<string>): boolean {
-  return (
-    coverageWorkflow.includes(
-      `cargo llvm-cov --locked --manifest-path workers/${crate}/Cargo.toml`,
-    ) || loopCovered.has(crate)
+  // Accept the manifest path quoted or unquoted: both are valid shell.
+  const direct = new RegExp(
+    `cargo llvm-cov --locked --manifest-path\\s+"?workers/${crate}/Cargo\\.toml"?`,
   );
+  return direct.test(coverageWorkflow) || loopCovered.has(crate);
 }
 
 test.describe('locked-dependency coverage builds (static pin)', () => {
@@ -1011,10 +1016,17 @@ test.describe('locked-dependency coverage builds (static pin)', () => {
   test('stream stays covered by the root workspace step while a member, locked step if extracted', () => {
     const rootManifest = readFileSync(new URL('../../Cargo.toml', import.meta.url), 'utf8');
     const members = rootManifest.match(/members = \[([^\]]*)\]/)?.[1] ?? '';
-    if (members.includes('workers/stream')) {
+    // Compare complete member values: a substring match would let e.g.
+    // `workers/stream-tools` select the workspace branch and bypass the
+    // locked stream-step assertion.
+    const memberValues = [...members.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    if (memberValues.includes('workers/stream')) {
       expect(
         coverageCommands.some(
-          (command) => command.includes('--workspace') && !command.includes('--manifest-path'),
+          (command) =>
+            command.includes('--workspace') &&
+            !command.includes('--manifest-path') &&
+            !/--exclude|--package|\s-p\s/.test(command),
         ),
         'root workspace llvm-cov step covering workers/stream is missing',
       ).toBe(true);
