@@ -305,6 +305,8 @@ jobs:
           persist-credentials: false
       - name: Run mb-import ETL fixture tests
         run: bash containers/mb-import/tests/test_etl.sh
+      - name: Run mb-import ETL reference-graph tests
+        run: bash containers/mb-import/tests/test_etl_reference_graphs.sh
       - name: Run mb-import argv-hygiene tests
         run: bash containers/mb-import/tests/test_argv_hygiene.sh
       - name: Run mb-import pg-env tests

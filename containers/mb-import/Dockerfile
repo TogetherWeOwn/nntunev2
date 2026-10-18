@@ -11,8 +11,9 @@ WORKDIR /job
 COPY containers/mb-import/etl.sh /job/etl.sh
 COPY containers/mb-import/etl.py /job/etl.py
 COPY containers/mb-import/tests /job/tests
-RUN chmod 0755 /job/etl.sh /job/etl.py /job/tests/test_etl.sh \
+RUN chmod 0755 /job/etl.sh /job/etl.py /job/tests/test_etl.sh /job/tests/test_etl_reference_graphs.sh \
  && bash /job/tests/test_etl.sh \
+ && bash /job/tests/test_etl_reference_graphs.sh \
  && touch /tmp/mb-import-tests-passed
 
 FROM rust:1-bookworm AS validator
