@@ -384,6 +384,37 @@ def test_invalid_env_table_fails_closed():
     _assert_rejected(repo, "invalid env table")
 
 
+def test_string_r2_buckets_table_fails_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": 'r2_buckets = "oops"\n'})
+    _assert_rejected(repo, "invalid r2_buckets table")
+
+
+def test_non_dict_toml_document_fails_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": CLEAN_MANIFEST})
+    with mock.patch(
+        "check_archive_bindings.tomllib.loads",
+        return_value=["not", "a", "dict"],
+    ):
+        _assert_rejected(repo, "invalid TOML document")
+
+
+def test_integer_env_table_fails_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": "env = 42\n"})
+    _assert_rejected(repo, "invalid env table")
+
+
+def test_string_env_entry_fails_closed():
+    repo = _repo_with(
+        {"workers/stream/wrangler.toml": 'env = { production = "oops" }\n'}
+    )
+    _assert_rejected(repo, "invalid env entry")
+
+
+def test_string_r2_buckets_entry_fails_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": 'r2_buckets = ["oops"]\n'})
+    _assert_rejected(repo, "invalid r2_buckets entry")
+
+
 def test_non_utf8_unrelated_path_does_not_break_scan():
     repo = _repo_with({"workers/stream/wrangler.toml": CLEAN_MANIFEST})
     bad_path = os.fsencode(repo) + b"/workers/\xff-not-a-config.txt"
@@ -496,6 +527,11 @@ if __name__ == "__main__":
     test_wrangler_named_document_is_not_treated_as_a_manifest()
     test_array_environment_table_fails_closed()
     test_invalid_env_table_fails_closed()
+    test_string_r2_buckets_table_fails_closed()
+    test_non_dict_toml_document_fails_closed()
+    test_integer_env_table_fails_closed()
+    test_string_env_entry_fails_closed()
+    test_string_r2_buckets_entry_fails_closed()
     test_non_utf8_unrelated_path_does_not_break_scan()
     test_non_git_directory_fails_listing_closed()
     test_failing_git_binary_fails_listing_closed()
