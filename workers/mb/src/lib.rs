@@ -494,6 +494,68 @@ async fn handle_lookup<R: MbRepo, C: SuccessCache>(
     }
 }
 
+/// Minimal validation for a cached release-recordings body: JSON object
+/// whose `release_mbid` is the requested release (canonical UUID
+/// comparison, case-insensitive) and whose `recordings` is a typed list no
+/// longer than [`RELEASE_RECORDINGS_LIMIT`]. Each entry needs a UUID-shaped
+/// string `mbid` and a string `title`; optional fields (`release_mbid`,
+/// `track_no`, `duration_ms`, `medium_no`) may be missing or null, and when
+/// present must be correctly typed. Extra top-level or per-row fields are
+/// preserved. Anything else is a miss so the repository is read instead.
+fn is_valid_cached_recordings(body: &str, release_mbid: &str) -> bool {
+    let value: serde_json::Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let obj = match value.as_object() {
+        Some(obj) => obj,
+        None => return false,
+    };
+    let cached_mbid = match obj.get("release_mbid").and_then(|v| v.as_str()) {
+        Some(mbid) => mbid,
+        None => return false,
+    };
+    if !cached_mbid.eq_ignore_ascii_case(release_mbid) {
+        return false;
+    }
+    let recordings = match obj.get("recordings").and_then(|v| v.as_array()) {
+        Some(recordings) => recordings,
+        None => return false,
+    };
+    if recordings.len() > RELEASE_RECORDINGS_LIMIT {
+        return false;
+    }
+    for row in recordings {
+        let map = match row.as_object() {
+            Some(map) => map,
+            None => return false,
+        };
+        match map.get("mbid").and_then(|v| v.as_str()) {
+            Some(mbid) if is_valid_mbid(mbid) => {}
+            _ => return false,
+        }
+        if map.get("title").and_then(|v| v.as_str()).is_none() {
+            return false;
+        }
+        if let Some(v) = map.get("release_mbid") {
+            if !v.is_null() {
+                match v.as_str() {
+                    Some(mbid) if is_valid_mbid(mbid) => {}
+                    _ => return false,
+                }
+            }
+        }
+        for key in ["track_no", "duration_ms", "medium_no"] {
+            if let Some(v) = map.get(key) {
+                if !v.is_null() && !(v.is_i64() || v.is_u64()) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Release-recordings core: validate → KV → DB. A listing for an
 /// existing release (including an empty one) is a cacheable success at
 /// the lookup TTL; a missing release is a 404 and a read failure a 500,
@@ -511,7 +573,9 @@ pub async fn handle_release_recordings<R: MbRepo, C: SuccessCache>(
     }
     let key = release_recordings_cache_key(release_mbid);
     if let Some(body) = cache.get(&key).await {
-        return success_response(body, LOOKUP_CACHE_TTL_S);
+        if is_valid_cached_recordings(&body, release_mbid) {
+            return success_response(body, LOOKUP_CACHE_TTL_S);
+        }
     }
     let release_mbid = release_mbid.to_lowercase();
     match repo.release_recordings(&release_mbid).await {
@@ -547,6 +611,71 @@ fn search_paged_cache_key(kind: Kind, normalized_q: &str, limit: u32, offset: u3
         "mb:search:{}:{normalized_q}:{limit}:{offset}",
         kind.as_str()
     )
+}
+
+/// Minimal validation for a cached paged-search body: JSON object whose
+/// `q` is the normalized query, whose `type` is the requested kind, whose
+/// `limit`/`offset` are the effective page coordinates, and whose `results`
+/// is a typed hit list no longer than the effective limit. Each hit needs a
+/// UUID-shaped string `mbid`, a numeric `score`, and the kind-aware label
+/// (`name` for artists, `title` for releases/recordings). Empty results,
+/// extra fields, null release optionals and uppercase UUIDs stay hits.
+/// Anything else is a miss so the repository is read instead.
+fn is_valid_cached_search(
+    body: &str,
+    kind: Kind,
+    normalized_q: &str,
+    effective_limit: u32,
+    effective_offset: u32,
+) -> bool {
+    let value: serde_json::Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let obj = match value.as_object() {
+        Some(obj) => obj,
+        None => return false,
+    };
+    if obj.get("q").and_then(|v| v.as_str()) != Some(normalized_q) {
+        return false;
+    }
+    if obj.get("type").and_then(|v| v.as_str()) != Some(kind.as_str()) {
+        return false;
+    }
+    if obj.get("limit").and_then(|v| v.as_u64()) != Some(u64::from(effective_limit)) {
+        return false;
+    }
+    if obj.get("offset").and_then(|v| v.as_u64()) != Some(u64::from(effective_offset)) {
+        return false;
+    }
+    let results = match obj.get("results").and_then(|v| v.as_array()) {
+        Some(results) => results,
+        None => return false,
+    };
+    if results.len() > effective_limit as usize {
+        return false;
+    }
+    let label_key = match kind {
+        Kind::Artist => "name",
+        Kind::Release | Kind::Recording => "title",
+    };
+    for hit in results {
+        let map = match hit.as_object() {
+            Some(map) => map,
+            None => return false,
+        };
+        match map.get("mbid").and_then(|v| v.as_str()) {
+            Some(mbid) if is_valid_mbid(mbid) => {}
+            _ => return false,
+        }
+        if map.get("score").is_none_or(|v| !v.is_number()) {
+            return false;
+        }
+        if map.get(label_key).and_then(|v| v.as_str()).is_none() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Search core: validate → KV → DB serving `GET /v1/mb/search` with
@@ -601,7 +730,15 @@ pub async fn handle_search_paged<R: MbRepo, C: SuccessCache>(
     let normalized_q = normalize_query(q);
     let key = search_paged_cache_key(kind, &normalized_q, effective_limit, effective_offset);
     if let Some(body) = cache.get(&key).await {
-        return success_response(body, SEARCH_CACHE_TTL_S);
+        if is_valid_cached_search(
+            &body,
+            kind,
+            &normalized_q,
+            effective_limit,
+            effective_offset,
+        ) {
+            return success_response(body, SEARCH_CACHE_TTL_S);
+        }
     }
     match repo
         .search(kind, &normalized_q, effective_limit, effective_offset)
@@ -1730,7 +1867,7 @@ mod tests {
         let cache = FakeCache::default();
         cache.stored.borrow_mut().insert(
             release_recordings_cache_key(MBID),
-            r#"{"release_mbid":"x","cached":true}"#.to_string(),
+            serde_json::json!({"release_mbid": MBID, "recordings": [], "cached": true}).to_string(),
         );
         let repo = FakeRepo::default();
         let resp = block_on(handle_release_recordings(&repo, &cache, MBID));
@@ -1815,7 +1952,7 @@ mod tests {
         let cache = FakeCache::default();
         cache.stored.borrow_mut().insert(
             search_paged_cache_key(Kind::Artist, "test", MAX_PAGE_SIZE as u32, 0),
-            r#"{"q":"test","cached":true}"#.to_string(),
+            serde_json::json!({"q": "test", "type": "artist", "limit": MAX_PAGE_SIZE, "offset": 0, "results": [], "cached": true}).to_string(),
         );
         let repo = FakeRepo::default();
         let resp = block_on(handle_search_paged(
