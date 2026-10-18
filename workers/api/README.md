@@ -48,7 +48,8 @@ the core and require exactly one row before any response.
 | `POST /v1/vault/test` (`/v1/vault/test-connection` compatibility alias) | `{"ok": bool}` only; atomically rate-limited, per-user concurrency lease, bounded pinned-address dial; empty body tests the stored vault, a `{provider, indexer}` envelope tests a candidate without persisting it |
 | `POST /api/test-codes` (staging-only seam, no `OPTIONS` arm — see below) | returns the issued signup code for an `example.test` mailbox without minting; fail-closed 404/401 outside the staging posture |
 
-`OPTIONS` on any listed route answers an empty 204. Credentialed CORS
+`OPTIONS` on any listed route except the staging-only `POST /api/test-codes`
+seam answers an empty 204. Credentialed CORS
 headers (`Access-Control-Allow-Origin`, never `*`) are emitted only when
 the request `Origin` exactly equals the configured origin; any other
 origin gets none, so cross-origin JSON posts die at preflight. The web
@@ -72,6 +73,21 @@ first when signed in elsewhere. A failed sign-out keeps the button and
 shows "Could not sign out. Try again." instead of success. Typo-class register failures (wrong emailed code, wrong
 invite code) are pre-validated before either single-use claim, so a
 corrected retry against the same challenge still enrolls.
+
+Generic errors only: auth `401 {"error":"check your email and try
+again"}`, vault `400 {"error":"vault unavailable"}`, internal
+`500 {"error":"internal error"}`. Cookie-authenticated mutations also
+require an exact `Origin` header match.
+
+Known limits of this slice: attestation `x5c` chains reject (no CA
+trust store yet); test-connection dials the vetted IP literal, so a
+provider certificate issued only for the hostname fails closed as
+`ok:false` on TLS ports; magic-link delivery needs the operator's
+`EMAIL_WEBHOOK_URL` (without it links are issued but not delivered, and
+passkey signup cannot complete its inbox-proof step);
+test-connection is a direct bounded dial, not yet routed through the
+stream pool. Staging deploy (worker-build plumbing + per-env wrangler
+config from secrets) is a follow-up slice.
 
 ### Staging-only test-code seam (not part of the production surface)
 
@@ -100,6 +116,12 @@ behavior changes here.
   issuance as `{"magic_token": ...}` only while unexpired, else 404. The
   E2E side (`retrieveStagedSignupCode` in `e2e/helpers/accounts.ts`)
   requires a nonblank `magic_token` and never fabricates a code.
+- **Capture-side gate:** magic issuance stores the raw token in the
+  migration 0018 outbox (`qa_issued_codes`) only when `QA_CODE_SEAM` is
+  armed and the recipient is an `example.test` mailbox
+  (`src/handlers.rs`) — the deliberate narrow exception to the §4
+  "plaintext token never stored" invariant; see
+  `docs/security/threat-model.md` §14.
 - **Gating:** armed ONLY by the explicit staging flag
   (`Config::qa_code_seam` via `with_qa_code_seam` in `src/handlers.rs`,
   wired from `QA_CODE_SEAM` in `src/worker_entry.rs`) plus the staged
@@ -112,21 +134,6 @@ behavior changes here.
   gate test (`src/handlers.rs`). The E2E returns null without
   `QA_AUTH_TOKEN` and treats the seam as required infrastructure once it
   is set (`e2e/helpers/accounts.ts`).
-
-Generic errors only: auth `401 {"error":"check your email and try
-again"}`, vault `400 {"error":"vault unavailable"}`, internal
-`500 {"error":"internal error"}`. Cookie-authenticated mutations also
-require an exact `Origin` header match.
-
-Known limits of this slice: attestation `x5c` chains reject (no CA
-trust store yet); test-connection dials the vetted IP literal, so a
-provider certificate issued only for the hostname fails closed as
-`ok:false` on TLS ports; magic-link delivery needs the operator's
-`EMAIL_WEBHOOK_URL` (without it links are issued but not delivered, and
-passkey signup cannot complete its inbox-proof step);
-test-connection is a direct bounded dial, not yet routed through the
-stream pool. Staging deploy (worker-build plumbing + per-env wrangler
-config from secrets) is a follow-up slice.
 
 ## Security contract (threat-model §3–§4)
 
