@@ -20,6 +20,14 @@ pub const REGISTRY: &[CodeSpec] = &[
         status: 400,
         retryable: false,
     },
+    // Paged-search empty-query guard: distinct from `invalid_request` so
+    // callers can tell "no query" (fix the request shape) apart from "bad
+    // query values". Same status and retry policy as `invalid_request`.
+    CodeSpec {
+        code: "MB_SEARCH_EMPTY_QUERY",
+        status: 400,
+        retryable: false,
+    },
     CodeSpec {
         code: "not_found",
         status: 404,

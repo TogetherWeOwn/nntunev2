@@ -18,11 +18,10 @@ pub mod webauthn;
 pub mod worker_entry;
 
 /// Structured log emitter and trace-ID propagation shared with the other
-/// workers (`docs/logging-standard.md`). The api Worker's HTTP entry — the
-/// fetch boundary that resolves inbound `x-trace-id`s, stamps this emitter,
-/// and echoes the trace downstream — lands in a follow-up slice; until then
-/// this re-export is the contract that entry programs against, exercised by
-/// the tests below.
+/// workers (`docs/logging-standard.md`). The api Worker's HTTP entry
+/// (`worker_entry::dispatch`) resolves inbound `x-trace-id`s through this
+/// emitter and records every served request plus startup/database failures;
+/// the contract tests below pin the envelope this entry programs against.
 pub use nntune_logging as logging;
 
 #[cfg(test)]

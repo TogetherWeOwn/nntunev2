@@ -19,6 +19,7 @@ export const KNOWN_ERROR_CODES = new Set([
 	'conflict',
 	'account_deleting',
 	'invalid_request',
+	'MB_SEARCH_EMPTY_QUERY',
 	'payload_too_large',
 	'range_not_satisfiable',
 	'validation_failed',

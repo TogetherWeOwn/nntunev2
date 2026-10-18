@@ -57,7 +57,8 @@ which buckets a Worker may never consume.
   per `workers/mb/src/lib.rs` (`LOOKUP_CACHE_TTL_S = 86400`,
   `SEARCH_CACHE_TTL_S = 300`, `cache_control`, `json_headers`,
   `cache_ttl == None` renders `no-store`, KV keys
-  `mb:lookup:<kind>:<mbid>` and `mb:search:<kind>:<normalized q>` with
+  `mb:lookup:<kind>:<mbid>` and
+  `mb:search:<kind>:<normalized q>:<limit>:<offset>` with
   matching TTLs). Art-byte `public, max-age=86400, immutable` is prescribed
   where unauthenticated serving lands; no R2 image-body serving path exists
   yet (entities carry `caa_url`; see deltas). Object shape unreconciled
@@ -121,12 +122,12 @@ Implemented edge headers (verified in code):
 - MusicBrainz lookups: `public, max-age=86400`, backed by KV key
   `mb:lookup:<kind>:<mbid>` with a matching 24 h TTL.
 - MusicBrainz search: `public, max-age=300`, backed by KV key
-  `mb:search:<kind>:<normalized q>` with a matching 5 min TTL.
+  `mb:search:<kind>:<normalized q>:<limit>:<offset>` with a matching 5 min TTL.
 - MusicBrainz failures (400/404/500): `no-store`, written to neither
   cache. A successful search with zero hits counts as a success.
 
 Sources: `workers/mb/src/lib.rs` (`LOOKUP_CACHE_TTL_S`, `SEARCH_CACHE_TTL_S`,
-`lookup_cache_key`, `search_cache_key`, `cache_control`, `json_headers`,
+`lookup_cache_key`, `search_paged_cache_key`, `cache_control`, `json_headers`,
 success-path `cache.put` with matching TTLs, `cache_ttl: None` for
 failures).
 
