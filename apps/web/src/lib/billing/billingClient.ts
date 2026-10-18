@@ -151,7 +151,7 @@ const SUBSCRIPTION_DATE_FIELDS = ['currentPeriodEnd', 'trialEndsAt'] as const;
  * dates the parser would roll over (`2026-02-30` -> March 2).
  */
 const SUBSCRIPTION_DATE_RE =
-	/^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?:T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d))?$/;
+	/^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?:T([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d{1,9})?)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d))?$/;
 
 function isParseableDateString(value: unknown): value is string {
 	if (typeof value !== 'string' || value.length === 0) return false;
@@ -160,7 +160,9 @@ function isParseableDateString(value: unknown): value is string {
 	const year = Number(match[1]);
 	const month = Number(match[2]);
 	const day = Number(match[3]);
-	const probe = new Date(Date.UTC(year, month - 1, day));
+	// Date.UTC(year, ...) treats 00–99 as 1900–1999; preserve the literal ISO year.
+	const probe = new Date(0);
+	probe.setUTCFullYear(year, month - 1, day);
 	if (
 		probe.getUTCFullYear() !== year ||
 		probe.getUTCMonth() !== month - 1 ||
