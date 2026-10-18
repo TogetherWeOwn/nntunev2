@@ -616,6 +616,10 @@ jobs:
         working-directory: e2e
         run: npm run test:unit
 
+      - name: Two-track fixture self-check (offline, no staging)
+        working-directory: e2e
+        run: node fixtures/two-track-self-check.mjs
+
       - name: List specs (compiles the suite without staging)
         working-directory: e2e
         run: npm run e2e:list

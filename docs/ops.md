@@ -333,6 +333,13 @@ Binding names are chosen in Worker configs; resource names must match this table
 | Ingest Queue | `nntunev2-ingest-staging` | `nntunev2-ingest-prod` |
 | Ingest DLQ / no consumer observed (Cloudflare metadata GET 2026-10-17; 345600 seconds observed, matching documented 4-day default with no active consumer) | `nntunev2-ingest-dlq-staging` (`e7ab1d4b284f44f094c5fe62f9bf96a5`) | `nntunev2-ingest-dlq-prod` (`e9d0a9f5549249df9eebaa5c00951328`) |
 | Config KV | `nntunev2-config-staging` | `nntunev2-config-prod` |
+| Stream NNTP pool (DO class) | `NntpPool` | `NntpPool` |
+| Repair jobs (DO class) | `RepairContainer` | `RepairContainer` |
+| Stream meter (AE dataset) | `nntune_meter` | `nntune_meter` |
+| Ingest meter (AE dataset) | `nntune_ingest_meter` | `nntune_ingest_meter` |
+| Stream service (ingest `NNTP_POOL` cross-script target) | `nntune-stream-staging` | `nntune-stream` |
+| Repair service (ingest `REPAIR_CONTAINER` target) | `nntune-repair-staging` | `nntune-repair` |
+| MB service (ingest `MB_API` target; Wrangler default-suffixed, no per-env `name` committed) | `nntune-mb-staging` | `nntune-mb-production` |
 | Hostname | `v2-staging.nntune.com` (+ Access; deployment pending) | TBD at launch |
 | App Hyperdrive variable | `HYPERDRIVE_ID_STAGING` | `HYPERDRIVE_ID_PROD` |
 | App PlanetScale branch / PostgreSQL database | `nntunev2` / `main` / `nntunev2_staging` | same `main` cluster / currently `postgres`; clean launch DB deferred |
@@ -364,8 +371,9 @@ tables above. Where a committed config still carries a stale name, the
 reconciliation table in the R2 section governs: align the config to this
 table, never the reverse. IDs below are non-credential binding metadata;
 no database URLs or secret values are recorded here. Non-storage bindings
-(Durable Object, Analytics Engine, Container service) are out of scope of
-this table.
+(Durable Object, Analytics Engine, service) are out of scope of
+this table; they are inventoried with per-environment values and committed
+config sources in the Non-storage bindings inventory below.
 
 | Worker (config source) | Binding | Type | staging | prod | ID / variable |
 |---|---|---|---|---|---|
@@ -386,6 +394,54 @@ and DLQ names to the per-environment inventory before enabling the configs. Do
 not add a nested `[[queues.consumers.dead_letter_queue]]` table: Wrangler
 rejects that shape, so it will not configure dead-letter routing.
 
+### Non-storage bindings inventory (DO, Analytics Engine, service)
+
+Every non-storage binding with its owning worker, per-environment value,
+and committed config source (file with line ranges; code constants where
+they pin the name). No secret values and no uncommitted IDs are recorded
+here: Analytics Engine datasets and service/DO names below are all
+committed in the cited Wrangler configs. The Environments matrix above
+carries the same per-environment values; this table adds the owning
+worker and the exact config source for each row.
+
+| Binding | Type | Owning worker | staging | prod | Committed config source |
+|---|---|---|---|---|---|
+| `NNTP_POOL` (class declaration) | Durable Object | `stream` | class `NntpPool` | class `NntpPool` | `workers/stream/wrangler.toml:22-24` (top-level), `:44-46` (staging), `:56-58` (production); migration tag `v1` `:26-28`; code `workers/stream/src/runtime.rs:44`, `workers/stream/src/routes.rs:14` |
+| `NNTP_POOL` (cross-script use) | Durable Object | `ingest` → `stream` | script `nntune-stream-staging` | script `nntune-stream` | `workers/ingest/wrangler.toml.example:105-112` (pins the prod `script_name`; per-env resolution follows the stream worker names in `workers/stream/wrangler.toml:43,55`) |
+| `METER` | Analytics Engine | `stream` | dataset `nntune_meter` | dataset `nntune_meter` | `workers/stream/wrangler.toml:38-40` (top-level), `:50-52` (staging), `:62-64` (production); code `workers/stream/src/observability.rs:23` |
+| `INGEST_METER` | Analytics Engine | `ingest` | dataset `nntune_ingest_meter` | dataset `nntune_ingest_meter` | `workers/ingest/wrangler.toml.example:124-127`; code `workers/ingest/src/metering.rs:16-18` |
+| `REPAIR_CONTAINER` | service | `ingest` → `repair` | service `nntune-repair-staging` | service `nntune-repair` | `workers/ingest/wrangler.toml.example:129-133` (pins the prod service name); target names `workers/repair/wrangler.toml:15` (prod default), `:50` (staging), `:69` (prod); contract note `:3-6`; code `workers/ingest/src/repair.rs:19` |
+| `MB_API` | service | `ingest` → `mb` | service `nntune-mb-staging` | service `nntune-mb-production` | `workers/ingest/wrangler.toml.example:135-140` (single `service = "nntune-mb"`, needs env split); target top-level `name = "nntune-mb"` `workers/mb/wrangler.toml.example:3` with no per-env `name` in `:28-39` (staging) or `:41-52` (production), so Wrangler publishes `nntune-mb-staging` / `nntune-mb-production`; code `workers/ingest/src/matching.rs:27` |
+| `REPAIR_JOBS` | Durable Object | `repair` | class `RepairContainer` | class `RepairContainer` | `workers/repair/wrangler.toml:33-35` (top-level), `:61-63` (staging), `:80-82` (production); migration tag `v1` `:37-39`; Container class/image/sizing `:23-31`, `:52-60`, `:71-79`; code `workers/repair/src/runtime.rs:122` |
+
+Notes, all referencing (not changing) owning-lane state:
+
+- The committed ingest example carries single (non-env-split) values for
+  its cross-script and service targets (`script_name = "nntune-stream"`,
+  `service = "nntune-repair"`, `service = "nntune-mb"`). Stream and repair
+  have explicit per-env `name` overrides committed in their configs, so
+  their per-environment resolution follows the target workers' committed
+  names above; mb has no per-env `name` (`workers/mb/wrangler.toml.example:3`
+  only, none in `:28-39` or `:41-52`), so its per-environment values above
+  are the Wrangler default-suffixed names and ingest's single
+  `service = "nntune-mb"` needs the same env split. Wiring the env split is
+  owned by the integration lane, like the ingest queue-name drift recorded
+  in the R2 reconciliation table and the paragraph above.
+- The repair Worker is not yet deployed: its config header
+  (`workers/repair/wrangler.toml:11-13`) requires Cloudflare Containers on
+  the existing plan (no new spend) with deploy as a later operator action.
+  Until then the `REPAIR_CONTAINER` target names are reserved, not live —
+  and ingest cannot deploy with the committed example until the repair
+  target exists, because Cloudflare fails a deploy whose service-binding
+  target does not exist.
+- Deploy order is stream, mb, and repair (once Containers are enabled)
+  before ingest. Ingest reaches the per-user `NntpPool` object through the
+  cross-script `NNTP_POOL` binding (`workers/stream/wrangler.toml:4-8`),
+  and it declares unconditional `[[services]]` bindings to `nntune-repair`
+  and `nntune-mb` (`workers/ingest/wrangler.toml.example:129-140`; mb-first
+  is also stated at `:135-137`). Ingest cannot deploy with the committed
+  example until those service targets exist.
+
 ## Staging promotion checklist
 
 Promotion is `main` HEAD → staging; production promotion is a later gated
@@ -399,20 +455,30 @@ lane. Complete every box on the exact head being promoted.
   `deploy.yml` run for the promotion SHA, and require its `staging-web` job
   conclusion to be `success` (not `skipped`); verify staging health. This
   workflow deploys `apps/web` only; it does not deploy stream, MB, API or
-  ingest Workers. The current `/api/health` returns only `{ok:true}`, with no
-  build identity, so neither a green deploy run nor a health response proves
-  which SHA is serving. Do not claim same-build evidence until a deployed-build
-  identity is exposed and compared with the promotion SHA. The deploy owner
-  replaces the placeholder `100::` record through a Workers custom domain.
+  ingest Workers. `/api/health` returns exactly `{ok, version}` — the public
+  package version, never a build identifier
+  (`apps/web/src/routes/api/health/+server.ts`, pinned by
+  `apps/web/tests/smoke.spec.ts`) — so a health response alone never proves
+  which SHA is serving. Deployed-build identity lives on the dedicated
+  surface `GET /api/build`, which returns exactly `{sha}`: the 40-char
+  lowercase hex head baked at build time (`BUILD_SHA`/`GITHUB_SHA` via the
+  `__BUILD_SHA__` define in `apps/web/vite.config.ts`), or the explicit
+  string `"unknown"` when the build carried no identity
+  (`apps/web/src/lib/build.ts`, `apps/web/src/routes/api/build/+server.ts`).
+  Claim same-build evidence only when staging `/api/build` returns the
+  promotion SHA itself (40-hex match; `"unknown"` is never evidence). The
+  deploy owner replaces the placeholder `100::` record through a Workers
+  custom domain.
 - [ ] Staging E2E: `deploy.yml` sequences it — its `post-deploy-e2e` job
   calls `e2e-staging.yml` (reusable workflow) only after the same run's
   `staging-web` job succeeds (`needs`, no `always()`), so a skipped/failed
   deploy cannot produce a full-journey PASS and no separate dispatch is
   needed or accepted as evidence. Scheduled/manual `e2e-staging` runs are
   synthetic monitoring only (the full-journey job is skipped there).
-  Record the deploy run and the `post-deploy-e2e` result, and do not call
-  it same-build evidence until the staging build identity is verified
-  against the deploy SHA (a source SHA alone is not build identity).
+  Record the deploy run and the `post-deploy-e2e` result, and call it
+  same-build evidence only when staging `GET /api/build` returns the
+  deploy SHA itself (a source SHA alone is not build identity; see the
+  box above).
   Pre-configuration skips do not count once staging is configured; the
   workflow fails closed without both Access client credentials.
 - [ ] Access intact: the `NNTune v2 staging` Access app, its owner-OTP allow
@@ -460,7 +526,7 @@ be called accepted:
 | # | Retain | Acceptance bar |
 |---|---|---|
 | 1 | Deployed Worker and version | Worker (script) name and the version reported by the deploy tooling for the version now serving, plus the environment deployed to. |
-| 2 | Source revision | The exact commit SHA that version was built from. Where the Worker exposes a deployed-build identity, record it and require it to match this SHA; without one, do not claim same-build evidence (same caveat as the web checklist). |
+| 2 | Source revision | The exact commit SHA that version was built from. Where the Worker exposes a deployed-build identity, record it and require it to match this SHA; without one, do not claim same-build evidence (the web checklist above verifies this via `GET /api/build`; a Worker with no such surface cannot claim it). |
 | 3 | Deploy run | URL of the workflow run (or equivalent executed deploy record) that produced item 1, with the Worker deploy job's conclusion `success`. A `skipped` job, a skipped gate, or overall workflow success without that job succeeding is not deploy evidence. Any pre-deploy gate the lane requires — for the API Worker, the Hyperdrive cache-disabled check described in `deploy.yml` — records its pass/fail result here, by name and outcome only. |
 | 4 | Prior known-good version | Recorded **before** the new deploy: the previously serving Worker's name, version and source SHA, its own successful deploy run (item 3 bar), and its last passing health result. A first deploy has no prior known-good version, so rollback acceptance cannot be claimed for it; removing or disabling a first deployment is a separate gated action, not defined here. |
 | 5 | Rollback action and run | Which mechanism was used (redeploy of the prior known-good source revision, or activation of the prior version, whichever the lane implements), the target it restored (item 4's version and SHA), and the URL of the rollback run with the rollback/deploy job's conclusion `success` (not `skipped`). |

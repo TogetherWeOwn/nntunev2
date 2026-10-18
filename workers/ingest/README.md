@@ -259,6 +259,34 @@ stub whose NZB references fixture message-ids.
   key, `ON CONFLICT DO UPDATE` so replays converge on the latest MB match.
 - Repair dispatch (`src/repair.rs`): missing blocks + par2 set → Container
   `POST /repair`; missing blocks with no par2 set fails the job.
+- Repair re-verify guard (status only — no runtime change): the re-verify
+  feedback loop is still open. After a repair round, `Verifying` re-runs
+  the verify driver over the pool body route (`src/queue_consumer.rs:696-699`,
+  `PoolBodySource::fetch_body` via `call_pool_body` at
+  `src/queue_consumer.rs:792-799`) and does not yet consume the repair
+  round's `out/` objects (the repair Worker streams outputs back to `out/`
+  per `workers/repair/README.md:23-28`; key shapes in
+  `workers/repair/src/contract.rs:278-286`), so the `Repairing` step must
+  not be exercised live until that consumption lands
+  (`src/queue_consumer.rs:245-253`). The consumer stays disabled meanwhile:
+  the `[[queues.consumers]]` entry stays commented out
+  (`workers/ingest/wrangler.toml.example:30-31`,
+  `workers/ingest/wrangler.toml.example:58-59`), and ingest stays unable
+  to finish a `Repairing` job (`workers/repair/README.md:40-44`) — this
+  is one gate alongside the search step, which is also not wired yet, so
+  enabling the consumer now would burn search jobs' retry budget
+  (`workers/ingest/wrangler.toml.example:52-56`).
+  A checkpoint reaching `Repairing` without a recorded `par2_set_id` is a
+  permanent failure — there is nothing a redelivery could add
+  (`src/queue_consumer.rs:251-253`; the missing-inputs arm at
+  `src/queue_consumer.rs:257-262`); with `missing_blocks == 0` (the
+  `#[serde(default)]` zero at `src/jobs.rs:78-81`) the step takes the
+  `Ok(None)` arm (`src/repair.rs:43-45`,
+  `src/queue_consumer.rs:272-278`) and returns to `Verifying`. The ingest
+  Worker owns repair dispatch and queue behavior (`src/repair.rs`,
+  `src/queue_consumer.rs`); the repair Worker owns the Container runtime,
+  whose contract is `workers/repair/README.md`; this note only records
+  the guard.
 - Metering (`src/metering.rs`): one `nntune_ingest_meter` event per
   workflow step (workers-rs 0.3 has no Analytics Engine client, so the edge
   write goes through the dataset binding's HTTP API).
@@ -270,24 +298,42 @@ stub whose NZB references fixture message-ids.
   `src/pool_probe.rs`): an upload in `Probing` re-parses its
   content-addressed payload, asks the user's `NntpPool` DO about
   `parse::probe_batches` batches not yet in the checkpoint tally
-  (`build_probe_request` → `call_pool_probe` → `apply_probe_batch`), and
-  moves to `Verifying` carrying the completed tally's missing-segment
-  count. Folded batches ride the delivery's one checkpoint write (KV
-  allows 1 write/s per key, so there is deliberately no write per batch);
-  a crash before that write re-asks them, which is safe because `STAT`
-  is idempotent and the tally is keyed by batch index. Probing is
-  budget-capped per delivery (at most 4 batches and 30 s of wall time),
-  because a cap-sized NZB (~120 batches × 500 sequential `STAT`s) would
-  otherwise run into the 15-minute consumer invocation limit before
-  ever persisting, and every redelivery would restart at batch 0. A
-  budget stop persists the partial tally and *continues*: a fresh copy
-  of the message is enqueued (5 s delay) and the original acked,
-  spending neither the checkpoint attempt budget nor a native
-  `max_retries` slot; a failed continuation enqueue falls back to a
-  native retry. A busy/unavailable pool (`PoolProbeError::Retry`)
-  redelivers no sooner than its `Retry-After` and the shared backoff,
-  inside the same attempt budget; a refused envelope (`Rejected`) fails
-  the job with the generic `probe_failed` reason. Unit tests cover the
+  (`build_probe_request_with_ranges` [`src/probe.rs`] →
+  `call_pool_probe` [`src/pool_probe.rs`] → `apply_probe_batch`
+  [`src/probe.rs`]), and moves to `Verifying` carrying the completed
+  tally's missing-segment count. Folded batches ride the delivery's one
+  checkpoint write (`plan_settlement`/`persist` in
+  `src/queue_consumer.rs`; KV allows 1 write/s per key per
+  `KV_SAME_KEY_WRITE_WINDOW_MS = 1_000` in `src/checkpoint.rs`, so there
+  is deliberately no write per batch); a crash before that write re-asks
+  them, which is safe because `STAT` is idempotent and the tally is keyed
+  by batch index (`ProbeTally` in `src/probe.rs`). Probing is
+  budget-capped per delivery (at most 4 batches per
+  `MAX_PROBE_BATCHES_PER_DELIVERY = 4` and 30 s of wall time per
+  `PROBE_DELIVERY_BUDGET_MS = 30_000`, both in `src/queue_consumer.rs`),
+  because a cap-sized NZB (~120 batches = `MAX_SEGMENTS = 60_000` in
+  `src/nzb_intake.rs` ÷ `MAX_PROBE_SEGMENTS = 500` in `src/probe.rs`,
+  × 500 sequential `STAT`s) would otherwise run into the 15-minute
+  consumer invocation limit (pinned by the `const` asserts in
+  `src/queue_consumer.rs`) before ever persisting, and every redelivery
+  would restart at batch 0. A budget stop persists the partial tally and
+  *continues*: a fresh copy of the message is enqueued (5 s delay per
+  `PROBE_CONTINUATION_DELAY_SECS = 5` in `src/queue_consumer.rs`,
+  matching the first shared-backoff step `retry_delay_secs(1) = 5` in
+  `src/retry.rs` via `payload_retry_delay_ms(0)` in `src/dispatch.rs`)
+  and the original acked, spending neither the checkpoint attempt budget
+  nor a native `max_retries` slot (`Disposition::Continue` in
+  `src/retry.rs`; native slots are `CONSUMER_MAX_RETRIES` in
+  `src/retry.rs`); a failed continuation enqueue falls back to a native
+  retry (`Settlement::Continue` fallback in `src/queue_consumer.rs`). A
+  busy/unavailable pool (`PoolProbeError::Retry` in `src/pool_probe.rs`)
+  redelivers no sooner than its `Retry-After` and the shared backoff
+  (`decide_checkpoint` in `src/retry.rs` honors the hint only as a floor
+  clamped to `MAX_HINTED_RETRY_DELAY_SECS`; pool defaults
+  `DEFAULT_RETRY_SECS`/`MAX_RETRY_SECS` in `src/pool_probe.rs`), inside
+  the same attempt budget; a refused envelope (`Rejected` in
+  `src/pool_probe.rs`) fails the job with the generic `probe_failed`
+  reason (`ERR_PROBE_FAILED` in `src/retry.rs`). Unit tests cover the
   fold/resume/retry/budget policy against a scripted pool fake; no live
   Worker runs in CI.
 
