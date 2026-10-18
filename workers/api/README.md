@@ -25,12 +25,21 @@ workers/api/
 `migrations/0002_auth_vault.sql` plus `0003` (library), `0004` (challenge
 purpose), `0005` (atomic rate-limit slots and test leases), `0006` (account
 deletion), `0007` (registration-challenge user foreign key), `0008`
-(database-enforced challenge purpose: CHECK plus an immutability trigger)
-and `0015_kek_rotation` (vault `rewrapped_at` marker + `kek_version`
-index, see `docs/security/kek-rotation.md` §2) define the Postgres schema
-(PlanetScale via Hyperdrive). CI applies every migration to a throwaway
+(database-enforced challenge purpose: CHECK plus an immutability trigger),
+`0009`–`0012` (metered admission ledger, atomic claim lease, claim-epoch
+fencing, queued replay window), `0013` (session-bound reauth purpose),
+`0015_kek_rotation` (vault `rewrapped_at` marker + `kek_version`
+index, see `docs/security/kek-rotation.md` §2) and `0018`
+(staging-only `qa_issued_codes` outbox for the test-code seam below)
+define the app-target Postgres schema (PlanetScale via Hyperdrive;
+targets per `migrations/manifest.toml`). The mirror-target `0001`
+(MusicBrainz mirror base), `0014` (import resume cursors + dead-letter
+queue), `0016` (release-to-track membership) and `0017` (replication
+packet ledger) serve the mb mirror, not this worker (see
+`workers/mb/README.md`). CI applies every migration to a throwaway
 Postgres and runs `tests/sql/*.sql` against it
-(`tests/run_migration_tests.sh`). All queries are parameterized;
+(`tests/run_migration_tests.sh`, `api-migrations` job in
+`.github/workflows/ci.yml`). All queries are parameterized;
 single-use claims execute the conditional `UPDATE ... RETURNING` prepared by
 the core and require exactly one row before any response.
 
