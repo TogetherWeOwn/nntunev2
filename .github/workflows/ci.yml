@@ -219,6 +219,7 @@ jobs:
       - name: Unit-test the parity check
         run: |
           python3 .github/scripts/test_binding_parity.py
+          python3 .github/scripts/test_binding_parity_missing_config.py
           python3 .github/scripts/test_binding_parity_unknown_envs.py
           python3 .github/scripts/test_binding_parity_table_shape.py
           python3 .github/scripts/test_binding_parity_known_drift_guards.py
