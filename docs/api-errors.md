@@ -86,19 +86,33 @@ The repair worker defines its own stable fault shape in
 for logs and operators, carrying no user data. Ingest maps those faults
 in `workers/ingest/src/repair.rs` (`classify_repair_reply`): replies
 with status 400, 404, 409, or 413 are `Unrepairable` (permanent — a
-retry would send the same bytes, so the job fails terminally); a 200
+retry would send the same bytes, so the job fails terminally), provided
+the reply body does not exceed `MAX_REPAIR_REPLY_BYTES` (oversized
+bodies are `Retry` before the status is checked); a 200
 reply is decided by its `status` field (`repaired` -> `Repaired`,
 `unrepairable` -> `Unrepairable` which is also terminal, anything else
 or a malformed or oversized body -> `Retry`); every other (non-200)
 status is `Retry` (transient — retried through the shared
 job attempt budget). Container replies are classified in
 `workers/repair/src/contract.rs` (`classify_container_reply`,
-`ContainerOutcome::Forward`): only a well-formed 200 result completes
-the repair worker's request (`Done` — persist outputs and reply 200);
-on 400/404/409/413/503 any container `error` code of at most 64
-lowercase/digit/underscore characters is forwarded unchanged (it is not
-checked against any registry), and everything else forwards as 502
-`container_unavailable`.
+`ContainerOutcome::Forward`) and then narrowed in
+`workers/repair/src/runtime.rs` (`leak_code`): only a well-formed 200
+result completes the repair worker's request (`Done` — persist outputs
+and reply 200); on 400/404/409/413/503 a container `error` code of at
+most 64 lowercase/digit/underscore characters is passed through
+`leak_code`, a closed allow-list (`invalid_request`,
+`invalid_manifest`, `not_found`, `payload_too_large`,
+`repair_manifest_conflict`, `repair_timeout`, `repair_resource`,
+`repair_failed`, `scratch_input_mismatch`). Listed codes reach ingest
+unchanged with the container's status; any other code becomes
+`container_unavailable` with that same status (a container 409
+`some_new_code` reaches ingest as 409 `container_unavailable`). A
+missing or unparseable code, or a status outside that list, becomes 502
+`container_unavailable`. Six of the listed codes
+(`invalid_manifest`, `repair_manifest_conflict`, `repair_timeout`,
+`repair_resource`, `repair_failed`, `scratch_input_mismatch`) are
+repair-only with no registry row — the unregistered repair taxonomy
+this section records.
 
 This registry currently carries no repair rows: every row in the table
 above names an owning worker drawn from api, ingest, mb, and stream,
@@ -120,9 +134,11 @@ A future repair row follows the same `Adding a code` rule below once
 those prerequisites exist: one registry row here (code, status,
 retryable, owning worker `repair`) plus the same entry in a repair-side
 error registry covered by a doc-lint test (or an explicit exemption
-recorded here); never rename or reuse a code, and never change a code's
-status or retryable flag in place. No such row is added by this
-note.
+recorded here), plus a `leak_code` arm in
+`workers/repair/src/runtime.rs` for any container-origin code that must
+reach the wire (unlisted codes are renamed `container_unavailable`);
+never rename or reuse a code, and never change a code's status or
+retryable flag in place. No such row is added by this note.
 
 ## Billing-limit shapes (402 / 429)
 
