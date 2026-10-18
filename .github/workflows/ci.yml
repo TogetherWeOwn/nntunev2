@@ -675,6 +675,7 @@ jobs:
         run: |
           python3 .github/scripts/test_check_traceability.py
           python3 .github/scripts/test_check_traceability_list_format.py
+          python3 .github/scripts/test_check_traceability_drift_strings.py
 
   svelte-check:
     name: svelte-check
