@@ -125,7 +125,7 @@ async function requestJson<T>(
 	label: string,
 	fetchFn: typeof fetch,
 	init: RequestInit = {}
-): Promise<T> {
+): Promise<{ data: T; status: number }> {
 	const controller = new AbortController();
 	let timedOut = false;
 	const timeoutError = () => new BillingApiError(
@@ -178,7 +178,7 @@ async function requestJson<T>(
 			throw new BillingApiError(res.status, label, hint, parsed.code, parsed.retryable, paywall);
 		}
 		try {
-			return (await Promise.race([res.json(), deadline])) as T;
+			return { data: (await Promise.race([res.json(), deadline])) as T, status: res.status };
 		} catch (error) {
 			if (timedOut) throw timeoutError();
 			// A 2xx whose body is not JSON is a backend contract violation, not
@@ -199,7 +199,7 @@ async function requestJson<T>(
 }
 
 export async function fetchPlans(fetchFn: typeof fetch = fetch): Promise<PlanDTO[]> {
-	const data = await requestJson<unknown>('/v1/plans', 'Load plans', fetchFn);
+	const { data } = await requestJson<unknown>('/v1/plans', 'Load plans', fetchFn);
 	if (!isValidPlansPayload(data)) throw new Error('Invalid plans payload');
 	return data.plans;
 }
@@ -207,13 +207,52 @@ export async function fetchPlans(fetchFn: typeof fetch = fetch): Promise<PlanDTO
 export async function fetchUsage(
 	fetchFn: typeof fetch = fetch
 ): Promise<UsageSnapshot & { period: string }> {
-	const data = await requestJson<unknown>('/v1/me/usage', 'Load usage', fetchFn);
+	const { data } = await requestJson<unknown>('/v1/me/usage', 'Load usage', fetchFn);
 	if (!isValidUsagePayload(data)) throw new Error('Invalid usage payload');
 	return data;
 }
 
 export async function fetchSubscription(fetchFn: typeof fetch = fetch): Promise<SubscriptionDTO> {
-	return await requestJson('/v1/me/subscription', 'Load subscription', fetchFn);
+	const { data } = await requestJson<SubscriptionDTO>('/v1/me/subscription', 'Load subscription', fetchFn);
+	return data;
+}
+
+/**
+ * Authorized Stripe redirect hosts for checkout/portal 2xx bodies. Any
+ * allowlisted `https:` target resolves verbatim; everything else rejects
+ * with the typed client error so an off-allowlist or malformed target never
+ * reaches a `window.location.href` assignment (open-redirect guard).
+ */
+const STRIPE_REDIRECT_HOSTS = new Set(['checkout.stripe.com', 'billing.stripe.com']);
+
+function isAllowlistedRedirectUrl(value: unknown): value is string {
+	if (typeof value !== 'string' || value.trim() === '') return false;
+	// WHATWG URL parsing recovers an allowlisted host from a scheme without
+	// an explicit authority (`https:checkout.stripe.com/...` parses with
+	// hostname checkout.stripe.com), but a `window.location.href` assignment
+	// of that same string resolves against the app origin instead — so the
+	// raw string must carry the explicit `https://` authority up front.
+	if (!value.startsWith('https://')) return false;
+	let parsed: URL;
+	try {
+		parsed = new URL(value);
+	} catch {
+		return false;
+	}
+	return parsed.protocol === 'https:' && STRIPE_REDIRECT_HOSTS.has(parsed.hostname.toLowerCase());
+}
+
+function redirectUrlOrThrow(
+	data: unknown,
+	status: number,
+	label: string,
+	hint: string
+): string {
+	if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
+		const url = (data as Record<string, unknown>).url;
+		if (isAllowlistedRedirectUrl(url)) return url;
+	}
+	throw new BillingApiError(status, label, hint);
 }
 
 export async function startCheckout(
@@ -221,13 +260,12 @@ export async function startCheckout(
 	fetchFn: typeof fetch = fetch
 ): Promise<string> {
 	if (!planId || /[^a-z0-9-]/.test(planId)) throw new Error('Invalid plan');
-	const data = await requestJson<{ url: string }>('/v1/billing/checkout', 'Start checkout', fetchFn, {
+	const { data, status } = await requestJson<unknown>('/v1/billing/checkout', 'Start checkout', fetchFn, {
 		method: 'POST',
 		headers: { 'content-type': 'application/json' },
 		body: JSON.stringify({ planId })
 	});
-	if (!data.url.startsWith('https://')) throw new Error('Invalid checkout URL');
-	return data.url;
+	return redirectUrlOrThrow(data, status, 'Start checkout', ': Invalid checkout URL');
 }
 
 /**
@@ -243,11 +281,10 @@ export function signupUrlForCheckoutFailure(planId: string, err: unknown): strin
 }
 
 export async function openPortal(fetchFn: typeof fetch = fetch): Promise<string> {
-	const data = await requestJson<{ url: string }>('/v1/billing/portal', 'Open billing portal', fetchFn, {
+	const { data, status } = await requestJson<unknown>('/v1/billing/portal', 'Open billing portal', fetchFn, {
 		method: 'POST',
 		headers: { 'content-type': 'application/json' },
 		body: '{}'
 	});
-	if (!data.url.startsWith('https://')) throw new Error('Invalid portal URL');
-	return data.url;
+	return redirectUrlOrThrow(data, status, 'Open billing portal', ': Invalid portal URL');
 }
