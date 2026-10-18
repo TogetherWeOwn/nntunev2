@@ -20,7 +20,9 @@ from report_worker_wasm_sizes import (
     collect_rows,
     format_bytes,
     gzip_size,
+    main,
     measure_worker,
+    publish,
     render_table,
     summarize_failure,
     wasm_path,
@@ -230,6 +232,179 @@ class RenderTests(unittest.TestCase):
         self.assertIn("2.0 KiB", table)
         self.assertIn("1.0 KiB", table)
         self.assertIn("report-only", table.lower())
+
+
+class CollectRowsFailureIsolationTests(unittest.TestCase):
+    def _write_wasm(self, root: Path, spec: dict, data: bytes) -> Path:
+        path = wasm_path(root, spec)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    def test_one_build_failure_isolated_remaining_measured(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for spec in WORKERS:
+                self._write_wasm(root, spec, b"\x00asm" + b"q" * 2048)
+            failing = "ingest"
+
+            def fake_build(root_arg, spec):
+                if spec["worker"] == failing:
+                    return False, "exit 101: boom"
+                return True, "ok"
+
+            with patch(
+                "report_worker_wasm_sizes.build_worker",
+                side_effect=fake_build,
+            ) as mock_build:
+                rows = collect_rows(root, skip_build=False)
+            self.assertEqual(len(rows), len(WORKERS))
+            self.assertEqual(mock_build.call_count, len(WORKERS))
+            by_worker = {row["worker"]: row for row in rows}
+            self.assertTrue(
+                by_worker[failing]["status"].startswith("error: build failed ("),
+                by_worker[failing]["status"],
+            )
+            self.assertIn("exit 101: boom", by_worker[failing]["status"])
+            self.assertIsNone(by_worker[failing]["raw"])
+            self.assertIsNone(by_worker[failing]["compressed"])
+            for spec in WORKERS:
+                if spec["worker"] == failing:
+                    continue
+                self.assertEqual(
+                    by_worker[spec["worker"]]["status"],
+                    "ok",
+                    by_worker[spec["worker"]],
+                )
+                self.assertIsNotNone(by_worker[spec["worker"]]["raw"])
+                self.assertIsNotNone(by_worker[spec["worker"]]["compressed"])
+
+    def test_main_returns_zero_with_isolated_build_failure(self):
+        import io
+        import os
+        import tempfile
+        from contextlib import redirect_stderr, redirect_stdout
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for spec in WORKERS:
+                self._write_wasm(root, spec, b"\x00asm" + b"q" * 2048)
+
+            def fake_build(root_arg, spec):
+                if spec["worker"] == "mb":
+                    return False, "exit 1: kaboom"
+                return True, "ok"
+
+            env = {
+                k: v for k, v in os.environ.items() if k != "GITHUB_STEP_SUMMARY"
+            }
+            with (
+                patch(
+                    "report_worker_wasm_sizes.build_worker",
+                    side_effect=fake_build,
+                ),
+                patch.dict(os.environ, env, clear=True),
+            ):
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    rc = main(["--root", str(root)])
+            self.assertEqual(rc, 0)
+            self.assertIn("error: build failed (exit 1: kaboom)", out.getvalue())
+            self.assertEqual(err.getvalue(), "")
+
+
+class PublishSummaryTests(unittest.TestCase):
+    def test_summary_set_appends_table_bytes(self):
+        import io
+        import os
+        import tempfile
+        from contextlib import redirect_stderr, redirect_stdout
+
+        table = "## Worker Wasm sizes\n| a |\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = Path(tmp) / "summary.md"
+            summary.write_text("prior\n", encoding="utf-8")
+            with patch.dict(
+                os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}
+            ):
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    publish(table)
+            self.assertEqual(out.getvalue(), table)
+            self.assertEqual(err.getvalue(), "")
+            content = summary.read_text(encoding="utf-8")
+            self.assertTrue(content.startswith("prior\n"))
+            self.assertTrue(content.endswith(table))
+            self.assertIn(table, content)
+
+    def test_summary_unset_stdout_only_no_warning(self):
+        import io
+        import os
+        import tempfile
+        from contextlib import redirect_stderr, redirect_stdout
+
+        table = "## Worker Wasm sizes\n| a |\n"
+        with tempfile.TemporaryDirectory():
+            env = {
+                k: v for k, v in os.environ.items() if k != "GITHUB_STEP_SUMMARY"
+            }
+            with patch.dict(os.environ, env, clear=True):
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    publish(table)
+            self.assertEqual(out.getvalue(), table)
+            self.assertEqual(err.getvalue(), "")
+
+    def test_summary_append_oserror_warns_and_keeps_stdout(self):
+        import io
+        import os
+        from contextlib import redirect_stderr, redirect_stdout
+
+        table = "## Worker Wasm sizes\n| a |\n"
+        with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": "/nope/summary.md"}):
+            with patch(
+                "builtins.open", side_effect=OSError("disk full")
+            ):
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    publish(table)
+        self.assertEqual(out.getvalue(), table)
+        self.assertIn("warning: could not append job summary", err.getvalue())
+        self.assertIn("disk full", err.getvalue())
+
+
+class MainWarningOnlyTests(unittest.TestCase):
+    def _write_wasm(self, root: Path, spec: dict, data: bytes) -> Path:
+        path = wasm_path(root, spec)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    def test_main_returns_zero_when_summary_append_fails(self):
+        import io
+        import os
+        import tempfile
+        from contextlib import redirect_stderr, redirect_stdout
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for spec in WORKERS:
+                self._write_wasm(root, spec, b"\x00asm" + b"z" * 1024)
+            with patch.dict(
+                os.environ, {"GITHUB_STEP_SUMMARY": str(Path(tmp) / "s.md")}
+            ):
+                with patch(
+                    "builtins.open", side_effect=OSError("boom")
+                ):
+                    out, err = io.StringIO(), io.StringIO()
+                    with redirect_stdout(out), redirect_stderr(err):
+                        rc = main(["--root", str(root), "--skip-build"])
+            self.assertEqual(rc, 0)
+            self.assertIn("Worker", out.getvalue())
+            self.assertIn("warning: could not append job summary", err.getvalue())
+            self.assertIn("boom", err.getvalue())
 
 
 class BuildWorkerTimeoutTests(unittest.TestCase):
