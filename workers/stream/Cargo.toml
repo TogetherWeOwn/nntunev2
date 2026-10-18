@@ -29,6 +29,9 @@ futures-util = "0.3"
 
 [dev-dependencies]
 nntune-core = { version = "0.1.0", path = "../../crates/nntune-core", features = ["native-tls"] }
+# Agreement pin only: lets the BUILD_SHA_UNKNOWN acceptance test import both
+# crates without touching the runtime dependency set above.
+nntune-logging = { version = "0.1.0", path = "../../crates/nntune-logging" }
 nntune-test-nntp = { version = "0.1.0", path = "../../crates/nntune-test-nntp" }
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 quote = "1"
