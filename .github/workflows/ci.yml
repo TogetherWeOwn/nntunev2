@@ -221,6 +221,7 @@ jobs:
           python3 .github/scripts/test_binding_parity.py
           python3 .github/scripts/test_binding_parity_unknown_envs.py
           python3 .github/scripts/test_binding_parity_table_shape.py
+          python3 .github/scripts/test_binding_parity_known_drift_guards.py
       - name: Parity check on this repo
         run: python3 .github/scripts/binding_parity.py
       - name: Parity check passes on the matching fixture
