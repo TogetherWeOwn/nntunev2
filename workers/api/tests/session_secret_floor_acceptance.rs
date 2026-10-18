@@ -28,8 +28,8 @@
 //! - Renaming or moving the floor without updating this suite fails the
 //!   `min_secret_len_is_exactly_32` literal pin.
 //!
-//! Out of scope: rotation-window behavior (TOG-25182), skew rejection
-//! (TOG-30201), and any implementation change. Fixtures use synthetic
+//! Out of scope: rotation-window `previous`-key behavior, skew rejection,
+//! and any implementation change. Fixtures use synthetic
 //! secrets only (public repo: never real secrets; no secret material is
 //! logged or asserted on — only lengths and error variants).
 //!
