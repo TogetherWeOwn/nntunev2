@@ -456,6 +456,43 @@ class TestDriftCases(unittest.TestCase):
                     )
                 )
 
+    def test_mapped_jsonc_config_cli_exits_two_with_exact_message(self):
+        # Pins the fail-closed CLI arm for mapped non-TOML configs:
+        # parse_config rejects wrangler.jsonc (binding_parity.py:309-310),
+        # main() maps ParityError to exit 2 with a single
+        # ::error::binding-parity: annotation (binding_parity.py:814-816),
+        # never exit 1 and never a traceback. Mini-repo fixtures carry only
+        # synthetic fx- resource ids and the exact-output assertion proves
+        # none of them leaks into the failure line (sensitivity).
+        manifest = MANIFEST.replace("wrangler.toml", "wrangler.jsonc")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(
+                tmp,
+                wrangler='{"name":"demo"}',
+                manifest=manifest,
+                config_name="wrangler.jsonc",
+            )
+            config = root / "workers" / "demo" / "wrangler.jsonc"
+            with self.assertRaisesRegex(
+                ParityError,
+                r"unsupported wrangler config format; TOML is required",
+            ) as raised:
+                run_check(root)
+            self.assertEqual(
+                f"{config}: unsupported wrangler config format; TOML is required",
+                str(raised.exception),
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(2, main(["--root", str(root)]))
+            self.assertEqual(
+                f"::error::binding-parity: {config}: "
+                "unsupported wrangler config format; TOML is required\n",
+                output.getvalue(),
+            )
+            self.assertNotIn("Traceback", output.getvalue())
+            self.assertNotIn("fx-", output.getvalue())
+
     def test_duplicate_environment_aliases_fail_closed(self):
         wrangler = MATCHING_WRANGLER + "\n[env.prod]\n"
         with tempfile.TemporaryDirectory() as tmp:
