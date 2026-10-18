@@ -259,6 +259,7 @@ jobs:
           python3 .github/scripts/test_migrations_gate.py
           python3 .github/scripts/test_migrations_gate_regressions.py
           python3 .github/scripts/test_migrations_gate_unreadable_sql.py
+          python3 .github/scripts/test_migrations_gate_manifest_shape.py
 
   test-nntp:
     name: test-nntp
