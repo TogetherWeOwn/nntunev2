@@ -6,22 +6,17 @@ import { BillingApiError, fetchSubscription } from './billingClient';
  * /v1/me/subscription payloads must be validated at the client boundary
  * before any caller renders plan, status or renewal dates.
  *
- * Contract under test (SubscriptionDTO shape):
+ * Contract under test (ADR 0002 §4 and ADR 0005 status/entitlement table):
  * - Body is a plain object (never null/array/scalar).
  * - `planId` is a required non-empty string.
- * - `status` is one of the eight Stripe statuses the subscriptions row
- *   stores verbatim (ADR 0002 data-model, ADR 0005 billing table):
- *   `trialing`/`active`/`past_due`/`canceled`/`unpaid`/`paused`/
- *   `incomplete`/`incomplete_expired`. Anything else (including the
- *   non-existent local `expired` shortcut, misspellings, non-strings)
- *   rejects instead of rendering a raw unknown status.
+ * - All eight verbatim Stripe statuses are valid, including `unpaid`,
+ *   `paused` and `incomplete_expired`. Local `expired`, unknown statuses,
+ *   misspellings and non-strings reject; validation is not entitlement.
  * - `currentPeriodEnd` and `trialEndsAt` are required and are either
- *   null or an ISO-8601 date string naming a real calendar date —
- *   garbage strings, loose strings `Date.parse` accepts, and rolled-over
- *   dates (February 30) reject instead of rendering "Invalid Date" or a
- *   shifted renewal day.
- * - `graceUntil` may be absent; when present it is null or a parseable
- *   date string.
+ *   null or real ISO calendar dates / zoned timestamps. Impossible dates,
+ *   loose Date.parse strings and malformed times reject, not normalize.
+ * - `graceUntil` may be absent; when present it follows the same nullable
+ *   ISO-date contract.
  * - Unknown extra fields are allowed.
  * - HTTP error semantics (401/404) are unchanged.
  */
@@ -60,33 +55,43 @@ describe('fetchSubscription accepts well-formed successful payloads', () => {
 		await expect(fetchSubscription(jsonOk(VALID))).resolves.toEqual(VALID);
 	});
 
-	it.each(
-		[
-			'trialing',
-			'active',
-			'past_due',
-			'canceled',
-			'unpaid',
-			'paused',
-			'incomplete',
-			'incomplete_expired'
-		] as const
-	)(
-		'accepts status %s',
-		async (status) => {
-			await expect(fetchSubscription(jsonOk({ ...VALID, status }))).resolves.toMatchObject({
-				planId: 'plus',
-				status
-			});
-		}
-	);
+	it.each([
+		'trialing',
+		'active',
+		'past_due',
+		'canceled',
+		'unpaid',
+		'paused',
+		'incomplete',
+		'incomplete_expired'
+	] as const)('accepts verbatim Stripe status %s without changing the plan', async (status) => {
+		const body = { ...VALID, status };
+		await expect(fetchSubscription(jsonOk(body))).resolves.toEqual(body);
+	});
 
 	it('accepts null renewal and trial dates', async () => {
 		const body = { ...VALID, currentPeriodEnd: null, trialEndsAt: null };
 		await expect(fetchSubscription(jsonOk(body))).resolves.toEqual(body);
 	});
 
-	it('accepts parseable dates in every date field, including graceUntil', async () => {
+	describe.each(DATE_FIELDS)('%s ISO date acceptance', (field) => {
+		it.each([
+			'2026-11-15',
+			'2028-02-29',
+			'2000-02-29',
+			'2026-02-28T23:59:59Z',
+			'2028-02-29T12:30:00.123Z',
+			// Valid local leap days can fall on a different UTC calendar day.
+			'2028-02-29T00:15:00+05:30',
+			'2028-02-29T23:45:00-03:30',
+			'2026-11-15T12:30:00+00:00'
+		])('accepts %s unchanged', async (date) => {
+			const body = { ...VALID, [field]: date };
+			await expect(fetchSubscription(jsonOk(body))).resolves.toEqual(body);
+		});
+	});
+
+	it('accepts ISO timestamps in every date field, including graceUntil', async () => {
 		const body = {
 			planId: 'pro-5x',
 			status: 'past_due',
@@ -125,7 +130,7 @@ describe('fetchSubscription rejects malformed successful payloads', () => {
 	});
 
 	it.each([
-		['expired (no local expired status per ADR 0002)', 'expired'],
+		['local expired shortcut (not a Stripe status)', 'expired'],
 		['unknown word', 'banana'],
 		['plan id in the status slot', 'free'],
 		['uppercase', 'ACTIVE'],
@@ -141,32 +146,39 @@ describe('fetchSubscription rejects malformed successful payloads', () => {
 		await expectMalformedRejection(jsonOk({ ...VALID, status }));
 	});
 
-	it.each([
-		['empty string', ''],
-		['garbage text', 'garbage'],
-		['free text', 'not a date'],
-		['month 13', '2026-13-01T00:00:00Z'],
-		['month 00', '2026-00-10T00:00:00Z'],
-		['hour 25', '2026-10-20T25:00:00Z'],
-		['impossible calendar date (Feb 30 rolls over to March)', '2026-02-30T00:00:00Z'],
-		['loose string Date.parse accepts (bare 1)', '1'],
-		['dashes only', '--'],
-		['time only', 'T00:00:00Z'],
-		['the literal string Invalid Date', 'Invalid Date']
-	])('rejects an unparseable currentPeriodEnd that is %s', async (_label, currentPeriodEnd) => {
-		await expectMalformedRejection(jsonOk({ ...VALID, currentPeriodEnd }));
-	});
-
-	it.each(DATE_FIELDS)('rejects an impossible calendar date in %s', async (field) => {
-		await expectMalformedRejection(jsonOk({ ...VALID, [field]: '2026-02-30T00:00:00Z' }));
-	});
-
-	it.each(DATE_FIELDS)('rejects a garbage date string in %s', async (field) => {
-		await expectMalformedRejection(jsonOk({ ...VALID, [field]: 'garbage' }));
-	});
-
-	it.each(DATE_FIELDS)('rejects an empty-string date in %s', async (field) => {
-		await expectMalformedRejection(jsonOk({ ...VALID, [field]: '' }));
+	describe.each(DATE_FIELDS)('%s calendar and time validation', (field) => {
+		it.each([
+			['empty string', ''],
+			['garbage text', 'garbage'],
+			['free text', 'not a date'],
+			['month 13', '2026-13-01T00:00:00Z'],
+			['month 00', '2026-00-10T00:00:00Z'],
+			['hour 25', '2026-10-20T25:00:00Z'],
+			['dashes only', '--'],
+			['time only', 'T00:00:00Z'],
+			['the literal string Invalid Date', 'Invalid Date'],
+			['February 30 date-only', '2028-02-30'],
+			['February 30 timestamp', '2028-02-30T12:30:00Z'],
+			['non-leap February 29 date-only', '2026-02-29'],
+			['non-leap February 29 timestamp', '2026-02-29T12:30:00+05:30'],
+			['non-leap century February 29', '2100-02-29'],
+			['April 31', '2026-04-31T12:30:00Z'],
+			['day zero', '2026-11-00'],
+			['day 32', '2026-11-32'],
+			['loose single-digit Date.parse input', '1'],
+			['loose slash-separated date', '11/15/2026'],
+			['loose English date', 'November 15, 2026'],
+			['unpadded ISO-looking date', '2026-2-9'],
+			['minute 60', '2026-11-15T12:60:00Z'],
+			['second 60', '2026-11-15T12:30:60Z'],
+			['missing minute digits', '2026-11-15T12::00Z'],
+			['fraction without digits', '2026-11-15T12:30:00.Z'],
+			['missing time zone', '2026-11-15T12:30:00'],
+			['invalid offset hour', '2026-11-15T12:30:00+25:00'],
+			['invalid offset minute', '2026-11-15T12:30:00+05:60']
+		])('rejects %s rather than normalizing it', async (_label, date) => {
+			await expectMalformedRejection(jsonOk({ ...VALID, [field]: date }));
+		});
 	});
 
 	it.each(DATE_FIELDS)('rejects an epoch number instead of a date string in %s', async (field) => {
@@ -179,6 +191,10 @@ describe('fetchSubscription rejects malformed successful payloads', () => {
 
 	it.each(DATE_FIELDS)('rejects an object instead of a date string in %s', async (field) => {
 		await expectMalformedRejection(jsonOk({ ...VALID, [field]: { iso: '2026-11-15' } }));
+	});
+
+	it.each(DATE_FIELDS)('rejects an array instead of a date string in %s', async (field) => {
+		await expectMalformedRejection(jsonOk({ ...VALID, [field]: ['2026-11-15'] }));
 	});
 
 	it.each(['planId', 'status', 'currentPeriodEnd', 'trialEndsAt'])(
