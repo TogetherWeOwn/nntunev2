@@ -155,9 +155,12 @@ pub fn build_search_url(params: &SearchParams<'_>) -> Result<String, &'static st
 }
 
 /// Append the vault-resolved key at request time. Never log the result.
+///
+/// Honors the saved-key contract the vault and setup wizard enforce: a
+/// nonempty key of at most 1024 UTF-8 bytes (`str::len` is byte length).
 pub fn inject_api_key(url_without_key: &str, api_key: &str) -> Result<String, &'static str> {
-    if api_key.is_empty() || api_key.len() > 256 {
-        return Err("api key must be 1..=256 chars");
+    if api_key.is_empty() || api_key.len() > 1024 {
+        return Err("api key must be 1..=1024 bytes");
     }
     Ok(format!(
         "{url_without_key}&apikey={}",
