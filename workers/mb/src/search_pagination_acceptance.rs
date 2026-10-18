@@ -1,8 +1,7 @@
 //! Acceptance tests for "mb: search pagination, limits and empty-query
-//! handling" ([TOG-25374](/TOG/issues/TOG-25374), roadmap T3 on
-//! [TOG-25350](/TOG/issues/TOG-25350#document-roadmap)).
+//! handling" (the search-paging slice of the project roadmap).
 //!
-//! Owned by [TOG-25373](/TOG/issues/TOG-25373). The Builder (TOG-25374) builds
+//! Acceptance-owned: the build slice builds on this branch and **never edits
 //! on this branch and **never edits this file** (nor the golden fixture in
 //! `../testdata/`): make the tests below pass by changing non-test code only.
 //! Keep the `#[cfg(test)] mod search_pagination_acceptance;` line in
@@ -34,7 +33,7 @@
 //! 4. Empty or whitespace-only queries return **400** with the stable
 //!    envelope `{"code": "MB_SEARCH_EMPTY_QUERY", "message": <non-empty>,
 //!    "retryable": false}` (register the code in `docs/api-errors.md` under
-//!    [TOG-25315](/TOG/issues/TOG-25315)), `no-store`, without touching the
+//!    the shared API error catalog), `no-store`, without touching the
 //!    repo (never a scan) or the cache. The empty check runs before `type`
 //!    validation, so the code is stable regardless of `type`.
 //!
@@ -42,7 +41,7 @@
 //! and the trait widening do not exist yet; the empty path has no `code`)
 //! and pass once the build card implements the contract above.
 
-use super::{Entity, Kind, MbRepo, RepoError, SearchHit, SuccessCache};
+use super::{Entity, Kind, MbRepo, Recording, RepoError, SearchHit, SuccessCache};
 use std::cell::RefCell;
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
@@ -81,6 +80,8 @@ fn golden_hits() -> Vec<SearchHit> {
             mbid: row.mbid,
             label: row.label,
             score: 0.99 - (i as f32 * 0.001),
+            artist_mbid: None,
+            artist_name: None,
         })
         .collect()
 }
@@ -124,6 +125,13 @@ impl MbRepo for FakePagedRepo {
         let from = (offset as usize).min(self.hits.len());
         let to = from.saturating_add(limit as usize).min(self.hits.len());
         Ok(self.hits[from..to].to_vec())
+    }
+
+    async fn release_recordings(
+        &self,
+        _release_mbid: &str,
+    ) -> Result<Option<Vec<Recording>>, RepoError> {
+        Ok(None)
     }
 }
 
