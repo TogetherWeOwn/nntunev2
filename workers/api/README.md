@@ -87,6 +87,40 @@ test-connection is a direct bounded dial, not yet routed through the
 stream pool. Staging deploy (worker-build plumbing + per-env wrangler
 config from secrets) is a follow-up slice.
 
+### Test-connection routing boundary
+
+- The current path is a direct dial from the api Worker:
+  `vault_test_connection` in `workers/api/src/handlers.rs` resolves all
+  records, validates the provider config, then calls the injected
+  `Dialer::probe` on the vetted target (`workers/api/src/handlers.rs`),
+  and the Worker entry wires that dialer to `SocketDialer`
+  (`workers/api/src/worker_entry.rs`).
+- The dial targets only the vetted IP literals (at most
+  `MAX_DIAL_ADDRESSES` in `workers/api/src/vault.rs`), never a second
+  DNS lookup (`workers/api/src/handlers.rs`,
+  `workers/api/src/worker_entry.rs`); the per-address and total
+  deadlines come from `DIAL_TIMEOUT_MS` / `TOTAL_TIMEOUT_MS` in
+  `workers/api/src/vault.rs`, with per-user concurrency capped by
+  `MAX_TEST_CONCURRENCY` in `workers/api/src/vault.rs`.
+- TLS fails closed on hostname-only certificates: `probe_one` in
+  `workers/api/src/worker_entry.rs` dials the IP literal with the
+  runtime socket, so the runtime validates the certificate against the
+  dialed address and a hostname-only provider certificate returns
+  `ok:false` instead of bypassing the pin
+  (`workers/api/src/worker_entry.rs`).
+- Stream-pool routing is not yet in place: the per-user `NntpPool`
+  Durable Object and its probe/body lanes live in `workers/stream`
+  (`workers/stream/src/lib.rs`, `workers/stream/src/runtime.rs`,
+  `workers/stream/wrangler.toml`), and test-connection does not call
+  the pool binding (`workers/ingest/src/pool_probe.rs`); pool
+  integration is future work, not started here.
+- Boundary ownership: scoped-credential behavior is owned by its own
+  lane and port-allowlist hardening by the SSRF-guard lane
+  (`ALLOWED_NNTP_PORTS` in `workers/api/src/vault.rs`, threat-model §3
+  in `docs/security/threat-model.md`); this note describes the routing
+  boundary only and changes no vault, dial, TLS, pool, or credential
+  behavior.
+
 ## Security contract (threat-model §3–§4)
 
 - **Envelope encryption:** per-user random 256-bit DEK, wrapped by the KEK
