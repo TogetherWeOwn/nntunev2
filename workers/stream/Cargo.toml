@@ -28,6 +28,9 @@ wasm-bindgen = "0.2.129"
 futures-util = "0.3"
 
 [dev-dependencies]
+# id_cap_agreement_acceptance.rs reads the api ledger as source text via
+# include_str! (no crate dep): workers/api is dockerignored out of the
+# container build contexts, so a path dep here breaks clean-checkout builds.
 nntune-core = { version = "0.1.0", path = "../../crates/nntune-core", features = ["native-tls"] }
 # Agreement pin only: lets the BUILD_SHA_UNKNOWN acceptance test import both
 # crates without touching the runtime dependency set above.
