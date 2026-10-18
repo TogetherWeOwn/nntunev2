@@ -760,9 +760,33 @@ pub trait Dialer {
 
 /// Async DNS for handler-time resolution (the sync core guard consumes
 /// the result via a static adapter, so exactly the resolved set is what
-/// gets vetted and dialed).
+/// gets vetted and dialed). The caller bounds the ENTIRE resolution using
+/// `vault::RESOLUTION_TIMEOUT_MS`, separately from the socket budgets.
+/// Implementations must cancel underlying I/O when their future is dropped;
+/// dropping a Rust future alone does not abort a JavaScript fetch/body.
 pub trait AsyncDns {
     fn resolve<'a>(&'a self, host: &'a str) -> Pin<Box<dyn Future<Output = Vec<IpAddr>> + 'a>>;
+}
+
+pub(crate) async fn resolve_bounded(dns: &impl AsyncDns, host: &str) -> Vec<IpAddr> {
+    let duration = std::time::Duration::from_millis(vault::RESOLUTION_TIMEOUT_MS);
+    #[cfg(not(target_arch = "wasm32"))]
+    let deadline = futures_timer::Delay::new(duration);
+    #[cfg(target_arch = "wasm32")]
+    let deadline = worker::Delay::from(duration);
+
+    let mut deadline = std::pin::pin!(deadline);
+    let mut resolution = dns.resolve(host);
+    std::future::poll_fn(|cx| {
+        // Expiry wins even if answers become ready in the same poll. Never
+        // return a partial family: all answers must reach the core SSRF guard.
+        if deadline.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(Vec::new());
+        }
+        resolution.as_mut().poll(cx)
+    })
+    .await
+    // Both losing futures drop before the caller can validate or dial.
 }
 
 struct StaticDns {
@@ -1279,7 +1303,7 @@ where
 
     async fn resolve_all(&self, host: &str) -> StaticDns {
         StaticDns {
-            addresses: self.dns.resolve(host).await,
+            addresses: resolve_bounded(self.dns, host).await,
         }
     }
 }

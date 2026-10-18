@@ -94,9 +94,8 @@ test('swap-guarded link offers sign-out with no label and redeems after sign-out
 	});
 	await expect(signOut).toBeVisible();
 	await signOut.click();
-	expect(logoutPosts).toBe(1);
-
 	await expect(page.getByText(/signed out/i).first()).toBeVisible();
+	expect(logoutPosts).toBe(1);
 	await page.getByRole('button', { name: /try this link again/i }).click();
 
 	const retry = page.getByRole('button', { name: /sign in with this link/i });
@@ -143,9 +142,8 @@ test('failed logout keeps the sign-out action and reports the failure', async ({
 	const signOut = page.getByRole('button', { name: /sign out/i });
 	await expect(signOut).toBeVisible();
 	await signOut.click();
-	expect(logoutPosts).toBe(1);
-
 	await expect(page.getByText(/could not sign out/i)).toBeVisible();
+	expect(logoutPosts).toBe(1);
 	// Success copy must not appear, and the button stays enabled for retry.
 	await expect(page.getByText(/signed out\. if that link/i)).toHaveCount(0);
 	await expect(page.getByRole('button', { name: /sign out/i })).toBeEnabled();
@@ -217,8 +215,8 @@ test('401 logout clears a stale account label and leaves the link retryable', as
 	await expect(page.getByRole('alert').first()).toContainText('stale@example.com');
 
 	await page.getByRole('button', { name: /sign out stale@example.com/i }).click();
-	expect(logoutPosts).toBe(1);
 	await expect(page.getByText(/signed out\. if that link/i)).toBeVisible();
+	expect(logoutPosts).toBe(1);
 	await page.getByRole('button', { name: /try this link again/i }).click();
 	await page.getByRole('button', { name: /sign in with this link/i }).click();
 

@@ -44,8 +44,8 @@ wasm-bindgen-futures = "0.4"
 # Only for the capped request-body stream read in the Worker entry.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
+# Handler deadlines also run under native synthetic executors without Tokio.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# Executor-independent deadline for native handler callers; Workers use Delay.
 futures-timer = "3"
 
 [dev-dependencies]

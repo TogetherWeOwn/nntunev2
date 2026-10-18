@@ -1353,6 +1353,19 @@ struct DohAnswer {
     data: String,
 }
 
+/// A dropped JsFuture does not cancel fetch. Keep this controller alive through
+/// response.json(), and abort on every exit (including deadline/caller drop).
+/// The signal cancels both pending response headers and an unread response body.
+struct AbortDohOnDrop(Option<worker::AbortController>);
+
+impl Drop for AbortDohOnDrop {
+    fn drop(&mut self) {
+        if let Some(controller) = self.0.take() {
+            controller.abort();
+        }
+    }
+}
+
 async fn doh_query(host: &str, rrtype: &str) -> Vec<IpAddr> {
     let mut url = match url::Url::parse(DOH_ENDPOINT) {
         Ok(url) => url,
@@ -1371,7 +1384,10 @@ async fn doh_query(host: &str, rrtype: &str) -> Vec<IpAddr> {
         Ok(request) => request,
         Err(_) => return Vec::new(),
     };
-    let mut response = match Fetch::Request(request).send().await {
+    let controller = worker::AbortController::default();
+    let signal = controller.signal();
+    let _abort = AbortDohOnDrop(Some(controller));
+    let mut response = match Fetch::Request(request).send_with_signal(&signal).await {
         Ok(response) => response,
         Err(_) => return Vec::new(),
     };
@@ -1402,6 +1418,8 @@ impl AsyncDns for DohDns {
             if let Ok(ip) = host.parse::<IpAddr>() {
                 return vec![ip];
             }
+            // The handler's single resolution deadline covers BOTH queries,
+            // including headers + JSON bodies; it never restarts for AAAA.
             // Resolve ALL records (A + AAAA): one forbidden answer fails
             // the whole target inside the core guard.
             let mut addrs = doh_query(host, "A").await;
