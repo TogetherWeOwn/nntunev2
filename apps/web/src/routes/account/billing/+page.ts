@@ -5,7 +5,7 @@ import {
 	fetchUsage,
 	type SubscriptionDTO
 } from '#lib/billing/billingClient.js';
-import { resolveEffectivePlan } from '#lib/billing/plans.js';
+import { getPlan, resolveEffectivePlan } from '#lib/billing/plans.js';
 import { evaluateUsage, type LimitStatus, type UsageSnapshot } from '#lib/billing/usage.js';
 
 export type UsageDTO = UsageSnapshot & { period: string };
@@ -119,8 +119,11 @@ export const load: PageLoad = async ({ fetch }) => {
 		if (usageFailed) notices.push('Could not load usage.');
 	}
 
+	// Keep a known stored billing tier for portal-only states without granting
+	// entitlement or scoring usage against that tier.
+	const billingPlan = manageBillingOnly && subscription ? getPlan(subscription.planId) : undefined;
 	return {
-		planId: plan.id,
+		planId: billingPlan?.id ?? plan.id,
 		planUnknown,
 		signedOut,
 		hadFetchError: !signedOut && (subFailed || usageFailed || retryableLimit),
