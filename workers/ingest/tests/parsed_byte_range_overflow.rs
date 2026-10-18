@@ -96,7 +96,7 @@ fn total_over_64gib_yields_document_limit_error() {
     // 33 maxed segments: representable, every segment in-bounds, total
     // ~2 GiB over the cap.
     assert_eq!(33u64 * MAX_SEGMENT_BYTES, 70_866_960_351);
-    assert!(33u64 * MAX_SEGMENT_BYTES > DOCUMENT_CAP);
+    const { assert!(33u64 * MAX_SEGMENT_BYTES > DOCUMENT_CAP) };
     let (estimate, parsed) = parsed_with_bytes(vec![Some(MAX_SEGMENT_BYTES); 33]);
     let err =
         check_parsed(&estimate, &parsed).expect_err("total over 64 GiB must fail the document cap");
