@@ -19,6 +19,7 @@
 //!   changes the answer, `retryable: false`);
 //! - concurrent streams → 429 `rate_limited` (retryable: release or wait,
 //!   `retryable: true` with `Retry-After`).
+//!
 //! On the combined stream path the monthly 402 takes precedence over the
 //! concurrent 429: a terminal exhaustion must never read as retryable.
 //!
@@ -82,7 +83,7 @@ impl PlanId {
 
     /// Parse a canonical id. Unknown ids return `None` — the caller fails
     /// closed to [`PlanId::Free`] via [`resolve_or_free`], never to a guess.
-    pub fn from_str(id: &str) -> Option<PlanId> {
+    pub fn parse_id(id: &str) -> Option<PlanId> {
         match id {
             "free" => Some(PlanId::Free),
             "plus" => Some(PlanId::Plus),
@@ -126,7 +127,7 @@ impl PlanId {
 /// Resolve a plan id string, failing closed to the smallest caps on unknown
 /// input. Never invents a paid tier for an unknown state.
 pub fn resolve_or_free(id: &str) -> PlanId {
-    PlanId::from_str(id).unwrap_or(PlanId::Free)
+    PlanId::parse_id(id).unwrap_or(PlanId::Free)
 }
 
 /// Per-plan caps (see ADR 0004; stream cap stored here in seconds).
@@ -403,7 +404,7 @@ mod tests {
         assert_eq!(PlanId::all().len(), 4);
         for (plan, id, stream_s, concurrent, library, ingest) in cases {
             assert_eq!(plan.as_str(), id);
-            assert_eq!(PlanId::from_str(id), Some(plan));
+            assert_eq!(PlanId::parse_id(id), Some(plan));
             let caps = plan.caps();
             assert_eq!(caps.stream_seconds_month, stream_s, "{id} stream");
             assert_eq!(caps.max_concurrent_streams, concurrent, "{id} concurrent");
@@ -415,7 +416,7 @@ mod tests {
     #[test]
     fn unknown_plan_ids_fail_closed_to_free() {
         for unknown in ["", "FREE", "pro", "pro-20", "enterprise", "free "] {
-            assert_eq!(PlanId::from_str(unknown), None, "{unknown:?}");
+            assert_eq!(PlanId::parse_id(unknown), None, "{unknown:?}");
             assert_eq!(resolve_or_free(unknown), PlanId::Free, "{unknown:?}");
         }
         // The fallback really is the smallest caps on every dimension.

@@ -9,7 +9,7 @@
   monthly folds). The daily `usage_ledger` aggregation (sum daily rows in the UTC
   calendar month) is built in a later slice by folding these windows; no daily table
   exists yet and no writer assumes its `(user_id, period)` upsert.
-- **Revised:** 2026-10-18 — enforcement wire (TOG-28780): over-cap
+- **Revised:** 2026-10-18 — enforcement wire: over-cap
   ingest-write/stream acquisition refuses `402 plan_limit_exceeded` (monthly,
   daily, library) or `429 rate_limited` (concurrent) with `x-plan-limit` /
   `x-plan-reset` headers (`retry-after` on 429) and an `upgrade_url: /pricing`
