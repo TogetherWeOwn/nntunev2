@@ -12,8 +12,10 @@
 //!   so neither the size cap nor the count caps fire first.
 //! - An unparseable `bytes=` (non-numeric, empty) is [`IntakeRejection::Malformed`]
 //!   (400), never a wrap/panic: the summing scan fails closed.
-//! - Nesting 1_025 deep is [`IntakeRejection::Malformed`]; the everyday
-//!   ~4-deep shape (`nzb > file > segments > segment`) passes.
+//! - Nesting with 1_022 `<a>` elements between `<nzb>` and `<segment>` passes
+//!   (1_024 open elements total: the bound counts `<nzb>` and the leaf
+//!   `<segment>`); 1_023 `<a>` elements is [`IntakeRejection::Malformed`].
+//!   The everyday ~4-deep shape (`nzb > file > segments > segment`) passes.
 //!
 //! File/segment count caps are pinned separately in
 //! `tests/nzb_intake_default_count_caps.rs`; route envelope wiring for the
@@ -125,9 +127,35 @@ fn nesting_1025_deep_is_malformed_while_4_deep_passes() {
     assert_eq!(est.segment_count, 1);
     assert_eq!(est.declared_bytes, 100);
 
-    // 1_025 nested elements inside <nzb> blow past the 1_024 well-formedness
-    // depth bound in a few KB, so the depth gate (not any size/count cap)
-    // is what fires.
+    // The 1_024 well-formedness bound counts <nzb> and the leaf <segment>,
+    // so 1_022 intermediate elements are the last accepted shape and 1_023
+    // is the first rejected shape; each payload is a few KB, so the depth
+    // gate (not any size/count cap) is what fires.
+    for (depth, ok) in [(1_022, true), (1_023, false)] {
+        let doc = nesting_doc(depth);
+        assert!(doc.len() < MAX_NZB_BYTES);
+        if ok {
+            assert!(
+                estimate_nzb(&doc).is_ok(),
+                "depth {depth} (1_022 intermediates) should pass",
+            );
+            assert!(
+                estimate_nzb_with_limits(&doc, &DEFAULT_LIMITS).is_ok(),
+                "depth {depth} through DEFAULT_LIMITS should pass",
+            );
+        } else {
+            assert_eq!(
+                estimate_nzb(&doc).unwrap_err(),
+                IntakeRejection::Malformed,
+                "depth {depth} (1_023 intermediates) should be malformed",
+            );
+            assert_eq!(
+                estimate_nzb_with_limits(&doc, &DEFAULT_LIMITS).unwrap_err(),
+                IntakeRejection::Malformed,
+                "depth {depth} through DEFAULT_LIMITS should be malformed",
+            );
+        }
+    }
     let deep = nesting_doc(1_025);
     assert!(deep.len() < MAX_NZB_BYTES);
     let rejected = estimate_nzb(&deep).unwrap_err();
