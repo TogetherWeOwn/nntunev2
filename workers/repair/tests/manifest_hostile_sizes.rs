@@ -1,11 +1,13 @@
 //! Pin scratch-manifest hostile sizes fail closed.
 //!
 //! [`parse_manifest`] rejects absurd `size` values with 400
-//! `invalid_manifest` before any streaming: two files at `u64::MAX` each
-//! (checked-add overflow) and a single `u64::MAX` file (over the total
-//! ceiling) both fail, while small sizes still parse.
+//! `invalid_manifest` before any streaming: `[u64::MAX, 2]` overflows the
+//! running total via `checked_add` (it would wrap to 1 under `wrapping_add`,
+//! below the 8 GiB ceiling, so only the overflow guard rejects it) and a
+//! single `u64::MAX` file exceeds the total ceiling; the exact-ceiling
+//! total still parses while ceiling-plus-one fails, and small sizes parse.
 
-use nntune_core::par2::scratch::object_key_for_file_name;
+use nntune_core::par2::scratch::{object_key_for_file_name, MAX_SCRATCH_TOTAL_BYTES};
 use nntune_repair::contract::parse_manifest;
 
 fn manifest_json_for_sizes(sizes: &[u64]) -> Vec<u8> {
@@ -36,8 +38,9 @@ fn manifest_json_for_sizes(sizes: &[u64]) -> Vec<u8> {
 }
 
 #[test]
-fn two_max_sizes_fail_closed() {
-    let body = manifest_json_for_sizes(&[u64::MAX, u64::MAX]);
+fn overflow_wraps_below_ceiling_fails_closed() {
+    // Wraps to 1 under wrapping_add, so only checked_add rejects it.
+    let body = manifest_json_for_sizes(&[u64::MAX, 2]);
     let err = parse_manifest(&body).unwrap_err();
     assert_eq!((err.status, err.code), (400, "invalid_manifest"));
 }
@@ -45,6 +48,19 @@ fn two_max_sizes_fail_closed() {
 #[test]
 fn single_max_size_fails() {
     let body = manifest_json_for_sizes(&[u64::MAX]);
+    let err = parse_manifest(&body).unwrap_err();
+    assert_eq!((err.status, err.code), (400, "invalid_manifest"));
+}
+
+#[test]
+fn exact_ceiling_parses() {
+    let body = manifest_json_for_sizes(&[MAX_SCRATCH_TOTAL_BYTES - 8, 8]);
+    assert!(parse_manifest(&body).is_ok());
+}
+
+#[test]
+fn ceiling_plus_one_fails() {
+    let body = manifest_json_for_sizes(&[MAX_SCRATCH_TOTAL_BYTES - 8, 9]);
     let err = parse_manifest(&body).unwrap_err();
     assert_eq!((err.status, err.code), (400, "invalid_manifest"));
 }
