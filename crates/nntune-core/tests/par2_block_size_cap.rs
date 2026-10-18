@@ -32,7 +32,7 @@ const FILENAME: &str = "cap-bound.flac";
 const CAP_NEXT_ALIGNED: u64 = (256 << 20) + 4;
 /// Largest multiple of 4: the aligned equivalent of `u64::MAX` (which is
 /// 3 mod 4 and likewise hits the alignment guard first).
-const ALIGNED_U64_MAX: u64 = u64::MAX & !3;
+const ALIGNED_U64_MAX: u64 = u64::MAX - 3;
 /// 8 KiB zero chunks, mirroring the crate's streaming hasher so verification
 /// never holds a slice-sized zero allocation in the test either.
 const ZERO_CHUNK: usize = 8192;
