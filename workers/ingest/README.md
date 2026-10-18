@@ -272,14 +272,21 @@ stub whose NZB references fixture message-ids.
   the `[[queues.consumers]]` entry stays commented out
   (`workers/ingest/wrangler.toml.example:30-31`,
   `workers/ingest/wrangler.toml.example:58-59`), and ingest stays unable
-  to finish a `Repairing` job (`workers/repair/README.md:40-44`).
-  A checkpoint reaching `Repairing` without recorded verify inputs
-  (`par2_set_id`/`missing_blocks`) is a permanent failure — there is
-  nothing a redelivery could add (`src/queue_consumer.rs:251-253`; the
-  missing-inputs arm at `src/queue_consumer.rs:257-262`). Repair runtime
-  work (dispatch, Container, queue behavior) sits with the blocked
-  repair-dispatch owner, whose runtime contract is
-  `workers/repair/README.md`; this note only records the guard.
+  to finish a `Repairing` job (`workers/repair/README.md:40-44`) — this
+  is one gate alongside the search step, which is also not wired yet, so
+  enabling the consumer now would burn search jobs' retry budget
+  (`workers/ingest/wrangler.toml.example:52-56`).
+  A checkpoint reaching `Repairing` without a recorded `par2_set_id` is a
+  permanent failure — there is nothing a redelivery could add
+  (`src/queue_consumer.rs:251-253`; the missing-inputs arm at
+  `src/queue_consumer.rs:257-262`); with `missing_blocks == 0` (the
+  `#[serde(default)]` zero at `src/jobs.rs:78-81`) the step takes the
+  `Ok(None)` arm (`src/repair.rs:43-45`,
+  `src/queue_consumer.rs:272-278`) and returns to `Verifying`. The ingest
+  Worker owns repair dispatch and queue behavior (`src/repair.rs`,
+  `src/queue_consumer.rs`); the repair Worker owns the Container runtime,
+  whose contract is `workers/repair/README.md`; this note only records
+  the guard.
 - Metering (`src/metering.rs`): one `nntune_ingest_meter` event per
   workflow step (workers-rs 0.3 has no Analytics Engine client, so the edge
   write goes through the dataset binding's HTTP API).
