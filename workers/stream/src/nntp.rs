@@ -82,16 +82,29 @@ fn parse_status_code(line: &str) -> Option<u16> {
 }
 
 /// Whether `mid` (outer whitespace / `<>` already stripped) is safe to put
-/// on the wire inside `BODY <…>`: RFC 5536 msg-id characters only, so a
-/// hostile NZB cannot smuggle CR/LF (extra NNTP commands) or desynchronize
-/// the pooled connection.
+/// on the wire inside `BODY <…>`: RFC 5536 msg-id shape (bracketless form),
+/// so a hostile NZB cannot smuggle CR/LF (extra NNTP commands) or
+/// desynchronize the pooled connection.
+///
+/// Rules (mirrors `workers/ingest` `validate_message_id` at its own
+/// 250-byte adapter ceiling): 1..=250 bytes, printable ASCII (`0x21..=0x7E`)
+/// only, no `<`/`>`, exactly one `@` with non-empty local and domain sides.
 pub fn valid_message_id(mid: &str) -> bool {
     const MAX_LEN: usize = 250;
-    !mid.is_empty()
-        && mid.len() <= MAX_LEN
-        && !mid
-            .bytes()
-            .any(|b| matches!(b, b'\r' | b'\n' | b'\0' | b' ' | b'\t' | b'<' | b'>'))
+    if mid.is_empty() || mid.len() > MAX_LEN {
+        return false;
+    }
+    if !mid.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
+        return false;
+    }
+    if mid.contains('<') || mid.contains('>') {
+        return false;
+    }
+    let mut parts = mid.split('@');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(local), Some(domain), None) if !local.is_empty() && !domain.is_empty()
+    )
 }
 
 impl From<std::io::Error> for NntpError {
@@ -363,6 +376,15 @@ mod tests {
         assert!(!valid_message_id("a<b@c"));
         assert!(!valid_message_id(&"a".repeat(251)));
         assert!(valid_message_id(&format!("{}@c", "a".repeat(248))));
+        // Shape rules (mirrors ingest `validate_message_id`): exactly one
+        // `@` with non-empty sides, printable ASCII only.
+        assert!(!valid_message_id("not-an-id"));
+        assert!(!valid_message_id("a@b@c"));
+        assert!(!valid_message_id("@synthetic.test"));
+        assert!(!valid_message_id("local@"));
+        assert!(!valid_message_id("s\u{e9}g@synthetic.test"));
+        assert!(!valid_message_id("a\u{1}b@synthetic.test"));
+        assert!(!valid_message_id("a\u{7f}b@synthetic.test"));
     }
 
     #[test]
