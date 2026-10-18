@@ -88,7 +88,7 @@ fn fetch_with_scripted_reply(
     let (tx, rx) = mpsc::channel();
     let server = thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept client");
-        let _ = stream
+        stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("timeouts");
         let mut reader = BufReader::new(stream.try_clone().expect("clone conn"));
@@ -100,6 +100,11 @@ fn fetch_with_scripted_reply(
         reader.read_line(&mut command).expect("BODY command");
         writer.write_all(&reply).expect("scripted reply");
         writer.flush().expect("flush");
+        let mut trailing = Vec::new();
+        reader
+            .read_to_end(&mut trailing)
+            .expect("remaining client bytes");
+        command.push_str(&String::from_utf8(trailing).expect("UTF-8 BODY command"));
         tx.send(command).expect("report command");
     });
 
