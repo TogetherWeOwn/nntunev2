@@ -164,6 +164,73 @@ async fn article_one_byte_over_cap_is_refused_fail_closed() {
 }
 
 #[tokio::test]
+async fn article_over_cap_on_warm_connection_refused_without_quarantine() {
+    // Pins the warm-lease `Err(FetchFail::TooLarge)` arm (body.rs warm
+    // path): an over-cap article fetched on an already-pooled connection
+    // must refuse with `TooLarge` while keeping the pool healthy and the
+    // in-sync connection retained. A regression that quarantines the pool
+    // or drops the connection here would 503 every later segment.
+    // (`server_with` seeds the default corpus plus the big article, so the
+    // small fetch below warms the pool and the big fetch hits the warm arm.)
+    let server = server_with(MAX_BODY_ARTICLE_BYTES + 1, BIG_ID, 900).await;
+    let cfg = config(server.addr(), "testpass");
+    let dials = Cell::new(0);
+    let pool: RefCell<Pool<Client>> = RefCell::new(Pool::new(4));
+
+    // Warm the pool with a small corpus article: one dial, one idle conn.
+    let small = &nntune_test_nntp::default_corpus()[0];
+    let small_id = small.message_id.trim_matches(['<', '>']);
+    run_body(
+        &pool,
+        || dial(cfg.clone(), &dials),
+        no_tick,
+        &request("user_01", small_id),
+    )
+    .await
+    .expect("warm-up fetch must serve");
+    assert_eq!(dials.get(), 1, "warm-up must dial once");
+    assert_eq!(pool.borrow().idle(), 1, "warm-up must leave one idle conn");
+
+    // Over-cap fetch on the warm pooled connection: no fresh dial.
+    let err = run_body(
+        &pool,
+        || dial(cfg.clone(), &dials),
+        no_tick,
+        &request("user_01", BIG_ID),
+    )
+    .await
+    .expect_err("warm over-cap article must refuse");
+    assert_eq!(err, ProbeError::TooLarge);
+    assert_eq!(dials.get(), 1, "warm refusal must not redial");
+    {
+        let pool = pool.borrow();
+        assert!(
+            !pool.quarantined(),
+            "a warm over-cap refusal must not quarantine"
+        );
+        assert_eq!(pool.in_use(), 0, "no lease may be held");
+        assert_eq!(
+            pool.idle(),
+            1,
+            "the warm in-sync connection must be retained"
+        );
+    }
+
+    // The retained connection still serves: no fresh dial.
+    let outcome = run_body(
+        &pool,
+        || dial(cfg.clone(), &dials),
+        no_tick,
+        &request("user_01", small_id),
+    )
+    .await
+    .expect("pool must still serve after a warm over-cap refusal");
+    assert!(matches!(outcome, BodyOutcome::Bytes(_)));
+    assert_eq!(dials.get(), 1, "retained connection must be reused");
+    assert!(pool.borrow().reuses() >= 2);
+}
+
+#[tokio::test]
 async fn serve_layer_maps_over_cap_article_to_413() {
     let server = server_with(MAX_BODY_ARTICLE_BYTES + 1, BIG_ID, 900).await;
     let cfg = config(server.addr(), "testpass");
