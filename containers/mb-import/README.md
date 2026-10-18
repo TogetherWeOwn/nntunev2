@@ -131,10 +131,13 @@ reset).) Unit tests for the validator run with the workspace: `cargo test`.
 ## Secrets
 
 `DATABASE_URL` comes from the secret store — never committed, never
-logged. The job scripts (`import.sh`, `replicate.sh`) read it from env
+logged by the scripts under normal (non-xtrace) operation. The job scripts (`import.sh`, `replicate.sh`) read it from env
 only: `pg-env.sh` translates it into `PG*` variables and unsets it, so
 `psql` is invoked with no connection string in its argv (argv hygiene is
-pinned by `tests/test_argv_hygiene.sh`). (Sources: `import.sh:4-6,67-73,95-99`;
+pinned by `tests/test_argv_hygiene.sh`). Do not run the scripts under
+`bash -x` / `SHELLOPTS=xtrace`: tracing expands the
+`: "${DATABASE_URL:?...}"` presence check and `pg-env.sh`'s `eval`,
+printing the secret to stderr. (Sources: `import.sh:4-6,67-73,95-99`;
 `replicate.sh:12,21-27`; `pg-env.sh:1-12,287-297`;
 `tests/test_argv_hygiene.sh`.)
 
@@ -145,8 +148,16 @@ job, keep serving the previous packet" (`mb_import_state.last_packet`
 shows the last good one). Exception: `mb_track` prunes positions the
 newest dump no longer lists — but only inside the final chunk's
 transaction together with the cursor advance, so an interrupted import
-leaves rows at worst stale, never truncated. No destructive migrations in
-this path (additive tables/columns only). (Sources: `import.sh:152-172`
-(prune), `:381-386` (final-chunk atomicity), `:391-393` (forward-only
-guard); `migrations/0016_mb_track.sql`;
-`migrations/0014_mb_import_resume_dlq.sql`.)
+leaves rows at worst stale, never truncated. Once the last `mb_track`
+chunk commits, the prune is final: an older dump cannot restore it (the
+forward-only guard skips its updates and the prune deletes any
+older-timestamp rows it inserts), so recovery is a corrected dump stamped
+with a newer `DUMP_TS`, or a database restore. A position whose
+replacement row landed in the DLQ (poison or FK orphan) also loses its
+old row, leaving a visible gap rather than a stale recording. No
+data-destroying migrations in this path; 0014/0016 swap constraints in
+place (cursor PK, DLQ unique, `table_name` checks). (Sources: `import.sh:152-172`
+(prune, DLQ gap), `:381-386` (final-chunk atomicity), `:391-393` (forward-only
+guard); `test-import.sh:427-445` (older dump leaves rows alone);
+`migrations/0016_mb_track.sql:38-43` (check swaps);
+`migrations/0014_mb_import_resume_dlq.sql:28-29,46-49` (PK/unique swaps).)
