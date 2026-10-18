@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from binding_parity import (
     ParityError,
     check,
+    extract_bindings,
     extract_commented_bindings,
     load_manifest,
     main,
@@ -592,6 +593,57 @@ reason = "fixture: value fix owned elsewhere"
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(ParityError):
                 run_check(make_repo(tmp, wrangler=wrangler))
+
+    def test_duplicate_r2_binding_diagnostic_pins_message(self):
+        # Two [[r2_buckets]] sharing binding DATA must fail closed with the
+        # exact duplicate-binding diagnostic (binding_parity.py:140-143).
+        wrangler = MATCHING_WRANGLER + (
+            '\n[[env.staging.r2_buckets]]\nbinding = "DATA"\n'
+            'bucket_name = "fx-a"\n'
+            '[[env.staging.r2_buckets]]\nbinding = "DATA"\n'
+            'bucket_name = "fx-b"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp, wrangler=wrangler)
+            with self.assertRaisesRegex(
+                ParityError, r"duplicate binding 'DATA' \(r2\)"
+            ):
+                run_check(root)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(2, main(["--root", str(root)]))
+            self.assertIn("duplicate binding 'DATA' (r2)", output.getvalue())
+            self.assertIn("::error::binding-parity:", output.getvalue())
+            self.assertNotIn("Traceback", output.getvalue())
+
+    def test_same_binding_name_across_types_passes(self):
+        # The duplicate key is (type, binding): same name across different
+        # types must not raise (no false positive).
+        out = extract_bindings(
+            {
+                "r2_buckets": [{"binding": "DATA", "bucket_name": "fx-a"}],
+                "kv_namespaces": [{"binding": "DATA", "id": "fx-kv"}],
+            }
+        )
+        self.assertIn(("r2", "DATA"), out)
+        self.assertIn(("kv", "DATA"), out)
+        wrangler = MATCHING_WRANGLER + (
+            '\n[[env.staging.r2_buckets]]\nbinding = "DATA"\n'
+            'bucket_name = "fx-a"\n'
+            '[[env.staging.kv_namespaces]]\nbinding = "DATA"\nid = "fx-kv"\n'
+            '[[env.production.r2_buckets]]\nbinding = "DATA"\n'
+            'bucket_name = "fx-b"\n'
+            '[[env.production.kv_namespaces]]\nbinding = "DATA"\n'
+            'id = "fx-kv-prod"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp, wrangler=wrangler)
+            config = root / "workers" / "demo" / "wrangler.toml"
+            effective, _, _ = parse_config(config)
+            self.assertIn(("r2", "DATA"), effective["staging"])
+            self.assertIn(("kv", "DATA"), effective["staging"])
+            self.assertIn(("r2", "DATA"), effective["prod"])
+            self.assertIn(("kv", "DATA"), effective["prod"])
 
     def test_unknown_binding_table_is_flagged_not_ignored(self):
         wrangler = MATCHING_WRANGLER + (
