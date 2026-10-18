@@ -269,6 +269,12 @@ pub struct RepairReply {
 /// 502 `container_unavailable` fault the runtime already uses for a
 /// Container reply it cannot trust. A non-`Repaired` result carries
 /// no output set to validate.
+///
+/// The rule is set equality with the manifest's Data files: exactly
+/// one output per Data file, with unique file names and unique
+/// canonical object keys. Sizes are deliberately not compared — a
+/// recreated zero-length Data target carries its repaired on-disk
+/// size, not the manifest's 0.
 pub fn validate_repaired_output_set(
     manifest: &ScratchManifest,
     result: &RepairResult,
@@ -276,17 +282,25 @@ pub fn validate_repaired_output_set(
     if result.status != RepairStatus::Repaired {
         return Ok(());
     }
+    let invalid = || ApiFault::new(502, "container_unavailable");
     let data_names: HashSet<&str> = manifest
         .files
         .iter()
         .filter(|f| f.role == FileRole::Data)
         .map(|f| f.file_name.as_str())
         .collect();
+    if result.files.len() != data_names.len() {
+        return Err(invalid());
+    }
+    let mut seen_names = HashSet::with_capacity(result.files.len());
+    let mut seen_keys = HashSet::with_capacity(result.files.len());
     for output in &result.files {
         if !data_names.contains(output.file_name.as_str())
             || output.key != object_key_for_file_name(&output.file_name)
+            || !seen_names.insert(output.file_name.as_str())
+            || !seen_keys.insert(output.key.as_str())
         {
-            return Err(ApiFault::new(502, "container_unavailable"));
+            return Err(invalid());
         }
     }
     Ok(())
