@@ -263,6 +263,35 @@ pub struct RepairReply {
     pub file_count: usize,
 }
 
+/// Validate the set of outputs a `Repaired` result claims against the
+/// manifest. The wasm runtime calls this before copying any output or
+/// writing the durable result marker; rejections are the retryable
+/// 502 `container_unavailable` fault the runtime already uses for a
+/// Container reply it cannot trust. A non-`Repaired` result carries
+/// no output set to validate.
+pub fn validate_repaired_output_set(
+    manifest: &ScratchManifest,
+    result: &RepairResult,
+) -> Result<(), ApiFault> {
+    if result.status != RepairStatus::Repaired {
+        return Ok(());
+    }
+    let data_names: HashSet<&str> = manifest
+        .files
+        .iter()
+        .filter(|f| f.role == FileRole::Data)
+        .map(|f| f.file_name.as_str())
+        .collect();
+    for output in &result.files {
+        if !data_names.contains(output.file_name.as_str())
+            || output.key != object_key_for_file_name(&output.file_name)
+        {
+            return Err(ApiFault::new(502, "container_unavailable"));
+        }
+    }
+    Ok(())
+}
+
 pub fn ingest_reply_body(result: &RepairResult) -> Vec<u8> {
     let reply = RepairReply {
         status: result.status,
