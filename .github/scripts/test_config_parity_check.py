@@ -9,11 +9,16 @@ fails with exit 1. Run from the repo root:
 """
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from config_parity_check import U64_MAX, check_value, validate_env
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / ".github" / "scripts" / "config_parity_check.py"
@@ -174,6 +179,60 @@ class ParityCheckTests(unittest.TestCase):
             code, out, _ = run_check(staging_path, prod_path, schema=schema_path)
         self.assertEqual(code, 1, out)
         self.assertIn("expected bool, got int", out)
+
+    def test_check_value_verdict_table(self):
+        # Direct-call pin for every check_value arm (config_parity_check.py:
+        # 96-111): each case asserts the exact error string or None, so a
+        # weakened validator cannot stay green.
+        cases = [
+            ("u64 bool is not a u64", "k", "u64", True,
+             "k: expected u64, got bool"),
+            ("u64 negative is out of range", "k", "u64", -1,
+             "k: u64 out of range"),
+            ("u64 2**64 is out of range", "k", "u64", 2**64,
+             "k: u64 out of range"),
+            ("u64 float is not a u64", "k", "u64", 1.5,
+             "k: expected u64, got float"),
+            ("u64 zero is valid", "k", "u64", 0, None),
+            ("u64 max is valid", "k", "u64", U64_MAX, None),
+            ("empty string is empty", "k", "string", "",
+             "k: required string is empty"),
+            ("blank string is empty", "k", "string", "  ",
+             "k: required string is empty"),
+            ("string int is not a string", "k", "string", 5,
+             "k: expected string, got int"),
+            ("non-empty string is valid", "k", "string", "ok", None),
+            ("bogus type is unknown", "k", "bogus", "x",
+             "k: unknown declared type 'bogus'"),
+        ]
+        for label, key, declared, value, want in cases:
+            with self.subTest(label):
+                self.assertEqual(want, check_value(key, declared, value))
+
+    def test_list_root_fixture_reports_object_error(self):
+        # Direct-call pin for validate_env's non-dict root arm: a JSON array
+        # root reports the exact object error, never a traceback or pass.
+        self.assertEqual(
+            ["staging: fixture root must be a JSON object"],
+            validate_env("staging", [], {}),
+        )
+
+    def test_empty_required_string_cli_fails_naming_key(self):
+        # CLI wiring: a staging fixture with an empty required string
+        # (auth.rp_id) exits 1 and names the key. Tmp-dir JSON only; the
+        # shipped config/ fixtures stay read-only.
+        staging = json.loads(STAGING.read_text(encoding="utf-8"))
+        staging["auth.rp_id"] = ""
+        prod = json.loads((ROOT / "config" / "prod.json").read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as tmp:
+            staging_path = Path(tmp) / "staging.json"
+            prod_path = Path(tmp) / "prod.json"
+            write_json(staging_path, staging)
+            write_json(prod_path, prod)
+            code, out, _ = run_check(staging_path, prod_path)
+        self.assertEqual(code, 1, out)
+        self.assertIn("auth.rp_id", out)
+        self.assertIn("required string is empty", out)
 
     def test_missing_file_is_input_error(self):
         code, _, _ = run_check(STAGING, FIXTURES / "does-not-exist.json")
