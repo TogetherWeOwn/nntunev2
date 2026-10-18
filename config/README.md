@@ -43,6 +43,7 @@ makes drift fail CI.
    - `python3 .github/scripts/config_parity_check.py --schema config/schema.json --staging config/staging.json --prod config/prod.json`
    - `python3 .github/scripts/test_config_parity_check.py`
    - `python3 .github/scripts/test_config_duplicate_members.py`
+   - `python3 .github/scripts/test_config_empty_schema_keys.py`
    - `cargo test -p nntune-config` (also covered by CI's workspace test run)
 4. Read the key in workers only via `Config::get_u64` / `get_bool` /
    `get_str`. Bump `schema_version` (schema file + `SCHEMA_VERSION`) when
@@ -51,8 +52,8 @@ makes drift fail CI.
 ## CI
 
 The `config-parity` job (part of the required `ci-ok` gate) runs the parity
-check on the shipped schema and environment files, the script's self-tests, and the
-duplicate-member tests. It fails on a missing required key, a type
+check on the shipped schema and environment files, the script's self-tests,
+the duplicate-member tests, and the empty-schema-keys tests. It fails on a missing required key, a type
 mismatch, an undeclared key, or a staging/prod key-set asymmetry, and
 passes on identical fixtures or fixtures that differ in values only.
 
@@ -76,7 +77,7 @@ passes on identical fixtures or fixtures that differ in values only.
   (getters), `:238-251` (key-names-only errors); cross-checks `:558-638`
   and `:664-750`. `env_var`-exactly-when-overridable per
   `config_parity_check.py:144-148` and `lib.rs:43-44`.
-- CI: `.github/workflows/ci.yml:393-406` (three run steps); `ci-ok` is
+- CI: `.github/workflows/ci.yml:409-416` (four run steps); `ci-ok` is
   required (`:3`) with `config-parity` in needs (`:755`); `cargo test
   --workspace` in `rust-test` (`:47-51`) covers `crates/nntune-config`
   (workspace member per `Cargo.toml:2`).
