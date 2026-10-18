@@ -73,6 +73,42 @@ BEGIN
         NULL;
     END;
 
+    -- Deletion fence (ADR 0002 rule 3): the production mint writes
+    -- through INSERT ... SELECT over the owner fence
+    -- (worker_entry.rs insert_native_credential), so a deleting account's
+    -- insert lands zero rows and fails closed. The fence is application
+    -- SQL, not a table constraint, so replicate the fenced shape here: a
+    -- direct VALUES insert would bypass it and must not be used for this
+    -- case.
+    INSERT INTO users (id, email, created_at)
+    VALUES ('user-nrc-3', 'nrc-3@example.com', 1700000000);
+    UPDATE users SET deleting_at = NOW() WHERE id = 'user-nrc-3';
+    INSERT INTO native_rest_credentials
+        (id, user_id, label, key_prefix, key_hmac, pepper_version,
+         scopes, created_at, expires_at, created_from_ip)
+    SELECT 'cred-deleting', 'user-nrc-3', '', 'ntk_abcd1234',
+           'dd44', 1, ARRAY['library:read'],
+           1700000000, 1731536000, '198.51.100.9'
+    FROM (SELECT id FROM users
+          WHERE id = 'user-nrc-3' AND deleting_at IS NULL FOR SHARE) AS writer_fence;
+    IF (SELECT count(*) FROM native_rest_credentials
+        WHERE id = 'cred-deleting') <> 0 THEN
+        RAISE EXCEPTION 'fenced insert landed a row behind the deletion marker';
+    END IF;
+    -- Positive control: the same fenced shape lands one row for a live user.
+    INSERT INTO native_rest_credentials
+        (id, user_id, label, key_prefix, key_hmac, pepper_version,
+         scopes, created_at, expires_at, created_from_ip)
+    SELECT 'cred-fenced-live', 'user-nrc-2', '', 'ntk_abcd1234',
+           'ee55', 1, ARRAY['library:read'],
+           1700000000, 1731536000, '198.51.100.9'
+    FROM (SELECT id FROM users
+          WHERE id = 'user-nrc-2' AND deleting_at IS NULL FOR SHARE) AS writer_fence;
+    IF (SELECT count(*) FROM native_rest_credentials
+        WHERE id = 'cred-fenced-live') <> 1 THEN
+        RAISE EXCEPTION 'fenced insert missed a live user';
+    END IF;
+
     -- Erasure cascade: deleting the user removes its credential rows
     -- (child order for account erasure, alongside sessions).
     DELETE FROM users WHERE id = 'user-nrc-1';

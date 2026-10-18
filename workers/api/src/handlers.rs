@@ -3225,6 +3225,12 @@ mod tests {
         orphan_user_after_next_challenge: RefCell<Option<String>>,
         challenge_reads: RefCell<usize>,
         rate_limit_slot_probes: RefCell<usize>,
+        /// Bearer-gate pins: every `reserve_rate_limit_pair` call and every
+        /// `native_credential_by_hmac` lookup. The shape gate must return
+        /// before either is touched, so a malformed token leaves both at
+        /// zero while a well-formed unknown key increments both.
+        rate_limit_pair_calls: RefCell<usize>,
+        native_credential_lookups: RefCell<usize>,
         fail_reauth_revocation: RefCell<bool>,
         fail_reauth_insert: RefCell<bool>,
         /// Users whose `users.deleting_at` is set (ADR 0002 rule 3):
@@ -3411,6 +3417,7 @@ mod tests {
             second: RateLimitBudget<'_>,
             now: u64,
         ) -> Result<PairAdmission, StoreError> {
+            *self.rate_limit_pair_calls.borrow_mut() += 1;
             // All-or-none under the single slot-map borrow: count and
             // locate a free slot in BOTH budgets first, insert only
             // when both admit.
@@ -3678,6 +3685,7 @@ mod tests {
             pepper_version: u32,
             key_hmac: &str,
         ) -> Result<Option<NativeCredentialRow>, StoreError> {
+            *self.native_credential_lookups.borrow_mut() += 1;
             Ok(self
                 .native_credentials
                 .borrow()
@@ -5299,6 +5307,62 @@ mod tests {
         assert_eq!(bearer_mint.status, 401, "{}", bearer_mint.body);
         let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
         assert_eq!(rows.len(), 2, "bearer mint attempt stores nothing");
+    }
+
+    #[test]
+    fn malformed_bearer_shape_costs_no_store_work() {
+        // ADR 0010 DoS pin: the shape gate must run BEFORE the per-IP
+        // budget claim and the HMAC/DB lookup. A malformed token answers
+        // the generic 401 with zero `reserve_rate_limit_pair` calls and
+        // zero `native_credential_by_hmac` lookups; a well-formed unknown
+        // key reaches both and still fails closed. Short-circuiting the
+        // `is_plausible_credential_shape` guard must fail here (both
+        // counters would move on the malformed leg).
+        let h = peppered_harness();
+        let pair_calls = || *h.store.rate_limit_pair_calls.borrow();
+        let lookups = || *h.store.native_credential_lookups.borrow();
+        let (base_pairs, base_lookups) = (pair_calls(), lookups());
+        // Each malformed shape: generic 401, no store work at all.
+        for header in [
+            Some("Bearer ntk_short".to_string()),
+            Some(format!("Bearer ntk_{}", "0".repeat(42))),
+            Some(format!("Bearer ntk_{}", "0".repeat(44))),
+            Some("Bearer ntk_no-such-credential-000000000000000000".to_string()),
+        ] {
+            let resp = h.call_bearer("GET", "/v1/search", header);
+            assert_eq!(resp.status, 401, "{}", resp.body);
+            assert_eq!(
+                resp.body,
+                r#"{"code":"unauthorized","message":"invalid credential","retryable":false}"#
+            );
+        }
+        assert_eq!(
+            pair_calls(),
+            base_pairs,
+            "malformed shapes must not claim the lookup budget"
+        );
+        assert_eq!(
+            lookups(),
+            base_lookups,
+            "malformed shapes must not reach the credential lookup"
+        );
+        // A well-formed unknown key passes the gate and pays for the
+        // lookup before failing closed — proving the counters observe the
+        // gate rather than the harness.
+        let unknown = h.call_bearer(
+            "GET",
+            "/v1/search",
+            Some(format!("Bearer ntk_{}", "0".repeat(43))),
+        );
+        assert_eq!(unknown.status, 401, "{}", unknown.body);
+        assert!(
+            pair_calls() > base_pairs,
+            "a well-formed key must claim the lookup budget"
+        );
+        assert!(
+            lookups() > base_lookups,
+            "a well-formed key must reach the credential lookup"
+        );
     }
 
     #[test]

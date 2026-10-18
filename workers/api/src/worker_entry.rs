@@ -2380,13 +2380,14 @@ mod tests {
     #[test]
     fn fenced_vault_statements_pin_the_owner_fence_and_zero_row_guard() {
         // ADR 0002 rule 3: PUT /v1/vault is reachable today, and the vault
-        // upsert fence, its zero-row guard, and the test-lease fence are the
-        // only things stopping credential writes behind the deletion marker.
+        // upsert fence, its zero-row guard, the test-lease fence, and the
+        // native-credential mint fence are the only things stopping
+        // credential writes behind the deletion marker.
         // Pin them the same way `insert_magic_prune_is_per_user_and_expired_only`
         // pins its statement: slice ONLY each fn body out of the pre-test
         // source, so this test's own literals cannot satisfy the assertions.
-        // Dropping `AND deleting_at IS NULL` from either statement, or the
-        // `affected == 0` guard from the upsert, must fail here.
+        // Dropping `AND deleting_at IS NULL` from any statement, or the
+        // `affected == 0` guard from a fenced write, must fail here.
         let source = include_str!("worker_entry.rs");
         let production = source
             .split_once("#[cfg(test)]")
@@ -2445,6 +2446,35 @@ mod tests {
         assert!(
             lease.contains("if !rows.is_empty()"),
             "lease must deny when the fence returns no row"
+        );
+        // Native-credential mint: the same deletion fence on the owner
+        // parameter, so a fresh session during the 24 h grace cannot mint
+        // a new long-lived bearer path behind the marker. The credential
+        // id binds $1, so the owner fence binds $2 here (not $1 as in the
+        // vault upsert above).
+        const NATIVE_FENCE: &str = "FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence";
+        let mint = fn_body("async fn insert_native_credential(");
+        assert!(
+            mint.contains(NATIVE_FENCE),
+            "insert_native_credential must select its row through the owner fence"
+        );
+        assert!(
+            !mint.contains("WHERE id = $1"),
+            "insert_native_credential fence binds the owner ($2), never $1"
+        );
+        assert!(
+            mint.contains("SELECT $1, $2"),
+            "insert_native_credential must keep SELECT $1 bound to the credential id and $2 to the owner"
+        );
+        let mint_guard = mint
+            .find("if affected == 0")
+            .expect("insert_native_credential must fail closed on 0 rows");
+        let mint_ok = mint
+            .find("Ok(())")
+            .expect("insert_native_credential must return Ok on the write path");
+        assert!(
+            mint_guard < mint_ok,
+            "the zero-row guard must precede the success return"
         );
     }
 

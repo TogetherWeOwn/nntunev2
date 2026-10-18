@@ -587,6 +587,50 @@ mod tests {
     }
 
     #[test]
+    fn plausible_shape_gate_accepts_only_minted_form() {
+        // The HTTP bearer gate runs this BEFORE any HMAC or DB work, so a
+        // regression here reopens the unauthenticated DB-amplification the
+        // gate exists to close. Pin the exact minted form and each
+        // rejection class: removing the guard must fail here.
+        let minted = issue_credential(USER, &[Scope::LibraryRead], 60, NOW, &pepper());
+        assert!(
+            is_plausible_credential_shape(&minted.display_once),
+            "a freshly minted secret must pass the shape gate"
+        );
+        // Wrong prefix (including the empty token) never passes.
+        for bad in ["", "bearer abc", "Bearer ntk_abc", "atk_"] {
+            assert!(
+                !is_plausible_credential_shape(bad),
+                "{bad:?} must fail the shape gate"
+            );
+        }
+        let good_tail = &minted.display_once[CREDENTIAL_PREFIX.len()..];
+        assert_eq!(good_tail.len(), SECRET_ENTROPY_BASE62_LEN);
+        // 42 and 44 chars: exactly 43 base62 chars are required.
+        assert!(!is_plausible_credential_shape(&format!(
+            "{CREDENTIAL_PREFIX}{}",
+            &good_tail[..SECRET_ENTROPY_BASE62_LEN - 1]
+        )));
+        assert!(!is_plausible_credential_shape(&format!(
+            "{CREDENTIAL_PREFIX}{}0",
+            good_tail
+        )));
+        // Non-base62 char (dash, underscore, space) fails even at 43 length.
+        let mut dashed = good_tail.to_string();
+        dashed.replace_range(0..1, "-");
+        assert!(!is_plausible_credential_shape(&format!(
+            "{CREDENTIAL_PREFIX}{dashed}"
+        )));
+        // Well-formed random entropy passes the gate (it still fails closed
+        // after the HMAC lookup with the generic 401; shape alone never
+        // authenticates).
+        assert!(is_plausible_credential_shape(&format!(
+            "{CREDENTIAL_PREFIX}{}",
+            "0".repeat(SECRET_ENTROPY_BASE62_LEN)
+        )));
+    }
+
+    #[test]
     fn lowercase_head_denies_while_pinned_head_passes() {
         // Only the pinned HEAD shape is bearer-reachable.
         assert_eq!(
