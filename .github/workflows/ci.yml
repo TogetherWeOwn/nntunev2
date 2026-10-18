@@ -550,6 +550,8 @@ jobs:
         run: |
           python3 .github/scripts/test_check_archive_bindings.py
           python3 .github/scripts/test_archive_json_inspection_errors.py
+      - name: Unit-test the guard byte paths
+        run: python3 .github/scripts/test_archive_manifest_byte_paths.py
       - name: Unit-test the guard case folding
         run: python3 .github/scripts/test_archive_binding_casefold.py
 
