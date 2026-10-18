@@ -20,7 +20,9 @@ from binding_parity import (
     ParityError,
     check,
     extract_commented_bindings,
+    load_manifest,
     main,
+    parse_config,
     parse_ops_inventory,
 )
 
@@ -920,6 +922,89 @@ prod = "fx-jobs"
                 run_check(root)
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(2, main(["--root", str(root)]))
+
+
+class TestUnreadableInputs(unittest.TestCase):
+    """Pin fail-closed exits for unreadable/invalid-UTF8 inputs.
+
+    Covers binding_parity.py parse_config (config read), load_manifest
+    (manifest read) and check (ops inventory read): OSError (directory
+    stand-ins) and UnicodeDecodeError (invalid-UTF8 byte fixtures) must
+    raise ParityError naming the file and exit 2 via main, with no
+    traceback on stdout.
+    """
+
+    def assert_check_fails_closed_with_exit_two(self, root, pattern):
+        with self.assertRaisesRegex(ParityError, pattern):
+            run_check(root)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(2, main(["--root", str(root)]))
+        self.assertIn("::error::binding-parity:", output.getvalue())
+        self.assertNotIn("Traceback", output.getvalue())
+
+    def test_invalid_utf8_wrangler_config_names_config_and_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp)
+            config = root / "workers" / "demo" / "wrangler.toml"
+            config.write_bytes(b'name = "demo"\n\xff\xfe not utf-8\n')
+            self.assert_check_fails_closed_with_exit_two(
+                root, r"wrangler\.toml.*cannot parse wrangler config"
+            )
+
+    def test_wrangler_config_directory_names_config(self):
+        # check() reports a directory at the mapped config path as missing
+        # (is_file guard), so pin the parse_config OSError branch directly:
+        # a directory named wrangler.toml raises IsADirectoryError (OSError).
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "wrangler.toml"
+            config_dir.mkdir()
+            with self.assertRaisesRegex(
+                ParityError, r"wrangler\.toml.*cannot parse wrangler config"
+            ):
+                parse_config(config_dir)
+
+    def test_invalid_utf8_manifest_names_manifest_and_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp)
+            manifest = root / ".github" / "scripts" / "binding_manifest.toml"
+            manifest.write_bytes(b'[[worker]]\nname = "\xff\xfe"\n')
+            self.assert_check_fails_closed_with_exit_two(
+                root, r"binding_manifest\.toml.*cannot parse manifest"
+            )
+
+    def test_directory_as_manifest_names_manifest_and_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp)
+            manifest = root / ".github" / "scripts" / "binding_manifest.toml"
+            manifest.unlink()
+            manifest.mkdir()
+            with self.assertRaisesRegex(
+                ParityError, r"binding_manifest\.toml.*cannot parse manifest"
+            ):
+                load_manifest(manifest)
+            self.assert_check_fails_closed_with_exit_two(
+                root, r"binding_manifest\.toml.*cannot parse manifest"
+            )
+
+    def test_invalid_utf8_ops_inventory_names_inventory_and_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp)
+            ops = root / "docs" / "ops.md"
+            ops.write_bytes(b"# ops\n\xff\xfe not utf-8\n")
+            self.assert_check_fails_closed_with_exit_two(
+                root, r"ops\.md.*cannot read inventory"
+            )
+
+    def test_directory_as_ops_inventory_names_inventory_and_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp)
+            ops = root / "docs" / "ops.md"
+            ops.unlink()
+            ops.mkdir()
+            self.assert_check_fails_closed_with_exit_two(
+                root, r"ops\.md.*cannot read inventory"
+            )
 
 
 if __name__ == "__main__":
