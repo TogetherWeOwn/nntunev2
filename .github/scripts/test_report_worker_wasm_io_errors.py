@@ -218,16 +218,18 @@ class MainIsolationTests(unittest.TestCase):
             _write_all_wasms(root)
             failing = WORKERS[0]["worker"]
             later = WORKERS[1]["worker"]
-            failing_artifact = wasm_path(root, WORKERS[0]).resolve()
+            failing_artifact_abs = os.path.abspath(wasm_path(root, WORKERS[0]))
             real_stat = Path.stat
 
             def fake_stat(self, *args, **kwargs):
                 # is_file() calls stat(follow_symlinks=...): let those
                 # through so the existence check succeeds, then fail the
                 # bare stat() inside measure_worker for the victim only.
+                # NOTE: never call .resolve() here: it stats the path and
+                # would recurse into this mock. os.path.abspath is lexical.
                 if "follow_symlinks" in kwargs:
                     return real_stat(self, *args, **kwargs)
-                if Path(self).resolve() == failing_artifact:
+                if os.path.abspath(self) == failing_artifact_abs:
                     raise OSError(STAT_SENTINEL)
                 return real_stat(self, *args, **kwargs)
 
@@ -249,14 +251,16 @@ class MainIsolationTests(unittest.TestCase):
             root = Path(tmp)
             _write_all_wasms(root)
             failing = WORKERS[0]["worker"]
-            failing_artifact = wasm_path(root, WORKERS[0]).resolve()
+            failing_artifact_abs = os.path.abspath(wasm_path(root, WORKERS[0]))
 
             import report_worker_wasm_sizes as reporter
 
             real_gzip = reporter.gzip_size
 
             def fake_gzip(path):
-                if Path(path).resolve() == failing_artifact:
+                # os.path.abspath is lexical (no stat); keeps this mock
+                # robust even if a stat mock is ever layered on top.
+                if os.path.abspath(path) == failing_artifact_abs:
                     raise OSError(READ_SENTINEL)
                 return real_gzip(path)
 
