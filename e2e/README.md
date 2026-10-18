@@ -184,7 +184,11 @@ How the suite uses them:
   journey runs only as a reusable-workflow call from `deploy.yml`'s
   `post-deploy-e2e` job, which `needs` the same run's `staging-web`
   deploy, so a skipped/failed deploy cannot produce a full-journey PASS
-  and the E2E run cannot race its deploy. Manual dispatch and the
+  and no run can start without its own deploy. A later main push can
+  still deploy staging mid-journey (deploy releases its job-level group
+  when the deploy finishes while E2E serializes separately) — that
+  timing fails the closing build-identity re-read instead of passing
+  green (see below). Manual dispatch and the
   6-hour schedule run the synthetic smoke only (monitoring, not
   post-deploy promotion evidence); dispatch defines no `post_deploy`
   input, so it cannot mint that evidence by hand.
@@ -204,10 +208,14 @@ How the suite uses them:
   require the post-deploy full-journey result (the `post-deploy-e2e` job in
   the same `deploy.yml` run as the successful `staging-web` deploy) and
   block promotion on failure. Sequencing after the deploy is wired, and the
-  full journey now carries same-build evidence: `build-identity.spec.ts`
-  compares `GET /api/build` (baked at build time) with the promotion SHA
-  `deploy.yml` passes as `expected_sha` from `github.sha` — never a source
-  checkout. Blocking a later production promotion on that result, and live
+  full journey now carries same-build evidence: the opening
+  `build-identity.spec.ts` leg and the closing
+  `zz-build-identity-final.spec.ts` leg (which sorts last under the
+  serial config) both compare `GET /api/build` (baked at build time)
+  with the promotion SHA `deploy.yml` passes as `expected_sha` from
+  `github.sha` — never a source checkout — through one shared helper, so
+  a green run proves the whole journey ran against the promoted build.
+  Blocking a later production promotion on that result, and live
   enforcement, are still acceptance prerequisites of that later lane.
 
 ## Evidence
@@ -230,8 +238,9 @@ enable traces/screenshots or the html reporter for credential-bearing runs
 without a verified redaction path. A QA PASS verdict cites the green
 post-deploy run URL (the `deploy.yml` run whose `staging-web` succeeded
 and whose `post-deploy-e2e` full journey passed) + the deployed head SHA
-(the promotion SHA proven equal to `GET /api/build` by
-`build-identity.spec.ts`) — never a scheduled/manual synthetic run, which
+(the promotion SHA proven equal to `GET /api/build` at both the start
+and the end of the journey by the build-identity opening + closing
+specs) — never a scheduled/manual synthetic run, which
 is monitoring only; NEEDS WORK cites the failing spec + step. Every spec that branches on the test-account seam records a
 bounded `signup-path` test annotation — exactly `public-ui-signup` or
 `api-minted-account`, with no email, account id, token or provider data.

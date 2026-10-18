@@ -166,6 +166,7 @@ test.describe('credential scope (static pins)', () => {
       'demo-audio-contract.spec.ts',
       'demo-media-sessionless.spec.ts',
       'build-identity.spec.ts',
+      'zz-build-identity-final.spec.ts',
     ]) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must not carry credentials on a raw request call`).not.toMatch(
@@ -178,10 +179,18 @@ test.describe('credential scope (static pins)', () => {
       'player-queue-order.spec.ts',
       'demo-audio-contract.spec.ts',
       'demo-media-sessionless.spec.ts',
-      'build-identity.spec.ts',
     ]) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must use the no-follow wrapper`).toContain('apiGet(');
+    }
+    // The build-identity opening + closing legs reach the no-follow wrapper
+    // through the shared live helper (pinned in the deployed-build identity
+    // section below), never raw: the ban above still applies to both files.
+    for (const name of ['build-identity.spec.ts', 'zz-build-identity-final.spec.ts']) {
+      const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
+      expect(source, `${name} must route through the shared live helper`).toContain(
+        'assertServingBuildMatchesPromotion(',
+      );
     }
   });
 
@@ -1242,24 +1251,77 @@ test.describe('deployed-build identity wiring (static pin)', () => {
     expect(helper).not.toContain('stagingBaseUrl(');
   });
 
-  test('build-identity spec compares the serving build with the promotion SHA', () => {
-    const spec = readFileSync(new URL('../tests/build-identity.spec.ts', import.meta.url), 'utf8');
-    expect(spec).toContain(
+  test('build-identity legs compare the serving build with the promotion SHA via the shared live helper', () => {
+    // One-shot reads cannot bind a ~30 min journey: the opening leg proves
+    // the deploy delivered the promoted build before the journey and the
+    // closing leg re-reads after every other spec. Both route through one
+    // shared helper so the two reads cannot drift apart.
+    const helper = readFileSync(
+      new URL('../helpers/build-identity-live.ts', import.meta.url),
+      'utf8',
+    );
+    expect(helper).toContain('export async function assertServingBuildMatchesPromotion');
+    expect(helper).toContain('API.build');
+    expect(helper).toContain('expectedPromotionSha(');
+    expect(helper).toContain('extractDeployedSha(');
+    expect(helper).toContain('assertDeployedBuildMatchesPromotion(');
+    expect(helper).toContain('assertNoAccessWall(');
+    expect(helper).toContain('apiGet(');
+    expect(helper).toContain('accessHeaders(');
+    // The helper performs pure verdict throws, never a source checkout.
+    expect(helper).not.toContain('rev-parse');
+    expect(helper).not.toContain('child_process');
+
+    const opener = readFileSync(
+      new URL('../tests/build-identity.spec.ts', import.meta.url),
+      'utf8',
+    );
+    expect(opener).toContain(
       'deployed build matches the promotion SHA (exact-head staging evidence)',
     );
-    expect(spec).toContain('API.build');
-    expect(spec).toContain('expectedPromotionSha(');
-    expect(spec).toContain('extractDeployedSha(');
-    expect(spec).toContain('assertDeployedBuildMatchesPromotion(');
-    expect(spec).toContain('assertNoAccessWall(');
-    expect(spec).toContain('apiGet(');
     // Fail-closed: unknown and mismatch paths are pinned in the offline
     // describe of the same file (not restated here).
-    expect(spec).toContain("'unknown'");
+    expect(opener).toContain("'unknown'");
     // Pre-deploy skip is in-test on STAGING_BASE_URL only — no file-level
     // skip, so the offline verdict pins still run via test:unit.
-    expect(spec).toContain('STAGING_BASE_URL not configured (pre-deploy)');
-    expect(spec).not.toMatch(/^test\.skip\(\s*\n?\s*!process\.env\.STAGING_BASE_URL/m);
+    expect(opener).toContain('STAGING_BASE_URL not configured (pre-deploy)');
+    expect(opener).not.toMatch(/^test\.skip\(\s*\n?\s*!process\.env\.STAGING_BASE_URL/m);
+
+    const closer = readFileSync(
+      new URL('../tests/zz-build-identity-final.spec.ts', import.meta.url),
+      'utf8',
+    );
+    expect(closer).toContain(
+      'deployed build still matches the promotion SHA at journey end (superseded-deploy guard)',
+    );
+    // A mid-journey deploy voids the evidence: the closing leg names the
+    // supersession instead of reporting a bare mismatch.
+    expect(closer).toContain('superseded by a newer deploy');
+    expect(closer).toContain('STAGING_BASE_URL not configured (pre-deploy)');
+    expect(closer).not.toMatch(/^test\.skip\(\s*\n?\s*!process\.env\.STAGING_BASE_URL/m);
+  });
+
+  test('closing identity check runs last under the serial config', () => {
+    // Playwright runs test files alphabetically with a single worker and no
+    // parallelism, so the `zz-` prefix sorts the closing read after every
+    // other spec. Pin the config and the sort position so a future
+    // parallelization or rename cannot silently move the guard mid-journey.
+    const configSource = readFileSync(
+      new URL('../playwright.config.ts', import.meta.url),
+      'utf8',
+    );
+    expect(configSource).toMatch(/workers:\s*1/);
+    expect(configSource).toMatch(/fullyParallel:\s*false/);
+    const specs = readdirSync(fileURLToPath(new URL('../tests/', import.meta.url))).filter(
+      (name) => name.endsWith('.spec.ts'),
+    );
+    expect(specs).toContain('zz-build-identity-final.spec.ts');
+    for (const name of specs) {
+      expect(
+        name <= 'zz-build-identity-final.spec.ts',
+        `${name} must sort before the closing identity check`,
+      ).toBe(true);
+    }
   });
 
   test('synthetic smoke stays health-only (monitoring cannot mint same-build evidence)', () => {
@@ -1269,5 +1331,6 @@ test.describe('deployed-build identity wiring (static pin)', () => {
     expect(pkg.scripts['e2e:smoke']).toContain('tests/health.spec.ts');
     expect(pkg.scripts['e2e:smoke']).not.toContain('build-identity');
     expect(pkg.scripts['test:unit']).toContain('tests/build-identity.spec.ts');
+    expect(pkg.scripts['test:unit']).toContain('tests/zz-build-identity-final.spec.ts');
   });
 });

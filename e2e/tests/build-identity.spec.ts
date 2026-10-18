@@ -1,7 +1,6 @@
 import { test, expect } from '@playwright/test';
-import { API } from '../helpers/contract.js';
-import { accessHeaders, assertNoAccessWall, stagingBaseUrl } from '../helpers/access.js';
-import { apiGet } from '../helpers/accounts.js';
+import { stagingBaseUrl } from '../helpers/access.js';
+import { assertServingBuildMatchesPromotion } from '../helpers/build-identity-live.js';
 import {
   assertDeployedBuildMatchesPromotion,
   expectedPromotionSha,
@@ -13,6 +12,18 @@ import {
 // the promotion commit) must equal the promotion SHA from the
 // push-triggered deploy run (`EXPECTED_BUILD_SHA` via deploy.yml
 // `expected_sha` from `github.sha`) — never a local source checkout.
+//
+// This file holds the OPENING read plus the offline verdict pins. A single
+// point-in-time read cannot bind a ~30 min journey: a later main push may
+// deploy staging mid-journey after this read passes. The CLOSING read
+// (`e2e/tests/zz-build-identity-final.spec.ts`, `zz-` prefix sorts it last
+// under the serial `workers: 1` config) re-reads `/api/build` after every
+// other spec through the same shared helper below and fails with a
+// "superseded by a newer deploy" message when the serving build changed —
+// so a green run proves the whole journey ran against the promoted SHA.
+// Deploy concurrency is intentionally unchanged (job-level groups release
+// when the deploy finishes); the closing read turns the race into a red
+// run instead of a false pass.
 //
 // NO file-level skip by design: the offline describe below pins the verdict
 // contract on every PR (via `npm run test:unit`) with no staging, while the
@@ -142,19 +153,8 @@ test('deployed build matches the promotion SHA (exact-head staging evidence)', a
     test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
     return;
   }
-  // Promotion SHA from the push-triggered deploy run (EXPECTED_BUILD_SHA via
-  // deploy.yml expected_sha from github.sha) — never a source checkout.
-  // Missing or malformed values throw here: fail closed, never skip-green.
-  const expected = expectedPromotionSha('build-identity');
-  // apiGet fetches with maxRedirects: 0 so a staging 302 never carries the
-  // Access pair to another origin (see helpers/accounts.ts).
-  const res = await apiGet(request, `${baseURL}${API.build}`, accessHeaders(), 'build-identity');
-  const bodyText = await res.text().catch(() => '');
-  assertNoAccessWall(
-    { status: res.status(), headers: res.headers(), bodyText, url: `${baseURL}${API.build}` },
-    'build-identity',
-  );
-  expect(res.status(), `build body: ${bodyText.slice(0, 500)}`).toBe(200);
-  const deployed = extractDeployedSha(bodyText, 'build-identity');
-  assertDeployedBuildMatchesPromotion(deployed, expected, 'build-identity');
+  // Opening read: proves the deploy delivered the promoted build before the
+  // journey. The closing spec re-reads at the end through the same helper —
+  // a mid-journey deploy reds the run instead of passing green.
+  await assertServingBuildMatchesPromotion(request, baseURL, 'build-identity');
 });
