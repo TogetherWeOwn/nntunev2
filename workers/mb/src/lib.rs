@@ -7,7 +7,9 @@
 //! - `GET /v1/mb/recording/:mbid` — recording lookup by MBID.
 //! - `GET /v1/mb/release/:mbid/recordings` — a release's recordings, in
 //!   track order.
-//! - `GET /v1/mb/search?q=&type=artist|release|recording` — trigram search.
+//! - `GET /v1/mb/search?q=&type=artist|release|recording&limit=&offset=` — trigram search,
+//!   paged (`limit` defaults to `MAX_PAGE_SIZE`, over-limit clamped; empty `q` is 400
+//!   `MB_SEARCH_EMPTY_QUERY`).
 //!
 //! Data comes from PlanetScale Postgres (`nntunev2-mb`) via the Hyperdrive
 //! binding `MB_DB`; successful responses are cached in KV (`MB_CACHE`) and
@@ -19,7 +21,7 @@
 //! bindings and public hosts are activated. See `README.md` and
 //! `migrations/0001_mb_mirror.sql`.
 //!
-//! Structure: [`handle_lookup`] / [`handle_search`] are the testable core
+//! Structure: [`handle_lookup`] / [`handle_search_paged`] are the testable core
 //! over the [`MbRepo`] and [`SuccessCache`] traits. The HTTP layer at the bottom wires them to a per-request
 //! `tokio-postgres` client over the Hyperdrive socket and to the KV binding.
 
@@ -36,16 +38,18 @@ pub mod replication;
 const LOOKUP_CACHE_TTL_S: u32 = 86_400;
 const SEARCH_CACHE_TTL_S: u32 = 300;
 
-/// Search returns at most this many hits (SQL `LIMIT` and a defensive
-/// truncation in [`handle_search`]).
-const SEARCH_LIMIT: usize = 25;
-
 /// A release's recordings listing returns at most this many rows (SQL
 /// `LIMIT` and a defensive truncation in [`handle_release_recordings`]).
 /// Sized for box sets while keeping one response bounded; the ingest
 /// library write accepts up to 10k recording MBIDs, so this cap is the
 /// tighter of the two.
 const RELEASE_RECORDINGS_LIMIT: usize = 1000;
+
+/// Documented max page size for `GET /v1/mb/search` (`limit`/`offset`).
+/// Matches the trigram `LIMIT 25` and the README's documented limit:
+/// `None` defaults to this, `1..=MAX_PAGE_SIZE` is honored, anything above
+/// is clamped (never rejected), and `Some(0)` is a 400.
+const MAX_PAGE_SIZE: usize = 25;
 
 /// Upper bound on `q` length, in chars. Bounds trigram work and KV keys.
 const MAX_QUERY_CHARS: usize = 100;
@@ -167,33 +171,38 @@ const RELEASE_RECORDINGS_SQL: &str =
 
 /// Trigram search statement per kind. `$1` is the normalized query; `%` is
 /// the `pg_trgm` similarity predicate (GIN index in migration 0001),
-/// ordered by score with a deterministic tiebreak and a hard limit.
-/// Release hits also carry the release's artist (`artist_mbid` /
-/// `artist_name`, NULL when the release has none) so callers can verify
-/// an "Artist - Album" query against the artist instead of trusting a
-/// title-only score; other kinds select NULLs for the same columns.
-fn search_sql(kind: Kind) -> &'static str {
-    match kind {
+/// ordered by score with a deterministic tiebreak. Release hits also carry
+/// the release's artist (`artist_mbid` / `artist_name`, NULL when the
+/// release has none) so callers can verify an "Artist - Album" query
+/// against the artist instead of trusting a title-only score; other kinds
+/// select NULLs for the same columns. `LIMIT`/`OFFSET` are interpolated
+/// from `u32` values already resolved by [`handle_search_paged`] (an
+/// effective limit in `1..=MAX_PAGE_SIZE` and any `u32` offset): plain
+/// integers cannot inject SQL, while binding them as `$2`/`$3` would
+/// reintroduce the parameter-typing pitfalls documented on [`lookup_sql`].
+fn search_sql(kind: Kind, limit: u32, offset: u32) -> String {
+    let base = match kind {
         Kind::Artist => {
             "SELECT mbid::text AS mbid, name AS label, similarity(name, $1) AS score, \
              NULL::text AS artist_mbid, NULL::text AS artist_name \
              FROM mb_artist WHERE name % $1 \
-             ORDER BY score DESC, label ASC, mbid ASC LIMIT 25"
+             ORDER BY score DESC, label ASC, mbid ASC"
         }
         Kind::Release => {
             "SELECT r.mbid::text AS mbid, r.title AS label, similarity(r.title, $1) AS score, \
              r.artist_mbid::text AS artist_mbid, a.name AS artist_name \
              FROM mb_release r LEFT JOIN mb_artist a ON a.mbid = r.artist_mbid \
              WHERE r.title % $1 \
-             ORDER BY score DESC, label ASC, r.mbid ASC LIMIT 25"
+             ORDER BY score DESC, label ASC, r.mbid ASC"
         }
         Kind::Recording => {
             "SELECT mbid::text AS mbid, title AS label, similarity(title, $1) AS score, \
              NULL::text AS artist_mbid, NULL::text AS artist_name \
              FROM mb_recording WHERE title % $1 \
-             ORDER BY score DESC, label ASC, mbid ASC LIMIT 25"
+             ORDER BY score DESC, label ASC, mbid ASC"
         }
-    }
+    };
+    format!("{base} LIMIT {limit} OFFSET {offset}")
 }
 
 /// Validate an MBID string (UUID shape `8-4-4-4-12` hex). Keeps malformed
@@ -239,11 +248,6 @@ fn lookup_cache_key(kind: Kind, mbid: &str) -> String {
 /// `mb:release-recordings:<release mbid>`.
 fn release_recordings_cache_key(release_mbid: &str) -> String {
     format!("mb:release-recordings:{}", release_mbid.to_lowercase())
-}
-
-/// Stable KV key for a search success: `mb:search:<kind>:<normalized q>`.
-fn search_cache_key(kind: Kind, raw_q: &str) -> String {
-    format!("mb:search:{}:{}", kind.as_str(), normalize_query(raw_q))
 }
 
 /// Success-path `Cache-Control` value for the given TTL.
@@ -362,9 +366,17 @@ impl SearchHit {
 struct RepoError;
 
 /// Read-only mirror repository over the `MB_DB` Hyperdrive binding.
+/// `search` takes the resolved page so SQL applies `LIMIT`/`OFFSET`
+/// directly; callers pass the clamped limit, never the raw request value.
 trait MbRepo {
     async fn lookup(&self, kind: Kind, mbid: &str) -> Result<Option<Entity>, RepoError>;
-    async fn search(&self, kind: Kind, normalized_q: &str) -> Result<Vec<SearchHit>, RepoError>;
+    async fn search(
+        &self,
+        kind: Kind,
+        normalized_q: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SearchHit>, RepoError>;
     /// Recordings of one release in album order (medium, then track).
     /// `None` means the release itself does not exist; `Some(empty)`
     /// is a release with no recordings in the mirror yet.
@@ -503,15 +515,45 @@ async fn handle_release_recordings<R: MbRepo, C: SuccessCache>(
     }
 }
 
-/// Search core: validate → KV → DB. A successful query (including an
-/// empty result list) is cached for [`SEARCH_CACHE_TTL_S`]; a read
-/// failure is a 500, never an empty success, and is never cached.
-async fn handle_search<R: MbRepo, C: SuccessCache>(
+/// Stable 4xx for empty/whitespace search queries: 400 with the registered
+/// `MB_SEARCH_EMPTY_QUERY` code (see `docs/api-errors.md`), `no-store`,
+/// without touching the repo (never a scan) or the cache.
+fn empty_query_response() -> ApiResponse {
+    error_response(ApiError::by_code(
+        "MB_SEARCH_EMPTY_QUERY",
+        "search query must not be empty",
+    ))
+}
+
+/// Stable KV key for a paged search success. Page coordinates are part of the
+/// key so one page can never serve another page's cached body.
+fn search_paged_cache_key(kind: Kind, normalized_q: &str, limit: u32, offset: u32) -> String {
+    format!(
+        "mb:search:{}:{normalized_q}:{limit}:{offset}",
+        kind.as_str()
+    )
+}
+
+/// Search core: validate → KV → DB serving `GET /v1/mb/search` with
+/// `limit`/`offset`. `limit`: `None` defaults to
+/// [`MAX_PAGE_SIZE`]; `Some(0)` is a 400; `1..=MAX_PAGE_SIZE` is honored;
+/// anything above is clamped, never rejected. `offset`: `None` (and, at the
+/// HTTP layer, unparsable) defaults to `0`; past the end of the result set is
+/// a 200 with `"results": []`. Successes echo the effective `limit`/`offset`
+/// alongside the normalized `q`, `type` and `results`.
+async fn handle_search_paged<R: MbRepo, C: SuccessCache>(
     repo: &R,
     cache: &C,
     raw_kind: Option<String>,
     raw_q: &str,
+    limit: Option<u32>,
+    offset: Option<u32>,
 ) -> ApiResponse {
+    // Empty check first: before `type` validation so the code is stable
+    // regardless of `type`, and before cache/repo so it is never a scan.
+    if raw_q.trim().is_empty() {
+        return empty_query_response();
+    }
     let q = raw_q.trim();
     let q_chars = q.chars().count();
     if q_chars < 2 {
@@ -533,22 +575,32 @@ async fn handle_search<R: MbRepo, C: SuccessCache>(
             ))
         }
     };
-    let key = search_cache_key(kind, q);
+    let effective_limit = match limit {
+        None => MAX_PAGE_SIZE as u32,
+        Some(0) => return error_response(ApiError::invalid_request("limit must be 1..=25")),
+        Some(n) => n.min(MAX_PAGE_SIZE as u32),
+    };
+    let effective_offset = offset.unwrap_or(0);
+    let normalized_q = normalize_query(q);
+    let key = search_paged_cache_key(kind, &normalized_q, effective_limit, effective_offset);
     if let Some(body) = cache.get(&key).await {
         return success_response(body, SEARCH_CACHE_TTL_S);
     }
-    // The body echoes the normalized query, not the raw one: case and
-    // whitespace variants share this cache entry, so the first writer's
-    // raw casing must not leak into later variants' responses.
-    let normalized_q = normalize_query(q);
-    match repo.search(kind, &normalized_q).await {
+    match repo
+        .search(kind, &normalized_q, effective_limit, effective_offset)
+        .await
+    {
         Ok(mut hits) => {
-            hits.truncate(SEARCH_LIMIT);
+            // Defensive: SQL already applied the clamped `LIMIT`, but a repo
+            // that over-returns must not widen the page.
+            hits.truncate(effective_limit as usize);
             let results: Vec<serde_json::Value> =
                 hits.iter().map(|hit| hit.to_json(kind)).collect();
             let body = serde_json::json!({
                 "q": normalized_q,
                 "type": kind.as_str(),
+                "limit": effective_limit,
+                "offset": effective_offset,
                 "results": results,
             })
             .to_string();
@@ -710,10 +762,13 @@ mod http_layer {
             &self,
             kind: Kind,
             normalized_q: &str,
+            limit: u32,
+            offset: u32,
         ) -> Result<Vec<SearchHit>, RepoError> {
             let client = self.connect().await?;
+            let sql = search_sql(kind, limit, offset);
             let rows = client
-                .query(search_sql(kind), &[&normalized_q])
+                .query(sql.as_str(), &[&normalized_q])
                 .await
                 .map_err(|_| RepoError)?;
             rows.iter().map(hit_from_row).collect()
@@ -936,11 +991,18 @@ mod http_layer {
             trace_id: trace_id.clone(),
         };
         let cache = EdgeCache::from_env(&ctx.env);
-        let api = handle_search(
+        // Unparsable `limit`/`offset` fall back to the defaults (`None`):
+        // a full first page. An explicit `limit=0` still reaches the handler
+        // as `Some(0)` and is rejected there, never silently defaulted.
+        let limit = query.get("limit").and_then(|v| v.parse::<u32>().ok());
+        let offset = query.get("offset").and_then(|v| v.parse::<u32>().ok());
+        let api = handle_search_paged(
             &repo,
             &cache,
             query.get("type").cloned(),
             query.get("q").map(String::as_str).unwrap_or(""),
+            limit,
+            offset,
         )
         .await;
         // The raw query text never logs (free-form user input); the line
@@ -999,6 +1061,8 @@ pub async fn main(
         .await
 }
 #[cfg(test)]
+mod search_pagination_acceptance;
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
@@ -1042,13 +1106,22 @@ mod tests {
             Ok(self.entity.clone())
         }
 
-        async fn search(&self, _kind: Kind, q: &str) -> Result<Vec<SearchHit>, RepoError> {
+        async fn search(
+            &self,
+            _kind: Kind,
+            q: &str,
+            limit: u32,
+            offset: u32,
+        ) -> Result<Vec<SearchHit>, RepoError> {
             *self.search_calls.borrow_mut() += 1;
             *self.last_search_q.borrow_mut() = q.to_string();
             if self.fail {
                 return Err(RepoError);
             }
-            Ok(self.hits.clone())
+            // Mirror SQL `LIMIT`/`OFFSET` so paging tests exercise the slice.
+            let from = (offset as usize).min(self.hits.len());
+            let to = from.saturating_add(limit as usize).min(self.hits.len());
+            Ok(self.hits[from..to].to_vec())
         }
 
         async fn release_recordings(
@@ -1193,7 +1266,7 @@ mod tests {
     #[test]
     fn search_sql_is_trigram_bounded_and_ordered() {
         for kind in [Kind::Artist, Kind::Release, Kind::Recording] {
-            let sql = search_sql(kind);
+            let sql = search_sql(kind, MAX_PAGE_SIZE as u32, 0);
             assert!(sql.contains("% $1"), "{sql}");
             assert!(sql.contains("similarity("), "{sql}");
             assert!(sql.contains("ORDER BY score DESC"), "{sql}");
@@ -1202,10 +1275,10 @@ mod tests {
             assert!(sql.contains("AS artist_mbid"), "{sql}");
             assert!(sql.contains("AS artist_name"), "{sql}");
         }
-        assert_eq!(SEARCH_LIMIT, 25);
+        assert_eq!(MAX_PAGE_SIZE, 25);
         // Release search is artist-aware: the artist comes from the
         // joined mb_artist row, not from the title score.
-        let release_sql = search_sql(Kind::Release);
+        let release_sql = search_sql(Kind::Release, MAX_PAGE_SIZE as u32, 0);
         assert!(
             release_sql.contains("LEFT JOIN mb_artist a ON a.mbid = r.artist_mbid"),
             "{release_sql}"
@@ -1229,11 +1302,13 @@ mod tests {
             ..Default::default()
         };
         let cache = FakeCache::default();
-        let resp = block_on(handle_search(
+        let resp = block_on(handle_search_paged(
             &repo,
             &cache,
             Some("release".to_string()),
             "Metallica - Load",
+            None,
+            None,
         ));
         assert_eq!(resp.status, 200);
         let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
@@ -1263,8 +1338,8 @@ mod tests {
             format!("mb:lookup:artist:{MBID}")
         );
         assert_eq!(
-            search_cache_key(Kind::Release, "  Blue   Monday "),
-            "mb:search:release:blue monday"
+            search_paged_cache_key(Kind::Release, "blue monday", MAX_PAGE_SIZE as u32, 0),
+            "mb:search:release:blue monday:25:0"
         );
         assert_eq!(normalize_query("  Blue   Monday "), "blue monday");
     }
@@ -1345,11 +1420,13 @@ mod tests {
             body,
             serde_json::json!({"code":"not_found","message":"not found","retryable":false})
         );
-        let short_q = block_on(handle_search(
+        let short_q = block_on(handle_search_paged(
             &repo,
             &cache,
             Some("artist".to_string()),
             "x",
+            None,
+            None,
         ));
         let body: serde_json::Value = serde_json::from_str(&short_q.body).unwrap();
         assert_eq!(body["code"], "invalid_request");
@@ -1614,17 +1691,21 @@ mod tests {
             ..Default::default()
         };
         let cache = FakeCache::default();
-        let resp = block_on(handle_search(
+        let resp = block_on(handle_search_paged(
             &repo,
             &cache,
             Some("artist".to_string()),
             "  Test  ",
+            None,
+            None,
         ));
         assert_eq!(resp.status, 200);
         assert_eq!(resp.cache_ttl, Some(300));
         let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
         assert_eq!(body["type"], "artist");
         assert_eq!(body["q"], "test");
+        assert_eq!(body["limit"], MAX_PAGE_SIZE as u64);
+        assert_eq!(body["offset"], 0);
         let results = body["results"].as_array().unwrap();
         assert_eq!(results.len(), 25);
         assert_eq!(results[0]["name"], "Hit 0");
@@ -1638,11 +1719,13 @@ mod tests {
     fn search_empty_success_is_200_and_cacheable() {
         let repo = FakeRepo::default();
         let cache = FakeCache::default();
-        let resp = block_on(handle_search(
+        let resp = block_on(handle_search_paged(
             &repo,
             &cache,
             Some("release".to_string()),
             "nothing matches",
+            None,
+            None,
         ));
         assert_eq!(resp.status, 200);
         let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
@@ -1657,11 +1740,13 @@ mod tests {
             ..Default::default()
         };
         let cache = FakeCache::default();
-        let resp = block_on(handle_search(
+        let resp = block_on(handle_search_paged(
             &repo,
             &cache,
             Some("recording".to_string()),
             "anything",
+            None,
+            None,
         ));
         assert_eq!(resp.status, 500);
         assert!(!resp.body.contains("results"));
@@ -1673,15 +1758,17 @@ mod tests {
     fn search_cache_hit_skips_repo() {
         let cache = FakeCache::default();
         cache.stored.borrow_mut().insert(
-            search_cache_key(Kind::Artist, "test"),
+            search_paged_cache_key(Kind::Artist, "test", MAX_PAGE_SIZE as u32, 0),
             r#"{"q":"test","cached":true}"#.to_string(),
         );
         let repo = FakeRepo::default();
-        let resp = block_on(handle_search(
+        let resp = block_on(handle_search_paged(
             &repo,
             &cache,
             Some("artist".to_string()),
             " Test ",
+            None,
+            None,
         ));
         assert_eq!(resp.status, 200);
         assert!(resp.body.contains("cached"));
@@ -1698,16 +1785,18 @@ mod tests {
             (None, "valid query"),
             (Some("artist".to_string()), "x"),
         ] {
-            let resp = block_on(handle_search(&repo, &cache, kind, q));
+            let resp = block_on(handle_search_paged(&repo, &cache, kind, q, None, None));
             assert_eq!(resp.status, 400, "q={q}");
             assert_eq!(resp.cache_ttl, None);
         }
         let too_long = "a".repeat(MAX_QUERY_CHARS + 1);
-        let resp = block_on(handle_search(
+        let resp = block_on(handle_search_paged(
             &repo,
             &cache,
             Some("artist".to_string()),
             &too_long,
+            None,
+            None,
         ));
         assert_eq!(resp.status, 400);
         assert_eq!(*repo.search_calls.borrow(), 0);
@@ -1718,11 +1807,13 @@ mod tests {
     fn search_rejects_control_characters_before_cache_or_repo() {
         let repo = FakeRepo::default();
         let cache = FakeCache::default();
-        let resp = block_on(handle_search(
+        let resp = block_on(handle_search_paged(
             &repo,
             &cache,
             Some("artist".to_string()),
             "\0ab",
+            None,
+            None,
         ));
 
         assert_eq!(resp.status, 400);
