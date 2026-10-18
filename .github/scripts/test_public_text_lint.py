@@ -6,6 +6,8 @@ lint itself via FIXTURE_EXCLUSIONS in public_text_lint — exact path only,
 no directory or extension exemptions.
 """
 
+import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -16,8 +18,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from public_text_lint import (
     FIXTURE_EXCLUSIONS,
     HOST_FIXTURE_EXCLUSIONS,
+    _escape_annotation_property,
     find_violations,
     is_artifact_path,
+    main,
     scan_path,
 )
 
@@ -418,6 +422,85 @@ class TestMechanics(unittest.TestCase):
         self.assertIn(
             ".github/scripts/test_public_text_lint.py", FIXTURE_EXCLUSIONS
         )
+
+
+class TestMultiRuleHits(unittest.TestCase):
+    # One hit per rule per line at most: a line matching two rules
+    # yields two hits, the same rule twice on one line yields one.
+    def test_one_line_matching_two_rules_yields_two_hits(self):
+        hits = find_violations("see TOG-90001 and /NNTUNE/issues/99 here")
+        self.assertEqual(2, len(hits))
+        self.assertEqual([(1, "instance-path"), (1, "tog-id")], sorted(hits))
+
+    def test_same_rule_twice_on_one_line_yields_one_hit(self):
+        self.assertEqual(
+            [(1, "tog-id")], find_violations("see TOG-90001 then TOG-90002")
+        )
+
+    def test_empty_string_yields_no_hits(self):
+        self.assertEqual([], find_violations(""))
+
+
+class TestArtifactPathEdges(unittest.TestCase):
+    # Compiled artifacts are matched on path, never scanned for
+    # content. Backslash separators are normalized before matching;
+    # forward-slash behavior is unchanged.
+    def test_pyo_is_artifact(self):
+        self.assertTrue(is_artifact_path("docs/note.pyo"))
+        self.assertTrue(is_artifact_path("docs/note.pyc"))
+
+    def test_backslash_paths_are_artifacts(self):
+        self.assertTrue(is_artifact_path("docs\\note.pyo"))
+        self.assertTrue(is_artifact_path("docs\\note.pyc"))
+        self.assertTrue(is_artifact_path("a\\b\\__pycache__\\x.pyc"))
+
+    def test_forward_slash_behavior_unchanged(self):
+        self.assertTrue(is_artifact_path(".github/scripts/__pycache__/x.pyc"))
+        self.assertTrue(is_artifact_path("a/b/__pycache__/y.py"))
+        self.assertFalse(is_artifact_path("workers/api/src/session.rs"))
+        self.assertFalse(is_artifact_path("a\\b\\session.rs"))
+
+    def test_pyo_scan_reports_binary_artifact_without_reading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = os.path.join(tmp, "lint.pyo")
+            with open(artifact, "wb") as fh:
+                fh.write(b"see TOG-90001 here\x00")
+            self.assertEqual([(1, "binary-artifact")], scan_path(artifact))
+
+
+class TestAnnotationEscaping(unittest.TestCase):
+    # Workflow-command property values escape %, :, ,, and controls
+    # percent-style (% first so existing text stays literal); a
+    # violating file with a hostile name still emits the ,line=
+    # annotation.
+    def test_colon_escapes(self):
+        self.assertEqual("a%3Ab", _escape_annotation_property("a:b"))
+
+    def test_percent_and_comma_escape(self):
+        self.assertEqual("a%25b", _escape_annotation_property("a%b"))
+        self.assertEqual("a%2Cb", _escape_annotation_property("a,b"))
+        self.assertEqual("%253A", _escape_annotation_property("%3A"))
+
+    def test_del_and_controls_escape(self):
+        self.assertEqual("%7F", _escape_annotation_property("\x7f"))
+        self.assertEqual("%00", _escape_annotation_property("\x00"))
+        self.assertEqual("a%0Ab", _escape_annotation_property("a\nb"))
+        self.assertEqual("a%0Db", _escape_annotation_property("a\rb"))
+        self.assertEqual("a%01b", _escape_annotation_property("a\x01b"))
+        self.assertEqual("a%1Fb", _escape_annotation_property("a\x1fb"))
+
+    def test_hostile_filename_on_violating_file_emits_line_annotation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hostile = os.path.join(tmp, "evil:a,b%c.md")
+            with open(hostile, "w") as fh:
+                fh.write("see TOG-90001 here\n")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["public_text_lint.py", hostile])
+            self.assertEqual(1, rc)
+            out = buf.getvalue()
+            self.assertIn("evil%3Aa%2Cb%25c.md,line=1", out)
+            self.assertIn("tog-id", out)
 
 
 if __name__ == "__main__":
