@@ -419,6 +419,8 @@ jobs:
         run: python3 .github/scripts/test_config_duplicate_members.py
       - name: Parity checker empty-schema-keys tests
         run: python3 .github/scripts/test_config_empty_schema_keys.py
+      - name: Parity checker diagnostic-truncation tests
+        run: python3 .github/scripts/test_config_diagnostic_truncation.py
       - name: Parity checker environment-IO tests
         run: python3 .github/scripts/test_config_parity_environment_io.py
 
@@ -673,6 +675,7 @@ jobs:
         run: |
           python3 .github/scripts/test_check_traceability.py
           python3 .github/scripts/test_check_traceability_list_format.py
+          python3 .github/scripts/test_check_traceability_drift_strings.py
 
   svelte-check:
     name: svelte-check
