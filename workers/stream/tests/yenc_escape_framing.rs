@@ -138,13 +138,24 @@ fn duplicate_trailer_is_bad_framing() {
 
 #[test]
 fn ypart_after_trailer_is_bad_framing() {
-    // Garbage framing: placement record after the trailer.
+    // Garbage framing: placement record after the trailer. Hand-built with
+    // no body and no earlier `=ypart`, so only the `seen_trailer` disjunct
+    // of the `=ypart` guard can reject it.
+    let article = b"=ybegin line=128 size=0 name=a.bin\r\n=yend size=0\r\n=ypart begin=1 end=1\r\n";
+    assert_eq!(decode_part(article), Err(YencError::BadFraming));
+}
+
+#[test]
+fn duplicate_ypart_is_bad_framing() {
+    // Garbage framing: a repeated `=ypart` before the body must stay
+    // BadFraming (not BadPart). The second line hits only the
+    // `part_range.is_some()` disjunct of the `=ypart` guard.
     let article = multipart(PAYLOAD, 0, 1000);
     let ypart_start = find(&article, b"=ypart");
     let ypart_end = ypart_start + find(&article[ypart_start..], b"\r\n") + 2;
-    let mut mutated = article.clone();
-    mutated.extend_from_slice(b"=ypart begin=1 end=10\r\n");
-    let _ = &article[ypart_start..ypart_end];
+    let mut mutated = article[..ypart_end].to_vec();
+    mutated.extend_from_slice(&article[ypart_start..ypart_end]);
+    mutated.extend_from_slice(&article[ypart_end..]);
     assert_eq!(decode_part(&mutated), Err(YencError::BadFraming));
 }
 
