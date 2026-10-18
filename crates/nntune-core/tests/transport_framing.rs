@@ -162,10 +162,10 @@ async fn max_line_bytes_newline_found_arm() {
 
 #[tokio::test]
 async fn max_line_bytes_buffer_full_arm() {
-    // Trickled delivery of the same 16 KiB payload: the buffer reaches
-    // MAX_LINE_BYTES before any LF arrives, so the buffer-full arm fires.
-    let mut data = vec![b'A'; MAX_LINE_BYTES];
-    data.extend_from_slice(b"\r\n");
+    // No LF at all: only the buffer-full arm can reject this with InvalidData.
+    // Without that guard the transport would read to EOF and return
+    // UnexpectedEof ("closed without CRLF"), so the assertions below fail.
+    let data = vec![b'A'; MAX_LINE_BYTES]; // no LF: only the buffer-full arm can reject this
     for chunk in [1, 1024] {
         let (mut t, _) = transport(&data, chunk);
         let err = t.read_line().await.unwrap_err();
