@@ -4,6 +4,10 @@
 - **Date:** 2026-10-13
 - **Revised:** 2026-10-15 — bounded renewal settlement, payment-conditional trial
   conversion/expiry and authoritative per-environment price mappings.
+- **Revised:** 2026-10-18 — slice-1 per-play precursor: stream usage accrues in
+  `stream_play_ledger` (per-play windows, `play:` keys, monthly folds), never a Stripe
+  meter. The daily `usage_ledger` cap input is folded from these windows in a later
+  slice; no daily table exists yet.
 
 ## Decision
 

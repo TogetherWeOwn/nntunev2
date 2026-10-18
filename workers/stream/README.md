@@ -356,6 +356,18 @@ and `reconcile` does not currently emit to Analytics Engine or call
   fetch→decode→decrypt→fan-out shape. Production content keys arrive via
   the BYOP vault with the ingest-owned envelope (sibling cards); swap the
   marked lines, keep the flow.
-- Planned metering sinks: Analytics Engine dataset `nntune_meter` and a
-  Hyperdrive usage-ledger table. Neither sink is wired by the portable-core
-  reconciliation model described above.
+- Planned metering sinks: Analytics Engine dataset `nntune_meter` (point
+  shape in `src/meter.rs`: blobs `[kind, user_id, track_id]`, doubles
+  `[bytes, seconds]`) and the Hyperdrive per-play table
+  (`migrations/0020_stream_play_ledger.sql`, `stream_play_ledger` — not the
+  ADR daily `usage_ledger`; row intents and statements owned by
+  the api worker's `src/ledger.rs`, with the same `play:` key derivation and
+  select+classify replay flow, fenced through the play owner's `users` row).
+  Neither sink is wired by the portable-core
+  reconciliation model described above. Every event carries stream seconds
+  at the nominal 48 000 bytes/s rate. Billing folds per play, never across
+  plays: the worker folds that play's bytes only (its own `served` counter
+  into `CompletePlay.bytes`) and derives seconds from that play's total —
+  per-event seconds each round up, so summing them overcounts split windows,
+  and summing one `(user, track)` pair across play ids would bill one play
+  for another's listen.

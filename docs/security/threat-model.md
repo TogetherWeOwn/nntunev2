@@ -195,7 +195,7 @@ exact implementation PR head:
 | F-HYG-01 | Dependabot updates config (alerts ≠ updates) | Paperclip child card (see above) |
 | F-HYG-02 | CI lint banning internal ids/hosts/agent names in public text | Paperclip child card (see above) |
 | F-HYG-03 | PR-template secrets affirmation checkbox | Paperclip child card (see above) |
-| F-DEL-01 | Account-deletion fence gaps (required by ADR 0002 rule 3, not yet implemented): auth/session writers carry no fence in either state — the `scheduled`-only bound lands with the cancel-deletion and executor slice; no stream production sink exists (only `LEDGER_WRITE_FENCE_SQL` plus the in-memory `UsageLedger::record_fenced` mirror) | Paperclip child card (mapping in the threat-model card thread, never pasted here) |
+| F-DEL-01 | Account-deletion fence gaps (required by ADR 0002 rule 3, not yet implemented): auth/session writers carry no fence in either state — the `scheduled`-only bound lands with the cancel-deletion and executor slice; no stream production sink executes yet (the `stream_play_ledger` INSERT statement itself is fenced in-statement with select+probe disambiguation, plus the in-memory `UsageLedger::record_fenced` mirror) | Paperclip child card (mapping in the threat-model card thread, never pasted here) |
 
 V1 lessons carried forward: per-user resource authorization precedes lookup (no
 existence oracles — cf. avatar-oracle fix); every credential-adjacent finding
@@ -357,19 +357,22 @@ Fenced writers (account-owned creates/restores, api/ingest/stream):
   through `upsert_job_result` to the permanent `account_deleting`
   failure — never retried behind the delete.
 - **stream usage-ledger / play-event write**
-  (`workers/stream/src/meter.rs`): required, not yet implemented (F-DEL-01)
-  — no production sink exists (`workers/stream/README.md`: metering "is
-  not yet wired into the production `play()` path or production sinks";
-  `UsageLedger` is an in-memory portable-core model, not a live Hyperdrive
-  table). When the sink lands, its INSERT must select through
-  `LEDGER_WRITE_FENCE_SQL`; the portable-core mirror
+  (`workers/stream/src/meter.rs`, `workers/api/src/ledger.rs`): half landed
+  (F-DEL-01) — the only INSERT for `stream_play_ledger`
+  (`ledger_insert_statement`) now selects through `LEDGER_WRITE_FENCE_SQL`
+  in-statement (`FOR SHARE` on the play owner's `users` row, pinned verbatim
+  in the ledger tests), and a zero-row insert disambiguates via `SELECT` +
+  `classify_fenced_replay` with the `ACCOUNT_DELETING_PROBE_SQL` probe (a
+  stored row classifies as duplicate/conflict without consulting the probe,
+  so healthy duplicates never read as `account_deleting`; no stored row with
+  a closed fence is the typed `account_deleting`). The portable-core mirror
   (`UsageLedger::record_fenced`) already reports
   `RecordOutcome::AccountDeleting` and appends nothing, so a play can
-  never repopulate a deleting account's ledger/event rows. Zero rows is
-  ambiguous under `DO NOTHING` (a duplicate redelivery with an open
-  fence also affects 0 rows), so the production sink must converge with
-  `DO UPDATE` or probe the fence first — healthy duplicates must never
-  read as `account_deleting`.
+  never repopulate a deleting account's ledger/event rows. No production
+  sink executes the statement yet (`workers/stream/README.md`: metering "is
+  not yet wired into the production `play()` path or production sinks";
+  `UsageLedger` is an in-memory portable-core model, not a live Hyperdrive
+  table) — that call-site wiring, and the play-event write, remain F-DEL-01.
 
 Exemptions (bounded, ADR 0002 rule 3 — required, not yet implemented,
 F-DEL-01): the auth/session writers needed to cancel during grace (new
