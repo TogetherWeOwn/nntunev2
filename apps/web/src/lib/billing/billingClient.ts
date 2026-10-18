@@ -104,6 +104,53 @@ function isValidUsagePayload(data: unknown): data is UsageSnapshot & { period: s
 	return true;
 }
 
+/**
+ * Successful GET /v1/me/subscription DTO guard. `planId` is a required
+ * non-empty string; `status` must be one of the statuses the DTO admits
+ * (the ADR 0002 statuses plus tolerated `incomplete`) so a raw unknown
+ * status never reaches rendering. `currentPeriodEnd` and `trialEndsAt`
+ * are required and are either null or a date string that parses to a real
+ * date — garbage strings reject instead of rendering "Invalid Date".
+ * `graceUntil` may be absent; when present it is null or a parseable
+ * date string. Unknown extra fields are allowed. Anything else rejects
+ * into the existing recoverable loader path instead of reaching rendering.
+ */
+const SUBSCRIPTION_STATUSES = [
+	'trialing',
+	'active',
+	'past_due',
+	'canceled',
+	'expired',
+	'incomplete'
+] as const;
+
+const SUBSCRIPTION_DATE_FIELDS = ['currentPeriodEnd', 'trialEndsAt'] as const;
+
+function isParseableDateString(value: unknown): value is string {
+	return typeof value === 'string' && value.length > 0 && !Number.isNaN(Date.parse(value));
+}
+
+function isValidSubscriptionPayload(data: unknown): data is SubscriptionDTO {
+	if (typeof data !== 'object' || data === null || Array.isArray(data)) return false;
+	const record = data as Record<string, unknown>;
+	if (typeof record.planId !== 'string' || record.planId.length === 0) return false;
+	if (
+		typeof record.status !== 'string' ||
+		!(SUBSCRIPTION_STATUSES as readonly string[]).includes(record.status)
+	)
+		return false;
+	for (const field of SUBSCRIPTION_DATE_FIELDS) {
+		const value = record[field];
+		if (value !== null && !isParseableDateString(value)) return false;
+	}
+	if ('graceUntil' in record) {
+		const graceUntil = record.graceUntil;
+		if (graceUntil !== undefined && graceUntil !== null && !isParseableDateString(graceUntil))
+			return false;
+	}
+	return true;
+}
+
 async function readJson<T>(res: Response, label: string): Promise<T> {
 	if (!res.ok) {
 		let body: unknown = null;
@@ -140,7 +187,9 @@ export async function fetchUsage(
 
 export async function fetchSubscription(fetchFn: typeof fetch = fetch): Promise<SubscriptionDTO> {
 	const res = await fetchFn('/v1/me/subscription', { credentials: 'include' });
-	return await readJson(res, 'Load subscription');
+	const data = await readJson<unknown>(res, 'Load subscription');
+	if (!isValidSubscriptionPayload(data)) throw new Error('Invalid subscription payload');
+	return data;
 }
 
 export async function startCheckout(
