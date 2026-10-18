@@ -109,6 +109,35 @@ describe('evictToCap', () => {
 	});
 });
 
+describe('snapshot cap literals', () => {
+	// Literal pins for the two snapshot caps (`cache.ts:51,54`). Eviction
+	// behavior is pinned symbolically elsewhere in this file; these tests
+	// pin the exact bound values so a silent cap change turns red.
+	//
+	// Sensitivity (implementation untouched):
+	// - changing MAX_SNAPSHOT_ITEMS off 200 fails `pins the item-count cap at 200`
+	//   and `keeps the head 200 by default over 250 small items`;
+	// - changing MAX_SNAPSHOT_BYTES off 204_800 fails `pins the byte cap at 204_800`.
+	it('pins the item-count cap at 200', () => {
+		expect(MAX_SNAPSHOT_ITEMS).toBe(200);
+	});
+
+	it('pins the byte cap at 204_800', () => {
+		expect(MAX_SNAPSHOT_BYTES).toBe(204_800);
+	});
+
+	it('keeps the head 200 by default over 250 small items', () => {
+		const items = Array.from({ length: 250 }, (_, i) => item(`t${i}`));
+		const kept = evictToCap(items);
+		expect(kept).toHaveLength(200);
+		expect(kept[0]?.id).toBe('t0');
+		expect(kept[199]?.id).toBe('t199');
+		expect(snapshotByteSize(kept, new Date().toISOString())).toBeLessThanOrEqual(
+			MAX_SNAPSHOT_BYTES
+		);
+	});
+});
+
 describe('snapshot round-trip', () => {
 	it('saves and loads a fresh snapshot', () => {
 		const storage = memoryStorage();

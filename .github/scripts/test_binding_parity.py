@@ -940,6 +940,101 @@ prod = "fx-jobs"
             wrangler, r"queues\.consumers: entry without 'queue'"
         )
 
+    def assert_binding_table_fails_closed(self, wrangler, pattern, absent=()):
+        # Fail-closed pin for the binding-table not-a-table family
+        # (binding_parity.py:137,181,197,202): exit 2 with the exact diagnostic on
+        # the ::error::binding-parity: annotation, never exit 1 and never
+        # an uncaught traceback. Synthetic fixture ids must never leak.
+        # `absent` holds sibling-family patterns that must NOT match, proving
+        # each diagnostic is sensitive to its own arm only.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp, wrangler=wrangler)
+            with self.assertRaisesRegex(ParityError, pattern) as ctx:
+                run_check(root)
+            for other in absent:
+                self.assertNotRegex(str(ctx.exception), other)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
+                stderr
+            ):
+                code = main(["--root", str(root)])
+            self.assertEqual(2, code)
+            self.assertNotEqual(1, code)
+            combined = stdout.getvalue() + stderr.getvalue()
+            self.assertIn("::error::binding-parity:", stdout.getvalue())
+            self.assertRegex(combined, pattern)
+            for other in absent:
+                self.assertNotRegex(combined, other)
+            self.assertNotIn("Traceback", combined)
+            self.assertNotIn("fx-", combined)
+
+    def test_env_staging_level_not_a_table_fails_closed_with_exit_two(self):
+        # Non-table env.staging level is malformed, not absent: it must fail
+        # closed with the table-level diagnostic via main()
+        # (binding_parity.py:137).
+        head, _, _ = MATCHING_WRANGLER.partition("[env.staging]")
+        _, _, prod_tail = MATCHING_WRANGLER.partition("[env.production]")
+        wrangler = head + '[env]\nstaging = "oops"\n[env.production]' + prod_tail
+        self.assert_binding_table_fails_closed(
+            wrangler,
+            r"wrangler table level is not a table",
+            absent=[
+                r"durable_objects: not a table",
+                r"unsafe: not a table",
+                r"logfwdr: not a table",
+            ],
+        )
+
+    def test_durable_objects_not_a_table_fails_closed_with_exit_two(self):
+        # Non-table [env.staging.durable_objects] is malformed, not absent:
+        # it must fail closed instead of being silently ignored
+        # (binding_parity.py:181).
+        wrangler = MATCHING_WRANGLER.replace(
+            "[env.staging]\n", '[env.staging]\ndurable_objects = "oops"\n', 1
+        )
+        self.assert_binding_table_fails_closed(
+            wrangler,
+            r"durable_objects: not a table",
+            absent=[
+                r"wrangler table level is not a table",
+                r"unsafe: not a table",
+                r"logfwdr: not a table",
+            ],
+        )
+
+    def test_unsafe_not_a_table_fails_closed_with_exit_two(self):
+        # Non-table [env.staging.unsafe] is malformed, not absent: it must
+        # fail closed instead of being silently ignored (binding_parity.py:197).
+        wrangler = MATCHING_WRANGLER.replace(
+            "[env.staging]\n", '[env.staging]\nunsafe = "oops"\n', 1
+        )
+        self.assert_binding_table_fails_closed(
+            wrangler,
+            r"unsafe: not a table",
+            absent=[
+                r"wrangler table level is not a table",
+                r"durable_objects: not a table",
+                r"logfwdr: not a table",
+            ],
+        )
+
+    def test_logfwdr_not_a_table_fails_closed_with_exit_two(self):
+        # Non-table [env.staging.logfwdr] is malformed, not absent: it must
+        # fail closed instead of being silently ignored (binding_parity.py:202).
+        wrangler = MATCHING_WRANGLER.replace(
+            "[env.staging]\n", '[env.staging]\nlogfwdr = "oops"\n', 1
+        )
+        self.assert_binding_table_fails_closed(
+            wrangler,
+            r"logfwdr: not a table",
+            absent=[
+                r"wrangler table level is not a table",
+                r"durable_objects: not a table",
+                r"unsafe: not a table",
+            ],
+        )
+
     def test_non_string_binding_fails_closed_with_exit_two(self):
         wrangler = MATCHING_WRANGLER.replace(
             "[[env.staging.hyperdrive]]",
