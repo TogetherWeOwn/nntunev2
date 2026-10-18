@@ -12,9 +12,9 @@ which buckets a Worker may never consume.
 
 | Bucket | Env | Consumer | Edge `Cache-Control` on reads | R2 object lifetime / eviction |
 |---|---|---|---|---|
-| `nntunev2-audio-staging` | staging | stream Worker (`AUDIO_CACHE`) | prescribed `no-store`; not yet wired (see deltas) | persistent content-addressed blobs (`audio/<sha256>` + `track/<id>` pointers); no object expiry; incomplete multipart uploads abort after 7 days |
+| `nntunev2-audio-staging` | staging | stream Worker (`AUDIO_CACHE`) | prescribed `no-store`; not yet wired (see deltas) | persistent content-addressed blobs (`audio/<sha256>` + `track/<id>` pointers); no object expiry (multipart abort observed only on archive buckets — see TTL section) |
 | `nntunev2-audio-prod` | prod | stream Worker (`AUDIO_CACHE`) | prescribed `no-store`; not yet wired (see deltas) | same as staging |
-| `nntunev2-art-staging` | staging | MusicBrainz Worker artwork cache (`ART_CACHE`) | `public, max-age=86400, immutable` prescribed where art bytes are served; lookup/search JSON headers below are implemented | persistent immutable objects (`art/{hh}/{hh}/{sha}-{size}`); no object expiry; incomplete multipart uploads abort after 7 days |
+| `nntunev2-art-staging` | staging | MusicBrainz Worker artwork cache (`ART_CACHE`) | `public, max-age=86400, immutable` prescribed where art bytes are served; lookup/search JSON headers below are implemented | persistent immutable objects (`art/{hh}/{hh}/{sha}-{size}`); no object expiry (multipart abort observed only on archive buckets — see TTL section) |
 | `nntunev2-art-prod` | prod | MusicBrainz Worker artwork cache (`ART_CACHE`) | same as staging | same as staging |
 | `nntunev2-archive-staging` | staging | **none — reserved; no Worker binding in this repo (CI-enforced)** | n/a (no reads) | reserved; no bucket lock configured; no object expiry |
 | `nntunev2-archive-prod` | prod | **none — reserved; no Worker binding in this repo (CI-enforced)** | n/a (no reads) | reserved; no bucket lock configured; no object expiry |
@@ -33,8 +33,8 @@ which buckets a Worker may never consume.
   `content-type` (plus `retry-after` when carried); the portable
   `PlayResponse::cache_headers` emits only `Cache-Status` plus `Age`
   telemetry (see prescribed-vs-wired evidence). Lifetime (no object expiry;
-  multipart-abort default only) per the TTL section and `docs/ops.md` R2
-  lifecycle.
+  the only lifecycle rule observed in `docs/ops.md` is the archive-bucket
+  multipart abort — see TTL section).
 - `nntunev2-art-staging` / `nntunev2-art-prod`: env and `ART_CACHE`
   consumer per `workers/mb/wrangler.toml.example` (commented template:
   top-level plus `env.staging` staging name, `env.production` prod name;
