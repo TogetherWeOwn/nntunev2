@@ -604,8 +604,9 @@ mod tests {
 
     #[test]
     fn fenced_replay_prefers_the_stored_row_over_the_probe() {
-        let first = prepare_play_ledger_row("user-1", "track-9", "play-7", 48_000, 1, 1_767_225_600)
-            .expect("valid play row");
+        let first =
+            prepare_play_ledger_row("user-1", "track-9", "play-7", 48_000, 1, 1_767_225_600)
+                .expect("valid play row");
         let replay =
             prepare_play_ledger_row("user-1", "track-9", "play-7", 48_000, 1, 1_767_225_600)
                 .unwrap();
