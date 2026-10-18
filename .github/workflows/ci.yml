@@ -563,6 +563,8 @@ jobs:
         run: python3 .github/scripts/docs_link_lint.py --root . --base-ref "$DOCS_LINKS_BASE_REF"
       - name: Run docs-link lint self-tests
         run: python3 .github/scripts/test_docs_link_lint.py
+      - name: Run docs-link directory-anchor self-tests
+        run: python3 .github/scripts/test_docs_link_directories.py
       - name: Lint whole tree on this repo
         run: python3 .github/scripts/docs_link_lint.py --root .
       - name: Lint passes on the matching fixture
