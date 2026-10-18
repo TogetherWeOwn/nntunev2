@@ -2252,19 +2252,14 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
-    if ctx
-        .store
-        .revoke_all_sessions(&claims.user_id)
-        .await
-        .is_err()
-    {
-        return internal();
-    }
     // ADR 0010 session-compromise response: the same event revokes every
-    // unrevoked native REST credential alongside the sessions (production
-    // does both against one connection; a store failure fails closed
-    // before the cookie clears). Bulk revocations audit without key
-    // material — the id-carrying single revokes stay on their own route.
+    // unrevoked native REST credential alongside the sessions. Native
+    // credentials go first: if the session sweep then fails, the caller
+    // keeps a valid session and can retry, while already-revoked bearer
+    // keys fail closed. The reverse order would strand live bearer keys
+    // behind dead sessions with no retry path. The two sweeps are
+    // separate store calls (no cross-table transaction), so a failure
+    // between them returns 500 and the caller retries the whole event.
     let revoked_native = match ctx
         .store
         .revoke_all_native_credentials(&claims.user_id, ctx.now)
@@ -2273,6 +2268,14 @@ where
         Ok(revoked) => revoked,
         Err(_) => return internal(),
     };
+    if ctx
+        .store
+        .revoke_all_sessions(&claims.user_id)
+        .await
+        .is_err()
+    {
+        return internal();
+    }
     ctx.audit(&claims.user_id, "session.revoke_all", true).await;
     if revoked_native > 0 {
         ctx.audit(&claims.user_id, "native_credentials_revoked_all", true)
