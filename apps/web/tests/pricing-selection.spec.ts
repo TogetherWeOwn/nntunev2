@@ -343,7 +343,11 @@ test('held checkout destination: success keeps the lock until navigation commits
 	// exactly like a real user's click in that window.
 	const pro5xBox = await buttons.pro5x.boundingBox();
 	expect(pro5xBox, 'Pro 5x button is laid out before selection').not.toBeNull();
-	await buttons.plus.click();
+	// The destination stays held until this test releases it, and that
+	// release is sequenced after this click returns. Skip only the
+	// post-click navigation barrier; the pointer activation itself is
+	// unchanged, so a premature lock release still fails below.
+	await buttons.plus.click({ noWaitAfter: true });
 
 	// Checkout succeeded and `window.location.href` has started the
 	// cross-origin navigation, but the (held) checkout host has not
