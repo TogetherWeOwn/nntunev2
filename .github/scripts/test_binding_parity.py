@@ -1035,6 +1035,74 @@ prod = "fx-jobs"
             ],
         )
 
+    def assert_per_entry_not_a_table_fails_closed(self, table, type_name):
+        # Fail-closed pin for the per-entry not-a-table arm
+        # (binding_parity.py:98-100): a binding-list entry that is not a
+        # table is malformed, not absent: it must fail closed instead of
+        # being silently ignored. Exit 2 with the exact diagnostic on the
+        # ::error::binding-parity: annotation, never exit 1 and never an
+        # uncaught traceback. The exact-output assertion proves
+        # sensitivity: rewording the message flips the pin. Synthetic
+        # fixture ids must never leak.
+        wrangler = (
+            'name = "demo"\nmain = "shim.mjs"\n'
+            'compatibility_date = "2026-10-01"\n\n'
+            "[env.staging]\n"
+            f'{table} = ["oops"]\n\n'
+            "[env.production]\n"
+            '[[env.production.r2_buckets]]\nbinding = "AUDIO_CACHE"\n'
+            'bucket_name = "fx-audio-prod"\n'
+            '[[env.production.hyperdrive]]\nbinding = "DB"\n'
+            'id = "fx-hd-prod"\n'
+        )
+        pattern = (
+            rf"{re.escape(table)}: entry is not a table "
+            rf"\({re.escape(type_name)}\)"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp, wrangler=wrangler)
+            config = root / "workers" / "demo" / "wrangler.toml"
+            with self.assertRaisesRegex(ParityError, pattern):
+                run_check(root)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
+                stderr
+            ):
+                code = main(["--root", str(root)])
+            self.assertEqual(2, code)
+            self.assertNotEqual(1, code)
+            combined = stdout.getvalue() + stderr.getvalue()
+            self.assertIn("::error::binding-parity:", stdout.getvalue())
+            self.assertRegex(combined, pattern)
+            self.assertEqual(
+                f"::error::binding-parity: {config}: {table}: "
+                f"entry is not a table ({type_name})\n",
+                stdout.getvalue(),
+            )
+            self.assertNotIn("Traceback", combined)
+            self.assertNotIn("fx-", combined)
+
+    def test_r2_buckets_entry_not_a_table_fails_closed_with_exit_two(self):
+        # A non-table r2_buckets list entry is malformed, not absent: it
+        # must fail closed with the per-entry diagnostic
+        # (binding_parity.py:98-100).
+        self.assert_per_entry_not_a_table_fails_closed("r2_buckets", "r2")
+
+    def test_kv_namespaces_entry_not_a_table_fails_closed_with_exit_two(self):
+        # A non-table kv_namespaces list entry is malformed, not absent: it
+        # must fail closed with the per-entry diagnostic
+        # (binding_parity.py:98-100).
+        self.assert_per_entry_not_a_table_fails_closed("kv_namespaces", "kv")
+
+    def test_hyperdrive_entry_not_a_table_fails_closed_with_exit_two(self):
+        # A non-table hyperdrive list entry is malformed, not absent: it
+        # must fail closed with the per-entry diagnostic
+        # (binding_parity.py:98-100).
+        self.assert_per_entry_not_a_table_fails_closed(
+            "hyperdrive", "hyperdrive"
+        )
+
     def test_non_string_binding_fails_closed_with_exit_two(self):
         wrangler = MATCHING_WRANGLER.replace(
             "[[env.staging.hyperdrive]]",
