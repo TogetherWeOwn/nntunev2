@@ -46,8 +46,10 @@ the core and require exactly one row before any response.
 | `POST /v1/session/reauthenticate/start` / `finish` | current-session-bound passkey proof and atomic single-session replacement |
 | `GET` / `PUT` / `DELETE /v1/vault` | booleans-only summary / encrypted upsert / delete |
 | `POST /v1/vault/test` (`/v1/vault/test-connection` compatibility alias) | `{"ok": bool}` only; atomically rate-limited, per-user concurrency lease, bounded pinned-address dial; empty body tests the stored vault, a `{provider, indexer}` envelope tests a candidate without persisting it |
+| `POST /api/test-codes` (staging-only seam, no `OPTIONS` arm — see below) | returns the issued signup code for an `example.test` mailbox without minting; fail-closed 404/401 outside the staging posture |
 
-`OPTIONS` on any listed route answers an empty 204. Credentialed CORS
+`OPTIONS` on any listed route except the staging-only `POST /api/test-codes`
+seam answers an empty 204. Credentialed CORS
 headers (`Access-Control-Allow-Origin`, never `*`) are emitted only when
 the request `Origin` exactly equals the configured origin; any other
 origin gets none, so cross-origin JSON posts die at preflight. The web
@@ -120,6 +122,52 @@ config from secrets) is a follow-up slice.
   in `docs/security/threat-model.md`); this note describes the routing
   boundary only and changes no vault, dial, TLS, pool, or credential
   behavior.
+
+### Staging-only test-code seam (not part of the production surface)
+
+Shipped by the staging-seam build slice — this note records guardrails
+only, not implementation work. The normative security note is
+`docs/security/threat-model.md` §14 (see also row 1 of
+`docs/m1-exit-traceability.md`). No route, auth, migration, or credential
+behavior changes here.
+
+- **Seam path:** `POST /api/test-codes` (`QA_TEST_CODES_PATH`, served by
+  `qa_test_codes` in `src/handlers.rs`). The E2E pins the same path as
+  `testCodes` in `e2e/helpers/contract.ts` — a rename must change both
+  sides together — and reads it via `retrieveStagedSignupCode` in
+  `e2e/helpers/accounts.ts`. The path is deliberately absent from
+  `is_known_path` (`src/handlers.rs`), so unlike every row above it has
+  no `OPTIONS` 204 arm and is not enumerable from production.
+- **`example.test`-only scope:** only a well-formed synthetic mailbox
+  passes `is_example_test_mailbox` (`src/handlers.rs`: exactly one `@`,
+  reserved `example.test` domain matched case-insensitively; subdomains
+  and suffix lookalikes do not match). The E2E mints such mailboxes with
+  `uniqueTestEmail` (`e2e/helpers/contract.ts`, used from
+  `e2e/helpers/accounts.ts`). Any other address answers the
+  indistinguishable unknown-route 404.
+- **Never mints:** `qa_test_codes` (`src/handlers.rs`) is read-only — it
+  creates no users, challenges, or magic rows — and returns the captured
+  issuance as `{"magic_token": ...}` only while unexpired, else 404. The
+  E2E side (`retrieveStagedSignupCode` in `e2e/helpers/accounts.ts`)
+  requires a nonblank `magic_token` and never fabricates a code.
+- **Capture-side gate:** magic issuance stores the raw token in the
+  migration 0018 outbox (`qa_issued_codes`) only when `QA_CODE_SEAM` is
+  armed and the recipient is an `example.test` mailbox
+  (`src/handlers.rs`) — the deliberate narrow exception to the §4
+  "plaintext token never stored" invariant; see
+  `docs/security/threat-model.md` §14.
+- **Gating:** armed ONLY by the explicit staging flag
+  (`Config::qa_code_seam` via `with_qa_code_seam` in `src/handlers.rs`,
+  wired from `QA_CODE_SEAM` in `src/worker_entry.rs`) plus the staged
+  bearer (`Config::qa_auth_token` via `with_qa_auth_token`, compared
+  constant-time by `qa_bearer_ok` in `src/handlers.rs` against the
+  `Authorization: Bearer <QA_AUTH_TOKEN>` header). Flag off or bearer
+  unstaged serves the seam path as the plain unknown-route 404; a wrong
+  bearer is a names-only 401. Production never sets the flag or stages
+  the bearer, proven by the `qa_seam_absent_without_the_staging_flag`
+  gate test (`src/handlers.rs`). The E2E returns null without
+  `QA_AUTH_TOKEN` and treats the seam as required infrastructure once it
+  is set (`e2e/helpers/accounts.ts`).
 
 ## Security contract (threat-model §3–§4)
 
