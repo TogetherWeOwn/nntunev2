@@ -63,7 +63,7 @@ exactly these fields:
 |---|---|
 | ID | `E1`, `E2`, … in order of first citation. Stable once published; never renumber. |
 | Claim proven | One observable sentence, for example "staging `/api/health` returned 200 on the promoted build". |
-| Build + environment | Exact commit SHA (full or ≥12 chars) and the environment name. Evidence from a different SHA does not prove a claim about this one. |
+| Build + environment | Exact commit SHA (full preferred; ≥12 chars minimum for display) and the environment name. Evidence from a different SHA does not prove a claim about this one. Same-build comparison requires the full 40-char lowercase hex match on `GET /api/build` per the staging promotion checklist in `docs/ops.md`; a truncated SHA is never same-build evidence. |
 | Link | Permalink to the specific run, artifact, or record (CI run, E2E report, log query, pricing page with access date) — never a dashboard home page, a "latest" alias, or a URL carrying credentials. In-repo evidence uses a repo-relative path plus line range. |
 | Observed | The `YYYY-MM-DD` the evidence was produced. |
 | Result | `PASS`, `FAIL`, or `SKIPPED`. `SKIPPED` never counts as a pass; a skipped must-pass step makes its row `INCONCLUSIVE`. |
@@ -164,14 +164,20 @@ entry; an omitted table is not.
 
 ### 3. Infrastructure cost basis
 
-Unit prices are public list prices captured on the `Price source` date;
+Unit prices are public list prices captured on the `Price source` date,
+per the formulas in `docs/cost-basis.md` (§1–§7, checked 2026-10-17);
 usage volumes are either measured on staging (labelled `measured`, with the
 evidence ID proving the volume in the usage-basis cell) or stated
 assumptions (labelled `assumed`). A `measured` volume with no evidence ID
 is deleted or marked `INCONCLUSIVE`, like any other unsupported claim. One
 row per metered resource the staging journey touches. Fixed platform fees
 go in their own rows so the variable cost-as-function-of-usage stays
-visible.
+visible. Analytics Engine is prospective (not currently billed) per
+`docs/cost-basis.md` §5 and §7: quote it separately and exclude it from
+the currently-billed total. The worksheet is not an all-in bill — Durable
+Objects, Containers, Workers Logs, domain/DNS, and any non-Cloudflare,
+non-PlanetScale services are out of scope there and must be listed as
+unpriced here before any total is quoted as complete.
 
 | Resource | Unit | Unit price | Price source (link + date) | Usage basis (`measured` + evidence ID / `assumed`, volume) | Formula | Monthly estimate |
 |---|---|---:|---|---|---|---:|
@@ -278,16 +284,20 @@ All prices and volumes invented for format demonstration.
 | R2 storage + operations | GB-month | $0.015 | <https://example.invalid/pricing-r2> (2026-01-01) | measured on staging, 40 GB (E15) | 40 × $0.015 | $0.60 |
 | KV reads/writes/storage | 1M reads | $0.50 | <https://example.invalid/pricing-kv> (2026-01-01) | assumed, 1M reads | 1 × $0.50 | $0.50 |
 | Queues operations | 1M operations | $0.40 | <https://example.invalid/pricing-queues> (2026-01-01) | assumed, 0.2M operations | 0.2 × $0.40 | $0.08 |
-| Analytics Engine events | 1M events | $0.25 | <https://example.invalid/pricing-analytics> (2026-01-01) | assumed, 1M events | 1 × $0.25 | $0.25 |
+| Analytics Engine events (prospective; not currently billed, excluded from the currently-billed total per `docs/cost-basis.md` §5 and §7) | 1M events | $0.25 | <https://example.invalid/pricing-analytics> (2026-01-01) | assumed, 1M events | 1 × $0.25 | $0.25 |
 | Postgres (app + mirror clusters) | cluster-month (fixed) | $10.00 | <https://example.invalid/pricing-postgres> (2026-01-01) | fixed fee at current tier; storage/egress excluded | flat | $10.00 |
 | Egress / other metered items | — | $0.00 | not metered in this synthetic example | not measured | — | $0.00 |
-| **Total at stated usage** | | | | | | **$12.03** |
+| **Total currently billed at stated usage (excludes prospective Analytics Engine)** | | | | | | **$11.78** |
+| Total including prospective Analytics Engine | | | | | | $12.03 |
 
 At the stated (invented) usage the fixed Postgres fee dominates; R2 storage
 is the line that grows with library size. Not metered or priced: Workers
 CPU (the Workers formula prices requests only), R2 operations (the R2
 formula prices storage only), KV writes and storage (the KV formula prices
-reads only), Postgres storage, and egress. The total is therefore a floor,
+reads only), Postgres storage, and egress — plus the `docs/cost-basis.md`
+out-of-scope services (Durable Objects, Containers, Workers Logs,
+domain/DNS, and any non-Cloudflare, non-PlanetScale services), none of
+which this synthetic example prices. The total is therefore a floor,
 not an all-in bill.
 
 ### 4. Explicit non-goals
@@ -319,7 +329,7 @@ not an all-in bill.
 | E14 | Confirmation screen on one locale displays a raw message key instead of localized text | `0123456789ab` · staging | <https://example.invalid/runs/e2e-staging/14> | 2026-01-14 | FAIL | QA, 2026-01-15 |
 | E15 | Storage metrics query reports 40 GB stored in the staging R2 bucket | `0123456789ab` · staging | <https://example.invalid/metrics/r2-storage/15> | 2026-01-15 | PASS | QA, 2026-01-15 |
 | E16 | Previous promoted build has no must-pass `FAIL`, so this is the first consecutive failing promoted build | `89abcdef0123` · staging | <https://example.invalid/records/prior-readout/16> | 2026-01-13 | PASS | QA, 2026-01-15 |
-| E17 | Section 3 line items sum to the $12.03 monthly estimate at the stated usage | `0123456789ab` · staging | <https://example.invalid/records/cost-total/17> | 2026-01-15 | PASS | QA, 2026-01-15 |
+| E17 | Section 3 line items sum to the $11.78 currently-billed monthly estimate ($12.03 including prospective Analytics Engine) at the stated usage | `0123456789ab` · staging | <https://example.invalid/records/cost-total/17> | 2026-01-15 | PASS | QA, 2026-01-15 |
 | E18 | Scan of the run logs and evidence artifacts finds no secret value or personal data | `0123456789ab` · staging | <https://example.invalid/logs/secret-scan/18> | 2026-01-15 | PASS | QA, 2026-01-15 |
 
 ### 6. Kill rules and verdict
@@ -327,11 +337,11 @@ not an all-in bill.
 | ID | Condition (pre-registered) | Source of threshold | Observed value | Evidence | Verdict |
 |---|---|---|---|---|---|
 | K1 | Any must-pass synthetic-flow step `FAIL` on two consecutive promoted builds | Launch-quality bar for the core journey | 1 consecutive failing build (step 5 on this build; none on the previous promoted build) | E10, E16 | NOT TRIGGERED |
-| K2 | Estimated monthly infra cost at stated usage exceeds $50 | Pre-launch cost ceiling for the validation phase | $12.03 floor (five cost parts unpriced, no evidenced upper bound — section 3) | E15, E17 | INCONCLUSIVE |
+| K2 | Estimated monthly infra cost at stated usage exceeds $50 | Pre-launch cost ceiling for the validation phase | $11.78 currently-billed floor (unpriced parts, no evidenced upper bound — section 3; $12.03 including prospective Analytics Engine) | E15, E17 | INCONCLUSIVE |
 | K3 | Any secret value or personal data found in staging logs/evidence during the run | "Must never contain" rules in this template | None found | E18 | NOT TRIGGERED |
 
 ```text
-VERDICT: NO-GO — must-pass step 5 (play/seek) failed per E10 and cost kill rule K2 is INCONCLUSIVE on the $12.03 floor per E15, E17; no kill rule triggered (product lead, 2026-01-15)
+VERDICT: NO-GO — must-pass step 5 (play/seek) failed per E10 and cost kill rule K2 is INCONCLUSIVE on the $11.78 currently-billed floor per E15, E17; no kill rule triggered (product lead, 2026-01-15)
 ```
 
 ### 7. Sign-off
@@ -344,5 +354,6 @@ VERDICT: NO-GO — must-pass step 5 (play/seek) failed per E10 and cost kill rul
   `product lead, 2026-01-15`
 - What could not be verified: the unmetered/unpriced costs listed in
   section 3 (Workers CPU, R2 operations, KV writes and storage, Postgres
-  storage, and egress); K2 is therefore `INCONCLUSIVE`, not
-  `NOT TRIGGERED`.
+  storage, and egress, plus Durable Objects, Containers, Workers Logs,
+  domain/DNS, and any non-Cloudflare, non-PlanetScale services); K2 is
+  therefore `INCONCLUSIVE`, not `NOT TRIGGERED`.
