@@ -137,6 +137,14 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   app-shell document response still carries the security headers and
   nonce-bearing CSP (static posture pinned offline by
   `apps/web/tests/`). Staging hardening, not journey coverage.
+- `e2e/tests/scoped-credentials.spec.ts` pins the scoped native REST
+  credential contract (ADR 0010) both offline and live: the offline
+  describe pins the scope vocabulary, canonical bearer routes and the
+  session-only set on every PR via `test:unit` with no staging, while the
+  staging legs prove the lifecycle (mint, scoped 200, revoke, closed
+  denial), the cross-scope denials, the header-only transport and the
+  secret-free list surface — skipping green without staging and failing
+  closed once configured. Credential hardening, not journey coverage.
 - `e2e/tests/demo-media-sessionless.spec.ts` pins the sessionless invariant
   live: `e2e/tests/demo-media-sessionless.spec.ts:25` "sessionless GET
   /api/demo/audio serves synthetic bytes (200; 206 for Range)" plus the
