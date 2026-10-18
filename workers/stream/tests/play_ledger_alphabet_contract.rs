@@ -2,28 +2,34 @@
 //!
 //! The API crate is workspace-excluded and absent from container build
 //! contexts, so a stream path dev-dependency would break container builds.
-//! Run a native, test-only Cargo harness in scratch instead. Both production
-//! crates are normal path dependencies there; no ledger logic is copied,
-//! no database/provider is contacted, and no tracked manifest is changed.
+//! Run a native, test-only Cargo harness in Cargo-owned storage instead.
+//! Both production crates are normal path dependencies there; no ledger logic
+//! is copied, no database/provider is contacted, and no tracked manifest is changed.
 //!
 //! Sensitivity: accepting punctuation/Unicode in any identity field fails
 //! derivation and CompletePlay assertions. Rewriting identities, rejecting
 //! valid ASCII, changing byte caps, or changing billing/replay behavior fails
 //! positive controls and the actual CompletePlay -> prepare_ledger_row path.
 
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::process::Command;
 
 #[test]
 fn play_ledger_alphabet_contract() {
     let stream = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let api = stream.join("../api").canonicalize().expect("API checkout");
-    let scratch = std::env::var_os("PAPERCLIP_RUN_SCRATCH_DIR")
-        .or_else(|| std::env::var_os("PAPERCLIP_SCRATCH_DIR"))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join(format!("play-ledger-alphabet-{}", std::process::id()));
+    // Reuse one Cargo-cleanable build root per checkout, even when workspaces
+    // share an outer target directory. Serialize same-checkout invocations
+    // before rewriting the generated manifest, test source, or lockfile.
+    let mut workspace = DefaultHasher::new();
+    stream.hash(&mut workspace);
+    let scratch = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("play-ledger-alphabet-{:016x}", workspace.finish()));
     fs::create_dir_all(&scratch).expect("create native contract harness");
+    let harness_lock = fs::File::create(scratch.join("harness.lock")).expect("open harness lock");
+    harness_lock.lock().expect("lock native contract harness");
     let manifest = format!(
         "[package]\nname = \"play-ledger-alphabet-contract\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
          [workspace]\n\
