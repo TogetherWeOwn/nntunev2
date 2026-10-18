@@ -627,7 +627,7 @@ pub trait Store {
     }
     fn insert_audit(&self, event: &AuditEvent) -> impl Future<Output = Result<(), StoreError>>;
     /// Persist a freshly issued native REST credential row (migration
-    /// 0018). Fail-closed default (`Err`) so an unprovisioned store can
+    /// 0019). Fail-closed default (`Err`) so an unprovisioned store can
     /// never report a mint it did not durably record; production and the
     /// test fake override it.
     fn insert_native_credential(
