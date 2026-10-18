@@ -68,10 +68,11 @@ and library tracks refuse with `402 plan_limit_exceeded` (`retryable: false`);
 concurrent-stream exhaustion refuses with `429 rate_limited` (`retryable: true`
 plus `Retry-After`). Every refusal carries `x-plan-limit` / `x-plan-reset`
 headers and an `upgrade_url: /pricing` body pointer, names-only with no PII,
-and never a 500. The lower-bitrate degraded mode above describes sustained
-media quality, not the acquisition decision — which the over-limit e2e legs
-assert as a refusal. Checks are `>=` (at-cap denies); unknown plan ids fail
-closed to the free caps.
+and never a 500. The lower-bitrate degraded mode above describes the
+sustained quality of playback already admitted when the cap is reached —
+not a right to start new playback, which the over-limit e2e legs assert is
+refused with 402 until the next calendar month. Checks are `>=` (at-cap
+denies); unknown plan ids fail closed to the free caps.
 
 ### Trial and payment gate
 

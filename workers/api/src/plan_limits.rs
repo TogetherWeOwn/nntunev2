@@ -310,10 +310,15 @@ pub fn check_ingest_write(plan: PlanId, ingest_today: u32) -> Decision {
     }
 }
 
-/// Library guard: new additions/writes call this before inserting.
-pub fn check_library(plan: PlanId, library_tracks: u64) -> Decision {
+/// Library guard: new additions/writes call this before inserting `adding`
+/// tracks. At-cap denies (`>=`); so does any batch whose post-insert count
+/// would exceed the cap. The sum saturates, so a huge count can only deny,
+/// never wrap into an allow.
+pub fn check_library(plan: PlanId, library_tracks: u64, adding: u64) -> Decision {
     let caps = plan.caps();
-    if library_tracks >= caps.max_library_tracks {
+    if library_tracks >= caps.max_library_tracks
+        || library_tracks.saturating_add(adding) > caps.max_library_tracks
+    {
         deny_plan(LimitDimension::Library, &caps)
     } else {
         Decision::Allow
@@ -357,10 +362,12 @@ pub fn check_stream(plan: PlanId, stream_seconds_month: u64, concurrent_now: u32
     }
 }
 
-/// Combined guard across one usage snapshot. Terminal 402s win over the
-/// retryable 429 in this order: stream month, ingest day, library, then
-/// concurrency. The first denial names its own dimension.
-pub fn evaluate(plan: PlanId, usage: &UsageSnapshot) -> Decision {
+/// Combined guard across one usage snapshot plus the pending library
+/// addition for this attempt. Terminal 402s win over the retryable 429 in
+/// this order: stream month, ingest day, library, then concurrency. The
+/// first denial names its own dimension. Snapshot-only callers pass
+/// `library_adding: 0`.
+pub fn evaluate(plan: PlanId, usage: &UsageSnapshot, library_adding: u64) -> Decision {
     let month = check_stream_month(plan, usage.stream_seconds_month);
     if !month.is_allow() {
         return month;
@@ -369,7 +376,7 @@ pub fn evaluate(plan: PlanId, usage: &UsageSnapshot) -> Decision {
     if !ingest.is_allow() {
         return ingest;
     }
-    let library = check_library(plan, usage.library_tracks);
+    let library = check_library(plan, usage.library_tracks, library_adding);
     if !library.is_allow() {
         return library;
     }
@@ -444,12 +451,13 @@ mod tests {
             assert!(!check_ingest_write(plan, caps.ingest_jobs_day).is_allow());
             assert!(!check_ingest_write(plan, caps.ingest_jobs_day.saturating_add(1)).is_allow());
             assert!(!check_ingest_write(plan, u32::MAX).is_allow());
-            // Library (402).
-            assert!(check_library(plan, 0).is_allow());
-            assert!(check_library(plan, caps.max_library_tracks.saturating_sub(1)).is_allow());
-            assert!(!check_library(plan, caps.max_library_tracks).is_allow());
-            assert!(!check_library(plan, caps.max_library_tracks.saturating_add(1)).is_allow());
-            assert!(!check_library(plan, u64::MAX).is_allow());
+            // Library (402): current-count checks pass `adding: 0`.
+            assert!(check_library(plan, 0, 0).is_allow());
+            assert!(check_library(plan, caps.max_library_tracks.saturating_sub(1), 0).is_allow());
+            assert!(!check_library(plan, caps.max_library_tracks, 0).is_allow());
+            assert!(!check_library(plan, caps.max_library_tracks.saturating_add(1), 0).is_allow());
+            assert!(!check_library(plan, u64::MAX, 0).is_allow());
+            assert!(!check_library(plan, u64::MAX, u64::MAX).is_allow());
             // Stream month (402).
             assert!(check_stream_month(plan, 0).is_allow());
             assert!(
@@ -471,6 +479,32 @@ mod tests {
             );
             assert!(!check_concurrent(plan, u32::MAX).is_allow());
         }
+    }
+
+    #[test]
+    fn library_batch_addition_denies_cap_crossing() {
+        // Batch writes state how many tracks they add: a batch that fits
+        // allows, a batch that crosses the cap denies even though the
+        // current count alone is under it, and the sum saturates instead
+        // of wrapping on hostile counts. Landing exactly on the cap
+        // allows (at-cap only denies the *next* addition).
+        for plan in PlanId::all() {
+            let caps = plan.caps();
+            let below = caps.max_library_tracks.saturating_sub(10);
+            assert!(check_library(plan, below, 0).is_allow());
+            assert!(check_library(plan, below, 9).is_allow());
+            assert!(check_library(plan, below, 10).is_allow());
+            assert!(!check_library(plan, below, 11).is_allow());
+            assert!(!check_library(plan, 0, u64::MAX).is_allow());
+        }
+        // The review's example: 999 existing Free tracks plus a 100-track
+        // write must deny (cap 1,000), not pass on the current count.
+        assert!(!check_library(PlanId::Free, 999, 100).is_allow());
+        let denial = check_library(PlanId::Free, 999, 100)
+            .denial()
+            .expect("cap-crossing batch must deny");
+        assert_eq!((denial.status, denial.code), (402, "plan_limit_exceeded"));
+        assert_eq!(denial.dimension, LimitDimension::Library);
     }
 
     #[test]
@@ -501,14 +535,14 @@ mod tests {
     fn combined_evaluate_names_first_terminal_denial() {
         let caps = PlanId::Plus.caps();
         // All clear allows.
-        assert!(evaluate(PlanId::Plus, &usage_zero()).is_allow());
+        assert!(evaluate(PlanId::Plus, &usage_zero(), 0).is_allow());
         // Each dimension alone denies with its own status/dimension.
         let month = UsageSnapshot {
             stream_seconds_month: caps.stream_seconds_month,
             ..usage_zero()
         };
         assert_eq!(
-            evaluate(PlanId::Plus, &month)
+            evaluate(PlanId::Plus, &month, 0)
                 .denial()
                 .map(|d| (d.status, d.dimension)),
             Some((402, LimitDimension::StreamMonth))
@@ -518,7 +552,7 @@ mod tests {
             ..usage_zero()
         };
         assert_eq!(
-            evaluate(PlanId::Plus, &ingest)
+            evaluate(PlanId::Plus, &ingest, 0)
                 .denial()
                 .map(|d| (d.status, d.dimension)),
             Some((402, LimitDimension::IngestDay))
@@ -528,7 +562,20 @@ mod tests {
             ..usage_zero()
         };
         assert_eq!(
-            evaluate(PlanId::Plus, &library)
+            evaluate(PlanId::Plus, &library, 0)
+                .denial()
+                .map(|d| (d.status, d.dimension)),
+            Some((402, LimitDimension::Library))
+        );
+        // A batch that crosses the library cap denies even though the
+        // snapshot count alone is under it; zero-addition below cap allows.
+        let batch = UsageSnapshot {
+            library_tracks: caps.max_library_tracks.saturating_sub(10),
+            ..usage_zero()
+        };
+        assert!(evaluate(PlanId::Plus, &batch, 0).is_allow());
+        assert_eq!(
+            evaluate(PlanId::Plus, &batch, 11)
                 .denial()
                 .map(|d| (d.status, d.dimension)),
             Some((402, LimitDimension::Library))
@@ -538,7 +585,7 @@ mod tests {
             ..usage_zero()
         };
         assert_eq!(
-            evaluate(PlanId::Plus, &conc)
+            evaluate(PlanId::Plus, &conc, 0)
                 .denial()
                 .map(|d| (d.status, d.dimension)),
             Some((429, LimitDimension::Concurrent))
@@ -550,7 +597,7 @@ mod tests {
             ..usage_zero()
         };
         assert_eq!(
-            evaluate(PlanId::Plus, &both).denial().map(|d| d.status),
+            evaluate(PlanId::Plus, &both, 0).denial().map(|d| d.status),
             Some(402)
         );
     }
@@ -592,8 +639,8 @@ mod tests {
             let denials = [
                 check_ingest_write(plan, caps.ingest_jobs_day),
                 check_ingest_write(plan, u32::MAX),
-                check_library(plan, caps.max_library_tracks),
-                check_library(plan, u64::MAX),
+                check_library(plan, caps.max_library_tracks, 0),
+                check_library(plan, u64::MAX, u64::MAX),
                 check_stream_month(plan, caps.stream_seconds_month),
                 check_stream_month(plan, u64::MAX),
                 check_concurrent(plan, caps.max_concurrent_streams),
