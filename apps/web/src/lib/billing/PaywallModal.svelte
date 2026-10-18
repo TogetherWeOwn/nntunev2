@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import {
 		formatCountdown,
 		trackPaywallShown,
@@ -20,14 +21,24 @@
 	let { model, onclose, track }: Props = $props();
 
 	let dialog: HTMLDialogElement | undefined = $state();
-	// Local ticking copy of the server-provided wait; the model stays frozen.
-	// The effect below resynchronizes it when another limit response updates
-	// this still-open modal.
+	// Local ticking copy of the server-provided wait, counted from a
+	// per-model deadline in wall-clock time; the model stays frozen. The
+	// effect below resynchronizes both when another limit response updates
+	// this still-open modal, so a fresh response starts a fresh deadline.
 	// svelte-ignore state_referenced_locally
 	let remaining = $state<number | null>(model.retryAfterSeconds);
+	// svelte-ignore state_referenced_locally
+	let deadline = $state<number | null>(
+		model.retryAfterSeconds === null ? null : Date.now() + model.retryAfterSeconds * 1000
+	);
 
 	$effect(() => {
-		remaining = model.retryAfterSeconds;
+		// Track the model object itself (not just its seconds) so a new
+		// limit response with the same wait still starts a fresh deadline.
+		const current = model;
+		const seconds = current.retryAfterSeconds;
+		remaining = seconds;
+		deadline = seconds === null ? null : Date.now() + seconds * 1000;
 	});
 
 	const countdownText = $derived(
@@ -50,12 +61,22 @@
 		if (!dialog.open) dialog.showModal();
 	});
 
-	// Tick the retry countdown down to zero; at zero the text flips to
-	// "You can try again now." and the interval stops.
+	// Count down the retry wait by elapsed wall-clock time from the
+	// per-model deadline: each callback recomputes what is left, so a
+	// suspended tab (or throttled timer) that jumps forward lands on the
+	// correct remaining time instead of one second less. At zero the text
+	// flips to "You can try again now." and the interval stops; the
+	// cleanup also disposes the timer when a fresh deadline replaces it,
+	// when the wait is unknown/zero, or when the modal unmounts.
 	$effect(() => {
-		if (remaining === null || remaining <= 0) return;
+		const currentDeadline = deadline;
+		if (currentDeadline === null) return;
+		const initial: number | null = untrack(() => remaining);
+		if (initial === null || initial <= 0) return;
 		const timer = setInterval(() => {
-			remaining = remaining === null ? null : Math.max(0, remaining - 1);
+			const left = Math.max(0, Math.ceil((currentDeadline - Date.now()) / 1000));
+			remaining = left;
+			if (left <= 0) clearInterval(timer);
 		}, 1000);
 		return () => clearInterval(timer);
 	});
