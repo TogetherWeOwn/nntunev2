@@ -405,6 +405,64 @@ mod tests {
     }
 
     #[test]
+    fn u64_endpoints_load_and_overflow_shapes_rejected() {
+        // Endpoints pin current `trimmed.parse::<u64>()` behavior.
+        for (raw, expected) in [("0", 0u64), ("18446744073709551615", u64::MAX)] {
+            let mut kv_input = identity();
+            kv_input.insert("session.ttl_secs".to_string(), raw.to_string());
+            let config = Config::load(&kv_input).expect("endpoint loads");
+            assert_eq!(
+                config.get_u64("session.ttl_secs"),
+                Some(expected),
+                "endpoint {raw:?} must load"
+            );
+        }
+        // Overflow and non-decimal shapes fail as InvalidType.
+        for bad in ["18446744073709551616", "0x10", "+18446744073709551616"] {
+            let mut kv_input = identity();
+            kv_input.insert("session.ttl_secs".to_string(), bad.to_string());
+            assert_eq!(
+                Config::load(&kv_input),
+                Err(ConfigError::InvalidType {
+                    key: "session.ttl_secs",
+                    expected: ConfigType::U64,
+                }),
+                "bad value {bad:?} must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn whitespace_padded_numerics_load() {
+        let mut raw = identity();
+        raw.insert("session.ttl_secs".to_string(), " 3600 ".to_string());
+        let config = Config::load(&raw).expect("padded numeric loads");
+        assert_eq!(config.get_u64("session.ttl_secs"), Some(3600));
+    }
+
+    #[test]
+    fn nonblank_string_with_surrounding_spaces_round_trips_exact() {
+        let spaced = "  v2-staging.nntune.com  ";
+        let mut raw = identity();
+        raw.insert("auth.rp_id".to_string(), spaced.to_string());
+        let config = Config::load(&raw).expect("spaced string loads");
+        assert_eq!(
+            config.get_str("auth.rp_id"),
+            Some(spaced),
+            "KV load must preserve surrounding spaces exactly"
+        );
+
+        let mut config = Config::load(&identity()).expect("identity loads");
+        let env = kv(&[("RP_ID", spaced)]);
+        config.apply_env(&env).expect("env overlay applies");
+        assert_eq!(
+            config.get_str("auth.rp_id"),
+            Some(spaced),
+            "env overlay must preserve surrounding spaces exactly"
+        );
+    }
+
+    #[test]
     fn unknown_kv_key_rejected() {
         let mut raw = identity();
         raw.insert("debug.backdoor".to_string(), "true".to_string());
