@@ -650,7 +650,9 @@ jobs:
             --list-output "$RUNNER_TEMP/e2e-list.txt"
 
       - name: Self-test the traceability check
-        run: python3 .github/scripts/test_check_traceability.py
+        run: |
+          python3 .github/scripts/test_check_traceability.py
+          python3 .github/scripts/test_check_traceability_list_format.py
 
   svelte-check:
     name: svelte-check
