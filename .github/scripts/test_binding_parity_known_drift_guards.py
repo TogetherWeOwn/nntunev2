@@ -1,7 +1,7 @@
 """Pin binding-parity known_drift allowlist entry guards.
 
-Covers the four ``load_manifest`` guards in ``binding_parity.py``
-(:583-596): a ``[[known_drift]]`` entry naming an unmapped worker, an
+Covers the four ``load_manifest`` known_drift validation guards in
+``binding_parity.py``: a ``[[known_drift]]`` entry naming an unmapped worker, an
 unmapped binding, an id-typed (KV/Hyperdrive) binding, or an ``expected``
 value that disagrees with the binding map must each fail closed with
 ``ParityError``. Without these, a rogue allowlist entry could legitimize
@@ -126,16 +126,22 @@ class TestKnownDriftGuards(unittest.TestCase):
         )
 
     def test_id_typed_binding_fails_closed(self):
-        # SESSION_CACHE is a KV (id-typed) binding whose expected value
-        # agrees with the map, isolating the id-typed guard itself.
-        self.assert_guard_fails_closed(
-            manifest_with_drift(
-                binding="SESSION_CACHE",
-                actual="fx-kv-staging",
-                expected="fx-kv-staging",
-            ),
-            r"not allowed for id-typed bindings",
-        )
+        # Both id-typed arms (KV SESSION_CACHE and Hyperdrive DB) must
+        # fail closed. Expected agrees with the map in each case, isolating
+        # the id-typed guard itself from the disagreeing-expected guard.
+        for binding, ident in (
+            ("SESSION_CACHE", "fx-kv-staging"),
+            ("DB", "fx-hd-staging"),
+        ):
+            with self.subTest(binding=binding):
+                self.assert_guard_fails_closed(
+                    manifest_with_drift(
+                        binding=binding,
+                        actual=ident,
+                        expected=ident,
+                    ),
+                    r"not allowed for id-typed bindings",
+                )
 
     def test_disagreeing_expected_fails_closed(self):
         self.assert_guard_fails_closed(
