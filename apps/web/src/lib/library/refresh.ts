@@ -191,6 +191,12 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				return;
 			}
 			activeResponse = response;
+			if (!response.ok) {
+				// Refusal bodies are never read. Detach before best-effort cleanup
+				// so abort/disposal cannot cancel them again; never await cleanup.
+				activeResponse = null;
+				cancelResponse(response);
+			}
 			if (response.status === 404) {
 				// The list endpoint has not landed yet. Do not treat a 404 as
 				// session verification or expose a previously saved snapshot.
