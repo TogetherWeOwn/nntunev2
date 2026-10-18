@@ -6,8 +6,10 @@
 //! Worker entry reuses these pure rules plus the parameterized statements.
 
 use nntune_api::ledger::{
-    self, fold_monthly_totals, ledger_insert_statement, ledger_monthly_total_statement,
-    new_idempotency_key, period_month_for_timestamp, prepare_ledger_row, LedgerError, LedgerRow,
+    self, classify_replay, derive_play_idempotency_key, fold_monthly_totals,
+    ledger_insert_statement, ledger_monthly_total_statement, ledger_select_by_key_statement,
+    new_idempotency_key, period_month_for_timestamp, prepare_ledger_row,
+    prepare_play_ledger_row, LedgerError, LedgerRow, ReplayOutcome,
 };
 
 // --- Fixtures ---------------------------------------------------------------
@@ -55,32 +57,45 @@ fn prepare_builds_a_fully_specified_intent() {
 #[test]
 fn prepare_rejects_empty_and_overlong_handles() {
     let key = new_idempotency_key();
-    let long = "x".repeat(129);
+    let long_user = "x".repeat(129);
+    let long_track = "x".repeat(513);
     for (user, track, k) in [
         ("", "track-1", key.as_str()),
         ("user-alice", "", key.as_str()),
         ("", "", key.as_str()),
-        (long.as_str(), "track-1", key.as_str()),
-        ("user-alice", long.as_str(), key.as_str()),
+        (long_user.as_str(), "track-1", key.as_str()),
+        ("user-alice", long_track.as_str(), key.as_str()),
     ] {
         assert_eq!(
             prepare_ledger_row(user, track, k, 48_000, 1, 1_767_225_600),
             Err(LedgerError::Invalid),
-            "user {user:?} track {track:?}"
+            "user len {} track len {}",
+            user.len(),
+            track.len()
         );
     }
-    // Handles at exactly the cap pass (chars, not bytes).
+    // Handles at exactly the cap pass (chars, not bytes). Track matches the
+    // stream worker's 512 limit so a stream-accepted track is never rejected.
     let wide = "é".repeat(128);
     assert_eq!(wide.len(), 256);
     assert!(
         prepare_ledger_row(&wide, "track-1", &key, 48_000, 1, 1_767_225_600).is_ok(),
-        "128 two-byte chars fit the 128-char cap"
+        "128 two-byte chars fit the 128-char user cap"
+    );
+    let wide_track = "t".repeat(512);
+    assert!(
+        prepare_ledger_row("user-alice", &wide_track, &key, 48_000, 1, 1_767_225_600)
+            .is_ok(),
+        "512-char track fits the 512 cap"
     );
 }
 
 #[test]
 fn prepare_rejects_bad_keys_zero_and_oversized_bytes() {
     let good_key = new_idempotency_key();
+    // `:` is allowed: stream play keys are `play:{user}:{track}:{play}`.
+    // Length cap is 1159 (longest derivable play key), alphabet is
+    // `[A-Za-z0-9_:-]` on both Rust and SQL sides.
     for bad_key in [
         "",
         "!!!",
@@ -88,7 +103,8 @@ fn prepare_rejects_bad_keys_zero_and_oversized_bytes() {
         "a/b",
         "a+b",
         "a=b",
-        &"x".repeat(129),
+        "play:has space:t:1",
+        &"x".repeat(1160),
     ] {
         assert_eq!(
             prepare_ledger_row("user-alice", "track-1", bad_key, 48_000, 1, 1_767_225_600),
@@ -96,6 +112,20 @@ fn prepare_rejects_bad_keys_zero_and_oversized_bytes() {
             "key {bad_key:?}"
         );
     }
+    // A `play:` key that does not bind its identity fails closed, even with
+    // an otherwise valid shape.
+    assert_eq!(
+        prepare_ledger_row(
+            "mallory",
+            "t",
+            "play:alice:t:1",
+            48_000,
+            1,
+            1_767_225_600
+        ),
+        Err(LedgerError::Invalid),
+        "forged play key must not bind"
+    );
     // Zero bytes bill nothing: rejected (the table CHECK agrees).
     assert_eq!(
         prepare_ledger_row("user-alice", "track-1", &good_key, 0, 0, 1_767_225_600),
@@ -290,8 +320,8 @@ fn fold_is_order_independent_and_split_preserving() {
 fn statements_are_parameterized_replay_safe_and_month_scoped() {
     let insert = ledger_insert_statement();
     assert!(
-        insert.starts_with("INSERT INTO usage_ledger "),
-        "right table: {insert}"
+        insert.starts_with("INSERT INTO stream_play_ledger "),
+        "right table (not the ADR daily usage_ledger): {insert}"
     );
     assert!(
         insert.contains("(idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at)"),
@@ -305,13 +335,20 @@ fn statements_are_parameterized_replay_safe_and_month_scoped() {
         insert.contains("ON CONFLICT (idempotency_key) DO NOTHING"),
         "replay-safe: {insert}"
     );
-    for sql in [insert, ledger_monthly_total_statement()] {
+    // A zero-row insert is ambiguous: the Worker selects the stored row and
+    // classifies exact redelivery vs conflicting payload.
+    let select = ledger_select_by_key_statement();
+    assert!(
+        select.contains("FROM stream_play_ledger WHERE idempotency_key = $1"),
+        "select by key: {select}"
+    );
+    for sql in [insert, select, ledger_monthly_total_statement()] {
         assert!(!sql.contains('{'), "no interpolation: {sql}");
         assert!(!sql.contains("%s"), "no interpolation: {sql}");
     }
     let monthly = ledger_monthly_total_statement();
     assert!(
-        monthly.contains("FROM usage_ledger WHERE user_id = $1 AND period_month = $2"),
+        monthly.contains("FROM stream_play_ledger WHERE user_id = $1 AND period_month = $2"),
         "owner+period scope grouped as one AND unit: {monthly}"
     );
     assert!(
@@ -327,13 +364,68 @@ fn statements_are_parameterized_replay_safe_and_month_scoped() {
 }
 
 #[test]
+fn stream_play_feeds_the_ledger_without_silent_replays() {
+    // Feed-through: the stream worker's CompletePlay identity
+    // (user-1, track-9, play-7) derives `play:user-1:track-9:play-7` on both
+    // sides; the ledger accepts it, converges an exact redelivery, and flags
+    // a same-key payload disagreement as a conflict (never a silent rowcount
+    // 0). Removing the `play:` acceptance, the identity binding, or the
+    // select+classify flow fails this test.
+    let first =
+        prepare_play_ledger_row("user-1", "track-9", "play-7", 40_000, 1, 1_767_225_600)
+            .expect("stream play feeds the ledger");
+    assert_eq!(first.idempotency_key, "play:user-1:track-9:play-7");
+    assert_eq!(
+        derive_play_idempotency_key("user-1", "track-9", "play-7").unwrap(),
+        first.idempotency_key,
+        "api and stream derivations agree"
+    );
+    // Exact redelivery converges.
+    let replay =
+        prepare_play_ledger_row("user-1", "track-9", "play-7", 40_000, 1, 1_767_225_600)
+            .unwrap();
+    assert_eq!(
+        classify_replay(Some(&first), &replay),
+        ReplayOutcome::Duplicate
+    );
+    // Same key, changed bytes: conflict, never converged.
+    let mut tampered = first.clone();
+    tampered.bytes_served = 41_500;
+    tampered.stream_seconds = 41_500u64.div_ceil(ledger::STREAM_BYTES_PER_SEC);
+    assert_eq!(
+        classify_replay(Some(&first), &tampered),
+        ReplayOutcome::Conflict
+    );
+    // Same key, changed beneficiary: conflict.
+    let mut rebilled = first.clone();
+    rebilled.user_id = "user-2".into();
+    assert_eq!(
+        classify_replay(Some(&first), &rebilled),
+        ReplayOutcome::Conflict
+    );
+    // No stored row: fresh, never a duplicate.
+    assert_eq!(classify_replay(None, &first), ReplayOutcome::Fresh);
+    // A genuine second listen carries a different play id and bills its own
+    // row instead of converging.
+    let second =
+        prepare_play_ledger_row("user-1", "track-9", "play-8", 40_000, 1, 1_767_225_600)
+            .unwrap();
+    assert_ne!(second.idempotency_key, first.idempotency_key);
+    assert_eq!(
+        classify_replay(Some(&first), &second),
+        ReplayOutcome::Conflict,
+        "different play id with same bytes is a distinct window, not a replay"
+    );
+}
+
+#[test]
 fn migration_pins_rate_and_persisted_caps() {
     // The migration is the persisted half of the prepare gate: if its rate
     // literal drifts (e.g. 48000 -> 4800) every prepare-valid row fails at
     // the DB, or corrupt rows are accepted. Dropping the CHECK has the same
     // effect. This test reads the migration file so either mutant fails the
     // suite.
-    const MIGRATION: &str = include_str!("../../../migrations/0019_usage_ledger.sql");
+    const MIGRATION: &str = include_str!("../../../migrations/0019_stream_play_ledger.sql");
     let rate = ledger::STREAM_BYTES_PER_SEC.to_string();
     assert!(
         MIGRATION.contains(&format!("bytes_served / {rate}")),
@@ -366,4 +458,39 @@ fn migration_pins_rate_and_persisted_caps() {
     assert_eq!(ledger::MAX_STREAM_SECONDS_PER_ROW, 86_400);
     assert_eq!(ledger::MAX_BYTES_PER_ROW, 4_147_200_000);
     assert_eq!(ledger::MAX_RECORDED_AT, 253_402_300_799);
+    // Table identity: per-play windows live in `stream_play_ledger`, never
+    // the ADR daily `usage_ledger` — a colliding name would let the future
+    // daily CREATE silently no-op and then fail its (user_id, period)
+    // upsert. Renaming the table without updating the statements fails here.
+    assert!(
+        MIGRATION.contains("CREATE TABLE IF NOT EXISTS stream_play_ledger ("),
+        "migration must create stream_play_ledger"
+    );
+    assert!(
+        !MIGRATION.contains("CREATE TABLE IF NOT EXISTS usage_ledger ("),
+        "migration must not claim the ADR usage_ledger name"
+    );
+    // Rust/SQL alphabet and length agreement: play keys (`play:` + 128 +
+    // 512 + 512 = 1159, `[A-Za-z0-9_:-]`) and 512-char tracks must persist;
+    // shrinking either side rejects stream-accepted plays at the DB.
+    assert!(
+        MIGRATION.contains(&format!(
+            "char_length(idempotency_key) BETWEEN 1 AND {}",
+            ledger::MAX_IDEMPOTENCY_KEY_LEN
+        )),
+        "migration must persist the 1159-char key cap"
+    );
+    assert!(
+        MIGRATION.contains("idempotency_key ~ '^[A-Za-z0-9_:-]+$'"),
+        "migration must persist the key alphabet (including ':')"
+    );
+    assert!(
+        MIGRATION.contains(&format!(
+            "char_length(track_id) BETWEEN 1 AND {}",
+            ledger::MAX_TRACK_ID_LEN
+        )),
+        "migration must persist the 512-char track cap"
+    );
+    assert_eq!(ledger::MAX_IDEMPOTENCY_KEY_LEN, 1_159);
+    assert_eq!(ledger::MAX_TRACK_ID_LEN, 512);
 }

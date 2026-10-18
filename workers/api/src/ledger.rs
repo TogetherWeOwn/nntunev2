@@ -1,4 +1,4 @@
-//! Authoritative usage ledger: one row per billed play segment.
+//! Authoritative per-play stream ledger: one row per billed play window.
 //!
 //! Analytics Engine carries the fast per-second/per-byte signal (see the
 //! stream worker's metering); this table is the billing truth the usage
@@ -6,8 +6,20 @@
 //! statements the Worker entry binds against PlanetScale Postgres via
 //! Hyperdrive — never string-interpolated SQL.
 //!
+//! Table identity (Paperclip Review `6508688`, warning 1): this is NOT the
+//! accepted ADR 0002/0004 daily `usage_ledger` (`period DATE`, `ingest_jobs`,
+//! `UNIQUE (user_id, period)`, additive `ON CONFLICT (user_id, period)
+//! DO UPDATE`). That daily aggregate remains the cap-enforcement shape and is
+//! built in a later slice by folding these per-play windows (and ingest
+//! accepts). To keep the future `CREATE TABLE IF NOT EXISTS usage_ledger`
+//! from silently no-op'ing on a colliding name and then failing its
+//! `ON CONFLICT (user_id, period)`, this slice's per-play table is named
+//! `stream_play_ledger` (`migrations/0019_stream_play_ledger.sql`). See the
+//! amendment notes in `docs/adr/0002-data-model.md`, `0004-plan-matrix.md`
+//! and `0005-billing.md`.
+//!
 //! Rules:
-//! - One [`LedgerRow`] per billed service window: (`user_id`, `track_id`,
+//! - One [`LedgerRow`] per billed play window: (`user_id`, `track_id`,
 //!   `idempotency_key`, `bytes_served`, `stream_seconds`, `recorded_at`).
 //!   Seconds MUST equal `ceil(bytes / STREAM_BYTES_PER_SEC)` — the same rate
 //!   the stream worker attributes with — derived from the window's folded
@@ -16,8 +28,20 @@
 //! - `period_month` (`YYYY-MM`, UTC) derives deterministically from
 //!   `recorded_at`; monthly usage is `SUM` over (`user_id`, `period_month`).
 //! - Replay safety: the insert is `ON CONFLICT (idempotency_key) DO NOTHING`,
-//!   so a retried finalize never double-bills. Keys are fresh 128-bit
-//!   base64url handles from [`new_idempotency_key`].
+//!   so a retried finalize never double-bills. Stream plays MUST derive the
+//!   key deterministically with [`derive_play_idempotency_key`] from the same
+//!   `(user_id, track_id, play_id)` identity the stream worker uses — a
+//!   redelivery derives the same key, a genuine second listen carries a
+//!   different `play_id` and bills separately. Fresh random handles from
+//!   [`new_idempotency_key`] remain for non-play windows; they MUST be minted
+//!   once per window and reused across retries (a new random key per retry
+//!   cannot deduplicate). A zero-row insert is ambiguous: the Worker MUST
+//!   `SELECT` the existing row with [`ledger_select_by_key_statement`] and
+//!   run [`classify_replay`] — exact redelivery reports
+//!   [`ReplayOutcome::Duplicate`], any user/track/byte/second disagreement (or
+//!   a `play:` key that does not bind its identity) reports
+//!   [`ReplayOutcome::Conflict`] and changes nothing. Conflicts are flagged,
+//!   never silently converged.
 //! - Bounds: a single row carries at most [`MAX_BYTES_PER_ROW`] bytes (24 h
 //!   of audio at the nominal rate); zero-byte rows are rejected — an empty
 //!   row bills nothing and only widens the table.
@@ -34,15 +58,28 @@ pub const MAX_STREAM_SECONDS_PER_ROW: u64 = 86_400;
 pub const MAX_BYTES_PER_ROW: u64 = 4_147_200_000;
 /// Last Unix second representable by the persisted four-digit `YYYY-MM` month.
 pub const MAX_RECORDED_AT: u64 = 253_402_300_799;
-/// Maximum length of user, track and idempotency-key handles (chars).
+/// Maximum length of user handles and fresh random keys (chars).
 pub const MAX_ID_LEN: usize = 128;
+/// Maximum user-id length (chars for handles, bytes for key fields; ASCII —
+/// the only alphabet real ids use — is identical in both).
+pub const MAX_USER_ID_LEN: usize = 128;
+/// Maximum track-id length. Matches the stream worker's 512-byte limit so a
+/// stream-accepted track is never rejected here.
+pub const MAX_TRACK_ID_LEN: usize = 512;
+/// Maximum play-id length. Matches the stream worker's 512-byte limit.
+pub const MAX_PLAY_ID_LEN: usize = 512;
+/// Maximum idempotency-key length: `play:` + 128-byte user + `:` + 512-byte
+/// track + `:` + 512-byte play id = 1159. Covers every stream-derived key
+/// and every 22-char fresh random handle.
+pub const MAX_IDEMPOTENCY_KEY_LEN: usize = 1159;
 
 /// Why a ledger row was rejected. Failures stay generic: inputs are never
 /// echoed (they may carry caller-chosen handles).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LedgerError {
     /// Shape violation (empty/overlong handle, bad key charset, zero or
-    /// oversized bytes, seconds disagreeing with bytes): HTTP 422.
+    /// oversized bytes, seconds disagreeing with bytes, play key not binding
+    /// its identity): HTTP 422.
     Invalid,
 }
 
@@ -63,13 +100,78 @@ impl std::fmt::Display for LedgerError {
 }
 
 /// Fresh 128-bit idempotency key (base64url, 22 chars, via the shared
-/// [`crate::b64`] helper). Never sequential. Mint once per billed service
-/// window and reuse the returned key for every finalize retry, so
-/// `ON CONFLICT (idempotency_key) DO NOTHING` can deduplicate retries.
+/// [`crate::b64`] helper). Never sequential. For NON-PLAY windows only: mint
+/// once per billed service window and reuse the returned key for every
+/// finalize retry, so `ON CONFLICT (idempotency_key) DO NOTHING` can
+/// deduplicate retries. Stream plays MUST use
+/// [`derive_play_idempotency_key`] instead — a fresh random key per retry
+/// cannot deduplicate a redelivery.
 pub fn new_idempotency_key() -> String {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("secure randomness unavailable");
     crate::b64::encode(&bytes)
+}
+
+/// Byte-based key-field check mirroring the stream worker's
+/// `is_valid_key_field` exactly: non-empty, at most `max_bytes` bytes, and
+/// containing no `:`, `=`, whitespace, or control characters, so derived keys
+/// stay unambiguous and safe to emit as single-line structured logs.
+fn is_valid_key_field(field: &str, max_bytes: usize) -> bool {
+    !field.is_empty()
+        && field.len() <= max_bytes
+        && !field.contains(':')
+        && !field.contains('=')
+        && !field
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+}
+
+/// Derive the idempotency key for one stream play: `play:{user}:{track}:{play}`.
+///
+/// Byte-for-byte the stream worker's `derive_play_idempotency_key`
+/// (`workers/stream/src/meter.rs`): same `play:` vocabulary, same 128/512/512
+/// byte limits, same rejections. A redelivered play derives the same key; a
+/// genuine second listen carries a different `play_id` and bills separately.
+/// The feed-through test pins the shared vectors, so either side drifting
+/// fails the suite instead of silently unbilled plays.
+pub fn derive_play_idempotency_key(
+    user_id: &str,
+    track_id: &str,
+    play_id: &str,
+) -> Result<String, LedgerError> {
+    if !is_valid_key_field(user_id, MAX_USER_ID_LEN) {
+        return Err(LedgerError::Invalid);
+    }
+    if !is_valid_key_field(track_id, MAX_TRACK_ID_LEN) {
+        return Err(LedgerError::Invalid);
+    }
+    if !is_valid_key_field(play_id, MAX_PLAY_ID_LEN) {
+        return Err(LedgerError::Invalid);
+    }
+    Ok(format!("play:{user_id}:{track_id}:{play_id}"))
+}
+
+/// The `play:` key must bind the play's identity: exactly
+/// `play:{user_id}:{track_id}:{play_id}` with the same field limits as
+/// [`derive_play_idempotency_key`]. [`LedgerRow`] exposes public fields, so a
+/// directly constructed value can bypass derivation; `prepare` re-checks here
+/// so the dedup point never accepts a key the derivation would reject.
+fn key_binds_identity(idempotency_key: &str, user_id: &str, track_id: &str) -> bool {
+    if !is_valid_key_field(user_id, MAX_USER_ID_LEN)
+        || !is_valid_key_field(track_id, MAX_TRACK_ID_LEN)
+    {
+        return false;
+    }
+    let Some(rest) = idempotency_key.strip_prefix("play:") else {
+        return false;
+    };
+    let mut parts = rest.split(':');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(user), Some(track), Some(play_id), None) => {
+            user == user_id && track == track_id && is_valid_key_field(play_id, MAX_PLAY_ID_LEN)
+        }
+        _ => false,
+    }
 }
 
 /// Calendar month (`YYYY-MM`, UTC) containing Unix timestamp `recorded_at`.
@@ -108,20 +210,27 @@ pub struct LedgerRow {
     pub recorded_at: u64,
 }
 
-fn check_handle(value: &str) -> Result<String, LedgerError> {
-    if value.is_empty() || value.chars().count() > MAX_ID_LEN {
+fn check_user_handle(value: &str) -> Result<String, LedgerError> {
+    if value.is_empty() || value.chars().count() > MAX_USER_ID_LEN {
+        return Err(LedgerError::Invalid);
+    }
+    Ok(value.to_string())
+}
+
+fn check_track_handle(value: &str) -> Result<String, LedgerError> {
+    if value.is_empty() || value.chars().count() > MAX_TRACK_ID_LEN {
         return Err(LedgerError::Invalid);
     }
     Ok(value.to_string())
 }
 
 fn check_key(value: &str) -> Result<String, LedgerError> {
-    if value.is_empty() || value.chars().count() > MAX_ID_LEN {
+    if value.is_empty() || value.chars().count() > MAX_IDEMPOTENCY_KEY_LEN {
         return Err(LedgerError::Invalid);
     }
     if !value
         .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b':')
     {
         return Err(LedgerError::Invalid);
     }
@@ -132,6 +241,12 @@ fn check_key(value: &str) -> Result<String, LedgerError> {
 /// must already equal `ceil(bytes_served / STREAM_BYTES_PER_SEC)` — the
 /// Worker passes through what the stream worker metered, and any skew fails
 /// closed instead of billing a number neither side derived.
+///
+/// Keys: fresh [`new_idempotency_key`] handles are accepted as-is; a key
+/// starting with `play:` MUST bind `(user_id, track_id)` per
+/// [`derive_play_idempotency_key`] (forged or truncated play keys fail
+/// closed). Stream plays should prefer [`prepare_play_ledger_row`], which
+/// carries the `play_id` explicitly and derives the key.
 pub fn prepare_ledger_row(
     user_id: &str,
     track_id: &str,
@@ -140,9 +255,14 @@ pub fn prepare_ledger_row(
     stream_seconds: u64,
     recorded_at: u64,
 ) -> Result<LedgerRow, LedgerError> {
-    let user_id = check_handle(user_id)?;
-    let track_id = check_handle(track_id)?;
+    let user_id = check_user_handle(user_id)?;
+    let track_id = check_track_handle(track_id)?;
     let idempotency_key = check_key(idempotency_key)?;
+    if idempotency_key.starts_with("play:")
+        && !key_binds_identity(&idempotency_key, &user_id, &track_id)
+    {
+        return Err(LedgerError::Invalid);
+    }
     if bytes_served == 0 || bytes_served > MAX_BYTES_PER_ROW {
         return Err(LedgerError::Invalid);
     }
@@ -161,6 +281,81 @@ pub fn prepare_ledger_row(
         bytes_served,
         recorded_at,
     })
+}
+
+/// Build the ledger intent for one stream play, carrying its `play_id`.
+///
+/// Derives the idempotency key deterministically with
+/// [`derive_play_idempotency_key`] from `(user_id, track_id, play_id)` — the
+/// same derivation the stream worker's `CompletePlay::new` uses — then runs
+/// [`prepare_ledger_row`]. A redelivery with the same play id derives the
+/// same key and converges via `ON CONFLICT DO NOTHING` +
+/// [`classify_replay`]; a genuine second listen carries a different play id
+/// and bills as its own row. The stream worker MUST fold that play's bytes
+/// only (never a cross-play `(user, track)` sum) before calling here:
+/// per-event seconds round up, so the billed seconds derive from the play's
+/// folded byte total.
+pub fn prepare_play_ledger_row(
+    user_id: &str,
+    track_id: &str,
+    play_id: &str,
+    bytes_served: u64,
+    stream_seconds: u64,
+    recorded_at: u64,
+) -> Result<LedgerRow, LedgerError> {
+    let idempotency_key = derive_play_idempotency_key(user_id, track_id, play_id)?;
+    prepare_ledger_row(
+        user_id,
+        track_id,
+        &idempotency_key,
+        bytes_served,
+        stream_seconds,
+        recorded_at,
+    )
+}
+
+/// What a zero-row `ON CONFLICT DO NOTHING` insert means. The insert alone
+/// cannot tell an exact redelivery from a conflicting payload with the same
+/// key — the Worker MUST select the existing row and run
+/// [`classify_replay`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayOutcome {
+    /// No row for this key yet: the insert should have affected one row.
+    Fresh,
+    /// Exact redelivery: every billed field matches. Safe to acknowledge,
+    /// never a double-bill.
+    Duplicate,
+    /// Same key, different billed payload — or a `play:` key that does not
+    /// bind its identity. Never converges, never overwrites: flag it.
+    Conflict,
+}
+
+/// Classify a retried finalize against the stored row.
+///
+/// `existing = None` (select found no row) is [`ReplayOutcome::Fresh`]. Exact
+/// field-for-field agreement is [`ReplayOutcome::Duplicate`]; any
+/// disagreement in user, track, bytes, seconds, timestamp, or derived month —
+/// or a stored/incoming `play:` key that does not bind its identity — is
+/// [`ReplayOutcome::Conflict`]. First write wins: conflicts never append,
+/// sum into, or overwrite the stored row (that disagreement is the
+/// reconciler's job to flag).
+pub fn classify_replay(existing: Option<&LedgerRow>, incoming: &LedgerRow) -> ReplayOutcome {
+    let Some(stored) = existing else {
+        return ReplayOutcome::Fresh;
+    };
+    if stored != incoming {
+        return ReplayOutcome::Conflict;
+    }
+    if stored.idempotency_key.starts_with("play:")
+        && !key_binds_identity(
+            &stored.idempotency_key,
+            &stored.user_id,
+            &stored.track_id,
+        )
+    {
+        return ReplayOutcome::Conflict;
+    }
+    ReplayOutcome::Duplicate
 }
 
 /// Monthly usage for one user: what the usage endpoint reads.
@@ -201,13 +396,26 @@ pub fn fold_monthly_totals(rows: &[LedgerRow]) -> Vec<MonthlyTotal> {
 // The Worker binds intent fields positionally ($1..$n); never interpolates a
 // value into SQL. The insert is replay-safe (`ON CONFLICT DO NOTHING` on the
 // idempotency key): a retried finalize inserts zero rows instead of
-// double-billing. The monthly total is the usage truth for caps and display.
+// double-billing. Zero inserted rows are ambiguous (exact redelivery vs
+// conflicting payload), so the Worker selects the existing row with
+// `ledger_select_by_key_statement` and runs `classify_replay`: duplicates
+// acknowledge, conflicts flag. The monthly total is the usage truth for caps
+// and display.
 
 /// Parameters: idempotency_key, user_id, track_id, period_month,
-/// stream_seconds, bytes_served, recorded_at. Zero inserted rows means the
-/// key already exists (safe replay), never an error.
+/// stream_seconds, bytes_served, recorded_at. One inserted row means the play
+/// was first billed; zero rows means the key already exists — SELECT it and
+/// run [`classify_replay`], never assume a benign replay.
 pub fn ledger_insert_statement() -> &'static str {
-    "INSERT INTO usage_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (idempotency_key) DO NOTHING"
+    "INSERT INTO stream_play_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (idempotency_key) DO NOTHING"
+}
+
+/// Parameters: idempotency_key. Fetches the stored row after a zero-row
+/// insert so [`classify_replay`] can separate exact redeliveries
+/// ([`ReplayOutcome::Duplicate`]) from conflicting payloads
+/// ([`ReplayOutcome::Conflict`]).
+pub fn ledger_select_by_key_statement() -> &'static str {
+    "SELECT idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at FROM stream_play_ledger WHERE idempotency_key = $1"
 }
 
 /// Parameters: user_id, period_month. One row; zeros when the user has no
@@ -215,7 +423,7 @@ pub fn ledger_insert_statement() -> &'static str {
 /// (`SUM` over BIGINT returns NUMERIC in Postgres) so callers can always
 /// decode them as integers.
 pub fn ledger_monthly_total_statement() -> &'static str {
-    "SELECT COALESCE(SUM(stream_seconds), 0)::BIGINT AS stream_seconds, COALESCE(SUM(bytes_served), 0)::BIGINT AS bytes_served FROM usage_ledger WHERE user_id = $1 AND period_month = $2"
+    "SELECT COALESCE(SUM(stream_seconds), 0)::BIGINT AS stream_seconds, COALESCE(SUM(bytes_served), 0)::BIGINT AS bytes_served FROM stream_play_ledger WHERE user_id = $1 AND period_month = $2"
 }
 
 #[cfg(test)]
@@ -232,6 +440,11 @@ mod tests {
         assert_eq!(MAX_BYTES_PER_ROW, 4_147_200_000);
         assert_eq!(MAX_BYTES_PER_ROW, 86_400 * 48_000);
         assert_eq!(MAX_ID_LEN, 128);
+        assert_eq!(MAX_USER_ID_LEN, 128);
+        assert_eq!(MAX_TRACK_ID_LEN, 512);
+        assert_eq!(MAX_PLAY_ID_LEN, 512);
+        // play: + 128 + : + 512 + : + 512.
+        assert_eq!(MAX_IDEMPOTENCY_KEY_LEN, 1_159);
         assert_eq!(LedgerError::Invalid.http_status(), 422);
     }
 
@@ -242,6 +455,24 @@ mod tests {
         assert!(check_key(&key).is_ok());
         let other = new_idempotency_key();
         assert_ne!(key, other, "keys must not repeat");
+    }
+
+    #[test]
+    fn play_key_derivation_matches_the_stream_worker() {
+        // Shared vectors with workers/stream/src/meter.rs: either side
+        // drifting fails here instead of silently unbilled plays.
+        assert_eq!(
+            derive_play_idempotency_key("user-1", "track-9", "play-7").unwrap(),
+            "play:user-1:track-9:play-7"
+        );
+        for invalid in ["has space", "has\ttab", "forged=value", "a:b"] {
+            assert!(derive_play_idempotency_key(invalid, "track", "play").is_err());
+            assert!(derive_play_idempotency_key("user", invalid, "play").is_err());
+            assert!(derive_play_idempotency_key("user", "track", invalid).is_err());
+        }
+        assert!(derive_play_idempotency_key(&"u".repeat(129), "t", "p").is_err());
+        assert!(derive_play_idempotency_key("u", &"t".repeat(513), "p").is_err());
+        assert!(derive_play_idempotency_key("u", "t", &"p".repeat(513)).is_err());
     }
 
     #[test]
@@ -333,12 +564,17 @@ mod tests {
     fn statements_match_exact_text() {
         assert_eq!(
             ledger_insert_statement(),
-            "INSERT INTO usage_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (idempotency_key) DO NOTHING",
+            "INSERT INTO stream_play_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (idempotency_key) DO NOTHING",
             "ledger insert"
         );
         assert_eq!(
+            ledger_select_by_key_statement(),
+            "SELECT idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at FROM stream_play_ledger WHERE idempotency_key = $1",
+            "ledger select by key"
+        );
+        assert_eq!(
             ledger_monthly_total_statement(),
-            "SELECT COALESCE(SUM(stream_seconds), 0)::BIGINT AS stream_seconds, COALESCE(SUM(bytes_served), 0)::BIGINT AS bytes_served FROM usage_ledger WHERE user_id = $1 AND period_month = $2",
+            "SELECT COALESCE(SUM(stream_seconds), 0)::BIGINT AS stream_seconds, COALESCE(SUM(bytes_served), 0)::BIGINT AS bytes_served FROM stream_play_ledger WHERE user_id = $1 AND period_month = $2",
             "monthly total"
         );
     }

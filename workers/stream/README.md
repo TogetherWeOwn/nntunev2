@@ -358,9 +358,11 @@ and `reconcile` does not currently emit to Analytics Engine or call
   marked lines, keep the flow.
 - Planned metering sinks: Analytics Engine dataset `nntune_meter` (point
   shape in `src/meter.rs`: blobs `[kind, user_id, track_id]`, doubles
-  `[bytes, seconds]`) and the Hyperdrive usage-ledger table
-  (`migrations/0019_usage_ledger.sql`; row intents and statements owned by
-  the api worker's `src/ledger.rs`). Neither sink is wired by the portable-core
+  `[bytes, seconds]`) and the Hyperdrive per-play table
+  (`migrations/0019_stream_play_ledger.sql`, `stream_play_ledger` — not the
+  ADR daily `usage_ledger`; row intents and statements owned by
+  the api worker's `src/ledger.rs`, with the same `play:` key derivation and
+  select+classify replay flow). Neither sink is wired by the portable-core
   reconciliation model described above. Every event carries stream seconds
   at the nominal 48 000 bytes/s rate. Reconciliation must fold bytes first
   (`served_bytes`) and derive seconds from that total: per-event seconds

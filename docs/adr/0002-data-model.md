@@ -16,6 +16,12 @@
 - **Revised:** 2026-10-17 — bound playlist migration work to safe pre-cutover
   preparations and one atomic migration/backfill/read-write cutover PR; state the
   one-day limit and required fixtures/checks without permitting partial cutovers.
+- **Revised:** 2026-10-18 — slice-1 per-play precursor: `migrations/0019_stream_play_ledger.sql`
+  creates `stream_play_ledger` (one row per billed play window, `play:` idempotency keys,
+  monthly `period_month` folds). It does NOT replace the daily `usage_ledger` defined below
+  (`period DATE`, `ingest_jobs`, `UNIQUE (user_id, period)`); a later slice folds these windows
+  into that daily aggregate. The distinct name keeps the future daily `CREATE TABLE IF NOT
+  EXISTS usage_ledger` from colliding.
 - **Baseline inspected:** main `553902652cc8f5bea149c3a1bfbc55725ce5f757`
   (includes `migrations/0001_mb_mirror.sql`, `0002_auth_vault.sql` and
   `0003_library.sql` via #28 plus `workers/api/src/library.rs` playlist
@@ -414,6 +420,14 @@ The ingest job's payload is retained by the dispatch/queue path; a durable
 operation/outbox must make DB acceptance and enqueue retryable without counting
 a job twice. An accepted job is not evidence that normalized library tables
 or media already exist.
+
+Slice-1 precursor (`stream_play_ledger`, migration `0019`): per-play billed windows with
+deterministic `play:{user}:{track}:{play}` idempotency keys (128/512/512 limits, alphabet
+`[A-Za-z0-9_:-]`) and monthly `period_month` folds feed the rule-5 daily `usage_ledger`
+in a later slice; until then no daily `usage_ledger` table exists and no writer assumes its
+`(user_id, period)` upsert. Play-key binding, zero-row `SELECT` + classify (exact redelivery
+vs conflict), and the shared key vectors live in `workers/api/src/ledger.rs` with the stream
+worker's `derive_play_idempotency_key`.
 
 ### ERD (logical relationships; actual FKs as above)
 

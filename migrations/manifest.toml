@@ -89,6 +89,6 @@ target = "app"
 sha256 = "f87059e056224631b17463fd99d63cefb060f499c3e41738258e0e43a7244c68"
 
 [[migration]]
-file = "0019_usage_ledger.sql"
+file = "0019_stream_play_ledger.sql"
 target = "app"
-sha256 = "f2d89bfeb673184ce81f97f74b276d78b69e4b71484973aa15cc669b73ffac78"
+sha256 = "cd67e713c0da150acdcfa43a635a587818aaf6b8db4e7102040985291b6f8b4d"

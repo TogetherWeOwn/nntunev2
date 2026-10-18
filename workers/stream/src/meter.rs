@@ -8,7 +8,8 @@
 //!   the same key; a genuine second listen carries a different `play_id`
 //!   and bills separately.
 //! - [`UsageLedger`] is the portable-core model of the Hyperdrive
-//!   usage-ledger table, which in production must key
+//!   `stream_play_ledger` table (`migrations/0019_stream_play_ledger.sql`,
+//!   NOT the ADR daily `usage_ledger`), which in production must key
 //!   `UNIQUE(idempotency_key)` exactly as the ingest library upsert
 //!   converges `ON CONFLICT (idempotency_key)`. [`UsageLedger::record`]
 //!   converges exact redeliveries to one entry, first write wins, and
@@ -281,10 +282,13 @@ fn key_binds_identity(play: &CompletePlay) -> bool {
 pub const LEDGER_WRITE_FENCE_SQL: &str =
     "(SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence";
 
-/// Portable-core model of the Hyperdrive usage-ledger table.
+/// Portable-core model of the Hyperdrive `stream_play_ledger` table.
 ///
 /// Production must key `UNIQUE(idempotency_key)` exactly as the ingest
-/// library upsert converges `ON CONFLICT (idempotency_key)`.
+/// library upsert converges `ON CONFLICT (idempotency_key)`. A zero-row
+/// `DO NOTHING` insert is ambiguous: the api Worker's
+/// `ledger_select_by_key_statement` + `classify_replay` separate exact
+/// redeliveries (`Duplicate`) from conflicting payloads (`Conflict`).
 #[derive(Default, Debug)]
 pub struct UsageLedger {
     entries: Vec<LedgerEntry>,

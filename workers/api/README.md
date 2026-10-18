@@ -17,7 +17,7 @@ workers/api/
   src/handlers.rs     # framework-agnostic HTTP handlers over store traits
   src/worker_entry.rs # Hyperdrive Postgres, DoH DNS, socket dialer, mailer
   src/library.rs      # genres/playlists: opaque ids, owner-scoped authz
-  src/ledger.rs       # usage ledger: validated row intents, monthly folds, SQL
+  src/ledger.rs       # per-play stream ledger: validated row intents, monthly folds, SQL
   src/b64.rs          # strict base64 helpers
   tests/              # acceptance + security-regression tests, including ledger property tests
   wrangler.toml.example  # Worker config template (no secrets)
@@ -32,8 +32,8 @@ fencing, queued replay window), `0013` (session-bound reauth purpose),
 `0015_kek_rotation` (vault `rewrapped_at` marker + `kek_version`
 index, see `docs/security/kek-rotation.md` §2), `0018`
 (staging-only `qa_issued_codes` outbox for the test-code seam below), and
-`0019_usage_ledger.sql` (authoritative usage ledger: validated row intents,
-monthly folds, replay-safe parameterized SQL)
+`0019_stream_play_ledger.sql` (per-play stream ledger: validated row intents,
+monthly folds, replay-safe parameterized SQL; NOT the ADR daily `usage_ledger`)
 define the app-target Postgres schema (PlanetScale via Hyperdrive;
 targets per `migrations/manifest.toml`). The mirror-target `0001`
 (MusicBrainz mirror base), `0014` (import resume cursors + dead-letter
@@ -350,9 +350,15 @@ behavior changes here.
   omit `items`, which single reads return. UPDATE/DELETE affecting 0 rows
   maps to 404 — the owner predicate already makes cross-owner writes
   inexpressible.
-- **Usage ledger:** one row per billed service window with a fresh 128-bit
-  idempotency key; the insert is `ON CONFLICT DO NOTHING`, so a retried
-  finalize inserts zero rows instead of double-billing. Stream seconds must
+- **Per-play stream ledger (`stream_play_ledger`, not the ADR daily
+  `usage_ledger`):** one row per billed play window. Stream plays derive a
+  deterministic `play:{user}:{track}:{play}` key (same derivation as the
+  stream worker; 128/512/512 limits, alphabet `[A-Za-z0-9_:-]`); non-play
+  windows use a fresh 128-bit key minted once and reused across retries. The
+  insert is `ON CONFLICT DO NOTHING`, so a retried finalize inserts zero
+  rows instead of double-billing — then the Worker selects the stored row
+  and classifies exact redelivery (`Duplicate`) vs changed payload
+  (`Conflict`, flagged never converged). Stream seconds must
   equal `ceil(bytes / 48_000)` — the stream worker's nominal rate — or the
   row is rejected; `period_month` derives from `recorded_at`, and monthly
   usage is `SUM` over (`user_id`, `period_month`). All SQL is parameterized;
