@@ -8,8 +8,8 @@
 use nntune_api::ledger::{
     self, classify_replay, derive_play_idempotency_key, fold_monthly_totals,
     ledger_insert_statement, ledger_monthly_total_statement, ledger_select_by_key_statement,
-    new_idempotency_key, period_month_for_timestamp, prepare_ledger_row,
-    prepare_play_ledger_row, LedgerError, LedgerRow, ReplayOutcome,
+    new_idempotency_key, period_month_for_timestamp, prepare_ledger_row, prepare_play_ledger_row,
+    LedgerError, LedgerRow, ReplayOutcome,
 };
 
 // --- Fixtures ---------------------------------------------------------------
@@ -84,8 +84,7 @@ fn prepare_rejects_empty_and_overlong_handles() {
     );
     let wide_track = "t".repeat(512);
     assert!(
-        prepare_ledger_row("user-alice", &wide_track, &key, 48_000, 1, 1_767_225_600)
-            .is_ok(),
+        prepare_ledger_row("user-alice", &wide_track, &key, 48_000, 1, 1_767_225_600).is_ok(),
         "512-char track fits the 512 cap"
     );
 }
@@ -115,14 +114,7 @@ fn prepare_rejects_bad_keys_zero_and_oversized_bytes() {
     // A `play:` key that does not bind its identity fails closed, even with
     // an otherwise valid shape.
     assert_eq!(
-        prepare_ledger_row(
-            "mallory",
-            "t",
-            "play:alice:t:1",
-            48_000,
-            1,
-            1_767_225_600
-        ),
+        prepare_ledger_row("mallory", "t", "play:alice:t:1", 48_000, 1, 1_767_225_600),
         Err(LedgerError::Invalid),
         "forged play key must not bind"
     );
@@ -371,9 +363,8 @@ fn stream_play_feeds_the_ledger_without_silent_replays() {
     // a same-key payload disagreement as a conflict (never a silent rowcount
     // 0). Removing the `play:` acceptance, the identity binding, or the
     // select+classify flow fails this test.
-    let first =
-        prepare_play_ledger_row("user-1", "track-9", "play-7", 40_000, 1, 1_767_225_600)
-            .expect("stream play feeds the ledger");
+    let first = prepare_play_ledger_row("user-1", "track-9", "play-7", 40_000, 1, 1_767_225_600)
+        .expect("stream play feeds the ledger");
     assert_eq!(first.idempotency_key, "play:user-1:track-9:play-7");
     assert_eq!(
         derive_play_idempotency_key("user-1", "track-9", "play-7").unwrap(),
@@ -382,8 +373,7 @@ fn stream_play_feeds_the_ledger_without_silent_replays() {
     );
     // Exact redelivery converges.
     let replay =
-        prepare_play_ledger_row("user-1", "track-9", "play-7", 40_000, 1, 1_767_225_600)
-            .unwrap();
+        prepare_play_ledger_row("user-1", "track-9", "play-7", 40_000, 1, 1_767_225_600).unwrap();
     assert_eq!(
         classify_replay(Some(&first), &replay),
         ReplayOutcome::Duplicate
@@ -408,8 +398,7 @@ fn stream_play_feeds_the_ledger_without_silent_replays() {
     // A genuine second listen carries a different play id and bills its own
     // row instead of converging.
     let second =
-        prepare_play_ledger_row("user-1", "track-9", "play-8", 40_000, 1, 1_767_225_600)
-            .unwrap();
+        prepare_play_ledger_row("user-1", "track-9", "play-8", 40_000, 1, 1_767_225_600).unwrap();
     assert_ne!(second.idempotency_key, first.idempotency_key);
     assert_eq!(
         classify_replay(Some(&first), &second),

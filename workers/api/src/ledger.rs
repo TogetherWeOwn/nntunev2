@@ -347,11 +347,7 @@ pub fn classify_replay(existing: Option<&LedgerRow>, incoming: &LedgerRow) -> Re
         return ReplayOutcome::Conflict;
     }
     if stored.idempotency_key.starts_with("play:")
-        && !key_binds_identity(
-            &stored.idempotency_key,
-            &stored.user_id,
-            &stored.track_id,
-        )
+        && !key_binds_identity(&stored.idempotency_key, &stored.user_id, &stored.track_id)
     {
         return ReplayOutcome::Conflict;
     }
