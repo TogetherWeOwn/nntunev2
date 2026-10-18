@@ -948,6 +948,10 @@ where
         if !mail_global_ok {
             // Alert without including request/user data; this signals fleet-wide
             // outbound-mail pressure while keeping auth starts available.
+            // Still a plain console line: emitting it through the structured
+            // logger needs the request trace threaded through `Request`
+            // first (follow-up slice), and a fresh ID here would break
+            // correlation, so it stays as-is until then.
             #[cfg(target_arch = "wasm32")]
             worker::console_log!("api global mail budget exhausted");
             return;
