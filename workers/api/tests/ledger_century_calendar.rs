@@ -144,6 +144,16 @@ fn fold_separates_february_and_march_at_century_boundaries() {
     let rows = vec![feb_2000, mar_2000, feb_2100, mar_2100, feb_2400, mar_2400];
     let totals = fold_monthly_totals(&rows);
     assert_eq!(totals.len(), 6, "one bucket per century month: {totals:?}");
+    // Every bucket must carry its exact expected month: the per-bucket totals
+    // below cannot catch a mislabeled month on their own (any non-February
+    // label lands in the March arm with matching totals).
+    let mut months: Vec<&str> = totals.iter().map(|t| t.period_month.as_str()).collect();
+    months.sort_unstable();
+    assert_eq!(
+        months,
+        ["2000-02", "2000-03", "2100-02", "2100-03", "2400-02", "2400-03"],
+        "fold must preserve each century month: {totals:?}"
+    );
     for total in &totals {
         // One row per bucket here: exactly 1 s / 48_000 B in February buckets,
         // 2 s / 96_000 B in March buckets.
