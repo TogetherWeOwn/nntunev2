@@ -29,11 +29,10 @@
 	}
 
 	/**
-	 * Ceremony dismissal (the user closed the platform prompt): the
-	 * browser rejects `navigator.credentials.get` with `NotAllowedError`
-	 * or `AbortError` before any server finish call. Branch on
-	 * `error.name` only; server (`ApiError`) paths never carry these
-	 * names, so login stays non-enumerating.
+	 * Retryable ceremony interruption: `NotAllowedError` / `AbortError`
+	 * can mean dismissal, timeout, or an unavailable passkey. The name
+	 * alone cannot identify the cause. Server (`ApiError`) paths never
+	 * carry these names, so login stays non-enumerating.
 	 */
 	function isPasskeyDismissal(error: unknown): boolean {
 		const name = (error as { name?: unknown } | null)?.name;
@@ -96,8 +95,8 @@
 				return;
 			}
 			if (isPasskeyDismissal(error)) {
-				// Dismissed before any server finish call: same message for
-				// every address, so login stays non-enumerating.
+				// Interrupted ceremony: same possible causes for every
+				// address, so login stays non-enumerating.
 				passkeyStatus = 'dismissed';
 				return;
 			}
@@ -124,7 +123,10 @@
 		{#if passkeyStatus === 'unsupported'}
 			<p role="status">This browser does not support passkeys — use an email link instead.</p>
 		{:else if passkeyStatus === 'dismissed'}
-			<p role="alert">You dismissed the passkey prompt — try again when you're ready.</p>
+			<p role="alert">
+				Passkey sign-in didn't complete. Possible reasons: You dismissed the passkey prompt,
+				it timed out, or no usable passkey was available. Try again or use an email link.
+			</p>
 		{:else if passkeyStatus === 'error'}
 			<p role="alert">Sign-in failed. Try again or use an email link.</p>
 		{/if}

@@ -279,11 +279,12 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
     retry countdown measuring elapsed wall-clock time from a per-model
     deadline, with unknown and zero waits never auto-retrying and a
     dismissed modal disposing its timer.
-  - `apps/web/tests/passkey-dismissal.spec.ts` — pins dismissing the
-    passkey prompt telling the user so with the emailed signup code left
-    valid for an in-place retry (and a retryable notice on login), while
-    genuine finish failures and non-dismissal ceremony errors keep their
-    exact current messages and login stays non-enumerating.
+  - `apps/web/tests/passkey-dismissal.spec.ts` — pins an interrupted
+    passkey ceremony showing a retryable notice mentioning dismissal,
+    with the emailed signup code preserved for in-place retry (expiry
+    still applies), while genuine finish failures and other ceremony
+    errors keep their exact current messages and login stays
+    non-enumerating.
   - `apps/web/tests/smoke.spec.ts` — pins the landing BYOP copy with
     working signup/pricing CTAs, the health/readiness endpoints,
     contract routes rendering their e2e hooks, signup/login/magic-link

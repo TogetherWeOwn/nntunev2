@@ -56,11 +56,11 @@
 	}
 
 	/**
-	 * Ceremony dismissal (the user closed the platform prompt): the
-	 * browser rejects `navigator.credentials.create` with `NotAllowedError`
-	 * or `AbortError` before any server finish call, so the emailed code
-	 * and single-use challenge are still valid. Branch on `error.name`
-	 * only; server (`ApiError`) paths never carry these names.
+	 * Retryable ceremony interruption: `NotAllowedError` / `AbortError`
+	 * can mean dismissal, timeout, or an unavailable authenticator. No
+	 * finish call was sent, so the code and challenge are unconsumed
+	 * (their expiry still applies). Server (`ApiError`) paths never
+	 * carry these names.
 	 */
 	function isPasskeyDismissal(error: unknown): boolean {
 		const name = (error as { name?: unknown } | null)?.name;
@@ -126,7 +126,7 @@
 				return;
 			}
 			if (isPasskeyDismissal(error)) {
-				// Dismissed before any server contact: keep the typed code
+				// Interrupted before any finish call: keep the typed code
 				// and the pending challenge so the user retries in place.
 				status = 'dismissed';
 				return;
@@ -160,8 +160,9 @@
 			</p>
 			{#if status === 'dismissed'}
 				<p role="alert">
-					You dismissed the passkey prompt — your code is still valid. Try again when
-					you're ready.
+					Passkey creation didn't complete. Possible reasons: You dismissed the passkey prompt,
+					it timed out, or no authenticator was available. Your code is still valid until it
+					expires. Try again when you're ready.
 				</p>
 			{/if}
 			{#if status === 'code-error'}
