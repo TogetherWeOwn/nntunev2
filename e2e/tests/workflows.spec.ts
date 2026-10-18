@@ -971,7 +971,11 @@ test.describe('deploy.yml carries no backend Worker deploy job', () => {
       commands,
       `wrangler commands stay exactly the evidenced web lanes (got ${JSON.stringify(commands)})`,
     ).toEqual(['deploy --env staging', 'preview']);
-    expect(body).not.toContain('wrangler deploy');
+    // Raw-CLI pin: no `run:` step may invoke a wrangler deploy, even split
+    // across lines (`wrangler \` + newline + `deploy`). A contiguous
+    // `wrangler deploy` substring check misses continuations, so match
+    // across whitespace and line-continuation backslashes.
+    expect(body).not.toMatch(/wrangler[\s\\]+deploy/);
     for (const line of body.split('\n')) {
       if (line.includes('workingDirectory:') || line.includes('working-directory:')) {
         expect(line, `deploy working directory stays apps/web (${line.trim()})`).toContain(
@@ -1031,8 +1035,11 @@ test.describe('deploy.yml carries no backend Worker deploy job', () => {
     // string, no workers/ or production marker — only the exact command pin
     // catches it, and it would deploy the production worker name.
     const bareDeployMutant = jobsBody.replace('command: preview', 'command: deploy');
+    // Multiline raw-CLI deploy: `wrangler \` + newline + `deploy` evades a
+    // contiguous `wrangler deploy` substring check but still deploys.
+    const multilineMutant = `${jobsBody}\n      - run: pnpm exec wrangler \\\n        deploy --env staging\n`;
 
-    for (const mutant of [workerMutant, prodMutant, bareDeployMutant]) {
+    for (const mutant of [workerMutant, prodMutant, bareDeployMutant, multilineMutant]) {
       expect(() => assertDeployGuard(mutant), 'mutant must violate the deploy guard').toThrow();
     }
     // Targeted evidence for which pin each mutant trips.
@@ -1042,5 +1049,6 @@ test.describe('deploy.yml carries no backend Worker deploy job', () => {
     expect(() => assertDeployBody(prodMutant)).toThrow();
     expect(() => assertNoBackendPath(prodMutant)).toThrow();
     expect(() => assertDeployBody(bareDeployMutant)).toThrow();
+    expect(() => assertDeployBody(multilineMutant)).toThrow();
   });
 });
