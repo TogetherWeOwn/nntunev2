@@ -1,6 +1,6 @@
 //! Poison-escape unit pins for `escape_poison_field`.
 //!
-//! Tests-only pin of current behavior (refill-19 slice of TOG-30191);
+//! Tests-only pin of current behavior;
 //! implementation stays untouched. Backslash is escaped first in a single
 //! left-to-right pass, so a lone backslash doubles to `\\` and a following
 //! TAB becomes `\t` without re-escaping the introduced backslash. NUL
@@ -35,7 +35,7 @@ fn lone_backslash_doubles_before_tab_escape() {
     // backslash, backslash, backslash, t). Tab-first ordering would
     // re-escape the introduced backslash and yield five bytes instead.
     let out = escape_poison_field("\\\t");
-    assert_eq!(out.as_bytes(), &[b'\\', b'\\', b'\\', b't']);
+    assert_eq!(out.as_bytes(), b"\\\\\\t");
     assert_eq!(out, format!("{}{}", "\\\\", "\\t"));
 }
 
