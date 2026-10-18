@@ -714,13 +714,38 @@ pub trait Store {
 }
 
 /// Magic-link delivery. The token is passed only to the mailer; it must
-/// never be logged by implementations.
+/// never be logged by implementations. Dropping the returned future must
+/// cancel the underlying I/O, not just stop polling it.
 pub trait Mailer {
     fn send_magic_link(
         &self,
         email: &str,
         token: &str,
     ) -> impl Future<Output = Result<(), StoreError>>;
+}
+
+// Only the admitted send is timed: issuance and staging capture have already
+// completed. A timeout follows the ordinary ignored delivery-error path.
+pub(crate) async fn deliver_mail_with_deadline(
+    send: impl Future<Output = Result<(), StoreError>>,
+) -> Result<(), StoreError> {
+    let duration = std::time::Duration::from_secs(5);
+    #[cfg(target_arch = "wasm32")]
+    let deadline = worker::Delay::from(duration);
+    #[cfg(not(target_arch = "wasm32"))]
+    let deadline = futures_timer::Delay::new(duration);
+    let mut deadline = std::pin::pin!(deadline);
+    let mut send = std::pin::pin!(send);
+    std::future::poll_fn(|cx| {
+        // Worker Delay arms on first poll, so poll it before starting I/O.
+        // Expiry wins if both become ready together; there is no late retry.
+        if deadline.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(Err(StoreError));
+        }
+        send.as_mut().poll(cx)
+    })
+    .await
+    // Both futures are dropped here, before the public response is built.
 }
 
 /// Bounded outbound probe for `test connection`. Implementations dial
@@ -1248,7 +1273,7 @@ where
                     .record_qa_issued_code(email, &token, self.now)
                     .await;
             }
-            let _ = self.mailer.send_magic_link(email, &token).await;
+            let _ = deliver_mail_with_deadline(self.mailer.send_magic_link(email, &token)).await;
         }
     }
 
