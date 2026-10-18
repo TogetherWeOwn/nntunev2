@@ -84,6 +84,11 @@ target = "mirror"
 sha256 = "62ceb24df9c5ea7032fc3cf4e48e5e10f87d909639fa469ed79b4dfcd92009d6"
 
 [[migration]]
+file = "0018_qa_issued_codes.sql"
+target = "app"
+sha256 = "f87059e056224631b17463fd99d63cefb060f499c3e41738258e0e43a7244c68"
+
+[[migration]]
 file = "0019_native_rest_credentials.sql"
 target = "app"
 sha256 = "0784422be11365318a5c9bf8e66bda1f0f7e233d836a9e809182e28d87da4b56"

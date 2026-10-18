@@ -19,6 +19,13 @@ SESSION_TTL_SECS = "86400"
 # INVITES_REQUIRED = "true"
 # ALLOW_LOOPBACK_DEV = "true"          # local dev only, never staging/prod
 # EMAIL_WEBHOOK_URL = "https://<mail-provider-webhook>"  # magic-link delivery
+# Staging-only emailed-code retrieval seam (POST /api/test-codes, returns
+# the issued code for example.test mailboxes without minting; see
+# docs/security/threat-model.md). Staging env ONLY — never set on prod:
+# QA_CODE_SEAM = "1" arms capture + retrieval, and QA_AUTH_TOKEN (secret,
+# below) authenticates retrieval. Either missing answers the seam path
+# with the plain unknown-route 404.
+# QA_CODE_SEAM = "1"
 # Rate-limit defaults live in src/rate_limit.rs (documented there: auth
 # 10/60s, vault test-connection 5/60s per account and 25/60s per IP,
 # single-sourced with src/vault.rs). The Worker entry reads these
@@ -88,3 +95,8 @@ SESSION_TTL_SECS = "86400"
 #                                 (stored per row; lookup is by the exact
 #                                 composite (pepper_version, key_hmac)).
 #   EMAIL_API_KEY                 transactional email provider key (magic-link delivery)
+#   QA_AUTH_TOKEN                 bearer for POST /api/test-codes (staging QA
+#                                 seam only). High-entropy; same value as the
+#                                 e2e-staging QA_AUTH_TOKEN secret. Staged only
+#                                 together with QA_CODE_SEAM=1 (staging env);
+#                                 never on prod.

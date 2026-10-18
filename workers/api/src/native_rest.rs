@@ -123,9 +123,9 @@ fn base62_encode(bytes: &[u8]) -> String {
     let mut start = 0usize;
     while start < num.len() {
         let mut rem: u16 = 0;
-        for i in start..num.len() {
-            let cur = (rem << 8) | u16::from(num[i]);
-            num[i] = (cur / 62) as u8;
+        for byte in num.iter_mut().skip(start) {
+            let cur = (rem << 8) | u16::from(*byte);
+            *byte = (cur / 62) as u8;
             rem = cur % 62;
         }
         out.push(BASE62_ALPHABET[rem as usize]);
