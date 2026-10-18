@@ -5,9 +5,10 @@
 //! the first `MAX` bytes would otherwise parse (trailing-whitespace padding
 //! keeps the padded fixture valid JSON, so only the size gate rejects it),
 //! corrupt under-cap bytes are the same 500, an under-cap valid result with
-//! a matching digest is [`Plan::AlreadyDone`], and exactly-`MAX` invalid
-//! JSON still 500s (the gate is `>`, so the boundary reaches the parser
-//! and fails there).
+//! a matching digest is [`Plan::AlreadyDone`], a valid result padded to
+//! exactly `MAX` is also [`Plan::AlreadyDone`] (the gate is `>`, pinning the
+//! boundary against a `>=` regression), and exactly-`MAX` invalid JSON still
+//! 500s via the parser.
 
 use nntune_core::par2::scratch::object_key_for_file_name;
 use nntune_repair::contract::{
@@ -131,4 +132,22 @@ fn exactly_at_cap_invalid_json_still_500s() {
     assert_eq!(body.len(), MAX_RESULT_BYTES);
     let err = plan(&req, Some(&body), &digest).unwrap_err();
     assert_eq!((err.status, err.code), (500, "repair_unavailable"));
+}
+
+#[test]
+fn valid_stored_result_exactly_at_cap_is_already_done() {
+    let req = dummy_req();
+    let digest = manifest_digest(&manifest());
+    let base = valid_result_bytes(&digest);
+    let body = padded_to(&base, MAX_RESULT_BYTES);
+    assert_eq!(body.len(), MAX_RESULT_BYTES);
+    serde_json::from_slice::<RepairResult>(&body).unwrap();
+
+    match plan(&req, Some(&body), &digest).unwrap() {
+        Plan::AlreadyDone(result) => {
+            assert_eq!(result.manifest_digest, digest);
+            assert_eq!(result.status, RepairStatus::Repaired);
+        }
+        other => panic!("expected AlreadyDone, got {other:?}"),
+    }
 }
