@@ -17,7 +17,13 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from check_traceability import check, main, parse_list_output, parse_matrix
+from check_traceability import (
+    TraceabilityError,
+    check,
+    main,
+    parse_list_output,
+    parse_matrix,
+)
 
 LIST_TWO_FILES = """\
 Listing tests:
@@ -201,6 +207,133 @@ class CheckTraceabilityTest(unittest.TestCase):
                     2,
                 )
             self.assertIn("::error::traceability", buf.getvalue())
+
+    def test_check_matrix_invalid_utf8_raises_naming_matrix(self):
+        # check() lines 171-177: an undecodable matrix fails closed with
+        # the matrix path named, not a bare UnicodeDecodeError.
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix_path = write_tree(tmp, MATRIX_COVERING_BOTH, LIST_TWO_FILES)
+            matrix_path.write_bytes(b"# \xff\xfe not utf-8\n")
+            with open(os.path.join(tmp, "list.txt"), encoding="utf-8") as fh:
+                list_text = fh.read()
+            with self.assertRaises(TraceabilityError) as ctx:
+                check(Path(tmp), matrix_path, list_text)
+            self.assertIn(str(matrix_path), str(ctx.exception))
+            self.assertIn("cannot read matrix", str(ctx.exception))
+
+    def test_main_matrix_invalid_utf8_is_exit_2_naming_matrix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix_path = write_tree(tmp, MATRIX_COVERING_BOTH, LIST_TWO_FILES)
+            matrix_path.write_bytes(b"# \xff\xfe not utf-8\n")
+            list_path = os.path.join(tmp, "list.txt")
+            with contextlib.redirect_stdout(
+                io.StringIO()
+            ) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(
+                    main(
+                        [
+                            "--root",
+                            tmp,
+                            "--matrix",
+                            str(matrix_path),
+                            "--list-output",
+                            list_path,
+                        ]
+                    ),
+                    2,
+                )
+            combined = out.getvalue() + err.getvalue()
+            self.assertIn("::error::traceability", combined)
+            self.assertIn("cannot read matrix", combined)
+            self.assertIn(str(matrix_path), combined)
+            self.assertNotIn("Traceback", combined)
+
+    def test_main_list_invalid_utf8_is_exit_2_matrix_never_read(self):
+        # The list-output read fails before check() runs, so even a
+        # missing matrix must not surface: the annotation names the
+        # list output, never the matrix.
+        with tempfile.TemporaryDirectory() as tmp:
+            write_tree(tmp, MATRIX_COVERING_BOTH, LIST_TWO_FILES)
+            list_path = os.path.join(tmp, "list.txt")
+            Path(list_path).write_bytes(b"\xff\xfe not utf-8\n")
+            missing_matrix = os.path.join(tmp, "docs", "missing.md")
+            with contextlib.redirect_stdout(
+                io.StringIO()
+            ) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(
+                    main(
+                        [
+                            "--root",
+                            tmp,
+                            "--matrix",
+                            missing_matrix,
+                            "--list-output",
+                            list_path,
+                        ]
+                    ),
+                    2,
+                )
+            combined = out.getvalue() + err.getvalue()
+            self.assertIn("::error::traceability", combined)
+            self.assertIn("cannot read list output", combined)
+            self.assertNotIn("cannot read matrix", combined)
+            self.assertNotIn("Traceback", combined)
+
+    def test_main_directory_as_matrix_is_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_tree(tmp, MATRIX_COVERING_BOTH, LIST_TWO_FILES)
+            list_path = os.path.join(tmp, "list.txt")
+            matrix_dir = os.path.join(tmp, "docs")
+            with contextlib.redirect_stdout(
+                io.StringIO()
+            ) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(
+                    main(
+                        [
+                            "--root",
+                            tmp,
+                            "--matrix",
+                            matrix_dir,
+                            "--list-output",
+                            list_path,
+                        ]
+                    ),
+                    2,
+                )
+            combined = out.getvalue() + err.getvalue()
+            self.assertIn("::error::traceability", combined)
+            self.assertIn("cannot read matrix", combined)
+            self.assertIn(matrix_dir, combined)
+            self.assertNotIn("Traceback", combined)
+
+    def test_main_directory_as_list_is_exit_2_matrix_never_read(self):
+        # Same ordering pin as the undecodable list: a directory
+        # list-output fails before the matrix is read, so a missing
+        # matrix must stay silent.
+        with tempfile.TemporaryDirectory() as tmp:
+            write_tree(tmp, MATRIX_COVERING_BOTH, LIST_TWO_FILES)
+            missing_matrix = os.path.join(tmp, "docs", "missing.md")
+            with contextlib.redirect_stdout(
+                io.StringIO()
+            ) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(
+                    main(
+                        [
+                            "--root",
+                            tmp,
+                            "--matrix",
+                            missing_matrix,
+                            "--list-output",
+                            tmp,
+                        ]
+                    ),
+                    2,
+                )
+            combined = out.getvalue() + err.getvalue()
+            self.assertIn("::error::traceability", combined)
+            self.assertIn("cannot read list output", combined)
+            self.assertNotIn("cannot read matrix", combined)
+            self.assertNotIn("Traceback", combined)
 
 
 if __name__ == "__main__":
