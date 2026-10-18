@@ -10,10 +10,11 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from check_archive_bindings import ManifestError, archive_bindings, main
+from check_archive_bindings import ManifestError, _bucket_names, archive_bindings, main
 
 CLEAN_MANIFEST = """\
 name = "nntune-stream"
@@ -392,6 +393,68 @@ def test_non_utf8_unrelated_path_does_not_break_scan():
     assert archive_bindings(repo) == []
 
 
+def test_non_git_directory_fails_listing_closed():
+    tmp = Path(tempfile.mkdtemp())
+    for root in ("workers", "apps"):
+        (tmp / root).mkdir()
+    stream = tmp / "workers" / "stream"
+    stream.mkdir(parents=True)
+    (stream / "wrangler.toml").write_text(CLEAN_MANIFEST)
+    _assert_rejected(tmp, "cannot list tracked repository files")
+
+
+def test_failing_git_binary_fails_listing_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": CLEAN_MANIFEST})
+    with mock.patch(
+        "check_archive_bindings.subprocess.run",
+        side_effect=OSError("git binary missing"),
+    ):
+        _assert_rejected(repo, "cannot list tracked repository files")
+
+
+def test_git_nonzero_exit_fails_listing_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": CLEAN_MANIFEST})
+    failure = subprocess.CalledProcessError(128, ["git", "ls-files", "-z"])
+    with mock.patch(
+        "check_archive_bindings.subprocess.run",
+        side_effect=failure,
+    ):
+        _assert_rejected(repo, "cannot list tracked repository files")
+
+
+def test_manifest_directory_fails_read_closed():
+    # A directory can never survive the is_file() candidate filter in
+    # archive_bindings, so pin the read failure at the _bucket_names level.
+    tmp = Path(tempfile.mkdtemp())
+    manifest_dir = tmp / "wrangler.toml"
+    manifest_dir.mkdir()
+    try:
+        _bucket_names(manifest_dir)
+    except ManifestError as exc:
+        assert "cannot read TOML config" in str(exc), f"unexpected error: {exc!r}"
+        assert str(manifest_dir) in str(exc), f"manifest not named: {exc!r}"
+    else:
+        raise AssertionError("expected directory manifest to fail")
+
+
+def test_invalid_utf8_manifest_fails_read_closed():
+    tmp = Path(tempfile.mkdtemp())
+    subprocess.run(["git", "init", "--quiet", str(tmp)], check=True)
+    for root in ("workers", "apps"):
+        (tmp / root).mkdir()
+    manifest = tmp / "workers" / "stream" / "wrangler.toml"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_bytes(b"\xff\xfe\x00not-utf8 \x80\x81")
+    subprocess.run(["git", "-C", str(tmp), "add", "--all"], check=True)
+    try:
+        archive_bindings(tmp)
+    except ManifestError as exc:
+        assert "cannot read TOML config" in str(exc), f"unexpected error: {exc!r}"
+        assert "wrangler.toml" in str(exc), f"manifest not named: {exc!r}"
+    else:
+        raise AssertionError("expected invalid-UTF8 manifest to fail")
+
+
 def test_current_repo_manifests_pass():
     repo = Path(__file__).resolve().parent.parent.parent
     hits = archive_bindings(repo)
@@ -434,5 +497,10 @@ if __name__ == "__main__":
     test_array_environment_table_fails_closed()
     test_invalid_env_table_fails_closed()
     test_non_utf8_unrelated_path_does_not_break_scan()
+    test_non_git_directory_fails_listing_closed()
+    test_failing_git_binary_fails_listing_closed()
+    test_git_nonzero_exit_fails_listing_closed()
+    test_manifest_directory_fails_read_closed()
+    test_invalid_utf8_manifest_fails_read_closed()
     test_current_repo_manifests_pass()
     print("check_archive_bindings: all tests passed")
