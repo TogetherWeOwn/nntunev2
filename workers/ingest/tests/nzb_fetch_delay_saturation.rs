@@ -1,8 +1,9 @@
 //! Hostile NZB-fetch chunk-delay saturation pin (tests-only).
 //!
-//! Refill-19 slice of TOG-30191: pins the current `fetch_nzb` reported-delay
-//! accounting against hostile `delay_ms` values without touching the
-//! implementation. The fetcher accumulates per-chunk `delay_ms` with
+//! Refill-19 slice of the NNTune next-ready-work roadmap: pins the current
+//! `fetch_nzb` reported-delay accounting against hostile `delay_ms` values
+//! without touching the implementation. The fetcher accumulates per-chunk
+//! `delay_ms` with
 //! `saturating_add` and rejects at or beyond `config.timeout_ms`; this suite
 //! pins that a saturating sum — never a wrap — drives the timeout.
 //!
