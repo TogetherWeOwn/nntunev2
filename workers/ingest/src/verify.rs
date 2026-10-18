@@ -1809,7 +1809,13 @@ fn match_set_file<'a>(
     // Length fallback needs the true assembled length: only meaningful
     // when every segment decoded.
     if segs.len() >= total_segments && segs.iter().all(|s| !s.missing) {
-        let len: u64 = segs.iter().map(|s| s.size).sum();
+        // Checked sum: on overflow there is no true assembled length, so
+        // skip the length fallback (no match) and let the loader fail
+        // closed with the permanent geometry error. An unchecked sum would
+        // panic in debug and could match a wrapped length in release.
+        let len = segs
+            .iter()
+            .try_fold(0u64, |acc, s| acc.checked_add(s.size))?;
         let mut found: Option<(&RecoverySet, &RecoveryFile)> = None;
         for set in sets {
             for entry in set.files.values() {
