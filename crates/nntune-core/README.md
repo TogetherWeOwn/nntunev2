@@ -53,9 +53,14 @@ wiring consumes (separate intake card, untouched here):
 - **Stable codes:** `TransportRejection::code()` returns
   `transport_tls_required` (`TlsRequired`), `transport_port_not_allowed`
   (`PortNotAllowed(port)` — the payload never changes the code), and
-  `transport_cancelled` (`Cancelled`). The native connect error embeds the
-  same code in its `io::Error` message (`InvalidInput`); the Workers
-  `connect_pinned` error carries it in `worker::Error::RustError`.
+  `transport_cancelled` (`Cancelled`). Both pinned entries funnel through
+  the shared `pinned_rejection_message` helper before any dial, so they
+  embed the same codes by construction: native `connect_pinned` in its
+  `io::Error` message (`InvalidInput`), Workers `connect_pinned` in
+  `worker::Error::RustError`. The helper's mapping is unit-tested natively
+  and a wiring guard fails if either entry stops calling it first (the
+  Workers socket open itself stays wasm32 compile-checked — CI has no wasm
+  test runner).
 - **Names-only diagnostics:** `Display`/`Debug` for `TransportRejection` and
   `ValidatedEndpoint` render host, port and code material only — never the
   configured username or password. Shared path is `std`-only (cancellation

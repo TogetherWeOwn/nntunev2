@@ -19,10 +19,12 @@
 //! - **Stable codes:** [`TransportRejection::code`] returns
 //!   `transport_tls_required`, `transport_port_not_allowed`
 //!   (port payload never changes the code), `transport_cancelled`. The
-//!   pinned entry points run the same validation before any dial and embed
-//!   the same codes: native `connect_pinned` (`io::Error`, `InvalidInput`)
-//!   and wasm32 `WorkerTransport::connect_pinned`
-//!   (`worker::Error::RustError`). The general `connect` entry points stay
+//!   pinned entry points funnel through [`pinned_rejection_message`] before
+//!   any dial and embed the same codes: native `connect_pinned`
+//!   (`io::Error`, `InvalidInput`) and wasm32
+//!   `WorkerTransport::connect_pinned` (`worker::Error::RustError`), with a
+//!   natively-run wiring guard failing if either entry stops calling the
+//!   helper first. The general `connect` entry points stay
 //!   permissive on purpose: the stream/ingest fixture harnesses and the
 //!   client unit tests dial plaintext loopback servers through them
 //!   (pool/stream call-site changes are out of scope); the NZB fetch path
@@ -127,6 +129,21 @@ pub fn validate_nntp_endpoint(
     })
 }
 
+/// Shared rejection renderer for the pinned entry points.
+///
+/// Returns the names-only rejection message when `config` fails
+/// [`validate_nntp_endpoint`], `None` when it passes. Both the native
+/// `connect_pinned` (`io::Error`, `InvalidInput`) and the wasm32
+/// `WorkerTransport::connect_pinned` (`worker::Error::RustError`) delegate to
+/// this, so the two entries embed the same stable codes by construction.
+/// `std`-only: natively unit-tested (the Workers socket open itself stays
+/// wasm32 compile-checked — CI has no wasm test runner).
+pub fn pinned_rejection_message(config: &NntpConfig) -> Option<String> {
+    validate_nntp_endpoint(config)
+        .err()
+        .map(|rejection| rejection.to_string())
+}
+
 /// Cooperative cancellation combinator for the fetch path: resolves the
 /// fetch unless `cancel` resolves first.
 ///
@@ -153,4 +170,113 @@ where
         }
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    const SENTINEL_USER: &str = "sentinel-user-9f3c";
+    const SENTINEL_PASS: &str = "sentinel-pass-7a1e";
+
+    fn config(host: &str, port: u16, tls: bool) -> NntpConfig {
+        NntpConfig {
+            host: host.to_owned(),
+            port,
+            tls,
+            username: Some(SENTINEL_USER.to_owned()),
+            password: Some(SENTINEL_PASS.to_owned()),
+            timeout: Duration::from_millis(200),
+            max_pipelined: 1,
+            max_article_bytes: crate::transport::MAX_ARTICLE_BYTES,
+        }
+    }
+
+    fn assert_names_only(msg: &str, code: &str) {
+        assert!(
+            msg.contains(code),
+            "rejection message must carry stable code {code}: {msg}"
+        );
+        assert!(
+            !msg.contains(SENTINEL_USER) && !msg.contains(SENTINEL_PASS),
+            "rejection message must stay names-only: {msg}"
+        );
+    }
+
+    /// The shared helper rejects TLS-off configs on any port (kills a mutant
+    /// that weakens the helper: the mutant would return `None` and the pinned
+    /// entries would dial plaintext).
+    #[test]
+    fn pinned_helper_rejects_tls_off_on_any_port() {
+        for port in [80, 119, 563] {
+            let msg = pinned_rejection_message(&config("127.0.0.1", port, false))
+                .expect("TLS-off config must be rejected");
+            assert_names_only(&msg, "transport_tls_required");
+        }
+    }
+
+    /// The shared helper rejects TLS-on configs on off-allowlist ports and
+    /// accepts the allowlist (kills a mutant that weakens port policy).
+    #[test]
+    fn pinned_helper_enforces_port_allowlist() {
+        let msg = pinned_rejection_message(&config("127.0.0.1", 80, true))
+            .expect("port-80 config must be rejected");
+        assert_names_only(&msg, "transport_port_not_allowed");
+
+        for port in ALLOWED_NNTP_PORTS {
+            assert!(
+                pinned_rejection_message(&config("news.example", port, true)).is_none(),
+                "allowlisted TLS port {port} must pass"
+            );
+        }
+    }
+
+    /// TLS-first order through the shared helper: a TLS-off config on an
+    /// off-allowlist port is a TLS rejection, never a port rejection.
+    #[test]
+    fn pinned_helper_checks_tls_before_ports() {
+        let msg = pinned_rejection_message(&config("127.0.0.1", 80, false))
+            .expect("TLS-off config must be rejected");
+        assert_names_only(&msg, "transport_tls_required");
+    }
+
+    /// Wiring guard: fails if a pinned entry point stops funnelling through
+    /// the shared helper before its dial. Kills the bypass mutant (validation
+    /// dropped or reordered after the dial) on targets CI cannot execute
+    /// (the Workers entry is wasm32-only; CI compile-checks it).
+    fn assert_pinned_entry_wires_through_helper(source: &str, file: &str, dial: &str) {
+        let fn_start = source.find("fn connect_pinned").unwrap_or_else(|| {
+            panic!("{file} must define connect_pinned");
+        });
+        let body = &source[fn_start..];
+        let helper_pos = body.find("pinned_rejection_message").unwrap_or_else(|| {
+            panic!("{file} connect_pinned must call pinned_rejection_message");
+        });
+        let dial_pos = body.find(dial).unwrap_or_else(|| {
+            panic!("{file} connect_pinned must delegate to {dial}");
+        });
+        assert!(
+            helper_pos < dial_pos,
+            "{file} connect_pinned must validate before dialling"
+        );
+    }
+
+    #[test]
+    fn worker_pinned_entry_wires_through_shared_helper_before_dial() {
+        assert_pinned_entry_wires_through_helper(
+            include_str!("transports/worker_socket.rs"),
+            "worker_socket.rs",
+            "Self::connect(config)",
+        );
+    }
+
+    #[test]
+    fn native_pinned_entry_wires_through_shared_helper_before_dial() {
+        assert_pinned_entry_wires_through_helper(
+            include_str!("transports/tokio_tls.rs"),
+            "tokio_tls.rs",
+            "connect(config).await",
+        );
+    }
 }

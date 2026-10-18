@@ -94,11 +94,8 @@ pub async fn connect(config: &NntpConfig) -> io::Result<NativeTlsTransport> {
 /// credentials. The NZB intake wiring consumes this (not [`connect`]) plus
 /// [`crate::pinned_transport::with_cancel`] for the fetch itself.
 pub async fn connect_pinned(config: &NntpConfig) -> io::Result<NativeTlsTransport> {
-    if let Err(rejection) = crate::pinned_transport::validate_nntp_endpoint(config) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            rejection.to_string(),
-        ));
+    if let Some(message) = crate::pinned_transport::pinned_rejection_message(config) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
     }
     connect(config).await
 }

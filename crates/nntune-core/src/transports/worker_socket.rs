@@ -49,9 +49,10 @@ async fn with_timeout<T>(
 
 impl WorkerTransport {
     /// Pinned NZB-fetch entry point (wasm32): runs the fail-closed
-    /// [`crate::pinned_transport`] policy (TLS-first, then port allowlist
-    /// `119`/`563`) BEFORE opening the `connect()` socket, then delegates to
-    /// [`Self::connect`].
+    /// [`crate::pinned_transport`] policy via
+    /// [`crate::pinned_transport::pinned_rejection_message`] (TLS-first, then
+    /// port allowlist `119`/`563`) BEFORE opening the `connect()` socket,
+    /// then delegates to [`Self::connect`].
     ///
     /// A TLS-off or off-allowlist config fails here with
     /// `worker::Error::RustError` whose message carries the stable code
@@ -59,8 +60,8 @@ impl WorkerTransport {
     /// diagnostic is names-only, never credentials. The NZB intake wiring on
     /// Workers consumes this (not [`Self::connect`]).
     pub fn connect_pinned(config: &NntpConfig) -> worker::Result<Self> {
-        if let Err(rejection) = crate::pinned_transport::validate_nntp_endpoint(config) {
-            return Err(worker::Error::RustError(rejection.to_string()));
+        if let Some(message) = crate::pinned_transport::pinned_rejection_message(config) {
+            return Err(worker::Error::RustError(message));
         }
         Self::connect(config)
     }
