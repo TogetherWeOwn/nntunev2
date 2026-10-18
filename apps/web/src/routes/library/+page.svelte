@@ -4,25 +4,28 @@
 		browserStorage,
 		clearSnapshot,
 		invalidateLibraryCache,
-		LIBRARY_AUTH_TRANSITION_KEY,
-		loadSnapshot,
-		saveSnapshot,
 		staleLabel,
-		toLibraryItems,
 		type LibraryItem
 	} from '#lib/library/cache.js';
+	import { createLibraryRefresher } from '#lib/library/refresh.js';
 
 	let items: LibraryItem[] = $state([]);
 	let staleAt: string | null = $state(null);
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
 	let libraryUnavailable = $state(false);
-	let authenticatedThisLoad = false;
-	let inMemorySnapshot: ReturnType<typeof saveSnapshot> | null = null;
-	let activeRequest: AbortController | null = null;
-	let requestGeneration = 0;
 
-	const LIBRARY_REQUEST_TIMEOUT_MS = 10_000;
+	const refresher = createLibraryRefresher({
+		sessionStorage: () => browserStorage('session'),
+		invalidateLibraryCache,
+		onStateChange: (state) => {
+			items = state.items;
+			staleAt = state.staleAt;
+			loading = state.loading;
+			loadError = state.loadError;
+			libraryUnavailable = state.libraryUnavailable;
+		}
+	});
 
 	// e2e contract hooks (e2e/helpers/contract.ts TESTIDS) owned by sibling
 	// slices: usage metering, plan-limit enforcement and the player land with
@@ -42,92 +45,12 @@
 		return typeof artist === 'string' && artist.trim().length > 0 ? artist : null;
 	}
 
-	async function refresh(fetchFn: typeof fetch = fetch): Promise<void> {
-		if (activeRequest) return;
-		const generation = ++requestGeneration;
-		loading = true;
-		loadError = null;
-		libraryUnavailable = false;
-		const controller = new AbortController();
-		activeRequest = controller;
-		let timeoutId: ReturnType<typeof setTimeout> | undefined;
-		const timeout = new Promise<never>((_, reject) => {
-			timeoutId = setTimeout(() => {
-				controller.abort();
-				reject(new Error('library request timed out'));
-			}, LIBRARY_REQUEST_TIMEOUT_MS);
-		});
-
-		try {
-			const response = await Promise.race([
-				fetchFn('/api/library', { credentials: 'include', signal: controller.signal }),
-				timeout
-			]);
-			if (generation !== requestGeneration) return;
-			if (response.status === 404) {
-				// The list endpoint has not landed yet. Do not treat a 404 as
-				// session verification or expose a previously saved snapshot.
-				authenticatedThisLoad = false;
-				inMemorySnapshot = null;
-				items = [];
-				staleAt = null;
-				libraryUnavailable = true;
-				return;
-			}
-			if (response.status === 401 || response.status === 403) {
-				authenticatedThisLoad = false;
-				inMemorySnapshot = null;
-				invalidateLibraryCache();
-				items = [];
-				staleAt = null;
-				loadError = 'You are signed out or do not have access to this library.';
-				return;
-			}
-			if (!response.ok) throw new Error(`library request failed (${response.status})`);
-			const payload = await Promise.race([response.json(), timeout]);
-			if (generation !== requestGeneration) return;
-			const fresh = toLibraryItems(payload);
-			if (fresh === null) throw new Error('library response has an invalid shape');
-			authenticatedThisLoad = true;
-			items = fresh;
-			staleAt = null;
-			const persistedSnapshot = saveSnapshot(browserStorage('session'), fresh);
-			inMemorySnapshot = { ...persistedSnapshot, items: fresh };
-		} catch {
-			if (generation !== requestGeneration) return;
-			// Do not trust a tab's snapshot until this page has verified its session.
-			const snapshot = authenticatedThisLoad
-				? (inMemorySnapshot ?? loadSnapshot(browserStorage('session')))
-				: null;
-			if (snapshot) {
-				items = snapshot.items;
-				staleAt = snapshot.savedAt;
-			} else {
-				items = [];
-				staleAt = null;
-				loadError = 'Library is not reachable right now.';
-			}
-		} finally {
-			if (timeoutId !== undefined) clearTimeout(timeoutId);
-			if (activeRequest === controller) {
-				activeRequest = null;
-				if (generation === requestGeneration) loading = false;
-			}
-		}
+	function refresh(): Promise<void> {
+		return refresher.refresh();
 	}
 
 	function handleAuthTransition(event: StorageEvent): void {
-		if (event.key !== LIBRARY_AUTH_TRANSITION_KEY) return;
-		requestGeneration += 1;
-		activeRequest?.abort();
-		activeRequest = null;
-		authenticatedThisLoad = false;
-		inMemorySnapshot = null;
-		clearSnapshot(browserStorage('session'));
-		items = [];
-		staleAt = null;
-		loadError = 'Your session changed. Sign in again to see this library.';
-		loading = false;
+		refresher.handleAuthTransition(event);
 	}
 
 	onMount(() => {
@@ -136,8 +59,7 @@
 		clearSnapshot(browserStorage('local'));
 		void refresh();
 		return () => {
-			requestGeneration += 1;
-			activeRequest?.abort();
+			refresher.dispose();
 			window.removeEventListener('storage', handleAuthTransition);
 		};
 	});
