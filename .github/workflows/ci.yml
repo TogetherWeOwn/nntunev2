@@ -533,6 +533,8 @@ jobs:
         run: python3 .github/scripts/check_archive_bindings.py
       - name: Unit-test the guard
         run: python3 .github/scripts/test_check_archive_bindings.py
+      - name: Unit-test the guard byte paths
+        run: python3 .github/scripts/test_archive_manifest_byte_paths.py
 
   # Docs internal-link lint: broken file links/anchors in changed markdown
   # (roadmap, matrix, ops, ADRs) fail the build. The lint step is scoped to
