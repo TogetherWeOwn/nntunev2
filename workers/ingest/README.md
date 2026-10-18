@@ -363,31 +363,57 @@ invocation is claimed here.
 
 ## Slice T2 — retry budget + DLQ (this slice)
 
-- Retry budget (`src/retry.rs`): 1 delivery + 4 redeliveries
-  (`jobs::MAX_ATTEMPTS` = 5 = `CONSUMER_MAX_RETRIES` + 1 =
-  `PAYLOAD_RETRY_ATTEMPTS` + 1, enforced by a compile-time assert).
-  The durable checkpoint in `INGEST_STATE` is authoritative because Cloudflare
-  redelivers the unchanged Queue body. `decide_checkpoint` increments the
-  checkpoint before returning Retry; the handler must persist it before calling
-  `retry_with_options`. Backoff is derived from the payload-fetch schedule.
+- Retry budget (`src/retry.rs`, decided by `decide_checkpoint`): 1 delivery
+  + 4 redeliveries (`MAX_ATTEMPTS = 5` in `src/jobs.rs` =
+  `CONSUMER_MAX_RETRIES = 4` + 1 in `src/retry.rs` =
+  `PAYLOAD_RETRY_ATTEMPTS = 4` + 1 in `src/dispatch.rs`, enforced by the
+  compile-time asserts in `src/retry.rs`).
+  The durable checkpoint in `INGEST_STATE` is authoritative
+  (`JobCheckpoint.attempt`, 1-based, in `src/jobs.rs`) because Cloudflare
+  redelivers the unchanged Queue body (pinned by the
+  `poison_job_burns_durable_budget_on_unchanged_queue_body` test in
+  `tests/retry_dlq.rs`). `decide_checkpoint` increments the
+  checkpoint (`record_redelivery` in `src/retry.rs`) before returning
+  Retry; the handler must persist it (`plan_settlement`/`persist` in
+  `src/queue_consumer.rs`) before calling `retry_with_options`. Backoff
+  is derived from the payload-fetch schedule (`retry_delay_secs` in
+  `src/retry.rs` via `payload_retry_delay_ms` in `src/dispatch.rs`:
+  5/15/30/60 s).
   One settlement is exempt from the budget: a progress continuation
-  (`JobError::progress` → `Disposition::Continue`, today only the probe
-  budget stop above) persists new checkpoint progress, enqueues a fresh
-  message copy, and acks — no attempt increment, no native retry slot —
+  (`JobError::progress` → `Disposition::Continue` in `src/retry.rs`,
+  today only the probe budget stop above) persists new checkpoint
+  progress, enqueues a fresh message copy (`send_continuation`, 5 s delay
+  per `PROBE_CONTINUATION_DELAY_SECS = 5` in `src/queue_consumer.rs`),
+  and acks — no attempt increment, no native retry slot —
   because each continuation must carry new progress toward a finite total.
-  The consumer settles **per message**, so one poison job costs retries but
+  The consumer settles **per message** (`ingest_queue` loops the batch's
+  raw messages and settles each via `process_raw_message` → `process_message`
+  → `plan_settlement` in `src/queue_consumer.rs`; `drive_batch` in
+  `src/retry.rs` encodes the same per-message semantics for tests),
+  so one poison job costs retries but
   does not head-of-line block valid jobs. Permanent failures skip the budget
-  and quarantine at once; quarantine marks the checkpoint Failed before ack. If a DLQ send fails, the consumer must call `retry_with_options` with a delay
-  (or return an error) for that message; merely skipping `ack()` and returning
+  and quarantine at once; quarantine marks the checkpoint Failed
+  (`fail_checkpoint` in `src/retry.rs`, persisted before settle) before
+  ack. If a DLQ send fails, the consumer must call `retry_with_options` with a delay
+  (or return an error) for that message (`process_raw_message` in
+  `src/queue_consumer.rs` retries after `UNPERSISTED_RETRY_SECS = 5 s`);
+  merely skipping `ack()` and returning
   implicitly acknowledges it. Each retry also spends one of the four native
-  `max_retries` slots, after which Cloudflare moves the raw body to its native
+  `max_retries` slots (`max_retries = 4` in `wrangler.toml.example`,
+  still commented while the consumer stays disabled), after which
+  Cloudflare moves the raw body to its native
   DLQ if `dead_letter_queue` is configured; otherwise Cloudflare drops it. A
   successful send followed by an ack failure may create a duplicate DLQ
-  entry, so DLQ processing must be idempotent by `job_id`.
+  entry (a `Failed` redelivery re-quarantines the recorded failure, which
+  is also how a DLQ-send failure retries the send), so DLQ processing
+  must be idempotent by `job_id`.
 - DLQ quarantine: on exhaustion the consumer sends one `DlqEntry` to
-  `nntune-ingest-dlq` (`INGEST_DLQ` binding) — the original `QueueMsg` plus
+  `nntune-ingest-dlq` (`DLQ_QUEUE_NAME` via the `INGEST_DLQ` binding,
+  `DLQ_QUEUE_BINDING`, both in `src/retry.rs`) — the original `QueueMsg` plus
   machine-readable `error_code` / `attempts` fields in the serialized DLQ
-  body — then acks the original. The native dead-letter route can be enabled
+  body (`reason` redacted via `redact_api_key` and bounded to
+  `MAX_DLQ_DETAIL_CHARS = 512` by `bounded_redacted_detail` in
+  `src/retry.rs`) — then acks the original. The native dead-letter route can be enabled
   as a safety net for messages the handler never settles (panic, timeout),
   which arrive as raw bodies with no reason envelope.
 - Poison coverage (`tests/retry_dlq.rs`): an always-failing job burns all 5
@@ -396,25 +422,39 @@ invocation is claimed here.
 
 ## Redrive (DLQ back to queue)
 
-1. On **Workers Paid**, the Cloudflare DLQ defaults to **4 days retention**;
-   configure up to 14 days with
+1. On **Workers Paid**, the Cloudflare DLQ defaults to **4 days retention**
+   (345,600 s); configure up to 14 days with
    `npx wrangler queues update nntune-ingest-dlq --message-retention-period-secs 1209600`
    (60–1,209,600 seconds). On **Workers Free**, retention is fixed at 24 hours
-   and cannot be configured. Unconsumed entries are deleted at expiry on either
+   and cannot be configured. (Per the official Queues
+   [limits](https://developers.cloudflare.com/queues/platform/limits/):
+   Free persistence is non-configurable at 24 h, Paid is configurable up
+   to 14 days; the 4-day default is the wrangler
+   `--message-retention-period-secs` default.) Unconsumed entries are deleted
+   at expiry on either
    plan, so treat the applicable retention period as the redrive deadline; this
    queue is not a permanent archive.
 2. Read the DLQ: each entry is either a `DlqEntry` (explicit quarantine, with
-   `error_code` / `attempts` / redacted, bounded `reason`) or a raw `QueueMsg`
+   `error_code` / `attempts` / redacted, bounded `reason` per
+   `bounded_redacted_detail` in `src/retry.rs`) or a raw `QueueMsg`
    (native dead-letter fallback). Fix the cause first.
-3. Load the matching `INGEST_STATE` checkpoint. The redrive helpers reject a
-   checkpoint that is not `Failed`, so for a raw native-DLQ body first mark any
-   nonterminal checkpoint `Failed` with code `native_dead_letter` and persist it.
+3. Load the matching `INGEST_STATE` checkpoint. The redrive helpers
+   (`retry::redrive`, `retry::redrive_raw` in `src/retry.rs`) reject a
+   checkpoint that is not `Failed` (`RetryError::CheckpointNotFailed`), so
+   for a raw native-DLQ body first mark any
+   nonterminal checkpoint `Failed` with code `native_dead_letter` (an
+   operator-chosen marker, not a code constant — no such const exists in
+   `src/retry.rs`; `fail_checkpoint` accepts any code) and persist it.
    A `Done` checkpoint must not be redriven. Then call
    `retry::redrive(&entry, &mut checkpoint)` (or
    `retry::redrive_raw(&msg, &mut checkpoint)`). The helper resets the durable
-   checkpoint and returns a matching message; persist the reset under the same
-   job id before enqueue. Identity and input are kept, budgets/state are reset,
-   and `probe_tally` / `failure_code` / `failure_reason` are cleared. Never
+   checkpoint (`redrive_checkpoint` in `src/retry.rs`) and returns a matching
+   message; persist the reset under the same
+   job id before enqueue. Identity and input are kept (`job_id`, `user_id`,
+   `idempotency_key`, `source`, payload/query refs), budgets/state are reset
+   (`state` → `Queued`, `attempt` → 1, `repair_rounds` → 0),
+   and `probe_tally`, repair inputs (`par2_set_id`, `missing_blocks`),
+   `failure_code` / `failure_reason` are cleared. Never
    enqueue if the checkpoint write failed.
 4. No paging on DLQ depth in this slice (out of scope): inspect queue depth
    before bulk redrive so a systemic cause does not re-poison the queue faster
