@@ -574,7 +574,9 @@ jobs:
       - name: Check internal links in changed docs
         run: python3 .github/scripts/docs_link_lint.py --root . --base-ref "$DOCS_LINKS_BASE_REF"
       - name: Run docs-link lint self-tests
-        run: python3 .github/scripts/test_docs_link_lint.py
+        run: |
+          python3 .github/scripts/test_docs_link_lint.py
+          python3 .github/scripts/test_docs_link_diff_path_bytes.py
       - name: Run docs-link directory-anchor self-tests
         run: python3 .github/scripts/test_docs_link_directories.py
       - name: Run docs-link diff-failure self-tests
