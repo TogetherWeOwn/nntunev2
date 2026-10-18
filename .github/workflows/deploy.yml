@@ -127,10 +127,12 @@ jobs:
     name: staging-api
     needs: [gate]
     if: ${{ github.event_name == 'push' && needs.gate.outputs.enabled == 'true' }}
-    # Same deploy serialization as staging-web: queued main pushes deploy
-    # in order instead of racing wrangler.
+    # Own deploy group (never shared with staging-web): GitHub allows one
+    # running plus one pending job per group, so sharing would let a push's
+    # own lanes cancel each other and leave web and api at different SHAs.
+    # Queued main pushes still deploy in order instead of racing wrangler.
     concurrency:
-      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      group: ${{ github.workflow }}-staging-api-${{ github.ref }}
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -188,13 +190,23 @@ jobs:
           # serialized https origin whose host is exactly RP_ID: fail the
           # job here (names only) instead of deploying a worker that 500s.
           python3 - <<'PY'
-          import os, urllib.parse
+          import os, tomllib, urllib.parse
           rp_id = os.environ["API_RP_ID_STAGING"]
           origin = os.environ["API_RP_ORIGIN_STAGING"]
           parts = urllib.parse.urlsplit(origin)
           assert parts.scheme == "https", "API_RP_ORIGIN_STAGING must be https"
           assert parts.hostname == rp_id, "API_RP_ORIGIN_STAGING host must equal API_RP_ID_STAGING"
           assert origin == f"https://{rp_id}", "API_RP_ORIGIN_STAGING must be the canonical serialized origin"
+          # Parity pin: the generated config binds HYPERDRIVE_ID_STAGING
+          # directly, bypassing binding-parity (which only reads the
+          # committed example). Fail unless it equals the committed staging
+          # inventory id for the api HYPERDRIVE binding (names only).
+          with open("../../.github/scripts/binding_manifest.toml", "rb") as f:
+              manifest = tomllib.load(f)
+          api = next(w for w in manifest["worker"] if w["name"] == "api")
+          expected = next(b for b in api["binding"] if b["binding"] == "HYPERDRIVE")["staging"]
+          assert os.environ["HYPERDRIVE_ID_STAGING"] == expected, \
+              "HYPERDRIVE_ID_STAGING must equal the api staging inventory id"
           PY
           # Generated, never committed: bindings + public vars only, no
           # secrets. HYPERDRIVE_CACHING_DISABLED=1 is set here only because

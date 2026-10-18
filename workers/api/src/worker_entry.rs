@@ -1773,9 +1773,10 @@ fn served_display_path(path: &str) -> String {
 
 /// Build identity for log lines: the 40-char lowercase hex commit supplied
 /// at deploy time by the deploy lane via the public `BUILD_SHA` var (for
-/// example `--var BUILD_SHA:$GITHUB_SHA`; no workflow wires it for the api
-/// Worker yet), or the explicit `"unknown"` marker when absent or invalid
-/// (dev, preview without env, unwired lane). Public non-secret config (see
+/// example `--var BUILD_SHA:$GITHUB_SHA`, wired for the api Worker by the
+/// `staging-api` lane in `.github/workflows/deploy.yml`), or the explicit
+/// `"unknown"` marker when absent or invalid (dev, preview without env,
+/// unwired lane). Public non-secret config (see
 /// `wrangler.toml.example`); never fail-closed, so a missing identity
 /// degrades the line instead of the request. Normalized through the shared
 /// validator, never logged raw.

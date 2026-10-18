@@ -885,11 +885,20 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     // pushes would be cancelled before ever deploying. Job-level groups
     // release when the deploy finishes; E2E serializes on e2e-staging.
     expect(deployWorkflow.split('\njobs:\n')[0]!).not.toMatch(/^concurrency:/m);
-    for (const job of ['staging-web', 'preview-web']) {
+    for (const job of ['staging-web', 'staging-api', 'preview-web']) {
       const section = jobSection(deployWorkflow, job);
       expect(section).toMatch(/^    concurrency:\n      group: .+\n      cancel-in-progress: /m);
       expect(section).toContain("cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}");
     }
+    // staging-api serializes on its own group: one pending job per group,
+    // so sharing staging-web's group lets a push's own lanes cancel each
+    // other and leaves web and api at different SHAs with no post-deploy
+    // E2E. (preview-web shares the web expression but only runs on PR
+    // events, so it never contends with the push-only lanes.)
+    const webGroup = jobSection(deployWorkflow, 'staging-web').match(/^      group: (.+)$/m)![1];
+    const apiGroup = jobSection(deployWorkflow, 'staging-api').match(/^      group: (.+)$/m)![1];
+    expect(apiGroup).toContain('staging-api');
+    expect(apiGroup, 'staging-api must not share the staging-web group').not.toBe(webGroup);
     // post-deploy-e2e needs no group of its own: the called workflow
     // serializes on its e2e-staging group.
     expect(jobSection(deployWorkflow, 'post-deploy-e2e')).not.toContain('concurrency:');
@@ -1167,6 +1176,14 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     expect(section).toContain('check_hyperdrive_cache.sh');
     expect(section, 'real deploys must not pass --allow-skip').not.toContain('--allow-skip');
     expect(section, 'api lane must not map a GitHub environment').not.toMatch(/^\s*environment:/m);
+    // Own concurrency group: sharing staging-web's group lets a push's
+    // own lanes cancel each other (one pending job per group).
+    expect(section).toContain('group: ${{ github.workflow }}-staging-api-${{ github.ref }}');
+    // Generated-config parity: the only real api wrangler config is
+    // generated from HYPERDRIVE_ID_STAGING, which binding-parity never
+    // reads — the lane pins it to the committed staging inventory id.
+    expect(section).toContain('binding_manifest.toml');
+    expect(section).toContain('HYPERDRIVE_ID_STAGING must equal the api staging inventory id');
   };
 
   const assertDeployGuard = (body: string) => {
@@ -1236,6 +1253,19 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     // Api lane without the public BUILD_SHA var: records would render
     // "unknown" instead of the deploy SHA.
     const noBuildShaMutant = jobsBody.replace(' --var BUILD_SHA:${{ github.sha }}', '');
+    // Api lane sharing staging-web's group: a push's own lanes cancel each
+    // other, leaving web and api at different SHAs.
+    const sharedGroupMutant = jobsBody.replace(
+      'group: ${{ github.workflow }}-staging-api-${{ github.ref }}',
+      'group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}',
+    );
+    // Api lane without the generated-config parity pin: a mis-set
+    // HYPERDRIVE_ID_STAGING (e.g. the prod value) deploys staging against
+    // the wrong database with no CI failure.
+    const noParityMutant = jobsBody.replace(
+      'HYPERDRIVE_ID_STAGING must equal the api staging inventory id',
+      'HYPERDRIVE_ID_STAGING looks fine',
+    );
 
     for (const mutant of [
       workerMutant,
@@ -1248,6 +1278,8 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       quotedEnvMutant,
       allowSkipMutant,
       noBuildShaMutant,
+      sharedGroupMutant,
+      noParityMutant,
     ]) {
       expect(() => assertDeployGuard(mutant), 'mutant must violate the deploy guard').toThrow();
     }
@@ -1266,6 +1298,8 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     expect(() => assertStagingApi(allowSkipMutant)).toThrow();
     expect(() => assertStagingApi(noBuildShaMutant)).toThrow();
     expect(() => assertDeployBody(noBuildShaMutant)).toThrow();
+    expect(() => assertStagingApi(sharedGroupMutant)).toThrow();
+    expect(() => assertStagingApi(noParityMutant)).toThrow();
   });
 });
 
