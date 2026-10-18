@@ -315,9 +315,10 @@ applicable data-retention gate before deleting configs, roles, or databases.
 
 Public list prices and cost-as-function-of-usage formulas for Workers,
 R2, KV, Queues, Analytics Engine and PlanetScale Postgres are in
-[`docs/cost-basis.md`](cost-basis.md) (checked 2026-10-17). Plug measured
-staging volumes into those formulas for a monthly estimate; that document
-is a worksheet, not a measured bill.
+[`docs/cost-basis.md`](cost-basis.md) (checked 2026-10-17). The first
+measured staging bill (2026-10-13 → 2026-10-17) is recorded in section 10
+of that document; plug later staging volumes into the same formulas for
+updated estimates.
 
 ## Environments matrix
 

@@ -90,7 +90,7 @@ dependencies this harness needs.
 |---|---|---|
 | `STAGING_BASE_URL` | yes (post-deploy) | `https://` staging origin. Unset → skip with notice. |
 | `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | whenever staging is configured | QA service-token pair. Both absent or either absent → fail closed before requests. |
-| `QA_AUTH_TOKEN` | optional | Bearer for `POST /api/test-accounts` (staging-only seam). Absent → UI signup fallback. The dedicated public UI-signup case ignores the seam either way. |
+| `QA_AUTH_TOKEN` | optional | Bearer for `POST /api/test-accounts` (staging-only seam) and `POST /api/test-codes` (staging-only emailed-code retrieval seam for `example.test` mailboxes — returns the issued code without minting). Absent → UI signup fallback, and the wizard-arrival spec (`signup-wizard-arrival.spec.ts`) skips locally / fails closed on CI. The dedicated public UI-signup case ignores both seams either way. |
 | `SYNTHETIC_NNTP_HOST` / `_PORT` / `_USER` / `_TLS` | for BYOP spec | Hosted fixture server or test provider (defaults: `synthetic-nntp`, `563`, `e2e`, TLS on). The port must be in the BYOP allowlist (`119` or `563`) and TLS-off is rejected — the harness fails closed on a fixture transport the wizard cannot represent. |
 | `SYNTHETIC_NNTP_PASS` | for BYOP spec | No default — fail closed when missing. |
 
@@ -144,19 +144,32 @@ How the suite uses them:
   `/signup` form with a unique synthetic mailbox and requires the
   emailed-code step with no inline error, even when `QA_AUTH_TOKEN`
   is set, so a seam-backed run still proves public UI form submission.
-  Wizard arrival via the form is not asserted: the code-plus-passkey
-  finish needs a staging code-retrieval seam that does not exist yet
+  Form-to-wizard arrival is asserted by `signup-wizard-arrival.spec.ts`: the
+  code-plus-passkey finish retrieves the code from the staging-only
+  `POST /api/test-codes` seam, which is implemented in the API worker but
+  awaits its staging deployment and activation
   (see row 1 of `docs/m1-exit-traceability.md`). Once `QA_AUTH_TOKEN` is set the seam is
   required infrastructure: transport errors, non-2xx and non-JSON mint
   responses throw instead of collapsing into a silent skip, and API-driven
   steps (`requireApiAccount`) refuse to run anonymously. The identity that
   ingests always completes the BYOP wizard first (shared
   `completeByopWizard` helper), because the ingest worker probes through the
-  user's provider connection. The over-limit check needs the seam to support
-  `{plan:"overlimit"}` (metering card); when the capped account's library is
-  empty the harness ingests the fixture as that account, so no pre-seeded
-  track is required. On CI an unavailable over-limit seam fails instead of
-  skipping, so plan-limit enforcement can never pass unexercised.
+  user's provider connection. The over-limit checks need the seam to support
+  `{plan:"overlimit"}` (metering card): the stream leg and the ingest leg
+  each mint their own capped account (never the journey identity, never each
+  other's) and run AFTER the browser legs at the end of the serial chain, so
+  a red-by-design capped-account failure skips no other verdict. The stream
+  leg requires the seam to pre-seed a streamable track on its capped account:
+  ingesting the fixture as the capped account would contradict the
+  ingest-refusal leg (the same ingest must be refused). An unavailable
+  over-limit seam fails instead of skipping — locally and on CI — so
+  plan-limit enforcement can never pass unexercised. Each leg asserts the
+  full refusal verdict (`assertPlanLimitRefusal` in `helpers/contract.ts`):
+  402/429 status, limit + reset headers (429 additionally requires
+  `retry-after`), the status-consistent limit code (`plan_limit_exceeded` on
+  402, `rate_limited` on 429) with a present, status-consistent retryable
+  flag, the upgrade CTA pointer (a matching key whose value points at
+  `/pricing`), and no secret leakage.
 
 ## CI
 

@@ -603,6 +603,7 @@ impl Harness {
             path: path.to_string(),
             cookie,
             origin: origin.map(str::to_string),
+            authorization: None,
             body: body.map(|text| text.into_bytes()).unwrap_or_default(),
         };
         block_on(handlers::handle(&self.ctx(), &request))

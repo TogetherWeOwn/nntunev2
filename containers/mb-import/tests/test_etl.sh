@@ -68,4 +68,47 @@ if DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/unknown-count
 fi
 grep -q 'missing input file: .*release_unknown_country' "$temp_dir/unknown-country-missing.err"
 
+# Publication survival: identical same-DUMP_TS reruns reuse the published
+# snapshot byte-for-byte; changed or failed reruns must leave the published
+# snapshot, its symlink target and all four TSV hashes untouched.
+published_target="$(readlink "$temp_dir/mbdump/curated")"
+published_hashes="$temp_dir/published.sha256"
+( cd "$temp_dir/mbdump/curated" && sha256sum mbdump-artist.tsv mbdump-release.tsv mbdump-recording.tsv mbdump-track.tsv > "$published_hashes" )
+
+# Identical input at the same DUMP_TS reuses the existing snapshot.
+DUMP_TS=2025-02-03T04:05:07Z "$container_dir/etl.sh" "$temp_dir/mbdump"
+[[ "$(readlink "$temp_dir/mbdump/curated")" == "$published_target" ]]
+( cd "$temp_dir/mbdump/curated" && sha256sum -c "$published_hashes" )
+
+# Changed output at the same DUMP_TS is refused, not published.
+cp "$temp_dir/mbdump/artist" "$temp_dir/artist.bak"
+sed -i 's/First Artist/First Artist Renamed/' "$temp_dir/mbdump/artist"
+if DUMP_TS=2025-02-03T04:05:07Z "$container_dir/etl.sh" "$temp_dir/mbdump" 2>"$temp_dir/changed.err"; then
+  echo 'expected same-timestamp changed-output refusal' >&2
+  exit 1
+fi
+grep -q 'already has different curated output' "$temp_dir/changed.err"
+[[ "$(readlink "$temp_dir/mbdump/curated")" == "$published_target" ]]
+( cd "$temp_dir/mbdump/curated" && sha256sum -c "$published_hashes" )
+cp "$temp_dir/artist.bak" "$temp_dir/mbdump/artist"
+
+# A malformed/failed rerun preserves the symlink target and all TSV hashes.
+printf 'broken\n' > "$temp_dir/mbdump/artist"
+if DUMP_TS=2025-02-03T04:05:07Z "$container_dir/etl.sh" "$temp_dir/mbdump" 2>"$temp_dir/preserved.err"; then
+  echo 'expected malformed rerun failure' >&2
+  exit 1
+fi
+grep -q 'expected 19 fields, got 1' "$temp_dir/preserved.err"
+[[ "$(readlink "$temp_dir/mbdump/curated")" == "$published_target" ]]
+( cd "$temp_dir/mbdump/curated" && sha256sum -c "$published_hashes" )
+cp "$temp_dir/artist.bak" "$temp_dir/mbdump/artist"
+
+# A subsequent valid newer timestamp publishes successfully.
+DUMP_TS=2025-02-03T04:05:08Z "$container_dir/etl.sh" "$temp_dir/mbdump"
+new_target="$(readlink "$temp_dir/mbdump/curated")"
+[[ "$new_target" != "$published_target" ]]
+for table in artist release recording track; do
+  grep -q '2025-02-03T04:05:08Z$' "$temp_dir/mbdump/curated/mbdump-$table.tsv"
+done
+
 echo 'mb-import ETL fixture tests: PASS'

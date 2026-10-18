@@ -49,6 +49,12 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # Transport-free portable core on the same native runner: executes
+      # nntune-core without default TLS features. This is native portable
+      # behavior, not a wasm-runtime check (see rust-wasm) nor a
+      # TLS-integration proof (covered by the default-feature tests above).
+      # Same job, so failures fail rust-test and the ci-ok aggregate.
+      - run: cargo test --locked -p nntune-core --no-default-features
 
   rust-wasm:
     name: rust check (wasm32)

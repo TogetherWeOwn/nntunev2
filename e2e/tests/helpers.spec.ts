@@ -11,7 +11,7 @@ import {
   stagingBaseUrl,
   syntheticNntpEndpoint,
 } from '../helpers/access.js';
-import { extractLibraryItems, extractPlanMeta, extractRecordingMbids, extractUsageBytes, isMbid } from '../helpers/contract.js';
+import { assertPlanLimitHeaders, assertPlanLimitRefusal, extractLibraryItems, extractLimitCode, extractPlanMeta, extractRecordingMbids, extractUpgradeCta, extractUsageBytes, isMbid, secretLeak } from '../helpers/contract.js';
 import {
   anonymousApiGet,
   anonymousGet,
@@ -1178,5 +1178,256 @@ test.describe('extractRecordingMbids', () => {
       /recording_mbids\[0\]/,
     );
     expect(() => extractRecordingMbids(null)).toThrow(/object/);
+  });
+});
+
+test.describe('plan-limit refusal verdict (offline pins)', () => {
+  const clean402 = {
+    status: 402,
+    headers: { 'x-plan-limit': '100', 'x-plan-reset': '3600' },
+    bodyText: JSON.stringify({
+      code: 'plan_limit_exceeded',
+      message: 'plan limit reached',
+      retryable: false,
+      upgrade_url: '/pricing',
+    }),
+  };
+  const secrets = [
+    { name: 'account email', value: 'capped+sentinel@example.test' },
+    { name: 'account session', value: 'sentinel-session-capped' },
+  ];
+
+  test('a canonical 402 refusal passes', () => {
+    expect(() =>
+      assertPlanLimitRefusal({ ...clean402, secrets, context: 'plan-limit-stream' }),
+    ).not.toThrow();
+  });
+
+  test('a 429 with retry-after + limit header passes', () => {
+    expect(() =>
+      assertPlanLimitRefusal({
+        status: 429,
+        headers: { 'ratelimit-limit': '50', 'retry-after': '45' },
+        bodyText: JSON.stringify({
+          code: 'rate_limited',
+          message: 'too many requests',
+          retryable: true,
+          upgrade_url: '/pricing',
+        }),
+        secrets,
+        context: 'plan-limit-ingest',
+      }),
+    ).not.toThrow();
+  });
+
+  test('a non-limit status fails naming expected vs actual', () => {
+    expect(() =>
+      assertPlanLimitRefusal({ ...clean402, status: 206, secrets, context: 'plan-limit-stream' }),
+    ).toThrow(/expected a plan-limit status \(402\/429\), got HTTP 206/);
+  });
+
+  test('missing headers fail naming the received names', () => {
+    expect(() =>
+      assertPlanLimitRefusal({
+        ...clean402,
+        headers: { 'content-type': 'application/json' },
+        secrets,
+        context: 'plan-limit-stream',
+      }),
+    ).toThrow(/missing .*limit header.*got headers: content-type/);
+    expect(() =>
+      assertPlanLimitRefusal({
+        ...clean402,
+        headers: { 'x-plan-limit': '100' },
+        secrets,
+        context: 'plan-limit-stream',
+      }),
+    ).toThrow(/reset\/retry header.*got headers: x-plan-limit/);
+  });
+
+  test('extractLimitCode reads the envelope and legacy shapes', () => {
+    expect(
+      extractLimitCode(JSON.stringify({ code: 'plan_limit_exceeded' }), 'plan-limit-stream'),
+    ).toBe('plan_limit_exceeded');
+    expect(extractLimitCode('{"error":"rate_limited"}', 'plan-limit-stream')).toBe('rate_limited');
+    expect(
+      extractLimitCode('{"error":{"code":"plan_limit_exceeded"}}', 'plan-limit-stream'),
+    ).toBe('plan_limit_exceeded');
+  });
+
+  test('extractLimitCode names the keys on drift', () => {
+    expect(() =>
+      extractLimitCode(JSON.stringify({ status: 'limited' }), 'plan-limit-stream'),
+    ).toThrow(/\[plan-limit-stream\][\s\S]*status/);
+    expect(() => extractLimitCode('not json', 'plan-limit-stream')).toThrow(/not JSON/);
+  });
+
+  test('a status-inconsistent retryable flag fails', () => {
+    expect(() =>
+      assertPlanLimitRefusal({
+        ...clean402,
+        bodyText: JSON.stringify({
+          code: 'plan_limit_exceeded',
+          message: 'plan limit reached',
+          retryable: true,
+          upgrade_url: '/pricing',
+        }),
+        secrets,
+        context: 'plan-limit-stream',
+      }),
+    ).toThrow(/retryable flag disagrees/);
+  });
+
+  test('extractUpgradeCta accepts a key or a /pricing value', () => {
+    expect(extractUpgradeCta({ code: 'x', upgrade_url: '/pricing' }, 'c')).toBe("key 'upgrade_url'");
+    expect(extractUpgradeCta({ code: 'x', note: 'see /pricing to continue' }, 'c')).toMatch(
+      /value/,
+    );
+  });
+
+  test('prose without the /pricing route is not a CTA pointer', () => {
+    expect(() => extractUpgradeCta({ code: 'x', note: 'Upgrade now' }, 'c')).toThrow(
+      /no upgrade CTA pointer/,
+    );
+  });
+
+  test('a matching key with a non-route value is not a CTA pointer', () => {
+    expect(() => extractUpgradeCta({ code: 'x', upgrade_available: false }, 'c')).toThrow(
+      /no upgrade CTA pointer/,
+    );
+    expect(() => extractUpgradeCta({ code: 'x', upgrade_url: '' }, 'c')).toThrow(
+      /no upgrade CTA pointer/,
+    );
+    expect(() =>
+      extractUpgradeCta({ code: 'x', upgrade_url: 'Upgrade now, no route' }, 'c'),
+    ).toThrow(/no upgrade CTA pointer/);
+  });
+
+  test('a nested /pricing route behind a matching key still counts', () => {
+    expect(extractUpgradeCta({ code: 'x', cta: { href: '/pricing' } }, 'c')).toMatch(/cta/);
+  });
+
+  test('a body without the CTA pointer fails naming its keys', () => {
+    expect(() =>
+      extractUpgradeCta({ code: 'plan_limit_exceeded', message: 'nope' }, 'plan-limit-stream'),
+    ).toThrow(/\[plan-limit-stream\][\s\S]*code, message/);
+    expect(() =>
+      assertPlanLimitRefusal({
+        ...clean402,
+        bodyText: JSON.stringify({ code: 'plan_limit_exceeded', retryable: false }),
+        secrets,
+        context: 'plan-limit-stream',
+      }),
+    ).toThrow(/no upgrade CTA pointer/);
+  });
+
+  test('secretLeak names the secret, never its value', () => {
+    const body = JSON.stringify({ code: 'x', detail: 'for capped+sentinel@example.test' });
+    const leak = secretLeak(body, secrets, 'plan-limit-stream');
+    expect(leak).toMatch(/account email/);
+    expect(leak).not.toContain('capped+sentinel@example.test');
+    const keyed = secretLeak(JSON.stringify({ token: 'abc' }), [], 'plan-limit-stream');
+    expect(keyed).toMatch(/credential-shaped key 'token'/);
+    expect(secretLeak(clean402.bodyText, secrets, 'plan-limit-stream')).toBeNull();
+  });
+
+  test('a leaking refusal body fails the verdict', () => {
+    expect(() =>
+      assertPlanLimitRefusal({
+        ...clean402,
+        bodyText: JSON.stringify({
+          code: 'plan_limit_exceeded',
+          retryable: false,
+          upgrade_url: '/pricing',
+          session: 'sentinel-session-capped',
+        }),
+        secrets,
+        context: 'plan-limit-stream',
+      }),
+    ).toThrow(/leaks the account session/);
+  });
+
+  test('assertPlanLimitHeaders tolerates header-name variants', () => {
+    expect(() =>
+      assertPlanLimitHeaders(
+        { 'RateLimit-Limit': '10', 'RateLimit-Reset': '60' },
+        'plan-limit-stream',
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertPlanLimitHeaders({ 'X-Plan-Limit': '', 'Retry-After': '5' }, 'plan-limit-stream'),
+    ).toThrow(/present but empty/);
+  });
+
+  test('a 429 without retry-after fails even with another reset header', () => {
+    expect(() =>
+      assertPlanLimitHeaders(
+        { 'x-plan-limit': '50', 'x-plan-reset': '45' },
+        'plan-limit-ingest',
+        429,
+      ),
+    ).toThrow(/retry-after/);
+    expect(() =>
+      assertPlanLimitHeaders({ 'x-plan-limit': '50', 'retry-after': '' }, 'plan-limit-ingest', 429),
+    ).toThrow(/retry-after|present but empty/);
+    expect(() =>
+      assertPlanLimitRefusal({
+        status: 429,
+        headers: { 'ratelimit-limit': '50', 'ratelimit-reset': '45' },
+        bodyText: JSON.stringify({
+          code: 'rate_limited',
+          message: 'too many requests',
+          retryable: true,
+          upgrade_url: '/pricing',
+        }),
+        secrets,
+        context: 'plan-limit-ingest',
+      }),
+    ).toThrow(/retry-after/);
+  });
+
+  test('a status-inconsistent limit code fails', () => {
+    expect(() =>
+      assertPlanLimitRefusal({
+        ...clean402,
+        bodyText: JSON.stringify({
+          code: 'rate_limited',
+          message: 'too many requests',
+          retryable: false,
+          upgrade_url: '/pricing',
+        }),
+        secrets,
+        context: 'plan-limit-stream',
+      }),
+    ).toThrow(/code 'rate_limited' disagrees with the status/);
+    expect(() =>
+      assertPlanLimitRefusal({
+        status: 429,
+        headers: { 'ratelimit-limit': '50', 'retry-after': '45' },
+        bodyText: JSON.stringify({
+          code: 'plan_limit_exceeded',
+          message: 'plan limit reached',
+          retryable: true,
+          upgrade_url: '/pricing',
+        }),
+        secrets,
+        context: 'plan-limit-ingest',
+      }),
+    ).toThrow(/code 'plan_limit_exceeded' disagrees with the status/);
+  });
+
+  test('a missing retryable flag fails', () => {
+    expect(() =>
+      assertPlanLimitRefusal({
+        ...clean402,
+        bodyText: JSON.stringify({
+          code: 'plan_limit_exceeded',
+          message: 'plan limit reached',
+          upgrade_url: '/pricing',
+        }),
+        secrets,
+        context: 'plan-limit-stream',
+      }),
+    ).toThrow(/retryable flag disagrees/);
   });
 });
