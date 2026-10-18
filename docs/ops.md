@@ -454,8 +454,9 @@ lane. Complete every box on the exact head being promoted.
 - [ ] Staging deploy evidence: record the successful push-triggered
   `deploy.yml` run for the promotion SHA, and require its `staging-web` job
   conclusion to be `success` (not `skipped`); verify staging health. This
-  workflow deploys `apps/web` only; it does not deploy stream, MB, API or
-  ingest Workers. `/api/health` returns exactly `{ok, version}` — the public
+  workflow deploys `apps/web` (`staging-web`) plus the api Worker staging
+  lane (`staging-api`, staging only); it does not deploy stream, MB, ingest
+  or repair Workers. `/api/health` returns exactly `{ok, version}` — the public
   package version, never a build identifier
   (`apps/web/src/routes/api/health/+server.ts`, pinned by
   `apps/web/tests/smoke.spec.ts`) — so a health response alone never proves
@@ -508,16 +509,20 @@ lane. Complete every box on the exact head being promoted.
 This section defines evidence only. It does not create a lane.
 
 **Current claim boundary.** `.github/workflows/deploy.yml` deploys
-`apps/web` only (`staging-web` on push, `preview-web` on pull requests). No
-tracked workflow deploys the backend Workers under `workers/` (`api`,
-`ingest`, `stream`, `mb`, `repair`), and
+`apps/web` (`staging-web` on push, `preview-web` on pull requests) plus the
+api Worker staging lane (`staging-api` on push, staging only, skipped until
+the Operator wires the staging variables). No other tracked workflow
+deploys the backend Workers under `workers/` (`ingest`, `stream`, `mb`,
+`repair`), and
 `.github/workflows/e2e-staging.yml` exercises the staging web URL, not a
 Worker deploy or rollback. Worker source and Wrangler configs existing in
 the repo are not deployment. Therefore **no backend-Worker deploy,
 rollback, activation, or staging acceptance is currently claimed**, for any
-environment, until a lane for that Worker exists and its gates pass on the
-exact head being promoted. The web-only checklist above is unchanged by
-this section and remains the only staging promotion checklist in force.
+Worker in any environment, until that Worker's lane exists and its gates
+pass on the exact head being promoted — for the api Worker that means a
+`staging-api` job conclusion `success` (not `skipped`) on the promotion
+run. The web checklist above is unchanged by this section and remains in
+force alongside the per-Worker evidence table below.
 
 **Evidence a future Worker staging lane must retain**, per Worker and per
 environment, linked from that promotion's deploy record before rollback can

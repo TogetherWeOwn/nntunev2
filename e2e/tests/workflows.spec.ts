@@ -885,11 +885,20 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     // pushes would be cancelled before ever deploying. Job-level groups
     // release when the deploy finishes; E2E serializes on e2e-staging.
     expect(deployWorkflow.split('\njobs:\n')[0]!).not.toMatch(/^concurrency:/m);
-    for (const job of ['staging-web', 'preview-web']) {
+    for (const job of ['staging-web', 'staging-api', 'preview-web']) {
       const section = jobSection(deployWorkflow, job);
       expect(section).toMatch(/^    concurrency:\n      group: .+\n      cancel-in-progress: /m);
       expect(section).toContain("cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}");
     }
+    // staging-api serializes on its own group: one pending job per group,
+    // so sharing staging-web's group lets a push's own lanes cancel each
+    // other and leaves web and api at different SHAs with no post-deploy
+    // E2E. (preview-web shares the web expression but only runs on PR
+    // events, so it never contends with the push-only lanes.)
+    const webGroup = jobSection(deployWorkflow, 'staging-web').match(/^      group: (.+)$/m)![1];
+    const apiGroup = jobSection(deployWorkflow, 'staging-api').match(/^      group: (.+)$/m)![1];
+    expect(apiGroup).toContain('staging-api');
+    expect(apiGroup, 'staging-api must not share the staging-web group').not.toBe(webGroup);
     // post-deploy-e2e needs no group of its own: the called workflow
     // serializes on its e2e-staging group.
     expect(jobSection(deployWorkflow, 'post-deploy-e2e')).not.toContain('concurrency:');
@@ -1050,24 +1059,35 @@ test.describe('locked-dependency coverage builds (static pin)', () => {
   });
 });
 
-test.describe('deploy.yml carries no backend Worker deploy job', () => {
-  // Backend Worker deploys are intentionally NOT wired in deploy.yml (see its
-  // header): this workflow deploys apps/web only, and each backend lane must
-  // add its own evidenced job. These pins fail on any new
-  // `deploy-api-worker`-style job with `wrangler deploy --env staging`,
-  // anything deploying under workers/, any production-environment deploy
-  // step, or a bare `command: deploy` (apps/web top-level name equals the
-  // production env name, so a bare deploy targets production). When the
-  // authorized backend lane lands, it extends this guard (allowlist +
-  // evidence) instead of weakening it.
+test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)', () => {
+  // deploy.yml deploys apps/web plus the one authorized backend lane,
+  // `staging-api` (api Worker, staging only); every further backend lane
+  // (ingest/mb/stream/repair) must extend this guard with its own
+  // allowlist + evidence instead of weakening it. These pins fail on any
+  // new `deploy-api-worker`-style job with `wrangler deploy --env staging`,
+  // anything deploying under workers/ outside `staging-api`, any
+  // production-environment deploy step, or a bare `command: deploy`
+  // (apps/web top-level name equals the production env name, so a bare
+  // deploy targets production).
   const jobsBody = deployWorkflow.split('\njobs:\n')[1]!;
+
+  // The one authorized backend lane. Everything outside it stays web-only.
+  const bodyWithoutJob = (body: string, job: string): string => {
+    const section = jobSection(body, job);
+    return body.split(section).join('');
+  };
+  const codeLines = (text: string): string =>
+    text
+      .split('\n')
+      .filter((l) => !/^\s*#/.test(l))
+      .join('\n');
 
   // Shared guard: the real pins below call these helpers, and the mutant
   // test asserts the same helpers throw for each synthetic backend lane —
   // so weakening a pin breaks the mutant test instead of silently passing.
   const assertJobSet = (body: string) => {
     const names = [...body.matchAll(/^  ([A-Za-z0-9_-]+):$/gm)].map((m) => m[1]!).sort();
-    expect(names).toEqual(['gate', 'post-deploy-e2e', 'preview-web', 'staging-web']);
+    expect(names).toEqual(['gate', 'post-deploy-e2e', 'preview-web', 'staging-api', 'staging-web']);
     for (const name of names) {
       expect(name, `job ${name} must not look like a backend deploy lane`).not.toMatch(
         /worker|backend/i,
@@ -1076,19 +1096,25 @@ test.describe('deploy.yml carries no backend Worker deploy job', () => {
   };
 
   const assertDeployBody = (body: string) => {
-    expect(body.match(/wrangler-action/g) ?? []).toHaveLength(2);
-    expect(body.match(/deploy --env/g) ?? []).toHaveLength(1);
-    // Exact command pin: staging-web deploys to staging, preview-web runs
-    // `preview`. A bare `command: deploy` (no --env) deploys the top-level
-    // worker name, which equals the production env name — count checks alone
-    // miss it, so pin every wrangler-action command value exactly.
+    expect(body.match(/wrangler-action/g) ?? []).toHaveLength(3);
+    expect(body.match(/deploy --env/g) ?? []).toHaveLength(2);
+    // Exact command pin: staging-web deploys to staging, staging-api
+    // deploys the api Worker to staging with the public BUILD_SHA var, and
+    // preview-web runs `preview`. A bare `command: deploy` (no --env)
+    // deploys the top-level worker name, which equals the production env
+    // name — count checks alone miss it, so pin every wrangler-action
+    // command value exactly.
     const commands = [...body.matchAll(/^\s+command: (.+)$/gm)]
       .map((m) => m[1]!.trim())
       .sort();
     expect(
       commands,
-      `wrangler commands stay exactly the evidenced web lanes (got ${JSON.stringify(commands)})`,
-    ).toEqual(['deploy --env staging', 'preview']);
+      `wrangler commands stay exactly the evidenced lanes (got ${JSON.stringify(commands)})`,
+    ).toEqual([
+      'deploy --env staging',
+      'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
+      'preview',
+    ]);
     // Raw-CLI pin: no `run:` step may invoke a wrangler deploy, even split
     // across lines (`wrangler \` + newline + `deploy`), version-pinned
     // (`wrangler@<ver> deploy`), or flag-first (`wrangler --config x
@@ -1097,10 +1123,19 @@ test.describe('deploy.yml carries no backend Worker deploy job', () => {
     // same logical line by `deploy`.
     const flat = body.replace(/\\\r?\n\s*/g, ' ');
     expect(flat).not.toMatch(/\bwrangler\b(?!-action)[^\n]*\bdeploy\b/);
-    for (const line of body.split('\n')) {
+    // Working directories: apps/web everywhere except the api lane, which
+    // is the only job allowed to touch workers/api.
+    for (const line of bodyWithoutJob(body, 'staging-api').split('\n')) {
       if (line.includes('workingDirectory:') || line.includes('working-directory:')) {
         expect(line, `deploy working directory stays apps/web (${line.trim()})`).toContain(
           'apps/web',
+        );
+      }
+    }
+    for (const line of jobSection(body, 'staging-api').split('\n')) {
+      if (line.includes('workingDirectory:') || line.includes('working-directory:')) {
+        expect(line, `api lane deploys from workers/api (${line.trim()})`).toContain(
+          'workers/api',
         );
       }
     }
@@ -1108,43 +1143,75 @@ test.describe('deploy.yml carries no backend Worker deploy job', () => {
 
   const assertNoBackendPath = (body: string) => {
     // Header comments (above `jobs:`) legitimately name workers/ and the
-    // future Hyperdrive gate; the jobs body itself stays web-only with no
-    // production path. Case-sensitive: the preview job carries a `Workers
-    // preview deployment` comment (no path), which must keep passing.
-    // Production pin: the jobs body carries no `production` word at all in
-    // code (comments stripped). That covers `--env production`,
+    // Hyperdrive gate; outside `staging-api` the jobs body itself stays
+    // web-only with no production path. Case-sensitive: the preview job
+    // carries a `Workers preview deployment` comment (no path), which must
+    // keep passing.
+    // Production pin: no job carries the `production` word at all in code
+    // (comments stripped) — that covers `--env production`,
     // `--env=production`, `environment: production`, the mapping form
     // (`environment:\n  name: production`), quoted values, and
     // `CLOUDFLARE_ENV: production` — while a harmless full-line comment
-    // mentioning production still passes.
-    expect(body).not.toContain('workers/');
-    const code = body
-      .split('\n')
-      .filter((l) => !/^\s*#/.test(l))
-      .join('\n');
-    expect(code.toLowerCase()).not.toContain('production');
+    // mentioning production still passes. The api lane is staging-only, so
+    // the pin applies to its section too.
+    const rest = bodyWithoutJob(body, 'staging-api');
+    expect(rest).not.toContain('workers/');
+    expect(codeLines(rest).toLowerCase()).not.toContain('production');
+    expect(codeLines(jobSection(body, 'staging-api')).toLowerCase()).not.toContain('production');
+  };
+
+  const assertStagingApi = (body: string) => {
+    // Evidence the api staging lane must keep: push-only + token gate,
+    // staging-only deploy with the public BUILD_SHA var, the fail-closed
+    // Hyperdrive cache-disabled gate (CI-only --allow-skip forbidden), and
+    // no GitHub-environment mapping (which would resolve prod-scoped
+    // secrets and protection rules).
+    const section = jobSection(body, 'staging-api');
+    expect(section).toContain('needs: [gate]');
+    const condition = jobIf(body, 'staging-api');
+    expect(condition, 'staging-api must carry a job-level if').toBeDefined();
+    expect(condition).toContain("github.event_name == 'push'");
+    expect(condition).toContain("needs.gate.outputs.enabled == 'true'");
+    expect(section).toContain('command: deploy --env staging --var BUILD_SHA:${{ github.sha }}');
+    expect(section).toContain('check_hyperdrive_cache.sh');
+    expect(section, 'real deploys must not pass --allow-skip').not.toContain('--allow-skip');
+    expect(section, 'api lane must not map a GitHub environment').not.toMatch(/^\s*environment:/m);
+    // Own concurrency group: sharing staging-web's group lets a push's
+    // own lanes cancel each other (one pending job per group).
+    expect(section).toContain('group: ${{ github.workflow }}-staging-api-${{ github.ref }}');
+    // Generated-config parity: the only real api wrangler config is
+    // generated from HYPERDRIVE_ID_STAGING, which binding-parity never
+    // reads — the lane pins it to the committed staging inventory id.
+    expect(section).toContain('binding_manifest.toml');
+    expect(section).toContain('HYPERDRIVE_ID_STAGING must equal the api staging inventory id');
   };
 
   const assertDeployGuard = (body: string) => {
     assertJobSet(body);
     assertDeployBody(body);
     assertNoBackendPath(body);
+    assertStagingApi(body);
   };
 
-  test('job set is exactly the evidenced web-only lanes', () => {
+  test('job set is exactly the evidenced lanes (web + api staging)', () => {
     assertJobSet(jobsBody);
   });
 
-  test('only the evidenced web staging step runs a wrangler deploy', () => {
-    // staging-web deploys apps/web to staging; preview-web runs `preview`
-    // (not deploy). Any additional wrangler deploy — action or raw
-    // `wrangler deploy` CLI — is a backend-lane candidate until evidenced.
+  test('only the evidenced staging steps run a wrangler deploy', () => {
+    // staging-web deploys apps/web to staging, staging-api deploys the api
+    // Worker to staging with BUILD_SHA, preview-web runs `preview` (not
+    // deploy). Any additional wrangler deploy — action or raw `wrangler
+    // deploy` CLI — is a backend-lane candidate until evidenced.
     assertDeployBody(jobsBody);
     expect(jobSection(deployWorkflow, 'staging-web')).toContain('command: deploy --env staging');
   });
 
-  test('no workers/ path or production-environment deploy step in the jobs body', () => {
+  test('no workers/ path or production-environment deploy step outside staging-api', () => {
     assertNoBackendPath(jobsBody);
+  });
+
+  test('staging-api lane carries BUILD_SHA + hyperdrive gate evidence', () => {
+    assertStagingApi(jobsBody);
   });
 
   test('synthetic backend-deploy mutants trip the pins above', () => {
@@ -1177,6 +1244,28 @@ test.describe('deploy.yml carries no backend Worker deploy job', () => {
     );
     // Quoted production environment value.
     const quotedEnvMutant = `${jobsBody}\n    environment: "production"\n`;
+    // CI-only gate bypass in the api lane: the Hyperdrive cache-disabled
+    // gate must never pass --allow-skip in a real deploy.
+    const allowSkipMutant = jobsBody.replace(
+      './check_hyperdrive_cache.sh --config-id "${{ vars.HYPERDRIVE_ID_STAGING }}"',
+      './check_hyperdrive_cache.sh --config-id "${{ vars.HYPERDRIVE_ID_STAGING }}" --allow-skip',
+    );
+    // Api lane without the public BUILD_SHA var: records would render
+    // "unknown" instead of the deploy SHA.
+    const noBuildShaMutant = jobsBody.replace(' --var BUILD_SHA:${{ github.sha }}', '');
+    // Api lane sharing staging-web's group: a push's own lanes cancel each
+    // other, leaving web and api at different SHAs.
+    const sharedGroupMutant = jobsBody.replace(
+      'group: ${{ github.workflow }}-staging-api-${{ github.ref }}',
+      'group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}',
+    );
+    // Api lane without the generated-config parity pin: a mis-set
+    // HYPERDRIVE_ID_STAGING (e.g. the prod value) deploys staging against
+    // the wrong database with no CI failure.
+    const noParityMutant = jobsBody.replace(
+      'HYPERDRIVE_ID_STAGING must equal the api staging inventory id',
+      'HYPERDRIVE_ID_STAGING looks fine',
+    );
 
     for (const mutant of [
       workerMutant,
@@ -1187,6 +1276,10 @@ test.describe('deploy.yml carries no backend Worker deploy job', () => {
       flagFirstMutant,
       envMappingMutant,
       quotedEnvMutant,
+      allowSkipMutant,
+      noBuildShaMutant,
+      sharedGroupMutant,
+      noParityMutant,
     ]) {
       expect(() => assertDeployGuard(mutant), 'mutant must violate the deploy guard').toThrow();
     }
@@ -1202,6 +1295,11 @@ test.describe('deploy.yml carries no backend Worker deploy job', () => {
     expect(() => assertDeployBody(flagFirstMutant)).toThrow();
     expect(() => assertNoBackendPath(envMappingMutant)).toThrow();
     expect(() => assertNoBackendPath(quotedEnvMutant)).toThrow();
+    expect(() => assertStagingApi(allowSkipMutant)).toThrow();
+    expect(() => assertStagingApi(noBuildShaMutant)).toThrow();
+    expect(() => assertDeployBody(noBuildShaMutant)).toThrow();
+    expect(() => assertStagingApi(sharedGroupMutant)).toThrow();
+    expect(() => assertStagingApi(noParityMutant)).toThrow();
   });
 });
 
