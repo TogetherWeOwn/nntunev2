@@ -95,7 +95,9 @@ impl SuccessCache for FakeCache {
 fn exactly_100_chars_reaches_the_repository() {
     let repo = CountingRepo::default();
     let cache = FakeCache::default();
-    let q = "a".repeat(100);
+    // Multibyte tail: exactly 100 chars but 101 bytes, so a
+    // bytes-instead-of-chars count would wrongly reject this.
+    let q = format!("{}é", "a".repeat(99));
     assert_eq!(q.chars().count(), 100);
     let resp = block_on(handle_search_paged(
         &repo,
@@ -118,10 +120,12 @@ fn exactly_100_chars_reaches_the_repository() {
 
 #[test]
 fn boundary_pair_pass_reject() {
-    // 100 chars: pass with a repo scan and a cache put.
+    // 100 chars (multibyte tail: 101 bytes): pass with a repo scan and a
+    // cache put. A bytes-instead-of-chars count would wrongly reject this.
     let repo = CountingRepo::default();
     let cache = FakeCache::default();
-    let pass_q = "a".repeat(100);
+    let pass_q = format!("{}é", "a".repeat(99));
+    assert_eq!(pass_q.chars().count(), 100);
     let resp = block_on(handle_search_paged(
         &repo,
         &cache,
