@@ -1086,3 +1086,108 @@ test.describe('deploy.yml carries no backend Worker deploy job', () => {
     expect(() => assertNoBackendPath(quotedEnvMutant)).toThrow();
   });
 });
+
+test.describe('agent-footer absence in shipped sources (static pin)', () => {
+  // The last agent footer line was removed from a shipped README, and no
+  // check failed while it was present. These pins fail on any reintroduced
+  // footer line so agent metadata cannot ship silently in docs again. The
+  // public-text sweep owns tracker/host/agent-handle hygiene, not footer
+  // hygiene, so this guard lives here beside the other static pins and
+  // scans shipped markdown only: prose is where footers land, and keeping
+  // code out of scope keeps this spec's own mutant strings inert.
+  const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
+
+  // A footer line states the convention and its skill list after a colon at
+  // the start of a line. Case and spacing stay loose (rewordings must still
+  // fail); the colon is required so prose that merely mentions skills in a
+  // sentence never matches.
+  const AGENT_FOOTER = /^[ \t]*skills[ \t]+used[ \t]*:/im;
+
+  // Lint test data holding intentionally crafted content is never shipped
+  // prose: mirror the fixture exclusions of both Python lints.
+  const FIXTURE_PREFIX = '.github/scripts/fixtures/';
+
+  const isScannedDoc = (path: string): boolean => {
+    const lower = path.toLowerCase();
+    const markdown =
+      lower.endsWith('.md') || lower.endsWith('.markdown') || lower.endsWith('.mdown');
+    return markdown && !path.startsWith(FIXTURE_PREFIX);
+  };
+
+  const trackedDocs = (): string[] => {
+    const run = spawnSync('git', ['ls-files', '-z'], {
+      cwd: repoRoot,
+      encoding: 'buffer',
+    });
+    expect(run.error).toBeUndefined();
+    expect(run.status, 'git ls-files must list the tracked tree').toBe(0);
+    return run.stdout
+      .toString('utf8')
+      .split('\0')
+      .filter((entry) => entry !== '' && isScannedDoc(entry));
+  };
+
+  // Shared guard: the real pins below call this helper, and the mutant test
+  // asserts the same helper throws for each synthetic footer — so weakening
+  // the pin breaks the mutant test instead of silently passing.
+  const assertNoAgentFooter = (entries: Array<{ path: string; content: string }>) => {
+    const offenders = entries
+      .filter((entry) => AGENT_FOOTER.test(entry.content))
+      .map((entry) => entry.path);
+    expect(offenders, `agent footer present in: ${offenders.join(', ')}`).toEqual([]);
+  };
+
+  test('shipped markdown carries no agent footer', () => {
+    const paths = trackedDocs();
+    expect(paths.length, 'expected shipped markdown to scan').toBeGreaterThan(0);
+    assertNoAgentFooter(
+      paths.map((path) => ({ path, content: readFileSync(join(repoRoot, path), 'utf8') })),
+    );
+  });
+
+  test('footer scope covers the shipped docs and skips lint fixtures', () => {
+    const paths = trackedDocs();
+    // The regression site: the shipped README that carried the removed footer.
+    expect(paths).toContain('workers/mb/README.md');
+    expect(paths).toContain('README.md');
+    expect(paths.some((path) => path.startsWith('docs/'))).toBe(true);
+    expect(paths.some((path) => path.startsWith(FIXTURE_PREFIX))).toBe(false);
+    expect(isScannedDoc('.github/scripts/fixtures/docs-links/match/docs/a.md')).toBe(false);
+    expect(isScannedDoc('workers/mb/README.md')).toBe(true);
+  });
+
+  test('footer mutants trip the shared guard while clean prose passes', () => {
+    // Regression proof for the shared guard: each mutant models a
+    // reintroduced footer and must throw the same helper the real pin calls
+    // (not a restated copy of the expectations).
+    const mutants = [
+      'Skills used: executing-plans, verification-before-completion.',
+      '\nSome shipped prose.\n\nSkills used: executing-plans.',
+      'skills used: verification-before-completion',
+      'Skills  used  :  executing-plans',
+      '   Skills used: executing-plans',
+      '\tSkills used: executing-plans, test-driven-development.',
+    ];
+    for (const mutant of mutants) {
+      expect(
+        () => assertNoAgentFooter([{ path: 'docs/probe.md', content: mutant }]),
+        `mutant must violate the footer guard: ${JSON.stringify(mutant)}`,
+      ).toThrow();
+      expect(mutant).toMatch(AGENT_FOOTER);
+    }
+    // Targeted evidence for what the pin deliberately ignores: skill mentions
+    // mid-sentence, the singular form, and code-identifier spellings never
+    // match, and neither does the helper flag them.
+    const clean = [
+      'The skills used by the team are documented above.',
+      'Skills used in this project are listed in the handbook',
+      'Skill used: executing-plans',
+      'skills_used: executing-plans',
+      'See "Skills used:" in the contributor guide',
+    ];
+    for (const prose of clean) {
+      expect(prose).not.toMatch(AGENT_FOOTER);
+    }
+    assertNoAgentFooter(clean.map((content, index) => ({ path: `docs/clean-${index}.md`, content })));
+  });
+});
