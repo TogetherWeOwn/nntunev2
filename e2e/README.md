@@ -38,7 +38,7 @@ the activation checklist is accurate:
 
 - `GET /api/health` returns `{ok:true, version:<pkg>}`
   (`apps/web/src/routes/api/health/+server.ts`, pinned by
-  `apps/web/tests/smoke.spec.ts` exact-keys assertion). `health.spec.ts`
+  `apps/web/tests/smoke.spec.ts` exact-keys assertion). `tests/health.spec.ts`
   requires `ok === true` and asserts `version` whenever the deployed app
   ships it, so the check stays green across the deploy boundary.
 - `GET /api/ready` currently returns 200 `{ok:true}` while the stateless app
