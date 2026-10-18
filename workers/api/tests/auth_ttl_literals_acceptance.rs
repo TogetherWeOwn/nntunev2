@@ -31,7 +31,7 @@
 //! Run only this file:
 //!
 //! ```sh
-//! cargo test -p nntune-api --test auth_ttl_literals_acceptance
+//! cargo test --manifest-path workers/api/Cargo.toml --test auth_ttl_literals_acceptance
 //! ```
 
 use nntune_api::auth::{
