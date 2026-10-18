@@ -344,6 +344,19 @@ export class ApiClient {
 			const paywall = paywallFromResponse({ status: response.status, headers: response.headers, body });
 			throw new ApiError(response.status, parsed.code, parsed.message, paywall, parsed.retryable);
 		}
-		return (await response.json()) as T;
+		try {
+			return (await response.json()) as T;
+		} catch (error) {
+			// A 2xx whose body is not JSON is a backend contract violation,
+			// not a usable result: surface the typed error, never a bare
+			// SyntaxError. Same generic fallback as undecodable error
+			// bodies, but never retryable and never a paywall. Only decode
+			// failures are rewrapped: transport errors (TypeError/AbortError
+			// from a mid-body stream failure) rethrow untouched so they stay
+			// distinguishable and retryable.
+			if (!(error instanceof SyntaxError)) throw error;
+			const parsed = parseErrorBody(null, response.status);
+			throw new ApiError(response.status, parsed.code, parsed.message, null, false);
+		}
 	}
 }
