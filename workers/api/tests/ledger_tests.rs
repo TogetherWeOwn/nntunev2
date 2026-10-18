@@ -6,7 +6,7 @@
 //! Worker entry reuses these pure rules plus the parameterized statements.
 
 use nntune_api::ledger::{
-    self, classify_replay, derive_play_idempotency_key, fold_monthly_totals,
+    self, classify_fenced_replay, classify_replay, derive_play_idempotency_key, fold_monthly_totals,
     ledger_insert_statement, ledger_monthly_total_statement, ledger_select_by_key_statement,
     new_idempotency_key, period_month_for_timestamp, prepare_ledger_row, prepare_play_ledger_row,
     LedgerError, LedgerRow, ReplayOutcome,
@@ -320,12 +320,22 @@ fn statements_are_parameterized_replay_safe_and_month_scoped() {
         "column order: {insert}"
     );
     assert!(
-        insert.contains("VALUES ($1, $2, $3, $4, $5, $6, $7)"),
-        "positional bind: {insert}"
+        insert.contains("SELECT $1, $2, $3, $4, $5, $6, $7 FROM"),
+        "positional bind through the fence select: {insert}"
     );
     assert!(
         insert.contains("ON CONFLICT (idempotency_key) DO NOTHING"),
         "replay-safe: {insert}"
+    );
+    // ADR 0002 rule-3 writer fence in-statement (the library.rs genre
+    // pattern): the play owner's users row gates the write, held FOR SHARE
+    // through the insert. A bare VALUES insert would record plays behind the
+    // account-deletion marker; removing the fence fails here.
+    assert!(
+        insert.contains(
+            "FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence"
+        ),
+        "fenced through the play owner's users row: {insert}"
     );
     // A zero-row insert is ambiguous: the Worker selects the stored row and
     // classifies exact redelivery vs conflicting payload.
@@ -482,4 +492,45 @@ fn migration_pins_rate_and_persisted_caps() {
     );
     assert_eq!(ledger::MAX_IDEMPOTENCY_KEY_LEN, 1_159);
     assert_eq!(ledger::MAX_TRACK_ID_LEN, 512);
+}
+
+#[test]
+fn fenced_zero_row_insert_disambiguates_deletion_from_replay() {
+    // Zero rows from the fenced DO NOTHING insert is three-ways ambiguous.
+    // The Worker SELECTs the stored row and probes the fence
+    // (ACCOUNT_DELETING_PROBE_SQL), then classifies: a stored row decides
+    // without the probe (healthy duplicates never read as deleting), and
+    // only a missing row consults the probe — fence closed fails closed
+    // with AccountDeleting, fence open is Fresh.
+    let first = prepare_play_ledger_row("user-1", "track-9", "play-7", 48_000, 1, 1_767_225_600)
+        .expect("stream play feeds the ledger");
+    let replay =
+        prepare_play_ledger_row("user-1", "track-9", "play-7", 48_000, 1, 1_767_225_600).unwrap();
+    assert_eq!(
+        classify_fenced_replay(Some(&first), &replay, true),
+        ReplayOutcome::Duplicate,
+        "stored exact row acknowledges even with the marker set"
+    );
+    assert_eq!(
+        classify_fenced_replay(Some(&first), &replay, false),
+        ReplayOutcome::Duplicate
+    );
+    let mut tampered = first.clone();
+    tampered.bytes_served = 96_000;
+    tampered.stream_seconds = 2;
+    assert_eq!(
+        classify_fenced_replay(Some(&first), &tampered, false),
+        ReplayOutcome::Conflict,
+        "stored disagreement flags, never converges"
+    );
+    assert_eq!(
+        classify_fenced_replay(None, &first, true),
+        ReplayOutcome::AccountDeleting,
+        "no stored row + closed fence refuses behind the marker"
+    );
+    assert_eq!(
+        classify_fenced_replay(None, &first, false),
+        ReplayOutcome::Fresh,
+        "no stored row + open fence should have inserted"
+    );
 }

@@ -1,14 +1,14 @@
 //! Ledger property tests for the stream metering half.
 //!
 //! These tests exercise only the public [`nntune_stream::meter`] surface the
-//! way the ledger builder consumes it: `served_bytes` totals per
-//! (user, track) become ledger row inputs, and `stream_seconds_for_bytes`
-//! must agree with every emitted event's `seconds`. Deterministic xorshift
-//! streams stand in for a property-test RNG so this crate stays
-//! dependency-free.
+//! way the ledger builder consumes it: each play carries its OWN byte total
+//! (`CompletePlay.bytes`, folded from that play's chunks alone — never a
+//! cross-play `(user, track)` sum), and `stream_seconds_for_bytes` must agree
+//! with every emitted event's `seconds`. Deterministic xorshift streams stand
+//! in for a property-test RNG so this crate stays dependency-free.
 
 use nntune_stream::meter::{
-    analytics_point, served_bytes, stream_seconds_for_bytes, MeterEvent, MeterKind,
+    analytics_point, stream_seconds_for_bytes, CompletePlay, MeterEvent, MeterKind, UsageLedger,
     STREAM_BYTES_PER_SEC,
 };
 
@@ -51,53 +51,85 @@ fn event_seconds_always_match_the_formula() {
 
 #[test]
 fn chunked_service_folds_to_the_whole_play() {
-    // A track served as many small events (chunks, restarts, orphan flushes)
-    // folds to the same byte total as one whole-track event: splitting never
-    // creates or destroys billable bytes.
+    // One play served as many small events (chunks, restarts, orphan flushes)
+    // folds to the same byte total as one whole-play event: splitting never
+    // creates or destroys billable bytes. The fold is per-play — this test
+    // holds a single play id throughout — and the billed play carries exactly
+    // that total.
     let mut state = 777u64;
-    for _ in 0..500 {
+    for i in 0..500 {
         let chunks = 1 + rng_next(&mut state) % 8;
-        let mut events = Vec::new();
         let mut total = 0u64;
         for _ in 0..chunks {
             let bytes = 1 + rng_next(&mut state) % 100_000;
             total = total.saturating_add(bytes);
-            events.push(served_event("user-1", "track-9", bytes));
         }
-        assert_eq!(served_bytes(&events, "user-1", "track-9"), total);
-        // And the whole-track event carries the same total.
-        let whole = vec![served_event("user-1", "track-9", total)];
+        let play_id = format!("play-{i}");
+        let play =
+            CompletePlay::new("user-1", "track-9", &play_id, total).expect("folded play total");
+        assert_eq!(play.bytes, total);
         assert_eq!(
-            served_bytes(&whole, "user-1", "track-9"),
-            served_bytes(&events, "user-1", "track-9")
+            stream_seconds_for_bytes(play.bytes),
+            total.div_ceil(STREAM_BYTES_PER_SEC)
+        );
+        let mut ledger = UsageLedger::default();
+        ledger.record(&play);
+        assert_eq!(
+            ledger.get(&play.idempotency_key).map(|e| e.bytes),
+            Some(total)
         );
     }
 }
 
 #[test]
-fn per_user_per_track_totals_are_independent() {
-    // Folding is scoped: one user's bytes never leak into another user's or
-    // another track's total, no matter the interleaving.
+fn per_play_totals_are_independent_on_one_track() {
+    // Two listens of one (user, track) bill as two independent rows: the
+    // second play's bytes never leak into the first play's row, no matter the
+    // interleaving of their chunk events.
     let mut state = 31u64;
-    for _ in 0..300 {
-        let mut events = Vec::new();
-        let mut expected_a = 0u64;
-        let mut expected_b = 0u64;
+    for i in 0..300 {
+        let mut chunks_7 = Vec::new();
+        let mut chunks_8 = Vec::new();
+        let mut expected_7 = 0u64;
+        let mut expected_8 = 0u64;
         for _ in 0..10 {
             let bytes = 1 + rng_next(&mut state) % 50_000;
             if rng_next(&mut state).is_multiple_of(2) {
-                events.push(served_event("alice", "track-a", bytes));
-                expected_a += bytes;
+                chunks_7.push(served_event("user-1", "track-9", bytes));
+                expected_7 = expected_7.saturating_add(bytes);
             } else {
-                events.push(served_event("bob", "track-a", bytes));
-                expected_b += bytes;
+                chunks_8.push(served_event("user-1", "track-9", bytes));
+                expected_8 = expected_8.saturating_add(bytes);
             }
         }
-        // Reverse the interleaving: folding is order-independent.
-        events.reverse();
-        assert_eq!(served_bytes(&events, "alice", "track-a"), expected_a);
-        assert_eq!(served_bytes(&events, "bob", "track-a"), expected_b);
-        assert_eq!(served_bytes(&events, "alice", "track-b"), 0);
+        // Reverse each play's chunk order: a play's fold is order-independent.
+        chunks_7.reverse();
+        chunks_8.reverse();
+        let fold = |chunks: &[MeterEvent]| {
+            chunks
+                .iter()
+                .map(|e| e.bytes)
+                .fold(0u64, u64::saturating_add)
+        };
+        assert_eq!(fold(&chunks_7), expected_7);
+        assert_eq!(fold(&chunks_8), expected_8);
+        let play_7 =
+            CompletePlay::new("user-1", "track-9", &format!("play-7-{i}"), expected_7).unwrap();
+        let play_8 =
+            CompletePlay::new("user-1", "track-9", &format!("play-8-{i}"), expected_8).unwrap();
+        assert_ne!(play_7.idempotency_key, play_8.idempotency_key);
+        let mut ledger = UsageLedger::default();
+        ledger.record(&play_7);
+        ledger.record(&play_8);
+        assert_eq!(
+            ledger.get(&play_7.idempotency_key).map(|e| e.bytes),
+            Some(expected_7),
+            "play-7 bills only its own chunks, never the cross-play sum"
+        );
+        assert_eq!(
+            ledger.get(&play_8.idempotency_key).map(|e| e.bytes),
+            Some(expected_8)
+        );
     }
 }
 

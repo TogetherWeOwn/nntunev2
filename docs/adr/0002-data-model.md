@@ -427,7 +427,10 @@ deterministic `play:{user}:{track}:{play}` idempotency keys (128/512/512 limits,
 in a later slice; until then no daily `usage_ledger` table exists and no writer assumes its
 `(user_id, period)` upsert. Play-key binding, zero-row `SELECT` + classify (exact redelivery
 vs conflict), and the shared key vectors live in `workers/api/src/ledger.rs` with the stream
-worker's `derive_play_idempotency_key`.
+worker's `derive_play_idempotency_key`. The precursor's `ledger_insert_statement` is a rule-3
+fenced writer: `SELECT ... FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL
+FOR SHARE) AS writer_fence`, with zero-row disambiguation through the fence probe
+(`classify_fenced_replay`: no stored row + closed fence is the typed `account_deleting`).
 
 ### ERD (logical relationships; actual FKs as above)
 
@@ -674,9 +677,10 @@ Enumerate the user's own `ingest_jobs` and their `local_job_id` owner index
 before deleting jobs; this indexed owner path (not `local_key` parsing) drives
 local catalog cleanup, independent of current memberships/sources. In batches
 keyed on the `(user_id, played_at)` event indexes remove `play_event_outbox`,
-the user's monthly `play_events`, and `usage_ledger` rows before deleting
-referenced tracks or the user; account erasure is the first explicit exception
-to append-only event retention (rule 5). Then remove playlist entries and
+the user's monthly `play_events`, `stream_play_ledger` rows, and
+`usage_ledger` rows before deleting referenced tracks or the user; account
+erasure is the first explicit exception to append-only event retention
+(rule 5). Then remove playlist entries and
 library memberships, media, grants and sources. Remove owner-local catalog rows
 and `release_art` descriptors with no remaining library/playlist references
 under the release serializer. Billing is deleted only after remote termination is gated. The gate runs under

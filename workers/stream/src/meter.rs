@@ -552,20 +552,6 @@ pub fn analytics_point(event: &MeterEvent) -> AnalyticsPoint {
     }
 }
 
-/// Total bytes served to (`user_id`, `track_id`) across `events`: the sum of
-/// every `BytesServed` payload. The ledger row for a play derives from this
-/// total, so splitting service across chunks, aborts or orphans never changes
-/// the billed bytes.
-pub fn served_bytes(events: &[MeterEvent], user_id: &str, track_id: &str) -> u64 {
-    events
-        .iter()
-        .filter(|e| {
-            e.kind == MeterKind::BytesServed && e.user_id == user_id && e.track_id == track_id
-        })
-        .map(|e| e.bytes)
-        .fold(0u64, u64::saturating_add)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,59 +987,37 @@ mod tests {
     }
 
     #[test]
-    fn served_bytes_sums_only_matching_bytes_served_events() {
-        let events = vec![
-            MeterEvent {
-                kind: MeterKind::PlayStart,
-                user_id: "u".to_string(),
-                track_id: "t".to_string(),
-                // Deliberately non-zero to make kind-filtering observable.
-                bytes: 1,
-                seconds: 1,
-                lane: None,
-                backoff_ms: 0,
-            },
-            MeterEvent {
-                kind: MeterKind::BytesServed,
-                user_id: "u".to_string(),
-                track_id: "t".to_string(),
-                bytes: 16_384,
-                seconds: 1,
-                lane: None,
-                backoff_ms: 0,
-            },
-            MeterEvent {
-                kind: MeterKind::BytesServed,
-                user_id: "u".to_string(),
-                track_id: "t".to_string(),
-                bytes: 100_000,
-                seconds: 3,
-                lane: None,
-                backoff_ms: 0,
-            },
-            MeterEvent {
-                kind: MeterKind::BytesServed,
-                user_id: "u".to_string(),
-                track_id: "other".to_string(),
-                bytes: 50_000,
-                seconds: 2,
-                lane: None,
-                backoff_ms: 0,
-            },
-            MeterEvent {
-                kind: MeterKind::BytesServed,
-                user_id: "v".to_string(),
-                track_id: "t".to_string(),
-                bytes: 60_000,
-                seconds: 2,
-                lane: None,
-                backoff_ms: 0,
-            },
-        ];
-        assert_eq!(served_bytes(&events, "u", "t"), 116_384);
-        assert_eq!(served_bytes(&events, "u", "other"), 50_000);
-        assert_eq!(served_bytes(&events, "v", "t"), 60_000);
-        assert_eq!(served_bytes(&events, "nobody", "t"), 0);
+    fn two_plays_on_one_track_bill_independently() {
+        // There is no cross-play (user, track) fold: each play carries its
+        // own byte total (`CompletePlay.bytes`, fed from the play's own
+        // `served` counter), and the ledger converges per idempotency key.
+        // Summing both plays' bytes into play-7's row would bill play-7 for
+        // both listens and bill (or conflict) play-8 on top.
+        let play_7 = CompletePlay::new("user-1", "track-9", "play-7", 40_000).unwrap();
+        let play_8 = CompletePlay::new("user-1", "track-9", "play-8", 75_000).unwrap();
+        assert_ne!(play_7.idempotency_key, play_8.idempotency_key);
+        let mut ledger = UsageLedger::default();
+        assert_eq!(ledger.record(&play_7), RecordOutcome::Recorded);
+        assert_eq!(ledger.record(&play_8), RecordOutcome::Recorded);
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(
+            ledger.get(&play_7.idempotency_key).map(|e| e.bytes),
+            Some(40_000),
+            "play-7 bills only its own bytes, never the cross-play sum"
+        );
+        assert_eq!(
+            ledger.get(&play_8.idempotency_key).map(|e| e.bytes),
+            Some(75_000)
+        );
+        assert_eq!(ledger.total_bytes_for_user("user-1"), 115_000);
+        // A redelivery of play-7 converges to play-7 alone and leaves
+        // play-8 untouched.
+        assert_eq!(ledger.record(&play_7), RecordOutcome::Duplicate);
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(
+            ledger.get(&play_8.idempotency_key).map(|e| e.bytes),
+            Some(75_000)
+        );
     }
 
     // Deterministic stand-in for a property-test RNG (this crate stays

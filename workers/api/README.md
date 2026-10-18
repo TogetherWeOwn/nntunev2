@@ -355,10 +355,14 @@ behavior changes here.
   deterministic `play:{user}:{track}:{play}` key (same derivation as the
   stream worker; 128/512/512 limits, alphabet `[A-Za-z0-9_:-]`); non-play
   windows use a fresh 128-bit key minted once and reused across retries. The
-  insert is `ON CONFLICT DO NOTHING`, so a retried finalize inserts zero
-  rows instead of double-billing — then the Worker selects the stored row
-  and classifies exact redelivery (`Duplicate`) vs changed payload
-  (`Conflict`, flagged never converged). Stream seconds must
+  insert is fenced `ON CONFLICT DO NOTHING` through the play owner's
+  `users` row (`FOR SHARE`, ADR 0002 rule 3), so a play finalized behind
+  the account-deletion marker inserts nothing — then the Worker selects
+  the stored row, probes the fence, and classifies exact redelivery
+  (`Duplicate`) vs changed payload (`Conflict`, flagged never converged)
+  vs fenced refusal (`AccountDeleting`, typed 409 `account_deleting`).
+  A stored row decides without the probe, so healthy duplicates never read
+  as deleting. Stream seconds must
   equal `ceil(bytes / 48_000)` — the stream worker's nominal rate — or the
   row is rejected; `period_month` derives from `recorded_at`, and monthly
   usage is `SUM` over (`user_id`, `period_month`). All SQL is parameterized;

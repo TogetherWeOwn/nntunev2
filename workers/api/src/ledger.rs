@@ -27,8 +27,10 @@
 //!   so per-event seconds are not additive); mismatched seconds are rejected.
 //! - `period_month` (`YYYY-MM`, UTC) derives deterministically from
 //!   `recorded_at`; monthly usage is `SUM` over (`user_id`, `period_month`).
-//! - Replay safety: the insert is `ON CONFLICT (idempotency_key) DO NOTHING`,
-//!   so a retried finalize never double-bills. Stream plays MUST derive the
+//! - Replay safety: the insert is fenced `ON CONFLICT (idempotency_key)
+//!   DO NOTHING` through the ADR 0002 rule-3 writer fence (the play owner's
+//!   `users` row `FOR SHARE`), so a play finalized behind the account-deletion
+//!   marker inserts nothing. Stream plays MUST derive the
 //!   key deterministically with [`derive_play_idempotency_key`] from the same
 //!   `(user_id, track_id, play_id)` identity the stream worker uses — a
 //!   redelivery derives the same key, a genuine second listen carries a
@@ -36,12 +38,13 @@
 //!   [`new_idempotency_key`] remain for non-play windows; they MUST be minted
 //!   once per window and reused across retries (a new random key per retry
 //!   cannot deduplicate). A zero-row insert is ambiguous: the Worker MUST
-//!   `SELECT` the existing row with [`ledger_select_by_key_statement`] and
-//!   run [`classify_replay`] — exact redelivery reports
+//!   `SELECT` the existing row with [`ledger_select_by_key_statement`], probe
+//!   the fence, and run [`classify_fenced_replay`] — exact redelivery reports
 //!   [`ReplayOutcome::Duplicate`], any user/track/byte/second disagreement (or
 //!   a `play:` key that does not bind its identity) reports
-//!   [`ReplayOutcome::Conflict`] and changes nothing. Conflicts are flagged,
-//!   never silently converged.
+//!   [`ReplayOutcome::Conflict`], and no stored row with a closed fence reports
+//!   [`ReplayOutcome::AccountDeleting`] (typed 409 `account_deleting`, never
+//!   retried). Conflicts are flagged, never silently converged.
 //! - Bounds: a single row carries at most [`MAX_BYTES_PER_ROW`] bytes (24 h
 //!   of audio at the nominal rate); zero-byte rows are rejected — an empty
 //!   row bills nothing and only widens the table.
@@ -314,13 +317,15 @@ pub fn prepare_play_ledger_row(
     )
 }
 
-/// What a zero-row `ON CONFLICT DO NOTHING` insert means. The insert alone
-/// cannot tell an exact redelivery from a conflicting payload with the same
-/// key — the Worker MUST select the existing row and run
-/// [`classify_replay`].
+/// What a zero-row fenced `ON CONFLICT DO NOTHING` insert means. The insert
+/// alone cannot tell an exact redelivery from a conflicting payload with the
+/// same key — or from the writer fence refusing the write — so the Worker
+/// MUST select the existing row, probe the fence, and run
+/// [`classify_fenced_replay`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayOutcome {
-    /// No row for this key yet: the insert should have affected one row.
+    /// No row for this key yet and the fence is open: the insert should have
+    /// affected one row.
     Fresh,
     /// Exact redelivery: every billed field matches. Safe to acknowledge,
     /// never a double-bill.
@@ -328,6 +333,12 @@ pub enum ReplayOutcome {
     /// Same key, different billed payload — or a `play:` key that does not
     /// bind its identity. Never converges, never overwrites: flag it.
     Conflict,
+    /// No row for this key and the fence is closed (`users.deleting_at` is
+    /// set): the play was refused behind the account-deletion marker and
+    /// nothing was written. The Worker fails closed with the typed 409
+    /// `account_deleting` (`retryable: false`), never retried behind the
+    /// delete.
+    AccountDeleting,
 }
 
 /// Classify a retried finalize against the stored row.
@@ -352,6 +363,32 @@ pub fn classify_replay(existing: Option<&LedgerRow>, incoming: &LedgerRow) -> Re
         return ReplayOutcome::Conflict;
     }
     ReplayOutcome::Duplicate
+}
+
+/// Classify a zero-row fenced insert after the `SELECT` + fence probe.
+///
+/// `account_deleting` is the fence state the Worker obtains from the
+/// lock-free `ACCOUNT_DELETING_PROBE_SQL` (`account_deletion.rs`) in the same
+/// handling as the insert — `true` when `users.deleting_at` is set. The
+/// stored row decides first: when a row exists the write changed nothing new
+/// (the row predates the marker), so an exact redelivery acknowledges as
+/// [`ReplayOutcome::Duplicate`] and a disagreement flags
+/// [`ReplayOutcome::Conflict`] — healthy duplicates never read as
+/// `account_deleting`. Only a missing row consults the probe: fence closed is
+/// [`ReplayOutcome::AccountDeleting`], fence open is [`ReplayOutcome::Fresh`]
+/// (the insert should have landed; surface it, never assume a replay).
+pub fn classify_fenced_replay(
+    existing: Option<&LedgerRow>,
+    incoming: &LedgerRow,
+    account_deleting: bool,
+) -> ReplayOutcome {
+    if existing.is_some() {
+        return classify_replay(existing, incoming);
+    }
+    if account_deleting {
+        return ReplayOutcome::AccountDeleting;
+    }
+    ReplayOutcome::Fresh
 }
 
 /// Monthly usage for one user: what the usage endpoint reads.
@@ -387,23 +424,32 @@ pub fn fold_monthly_totals(rows: &[LedgerRow]) -> Vec<MonthlyTotal> {
         .collect()
 }
 
-// --- Statements: parameterized, idempotent ----------------------------------
+// --- Statements: parameterized, fenced, idempotent ----------------------------
 //
 // The Worker binds intent fields positionally ($1..$n); never interpolates a
-// value into SQL. The insert is replay-safe (`ON CONFLICT DO NOTHING` on the
+// value into SQL. The insert carries the ADR 0002 rule-3 writer fence
+// in-statement (the `library.rs` genre pattern): it selects through the play
+// owner's `users` row `FOR SHARE`, so a play finalized behind the
+// account-deletion marker inserts zero rows instead of repopulating a swept
+// ledger. The insert is replay-safe (`ON CONFLICT DO NOTHING` on the
 // idempotency key): a retried finalize inserts zero rows instead of
-// double-billing. Zero inserted rows are ambiguous (exact redelivery vs
-// conflicting payload), so the Worker selects the existing row with
-// `ledger_select_by_key_statement` and runs `classify_replay`: duplicates
-// acknowledge, conflicts flag. The monthly total is the usage truth for caps
-// and display.
+// double-billing. Zero inserted rows are three-ways ambiguous (exact
+// redelivery vs conflicting payload vs fenced refusal), so the Worker selects
+// the existing row with `ledger_select_by_key_statement`, probes the fence,
+// and runs `classify_fenced_replay`: duplicates acknowledge, conflicts flag,
+// fenced refusals fail closed with the typed 409. The monthly total is the
+// usage truth for caps and display.
 
-/// Parameters: idempotency_key, user_id, track_id, period_month,
-/// stream_seconds, bytes_served, recorded_at. One inserted row means the play
-/// was first billed; zero rows means the key already exists — SELECT it and
-/// run [`classify_replay`], never assume a benign replay.
+/// Fenced replay-safe insert for one billed play window.
+///
+/// Parameters: idempotency_key ($1), user_id ($2, also the fence key),
+/// track_id ($3), period_month ($4), stream_seconds ($5), bytes_served ($6),
+/// recorded_at ($7). One inserted row means the play was first billed while
+/// the fence was open; zero rows means the key already exists or the fence
+/// refused the write — SELECT the stored row, probe the fence, and run
+/// [`classify_fenced_replay`], never assume a benign replay.
 pub fn ledger_insert_statement() -> &'static str {
-    "INSERT INTO stream_play_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (idempotency_key) DO NOTHING"
+    "INSERT INTO stream_play_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at) SELECT $1, $2, $3, $4, $5, $6, $7 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (idempotency_key) DO NOTHING"
 }
 
 /// Parameters: idempotency_key. Fetches the stored row after a zero-row
@@ -557,10 +603,47 @@ mod tests {
     }
 
     #[test]
+    fn fenced_replay_prefers_the_stored_row_over_the_probe() {
+        let first = prepare_play_ledger_row("user-1", "track-9", "play-7", 48_000, 1, 1_767_225_600)
+            .expect("valid play row");
+        let replay =
+            prepare_play_ledger_row("user-1", "track-9", "play-7", 48_000, 1, 1_767_225_600)
+                .unwrap();
+        // A stored row decides without consulting the probe: a healthy
+        // duplicate never reads as account_deleting, even with the marker set.
+        assert_eq!(
+            classify_fenced_replay(Some(&first), &replay, true),
+            ReplayOutcome::Duplicate
+        );
+        assert_eq!(
+            classify_fenced_replay(Some(&first), &replay, false),
+            ReplayOutcome::Duplicate
+        );
+        let mut tampered = first.clone();
+        tampered.bytes_served = 96_000;
+        tampered.stream_seconds = 2;
+        assert_eq!(
+            classify_fenced_replay(Some(&first), &tampered, false),
+            ReplayOutcome::Conflict
+        );
+        // No stored row: only the probe decides. Fence closed refuses the
+        // play behind the marker; fence open means the insert should have
+        // landed.
+        assert_eq!(
+            classify_fenced_replay(None, &first, true),
+            ReplayOutcome::AccountDeleting
+        );
+        assert_eq!(
+            classify_fenced_replay(None, &first, false),
+            ReplayOutcome::Fresh
+        );
+    }
+
+    #[test]
     fn statements_match_exact_text() {
         assert_eq!(
             ledger_insert_statement(),
-            "INSERT INTO stream_play_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (idempotency_key) DO NOTHING",
+            "INSERT INTO stream_play_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at) SELECT $1, $2, $3, $4, $5, $6, $7 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (idempotency_key) DO NOTHING",
             "ledger insert"
         );
         assert_eq!(

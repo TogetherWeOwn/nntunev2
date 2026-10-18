@@ -362,8 +362,12 @@ and `reconcile` does not currently emit to Analytics Engine or call
   (`migrations/0019_stream_play_ledger.sql`, `stream_play_ledger` — not the
   ADR daily `usage_ledger`; row intents and statements owned by
   the api worker's `src/ledger.rs`, with the same `play:` key derivation and
-  select+classify replay flow). Neither sink is wired by the portable-core
+  select+classify replay flow, fenced through the play owner's `users` row).
+  Neither sink is wired by the portable-core
   reconciliation model described above. Every event carries stream seconds
-  at the nominal 48 000 bytes/s rate. Reconciliation must fold bytes first
-  (`served_bytes`) and derive seconds from that total: per-event seconds
-  each round up, so summing them overcounts split windows.
+  at the nominal 48 000 bytes/s rate. Billing folds per play, never across
+  plays: the worker folds that play's bytes only (its own `served` counter
+  into `CompletePlay.bytes`) and derives seconds from that play's total —
+  per-event seconds each round up, so summing them overcounts split windows,
+  and summing one `(user, track)` pair across play ids would bill one play
+  for another's listen.
