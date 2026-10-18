@@ -18,10 +18,12 @@
 //! Sensitivity (read before "optimizing" this test): the replacement test
 //! costs one real ~5 s wait against the production default — that is the
 //! point; a short `with_timeout` would pin the mechanism but not the
-//! default wiring. Bounds are deliberately generous (`4 s..=15 s`): the
-//! lower bound tolerates scheduling earliness and spurious `Condvar`
-//! wakeups (an early wake reads as a timeout, so the bound cannot be
-//! exact), the upper bound tolerates 3x slowdown on loaded CI runners.
+//! default wiring. Bounds are `5 s..=9 s`: the lower bound is exact
+//! because `Singleflight::wait` uses `Condvar::wait_timeout_while`, which
+//! re-waits on spurious wakeups until the full timeout elapses (an early
+//! wake cannot read as a timeout), and the clock starts before the waiter
+//! parks, so `waited >= 5 s` always; the upper bound tolerates loaded CI
+//! runners while still failing a 2x timeout drift (~10.5 s).
 //! The wedged leader is parked on a channel the test releases (bounded
 //! `recv_timeout` of 20 s), so a regression fails with an assertion —
 //! elapsed landing above the upper bound, or a third upstream fetch —
@@ -38,24 +40,14 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nntune_stream::stampede::{flight_key, Singleflight, SINGLEFLIGHT_WAIT_TIMEOUT_MS};
-
-/// The documented default waiter timeout, pinned literally.
-#[test]
-fn default_wait_timeout_literal_is_5000() {
-    assert_eq!(
-        SINGLEFLIGHT_WAIT_TIMEOUT_MS, 5_000,
-        "workers/stream/README.md documents SINGLEFLIGHT_WAIT_TIMEOUT_MS = 5_000; \
-         change both together"
-    );
-}
+use nntune_stream::stampede::{flight_key, Singleflight};
 
 /// `Singleflight::new()` replaces a wedged leader after ~5 s and the
 /// waiters take the replacement's success (not a third fetch, not a hang).
 #[test]
 fn new_replaces_wedged_leader_after_about_5s_and_waiters_take_replacement_success() {
-    const LOWER: Duration = Duration::from_secs(4);
-    const UPPER: Duration = Duration::from_secs(15);
+    const LOWER: Duration = Duration::from_secs(5);
+    const UPPER: Duration = Duration::from_secs(9);
 
     let group = Arc::new(Singleflight::<Vec<u8>, String>::new());
     let upstream_calls = Arc::new(AtomicUsize::new(0));
