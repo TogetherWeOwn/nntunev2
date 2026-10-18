@@ -122,10 +122,10 @@ fn upload_cap_literal_is_13_mib() {
 fn upload_cap_fits_maximally_escaped_nzb() {
     assert_eq!(MAX_NZB_BYTES, 2_097_152, "decoded-NZB cap must stay 2 MiB");
     assert_eq!(MAX_NZB_BYTES, 2 * 1024 * 1024);
-    assert!(
-        MAX_UPLOAD_BODY_BYTES >= MAX_NZB_BYTES,
-        "wire cap ({MAX_UPLOAD_BODY_BYTES}) must fit a full-size decoded NZB ({MAX_NZB_BYTES})"
-    );
+    // Wire cap must fit a full-size decoded NZB (2 MiB) with room for ~6x
+    // JSON-escaping inflation; const-asserted so clippy::assertions_on_constants
+    // stays quiet (constants only, no runtime involved).
+    const { assert!(MAX_UPLOAD_BODY_BYTES >= MAX_NZB_BYTES) };
     // ~6.5x headroom over the decoded cap: JSON escaping inflates hostile
     // input ~6x on the wire (lib.rs:68-71), so the wire cap must clear 6x with
     // margin while staying far below isolate memory pressure.
