@@ -200,14 +200,7 @@ pub const BUILD_SHA_UNKNOWN: &str = "unknown";
 #[must_use]
 pub fn parse_build_sha(raw: Option<&str>) -> String {
     match raw {
-        Some(value)
-            if value.len() == 40
-                && value
-                    .bytes()
-                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) =>
-        {
-            value.to_string()
-        }
+        Some(value) if is_build_sha_known(value) => value.to_string(),
         _ => BUILD_SHA_UNKNOWN.to_string(),
     }
 }
@@ -606,6 +599,8 @@ mod tests {
     #[test]
     fn build_sha_normalizes_to_known_or_unknown() {
         const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        const SHA_41: &str = "0123456789abcdef0123456789abcdef012345670";
+        const SHA_64: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         assert_eq!(parse_build_sha(Some(SHA)), SHA);
         assert!(is_build_sha_known(SHA));
         assert!(is_build_sha_known(&parse_build_sha(Some(SHA))));
@@ -616,11 +611,25 @@ mod tests {
             Some("0123456789abcdef"),                         // truncated
             Some("0123456789ABCDEF0123456789ABCDEF01234567"), // uppercase
             Some("0123456789abcdef0123456789abcdef0123456g"), // non-hex
+            Some(SHA_41),                                     // over-length
+            Some(SHA_64), // 64-hex digest, never a commit identity
         ] {
             assert_eq!(parse_build_sha(raw), BUILD_SHA_UNKNOWN, "raw: {raw:?}");
             assert!(!is_build_sha_known(&parse_build_sha(raw)));
         }
         assert!(!is_build_sha_known(BUILD_SHA_UNKNOWN));
+        // Direct bounds: length alone must not confer identity, whatever the
+        // caller passes without going through `parse_build_sha`.
+        for sha in [
+            "",
+            "0123456789abcdef",
+            "0123456789ABCDEF0123456789ABCDEF01234567",
+            SHA_41,
+            SHA_64,
+            BUILD_SHA_UNKNOWN,
+        ] {
+            assert!(!is_build_sha_known(sha), "must be unknown: {sha:?}");
+        }
         // Both spellings survive field validation, so emitters can always
         // carry the key (known SHA or explicit unknown).
         assert!(fields(serde_json::json!({"build_sha": SHA})).contains_key("build_sha"));

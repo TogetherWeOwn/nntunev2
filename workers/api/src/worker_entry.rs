@@ -1771,12 +1771,14 @@ fn served_display_path(path: &str) -> String {
     }
 }
 
-/// Build identity for log lines: the 40-char lowercase hex commit baked at
-/// deploy time via the public `BUILD_SHA` var, or the explicit `"unknown"`
-/// marker when absent or invalid (dev, preview without env, misconfigured
-/// CI). Public non-secret config (see `wrangler.toml.example`); never
-/// fail-closed, so a missing identity degrades the line instead of the
-/// request. Normalized through the shared validator, never logged raw.
+/// Build identity for log lines: the 40-char lowercase hex commit supplied
+/// at deploy time by the deploy lane via the public `BUILD_SHA` var (for
+/// example `--var BUILD_SHA:$GITHUB_SHA`; no workflow wires it for the api
+/// Worker yet), or the explicit `"unknown"` marker when absent or invalid
+/// (dev, preview without env, unwired lane). Public non-secret config (see
+/// `wrangler.toml.example`); never fail-closed, so a missing identity
+/// degrades the line instead of the request. Normalized through the shared
+/// validator, never logged raw.
 fn build_sha_from_env(env: &Env) -> String {
     crate::logging::parse_build_sha(env_string(env, "BUILD_SHA").as_deref())
 }
@@ -2143,9 +2145,14 @@ mod tests {
         for event in ["api.request.served", "api.start.misconfigured"] {
             assert!(dispatch_body.contains(event), "dispatch must emit {event}");
         }
-        assert!(
-            dispatch_body.contains("build_sha"),
-            "dispatch emit sites must carry the build_sha key"
+        // Match the key literal inside the `json!` fields, not the bare
+        // substring: `let build_sha = …` alone must never satisfy this.
+        // `dispatch` holds two emit sites (served + misconfigured), so a
+        // dropped key at either site drops the count below two.
+        assert_eq!(
+            dispatch_body.matches("\"build_sha\": build_sha").count(),
+            2,
+            "served and misconfigured must each carry the build_sha key"
         );
         let store_body = production
             .split_once("impl PgStore")
@@ -2159,7 +2166,7 @@ mod tests {
             "PgStore::connect must emit api.db.connection_error"
         );
         assert!(
-            store_body.contains("build_sha"),
+            store_body.contains("\"build_sha\": build_sha"),
             "the db connection_error site must carry the build_sha key"
         );
     }
