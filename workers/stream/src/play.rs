@@ -1099,8 +1099,14 @@ impl PlayStream {
 
     /// Finish the play: meter the bytes served, and on a miss pull any
     /// segments the client's range skipped, complete the staged write into
-    /// `cache` and return the connection to `pool`. Errors (a gone article,
-    /// a bad segment, a dead connection) leave the cache untouched.
+    /// `cache` and return the connection to `pool`. Serve-phase errors (a
+    /// gone article, a bad segment, a dead connection before the client got
+    /// its bytes) keep the exact `settle` behavior and leave the cache
+    /// untouched. Post-range fill errors — the client already has its full
+    /// `206` and `error()` is `None` — are background work: they return
+    /// `Ok`, never quarantine the breaker, never cache a partial track, and
+    /// drop a desynchronized (provider-failure) connection instead of
+    /// parking it warm.
     pub fn finalize(
         mut self,
         pool: &mut StreamPool,
@@ -1120,6 +1126,16 @@ impl PlayStream {
             Some(Source::Live(live)) => live,
             _ => return Ok(()),
         };
+        // Whether serving itself already failed before the fill runs. The
+        // iterator records serve-phase failures on `live.failed`; the fill
+        // loop below only runs when that is still `None`, so any failure it
+        // raises is background work, never a serve failure. Only a
+        // fully-drained play (`pos >= end`, the client has its full `206`)
+        // gets the background-fill treatment — an unread (`served == 0`) or
+        // partially-drained stream keeps the exact `settle` behavior, so the
+        // existing `stale_auth_midstream` finalize expectation holds.
+        let serve_failed = live.failed.is_some();
+        let fully_served = self.pos >= self.end;
         // Fetch whatever serving skipped — segments past the client's
         // range, plus the prefix a covering fetch jumped over — in file
         // order, so staging flushes the whole track into the upload.
@@ -1155,6 +1171,34 @@ impl PlayStream {
                 } = *live;
                 pool.release(lease, Some(client));
                 cache.put_track_at(&self.track_id, upload.complete(), started_at);
+                Ok(())
+            }
+            // Background fill failure on a fully-served, error-free play: the
+            // client already has its full `206`, so this is meter-only. Never
+            // touch the breaker (no `record_provider_error_for`, no
+            // `QuarantineEntered`) and never cache the partial track. A
+            // provider-failure connection timed out mid-BODY and is
+            // desynchronized, so it is dropped rather than parked warm; any
+            // other connection reuses `settle`'s warm/drop decision without
+            // its breaker accounting.
+            Some((_, conn)) if !serve_failed && fully_served => {
+                let live = *live;
+                if conn == Conn::ProviderFailure {
+                    meter.emit(ev(
+                        MeterKind::ProviderError,
+                        &self.user_id,
+                        &self.track_id,
+                        0,
+                    ));
+                }
+                pool.release(
+                    live.lease,
+                    if conn == Conn::KeepWarm {
+                        Some(live.client)
+                    } else {
+                        None
+                    },
+                );
                 Ok(())
             }
             Some(failure) => {
