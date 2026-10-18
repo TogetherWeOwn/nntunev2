@@ -22,7 +22,9 @@ previous snapshots are retained. It uses the image's Python 3 and a temporary,
 disk-backed SQLite projection (no external database). Run the fixture checks
 with `bash containers/mb-import/tests/test_etl.sh` and
 `bash containers/mb-import/tests/test_etl_reference_graphs.sh` (from the
-repository root — the latter pins the broken-reference refusal diagnostics);
+repository root — the latter pins four broken-reference refusal diagnostics:
+missing artist_type, release credit-name rows, track recording, medium
+release);
 the Dockerfile's test stage runs them during the normal image build without
 shipping fixtures in the runtime image. (Sources: `etl.sh:1-14`;
 `etl.py:141-160` (`DUMP_TS`, temp SQLite projection), `:319-335` (immutable
@@ -113,7 +115,7 @@ same-dump rerun, newer-dump upsert, DLQ, FK orphans, all-poison and
 dupe/cursor-ahead refusals, track repoint/prune, interrupted multi-chunk
 resume) against a scratch database: (Sources: `test-import.sh:1-8`
 (contract), `:82-136,221-260,264-323,324-377,379-525` (suites 1-12);
-`.github/workflows/ci.yml:481-514`.)
+`.github/workflows/ci.yml:483-516`.)
 
 ```sh
 cargo build -p mb-import-validate

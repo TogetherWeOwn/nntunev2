@@ -73,4 +73,4 @@ cargo clippy --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-u
 ```
 
 (Mirrors CI job `rust (workers/repair)`;
-Sources: `.github/workflows/ci.yml:428-449`.)
+Sources: `.github/workflows/ci.yml:430-451`.)

@@ -4,9 +4,11 @@
 # containers/mb-import/etl.py refuses correctly shaped rows whose joins
 # dangle (missing lookup/credit/track/medium references); test_etl.sh only
 # covers malformed file/argument shape and snapshot publication/survival, so
-# this companion suite pins each reference diagnostic with independent
-# synthetic fixture copies. Every mutation rewrites a single TSV field with
-# awk (tab counts unchanged) and the field-count guard below proves the run
+# this companion suite pins four broken-reference refusal diagnostics
+# (missing artist_type, release credit-name rows, track recording, medium
+# release) with independent synthetic fixture copies; every mutation rewrites
+# a single TSV field with awk (tab counts unchanged) and the field-count
+# guard below proves the run
 # reached the join check instead of failing on shape. Each broken case must
 # exit nonzero with its existing diagnostic before any curated snapshot is
 # published. Uses local tiny fixture copies only; no network, no database.
@@ -37,7 +39,7 @@ assert_field_count() {
 # no curated snapshot may have been published.
 assert_refused() {
   local case_dir="$1" err_file="$2" diagnostic="$3"
-  grep -qF "$diagnostic" "$err_file" || fail "missing diagnostic '$diagnostic' in $err_file"
+  grep -qFx "etl: $diagnostic" "$err_file" || fail "missing diagnostic '$diagnostic' in $err_file"
   [[ ! -e "$case_dir/curated" ]] || fail "curated published for broken case $case_dir"
   if compgen -G "$case_dir/.curated-*" > /dev/null; then fail "snapshot published for broken case $case_dir"; fi
 }
