@@ -54,10 +54,14 @@ Implementation: [src/lib.rs](src/lib.rs).
   `schema_version` when you change the meaning of an existing key, not when
   you add one; a supported version bump updates the schema file,
   `SCHEMA_VERSION`, the accepted version in `validate_schema` in
-  `../../.github/scripts/config_parity_check.py:119`, and its self-test (which
+  `../../.github/scripts/config_parity_check.py:119`, its self-test (which
   must then reject the next unsupported version, currently pinned at
   `../../.github/scripts/test_config_parity_check.py:113` rejecting version
-  2). Adding a key follows the procedure in the
+  2), and the `VALID_SCHEMA` fixture in
+  `../../.github/scripts/test_config_duplicate_members.py:36` (whose positive
+  control `test_valid_distinct_per_environment_values_accepted` in
+  `../../.github/scripts/test_config_duplicate_members.py:245-251` asserts
+  exit 0, so it must track the accepted version). Adding a key follows the procedure in the
   [config dir README](../../config/README.md) (schema file, both env
   fixtures, and the `KEYS` table together).
   (Sources: `src/lib.rs:19-21`, `src/lib.rs:88-91`; pinned by
