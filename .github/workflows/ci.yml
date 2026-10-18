@@ -415,6 +415,8 @@ jobs:
         run: python3 .github/scripts/test_config_parity_check.py
       - name: Parity checker duplicate-member tests
         run: python3 .github/scripts/test_config_duplicate_members.py
+      - name: Parity checker empty-schema-keys tests
+        run: python3 .github/scripts/test_config_empty_schema_keys.py
 
   rust-ingest:
     name: rust (workers/ingest)
