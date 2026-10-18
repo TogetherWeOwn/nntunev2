@@ -8,8 +8,10 @@ the provider pages linked in each section; re-check before relying on any
 number, because list prices change.
 
 This worksheet covers only the services listed below. It is **not** an
-all-in bill: Durable Objects (used by the `stream` Worker pool), Containers
-(repair path), Workers Logs, domain/DNS and any non-Cloudflare,
+all-in bill: Durable Objects (the `stream` Worker's `NntpPool` pool and the
+repair Worker's `RepairContainer` class; see the non-storage bindings
+inventory in `docs/ops.md`), Containers (repair path), Workers Logs,
+Cloudflare Access (staging gate), domain/DNS and any non-Cloudflare,
 non-PlanetScale services are out of scope here and must be added before
 any total is quoted as complete. Hyperdrive itself carries no separate
 line item beyond the Workers plan per the Workers pricing page, but the
@@ -42,7 +44,7 @@ workers = 5.00
 
 Volume sources at staging time: per-Worker request and CPU metrics in the
 Cloudflare dashboard / GraphQL Analytics API, summed over every deployed
-Worker (`web`, `api`, `stream`, `mb`, `ingest`).
+Worker (`web`, `api`, `stream`, `mb`, `ingest`, `repair`).
 
 ## 2. Cloudflare R2
 

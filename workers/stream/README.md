@@ -42,12 +42,15 @@ Pool semantics (`pool.rs`):
   healthy connection again. Two uncached tracks in a row cost one dial
   (asserted against the synthetic server's own connection count). A warm
   connection the provider closed is redialed once, transparently.
-- Lanes are enforced at acquire time: `Playback` may use every slot;
-  `Prefetch` and `Ingest` always leave one slot free for playback (so with a
-  cap of 1 they never run). Waiter ordering across async tasks arrives with
+- Lanes are enforced at acquire time (`Pool::reserve`, `Pool::try_acquire`):
+  `Playback` may use every slot; `Prefetch` and `Ingest` leave one slot free
+  for playback (so with a cap of 1 they never run outside the half-open probe
+  below, which admits one `Playback` or `Ingest` acquire with no reservation).
+  Waiter ordering across async tasks arrives with
   the Durable Object entry point; the reservation is what guarantees
   playback priority today.
 - Only connection-level failures (I/O, protocol errors, read timeouts)
+  (`NntpError::is_provider_failure`; settled per lease in `settle`)
   count toward the circuit breaker; a gone article (`430`/`423`) or a corrupt
   segment fails that one play (`ArticleMissing` / `Decode`) and returns the
   healthy connection. Breaker values are documented below.

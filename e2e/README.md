@@ -38,7 +38,7 @@ the activation checklist is accurate:
 
 - `GET /api/health` returns `{ok:true, version:<pkg>}`
   (`apps/web/src/routes/api/health/+server.ts`, pinned by
-  `apps/web/tests/smoke.spec.ts` exact-keys assertion). `health.spec.ts`
+  `apps/web/tests/smoke.spec.ts` exact-keys assertion). `tests/health.spec.ts`
   requires `ok === true` and asserts `version` whenever the deployed app
   ships it, so the check stays green across the deploy boundary.
 - `GET /api/ready` currently returns 200 `{ok:true}` while the stateless app
@@ -66,7 +66,7 @@ the activation checklist is accurate:
 ```sh
 cd e2e
 npm ci
-npx playwright install chromium
+npx playwright install --with-deps chromium
 STAGING_BASE_URL=https://staging.example \
   CF_ACCESS_CLIENT_ID='<from ~/secure-drop>' \
   CF_ACCESS_CLIENT_SECRET='<from ~/secure-drop>' \
@@ -83,6 +83,13 @@ Smoke only: `npm run e2e:smoke`. Validate without staging: `npm run typecheck`,
 If `NODE_ENV=production` is exported in your shell, install with
 `npm install --include=dev` — otherwise npm silently omits the dev
 dependencies this harness needs.
+
+Toolchain: CI runs Node 26 for this harness (both jobs in
+`.github/workflows/e2e-staging.yml` and the `e2e-lint` job in `ci.yml`,
+kept in sync with the `@types/node` major in `e2e/package.json`;
+Playwright `1.64.0` there too). The app itself uses Node 24 + pnpm
+(`NODE_VERSION`/`PNPM_VERSION` in `ci.yml`) and is unrelated to this
+npm-based harness (`e2e/package-lock.json`).
 
 ## Environment
 
@@ -177,7 +184,11 @@ How the suite uses them:
   journey runs only as a reusable-workflow call from `deploy.yml`'s
   `post-deploy-e2e` job, which `needs` the same run's `staging-web`
   deploy, so a skipped/failed deploy cannot produce a full-journey PASS
-  and the E2E run cannot race its deploy. Manual dispatch and the
+  and no run can start without its own deploy. A later main push can
+  still deploy staging mid-journey (deploy releases its job-level group
+  when the deploy finishes while E2E serializes separately) — that
+  timing fails the closing build-identity re-read instead of passing
+  green (see below). Manual dispatch and the
   6-hour schedule run the synthetic smoke only (monitoring, not
   post-deploy promotion evidence); dispatch defines no `post_deploy`
   input, so it cannot mint that evidence by hand.
@@ -185,7 +196,8 @@ How the suite uses them:
   Both jobs require the Access pair in preflight before activating tests;
   configured staging never skips for missing credentials. Failure artifacts
   are kept 7 days.
-- `e2e-lint` inside `ci.yml` (part of `ci-ok`) — `npm ci`, `tsc --noEmit`,
+- `e2e-lint` inside `ci.yml` (part of `ci-ok`) — `npm ci`, Playwright
+  chromium install (`--with-deps`), `tsc --noEmit`,
   helper/workflow self-tests, `playwright test --list`, and the
   traceability-matrix check (`docs/m1-exit-traceability.md` must cite every
   listed spec). Runs on every PR
@@ -195,11 +207,16 @@ How the suite uses them:
 - **Prod promotion gate (required integration):** the deployment lane must
   require the post-deploy full-journey result (the `post-deploy-e2e` job in
   the same `deploy.yml` run as the successful `staging-web` deploy) and
-  block promotion on failure. Sequencing after the deploy is wired;
-  blocking a later production promotion on that result, and live
-  enforcement, are still acceptance prerequisites of that later lane. A
-  source SHA is not deployed-build identity, so the result is not
-  same-build evidence until build identity is separately proven.
+  block promotion on failure. Sequencing after the deploy is wired, and the
+  full journey now carries same-build evidence: the opening
+  `build-identity.spec.ts` leg and the closing
+  `zz-build-identity-final.spec.ts` leg (which sorts last under the
+  serial config) both compare `GET /api/build` (baked at build time)
+  with the promotion SHA `deploy.yml` passes as `expected_sha` from
+  `github.sha` — never a source checkout — through one shared helper, so
+  a green run proves the whole journey ran against the promoted build.
+  Blocking a later production promotion on that result, and live
+  enforcement, are still acceptance prerequisites of that later lane.
 
 ## Evidence
 
@@ -209,7 +226,8 @@ headers/bodies and screenshots can expose account/provider information. CI
 uses the junit reporter only — the html reporter embeds step fill values
 (including the BYOP password) as a base64 zip in
 `playwright-report/index.html`, so it is never published. Sanitization is
-still required with traces off: Playwright 1.55 writes
+still required with traces off: Playwright (`1.64.0` in
+`e2e/package.json`) writes
 `test-results/**/error-context.md` (an ARIA snapshot rendering filled input
 values, including the BYOP password) — the workflow deletes
 error-context.md plus the whole `playwright-report/` dir before upload, and
@@ -219,9 +237,11 @@ is absent from every uploaded file including base64-decoded payloads. Do not
 enable traces/screenshots or the html reporter for credential-bearing runs
 without a verified redaction path. A QA PASS verdict cites the green
 post-deploy run URL (the `deploy.yml` run whose `staging-web` succeeded
-and whose `post-deploy-e2e` full journey passed) + the source head SHA —
-never a scheduled/manual synthetic run, which is monitoring only; NEEDS
-WORK cites the failing spec + step. Every spec that branches on the test-account seam records a
+and whose `post-deploy-e2e` full journey passed) + the deployed head SHA
+(the promotion SHA proven equal to `GET /api/build` at both the start
+and the end of the journey by the build-identity opening + closing
+specs) — never a scheduled/manual synthetic run, which
+is monitoring only; NEEDS WORK cites the failing spec + step. Every spec that branches on the test-account seam records a
 bounded `signup-path` test annotation — exactly `public-ui-signup` or
 `api-minted-account`, with no email, account id, token or provider data.
 Both staging jobs publish those labels to the run's step summary on every

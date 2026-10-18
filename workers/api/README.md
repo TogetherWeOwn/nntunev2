@@ -25,12 +25,21 @@ workers/api/
 `migrations/0002_auth_vault.sql` plus `0003` (library), `0004` (challenge
 purpose), `0005` (atomic rate-limit slots and test leases), `0006` (account
 deletion), `0007` (registration-challenge user foreign key), `0008`
-(database-enforced challenge purpose: CHECK plus an immutability trigger)
-and `0015_kek_rotation` (vault `rewrapped_at` marker + `kek_version`
-index, see `docs/security/kek-rotation.md` §2) define the Postgres schema
-(PlanetScale via Hyperdrive). CI applies every migration to a throwaway
+(database-enforced challenge purpose: CHECK plus an immutability trigger),
+`0009`–`0012` (metered admission ledger, atomic claim lease, claim-epoch
+fencing, queued replay window), `0013` (session-bound reauth purpose),
+`0015_kek_rotation` (vault `rewrapped_at` marker + `kek_version`
+index, see `docs/security/kek-rotation.md` §2) and `0018`
+(staging-only `qa_issued_codes` outbox for the test-code seam below)
+define the app-target Postgres schema (PlanetScale via Hyperdrive;
+targets per `migrations/manifest.toml`). The mirror-target `0001`
+(MusicBrainz mirror base), `0014` (import resume cursors + dead-letter
+queue), `0016` (release-to-track membership) and `0017` (replication
+packet ledger) serve the mb mirror, not this worker (see
+`workers/mb/README.md`). CI applies every migration to a throwaway
 Postgres and runs `tests/sql/*.sql` against it
-(`tests/run_migration_tests.sh`). All queries are parameterized;
+(`tests/run_migration_tests.sh`, `api-migrations` job in
+`.github/workflows/ci.yml`). All queries are parameterized;
 single-use claims execute the conditional `UPDATE ... RETURNING` prepared by
 the core and require exactly one row before any response.
 
@@ -46,8 +55,10 @@ the core and require exactly one row before any response.
 | `POST /v1/session/reauthenticate/start` / `finish` | current-session-bound passkey proof and atomic single-session replacement |
 | `GET` / `PUT` / `DELETE /v1/vault` | booleans-only summary / encrypted upsert / delete |
 | `POST /v1/vault/test` (`/v1/vault/test-connection` compatibility alias) | `{"ok": bool}` only; atomically rate-limited, per-user concurrency lease, bounded pinned-address dial; empty body tests the stored vault, a `{provider, indexer}` envelope tests a candidate without persisting it |
+| `POST /api/test-codes` (staging-only seam, no `OPTIONS` arm — see below) | returns the issued signup code for an `example.test` mailbox without minting; fail-closed 404/401 outside the staging posture |
 
-`OPTIONS` on any listed route answers an empty 204. Credentialed CORS
+`OPTIONS` on any listed route except the staging-only `POST /api/test-codes`
+seam answers an empty 204. Credentialed CORS
 headers (`Access-Control-Allow-Origin`, never `*`) are emitted only when
 the request `Origin` exactly equals the configured origin; any other
 origin gets none, so cross-origin JSON posts die at preflight. The web
@@ -121,12 +132,62 @@ config from secrets) is a follow-up slice.
   boundary only and changes no vault, dial, TLS, pool, or credential
   behavior.
 
+### Staging-only test-code seam (not part of the production surface)
+
+Shipped by the staging-seam build slice — this note records guardrails
+only, not implementation work. The normative security note is
+`docs/security/threat-model.md` §14 (see also row 1 of
+`docs/m1-exit-traceability.md`). No route, auth, migration, or credential
+behavior changes here.
+
+- **Seam path:** `POST /api/test-codes` (`QA_TEST_CODES_PATH`, served by
+  `qa_test_codes` in `src/handlers.rs`). The E2E pins the same path as
+  `testCodes` in `e2e/helpers/contract.ts` — a rename must change both
+  sides together — and reads it via `retrieveStagedSignupCode` in
+  `e2e/helpers/accounts.ts`. The path is deliberately absent from
+  `is_known_path` (`src/handlers.rs`), so unlike every row above it has
+  no `OPTIONS` 204 arm and is not enumerable from production.
+- **`example.test`-only scope:** only a well-formed synthetic mailbox
+  passes `is_example_test_mailbox` (`src/handlers.rs`: exactly one `@`,
+  reserved `example.test` domain matched case-insensitively; subdomains
+  and suffix lookalikes do not match). The E2E mints such mailboxes with
+  `uniqueTestEmail` (`e2e/helpers/contract.ts`, used from
+  `e2e/helpers/accounts.ts`). Any other address answers the
+  indistinguishable unknown-route 404.
+- **Never mints:** `qa_test_codes` (`src/handlers.rs`) is read-only — it
+  creates no users, challenges, or magic rows — and returns the captured
+  issuance as `{"magic_token": ...}` only while unexpired, else 404. The
+  E2E side (`retrieveStagedSignupCode` in `e2e/helpers/accounts.ts`)
+  requires a nonblank `magic_token` and never fabricates a code.
+- **Capture-side gate:** magic issuance stores the raw token in the
+  migration 0018 outbox (`qa_issued_codes`) only when `QA_CODE_SEAM` is
+  armed and the recipient is an `example.test` mailbox
+  (`src/handlers.rs`) — the deliberate narrow exception to the §4
+  "plaintext token never stored" invariant; see
+  `docs/security/threat-model.md` §14.
+- **Gating:** armed ONLY by the explicit staging flag
+  (`Config::qa_code_seam` via `with_qa_code_seam` in `src/handlers.rs`,
+  wired from `QA_CODE_SEAM` in `src/worker_entry.rs`) plus the staged
+  bearer (`Config::qa_auth_token` via `with_qa_auth_token`, compared
+  constant-time by `qa_bearer_ok` in `src/handlers.rs` against the
+  `Authorization: Bearer <QA_AUTH_TOKEN>` header). Flag off or bearer
+  unstaged serves the seam path as the plain unknown-route 404; a wrong
+  bearer is a names-only 401. Production never sets the flag or stages
+  the bearer, proven by the `qa_seam_absent_without_the_staging_flag`
+  gate test (`src/handlers.rs`). The E2E returns null without
+  `QA_AUTH_TOKEN` and treats the seam as required infrastructure once it
+  is set (`e2e/helpers/accounts.ts`).
+
 ## Security contract (threat-model §3–§4)
 
 - **Envelope encryption:** per-user random 256-bit DEK, wrapped by the KEK
   (Cloudflare Worker secret, versioned). AES-256-GCM, random 96-bit nonces,
   AAD binds `user_id` (+ KEK version for the wrap). Row-swap between users
   fails to decrypt. Rotation via `rewrap_dek` without touching ciphertext.
+  (Sources: `workers/api/src/vault.rs` — `encrypt_vault`, `decrypt_vault`,
+  `dek_aad`/`payload_aad`, `rewrap_dek`; KEK from `VAULT_KEK_BASE64` +
+  `VAULT_KEK_VERSION` in `workers/api/src/worker_entry.rs`; marker/index in
+  `migrations/0015_kek_rotation.sql`, design `docs/security/kek-rotation.md` §1–§2.)
 - **Never logged, never returned:** reads return booleans only
   (`redacted_summary`); `test connection` returns a boolean, never provider
   banners; audit events carry ids/results only — there is no field for
@@ -205,8 +266,10 @@ config from secrets) is a follow-up slice.
   attempts reserve fixed slot rows through an atomic `INSERT .. ON CONFLICT`
   before side effects; magic-link and registration inbox-proof sends share
   one per-email window. Every auth start (register, login, magic) reserves
-  one per-IP slot (30/hour, keyed on the client /64 for IPv6 and the full
-  address for IPv4) before any user/challenge row or mail (no
+  per-IP slots — the 30/hour budget plus the configured short-window burst
+  as one all-or-none pair (`auth.start_ip` + `auth.start_ip_burst`, defaults
+  30/hour + 10/60s), keyed on the client /64 for IPv6 and the full
+  address for IPv4 — before any user/challenge row or mail (no
   global slot at start, so exhaustion cannot block challenge issuance),
   and every mail send reserves a per-IP (30/hour) plus global (100/5 min)
   issuance slot in front of the per-email window — distinct-email loops
@@ -230,7 +293,14 @@ config from secrets) is a follow-up slice.
   challenge; legitimate single attempts and typo retries are unaffected.
   Unknown login emails use a keyed stand-in scope, expired challenges are
   pruned, and login options omit `allow_credentials` to avoid leaking
-  variable-length credential IDs.
+  variable-length credential IDs. (Sources: `workers/api/src/handlers.rs` —
+  `admit_auth_start`, `send_magic_link_if_allowed`, `rate_limit_ip_key`,
+  `throttled` (429 `{"error":"rate_limited"}`), `RATE_LIMIT_EXHAUSTED_SQL`,
+  finish-budget consts; `workers/api/src/rate_limit.rs` defaults +
+  `RateLimitConfig::from_vars`; atomic claim/pair in
+  `workers/api/src/worker_entry.rs` (`claim_rate_limit_slot`,
+  `reserve_rate_limit_pair`); tables in
+  `migrations/0005_atomic_rate_limits_and_leases.sql`.)
 - **Passkeys:** RP ID equals the exact origin host (cross-subdomain RP
   suffixes are intentionally unsupported). Configuration must be a canonical
   serialized origin: https, or http with the host exactly `localhost`,
@@ -288,17 +358,39 @@ config from secrets) is a follow-up slice.
   at every dial/fetch and pin the transport to that address set without
   another DNS lookup; retain the original hostname for TLS SNI/certificate
   checks and HTTP Host. Save-time validation is not a fetch authorization.
-  Indexer fetches forbid redirects. Test-connection attempts atomically
+  This worker performs no indexer fetches; indexer URLs are validated at
+  save/test time only (`IndexerConfig::validate`). Indexer fetches must
+  forbid redirects (`INDEXER_ALLOW_REDIRECTS = false`, threat-model
+  F-INGEST-01). No live indexer fetch transport exists yet;
+  `workers/ingest/src/indexer_fetch.rs` is a test-only policy model whose
+  3-hop redirect following is an unresolved discrepancy (see
+  `workers/ingest/README.md`). Test-connection attempts atomically
   reserve shared-store rate slots, acquire one of two per-user expiring
   leases, dial at most four addresses with a 5-second per-address timeout,
-  and stop the complete probe at 15 seconds.
+  and stop the complete probe at 15 seconds. (Sources:
+  `workers/api/src/vault.rs` — `host_shape_ok`, `ip_is_forbidden`,
+  `resolve_public_target`, `ProviderConfig::validate`,
+  `authorize_pool_dial`, `ALLOWED_NNTP_PORTS`, `MAX_DIAL_ADDRESSES`,
+  `DIAL_TIMEOUT_MS`/`TOTAL_TIMEOUT_MS`, `MAX_TEST_CONCURRENCY`,
+  `INDEXER_ALLOW_REDIRECTS`; pinned dial in
+  `workers/api/src/worker_entry.rs` (`SocketDialer::probe`, `probe_one`);
+  slots/leases in `workers/api/src/handlers.rs` (`vault_test_connection`)
+  and `workers/api/src/worker_entry.rs`
+  (`reserve_rate_limit_pair`, `acquire_test_connection_lease`); tables in
+  `migrations/0005_atomic_rate_limits_and_leases.sql`.)
 
 ## Test
 
 ```sh
-cargo test --manifest-path workers/api/Cargo.toml
-cargo clippy --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets
+cargo clippy --locked --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
 cargo fmt --manifest-path workers/api/Cargo.toml -- --check
+cargo check --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
+bash workers/api/check_hyperdrive_cache.sh --self-test
 ```
+
+(Mirrors CI job `api`; `fmt` takes no `--locked` (it resolves no
+dependencies), so the asymmetry is intentional.
+Sources: `.github/workflows/ci.yml:271-296`.)
 
 Fixtures use synthetic credentials only (`news.example.com`, `203.0.113.7`).

@@ -67,5 +67,10 @@ transport and body-read failure is `Retry`, never a terminal outcome.)
 ```sh
 cargo test --manifest-path workers/repair/Cargo.toml --all-targets
 cargo clippy --manifest-path workers/repair/Cargo.toml --all-targets -- -D warnings
+cargo fmt --manifest-path workers/repair/Cargo.toml -- --check
 cargo check --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown
+cargo clippy --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
 ```
+
+(Mirrors CI job `rust (workers/repair)`;
+Sources: `.github/workflows/ci.yml:428-449`.)
