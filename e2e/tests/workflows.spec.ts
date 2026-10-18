@@ -931,3 +931,72 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     expect(section).not.toContain('deploy --env');
   });
 });
+
+test.describe('deploy.yml carries no backend Worker deploy job', () => {
+  // Backend Worker deploys are intentionally NOT wired in deploy.yml (see its
+  // header): this workflow deploys apps/web only, and each backend lane must
+  // add its own evidenced job. These pins fail on any new
+  // `deploy-api-worker`-style job with `wrangler deploy --env staging`,
+  // anything deploying under workers/, or any production-environment deploy
+  // step. When the authorized backend lane lands, it extends this guard
+  // (allowlist + evidence) instead of weakening it.
+  const jobsBody = deployWorkflow.split('\njobs:\n')[1]!;
+
+  test('job set is exactly the evidenced web-only lanes', () => {
+    const names = [...jobsBody.matchAll(/^  ([A-Za-z0-9_-]+):$/gm)].map((m) => m[1]!).sort();
+    expect(names).toEqual(['gate', 'post-deploy-e2e', 'preview-web', 'staging-web']);
+    for (const name of names) {
+      expect(name, `job ${name} must not look like a backend deploy lane`).not.toMatch(
+        /worker|backend/i,
+      );
+    }
+  });
+
+  test('only the evidenced web staging step runs a wrangler deploy', () => {
+    // staging-web deploys apps/web to staging; preview-web runs `preview`
+    // (not deploy). Any additional wrangler deploy — action or raw
+    // `wrangler deploy` CLI — is a backend-lane candidate until evidenced.
+    expect(jobsBody.match(/wrangler-action/g) ?? []).toHaveLength(2);
+    expect(jobsBody.match(/deploy --env/g) ?? []).toHaveLength(1);
+    expect(jobSection(deployWorkflow, 'staging-web')).toContain('command: deploy --env staging');
+    expect(jobsBody).not.toContain('wrangler deploy');
+    for (const line of jobsBody.split('\n')) {
+      if (line.includes('workingDirectory:') || line.includes('working-directory:')) {
+        expect(line, `deploy working directory stays apps/web (${line.trim()})`).toContain(
+          'apps/web',
+        );
+      }
+    }
+  });
+
+  test('no workers/ path or production-environment deploy step in the jobs body', () => {
+    // Header comments (above `jobs:`) legitimately name workers/ and the
+    // future Hyperdrive gate; the jobs body itself stays web-only with no
+    // production path. Case-sensitive: the preview job carries a `Workers
+    // preview deployment` comment (no path), which must keep passing.
+    expect(jobsBody).not.toContain('workers/');
+    expect(jobsBody).not.toContain('--env production');
+    expect(jobsBody).not.toMatch(/environment:\s*production/i);
+    expect(jobsBody.toLowerCase()).not.toContain('production');
+  });
+
+  test('synthetic backend-deploy mutants trip the pins above', () => {
+    // Regression proof for the pins: each mutant models an unauthorized
+    // backend lane and must violate at least one expectation above.
+    const workerJob =
+      '\n  deploy-api-worker:\n    runs-on: ubuntu-latest\n    defaults:\n      run:\n        working-directory: workers/api\n    steps:\n      - run: wrangler deploy --env staging\n';
+    const workerMutant = `${jobsBody}${workerJob}`;
+    const mutantNames = [...workerMutant.matchAll(/^  ([A-Za-z0-9_-]+):$/gm)]
+      .map((m) => m[1]!)
+      .sort();
+    expect(mutantNames).not.toEqual(['gate', 'post-deploy-e2e', 'preview-web', 'staging-web']);
+    expect('deploy-api-worker').toMatch(/worker|backend/i);
+    expect(workerMutant).toContain('workers/');
+    expect(workerMutant).toContain('wrangler deploy');
+    expect(workerMutant.match(/deploy --env/g) ?? []).not.toHaveLength(1);
+
+    const prodMutant = `${jobsBody}\n      - run: wrangler deploy --env production\n`;
+    expect(prodMutant).toContain('--env production');
+    expect(prodMutant.toLowerCase()).toContain('production');
+  });
+});
