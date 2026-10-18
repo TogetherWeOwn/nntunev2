@@ -752,9 +752,9 @@ mod tests {
         let key = derive_play_idempotency_key(&user, &track, &play_id).unwrap();
         assert_eq!(key, format!("play:{user}:{track}:{play_id}"));
 
-        // The limits count bytes, not chars: 64 two-byte chars are exactly
-        // 128 bytes, 65 are 130.
-        assert!(derive_play_idempotency_key(&"\u{e9}".repeat(64), "t", "p").is_ok());
+        // Non-ASCII identities are refused even at the byte limit:
+        // 64 two-byte chars are exactly 128 bytes, 65 are 130.
+        assert!(derive_play_idempotency_key(&"\u{e9}".repeat(64), "t", "p").is_err());
         assert!(derive_play_idempotency_key(&"\u{e9}".repeat(65), "t", "p").is_err());
 
         // The ledger accepts exact-limit fields too, so its identity re-check
