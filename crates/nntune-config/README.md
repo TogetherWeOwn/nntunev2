@@ -1,7 +1,10 @@
 # nntune-config
 
-Typed accessor over the versioned KV config schema. Workers read config keys
-through `Config`, never with raw stringly KV lookups on config paths.
+Typed accessor over the versioned KV config schema. New Worker code must read
+config keys through `Config`, never with raw stringly KV lookups on config
+paths; existing Workers still read env/KV directly (e.g.
+`workers/api/src/worker_entry.rs`) and migrate incrementally, so the guarantees
+below apply once a caller uses `Config::load`.
 Compiles for native targets and `wasm32-unknown-unknown`.
 
 The schema source of truth is [config/schema.json](../../config/schema.json):
@@ -23,8 +26,10 @@ Implementation: [src/lib.rs](src/lib.rs).
   `true`/`false` (case-insensitive).
   (Sources: `src/lib.rs:56-85` for parsing, `src/lib.rs:262-287` for load;
   pinned by `defaults_apply_for_unset_keys`,
-  `missing_required_key_without_default_fails`, `invalid_types_rejected`, and
-  `unknown_kv_key_rejected` in `src/lib.rs:356-427`.)
+  `missing_required_key_without_default_fails`, `invalid_types_rejected`,
+  `unknown_kv_key_rejected` in `src/lib.rs:356-427`, and
+  `empty_and_blank_strings_rejected` in `src/lib.rs:481-517` for the
+  empty/whitespace-string rejection matching the CI parity checker.)
 - **Env overlay is scoped and atomic.** `Config::apply_env` consults only keys
   declared `env_overridable`, and only through their documented `env_var`
   name; every other environment entry is ignored. Precedence is KV first,
@@ -38,18 +43,23 @@ Implementation: [src/lib.rs](src/lib.rs).
   `env_overlay_is_atomic_across_vars` in `src/lib.rs:430-478`.)
 - **Never secrets.** Secret values are never config keys: Worker secrets and
   rotation live outside KV config entirely. Error text reports key names
-  only, never values, so it is safe for CI logs.
+  only, never values, so it is safe for CI logs. This holds by construction
+  — the error variants carry key names only (`src/lib.rs:229-236`); no test
+  asserts the `Display` output.
   (Sources: `src/lib.rs:11-12` for the rule, `src/lib.rs:226-251` for the
-  fail-closed error type; blank-string rejection matching the CI parity
-  checker is pinned by `empty_and_blank_strings_rejected` in
-  `src/lib.rs:481-517`.)
+  fail-closed error type.)
 - **Schema version bumps with meaning changes.** `SCHEMA_VERSION` is the
   version of `config/schema.json` this accessor implements; bump it together
   with the schema file — the cross-check test fails on drift. Bump
-  `schema_version` (schema file + `SCHEMA_VERSION`) when you change the
-  meaning of an existing key, not when you add one; adding a key follows the
-  procedure in the [config dir README](../../config/README.md) (schema file,
-  both env fixtures, and the `KEYS` table together).
+  `schema_version` when you change the meaning of an existing key, not when
+  you add one; a supported version bump updates the schema file,
+  `SCHEMA_VERSION`, the accepted version in `validate_schema` in
+  `../../.github/scripts/config_parity_check.py:119`, and its self-test (which
+  must then reject the next unsupported version, currently pinned at
+  `../../.github/scripts/test_config_parity_check.py:113` rejecting version
+  2). Adding a key follows the procedure in the
+  [config dir README](../../config/README.md) (schema file, both env
+  fixtures, and the `KEYS` table together).
   (Sources: `src/lib.rs:19-21`, `src/lib.rs:88-91`; pinned by
   `schema_file_matches_code_table` in `src/lib.rs:558-638`, which also checks
   key set, types, required flags, env-overridability, env vars, and defaults.)
