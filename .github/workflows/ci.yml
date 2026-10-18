@@ -178,6 +178,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Unit-test the size reporter
         run: python3 .github/scripts/test_report_worker_wasm_sizes.py
+      - name: Unit-test the size reporter I/O errors
+        run: python3 .github/scripts/test_report_worker_wasm_io_errors.py
       - name: Build and report per-Worker compressed Wasm sizes
         run: python3 .github/scripts/report_worker_wasm_sizes.py
 
@@ -215,7 +217,9 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
       - name: Unit-test the parity check
-        run: python3 .github/scripts/test_binding_parity.py
+        run: |
+          python3 .github/scripts/test_binding_parity.py
+          python3 .github/scripts/test_binding_parity_unknown_envs.py
       - name: Parity check on this repo
         run: python3 .github/scripts/binding_parity.py
       - name: Parity check passes on the matching fixture
@@ -253,6 +257,7 @@ jobs:
         run: |
           python3 .github/scripts/test_migrations_gate.py
           python3 .github/scripts/test_migrations_gate_regressions.py
+          python3 .github/scripts/test_migrations_gate_unreadable_sql.py
 
   test-nntp:
     name: test-nntp
@@ -533,6 +538,8 @@ jobs:
         run: python3 .github/scripts/check_archive_bindings.py
       - name: Unit-test the guard
         run: python3 .github/scripts/test_check_archive_bindings.py
+      - name: Unit-test the guard case folding
+        run: python3 .github/scripts/test_archive_binding_casefold.py
 
   # Docs internal-link lint: broken file links/anchors in changed markdown
   # (roadmap, matrix, ops, ADRs) fail the build. The lint step is scoped to
@@ -559,6 +566,8 @@ jobs:
         run: |
           python3 .github/scripts/test_docs_link_lint.py
           python3 .github/scripts/test_docs_link_diff_path_bytes.py
+      - name: Run docs-link directory-anchor self-tests
+        run: python3 .github/scripts/test_docs_link_directories.py
       - name: Lint whole tree on this repo
         run: python3 .github/scripts/docs_link_lint.py --root .
       - name: Lint passes on the matching fixture
