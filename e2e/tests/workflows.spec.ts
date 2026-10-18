@@ -1098,10 +1098,11 @@ test.describe('agent-footer absence in shipped sources (static pin)', () => {
   const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 
   // A footer line states the convention and its skill list after a colon at
-  // the start of a line. Case and spacing stay loose (rewordings must still
-  // fail); the colon is required so prose that merely mentions skills in a
-  // sentence never matches.
-  const AGENT_FOOTER = /^[ \t]*skills[ \t]+used[ \t]*:/im;
+  // the start of a line, optionally behind a list, quote, or bold marker.
+  // Case and spacing stay loose (rewordings must still fail); the colon is
+  // required so prose that merely mentions skills in a sentence never
+  // matches.
+  const AGENT_FOOTER = /^[ \t]*(?:[-*>]|\*\*)?[ \t]*skills[ \t]+used[ \t]*(?:\*\*)?[ \t]*:/im;
 
   // Lint test data holding intentionally crafted content is never shipped
   // prose: mirror the fixture exclusions of both Python lints.
@@ -1167,6 +1168,9 @@ test.describe('agent-footer absence in shipped sources (static pin)', () => {
       'Skills  used  :  executing-plans',
       '   Skills used: executing-plans',
       '\tSkills used: executing-plans, test-driven-development.',
+      '- Skills used: executing-plans.',
+      '> Skills used: executing-plans.',
+      '**Skills used**: executing-plans.',
     ];
     for (const mutant of mutants) {
       expect(
