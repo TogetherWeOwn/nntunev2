@@ -1807,9 +1807,12 @@ fn match_set_file<'a>(
         }
     }
     // Length fallback needs the true assembled length: only meaningful
-    // when every segment decoded.
+    // when every segment decoded. The sum is checked: overflowing part
+    // sizes prove no length, so there is no match (fail closed, no panic).
     if segs.len() >= total_segments && segs.iter().all(|s| !s.missing) {
-        let len: u64 = segs.iter().map(|s| s.size).sum();
+        let Some(len) = segs.iter().try_fold(0u64, |acc, s| acc.checked_add(s.size)) else {
+            return None;
+        };
         let mut found: Option<(&RecoverySet, &RecoveryFile)> = None;
         for set in sets {
             for entry in set.files.values() {
@@ -2654,5 +2657,77 @@ mod tests {
         let json = serde_json::to_string(&progress).unwrap();
         let back: VerifyProgress = serde_json::from_str(&json).unwrap();
         assert_eq!(back, progress);
+    }
+
+    fn header_with_len(len: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16);
+        out.extend_from_slice(b"PAR2\0PKT");
+        out.extend_from_slice(&len.to_le_bytes());
+        out
+    }
+
+    fn valid_64b_packet() -> Vec<u8> {
+        let mut out = vec![0u8; 64];
+        out[..8].copy_from_slice(b"PAR2\0PKT");
+        out[8..16].copy_from_slice(&64u64.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn packet_walk_stops_on_max_declared_len() {
+        // 16-byte header declaring len = u64::MAX: the alignment guard
+        // (`MAX % 4 == 3`) stops the walk at prefix 0 — no panic, no alloc.
+        let bytes = header_with_len(u64::MAX);
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(complete_packet_prefix(&bytes), 0);
+        assert!(!packets_within_bound(&bytes, u64::MAX));
+    }
+
+    #[test]
+    fn packet_walk_overflow_needs_checked_add() {
+        // Whole first packet (64 bytes) then the largest multiple of 4:
+        // passes alignment, so only the checked-add arm can stop the walk
+        // at 64. With wrapping arithmetic the walk would advance to 60.
+        const ALIGNED_MAX: u64 = u64::MAX - 3;
+        assert_eq!(ALIGNED_MAX % 4, 0);
+        let mut bytes = valid_64b_packet();
+        bytes.extend_from_slice(&header_with_len(ALIGNED_MAX));
+        assert_eq!(bytes.len(), 80);
+        assert_eq!(complete_packet_prefix(&bytes), 64);
+        assert_eq!(64usize.wrapping_add(ALIGNED_MAX as usize), 60);
+        assert!(!packets_within_bound(&bytes, u64::MAX));
+    }
+
+    #[test]
+    fn implied_len_overflow_is_none_for_present_missing_two_pow_63() {
+        // Two segments [2^63 present, missing]: part size 2^63, last length
+        // falls back to the part size, and 2^63 + 2^63 overflows u64, so no
+        // geometry is proven. Wrapping would yield total 0 (small enough to
+        // pass every cap), so this pin kills the wrapping mutant.
+        const TWO_POW_63: u64 = 1 << 63;
+        let segs = vec![srec(TWO_POW_63), smissing()];
+        assert_eq!(uniform_part_size(&segs, 2), Some(TWO_POW_63));
+        assert_eq!(implied_len(&segs, 2), None);
+        assert_eq!(TWO_POW_63.wrapping_add(TWO_POW_63), 0);
+    }
+
+    #[test]
+    fn implied_len_all_present_sum_overflow_is_none() {
+        // All-present [2^63, 2^63, 1]: the checked sum overflows, so no
+        // geometry is proven. Wrapping would yield 1 and hide the overflow.
+        const TWO_POW_63: u64 = 1 << 63;
+        let segs = vec![srec(TWO_POW_63), srec(TWO_POW_63), srec(1)];
+        assert_eq!(implied_len(&segs, 3), None);
+        assert_eq!(TWO_POW_63.wrapping_add(TWO_POW_63).wrapping_add(1), 1);
+    }
+
+    #[test]
+    fn match_set_file_length_fallback_is_checked() {
+        // Overflowing part sizes prove no length: no match, no panic.
+        const TWO_POW_63: u64 = 1 << 63;
+        let segs = vec![srec(TWO_POW_63), srec(TWO_POW_63), srec(1)];
+        let file = parsed("track.flac", false);
+        let mut claimed = std::collections::HashSet::new();
+        assert!(match_set_file(&[], &file, &segs, 3, &mut claimed).is_none());
     }
 }
