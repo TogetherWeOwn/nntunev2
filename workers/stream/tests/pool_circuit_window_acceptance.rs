@@ -48,6 +48,22 @@ fn failures_spread_wider_than_window_do_not_trip_breaker() {
 }
 
 #[test]
+fn failure_at_exact_window_boundary_remains_in_streak() {
+    let mut pool: Pool<()> = Pool::new(4);
+    for _ in 0..(CIRCUIT_FAILURE_THRESHOLD - 1) {
+        pool.record_provider_error();
+    }
+    // A span of exactly CIRCUIT_WINDOW_MS is still inside the window (`>`
+    // reset, not `>=`): the threshold-reaching failure must open the breaker.
+    pool.advance(CIRCUIT_WINDOW_MS);
+    pool.record_provider_error();
+    assert!(
+        pool.quarantined(),
+        "failure exactly at the window edge stays in the streak"
+    );
+}
+
+#[test]
 fn two_close_failures_then_window_expiry_restarts_streak() {
     let mut pool: Pool<()> = Pool::new(4);
     pool.record_provider_error();
