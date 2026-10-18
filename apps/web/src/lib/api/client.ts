@@ -55,6 +55,15 @@ export const PROVIDER_AUTH_EXPIRED_CODE = 'provider_auth_expired';
  * provider code: the web app names the API key (never the password) for it. */
 export const INDEXER_AUTH_EXPIRED_CODE = 'indexer_auth_expired';
 
+/**
+ * Deadline for a single ApiClient request (headers + body). Hung auth/vault
+ * calls must abort instead of wedging login/signup/BYOP spinners forever.
+ * Well under the acceptance cap (10 fake minutes) and above the
+ * still-pending probe (1s); fake-timer driven via `setTimeout` so vitest
+ * controls it (unlike `AbortSignal.timeout`'s internal timer).
+ */
+export const API_REQUEST_TIMEOUT_MS = 30_000;
+
 export interface MagicLinkResult {
 	ok: true;
 	/**
@@ -327,23 +336,72 @@ export class ApiClient {
 		};
 		if (this.token !== null) headers['authorization'] = `Bearer ${this.token}`;
 
-		const response = await this.fetchFn(`${this.baseUrl}${path}`, {
-			...init,
-			headers,
-			credentials: 'include'
-		});
-		if (!response.ok) {
-			// Read once so the paywall and typed error share the structured contract.
-			let body: unknown = null;
-			try {
-				body = await response.json();
-			} catch {
-				/* non-JSON error body: use status-based defaults */
+		// Per-request deadline: abort hung fetches AND stalled body reads so
+		// auth/vault spinners always settle. The timer is cleared on settle so
+		// fast requests never wait for it and later requests are unaffected.
+		const controller = new AbortController();
+		const callerSignal = init.signal as AbortSignal | null | undefined;
+		const onCallerAbort = (): void => controller.abort(callerSignal?.reason);
+		if (callerSignal?.aborted) controller.abort(callerSignal.reason);
+		else callerSignal?.addEventListener('abort', onCallerAbort, { once: true });
+		let timedOut = false;
+		const timer = setTimeout(() => {
+			timedOut = true;
+			controller.abort(new DOMException(`request timed out after ${API_REQUEST_TIMEOUT_MS}ms`, 'TimeoutError'));
+		}, API_REQUEST_TIMEOUT_MS);
+		try {
+			const response = await this.fetchFn(`${this.baseUrl}${path}`, {
+				...init,
+				signal: controller.signal,
+				headers,
+				credentials: 'include'
+			});
+			if (!response.ok) {
+				// Read once so the paywall and typed error share the structured contract.
+				let body: unknown = null;
+				try {
+					body = await response.json();
+				} catch {
+					// A body read cut short by the deadline surfaces the
+					// timeout, not a status default; anything else keeps the
+					// existing non-JSON fallback below.
+					if (timedOut) throw this.timeoutError();
+					/* non-JSON error body: use status-based defaults */
+				}
+				const parsed = parseErrorBody(body, response.status);
+				const paywall = paywallFromResponse({ status: response.status, headers: response.headers, body });
+				throw new ApiError(response.status, parsed.code, parsed.message, paywall, parsed.retryable);
 			}
-			const parsed = parseErrorBody(body, response.status);
-			const paywall = paywallFromResponse({ status: response.status, headers: response.headers, body });
-			throw new ApiError(response.status, parsed.code, parsed.message, paywall, parsed.retryable);
+			try {
+				return (await response.json()) as T;
+			} catch (error) {
+				if (timedOut) throw this.timeoutError();
+				throw error;
+			}
+		} catch (error) {
+			if (error instanceof ApiError) throw error;
+			// Only the deadline maps to the typed timeout error: caller
+			// aborts and network failures rethrow untouched.
+			if (timedOut) throw this.timeoutError();
+			throw error;
+		} finally {
+			clearTimeout(timer);
+			callerSignal?.removeEventListener('abort', onCallerAbort);
 		}
-		return (await response.json()) as T;
+	}
+
+	/**
+	 * Typed deadline failure: retryable (transient), never a paywall or an
+	 * auth/plan classification. Status 504 keeps `retryableFromStatus`
+	 * consistent for any caller that derives policy from status.
+	 */
+	private timeoutError(): ApiError {
+		return new ApiError(
+			504,
+			'request_timeout',
+			`request timed out after ${API_REQUEST_TIMEOUT_MS}ms deadline`,
+			null,
+			true
+		);
 	}
 }
