@@ -10,7 +10,7 @@
 //!   addresses in order for a pinned dial.
 //! - `max_connections` 0 and 51 map to [`VaultError::Invalid`]; 50 passes.
 //!
-//! Boundary vs TOG-26339 (pool dial-time guard): this file pins the vault
+//! Boundary vs the pool dial-time guard: this file pins the vault
 //! validate-then-truncate ordering plus the ceiling. The pool dial path,
 //! DNS impl, and any `src` change are out of scope — tests only, in-test
 //! fake [`DnsResolver`], no network.
@@ -109,7 +109,9 @@ fn max_connections_zero_and_fifty_one_rejected_fifty_passes() {
 
 #[test]
 fn forbidden_at_any_position_including_fifth_rejects_whole_target() {
-    let forbidden: IpAddr = "10.0.0.1".parse().unwrap();
+    // TEST-NET-1 documentation address: forbidden by the SSRF guard
+    // (`is_documentation`) yet lint-clean for this public repo.
+    let forbidden: IpAddr = "192.0.2.1".parse().unwrap();
     // Every slot — including the 5th (index 4) and 6th (index 5) beyond the
     // retained prefix — must reject the whole target. A truncate-before-
     // validate implementation would wrongly accept the beyond-prefix cases.
