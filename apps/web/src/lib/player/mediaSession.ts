@@ -116,7 +116,12 @@ export function applyMediaSession(
 	if (session === null) return false;
 
 	if (track === null) {
-		session.metadata = null;
+		try {
+			session.metadata = null;
+		} catch {
+			// A setter rejecting null must not orphan OS controls: the
+			// handler clears below still run via per-action isolation.
+		}
 		setHandler(session, 'nexttrack', null);
 		setHandler(session, 'previoustrack', null);
 		setHandler(session, 'play', null);
