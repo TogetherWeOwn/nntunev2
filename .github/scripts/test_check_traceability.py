@@ -203,5 +203,80 @@ class CheckTraceabilityTest(unittest.TestCase):
             self.assertIn("::error::traceability", buf.getvalue())
 
 
+    def test_main_drift_is_exit_1_with_one_error_per_drift(self):
+        # Drift path via main(): exit 1 with one ::error:: line per drift.
+        matrix = (
+            MATRIX_COVERING_BOTH
+            + '"renamed away title"\n`e2e/tests/vanished.spec.ts`\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix_path = write_tree(tmp, matrix, LIST_TWO_FILES)
+            list_path = os.path.join(tmp, "list.txt")
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                self.assertEqual(
+                    main(
+                        [
+                            "--root",
+                            tmp,
+                            "--matrix",
+                            str(matrix_path),
+                            "--list-output",
+                            list_path,
+                        ]
+                    ),
+                    1,
+                )
+            out = buf.getvalue()
+            self.assertEqual(out.count("::error::traceability:"), 2)
+            self.assertIn("renamed away title", out)
+            self.assertIn("e2e/tests/vanished.spec.ts", out)
+
+    def test_main_relative_paths_resolve_under_root(self):
+        # Relative --matrix/--list-output join under --root (absolute
+        # paths never exercise the joins at check_traceability.py:232-235).
+        with tempfile.TemporaryDirectory() as tmp:
+            write_tree(tmp, MATRIX_COVERING_BOTH, LIST_TWO_FILES)
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                self.assertEqual(
+                    main(
+                        [
+                            "--root",
+                            tmp,
+                            "--matrix",
+                            os.path.join("docs", "matrix.md"),
+                            "--list-output",
+                            "list.txt",
+                        ]
+                    ),
+                    0,
+                )
+            self.assertNotIn("::error::traceability:", buf.getvalue())
+
+    def test_main_missing_matrix_is_exit_2_naming_matrix(self):
+        # Missing-matrix path via main(): exit 2 naming the matrix (only
+        # the list-output-missing path was previously pinned).
+        with tempfile.TemporaryDirectory() as tmp:
+            write_tree(tmp, MATRIX_COVERING_BOTH, LIST_TWO_FILES)
+            missing = os.path.join(tmp, "docs", "missing.md")
+            list_path = os.path.join(tmp, "list.txt")
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                self.assertEqual(
+                    main(
+                        [
+                            "--root",
+                            tmp,
+                            "--matrix",
+                            missing,
+                            "--list-output",
+                            list_path,
+                        ]
+                    ),
+                    2,
+                )
+            out = buf.getvalue()
+            self.assertIn("::error::traceability:", out)
+            self.assertIn("missing.md", out)
+
+
 if __name__ == "__main__":
     unittest.main()
