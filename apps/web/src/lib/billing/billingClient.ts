@@ -151,6 +151,19 @@ function isValidSubscriptionPayload(data: unknown): data is SubscriptionDTO {
 	return true;
 }
 
+/**
+ * Successful GET /v1/plans DTO guard. The body must be an object whose
+ * `plans` field is an array (possibly empty). Unknown extra envelope
+ * fields are allowed and entries pass through verbatim; per-plan field
+ * validation is out of scope. Anything else rejects into the existing
+ * recoverable loader path instead of reaching pricing rendering as
+ * `undefined`, a string, or any other non-array value.
+ */
+function isValidPlansPayload(data: unknown): data is { plans: PlanDTO[] } {
+	if (typeof data !== 'object' || data === null || Array.isArray(data)) return false;
+	return Array.isArray((data as Record<string, unknown>).plans);
+}
+
 async function readJson<T>(res: Response, label: string): Promise<T> {
 	if (!res.ok) {
 		let body: unknown = null;
@@ -167,12 +180,27 @@ async function readJson<T>(res: Response, label: string): Promise<T> {
 		const hint = parsed.message ? `: ${parsed.message}` : '';
 		throw new BillingApiError(res.status, label, hint, parsed.code, parsed.retryable, paywall);
 	}
-	return (await res.json()) as T;
+	try {
+		return (await res.json()) as T;
+	} catch (error) {
+		// A 2xx whose body is not JSON is a backend contract violation, not
+		// a usable result: surface the typed error keeping the caller's
+		// label — never a bare SyntaxError, and never a downstream TypeError
+		// from reading fields off an undecodable body. Same generic fallback
+		// as undecodable error bodies, but never retryable and never a paywall.
+		// Only decode failures are rewrapped: transport errors rethrow
+		// untouched so they stay distinguishable.
+		if (!(error instanceof SyntaxError)) throw error;
+		const parsed = parseErrorBody(null, res.status);
+		const hint = parsed.message ? `: ${parsed.message}` : '';
+		throw new BillingApiError(res.status, label, hint, parsed.code, false, null);
+	}
 }
 
 export async function fetchPlans(fetchFn: typeof fetch = fetch): Promise<PlanDTO[]> {
 	const res = await fetchFn('/v1/plans', { credentials: 'include' });
-	const data = await readJson<{ plans: PlanDTO[] }>(res, 'Load plans');
+	const data = await readJson<unknown>(res, 'Load plans');
+	if (!isValidPlansPayload(data)) throw new Error('Invalid plans payload');
 	return data.plans;
 }
 

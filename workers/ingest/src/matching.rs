@@ -13,9 +13,12 @@
 //! recordings (`GET /v1/mb/release/:mbid/recordings`) to fill
 //! `recording_mbids`. A recordings-fetch failure never loses the release
 //! match: transient failures retry the job (the match is re-resolved on
-//! redelivery), and permanent failures write the matched release with an
-//! empty list — the library upsert converges (`ON CONFLICT DO UPDATE`),
-//! so a later replay can still fill them in. See
+//! redelivery), and permanent (non-404 4xx) failures write the matched
+//! release with an empty list — the library upsert converges
+//! (`ON CONFLICT DO UPDATE`), so a later replay can still fill them in.
+//! A 404 is transient on both routes: the canonical `not_found` body is
+//! shared by route misses and genuinely missing releases, so it retries
+//! rather than DLQ-ing the match or wiping recordings. See
 //! [`recording_mbids_or_fallback`].
 
 use serde::Deserialize;
@@ -100,9 +103,12 @@ pub enum MatchFailure {
     /// Binding/transport failure, a 5xx, or an unreadable body: the same
     /// lookup may succeed on redelivery.
     Transient,
-    /// The MB worker rejected the request itself (4xx). The query is
-    /// pre-validated against the MB contract ([`validate_match_query`]),
-    /// so a 4xx is a contract bug, not a retry.
+    /// The MB worker rejected the request itself (a 4xx other than 404).
+    /// The query is pre-validated against the MB contract
+    /// ([`validate_match_query`]), so such a 4xx is a contract bug, not
+    /// a retry. A 404 is `Transient` instead: the canonical
+    /// `not_found` body is shared by route misses and genuinely missing
+    /// releases, so it proves neither.
     Permanent,
 }
 
@@ -142,11 +148,17 @@ pub fn mb_search_url(query: &str) -> String {
 
 /// Classify one MB search response. Only a 200 with the documented body
 /// shape is a result; an empty result list is a successful no-match.
+///
+/// A 404 is `Transient`, never a no-match: the legitimate no-match is a
+/// 200 with an empty `results` list, so a search 404 can only be a route
+/// miss / version skew (e.g. a rolling MB deploy with no search route
+/// yet). It retries with backoff; every other 4xx stays `Permanent`.
 pub fn parse_mb_search_response(status: u16, body: &str) -> Result<Vec<MbSearchHit>, MatchFailure> {
     match status {
         200 => serde_json::from_str::<MbSearchBody>(body)
             .map(|parsed| parsed.results)
             .map_err(|_| MatchFailure::Transient),
+        404 => Err(MatchFailure::Transient),
         400..=499 => Err(MatchFailure::Permanent),
         _ => Err(MatchFailure::Transient),
     }
@@ -167,15 +179,20 @@ pub fn mb_release_recordings_url(release_mbid: &str) -> String {
 /// MBIDs are dropped, duplicates keep their first position, and the
 /// list is capped at [`MAX_RECORDING_MBIDS`]. An empty recordings list
 /// is a successful empty result. Status classification mirrors
-/// [`parse_mb_search_response`]; note a 404 here is `Permanent` (the
-/// release vanished between search and this fetch, or a contract bug),
-/// and [`recording_mbids_or_fallback`] decides what that means for the
+/// [`parse_mb_search_response`]: a 404 is `Transient`, retrying instead
+/// of writing a zero-recording success. The MB worker renders the same
+/// `{"code":"not_found",...}` body for a route miss and for a genuinely
+/// missing release, so no 404 body proves the release has no recordings;
+/// a genuinely missing release therefore retries until the normal retry
+/// budget is exhausted rather than converging to an empty write.
+/// [`recording_mbids_or_fallback`] decides what that means for the
 /// write.
 pub fn parse_mb_recordings_response(status: u16, body: &str) -> Result<Vec<String>, MatchFailure> {
     match status {
         200 => serde_json::from_str::<MbRecordingsBody>(body)
             .map(|parsed| recording_mbids_in_track_order(&parsed.recordings))
             .map_err(|_| MatchFailure::Transient),
+        404 => Err(MatchFailure::Transient),
         400..=499 => Err(MatchFailure::Permanent),
         _ => Err(MatchFailure::Transient),
     }
@@ -565,6 +582,12 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        // A search 404 is a route miss / version skew, never a
+        // no-match (the no-match is a 200 with empty results): retry.
+        assert_eq!(
+            parse_mb_search_response(404, "{}"),
+            Err(MatchFailure::Transient)
+        );
         assert_eq!(
             parse_mb_search_response(400, "{}"),
             Err(MatchFailure::Permanent)
@@ -798,9 +821,19 @@ mod tests {
         )
         .unwrap()
         .is_empty());
+        // A 404 retries: the canonical `not_found` body is shared by
+        // route misses and genuinely missing releases, so it proves
+        // neither. Every other 4xx stays permanent.
         assert_eq!(
             parse_mb_recordings_response(404, "{}"),
-            Err(MatchFailure::Permanent)
+            Err(MatchFailure::Transient)
+        );
+        assert_eq!(
+            parse_mb_recordings_response(
+                404,
+                r#"{"code":"not_found","message":"not found","retryable":false}"#
+            ),
+            Err(MatchFailure::Transient)
         );
         assert_eq!(
             parse_mb_recordings_response(400, "{}"),
