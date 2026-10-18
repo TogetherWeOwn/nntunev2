@@ -1,4 +1,4 @@
-//! Pin `Error` rendering and redaction (TOG-29664).
+//! Pin `Error` rendering and redaction.
 //!
 //! Snapshots every `Display` arm, pins `Debug` redaction for the
 //! credential-bearing variants, and covers `source()`, `From<io::Error>`,
@@ -12,6 +12,24 @@ use std::error::Error as StdError;
 use std::io;
 
 use nntune_core::error::{Error, PROVIDER_AUTH_EXPIRED_CODE};
+
+/// Exhaustive match with no wildcard arm: adding a new `Error` variant breaks
+/// compilation here, forcing this file to pin the new variant's rendering.
+fn assert_all_variants_known(err: &Error) {
+    match err {
+        Error::Io(_)
+        | Error::NntpReply { .. }
+        | Error::AuthFailed(_)
+        | Error::NoPermission(_)
+        | Error::ArticleNotFound(_)
+        | Error::Malformed(_)
+        | Error::CrcMismatch { .. }
+        | Error::Bounds { .. }
+        | Error::Decrypt(_)
+        | Error::Par2Unhealthy { .. }
+        | Error::UnsupportedOnWasm(_) => {}
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Display: exact snapshot of every arm
@@ -343,6 +361,8 @@ fn code_covers_all_eleven_variants() {
     ];
     assert_eq!(cases.len(), 11, "all 11 Error variants must be covered");
     for (err, expected) in &cases {
+        // Compile-time guard: a new variant breaks `assert_all_variants_known`.
+        assert_all_variants_known(err);
         assert_eq!(err.code(), *expected, "wrong code for {err}");
     }
     // Only AuthFailed is the auth failure signal.
