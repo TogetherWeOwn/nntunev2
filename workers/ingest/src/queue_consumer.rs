@@ -1404,11 +1404,15 @@ async fn process_raw_message(env: &Env, raw: worker::RawMessage) {
     // replaced, never trusted or logged. Only opaque job facts enter the line.
     let trace_id = nntune_logging::resolve_trace_id(msg.trace_id.as_deref());
     msg.trace_id = Some(trace_id.clone());
+    // Build identity rides every line (mirrors the api worker and the fetch
+    // routes above): the consumer runs in the same deployment, so its own
+    // env carries the same public BUILD_SHA var, or explicit "unknown".
+    let build_sha = crate::build_sha_from_env(env);
     crate::emit(
         nntune_logging::Level::Info,
         &trace_id,
         "ingest.job.consumed",
-        serde_json::json!({"job_id": msg.job_id}),
+        serde_json::json!({"job_id": msg.job_id, "build_sha": build_sha}),
     );
     match process_message(env, &msg).await {
         Settlement::Ack => raw.ack(),
