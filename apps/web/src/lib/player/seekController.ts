@@ -43,6 +43,29 @@ function abortError(): DOMException {
 }
 
 /**
+ * Release a response discarded before body consumption. A rejected
+ * streaming response must not keep producing into nothing: cancel its
+ * unused body so upstream work stops. Cleanup failures are swallowed
+ * so they never replace the original response error, and a missing
+ * body is a no-op. Never reads the body (no `arrayBuffer`) and never
+ * retains a reader lock.
+ */
+async function releaseRejectedBody(response: Response): Promise<void> {
+	let body: ReadableStream<Uint8Array> | null;
+	try {
+		body = response.body;
+	} catch {
+		return;
+	}
+	if (body === null) return;
+	try {
+		await body.cancel();
+	} catch {
+		// Cleanup failure contained; caller still throws the original error.
+	}
+}
+
+/**
  * Read at most `expectedLength` body bytes incrementally, so a finite
  * range never accumulates an oversized response before validation.
  * Accumulated buffers are bounded by `expectedLength` (a boundary
@@ -183,10 +206,12 @@ export class SeekController {
 				signal: controller.signal
 			});
 			if (controller.signal.aborted) {
+				await releaseRejectedBody(response);
 				throw new DOMException('Seek superseded by a newer seek', 'AbortError');
 			}
 
 			if (response.status !== 206 && response.status !== 200) {
+				await releaseRejectedBody(response);
 				throw new Error(`Range request failed with HTTP ${response.status}`);
 			}
 			if (response.status === 206) {
@@ -197,6 +222,7 @@ export class SeekController {
 					(requestedEnd !== undefined && range.end !== Math.min(requestedEnd, range.total - 1)) ||
 					(requestedEnd === undefined && range.end !== range.total - 1)
 				) {
+					await releaseRejectedBody(response);
 					throw new Error('Range response does not satisfy the requested byte range');
 				}
 				const expectedLength = range.end - range.start + 1;
@@ -215,7 +241,10 @@ export class SeekController {
 
 			// A 200 is a full representation, so it only satisfies a range
 			// starting at byte zero. Slice only when the caller asked for an end.
-			if (requestedStart !== 0) throw new Error('Server ignored a non-zero byte range');
+			if (requestedStart !== 0) {
+				await releaseRejectedBody(response);
+				throw new Error('Server ignored a non-zero byte range');
+			}
 			if (requestedEnd !== undefined) {
 				// Finite prefix: collect only the requested bytes and cancel
 				// the unused remainder instead of buffering the whole body.
