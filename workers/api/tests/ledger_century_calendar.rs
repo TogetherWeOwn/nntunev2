@@ -157,5 +157,5 @@ fn fold_separates_february_and_march_at_century_boundaries() {
     let bytes: u64 = totals.iter().map(|t| t.bytes_served).sum();
     let seconds: u64 = totals.iter().map(|t| t.stream_seconds).sum();
     assert_eq!(bytes, 48_000 * 3 + 96_000 * 3);
-    assert_eq!(seconds, 1 * 3 + 2 * 3);
+    assert_eq!(seconds, 9); // 3 x 1 s February rows + 3 x 2 s March rows.
 }
