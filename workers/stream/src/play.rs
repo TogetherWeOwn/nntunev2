@@ -336,7 +336,9 @@ struct Live {
     /// `PlayInput::now_unix` at play time: the cache write stamped on
     /// `finalize`, so the SWR clock runs from when the bytes were fetched.
     started_at: u64,
-    /// File size declared by the first fetched segment.
+    /// File size for the play: the first fetched segment's declared size,
+    /// or the ranges total when that first article (segment 0) disagreed
+    /// with the ground-truth ranges and was refetched.
     total: u64,
     /// The most recently decoded segment, shared with `pending` (no copy).
     buf: Arc<[u8]>,
@@ -559,12 +561,21 @@ fn play_authorized(
         let agrees = first.file_size == r[r.len() - 1].1
             && first.offset == r[first_seg].0
             && first.data.len() as u64 == r[first_seg].1 - r[first_seg].0;
-        if !agrees && first_seg != 0 {
-            // The hint lied about the covering article: discard it and
-            // restart as a prefix walk on the same connection.
+        if !agrees {
+            // The first article disagrees with the ground-truth ranges:
+            // discard it and restart as a prefix walk on the same
+            // connection. When the covering fetch already was segment 0
+            // the refetch is the same article, so its provider-declared
+            // `size=` must never define the 206 window — the ranges total
+            // does. A covering `!= 0` refetch lands on a different segment
+            // 0 whose declared size already is the total.
+            let was_first_seg_zero = first_seg == 0;
             match fetch_segment(&mut client, &input.segments[0]) {
                 Ok(decoded) => {
                     first = decoded;
+                    if was_first_seg_zero {
+                        first.file_size = r[r.len() - 1].1;
+                    }
                     first_seg = 0;
                 }
                 Err(SegmentError::Nntp(e)) => {
