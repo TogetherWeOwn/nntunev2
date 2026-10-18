@@ -12,17 +12,28 @@
 //! vice versa, so the suite pins both the boundary behaviour (empty and
 //! 513-byte ids rejected, exactly-512 accepted, for track AND play
 //! independently) and the literal agreement
-//! (`512 == MAX_TRACK_ID_LEN == MAX_PLAY_ID_LEN`, importing both crates).
+//! (`512 == MAX_TRACK_ID_LEN == MAX_PLAY_ID_LEN`, read from the ledger
+//! source — see below).
 //!
 //! Sensitivity (what each pin kills; implementation stays untouched):
 //!
 //! - raising/lowering either stream-side literal (e.g. 256 or 1024) fails
 //!   the boundary tests on that field — the ledger constants still say 512,
 //!   so the drift surfaces here instead of silently unbilled plays;
-//! - raising/lowering either ledger constant fails
+//! - raising/lowering either ledger constant (or renaming it) fails
 //!   `ledger_caps_are_512_and_agree` even when the stream behaviour is
 //!   unchanged, catching a ledger-side drift before it rejects
 //!   stream-accepted ids;
+//!
+//! The ledger side is read as source text via `include_str!`, not imported
+//! as a crate: `workers/api` is a standalone worker excluded from the root
+//! workspace AND from the container build contexts (`.dockerignore`
+//! `workers/*` minus `!workers/stream/`), so a `nntune-api` path dev-dep
+//! breaks `containers/mb-import` and `containers/repair` clean-checkout
+//! builds (`no matching package named nntune-api found`). This follows the
+//! `workers/mb/tests/api_errors_cross_worker.rs` precedent. `cargo build`
+//! never compiles `tests/`, so the missing file in those contexts is never
+//! touched; full-checkout `cargo test` always has it.
 //! - splitting the two caps apart (track 512 / play 256 or vice versa) fails
 //!   the agreement assert, which requires both to stay 512 together;
 //! - accepting empty ids fails `empty_*_rejected`; accepting 513-byte ids
@@ -39,10 +50,13 @@
 //! cargo test -p nntune-stream --test id_cap_agreement_acceptance
 //! ```
 
-use nntune_api::ledger::{MAX_PLAY_ID_LEN, MAX_TRACK_ID_LEN};
 use nntune_stream::meter::derive_play_idempotency_key;
 
 const USER: &str = "user-1";
+
+/// Ledger source, read as text (NOT a crate import — see module docs for why
+/// a `nntune-api` dev-dependency is forbidden here).
+const LEDGER_RS: &str = include_str!("../../api/src/ledger.rs");
 
 fn id_of_len(len: usize) -> String {
     "a".repeat(len)
@@ -50,18 +64,20 @@ fn id_of_len(len: usize) -> String {
 
 #[test]
 fn ledger_caps_are_512_and_agree() {
-    assert_eq!(
-        MAX_TRACK_ID_LEN, 512,
-        "ledger MAX_TRACK_ID_LEN must stay exactly 512 bytes"
-    );
-    assert_eq!(
-        MAX_PLAY_ID_LEN, 512,
-        "ledger MAX_PLAY_ID_LEN must stay exactly 512 bytes"
-    );
-    assert_eq!(
-        MAX_TRACK_ID_LEN, MAX_PLAY_ID_LEN,
-        "ledger track/play caps must agree with each other and the stream 512"
-    );
+    // Exact declaration strings pin the constant NAMES, types and values
+    // together: any rename, retype or cap change fails here and points at
+    // both sides of the contract.
+    for decl in [
+        "pub const MAX_TRACK_ID_LEN: usize = 512;",
+        "pub const MAX_PLAY_ID_LEN: usize = 512;",
+    ] {
+        assert!(
+            LEDGER_RS.contains(decl),
+            "workers/api/src/ledger.rs must still declare `{decl}`: \
+             stream enforces bare-512 caps in meter.rs and a ledger-side \
+             drift would reject stream-accepted ids (or vice versa)"
+        );
+    }
 }
 
 #[test]
