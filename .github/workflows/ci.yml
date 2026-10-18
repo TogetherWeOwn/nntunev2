@@ -261,6 +261,7 @@ jobs:
           python3 .github/scripts/test_migrations_gate_regressions.py
           python3 .github/scripts/test_migrations_gate_unreadable_sql.py
           python3 .github/scripts/test_migrations_gate_manifest_shape.py
+          python3 .github/scripts/test_migrations_gate_root_traversal.py
 
   test-nntp:
     name: test-nntp
@@ -571,6 +572,8 @@ jobs:
         run: python3 .github/scripts/test_docs_link_directories.py
       - name: Run docs-link diff-failure self-tests
         run: python3 .github/scripts/test_docs_link_diff_failure.py
+      - name: Pin explicit-file root confinement
+        run: python3 .github/scripts/test_docs_link_explicit_root.py
       - name: Lint whole tree on this repo
         run: python3 .github/scripts/docs_link_lint.py --root .
       - name: Lint passes on the matching fixture
