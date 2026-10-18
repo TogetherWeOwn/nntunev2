@@ -399,20 +399,30 @@ lane. Complete every box on the exact head being promoted.
   `deploy.yml` run for the promotion SHA, and require its `staging-web` job
   conclusion to be `success` (not `skipped`); verify staging health. This
   workflow deploys `apps/web` only; it does not deploy stream, MB, API or
-  ingest Workers. The current `/api/health` returns only `{ok:true}`, with no
-  build identity, so neither a green deploy run nor a health response proves
-  which SHA is serving. Do not claim same-build evidence until a deployed-build
-  identity is exposed and compared with the promotion SHA. The deploy owner
-  replaces the placeholder `100::` record through a Workers custom domain.
+  ingest Workers. `/api/health` returns exactly `{ok, version}` — the public
+  package version, never a build identifier
+  (`apps/web/src/routes/api/health/+server.ts`, pinned by
+  `apps/web/tests/smoke.spec.ts`) — so a health response alone never proves
+  which SHA is serving. Deployed-build identity lives on the dedicated
+  surface `GET /api/build`, which returns exactly `{sha}`: the 40-char
+  lowercase hex head baked at build time (`BUILD_SHA`/`GITHUB_SHA` via the
+  `__BUILD_SHA__` define in `apps/web/vite.config.ts`), or the explicit
+  string `"unknown"` when the build carried no identity
+  (`apps/web/src/lib/build.ts`, `apps/web/src/routes/api/build/+server.ts`).
+  Claim same-build evidence only when staging `/api/build` returns the
+  promotion SHA itself (40-hex match; `"unknown"` is never evidence). The
+  deploy owner replaces the placeholder `100::` record through a Workers
+  custom domain.
 - [ ] Staging E2E: `deploy.yml` sequences it — its `post-deploy-e2e` job
   calls `e2e-staging.yml` (reusable workflow) only after the same run's
   `staging-web` job succeeds (`needs`, no `always()`), so a skipped/failed
   deploy cannot produce a full-journey PASS and no separate dispatch is
   needed or accepted as evidence. Scheduled/manual `e2e-staging` runs are
   synthetic monitoring only (the full-journey job is skipped there).
-  Record the deploy run and the `post-deploy-e2e` result, and do not call
-  it same-build evidence until the staging build identity is verified
-  against the deploy SHA (a source SHA alone is not build identity).
+  Record the deploy run and the `post-deploy-e2e` result, and call it
+  same-build evidence only when staging `GET /api/build` returns the
+  deploy SHA itself (a source SHA alone is not build identity; see the
+  box above).
   Pre-configuration skips do not count once staging is configured; the
   workflow fails closed without both Access client credentials.
 - [ ] Access intact: the `NNTune v2 staging` Access app, its owner-OTP allow
@@ -460,7 +470,7 @@ be called accepted:
 | # | Retain | Acceptance bar |
 |---|---|---|
 | 1 | Deployed Worker and version | Worker (script) name and the version reported by the deploy tooling for the version now serving, plus the environment deployed to. |
-| 2 | Source revision | The exact commit SHA that version was built from. Where the Worker exposes a deployed-build identity, record it and require it to match this SHA; without one, do not claim same-build evidence (same caveat as the web checklist). |
+| 2 | Source revision | The exact commit SHA that version was built from. Where the Worker exposes a deployed-build identity, record it and require it to match this SHA; without one, do not claim same-build evidence (the web checklist above verifies this via `GET /api/build`; a Worker with no such surface cannot claim it). |
 | 3 | Deploy run | URL of the workflow run (or equivalent executed deploy record) that produced item 1, with the Worker deploy job's conclusion `success`. A `skipped` job, a skipped gate, or overall workflow success without that job succeeding is not deploy evidence. Any pre-deploy gate the lane requires — for the API Worker, the Hyperdrive cache-disabled check described in `deploy.yml` — records its pass/fail result here, by name and outcome only. |
 | 4 | Prior known-good version | Recorded **before** the new deploy: the previously serving Worker's name, version and source SHA, its own successful deploy run (item 3 bar), and its last passing health result. A first deploy has no prior known-good version, so rollback acceptance cannot be claimed for it; removing or disabling a first deployment is a separate gated action, not defined here. |
 | 5 | Rollback action and run | Which mechanism was used (redeploy of the prior known-good source revision, or activation of the prior version, whichever the lane implements), the target it restored (item 4's version and SHA), and the URL of the rollback run with the rollback/deploy job's conclusion `success` (not `skipped`). |

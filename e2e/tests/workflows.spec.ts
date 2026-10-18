@@ -1038,3 +1038,158 @@ test.describe('locked-dependency coverage builds (static pin)', () => {
     }
   });
 });
+
+test.describe('deploy.yml carries no backend Worker deploy job', () => {
+  // Backend Worker deploys are intentionally NOT wired in deploy.yml (see its
+  // header): this workflow deploys apps/web only, and each backend lane must
+  // add its own evidenced job. These pins fail on any new
+  // `deploy-api-worker`-style job with `wrangler deploy --env staging`,
+  // anything deploying under workers/, any production-environment deploy
+  // step, or a bare `command: deploy` (apps/web top-level name equals the
+  // production env name, so a bare deploy targets production). When the
+  // authorized backend lane lands, it extends this guard (allowlist +
+  // evidence) instead of weakening it.
+  const jobsBody = deployWorkflow.split('\njobs:\n')[1]!;
+
+  // Shared guard: the real pins below call these helpers, and the mutant
+  // test asserts the same helpers throw for each synthetic backend lane —
+  // so weakening a pin breaks the mutant test instead of silently passing.
+  const assertJobSet = (body: string) => {
+    const names = [...body.matchAll(/^  ([A-Za-z0-9_-]+):$/gm)].map((m) => m[1]!).sort();
+    expect(names).toEqual(['gate', 'post-deploy-e2e', 'preview-web', 'staging-web']);
+    for (const name of names) {
+      expect(name, `job ${name} must not look like a backend deploy lane`).not.toMatch(
+        /worker|backend/i,
+      );
+    }
+  };
+
+  const assertDeployBody = (body: string) => {
+    expect(body.match(/wrangler-action/g) ?? []).toHaveLength(2);
+    expect(body.match(/deploy --env/g) ?? []).toHaveLength(1);
+    // Exact command pin: staging-web deploys to staging, preview-web runs
+    // `preview`. A bare `command: deploy` (no --env) deploys the top-level
+    // worker name, which equals the production env name — count checks alone
+    // miss it, so pin every wrangler-action command value exactly.
+    const commands = [...body.matchAll(/^\s+command: (.+)$/gm)]
+      .map((m) => m[1]!.trim())
+      .sort();
+    expect(
+      commands,
+      `wrangler commands stay exactly the evidenced web lanes (got ${JSON.stringify(commands)})`,
+    ).toEqual(['deploy --env staging', 'preview']);
+    // Raw-CLI pin: no `run:` step may invoke a wrangler deploy, even split
+    // across lines (`wrangler \` + newline + `deploy`), version-pinned
+    // (`wrangler@<ver> deploy`), or flag-first (`wrangler --config x
+    // deploy`). Join continuations, then match `wrangler` (excluding
+    // `wrangler-action` and `wranglerVersion`) followed anywhere on the
+    // same logical line by `deploy`.
+    const flat = body.replace(/\\\r?\n\s*/g, ' ');
+    expect(flat).not.toMatch(/\bwrangler\b(?!-action)[^\n]*\bdeploy\b/);
+    for (const line of body.split('\n')) {
+      if (line.includes('workingDirectory:') || line.includes('working-directory:')) {
+        expect(line, `deploy working directory stays apps/web (${line.trim()})`).toContain(
+          'apps/web',
+        );
+      }
+    }
+  };
+
+  const assertNoBackendPath = (body: string) => {
+    // Header comments (above `jobs:`) legitimately name workers/ and the
+    // future Hyperdrive gate; the jobs body itself stays web-only with no
+    // production path. Case-sensitive: the preview job carries a `Workers
+    // preview deployment` comment (no path), which must keep passing.
+    // Production pin: the jobs body carries no `production` word at all in
+    // code (comments stripped). That covers `--env production`,
+    // `--env=production`, `environment: production`, the mapping form
+    // (`environment:\n  name: production`), quoted values, and
+    // `CLOUDFLARE_ENV: production` — while a harmless full-line comment
+    // mentioning production still passes.
+    expect(body).not.toContain('workers/');
+    const code = body
+      .split('\n')
+      .filter((l) => !/^\s*#/.test(l))
+      .join('\n');
+    expect(code.toLowerCase()).not.toContain('production');
+  };
+
+  const assertDeployGuard = (body: string) => {
+    assertJobSet(body);
+    assertDeployBody(body);
+    assertNoBackendPath(body);
+  };
+
+  test('job set is exactly the evidenced web-only lanes', () => {
+    assertJobSet(jobsBody);
+  });
+
+  test('only the evidenced web staging step runs a wrangler deploy', () => {
+    // staging-web deploys apps/web to staging; preview-web runs `preview`
+    // (not deploy). Any additional wrangler deploy — action or raw
+    // `wrangler deploy` CLI — is a backend-lane candidate until evidenced.
+    assertDeployBody(jobsBody);
+    expect(jobSection(deployWorkflow, 'staging-web')).toContain('command: deploy --env staging');
+  });
+
+  test('no workers/ path or production-environment deploy step in the jobs body', () => {
+    assertNoBackendPath(jobsBody);
+  });
+
+  test('synthetic backend-deploy mutants trip the pins above', () => {
+    // Regression proof for the shared guard: each mutant models an
+    // unauthorized backend lane and must throw the same helpers the real
+    // pins call (not a restated copy of the expectations).
+    const workerJob =
+      '\n  deploy-api-worker:\n    runs-on: ubuntu-latest\n    defaults:\n      run:\n        working-directory: workers/api\n    steps:\n      - run: wrangler deploy --env staging\n';
+    const workerMutant = `${jobsBody}${workerJob}`;
+    const prodMutant = `${jobsBody}\n      - run: wrangler deploy --env production\n`;
+    // Bare `command: deploy` on preview-web: no --env, no `wrangler deploy`
+    // string, no workers/ or production marker — only the exact command pin
+    // catches it, and it would deploy the production worker name.
+    const bareDeployMutant = jobsBody.replace('command: preview', 'command: deploy');
+    // Multiline raw-CLI deploy: `wrangler \` + newline + `deploy` evades a
+    // contiguous `wrangler deploy` substring check but still deploys.
+    const multilineMutant = `${jobsBody}\n      - run: pnpm exec wrangler \\\n        deploy --env staging\n`;
+    // Version-pinned raw-CLI deploy (the workflow's own WRANGLER_VERSION
+    // spelling): `@<ver>` sits between the tokens, so a
+    // `wrangler\s+deploy` check misses it.
+    const versionPinnedMutant = `${jobsBody}\n      - run: npx wrangler@\${{ env.WRANGLER_VERSION }} deploy\n`;
+    // Flag-first raw-CLI deploy: a flag before the subcommand evades a
+    // `wrangler deploy` adjacency check.
+    const flagFirstMutant = `${jobsBody}\n      - run: pnpm exec wrangler --config wrangler.toml deploy\n`;
+    // Production GitHub environment mapping form on a PR-triggered job:
+    // resolves production-scoped secrets and protection rules.
+    const envMappingMutant = jobsBody.replace(
+      '    needs: [gate]\n    if: ${{ github.event_name == ',
+      '    needs: [gate]\n    environment:\n      name: production\n    if: ${{ github.event_name == ',
+    );
+    // Quoted production environment value.
+    const quotedEnvMutant = `${jobsBody}\n    environment: "production"\n`;
+
+    for (const mutant of [
+      workerMutant,
+      prodMutant,
+      bareDeployMutant,
+      multilineMutant,
+      versionPinnedMutant,
+      flagFirstMutant,
+      envMappingMutant,
+      quotedEnvMutant,
+    ]) {
+      expect(() => assertDeployGuard(mutant), 'mutant must violate the deploy guard').toThrow();
+    }
+    // Targeted evidence for which pin each mutant trips.
+    expect(() => assertJobSet(workerMutant)).toThrow();
+    expect(() => assertDeployBody(workerMutant)).toThrow();
+    expect(() => assertNoBackendPath(workerMutant)).toThrow();
+    expect(() => assertDeployBody(prodMutant)).toThrow();
+    expect(() => assertNoBackendPath(prodMutant)).toThrow();
+    expect(() => assertDeployBody(bareDeployMutant)).toThrow();
+    expect(() => assertDeployBody(multilineMutant)).toThrow();
+    expect(() => assertDeployBody(versionPinnedMutant)).toThrow();
+    expect(() => assertDeployBody(flagFirstMutant)).toThrow();
+    expect(() => assertNoBackendPath(envMappingMutant)).toThrow();
+    expect(() => assertNoBackendPath(quotedEnvMutant)).toThrow();
+  });
+});
