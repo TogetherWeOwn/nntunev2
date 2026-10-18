@@ -4,9 +4,10 @@
 //! stream worker's existing Analytics Engine row or event vocabulary: one
 //! finished play still maps to one row with stable blob/double positions,
 //! the sampling index stays the hashed user identity, and the structured log
-//! line keeps exactly its legacy keys. Correlation arrives additively in a
-//! later slice; this pin must be updated deliberately if that ever changes
-//! the shape asserted here.
+//! line keeps exactly its legacy keys. Correlation lands in a later slice by
+//! moving these keys under `fields` (per `docs/logging-standard.md`), which
+//! changes the top-level shape: this pin must be updated deliberately when
+//! that migration lands.
 //!
 //! Static fixtures only: no live pool, no NNTP, no network.
 
@@ -69,7 +70,7 @@ fn json_log_keeps_exactly_its_legacy_keys() {
             "bytes",
             "pool_error_code",
         ]),
-        "stream log shape is unchanged; correlation stays additive"
+        "stream log shape is unchanged; correlation migrates these keys under `fields`, update this pin deliberately then"
     );
     assert_eq!(object["cache_status"], "hit");
     assert_eq!(object["ttft_ms"], 12);

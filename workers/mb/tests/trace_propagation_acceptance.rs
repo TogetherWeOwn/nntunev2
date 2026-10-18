@@ -136,4 +136,35 @@ fn mb_emitter_privacy_backstop_rejects_personal_data_and_secrets() {
 #[test]
 fn trace_echo_rides_the_same_header_name() {
     assert_eq!(TRACE_HEADER, "x-trace-id");
+    // Pin the wasm-only adapter by source (Response/Headers need
+    // wasm-bindgen, so it cannot run natively): `with_trace` must echo on
+    // the shared header and `inbound_trace_id` must resolve the inbound
+    // value, so renaming the echo or minting unconditionally fails here.
+    let source = include_str!("../src/lib.rs");
+    let production = source
+        .split_once("#[cfg(test)]")
+        .expect("test module must exist")
+        .0;
+    let echo = production
+        .split_once("fn with_trace(")
+        .expect("with_trace must exist")
+        .1
+        .split_once("\n    }\n")
+        .expect("with_trace must close")
+        .0;
+    assert!(
+        echo.contains(".append(nntune_logging::TRACE_HEADER, trace_id)"),
+        "with_trace must echo the trace on the shared x-trace-id header"
+    );
+    let inbound = production
+        .split_once("fn inbound_trace_id(")
+        .expect("inbound_trace_id must exist")
+        .1
+        .split_once("\n    }\n")
+        .expect("inbound_trace_id must close")
+        .0;
+    assert!(
+        inbound.contains("resolve_trace_id(header.as_deref())"),
+        "inbound_trace_id must resolve the inbound header value, not mint unconditionally"
+    );
 }

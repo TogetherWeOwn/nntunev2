@@ -66,6 +66,30 @@ fn consumer_preserves_a_valid_inbound_trace_and_mints_otherwise() {
         assert!(is_valid_trace_id(&resolved));
         assert_ne!(resolved.as_str(), header.unwrap_or(""));
     }
+    // Pin the consumer wiring itself, not just the shared resolver: the
+    // wasm-only `process_raw_message` must keep the inbound ID and stamp it
+    // back on the message, so `resolve_trace_id(None)` there fails here.
+    // Slice the pre-test source so this test's own literals cannot satisfy it.
+    let source = include_str!("../src/queue_consumer.rs");
+    let production = source
+        .split_once("#[cfg(test)]")
+        .expect("test module must exist")
+        .0;
+    let consumer = production
+        .split_once("async fn process_raw_message")
+        .expect("process_raw_message must exist")
+        .1
+        .split_once("#[worker::event(queue)]")
+        .expect("queue entrypoint must bound process_raw_message")
+        .0;
+    assert!(
+        consumer.contains("resolve_trace_id(msg.trace_id.as_deref())"),
+        "consumer must resolve the inbound message trace ID, not mint unconditionally"
+    );
+    assert!(
+        consumer.contains("msg.trace_id = Some(trace_id.clone())"),
+        "consumer must stamp the resolved trace ID back on the message"
+    );
 }
 
 #[test]
