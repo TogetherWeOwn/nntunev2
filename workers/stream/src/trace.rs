@@ -73,6 +73,38 @@ pub fn normalize_trace_id(raw: Option<&str>) -> Option<String> {
     }
 }
 
+/// Marker for a log record whose build identity is unwired: the transport did
+/// not supply a build SHA, so the line carries no release attribution.
+/// Mirrors `nntune_logging::BUILD_SHA_UNKNOWN` — same literal, agreed by
+/// contract instead of shared (the `stream` crate does not depend on
+/// `nntune-logging`).
+pub const BUILD_SHA_UNKNOWN: &str = "unknown";
+
+/// True when the SHA is a real 40-char lowercase hex build identity, false
+/// for [`BUILD_SHA_UNKNOWN`] and anything else unparseable.
+/// Mirrors `nntune_logging::is_build_sha_known` exactly.
+#[must_use]
+pub fn is_build_sha_known(sha: &str) -> bool {
+    sha.len() == 40
+        && sha
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// Normalize a candidate build SHA to the log-safe form: a 40-char lowercase
+/// hex commit SHA passes through, anything else (absent, empty, truncated,
+/// uppercase, non-hex) becomes [`BUILD_SHA_UNKNOWN`]. Never logs the raw
+/// candidate; an invalid value is dropped, never trusted. Mirrors
+/// `nntune_logging::parse_build_sha`; a future stream transport calls this on
+/// its build-SHA var before inserting `build_sha` into [`LogFields`].
+#[must_use]
+pub fn normalize_build_sha(raw: Option<&str>) -> String {
+    match raw {
+        Some(value) if is_build_sha_known(value) => value.to_string(),
+        _ => BUILD_SHA_UNKNOWN.to_string(),
+    }
+}
+
 /// Stream event rule from the standard: lowercase `[a-z0-9_.]`, non-empty, no
 /// leading/trailing `.`/`_`, max 96 chars. No dot required (legacy
 /// vocabulary such as `play_start` stays valid).
@@ -440,6 +472,67 @@ mod tests {
         ] {
             assert_eq!(normalize_trace_id(header), None);
         }
+    }
+
+    #[test]
+    fn build_sha_normalizes_to_known_or_unknown() {
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        const SHA_41: &str = "0123456789abcdef0123456789abcdef012345670";
+        const SHA_64: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(normalize_build_sha(Some(SHA)), SHA);
+        assert!(is_build_sha_known(SHA));
+        assert!(is_build_sha_known(&normalize_build_sha(Some(SHA))));
+        for raw in [
+            None,
+            Some(""),
+            Some("unknown"),
+            Some("0123456789abcdef"),                         // truncated
+            Some("0123456789ABCDEF0123456789ABCDEF01234567"), // uppercase
+            Some("0123456789abcdef0123456789abcdef0123456g"), // non-hex
+            Some(SHA_41),                                     // over-length
+            Some(SHA_64), // 64-hex digest, never a commit identity
+        ] {
+            assert_eq!(normalize_build_sha(raw), BUILD_SHA_UNKNOWN, "raw: {raw:?}");
+            assert!(!is_build_sha_known(&normalize_build_sha(raw)));
+        }
+        assert!(!is_build_sha_known(BUILD_SHA_UNKNOWN));
+        // Direct bounds: length alone must not confer identity, whatever the
+        // caller passes without going through `normalize_build_sha`.
+        for sha in [
+            "",
+            "0123456789abcdef",
+            "0123456789ABCDEF0123456789ABCDEF01234567",
+            SHA_41,
+            SHA_64,
+            BUILD_SHA_UNKNOWN,
+        ] {
+            assert!(!is_build_sha_known(sha), "must be unknown: {sha:?}");
+        }
+    }
+
+    #[test]
+    fn rendered_line_carries_build_sha_literally() {
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        let mut fields = fields_with_track();
+        fields
+            .insert_str("build_sha", &normalize_build_sha(Some(SHA)))
+            .expect("build_sha must pass field validation");
+        let line = render_log_line(TS, "info", TRACE, event::PLAY_START, &fields)
+            .expect("valid envelope must render");
+        let want = format!("\"build_sha\":\"{SHA}\"");
+        assert_eq!(line.matches(&want).count(), 1, "line: {line}");
+        // The unwired marker renders too, so emitters can always carry the key.
+        let mut unknown_fields = fields_with_track();
+        unknown_fields
+            .insert_str("build_sha", &normalize_build_sha(None))
+            .expect("unknown marker must pass field validation");
+        let unknown_line = render_log_line(TS, "info", TRACE, event::PLAY_START, &unknown_fields)
+            .expect("valid envelope must render");
+        assert_eq!(
+            unknown_line.matches("\"build_sha\":\"unknown\"").count(),
+            1,
+            "line: {unknown_line}"
+        );
     }
 
     #[test]
