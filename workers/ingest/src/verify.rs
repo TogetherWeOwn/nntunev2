@@ -2661,4 +2661,108 @@ mod tests {
         let back: VerifyProgress = serde_json::from_str(&json).unwrap();
         assert_eq!(back, progress);
     }
+
+    fn header_with_len(len: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16);
+        out.extend_from_slice(b"PAR2\0PKT");
+        out.extend_from_slice(&len.to_le_bytes());
+        out
+    }
+
+    fn valid_64b_packet() -> Vec<u8> {
+        let mut out = vec![0u8; 64];
+        out[..8].copy_from_slice(b"PAR2\0PKT");
+        out[8..16].copy_from_slice(&64u64.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn packet_walk_stops_on_max_declared_len() {
+        // 16-byte header declaring len = u64::MAX: the alignment guard
+        // (`MAX % 4 == 3`) stops the walk at prefix 0 — no panic, no alloc.
+        let bytes = header_with_len(u64::MAX);
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(complete_packet_prefix(&bytes), 0);
+        assert!(!packets_within_bound(&bytes, u64::MAX));
+    }
+
+    #[test]
+    fn packet_walk_overflow_needs_checked_add() {
+        // Whole first packet (64 bytes) then the largest multiple of 4:
+        // passes alignment, so only the checked-add arm can stop the walk
+        // at 64. With wrapping arithmetic the walk would advance to 60.
+        const ALIGNED_MAX: u64 = u64::MAX - 3;
+        assert_eq!(ALIGNED_MAX % 4, 0);
+        let mut bytes = valid_64b_packet();
+        bytes.extend_from_slice(&header_with_len(ALIGNED_MAX));
+        assert_eq!(bytes.len(), 80);
+        assert_eq!(complete_packet_prefix(&bytes), 64);
+        assert_eq!(64usize.wrapping_add(ALIGNED_MAX as usize), 60);
+        // This buffer alone does not pin `packets_within_bound`'s
+        // checked-add (wrapping still returns false, via an unrelated
+        // misread at offset 60); the dedicated buffer below does.
+        assert!(!packets_within_bound(&bytes, u64::MAX));
+
+        // Killing buffer for `packets_within_bound`'s checked-add: first
+        // packet declares 64, second declares MAX - 55 (aligned and within
+        // the u64::MAX bound, so only the overflow arm can stop the walk).
+        // Checked stops at 64; wrapping advances 64 -> 8, reads
+        // bytes[16..24] (= 72) as a length, lands at 80 and returns true.
+        const WRAPPING_LEN: u64 = u64::MAX - 55;
+        assert_eq!(WRAPPING_LEN % 4, 0);
+        let mut first = valid_64b_packet();
+        first[16..24].copy_from_slice(&72u64.to_le_bytes());
+        let mut bound_bytes = first;
+        bound_bytes.extend_from_slice(&header_with_len(WRAPPING_LEN));
+        assert_eq!(bound_bytes.len(), 80);
+        assert_eq!(64usize.wrapping_add(WRAPPING_LEN as usize), 8);
+        assert!(!packets_within_bound(&bound_bytes, u64::MAX));
+    }
+
+    #[test]
+    fn implied_len_overflow_is_none_for_present_missing_two_pow_63() {
+        // Two segments [2^63 present, missing]: part size 2^63, last length
+        // falls back to the part size, and 2^63 + 2^63 overflows u64, so no
+        // geometry is proven. Wrapping would yield total 0 (small enough to
+        // pass every cap), so this pin kills the wrapping mutant.
+        const TWO_POW_63: u64 = 1 << 63;
+        let segs = vec![srec(TWO_POW_63), smissing()];
+        assert_eq!(uniform_part_size(&segs, 2), Some(TWO_POW_63));
+        assert_eq!(implied_len(&segs, 2), None);
+        assert_eq!(TWO_POW_63.wrapping_add(TWO_POW_63), 0);
+    }
+
+    #[test]
+    fn implied_len_checked_mul_overflow_is_none() {
+        // [2^63 present, missing, 5] over 3 segments: part size 2^63, last
+        // length 5, and 2^63 * 2 overflows u64, so no geometry is proven.
+        // Wrapping would yield 0 + 5 = 5 (passes every cap, judging the
+        // file on a 5-byte geometry), so this pin kills the
+        // checked-mul -> wrapping-mul mutant.
+        const TWO_POW_63: u64 = 1 << 63;
+        let segs = vec![srec(TWO_POW_63), smissing(), srec(5)];
+        assert_eq!(uniform_part_size(&segs, 3), Some(TWO_POW_63));
+        assert_eq!(implied_len(&segs, 3), None);
+        assert_eq!(TWO_POW_63.wrapping_mul(2).wrapping_add(5), 5);
+    }
+
+    #[test]
+    fn implied_len_all_present_sum_overflow_is_none() {
+        // All-present [2^63, 2^63, 1]: the checked sum overflows, so no
+        // geometry is proven. Wrapping would yield 1 and hide the overflow.
+        const TWO_POW_63: u64 = 1 << 63;
+        let segs = vec![srec(TWO_POW_63), srec(TWO_POW_63), srec(1)];
+        assert_eq!(implied_len(&segs, 3), None);
+        assert_eq!(TWO_POW_63.wrapping_add(TWO_POW_63).wrapping_add(1), 1);
+    }
+
+    #[test]
+    fn match_set_file_length_fallback_is_checked() {
+        // Overflowing part sizes prove no length: no match, no panic.
+        const TWO_POW_63: u64 = 1 << 63;
+        let segs = vec![srec(TWO_POW_63), srec(TWO_POW_63), srec(1)];
+        let file = parsed("track.flac", false);
+        let mut claimed = std::collections::HashSet::new();
+        assert!(match_set_file(&[], &file, &segs, 3, &mut claimed).is_none());
+    }
 }
