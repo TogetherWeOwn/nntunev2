@@ -636,4 +636,158 @@ mod tests {
             }
         }
     }
+
+    /// Load one checked-in environment fixture (`config/{env}.json`) and
+    /// convert each value into the exact string-valued KV input representation
+    /// [`Config::load`] consumes: JSON strings stay exact, numbers/bools use
+    /// their canonical text form (what KV would hold on the wire).
+    fn fixture_kv(env: &str) -> HashMap<String, String> {
+        let path = format!("{}/../../config/{env}.json", env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(&path).expect("fixture readable");
+        let json: serde_json::Value = serde_json::from_str(&text).expect("fixture parses");
+        json.as_object()
+            .expect("fixture is an object")
+            .iter()
+            .map(|(key, value)| {
+                let raw = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    other => panic!("non-scalar fixture value for {key}: {other:?}"),
+                };
+                (key.clone(), raw)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shipped_fixtures_load_through_typed_getters() {
+        for env in ["staging", "prod"] {
+            let kv = fixture_kv(env);
+            // Every declared key must be present in the fixture and no extra
+            // keys may ship: future additions fail here until covered.
+            let fixture_names: std::collections::HashSet<_> =
+                kv.keys().map(String::as_str).collect();
+            let code_names: std::collections::HashSet<_> =
+                KEYS.iter().map(|spec| spec.name).collect();
+            assert_eq!(
+                fixture_names, code_names,
+                "{env} fixture key set drift vs code table"
+            );
+            let config = Config::load(&kv).expect("shipped fixture loads");
+            // Every declared fixture value round-trips through its correct
+            // typed getter via the same parse path `load` uses.
+            for spec in KEYS {
+                let raw = kv
+                    .get(spec.name)
+                    .unwrap_or_else(|| panic!("{env} fixture missing {}", spec.name));
+                match spec.parse(raw).unwrap_or_else(|_| {
+                    panic!("{env} fixture value fails to parse for {}", spec.name)
+                }) {
+                    Value::U64(expected) => assert_eq!(
+                        config.get_u64(spec.name),
+                        Some(expected),
+                        "{env} fixture {}",
+                        spec.name
+                    ),
+                    Value::Str(_) => assert_eq!(
+                        config.get_str(spec.name),
+                        Some(raw.as_str()),
+                        "{env} fixture {}",
+                        spec.name
+                    ),
+                    Value::Bool(expected) => assert_eq!(
+                        config.get_bool(spec.name),
+                        Some(expected),
+                        "{env} fixture {}",
+                        spec.name
+                    ),
+                }
+            }
+        }
+
+        // Intentional staging/production identity divergence. Per
+        // config/README.md, values may otherwise differ (per-env tuning is
+        // the point) and the parity checker stays green on value-only drift,
+        // so this test pins only the identity values plus literal spot
+        // values — it must not require cross-env sameness.
+        let staging = Config::load(&fixture_kv("staging")).expect("staging loads");
+        let prod = Config::load(&fixture_kv("prod")).expect("prod loads");
+        assert_eq!(staging.get_str("auth.rp_id"), Some("v2-staging.nntune.com"));
+        assert_eq!(prod.get_str("auth.rp_id"), Some("nntune.com"));
+        assert_eq!(
+            staging.get_str("auth.rp_origin"),
+            Some("https://v2-staging.nntune.com")
+        );
+        assert_eq!(prod.get_str("auth.rp_origin"), Some("https://nntune.com"));
+        // Literal anchors (not derived from `spec.parse`): a parser mutant
+        // returning n+1 must fail here. Both envs currently share these
+        // tuning values; if per-env tuning intentionally diverges, split the
+        // pins per env rather than reintroducing a blanket sameness loop.
+        const EXPECTED_U64: &[(&str, u64)] = &[
+            ("auth.challenge_ttl_secs", 300),
+            ("auth.invite_redemption_max_attempts", 10),
+            ("auth.invite_redemption_window_secs", 300),
+            ("auth.magic_link_ttl_secs", 900),
+            ("ingest.max_nzb_bytes", 2097152),
+            ("ingest.payload_retry_attempts", 4),
+            ("ingest.payload_ttl_secs", 2592000),
+            ("mb.lookup_cache_ttl_s", 86400),
+            ("mb.max_query_chars", 100),
+            ("mb.search_cache_ttl_s", 300),
+            ("mb.search_limit", 25),
+            ("session.ttl_secs", 86400),
+            ("stream.r2_min_part_bytes", 5242880),
+        ];
+        for (key, expected) in EXPECTED_U64 {
+            assert_eq!(
+                staging.get_u64(key),
+                Some(*expected),
+                "staging fixture {key}"
+            );
+            assert_eq!(prod.get_u64(key), Some(*expected), "prod fixture {key}");
+        }
+    }
+
+    #[test]
+    fn shipped_fixture_mutations_fail_closed() {
+        // In-memory mutations only; the shipped JSON files stay untouched.
+        for env in ["staging", "prod"] {
+            let missing_identity = {
+                let mut kv = fixture_kv(env);
+                kv.remove("auth.rp_id");
+                kv
+            };
+            assert_eq!(
+                Config::load(&missing_identity),
+                Err(ConfigError::MissingRequired("auth.rp_id")),
+                "{env} fixture without identity must fail"
+            );
+
+            let wrong_type = {
+                let mut kv = fixture_kv(env);
+                kv.insert("session.ttl_secs".to_string(), "not-a-number".to_string());
+                kv
+            };
+            assert_eq!(
+                Config::load(&wrong_type),
+                Err(ConfigError::InvalidType {
+                    key: "session.ttl_secs",
+                    expected: ConfigType::U64,
+                }),
+                "{env} fixture with wrong type must fail"
+            );
+
+            let unknown_key = {
+                let mut kv = fixture_kv(env);
+                kv.insert("debug.backdoor".to_string(), "true".to_string());
+                kv
+            };
+            assert_eq!(
+                Config::load(&unknown_key),
+                Err(ConfigError::UnknownKey("debug.backdoor".to_string())),
+                "{env} fixture with unknown key must fail"
+            );
+        }
+    }
 }
