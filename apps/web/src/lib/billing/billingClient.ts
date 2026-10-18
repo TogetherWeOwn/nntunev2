@@ -153,6 +153,12 @@ const STRIPE_REDIRECT_HOSTS = new Set(['checkout.stripe.com', 'billing.stripe.co
 
 function isAllowlistedRedirectUrl(value: unknown): value is string {
 	if (typeof value !== 'string' || value.trim() === '') return false;
+	// WHATWG URL parsing recovers an allowlisted host from a scheme without
+	// an explicit authority (`https:checkout.stripe.com/...` parses with
+	// hostname checkout.stripe.com), but a `window.location.href` assignment
+	// of that same string resolves against the app origin instead — so the
+	// raw string must carry the explicit `https://` authority up front.
+	if (!value.startsWith('https://')) return false;
 	let parsed: URL;
 	try {
 		parsed = new URL(value);
