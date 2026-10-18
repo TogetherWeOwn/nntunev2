@@ -282,15 +282,18 @@ pub struct Release {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Recording {
-    mbid: String,
-    release_mbid: Option<String>,
-    title: String,
-    track_no: Option<i16>,
-    duration_ms: Option<i32>,
+    /// `pub` fields mirror [`SearchHit`]: the `tests/` integration pin
+    /// (`release_recordings_cap_acceptance`) builds oversized corpora, so
+    /// the shape and serialization are unchanged.
+    pub mbid: String,
+    pub release_mbid: Option<String>,
+    pub title: String,
+    pub track_no: Option<i16>,
+    pub duration_ms: Option<i32>,
     /// Medium (disc) position within the release, from `mb_track`.
     /// Only the release-recordings listing sets it; a bare recording
     /// lookup answers `null`.
-    medium_no: Option<i16>,
+    pub medium_no: Option<i16>,
 }
 
 /// One lookup row, tagged by [`Kind`] again at serialization time so the
@@ -495,7 +498,10 @@ async fn handle_lookup<R: MbRepo, C: SuccessCache>(
 /// existing release (including an empty one) is a cacheable success at
 /// the lookup TTL; a missing release is a 404 and a read failure a 500,
 /// neither cached.
-async fn handle_release_recordings<R: MbRepo, C: SuccessCache>(
+/// `pub` for the `tests/` integration pin
+/// (`release_recordings_cap_acceptance`): the validation, truncation and
+/// cache contract is unchanged.
+pub async fn handle_release_recordings<R: MbRepo, C: SuccessCache>(
     repo: &R,
     cache: &C,
     release_mbid: &str,
