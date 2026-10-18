@@ -389,12 +389,21 @@ behavior changes here.
   3-hop redirect following is an unresolved discrepancy (see
   `workers/ingest/README.md`). Test-connection attempts atomically
   reserve shared-store rate slots, acquire one of two per-user expiring
-  leases, dial at most four addresses with a 5-second per-address timeout,
-  and stop the complete probe at 15 seconds. (Sources:
+  leases. Each handler-time DNS resolution has one 5-second lifetime covering
+  both A and AAAA response headers and JSON bodies, not 5 seconds per family
+  or per phase. Expiry drops pending resolver work, aborts the Worker fetch/body
+  with its AbortSignal, discards partial answers, and fails closed before any
+  socket dial. Caller cancellation also aborts pending DoH work. Fast literal
+  and dual-family results retain the same all-address validation. This DNS
+  budget applies to save/test validation (provider and indexer), separately
+  per host; it is not an overall HTTP-request deadline. After successful DNS
+  validation, the unchanged socket budgets dial at most four addresses with a
+  5-second per-address timeout and stop the socket attempts at 15 seconds.
+  (Sources:
   `workers/api/src/vault.rs` — `host_shape_ok`, `ip_is_forbidden`,
   `resolve_public_target`, `ProviderConfig::validate`,
   `authorize_pool_dial`, `ALLOWED_NNTP_PORTS`, `MAX_DIAL_ADDRESSES`,
-  `DIAL_TIMEOUT_MS`/`TOTAL_TIMEOUT_MS`, `MAX_TEST_CONCURRENCY`,
+  `RESOLUTION_TIMEOUT_MS`, `DIAL_TIMEOUT_MS`/`TOTAL_TIMEOUT_MS`, `MAX_TEST_CONCURRENCY`,
   `INDEXER_ALLOW_REDIRECTS`; pinned dial in
   `workers/api/src/worker_entry.rs` (`SocketDialer::probe`, `probe_one`);
   slots/leases in `workers/api/src/handlers.rs` (`vault_test_connection`)
