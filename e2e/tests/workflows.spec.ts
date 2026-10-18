@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { readFileSync, readdirSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -157,16 +157,60 @@ test.describe('credential scope (static pins)', () => {
     // origin WITH the Access pair + bearer. Live specs must go through
     // apiGet/apiPost; helpers.spec.ts may use the raw fixture inside its own
     // no-follow proof (it asserts the wrapper, not staging).
-    for (const name of ['health.spec.ts', 'ingest-play-meter.spec.ts', 'signup-byop.spec.ts']) {
+    for (const name of [
+      'health.spec.ts',
+      'ingest-play-meter.spec.ts',
+      'signup-byop.spec.ts',
+      'signup-wizard-arrival.spec.ts',
+      'player-queue-order.spec.ts',
+      'demo-audio-contract.spec.ts',
+      'demo-media-sessionless.spec.ts',
+      'build-identity.spec.ts',
+      'zz-build-identity-final.spec.ts',
+    ]) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must not carry credentials on a raw request call`).not.toMatch(
         RAW_API_CALL,
       );
     }
-    for (const name of ['health.spec.ts', 'ingest-play-meter.spec.ts']) {
+    for (const name of [
+      'health.spec.ts',
+      'ingest-play-meter.spec.ts',
+      'player-queue-order.spec.ts',
+      'demo-audio-contract.spec.ts',
+      'demo-media-sessionless.spec.ts',
+    ]) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must use the no-follow wrapper`).toContain('apiGet(');
     }
+    // The build-identity opening + closing legs reach the no-follow wrapper
+    // through the shared live helper (pinned in the deployed-build identity
+    // section below), never raw: the ban above still applies to both files.
+    for (const name of ['build-identity.spec.ts', 'zz-build-identity-final.spec.ts']) {
+      const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
+      expect(source, `${name} must route through the shared live helper`).toContain(
+        'assertServingBuildMatchesPromotion(',
+      );
+    }
+  });
+
+  test('anonymous denial probe stays credential-free and no-follow', () => {
+    // The anonymous app-shell check must go through anonymousGet (no headers
+    // parameter, maxRedirects: 0) and the inverse wall assertion. Pin both
+    // so it cannot silently regress to a credentialed apiGet (which would
+    // prove the with-token side again) or to a raw call.
+    const accounts = readFileSync(new URL('../helpers/accounts.ts', import.meta.url), 'utf8');
+    expect(accounts).toContain('export async function anonymousGet');
+    const health = readFileSync(new URL(`../tests/health.spec.ts`, import.meta.url), 'utf8');
+    expect(health, 'health.spec.ts must probe anonymously via anonymousGet').toContain(
+      'anonymousGet(',
+    );
+    expect(health, 'health.spec.ts must assert the Access wall for the anonymous probe').toContain(
+      'assertAccessWall(',
+    );
+    expect(health, 'anonymous probe must use an isolated request context').toContain(
+      'playwrightRequest.newContext(',
+    );
   });
 
   test('no-follow pin catches nested-paren and fetch mutants', () => {
@@ -181,6 +225,150 @@ test.describe('credential scope (static pins)', () => {
     expect(fetchCall).toMatch(RAW_API_CALL);
     expect(pageScoped).toMatch(RAW_API_CALL);
     expect("await apiGet(request, url, headers, 'range')").not.toMatch(RAW_API_CALL);
+  });
+});
+
+test.describe('public UI signup coverage (static pin)', () => {
+  // Isolate the dedicated case and the shared form helper by slicing from
+  // their markers to the next top-level test/export (or EOF), so a mint call
+  // added to either segment (the bypass this coverage exists to prevent)
+  // fails here even though other tests in the file legitimately mint.
+  test('dedicated UI-signup case submits the form with no account-seam mint', () => {
+    const spec = readFileSync(new URL('../tests/signup-byop.spec.ts', import.meta.url), 'utf8');
+    const marker = "test('public UI signup succeeds even when the test-account seam is configured'";
+    const start = spec.indexOf(marker);
+    expect(start, 'dedicated public UI signup case is missing').toBeGreaterThan(-1);
+    const rest = spec.slice(start + marker.length);
+    const nextTest = rest.search(/\ntest(?:\(|\.describe)/);
+    const dedicated = nextTest === -1 ? spec.slice(start) : spec.slice(start, start + marker.length + nextTest);
+    // Null identity = Access pair only: the page starts unauthenticated, so
+    // the form is the only account-creation path even with QA_AUTH_TOKEN set.
+    expect(dedicated).toContain('applyAccountToPage(page, null, baseURL)');
+    expect(dedicated).toContain('submitPublicUiSignup(page, baseURL)');
+    expect(dedicated).not.toContain('tryMintTestAccount');
+
+    const accounts = readFileSync(new URL('../helpers/accounts.ts', import.meta.url), 'utf8');
+    const helperStart = accounts.indexOf('export async function submitPublicUiSignup');
+    expect(helperStart, 'shared public UI signup helper is missing').toBeGreaterThan(-1);
+    const helperRest = accounts.slice(helperStart + 'export async function submitPublicUiSignup'.length);
+    const nextExport = helperRest.search(/\nexport /);
+    const helper = nextExport === -1 ? accounts.slice(helperStart) : accounts.slice(helperStart, helperStart + 'export async function submitPublicUiSignup'.length + nextExport);
+    expect(helper).toContain('uniqueTestEmail(');
+    expect(helper).toContain('`${baseURL}/signup`');
+    expect(helper).toContain('TESTIDS.signupEmail');
+    expect(helper).toContain('TESTIDS.signupSubmit');
+    expect(helper).toContain('TESTIDS.signupError');
+    // The real page is two-step: the helper asserts the emailed-code step
+    // (magic_code form), never wizard arrival — asserting the wizard without
+    // the code-retrieval seam reds every configured run.
+    expect(helper).toContain('magic_code');
+    expect(helper).not.toContain('TESTIDS.byopHost');
+    expect(helper).not.toContain("'/onboarding/byop'");
+    expect(helper).not.toContain('tryMintTestAccount');
+    expect(helper).not.toContain('API.testAccounts');
+    expect(helper).not.toContain('qaAuthHeader');
+  });
+
+  // Wizard-arrival leg: the new spec proves the real form reaches
+  // `/onboarding/byop` via the virtual authenticator + the staging-only code
+  // seam. These pins keep it honest offline: still no mint, still skip-green
+  // pre-deploy, still names-only diagnostics — while the wizard assertion
+  // lives in the NEW helper (the shared helper above must keep asserting the
+  // `magic_code` step only, never the wizard).
+  test('wizard-arrival case reaches the wizard with no account-seam mint', () => {
+    const spec = readFileSync(new URL('../tests/signup-wizard-arrival.spec.ts', import.meta.url), 'utf8');
+    const marker = "test('public UI signup with virtual authenticator reaches the BYOP wizard'";
+    const start = spec.indexOf(marker);
+    expect(start, 'wizard-arrival case is missing').toBeGreaterThan(-1);
+    const rest = spec.slice(start + marker.length);
+    const nextTest = rest.search(/\ntest(?:\(|\.describe)/);
+    const dedicated = nextTest === -1 ? spec.slice(start) : spec.slice(start, start + marker.length + nextTest);
+    // Null identity = Access pair only: the page starts unauthenticated, so
+    // the form is the only account-creation path even with QA_AUTH_TOKEN set.
+    expect(dedicated).toContain('applyAccountToPage(page, null, baseURL)');
+    expect(dedicated).toContain('submitPublicUiSignupToByopWizard(page, request, baseURL)');
+    // Arrival asserted at the spec level too (landed URL + wizard field).
+    expect(dedicated).toContain("'/onboarding/byop'");
+    expect(dedicated).toContain('page.url()');
+    expect(dedicated).toContain('TESTIDS.byopHost');
+    // Never the mint seam: arrival must come from the public form.
+    expect(dedicated).not.toContain('tryMintTestAccount');
+    expect(dedicated).not.toContain('API.testAccounts');
+    // Skip-green pre-deploy (file-level + in-test guards); QA_AUTH_TOKEN
+    // guard skips locally and fails closed on CI.
+    expect(spec).toContain('STAGING_BASE_URL');
+    expect(dedicated).toContain('QA_AUTH_TOKEN');
+    // Provenance label without account data.
+    expect(dedicated).toContain('annotateSignupPath');
+  });
+
+  test('wizard-arrival helper completes the form via the code seam and virtual authenticator', () => {
+    const accounts = readFileSync(new URL('../helpers/accounts.ts', import.meta.url), 'utf8');
+    const helperStart = accounts.indexOf('export async function submitPublicUiSignupToByopWizard');
+    expect(helperStart, 'wizard-arrival helper is missing').toBeGreaterThan(-1);
+    const helperRest = accounts.slice(helperStart + 'export async function submitPublicUiSignupToByopWizard'.length);
+    const nextExport = helperRest.search(/\nexport /);
+    const helper = nextExport === -1 ? accounts.slice(helperStart) : accounts.slice(helperStart, helperStart + 'export async function submitPublicUiSignupToByopWizard'.length + nextExport);
+    // Real form, both steps: email submit then the emailed-code field.
+    expect(helper).toContain('`${baseURL}/signup`');
+    expect(helper).toContain('TESTIDS.signupEmail');
+    expect(helper).toContain('TESTIDS.signupSubmit');
+    expect(helper).toContain('magic_code');
+    // Code comes from the staging-only seam (never minted, never fabricated).
+    // The seam path itself (`API.testCodes`) is pinned on the seam reader
+    // below plus the contract — this helper reaches it via the reader.
+    expect(helper).toContain('retrieveStagedSignupCode');
+    // Passkey finish runs against a virtual authenticator, not hardware
+    // (the CDP call lives in `enableVirtualAuthenticator`, pinned below).
+    expect(helper).toContain('enableVirtualAuthenticator');
+    // Wizard arrival asserted here (unlike the shared helper above).
+    expect(helper).toContain("'/onboarding/byop'");
+    expect(helper).toContain('page.url()');
+    expect(helper).toContain('TESTIDS.byopHost');
+    // Never the mint seam in the arrival path.
+    expect(helper).not.toContain('tryMintTestAccount');
+    expect(helper).not.toContain('API.testAccounts');
+    // Names-only diagnostics: neither the mailbox nor the code value may be
+    // interpolated into an error.
+    expect(helper).toContain('no values logged');
+    expect(helper).not.toContain('${email}');
+    expect(helper).not.toContain('${code}');
+
+    // The seam reader itself: token-gated, fail-closed, names-only.
+    const seamStart = accounts.indexOf('export async function retrieveStagedSignupCode');
+    expect(seamStart, 'staged code-seam reader is missing').toBeGreaterThan(-1);
+    const seamRest = accounts.slice(seamStart + 'export async function retrieveStagedSignupCode'.length);
+    const seamNext = seamRest.search(/\nexport /);
+    const seam = seamNext === -1 ? accounts.slice(seamStart) : accounts.slice(seamStart, seamStart + 'export async function retrieveStagedSignupCode'.length + seamNext);
+    expect(seam).toContain('QA_AUTH_TOKEN');
+    expect(seam).toContain('API.testCodes');
+    expect(seam).toContain('qaAuthHeader');
+    expect(seam).toContain('magic_token');
+    expect(seam).toContain('HTTP ${status}');
+    expect(seam).toContain('no values logged');
+    expect(seam).not.toContain('${email}');
+    expect(seam).not.toContain('tryMintTestAccount');
+    expect(seam).not.toContain('API.testAccounts');
+
+    // The virtual authenticator: CDP WebAuthn domain, resident-key plus
+    // user-verification capable and pre-verified, matching the signup page's
+    // `required` ceremony. Failures stay names-only.
+    const vaStart = accounts.indexOf('export async function enableVirtualAuthenticator');
+    expect(vaStart, 'virtual-authenticator helper is missing').toBeGreaterThan(-1);
+    const vaRest = accounts.slice(vaStart + 'export async function enableVirtualAuthenticator'.length);
+    const vaNext = vaRest.search(/\nexport /);
+    const va = vaNext === -1 ? accounts.slice(vaStart) : accounts.slice(vaStart, vaStart + 'export async function enableVirtualAuthenticator'.length + vaNext);
+    expect(va).toContain('WebAuthn.enable');
+    expect(va).toContain('WebAuthn.addVirtualAuthenticator');
+    expect(va).toContain('hasResidentKey');
+    expect(va).toContain('hasUserVerification');
+    expect(va).toContain('isUserVerified');
+    expect(va).toContain('newCDPSession');
+    expect(va).toContain('no values logged');
+
+    // The contract carries the seam path so a rename fails by name.
+    const contract = readFileSync(new URL('../helpers/contract.ts', import.meta.url), 'utf8');
+    expect(contract).toContain("testCodes: '/api/test-codes'");
   });
 });
 
@@ -366,5 +554,881 @@ test.describe('failure-artifact sanitization', () => {
     } finally {
       rmSync(probe, { recursive: true, force: true });
     }
+  });
+});
+
+// Fail-closed publication gate (acceptance contract for the Builder):
+// Today both upload steps run on `failure() && configured` alone and the
+// sanitize blocks swallow cleanup failures (`|| true`, stderr discarded)
+// and per-file read errors (`except OSError: continue`), so a sanitizer
+// that failed, was skipped, or silently left a file unscrubbed still
+// publishes. The contract pinned below:
+//   1. Each sanitize step carries an `id:` and its job's upload step adds
+//      `steps.<sanitize-id>.outcome == 'success'` to its existing
+//      `failure() && steps.staging.outputs.configured == 'true'`
+//      condition. Skipped / failed / cancelled sanitize => no upload.
+//   2. The sanitize blocks exit nonzero (names-only reporting, never file
+//      contents) on any read or write failure of a file under the upload
+//      path, instead of leaving it eligible.
+//   3. A sanitize run may only report success when no `error-context.md`
+//      path remains under test-results/ and playwright-report/ is gone:
+//      a cleanup that could not remove them must fail, not pass silently.
+//   4. A legitimately absent test-results/ is handled explicitly: success
+//      (nothing is eligible) with an output notice stating it was absent,
+//      not a generic "sanitized" claim and not a crash/traceback.
+//   5. Uploads stay junit-only test-results/ with 7-day retention.
+// The tests execute the exact checked-in sanitize blocks (extracted
+// above) against synthetic fixtures. Failure injection is deterministic
+// and root-proof (no chmod): /proc/self/mem reads raise EIO and
+// /proc/version writes raise EACCES even for root, and a non-empty
+// directory named error-context.md cannot be removed by file deletion.
+const uploadSections = [...stagingWorkflow.matchAll(
+  /      - name: Upload failure artifacts\n        if: ([^\n]+)\n([\s\S]*?)retention-days: (\d+)/g,
+)];
+
+function evaluateUploadGate(
+  condition: string,
+  scenario: { jobFailed: boolean; configured: boolean; sanitizeOutcome: string },
+): boolean {
+  const expr = condition
+    .replace(/failure\(\)/g, String(scenario.jobFailed))
+    .replace(
+      /steps\.staging\.outputs\.configured\s*==\s*'true'/g,
+      String(scenario.configured),
+    )
+    .replace(
+      /steps\.([A-Za-z0-9_-]+)\.outcome\s*==\s*'success'/g,
+      String(scenario.sanitizeOutcome === 'success'),
+    );
+  // Anything the evaluator does not understand stays visible as a failure
+  // here rather than being silently treated as either true or false.
+  expect(expr, `unmodelled upload-gate syntax in: ${condition}`).toMatch(
+    /^[\s()!&|truefals]+$/,
+  );
+  return Function(`"use strict"; return (${expr});`)() as boolean;
+}
+
+function makeProbe(): string {
+  return mkdtempSync(
+    join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'artifact-gate-'),
+  );
+}
+
+const GATE_MARKER = 'SENTINEL-SECRET-VALUE-GATE';
+
+test.describe('fail-closed artifact publication gate', () => {
+  test('both uploads require a successful sanitizer outcome (evaluated)', () => {
+    expect(uploadSections).toHaveLength(2);
+    expect(sanitizeSections).toHaveLength(2);
+    for (const [index, upload] of uploadSections.entries()) {
+      const condition = upload[1]!;
+      const sanitizeId = sanitizeSections[index]![1]!.match(/^\s+id:\s*(\S+)/m)?.[1];
+      expect(
+        sanitizeId,
+        `sanitize step ${index} must carry an id so the upload can gate on its outcome`,
+      ).toBeDefined();
+      expect(condition).toContain('failure()');
+      expect(condition).toContain(`steps.staging.outputs.configured == 'true'`);
+      expect(condition).toContain(`steps.${sanitizeId!}.outcome == 'success'`);
+
+      const base = { jobFailed: true, configured: true };
+      expect(evaluateUploadGate(condition, { ...base, sanitizeOutcome: 'success' })).toBe(true);
+      for (const outcome of ['failure', 'skipped', 'cancelled']) {
+        expect(
+          evaluateUploadGate(condition, { ...base, sanitizeOutcome: outcome }),
+          `upload ${index} must not publish when sanitize outcome is ${outcome}`,
+        ).toBe(false);
+      }
+      expect(evaluateUploadGate(condition, { jobFailed: false, configured: true, sanitizeOutcome: 'success' })).toBe(false);
+      expect(evaluateUploadGate(condition, { jobFailed: true, configured: false, sanitizeOutcome: 'success' })).toBe(false);
+    }
+  });
+
+  test('uploads keep junit-only path and 7-day retention', () => {
+    expect(uploadSections).toHaveLength(2);
+    for (const upload of uploadSections) {
+      expect(upload[2]).toContain('e2e/test-results/');
+      expect(upload[2]).not.toContain('playwright-report');
+      expect(upload[2]).not.toContain('trace');
+      expect(upload[2]).not.toContain('screenshot');
+      expect(upload[3]).toBe('7');
+    }
+  });
+
+  for (const [index, block] of sanitizeBlocks.entries()) {
+    const script = block.replace(/^ {10}/gm, '');
+    const job = index === 0 ? 'synthetic' : 'journey';
+
+    test(`${job} sanitizer: positive control publishes only scrubbed junit`, () => {
+      const probe = makeProbe();
+      try {
+        mkdirSync(join(probe, 'test-results', 'case-1'), { recursive: true });
+        mkdirSync(join(probe, 'playwright-report'), { recursive: true });
+        writeFileSync(join(probe, 'test-results', 'junit.xml'), `<x>${GATE_MARKER}</x>`);
+        writeFileSync(join(probe, 'test-results', 'case-1', 'error-context.md'), GATE_MARKER);
+        writeFileSync(join(probe, 'playwright-report', 'index.html'), GATE_MARKER);
+        const result = runShell(script, { SYNTHETIC_NNTP_PASS: GATE_MARKER }, probe);
+        expect(result.status).toBe(0);
+        expect(result.output).not.toContain(GATE_MARKER);
+        expect(existsSync(join(probe, 'playwright-report'))).toBe(false);
+        const remaining = listFilesRecursive(join(probe, 'test-results'));
+        expect(remaining.some((f) => f.endsWith('error-context.md'))).toBe(false);
+        for (const file of remaining) {
+          expect(fileContainsMarker(file, GATE_MARKER), file).toBe(false);
+        }
+        expect(readFileSync(join(probe, 'test-results', 'junit.xml'), 'utf8')).toContain('***REDACTED***');
+      } finally {
+        rmSync(probe, { recursive: true, force: true });
+      }
+    });
+
+    test(`${job} sanitizer: unreadable file fails closed without leaking contents`, () => {
+      const probe = makeProbe();
+      try {
+        mkdirSync(join(probe, 'test-results'), { recursive: true });
+        writeFileSync(join(probe, 'test-results', 'junit.xml'), `<x>${GATE_MARKER}</x>`);
+        // Regular file whose reads deterministically raise EIO (root too).
+        symlinkSync('/proc/self/mem', join(probe, 'test-results', 'unreadable.xml'));
+        const result = runShell(script, { SYNTHETIC_NNTP_PASS: GATE_MARKER }, probe);
+        expect(
+          result.status,
+          'a file the scrub could not read must fail the sanitizer, not stay upload-eligible',
+        ).not.toBe(0);
+        expect(result.output).not.toContain(GATE_MARKER);
+      } finally {
+        rmSync(probe, { recursive: true, force: true });
+      }
+    });
+
+    test(`${job} sanitizer: unwritable file fails closed without leaking contents`, () => {
+      const probe = makeProbe();
+      try {
+        mkdirSync(join(probe, 'test-results'), { recursive: true });
+        // Readable regular file whose writes deterministically raise EACCES.
+        symlinkSync('/proc/version', join(probe, 'test-results', 'junit.xml'));
+        const result = runShell(script, { SYNTHETIC_NNTP_PASS: GATE_MARKER }, probe);
+        expect(result.status).not.toBe(0);
+        expect(result.output).not.toContain(GATE_MARKER);
+      } finally {
+        rmSync(probe, { recursive: true, force: true });
+      }
+    });
+
+    test(`${job} sanitizer: undeletable error-context cannot report success`, () => {
+      const probe = makeProbe();
+      try {
+        // A non-empty DIRECTORY named error-context.md: file deletion
+        // (`find -delete`, unlink) fails deterministically even for root.
+        // Success is acceptable only if the path is actually gone
+        // afterwards (a recursive remove is a legitimate stronger cleanup).
+        const ctxDir = join(probe, 'test-results', 'case-1', 'error-context.md');
+        mkdirSync(ctxDir, { recursive: true });
+        writeFileSync(join(ctxDir, 'inner.txt'), GATE_MARKER);
+        writeFileSync(join(probe, 'test-results', 'junit.xml'), '<x>ok</x>');
+        const result = runShell(script, { SYNTHETIC_NNTP_PASS: GATE_MARKER }, probe);
+        if (result.status === 0) {
+          expect(
+            existsSync(ctxDir),
+            'sanitizer reported success while error-context.md remains upload-eligible',
+          ).toBe(false);
+        }
+        expect(result.output).not.toContain(GATE_MARKER);
+      } finally {
+        rmSync(probe, { recursive: true, force: true });
+      }
+    });
+
+    test(`${job} sanitizer: absent test-results is explicit, not a generic success claim`, () => {
+      const probe = makeProbe();
+      try {
+        const result = runShell(script, { SYNTHETIC_NNTP_PASS: GATE_MARKER }, probe);
+        expect(result.status).toBe(0);
+        expect(result.output).toMatch(
+          /absent|missing|no test-results|nothing to (sanitize|upload)/i,
+        );
+        expect(result.output).not.toContain(GATE_MARKER);
+        expect(existsSync(join(probe, 'test-results'))).toBe(false);
+      } finally {
+        rmSync(probe, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+// Post-deploy sequencing contract: the full journey is promotion evidence,
+// so it may run only after the same run's staging-web deploy succeeds.
+// e2e-staging.yml must not race deploy.yml on push; instead deploy.yml
+// calls it as a reusable workflow from a job that `needs` staging-web,
+// and the journey job additionally requires the caller-only
+// `inputs.post_deploy`. Scheduled/manual runs stay synthetic monitoring.
+const deployWorkflow = readFileSync(new URL('deploy.yml', workflowDir), 'utf8');
+
+function jobSection(workflow: string, job: string): string {
+  const marker = `\n  ${job}:\n`;
+  const start = workflow.indexOf(marker);
+  expect(start, `job ${job} not found`).toBeGreaterThan(-1);
+  const bodyStart = start + marker.length;
+  const next = /\n  [A-Za-z0-9_-]+:\n/.exec(workflow.slice(bodyStart));
+  return workflow.slice(bodyStart, next ? bodyStart + next.index : undefined);
+}
+
+function jobIf(workflow: string, job: string): string | undefined {
+  // Job-level keys sit at 4-space indent; step conditions are deeper.
+  return jobSection(workflow, job).match(/^    if: (.+)$/m)?.[1];
+}
+
+const stagingOnBlock = stagingWorkflow
+  .split('\non:\n')[1]!
+  .split('\npermissions:\n')[0]!;
+
+test.describe('post-deploy sequencing (deploy → full journey)', () => {
+  test('e2e-staging does not trigger on push (no deploy race)', () => {
+    expect(stagingOnBlock).not.toMatch(/^  push:/m);
+    expect(stagingOnBlock).toMatch(/^  workflow_call:/m);
+    // Manual runs exist but define no inputs, so a dispatch cannot set
+    // post_deploy and mint promotion evidence by hand.
+    expect(stagingOnBlock).toContain('  workflow_dispatch:\n  schedule:');
+    expect(stagingOnBlock).toContain('- cron: "17 */6 * * *"');
+  });
+
+  test('post_deploy is a required boolean workflow_call input', () => {
+    const callBlock = stagingOnBlock
+      .split('  workflow_call:\n')[1]!
+      .split('\n  workflow_dispatch:')[0]!;
+    expect(callBlock).toMatch(/ {6}post_deploy:\n(?:.*\n)*? {8}type: boolean\n {8}required: true/);
+  });
+
+  test('full journey runs only for the post-deploy call (evaluated)', () => {
+    const condition = jobIf(stagingWorkflow, 'e2e');
+    expect(condition, 'e2e job must carry a job-level if').toBeDefined();
+    expect(condition).not.toContain('always()');
+    expect(condition).not.toContain('!cancelled()');
+    expect(jobSection(stagingWorkflow, 'e2e')).toContain('needs: [synthetic]');
+
+    const evaluate = (postDeploy: boolean | ''): boolean => {
+      const inner = condition!
+        .replace(/^\$\{\{\s*/, '')
+        .replace(/\s*\}\}$/, '');
+      const expr = inner.replace(
+        /inputs\.post_deploy/g,
+        postDeploy === '' ? 'false' : String(postDeploy),
+      );
+      expect(expr, `unmodelled journey-gate syntax in: ${condition}`).toMatch(
+        /^[\s()!&|truefals]+$/,
+      );
+      return Function(`"use strict"; return (${expr});`)() as boolean;
+    };
+    // workflow_call from deploy.yml passes post_deploy: true.
+    expect(evaluate(true)).toBe(true);
+    // workflow_dispatch/schedule leave the input unset: monitoring only.
+    expect(evaluate('')).toBe(false);
+    expect(evaluate(false)).toBe(false);
+  });
+
+  test('synthetic smoke stays ungated monitoring on every trigger', () => {
+    // No job-level if: scheduled and manual runs execute the smoke (and
+    // step-level skip while staging is unconfigured), distinct from the
+    // gated full journey above.
+    expect(jobIf(stagingWorkflow, 'synthetic')).toBeUndefined();
+  });
+
+  test('deploy calls e2e-staging only after a successful push staging-web (evaluated)', () => {
+    // The deploy being sequenced after is itself push-only and gated on
+    // the Cloudflare token; when it skips, dependents must skip too.
+    expect(jobIf(deployWorkflow, 'staging-web')).toContain("github.event_name == 'push'");
+    expect(jobIf(deployWorkflow, 'staging-web')).toContain("needs.gate.outputs.enabled == 'true'");
+
+    const section = jobSection(deployWorkflow, 'post-deploy-e2e');
+    expect(section).toContain('needs: [staging-web]');
+    expect(section).toContain('uses: ./.github/workflows/e2e-staging.yml');
+    expect(section).toMatch(/post_deploy: true/);
+
+    const condition = jobIf(deployWorkflow, 'post-deploy-e2e');
+    expect(condition, 'post-deploy-e2e must carry a job-level if').toBeDefined();
+    // No status-check function in the condition: GitHub then applies the
+    // implicit success() over `needs`, which is the whole contract — a
+    // skipped/failed/cancelled staging-web can never run this job.
+    for (const statusFn of ['always()', '!cancelled()', 'success()', 'failure()', 'cancelled()']) {
+      expect(condition, `post-deploy-e2e if must not use ${statusFn}`).not.toContain(statusFn);
+    }
+
+    const evaluate = (stagingWebResult: string, eventName: string): boolean => {
+      const inner = condition!
+        .replace(/^\$\{\{\s*/, '')
+        .replace(/\s*\}\}$/, '');
+      const expr = inner.replace(
+        /github\.event_name\s*==\s*'push'/g,
+        String(eventName === 'push'),
+      );
+      expect(expr, `unmodelled post-deploy syntax in: ${condition}`).toMatch(
+        /^[\s()!&|truefals]+$/,
+      );
+      const conditionHolds = Function(`"use strict"; return (${expr});`)() as boolean;
+      // Implicit success() over needs.
+      return stagingWebResult === 'success' && conditionHolds;
+    };
+    expect(evaluate('success', 'push')).toBe(true);
+    for (const result of ['skipped', 'failure', 'cancelled']) {
+      expect(
+        evaluate(result, 'push'),
+        `staging-web ${result} must not produce a full-journey run`,
+      ).toBe(false);
+    }
+    for (const event of ['pull_request', 'workflow_dispatch', 'schedule']) {
+      expect(evaluate('success', event), `${event} must not run post-deploy E2E`).toBe(false);
+    }
+  });
+
+  test('deploy concurrency is job-level so the E2E tail never holds the deploy group', () => {
+    // A workflow-level group is held until every job in the run finishes —
+    // now including up to ~40 min of post-deploy E2E — so queued main
+    // pushes would be cancelled before ever deploying. Job-level groups
+    // release when the deploy finishes; E2E serializes on e2e-staging.
+    expect(deployWorkflow.split('\njobs:\n')[0]!).not.toMatch(/^concurrency:/m);
+    for (const job of ['staging-web', 'staging-api', 'preview-web']) {
+      const section = jobSection(deployWorkflow, job);
+      expect(section).toMatch(/^    concurrency:\n      group: .+\n      cancel-in-progress: /m);
+      expect(section).toContain("cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}");
+    }
+    // staging-api serializes on its own group: one pending job per group,
+    // so sharing staging-web's group lets a push's own lanes cancel each
+    // other and leaves web and api at different SHAs with no post-deploy
+    // E2E. (preview-web shares the web expression but only runs on PR
+    // events, so it never contends with the push-only lanes.)
+    const webGroup = jobSection(deployWorkflow, 'staging-web').match(/^      group: (.+)$/m)![1];
+    const apiGroup = jobSection(deployWorkflow, 'staging-api').match(/^      group: (.+)$/m)![1];
+    expect(apiGroup).toContain('staging-api');
+    expect(apiGroup, 'staging-api must not share the staging-web group').not.toBe(webGroup);
+    // post-deploy-e2e needs no group of its own: the called workflow
+    // serializes on its e2e-staging group.
+    expect(jobSection(deployWorkflow, 'post-deploy-e2e')).not.toContain('concurrency:');
+    expect(stagingWorkflow.split('\njobs:\n')[0]!).toMatch(
+      /^concurrency:\n  group: e2e-staging\n  cancel-in-progress: false/m,
+    );
+  });
+
+  test('deploy.yml is the only reusable-workflow caller of e2e-staging', () => {
+    for (const name of readdirSync(fileURLToPath(workflowDir)).filter(n => n.endsWith('.yml'))) {
+      const workflow = readFileSync(new URL(name, workflowDir), 'utf8');
+      const calls = workflow.split('uses: ./.github/workflows/e2e-staging.yml').length - 1;
+      expect(calls, `${name} calls e2e-staging.yml`).toBe(name === 'deploy.yml' ? 1 : 0);
+    }
+  });
+
+  test('caller passes exactly the secrets e2e-staging reads, explicitly', () => {
+    expect(deployWorkflow).not.toContain('secrets: inherit');
+    const used = [...new Set(
+      [...stagingWorkflow.matchAll(/secrets\.([A-Z0-9_]+)/g)].map(m => m[1]!),
+    )].sort();
+    const declaredBlock = stagingOnBlock
+      .split('    secrets:\n')[1]!
+      .split('\n  workflow_dispatch:')[0]!;
+    const declared = [...declaredBlock.matchAll(/^      ([A-Z0-9_]+):$/gm)]
+      .map(m => m[1]!)
+      .sort();
+    const passedBlock = jobSection(deployWorkflow, 'post-deploy-e2e').split('    secrets:\n')[1]!;
+    const passed = [...passedBlock.matchAll(/^      ([A-Z0-9_]+): \$\{\{ secrets\.([A-Z0-9_]+) \}\}$/gm)];
+    expect(declared, 'workflow_call secret declarations').toEqual(used);
+    expect(passed.map(m => m[1]!).sort(), 'secrets passed by deploy.yml').toEqual(used);
+    for (const m of passed) expect(m[2], 'secret passed under its own name').toBe(m[1]);
+    // Every declared secret stays optional so the pre-configuration
+    // step-level skip (staging not configured yet) keeps working.
+    for (const m of declaredBlock.matchAll(/required: (\w+)/g)) {
+      expect(m[1]).toBe('false');
+    }
+  });
+
+  test('least permissions and no production deploy path are preserved', () => {
+    for (const workflow of [stagingWorkflow, deployWorkflow]) {
+      expect(workflow).toContain('\npermissions:\n  contents: read\n');
+    }
+    expect(stagingWorkflow).not.toMatch(/:\s*write\b/);
+    const section = jobSection(deployWorkflow, 'post-deploy-e2e');
+    expect(section).toContain('    permissions:\n      contents: read\n');
+    expect(section).not.toMatch(/:\s*write\b/);
+    expect(stagingWorkflow).not.toContain('wrangler');
+    expect(stagingWorkflow).not.toContain('--env production');
+    expect(section).not.toContain('deploy --env');
+  });
+});
+
+// Locked-dependency coverage builds (static pin): coverage.yml builds
+// `--locked` for every standalone crate with a committed workers/<crate>/
+// Cargo.lock plus the root workspace (covering stream), and fails closed on
+// missing reports — but nothing stops a future edit from dropping a
+// `--locked` flag or adding an uncovered standalone crate. These cases pin
+// the mapping offline so such an edit reds test:unit.
+// Commented-out steps are inactive: strip full-line `#` comments once at load
+// so a commented-out llvm-cov command cannot satisfy the pins below.
+const coverageWorkflow = readFileSync(new URL('coverage.yml', workflowDir), 'utf8').replace(
+  /^[ \t]*#.*$/gm,
+  '',
+);
+
+// Join backslash continuations so multi-line invocations read as one command.
+const coverageCommands = coverageWorkflow
+  .replace(/\\\n/g, '')
+  .split('\n')
+  .filter((line) => line.includes('cargo llvm-cov'));
+
+// `for crate in ingest mb; do cargo llvm-cov --locked --manifest-path
+// "workers/${crate}/Cargo.toml" ...` covers a set of crates with one generic
+// locked step: resolve the loop word lists whose OWN body is such a step.
+// The body scope matters: the summary loop below (`for crate in root api
+// ingest mb repair`) never runs llvm-cov, so testing the whole file would
+// wrongly credit its word list.
+function loopCoveredCrates(): Set<string> {
+  const covered = new Set<string>();
+  for (const match of coverageWorkflow.matchAll(/for (\w+) in ([^;]+); do([\s\S]*?)done/g)) {
+    const variable = match[1]!;
+    const words = match[2]!.trim().split(/\s+/);
+    const body = match[3]!;
+    const generic = new RegExp(
+      `cargo llvm-cov --locked --manifest-path\\s+"?workers/\\$\\{${variable}\\}/Cargo\\.toml"?`,
+    );
+    if (generic.test(body)) {
+      for (const word of words) covered.add(word);
+    }
+  }
+  return covered;
+}
+
+function crateHasLockedCoverageStep(crate: string, loopCovered: Set<string>): boolean {
+  // Accept the manifest path quoted or unquoted: both are valid shell.
+  const direct = new RegExp(
+    `cargo llvm-cov --locked --manifest-path\\s+"?workers/${crate}/Cargo\\.toml"?`,
+  );
+  return direct.test(coverageWorkflow) || loopCovered.has(crate);
+}
+
+test.describe('locked-dependency coverage builds (static pin)', () => {
+  test('every committed workers lockfile has a --locked llvm-cov step', () => {
+    // Enumerated from the tree (not a hardcoded list) so a newly added
+    // standalone crate with a committed Cargo.lock fails until coverage.yml
+    // gains a locked step for it.
+    const workersDir = fileURLToPath(new URL('../../workers/', import.meta.url));
+    const lockCrates = readdirSync(workersDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .filter((name) => existsSync(join(workersDir, name, 'Cargo.lock')))
+      .sort();
+    expect(lockCrates.length).toBeGreaterThan(0);
+    const loopCovered = loopCoveredCrates();
+    for (const crate of lockCrates) {
+      expect(
+        crateHasLockedCoverageStep(crate, loopCovered),
+        `workers/${crate}/Cargo.lock has no --locked llvm-cov step in coverage.yml`,
+      ).toBe(true);
+    }
+  });
+
+  test('no manifest-pinned llvm-cov step drops its --locked flag', () => {
+    expect(coverageCommands.length).toBeGreaterThan(0);
+    for (const command of coverageCommands) {
+      if (command.includes('--manifest-path')) {
+        expect(command, `llvm-cov step lost its --locked flag: ${command.trim()}`).toContain(
+          '--locked',
+        );
+      }
+    }
+  });
+
+  test('stream stays covered by the root workspace step while a member, locked step if extracted', () => {
+    const rootManifest = readFileSync(new URL('../../Cargo.toml', import.meta.url), 'utf8');
+    const members = rootManifest.match(/members = \[([^\]]*)\]/)?.[1] ?? '';
+    // Compare complete member values: a substring match would let e.g.
+    // `workers/stream-tools` select the workspace branch and bypass the
+    // locked stream-step assertion.
+    const memberValues = [...members.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    if (memberValues.includes('workers/stream')) {
+      expect(
+        coverageCommands.some(
+          (command) =>
+            command.includes('--workspace') &&
+            !command.includes('--manifest-path') &&
+            !/--exclude|--package|\s-p\s/.test(command),
+        ),
+        'root workspace llvm-cov step covering workers/stream is missing',
+      ).toBe(true);
+    } else {
+      expect(
+        crateHasLockedCoverageStep('stream', loopCoveredCrates()),
+        'workers/stream left the root workspace without a --locked llvm-cov step',
+      ).toBe(true);
+    }
+  });
+});
+
+test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)', () => {
+  // deploy.yml deploys apps/web plus the one authorized backend lane,
+  // `staging-api` (api Worker, staging only); every further backend lane
+  // (ingest/mb/stream/repair) must extend this guard with its own
+  // allowlist + evidence instead of weakening it. These pins fail on any
+  // new `deploy-api-worker`-style job with `wrangler deploy --env staging`,
+  // anything deploying under workers/ outside `staging-api`, any
+  // production-environment deploy step, or a bare `command: deploy`
+  // (apps/web top-level name equals the production env name, so a bare
+  // deploy targets production).
+  const jobsBody = deployWorkflow.split('\njobs:\n')[1]!;
+
+  // The one authorized backend lane. Everything outside it stays web-only.
+  const bodyWithoutJob = (body: string, job: string): string => {
+    const section = jobSection(body, job);
+    return body.split(section).join('');
+  };
+  const codeLines = (text: string): string =>
+    text
+      .split('\n')
+      .filter((l) => !/^\s*#/.test(l))
+      .join('\n');
+
+  // Shared guard: the real pins below call these helpers, and the mutant
+  // test asserts the same helpers throw for each synthetic backend lane —
+  // so weakening a pin breaks the mutant test instead of silently passing.
+  const assertJobSet = (body: string) => {
+    const names = [...body.matchAll(/^  ([A-Za-z0-9_-]+):$/gm)].map((m) => m[1]!).sort();
+    expect(names).toEqual(['gate', 'post-deploy-e2e', 'preview-web', 'staging-api', 'staging-web']);
+    for (const name of names) {
+      expect(name, `job ${name} must not look like a backend deploy lane`).not.toMatch(
+        /worker|backend/i,
+      );
+    }
+  };
+
+  const assertDeployBody = (body: string) => {
+    expect(body.match(/wrangler-action/g) ?? []).toHaveLength(3);
+    expect(body.match(/deploy --env/g) ?? []).toHaveLength(2);
+    // Exact command pin: staging-web deploys to staging, staging-api
+    // deploys the api Worker to staging with the public BUILD_SHA var, and
+    // preview-web runs `preview`. A bare `command: deploy` (no --env)
+    // deploys the top-level worker name, which equals the production env
+    // name — count checks alone miss it, so pin every wrangler-action
+    // command value exactly.
+    const commands = [...body.matchAll(/^\s+command: (.+)$/gm)]
+      .map((m) => m[1]!.trim())
+      .sort();
+    expect(
+      commands,
+      `wrangler commands stay exactly the evidenced lanes (got ${JSON.stringify(commands)})`,
+    ).toEqual([
+      'deploy --env staging',
+      'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
+      'preview',
+    ]);
+    // Raw-CLI pin: no `run:` step may invoke a wrangler deploy, even split
+    // across lines (`wrangler \` + newline + `deploy`), version-pinned
+    // (`wrangler@<ver> deploy`), or flag-first (`wrangler --config x
+    // deploy`). Join continuations, then match `wrangler` (excluding
+    // `wrangler-action` and `wranglerVersion`) followed anywhere on the
+    // same logical line by `deploy`.
+    const flat = body.replace(/\\\r?\n\s*/g, ' ');
+    expect(flat).not.toMatch(/\bwrangler\b(?!-action)[^\n]*\bdeploy\b/);
+    // Working directories: apps/web everywhere except the api lane, which
+    // is the only job allowed to touch workers/api.
+    for (const line of bodyWithoutJob(body, 'staging-api').split('\n')) {
+      if (line.includes('workingDirectory:') || line.includes('working-directory:')) {
+        expect(line, `deploy working directory stays apps/web (${line.trim()})`).toContain(
+          'apps/web',
+        );
+      }
+    }
+    for (const line of jobSection(body, 'staging-api').split('\n')) {
+      if (line.includes('workingDirectory:') || line.includes('working-directory:')) {
+        expect(line, `api lane deploys from workers/api (${line.trim()})`).toContain(
+          'workers/api',
+        );
+      }
+    }
+  };
+
+  const assertNoBackendPath = (body: string) => {
+    // Header comments (above `jobs:`) legitimately name workers/ and the
+    // Hyperdrive gate; outside `staging-api` the jobs body itself stays
+    // web-only with no production path. Case-sensitive: the preview job
+    // carries a `Workers preview deployment` comment (no path), which must
+    // keep passing.
+    // Production pin: no job carries the `production` word at all in code
+    // (comments stripped) — that covers `--env production`,
+    // `--env=production`, `environment: production`, the mapping form
+    // (`environment:\n  name: production`), quoted values, and
+    // `CLOUDFLARE_ENV: production` — while a harmless full-line comment
+    // mentioning production still passes. The api lane is staging-only, so
+    // the pin applies to its section too.
+    const rest = bodyWithoutJob(body, 'staging-api');
+    expect(rest).not.toContain('workers/');
+    expect(codeLines(rest).toLowerCase()).not.toContain('production');
+    expect(codeLines(jobSection(body, 'staging-api')).toLowerCase()).not.toContain('production');
+  };
+
+  const assertStagingApi = (body: string) => {
+    // Evidence the api staging lane must keep: push-only + token gate,
+    // staging-only deploy with the public BUILD_SHA var, the fail-closed
+    // Hyperdrive cache-disabled gate (CI-only --allow-skip forbidden), and
+    // no GitHub-environment mapping (which would resolve prod-scoped
+    // secrets and protection rules).
+    const section = jobSection(body, 'staging-api');
+    expect(section).toContain('needs: [gate]');
+    const condition = jobIf(body, 'staging-api');
+    expect(condition, 'staging-api must carry a job-level if').toBeDefined();
+    expect(condition).toContain("github.event_name == 'push'");
+    expect(condition).toContain("needs.gate.outputs.enabled == 'true'");
+    expect(section).toContain('command: deploy --env staging --var BUILD_SHA:${{ github.sha }}');
+    expect(section).toContain('check_hyperdrive_cache.sh');
+    expect(section, 'real deploys must not pass --allow-skip').not.toContain('--allow-skip');
+    expect(section, 'api lane must not map a GitHub environment').not.toMatch(/^\s*environment:/m);
+    // Own concurrency group: sharing staging-web's group lets a push's
+    // own lanes cancel each other (one pending job per group).
+    expect(section).toContain('group: ${{ github.workflow }}-staging-api-${{ github.ref }}');
+    // Generated-config parity: the only real api wrangler config is
+    // generated from HYPERDRIVE_ID_STAGING, which binding-parity never
+    // reads — the lane pins it to the committed staging inventory id.
+    expect(section).toContain('binding_manifest.toml');
+    expect(section).toContain('HYPERDRIVE_ID_STAGING must equal the api staging inventory id');
+  };
+
+  const assertDeployGuard = (body: string) => {
+    assertJobSet(body);
+    assertDeployBody(body);
+    assertNoBackendPath(body);
+    assertStagingApi(body);
+  };
+
+  test('job set is exactly the evidenced lanes (web + api staging)', () => {
+    assertJobSet(jobsBody);
+  });
+
+  test('only the evidenced staging steps run a wrangler deploy', () => {
+    // staging-web deploys apps/web to staging, staging-api deploys the api
+    // Worker to staging with BUILD_SHA, preview-web runs `preview` (not
+    // deploy). Any additional wrangler deploy — action or raw `wrangler
+    // deploy` CLI — is a backend-lane candidate until evidenced.
+    assertDeployBody(jobsBody);
+    expect(jobSection(deployWorkflow, 'staging-web')).toContain('command: deploy --env staging');
+  });
+
+  test('no workers/ path or production-environment deploy step outside staging-api', () => {
+    assertNoBackendPath(jobsBody);
+  });
+
+  test('staging-api lane carries BUILD_SHA + hyperdrive gate evidence', () => {
+    assertStagingApi(jobsBody);
+  });
+
+  test('synthetic backend-deploy mutants trip the pins above', () => {
+    // Regression proof for the shared guard: each mutant models an
+    // unauthorized backend lane and must throw the same helpers the real
+    // pins call (not a restated copy of the expectations).
+    const workerJob =
+      '\n  deploy-api-worker:\n    runs-on: ubuntu-latest\n    defaults:\n      run:\n        working-directory: workers/api\n    steps:\n      - run: wrangler deploy --env staging\n';
+    const workerMutant = `${jobsBody}${workerJob}`;
+    const prodMutant = `${jobsBody}\n      - run: wrangler deploy --env production\n`;
+    // Bare `command: deploy` on preview-web: no --env, no `wrangler deploy`
+    // string, no workers/ or production marker — only the exact command pin
+    // catches it, and it would deploy the production worker name.
+    const bareDeployMutant = jobsBody.replace('command: preview', 'command: deploy');
+    // Multiline raw-CLI deploy: `wrangler \` + newline + `deploy` evades a
+    // contiguous `wrangler deploy` substring check but still deploys.
+    const multilineMutant = `${jobsBody}\n      - run: pnpm exec wrangler \\\n        deploy --env staging\n`;
+    // Version-pinned raw-CLI deploy (the workflow's own WRANGLER_VERSION
+    // spelling): `@<ver>` sits between the tokens, so a
+    // `wrangler\s+deploy` check misses it.
+    const versionPinnedMutant = `${jobsBody}\n      - run: npx wrangler@\${{ env.WRANGLER_VERSION }} deploy\n`;
+    // Flag-first raw-CLI deploy: a flag before the subcommand evades a
+    // `wrangler deploy` adjacency check.
+    const flagFirstMutant = `${jobsBody}\n      - run: pnpm exec wrangler --config wrangler.toml deploy\n`;
+    // Production GitHub environment mapping form on a PR-triggered job:
+    // resolves production-scoped secrets and protection rules.
+    const envMappingMutant = jobsBody.replace(
+      '    needs: [gate]\n    if: ${{ github.event_name == ',
+      '    needs: [gate]\n    environment:\n      name: production\n    if: ${{ github.event_name == ',
+    );
+    // Quoted production environment value.
+    const quotedEnvMutant = `${jobsBody}\n    environment: "production"\n`;
+    // CI-only gate bypass in the api lane: the Hyperdrive cache-disabled
+    // gate must never pass --allow-skip in a real deploy.
+    const allowSkipMutant = jobsBody.replace(
+      './check_hyperdrive_cache.sh --config-id "${{ vars.HYPERDRIVE_ID_STAGING }}"',
+      './check_hyperdrive_cache.sh --config-id "${{ vars.HYPERDRIVE_ID_STAGING }}" --allow-skip',
+    );
+    // Api lane without the public BUILD_SHA var: records would render
+    // "unknown" instead of the deploy SHA.
+    const noBuildShaMutant = jobsBody.replace(' --var BUILD_SHA:${{ github.sha }}', '');
+    // Api lane sharing staging-web's group: a push's own lanes cancel each
+    // other, leaving web and api at different SHAs.
+    const sharedGroupMutant = jobsBody.replace(
+      'group: ${{ github.workflow }}-staging-api-${{ github.ref }}',
+      'group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}',
+    );
+    // Api lane without the generated-config parity pin: a mis-set
+    // HYPERDRIVE_ID_STAGING (e.g. the prod value) deploys staging against
+    // the wrong database with no CI failure.
+    const noParityMutant = jobsBody.replace(
+      'HYPERDRIVE_ID_STAGING must equal the api staging inventory id',
+      'HYPERDRIVE_ID_STAGING looks fine',
+    );
+
+    for (const mutant of [
+      workerMutant,
+      prodMutant,
+      bareDeployMutant,
+      multilineMutant,
+      versionPinnedMutant,
+      flagFirstMutant,
+      envMappingMutant,
+      quotedEnvMutant,
+      allowSkipMutant,
+      noBuildShaMutant,
+      sharedGroupMutant,
+      noParityMutant,
+    ]) {
+      expect(() => assertDeployGuard(mutant), 'mutant must violate the deploy guard').toThrow();
+    }
+    // Targeted evidence for which pin each mutant trips.
+    expect(() => assertJobSet(workerMutant)).toThrow();
+    expect(() => assertDeployBody(workerMutant)).toThrow();
+    expect(() => assertNoBackendPath(workerMutant)).toThrow();
+    expect(() => assertDeployBody(prodMutant)).toThrow();
+    expect(() => assertNoBackendPath(prodMutant)).toThrow();
+    expect(() => assertDeployBody(bareDeployMutant)).toThrow();
+    expect(() => assertDeployBody(multilineMutant)).toThrow();
+    expect(() => assertDeployBody(versionPinnedMutant)).toThrow();
+    expect(() => assertDeployBody(flagFirstMutant)).toThrow();
+    expect(() => assertNoBackendPath(envMappingMutant)).toThrow();
+    expect(() => assertNoBackendPath(quotedEnvMutant)).toThrow();
+    expect(() => assertStagingApi(allowSkipMutant)).toThrow();
+    expect(() => assertStagingApi(noBuildShaMutant)).toThrow();
+    expect(() => assertDeployBody(noBuildShaMutant)).toThrow();
+    expect(() => assertStagingApi(sharedGroupMutant)).toThrow();
+    expect(() => assertStagingApi(noParityMutant)).toThrow();
+  });
+});
+
+test.describe('deployed-build identity wiring (static pin)', () => {
+  // Same-build evidence: the full journey proves the serving build is the
+  // promoted one by comparing GET /api/build with the promotion SHA from the
+  // push-triggered deploy run — never a source checkout. These pins keep the
+  // chain (deploy expected_sha -> e2e-staging input -> EXPECTED_BUILD_SHA env
+  // -> build-identity spec) honest offline.
+  test('e2e-staging declares the expected_sha promotion input', () => {
+    expect(stagingWorkflow).toContain('expected_sha:');
+    expect(stagingWorkflow).toContain('Promotion SHA from the push-triggered deploy run');
+  });
+
+  test('deploy passes expected_sha from github.sha (never a checkout)', () => {
+    const section = jobSection(deployWorkflow, 'post-deploy-e2e');
+    expect(section).toContain('expected_sha: ${{ github.sha }}');
+    expect(section).not.toContain('rev-parse');
+  });
+
+  test('the e2e job exposes EXPECTED_BUILD_SHA from inputs.expected_sha', () => {
+    const section = jobSection(stagingWorkflow, 'e2e');
+    expect(section).toContain('EXPECTED_BUILD_SHA: ${{ inputs.expected_sha }}');
+  });
+
+  test('contract carries the build identity path', () => {
+    const contract = readFileSync(new URL('../helpers/contract.ts', import.meta.url), 'utf8');
+    expect(contract).toContain("build: '/api/build'");
+  });
+
+  test('build-identity helper exposes the promotion/verdict contract', () => {
+    const helper = readFileSync(
+      new URL('../helpers/build-identity.ts', import.meta.url),
+      'utf8',
+    );
+    expect(helper).toContain('export function expectedPromotionSha');
+    expect(helper).toContain('export function extractDeployedSha');
+    expect(helper).toContain('export function assertDeployedBuildMatchesPromotion');
+    expect(helper).toContain('EXPECTED_BUILD_SHA');
+    // Never a source checkout: the helper reads the run-provided env and
+    // performs pure string comparison — no shell-out to git, no checkout read.
+    // It never gates on staging itself (skip ownership stays with the spec).
+    expect(helper).not.toContain('child_process');
+    expect(helper).not.toContain('spawnSync');
+    expect(helper).not.toContain('execSync');
+    expect(helper).not.toContain('process.env.STAGING_BASE_URL');
+    expect(helper).not.toContain('stagingBaseUrl(');
+  });
+
+  test('build-identity legs compare the serving build with the promotion SHA via the shared live helper', () => {
+    // One-shot reads cannot bind a ~30 min journey: the opening leg proves
+    // the deploy delivered the promoted build before the journey and the
+    // closing leg re-reads after every other spec. Both route through one
+    // shared helper so the two reads cannot drift apart.
+    const helper = readFileSync(
+      new URL('../helpers/build-identity-live.ts', import.meta.url),
+      'utf8',
+    );
+    expect(helper).toContain('export async function assertServingBuildMatchesPromotion');
+    expect(helper).toContain('API.build');
+    expect(helper).toContain('expectedPromotionSha(');
+    expect(helper).toContain('extractDeployedSha(');
+    expect(helper).toContain('assertDeployedBuildMatchesPromotion(');
+    expect(helper).toContain('assertNoAccessWall(');
+    expect(helper).toContain('apiGet(');
+    expect(helper).toContain('accessHeaders(');
+    // The helper performs pure verdict throws, never a source checkout.
+    expect(helper).not.toContain('rev-parse');
+    expect(helper).not.toContain('child_process');
+
+    const opener = readFileSync(
+      new URL('../tests/build-identity.spec.ts', import.meta.url),
+      'utf8',
+    );
+    expect(opener).toContain(
+      'deployed build matches the promotion SHA (exact-head staging evidence)',
+    );
+    // Fail-closed: unknown and mismatch paths are pinned in the offline
+    // describe of the same file (not restated here).
+    expect(opener).toContain("'unknown'");
+    // Pre-deploy skip is in-test on STAGING_BASE_URL only — no file-level
+    // skip, so the offline verdict pins still run via test:unit.
+    expect(opener).toContain('STAGING_BASE_URL not configured (pre-deploy)');
+    expect(opener).not.toMatch(/^test\.skip\(\s*\n?\s*!process\.env\.STAGING_BASE_URL/m);
+
+    const closer = readFileSync(
+      new URL('../tests/zz-build-identity-final.spec.ts', import.meta.url),
+      'utf8',
+    );
+    expect(closer).toContain(
+      'deployed build still matches the promotion SHA at journey end (superseded-deploy guard)',
+    );
+    // A mid-journey deploy voids the evidence: the closing leg names the
+    // supersession instead of reporting a bare mismatch.
+    expect(closer).toContain('superseded by a newer deploy');
+    expect(closer).toContain('STAGING_BASE_URL not configured (pre-deploy)');
+    expect(closer).not.toMatch(/^test\.skip\(\s*\n?\s*!process\.env\.STAGING_BASE_URL/m);
+  });
+
+  test('closing identity check runs last under the serial config', () => {
+    // Playwright runs test files alphabetically with a single worker and no
+    // parallelism, so the `zz-` prefix sorts the closing read after every
+    // other spec. Pin the config and the sort position so a future
+    // parallelization or rename cannot silently move the guard mid-journey.
+    const configSource = readFileSync(
+      new URL('../playwright.config.ts', import.meta.url),
+      'utf8',
+    );
+    expect(configSource).toMatch(/workers:\s*1/);
+    expect(configSource).toMatch(/fullyParallel:\s*false/);
+    const specs = readdirSync(fileURLToPath(new URL('../tests/', import.meta.url))).filter(
+      (name) => name.endsWith('.spec.ts'),
+    );
+    expect(specs).toContain('zz-build-identity-final.spec.ts');
+    for (const name of specs) {
+      expect(
+        name <= 'zz-build-identity-final.spec.ts',
+        `${name} must sort before the closing identity check`,
+      ).toBe(true);
+    }
+  });
+
+  test('synthetic smoke stays health-only (monitoring cannot mint same-build evidence)', () => {
+    const pkg = JSON.parse(
+      readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+    ) as { scripts: Record<string, string> };
+    expect(pkg.scripts['e2e:smoke']).toContain('tests/health.spec.ts');
+    expect(pkg.scripts['e2e:smoke']).not.toContain('build-identity');
+    expect(pkg.scripts['test:unit']).toContain('tests/build-identity.spec.ts');
+    expect(pkg.scripts['test:unit']).toContain('tests/zz-build-identity-final.spec.ts');
   });
 });

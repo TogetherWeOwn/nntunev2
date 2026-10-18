@@ -72,7 +72,7 @@ describe('resolveEffectivePlan', () => {
 		expect(r.planUnknown).toBe(true);
 	});
 
-	it.each(['past_due', 'canceled', 'incomplete'] as const)(
+	it.each(['past_due', 'canceled', 'expired', 'incomplete'] as const)(
 		'falls back to the trial row when status is %s',
 		(status) => {
 			const r = resolveEffectivePlan({ planId: 'pro-5x', status });
@@ -80,4 +80,27 @@ describe('resolveEffectivePlan', () => {
 			expect(r.planUnknown).toBe(true);
 		}
 	);
+
+	it('keeps the real plan for past_due inside the grace window', () => {
+		const now = new Date('2026-10-15T12:00:00Z');
+		const r = resolveEffectivePlan(
+			{ planId: 'pro-5x', status: 'past_due', graceUntil: '2026-10-20T00:00:00Z' },
+			now
+		);
+		expect(r.plan.id).toBe('pro-5x');
+		expect(r.planUnknown).toBe(false);
+	});
+
+	it('treats past_due past the grace window (or with none) as lapsed', () => {
+		const now = new Date('2026-10-15T12:00:00Z');
+		for (const sub of [
+			{ planId: 'pro-5x', status: 'past_due', graceUntil: '2026-10-10T00:00:00Z' },
+			{ planId: 'pro-5x', status: 'past_due', graceUntil: null },
+			{ planId: 'pro-5x', status: 'past_due' }
+		] as const) {
+			const r = resolveEffectivePlan(sub, now);
+			expect(r.plan.id).toBe('free');
+			expect(r.planUnknown).toBe(true);
+		}
+	});
 });

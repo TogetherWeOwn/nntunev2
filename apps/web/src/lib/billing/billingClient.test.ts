@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { openPortal, startCheckout } from './billingClient';
+import {
+	BillingApiError,
+	openPortal,
+	signupUrlForCheckoutFailure,
+	startCheckout
+} from './billingClient';
 
 function ok(body: unknown): Response {
 	return new Response(JSON.stringify(body), { status: 200 });
@@ -34,10 +39,49 @@ describe('billingClient redirects', () => {
 		);
 	});
 
+	it('carries envelope code and retryable on billing failures', async () => {
+		const fetchFn = vi.fn(
+			async () =>
+				new Response(
+					JSON.stringify({ code: 'plan_limit_exceeded', message: 'plan limit reached', retryable: false }),
+					{ status: 402 }
+				)
+		);
+		const failure = await openPortal(fetchFn as typeof fetch).catch((e: unknown) => e);
+		expect(failure).toBeInstanceOf(BillingApiError);
+		expect((failure as BillingApiError).code).toBe('plan_limit_exceeded');
+		expect((failure as BillingApiError).retryable).toBe(false);
+		expect((failure as BillingApiError).status).toBe(402);
+	});
+
 	it('surfaces server errors without leaking bodies', async () => {
 		const fetchFn = vi.fn(
 			async () => new Response(JSON.stringify({ error: 'no such subscription' }), { status: 404 })
 		);
 		await expect(openPortal(fetchFn as typeof fetch)).rejects.toThrow('404');
+	});
+
+	it('attaches the paywall model to limit errors for caller handling', async () => {
+		const fetchFn = vi.fn(
+			async () => new Response(JSON.stringify({ code: 'plan_limit_exceeded' }), { status: 402 })
+		);
+		const request = openPortal(fetchFn as typeof fetch);
+		await expect(request).rejects.toMatchObject({
+			status: 402,
+			paywall: { kind: 'terminal', code: 'plan_limit_exceeded' }
+		});
+	});
+});
+
+describe('signupUrlForCheckoutFailure', () => {
+	it('routes a 401 to signup with the chosen plan', () => {
+		expect(signupUrlForCheckoutFailure('pro-5x', new BillingApiError(401, 'Start checkout'))).toBe(
+			'/signup?plan=pro-5x'
+		);
+	});
+
+	it('returns null for non-401 failures and non-API errors', () => {
+		expect(signupUrlForCheckoutFailure('plus', new BillingApiError(500, 'Start checkout'))).toBeNull();
+		expect(signupUrlForCheckoutFailure('plus', new Error('nope'))).toBeNull();
 	});
 });

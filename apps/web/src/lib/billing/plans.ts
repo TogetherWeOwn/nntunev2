@@ -107,6 +107,8 @@ export function streamCapSeconds(plan: Plan): number {
 export interface SubscriptionRef {
 	planId: string;
 	status: string;
+	/** End of the past-due grace window (ADR 0002 rule 4); null/omitted when none. */
+	graceUntil?: string | null;
 }
 
 export interface EffectivePlan {
@@ -122,13 +124,33 @@ export interface EffectivePlan {
 const ENTITLED_STATUSES = new Set(['active', 'trialing']);
 
 /**
+ * True while a past-due subscription is still inside its grace window
+ * (ADR 0002 rule 4): the server keeps enforcing the real plan's caps, so
+ * the UI must score usage against them too. An unparseable or missing
+ * window fails closed to lapsed.
+ */
+function inGraceWindow(subscription: SubscriptionRef, now: Date): boolean {
+	if (subscription.status !== 'past_due') return false;
+	if (!subscription.graceUntil) return false;
+	return new Date(subscription.graceUntil).getTime() > now.getTime();
+}
+
+/**
  * Effective plan per ADR 0004: the subscription's plan while it grants
- * entitlement (`active`/`trialing`) and names a known tier; the free trial
+ * entitlement (`active`/`trialing`, plus `past_due` inside its grace
+ * window per ADR 0002 rule 4) and names a known tier; the free trial
  * row otherwise. Never invents a paid tier for an unknown state.
  */
-export function resolveEffectivePlan(subscription: SubscriptionRef | null): EffectivePlan {
+export function resolveEffectivePlan(
+	subscription: SubscriptionRef | null,
+	now: Date = new Date()
+): EffectivePlan {
 	const plan = subscription ? getPlan(subscription.planId) : undefined;
-	if (subscription && plan && ENTITLED_STATUSES.has(subscription.status)) {
+	if (
+		subscription &&
+		plan &&
+		(ENTITLED_STATUSES.has(subscription.status) || inGraceWindow(subscription, now))
+	) {
 		return { plan, planUnknown: false };
 	}
 	return { plan: getPlan('free')!, planUnknown: true };

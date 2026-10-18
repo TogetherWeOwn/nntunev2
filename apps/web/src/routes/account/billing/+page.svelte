@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { invalidateAll } from '$app/navigation';
+	import { BillingApiError } from '#lib/billing/billingClient.js';
 	import { getPlan } from '#lib/billing/plans.js';
 	import type { PageData } from './$types';
 
@@ -8,6 +9,16 @@
 	// The loader only emits known plan ids; free is the last-resort fallback
 	// so the page can never promote an unknown state to a paid tier.
 	const plan = $derived(getPlan(data.planId) ?? getPlan('free')!);
+	// A lapsed subscriber still owns their plan: name it with its status
+	// instead of printing "Free trial" above a past_due line. The
+	// "couldn't confirm" wording is reserved for no-subscription-at-all.
+	const headingPlan = $derived(
+		!data.planUnknown || data.signedOut
+			? plan
+			: data.subscription
+				? (getPlan(data.subscription.planId) ?? plan)
+				: plan
+	);
 	// usageStatus is null unless the plan is confirmed AND usage loaded: no
 	// usage-vs-cap alert or upgrade button is rendered otherwise.
 	const status = $derived(data.usageStatus);
@@ -16,14 +27,19 @@
 	let busy: 'checkout' | 'portal' | null = $state(null);
 
 	async function checkout() {
-		if (!status?.upgradeTo) return;
+		// Belt and braces with the loader (which nulls upgradeTo for
+		// portal-only subscriptions): never start a checkout from here when
+		// the subscriber already holds a plan that needs the portal instead.
+		if (!status?.upgradeTo || data.manageBillingOnly) return;
 		actionError = null;
 		busy = 'checkout';
 		try {
 			const { startCheckout } = await import('#lib/billing/billingClient.js');
 			window.location.href = await startCheckout(status.upgradeTo);
 		} catch (err) {
-			actionError = err instanceof Error ? err.message : 'Checkout failed';
+			if (!(err instanceof BillingApiError && err.paywall)) {
+				actionError = err instanceof Error ? err.message : 'Checkout failed';
+			}
 			busy = null;
 		}
 	}
@@ -35,7 +51,9 @@
 			const { openPortal } = await import('#lib/billing/billingClient.js');
 			window.location.href = await openPortal();
 		} catch (err) {
-			actionError = err instanceof Error ? err.message : 'Portal failed';
+			if (!(err instanceof BillingApiError && err.paywall)) {
+				actionError = err instanceof Error ? err.message : 'Portal failed';
+			}
 			busy = null;
 		}
 	}
@@ -57,7 +75,7 @@
 	{/if}
 
 	{#if data.signedOut}
-		<p><a href="/signup">Sign in</a> to see your billing.</p>
+		<p><a href="/login">Sign in</a> to see your billing.</p>
 	{/if}
 
 	{#if data.hadFetchError}
@@ -65,7 +83,7 @@
 	{/if}
 
 	<section aria-labelledby="plan">
-		<h2 id="plan">Current plan: {plan.name}</h2>
+		<h2 id="plan">Current plan: {headingPlan.name}</h2>
 		{#if data.subscription}
 			<p>
 				Status: {data.subscription.status}
@@ -114,13 +132,17 @@
 
 	{#if !data.signedOut}
 		<div>
-			{#if status?.upgradeTo}
+			{#if status?.upgradeTo && !data.manageBillingOnly}
 				<button disabled={busy !== null} onclick={checkout}>
 					{busy === 'checkout' ? 'Starting…' : `Upgrade to ${status.upgradeTo}`}
 				</button>
 			{/if}
 			<button disabled={busy !== null} onclick={portal}>
-				{busy === 'portal' ? 'Opening…' : 'Manage billing'}
+				{busy === 'portal'
+					? 'Opening…'
+					: data.manageBillingOnly
+						? 'Manage billing to resolve'
+						: 'Manage billing'}
 			</button>
 		</div>
 	{/if}

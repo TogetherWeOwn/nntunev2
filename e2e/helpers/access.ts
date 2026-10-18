@@ -8,6 +8,8 @@
  * log or persist a secret value.
  */
 
+import { SUPPORTED_NNTP_PORTS } from './contract.js';
+
 export interface WallProbe {
   status: number;
   headers: Record<string, string>;
@@ -58,33 +60,72 @@ export function isStagingOrigin(requestUrl: string, baseURL: string): boolean {
 }
 
 /**
- * Fail closed when a response is the Cloudflare Access wall instead of the
- * app: a wall-status code (401/403/302) TOGETHER WITH Access markers means
- * the service token is missing or wrong. Status and markers are checked
- * jointly so a legitimate app 401/403 is never misreported as a wall.
- * Never silently treat the wall as an app response.
+ * Access-wall predicate shared by both directions of the check: a
+ * wall-status code (401/403/302) TOGETHER WITH Access markers. Status and
+ * markers are checked jointly so a legitimate app 401/403 or an app 302
+ * is never classified as Access, and an app 200 never is either.
  */
-export function assertNoAccessWall(probe: WallProbe, context: string): void {
-  const headerDump = Object.entries(probe.headers)
-    .map(([k, v]) => `${k}: ${v}`)
-    .join('\n');
+export function isAccessWall(probe: WallProbe): boolean {
+  // Match Access markers against header NAMES only. Header values can echo
+  // Access identifiers back (e.g. `Access-Control-Allow-Headers:
+  // CF-Access-Client-Id` on an ordinary app 403), which must never classify
+  // an application response as an Access wall.
+  const headerNames = Object.keys(probe.headers).join('\n');
   const location = probe.headers['location'] ?? probe.headers['Location'] ?? '';
   const redirectToAccess =
     probe.status === 302 && /cloudflareaccess\.com|\/cdn-cgi\/access/i.test(location);
   const wallStatus =
     probe.status === 401 || probe.status === 403 || probe.status === 302 || redirectToAccess;
+  // Access-specific response markers only. Generic edge-challenge
+  // markers (`cf-mitigated`, `cf_clearance`) are deliberately excluded: a
+  // bot-management/WAF challenge is not proof of Access enforcement, and
+  // accepting it would let anonymous checks pass without Access in play.
+  // A generic `<title>Access...` page is excluded for the same reason: only
+  // an explicit `Cloudflare Access` marker proves Access enforcement.
   const hasMarkers =
-    /cf-access|cf_authorization|cf-mitigated|cf_clearance/i.test(headerDump) ||
-    /cloudflare.?access/i.test(headerDump) ||
+    /cf-access|cf_authorization/i.test(headerNames) ||
+    /cloudflare.?access/i.test(headerNames) ||
     /cloudflare.?access/i.test(probe.bodyText) ||
-    /<title>\s*Access/i.test(probe.bodyText) ||
     redirectToAccess;
-  if (wallStatus && hasMarkers) {
+  return wallStatus && hasMarkers;
+}
+
+/**
+ * Fail closed when a response is the Cloudflare Access wall instead of the
+ * app: the wall means the service token is missing or wrong. Never
+ * silently treat the wall as an app response.
+ * The error names only the fixed context, status and config variable
+ * names: `probe.url` is never interpolated (the staging origin is not
+ * scrubbed from public artifacts, and URLs can carry secret-bearing
+ * components), matching the redirect diagnostics in accounts.ts.
+ */
+export function assertNoAccessWall(probe: WallProbe, context: string): void {
+  if (isAccessWall(probe)) {
     throw new Error(
-      `[${context}] hit the Cloudflare Access wall at ${probe.url} ` +
+      `[${context}] hit the Cloudflare Access wall ` +
         `(HTTP ${probe.status}). Set CF_ACCESS_CLIENT_ID + ` +
         'CF_ACCESS_CLIENT_SECRET for a QA service token with staging access. ' +
         'See e2e/README.md. No secret values are logged here by design.',
+    );
+  }
+}
+
+/**
+ * The inverse check for anonymous requests: fail unless the response IS
+ * an Access-specific denial. An application answer without Access — an
+ * `ok:true` 200, an app 403, an app redirect, a served app shell — means
+ * anonymous traffic reached (or may have reached) the app, which is exactly
+ * the failure this assertion exists to catch. Same diagnostics contract as
+ * assertNoAccessWall: fixed context and status only, never the probe
+ * URL, headers or body (all untrusted and potentially sensitive).
+ */
+export function assertAccessWall(probe: WallProbe, context: string): void {
+  if (!isAccessWall(probe)) {
+    throw new Error(
+      `[${context}] expected Cloudflare Access denial for an anonymous request, ` +
+        `got HTTP ${probe.status} without Access-specific markers: anonymous ` +
+        'traffic was not proven denied by Access (names only — no values logged). ' +
+        'See e2e/README.md.',
     );
   }
 }
@@ -142,21 +183,43 @@ export interface NntpEndpoint {
   host: string;
   port: number;
   user: string;
-  tls: boolean;
+  // The fixture harness only supports TLS-on: syntheticNntpEndpoint rejects
+  // TLS-off outright, so no endpoint with tls=false can exist here.
+  tls: true;
 }
 
 /**
  * NNTP endpoint config. Host/user have fixture defaults (not secrets); the
  * password has NO default and stays in the environment. TLS defaults on.
+ *
+ * Fail closed on a fixture transport the BYOP wizard cannot represent:
+ * only the UI allowlist ports (119 / 563) are accepted, and TLS-off is
+ * rejected outright — the product allows plaintext only behind an explicit
+ * in-page acknowledgement the fixture is not configured to give, so the
+ * harness must never enable (or silently ignore) plaintext on its behalf.
  */
 export function syntheticNntpEndpoint(): NntpEndpoint & { hasPassword: boolean } {
   const host = (process.env.SYNTHETIC_NNTP_HOST || 'synthetic-nntp').trim();
   const port = Number(process.env.SYNTHETIC_NNTP_PORT || '563');
   const user = (process.env.SYNTHETIC_NNTP_USER || 'e2e').trim();
-  const tls = (process.env.SYNTHETIC_NNTP_TLS || 'on').toLowerCase() !== 'off';
+  const tlsSetting = (process.env.SYNTHETIC_NNTP_TLS || 'on').trim().toLowerCase();
   if (!host) throw new Error('[byop] SYNTHETIC_NNTP_HOST is empty.');
-  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
-    throw new Error('[byop] SYNTHETIC_NNTP_PORT must be a valid TCP port number.');
+  if (!Number.isInteger(port) || !SUPPORTED_NNTP_PORTS.includes(port)) {
+    throw new Error(
+      '[byop] SYNTHETIC_NNTP_PORT must be one of the BYOP allowlist ports: 119 or 563. ' +
+        'The wizard cannot select any other port — refusing to run against an ' +
+        'unrepresentable fixture transport (names only — no values logged).',
+    );
   }
-  return { host, port, user, tls, hasPassword: Boolean(process.env.SYNTHETIC_NNTP_PASS) };
+  if (tlsSetting === 'off') {
+    throw new Error(
+      '[byop] SYNTHETIC_NNTP_TLS=off requests a plaintext transport, which the fixture ' +
+        'harness does not support: plaintext requires an explicit in-page acknowledgement ' +
+        'the fixture is not configured to give. Run the synthetic endpoint with TLS on.',
+    );
+  }
+  if (tlsSetting !== 'on') {
+    throw new Error('[byop] SYNTHETIC_NNTP_TLS must be "on" (or unset). See e2e/README.md.');
+  }
+  return { host, port, user, tls: true, hasPassword: Boolean(process.env.SYNTHETIC_NNTP_PASS) };
 }

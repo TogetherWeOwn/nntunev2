@@ -1,10 +1,11 @@
 //! Segment probe: availability checks through the user's pool DO.
 //!
-//! The wire contract (pool routes, auth, per-credential caps) is owned by
-//! the pool-DO card; this module owns the ingest side: the probe envelope
-//! and how its outcome moves the checkpoint. Live calls stay behind the
-//! checkpoint resume: a crash mid-`Probing` redelivers the same envelope,
-//! and the mapping below converges on one `Verifying` entry.
+//! The stream Worker's `NntpPool` Durable Object serves the probe
+//! (`workers/stream/src/probe.rs`: `STAT` on the pool's ingest lane);
+//! [`crate::pool_probe`] makes the call. This module owns the ingest side:
+//! the probe envelope and how its outcome moves the checkpoint. Live calls
+//! stay behind the checkpoint resume: a crash mid-`Probing` redelivers the
+//! same envelope, and the mapping below converges on one `Verifying` entry.
 
 use std::collections::BTreeMap;
 
@@ -16,6 +17,8 @@ use crate::queue::QueueMsg;
 /// Upper bound on message-ids per probe call: keeps one pool round-trip
 /// small and the checkpoint resume cheap.
 pub const MAX_PROBE_SEGMENTS: usize = 500;
+/// Maximum declared encoded size accepted for one NZB segment.
+pub const MAX_SEGMENT_BYTES: u64 = (1 << 31) - 1;
 
 /// Availability check for one batch of segments.
 ///
@@ -29,6 +32,9 @@ pub struct ProbeRequest {
     pub idempotency_key: String,
     pub batch_index: usize,
     pub segment_ids: Vec<String>,
+    /// Per-segment byte ranges parallel to `segment_ids`: `Some(n)` is a
+    /// known range from NZB `bytes=` metadata, `None` is explicit-unknown.
+    pub segment_bytes: Vec<Option<u64>>,
 }
 
 /// Pool answer: which segments answered ARTICLE, which answered 430.
@@ -91,6 +97,40 @@ pub fn build_probe_request(
         idempotency_key: msg.idempotency_key.clone(),
         batch_index,
         segment_ids: segment_ids.iter().map(|s| s.to_string()).collect(),
+        // Pre-range envelopes carry no ranges: explicit-unknown per slot.
+        segment_bytes: vec![None; segment_ids.len()],
+    })
+}
+
+/// Build one probe envelope carrying per-segment byte ranges.
+///
+/// Validates message-ids exactly like [`build_probe_request`]; `segments`
+/// carries `(message-id, bytes)` pairs and the bytes ride through parallel
+/// to the ids (`None` in, `None` out for unknown ranges).
+pub fn build_probe_request_with_ranges(
+    msg: &QueueMsg,
+    batch_index: usize,
+    segments: &[(&str, Option<u64>)],
+) -> Result<ProbeRequest, &'static str> {
+    if segments.is_empty() || segments.len() > MAX_PROBE_SEGMENTS {
+        return Err("probe batch must be 1..=500 segments");
+    }
+    if segments.iter().any(|(s, _)| !validate_message_id(s)) {
+        return Err("segment ids must be valid message-ids");
+    }
+    if segments
+        .iter()
+        .any(|(_, bytes)| bytes.is_some_and(|n| n == 0 || n > MAX_SEGMENT_BYTES))
+    {
+        return Err("segment byte ranges must be within the valid bounds");
+    }
+    Ok(ProbeRequest {
+        job_id: msg.job_id.clone(),
+        user_id: msg.user_id.clone(),
+        idempotency_key: msg.idempotency_key.clone(),
+        batch_index,
+        segment_ids: segments.iter().map(|(s, _)| s.to_string()).collect(),
+        segment_bytes: segments.iter().map(|(_, b)| *b).collect(),
     })
 }
 

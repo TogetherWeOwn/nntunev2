@@ -11,7 +11,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths: ['**.js', '**.jsx', '**.ts', '**.tsx', 'apps/web/**', '.github/workflows/**']
-  # Merge queue validation (TOG-24374): report on merge_group now so a future
+  # Merge queue validation: report on merge_group now so a future
   # code_scanning required rule never stalls the queue. Path filtering still
   # applies to the queue's merge diff.
   merge_group:

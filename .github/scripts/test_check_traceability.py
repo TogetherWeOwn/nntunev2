@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""Unit tests for check_traceability.
+
+All cases build throwaway matrix/list pairs in a temp directory, so the
+fail-then-pass behavior is pinned without touching the real matrix: a fully
+cited pair passes, while a missing spec, a stale path, a stale title, an
+unknown quote, and an unparseable list each fail with the drift named.
+"""
+
+import contextlib
+import io
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from check_traceability import (
+    TraceabilityError,
+    check,
+    main,
+    parse_list_output,
+    parse_matrix,
+)
+
+LIST_TWO_FILES = """\
+Listing tests:
+  [staging] › alpha.spec.ts:10:3 › group › first title
+  [staging] › alpha.spec.ts:20:3 › group › second title
+  [staging] › beta.spec.ts:5:3 › solo title
+Total: 3 tests in 2 files
+"""
+
+MATRIX_COVERING_BOTH = """\
+# Matrix
+
+| step | spec |
+|---|---|
+| one | `e2e/tests/alpha.spec.ts:10` "first title" |
+| two | `e2e/tests/beta.spec.ts:5` |
+
+Other refs: `e2e/helpers/util.ts`, the `e2e/README.md` "Evidence" section.
+
+```sh
+grep -n "test('" e2e/tests/*.spec.ts
+```
+"""
+
+
+def write_tree(root, matrix, listed):
+    root = Path(root)
+    (root / "docs").mkdir(parents=True, exist_ok=True)
+    (root / "e2e" / "helpers").mkdir(parents=True, exist_ok=True)
+    (root / "e2e" / "README.md").write_text("readme\n", encoding="utf-8")
+    (root / "e2e" / "helpers" / "util.ts").write_text("util\n", encoding="utf-8")
+    matrix_path = root / "docs" / "matrix.md"
+    matrix_path.write_text(matrix, encoding="utf-8")
+    list_path = root / "list.txt"
+    list_path.write_text(listed, encoding="utf-8")
+    return matrix_path
+
+
+class CheckTraceabilityTest(unittest.TestCase):
+    def run_check(self, matrix, listed):
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix_path = write_tree(tmp, matrix, listed)
+            with open(os.path.join(tmp, "list.txt"), encoding="utf-8") as fh:
+                return check(Path(tmp), matrix_path, fh.read())
+
+    def test_match_passes(self):
+        self.assertEqual(
+            self.run_check(MATRIX_COVERING_BOTH, LIST_TWO_FILES), []
+        )
+
+    def test_tests_prefix_parses_to_same_spec(self):
+        # Playwright may emit paths relative to the e2e root with a
+        # `tests/` prefix; both forms must map to the same spec file.
+        prefixed = LIST_TWO_FILES.replace("› alpha.spec.ts", "› tests/alpha.spec.ts")
+        prefixed = prefixed.replace("› beta.spec.ts", "› tests/beta.spec.ts")
+        self.assertEqual(
+            self.run_check(MATRIX_COVERING_BOTH, prefixed), []
+        )
+
+    def test_missing_spec_fails_naming_file_and_title(self):
+        listed = LIST_TWO_FILES.replace(
+            "Total: 3 tests in 2 files", "Total: 4 tests in 3 files"
+        ) + ("  [staging] › gamma.spec.ts:7:3 › probe group › dummy probe title\n")
+        drifts = self.run_check(MATRIX_COVERING_BOTH, listed)
+        self.assertEqual(len(drifts), 1)
+        self.assertIn("e2e/tests/gamma.spec.ts", drifts[0])
+        self.assertIn("dummy probe title", drifts[0])
+
+    def test_stale_spec_path_fails(self):
+        matrix = MATRIX_COVERING_BOTH + "`e2e/tests/vanished.spec.ts`\n"
+        drifts = self.run_check(matrix, LIST_TWO_FILES)
+        self.assertEqual(len(drifts), 1)
+        self.assertIn("e2e/tests/vanished.spec.ts", drifts[0])
+
+    def test_stale_helper_path_fails(self):
+        matrix = MATRIX_COVERING_BOTH + "`e2e/helpers/gone.ts`\n"
+        drifts = self.run_check(matrix, LIST_TWO_FILES)
+        self.assertEqual(len(drifts), 1)
+        self.assertIn("e2e/helpers/gone.ts", drifts[0])
+
+    def test_line_suffix_is_informational(self):
+        # :999 names no real line, but only the file is checked.
+        matrix = MATRIX_COVERING_BOTH.replace(
+            "`e2e/helpers/util.ts`", "`e2e/helpers/util.ts:999`"
+        )
+        self.assertEqual(self.run_check(matrix, LIST_TWO_FILES), [])
+
+    def test_stale_title_fails(self):
+        matrix = MATRIX_COVERING_BOTH + '"renamed away title"\n'
+        drifts = self.run_check(matrix, LIST_TWO_FILES)
+        self.assertEqual(len(drifts), 1)
+        self.assertIn("renamed away title", drifts[0])
+
+    def test_wrapped_stale_title_across_lines_fails(self):
+        # Matrix prose is hard-wrapped: a stale title split over two lines
+        # must still drift, not pass unchecked.
+        matrix = MATRIX_COVERING_BOTH + '"renamed away\ntitle"\n'
+        drifts = self.run_check(matrix, LIST_TWO_FILES)
+        self.assertEqual(len(drifts), 1)
+        self.assertIn("renamed away title", drifts[0])
+
+    def test_wrapped_valid_title_across_lines_passes(self):
+        matrix = MATRIX_COVERING_BOTH.replace(
+            '"first title"', '"first\ntitle"'
+        )
+        self.assertEqual(self.run_check(matrix, LIST_TWO_FILES), [])
+
+    def test_wrapped_spec_path_mid_token_passes(self):
+        # A hard-wrap split inside a spaceless path token must still cite
+        # the spec, not drift under a mangled name.
+        matrix = MATRIX_COVERING_BOTH.replace(
+            "`e2e/tests/beta.spec.ts:5`", "`e2e/tests/be\nta.spec.ts:5`"
+        )
+        self.assertEqual(self.run_check(matrix, LIST_TWO_FILES), [])
+
+    def test_unknown_quote_fails(self):
+        matrix = MATRIX_COVERING_BOTH + 'A new "Prose Section" reference.\n'
+        drifts = self.run_check(matrix, LIST_TWO_FILES)
+        self.assertEqual(len(drifts), 1)
+        self.assertIn("Prose Section", drifts[0])
+
+    def test_known_non_test_quote_passes(self):
+        # "Evidence" is a README section name, recorded in NON_TEST_QUOTES.
+        self.assertEqual(self.run_check(MATRIX_COVERING_BOTH, LIST_TWO_FILES), [])
+
+    def test_bare_spec_filename_counts_as_cited(self):
+        matrix = MATRIX_COVERING_BOTH.replace(
+            "`e2e/tests/beta.spec.ts:5`", "`beta.spec.ts:5`"
+        )
+        self.assertEqual(self.run_check(matrix, LIST_TWO_FILES), [])
+
+    def test_unparseable_list_fails_closed(self):
+        with self.assertRaises(Exception):
+            parse_list_output("nothing looking like a list here\n")
+
+    def test_total_mismatch_fails_closed(self):
+        with self.assertRaises(Exception):
+            parse_list_output(LIST_TWO_FILES.replace("3 tests", "99 tests"))
+
+    def test_fences_stay_inert(self):
+        matrix = MATRIX_COVERING_BOTH + '```\n"not a title" `e2e/tests/ghost.spec.ts`\n```\n'
+        self.assertEqual(self.run_check(matrix, LIST_TWO_FILES), [])
+
+    def test_parse_matrix_skips_globs_and_dirs(self):
+        _, paths, _ = parse_matrix("`e2e/tests/*.spec.ts` and `e2e/`\n")
+        self.assertEqual(paths, set())
+
+    def test_main_missing_file_is_exit_2(self):
+        # Capture stdout: main() prints `::error::` workflow commands, which
+        # Actions would turn into error annotations on every PR's e2e-lint
+        # job, even on green runs.
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix_path = write_tree(tmp, MATRIX_COVERING_BOTH, LIST_TWO_FILES)
+            list_path = os.path.join(tmp, "list.txt")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    main(
+                        [
+                            "--root",
+                            tmp,
+                            "--matrix",
+                            str(matrix_path),
+                            "--list-output",
+                            list_path,
+                        ]
+                    ),
+                    0,
+                )
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                self.assertEqual(
+                    main(
+                        [
+                            "--root",
+                            tmp,
+                            "--matrix",
+                            str(matrix_path),
+                            "--list-output",
+                            os.path.join(tmp, "nope.txt"),
+                        ]
+                    ),
+                    2,
+                )
+            self.assertIn("::error::traceability", buf.getvalue())
+
+    def test_check_matrix_invalid_utf8_raises_naming_matrix(self):
+        # check() lines 171-177: an undecodable matrix fails closed with
+        # the matrix path named, not a bare UnicodeDecodeError.
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix_path = write_tree(tmp, MATRIX_COVERING_BOTH, LIST_TWO_FILES)
+            matrix_path.write_bytes(b"# \xff\xfe not utf-8\n")
+            with open(os.path.join(tmp, "list.txt"), encoding="utf-8") as fh:
+                list_text = fh.read()
+            with self.assertRaises(TraceabilityError) as ctx:
+                check(Path(tmp), matrix_path, list_text)
+            self.assertIn(str(matrix_path), str(ctx.exception))
+            self.assertIn("cannot read matrix", str(ctx.exception))
+
+    def test_main_matrix_invalid_utf8_is_exit_2_naming_matrix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix_path = write_tree(tmp, MATRIX_COVERING_BOTH, LIST_TWO_FILES)
+            matrix_path.write_bytes(b"# \xff\xfe not utf-8\n")
+            list_path = os.path.join(tmp, "list.txt")
+            with contextlib.redirect_stdout(
+                io.StringIO()
+            ) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(
+                    main(
+                        [
+                            "--root",
+                            tmp,
+                            "--matrix",
+                            str(matrix_path),
+                            "--list-output",
+                            list_path,
+                        ]
+                    ),
+                    2,
+                )
+            combined = out.getvalue() + err.getvalue()
+            self.assertIn("::error::traceability", combined)
+            self.assertIn("cannot read matrix", combined)
+            self.assertIn(str(matrix_path), combined)
+            self.assertNotIn("Traceback", combined)
+
+    def test_main_list_invalid_utf8_is_exit_2_matrix_never_read(self):
+        # The list-output read fails before check() runs, so even a
+        # missing matrix must not surface: the annotation names the
+        # list output, never the matrix.
+        with tempfile.TemporaryDirectory() as tmp:
+            write_tree(tmp, MATRIX_COVERING_BOTH, LIST_TWO_FILES)
+            list_path = os.path.join(tmp, "list.txt")
+            Path(list_path).write_bytes(b"\xff\xfe not utf-8\n")
+            missing_matrix = os.path.join(tmp, "docs", "missing.md")
+            with contextlib.redirect_stdout(
+                io.StringIO()
+            ) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(
+                    main(
+                        [
+                            "--root",
+                            tmp,
+                            "--matrix",
+                            missing_matrix,
+                            "--list-output",
+                            list_path,
+                        ]
+                    ),
+                    2,
+                )
+            combined = out.getvalue() + err.getvalue()
+            self.assertIn("::error::traceability", combined)
+            self.assertIn("cannot read list output", combined)
+            self.assertNotIn("cannot read matrix", combined)
+            self.assertNotIn("Traceback", combined)
+
+    def test_main_directory_as_matrix_is_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_tree(tmp, MATRIX_COVERING_BOTH, LIST_TWO_FILES)
+            list_path = os.path.join(tmp, "list.txt")
+            matrix_dir = os.path.join(tmp, "docs")
+            with contextlib.redirect_stdout(
+                io.StringIO()
+            ) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(
+                    main(
+                        [
+                            "--root",
+                            tmp,
+                            "--matrix",
+                            matrix_dir,
+                            "--list-output",
+                            list_path,
+                        ]
+                    ),
+                    2,
+                )
+            combined = out.getvalue() + err.getvalue()
+            self.assertIn("::error::traceability", combined)
+            self.assertIn("cannot read matrix", combined)
+            self.assertIn(matrix_dir, combined)
+            self.assertNotIn("Traceback", combined)
+
+    def test_main_directory_as_list_is_exit_2_matrix_never_read(self):
+        # Same ordering pin as the undecodable list: a directory
+        # list-output fails before the matrix is read, so a missing
+        # matrix must stay silent.
+        with tempfile.TemporaryDirectory() as tmp:
+            write_tree(tmp, MATRIX_COVERING_BOTH, LIST_TWO_FILES)
+            missing_matrix = os.path.join(tmp, "docs", "missing.md")
+            with contextlib.redirect_stdout(
+                io.StringIO()
+            ) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(
+                    main(
+                        [
+                            "--root",
+                            tmp,
+                            "--matrix",
+                            missing_matrix,
+                            "--list-output",
+                            tmp,
+                        ]
+                    ),
+                    2,
+                )
+            combined = out.getvalue() + err.getvalue()
+            self.assertIn("::error::traceability", combined)
+            self.assertIn("cannot read list output", combined)
+            self.assertNotIn("cannot read matrix", combined)
+            self.assertNotIn("Traceback", combined)
+
+
+    def test_main_drift_is_exit_1_with_one_error_per_drift(self):
+        # Drift path via main(): exit 1 with one ::error:: line per drift.
+        matrix = (
+            MATRIX_COVERING_BOTH
+            + '"renamed away title"\n`e2e/tests/vanished.spec.ts`\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix_path = write_tree(tmp, matrix, LIST_TWO_FILES)
+            list_path = os.path.join(tmp, "list.txt")
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                self.assertEqual(
+                    main(
+                        [
+                            "--root",
+                            tmp,
+                            "--matrix",
+                            str(matrix_path),
+                            "--list-output",
+                            list_path,
+                        ]
+                    ),
+                    1,
+                )
+            out = buf.getvalue()
+            self.assertEqual(out.count("::error::traceability:"), 2)
+            self.assertIn("renamed away title", out)
+            self.assertIn("e2e/tests/vanished.spec.ts", out)
+
+    def test_main_relative_paths_resolve_under_root(self):
+        # Relative --matrix/--list-output join under --root (absolute
+        # paths never exercise the joins at check_traceability.py:232-235).
+        with tempfile.TemporaryDirectory() as tmp:
+            write_tree(tmp, MATRIX_COVERING_BOTH, LIST_TWO_FILES)
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                self.assertEqual(
+                    main(
+                        [
+                            "--root",
+                            tmp,
+                            "--matrix",
+                            os.path.join("docs", "matrix.md"),
+                            "--list-output",
+                            "list.txt",
+                        ]
+                    ),
+                    0,
+                )
+            self.assertNotIn("::error::traceability:", buf.getvalue())
+
+    def test_main_missing_matrix_is_exit_2_naming_matrix(self):
+        # Missing-matrix path via main(): exit 2 naming the matrix (only
+        # the list-output-missing path was previously pinned).
+        with tempfile.TemporaryDirectory() as tmp:
+            write_tree(tmp, MATRIX_COVERING_BOTH, LIST_TWO_FILES)
+            missing = os.path.join(tmp, "docs", "missing.md")
+            list_path = os.path.join(tmp, "list.txt")
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                self.assertEqual(
+                    main(
+                        [
+                            "--root",
+                            tmp,
+                            "--matrix",
+                            missing,
+                            "--list-output",
+                            list_path,
+                        ]
+                    ),
+                    2,
+                )
+            out = buf.getvalue()
+            self.assertIn("::error::traceability:", out)
+            self.assertIn("missing.md", out)
+
+
+if __name__ == "__main__":
+    unittest.main()
