@@ -652,21 +652,43 @@ fn play_authorized(
                 }
             }
             let ranges_total = r[r.len() - 1].1;
-            if let Ok(second) = fetch_segment(&mut client, &input.segments[1]) {
-                let first_size = first.file_size;
-                if second.file_size == ranges_total && first_size != ranges_total {
-                    // Segment 1 corroborates the ranges against a
-                    // self-inconsistent provider: ground truth wins and the
-                    // lying `size=` never defines the window.
-                    first.file_size = ranges_total;
+            match fetch_segment(&mut client, &input.segments[1]) {
+                Ok(second) => {
+                    let first_size = first.file_size;
+                    if second.file_size == ranges_total && first_size != ranges_total {
+                        // Segment 1 corroborates the ranges against a
+                        // self-inconsistent provider: ground truth wins and the
+                        // lying `size=` never defines the window.
+                        first.file_size = ranges_total;
+                    }
+                    if second.file_size == ranges_total || second.file_size == first_size {
+                        // Worth one save: the walk consumes this instead of a
+                        // second fetch of segment 1.
+                        prefetched = Some((1, second));
+                    }
+                    // Else all three sizes disagree: drop it and let the walk
+                    // refetch segment 1 on the provider total as before.
                 }
-                if second.file_size == ranges_total || second.file_size == first_size {
-                    // Worth one save: the walk consumes this instead of a
-                    // second fetch of segment 1.
-                    prefetched = Some((1, second));
+                Err(SegmentError::Nntp(e)) => {
+                    let failure = nntp_failure(e, &input.segments[1]);
+                    if failure.1 != Conn::KeepWarm {
+                        return Err(settle(
+                            pool,
+                            meter,
+                            lease,
+                            None,
+                            failure,
+                            user,
+                            input.track_id,
+                        ));
+                    }
+                    // Article-local failure: the client is still framed, so
+                    // fall through and let the walk refetch segment 1.
                 }
-                // Else all three sizes disagree: drop it and let the walk
-                // refetch segment 1 on the provider total as before.
+                Err(SegmentError::Decode(_)) => {
+                    // Undecodable bytes leave the connection framed; fall
+                    // through and let the walk refetch segment 1.
+                }
             }
             first_seg = 0;
         }
@@ -976,9 +998,9 @@ impl Live {
             .is_some_and(|(pidx, _)| *pidx == idx)
         {
             let (_, decoded) = self.prefetched.take().expect("prefetch checked");
-            let fetch_epoch = self.provider_error_epoch.load(Ordering::Acquire);
+            // The prefetch happened before `Live` was built; the epoch
+            // recorded at construction already bounds it.
             self.ingest(idx, decoded)?;
-            self.last_success_epoch = Some(fetch_epoch);
             return Ok(());
         }
         let mid = self.segments[idx].clone();
