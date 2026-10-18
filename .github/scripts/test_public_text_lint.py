@@ -514,6 +514,7 @@ class TestAnnotationEscaping(unittest.TestCase):
             self.assertEqual(1, rc)
             out = buf.getvalue()
             self.assertIn("evil%3Aa%2Cb%25c.md,line=1", out)
+            self.assertNotIn("evil:a,b%c.md", out)
             self.assertIn("tog-id", out)
 
 
