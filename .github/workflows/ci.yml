@@ -215,7 +215,9 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
       - name: Unit-test the parity check
-        run: python3 .github/scripts/test_binding_parity.py
+        run: |
+          python3 .github/scripts/test_binding_parity.py
+          python3 .github/scripts/test_binding_parity_unknown_envs.py
       - name: Parity check on this repo
         run: python3 .github/scripts/binding_parity.py
       - name: Parity check passes on the matching fixture
