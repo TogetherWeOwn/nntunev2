@@ -74,6 +74,36 @@ export class BillingApiError extends Error {
 	}
 }
 
+/**
+ * Successful GET /v1/me/usage DTO guard. `period` follows the existing
+ * `YYYY-MM` contract (month 01–12); usage fields are required finite
+ * nonnegative numbers. Unknown extra fields are allowed; valid zero usage
+ * is preserved. Anything else rejects into the existing recoverable loader
+ * path instead of reaching usage evaluation/rendering.
+ */
+const USAGE_PERIOD_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
+
+const USAGE_NUMERIC_FIELDS = [
+	'streamSecondsMonth',
+	'concurrentNow',
+	'libraryTracks',
+	'ingestToday'
+] as const;
+
+function isFiniteNonNegativeNumber(value: unknown): value is number {
+	return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function isValidUsagePayload(data: unknown): data is UsageSnapshot & { period: string } {
+	if (typeof data !== 'object' || data === null || Array.isArray(data)) return false;
+	const record = data as Record<string, unknown>;
+	if (typeof record.period !== 'string' || !USAGE_PERIOD_RE.test(record.period)) return false;
+	for (const field of USAGE_NUMERIC_FIELDS) {
+		if (!isFiniteNonNegativeNumber(record[field])) return false;
+	}
+	return true;
+}
+
 async function readJson<T>(res: Response, label: string): Promise<T> {
 	if (!res.ok) {
 		let body: unknown = null;
@@ -103,7 +133,9 @@ export async function fetchUsage(
 	fetchFn: typeof fetch = fetch
 ): Promise<UsageSnapshot & { period: string }> {
 	const res = await fetchFn('/v1/me/usage', { credentials: 'include' });
-	return await readJson(res, 'Load usage');
+	const data = await readJson<unknown>(res, 'Load usage');
+	if (!isValidUsagePayload(data)) throw new Error('Invalid usage payload');
+	return data;
 }
 
 export async function fetchSubscription(fetchFn: typeof fetch = fetch): Promise<SubscriptionDTO> {
