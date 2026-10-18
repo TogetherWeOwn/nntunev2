@@ -406,6 +406,8 @@ jobs:
         run: python3 .github/scripts/test_config_parity_check.py
       - name: Parity checker duplicate-member tests
         run: python3 .github/scripts/test_config_duplicate_members.py
+      - name: Parity checker environment-IO tests
+        run: python3 .github/scripts/test_config_parity_environment_io.py
 
   rust-ingest:
     name: rust (workers/ingest)
