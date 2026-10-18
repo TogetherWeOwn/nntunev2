@@ -117,16 +117,14 @@ pub fn new_idempotency_key() -> String {
 
 /// Byte-based key-field check mirroring the stream worker's
 /// `is_valid_key_field` exactly: non-empty, at most `max_bytes` bytes, and
-/// containing no `:`, `=`, whitespace, or control characters, so derived keys
-/// stay unambiguous and safe to emit as single-line structured logs.
+/// containing only ASCII alphanumerics, `-`, or `_`, matching the persisted
+/// ledger key alphabet. Colons delimit fields; identities are never rewritten.
 fn is_valid_key_field(field: &str, max_bytes: usize) -> bool {
     !field.is_empty()
         && field.len() <= max_bytes
-        && !field.contains(':')
-        && !field.contains('=')
-        && !field
-            .chars()
-            .any(|ch| ch.is_whitespace() || ch.is_control())
+        && field
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Derive the idempotency key for one stream play: `play:{user}:{track}:{play}`.
