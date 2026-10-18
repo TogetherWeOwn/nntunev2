@@ -28,6 +28,9 @@ wasm-bindgen = "0.2.129"
 futures-util = "0.3"
 
 [dev-dependencies]
+# Agreement-pin tests import the api ledger's named caps
+# (id_cap_agreement_acceptance.rs); test-only, never production code.
+nntune-api = { version = "0.1.0", path = "../api" }
 nntune-core = { version = "0.1.0", path = "../../crates/nntune-core", features = ["native-tls"] }
 nntune-test-nntp = { version = "0.1.0", path = "../../crates/nntune-test-nntp" }
 tokio = { version = "1", features = ["macros", "rt", "time"] }
