@@ -9,6 +9,12 @@
   monthly folds). The daily `usage_ledger` aggregation (sum daily rows in the UTC
   calendar month) is built in a later slice by folding these windows; no daily table
   exists yet and no writer assumes its `(user_id, period)` upsert.
+- **Revised:** 2026-10-18 — enforcement wire (TOG-28780): over-cap
+  ingest-write/stream acquisition refuses `402 plan_limit_exceeded` (monthly,
+  daily, library) or `429 rate_limited` (concurrent) with `x-plan-limit` /
+  `x-plan-reset` headers (`retry-after` on 429) and an `upgrade_url: /pricing`
+  body pointer. Pure decision in `workers/api/src/plan_limits.rs`; DB wiring
+  (subscriptions + usage reads) follows in a later slice.
 
 ## Context
 
@@ -55,6 +61,17 @@ served grants within the plan budget; tracks and refetch sources remain. Library
 and daily ingest limits reject new additions/jobs without deleting existing data.
 A downgrade preserves library metadata, blocks additions over the new limit, and
 makes excess cache grants eligible for eviction.
+
+**Enforcement wire (2026-10-18):** at the API boundary, new acquisition over
+cap is refused rather than degraded: monthly stream seconds, daily ingest jobs
+and library tracks refuse with `402 plan_limit_exceeded` (`retryable: false`);
+concurrent-stream exhaustion refuses with `429 rate_limited` (`retryable: true`
+plus `Retry-After`). Every refusal carries `x-plan-limit` / `x-plan-reset`
+headers and an `upgrade_url: /pricing` body pointer, names-only with no PII,
+and never a 500. The lower-bitrate degraded mode above describes sustained
+media quality, not the acquisition decision — which the over-limit e2e legs
+assert as a refusal. Checks are `>=` (at-cap denies); unknown plan ids fail
+closed to the free caps.
 
 ### Trial and payment gate
 
