@@ -38,7 +38,7 @@ the activation checklist is accurate:
 
 - `GET /api/health` returns `{ok:true, version:<pkg>}`
   (`apps/web/src/routes/api/health/+server.ts`, pinned by
-  `apps/web/tests/smoke.spec.ts` exact-keys assertion). `health.spec.ts`
+  `apps/web/tests/smoke.spec.ts` exact-keys assertion). `tests/health.spec.ts`
   requires `ok === true` and asserts `version` whenever the deployed app
   ships it, so the check stays green across the deploy boundary.
 - `GET /api/ready` currently returns 200 `{ok:true}` while the stateless app
@@ -66,7 +66,7 @@ the activation checklist is accurate:
 ```sh
 cd e2e
 npm ci
-npx playwright install chromium
+npx playwright install --with-deps chromium
 STAGING_BASE_URL=https://staging.example \
   CF_ACCESS_CLIENT_ID='<from ~/secure-drop>' \
   CF_ACCESS_CLIENT_SECRET='<from ~/secure-drop>' \
@@ -84,13 +84,20 @@ If `NODE_ENV=production` is exported in your shell, install with
 `npm install --include=dev` — otherwise npm silently omits the dev
 dependencies this harness needs.
 
+Toolchain: CI runs Node 26 for this harness (both jobs in
+`.github/workflows/e2e-staging.yml` and the `e2e-lint` job in `ci.yml`,
+kept in sync with the `@types/node` major in `e2e/package.json`;
+Playwright `1.64.0` there too). The app itself uses Node 24 + pnpm
+(`NODE_VERSION`/`PNPM_VERSION` in `ci.yml`) and is unrelated to this
+npm-based harness (`e2e/package-lock.json`).
+
 ## Environment
 
 | Name | Required | Purpose |
 |---|---|---|
 | `STAGING_BASE_URL` | yes (post-deploy) | `https://` staging origin. Unset → skip with notice. |
 | `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | whenever staging is configured | QA service-token pair. Both absent or either absent → fail closed before requests. |
-| `QA_AUTH_TOKEN` | optional | Bearer for `POST /api/test-accounts` (staging-only seam). Absent → UI signup fallback. The dedicated public UI-signup case ignores the seam either way. |
+| `QA_AUTH_TOKEN` | optional | Bearer for `POST /api/test-accounts` (staging-only seam) and `POST /api/test-codes` (staging-only emailed-code retrieval seam for `example.test` mailboxes — returns the issued code without minting). Absent → UI signup fallback, and the wizard-arrival spec (`signup-wizard-arrival.spec.ts`) skips locally / fails closed on CI. The dedicated public UI-signup case ignores both seams either way. |
 | `SYNTHETIC_NNTP_HOST` / `_PORT` / `_USER` / `_TLS` | for BYOP spec | Hosted fixture server or test provider (defaults: `synthetic-nntp`, `563`, `e2e`, TLS on). The port must be in the BYOP allowlist (`119` or `563`) and TLS-off is rejected — the harness fails closed on a fixture transport the wizard cannot represent. |
 | `SYNTHETIC_NNTP_PASS` | for BYOP spec | No default — fail closed when missing. |
 
@@ -117,6 +124,20 @@ How the suite uses them:
   offline checks remain usable with no staging URL and no Access pair. An Access wall (wall status + Access markers, including
   302s to the Access login) fails closed with a remediation message instead
   of masquerading as an app failure; plain app 4xx responses pass through.
+  The smoke also proves the inverse for `/api/health` and `/api/ready`:
+  `anonymousApiGet` requests both with no Access headers or credentials in
+  a fresh, isolated request context (no-follow) and `assertAccessWall`
+  passes only on an Access-specific denial — an application `ok:true`
+  answer to an anonymous request fails the smoke. Diagnostics stay
+  names-only (fixed context + status; no URL, header or body values).
+- The smoke also proves the inverse for the app shell: an anonymous `GET /`
+  from a fresh, isolated request context (no Access pair, no cookies,
+  redirects never followed — `anonymousGet` in `helpers/accounts.ts`) must
+  be denied by the Access wall under the same joint status+markers predicate
+  (`assertAccessWall`, `helpers/access.ts`) and must not return the 200 app
+  shell. The credentialed app-shell test in the same file is the authorized
+  control. The anonymous probe changes no Access policy, needs no
+  credential, and never emits response bodies, headers or cookies.
 - Test-account sessions minted by the seam travel as
   `Authorization: Bearer <session>` (contract owned by the auth card —
   `helpers/accounts.ts` names it; cookie sessions would update the helper +
@@ -130,19 +151,32 @@ How the suite uses them:
   `/signup` form with a unique synthetic mailbox and requires the
   emailed-code step with no inline error, even when `QA_AUTH_TOKEN`
   is set, so a seam-backed run still proves public UI form submission.
-  Wizard arrival via the form is not asserted: the code-plus-passkey
-  finish needs a staging code-retrieval seam that does not exist yet
+  Form-to-wizard arrival is asserted by `signup-wizard-arrival.spec.ts`: the
+  code-plus-passkey finish retrieves the code from the staging-only
+  `POST /api/test-codes` seam, which is implemented in the API worker but
+  awaits its staging deployment and activation
   (see row 1 of `docs/m1-exit-traceability.md`). Once `QA_AUTH_TOKEN` is set the seam is
   required infrastructure: transport errors, non-2xx and non-JSON mint
   responses throw instead of collapsing into a silent skip, and API-driven
   steps (`requireApiAccount`) refuse to run anonymously. The identity that
   ingests always completes the BYOP wizard first (shared
   `completeByopWizard` helper), because the ingest worker probes through the
-  user's provider connection. The over-limit check needs the seam to support
-  `{plan:"overlimit"}` (metering card); when the capped account's library is
-  empty the harness ingests the fixture as that account, so no pre-seeded
-  track is required. On CI an unavailable over-limit seam fails instead of
-  skipping, so plan-limit enforcement can never pass unexercised.
+  user's provider connection. The over-limit checks need the seam to support
+  `{plan:"overlimit"}` (metering card): the stream leg and the ingest leg
+  each mint their own capped account (never the journey identity, never each
+  other's) and run AFTER the browser legs at the end of the serial chain, so
+  a red-by-design capped-account failure skips no other verdict. The stream
+  leg requires the seam to pre-seed a streamable track on its capped account:
+  ingesting the fixture as the capped account would contradict the
+  ingest-refusal leg (the same ingest must be refused). An unavailable
+  over-limit seam fails instead of skipping — locally and on CI — so
+  plan-limit enforcement can never pass unexercised. Each leg asserts the
+  full refusal verdict (`assertPlanLimitRefusal` in `helpers/contract.ts`):
+  402/429 status, limit + reset headers (429 additionally requires
+  `retry-after`), the status-consistent limit code (`plan_limit_exceeded` on
+  402, `rate_limited` on 429) with a present, status-consistent retryable
+  flag, the upgrade CTA pointer (a matching key whose value points at
+  `/pricing`), and no secret leakage.
 
 ## CI
 
@@ -150,7 +184,11 @@ How the suite uses them:
   journey runs only as a reusable-workflow call from `deploy.yml`'s
   `post-deploy-e2e` job, which `needs` the same run's `staging-web`
   deploy, so a skipped/failed deploy cannot produce a full-journey PASS
-  and the E2E run cannot race its deploy. Manual dispatch and the
+  and no run can start without its own deploy. A later main push can
+  still deploy staging mid-journey (deploy releases its job-level group
+  when the deploy finishes while E2E serializes separately) — that
+  timing fails the closing build-identity re-read instead of passing
+  green (see below). Manual dispatch and the
   6-hour schedule run the synthetic smoke only (monitoring, not
   post-deploy promotion evidence); dispatch defines no `post_deploy`
   input, so it cannot mint that evidence by hand.
@@ -158,19 +196,27 @@ How the suite uses them:
   Both jobs require the Access pair in preflight before activating tests;
   configured staging never skips for missing credentials. Failure artifacts
   are kept 7 days.
-- `e2e-lint` inside `ci.yml` (part of `ci-ok`) — `npm ci`, `tsc --noEmit`,
-  helper/workflow self-tests, and `playwright test --list`. Runs on every PR
+- `e2e-lint` inside `ci.yml` (part of `ci-ok`) — `npm ci`, Playwright
+  chromium install (`--with-deps`), `tsc --noEmit`,
+  helper/workflow self-tests, `playwright test --list`, and the
+  traceability-matrix check (`docs/m1-exit-traceability.md` must cite every
+  listed spec). Runs on every PR
   with no staging needed. Offline tests execute both checked-in preflights
   and the aggregate gate with dummy inputs; failures, cancellations and skips
   of required jobs make `ci-ok` red.
 - **Prod promotion gate (required integration):** the deployment lane must
   require the post-deploy full-journey result (the `post-deploy-e2e` job in
   the same `deploy.yml` run as the successful `staging-web` deploy) and
-  block promotion on failure. Sequencing after the deploy is wired;
-  blocking a later production promotion on that result, and live
-  enforcement, are still acceptance prerequisites of that later lane. A
-  source SHA is not deployed-build identity, so the result is not
-  same-build evidence until build identity is separately proven.
+  block promotion on failure. Sequencing after the deploy is wired, and the
+  full journey now carries same-build evidence: the opening
+  `build-identity.spec.ts` leg and the closing
+  `zz-build-identity-final.spec.ts` leg (which sorts last under the
+  serial config) both compare `GET /api/build` (baked at build time)
+  with the promotion SHA `deploy.yml` passes as `expected_sha` from
+  `github.sha` — never a source checkout — through one shared helper, so
+  a green run proves the whole journey ran against the promoted build.
+  Blocking a later production promotion on that result, and live
+  enforcement, are still acceptance prerequisites of that later lane.
 
 ## Evidence
 
@@ -180,7 +226,8 @@ headers/bodies and screenshots can expose account/provider information. CI
 uses the junit reporter only — the html reporter embeds step fill values
 (including the BYOP password) as a base64 zip in
 `playwright-report/index.html`, so it is never published. Sanitization is
-still required with traces off: Playwright 1.55 writes
+still required with traces off: Playwright (`1.64.0` in
+`e2e/package.json`) writes
 `test-results/**/error-context.md` (an ARIA snapshot rendering filled input
 values, including the BYOP password) — the workflow deletes
 error-context.md plus the whole `playwright-report/` dir before upload, and
@@ -190,9 +237,11 @@ is absent from every uploaded file including base64-decoded payloads. Do not
 enable traces/screenshots or the html reporter for credential-bearing runs
 without a verified redaction path. A QA PASS verdict cites the green
 post-deploy run URL (the `deploy.yml` run whose `staging-web` succeeded
-and whose `post-deploy-e2e` full journey passed) + the source head SHA —
-never a scheduled/manual synthetic run, which is monitoring only; NEEDS
-WORK cites the failing spec + step. Every spec that branches on the test-account seam records a
+and whose `post-deploy-e2e` full journey passed) + the deployed head SHA
+(the promotion SHA proven equal to `GET /api/build` at both the start
+and the end of the journey by the build-identity opening + closing
+specs) — never a scheduled/manual synthetic run, which
+is monitoring only; NEEDS WORK cites the failing spec + step. Every spec that branches on the test-account seam records a
 bounded `signup-path` test annotation — exactly `public-ui-signup` or
 `api-minted-account`, with no email, account id, token or provider data.
 Both staging jobs publish those labels to the run's step summary on every

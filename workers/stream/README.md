@@ -25,7 +25,13 @@ client ── play(token, range?) ──▶ stream Worker
      the multipart write into the cache, hand the connection back warm.
      abort(): client left — return the connection, cache nothing.
   5. prefetch the next track while the pool has a spare slot (prefetch.rs)
-  6. every step emits metering events (meter.rs)
+  6. every step emits metering events to the `Meter` interface
+     (`workers/stream/src/meter.rs`; hit/miss/finalize/abort paths in
+     `workers/stream/src/play.rs`) — emitted events only, not deployed
+     billing: the production sink is required-not-implemented under
+     F-DEL-01 (`docs/security/threat-model.md` §9 row, §12 detail; owner
+     mapping in the threat-model card thread, never pasted here). See
+     “Metering reconciliation” below; §12 trust assumptions apply unchanged.
 ```
 
 Pool semantics (`pool.rs`):
@@ -36,12 +42,15 @@ Pool semantics (`pool.rs`):
   healthy connection again. Two uncached tracks in a row cost one dial
   (asserted against the synthetic server's own connection count). A warm
   connection the provider closed is redialed once, transparently.
-- Lanes are enforced at acquire time: `Playback` may use every slot;
-  `Prefetch` and `Ingest` always leave one slot free for playback (so with a
-  cap of 1 they never run). Waiter ordering across async tasks arrives with
+- Lanes are enforced at acquire time (`Pool::reserve`, `Pool::try_acquire`):
+  `Playback` may use every slot; `Prefetch` and `Ingest` leave one slot free
+  for playback (so with a cap of 1 they never run outside the half-open probe
+  below, which admits one `Playback` or `Ingest` acquire with no reservation).
+  Waiter ordering across async tasks arrives with
   the Durable Object entry point; the reservation is what guarantees
   playback priority today.
 - Only connection-level failures (I/O, protocol errors, read timeouts)
+  (`NntpError::is_provider_failure`; settled per lease in `settle`)
   count toward the circuit breaker; a gone article (`430`/`423`) or a corrupt
   segment fails that one play (`ArticleMissing` / `Decode`) and returns the
   healthy connection. Breaker values are documented below.

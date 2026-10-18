@@ -51,6 +51,7 @@ pub mod prefetch;
 pub mod probe;
 pub mod range;
 pub mod routes;
+pub mod trace;
 pub mod yenc;
 
 // Native only: the Mutex/Condvar waiter path traps on wasm32-unknown-unknown

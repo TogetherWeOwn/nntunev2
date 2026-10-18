@@ -328,6 +328,7 @@ fn input<'a>(
         cipher_key: CIPHER_KEY,
         now_unix: NOW_UNIX,
         up_next,
+        trace_id: None,
     }
 }
 
@@ -366,6 +367,7 @@ fn input_with_ranges<'a>(
     up_next: Option<&'a str>,
 ) -> PlayInput<'a> {
     PlayInput {
+        trace_id: None,
         token,
         track_id,
         range,
@@ -1173,6 +1175,124 @@ fn provider_outage_quarantines_then_recovers() {
         .finalize(&mut pool, &mut cache, &mut meter)
         .expect("finalize");
     assert!(!pool.quarantined(), "success clears the quarantine");
+}
+
+const TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
+const TRACE_TS: &str = "2026-10-15T20:00:00.123Z";
+
+fn traced_input<'a>(
+    token: &'a str,
+    track_id: &'a str,
+    server: &FakeNntp,
+    segments: &'a [String],
+    trace_id: Option<&'a str>,
+) -> PlayInput<'a> {
+    let mut inp = input(token, track_id, None, server, segments, None);
+    inp.trace_id = trace_id;
+    inp
+}
+
+#[test]
+fn trace_id_correlates_the_miss_path_end_to_end() {
+    use nntune_stream::trace;
+    let (plain, segments, articles) = fixture_track("a", 40_000, 20_000);
+    let server = FakeNntp::start(articles);
+    let mut pool: StreamPool = Pool::new(4);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+
+    let token = grant_for("track-a");
+    let inp = traced_input(&token, "track-a", &server, &segments, Some(TRACE));
+    let resp = play(&mut pool, &mut cache, &mut meter, SECRET, &inp).expect("miss play");
+    assert!(!resp.cache_hit);
+    assert_eq!(resp.trace_id.as_deref(), Some(TRACE));
+    assert_eq!(resp.stream.trace_id(), Some(TRACE));
+    let (body, stream) = drain_to_vec(resp.stream);
+    assert_eq!(body, plain);
+    assert_eq!(stream.trace_id(), Some(TRACE));
+    stream
+        .finalize(&mut pool, &mut cache, &mut meter)
+        .expect("finalize");
+    assert!(cache.get_track("track-a").is_some(), "miss must cache");
+
+    // AE rows keep their exact shape (no trace field): correlation is proven
+    // by the log envelope below sharing the same trace across events.
+    for kind in [
+        MeterKind::PlayStart,
+        MeterKind::CacheMiss,
+        MeterKind::BytesServed,
+    ] {
+        assert!(meter.has_kind(kind), "missing {kind:?}");
+    }
+
+    // The threaded trace renders a conforming six-key envelope for each
+    // play-path event (grant authorize, pool lease, cache/miss, meter).
+    for evt in ["play_start", "cache_miss", "bytes_served"] {
+        let mut fields = trace::LogFields::new();
+        fields.insert_str("track_id", "track-a").unwrap();
+        let line = trace::render_log_line(TRACE_TS, "info", TRACE, evt, &fields)
+            .expect("envelope must render");
+        assert!(line.contains(&format!("\"trace_id\":\"{TRACE}\"")));
+        assert!(line.contains(&format!("\"event\":\"{evt}\"")));
+        assert!(line.contains("\"worker\":\"stream\""));
+    }
+}
+
+#[test]
+fn invalid_trace_on_a_miss_runs_untraced_without_touching_auth() {
+    let (plain, segments, articles) = fixture_track("a", 20_000, 10_000);
+    let server = FakeNntp::start(articles);
+    let mut pool: StreamPool = Pool::new(4);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+
+    let token = grant_for("track-a");
+    let inp = traced_input(&token, "track-a", &server, &segments, Some("not-a-trace"));
+    let resp = play(&mut pool, &mut cache, &mut meter, SECRET, &inp).expect("miss play");
+    assert_eq!(resp.trace_id, None, "invalid trace must be dropped");
+    assert_eq!(resp.stream.trace_id(), None);
+    let (body, stream) = drain_to_vec(resp.stream);
+    assert_eq!(body, plain);
+    stream
+        .finalize(&mut pool, &mut cache, &mut meter)
+        .expect("finalize");
+}
+
+#[test]
+fn dropped_miss_stream_keeps_its_trace_in_the_orphan() {
+    let (_plain_a, segs_a, arts_a) = fixture_track("a", 40_000, 20_000);
+    let (plain_b, segs_b, arts_b) = fixture_track("b", 20_000, 10_000);
+    let server = FakeNntp::start(merge(arts_a, arts_b));
+    let mut pool: StreamPool = Pool::new(4);
+    let mut cache = ContentCache::new();
+    let mut meter = MemoryMeter::default();
+
+    let token = grant_for("track-a");
+    let inp = traced_input(&token, "track-a", &server, &segs_a, Some(TRACE));
+    let resp = play(&mut pool, &mut cache, &mut meter, SECRET, &inp).expect("miss play");
+    let mut stream = resp.stream;
+    assert!(stream.next().is_some());
+    drop(stream);
+
+    let token_b = grant_for("track-b");
+    let inp_b = traced_input(&token_b, "track-b", &server, &segs_b, None);
+    let resp_b = play(&mut pool, &mut cache, &mut meter, SECRET, &inp_b).expect("next play");
+    let (body_b, stream_b) = drain_to_vec(resp_b.stream);
+    assert_eq!(body_b, plain_b);
+    stream_b
+        .finalize(&mut pool, &mut cache, &mut meter)
+        .expect("finalize");
+    let orphaned: Vec<_> = meter
+        .events
+        .iter()
+        .filter(|e| e.kind == MeterKind::BytesServed && e.track_id == "track-a")
+        .collect();
+    assert_eq!(
+        orphaned.len(),
+        1,
+        "dropped traced play must still be metered"
+    );
+    assert!(orphaned[0].bytes > 0);
 }
 
 #[test]

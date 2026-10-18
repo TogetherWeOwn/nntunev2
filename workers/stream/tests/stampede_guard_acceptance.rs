@@ -62,6 +62,7 @@ fn stale_serve_projects_to_a_stale_observability_row_not_hit() {
 
     let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
     let input = PlayInput {
+        trace_id: None,
         token: &token,
         track_id: "track-swr",
         range: None,

@@ -178,8 +178,8 @@ exact implementation PR head:
    `TtlTooLong` at verify); media playback uses a §5 transport (header player
    or grant cookie, never signed query strings).
 8. KEK retire honors backup/PITR retention (`kek-rotation.md` §5, retire-after
-   date); a KEK-exposure response follows the §10 compromise path, never
-   routine rotation alone.
+   date); a KEK-exposure response follows the `kek-rotation.md` §10
+   compromise path, never routine rotation alone.
 
 ## 9. Findings index
 
@@ -423,3 +423,105 @@ security finding requiring a CISO disposition before merge):
   into recreate flows and conflates "fenced" with "not yours / no
   such row", breaking the §3 no-oracle shape; queuing a fenced write
   behind the delete violates fail-closed.
+
+## 13. Future Worker deploy-lane rollback: trust assumptions (docs-only)
+
+**Status: no Worker deploy lane exists.** `.github/workflows/deploy.yml`
+deploys `apps/web` only; no tracked workflow deploys the backend Workers
+under `workers/`. This section records trust assumptions only. It grants
+no deployment authorization, creates no lane, and changes neither the
+decided stack (§1) nor the standing review gate (§8).
+
+It is the trust companion to the procedure in `docs/ops.md` ("Future
+Worker deploy lanes: required rollback evidence", items 1–6). Procedure
+and trust boundary agree: a Worker rollback never restores data or the
+state of connected resources (Hyperdrive config, KV/R2/Durable Object
+contents, Access policies; cf. `docs/ops.md`: "Rollback is never a data
+restore"). Whether it also restores secrets, vars, and binding/route/
+migration declarations depends on the mechanism (items 2–3); the
+`docs/ops.md` "code only" wording is that evidence rule's shorthand for
+this boundary. Where they overlap, the evidence rule governs
+what must be retained and this section governs what must be trusted.
+
+**Rollback actor(s).** The only actor this note contemplates is the
+identity permitted to Re-run the future Worker deploy workflow's
+deploy/rollback job, acting through the repo's Cloudflare CI credentials
+(secret names only, never values; scope recorded in `docs/ops.md`, "CI API
+token + GitHub secrets"). Re-running is a privileged deploy action, not a
+read-only operation: whoever can re-run that job can ship Worker code to
+the target environment once the lane exists. Its reach is bounded by that
+identity's GitHub permissions plus the CI token's Cloudflare scope, and by
+the lane's own required gates on the exact head being (re)deployed. No
+other actor — reader, commenter, or holder of an unrelated token — gains
+any deploy capability from this note.
+
+**What re-running an old-SHA deploy implicitly trusts.** Whichever
+mechanism the future lane implements (redeploy of the prior known-good
+source revision, or activation of the prior version), the rollback trusts
+all three of the following at re-run time, not at the original deploy time:
+
+1. **Artifact integrity.** That the old source revision is the same code
+   that passed exact-head CI and review when it was the known-good
+   version (prior version, SHA, deploy run, and health result recorded
+   *before* the new deploy per `docs/ops.md` item 4); that a rebuild from
+   that SHA is faithful to what was reviewed (toolchain/pinning drift can
+   break this — hence the deployed-build identity check in `docs/ops.md`
+   items 2 and 6); and that source control and the build path have not been
+   tampered with since. A green rollback run alone does not prove the prior
+   version is serving — the post-rollback health result plus the
+   deployed-build identity do.
+2. **Secret versions (mechanism-dependent).** A redeploy of the prior
+   known-good source revision keeps the *current* Worker secret values
+   and trusts the current secrets, KEK versions, Hyperdrive credentials,
+   and Access policies — not the values in force at the old deploy.
+   Activation of a prior version instead restores that version's
+   snapshotted secret values, vars, and binding config as a unit (a Worker
+   version snapshots code plus bindings — secrets are a binding type —
+   plus vars and compatibility settings), so it can bring back a
+   pre-rotation `VAULT_KEK_BASE64` / `VAULT_KEK_VERSION` or
+   `SESSION_SECRET_BASE64` (read at `workers/api/src/worker_entry.rs`).
+   Old code must tolerate current secret versions (e.g. KEK version-pinned
+   decrypt, `kek-rotation.md`; the `kek_version` column is the only version
+   signal the decrypt path trusts). A forward-incompatible secret change
+   (new KEK generation retired, credential format change) can make a code
+   rollback fail or misbehave even when the rollback run is green.
+3. **Binding state (mechanism-dependent).** Activation of a prior version
+   restores that version's binding targets, vars, and compatibility
+   settings; a redeploy of an old SHA reapplies that SHA's Wrangler
+   binding, route, and migration declarations. Neither mechanism restores
+   resource state (Hyperdrive config, KV/R2 contents, Durable Object
+   storage, Access policies), which stays current as inventoried in
+   `docs/ops.md`. If the deploy being rolled back also changed any of
+   these (or schema/stored data), the rollback evidence is incomplete until
+   it states, per change, that the restored version is compatible with the
+   current state or records that change's own rollback. Evidence records
+   carry names, version identifiers, commit SHAs, and run/health-check URLs
+   only — never secret values (CI logs are attacker-readable, §2).
+
+**Explicit residual risk (accepted, not mitigated here):**
+
+- Old code against current secrets/bindings/schema may be incompatible;
+  fail-closed behavior is preferred but not guaranteed for every Worker.
+- A rebuilt artifact may differ byte-for-byte from the originally
+  deployed version if the toolchain is unpinned; without a
+  deployed-build identity matched to the rollback target, serving state
+  is unproven.
+- The re-run capability itself is a deploy capability: anyone holding it
+  can restore any recorded known-good SHA, including one predating a
+  security fix. The mitigation is the lane's exact-head gates and the
+  prior-known-good recording rule — not this note.
+- Data written by the newer version persists after a code rollback;
+  forward-only migrations in particular have no code-rollback path.
+- Activating a pre-rotation version after a secret or KEK compromise
+  rotation (`kek-rotation.md` §10, `session-secret-rotation.md` §6) undoes
+  the rotation by restoring the exposed secret values; such versions are
+  not rollback targets unless re-keyed first (e.g. `wrangler versions
+  secret put`), and the `docs/ops.md` item 4 prior-known-good record must
+  postdate the latest secret rotation.
+- A first deploy has no prior known-good version, so rollback acceptance
+  cannot be claimed for it (per `docs/ops.md` item 4); removal/disablement
+  is a separate gated action.
+
+## 14. Staging-only emailed-code retrieval seam (`POST /api/test-codes`)
+
+The seam exists so the staging E2E can complete the real `/signup` form with the genuinely issued inbox-proof code; its gates are layered so that no single misconfiguration exposes a real account's code: capture writes the raw token to the migration 0018 outbox only when the explicit `QA_CODE_SEAM` staging flag is armed and the recipient is an `example.test` mailbox (RFC 2606 reserved, never routable, so no real user is ever captured — a deliberate narrow exception to the §4 "plaintext token never stored" invariant), retrieval additionally requires the staged `QA_AUTH_TOKEN` bearer under constant-time comparison and returns only an unexpired code for a well-formed synthetic mailbox, every other posture (flag off, bearer unstaged or wrong, real mailbox, miss, expiry) answers the indistinguishable unknown-route 404 or a names-only 401 with no mailbox, token, or gate detail, the handler is strictly read-only (it creates no users, challenges, or magic rows), and production — which never sets the flag or stages the bearer — serves the path as a plain 404, proven by the `qa_seam_absent_without_the_staging_flag` gate test; residual risks accepted here are bearer brute-force without lockout (mitigated by the Cloudflare Access wall in front of staging plus a high-entropy token, not by this note) and plaintext test codes at rest in the isolated staging database (staging roles cannot reach prod per `docs/ops.md`).

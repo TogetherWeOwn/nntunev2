@@ -24,8 +24,8 @@ use crate::auth::{
     SingleUseStore,
 };
 use crate::handlers::{
-    self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, PairAdmission, RateLimitBudget, Store,
-    StoreError, UserRecord, VaultRow,
+    self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, PairAdmission, QaIssuedCode,
+    RateLimitBudget, Store, StoreError, UserRecord, VaultRow,
 };
 use crate::session::SessionRecord;
 use crate::vault::{
@@ -89,7 +89,7 @@ fn config_from_env(env: &Env) -> Option<Config> {
         Ok(previous) => previous,
         Err(()) => return None,
     };
-    let config = Config::new(
+    let mut config = Config::new(
         &rp_id,
         &origin,
         session_secret,
@@ -101,6 +101,19 @@ fn config_from_env(env: &Env) -> Option<Config> {
         session_previous_secret,
     )
     .ok()?;
+    // Staging-only emailed-code retrieval seam (`POST /api/test-codes`):
+    // armed ONLY by the explicit staging flag, and usable only with the
+    // staged QA bearer. Both default off/absent, so production serves the
+    // seam path as a plain 404. The token is read only when the flag is
+    // armed — an unflagged env never holds it in config.
+    if truthy("QA_CODE_SEAM") {
+        config = config.with_qa_code_seam(true);
+        if let Some(token) =
+            env_string(env, "QA_AUTH_TOKEN").filter(|token| !token.trim().is_empty())
+        {
+            config = config.with_qa_auth_token(&token);
+        }
+    }
     Some(apply_rate_limit_overlay(config, |name| {
         env_string(env, name)
     }))
@@ -379,14 +392,12 @@ impl PgStore {
             // No detail in logs: driver errors can carry host/role strings.
             // A background task has no inbound trace, so it roots a fresh one.
             if connection.await.is_err() {
-                crate::logging::LogRecord::new(
+                let _ = emit_record(
                     crate::logging::Level::Error,
                     "api.db.connection_error",
-                    crate::logging::TraceId::from_header(None),
-                )
-                .expect("static event is valid")
-                .error_class("service_unavailable")
-                .emit();
+                    &crate::logging::resolve_trace_id(None),
+                    serde_json::json!({"error_class": "service_unavailable"}),
+                );
             }
         });
         Ok(client)
@@ -598,6 +609,45 @@ impl Store for PgStore {
                 issued_at: u64_of(r.try_get("issued_at").map_err(|_| StoreError)?)?,
                 expires_at: u64_of(r.try_get("expires_at").map_err(|_| StoreError)?)?,
                 used: r.try_get("used").map_err(|_| StoreError)?,
+            })
+        })
+        .transpose()
+    }
+
+    // Staging-only code-seam outbox (migration 0018): one latest-token
+    // row per synthetic mailbox. Read-only retrieval never touches this
+    // table beyond the SELECT below.
+    async fn record_qa_issued_code(
+        &self,
+        email: &str,
+        token: &str,
+        now: u64,
+    ) -> Result<(), StoreError> {
+        let client = self.connect().await?;
+        client
+            .execute(
+                "INSERT INTO qa_issued_codes (email, token, issued_at) VALUES ($1, $2, $3) \
+                 ON CONFLICT (email) DO UPDATE SET token = EXCLUDED.token, issued_at = EXCLUDED.issued_at",
+                &[&email, &token, &i64_of(now)?],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        Ok(())
+    }
+
+    async fn qa_issued_code(&self, email: &str) -> Result<Option<QaIssuedCode>, StoreError> {
+        let client = self.connect().await?;
+        let row = client
+            .query_opt(
+                "SELECT token, issued_at FROM qa_issued_codes WHERE email = $1",
+                &[&email],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        row.map(|r| {
+            Ok(QaIssuedCode {
+                token: r.try_get("token").map_err(|_| StoreError)?,
+                issued_at: u64_of(r.try_get("issued_at").map_err(|_| StoreError)?)?,
             })
         })
         .transpose()
@@ -1506,6 +1556,50 @@ fn served_display_path(path: &str) -> String {
     }
 }
 
+/// Wall-clock milliseconds for record timestamps.
+#[cfg(target_arch = "wasm32")]
+fn now_millis() -> u64 {
+    worker::Date::now().as_millis()
+}
+
+/// Wall-clock milliseconds for record timestamps (native test builds).
+#[cfg(not(target_arch = "wasm32"))]
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Emit one structured record through the shared emitter
+/// (`docs/logging-standard.md` six-key envelope). Construction is
+/// fail-closed: a rejected record (banned key, secret-like value, invalid
+/// event) is dropped and `None` returned, never logged half-built. Every
+/// value passed here is a code-controlled constant or a validated route
+/// label, so a drop indicates a programming error. Returns the rendered
+/// line so native tests can pin the shape without a Worker console.
+fn emit_record(
+    level: crate::logging::Level,
+    event: &str,
+    trace_id: &str,
+    fields: serde_json::Value,
+) -> Option<String> {
+    let field_map = crate::logging::fields_from_json(fields).ok()?;
+    let record = crate::logging::LogRecord::new(
+        crate::logging::Worker::Api,
+        level,
+        trace_id,
+        event,
+        field_map,
+        now_millis(),
+    )
+    .ok()?;
+    let line = record.to_json_line();
+    #[cfg(target_arch = "wasm32")]
+    worker::console_log!("{line}");
+    Some(line)
+}
+
 /// Worker `fetch` entry: adapts the runtime request into the handlers'
 /// framework-agnostic shape. Misconfiguration (missing/invalid env)
 /// answers the same generic 500 as any store outage.
@@ -1517,19 +1611,17 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         .get(crate::logging::TRACE_HEADER)
         .ok()
         .flatten();
-    let trace_id = crate::logging::TraceId::from_header(incoming_trace.as_deref());
-    let start_ms = crate::logging::now_millis();
+    let trace_id = crate::logging::resolve_trace_id(incoming_trace.as_deref());
+    let start_ms = now_millis();
     let Some(config) = config_from_env(&env) else {
         // Misconfiguration is an operator problem; clients only ever see
         // the generic internal error (never which variable is wrong).
-        crate::logging::LogRecord::new(
+        let _ = emit_record(
             crate::logging::Level::Error,
             "api.start.misconfigured",
-            trace_id,
-        )
-        .expect("static event is valid")
-        .error_class("internal_error")
-        .emit();
+            &trace_id,
+            serde_json::json!({"error_class": "internal_error"}),
+        );
         return internal_render();
     };
     // Classify the body source from the actual runtime request, then
@@ -1570,6 +1662,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         path: req.path(),
         cookie: headers_map.get("cookie").cloned(),
         origin: headers_map.get("origin").cloned(),
+        authorization: headers_map.get("authorization").cloned(),
         // Template only: the gate replaces this with the collected bytes
         // on `Complete` and never dispatches it otherwise.
         body: Vec::new(),
@@ -1593,26 +1686,23 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     })
     .await;
     // One structured line per served request: route, status, latency, and
-    // the error registry code when an error body carries one.
+    // the error registry code when the response maps to one.
     let level = if response.status >= 500 {
         crate::logging::Level::Error
     } else {
         crate::logging::Level::Info
     };
-    let mut served = crate::logging::LogRecord::new(level, "api.request.served", trace_id)
-        .expect("static event is valid")
-        .route(&served_method, &served_path)
-        .field("status_code", response.status)
-        .field(
-            "duration_ms",
-            crate::logging::now_millis().saturating_sub(start_ms),
-        );
+    let mut fields = serde_json::json!({
+        "route": format!("{served_method} {served_path}"),
+        "status_code": response.status,
+        "duration_ms": now_millis().saturating_sub(start_ms),
+    });
     if response.status >= 400 {
         if let Some(code) = response_error_code(response.status, &response.body) {
-            served = served.error_class(&code);
+            fields["error_class"] = serde_json::Value::String(code);
         }
     }
-    served.emit();
+    let _ = emit_record(level, "api.request.served", &trace_id, fields);
     // Exact match only: the configured origin is the one frontend origin
     // this Worker trusts with credentialed cross-origin calls. The raw
     // request Origin goes into the tested `cors_headers` decision — never
@@ -1711,6 +1801,46 @@ mod tests {
         // ... and query strings never reach the log either.
         assert_eq!(served_display_path("/v1/vault?token=abc"), "/v1/vault");
         assert_eq!(served_display_path("/probe/x?token=abc"), "unknown");
+    }
+
+    #[test]
+    fn emit_record_renders_the_served_line_and_drops_rejected_fields() {
+        let line = emit_record(
+            crate::logging::Level::Info,
+            "api.request.served",
+            "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c",
+            serde_json::json!({
+                "route": "POST /v1/auth/magic/start",
+                "status_code": 200,
+                "duration_ms": 12,
+            }),
+        )
+        .expect("served line must render");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&line).expect("record must be one JSON object");
+        let object = parsed.as_object().expect("record must be an object");
+        assert_eq!(object.len(), 6, "exactly the six envelope keys");
+        assert_eq!(object["worker"], "api");
+        assert_eq!(object["event"], "api.request.served");
+        assert_eq!(object["fields"]["route"], "POST /v1/auth/magic/start");
+        // Fail-closed: a banned key or secret-like value drops the line.
+        assert!(emit_record(
+            crate::logging::Level::Info,
+            "api.request.served",
+            "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c",
+            serde_json::json!({"route": "GET unknown", "session_id": "s"}),
+        )
+        .is_none());
+        assert!(
+            emit_record(
+                crate::logging::Level::Info,
+                "api.request.served",
+                "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c",
+                serde_json::json!({"route": "GET /v1/vault/victim@example.com"}),
+            )
+            .is_none(),
+            "address-carrying route value must not become a log line"
+        );
     }
 
     fn previous_43() -> String {
@@ -2085,6 +2215,77 @@ mod tests {
         assert!(
             !body.contains("Some(config)"),
             "config_from_env must not return the un-overlaid config"
+        );
+    }
+
+    #[test]
+    fn config_from_env_arms_qa_seam_only_behind_the_flag() {
+        // The staging-only code seam must never arm by default: slice ONLY
+        // the `config_from_env` body out of the pre-test source (so this
+        // test's own literals cannot satisfy the assertions) and require
+        // the explicit-flag gate plus both builder calls. Dropping the
+        // flag check — or staging the bearer unconditionally — fails here.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let body = production
+            .split_once("fn config_from_env(")
+            .expect("config_from_env must exist")
+            .1
+            .split_once("\nfn ")
+            .expect("a following fn must bound the body")
+            .0;
+        assert!(
+            body.contains("if truthy(\"QA_CODE_SEAM\")"),
+            "config_from_env must gate the seam behind the explicit staging flag"
+        );
+        assert!(
+            body.contains("with_qa_code_seam(true)"),
+            "config_from_env must arm the seam inside the flag gate"
+        );
+        assert!(
+            body.contains("with_qa_auth_token(") && body.contains("\"QA_AUTH_TOKEN\""),
+            "config_from_env must stage the QA bearer from the secret inside the flag gate"
+        );
+        assert!(
+            body.contains("trim().is_empty()"),
+            "config_from_env must reject whitespace-only QA bearer values"
+        );
+    }
+
+    #[test]
+    fn qa_outbox_statements_key_by_email() {
+        // `PgStore` QA methods only compile into the wasm Worker, so pin
+        // their statement text natively: the upsert must target the
+        // migration 0018 table with a per-mailbox conflict key (one
+        // latest-token row per synthetic mailbox), and retrieval must
+        // filter by that same mailbox — never a full-table read.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let fn_body = |name: &str| {
+            production
+                .split_once(name)
+                .unwrap_or_else(|| panic!("{name} must exist"))
+                .1
+                .split_once("\n    async fn ")
+                .expect("a following fn must bound the body")
+                .0
+        };
+        let record = fn_body("async fn record_qa_issued_code(");
+        assert!(
+            record.contains("INSERT INTO qa_issued_codes (email, token, issued_at)")
+                && record.contains("ON CONFLICT (email) DO UPDATE"),
+            "record_qa_issued_code must upsert one latest-token row per mailbox"
+        );
+        let lookup = fn_body("async fn qa_issued_code(");
+        assert!(
+            lookup.contains("SELECT token, issued_at FROM qa_issued_codes WHERE email = $1"),
+            "qa_issued_code must read exactly one mailbox row"
         );
     }
 

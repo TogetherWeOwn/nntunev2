@@ -1,4 +1,10 @@
-import { expect, type APIRequestContext, type APIResponse, type Page } from '@playwright/test';
+import {
+  expect,
+  request as playwrightRequest,
+  type APIRequestContext,
+  type APIResponse,
+  type Page,
+} from '@playwright/test';
 import { API, TESTIDS, uniqueTestEmail } from './contract.js';
 import {
   accessHeaders,
@@ -6,6 +12,7 @@ import {
   isStagingOrigin,
   qaAuthHeader,
   syntheticNntpEndpoint,
+  type WallProbe,
 } from './access.js';
 
 export interface TestAccount {
@@ -184,6 +191,66 @@ export async function apiPost(
   });
   throwOnRedirect(res.status(), res.headers(), context);
   return res;
+}
+
+/**
+ * Anonymous GET in a fresh, isolated request context: no Access pair, no
+ * bearer, no cookies or storage state — the context is created here, not
+ * borrowed from a test fixture or browser context, and no headers are
+ * attached regardless of what the environment holds. Fetches with
+ * maxRedirects: 0 and returns the response as a WallProbe WITHOUT
+ * throwOnRedirect: a 302 to the Access login is the expected denial
+ * evidence here, and no-follow guarantees it is reported, not chased.
+ * Pair with `assertAccessWall` (helpers/access.ts). Transport failures
+ * throw names-only — neither the URL nor any credential value is logged.
+ */
+export async function anonymousApiGet(
+  url: string,
+  context: string,
+  opts?: { timeout?: number },
+): Promise<WallProbe> {
+  const anon = await playwrightRequest.newContext();
+  try {
+    let res: APIResponse;
+    try {
+      res = await anon.get(url, { timeout: opts?.timeout ?? 30_000, maxRedirects: 0 });
+    } catch {
+      throw new Error(
+        `[${context}] anonymous request transport failed (names only — no values logged). ` +
+          'Refusing to treat a transport failure as an Access denial.',
+      );
+    }
+    const bodyText = await res.text().catch(() => '');
+    return { status: res.status(), headers: res.headers(), bodyText, url };
+  } finally {
+    await anon.dispose().catch(() => {});
+  }
+}
+
+/**
+ * Anonymous GET: NO Access pair, NO Authorization, NO cookies — by
+ * construction, not by passing empty credentials through a credentialed
+ * wrapper. This helper never reads the environment and takes no headers
+ * parameter, so no caller can accidentally credential it. The caller MUST
+ * pass a fresh, isolated APIRequestContext (a new Playwright request
+ * context with no storageState or context-level headers) so no ambient
+ * session can ride along.
+ *
+ * Unlike apiGet it does NOT throw on 3xx: it fetches with maxRedirects: 0
+ * and returns the response as-is so the caller can classify it with
+ * assertAccessWall. Nothing is followed, so a redirect target (Access login
+ * or otherwise) receives zero follow-up requests from this probe.
+ */
+export async function anonymousGet(
+  request: APIRequestContext,
+  url: string,
+  opts?: { timeout?: number },
+): Promise<APIResponse> {
+  return request.get(url, {
+    headers: {},
+    timeout: opts?.timeout ?? 30_000,
+    maxRedirects: 0,
+  });
 }
 
 /**
@@ -440,5 +507,187 @@ export async function submitPublicUiSignup(page: Page, baseURL: string): Promise
   await expect(codeField, 'public UI signup did not reach the emailed-code step').toBeVisible({
     timeout: 15_000,
   });
+  return { email, viaApi: false };
+}
+
+/**
+ * Retrieve the issued signup code for a synthetic mailbox via the
+ * staging-only code seam (`POST /api/test-codes`, paired staging-seam
+ * build slice). The seam returns the code without minting an account, only
+ * for `example.test` mailboxes and only when the staging flag is set.
+ *
+ * Returns null ONLY when the seam is unconfigured (no QA_AUTH_TOKEN) so
+ * callers can skip locally / fail closed on CI. When the token IS
+ * configured the seam is required infrastructure: transport errors,
+ * non-2xx (including 404 while the seam is absent) and malformed bodies
+ * THROW with names-only detail instead of collapsing into a silent skip.
+ * The mailbox and code values are never interpolated into an error.
+ */
+export async function retrieveStagedSignupCode(
+  request: APIRequestContext,
+  baseURL: string,
+  email: string,
+): Promise<string | null> {
+  if (!process.env.QA_AUTH_TOKEN) return null;
+  const url = `${baseURL}${API.testCodes}`;
+  let status: number;
+  let headers: Record<string, string>;
+  let bodyText: string;
+  try {
+    const response = await apiPost(
+      request,
+      url,
+      { ...accessHeaders(), ...qaAuthHeader(), 'Content-Type': 'application/json' },
+      { email },
+      'code-seam',
+    );
+    status = response.status();
+    headers = response.headers();
+    bodyText = await response.text().catch(() => '');
+  } catch (error) {
+    // apiPost's no-follow throws (redirect/wall) already name the cause —
+    // preserve them instead of collapsing into a generic transport failure.
+    if (error instanceof Error && /unexpected redirect|Access wall/.test(error.message)) throw error;
+    throw new Error(
+      '[code-seam] POST /api/test-codes transport failed (names only — no values logged). ' +
+        'The seam is required once QA_AUTH_TOKEN is set; refusing to skip silently.',
+    );
+  }
+  assertNoAccessWall({ status, headers, bodyText, url }, 'code-seam');
+  if (status < 200 || status >= 300) {
+    throw new Error(
+      `[code-seam] POST /api/test-codes failed: HTTP ${status} (seam absent or outage — ` +
+        'names only, no values logged). The staging code-retrieval seam must ' +
+        'return the issued code for example.test mailboxes; without it the wizard-arrival ' +
+        'spec fails here. See e2e/README.md.',
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bodyText) as unknown;
+  } catch {
+    throw new Error('[code-seam] POST /api/test-codes returned a non-JSON body (seam outage — not a skip).');
+  }
+  const body: Record<string, unknown> =
+    parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  const code = nonblankString(body.magic_token);
+  if (!code) {
+    throw new Error(
+      '[code-seam] POST /api/test-codes returned no usable code: ' +
+        'the response is not an object with a nonblank magic_token identity ' +
+        '(names only — no values logged; refusing to fabricate a code).',
+    );
+  }
+  return code;
+}
+
+/**
+ * Attach a WebAuthn virtual authenticator to the page's browser context so
+ * the real `/signup` passkey ceremony completes without hardware. Uses the
+ * CDP WebAuthn domain: resident-key + user-verification capable, pre-verified
+ * with presence simulation, matching the signup page's `required` ceremony
+ * (`apps/web/src/routes/signup/+page.svelte`). Call before submitting the
+ * emailed-code form. Failures throw names-only (no device or credential
+ * values are ever logged).
+ */
+export async function enableVirtualAuthenticator(page: Page): Promise<void> {
+  try {
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('WebAuthn.enable');
+    await cdp.send('WebAuthn.addVirtualAuthenticator', {
+      options: {
+        protocol: 'ctap2',
+        transport: 'usb',
+        hasResidentKey: true,
+        hasUserVerification: true,
+        isUserVerified: true,
+        automaticPresenceSimulation: true,
+      },
+    });
+  } catch {
+    throw new Error(
+      '[webauthn] could not enable the virtual authenticator (names only — no values logged). ' +
+        'The wizard-arrival spec requires a Chromium virtual authenticator; refusing to ' +
+        'submit the passkey ceremony without one.',
+    );
+  }
+}
+
+/**
+ * Submit the public `/signup` form as a fresh synthetic identity and carry
+ * the real two-step flow all the way to the BYOP wizard: submit starts
+ * registration (`registerStart`), the emailed-code step is filled with the
+ * code from the staging-only retrieval seam (`retrieveStagedSignupCode`),
+ * and the passkey finish (`registerFinish`) runs against a WebAuthn virtual
+ * authenticator (`enableVirtualAuthenticator`), after which the page
+ * navigates to `/onboarding/byop`.
+ *
+ * Unlike `submitPublicUiSignup` (which stops at the `magic_code` step so
+ * every configured run stays green), this helper asserts wizard arrival and
+ * therefore requires the seam: without it the code-retrieval POST fails with
+ * the documented `[code-seam]` signature. It never touches the test-account
+ * mint seam, so the account it creates comes only from the public form. Call
+ * only on configured staging with QA_AUTH_TOKEN set (the spec skips green
+ * otherwise). The generated mailbox is returned for callers that track the
+ * identity; it and the code value are never interpolated into an assertion
+ * message or diagnostic here.
+ */
+export async function submitPublicUiSignupToByopWizard(
+  page: Page,
+  request: APIRequestContext,
+  baseURL: string,
+): Promise<TestAccount> {
+  const email = uniqueTestEmail('e2e-wizard');
+  await page.goto(`${baseURL}/signup`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  await expect(page.getByTestId(TESTIDS.signupEmail)).toBeVisible({ timeout: 15_000 });
+  await page.getByTestId(TESTIDS.signupEmail).fill(email);
+  await page.getByTestId(TESTIDS.signupSubmit).click();
+  // Either the code form appears, or an inline error explains why.
+  const codeField = page.locator('input[name="magic_code"]');
+  const error = page.getByTestId(TESTIDS.signupError);
+  await expect(async () => {
+    const onCodeStep = await codeField.isVisible().catch(() => false);
+    const onError = await error.isVisible().catch(() => false);
+    expect(onCodeStep || onError, 'neither signup code form nor signup error appeared').toBe(true);
+  }).toPass({ timeout: 30_000 });
+  expect(await error.isVisible().catch(() => false), 'public UI signup showed an inline error').toBe(
+    false,
+  );
+  await expect(codeField, 'public UI signup did not reach the emailed-code step').toBeVisible({
+    timeout: 15_000,
+  });
+  // Staging-only seam: the issued code for this synthetic mailbox, without
+  // minting. Absent seam (or absent QA_AUTH_TOKEN) fails here by name —
+  // never by asserting the wizard on a code that was never issued.
+  const code = await retrieveStagedSignupCode(request, baseURL, email);
+  if (!code) {
+    throw new Error(
+      '[code-seam] no staged signup code: this wizard-arrival step requires QA_AUTH_TOKEN ' +
+        'plus the staging code-retrieval seam for example.test mailboxes ' +
+        '(names only — no values logged). See e2e/README.md.',
+    );
+  }
+  // Virtual passkey ceremony: the page's `registerFinish` requires a real
+  // attestation from `navigator.credentials.create`.
+  await enableVirtualAuthenticator(page);
+  await codeField.fill(code);
+  await page.getByRole('button', { name: 'Finish creating account' }).click();
+  // The page navigates to the BYOP wizard only after the emailed code plus
+  // the passkey finish succeed server-side. The regex waits for the
+  // navigation; the plain-string read below names the arrival path verbatim
+  // (kept as a pinnable contract string, never a value).
+  await expect(page, 'public UI signup did not reach the BYOP wizard').toHaveURL(
+    /\/onboarding\/byop/,
+    { timeout: 30_000 },
+  );
+  expect(page.url(), 'public UI signup did not land on the BYOP wizard').toContain(
+    '/onboarding/byop',
+  );
+  await expect(
+    page.getByTestId(TESTIDS.byopHost),
+    'BYOP wizard not reachable after public UI signup',
+  ).toBeVisible({ timeout: 15_000 });
   return { email, viaApi: false };
 }

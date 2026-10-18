@@ -78,6 +78,74 @@ emit the code.
 | `upstream_circuit_open` | 503 | true | stream | The user's provider pool circuit breaker is open; retry after the supplied `Retry-After` delay. |
 | `service_unavailable` | 503 | true | api, ingest | A backing binding (queue, payload store) is unavailable; nothing was accepted. |
 
+## Repair taxonomy status (no registry rows)
+
+The repair worker defines its own stable fault shape in
+`workers/repair/src/contract.rs` (`ApiFault { status, code }`,
+`ApiFault::new`/`invalid`): an HTTP status plus a machine-readable code
+for logs and operators, carrying no user data. Ingest maps those faults
+in `workers/ingest/src/repair.rs` (`classify_repair_reply`): replies
+with status 400, 404, 409, or 413 are `Unrepairable` (permanent — a
+retry would send the same bytes, so the job fails terminally), provided
+the reply body does not exceed `MAX_REPAIR_REPLY_BYTES` (oversized
+bodies are `Retry` before the status is checked); a 200
+reply is decided by its `status` field (`repaired` -> `Repaired`,
+`unrepairable` -> `Unrepairable` which is also terminal, anything else
+or a malformed or oversized body -> `Retry`); every other (non-200)
+status is `Retry` (transient — retried through the shared
+job attempt budget). Container replies are classified in
+`workers/repair/src/contract.rs` (`classify_container_reply`,
+`ContainerOutcome::Forward`) and then narrowed in
+`workers/repair/src/runtime.rs` (`leak_code`): only a well-formed 200
+result completes the repair worker's request (`Done` — persist outputs
+and reply 200); on 400/404/409/413/503 a container `error` code of at
+most 64 lowercase/digit/underscore characters is passed through
+`leak_code`, a closed allow-list (`invalid_request`,
+`invalid_manifest`, `not_found`, `payload_too_large`,
+`repair_manifest_conflict`, `repair_timeout`, `repair_resource`,
+`repair_failed`, `scratch_input_mismatch`). Listed codes reach ingest
+unchanged with the container's status; any other code becomes
+`container_unavailable` with that same status (a container 409
+`some_new_code` reaches ingest as 409 `container_unavailable`). A
+missing or unparseable code, or a status outside that list, becomes 502
+`container_unavailable`. Six of the listed codes
+(`invalid_manifest`, `repair_manifest_conflict`, `repair_timeout`,
+`repair_resource`, `repair_failed`, `scratch_input_mismatch`) are
+container-origin repair-only codes with no registry row (two of the
+six — `invalid_manifest` and `scratch_input_mismatch` — are also
+emitted directly by the repair worker itself:
+`workers/repair/src/contract.rs:121,127` and
+`workers/repair/src/runtime.rs:325,356`). The repair worker also emits
+`container_unavailable` (502), `scratch_unavailable` (503),
+`repair_unavailable` (500/503), and `scratch_missing` (404) directly
+(not through `leak_code`); those have no registry row either.
+
+This registry currently carries no repair rows: every row in the table
+above names an owning worker drawn from api, ingest, mb, and stream,
+and none names repair. That is a status fact, not a registry change.
+Two qualifications apply to that fact. Repair replies use a bare
+`{"error": <code>}` body (`workers/repair/src/runtime.rs`,
+`fault_response`), not the `{code, message, retryable}` envelope, and
+already reuse the registered strings `invalid_request`,
+`payload_too_large`, and `not_found` without being listed as an owning
+worker on those rows — so the `Owning worker lists every worker that
+may emit the code` header is incomplete for those three codes. There is
+also no repair-side `api_error` registry or doc-lint test
+(`workers/repair/src` holds only `contract.rs`, `lib.rs`, `runtime.rs`;
+the `api_error` registries live under api, ingest, mb, and stream), so
+step 2 of `Adding a code` and its drift guard cannot be followed for
+repair as written.
+
+A future repair row follows the same `Adding a code` rule below once
+those prerequisites exist: one registry row here (code, status,
+retryable, owning worker `repair`) plus the same entry in a repair-side
+error registry covered by a doc-lint test (or an explicit exemption
+recorded here), plus a `leak_code` arm in
+`workers/repair/src/runtime.rs` for any container-origin code that must
+reach the wire (unlisted codes are renamed `container_unavailable`);
+never rename or reuse a code, and never change a code's status or
+retryable flag in place. No such row is added by this note.
+
 ## Billing-limit shapes (402 / 429)
 
 Server-side limit enforcement lands separately, but the wire shapes are
@@ -97,6 +165,34 @@ with HTTP 402 when a plan quota is exhausted for the period, and
 with HTTP 429 (and `Retry-After` where the worker knows a delay) for
 short-window throttling. `402` is never retryable: only an upgrade or the
 period reset changes the answer. `429` is always retryable.
+
+### Limit refusal wire (enforcement contract)
+
+When enforcement refuses an over-limit attempt, the refusal carries the
+limit facts a client needs to render the upgrade path instead of a
+dead-end error — asserted end to end by the over-limit e2e legs
+(`assertPlanLimitRefusal` in `e2e/helpers/contract.ts`, pinned offline in
+`e2e/tests/helpers.spec.ts`):
+
+- Headers: a header naming the limit (preferred `x-plan-limit`) and a
+  header naming the reset or retry (preferred `x-plan-reset`; `retry-after`
+  satisfies the retry side and stays required on 429). Both carry values.
+- Body: the envelope above plus an upgrade pointer (preferred
+  `upgrade_url` with value `/pricing`, the client's pricing route), so any
+  client can route the upgrade CTA without hardcoding it:
+
+```json
+{
+  "code": "plan_limit_exceeded",
+  "message": "plan limit reached",
+  "retryable": false,
+  "upgrade_url": "/pricing"
+}
+```
+
+Refusal bodies stay names-only: no account, credential, or provider
+material — the e2e legs fail a refusal that echoes the capped account's
+email/session or carries credential-shaped keys.
 
 ## Adding a code
 

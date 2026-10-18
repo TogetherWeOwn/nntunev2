@@ -113,6 +113,9 @@ fn dispatch(
         state: JobState::Queued,
         attempt: 1,
         repair_rounds: 0,
+        // The HTTP route stamps the resolved inbound trace after building;
+        // builders stay trace-free so dispatch math is unaffected.
+        trace_id: None,
         query: None,
         indexer_ref: None,
         categories: vec![],

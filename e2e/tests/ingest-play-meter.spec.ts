@@ -1,19 +1,30 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type APIRequestContext } from '@playwright/test';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   API,
-  PLAN_LIMIT_STATUSES,
   TESTIDS,
+  assertPlanLimitRefusal,
+  extractLibraryItems,
+  extractLimitCode,
   extractPlanMeta,
+  extractRecordingMbids,
   extractUsageBytes,
+  type NamedSecret,
 } from '../helpers/contract.js';
 import { assertNoAccessWall, readApiBody, stagingBaseUrl } from '../helpers/access.js';
 import { playbackFailure, type PlaybackEvidence } from '../helpers/playback.js';
 import {
+  mediaSessionFailure,
+  type ExpectedTrack,
+  type MediaSessionSnapshot,
+} from '../helpers/media-session.js';
+import {
   accountHeaders,
   annotateSignupPath,
   apiGet,
+  apiPost,
   applyAccountToPage,
   completeByopWizard,
   requireApiAccount,
@@ -26,8 +37,12 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE_NZB = path.resolve(here, '../fixtures/synthetic.nzb');
 
 // Golden path part 2: ingest the NZB fixture → stream with Range seeks →
-// usage meter moves → plan metadata stays consistent → over-limit staging
-// account is refused with the documented plan-limit status.
+// usage meter moves → plan metadata stays consistent → browser playback,
+// seek and Media Session → separately minted over-limit staging accounts are
+// refused on stream and on ingest with the documented plan-limit status
+// (headers, code, upgrade CTA, no leaks). Plan-limit legs run last: both
+// fail red-by-design until enforcement lands, and in describe.serial a
+// failure skips every later test.
 //
 // File-level skip: pre-deploy (no STAGING_BASE_URL) the whole file skips
 // without launching a browser. See health.spec.ts.
@@ -36,7 +51,46 @@ test.skip(
   'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.',
 );
 
-test.describe.serial('ingest → play → meter → plan limit', () => {
+// A capped plan on a throwaway account — a staging-only test seam owned
+// by the metering card. Never hammer a real account into over-limit: that
+// would probe a mutating path. Fail-closed everywhere (locally and on CI):
+// a skip here would leave plan-limit enforcement (an acceptance criterion)
+// never exercised while the job stays green.
+async function mintCappedAccount(
+  request: APIRequestContext,
+  baseURL: string,
+  context: string,
+): Promise<TestAccount> {
+  let capped: TestAccount | null;
+  try {
+    capped = await tryMintTestAccount(request, baseURL, 'overlimit');
+  } catch (error) {
+    throw new Error(
+      `[${context}] over-limit seam errored: ${(error as Error).message} — ` +
+        'the metering card\'s POST /api/test-accounts {plan:"overlimit"} must be ' +
+        'reachable; refusing to pass silently.',
+    );
+  }
+  if (!capped) {
+    throw new Error(
+      `[${context}] over-limit seed seam unavailable (needs QA_AUTH_TOKEN + ` +
+        'POST /api/test-accounts {plan:"overlimit"} from the metering card) — ' +
+        'refusing to pass silently.',
+    );
+  }
+  requireApiAccount(capped, context);
+  return capped;
+}
+
+// Values that must never appear in a 402/429 body (names only in
+// diagnostics — see secretLeak in helpers/contract.ts).
+function cappedSecrets(capped: TestAccount): NamedSecret[] {
+  const secrets: NamedSecret[] = [{ name: 'account email', value: capped.email }];
+  if (capped.session) secrets.push({ name: 'account session', value: capped.session });
+  return secrets;
+}
+
+test.describe.serial('ingest → play → meter → browser', () => {
   // Ingest polling (queue + NNTP fetch + verify) can take minutes on staging.
   test.describe.configure({ timeout: 300_000 });
 
@@ -107,8 +161,8 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     const library = await apiGet(request, libraryUrl, headers, 'reload');
     const libraryBody = await readApiBody(library, libraryUrl, 'reload');
     expect(library.ok(), `library listing failed: HTTP ${library.status()}`).toBe(true);
-    const items = JSON.parse(libraryBody) as Array<{ id?: string }>;
-    const trackId = Array.isArray(items) ? items[0]?.id : undefined;
+    const items = extractLibraryItems(libraryBody);
+    const trackId = items[0]?.id;
     expect(trackId, 'library is empty — ingest spec must run first').toBeTruthy();
 
     await applyAccountToPage(page, account, baseURL);
@@ -174,8 +228,8 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     const library = await apiGet(request, libraryUrl, headers, 'range');
     const libraryBody = await readApiBody(library, libraryUrl, 'range');
     expect(library.ok(), `library listing failed: HTTP ${library.status()}`).toBe(true);
-    const items = JSON.parse(libraryBody) as Array<{ id?: string }>;
-    const trackId = Array.isArray(items) ? items[0]?.id : undefined;
+    const items = extractLibraryItems(libraryBody);
+    const trackId = items[0]?.id;
     expect(trackId, 'library is empty — ingest spec must run first').toBeTruthy();
 
     // Binary success bodies are probed headers-only (no megabyte buffering);
@@ -234,8 +288,8 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     const library = await apiGet(request, libraryUrl, headers, 'meter');
     const libraryBody = await readApiBody(library, libraryUrl, 'meter');
     expect(library.ok(), `library listing failed: HTTP ${library.status()}`).toBe(true);
-    const items = JSON.parse(libraryBody) as Array<{ id?: string }>;
-    const trackId = Array.isArray(items) ? items[0]?.id : undefined;
+    const items = extractLibraryItems(libraryBody);
+    const trackId = items[0]?.id;
     expect(trackId, 'meter needs the ingested track — ingest spec must run first').toBeTruthy();
     const streamUrl = `${baseURL}${API.stream(trackId as string)}`;
     const rangeRes = await apiGet(request, streamUrl, { ...headers, Range: 'bytes=0-0' }, 'meter');
@@ -274,94 +328,6 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     const meta = extractPlanMeta(JSON.parse(metaBody));
     expect(meta.used).toBeLessThanOrEqual(meta.limit);
     await expect(page.getByTestId(TESTIDS.usageMeter).first()).toBeVisible({ timeout: 15_000 });
-  });
-
-  test('over-limit staging account is refused with a plan-limit status', async ({
-    page,
-    request,
-  }) => {
-    const baseURL = stagingBaseUrl('skip', 'plan-limit');
-    if (!baseURL) {
-      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
-      return;
-    }
-    // Deterministic enforcement needs a capped plan on a throwaway account —
-    // a staging-only test seam owned by the metering card. Never hammer a
-    // real account into over-limit: that would probe a mutating path.
-    // Fail-closed on CI: a skip here would leave plan-limit enforcement (an
-    // acceptance criterion) never exercised while the job stays green.
-    let capped: TestAccount | null;
-    try {
-      capped = await tryMintTestAccount(request, baseURL, 'overlimit');
-    } catch (error) {
-      if (!process.env.CI) {
-        test.skip(true, `over-limit seam errored locally: ${(error as Error).message}`);
-        return;
-      }
-      throw error;
-    }
-    if (!capped) {
-      const reason =
-        'over-limit seed seam unavailable (needs QA_AUTH_TOKEN + POST /api/test-accounts ' +
-        '{plan:"overlimit"} from the metering card) — refusing to pass silently on CI.';
-      if (process.env.CI) throw new Error(`[plan-limit] ${reason}`);
-      test.skip(true, `${reason} Usage/plan metadata above still verified.`);
-      return;
-    }
-    // Stream AS the capped account: its session (not the default identity)
-    // must be the credential on these calls, or a 206 would falsely pass.
-    const headers = accountHeaders(capped);
-    const libraryUrl = `${baseURL}${API.library}`;
-    const readTrackId = async (): Promise<string | undefined> => {
-      const library = await apiGet(request, libraryUrl, headers, 'plan-limit');
-      const libraryBody = await readApiBody(library, libraryUrl, 'plan-limit');
-      let items: Array<{ id?: string }>;
-      try {
-        items = JSON.parse(libraryBody) as Array<{ id?: string }>;
-      } catch {
-        items = [];
-      }
-      return Array.isArray(items) ? items[0]?.id : undefined;
-    };
-    let trackId = await readTrackId();
-    if (!trackId) {
-      // No pre-seeded track is required from the seam: ingest the fixture AS
-      // the capped account (BYOP first, since ingest needs the provider
-      // connection) and re-list. Anything still empty is a named seam
-      // precondition failure, not a silent pass.
-      await applyAccountToPage(page, capped, baseURL);
-      await completeByopWizard(page, baseURL);
-      await page.goto(`${baseURL}/library/import`, {
-        waitUntil: 'domcontentloaded',
-        timeout: 30_000,
-      });
-      const fileInput = page.getByTestId(TESTIDS.importFile);
-      await expect(fileInput, 'NZB import control missing').toBeAttached({ timeout: 15_000 });
-      await fileInput.setInputFiles(FIXTURE_NZB);
-      const importStatus = page.getByTestId(TESTIDS.importStatus);
-      await expect(importStatus, 'import gave no status').toBeVisible({ timeout: 60_000 });
-      await expect(importStatus, 'NZB ingest did not complete').toContainText(
-        /complete|ready|done/i,
-        { timeout: 240_000 },
-      );
-      trackId = await readTrackId();
-    }
-    expect(
-      trackId,
-      'library is empty for the capped account even after ingesting the fixture as that ' +
-        'account (the overlimit seam must allow ingest or pre-seed a streamable track)',
-    ).toBeTruthy();
-    const streamUrl = `${baseURL}${API.stream(trackId as string)}`;
-    const res = await apiGet(request, streamUrl, { ...headers, Range: 'bytes=0-8' }, 'plan-limit');
-    if (!((PLAN_LIMIT_STATUSES as readonly number[]).includes(res.status()))) {
-      // Only read the body on the unexpected path: a wall here must name
-      // itself instead of surfacing as a bare status mismatch below.
-      await readApiBody(res, streamUrl, 'plan-limit');
-    }
-    expect(
-      (PLAN_LIMIT_STATUSES as readonly number[]).includes(res.status()),
-      `expected a plan-limit status (${PLAN_LIMIT_STATUSES.join('/')}), got HTTP ${res.status()}`,
-    ).toBe(true);
   });
 
   test('synthetic audio actually plays in the browser', async ({ page, request }) => {
@@ -503,6 +469,46 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     expect(pageErrorNames, 'page errors during browser playback').toEqual([]);
   });
 
+  // FIXMEd until the staging MB mirror can match the synthetic fixture:
+  // synthetic.nzb's subject ("NNTune-Fixture sine-660 [01/03]") derives to
+  // the plain-title query "NNTune-Fixture sine-660", which has no release in
+  // the shared MB mirror, so the library write is empty by design
+  // (library_write_for in workers/ingest/src/matching.rs drops recordings
+  // without a release; the queue consumer resolves unmatched to Vec::new()).
+  // Below playback and FIXMEd, so it can never fail or skip a later step.
+  // Un-fixme paths: (a) ingest an `Artist - Album` fixture for a real,
+  // unambiguous mirrored release, or (b) seed a fixture release in staging.
+  test.fixme('ingested track carries recording_mbids', async ({ request }) => {
+    const baseURL = stagingBaseUrl('skip', 'recording-mbids');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    // Fail closed instead of asserting anonymously when neither the
+    // ingesting session nor the QA seam token exists.
+    requireApiAccount(account, 'recording-mbids');
+    const headers = accountHeaders(account);
+    const libraryUrl = `${baseURL}${API.library}`;
+    // The MB match + library write settle after the import status flips,
+    // so poll the listing until the ingested track carries its recording
+    // MBIDs. Every failure names the gap: transport/list shape, an empty
+    // library, or the missing/empty/malformed fill itself (see
+    // extractRecordingMbids in e2e/helpers/contract.ts).
+    await expect(async () => {
+      const library = await apiGet(request, libraryUrl, headers, 'recording-mbids');
+      const libraryBody = await readApiBody(library, libraryUrl, 'recording-mbids');
+      expect(library.ok(), `library listing failed: HTTP ${library.status()}`).toBe(true);
+      const items = extractLibraryItems(libraryBody);
+      expect(items.length, 'library is empty — ingest spec must run first').toBeGreaterThan(0);
+      const mbids = extractRecordingMbids(items[0]);
+      expect(
+        mbids.length,
+        '[recording-mbids] ingested track carries an empty recording_mbids list',
+      ).toBeGreaterThan(0);
+    }).toPass({ timeout: 60_000 });
+  });
+
   // Player-UI seek, as distinct from the API Range control above: that test
   // proves the stream endpoint answers byte ranges; this one proves the
   // user-visible player actually moves the active track's playback position
@@ -510,10 +516,13 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
   // native controls timeline (the contract markup is `<audio controls>`),
   // never a `currentTime` assignment and never a test-issued Range GET.
   //
-  // Last in the serial chain on purpose: the library player is still a
+  // After the meter/plan-limit specs on purpose: the library player is still a
   // contract placeholder, so on configured staging this test fails by name
-  // until the player slice lands — placing it last keeps that expected red
-  // from suppressing the meter/plan-limit evidence above it.
+  // until the player slice lands — placing it after them keeps that expected
+  // red from suppressing the meter/plan-limit evidence above it. Media Session
+  // closes the chain after this test (it needs everything this test needs
+  // plus applyMediaSession), so a Media Session failure cannot skip this
+  // seek verdict.
   //
   // The seek is performed while PAUSED. That is what makes the assertion
   // non-vacuous: a paused position cannot drift into the seeked region by
@@ -725,5 +734,266 @@ test.describe.serial('ingest → play → meter → plan limit', () => {
     const continued = await audioState();
     expect(continued.errorCode, 'player reported a media error after resuming').toBeNull();
     expect(pageErrors, `page errors during player seek: ${pageErrors.join('; ')}`).toEqual([]);
+  });
+
+  // Last in the serial chain: Media Session needs everything the seek test
+  // needs plus applyMediaSession on the library page, so it runs after seek —
+  // a Media Session failure cannot skip the M1 seek verdict above it.
+  test('Media Session metadata reflects the playing ingested track', async ({ page, request }) => {
+    const baseURL = stagingBaseUrl('skip', 'media-session');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    // Same identity discipline as Range/meter/playback: the metadata must be
+    // read as the ingesting account, never anonymously or as the generic QA
+    // seam. Full playback proof stays with the playback spec — here a light
+    // playing gate precedes the metadata read so the assertion runs during
+    // browser playback, not against an idle element.
+    const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    requireApiAccount(account, 'media-session');
+
+    // Names only: a page-error message can embed the staging origin or other
+    // values that must stay out of public CI artifacts.
+    const pageErrorNames: string[] = [];
+    page.on('pageerror', (error) => pageErrorNames.push(error.name || 'Error'));
+
+    // Expected identity comes from the library API (deterministic), never
+    // from the page: metadata must match the ingested track itself.
+    const headers = accountHeaders(account);
+    const libraryUrl = `${baseURL}${API.library}`;
+    const library = await apiGet(request, libraryUrl, headers, 'media-session');
+    const libraryBody = await readApiBody(library, libraryUrl, 'media-session');
+    expect(library.ok(), `library listing failed: HTTP ${library.status()}`).toBe(true);
+    let libraryItems: unknown;
+    try {
+      libraryItems = JSON.parse(libraryBody) as unknown;
+    } catch {
+      libraryItems = [];
+    }
+    const first = (Array.isArray(libraryItems) ? libraryItems : [])[0] as Record<string, unknown>;
+    const titleOf = (value: unknown): string | null =>
+      typeof value === 'string' && value.trim() !== '' ? value : null;
+    const expectedTitle =
+      titleOf(first?.title) ?? titleOf(first?.name) ?? titleOf(first?.track_title);
+    expect(
+      expectedTitle,
+      'library API returned no usable track title (keys: ' +
+        `${Object.keys((first as object) ?? {}).join(', ') || '(empty)'}) — ` +
+        'the contract drifted; update the title keys + this spec together',
+    ).toBeTruthy();
+    const expected: ExpectedTrack = {
+      title: expectedTitle as string,
+      artist: titleOf(first?.artist) ?? titleOf(first?.artist_name),
+    };
+
+    await applyAccountToPage(page, account, baseURL);
+    await page.goto(`${baseURL}/library`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    const item = page.getByTestId(TESTIDS.libraryItem).first();
+    await expect(
+      item,
+      'ingested track missing from library — ingest spec must run first',
+    ).toBeVisible({ timeout: 60_000 });
+    await item.click();
+    const audio = page.getByTestId(TESTIDS.audioPlayer);
+    await expect(
+      audio,
+      'selecting the library track did not show the audio player (player slice must land first)',
+    ).toBeVisible({ timeout: 15_000 });
+
+    // Light playing gate (booleans/numbers only — the source URL is never
+    // read out of the page): record playing/timeupdate evidence, use the
+    // player's own visible play control as the gesture, then require an
+    // advancing element. The synthetic track is sub-second, so ended with
+    // recorded advancement counts — ended with none does not.
+    await audio.evaluate((element) => {
+      const player = element as HTMLAudioElement & {
+        __nnMediaSession?: { sawPlaying: boolean; maxTime: number };
+      };
+      const recorder = {
+        sawPlaying: !player.paused && !player.ended,
+        maxTime: Number.isFinite(player.currentTime) ? player.currentTime : 0,
+      };
+      player.__nnMediaSession = recorder;
+      player.addEventListener('playing', () => {
+        recorder.sawPlaying = true;
+        recorder.maxTime = Math.max(recorder.maxTime, player.currentTime || 0);
+      });
+      player.addEventListener('timeupdate', () => {
+        recorder.maxTime = Math.max(recorder.maxTime, player.currentTime || 0);
+      });
+    });
+    const box = await audio.boundingBox();
+    expect(box, 'audio player is visible but has no clickable controls').not.toBeNull();
+    await audio.click({ position: { x: 20, y: Math.floor((box?.height ?? 40) / 2) } });
+    await expect
+      .poll(
+        async () =>
+          audio.evaluate((element) => {
+            const player = element as HTMLAudioElement & {
+              __nnMediaSession?: { sawPlaying: boolean; maxTime: number };
+            };
+            const recorder = player.__nnMediaSession ?? { sawPlaying: false, maxTime: 0 };
+            const maxTime = Math.max(recorder.maxTime, player.currentTime || 0);
+            const errored = player.error !== null;
+            const advancing =
+              recorder.sawPlaying || !player.paused || player.ended ? maxTime > 0 : false;
+            return !errored && advancing && Number.isFinite(player.duration) && player.duration > 0;
+          }),
+        {
+          timeout: 15_000,
+          message:
+            'audio element never entered an advancing playing state for the Media Session read',
+        },
+      )
+      .toBe(true);
+
+    // Metadata is applied by a client effect after hydration: poll the pure
+    // verdict (null = reflects the playing track). Titles/artists/artwork
+    // URLs are never interpolated — the failure names the field, not values.
+    const readMetadata = (): Promise<MediaSessionSnapshot | null> =>
+      page.evaluate(() => {
+        const metadata = navigator.mediaSession?.metadata;
+        if (!metadata) return null;
+        return {
+          title: typeof metadata.title === 'string' ? metadata.title : null,
+          artist: typeof metadata.artist === 'string' ? metadata.artist : null,
+          artworkSrcs: (metadata.artwork ?? []).map((entry) => entry.src),
+        };
+      });
+    await expect
+      .poll(async () => mediaSessionFailure(await readMetadata(), expected), {
+        timeout: 15_000,
+        message: 'Media Session metadata does not reflect the playing ingested track',
+      })
+      .toBeNull();
+    expect(
+      mediaSessionFailure(await readMetadata(), expected),
+      'final Media Session metadata regressed',
+    ).toBeNull();
+    expect(pageErrorNames, 'page errors during Media Session playback').toEqual([]);
+  });
+});
+
+// Plan-limit legs in their own group AFTER the journey serial: both fail
+// red-by-design until enforcement lands, and in describe.serial a failure
+// skips every later test in the SAME group — isolating them here means a
+// red plan-limit leg (or a red browser leg above) can never skip the other
+// group's verdicts. Each leg mints its own capped account (never the
+// journey identity, never each other's), so a capped-account failure
+// implicates only its own leg. The stream leg requires the overlimit seam
+// to pre-seed a streamable track: ingesting as the capped account would
+// contradict the ingest-refusal leg (the same ingest must be refused).
+test.describe('plan limit', () => {
+  test.describe.configure({ timeout: 300_000 });
+
+  test('over-limit staging account is refused with a plan-limit status', async ({
+    request,
+  }) => {
+    const baseURL = stagingBaseUrl('skip', 'plan-limit-stream');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    const capped = await mintCappedAccount(request, baseURL, 'plan-limit-stream');
+    // Stream AS the capped account: its session (not the default identity)
+    // must be the credential on these calls, or a 206 would falsely pass.
+    const headers = accountHeaders(capped);
+    const libraryUrl = `${baseURL}${API.library}`;
+    const readTrackId = async (): Promise<string | undefined> => {
+      const library = await apiGet(request, libraryUrl, headers, 'plan-limit-stream');
+      const libraryBody = await readApiBody(library, libraryUrl, 'plan-limit-stream');
+      let items: Array<Record<string, unknown>>;
+      try {
+        items = extractLibraryItems(libraryBody);
+      } catch {
+        // Fail fast when the listing itself is a limit refusal: without a
+        // pre-seeded track there is nothing to stream, and the empty-library
+        // message below would mislead.
+        let code: string | null = null;
+        try {
+          code = extractLimitCode(libraryBody, 'plan-limit-stream');
+        } catch {
+          code = null;
+        }
+        if (code) {
+          throw new Error(
+            `[plan-limit-stream] library listing for the capped account is itself refused ` +
+              `with limit code '${code}': the stream leg cannot reach a track — ` +
+              `the overlimit seam must pre-seed a streamable track when listing is capped.`,
+          );
+        }
+        items = [];
+      }
+      const trackId = items[0]?.id;
+      return typeof trackId === 'string' ? trackId : undefined;
+    };
+    const trackId = await readTrackId();
+    expect(
+      trackId,
+      'library is empty for the capped account: the overlimit seam must pre-seed ' +
+        'a streamable track (ingest-as-capped would contradict the ingest-refusal leg)',
+    ).toBeTruthy();
+    const streamUrl = `${baseURL}${API.stream(trackId as string)}`;
+    const res = await apiGet(
+      request,
+      streamUrl,
+      { ...headers, Range: 'bytes=0-8' },
+      'plan-limit-stream',
+    );
+    // The Range is 9 bytes, so reading the refusal body never buffers media.
+    const bodyText = await readApiBody(res, streamUrl, 'plan-limit-stream');
+    // The full refusal verdict: status, limit + reset headers (429 requires
+    // retry-after), the status-consistent limit code with a present,
+    // status-consistent retryable flag, the upgrade CTA pointer, and no
+    // secret leakage. Without enforcement this fails naming the 206 (and
+    // the missing headers); with enforcement it passes.
+    assertPlanLimitRefusal({
+      status: res.status(),
+      headers: res.headers(),
+      bodyText,
+      secrets: cappedSecrets(capped),
+      context: 'plan-limit-stream',
+    });
+  });
+
+  test('over-limit staging account is refused on ingest with a plan-limit status', async ({
+    request,
+  }) => {
+    const baseURL = stagingBaseUrl('skip', 'plan-limit-ingest');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    // A separately minted capped account (never the journey identity, never
+    // the stream leg's account): each refusal leg implicates only its own
+    // capped account. Placed last so its red-by-design failure skips nothing.
+    const capped = await mintCappedAccount(request, baseURL, 'plan-limit-ingest');
+    const headers = accountHeaders(capped);
+    // The fixture bytes are a valid NZB document, posted raw: the cap check
+    // is a guard on the ingest-write path, so a capped account is refused
+    // 402/429 rather than accepted for processing. This is the ingest the
+    // stream leg must NOT perform as its capped account.
+    const ingestUrl = `${baseURL}${API.ingest}`;
+    const res = await apiPost(
+      request,
+      ingestUrl,
+      { ...headers, 'Content-Type': 'application/octet-stream' },
+      readFileSync(FIXTURE_NZB),
+      'plan-limit-ingest',
+    );
+    const bodyText = await readApiBody(res, ingestUrl, 'plan-limit-ingest');
+    // Same refusal verdict as the stream leg: without enforcement this fails
+    // naming the missing status (accepted, or no route yet); with
+    // enforcement it passes. The route is the documented POST /api/ingest
+    // (e2e/helpers/contract.ts): no fallback route, no skip — an absent
+    // route fails naming its status.
+    assertPlanLimitRefusal({
+      status: res.status(),
+      headers: res.headers(),
+      bodyText,
+      secrets: cappedSecrets(capped),
+      context: 'plan-limit-ingest',
+    });
   });
 });

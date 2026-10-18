@@ -136,6 +136,7 @@ fn play_path_reports_over_cap_grants_as_unauthorized_ttl_too_long() {
     let mut cache = ContentCache::new();
     let mut meter = MemoryMeter::default();
     let input = PlayInput {
+        trace_id: None,
         token: &token,
         track_id: "track-9",
         range: None,

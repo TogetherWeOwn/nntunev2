@@ -20,6 +20,7 @@ fn msg() -> QueueMsg {
         limit: None,
         page: None,
         payload_ref: Some("nzb:sha256:abc".to_owned()),
+        trace_id: None,
     }
 }
 

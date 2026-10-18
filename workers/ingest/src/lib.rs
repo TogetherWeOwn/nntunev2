@@ -24,6 +24,7 @@
 //! See `README.md`.
 
 use futures_util::StreamExt;
+use nntune_logging::{Level, LogRecord, Worker as LogWorker};
 use worker::{console_log, Env, Request, Response, Result, RouteContext, Router};
 
 pub mod api_error;
@@ -117,6 +118,49 @@ fn headers_json() -> Result<worker::Headers> {
     let headers = worker::Headers::new();
     headers.append("content-type", "application/json; charset=utf-8")?;
     Ok(headers)
+}
+
+/// Resolve the request trace from the inbound `x-trace-id` header: a valid
+/// 128-bit ID is kept, anything else (absent, malformed, untrusted) is
+/// replaced with a fresh random ID. The invalid value is never logged.
+fn inbound_trace_id(req: &Request) -> String {
+    let header = req
+        .headers()
+        .get(nntune_logging::TRACE_HEADER)
+        .ok()
+        .flatten();
+    nntune_logging::resolve_trace_id(header.as_deref())
+}
+
+/// Emit one structured log line for this request (`docs/logging-standard.md`).
+/// Field validation runs at construction: a banned key or secret-like value
+/// drops the line instead of leaking it. All call-site fields are constants
+/// plus opaque IDs and counters, so the drop branch only fires on a code bug.
+pub(crate) fn emit(level: Level, trace_id: &str, event: &str, fields: serde_json::Value) {
+    let ts_millis = worker::Date::now().as_millis();
+    let Ok(field_map) = nntune_logging::fields_from_json(fields) else {
+        return;
+    };
+    let Ok(record) = LogRecord::new(
+        LogWorker::Ingest,
+        level,
+        trace_id,
+        event,
+        field_map,
+        ts_millis,
+    ) else {
+        return;
+    };
+    console_log!("{}", record.to_json_line());
+}
+
+/// Echo the request trace on a response so callers can correlate.
+/// Best-effort: a header failure must not fail the request itself.
+fn with_trace(mut response: Response, trace_id: &str) -> Response {
+    let _ = response
+        .headers_mut()
+        .append(nntune_logging::TRACE_HEADER, trace_id);
+    response
 }
 
 fn accepted(body: serde_json::Value) -> Result<Response> {
@@ -1082,8 +1126,10 @@ async fn store_upload_payload(env: &Env, payload_ref: &str, nzb_xml: &str) -> bo
 }
 
 /// Validate a search body and enqueue it; the Queue consumer runs the
-/// search → parse → probe → verify → match → write workflow.
-async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
+/// search → parse → probe → verify → match → write workflow. The resolved
+/// trace travels in every log line, in the `x-trace-id` response header, and
+/// in the queued message for the consumer.
+async fn search(req: &mut Request, ctx: &RouteContext<()>, trace_id: &str) -> Result<Response> {
     let text = match read_capped_text(req, MAX_SEARCH_BODY_BYTES).await {
         Ok(text) => text,
         Err(err) => return json_error(err),
@@ -1104,7 +1150,7 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
         return search_rate_limited_response(retry_after_secs);
     }
     let q = parsed.query.trim().to_string();
-    let msg = match dispatch::build_search_dispatch(
+    let mut msg = match dispatch::build_search_dispatch(
         &parsed.user_id,
         &q,
         &parsed.indexer_ref,
@@ -1115,7 +1161,15 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
         Ok(msg) => msg,
         Err(message) => return json_error(ApiError::invalid_request(message)),
     };
-    console_log!("ingest search q_len={} job={}", q.len(), msg.job_id);
+    msg.trace_id = Some(trace_id.to_string());
+    // Operational facts only: opaque job ID plus the query length. The query
+    // text, user handle, and indexer handle never enter a log line.
+    emit(
+        Level::Info,
+        trace_id,
+        "ingest.search.received",
+        serde_json::json!({"job_id": msg.job_id, "q_len": q.len()}),
+    );
     // Durable idempotent admission: the (job_id, stage) ledger owns the
     // enqueue + meter outbox, fail-closed. A 503 here means nothing was
     // accepted with its meter; the client retry converges on one `Ok`
@@ -1133,8 +1187,9 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
 }
 
 /// Validate an NZB upload and enqueue it; the consumer parses with
-/// `nntune-core`, probes the pool DO, and verifies before matching.
-async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Response> {
+/// `nntune-core`, probes the pool DO, and verifies before matching. Same
+/// trace contract as [`search`]: log lines, response header, queued message.
+async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>, trace_id: &str) -> Result<Response> {
     let text = match read_capped_text(req, MAX_UPLOAD_BODY_BYTES).await {
         Ok(text) => text,
         Err(err) => return json_error(err),
@@ -1163,23 +1218,37 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>) -> Result<Respons
                     ))
                 }
             }
-            let msg = match dispatch::build_upload_dispatch(&parsed.user_id, &parsed.nzb_xml) {
+            let mut msg = match dispatch::build_upload_dispatch(&parsed.user_id, &parsed.nzb_xml) {
                 Ok(msg) => msg,
                 Err(message) => return json_error(ApiError::invalid_request(message)),
             };
+            msg.trace_id = Some(trace_id.to_string());
             // The bytes must be durably stored before the job exists: an
             // enqueued job without retrievable bytes can never run.
             let payload_ref = msg.payload_ref.clone().unwrap_or_default();
             if payload_ref.is_empty()
                 || !store_upload_payload(&ctx.env, &payload_ref, &parsed.nzb_xml).await
             {
+                // KV/driver detail stays out of the line; the trace plus the
+                // failed stage is enough to correlate.
+                emit(
+                    Level::Error,
+                    trace_id,
+                    "ingest.payload.store_failed",
+                    serde_json::json!({"source": "nzb_upload"}),
+                );
                 return service_unavailable("payload store unavailable; nothing was accepted");
             }
-            console_log!(
-                "ingest upload files={} segments={} job={}",
-                est.file_count,
-                est.segment_count,
-                msg.job_id
+            // Counts plus the opaque job ID; filenames and NZB bytes never log.
+            emit(
+                Level::Info,
+                trace_id,
+                "ingest.upload.received",
+                serde_json::json!({
+                    "job_id": msg.job_id,
+                    "file_count": est.file_count,
+                    "segment_count": est.segment_count,
+                }),
             );
             // Durable idempotent admission after the payload store (bytes are
             // TTL-expired on failure): the (job_id, stage) ledger owns the
@@ -1215,11 +1284,19 @@ fn healthz() -> Result<Response> {
 /// Job checkpoint status: read the durable checkpoint written at
 /// admission and advanced by the Queue consumer. Unknown ids are 404; a
 /// checkpoint-store failure is 503 (never a fabricated status).
-async fn job_status(_req: &Request, ctx: &RouteContext<()>) -> Result<Response> {
+/// Malformed IDs answer 404 without a log line (scanner noise stays out of
+/// the logs); valid IDs log one `status_checked` line under the trace.
+async fn job_status(ctx: &RouteContext<()>, trace_id: &str) -> Result<Response> {
     let id = ctx.param("id").cloned().unwrap_or_default();
     if !validate_job_id(&id) {
         return json_error(ApiError::not_found("unknown job id"));
     }
+    emit(
+        Level::Info,
+        trace_id,
+        "ingest.job.status_checked",
+        serde_json::json!({"job_id": id}),
+    );
     match checkpoint::get(&ctx.env, &id).await {
         Ok(Some(cp)) => Response::from_json(&cp),
         Ok(None) => json_error(ApiError::not_found("unknown job id")),
@@ -2594,17 +2671,159 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
     Router::new()
         .get_async("/healthz", |_, _| async { healthz() })
         .post_async("/v1/ingest/search", |mut req, ctx| async move {
-            search(&mut req, &ctx).await
+            // Resolve once per request: the same trace rides the log lines,
+            // the `x-trace-id` response echo, and the queued message. Every
+            // response below passes through `with_trace`, so error shapes
+            // from the admission/meter paths stay byte-identical.
+            let trace_id = inbound_trace_id(&req);
+            search(&mut req, &ctx, &trace_id)
+                .await
+                .map(|r| with_trace(r, &trace_id))
         })
         .post_async("/v1/ingest/nzb", |mut req, ctx| async move {
-            upload_nzb(&mut req, &ctx).await
+            let trace_id = inbound_trace_id(&req);
+            upload_nzb(&mut req, &ctx, &trace_id)
+                .await
+                .map(|r| with_trace(r, &trace_id))
         })
         .get_async("/v1/ingest/jobs/:id", |req, ctx| async move {
-            job_status(&req, &ctx).await
+            let trace_id = inbound_trace_id(&req);
+            job_status(&ctx, &trace_id)
+                .await
+                .map(|r| with_trace(r, &trace_id))
         })
-        .or_else_any_method_async("/*catchall", |_, _| async {
-            json_error(ApiError::not_found("not found"))
+        .or_else_any_method_async("/*catchall", |req, _| async move {
+            let trace_id = inbound_trace_id(&req);
+            json_error(ApiError::not_found("not found")).map(|r| with_trace(r, &trace_id))
         })
         .run(req, env)
         .await
+}
+
+#[cfg(test)]
+mod logging_trace_tests {
+    use super::*;
+
+    const TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
+
+    /// The route's `received` line goes through the REAL emitter
+    /// (`nntune-logging`), not a hand-written fixture: the same constructor
+    /// and renderer production uses, checked against the six-key envelope.
+    #[test]
+    fn structured_received_lines_conform_to_the_standard() {
+        for (event, value) in [
+            (
+                "ingest.search.received",
+                serde_json::json!({"job_id": "job_01", "q_len": 9}),
+            ),
+            (
+                "ingest.upload.received",
+                serde_json::json!({"job_id": "job_01", "file_count": 1, "segment_count": 2}),
+            ),
+            (
+                "ingest.job.status_checked",
+                serde_json::json!({"job_id": "job_01"}),
+            ),
+        ] {
+            let fields = nntune_logging::fields_from_json(value).unwrap();
+            let record = LogRecord::new(
+                LogWorker::Ingest,
+                Level::Info,
+                TRACE,
+                event,
+                fields,
+                1_792_094_400_123,
+            )
+            .unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&record.to_json_line()).unwrap();
+            let object = parsed.as_object().unwrap();
+            assert_eq!(object.len(), 6);
+            assert_eq!(object["worker"], "ingest");
+            assert_eq!(object["trace_id"], TRACE);
+            assert_eq!(object["event"], event);
+            assert_eq!(object["ts"], "2026-10-15T20:00:00.123Z");
+            assert_eq!(record.trace_id(), TRACE);
+        }
+    }
+
+    /// The inbound gate is `resolve_trace_id`: valid IDs pass through for
+    /// downstream propagation, everything else is replaced — never trusted.
+    #[test]
+    fn invalid_inbound_trace_is_replaced_never_trusted() {
+        assert_eq!(
+            nntune_logging::resolve_trace_id(Some(TRACE)),
+            TRACE,
+            "a valid inbound ID must survive unchanged"
+        );
+        for bad in [
+            "",
+            "short",
+            "9F3A4C2E1B5D4F6A8C7E9D0B1A2F4E6C",
+            "Bearer abc",
+        ] {
+            let resolved = nntune_logging::resolve_trace_id(Some(bad));
+            assert!(nntune_logging::is_valid_trace_id(&resolved));
+            assert_ne!(resolved, bad);
+        }
+    }
+
+    /// Route-stamped traces ride the queue message to the consumer (which
+    /// must not replace a valid ID); builders stay trace-free so dispatch
+    /// math is unaffected by observability.
+    #[test]
+    fn queue_messages_carry_the_request_trace() {
+        let mut msg =
+            dispatch::build_search_dispatch("user_01", "dark side", "vault_idx_01-ab", &[], 25, 0)
+                .unwrap();
+        assert_eq!(msg.trace_id, None);
+        msg.trace_id = Some(TRACE.to_string());
+        let back: QueueMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(back.trace_id.as_deref(), Some(TRACE));
+    }
+
+    /// Negative privacy coverage: the exact field shapes the routes emit
+    /// carry only opaque IDs, counts, and fixed labels — no user handles,
+    /// query text, credentials, or network identifiers. Secret-like shapes
+    /// are hard-rejected by the emitter itself.
+    #[test]
+    fn route_field_shapes_carry_no_handles_or_secrets() {
+        const ALLOWED: &[&str] = &[
+            "job_id",
+            "q_len",
+            "file_count",
+            "segment_count",
+            "source",
+            "status_code",
+        ];
+        for value in [
+            serde_json::json!({"job_id": "job_aaa", "q_len": 9}),
+            serde_json::json!({"job_id": "job_aaa", "file_count": 1, "segment_count": 2}),
+            serde_json::json!({"job_id": "job_aaa"}),
+            serde_json::json!({"job_id": "job_aaa", "source": "nzb_upload"}),
+            serde_json::json!({"source": "nzb_upload"}),
+        ] {
+            let fields = nntune_logging::fields_from_json(value).unwrap();
+            for key in fields.keys() {
+                assert!(
+                    ALLOWED.contains(&key.as_str()),
+                    "unexpected route field {key}"
+                );
+            }
+        }
+        // Credential, identity, and network shapes are rejected outright by
+        // the emitter. (`user_id` passes the key filter as an opaque handle,
+        // but no route shape above attaches it — the allowlist proves it.)
+        for value in [
+            serde_json::json!({"authorization": "Bearer abc"}),
+            serde_json::json!({"client_ip": "192.0.2.1"}),
+            serde_json::json!({"api_key": "k"}),
+            serde_json::json!({"contact_email": "a@example.com"}),
+            serde_json::json!({"query": "dark side", "session_id": "s"}),
+        ] {
+            assert!(
+                nntune_logging::fields_from_json(value).is_err(),
+                "emitter accepted a banned shape"
+            );
+        }
+    }
 }

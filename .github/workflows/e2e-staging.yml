@@ -11,9 +11,9 @@ name: e2e-staging
 # cannot produce a full-journey PASS. Scheduled and manually dispatched
 # runs are monitoring only: they run the synthetic smoke and never the
 # full journey, so they cannot be cited as post-deploy promotion
-# evidence. A source SHA is not deployed-build identity (no build ID is
-# exposed through any public health endpoint), so even a post-deploy PASS
-# does not by itself prove which build is serving (see docs/ops.md).
+# evidence. Same-build evidence comes from the build-identity spec in the
+# full journey: it compares GET /api/build (baked at build time) with the
+# promotion SHA the caller passes as inputs.expected_sha (see docs/ops.md).
 #
 # Pre-deploy there is no staging yet: jobs skip at step level with a notice
 # when secrets.STAGING_BASE_URL is unset. Once staging is configured the
@@ -29,6 +29,15 @@ on:
         description: Run the full journey as post-deploy evidence
         type: boolean
         required: true
+      expected_sha:
+        # Promotion SHA from the push-triggered deploy run (deploy.yml passes
+        # github.sha). The build-identity spec compares GET /api/build with
+        # this value; a source checkout is never consulted. Optional so
+        # monitoring triggers (which never call this workflow) keep working;
+        # the spec fails closed when it is absent on a configured run.
+        description: Promotion commit SHA the staging deploy was built from
+        type: string
+        required: false
     secrets:
       STAGING_BASE_URL:
         required: false
@@ -323,6 +332,10 @@ jobs:
           SYNTHETIC_NNTP_USER: ${{ secrets.SYNTHETIC_NNTP_USER }}
           SYNTHETIC_NNTP_TLS: ${{ secrets.SYNTHETIC_NNTP_TLS }}
           SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
+          # Promotion SHA from the push-triggered deploy run (inputs.expected_sha,
+          # set by deploy.yml from github.sha) — never a source checkout. The
+          # build-identity spec fails closed when it is absent or malformed.
+          EXPECTED_BUILD_SHA: ${{ inputs.expected_sha }}
         run: npm run e2e:staging
 
       - name: Publish signup-path evidence summary

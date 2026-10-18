@@ -161,7 +161,12 @@ test.describe('credential scope (static pins)', () => {
       'health.spec.ts',
       'ingest-play-meter.spec.ts',
       'signup-byop.spec.ts',
+      'signup-wizard-arrival.spec.ts',
+      'player-queue-order.spec.ts',
+      'demo-audio-contract.spec.ts',
       'demo-media-sessionless.spec.ts',
+      'build-identity.spec.ts',
+      'zz-build-identity-final.spec.ts',
     ]) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must not carry credentials on a raw request call`).not.toMatch(
@@ -171,11 +176,41 @@ test.describe('credential scope (static pins)', () => {
     for (const name of [
       'health.spec.ts',
       'ingest-play-meter.spec.ts',
+      'player-queue-order.spec.ts',
+      'demo-audio-contract.spec.ts',
       'demo-media-sessionless.spec.ts',
     ]) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must use the no-follow wrapper`).toContain('apiGet(');
     }
+    // The build-identity opening + closing legs reach the no-follow wrapper
+    // through the shared live helper (pinned in the deployed-build identity
+    // section below), never raw: the ban above still applies to both files.
+    for (const name of ['build-identity.spec.ts', 'zz-build-identity-final.spec.ts']) {
+      const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
+      expect(source, `${name} must route through the shared live helper`).toContain(
+        'assertServingBuildMatchesPromotion(',
+      );
+    }
+  });
+
+  test('anonymous denial probe stays credential-free and no-follow', () => {
+    // The anonymous app-shell check must go through anonymousGet (no headers
+    // parameter, maxRedirects: 0) and the inverse wall assertion. Pin both
+    // so it cannot silently regress to a credentialed apiGet (which would
+    // prove the with-token side again) or to a raw call.
+    const accounts = readFileSync(new URL('../helpers/accounts.ts', import.meta.url), 'utf8');
+    expect(accounts).toContain('export async function anonymousGet');
+    const health = readFileSync(new URL(`../tests/health.spec.ts`, import.meta.url), 'utf8');
+    expect(health, 'health.spec.ts must probe anonymously via anonymousGet').toContain(
+      'anonymousGet(',
+    );
+    expect(health, 'health.spec.ts must assert the Access wall for the anonymous probe').toContain(
+      'assertAccessWall(',
+    );
+    expect(health, 'anonymous probe must use an isolated request context').toContain(
+      'playwrightRequest.newContext(',
+    );
   });
 
   test('no-follow pin catches nested-paren and fetch mutants', () => {
@@ -232,6 +267,108 @@ test.describe('public UI signup coverage (static pin)', () => {
     expect(helper).not.toContain('tryMintTestAccount');
     expect(helper).not.toContain('API.testAccounts');
     expect(helper).not.toContain('qaAuthHeader');
+  });
+
+  // Wizard-arrival leg: the new spec proves the real form reaches
+  // `/onboarding/byop` via the virtual authenticator + the staging-only code
+  // seam. These pins keep it honest offline: still no mint, still skip-green
+  // pre-deploy, still names-only diagnostics — while the wizard assertion
+  // lives in the NEW helper (the shared helper above must keep asserting the
+  // `magic_code` step only, never the wizard).
+  test('wizard-arrival case reaches the wizard with no account-seam mint', () => {
+    const spec = readFileSync(new URL('../tests/signup-wizard-arrival.spec.ts', import.meta.url), 'utf8');
+    const marker = "test('public UI signup with virtual authenticator reaches the BYOP wizard'";
+    const start = spec.indexOf(marker);
+    expect(start, 'wizard-arrival case is missing').toBeGreaterThan(-1);
+    const rest = spec.slice(start + marker.length);
+    const nextTest = rest.search(/\ntest(?:\(|\.describe)/);
+    const dedicated = nextTest === -1 ? spec.slice(start) : spec.slice(start, start + marker.length + nextTest);
+    // Null identity = Access pair only: the page starts unauthenticated, so
+    // the form is the only account-creation path even with QA_AUTH_TOKEN set.
+    expect(dedicated).toContain('applyAccountToPage(page, null, baseURL)');
+    expect(dedicated).toContain('submitPublicUiSignupToByopWizard(page, request, baseURL)');
+    // Arrival asserted at the spec level too (landed URL + wizard field).
+    expect(dedicated).toContain("'/onboarding/byop'");
+    expect(dedicated).toContain('page.url()');
+    expect(dedicated).toContain('TESTIDS.byopHost');
+    // Never the mint seam: arrival must come from the public form.
+    expect(dedicated).not.toContain('tryMintTestAccount');
+    expect(dedicated).not.toContain('API.testAccounts');
+    // Skip-green pre-deploy (file-level + in-test guards); QA_AUTH_TOKEN
+    // guard skips locally and fails closed on CI.
+    expect(spec).toContain('STAGING_BASE_URL');
+    expect(dedicated).toContain('QA_AUTH_TOKEN');
+    // Provenance label without account data.
+    expect(dedicated).toContain('annotateSignupPath');
+  });
+
+  test('wizard-arrival helper completes the form via the code seam and virtual authenticator', () => {
+    const accounts = readFileSync(new URL('../helpers/accounts.ts', import.meta.url), 'utf8');
+    const helperStart = accounts.indexOf('export async function submitPublicUiSignupToByopWizard');
+    expect(helperStart, 'wizard-arrival helper is missing').toBeGreaterThan(-1);
+    const helperRest = accounts.slice(helperStart + 'export async function submitPublicUiSignupToByopWizard'.length);
+    const nextExport = helperRest.search(/\nexport /);
+    const helper = nextExport === -1 ? accounts.slice(helperStart) : accounts.slice(helperStart, helperStart + 'export async function submitPublicUiSignupToByopWizard'.length + nextExport);
+    // Real form, both steps: email submit then the emailed-code field.
+    expect(helper).toContain('`${baseURL}/signup`');
+    expect(helper).toContain('TESTIDS.signupEmail');
+    expect(helper).toContain('TESTIDS.signupSubmit');
+    expect(helper).toContain('magic_code');
+    // Code comes from the staging-only seam (never minted, never fabricated).
+    // The seam path itself (`API.testCodes`) is pinned on the seam reader
+    // below plus the contract — this helper reaches it via the reader.
+    expect(helper).toContain('retrieveStagedSignupCode');
+    // Passkey finish runs against a virtual authenticator, not hardware
+    // (the CDP call lives in `enableVirtualAuthenticator`, pinned below).
+    expect(helper).toContain('enableVirtualAuthenticator');
+    // Wizard arrival asserted here (unlike the shared helper above).
+    expect(helper).toContain("'/onboarding/byop'");
+    expect(helper).toContain('page.url()');
+    expect(helper).toContain('TESTIDS.byopHost');
+    // Never the mint seam in the arrival path.
+    expect(helper).not.toContain('tryMintTestAccount');
+    expect(helper).not.toContain('API.testAccounts');
+    // Names-only diagnostics: neither the mailbox nor the code value may be
+    // interpolated into an error.
+    expect(helper).toContain('no values logged');
+    expect(helper).not.toContain('${email}');
+    expect(helper).not.toContain('${code}');
+
+    // The seam reader itself: token-gated, fail-closed, names-only.
+    const seamStart = accounts.indexOf('export async function retrieveStagedSignupCode');
+    expect(seamStart, 'staged code-seam reader is missing').toBeGreaterThan(-1);
+    const seamRest = accounts.slice(seamStart + 'export async function retrieveStagedSignupCode'.length);
+    const seamNext = seamRest.search(/\nexport /);
+    const seam = seamNext === -1 ? accounts.slice(seamStart) : accounts.slice(seamStart, seamStart + 'export async function retrieveStagedSignupCode'.length + seamNext);
+    expect(seam).toContain('QA_AUTH_TOKEN');
+    expect(seam).toContain('API.testCodes');
+    expect(seam).toContain('qaAuthHeader');
+    expect(seam).toContain('magic_token');
+    expect(seam).toContain('HTTP ${status}');
+    expect(seam).toContain('no values logged');
+    expect(seam).not.toContain('${email}');
+    expect(seam).not.toContain('tryMintTestAccount');
+    expect(seam).not.toContain('API.testAccounts');
+
+    // The virtual authenticator: CDP WebAuthn domain, resident-key plus
+    // user-verification capable and pre-verified, matching the signup page's
+    // `required` ceremony. Failures stay names-only.
+    const vaStart = accounts.indexOf('export async function enableVirtualAuthenticator');
+    expect(vaStart, 'virtual-authenticator helper is missing').toBeGreaterThan(-1);
+    const vaRest = accounts.slice(vaStart + 'export async function enableVirtualAuthenticator'.length);
+    const vaNext = vaRest.search(/\nexport /);
+    const va = vaNext === -1 ? accounts.slice(vaStart) : accounts.slice(vaStart, vaStart + 'export async function enableVirtualAuthenticator'.length + vaNext);
+    expect(va).toContain('WebAuthn.enable');
+    expect(va).toContain('WebAuthn.addVirtualAuthenticator');
+    expect(va).toContain('hasResidentKey');
+    expect(va).toContain('hasUserVerification');
+    expect(va).toContain('isUserVerified');
+    expect(va).toContain('newCDPSession');
+    expect(va).toContain('no values logged');
+
+    // The contract carries the seam path so a rename fails by name.
+    const contract = readFileSync(new URL('../helpers/contract.ts', import.meta.url), 'utf8');
+    expect(contract).toContain("testCodes: '/api/test-codes'");
   });
 });
 
@@ -803,5 +940,397 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     expect(stagingWorkflow).not.toContain('wrangler');
     expect(stagingWorkflow).not.toContain('--env production');
     expect(section).not.toContain('deploy --env');
+  });
+});
+
+// Locked-dependency coverage builds (static pin): coverage.yml builds
+// `--locked` for every standalone crate with a committed workers/<crate>/
+// Cargo.lock plus the root workspace (covering stream), and fails closed on
+// missing reports — but nothing stops a future edit from dropping a
+// `--locked` flag or adding an uncovered standalone crate. These cases pin
+// the mapping offline so such an edit reds test:unit.
+// Commented-out steps are inactive: strip full-line `#` comments once at load
+// so a commented-out llvm-cov command cannot satisfy the pins below.
+const coverageWorkflow = readFileSync(new URL('coverage.yml', workflowDir), 'utf8').replace(
+  /^[ \t]*#.*$/gm,
+  '',
+);
+
+// Join backslash continuations so multi-line invocations read as one command.
+const coverageCommands = coverageWorkflow
+  .replace(/\\\n/g, '')
+  .split('\n')
+  .filter((line) => line.includes('cargo llvm-cov'));
+
+// `for crate in ingest mb; do cargo llvm-cov --locked --manifest-path
+// "workers/${crate}/Cargo.toml" ...` covers a set of crates with one generic
+// locked step: resolve the loop word lists whose OWN body is such a step.
+// The body scope matters: the summary loop below (`for crate in root api
+// ingest mb repair`) never runs llvm-cov, so testing the whole file would
+// wrongly credit its word list.
+function loopCoveredCrates(): Set<string> {
+  const covered = new Set<string>();
+  for (const match of coverageWorkflow.matchAll(/for (\w+) in ([^;]+); do([\s\S]*?)done/g)) {
+    const variable = match[1]!;
+    const words = match[2]!.trim().split(/\s+/);
+    const body = match[3]!;
+    const generic = new RegExp(
+      `cargo llvm-cov --locked --manifest-path\\s+"?workers/\\$\\{${variable}\\}/Cargo\\.toml"?`,
+    );
+    if (generic.test(body)) {
+      for (const word of words) covered.add(word);
+    }
+  }
+  return covered;
+}
+
+function crateHasLockedCoverageStep(crate: string, loopCovered: Set<string>): boolean {
+  // Accept the manifest path quoted or unquoted: both are valid shell.
+  const direct = new RegExp(
+    `cargo llvm-cov --locked --manifest-path\\s+"?workers/${crate}/Cargo\\.toml"?`,
+  );
+  return direct.test(coverageWorkflow) || loopCovered.has(crate);
+}
+
+test.describe('locked-dependency coverage builds (static pin)', () => {
+  test('every committed workers lockfile has a --locked llvm-cov step', () => {
+    // Enumerated from the tree (not a hardcoded list) so a newly added
+    // standalone crate with a committed Cargo.lock fails until coverage.yml
+    // gains a locked step for it.
+    const workersDir = fileURLToPath(new URL('../../workers/', import.meta.url));
+    const lockCrates = readdirSync(workersDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .filter((name) => existsSync(join(workersDir, name, 'Cargo.lock')))
+      .sort();
+    expect(lockCrates.length).toBeGreaterThan(0);
+    const loopCovered = loopCoveredCrates();
+    for (const crate of lockCrates) {
+      expect(
+        crateHasLockedCoverageStep(crate, loopCovered),
+        `workers/${crate}/Cargo.lock has no --locked llvm-cov step in coverage.yml`,
+      ).toBe(true);
+    }
+  });
+
+  test('no manifest-pinned llvm-cov step drops its --locked flag', () => {
+    expect(coverageCommands.length).toBeGreaterThan(0);
+    for (const command of coverageCommands) {
+      if (command.includes('--manifest-path')) {
+        expect(command, `llvm-cov step lost its --locked flag: ${command.trim()}`).toContain(
+          '--locked',
+        );
+      }
+    }
+  });
+
+  test('stream stays covered by the root workspace step while a member, locked step if extracted', () => {
+    const rootManifest = readFileSync(new URL('../../Cargo.toml', import.meta.url), 'utf8');
+    const members = rootManifest.match(/members = \[([^\]]*)\]/)?.[1] ?? '';
+    // Compare complete member values: a substring match would let e.g.
+    // `workers/stream-tools` select the workspace branch and bypass the
+    // locked stream-step assertion.
+    const memberValues = [...members.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    if (memberValues.includes('workers/stream')) {
+      expect(
+        coverageCommands.some(
+          (command) =>
+            command.includes('--workspace') &&
+            !command.includes('--manifest-path') &&
+            !/--exclude|--package|\s-p\s/.test(command),
+        ),
+        'root workspace llvm-cov step covering workers/stream is missing',
+      ).toBe(true);
+    } else {
+      expect(
+        crateHasLockedCoverageStep('stream', loopCoveredCrates()),
+        'workers/stream left the root workspace without a --locked llvm-cov step',
+      ).toBe(true);
+    }
+  });
+});
+
+test.describe('deploy.yml carries no backend Worker deploy job', () => {
+  // Backend Worker deploys are intentionally NOT wired in deploy.yml (see its
+  // header): this workflow deploys apps/web only, and each backend lane must
+  // add its own evidenced job. These pins fail on any new
+  // `deploy-api-worker`-style job with `wrangler deploy --env staging`,
+  // anything deploying under workers/, any production-environment deploy
+  // step, or a bare `command: deploy` (apps/web top-level name equals the
+  // production env name, so a bare deploy targets production). When the
+  // authorized backend lane lands, it extends this guard (allowlist +
+  // evidence) instead of weakening it.
+  const jobsBody = deployWorkflow.split('\njobs:\n')[1]!;
+
+  // Shared guard: the real pins below call these helpers, and the mutant
+  // test asserts the same helpers throw for each synthetic backend lane —
+  // so weakening a pin breaks the mutant test instead of silently passing.
+  const assertJobSet = (body: string) => {
+    const names = [...body.matchAll(/^  ([A-Za-z0-9_-]+):$/gm)].map((m) => m[1]!).sort();
+    expect(names).toEqual(['gate', 'post-deploy-e2e', 'preview-web', 'staging-web']);
+    for (const name of names) {
+      expect(name, `job ${name} must not look like a backend deploy lane`).not.toMatch(
+        /worker|backend/i,
+      );
+    }
+  };
+
+  const assertDeployBody = (body: string) => {
+    expect(body.match(/wrangler-action/g) ?? []).toHaveLength(2);
+    expect(body.match(/deploy --env/g) ?? []).toHaveLength(1);
+    // Exact command pin: staging-web deploys to staging, preview-web runs
+    // `preview`. A bare `command: deploy` (no --env) deploys the top-level
+    // worker name, which equals the production env name — count checks alone
+    // miss it, so pin every wrangler-action command value exactly.
+    const commands = [...body.matchAll(/^\s+command: (.+)$/gm)]
+      .map((m) => m[1]!.trim())
+      .sort();
+    expect(
+      commands,
+      `wrangler commands stay exactly the evidenced web lanes (got ${JSON.stringify(commands)})`,
+    ).toEqual(['deploy --env staging', 'preview']);
+    // Raw-CLI pin: no `run:` step may invoke a wrangler deploy, even split
+    // across lines (`wrangler \` + newline + `deploy`), version-pinned
+    // (`wrangler@<ver> deploy`), or flag-first (`wrangler --config x
+    // deploy`). Join continuations, then match `wrangler` (excluding
+    // `wrangler-action` and `wranglerVersion`) followed anywhere on the
+    // same logical line by `deploy`.
+    const flat = body.replace(/\\\r?\n\s*/g, ' ');
+    expect(flat).not.toMatch(/\bwrangler\b(?!-action)[^\n]*\bdeploy\b/);
+    for (const line of body.split('\n')) {
+      if (line.includes('workingDirectory:') || line.includes('working-directory:')) {
+        expect(line, `deploy working directory stays apps/web (${line.trim()})`).toContain(
+          'apps/web',
+        );
+      }
+    }
+  };
+
+  const assertNoBackendPath = (body: string) => {
+    // Header comments (above `jobs:`) legitimately name workers/ and the
+    // future Hyperdrive gate; the jobs body itself stays web-only with no
+    // production path. Case-sensitive: the preview job carries a `Workers
+    // preview deployment` comment (no path), which must keep passing.
+    // Production pin: the jobs body carries no `production` word at all in
+    // code (comments stripped). That covers `--env production`,
+    // `--env=production`, `environment: production`, the mapping form
+    // (`environment:\n  name: production`), quoted values, and
+    // `CLOUDFLARE_ENV: production` — while a harmless full-line comment
+    // mentioning production still passes.
+    expect(body).not.toContain('workers/');
+    const code = body
+      .split('\n')
+      .filter((l) => !/^\s*#/.test(l))
+      .join('\n');
+    expect(code.toLowerCase()).not.toContain('production');
+  };
+
+  const assertDeployGuard = (body: string) => {
+    assertJobSet(body);
+    assertDeployBody(body);
+    assertNoBackendPath(body);
+  };
+
+  test('job set is exactly the evidenced web-only lanes', () => {
+    assertJobSet(jobsBody);
+  });
+
+  test('only the evidenced web staging step runs a wrangler deploy', () => {
+    // staging-web deploys apps/web to staging; preview-web runs `preview`
+    // (not deploy). Any additional wrangler deploy — action or raw
+    // `wrangler deploy` CLI — is a backend-lane candidate until evidenced.
+    assertDeployBody(jobsBody);
+    expect(jobSection(deployWorkflow, 'staging-web')).toContain('command: deploy --env staging');
+  });
+
+  test('no workers/ path or production-environment deploy step in the jobs body', () => {
+    assertNoBackendPath(jobsBody);
+  });
+
+  test('synthetic backend-deploy mutants trip the pins above', () => {
+    // Regression proof for the shared guard: each mutant models an
+    // unauthorized backend lane and must throw the same helpers the real
+    // pins call (not a restated copy of the expectations).
+    const workerJob =
+      '\n  deploy-api-worker:\n    runs-on: ubuntu-latest\n    defaults:\n      run:\n        working-directory: workers/api\n    steps:\n      - run: wrangler deploy --env staging\n';
+    const workerMutant = `${jobsBody}${workerJob}`;
+    const prodMutant = `${jobsBody}\n      - run: wrangler deploy --env production\n`;
+    // Bare `command: deploy` on preview-web: no --env, no `wrangler deploy`
+    // string, no workers/ or production marker — only the exact command pin
+    // catches it, and it would deploy the production worker name.
+    const bareDeployMutant = jobsBody.replace('command: preview', 'command: deploy');
+    // Multiline raw-CLI deploy: `wrangler \` + newline + `deploy` evades a
+    // contiguous `wrangler deploy` substring check but still deploys.
+    const multilineMutant = `${jobsBody}\n      - run: pnpm exec wrangler \\\n        deploy --env staging\n`;
+    // Version-pinned raw-CLI deploy (the workflow's own WRANGLER_VERSION
+    // spelling): `@<ver>` sits between the tokens, so a
+    // `wrangler\s+deploy` check misses it.
+    const versionPinnedMutant = `${jobsBody}\n      - run: npx wrangler@\${{ env.WRANGLER_VERSION }} deploy\n`;
+    // Flag-first raw-CLI deploy: a flag before the subcommand evades a
+    // `wrangler deploy` adjacency check.
+    const flagFirstMutant = `${jobsBody}\n      - run: pnpm exec wrangler --config wrangler.toml deploy\n`;
+    // Production GitHub environment mapping form on a PR-triggered job:
+    // resolves production-scoped secrets and protection rules.
+    const envMappingMutant = jobsBody.replace(
+      '    needs: [gate]\n    if: ${{ github.event_name == ',
+      '    needs: [gate]\n    environment:\n      name: production\n    if: ${{ github.event_name == ',
+    );
+    // Quoted production environment value.
+    const quotedEnvMutant = `${jobsBody}\n    environment: "production"\n`;
+
+    for (const mutant of [
+      workerMutant,
+      prodMutant,
+      bareDeployMutant,
+      multilineMutant,
+      versionPinnedMutant,
+      flagFirstMutant,
+      envMappingMutant,
+      quotedEnvMutant,
+    ]) {
+      expect(() => assertDeployGuard(mutant), 'mutant must violate the deploy guard').toThrow();
+    }
+    // Targeted evidence for which pin each mutant trips.
+    expect(() => assertJobSet(workerMutant)).toThrow();
+    expect(() => assertDeployBody(workerMutant)).toThrow();
+    expect(() => assertNoBackendPath(workerMutant)).toThrow();
+    expect(() => assertDeployBody(prodMutant)).toThrow();
+    expect(() => assertNoBackendPath(prodMutant)).toThrow();
+    expect(() => assertDeployBody(bareDeployMutant)).toThrow();
+    expect(() => assertDeployBody(multilineMutant)).toThrow();
+    expect(() => assertDeployBody(versionPinnedMutant)).toThrow();
+    expect(() => assertDeployBody(flagFirstMutant)).toThrow();
+    expect(() => assertNoBackendPath(envMappingMutant)).toThrow();
+    expect(() => assertNoBackendPath(quotedEnvMutant)).toThrow();
+  });
+});
+
+test.describe('deployed-build identity wiring (static pin)', () => {
+  // Same-build evidence: the full journey proves the serving build is the
+  // promoted one by comparing GET /api/build with the promotion SHA from the
+  // push-triggered deploy run — never a source checkout. These pins keep the
+  // chain (deploy expected_sha -> e2e-staging input -> EXPECTED_BUILD_SHA env
+  // -> build-identity spec) honest offline.
+  test('e2e-staging declares the expected_sha promotion input', () => {
+    expect(stagingWorkflow).toContain('expected_sha:');
+    expect(stagingWorkflow).toContain('Promotion SHA from the push-triggered deploy run');
+  });
+
+  test('deploy passes expected_sha from github.sha (never a checkout)', () => {
+    const section = jobSection(deployWorkflow, 'post-deploy-e2e');
+    expect(section).toContain('expected_sha: ${{ github.sha }}');
+    expect(section).not.toContain('rev-parse');
+  });
+
+  test('the e2e job exposes EXPECTED_BUILD_SHA from inputs.expected_sha', () => {
+    const section = jobSection(stagingWorkflow, 'e2e');
+    expect(section).toContain('EXPECTED_BUILD_SHA: ${{ inputs.expected_sha }}');
+  });
+
+  test('contract carries the build identity path', () => {
+    const contract = readFileSync(new URL('../helpers/contract.ts', import.meta.url), 'utf8');
+    expect(contract).toContain("build: '/api/build'");
+  });
+
+  test('build-identity helper exposes the promotion/verdict contract', () => {
+    const helper = readFileSync(
+      new URL('../helpers/build-identity.ts', import.meta.url),
+      'utf8',
+    );
+    expect(helper).toContain('export function expectedPromotionSha');
+    expect(helper).toContain('export function extractDeployedSha');
+    expect(helper).toContain('export function assertDeployedBuildMatchesPromotion');
+    expect(helper).toContain('EXPECTED_BUILD_SHA');
+    // Never a source checkout: the helper reads the run-provided env and
+    // performs pure string comparison — no shell-out to git, no checkout read.
+    // It never gates on staging itself (skip ownership stays with the spec).
+    expect(helper).not.toContain('child_process');
+    expect(helper).not.toContain('spawnSync');
+    expect(helper).not.toContain('execSync');
+    expect(helper).not.toContain('process.env.STAGING_BASE_URL');
+    expect(helper).not.toContain('stagingBaseUrl(');
+  });
+
+  test('build-identity legs compare the serving build with the promotion SHA via the shared live helper', () => {
+    // One-shot reads cannot bind a ~30 min journey: the opening leg proves
+    // the deploy delivered the promoted build before the journey and the
+    // closing leg re-reads after every other spec. Both route through one
+    // shared helper so the two reads cannot drift apart.
+    const helper = readFileSync(
+      new URL('../helpers/build-identity-live.ts', import.meta.url),
+      'utf8',
+    );
+    expect(helper).toContain('export async function assertServingBuildMatchesPromotion');
+    expect(helper).toContain('API.build');
+    expect(helper).toContain('expectedPromotionSha(');
+    expect(helper).toContain('extractDeployedSha(');
+    expect(helper).toContain('assertDeployedBuildMatchesPromotion(');
+    expect(helper).toContain('assertNoAccessWall(');
+    expect(helper).toContain('apiGet(');
+    expect(helper).toContain('accessHeaders(');
+    // The helper performs pure verdict throws, never a source checkout.
+    expect(helper).not.toContain('rev-parse');
+    expect(helper).not.toContain('child_process');
+
+    const opener = readFileSync(
+      new URL('../tests/build-identity.spec.ts', import.meta.url),
+      'utf8',
+    );
+    expect(opener).toContain(
+      'deployed build matches the promotion SHA (exact-head staging evidence)',
+    );
+    // Fail-closed: unknown and mismatch paths are pinned in the offline
+    // describe of the same file (not restated here).
+    expect(opener).toContain("'unknown'");
+    // Pre-deploy skip is in-test on STAGING_BASE_URL only — no file-level
+    // skip, so the offline verdict pins still run via test:unit.
+    expect(opener).toContain('STAGING_BASE_URL not configured (pre-deploy)');
+    expect(opener).not.toMatch(/^test\.skip\(\s*\n?\s*!process\.env\.STAGING_BASE_URL/m);
+
+    const closer = readFileSync(
+      new URL('../tests/zz-build-identity-final.spec.ts', import.meta.url),
+      'utf8',
+    );
+    expect(closer).toContain(
+      'deployed build still matches the promotion SHA at journey end (superseded-deploy guard)',
+    );
+    // A mid-journey deploy voids the evidence: the closing leg names the
+    // supersession instead of reporting a bare mismatch.
+    expect(closer).toContain('superseded by a newer deploy');
+    expect(closer).toContain('STAGING_BASE_URL not configured (pre-deploy)');
+    expect(closer).not.toMatch(/^test\.skip\(\s*\n?\s*!process\.env\.STAGING_BASE_URL/m);
+  });
+
+  test('closing identity check runs last under the serial config', () => {
+    // Playwright runs test files alphabetically with a single worker and no
+    // parallelism, so the `zz-` prefix sorts the closing read after every
+    // other spec. Pin the config and the sort position so a future
+    // parallelization or rename cannot silently move the guard mid-journey.
+    const configSource = readFileSync(
+      new URL('../playwright.config.ts', import.meta.url),
+      'utf8',
+    );
+    expect(configSource).toMatch(/workers:\s*1/);
+    expect(configSource).toMatch(/fullyParallel:\s*false/);
+    const specs = readdirSync(fileURLToPath(new URL('../tests/', import.meta.url))).filter(
+      (name) => name.endsWith('.spec.ts'),
+    );
+    expect(specs).toContain('zz-build-identity-final.spec.ts');
+    for (const name of specs) {
+      expect(
+        name <= 'zz-build-identity-final.spec.ts',
+        `${name} must sort before the closing identity check`,
+      ).toBe(true);
+    }
+  });
+
+  test('synthetic smoke stays health-only (monitoring cannot mint same-build evidence)', () => {
+    const pkg = JSON.parse(
+      readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+    ) as { scripts: Record<string, string> };
+    expect(pkg.scripts['e2e:smoke']).toContain('tests/health.spec.ts');
+    expect(pkg.scripts['e2e:smoke']).not.toContain('build-identity');
+    expect(pkg.scripts['test:unit']).toContain('tests/build-identity.spec.ts');
+    expect(pkg.scripts['test:unit']).toContain('tests/zz-build-identity-final.spec.ts');
   });
 });

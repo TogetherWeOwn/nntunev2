@@ -1,7 +1,12 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { API, TESTIDS } from '../helpers/contract.js';
-import { accessHeaders, assertNoAccessWall, stagingBaseUrl } from '../helpers/access.js';
-import { apiGet, applyAccountToPage } from '../helpers/accounts.js';
+import {
+  accessHeaders,
+  assertAccessWall,
+  assertNoAccessWall,
+  stagingBaseUrl,
+} from '../helpers/access.js';
+import { anonymousApiGet, anonymousGet, apiGet, applyAccountToPage } from '../helpers/accounts.js';
 import { assertPromotionReady } from '../helpers/readiness.js';
 
 // Fast synthetic smoke: runs post-deploy AND on a schedule. Must stay under
@@ -75,6 +80,33 @@ test.describe('staging synthetic smoke', () => {
     assertPromotionReady(readyProbe, 'ready');
   });
 
+  // Anonymous denial (the other side of the authorized checks above, which
+  // stay unchanged): a request with no Access headers or credentials, in an
+  // isolated request context, must be denied BY Access. An application
+  // ok:true answer here means anonymous traffic reached the app — a failure,
+  // not a pass. The probe helper attaches no headers regardless of the
+  // configured pair, and the assertion requires Access-specific markers,
+  // so an ordinary app error cannot masquerade as enforcement.
+  test('GET /api/health without Access credentials is denied by Access', async () => {
+    const baseURL = stagingBaseUrl('skip', 'health-anonymous');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    const probe = await anonymousApiGet(`${baseURL}${API.health}`, 'health-anonymous');
+    assertAccessWall(probe, 'health-anonymous');
+  });
+
+  test('GET /api/ready without Access credentials is denied by Access', async () => {
+    const baseURL = stagingBaseUrl('skip', 'ready-anonymous');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    const probe = await anonymousApiGet(`${baseURL}${API.ready}`, 'ready-anonymous');
+    assertAccessWall(probe, 'ready-anonymous');
+  });
+
   test('GET / serves the app shell behind Access', async ({ page }) => {
     const baseURL = stagingBaseUrl('skip', 'app-shell');
     if (!baseURL) {
@@ -110,6 +142,38 @@ test.describe('staging synthetic smoke', () => {
         page.getByRole('heading', { level: 1 }),
         'neither data-testid="app-root" nor the NNTune landing heading rendered',
       ).toContainText('NNTune', { timeout: 15_000 });
+    }
+  });
+
+  test('anonymous GET / (no credentials) is denied by Access, not served the app shell', async () => {
+    const baseURL = stagingBaseUrl('skip', 'access-anonymous');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    // Isolated request context: fresh cookie jar, no storageState, no
+    // context-level headers. The Access pair deliberately never enters this
+    // context — anonymousGet takes no headers and reads no env, and fetches
+    // with maxRedirects: 0 so an Access-login 302 is classified, not
+    // followed. The credentialed control is the test above (same origin,
+    // same path, Access pair attached): 200 + app shell there, wall here.
+    const anonymous = await playwrightRequest.newContext();
+    try {
+      const res = await anonymousGet(anonymous, `${baseURL}/`);
+      // Body is read only to feed the wall predicate; it is never put in an
+      // assertion message or log (anonymous responses must not be emitted).
+      const bodyText = await res.text().catch(() => '');
+      const probe = { status: res.status(), headers: res.headers(), bodyText, url: baseURL };
+      await res.dispose().catch(() => {});
+      assertAccessWall(probe, 'access-anonymous');
+      // Not the app shell: a wall status is never the shell's 200. Named
+      // with the status only — no body, headers or URL in the message.
+      expect(
+        probe.status,
+        'anonymous app-shell request returned 200 instead of an Access denial',
+      ).not.toBe(200);
+    } finally {
+      await anonymous.dispose();
     }
   });
 });

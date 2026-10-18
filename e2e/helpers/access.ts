@@ -60,37 +60,72 @@ export function isStagingOrigin(requestUrl: string, baseURL: string): boolean {
 }
 
 /**
+ * Access-wall predicate shared by both directions of the check: a
+ * wall-status code (401/403/302) TOGETHER WITH Access markers. Status and
+ * markers are checked jointly so a legitimate app 401/403 or an app 302
+ * is never classified as Access, and an app 200 never is either.
+ */
+export function isAccessWall(probe: WallProbe): boolean {
+  // Match Access markers against header NAMES only. Header values can echo
+  // Access identifiers back (e.g. `Access-Control-Allow-Headers:
+  // CF-Access-Client-Id` on an ordinary app 403), which must never classify
+  // an application response as an Access wall.
+  const headerNames = Object.keys(probe.headers).join('\n');
+  const location = probe.headers['location'] ?? probe.headers['Location'] ?? '';
+  const redirectToAccess =
+    probe.status === 302 && /cloudflareaccess\.com|\/cdn-cgi\/access/i.test(location);
+  const wallStatus =
+    probe.status === 401 || probe.status === 403 || probe.status === 302 || redirectToAccess;
+  // Access-specific response markers only. Generic edge-challenge
+  // markers (`cf-mitigated`, `cf_clearance`) are deliberately excluded: a
+  // bot-management/WAF challenge is not proof of Access enforcement, and
+  // accepting it would let anonymous checks pass without Access in play.
+  // A generic `<title>Access...` page is excluded for the same reason: only
+  // an explicit `Cloudflare Access` marker proves Access enforcement.
+  const hasMarkers =
+    /cf-access|cf_authorization/i.test(headerNames) ||
+    /cloudflare.?access/i.test(headerNames) ||
+    /cloudflare.?access/i.test(probe.bodyText) ||
+    redirectToAccess;
+  return wallStatus && hasMarkers;
+}
+
+/**
  * Fail closed when a response is the Cloudflare Access wall instead of the
- * app: a wall-status code (401/403/302) TOGETHER WITH Access markers means
- * the service token is missing or wrong. Status and markers are checked
- * jointly so a legitimate app 401/403 is never misreported as a wall.
- * Never silently treat the wall as an app response.
+ * app: the wall means the service token is missing or wrong. Never
+ * silently treat the wall as an app response.
  * The error names only the fixed context, status and config variable
  * names: `probe.url` is never interpolated (the staging origin is not
  * scrubbed from public artifacts, and URLs can carry secret-bearing
  * components), matching the redirect diagnostics in accounts.ts.
  */
 export function assertNoAccessWall(probe: WallProbe, context: string): void {
-  const headerDump = Object.entries(probe.headers)
-    .map(([k, v]) => `${k}: ${v}`)
-    .join('\n');
-  const location = probe.headers['location'] ?? probe.headers['Location'] ?? '';
-  const redirectToAccess =
-    probe.status === 302 && /cloudflareaccess\.com|\/cdn-cgi\/access/i.test(location);
-  const wallStatus =
-    probe.status === 401 || probe.status === 403 || probe.status === 302 || redirectToAccess;
-  const hasMarkers =
-    /cf-access|cf_authorization|cf-mitigated|cf_clearance/i.test(headerDump) ||
-    /cloudflare.?access/i.test(headerDump) ||
-    /cloudflare.?access/i.test(probe.bodyText) ||
-    /<title>\s*Access/i.test(probe.bodyText) ||
-    redirectToAccess;
-  if (wallStatus && hasMarkers) {
+  if (isAccessWall(probe)) {
     throw new Error(
       `[${context}] hit the Cloudflare Access wall ` +
         `(HTTP ${probe.status}). Set CF_ACCESS_CLIENT_ID + ` +
         'CF_ACCESS_CLIENT_SECRET for a QA service token with staging access. ' +
         'See e2e/README.md. No secret values are logged here by design.',
+    );
+  }
+}
+
+/**
+ * The inverse check for anonymous requests: fail unless the response IS
+ * an Access-specific denial. An application answer without Access — an
+ * `ok:true` 200, an app 403, an app redirect, a served app shell — means
+ * anonymous traffic reached (or may have reached) the app, which is exactly
+ * the failure this assertion exists to catch. Same diagnostics contract as
+ * assertNoAccessWall: fixed context and status only, never the probe
+ * URL, headers or body (all untrusted and potentially sensitive).
+ */
+export function assertAccessWall(probe: WallProbe, context: string): void {
+  if (!isAccessWall(probe)) {
+    throw new Error(
+      `[${context}] expected Cloudflare Access denial for an anonymous request, ` +
+        `got HTTP ${probe.status} without Access-specific markers: anonymous ` +
+        'traffic was not proven denied by Access (names only — no values logged). ' +
+        'See e2e/README.md.',
     );
   }
 }
