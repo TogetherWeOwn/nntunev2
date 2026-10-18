@@ -3055,9 +3055,7 @@ where
         // A presented-but-invalid bearer still fails closed here and is
         // never rescued by a cookie.
         if req.authorization.is_some() {
-            if let Err(resp) =
-                authorize_bearer(ctx, req.authorization.as_deref(), required).await
-            {
+            if let Err(resp) = authorize_bearer(ctx, req.authorization.as_deref(), required).await {
                 return resp;
             }
         }
@@ -3642,11 +3640,7 @@ mod tests {
         ) -> Result<(), StoreError> {
             // Mirror the production in-statement fence: a deleting
             // account's insert writes nothing and fails (ADR 0002 rule 3).
-            if self
-                .deleting_users
-                .borrow()
-                .contains(&row.record.user_id)
-            {
+            if self.deleting_users.borrow().contains(&row.record.user_id) {
                 return Err(StoreError);
             }
             let mut rows = self.native_credentials.borrow_mut();
@@ -5327,11 +5321,7 @@ mod tests {
 
         // A valid bearer passes before exhaustion (404: gate passed, no
         // data routes yet).
-        let ok = h.call_bearer(
-            "GET",
-            "/v1/search",
-            Some(format!("Bearer {secret}")),
-        );
+        let ok = h.call_bearer("GET", "/v1/search", Some(format!("Bearer {secret}")));
         assert_eq!(ok.status, 404, "{}", ok.body);
 
         // Exhaust the per-minute pool directly (same key/action the gate
@@ -5352,11 +5342,7 @@ mod tests {
 
         // Now even the valid credential is denied — with the generic 401,
         // never a 429 or any other shape.
-        let denied = h.call_bearer(
-            "GET",
-            "/v1/search",
-            Some(format!("Bearer {secret}")),
-        );
+        let denied = h.call_bearer("GET", "/v1/search", Some(format!("Bearer {secret}")));
         assert_eq!(denied.status, 401, "{}", denied.body);
         assert_eq!(
             denied.body,
@@ -5378,10 +5364,7 @@ mod tests {
             serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60}),
         );
         assert_eq!(first.status, 201, "{}", first.body);
-        h.store
-            .deleting_users
-            .borrow_mut()
-            .insert("u1".to_string());
+        h.store.deleting_users.borrow_mut().insert("u1".to_string());
         let fenced = mint_call(
             &h,
             &cookie,

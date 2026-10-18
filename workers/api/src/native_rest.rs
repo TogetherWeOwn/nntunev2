@@ -411,8 +411,10 @@ pub fn is_plausible_credential_shape(token: &str) -> bool {
     if rest.len() != SECRET_ENTROPY_BASE62_LEN {
         return false;
     }
-    rest.bytes().all(|b| matches!(b,
-        b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z'))
+    rest.bytes().all(|b| {
+        matches!(b,
+        b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
+    })
 }
 
 /// What a (method, path) needs. `Bearer` routes accept the named scope;
