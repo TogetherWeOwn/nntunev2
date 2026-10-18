@@ -253,6 +253,7 @@ jobs:
         run: |
           python3 .github/scripts/test_migrations_gate.py
           python3 .github/scripts/test_migrations_gate_regressions.py
+          python3 .github/scripts/test_migrations_gate_unreadable_sql.py
 
   test-nntp:
     name: test-nntp
