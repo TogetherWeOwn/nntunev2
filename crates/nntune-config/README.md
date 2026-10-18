@@ -61,7 +61,12 @@ Implementation: [src/lib.rs](src/lib.rs).
   `../../.github/scripts/test_config_duplicate_members.py:36` (whose positive
   control `test_valid_distinct_per_environment_values_accepted` in
   `../../.github/scripts/test_config_duplicate_members.py:245-251` asserts
-  exit 0, so it must track the accepted version). Adding a key follows the procedure in the
+  exit 0, so it must track the accepted version) and the `schema_version`
+  literals in `test_duplicate_schema_version_with_valid_final_value_rejected`
+  in `../../.github/scripts/test_config_duplicate_members.py:166-170`
+  (currently matching `"schema_version": 1` at `:168` and injecting version 2
+  at `:169`, so both sides must shift on a bump or the duplicate-input case
+  stops triggering). Adding a key follows the procedure in the
   [config dir README](../../config/README.md) (schema file, both env
   fixtures, and the `KEYS` table together).
   (Sources: `src/lib.rs:19-21`, `src/lib.rs:88-91`; pinned by
