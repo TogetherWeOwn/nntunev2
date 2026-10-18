@@ -127,6 +127,10 @@ config from secrets) is a follow-up slice.
   (Cloudflare Worker secret, versioned). AES-256-GCM, random 96-bit nonces,
   AAD binds `user_id` (+ KEK version for the wrap). Row-swap between users
   fails to decrypt. Rotation via `rewrap_dek` without touching ciphertext.
+  (Sources: `workers/api/src/vault.rs` — `encrypt_vault`, `decrypt_vault`,
+  `dek_aad`/`payload_aad`, `rewrap_dek`; KEK from `VAULT_KEK_BASE64` +
+  `VAULT_KEK_VERSION` in `workers/api/src/worker_entry.rs`; marker/index in
+  `migrations/0015_kek_rotation.sql`, design `docs/security/kek-rotation.md` §1–§2.)
 - **Never logged, never returned:** reads return booleans only
   (`redacted_summary`); `test connection` returns a boolean, never provider
   banners; audit events carry ids/results only — there is no field for
@@ -205,8 +209,10 @@ config from secrets) is a follow-up slice.
   attempts reserve fixed slot rows through an atomic `INSERT .. ON CONFLICT`
   before side effects; magic-link and registration inbox-proof sends share
   one per-email window. Every auth start (register, login, magic) reserves
-  one per-IP slot (30/hour, keyed on the client /64 for IPv6 and the full
-  address for IPv4) before any user/challenge row or mail (no
+  per-IP slots — the 30/hour budget plus the configured short-window burst
+  as one all-or-none pair (`auth.start_ip` + `auth.start_ip_burst`, defaults
+  30/hour + 10/60s), keyed on the client /64 for IPv6 and the full
+  address for IPv4 — before any user/challenge row or mail (no
   global slot at start, so exhaustion cannot block challenge issuance),
   and every mail send reserves a per-IP (30/hour) plus global (100/5 min)
   issuance slot in front of the per-email window — distinct-email loops
@@ -230,7 +236,14 @@ config from secrets) is a follow-up slice.
   challenge; legitimate single attempts and typo retries are unaffected.
   Unknown login emails use a keyed stand-in scope, expired challenges are
   pruned, and login options omit `allow_credentials` to avoid leaking
-  variable-length credential IDs.
+  variable-length credential IDs. (Sources: `workers/api/src/handlers.rs` —
+  `admit_auth_start`, `send_magic_link_if_allowed`, `rate_limit_ip_key`,
+  `throttled` (429 `{"error":"rate_limited"}`), `RATE_LIMIT_EXHAUSTED_SQL`,
+  finish-budget consts; `workers/api/src/rate_limit.rs` defaults +
+  `RateLimitConfig::from_vars`; atomic claim/pair in
+  `workers/api/src/worker_entry.rs` (`claim_rate_limit_slot`,
+  `reserve_rate_limit_pair`); tables in
+  `migrations/0005_atomic_rate_limits_and_leases.sql`.)
 - **Passkeys:** RP ID equals the exact origin host (cross-subdomain RP
   suffixes are intentionally unsupported). Configuration must be a canonical
   serialized origin: https, or http with the host exactly `localhost`,
@@ -288,10 +301,25 @@ config from secrets) is a follow-up slice.
   at every dial/fetch and pin the transport to that address set without
   another DNS lookup; retain the original hostname for TLS SNI/certificate
   checks and HTTP Host. Save-time validation is not a fetch authorization.
-  Indexer fetches forbid redirects. Test-connection attempts atomically
+  This worker performs no indexer fetches: indexer URLs are validated at
+  save/test time only, and `INDEXER_ALLOW_REDIRECTS` stays `false` as the
+  declared no-redirect policy. Indexer search fetching lives in
+  `workers/ingest`, where every redirect hop is re-guarded from scratch
+  (cap 3). Test-connection attempts atomically
   reserve shared-store rate slots, acquire one of two per-user expiring
   leases, dial at most four addresses with a 5-second per-address timeout,
-  and stop the complete probe at 15 seconds.
+  and stop the complete probe at 15 seconds. (Sources:
+  `workers/api/src/vault.rs` — `host_shape_ok`, `ip_is_forbidden`,
+  `resolve_public_target`, `ProviderConfig::validate`,
+  `authorize_pool_dial`, `ALLOWED_NNTP_PORTS`, `MAX_DIAL_ADDRESSES`,
+  `DIAL_TIMEOUT_MS`/`TOTAL_TIMEOUT_MS`, `MAX_TEST_CONCURRENCY`,
+  `INDEXER_ALLOW_REDIRECTS`; re-guarded redirect hops in
+  `workers/ingest/src/indexer_fetch.rs` (`MAX_REDIRECTS`); pinned dial in
+  `workers/api/src/worker_entry.rs` (`SocketDialer::probe`, `probe_one`);
+  slots/leases in `workers/api/src/handlers.rs` (`vault_test_connection`)
+  and `workers/api/src/worker_entry.rs`
+  (`reserve_rate_limit_pair`, `acquire_test_connection_lease`); tables in
+  `migrations/0005_atomic_rate_limits_and_leases.sql`.)
 
 ## Test
 
