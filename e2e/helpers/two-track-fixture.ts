@@ -11,11 +11,19 @@
  * failure. The paired fixture build fulfills the fixture side on
  * this branch without editing the acceptance files.
  *
- * Fixture resolution: when the two-track NZB exists it is staged alone;
- * until then the single-track NZB is staged as a fallback so the staging
- * leg fails TODAY with the documented single-track signature instead of a
- * missing-file error. A missing second track therefore fails by NAME (the
- * precondition message below), never by timeout.
+ * Fixture resolution: when both single-file NZBs exist (`synthetic.nzb`
+ * plus `synthetic-second-track.nzb`) both are staged in order — two uploads
+ * are two ingest jobs and two library rows per idempotency key, on current
+ * ingest and under the future per-file manifest (ADR 0002) alike. Until the
+ * second upload exists the single-track NZB is staged as a fallback so the
+ * staging leg fails with the documented single-track signature instead of
+ * a missing-file error. A missing second track therefore fails by NAME
+ * (the precondition message below), never by timeout.
+ *
+ * The two-file `synthetic-two-track.nzb` is never staged: one upload is one
+ * job and one library row on current ingest. It stays pinned by the offline
+ * `e2e/fixtures/two-track-self-check.mjs` gate as the reference two-file
+ * shape.
  *
  * This leg drives the ingest path (/library/import → /api/library) with a
  * fresh test account per run. It never touches the no-auth demo-audio
@@ -26,45 +34,47 @@
  * CI artifacts.
  */
 
-/** Single-track NZB the staging E2E already ingests (today's fallback). */
+/** First single-track NZB the staging E2E already ingests. */
 export const SINGLE_TRACK_FIXTURE_FILE = 'synthetic.nzb';
 
 /**
- * Two-track NZB the paired build card stages through the ingest path
- * (NZB → ingest → library), reusing the existing synthetic audio body with
- * deterministic ids. Absent until that card lands; see resolveTwoTrackFixture.
+ * Second single-track NZB: the 440 Hz tone as its own single-file upload
+ * (segment byte-identical to file 2 of the two-file NZB, deriving the
+ * distinct query `NNTune-Fixture sine-440`). Staged right after the first
+ * upload so the pair yields two library rows; see resolveTwoTrackFixture.
  */
-export const TWO_TRACK_FIXTURE_FILE = 'synthetic-two-track.nzb';
+export const SECOND_SINGLE_TRACK_FIXTURE_FILE = 'synthetic-second-track.nzb';
 
 export interface FixtureStaging {
   /** Absolute NZB paths to upload at /library/import, in order. */
   staged: string[];
-  /** True once the two-track NZB exists (the single-track fallback is gone). */
+  /** True once both single-file uploads exist (the single-track fallback is gone). */
   isTwoTrack: boolean;
 }
 
 /**
- * Resolve which fixture NZBs the staging leg stages. The two-track NZB
- * wins when present; otherwise the single-track NZB is staged so the leg
- * fails with the single-track precondition signature. Throws naming both
- * expected paths when neither exists — that is a missing-fixture failure,
- * not a passing skip. `exists` is injected so the offline spec pins this
- * without touching the filesystem.
+ * Resolve which fixture NZBs the staging leg stages. Both single-file NZBs
+ * win when present (two uploads through the existing staged loop);
+ * otherwise the single-track NZB is staged so the leg fails with the
+ * single-track precondition signature. Throws naming both expected paths
+ * when neither exists — that is a missing-fixture failure, not a passing
+ * skip. `exists` is injected so the offline spec pins this without touching
+ * the filesystem.
  */
 export function resolveTwoTrackFixture(
-  candidates: { twoTrack: string; singleTrack: string },
+  candidates: { singleTrack: string; secondSingle: string },
   exists: (candidate: string) => boolean,
 ): FixtureStaging {
-  if (exists(candidates.twoTrack)) {
-    return { staged: [candidates.twoTrack], isTwoTrack: true };
+  if (exists(candidates.singleTrack) && exists(candidates.secondSingle)) {
+    return { staged: [candidates.singleTrack, candidates.secondSingle], isTwoTrack: true };
   }
   if (exists(candidates.singleTrack)) {
     return { staged: [candidates.singleTrack], isTwoTrack: false };
   }
   throw new Error(
     '[two-track-fixture] no ingest fixture found: expected ' +
-      `${candidates.twoTrack} (two-track) or ` +
-      `${candidates.singleTrack} (single-track fallback).`,
+      `${candidates.singleTrack} (first single-track upload) and ` +
+      `${candidates.secondSingle} (second single-track upload).`,
   );
 }
 

@@ -15,8 +15,8 @@ import {
   tryMintTestAccount,
 } from '../helpers/accounts.js';
 import {
+  SECOND_SINGLE_TRACK_FIXTURE_FILE,
   SINGLE_TRACK_FIXTURE_FILE,
-  TWO_TRACK_FIXTURE_FILE,
   resolveTwoTrackFixture,
   twoTrackPreconditionFailure,
 } from '../helpers/two-track-fixture.js';
@@ -27,11 +27,15 @@ const FIXTURES_DIR = path.resolve(here, '../fixtures');
 // Test-first acceptance for the two-track synthetic fixture (roadmap M1/M3):
 // after running the fixture, the staging library must list ≥2 synthetic
 // tracks, and a missing second track must fail BY NAME (the precondition
-// message), not by timeout. Today only the single-track synthetic.nzb
-// exists, so the staging leg below stages that fallback and FAILS with the
-// documented single-track signature — that red IS the signal. The paired
-// build card lands synthetic-two-track.nzb on this branch (never editing
-// this file); the same leg then stages it and passes.
+// message), not by timeout. The leg stages two single-file uploads
+// (synthetic.nzb plus synthetic-second-track.nzb) — two uploads are two
+// ingest jobs and two library rows per idempotency key, on current ingest
+// and under the future per-file manifest (ADR 0002) alike. If the second
+// upload is missing, the leg stages the single-track fallback and FAILS
+// with the documented single-track signature — that red IS the signal.
+// The two-file synthetic-two-track.nzb is never staged (one upload is one
+// row on current ingest); it stays pinned by the offline self-check gate
+// as the reference two-file shape.
 //
 // Ingest path only (/library/import → /api/library, fresh test account per
 // run): this spec never touches the no-auth demo-audio route
@@ -47,17 +51,20 @@ const FIXTURES_DIR = path.resolve(here, '../fixtures');
 
 test.describe('two-track fixture precondition (offline fixtures)', () => {
   const candidates = {
-    twoTrack: '/fixtures/synthetic-two-track.nzb',
     singleTrack: '/fixtures/synthetic.nzb',
+    secondSingle: '/fixtures/synthetic-second-track.nzb',
   };
 
-  test('two-track NZB present stages just it', () => {
-    const staging = resolveTwoTrackFixture(candidates, (p) => p === candidates.twoTrack);
-    expect(staging.staged).toEqual([candidates.twoTrack]);
+  test('both single-file NZBs present stages both in order', () => {
+    const staging = resolveTwoTrackFixture(
+      candidates,
+      (p) => p === candidates.singleTrack || p === candidates.secondSingle,
+    );
+    expect(staging.staged).toEqual([candidates.singleTrack, candidates.secondSingle]);
     expect(staging.isTwoTrack).toBe(true);
   });
 
-  test('two-track NZB absent falls back to the single-track NZB', () => {
+  test('second single-file NZB absent falls back to the single-track NZB', () => {
     const staging = resolveTwoTrackFixture(candidates, (p) => p === candidates.singleTrack);
     expect(staging.staged).toEqual([candidates.singleTrack]);
     expect(staging.isTwoTrack).toBe(false);
@@ -65,7 +72,7 @@ test.describe('two-track fixture precondition (offline fixtures)', () => {
 
   test('neither NZB present fails naming both expected paths', () => {
     expect(() => resolveTwoTrackFixture(candidates, () => false)).toThrow(
-      /synthetic-two-track\.nzb.*synthetic\.nzb|synthetic\.nzb.*synthetic-two-track\.nzb/,
+      /synthetic-second-track\.nzb.*synthetic\.nzb|synthetic\.nzb.*synthetic-second-track\.nzb/,
     );
   });
 
@@ -110,8 +117,8 @@ test.describe.serial('two-track fixture stages library tracks (staging)', () => 
     }
     const staging = resolveTwoTrackFixture(
       {
-        twoTrack: path.resolve(FIXTURES_DIR, TWO_TRACK_FIXTURE_FILE),
         singleTrack: path.resolve(FIXTURES_DIR, SINGLE_TRACK_FIXTURE_FILE),
+        secondSingle: path.resolve(FIXTURES_DIR, SECOND_SINGLE_TRACK_FIXTURE_FILE),
       },
       existsSync,
     );
@@ -138,10 +145,9 @@ test.describe.serial('two-track fixture stages library tracks (staging)', () => 
     // password rather than ingesting into a provider-less account.
     await completeByopWizard(page, baseURL);
 
-    // Stage every resolved fixture NZB through the import UI. Today that is
-    // the single-track fallback (so the API gate below fails with the
-    // documented signature); once the two-track NZB lands it is staged
-    // alone and the gate passes.
+    // Stage every resolved fixture NZB through the import UI: both
+    // single-file uploads in order, so the API gate below sees two rows
+    // (two uploads are two jobs and two library rows per idempotency key).
     for (const nzb of staging.staged) {
       await page.goto(`${baseURL}/library/import`, {
         waitUntil: 'domcontentloaded',
