@@ -1,7 +1,7 @@
 //! Recording-cap boundary pins: the cap applies after ordering and
 //! deduplication, never before.
 //!
-//! Tests-only slice (TOG-29833). The matcher contract under test lives in
+//! Tests-only slice. The matcher contract under test lives in
 //! `workers/ingest/src/matching.rs`: [`parse_mb_recordings_response`]
 //! filters invalid MBIDs, re-sorts by (medium, track, MBID) without trusting
 //! wire order, deduplicates keeping the first sorted position, then caps at
