@@ -422,6 +422,46 @@ def test_git_nonzero_exit_fails_listing_closed():
         _assert_rejected(repo, "cannot list tracked repository files")
 
 
+def test_malformed_tracked_paths_fail_decode_closed():
+    # os.fsdecode uses surrogateescape on Linux so real undecodable bytes
+    # never raise there (see test_non_utf8_unrelated_path_does_not_break_scan);
+    # pin the defensive decode-failure diagnostic by failing the decode step
+    # for the malformed entry only, with a real `git ls-files -z` byte stream.
+    repo = _repo_with({"workers/stream/wrangler.toml": CLEAN_MANIFEST})
+    bad_stdout = b"workers/stream/wrangler.toml\x00workers/\xff-bad.txt\x00"
+    real_fsdecode = os.fsdecode
+
+    def _fail_bad_entry(entry):
+        if b"\xff" in bytes(entry):
+            raise UnicodeDecodeError("utf-8", bytes(entry), 8, 9, "invalid start byte")
+        return real_fsdecode(entry)
+
+    with (
+        mock.patch(
+            "check_archive_bindings.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                ["git", "ls-files", "-z"], 0, stdout=bad_stdout, stderr=""
+            ),
+        ),
+        mock.patch(
+            "check_archive_bindings.os.fsdecode",
+            side_effect=_fail_bad_entry,
+        ),
+    ):
+        try:
+            archive_bindings(repo)
+        except ManifestError as exc:
+            assert "cannot decode tracked repository paths" in str(exc), (
+                f"unexpected error: {exc!r}"
+            )
+            assert exc.__cause__ is not None, "decode failure must chain its cause"
+            assert isinstance(exc.__cause__, UnicodeDecodeError), (
+                f"unexpected cause: {exc.__cause__!r}"
+            )
+        else:
+            raise AssertionError("expected malformed tracked paths to fail")
+
+
 def test_manifest_directory_fails_read_closed():
     # A directory can never survive the is_file() candidate filter in
     # archive_bindings, so pin the read failure at the _bucket_names level.
@@ -500,6 +540,7 @@ if __name__ == "__main__":
     test_non_git_directory_fails_listing_closed()
     test_failing_git_binary_fails_listing_closed()
     test_git_nonzero_exit_fails_listing_closed()
+    test_malformed_tracked_paths_fail_decode_closed()
     test_manifest_directory_fails_read_closed()
     test_invalid_utf8_manifest_fails_read_closed()
     test_current_repo_manifests_pass()
