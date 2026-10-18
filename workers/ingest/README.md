@@ -259,6 +259,27 @@ stub whose NZB references fixture message-ids.
   key, `ON CONFLICT DO UPDATE` so replays converge on the latest MB match.
 - Repair dispatch (`src/repair.rs`): missing blocks + par2 set → Container
   `POST /repair`; missing blocks with no par2 set fails the job.
+- Repair re-verify guard (status only — no runtime change): the re-verify
+  feedback loop is still open. After a repair round, `Verifying` re-runs
+  the verify driver over the pool body route (`src/queue_consumer.rs:696-699`,
+  `PoolBodySource::fetch_body` via `call_pool_body` at
+  `src/queue_consumer.rs:792-799`) and does not yet consume the repair
+  round's `out/` objects (the repair Worker streams outputs back to `out/`
+  per `workers/repair/README.md:23-28`; key shapes in
+  `workers/repair/src/contract.rs:278-286`), so the `Repairing` step must
+  not be exercised live until that consumption lands
+  (`src/queue_consumer.rs:245-253`). The consumer stays disabled meanwhile:
+  the `[[queues.consumers]]` entry stays commented out
+  (`workers/ingest/wrangler.toml.example:30-31`,
+  `workers/ingest/wrangler.toml.example:58-59`), and ingest stays unable
+  to finish a `Repairing` job (`workers/repair/README.md:40-44`).
+  A checkpoint reaching `Repairing` without recorded verify inputs
+  (`par2_set_id`/`missing_blocks`) is a permanent failure — there is
+  nothing a redelivery could add (`src/queue_consumer.rs:251-253`; the
+  missing-inputs arm at `src/queue_consumer.rs:257-262`). Repair runtime
+  work (dispatch, Container, queue behavior) sits with the blocked
+  repair-dispatch owner, whose runtime contract is
+  `workers/repair/README.md`; this note only records the guard.
 - Metering (`src/metering.rs`): one `nntune_ingest_meter` event per
   workflow step (workers-rs 0.3 has no Analytics Engine client, so the edge
   write goes through the dataset binding's HTTP API).
