@@ -53,9 +53,15 @@ gate, COPY-escape check, empty-value rule, then the per-kind shape check
   `src/lib.rs:235-241`); durations as non-negative `i32`
   (`negative_duration`, `src/lib.rs:256-260`); medium/track positions as
   non-negative `i16` (`negative_position`, `src/lib.rs:261-268`).
-  Timestamps accept a date or date-plus-time with an optional `Z` /
-  `±hh[:mm]` zone, rejecting impossible months/days and leap-day on
-  non-leap years (`bad_timestamp`, `src/lib.rs:366-501`). Country must be
+  Timestamps are `YYYY-MM-DD`, optionally followed by `T` or space plus
+  `HH:MM:SS[.f{1,6}]`; `Z`/`z` may follow either form, while a `±hh`,
+  `±hhmm` or `±hh:mm` offset (hours ≤ 15, minutes ≤ 59) is accepted only
+  after a time — `HH:MM` without seconds, a date-only value with a numeric
+  offset, and >6 fractional digits are `bad_timestamp`. Impossible
+  months/days and leap-day on non-leap years are also rejected
+  (`bad_timestamp`, `src/lib.rs:366-501`; seconds required
+  `src/lib.rs:462-472,495`; numeric zone only after a time
+  `src/lib.rs:403-409`). Country must be
   empty or exactly 2 chars (`bad_country`, `src/lib.rs:249-255`).
 - **Escapes:** only the documented COPY text escapes may follow a
   backslash (`\\`, `\b \f \n \r \t \v`, octal `\` + 1-3 octal digits, hex
@@ -69,8 +75,12 @@ gate, COPY-escape check, empty-value rule, then the per-kind shape check
   constraint inside the chunk transaction); in a nullable column it passes
   through as the NULL marker (`src/lib.rs:190-201`). An empty NOT NULL
   timestamp/uuid/numeric is `bad_timestamp` / `bad_uuid` / `bad_int`
-  (empty numerics would abort the chunk transaction as `""`; an empty
-  timestamp would silently stamp `now()`); an empty NOT NULL text column
+  (an empty value would be rejected by COPY into the typed staging table
+  — `""` fails for timestamptz and numerics — and abort the chunk
+  transaction; the staging table carries no column defaults
+  (`CREATE TEMP TABLE stage (LIKE mb_${table})`,
+  `containers/mb-import/import.sh:389`), so no `now()` stamping occurs);
+  an empty NOT NULL text column
   passes through as `""` (`src/lib.rs:209-226`).
 
 Poison reason strings are lowercase snake_case with no tabs and are copied
@@ -90,8 +100,9 @@ by this crate (`containers/mb-import/import.sh:292-296`).
   (`src/lib.rs:196-201`). (The crate doc comment's "nullable
   numeric/uuid/timestamp" phrasing at `src/lib.rs:15-16` is shorthand: the
   code applies the rule to every nullable kind, including text and
-  country.) Everything else passes through byte-equal, so a `SELECT` after
-  import returns exactly what the dump held (`src/lib.rs:17-19`).
+  country.) The validator preserves other field bytes in its COPY output
+  (`src/lib.rs:17-19`); Postgres then decodes COPY text escapes on import,
+  so the stored value is the decoded meaning of the dump's encoded bytes.
 - **`line_no` append:** the 1-based line number in the whole dump file —
   chunk offset added by the caller — is appended as the final column, and
   the loader COPYs it into `line_no` (`src/lib.rs:16-17,81-84,137-138`).
