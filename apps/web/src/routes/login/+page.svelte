@@ -9,7 +9,7 @@
 
 	let email = $state('');
 	let status = $state<'idle' | 'sending' | 'sent' | 'error'>('idle');
-	let passkeyStatus = $state<'idle' | 'working' | 'unsupported' | 'error'>('idle');
+	let passkeyStatus = $state<'idle' | 'working' | 'unsupported' | 'dismissed' | 'error'>('idle');
 
 	const passkeysSupported =
 		typeof window !== 'undefined' &&
@@ -26,6 +26,17 @@
 		} catch (error) {
 			status = error instanceof ApiError && error.paywall ? 'idle' : 'error';
 		}
+	}
+
+	/**
+	 * Retryable ceremony interruption: `NotAllowedError` / `AbortError`
+	 * can mean dismissal, timeout, or an unavailable passkey. The name
+	 * alone cannot identify the cause. Server (`ApiError`) paths never
+	 * carry these names, so login stays non-enumerating.
+	 */
+	function isPasskeyDismissal(error: unknown): boolean {
+		const name = (error as { name?: unknown } | null)?.name;
+		return name === 'NotAllowedError' || name === 'AbortError';
 	}
 
 	async function signInWithPasskey() {
@@ -79,8 +90,18 @@
 			invalidateLibraryCache();
 			window.location.href = '/onboarding/provider';
 		} catch (error) {
+			if (error instanceof ApiError && error.paywall) {
+				passkeyStatus = 'idle';
+				return;
+			}
+			if (isPasskeyDismissal(error)) {
+				// Interrupted ceremony: same possible causes for every
+				// address, so login stays non-enumerating.
+				passkeyStatus = 'dismissed';
+				return;
+			}
 			// Generic: login errors stay non-enumerating, like the API.
-			passkeyStatus = error instanceof ApiError && error.paywall ? 'idle' : 'error';
+			passkeyStatus = 'error';
 		}
 	}
 </script>
@@ -101,6 +122,11 @@
 		</button>
 		{#if passkeyStatus === 'unsupported'}
 			<p role="status">This browser does not support passkeys — use an email link instead.</p>
+		{:else if passkeyStatus === 'dismissed'}
+			<p role="alert">
+				Passkey sign-in didn't complete. Possible reasons: You dismissed the passkey prompt,
+				it timed out, or no usable passkey was available. Try again or use an email link.
+			</p>
 		{:else if passkeyStatus === 'error'}
 			<p role="alert">Sign-in failed. Try again or use an email link.</p>
 		{/if}

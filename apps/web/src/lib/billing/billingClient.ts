@@ -32,11 +32,22 @@ export interface PlanDTO {
 export interface SubscriptionDTO {
 	planId: string;
 	/**
-	 * ADR 0002 statuses (`trialing`/`active`/`past_due`/`canceled`/`expired`),
-	 * plus Stripe's `incomplete` tolerated while payment confirms — never
-	 * entitlement-granting either way.
+	 * Stripe statuses stored verbatim (ADR 0002 data-model, ADR 0005
+	 * billing table): `incomplete`, `incomplete_expired`, `trialing`,
+	 * `active`, `past_due`, `canceled`, `unpaid`, `paused`. There is no
+	 * local `expired` shortcut. Only `active`/`trialing` (plus `past_due`
+	 * inside its grace window) grant entitlement — every other stored
+	 * status routes to the billing portal via the loader's LAPSED set.
 	 */
-	status: 'trialing' | 'active' | 'past_due' | 'canceled' | 'expired' | 'incomplete';
+	status:
+		| 'trialing'
+		| 'active'
+		| 'past_due'
+		| 'canceled'
+		| 'unpaid'
+		| 'paused'
+		| 'incomplete'
+		| 'incomplete_expired';
 	currentPeriodEnd: string | null;
 	trialEndsAt: string | null;
 	/** End of the past-due grace window (ADR 0002 rule 4); absent when the backend sends none. */
@@ -105,6 +116,84 @@ function isValidUsagePayload(data: unknown): data is UsageSnapshot & { period: s
 }
 
 /**
+ * Successful GET /v1/me/subscription DTO guard. `planId` is a required
+ * non-empty string; `status` must be one of the eight Stripe statuses the
+ * subscriptions row stores verbatim (ADR 0002 data-model, ADR 0005
+ * billing table) so a raw unknown status never reaches rendering — and
+ * subscribers in a stored non-entitled state (`unpaid`, `paused`,
+ * `incomplete_expired`) keep their portal route instead of failing into
+ * trial defaults. `currentPeriodEnd` and `trialEndsAt` are required and
+ * are either null or an ISO-8601 date string naming a real calendar date
+ * — garbage strings and rolled-over dates (e.g. February 30, which
+ * `Date.parse` normalizes into March) reject instead of rendering
+ * "Invalid Date" or a shifted renewal day. `graceUntil` may be absent;
+ * when present it is null or a valid date string. Unknown extra fields
+ * are allowed. Anything else rejects into the existing recoverable
+ * loader path instead of reaching rendering.
+ */
+const SUBSCRIPTION_STATUSES = [
+	'trialing',
+	'active',
+	'past_due',
+	'canceled',
+	'unpaid',
+	'paused',
+	'incomplete',
+	'incomplete_expired'
+] as const;
+
+const SUBSCRIPTION_DATE_FIELDS = ['currentPeriodEnd', 'trialEndsAt'] as const;
+
+/**
+ * ISO-8601 date/datetime with bounded fields (month 01–12, day 01–31,
+ * hour 00–23), so loose strings `Date.parse` accepts (`'1'`, `'garbage'`)
+ * never pass. A UTC round-trip on the calendar date rejects impossible
+ * dates the parser would roll over (`2026-02-30` -> March 2).
+ */
+const SUBSCRIPTION_DATE_RE =
+	/^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?:T([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d{1,9})?)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d))?$/;
+
+function isParseableDateString(value: unknown): value is string {
+	if (typeof value !== 'string' || value.length === 0) return false;
+	const match = SUBSCRIPTION_DATE_RE.exec(value);
+	if (!match) return false;
+	const year = Number(match[1]);
+	const month = Number(match[2]);
+	const day = Number(match[3]);
+	// Date.UTC(year, ...) treats 00–99 as 1900–1999; preserve the literal ISO year.
+	const probe = new Date(0);
+	probe.setUTCFullYear(year, month - 1, day);
+	if (
+		probe.getUTCFullYear() !== year ||
+		probe.getUTCMonth() !== month - 1 ||
+		probe.getUTCDate() !== day
+	)
+		return false;
+	return !Number.isNaN(Date.parse(value));
+}
+
+function isValidSubscriptionPayload(data: unknown): data is SubscriptionDTO {
+	if (typeof data !== 'object' || data === null || Array.isArray(data)) return false;
+	const record = data as Record<string, unknown>;
+	if (typeof record.planId !== 'string' || record.planId.length === 0) return false;
+	if (
+		typeof record.status !== 'string' ||
+		!(SUBSCRIPTION_STATUSES as readonly string[]).includes(record.status)
+	)
+		return false;
+	for (const field of SUBSCRIPTION_DATE_FIELDS) {
+		const value = record[field];
+		if (value !== null && !isParseableDateString(value)) return false;
+	}
+	if ('graceUntil' in record) {
+		const graceUntil = record.graceUntil;
+		if (graceUntil !== undefined && graceUntil !== null && !isParseableDateString(graceUntil))
+			return false;
+	}
+	return true;
+}
+
+/**
  * Successful GET /v1/plans DTO guard. The body must be an object whose
  * `plans` field is an array (possibly empty). Unknown extra envelope
  * fields are allowed and entries pass through verbatim; per-plan field
@@ -168,7 +257,47 @@ export async function fetchUsage(
 
 export async function fetchSubscription(fetchFn: typeof fetch = fetch): Promise<SubscriptionDTO> {
 	const res = await fetchFn('/v1/me/subscription', { credentials: 'include' });
-	return await readJson(res, 'Load subscription');
+	const data = await readJson<unknown>(res, 'Load subscription');
+	if (!isValidSubscriptionPayload(data)) throw new Error('Invalid subscription payload');
+	return data;
+}
+
+/**
+ * Authorized Stripe redirect hosts for checkout/portal 2xx bodies. Any
+ * allowlisted `https:` target resolves verbatim; everything else rejects
+ * with the typed client error so an off-allowlist or malformed target never
+ * reaches a `window.location.href` assignment (open-redirect guard).
+ */
+const STRIPE_REDIRECT_HOSTS = new Set(['checkout.stripe.com', 'billing.stripe.com']);
+
+function isAllowlistedRedirectUrl(value: unknown): value is string {
+	if (typeof value !== 'string' || value.trim() === '') return false;
+	// WHATWG URL parsing recovers an allowlisted host from a scheme without
+	// an explicit authority (`https:checkout.stripe.com/...` parses with
+	// hostname checkout.stripe.com), but a `window.location.href` assignment
+	// of that same string resolves against the app origin instead — so the
+	// raw string must carry the explicit `https://` authority up front.
+	if (!value.startsWith('https://')) return false;
+	let parsed: URL;
+	try {
+		parsed = new URL(value);
+	} catch {
+		return false;
+	}
+	return parsed.protocol === 'https:' && STRIPE_REDIRECT_HOSTS.has(parsed.hostname.toLowerCase());
+}
+
+function redirectUrlOrThrow(
+	data: unknown,
+	status: number,
+	label: string,
+	hint: string
+): string {
+	if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
+		const url = (data as Record<string, unknown>).url;
+		if (isAllowlistedRedirectUrl(url)) return url;
+	}
+	throw new BillingApiError(status, label, hint);
 }
 
 export async function startCheckout(
@@ -182,9 +311,8 @@ export async function startCheckout(
 		headers: { 'content-type': 'application/json' },
 		body: JSON.stringify({ planId })
 	});
-	const data = await readJson<{ url: string }>(res, 'Start checkout');
-	if (!data.url.startsWith('https://')) throw new Error('Invalid checkout URL');
-	return data.url;
+	const data = await readJson<unknown>(res, 'Start checkout');
+	return redirectUrlOrThrow(data, res.status, 'Start checkout', ': Invalid checkout URL');
 }
 
 /**
@@ -206,7 +334,6 @@ export async function openPortal(fetchFn: typeof fetch = fetch): Promise<string>
 		headers: { 'content-type': 'application/json' },
 		body: '{}'
 	});
-	const data = await readJson<{ url: string }>(res, 'Open billing portal');
-	if (!data.url.startsWith('https://')) throw new Error('Invalid portal URL');
-	return data.url;
+	const data = await readJson<unknown>(res, 'Open billing portal');
+	return redirectUrlOrThrow(data, res.status, 'Open billing portal', ': Invalid portal URL');
 }

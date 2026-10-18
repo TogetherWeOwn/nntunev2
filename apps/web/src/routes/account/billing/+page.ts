@@ -5,13 +5,25 @@ import {
 	fetchUsage,
 	type SubscriptionDTO
 } from '#lib/billing/billingClient.js';
-import { resolveEffectivePlan } from '#lib/billing/plans.js';
+import { getPlan, resolveEffectivePlan } from '#lib/billing/plans.js';
 import { evaluateUsage, type LimitStatus, type UsageSnapshot } from '#lib/billing/usage.js';
 
 export type UsageDTO = UsageSnapshot & { period: string };
 
-/** Subscription states whose entitlement has lapsed: portal, never checkout. */
-const LAPSED = new Set(['past_due', 'canceled', 'expired', 'incomplete']);
+/**
+ * Stored subscription states without entitlement (ADR 0002 data-model,
+ * ADR 0005 billing table): portal, never checkout. `unpaid`/`paused` keep
+ * the reserved slot and `incomplete_expired` has released it, but all
+ * three still owe the portal — never a second subscription.
+ */
+const LAPSED = new Set([
+	'past_due',
+	'canceled',
+	'unpaid',
+	'paused',
+	'incomplete',
+	'incomplete_expired'
+]);
 
 interface LoadOutcome<T> {
 	value: T | null;
@@ -40,7 +52,8 @@ async function loadOne<T>(read: () => Promise<T>): Promise<LoadOutcome<T>> {
  * against caps only when the plan is confirmed — otherwise no usage alert
  * or upgrade button is rendered, because the caps being compared against
  * would be the wrong plan's. Lapsed subscriptions (past_due / canceled /
- * expired / incomplete) resolve to the billing portal, never to a new
+ * unpaid / paused / incomplete / incomplete_expired) resolve to the
+ * billing portal, never to a new
  * checkout, so a paying user can neither be downgraded nor double-subscribed.
  * A 401 is reported as signed-out, not as an outage. No secrets here —
  * session cookie only.
@@ -106,8 +119,11 @@ export const load: PageLoad = async ({ fetch }) => {
 		if (usageFailed) notices.push('Could not load usage.');
 	}
 
+	// Keep a known stored billing tier for portal-only states without granting
+	// entitlement or scoring usage against that tier.
+	const billingPlan = manageBillingOnly && subscription ? getPlan(subscription.planId) : undefined;
 	return {
-		planId: plan.id,
+		planId: billingPlan?.id ?? plan.id,
 		planUnknown,
 		signedOut,
 		hadFetchError: !signedOut && (subFailed || usageFailed || retryableLimit),

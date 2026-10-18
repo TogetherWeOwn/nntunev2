@@ -139,10 +139,19 @@ fn encode_query_value(value: &str) -> String {
 }
 
 /// Absolute MB release-search URL for the `MB_API` service binding.
+///
+/// The `q=` value is the album-title retrieval text (see
+/// [`album_retrieval_query`]): for an "Artist - Album" query the album
+/// side alone, otherwise the query unchanged. Verification still uses
+/// the original query in [`pick_release_mbid`] — the queue caller
+/// passes the same query to both — so retrieval widens while the pick
+/// stays exact and nothing is ever accepted on title alone.
 pub fn mb_search_url(query: &str) -> String {
+    let retrieval = album_retrieval_query(query);
+    let text = retrieval.as_deref().unwrap_or(query);
     format!(
         "{MB_SERVICE_HOST}/v1/mb/search?type=release&q={}",
-        encode_query_value(query)
+        encode_query_value(text)
     )
 }
 
@@ -283,19 +292,25 @@ fn normalize_match_text(raw: &str) -> String {
     normalized.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Fold separator dashes (en/em dash, minus sign — as pasted from the
+/// web) to the ASCII hyphen so they count as the " - " separator.
+fn fold_separator_dashes(query: &str) -> String {
+    query
+        .chars()
+        .map(|c| match c {
+            '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
+            _ => c,
+        })
+        .collect()
+}
+
 /// Split an "Artist - Album" query into its normalized parts, when it
 /// has that shape (the shape [`derive_upload_query`] produces).
 /// Typographic dashes (en/em dash, minus sign — as pasted from the web)
 /// count as the separator hyphen. A query without " - ", or with an
 /// empty side, has no artist part.
 fn split_artist_album(query: &str) -> Option<(String, String)> {
-    let folded: String = query
-        .chars()
-        .map(|c| match c {
-            '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
-            _ => c,
-        })
-        .collect();
+    let folded = fold_separator_dashes(query);
     let (artist, album) = folded.split_once(" - ")?;
     let artist = normalize_match_text(artist);
     let album = normalize_match_text(album);
@@ -303,6 +318,32 @@ fn split_artist_album(query: &str) -> Option<(String, String)> {
         return None;
     }
     Some((artist, album))
+}
+
+/// Album-title retrieval text for an "Artist - Album" query.
+///
+/// The MB release search is a title-only predicate (`workers/mb`
+/// `Kind::Release`: `WHERE r.title % $1`, scored by
+/// `similarity(r.title, $1)`), so sending the whole `Artist - Album`
+/// identity lets a long artist push a short correct title below the
+/// retrieval bar before verification ever runs. For the shape
+/// [`split_artist_album`] already recognizes — the shape the pick
+/// verifies — send the album side alone, edition text such as `(Live)`
+/// / `[Remastered]` included, while the caller keeps passing the
+/// original identity to [`pick_release_mbid`].
+///
+/// Returns `None` when the query has no recognized shape (plain titles
+/// are sent unchanged) or when the album side would by itself be an
+/// invalid MB query (see [`validate_match_query`], e.g. a
+/// one-character title); the caller then sends the original query it
+/// already validated. Query limits are not widened and no SQL changes.
+fn album_retrieval_query(query: &str) -> Option<String> {
+    // Only the shape the pick verifies as Artist - Album: a query the
+    // pick treats as a plain title stays on the plain-title path.
+    split_artist_album(query)?;
+    let folded = fold_separator_dashes(query);
+    let album = folded.split_once(" - ")?.1;
+    validate_match_query(album)
 }
 
 /// Deterministic, ambiguity-rejecting release pick. What it can and
@@ -320,7 +361,11 @@ fn split_artist_album(query: &str) -> Option<(String, String)> {
 /// - Plain-title queries keep the scored pick, tightened to hits whose
 ///   normalized title is exactly the normalized query: the highest
 ///   score at or above [`MIN_MATCH_SCORE`], leading the runner-up by
-///   more than [`MIN_MATCH_MARGIN`]. Fuzzy near-misses write unmatched.
+///   more than [`MIN_MATCH_MARGIN`]. The floor gates the winner only:
+///   the runner-up is the next distinct MBID with a matching
+///   normalized title even when it scores below the floor, so a
+///   below-floor near-tie stays ambiguous instead of looking like a
+///   lone winner. Fuzzy near-misses write unmatched.
 ///
 /// Anything else — extra words in the query, edition suffixes, a
 /// featured-artist credit — yields `None` (unmatched) rather than a
@@ -350,19 +395,20 @@ pub fn pick_release_mbid(query: &str, hits: &[MbSearchHit]) -> Option<String> {
     if normalized_query.is_empty() {
         return None;
     }
-    let mut candidates: Vec<&MbSearchHit> = valid
-        .filter(|hit| {
-            hit.score >= MIN_MATCH_SCORE && normalize_match_text(&hit.title) == normalized_query
-        })
+    let mut matching: Vec<&MbSearchHit> = valid
+        .filter(|hit| normalize_match_text(&hit.title) == normalized_query)
         .collect();
-    candidates.sort_by(|a, b| {
+    matching.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(core::cmp::Ordering::Equal)
             .then_with(|| a.mbid.cmp(&b.mbid))
     });
-    let top = candidates.first()?;
-    if let Some(runner_up) = candidates.get(1) {
+    let top = matching.first()?;
+    if top.score < MIN_MATCH_SCORE {
+        return None;
+    }
+    if let Some(runner_up) = matching.iter().skip(1).find(|hit| hit.mbid != top.mbid) {
         if top.score - runner_up.score <= MIN_MATCH_MARGIN {
             return None;
         }

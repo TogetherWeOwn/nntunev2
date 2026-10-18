@@ -3,11 +3,16 @@
 //! Durable Object runs one fetch at a time per connection.
 //!
 //! Article bodies are raw bytes (yEnc is binary); callers get the
-//! dot-unstuffed bytes with `\n` line separators.
+//! dot-unstuffed bytes with `\n` line separators. Core's 16 KiB wire-line
+//! ceiling includes CRLF and stuffing; its 64 MiB article ceiling applies here
+//! to the native adapter's unstuffed LF output (core retains CRLF). Oversize
+//! input is refused, never truncated, and the connection cannot be reused.
 
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+
+use nntune_core::transport::{MAX_ARTICLE_BYTES, MAX_LINE_BYTES};
 
 /// Documented worker/API error code for stale provider credentials (S7).
 /// Shared verbatim with `nntune-core` and `workers/api`: the web app renders
@@ -58,17 +63,53 @@ impl NntpError {
     }
 }
 
+/// Parse a three-ASCII-digit NNTP status token with permitted
+/// separator/framing: the first three bytes must be ASCII digits and the
+/// fourth byte must be end-of-line or a single space before reply text.
+/// `2000`, `2220`, `4800` and friends merely start with a known code and
+/// are malformed frames, never truncated to their prefix. Returns `None`
+/// for a malformed frame; callers map that to a bounded generic
+/// [`NntpError::UnexpectedResponse`] without echoing the untrusted line.
+fn parse_status_code(line: &str) -> Option<u16> {
+    let stripped = line.trim_end_matches(['\r', '\n']);
+    let bytes = stripped.as_bytes();
+    if bytes.len() < 3 || !bytes[..3].iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    match bytes.get(3) {
+        None | Some(b' ') => {}
+        Some(_) => return None,
+    }
+    let code = u16::from(bytes[0] - b'0') * 100
+        + u16::from(bytes[1] - b'0') * 10
+        + u16::from(bytes[2] - b'0');
+    Some(code)
+}
+
 /// Whether `mid` (outer whitespace / `<>` already stripped) is safe to put
-/// on the wire inside `BODY <…>`: RFC 5536 msg-id characters only, so a
-/// hostile NZB cannot smuggle CR/LF (extra NNTP commands) or desynchronize
-/// the pooled connection.
+/// on the wire inside `BODY <…>`: RFC 5536 msg-id shape (bracketless form),
+/// so a hostile NZB cannot smuggle CR/LF (extra NNTP commands) or
+/// desynchronize the pooled connection.
+///
+/// Rules (mirrors `workers/ingest` `validate_message_id` at its own
+/// 250-byte adapter ceiling): 1..=250 bytes, printable ASCII (`0x21..=0x7E`)
+/// only, no `<`/`>`, exactly one `@` with non-empty local and domain sides.
 pub fn valid_message_id(mid: &str) -> bool {
     const MAX_LEN: usize = 250;
-    !mid.is_empty()
-        && mid.len() <= MAX_LEN
-        && !mid
-            .bytes()
-            .any(|b| matches!(b, b'\r' | b'\n' | b'\0' | b' ' | b'\t' | b'<' | b'>'))
+    if mid.is_empty() || mid.len() > MAX_LEN {
+        return false;
+    }
+    if !mid.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
+        return false;
+    }
+    if mid.contains('<') || mid.contains('>') {
+        return false;
+    }
+    let mut parts = mid.split('@');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(local), Some(domain), None) if !local.is_empty() && !domain.is_empty()
+    )
 }
 
 impl From<std::io::Error> for NntpError {
@@ -107,6 +148,7 @@ impl NntpDeadline {
 pub struct NntpClient {
     reader: BufReader<std::net::TcpStream>,
     read_timeout: Duration,
+    usable: bool,
 }
 
 impl NntpClient {
@@ -143,14 +185,19 @@ impl NntpClient {
         let mut client = Self {
             reader: BufReader::new(stream),
             read_timeout: timeouts.read,
+            usable: true,
         };
         let greeting = client.read_line_with_deadline(deadline)?;
-        if greeting.starts_with("200") || greeting.starts_with("201") {
-            Ok(client)
-        } else {
-            Err(NntpError::UnexpectedResponse(
-                greeting.trim_end().to_string(),
-            ))
+        match parse_status_code(&greeting) {
+            Some(200) | Some(201) => Ok(client),
+            Some(code) => Err(NntpError::UnexpectedResponse(format!(
+                "unexpected NNTP greeting code {code}"
+            ))),
+            // Generic and bounded: the greeting line is untrusted and must
+            // not be echoed, and a malformed prefix must never connect.
+            None => Err(NntpError::UnexpectedResponse(
+                "malformed NNTP greeting".into(),
+            )),
         }
     }
 
@@ -161,7 +208,7 @@ impl NntpClient {
         expected_peer: &SocketAddr,
         read_timeout: Duration,
     ) -> io::Result<bool> {
-        if self.reader.get_ref().peer_addr()? != *expected_peer {
+        if !self.usable || self.reader.get_ref().peer_addr()? != *expected_peer {
             return Ok(false);
         }
         self.reader.get_ref().set_read_timeout(Some(read_timeout))?;
@@ -186,6 +233,29 @@ impl NntpClient {
         message_id: &str,
         deadline: &NntpDeadline,
     ) -> Result<Vec<u8>, NntpError> {
+        if !self.usable {
+            return Err(NntpError::UnexpectedResponse(
+                "NNTP connection unusable".into(),
+            ));
+        }
+        let result = self.read_article(message_id, deadline);
+        if matches!(
+            &result,
+            Err(error) if !matches!(error, NntpError::NoSuchArticle(_) | NntpError::InvalidMessageId(_))
+        ) {
+            // A partial reply cannot be drained safely within the byte/deadline
+            // budget. Never issue another command on this desynchronized stream.
+            self.usable = false;
+            let _ = self.reader.get_ref().shutdown(std::net::Shutdown::Both);
+        }
+        result
+    }
+
+    fn read_article(
+        &mut self,
+        message_id: &str,
+        deadline: &NntpDeadline,
+    ) -> Result<Vec<u8>, NntpError> {
         let mid = message_id.trim().trim_matches(|c| c == '<' || c == '>');
         if !valid_message_id(mid) {
             return Err(NntpError::InvalidMessageId(message_id.to_string()));
@@ -198,38 +268,62 @@ impl NntpClient {
         self.reader.get_mut().write_all(cmd.as_bytes())?;
         self.reader.get_mut().flush()?;
         let status = self.read_line_with_deadline(deadline)?;
-        if status.starts_with("222") {
-            let mut body = Vec::new();
-            loop {
-                let mut line = Vec::new();
-                self.read_until_with_deadline(b'\n', &mut line, deadline)?;
-                if line.is_empty() {
-                    return Err(NntpError::UnexpectedResponse("eof inside article".into()));
+        match parse_status_code(&status) {
+            Some(222) => {
+                let mut body = Vec::new();
+                loop {
+                    let mut line = Vec::new();
+                    self.read_until_with_deadline(b'\n', &mut line, deadline)?;
+                    if line.is_empty() {
+                        return Err(NntpError::UnexpectedResponse("eof inside article".into()));
+                    }
+                    if line.ends_with(b"\n") {
+                        line.pop();
+                    }
+                    if line.ends_with(b"\r") {
+                        line.pop();
+                    }
+                    if line == b"." {
+                        break;
+                    }
+                    let data = unstuff(&line);
+                    // Native output normalizes CRLF to LF. Count the retained
+                    // unstuffed bytes plus that LF, not wire bytes or the final dot.
+                    if data.len() + 1 > MAX_ARTICLE_BYTES - body.len() {
+                        return Err(NntpError::UnexpectedResponse(
+                            "NNTP article exceeds byte limit".into(),
+                        ));
+                    }
+                    // Vec's default doubling could reserve beyond the article
+                    // ceiling even while its length fits. Clamp requested growth.
+                    let needed = body.len() + data.len() + 1;
+                    if needed > body.capacity() {
+                        let capacity = needed
+                            .max(body.capacity().saturating_mul(2))
+                            .min(MAX_ARTICLE_BYTES);
+                        body.reserve_exact(capacity - body.len());
+                    }
+                    body.extend_from_slice(data);
+                    body.push(b'\n');
                 }
-                if line.ends_with(b"\n") {
-                    line.pop();
-                }
-                if line.ends_with(b"\r") {
-                    line.pop();
-                }
-                if line == b"." {
-                    break;
-                }
-                body.extend_from_slice(unstuff(&line));
-                body.push(b'\n');
+                Ok(body)
             }
-            Ok(body)
-        } else if status.starts_with("480") || status.starts_with("481") {
-            // Session no longer authenticated (480, the standard BODY
-            // reply) or credentials rejected (481): re-auth signal, never
-            // a missing article. 482 here is out-of-sequence and stays a
-            // generic protocol error below. No credential material is
-            // retained: the status line is dropped.
-            Err(NntpError::AuthExpired)
-        } else if status.starts_with("430") || status.starts_with("423") {
-            Err(NntpError::NoSuchArticle(message_id.to_string()))
-        } else {
-            Err(NntpError::UnexpectedResponse(status.trim_end().to_string()))
+            Some(480) | Some(481) => {
+                // Session no longer authenticated (480, the standard BODY
+                // reply) or credentials rejected (481): re-auth signal, never
+                // a missing article. 482 here is out-of-sequence and stays a
+                // generic protocol error below. No credential material is
+                // retained: the status line is dropped.
+                Err(NntpError::AuthExpired)
+            }
+            Some(430) | Some(423) => Err(NntpError::NoSuchArticle(message_id.to_string())),
+            Some(code) => Err(NntpError::UnexpectedResponse(format!(
+                "unexpected NNTP reply code {code}"
+            ))),
+            // Generic and bounded: the status line is untrusted and must not
+            // be echoed. A malformed prefix never continues a body read and
+            // never prompts credential re-entry.
+            None => Err(NntpError::UnexpectedResponse("malformed NNTP reply".into())),
         }
     }
 
@@ -260,6 +354,14 @@ impl NntpClient {
                 .position(|byte| *byte == delimiter)
                 .map_or(available.len(), |index| index + 1);
             let terminated = available[count - 1] == delimiter;
+            // Count framing/stuffing bytes too, and refuse before retaining
+            // any chunk that would cross the cap, even without a delimiter.
+            if count > MAX_LINE_BYTES.saturating_sub(output.len()) {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "NNTP line exceeds byte limit",
+                ));
+            }
             output.extend_from_slice(&available[..count]);
             self.reader.consume(count);
             read += count;
@@ -331,6 +433,15 @@ mod tests {
         assert!(!valid_message_id("a<b@c"));
         assert!(!valid_message_id(&"a".repeat(251)));
         assert!(valid_message_id(&format!("{}@c", "a".repeat(248))));
+        // Shape rules (mirrors ingest `validate_message_id`): exactly one
+        // `@` with non-empty sides, printable ASCII only.
+        assert!(!valid_message_id("not-an-id"));
+        assert!(!valid_message_id("a@b@c"));
+        assert!(!valid_message_id("@synthetic.test"));
+        assert!(!valid_message_id("local@"));
+        assert!(!valid_message_id("s\u{e9}g@synthetic.test"));
+        assert!(!valid_message_id("a\u{1}b@synthetic.test"));
+        assert!(!valid_message_id("a\u{7f}b@synthetic.test"));
     }
 
     #[test]

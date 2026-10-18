@@ -33,10 +33,10 @@ pub fn is_indexer_auth_failure(http_status: u16) -> bool {
 pub const MAX_LIMIT: u32 = 100;
 /// Music-only search (`t=music`); the pipeline ingests audio releases.
 pub const SEARCH_TYPE: &str = "music";
-/// Upper bound on requested categories per search: every category becomes a
-/// `&cat=` parameter on the outbound URL, so an unbounded list is an
-/// unbounded URL. Routes reject larger lists with 400 before anything is
-/// built or enqueued.
+/// Upper bound on requested categories per search: the requested list is sent
+/// as one comma-delimited `&cat=` value (Newznab MUSIC-SEARCH union) on the
+/// outbound URL, so an unbounded list is an unbounded URL. Routes reject
+/// larger lists with 400 before anything is built or enqueued.
 pub const MAX_CATEGORIES: usize = 16;
 /// Upper bound on the requested page (0-based). With [`MAX_LIMIT`] this caps
 /// the offset at 10_000 rows; routes reject larger pages with 400.
@@ -94,8 +94,36 @@ fn check_base_url(base_url: &str) -> Result<String, &'static str> {
     Ok(base_url.trim_end_matches('/').to_string())
 }
 
-/// Build `https://{indexer}/api?apikey=…` query URL **without** the key.
+/// Endpoint for a validated base URL: a base whose final path segment is
+/// exactly `api` (lowercase) already ends at the Newznab endpoint and is
+/// preserved verbatim, so a saved `https://host/api` never becomes
+/// `/api/api`. Every other base gains exactly one `/api` segment, which
+/// composes deployment prefixes (`/newznab` -> `/newznab/api`) while leaving
+/// deeper paths otherwise untouched.
 ///
+/// Only an exact, lowercase, final `api` segment counts: `capi`, `apiary`,
+/// `apis`, `API`, a non-final `/api/…`, and an `api` host label all still
+/// gain `/api`. The input must already be trimmed of trailing slashes (see
+/// [`check_base_url`]).
+fn endpoint_for_base(base: &str) -> String {
+    let after_scheme = &base["https://".len()..];
+    match after_scheme.find('/') {
+        None => format!("{base}/api"),
+        Some(i) => {
+            let path = &after_scheme[i..];
+            if path.rsplit('/').next() == Some("api") {
+                base.to_string()
+            } else {
+                format!("{base}/api")
+            }
+        }
+    }
+}
+
+/// Build the `https://{indexer}/api?...` query URL **without** the key.
+///
+/// A saved base URL that already ends at the API endpoint is preserved (see
+/// [`endpoint_for_base`]); otherwise one `/api` segment is appended.
 /// Returns an error for empty queries, out-of-range limits, http URLs,
 /// and credential-embedding hosts.
 pub fn build_search_url(params: &SearchParams<'_>) -> Result<String, &'static str> {
@@ -113,22 +141,35 @@ pub fn build_search_url(params: &SearchParams<'_>) -> Result<String, &'static st
     if params.categories.len() > MAX_CATEGORIES {
         return Err("too many categories (max 16)");
     }
+    let endpoint = endpoint_for_base(&base);
     let mut url = format!(
-        "{base}/api?t={SEARCH_TYPE}&o=json&q={}&limit={}&offset={}",
+        "{endpoint}?t={SEARCH_TYPE}&o=json&q={}&limit={}&offset={}",
         percent_encode(q),
         params.limit,
         params.offset
     );
-    for cat in params.categories {
-        url.push_str(&format!("&cat={cat}"));
+    if !params.categories.is_empty() {
+        // Newznab MUSIC-SEARCH takes `cat` as one comma-delimited list;
+        // repeated `&cat=` params let scalar parsers keep only one value,
+        // dropping the rest of the requested union.
+        let joined = params
+            .categories
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        url.push_str(&format!("&cat={joined}"));
     }
     Ok(url)
 }
 
 /// Append the vault-resolved key at request time. Never log the result.
+///
+/// Honors the saved-key contract the vault and setup wizard enforce: a
+/// nonempty key of at most 1024 UTF-8 bytes (`str::len` is byte length).
 pub fn inject_api_key(url_without_key: &str, api_key: &str) -> Result<String, &'static str> {
-    if api_key.is_empty() || api_key.len() > 256 {
-        return Err("api key must be 1..=256 chars");
+    if api_key.is_empty() || api_key.len() > 1024 {
+        return Err("api key must be 1..=1024 bytes");
     }
     Ok(format!(
         "{url_without_key}&apikey={}",
@@ -197,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn categories_append_as_cat_params() {
+    fn categories_append_as_one_comma_delimited_cat_value() {
         let cats = [3000, 3040];
         let p = SearchParams {
             base_url: "https://indexer.example",
@@ -207,7 +248,23 @@ mod tests {
             offset: 20,
         };
         let url = build_search_url(&p).unwrap();
-        assert!(url.contains("&cat=3000&cat=3040"));
+        // One `cat` parameter carrying the union in order; repeated
+        // `&cat=` params are the defect (scalar parsers keep only one).
+        assert!(url.contains("&cat=3000,3040"));
+        assert_eq!(url.matches("&cat=").count(), 1);
+        // Singletons carry no comma; empties omit `cat` entirely.
+        let one = SearchParams {
+            base_url: "https://indexer.example",
+            query: "kind",
+            categories: &[3040],
+            limit: 10,
+            offset: 20,
+        };
+        let one_url = build_search_url(&one).unwrap();
+        assert!(one_url.contains("&cat=3040"));
+        assert_eq!(one_url.matches("&cat=").count(), 1);
+        let empty_url = build_search_url(&params("https://indexer.example", "kind")).unwrap();
+        assert!(!empty_url.contains("cat="));
     }
 
     #[test]
