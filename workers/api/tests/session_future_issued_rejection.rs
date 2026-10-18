@@ -1,4 +1,4 @@
-//! Tests-only pin: session future-issued-at skew rejection (refill-19 slice of TOG-30191).
+//! Tests-only pin: session future-issued-at skew rejection.
 //!
 //! Implementation stays untouched. These tests pin the current behavior of
 //! `session::verify_session` against the `CLOCK_SKEW_SECS` (60s) future
