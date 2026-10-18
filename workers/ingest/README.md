@@ -381,7 +381,10 @@ invocation is claimed here.
   5/15/30/60 s).
   One settlement is exempt from the budget: a progress continuation
   (`JobError::progress` → `Disposition::Continue` in `src/retry.rs`,
-  today only the probe budget stop above) persists new checkpoint
+  the probe budget stop above, every state-advance hand-off
+  (Probing→Verifying, Verifying→Matching/Repairing, Repairing→Verifying),
+  and verify steps that staged or spooled more — see the
+  `JobError::progress` sites in `src/queue_consumer.rs`) persists new checkpoint
   progress, enqueues a fresh message copy (`send_continuation`, 5 s delay
   per `PROBE_CONTINUATION_DELAY_SECS = 5` in `src/queue_consumer.rs`),
   and acks — no attempt increment, no native retry slot —
@@ -445,6 +448,14 @@ invocation is claimed here.
    nonterminal checkpoint `Failed` with code `native_dead_letter` (an
    operator-chosen marker, not a code constant — no such const exists in
    `src/retry.rs`; `fail_checkpoint` accepts any code) and persist it.
+   A message that reaches the native DLQ without a matching
+   `INGEST_STATE` checkpoint cannot be recovered through `redrive_raw`
+   (which requires a matching `Failed` checkpoint): this happens when a
+   validly decoded body fails `validate_queue_msg` in
+   `src/queue_consumer.rs`, which retries without ever creating a
+   checkpoint. Recover by fixing the cause and enqueueing a corrected
+   message (the first valid delivery creates a fresh checkpoint), not via
+   the redrive helpers.
    A `Done` checkpoint must not be redriven. Then call
    `retry::redrive(&entry, &mut checkpoint)` (or
    `retry::redrive_raw(&msg, &mut checkpoint)`). The helper resets the durable
