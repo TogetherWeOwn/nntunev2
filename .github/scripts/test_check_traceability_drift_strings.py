@@ -49,6 +49,19 @@ GAMMA_TITLES = [
     "gamma seven",
 ]
 
+DELTA_TITLES = [
+    "delta one",
+    "delta two",
+    "delta three",
+    "delta four",
+    "delta five",
+]
+
+ZETA_TITLES = [
+    "zeta one",
+    "zeta two",
+]
+
 
 def write_tree(root, matrix, listed):
     root = Path(root)
@@ -86,6 +99,69 @@ class DriftStringsTest(unittest.TestCase):
                 "uncited spec file e2e/tests/gamma.spec.ts (7 tests: "
                 "'gamma one', 'gamma two', 'gamma three', 'gamma four', "
                 "'gamma five' (+2 more)); cite it in the matrix"
+            ],
+        )
+
+    def test_five_title_uncited_spec_has_no_suffix(self):
+        lines = ["Listing tests:"]
+        lines.append("  [staging] › alpha.spec.ts:10:3 › group › first title")
+        lines.append("  [staging] › alpha.spec.ts:20:3 › group › second title")
+        lines.append("  [staging] › beta.spec.ts:5:3 › solo title")
+        for i, title in enumerate(DELTA_TITLES, start=1):
+            lines.append(f"  [staging] › delta.spec.ts:{i}:3 › group › {title}")
+        lines.append("Total: 8 tests in 3 files")
+        listed = "\n".join(lines) + "\n"
+        drifts = self.run_check(MATRIX_COVERING_BOTH, listed)
+        self.assertEqual(
+            drifts,
+            [
+                "uncited spec file e2e/tests/delta.spec.ts (5 tests: "
+                "'delta one', 'delta two', 'delta three', 'delta four', "
+                "'delta five'); cite it in the matrix"
+            ],
+        )
+
+    def test_six_title_uncited_spec_shows_plus_one_more(self):
+        lines = ["Listing tests:"]
+        lines.append("  [staging] › alpha.spec.ts:10:3 › group › first title")
+        lines.append("  [staging] › alpha.spec.ts:20:3 › group › second title")
+        lines.append("  [staging] › beta.spec.ts:5:3 › solo title")
+        for i, title in enumerate(GAMMA_TITLES[:6], start=1):
+            lines.append(f"  [staging] › epsilon.spec.ts:{i}:3 › group › {title}")
+        lines.append("Total: 9 tests in 3 files")
+        listed = "\n".join(lines) + "\n"
+        drifts = self.run_check(MATRIX_COVERING_BOTH, listed)
+        self.assertEqual(
+            drifts,
+            [
+                "uncited spec file e2e/tests/epsilon.spec.ts (6 tests: "
+                "'gamma one', 'gamma two', 'gamma three', 'gamma four', "
+                "'gamma five' (+1 more)); cite it in the matrix"
+            ],
+        )
+
+    def test_two_uncited_specs_are_sorted(self):
+        # zeta lines come first in `e2e:list` output, but drifts must be
+        # sorted, so gamma sorts first; pins the sorted() on the loop.
+        lines = ["Listing tests:"]
+        lines.append("  [staging] › alpha.spec.ts:10:3 › group › first title")
+        lines.append("  [staging] › alpha.spec.ts:20:3 › group › second title")
+        lines.append("  [staging] › beta.spec.ts:5:3 › solo title")
+        for i, title in enumerate(ZETA_TITLES, start=1):
+            lines.append(f"  [staging] › zeta.spec.ts:{i}:3 › group › {title}")
+        for i, title in enumerate(GAMMA_TITLES, start=1):
+            lines.append(f"  [staging] › gamma.spec.ts:{i}:3 › group › {title}")
+        lines.append("Total: 12 tests in 4 files")
+        listed = "\n".join(lines) + "\n"
+        drifts = self.run_check(MATRIX_COVERING_BOTH, listed)
+        self.assertEqual(
+            drifts,
+            [
+                "uncited spec file e2e/tests/gamma.spec.ts (7 tests: "
+                "'gamma one', 'gamma two', 'gamma three', 'gamma four', "
+                "'gamma five' (+2 more)); cite it in the matrix",
+                "uncited spec file e2e/tests/zeta.spec.ts (2 tests: "
+                "'zeta one', 'zeta two'); cite it in the matrix",
             ],
         )
 
