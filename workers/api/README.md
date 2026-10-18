@@ -98,8 +98,11 @@ provider certificate issued only for the hostname fails closed as
 `EMAIL_WEBHOOK_URL` (without it links are issued but not delivered, and
 passkey signup cannot complete its inbox-proof step);
 test-connection is a direct bounded dial, not yet routed through the
-stream pool. Staging deploy (worker-build plumbing + per-env wrangler
-config from secrets) is a follow-up slice.
+stream pool. Staging deploy rides the `staging-api` lane in
+`.github/workflows/deploy.yml` (generated per-env wrangler config from
+public repo variables, worker-build plumbing, `--var BUILD_SHA` wiring);
+Worker secrets and the staging variable values are Operator-wired, and the
+lane skips until they are.
 
 ### Test-connection routing boundary
 
