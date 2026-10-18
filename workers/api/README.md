@@ -382,9 +382,15 @@ behavior changes here.
 ## Test
 
 ```sh
-cargo test --manifest-path workers/api/Cargo.toml
-cargo clippy --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets
+cargo clippy --locked --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
 cargo fmt --manifest-path workers/api/Cargo.toml -- --check
+cargo check --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
+bash workers/api/check_hyperdrive_cache.sh --self-test
 ```
+
+(Mirrors CI job `api`; `fmt` takes no `--locked` (it resolves no
+dependencies), so the asymmetry is intentional.
+Sources: `.github/workflows/ci.yml:271-296`.)
 
 Fixtures use synthetic credentials only (`news.example.com`, `203.0.113.7`).
