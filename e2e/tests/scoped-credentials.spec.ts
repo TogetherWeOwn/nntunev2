@@ -1,17 +1,17 @@
 import { test, expect } from '@playwright/test';
 import { accessHeaders, assertNoAccessWall, stagingBaseUrl } from '../helpers/access.js';
 import {
-  accountHeaders,
   apiGet,
   apiPost,
   requireApiAccount,
   tryMintTestAccount,
+  type TestAccount,
 } from '../helpers/accounts.js';
 
 // Scoped native REST credentials (ADR 0010, paired acceptance card,
-// paired build card): mint → scoped route 200
-// → revoke → 401/403, scope-matrix denials by name, header-only transport,
-// names-only diagnostics.
+// paired build card): mint → scoped route 404 (gate passed; data routes
+// pending) → revoke → 401/403, scope-matrix denials by name, header-only
+// transport, names-only diagnostics.
 //
 // NO file-level skip here by design (see demo-audio-contract.spec.ts): the
 // offline describe pins the contract table on every PR (via
@@ -75,6 +75,41 @@ function bearerHeaders(secret: string): Record<string, string> {
   return { ...accessHeaders(), Authorization: `Bearer ${secret}` };
 }
 
+/** Raw session value for cookie transport (names-only failure, never the value). */
+function sessionValue(account: TestAccount | null): string {
+  const value = account?.session;
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new Error(
+      '[scoped-credentials] no authenticated account session (names only — no values logged).',
+    );
+  }
+  return value;
+}
+
+/**
+ * Session-cookie headers for the issuance surface (mint/revoke): the
+ * privileged gate reads the session cookie plus the exact configured
+ * Origin and ignores the Authorization bearer entirely.
+ */
+function privilegedHeaders(
+  account: TestAccount | null,
+  webBase: string,
+): Record<string, string> {
+  return {
+    ...accessHeaders(),
+    Cookie: `__Host-nntune-session=${sessionValue(account)}`,
+    Origin: new URL(webBase).origin,
+  };
+}
+
+/** Session-cookie headers for the list surface (ordinary session, no Origin gate). */
+function sessionCookieHeaders(account: TestAccount | null): Record<string, string> {
+  return {
+    ...accessHeaders(),
+    Cookie: `__Host-nntune-session=${sessionValue(account)}`,
+  };
+}
+
 test.describe('credential contract table (offline, no staging)', () => {
   test('scope vocabulary matches ADR 0010 exactly', () => {
     expect([...SCOPES]).toEqual([
@@ -113,7 +148,7 @@ test.describe('credential contract table (offline, no staging)', () => {
 });
 
 test.describe('staging credential lifecycle', () => {
-  test('mint → scoped route 200 → revoke → 401/403', async ({ request }) => {
+  test('mint → scoped route 404 (gate passed) → revoke → 401/403', async ({ request }) => {
     const webBase = stagingBaseUrl('skip', 'scoped-credentials-lifecycle');
     if (!webBase) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
@@ -130,16 +165,19 @@ test.describe('staging credential lifecycle', () => {
       return;
     }
     requireApiAccount(account, 'scoped-credentials-lifecycle');
-    const sessionHeaders = {
-      ...accountHeaders(account),
+    // Issuance is session-cookie + exact Origin (the bearer header is
+    // ignored there).
+    const mintHeaders = {
+      ...privilegedHeaders(account, webBase),
       'Content-Type': 'application/json',
     };
+    const revokeHeaders = privilegedHeaders(account, webBase);
 
     // Mint a library:read credential (one-time secret).
     const mint = await apiPost(
       request,
       `${nativeBase}${ISSUE_PATH}`,
-      sessionHeaders,
+      mintHeaders,
       { label: 'e2e-lifecycle', scopes: ['library:read'], ttl_secs: 3600 },
       'scoped-credentials-mint',
     );
@@ -164,7 +202,9 @@ test.describe('staging credential lifecycle', () => {
     const secretValue = secret as string;
     const idValue = credentialId as string;
 
-    // Scoped route answers 200 with the credential.
+    // Scoped route: the bearer passes the gate, then lands on the
+    // documented 404 until the data routes land (a presented-but-invalid
+    // bearer would be 401 instead, so 404 proves the gate passed).
     const scoped = await apiGet(
       request,
       `${nativeBase}${CANONICAL_ROUTE['library:read'].path}`,
@@ -175,11 +215,13 @@ test.describe('staging credential lifecycle', () => {
       { status: scoped.status(), headers: scoped.headers(), bodyText: '', url: 'use' },
       'scoped-credentials-use',
     );
-    expect(scoped.status(), 'in-scope bearer call must answer 200').toBe(200);
+    expect(scoped.status(), 'in-scope bearer call passes the gate to the documented 404').toBe(
+      404,
+    );
 
-    // Revoke via the session-authenticated surface.
+    // Revoke via the session-cookie + Origin surface.
     const revokeRes = await request.delete(`${nativeBase}${ISSUE_PATH}/${idValue}`, {
-      headers: sessionHeaders,
+      headers: revokeHeaders,
       timeout: 30_000,
       maxRedirects: 0,
     });
@@ -213,9 +255,11 @@ test.describe('staging credential lifecycle', () => {
     }
     const target = `${nativeBase}${CANONICAL_ROUTE['library:read'].path}`;
 
-    // No credential at all.
+    // No credential at all: header-absent callers skip the bearer gate
+    // and land on the plain 404 until the data routes land (fail-closed
+    // either way).
     const bare = await apiGet(request, target, accessHeaders(), 'scoped-credentials-bare');
-    expect([401, 403].includes(bare.status()), 'bare call must fail closed').toBe(true);
+    expect([401, 403, 404].includes(bare.status()), 'bare call must fail closed').toBe(true);
 
     // Garbage bearer.
     const garbage = await apiGet(
@@ -229,18 +273,21 @@ test.describe('staging credential lifecycle', () => {
     );
 
     // Session cookie WITHOUT an Authorization bearer: credential routes
-    // must not fall back to the cookie.
+    // must not fall back to the cookie (plain 404 until the data routes
+    // land with their session-or-bearer dispatch — fail-closed either way).
     const cookieOnly = await request.get(target, {
       headers: { ...accessHeaders(), Cookie: '__Host-nntune-session=e2e-synthetic-session' },
       timeout: 30_000,
       maxRedirects: 0,
     });
     expect(
-      [401, 403].includes(cookieOnly.status()),
+      [401, 403, 404].includes(cookieOnly.status()),
       'cookie-only call on a credential route must fail closed',
     ).toBe(true);
 
-    // Query-string bearer is rejected (query strings land in logs).
+    // Query-string bearer is rejected (query strings land in logs); with no
+    // Authorization header the probe lands on the plain 404 until the data
+    // routes land — fail-closed either way.
     const query = await apiGet(
       request,
       `${target}?apiKey=ntk_query-string-probe-00000000000000000`,
@@ -248,7 +295,7 @@ test.describe('staging credential lifecycle', () => {
       'scoped-credentials-query',
     );
     expect(
-      [401, 403].includes(query.status()),
+      [401, 403, 404].includes(query.status()),
       'query-string credential must be rejected',
     ).toBe(true);
   });
@@ -270,8 +317,10 @@ test.describe('staging credential lifecycle', () => {
       return;
     }
     requireApiAccount(account, 'scoped-credentials-matrix');
-    const sessionHeaders = {
-      ...accountHeaders(account),
+    // Issuance is session-cookie + exact Origin (the bearer header is
+    // ignored there).
+    const matrixMintHeaders = {
+      ...privilegedHeaders(account, webBase),
       'Content-Type': 'application/json',
     };
 
@@ -279,7 +328,7 @@ test.describe('staging credential lifecycle', () => {
       const res = await apiPost(
         request,
         `${nativeBase}${ISSUE_PATH}`,
-        sessionHeaders,
+        matrixMintHeaders,
         { label: `e2e-matrix-${scope}`, scopes: [scope], ttl_secs: 3600 },
         'scoped-credentials-matrix-mint',
       );
@@ -307,10 +356,15 @@ test.describe('staging credential lifecycle', () => {
 
     // library:read reaches its own route but not plays:write's, and vice
     // versa — each denial is 403 (authenticated, wrong scope by name).
+    // Own-scope bearers pass the gate to the documented 404 until the data
+    // routes land (a wrong-scope bearer is 403 instead, so 404 proves the
+    // gate passed for the right scope).
     const reader = await mintFor('library:read');
     const writer = await mintFor('plays:write');
-    expect(await call('GET', '/v1/search', reader), 'own scope must answer 200').toBe(200);
-    expect(await call('POST', '/v1/plays', writer), 'own scope must answer 200').toBe(200);
+    expect(await call('GET', '/v1/search', reader), 'own scope passes the gate to 404').toBe(
+      404,
+    );
+    expect(await call('POST', '/v1/plays', writer), 'own scope passes the gate to 404').toBe(404);
     expect(await call('POST', '/v1/plays', reader), 'cross-scope must be 403 by name').toBe(403);
     expect(await call('GET', '/v1/search', writer), 'cross-scope must be 403 by name').toBe(403);
   });
@@ -334,10 +388,8 @@ test.describe('staging credential lifecycle', () => {
       return;
     }
     requireApiAccount(account, 'scoped-credentials-list');
-    const sessionHeaders = {
-      ...accountHeaders(account),
-      'Content-Type': 'application/json',
-    };
+    // List is an ordinary session-cookie surface (no Origin gate, no bearer).
+    const listHeaders = sessionCookieHeaders(account);
 
     // Issuance itself requires a session: bearer and anonymous callers fail.
     const anonIssue = await apiPost(
@@ -355,7 +407,7 @@ test.describe('staging credential lifecycle', () => {
     const list = await apiGet(
       request,
       `${nativeBase}${ISSUE_PATH}`,
-      sessionHeaders,
+      listHeaders,
       'scoped-credentials-list',
     );
     expect(list.status(), 'credential list must answer 200 once implemented').toBe(200);
