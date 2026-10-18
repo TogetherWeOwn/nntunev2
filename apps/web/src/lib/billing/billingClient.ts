@@ -171,6 +171,44 @@ export async function fetchSubscription(fetchFn: typeof fetch = fetch): Promise<
 	return await readJson(res, 'Load subscription');
 }
 
+/**
+ * Authorized Stripe redirect hosts for checkout/portal 2xx bodies. Any
+ * allowlisted `https:` target resolves verbatim; everything else rejects
+ * with the typed client error so an off-allowlist or malformed target never
+ * reaches a `window.location.href` assignment (open-redirect guard).
+ */
+const STRIPE_REDIRECT_HOSTS = new Set(['checkout.stripe.com', 'billing.stripe.com']);
+
+function isAllowlistedRedirectUrl(value: unknown): value is string {
+	if (typeof value !== 'string' || value.trim() === '') return false;
+	// WHATWG URL parsing recovers an allowlisted host from a scheme without
+	// an explicit authority (`https:checkout.stripe.com/...` parses with
+	// hostname checkout.stripe.com), but a `window.location.href` assignment
+	// of that same string resolves against the app origin instead — so the
+	// raw string must carry the explicit `https://` authority up front.
+	if (!value.startsWith('https://')) return false;
+	let parsed: URL;
+	try {
+		parsed = new URL(value);
+	} catch {
+		return false;
+	}
+	return parsed.protocol === 'https:' && STRIPE_REDIRECT_HOSTS.has(parsed.hostname.toLowerCase());
+}
+
+function redirectUrlOrThrow(
+	data: unknown,
+	status: number,
+	label: string,
+	hint: string
+): string {
+	if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
+		const url = (data as Record<string, unknown>).url;
+		if (isAllowlistedRedirectUrl(url)) return url;
+	}
+	throw new BillingApiError(status, label, hint);
+}
+
 export async function startCheckout(
 	planId: string,
 	fetchFn: typeof fetch = fetch
@@ -182,9 +220,8 @@ export async function startCheckout(
 		headers: { 'content-type': 'application/json' },
 		body: JSON.stringify({ planId })
 	});
-	const data = await readJson<{ url: string }>(res, 'Start checkout');
-	if (!data.url.startsWith('https://')) throw new Error('Invalid checkout URL');
-	return data.url;
+	const data = await readJson<unknown>(res, 'Start checkout');
+	return redirectUrlOrThrow(data, res.status, 'Start checkout', ': Invalid checkout URL');
 }
 
 /**
@@ -206,7 +243,6 @@ export async function openPortal(fetchFn: typeof fetch = fetch): Promise<string>
 		headers: { 'content-type': 'application/json' },
 		body: '{}'
 	});
-	const data = await readJson<{ url: string }>(res, 'Open billing portal');
-	if (!data.url.startsWith('https://')) throw new Error('Invalid portal URL');
-	return data.url;
+	const data = await readJson<unknown>(res, 'Open billing portal');
+	return redirectUrlOrThrow(data, res.status, 'Open billing portal', ': Invalid portal URL');
 }
