@@ -253,12 +253,22 @@ pub fn recording_mbids_or_fallback(
     }
 }
 
-/// Normalize text for exact match comparison: lowercased, every
-/// non-alphanumeric run collapsed to single spaces. "Don't Stop!" and
-/// "dont stop" compare equal; different words never do.
+/// Normalize text for exact match comparison: lowercased, ASCII
+/// (`'`, U+0027) and typographic (`’`, U+2019) apostrophes deleted,
+/// every other non-alphanumeric run collapsed to single spaces.
+/// "Don't Stop!" and "dont stop" compare equal; different words never
+/// do. Deleting only the two pinned apostrophes preserves genuine
+/// word boundaries: any other punctuation still separates (so `ab cd`
+/// never equals `abcd`), and a spaced fragment such as `don t stop`
+/// keeps its spaces and never collapses to `dont stop`. An apostrophe
+/// outside a word needs no special case: with no adjacent
+/// alphanumerics on both sides the surrounding boundary already
+/// separates, so dropping the mark and mapping it to a space collapse
+/// to the same normalized form.
 fn normalize_match_text(raw: &str) -> String {
     raw.to_lowercase()
         .chars()
+        .filter(|c| *c != '\'' && *c != '\u{2019}')
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect::<String>()
         .split_whitespace()
