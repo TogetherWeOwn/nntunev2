@@ -301,11 +301,13 @@ config from secrets) is a follow-up slice.
   at every dial/fetch and pin the transport to that address set without
   another DNS lookup; retain the original hostname for TLS SNI/certificate
   checks and HTTP Host. Save-time validation is not a fetch authorization.
-  This worker performs no indexer fetches: indexer URLs are validated at
-  save/test time only, and `INDEXER_ALLOW_REDIRECTS` stays `false` as the
-  declared no-redirect policy. Indexer search fetching lives in
-  `workers/ingest`, where every redirect hop is re-guarded from scratch
-  (cap 3). Test-connection attempts atomically
+  This worker performs no indexer fetches; indexer URLs are validated at
+  save/test time only (`IndexerConfig::validate`). Indexer fetches must
+  forbid redirects (`INDEXER_ALLOW_REDIRECTS = false`, threat-model
+  F-INGEST-01). No live indexer fetch transport exists yet;
+  `workers/ingest/src/indexer_fetch.rs` is a test-only policy model whose
+  3-hop redirect following is an unresolved discrepancy (see
+  `workers/ingest/README.md`). Test-connection attempts atomically
   reserve shared-store rate slots, acquire one of two per-user expiring
   leases, dial at most four addresses with a 5-second per-address timeout,
   and stop the complete probe at 15 seconds. (Sources:
@@ -313,8 +315,7 @@ config from secrets) is a follow-up slice.
   `resolve_public_target`, `ProviderConfig::validate`,
   `authorize_pool_dial`, `ALLOWED_NNTP_PORTS`, `MAX_DIAL_ADDRESSES`,
   `DIAL_TIMEOUT_MS`/`TOTAL_TIMEOUT_MS`, `MAX_TEST_CONCURRENCY`,
-  `INDEXER_ALLOW_REDIRECTS`; re-guarded redirect hops in
-  `workers/ingest/src/indexer_fetch.rs` (`MAX_REDIRECTS`); pinned dial in
+  `INDEXER_ALLOW_REDIRECTS`; pinned dial in
   `workers/api/src/worker_entry.rs` (`SocketDialer::probe`, `probe_one`);
   slots/leases in `workers/api/src/handlers.rs` (`vault_test_connection`)
   and `workers/api/src/worker_entry.rs`
