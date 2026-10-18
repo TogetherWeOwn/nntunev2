@@ -51,6 +51,8 @@ jobs:
       - run: cargo test --workspace
       - name: Check ETL timestamps through the native importer validator
         run: bash containers/mb-import/tests/test_etl_timestamp_contract.sh
+      - name: Check ETL UTC bounds before publication
+        run: python3 containers/mb-import/tests/test_etl_timestamp_bounds.py
       # Transport-free portable core on the same native runner: executes
       # nntune-core without default TLS features. This is native portable
       # behavior, not a wasm-runtime check (see rust-wasm) nor a
