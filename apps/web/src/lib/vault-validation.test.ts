@@ -132,4 +132,27 @@ describe('validateIndexerUrl', () => {
 			expect(validateIndexerUrl(url, 'indexer-key'), `url rejected: ${url}`).not.toBeNull();
 		}
 	});
+
+	it('pins the exact indexer diagnostic strings', () => {
+		const URL = 'https://index.example.com/api';
+		const KEY = 'indexer-key';
+		expect(validateIndexerUrl('', 'orphaned-key')).toBe(
+			'Clear the indexer key or enter an indexer URL.'
+		);
+		expect(validateIndexerUrl('not-a-url', KEY)).toBe('That indexer URL does not look valid.');
+		expect(validateIndexerUrl('http://index.example.com/api', KEY)).toBe(
+			'Indexer URLs must use https.'
+		);
+		expect(validateIndexerUrl('ftp://index.example.com/', KEY)).toBe(
+			'Indexer URLs must use https.'
+		);
+		expect(validateIndexerUrl('https://localhost:8080/', KEY)).toBe(
+			'That indexer address is not allowed; use a public host.'
+		);
+		expect(validateIndexerUrl(URL, '')).toBe('Enter your indexer API key.');
+		expect(validateIndexerUrl(URL, 'k'.repeat(1025))).toBe(
+			'Indexer API key must be at most 1024 UTF-8 bytes.'
+		);
+		expect(validateIndexerUrl(URL, 'k'.repeat(1024))).toBeNull();
+	});
 });
