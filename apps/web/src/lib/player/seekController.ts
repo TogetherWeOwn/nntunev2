@@ -17,6 +17,12 @@ export interface SeekResult {
 }
 
 export function buildRangeHeader(start: number, end?: number): string {
+	if (!Number.isFinite(start)) {
+		throw new RangeError(`Invalid seek start: ${String(start)}`);
+	}
+	if (end !== undefined && !Number.isFinite(end)) {
+		throw new RangeError(`Invalid seek end: ${String(end)}`);
+	}
 	const safeStart = Math.max(0, Math.floor(start));
 	if (end === undefined) return `bytes=${safeStart}-`;
 	const safeEnd = Math.max(safeStart, Math.floor(end));
@@ -191,12 +197,14 @@ export class SeekController {
 	 * `AbortError` when this seek is itself superseded.
 	 */
 	async seek(start: number, end?: number): Promise<SeekResult> {
+		// Validate before any state change or fetch so non-finite
+		// positions never abort in-flight work nor reach the wire.
+		const rangeHeader = buildRangeHeader(start, end);
 		this.abortInFlight();
 		const controller = new AbortController();
 		this.current = controller;
 		this.generation += 1;
 		const generation = this.generation;
-		const rangeHeader = buildRangeHeader(start, end);
 		const requestedStart = Number(/^bytes=(\d+)-/.exec(rangeHeader)?.[1]);
 		const requestedEndText = /-(\d+)$/.exec(rangeHeader)?.[1];
 		const requestedEnd = requestedEndText === undefined ? undefined : Number(requestedEndText);
