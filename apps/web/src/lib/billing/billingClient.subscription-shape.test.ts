@@ -9,14 +9,17 @@ import { BillingApiError, fetchSubscription } from './billingClient';
  * Contract under test (SubscriptionDTO shape):
  * - Body is a plain object (never null/array/scalar).
  * - `planId` is a required non-empty string.
- * - `status` is one of the statuses the DTO admits: the ADR 0002
- *   statuses `trialing`/`active`/`past_due`/`canceled`/`expired` plus
- *   tolerated `incomplete`. Anything else (other Stripe statuses the
- *   DTO does not admit, misspellings, non-strings) rejects instead of
- *   rendering a raw unknown status.
+ * - `status` is one of the eight Stripe statuses the subscriptions row
+ *   stores verbatim (ADR 0002 data-model, ADR 0005 billing table):
+ *   `trialing`/`active`/`past_due`/`canceled`/`unpaid`/`paused`/
+ *   `incomplete`/`incomplete_expired`. Anything else (including the
+ *   non-existent local `expired` shortcut, misspellings, non-strings)
+ *   rejects instead of rendering a raw unknown status.
  * - `currentPeriodEnd` and `trialEndsAt` are required and are either
- *   null or a date string that parses to a real date — garbage strings
- *   reject instead of rendering "Invalid Date".
+ *   null or an ISO-8601 date string naming a real calendar date —
+ *   garbage strings, loose strings `Date.parse` accepts, and rolled-over
+ *   dates (February 30) reject instead of rendering "Invalid Date" or a
+ *   shifted renewal day.
  * - `graceUntil` may be absent; when present it is null or a parseable
  *   date string.
  * - Unknown extra fields are allowed.
@@ -57,7 +60,18 @@ describe('fetchSubscription accepts well-formed successful payloads', () => {
 		await expect(fetchSubscription(jsonOk(VALID))).resolves.toEqual(VALID);
 	});
 
-	it.each(['trialing', 'active', 'past_due', 'canceled', 'expired', 'incomplete'] as const)(
+	it.each(
+		[
+			'trialing',
+			'active',
+			'past_due',
+			'canceled',
+			'unpaid',
+			'paused',
+			'incomplete',
+			'incomplete_expired'
+		] as const
+	)(
 		'accepts status %s',
 		async (status) => {
 			await expect(fetchSubscription(jsonOk({ ...VALID, status }))).resolves.toMatchObject({
@@ -111,9 +125,7 @@ describe('fetchSubscription rejects malformed successful payloads', () => {
 	});
 
 	it.each([
-		['unpaid (Stripe status the DTO does not admit)', 'unpaid'],
-		['paused (Stripe status the DTO does not admit)', 'paused'],
-		['incomplete_expired (Stripe status the DTO does not admit)', 'incomplete_expired'],
+		['expired (no local expired status per ADR 0002)', 'expired'],
 		['unknown word', 'banana'],
 		['plan id in the status slot', 'free'],
 		['uppercase', 'ACTIVE'],
@@ -136,11 +148,17 @@ describe('fetchSubscription rejects malformed successful payloads', () => {
 		['month 13', '2026-13-01T00:00:00Z'],
 		['month 00', '2026-00-10T00:00:00Z'],
 		['hour 25', '2026-10-20T25:00:00Z'],
+		['impossible calendar date (Feb 30 rolls over to March)', '2026-02-30T00:00:00Z'],
+		['loose string Date.parse accepts (bare 1)', '1'],
 		['dashes only', '--'],
 		['time only', 'T00:00:00Z'],
 		['the literal string Invalid Date', 'Invalid Date']
 	])('rejects an unparseable currentPeriodEnd that is %s', async (_label, currentPeriodEnd) => {
 		await expectMalformedRejection(jsonOk({ ...VALID, currentPeriodEnd }));
+	});
+
+	it.each(DATE_FIELDS)('rejects an impossible calendar date in %s', async (field) => {
+		await expectMalformedRejection(jsonOk({ ...VALID, [field]: '2026-02-30T00:00:00Z' }));
 	});
 
 	it.each(DATE_FIELDS)('rejects a garbage date string in %s', async (field) => {

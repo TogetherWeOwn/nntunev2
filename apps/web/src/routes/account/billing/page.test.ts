@@ -200,7 +200,7 @@ describe('billing loader with an unconfirmed plan', () => {
 		expect(body).not.toContain('Upgrade to');
 	});
 
-	it.each(['past_due', 'canceled', 'expired', 'incomplete'] as const)(
+	it.each(['past_due', 'canceled', 'unpaid', 'paused', 'incomplete', 'incomplete_expired'] as const)(
 		'sends a %s subscription to the billing portal, never to a new checkout',
 		async (status) => {
 			const fetchFn = mockFetch({

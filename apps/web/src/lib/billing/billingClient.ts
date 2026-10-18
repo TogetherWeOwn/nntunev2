@@ -32,11 +32,22 @@ export interface PlanDTO {
 export interface SubscriptionDTO {
 	planId: string;
 	/**
-	 * ADR 0002 statuses (`trialing`/`active`/`past_due`/`canceled`/`expired`),
-	 * plus Stripe's `incomplete` tolerated while payment confirms — never
-	 * entitlement-granting either way.
+	 * Stripe statuses stored verbatim (ADR 0002 data-model, ADR 0005
+	 * billing table): `incomplete`, `incomplete_expired`, `trialing`,
+	 * `active`, `past_due`, `canceled`, `unpaid`, `paused`. There is no
+	 * local `expired` shortcut. Only `active`/`trialing` (plus `past_due`
+	 * inside its grace window) grant entitlement — every other stored
+	 * status routes to the billing portal via the loader's LAPSED set.
 	 */
-	status: 'trialing' | 'active' | 'past_due' | 'canceled' | 'expired' | 'incomplete';
+	status:
+		| 'trialing'
+		| 'active'
+		| 'past_due'
+		| 'canceled'
+		| 'unpaid'
+		| 'paused'
+		| 'incomplete'
+		| 'incomplete_expired';
 	currentPeriodEnd: string | null;
 	trialEndsAt: string | null;
 	/** End of the past-due grace window (ADR 0002 rule 4); absent when the backend sends none. */
@@ -106,28 +117,57 @@ function isValidUsagePayload(data: unknown): data is UsageSnapshot & { period: s
 
 /**
  * Successful GET /v1/me/subscription DTO guard. `planId` is a required
- * non-empty string; `status` must be one of the statuses the DTO admits
- * (the ADR 0002 statuses plus tolerated `incomplete`) so a raw unknown
- * status never reaches rendering. `currentPeriodEnd` and `trialEndsAt`
- * are required and are either null or a date string that parses to a real
- * date — garbage strings reject instead of rendering "Invalid Date".
- * `graceUntil` may be absent; when present it is null or a parseable
- * date string. Unknown extra fields are allowed. Anything else rejects
- * into the existing recoverable loader path instead of reaching rendering.
+ * non-empty string; `status` must be one of the eight Stripe statuses the
+ * subscriptions row stores verbatim (ADR 0002 data-model, ADR 0005
+ * billing table) so a raw unknown status never reaches rendering — and
+ * subscribers in a stored non-entitled state (`unpaid`, `paused`,
+ * `incomplete_expired`) keep their portal route instead of failing into
+ * trial defaults. `currentPeriodEnd` and `trialEndsAt` are required and
+ * are either null or an ISO-8601 date string naming a real calendar date
+ * — garbage strings and rolled-over dates (e.g. February 30, which
+ * `Date.parse` normalizes into March) reject instead of rendering
+ * "Invalid Date" or a shifted renewal day. `graceUntil` may be absent;
+ * when present it is null or a valid date string. Unknown extra fields
+ * are allowed. Anything else rejects into the existing recoverable
+ * loader path instead of reaching rendering.
  */
 const SUBSCRIPTION_STATUSES = [
 	'trialing',
 	'active',
 	'past_due',
 	'canceled',
-	'expired',
-	'incomplete'
+	'unpaid',
+	'paused',
+	'incomplete',
+	'incomplete_expired'
 ] as const;
 
 const SUBSCRIPTION_DATE_FIELDS = ['currentPeriodEnd', 'trialEndsAt'] as const;
 
+/**
+ * ISO-8601 date/datetime with bounded fields (month 01–12, day 01–31,
+ * hour 00–23), so loose strings `Date.parse` accepts (`'1'`, `'garbage'`)
+ * never pass. A UTC round-trip on the calendar date rejects impossible
+ * dates the parser would roll over (`2026-02-30` -> March 2).
+ */
+const SUBSCRIPTION_DATE_RE =
+	/^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?:T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d))?$/;
+
 function isParseableDateString(value: unknown): value is string {
-	return typeof value === 'string' && value.length > 0 && !Number.isNaN(Date.parse(value));
+	if (typeof value !== 'string' || value.length === 0) return false;
+	const match = SUBSCRIPTION_DATE_RE.exec(value);
+	if (!match) return false;
+	const year = Number(match[1]);
+	const month = Number(match[2]);
+	const day = Number(match[3]);
+	const probe = new Date(Date.UTC(year, month - 1, day));
+	if (
+		probe.getUTCFullYear() !== year ||
+		probe.getUTCMonth() !== month - 1 ||
+		probe.getUTCDate() !== day
+	)
+		return false;
+	return !Number.isNaN(Date.parse(value));
 }
 
 function isValidSubscriptionPayload(data: unknown): data is SubscriptionDTO {
