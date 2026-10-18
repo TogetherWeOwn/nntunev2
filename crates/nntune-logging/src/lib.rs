@@ -187,6 +187,41 @@ fn fallback_trace_id() -> String {
     format!("ffffffffffffffff{seq:016x}")
 }
 
+/// Explicit marker when the build carried no identity (dev server, preview
+/// without env, misconfigured CI). Mirrors the web build-identity surface
+/// (`apps/web/src/lib/build.ts`): the `sha` is either a 40-char lowercase
+/// hex commit or this exact string, so log grouping never sees a missing key.
+pub const BUILD_SHA_UNKNOWN: &str = "unknown";
+
+/// Normalize a candidate build SHA to the log-safe form: a 40-char
+/// lowercase hex commit SHA passes through, anything else (absent, empty,
+/// truncated, uppercase, non-hex) becomes [`BUILD_SHA_UNKNOWN`]. Never logs
+/// the raw candidate; an invalid value is dropped, never trusted.
+#[must_use]
+pub fn parse_build_sha(raw: Option<&str>) -> String {
+    match raw {
+        Some(value)
+            if value.len() == 40
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) =>
+        {
+            value.to_string()
+        }
+        _ => BUILD_SHA_UNKNOWN.to_string(),
+    }
+}
+
+/// True when the SHA is a real 40-char lowercase hex build identity, false
+/// for [`BUILD_SHA_UNKNOWN`] and anything else unparseable.
+#[must_use]
+pub fn is_build_sha_known(sha: &str) -> bool {
+    sha.len() == 40
+        && sha
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
 /// Format unix millis as an RFC 3339 UTC timestamp ending in `Z`, always with
 /// millisecond precision (`2026-10-15T20:00:00.123Z`). Pure civil-date math,
 /// no date library, so it behaves identically on native and wasm targets.
@@ -566,6 +601,32 @@ mod tests {
             assert!(is_valid_trace_id(&resolved), "bad resolve of {header:?}");
             assert_ne!(resolved.as_str(), header.unwrap_or(""));
         }
+    }
+
+    #[test]
+    fn build_sha_normalizes_to_known_or_unknown() {
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(parse_build_sha(Some(SHA)), SHA);
+        assert!(is_build_sha_known(SHA));
+        assert!(is_build_sha_known(&parse_build_sha(Some(SHA))));
+        for raw in [
+            None,
+            Some(""),
+            Some("unknown"),
+            Some("0123456789abcdef"),                         // truncated
+            Some("0123456789ABCDEF0123456789ABCDEF01234567"), // uppercase
+            Some("0123456789abcdef0123456789abcdef0123456g"), // non-hex
+        ] {
+            assert_eq!(parse_build_sha(raw), BUILD_SHA_UNKNOWN, "raw: {raw:?}");
+            assert!(!is_build_sha_known(&parse_build_sha(raw)));
+        }
+        assert!(!is_build_sha_known(BUILD_SHA_UNKNOWN));
+        // Both spellings survive field validation, so emitters can always
+        // carry the key (known SHA or explicit unknown).
+        assert!(fields(serde_json::json!({"build_sha": SHA})).contains_key("build_sha"));
+        assert!(
+            fields(serde_json::json!({"build_sha": BUILD_SHA_UNKNOWN})).contains_key("build_sha")
+        );
     }
 
     #[test]

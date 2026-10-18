@@ -407,6 +407,10 @@ impl PgStore {
             .connect_raw(socket, worker::postgres_tls::PassthroughTls)
             .await
             .map_err(|_| StoreError)?;
+        // Build identity rides along: a background task has no inbound
+        // trace, so it roots a fresh one and carries the same explicit
+        // known-or-unknown SHA as the request lines.
+        let build_sha = build_sha_from_env(&self.env);
         wasm_bindgen_futures::spawn_local(async move {
             // No detail in logs: driver errors can carry host/role strings.
             // A background task has no inbound trace, so it roots a fresh one.
@@ -415,7 +419,7 @@ impl PgStore {
                     crate::logging::Level::Error,
                     "api.db.connection_error",
                     &crate::logging::resolve_trace_id(None),
-                    serde_json::json!({"error_class": "service_unavailable"}),
+                    serde_json::json!({"error_class": "service_unavailable", "build_sha": build_sha}),
                 );
             }
         });
@@ -1767,6 +1771,16 @@ fn served_display_path(path: &str) -> String {
     }
 }
 
+/// Build identity for log lines: the 40-char lowercase hex commit baked at
+/// deploy time via the public `BUILD_SHA` var, or the explicit `"unknown"`
+/// marker when absent or invalid (dev, preview without env, misconfigured
+/// CI). Public non-secret config (see `wrangler.toml.example`); never
+/// fail-closed, so a missing identity degrades the line instead of the
+/// request. Normalized through the shared validator, never logged raw.
+fn build_sha_from_env(env: &Env) -> String {
+    crate::logging::parse_build_sha(env_string(env, "BUILD_SHA").as_deref())
+}
+
 /// Wall-clock milliseconds for record timestamps.
 #[cfg(target_arch = "wasm32")]
 fn now_millis() -> u64 {
@@ -1824,6 +1838,10 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         .flatten();
     let trace_id = crate::logging::resolve_trace_id(incoming_trace.as_deref());
     let start_ms = now_millis();
+    // Build identity first: every record below carries it, including the
+    // fail-closed paths. An absent or invalid var becomes explicit
+    // `"unknown"`, never a missing key.
+    let build_sha = build_sha_from_env(&env);
     let Some(config) = config_from_env(&env) else {
         // Misconfiguration is an operator problem; clients only ever see
         // the generic internal error (never which variable is wrong).
@@ -1831,7 +1849,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             crate::logging::Level::Error,
             "api.start.misconfigured",
             &trace_id,
-            serde_json::json!({"error_class": "internal_error"}),
+            serde_json::json!({"error_class": "internal_error", "build_sha": build_sha}),
         );
         return internal_render();
     };
@@ -1913,6 +1931,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         "route": format!("{served_method} {served_path}"),
         "status_code": response.status,
         "duration_ms": now_millis().saturating_sub(start_ms),
+        "build_sha": build_sha,
     });
     if response.status >= 400 {
         if let Some(code) = response_error_code(response.status, &response.body) {
@@ -2057,6 +2076,91 @@ mod tests {
             )
             .is_none(),
             "address-carrying route value must not become a log line"
+        );
+    }
+
+    #[test]
+    fn served_line_carries_build_sha_known_or_unknown() {
+        // The wiring (`dispatch` always sets the key) is pinned by the
+        // source-presence test below; this pins the rendered shape: a known
+        // SHA and the explicit unknown marker both survive validation and
+        // keep the six-key envelope.
+        for sha in [
+            "0123456789abcdef0123456789abcdef01234567",
+            crate::logging::BUILD_SHA_UNKNOWN,
+        ] {
+            let normalized = crate::logging::parse_build_sha(Some(sha));
+            let line = emit_record(
+                crate::logging::Level::Info,
+                "api.request.served",
+                "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c",
+                serde_json::json!({
+                    "route": "GET /healthz",
+                    "status_code": 200,
+                    "duration_ms": 3,
+                    "build_sha": normalized,
+                }),
+            )
+            .expect("served line with build_sha must render");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&line).expect("record must be one JSON object");
+            let object = parsed.as_object().expect("record must be an object");
+            assert_eq!(object.len(), 6, "exactly the six envelope keys");
+            assert_eq!(object["fields"]["build_sha"], sha);
+        }
+    }
+
+    #[test]
+    fn dispatch_wires_build_sha_into_every_emit_site() {
+        // `build_sha_from_env` needs a wasm Env, so pin the call sites the
+        // same way the keyring matrix pins `config_from_env`: slice the
+        // pre-test source so this test's own literals cannot satisfy it.
+        // Every api record (served, misconfigured, db connection_error)
+        // must carry the normalized key — never a missing key or a raw var.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        assert!(
+            production.contains("fn build_sha_from_env("),
+            "the BUILD_SHA reader must exist"
+        );
+        assert!(
+            production.contains("crate::logging::parse_build_sha"),
+            "the reader must normalize through the shared validator"
+        );
+        // The served `build_sha` key is set on the `fields` value built
+        // before the `emit_record` call, so a forward window from the event
+        // name would miss it: pin the enclosing function bodies instead.
+        let dispatch_body = production
+            .split_once("pub async fn dispatch(")
+            .expect("dispatch must exist")
+            .1
+            .split_once("\nfn ")
+            .expect("a following fn must bound dispatch")
+            .0;
+        for event in ["api.request.served", "api.start.misconfigured"] {
+            assert!(dispatch_body.contains(event), "dispatch must emit {event}");
+        }
+        assert!(
+            dispatch_body.contains("build_sha"),
+            "dispatch emit sites must carry the build_sha key"
+        );
+        let store_body = production
+            .split_once("impl PgStore")
+            .expect("PgStore impl must exist")
+            .1
+            .split_once("\nfn user_from_row")
+            .expect("a following fn must bound the impl")
+            .0;
+        assert!(
+            store_body.contains("api.db.connection_error"),
+            "PgStore::connect must emit api.db.connection_error"
+        );
+        assert!(
+            store_body.contains("build_sha"),
+            "the db connection_error site must carry the build_sha key"
         );
     }
 

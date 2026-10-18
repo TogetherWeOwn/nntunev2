@@ -16,6 +16,12 @@ command = "cargo install -q worker-build --locked && worker-build --release -- -
 RP_ID = "example.com"
 RP_ORIGIN = "https://example.com"
 SESSION_TTL_SECS = "86400"
+# Build identity for log lines (public, non-secret): the 40-char lowercase
+# hex commit SHA baked at deploy time (CI passes github.sha as the value).
+# Workers log it as the `build_sha` field on every record; an absent or
+# invalid value renders as the explicit string "unknown" (never a missing
+# key, never fail-closed). Leave unset for local dev.
+# BUILD_SHA = "unknown"
 # INVITES_REQUIRED = "true"
 # ALLOW_LOOPBACK_DEV = "true"          # local dev only, never staging/prod
 # EMAIL_WEBHOOK_URL = "https://<mail-provider-webhook>"  # magic-link delivery
