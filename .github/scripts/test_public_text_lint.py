@@ -107,6 +107,102 @@ class TestInternalHosts(unittest.TestCase):
         self.assertEqual([], find_violations("see foo.internal.bar docs"))
         self.assertEqual([], find_violations("dash is db.internal-legacy"))
 
+    def test_flags_192_168_positives(self):
+        for text in [
+            "proxy to http://192.168.0.1:8080/x",
+            "proxy to http://192.168.1.255:8080/x",
+        ]:
+            self.assertIn("internal-host", rules_for(text), text)
+
+    def test_flags_172_16_12_range_positives(self):
+        for text in [
+            "host 172.16.0.1 x",
+            "host 172.20.5.4 x",
+            "host 172.31.255.255 x",
+            "host 172.31.255.255!",
+        ]:
+            self.assertIn("internal-host", rules_for(text), text)
+
+    def test_172_15_and_172_32_are_outside_range(self):
+        for text in [
+            "host 172.15.0.1 x",
+            "host 172.15.255.255 x",
+            "host 172.32.0.1 x",
+            "host 172.32.5.5 x",
+        ]:
+            self.assertEqual([], find_violations(text), text)
+
+    def test_flags_private_suffix_variants(self):
+        for text in [
+            "point it at db.lan",
+            "point it at db.intranet",
+            "point it at db.corp",
+        ]:
+            self.assertIn("internal-host", rules_for(text), text)
+
+    def test_uppercase_suffix_flags(self):
+        for text in [
+            "point it at DB.INTERNAL",
+            "point it at db.LOCAL",
+            "point it at DB.LAN:8080",
+        ]:
+            self.assertIn("internal-host", rules_for(text), text)
+
+    def test_paren_lookahead_does_not_match(self):
+        # `(` after the host is attribute-call syntax, never a hostname.
+        for text in [
+            "value = self.internal()",
+            "at db.internal(foo)",
+            "at ops.acme.internal(foo)",
+        ]:
+            self.assertEqual([], find_violations(text), text)
+
+    def test_leading_paren_still_flags(self):
+        # Only a trailing `(` blocks the match; wrapping parens still flag.
+        self.assertIn("internal-host", rules_for("see (db.internal) here"))
+
+    def test_port_suffix_flags(self):
+        for text in [
+            "db.internal:3000 is the default",
+            "point it at db.lan:8080",
+            "point it at a.b.corp:443",
+        ]:
+            self.assertIn("internal-host", rules_for(text), text)
+
+    def test_flags_bare_workforce_host(self):
+        # No scheme needed: the workforce control-plane shape flags bare.
+        self.assertIn("internal-host", rules_for("bare workforce.host here"))
+        self.assertIn("internal-host", rules_for("see workforce.host"))
+        self.assertIn("internal-host", rules_for("see WORKFORCE.HOST x"))
+
+    def test_flags_http_scheme_absolute_links(self):
+        # `https?` covers `http:` too; absolute links flag internal-host
+        # and the embedded relative path flags instance-path.
+        rules = rules_for("see http://tracker.example.com/NNTUNE/issues/99 x")
+        self.assertIn("internal-host", rules)
+        self.assertIn("instance-path", rules)
+
+    def test_absolute_link_flags_all_five_kinds(self):
+        for kind in ["issues", "agents", "projects", "approvals", "runs"]:
+            text = f"see https://tracker.example.com/NNTUNE/{kind}/1 x"
+            self.assertIn("internal-host", rules_for(text), text)
+
+    def test_absolute_link_prefix_length_edges(self):
+        for prefix in ["AB", "ABCDEF"]:
+            text = f"see https://tracker.example.com/{prefix}/issues/1 x"
+            self.assertIn("internal-host", rules_for(text), text)
+        for prefix in ["A", "ABCDEFG"]:
+            text = f"see https://tracker.example.com/{prefix}/issues/1 x"
+            self.assertEqual([], find_violations(text), text)
+
+    def test_absolute_link_requires_trailing_slash(self):
+        for text in [
+            "see https://tracker.example.com/NNTUNE/issues x",
+            "see https://tracker.example.com/NNTUNE/issues99 x",
+        ]:
+            self.assertNotIn("internal-host", rules_for(text), text)
+            self.assertEqual([], find_violations(text), text)
+
     def test_loopback_and_localhost_are_dev_docs(self):
         self.assertEqual([], find_violations("listen on 127.0.0.1:3000"))
         self.assertEqual([], find_violations("open http://localhost:3000"))
@@ -118,6 +214,26 @@ class TestInstancePaths(unittest.TestCase):
 
     def test_lowercase_routes_are_code(self):
         self.assertEqual([], find_violations("GET /api/issues/42 returns JSON"))
+
+    def test_flags_all_five_kinds_relative(self):
+        for kind in ["issues", "agents", "projects", "approvals", "runs"]:
+            text = f"see /NNTUNE/{kind}/1 for context"
+            self.assertIn("instance-path", rules_for(text), text)
+
+    def test_relative_prefix_length_edges(self):
+        for prefix in ["AB", "ABCDEF"]:
+            text = f"see /{prefix}/issues/1 for context"
+            self.assertIn("instance-path", rules_for(text), text)
+        for prefix in ["A", "ABCDEFG"]:
+            text = f"see /{prefix}/issues/1 for context"
+            self.assertEqual([], find_violations(text), text)
+
+    def test_relative_requires_trailing_slash(self):
+        for text in [
+            "see /NNTUNE/issues for context",
+            "see /NNTUNE/issues99 for context",
+        ]:
+            self.assertEqual([], find_violations(text), text)
 
 
 class TestAgentNames(unittest.TestCase):
@@ -135,11 +251,74 @@ class TestAgentNames(unittest.TestCase):
             rules_for("PAPERCLIP_AGENT_ID=11111111-2222-3333-4444-555555555555"),
         )
 
+    def test_flags_runner_handle_underscore_variant(self):
+        self.assertIn("agent-name", rules_for("run as paperclip_agent today"))
+
+    def test_runner_handle_is_case_insensitive(self):
+        for text in [
+            "run as PAPERCLIP-AGENT today",
+            "run as PAPERCLIP_AGENT today",
+            "run as paperclip_agent-7",
+        ]:
+            self.assertIn("agent-name", rules_for(text), text)
+
+    def test_flags_run_task_session_chat_uuid_vars_with_equals(self):
+        for var in [
+            "PAPERCLIP_RUN_ID",
+            "PAPERCLIP_TASK_ID",
+            "PAPERCLIP_SESSION_ID",
+            "PAPERCLIP_CHAT_ID",
+        ]:
+            text = f"{var}=11111111-2222-3333-4444-555555555555"
+            self.assertIn("agent-name", rules_for(text), text)
+
+    def test_uuid_vars_accept_colon_separator(self):
+        for var in [
+            "PAPERCLIP_RUN_ID",
+            "PAPERCLIP_TASK_ID",
+            "PAPERCLIP_SESSION_ID",
+            "PAPERCLIP_CHAT_ID",
+        ]:
+            text = f"{var}: 11111111-2222-3333-4444-555555555555"
+            self.assertIn("agent-name", rules_for(text), text)
+
     def test_bare_env_names_are_documentable(self):
         self.assertEqual([], find_violations("set PAPERCLIP_API_URL in the environment"))
 
     def test_role_titles_are_not_agent_names(self):
         self.assertEqual([], find_violations("Owner: CISO"))
+
+
+class TestCaseSensitivityVerdicts(unittest.TestCase):
+    # Pins current behavior for owner confirmation (no pattern change):
+    # lowercase tog ids, uppercase AGENT:// and HTTPS:// schemes do not
+    # flag their own rule. Flagged in the PR body for owner confirmation
+    # that none of these is a hole.
+    def test_lowercase_tog_is_not_an_id(self):
+        self.assertEqual([], find_violations("see tog-123 here"))
+        self.assertIn("tog-id", rules_for("see TOG-123 here"))
+
+    def test_uppercase_agent_scheme_is_not_a_deeplink(self):
+        self.assertEqual(
+            [], find_violations("ping AGENT://11111111-2222-3333-4444-555555555555")
+        )
+        self.assertIn(
+            "agent-name",
+            rules_for("ping agent://11111111-2222-3333-4444-555555555555"),
+        )
+
+    def test_uppercase_https_is_not_an_absolute_link(self):
+        # The absolute-link rule is lowercase `https?` only, so an
+        # uppercase scheme misses internal-host — but the embedded
+        # relative UI path still flags instance-path.
+        rules = rules_for(
+            "see HTTPS://tracker.example.com/NNTUNE/issues/99 x"
+        )
+        self.assertNotIn("internal-host", rules)
+        self.assertIn("instance-path", rules)
+        self.assertEqual(
+            [], find_violations("see HTTPS://example.com/nothing here")
+        )
 
 
 class TestHostFixtureExclusions(unittest.TestCase):

@@ -17,6 +17,7 @@ from check_web_bundle_budget import (
     TOP_FILES_ON_REPORT,
     BudgetError,
     check,
+    default_client_dir,
     main,
     measure,
 )
@@ -177,6 +178,121 @@ def test_failure_reports_exactly_five_largest_in_order() -> None:
     ], report
 
 
+def test_default_client_dir_suffix() -> None:
+    """default_client_dir() must resolve under apps/web/.svelte-kit/output/client."""
+    parts = default_client_dir().parts
+    assert tuple(parts[-5:]) == (
+        "apps",
+        "web",
+        ".svelte-kit",
+        "output",
+        "client",
+    ), default_client_dir()
+
+
+def test_cli_defaults_match_pinned_constants() -> None:
+    """Argparse defaults must be default_client_dir() and BUDGET_CLIENT_JS_BYTES."""
+    import check_web_bundle_budget as mod
+
+    seen: dict[str, object] = {}
+    orig_check = mod.check
+
+    def fake_check(client_dir: Path, budget: int) -> tuple[int, list]:
+        seen["client_dir"] = client_dir
+        seen["budget"] = budget
+        return 0, []
+
+    mod.check = fake_check  # type: ignore[assignment]
+    try:
+        assert mod.main([]) == 0
+    finally:
+        mod.check = orig_check
+    assert seen["budget"] == BUDGET_CLIENT_JS_BYTES, seen
+    assert seen["client_dir"] == default_client_dir(), seen
+
+
+def test_cli_non_positive_budget_exits_1() -> None:
+    client = _client_dir_with({"a.js": 10})
+    assert main(["--client-dir", str(client), "--budget", "0"]) == 1
+    assert main(["--client-dir", str(client), "--budget", "-50"]) == 1
+
+
+def test_cli_non_integer_budget_exits_2() -> None:
+    client = _client_dir_with({"a.js": 10})
+    try:
+        main(["--client-dir", str(client), "--budget", "abc"])
+    except SystemExit as exc:
+        assert exc.code == 2, exc.code
+    else:
+        raise AssertionError("non-integer --budget must raise SystemExit(2)")
+
+
+def test_cli_file_as_client_dir_exits_1() -> None:
+    client = _client_dir_with({"a.js": 10})
+    existing_file = client / "a.js"
+    assert existing_file.is_file()
+    # Assert exit code only; the "missing" wording is owned elsewhere.
+    assert main(["--client-dir", str(existing_file), "--budget", "1000"]) == 1
+
+
+def test_empty_bundle_reports_fail_without_file_lines() -> None:
+    client = Path(tempfile.mkdtemp())
+    (client / "style.css").write_text("body {}", encoding="utf-8")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert main(["--client-dir", str(client), "--budget", "1000"]) == 1
+    lines = buf.getvalue().splitlines()
+    assert lines[0].startswith("bundle budget: FAIL"), lines
+    assert "no client JS files" in lines[0], lines
+    file_lines = [line for line in lines if line.startswith("bundle budget:   ")]
+    assert file_lines == [], file_lines
+
+
+def test_missing_dir_reports_fail_without_file_lines() -> None:
+    missing = Path(tempfile.mkdtemp()) / "no-such-client"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert main(["--client-dir", str(missing), "--budget", "1000"]) == 1
+    lines = buf.getvalue().splitlines()
+    assert lines[0].startswith("bundle budget: FAIL"), lines
+    assert "missing" in lines[0], lines
+    file_lines = [line for line in lines if line.startswith("bundle budget:   ")]
+    assert file_lines == [], file_lines
+
+
+def test_two_file_over_budget_reports_both_in_order() -> None:
+    client = _client_dir_with({"a.js": 900, "b.js": 200})
+    budget = 1_000
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert main(["--client-dir", str(client), "--budget", str(budget)]) == 1
+    lines = buf.getvalue().splitlines()
+    assert lines[0].startswith("bundle budget: FAIL"), lines
+    assert "over by 100 B" in lines[0], lines
+    report = [line for line in lines if line.startswith("bundle budget:   ")]
+    expected = [
+        f"bundle budget:   {size:>8} B  {path.name}"
+        for path, size in measure(client)[:TOP_FILES_ON_REPORT]
+    ]
+    assert report == expected, (report, expected)
+    assert len(report) == 2, report
+    assert [line.split()[-1] for line in report] == ["a.js", "b.js"], report
+
+
+def test_under_budget_pass_report_text() -> None:
+    client = _client_dir_with({"a.js": 100, "nested/b.js": 50})
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert main(["--client-dir", str(client), "--budget", "1000"]) == 0
+    lines = buf.getvalue().splitlines()
+    assert len(lines) == 1, lines
+    assert lines[0] == (
+        "bundle budget: PASS: client JS total 150 B "
+        "within budget 1000 B "
+        "(2 files, 850 B headroom)"
+    ), lines
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
@@ -238,8 +354,17 @@ def main_test() -> int:
         test_only_js_counts_toward_total,
         test_equal_size_files_sort_by_full_path,
         test_failure_reports_exactly_five_largest_in_order,
+        test_empty_bundle_reports_fail_without_file_lines,
+        test_missing_dir_reports_fail_without_file_lines,
+        test_two_file_over_budget_reports_both_in_order,
+        test_under_budget_pass_report_text,
         test_readme_budget_matches_pinned_constant,
         test_readme_baseline_matches_script_measured_figure,
+        test_default_client_dir_suffix,
+        test_cli_defaults_match_pinned_constants,
+        test_cli_non_positive_budget_exits_1,
+        test_cli_non_integer_budget_exits_2,
+        test_cli_file_as_client_dir_exits_1,
     )
     for case in cases:
         case()

@@ -4,6 +4,11 @@
 - **Date:** 2026-10-13
 - **Revised:** 2026-10-15 — concrete cache budgets, atomic stream accounting,
   payment-conditional trial conversion and bounded renewal settlement.
+- **Revised:** 2026-10-18 — slice-1 per-play precursor: stream usage accrues in
+  `stream_play_ledger` (one row per billed play window, deterministic `play:` keys,
+  monthly folds). The daily `usage_ledger` aggregation (sum daily rows in the UTC
+  calendar month) is built in a later slice by folding these windows; no daily table
+  exists yet and no writer assumes its `(user_id, period)` upsert.
 
 ## Context
 

@@ -8,7 +8,8 @@
 //!   the same key; a genuine second listen carries a different `play_id`
 //!   and bills separately.
 //! - [`UsageLedger`] is the portable-core model of the Hyperdrive
-//!   usage-ledger table, which in production must key
+//!   `stream_play_ledger` table (`migrations/0020_stream_play_ledger.sql`,
+//!   NOT the ADR daily `usage_ledger`), which in production must key
 //!   `UNIQUE(idempotency_key)` exactly as the ingest library upsert
 //!   converges `ON CONFLICT (idempotency_key)`. [`UsageLedger::record`]
 //!   converges exact redeliveries to one entry, first write wins, and
@@ -35,6 +36,25 @@
 pub const RECONCILE_MISMATCH_METRIC: &str = "play_reconcile_mismatch";
 
 use crate::pool::Lane;
+
+/// Analytics Engine binding name: must match `[analytics_engine_datasets]`
+/// in `workers/stream/wrangler.toml`.
+pub const METER_DATASET_BINDING: &str = "METER";
+/// Analytics Engine dataset receiving stream usage events.
+pub const METER_DATASET: &str = "nntune_meter";
+
+/// Nominal bytes per stream second: served bytes map to stream seconds at
+/// this rate (roughly 384 kbit/s lossless-ish audio). This is a metering
+/// primitive, not a bitrate claim about any track: it lets byte counts and
+/// second counts stay mutually derivable without a per-track bitrate lookup.
+/// The ledger side derives seconds from bytes with this same rate.
+pub const STREAM_BYTES_PER_SEC: u64 = 48_000;
+
+/// Stream seconds attributed to `bytes` served, rounding any partial second
+/// up: a started second counts. Zero bytes attribute zero seconds.
+pub fn stream_seconds_for_bytes(bytes: u64) -> u64 {
+    bytes.div_ceil(STREAM_BYTES_PER_SEC)
+}
 
 /// What happened, in billing-relevant order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +91,26 @@ pub enum MeterKind {
     ReconcileMismatch,
 }
 
+/// Stable Analytics Engine blob for a [`MeterKind`]. Distinct kinds never
+/// share a slug.
+pub fn kind_slug(kind: MeterKind) -> &'static str {
+    match kind {
+        MeterKind::PlayStart => "play_start",
+        MeterKind::CacheHit => "cache_hit",
+        MeterKind::CacheMiss => "cache_miss",
+        MeterKind::BytesServed => "bytes_served",
+        MeterKind::PrefetchEnqueued => "prefetch_enqueued",
+        MeterKind::ProviderError => "provider_error",
+        MeterKind::GrantRejectedExpired => "grant_rejected_expired",
+        MeterKind::GrantRejectedExcessiveExpiry => "grant_rejected_excessive_expiry",
+        MeterKind::GrantRejectedWrongTrack => "grant_rejected_wrong_track",
+        MeterKind::QuarantineEntered => "quarantine_entered",
+        MeterKind::QuarantineExited => "quarantine_exited",
+        MeterKind::WarmRedial => "warm_redial",
+        MeterKind::ReconcileMismatch => "play_reconcile_mismatch",
+    }
+}
+
 /// One billable-or-debuggable fact about a play.
 #[derive(Clone, Debug)]
 pub struct MeterEvent {
@@ -79,6 +119,9 @@ pub struct MeterEvent {
     pub track_id: String,
     /// Bytes served to the client (0 for non-serving events).
     pub bytes: u64,
+    /// Stream seconds attributed ([`stream_seconds_for_bytes`]); 0 for
+    /// non-serving events.
+    pub seconds: u64,
     /// Pool lane of the call a pool-health event belongs to; `None` for
     /// events unrelated to pool state.
     pub lane: Option<Lane>,
@@ -239,10 +282,13 @@ fn key_binds_identity(play: &CompletePlay) -> bool {
 pub const LEDGER_WRITE_FENCE_SQL: &str =
     "(SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence";
 
-/// Portable-core model of the Hyperdrive usage-ledger table.
+/// Portable-core model of the Hyperdrive `stream_play_ledger` table.
 ///
 /// Production must key `UNIQUE(idempotency_key)` exactly as the ingest
-/// library upsert converges `ON CONFLICT (idempotency_key)`.
+/// library upsert converges `ON CONFLICT (idempotency_key)`. A zero-row
+/// `DO NOTHING` insert is ambiguous: the api Worker's
+/// `ledger_select_by_key_statement` + `classify_replay` separate exact
+/// redeliveries (`Duplicate`) from conflicting payloads (`Conflict`).
 #[derive(Default, Debug)]
 pub struct UsageLedger {
     entries: Vec<LedgerEntry>,
@@ -434,6 +480,7 @@ pub fn reconcile(
             user_id: play.user_id.clone(),
             track_id: play.track_id.clone(),
             bytes: 0,
+            seconds: 0,
             lane: None,
             backoff_ms: 0,
         });
@@ -478,6 +525,33 @@ pub fn reconcile(
     }
 }
 
+/// One Analytics Engine point: blobs carry identity, doubles carry
+/// magnitude, the index is the billed user. `doubles` holds
+/// `[bytes, seconds]`; both stay exactly representable for every realistic
+/// play (magnitudes far below 2^53).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnalyticsPoint {
+    pub dataset: &'static str,
+    pub index: String,
+    pub blobs: [String; 3],
+    pub doubles: [f64; 2],
+}
+
+/// Build the [`AnalyticsPoint`] for one event. Blobs are
+/// `[kind, user_id, track_id]`; the index is the user.
+pub fn analytics_point(event: &MeterEvent) -> AnalyticsPoint {
+    AnalyticsPoint {
+        dataset: METER_DATASET,
+        index: event.user_id.clone(),
+        blobs: [
+            kind_slug(event.kind).to_string(),
+            event.user_id.clone(),
+            event.track_id.clone(),
+        ],
+        doubles: [event.bytes as f64, event.seconds as f64],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +565,7 @@ mod tests {
                 user_id: "u".to_string(),
                 track_id: "t".to_string(),
                 bytes: 7,
+                seconds: stream_seconds_for_bytes(7),
                 lane: None,
                 backoff_ms: 0,
             });
@@ -815,5 +890,214 @@ mod tests {
         assert!(line.contains("user_id=user%20with%20space"));
         assert!(line.contains("track_id=track%3Dvalue"));
         assert!(line.ends_with("metered_bytes=40 ledger_bytes=40"));
+    }
+
+    #[test]
+    fn dataset_names_match_wrangler() {
+        assert_eq!(METER_DATASET_BINDING, "METER");
+        assert_eq!(METER_DATASET, "nntune_meter");
+    }
+
+    #[test]
+    fn nominal_rate_is_pinned() {
+        // Literal pin (not in terms of the constant): changing the rate
+        // re-bills every historical byte count, so it must be deliberate.
+        assert_eq!(STREAM_BYTES_PER_SEC, 48_000);
+    }
+
+    #[test]
+    fn seconds_vectors() {
+        assert_eq!(stream_seconds_for_bytes(0), 0);
+        assert_eq!(stream_seconds_for_bytes(1), 1);
+        assert_eq!(stream_seconds_for_bytes(47_999), 1);
+        assert_eq!(stream_seconds_for_bytes(48_000), 1);
+        assert_eq!(stream_seconds_for_bytes(48_001), 2);
+        assert_eq!(stream_seconds_for_bytes(96_000), 2);
+        assert_eq!(stream_seconds_for_bytes(96_001), 3);
+        // No overflow at the top: div_ceil never adds before dividing.
+        // u64::MAX = 18_446_744_073_709_551_615 = 48_000 * 384_307_168_202_282
+        // + 41_615, so the ceiling is one past the quotient.
+        assert_eq!(stream_seconds_for_bytes(u64::MAX), 384_307_168_202_283);
+    }
+
+    #[test]
+    fn kind_slugs_are_distinct_snake_case() {
+        let slugs = [
+            kind_slug(MeterKind::PlayStart),
+            kind_slug(MeterKind::CacheHit),
+            kind_slug(MeterKind::CacheMiss),
+            kind_slug(MeterKind::BytesServed),
+            kind_slug(MeterKind::PrefetchEnqueued),
+            kind_slug(MeterKind::ProviderError),
+            kind_slug(MeterKind::GrantRejectedExpired),
+            kind_slug(MeterKind::GrantRejectedExcessiveExpiry),
+            kind_slug(MeterKind::GrantRejectedWrongTrack),
+            kind_slug(MeterKind::QuarantineEntered),
+            kind_slug(MeterKind::QuarantineExited),
+            kind_slug(MeterKind::WarmRedial),
+            kind_slug(MeterKind::ReconcileMismatch),
+        ];
+        assert_eq!(
+            slugs,
+            [
+                "play_start",
+                "cache_hit",
+                "cache_miss",
+                "bytes_served",
+                "prefetch_enqueued",
+                "provider_error",
+                "grant_rejected_expired",
+                "grant_rejected_excessive_expiry",
+                "grant_rejected_wrong_track",
+                "quarantine_entered",
+                "quarantine_exited",
+                "warm_redial",
+                "play_reconcile_mismatch"
+            ]
+        );
+        let mut distinct = slugs.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), slugs.len());
+    }
+
+    #[test]
+    fn analytics_point_carries_identity_in_blobs_and_magnitude_in_doubles() {
+        let event = MeterEvent {
+            kind: MeterKind::BytesServed,
+            user_id: "user-1".to_string(),
+            track_id: "track-9".to_string(),
+            bytes: 100_000,
+            seconds: stream_seconds_for_bytes(100_000),
+            lane: None,
+            backoff_ms: 0,
+        };
+        let point = analytics_point(&event);
+        assert_eq!(point.dataset, "nntune_meter");
+        assert_eq!(point.index, "user-1");
+        assert_eq!(
+            point.blobs,
+            [
+                "bytes_served".to_string(),
+                "user-1".to_string(),
+                "track-9".to_string()
+            ]
+        );
+        assert_eq!(point.doubles, [100_000.0, 3.0]);
+    }
+
+    #[test]
+    fn two_plays_on_one_track_bill_independently() {
+        // There is no cross-play (user, track) fold: each play carries its
+        // own byte total (`CompletePlay.bytes`, fed from the play's own
+        // `served` counter), and the ledger converges per idempotency key.
+        // Summing both plays' bytes into play-7's row would bill play-7 for
+        // both listens and bill (or conflict) play-8 on top.
+        let play_7 = CompletePlay::new("user-1", "track-9", "play-7", 40_000).unwrap();
+        let play_8 = CompletePlay::new("user-1", "track-9", "play-8", 75_000).unwrap();
+        assert_ne!(play_7.idempotency_key, play_8.idempotency_key);
+        let mut ledger = UsageLedger::default();
+        assert_eq!(ledger.record(&play_7), RecordOutcome::Recorded);
+        assert_eq!(ledger.record(&play_8), RecordOutcome::Recorded);
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(
+            ledger.get(&play_7.idempotency_key).map(|e| e.bytes),
+            Some(40_000),
+            "play-7 bills only its own bytes, never the cross-play sum"
+        );
+        assert_eq!(
+            ledger.get(&play_8.idempotency_key).map(|e| e.bytes),
+            Some(75_000)
+        );
+        assert_eq!(ledger.total_bytes_for_user("user-1"), 115_000);
+        // A redelivery of play-7 converges to play-7 alone and leaves
+        // play-8 untouched.
+        assert_eq!(ledger.record(&play_7), RecordOutcome::Duplicate);
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(
+            ledger.get(&play_8.idempotency_key).map(|e| e.bytes),
+            Some(75_000)
+        );
+    }
+
+    // Deterministic stand-in for a property-test RNG (this crate stays
+    // dependency-free): xorshift64* over a fixed seed.
+    fn rng_next(state: &mut u64) -> u64 {
+        *state ^= *state >> 12;
+        *state ^= *state << 25;
+        *state ^= *state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    #[test]
+    fn seconds_are_the_ceiling_monotone_and_split_bounded() {
+        let mut state = 0x1234_5678_9ABC_DEF1u64;
+        for i in 0usize..5_000 {
+            let bytes = if i.is_multiple_of(7) {
+                // Edge strata near multiples of the rate.
+                48_000 * (rng_next(&mut state) % 5) + rng_next(&mut state) % 3
+            } else {
+                rng_next(&mut state) % 20_000_000
+            };
+            let seconds = stream_seconds_for_bytes(bytes);
+            // Ceiling: the attributed seconds cover the bytes, and one fewer
+            // second would not (for any positive byte count).
+            assert!(seconds * STREAM_BYTES_PER_SEC >= bytes, "bytes {bytes}");
+            if bytes > 0 {
+                assert!(
+                    seconds
+                        .saturating_sub(1)
+                        .saturating_mul(STREAM_BYTES_PER_SEC)
+                        < bytes,
+                    "bytes {bytes}"
+                );
+            } else {
+                assert_eq!(seconds, 0);
+            }
+        }
+        let mut sorted: Vec<u64> = {
+            let mut s = 0xABCDu64;
+            (0..2_000).map(|_| rng_next(&mut s) % 50_000_000).collect()
+        };
+        sorted.sort_unstable();
+        let mut last = 0u64;
+        for bytes in sorted {
+            let seconds = stream_seconds_for_bytes(bytes);
+            assert!(seconds >= last, "monotone at {bytes}");
+            last = seconds;
+        }
+        // Split bound: serving a..b in two events attributes at most one
+        // extra second versus serving a+b at once, never fewer.
+        let mut s2 = 0x99u64;
+        for _ in 0..2_000 {
+            let a = rng_next(&mut s2) % 5_000_000;
+            let b = rng_next(&mut s2) % 5_000_000;
+            let whole = stream_seconds_for_bytes(a.saturating_add(b));
+            let split = stream_seconds_for_bytes(a).saturating_add(stream_seconds_for_bytes(b));
+            assert!(split >= whole, "split {a}+{b}");
+            assert!(split <= whole.saturating_add(1), "split {a}+{b}");
+        }
+    }
+
+    #[test]
+    fn doubles_stay_exact_for_realistic_plays() {
+        // Every byte count a real play can serve is far below 2^53, so the
+        // Analytics Engine doubles round-trip exactly.
+        let mut state = 42u64;
+        for _ in 0..1_000 {
+            let bytes = rng_next(&mut state) % 10_737_418_240;
+            let event = MeterEvent {
+                kind: MeterKind::BytesServed,
+                user_id: "u".to_string(),
+                track_id: "t".to_string(),
+                bytes,
+                seconds: stream_seconds_for_bytes(bytes),
+                lane: None,
+                backoff_ms: 0,
+            };
+            let point = analytics_point(&event);
+            assert_eq!(point.doubles[0] as u64, bytes);
+            assert_eq!(point.doubles[1] as u64, event.seconds);
+        }
     }
 }
