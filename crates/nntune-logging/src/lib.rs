@@ -900,4 +900,26 @@ mod tests {
             .to_string()
             .contains("password"));
     }
+
+    #[test]
+    fn entropy_fallback_trace_ids_stay_valid_distinct_and_marked() {
+        let first = fallback_trace_id();
+        let second = fallback_trace_id();
+        for id in [&first, &second] {
+            assert!(
+                id.starts_with("ffffffffffffffff"),
+                "fallback id must carry the f-prefix: {id}"
+            );
+            assert!(is_valid_trace_id(id), "fallback id must stay valid: {id}");
+        }
+        assert_ne!(first, second, "fallback ids must be distinct across calls");
+    }
+
+    #[test]
+    fn no_entropy_display_contract() {
+        assert_eq!(
+            LogError::NoEntropy.to_string(),
+            "trace-id randomness unavailable"
+        );
+    }
 }

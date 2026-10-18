@@ -404,4 +404,109 @@ mod tests {
         assert!(b.take(100, 0.5));
         assert_eq!(b.remaining(100), 3.5);
     }
+
+    #[test]
+    fn constructor_table_pins_capacity_and_refill_floors() {
+        // Pin the `TokenBucket::new` floors (lines 87-89).
+        // Each row: (capacity, refill) -> expected initial availability.
+        // Removing any `.max(0.0)` must turn a row red.
+        for (capacity, refill, want_remaining) in [
+            (-5.0, 1.0, 0.0),
+            (-0.5, 10.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (5.0, -2.0, 5.0),
+            (5.0, 0.0, 5.0),
+            (f64::NAN, 1.0, 0.0),
+            (5.0, f64::NAN, 5.0),
+            (f64::NAN, f64::NAN, 0.0),
+        ] {
+            let b = TokenBucket::new(capacity, refill, 100);
+            assert_eq!(
+                b.remaining(100),
+                want_remaining,
+                "capacity={capacity} refill={refill}"
+            );
+        }
+        // Negative capacity starts empty and stays empty: nothing to take,
+        // and time cannot refill above the zero cap.
+        let mut b = TokenBucket::new(-4.0, 2.0, 100);
+        assert!(!b.take(100, 1.0));
+        assert_eq!(b.remaining(1_000), 0.0);
+        // Negative/NaN refill clamps to zero: a full bucket drains, then
+        // never refills no matter how much time passes.
+        for refill in [-3.0, f64::NAN] {
+            let mut b = TokenBucket::new(2.0, refill, 100);
+            assert!(b.take(100, 2.0), "refill={refill}");
+            assert_eq!(b.remaining(100), 0.0, "refill={refill}");
+            assert_eq!(b.remaining(100 + 3_600), 0.0, "refill={refill}");
+            assert_eq!(b.retry_after_secs(100 + 3_600), u64::MAX, "refill={refill}");
+        }
+    }
+
+    #[test]
+    fn retry_after_secs_ceils_subsecond_waits_to_one() {
+        // Pin the line-146 `.max(1.0)` ceiling — a fractional wait must
+        // report exactly 1, never 0. Without the ceiling these rows return 0.
+        for (capacity, refill, take) in [
+            (1.0, 10.0, 1.0),
+            (1.0, 100.0, 1.0),
+            (2.0, 4.0, 1.9),
+            (10.0, 1.0, 9.5),
+        ] {
+            let mut b = TokenBucket::new(capacity, refill, 100);
+            assert!(b.take(100, take), "cap={capacity} refill={refill}");
+            assert!(
+                b.remaining(100) < 1.0,
+                "cap={capacity} refill={refill}: test setup must leave <1 token"
+            );
+            assert_eq!(
+                b.retry_after_secs(100),
+                1,
+                "cap={capacity} refill={refill} take={take}"
+            );
+        }
+        // Near-full bucket: a sub-nanosecond wait must still report 1,
+        // never 0. Without `.max(1.0)`, `(wait - 1e-9).ceil()` is `-0.0`
+        // here, which casts to `0`.
+        let mut b = TokenBucket::new(1.0, 1.0, 100);
+        assert!(b.take(100, 1e-10));
+        assert!(b.remaining(100) < 1.0);
+        assert_eq!(b.retry_after_secs(100), 1);
+        // Exact-integer waits stay exact: the 1e-9 epsilon must not push an
+        // on-the-second wait up by one.
+        let mut b = TokenBucket::new(2.0, 1.0, 100);
+        assert!(b.take(100, 2.0));
+        assert_eq!(b.retry_after_secs(100), 1);
+        let mut b = TokenBucket::new(3.0, 0.5, 100);
+        assert!(b.take(100, 3.0));
+        assert_eq!(b.retry_after_secs(100), 2);
+    }
+
+    #[test]
+    fn zero_capacity_bucket_admits_nothing_without_panicking() {
+        // Zero-capacity buckets must deny every positive take (no panic,
+        // no refill above the zero cap) regardless of rate.
+        for refill in [0.0, 1.0, 10.0] {
+            let mut b = TokenBucket::new(0.0, refill, 100);
+            assert_eq!(b.remaining(100), 0.0, "refill={refill}");
+            assert_eq!(b.remaining(100 + 3_600), 0.0, "refill={refill}");
+            assert!(!b.take(100, 1.0), "refill={refill}");
+            assert!(!b.take(100, 0.5), "refill={refill}");
+            assert_eq!(b.remaining(100), 0.0, "refill={refill}");
+            let _ = b.retry_after_secs(100);
+            let _ = b.retry_after_secs(100 + 3_600);
+        }
+        // `per_window(0, _)` is the same zero bucket through the window ctor.
+        let mut b = TokenBucket::per_window(0, 60, 100);
+        assert_eq!(b.remaining(100), 0.0);
+        assert!(!b.take(100, 1.0));
+        // Retry shape: with refill there is always at least a 1s wait;
+        // without refill the bucket can never refill.
+        assert_eq!(TokenBucket::new(0.0, 1.0, 100).retry_after_secs(100), 1);
+        assert_eq!(
+            TokenBucket::new(0.0, 0.0, 100).retry_after_secs(100),
+            u64::MAX
+        );
+    }
 }

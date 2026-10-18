@@ -6,19 +6,26 @@ lint itself via FIXTURE_EXCLUSIONS in public_text_lint — exact path only,
 no directory or extension exemptions.
 """
 
+import contextlib
+import io
 import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import public_text_lint
 from public_text_lint import (
     FIXTURE_EXCLUSIONS,
     HOST_FIXTURE_EXCLUSIONS,
+    _escape_annotation_property,
     find_violations,
     is_artifact_path,
+    main,
     scan_path,
+    tracked_files,
 )
 
 
@@ -418,6 +425,206 @@ class TestMechanics(unittest.TestCase):
         self.assertIn(
             ".github/scripts/test_public_text_lint.py", FIXTURE_EXCLUSIONS
         )
+
+
+class TestMultiRuleHits(unittest.TestCase):
+    # One hit per rule per line at most: a line matching two rules
+    # yields two hits, the same rule twice on one line yields one.
+    def test_one_line_matching_two_rules_yields_two_hits(self):
+        hits = find_violations("see TOG-90001 and /NNTUNE/issues/99 here")
+        self.assertEqual(2, len(hits))
+        self.assertEqual([(1, "instance-path"), (1, "tog-id")], sorted(hits))
+
+    def test_same_rule_twice_on_one_line_yields_one_hit(self):
+        self.assertEqual(
+            [(1, "tog-id")], find_violations("see TOG-90001 then TOG-90002")
+        )
+
+    def test_multi_pattern_rule_twice_on_one_line_yields_one_hit(self):
+        # internal-host has several patterns; two different patterns on
+        # one line still yield a single hit for the rule.
+        self.assertEqual(
+            [(1, "internal-host")],
+            find_violations("see build.internal and 10.0.0.1 here"),
+        )
+
+    def test_empty_string_yields_no_hits(self):
+        self.assertEqual([], find_violations(""))
+
+
+class TestArtifactPathEdges(unittest.TestCase):
+    # Compiled artifacts are matched on path, never scanned for
+    # content. Backslash separators are normalized before matching;
+    # forward-slash behavior is unchanged.
+    def test_pyo_is_artifact(self):
+        self.assertTrue(is_artifact_path("docs/note.pyo"))
+        self.assertTrue(is_artifact_path("docs/note.pyc"))
+
+    def test_backslash_paths_are_artifacts(self):
+        self.assertTrue(is_artifact_path("docs\\note.pyo"))
+        self.assertTrue(is_artifact_path("docs\\note.pyc"))
+        self.assertTrue(is_artifact_path("a\\b\\__pycache__\\x.pyc"))
+        # Non-compiled file under a backslash __pycache__: only passes
+        # when backslashes are normalized before matching.
+        self.assertTrue(is_artifact_path("a\\b\\__pycache__\\y.py"))
+
+    def test_forward_slash_behavior_unchanged(self):
+        self.assertTrue(is_artifact_path(".github/scripts/__pycache__/x.pyc"))
+        self.assertTrue(is_artifact_path("a/b/__pycache__/y.py"))
+        self.assertFalse(is_artifact_path("workers/api/src/session.rs"))
+        self.assertFalse(is_artifact_path("a\\b\\session.rs"))
+
+    def test_pyo_scan_reports_binary_artifact_without_reading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = os.path.join(tmp, "lint.pyo")
+            with open(artifact, "wb") as fh:
+                fh.write(b"see TOG-90001 here\x00")
+            self.assertEqual([(1, "binary-artifact")], scan_path(artifact))
+
+
+class TestAnnotationEscaping(unittest.TestCase):
+    # Workflow-command property values escape %, :, ,, and controls
+    # percent-style (% first so existing text stays literal); a
+    # violating file with a hostile name still emits the ,line=
+    # annotation.
+    def test_colon_escapes(self):
+        self.assertEqual("a%3Ab", _escape_annotation_property("a:b"))
+
+    def test_percent_and_comma_escape(self):
+        self.assertEqual("a%25b", _escape_annotation_property("a%b"))
+        self.assertEqual("a%2Cb", _escape_annotation_property("a,b"))
+        self.assertEqual("%253A", _escape_annotation_property("%3A"))
+
+    def test_del_and_controls_escape(self):
+        self.assertEqual("%7F", _escape_annotation_property("\x7f"))
+        self.assertEqual("%00", _escape_annotation_property("\x00"))
+        self.assertEqual("a%0Ab", _escape_annotation_property("a\nb"))
+        self.assertEqual("a%0Db", _escape_annotation_property("a\rb"))
+        self.assertEqual("a%01b", _escape_annotation_property("a\x01b"))
+        self.assertEqual("a%1Fb", _escape_annotation_property("a\x1fb"))
+
+    def test_hostile_filename_on_violating_file_emits_line_annotation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hostile = os.path.join(tmp, "evil:a,b%c.md")
+            with open(hostile, "w") as fh:
+                fh.write("see TOG-90001 here\n")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["public_text_lint.py", hostile])
+            self.assertEqual(1, rc)
+            out = buf.getvalue()
+            self.assertIn("evil%3Aa%2Cb%25c.md,line=1", out)
+            self.assertNotIn("evil:a,b%c.md", out)
+            self.assertIn("tog-id", out)
+
+
+class TestTrackedFilesPlumbing(unittest.TestCase):
+    # Pins public_text_lint.py:208-214 (-z/NUL split, empty-drop) and :214
+    # FIXTURE_EXCLUSIONS filtering through the function (not just the
+    # constant membership check above).
+    def test_splits_nul_drops_empties_and_excludes_fixtures(self):
+        fake_stdout = (
+            b"docs/guide.md\x00"
+            b"\x00"
+            b"workers/api/src/session.rs\x00"
+            b".github/scripts/test_public_text_lint.py\x00"
+            b"\x00"
+        )
+        with mock.patch.object(
+            public_text_lint.subprocess, "run"
+        ) as run:
+            run.return_value = mock.Mock(stdout=fake_stdout)
+            self.assertEqual(
+                tracked_files(),
+                ["docs/guide.md", "workers/api/src/session.rs"],
+            )
+        run.assert_called_once_with(
+            ["git", "ls-files", "-z"], check=True, capture_output=True
+        )
+
+    def test_empty_output_returns_empty_list(self):
+        with mock.patch.object(
+            public_text_lint.subprocess, "run"
+        ) as run:
+            run.return_value = mock.Mock(stdout=b"")
+            self.assertEqual(tracked_files(), [])
+        run.assert_called_once_with(
+            ["git", "ls-files", "-z"], check=True, capture_output=True
+        )
+
+    def test_only_excluded_and_empty_entries_returns_empty(self):
+        fake_stdout = (
+            b"\x00.github/scripts/test_public_text_lint.py\x00\x00"
+        )
+        with mock.patch.object(
+            public_text_lint.subprocess, "run"
+        ) as run:
+            run.return_value = mock.Mock(stdout=fake_stdout)
+            self.assertEqual(tracked_files(), [])
+
+
+class TestMainDefaultAndSummary(unittest.TestCase):
+    # Pins public_text_lint.py:267 main(["prog"]) default (tracked_files)
+    # path and :293-297 summary counts. Positive controls assert the
+    # hit-count/dict text, not just rule names.
+    TWO_RULE_BODY = "see TOG-99 here\nsee /NNTUNE/issues/99 for context\n"
+
+    def _run_main(self, argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(argv)
+        return rc, buf.getvalue()
+
+    def test_default_path_scans_tracked_files_and_counts_two_rules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = os.path.join(tmp, "two-rule.md")
+            with open(fixture, "w") as fh:
+                fh.write(self.TWO_RULE_BODY)
+            with mock.patch.object(
+                public_text_lint,
+                "tracked_files",
+                return_value=[fixture],
+            ) as tracked:
+                rc, out = self._run_main(["prog"])
+            tracked.assert_called_once_with()
+        self.assertEqual(rc, 1)
+        # Positive control on counts, not just rule names.
+        self.assertIn("scanned 1 files", out)
+        self.assertIn("0 failed", out)
+        self.assertIn("2 hits", out)
+        self.assertIn("'tog-id': 1", out)
+        self.assertIn("'instance-path': 1", out)
+
+    def test_default_path_clean_fixture_exits_zero_with_zero_hits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = os.path.join(tmp, "clean.md")
+            with open(fixture, "w") as fh:
+                fh.write("all clean here\n")
+            with mock.patch.object(
+                public_text_lint,
+                "tracked_files",
+                return_value=[fixture],
+            ):
+                rc, out = self._run_main(["prog"])
+        self.assertEqual(rc, 0)
+        self.assertIn("scanned 1 files", out)
+        self.assertIn("0 hits", out)
+        self.assertIn("{}", out)
+
+    def test_explicit_paths_bypass_tracked_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = os.path.join(tmp, "explicit.md")
+            with open(fixture, "w") as fh:
+                fh.write(self.TWO_RULE_BODY)
+            with mock.patch.object(
+                public_text_lint, "tracked_files"
+            ) as tracked:
+                rc, out = self._run_main(["prog", fixture])
+            tracked.assert_not_called()
+        self.assertEqual(rc, 1)
+        self.assertIn("2 hits", out)
+        self.assertIn("'tog-id': 1", out)
+        self.assertIn("'instance-path': 1", out)
 
 
 if __name__ == "__main__":
