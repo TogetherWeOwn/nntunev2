@@ -6,7 +6,8 @@ a non-dict, or an empty dict with ``keys must be a non-empty object``
 (exit 1). That is the only stop against an emptied schema validating
 zero keys and passing everything vacuously (exit 0).
 
-Each shape below (``keys: {}``, missing ``keys``, ``keys: []``) must
+Each shape below (``keys: {}``, missing ``keys``, ``keys: []``, and a
+truthy non-dict ``keys: ["x"]``) must
 exit 1 and name the guard; the shipped schema stays green as the
 control. Temporary fixture schemas only; the shipped config/ fixtures
 stay read-only.
@@ -77,6 +78,11 @@ class EmptySchemaKeysTests(unittest.TestCase):
     def test_keys_list_fails(self):
         schema = load_schema()
         schema["keys"] = []
+        self.assert_empty_keys_rejected(schema)
+
+    def test_keys_nonempty_non_object_fails(self):
+        schema = load_schema()
+        schema["keys"] = ["x"]
         self.assert_empty_keys_rejected(schema)
 
     def test_shipped_schema_green_control(self):
