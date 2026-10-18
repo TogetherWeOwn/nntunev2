@@ -24,9 +24,9 @@
 //! restored). An empty IFSC (zero entries, `0 % 20 == 0`) still parses — the
 //! control that separates the modulo arm from the short-body arm.
 //!
-//! Boundary: done TOG-29903 pins the precheck segment-sum overflow arm
-//! (different check); #397 pins packet-shape framing (different aspect);
-//! `MAX_BLOCK_SIZE` is pinned in `par2_block_size_cap.rs`. All packets are
+//! Boundary: the precheck segment-sum overflow pin covers a different check;
+//! #397 pins packet-shape framing (different aspect); `MAX_BLOCK_SIZE` is
+//! pinned in `par2_block_size_cap.rs`. All packets are
 //! constructed byte-for-byte in this file (magic, lengths, checksums, set-ID
 //! derivation) with the `packet()` builder copied from
 //! `par2_precheck_overflow.rs`, never via the parser under test. The only
@@ -280,7 +280,7 @@ fn ifsc_tail_not_a_multiple_of_20_is_rejected() {
             "tail {tail} must stay fractional after {pad} pad bytes"
         );
         let mut entries = entry(0x1234_5678).to_vec();
-        entries.extend(std::iter::repeat_n(0xABu8, tail));
+        entries.extend(std::iter::repeat(0xABu8).take(tail));
         let err = RecoverySet::parse(&set_bytes(64, &entries)).unwrap_err();
         assert_eq!(
             malformed_message(&err),
