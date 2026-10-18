@@ -66,40 +66,24 @@ fn ip_shaped_values_yield_exactly_ip_value() {
 
 #[test]
 fn pii_and_ip_rejections_never_echo_values() {
-    for (key, value) in [
-        ("contact", "a@example.com"),
-        ("host", "192.0.2.1"),
-        ("host", "2001:db8::1"),
+    // Both variants are payload-free, so their `Debug` rendering is exactly
+    // the variant name. An exact assertion catches any echo, including a leak
+    // of a short fragment that substring checks would miss.
+    for (key, value, expected) in [
+        ("contact", "a@example.com", "PiiValue"),
+        ("host", "192.0.2.1", "IpValue"),
+        ("host", "2001:db8::1", "IpValue"),
     ] {
         let mut fields = LogFields::new();
         let err = fields
             .insert_str(key, value)
             .expect_err("fixture value must be rejected");
-        let rendered = format!("{err:?}");
-        assert!(
-            !rendered.contains(value),
-            "rejection must not echo {value:?}, got {rendered:?}"
+        assert_eq!(
+            format!("{err:?}"),
+            expected,
+            "rejection of {value:?} must render as the payload-free variant name"
         );
-        // Distinctive substrings must not leak either (local part, domain,
-        // octets, hextets).
-        for fragment in value
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .filter(|part| part.len() >= 2)
-        {
-            // Short generic fragments (`db`, `co`) also appear in variant
-            // names by coincidence; only assert on fragments distinctive
-            // enough to identify the rejected value.
-            if fragment.len() >= 4 {
-                assert!(
-                    !rendered.contains(fragment),
-                    "rejection must not echo fragment {fragment:?} of {value:?}, got {rendered:?}"
-                );
-            }
-        }
     }
-    // Variant names themselves carry no payload.
-    assert_eq!(format!("{:?}", FieldRejection::PiiValue), "PiiValue");
-    assert_eq!(format!("{:?}", FieldRejection::IpValue), "IpValue");
 }
 
 #[test]
