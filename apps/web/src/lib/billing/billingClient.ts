@@ -92,12 +92,15 @@ async function readJson<T>(res: Response, label: string): Promise<T> {
 	}
 	try {
 		return (await res.json()) as T;
-	} catch {
+	} catch (error) {
 		// A 2xx whose body is not JSON is a backend contract violation, not
 		// a usable result: surface the typed error keeping the caller's
 		// label — never a bare SyntaxError, and never a downstream TypeError
 		// from reading fields off an undecodable body. Same generic fallback
 		// as undecodable error bodies, but never retryable and never a paywall.
+		// Only decode failures are rewrapped: transport errors rethrow
+		// untouched so they stay distinguishable.
+		if (!(error instanceof SyntaxError)) throw error;
 		const parsed = parseErrorBody(null, res.status);
 		const hint = parsed.message ? `: ${parsed.message}` : '';
 		throw new BillingApiError(res.status, label, hint, parsed.code, false, null);
