@@ -10,11 +10,14 @@
   calendar month) is built in a later slice by folding these windows; no daily table
   exists yet and no writer assumes its `(user_id, period)` upsert.
 - **Revised:** 2026-10-18 — enforcement wire: over-cap
-  ingest-write/stream acquisition refuses `402 plan_limit_exceeded` (monthly,
-  daily, library) or `429 rate_limited` (concurrent) with `x-plan-limit` /
+  ingest-write (daily) and library additions refuse `402 plan_limit_exceeded`;
+  concurrent-stream exhaustion refuses `429 rate_limited`, with `x-plan-limit` /
   `x-plan-reset` headers (`retry-after` on 429) and an `upgrade_url: /pricing`
-  body pointer. Pure decision in `workers/api/src/plan_limits.rs`; DB wiring
-  (subscriptions + usage reads) follows in a later slice.
+  body pointer. Monthly stream-hour exhaustion never refuses: playback past
+  the cap continues at the lower-bitrate degraded mode until the next calendar
+  month (the stream path guards only concurrency). Pure decision in
+  `workers/api/src/plan_limits.rs`; DB wiring (subscriptions + usage reads)
+  follows in a later slice.
 
 ## Context
 
