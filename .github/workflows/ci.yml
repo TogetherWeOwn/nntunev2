@@ -49,6 +49,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Check ETL timestamps through the native importer validator
+        run: bash containers/mb-import/tests/test_etl_timestamp_contract.sh
       # Transport-free portable core on the same native runner: executes
       # nntune-core without default TLS features. This is native portable
       # behavior, not a wasm-runtime check (see rust-wasm) nor a

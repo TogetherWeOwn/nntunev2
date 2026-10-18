@@ -10,7 +10,7 @@ import sqlite3
 import sys
 import tempfile
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # These 1-based positions and field counts follow the official CreateTables.sql:
@@ -125,7 +125,12 @@ def validate_timestamp(timestamp: str) -> str:
         raise ValueError("DUMP_TS must be an ISO-8601 timestamp with Z or an explicit UTC offset") from exc
     if parsed.tzinfo is None:
         raise ValueError("DUMP_TS must be an ISO-8601 timestamp with Z or an explicit UTC offset")
-    return timestamp
+    # Python accepts more ISO forms than the importer (separators, omitted
+    # seconds and second-resolution or large offsets). Publish one UTC shape.
+    try:
+        return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    except OverflowError as exc:
+        raise ValueError("DUMP_TS must be representable as a UTC timestamp") from exc
 
 
 def insert_select(db: sqlite3.Connection, query: str, output_path: Path, updated_at: str, row_transform=None) -> int:
