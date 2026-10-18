@@ -221,6 +221,7 @@ jobs:
           python3 .github/scripts/test_binding_parity.py
           python3 .github/scripts/test_binding_parity_unknown_envs.py
           python3 .github/scripts/test_binding_parity_table_shape.py
+          python3 .github/scripts/test_binding_parity_known_drift_guards.py
       - name: Parity check on this repo
         run: python3 .github/scripts/binding_parity.py
       - name: Parity check passes on the matching fixture
@@ -259,6 +260,7 @@ jobs:
           python3 .github/scripts/test_migrations_gate.py
           python3 .github/scripts/test_migrations_gate_regressions.py
           python3 .github/scripts/test_migrations_gate_unreadable_sql.py
+          python3 .github/scripts/test_migrations_gate_manifest_shape.py
 
   test-nntp:
     name: test-nntp
@@ -567,6 +569,8 @@ jobs:
         run: python3 .github/scripts/test_docs_link_lint.py
       - name: Run docs-link directory-anchor self-tests
         run: python3 .github/scripts/test_docs_link_directories.py
+      - name: Run docs-link diff-failure self-tests
+        run: python3 .github/scripts/test_docs_link_diff_failure.py
       - name: Lint whole tree on this repo
         run: python3 .github/scripts/docs_link_lint.py --root .
       - name: Lint passes on the matching fixture
@@ -650,7 +654,9 @@ jobs:
             --list-output "$RUNNER_TEMP/e2e-list.txt"
 
       - name: Self-test the traceability check
-        run: python3 .github/scripts/test_check_traceability.py
+        run: |
+          python3 .github/scripts/test_check_traceability.py
+          python3 .github/scripts/test_check_traceability_list_format.py
 
   svelte-check:
     name: svelte-check
