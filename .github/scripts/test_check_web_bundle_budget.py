@@ -17,6 +17,7 @@ from check_web_bundle_budget import (
     TOP_FILES_ON_REPORT,
     BudgetError,
     check,
+    default_client_dir,
     main,
     measure,
 )
@@ -177,6 +178,63 @@ def test_failure_reports_exactly_five_largest_in_order() -> None:
     ], report
 
 
+def test_default_client_dir_suffix() -> None:
+    """default_client_dir() must resolve under apps/web/.svelte-kit/output/client."""
+    parts = default_client_dir().parts
+    assert tuple(parts[-5:]) == (
+        "apps",
+        "web",
+        ".svelte-kit",
+        "output",
+        "client",
+    ), default_client_dir()
+
+
+def test_cli_defaults_match_pinned_constants() -> None:
+    """Argparse defaults must be default_client_dir() and BUDGET_CLIENT_JS_BYTES."""
+    import check_web_bundle_budget as mod
+
+    seen: dict[str, object] = {}
+    orig_check = mod.check
+
+    def fake_check(client_dir: Path, budget: int) -> tuple[int, list]:
+        seen["client_dir"] = client_dir
+        seen["budget"] = budget
+        return 0, []
+
+    mod.check = fake_check  # type: ignore[assignment]
+    try:
+        assert mod.main([]) == 0
+    finally:
+        mod.check = orig_check
+    assert seen["budget"] == BUDGET_CLIENT_JS_BYTES, seen
+    assert seen["client_dir"] == default_client_dir(), seen
+
+
+def test_cli_non_positive_budget_exits_1() -> None:
+    client = _client_dir_with({"a.js": 10})
+    assert main(["--client-dir", str(client), "--budget", "0"]) == 1
+    assert main(["--client-dir", str(client), "--budget", "-50"]) == 1
+
+
+def test_cli_non_integer_budget_exits_2() -> None:
+    client = _client_dir_with({"a.js": 10})
+    try:
+        main(["--client-dir", str(client), "--budget", "abc"])
+    except SystemExit as exc:
+        assert exc.code == 2, exc.code
+    else:
+        raise AssertionError("non-integer --budget must raise SystemExit(2)")
+
+
+def test_cli_file_as_client_dir_exits_1() -> None:
+    client = _client_dir_with({"a.js": 10})
+    existing_file = client / "a.js"
+    assert existing_file.is_file()
+    # Assert exit code only; the "missing" wording is owned elsewhere.
+    assert main(["--client-dir", str(existing_file), "--budget", "1000"]) == 1
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
@@ -240,6 +298,11 @@ def main_test() -> int:
         test_failure_reports_exactly_five_largest_in_order,
         test_readme_budget_matches_pinned_constant,
         test_readme_baseline_matches_script_measured_figure,
+        test_default_client_dir_suffix,
+        test_cli_defaults_match_pinned_constants,
+        test_cli_non_positive_budget_exits_1,
+        test_cli_non_integer_budget_exits_2,
+        test_cli_file_as_client_dir_exits_1,
     )
     for case in cases:
         case()
