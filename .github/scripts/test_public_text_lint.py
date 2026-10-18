@@ -437,6 +437,14 @@ class TestMultiRuleHits(unittest.TestCase):
             [(1, "tog-id")], find_violations("see TOG-90001 then TOG-90002")
         )
 
+    def test_multi_pattern_rule_twice_on_one_line_yields_one_hit(self):
+        # internal-host has several patterns; two different patterns on
+        # one line still yield a single hit for the rule.
+        self.assertEqual(
+            [(1, "internal-host")],
+            find_violations("see build.internal and 10.0.0.1 here"),
+        )
+
     def test_empty_string_yields_no_hits(self):
         self.assertEqual([], find_violations(""))
 
@@ -453,6 +461,9 @@ class TestArtifactPathEdges(unittest.TestCase):
         self.assertTrue(is_artifact_path("docs\\note.pyo"))
         self.assertTrue(is_artifact_path("docs\\note.pyc"))
         self.assertTrue(is_artifact_path("a\\b\\__pycache__\\x.pyc"))
+        # Non-compiled file under a backslash __pycache__: only passes
+        # when backslashes are normalized before matching.
+        self.assertTrue(is_artifact_path("a\\b\\__pycache__\\y.py"))
 
     def test_forward_slash_behavior_unchanged(self):
         self.assertTrue(is_artifact_path(".github/scripts/__pycache__/x.pyc"))
