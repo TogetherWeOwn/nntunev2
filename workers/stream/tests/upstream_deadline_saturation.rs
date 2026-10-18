@@ -135,10 +135,21 @@ fn play_path_max_durations_yield_upstream_error_without_panic() {
         Err(err) => err,
     };
     let elapsed = started.elapsed();
-    assert!(
-        matches!(err, PlayError::Upstream(_)),
-        "saturated play-path budget must surface the dial failure as upstream, got {err:?}"
-    );
+    match &err {
+        PlayError::Upstream(detail) => {
+            assert!(
+                !detail.contains("deadline"),
+                "saturated play-path deadline must yield the dial refusal, not a deadline failure, got {detail:?}"
+            );
+            assert!(
+                detail.to_lowercase().contains("refused"),
+                "play-path dial must reach the closed port (connection refused), got {detail:?}"
+            );
+        }
+        other => panic!(
+            "saturated play-path budget must surface the dial failure as upstream, got {other:?}"
+        ),
+    };
     assert!(
         elapsed < Duration::from_secs(10),
         "a refused play-path dial must fail fast instead of waiting out a saturated deadline, took {elapsed:?}"
