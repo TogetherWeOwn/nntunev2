@@ -15,8 +15,8 @@
 //! - attempts through [`invite_attempt_allowed`]: 9 fresh in-window
 //!   attempts pass, 10 deny, proving the limit travels the gate.
 //!
-//! Boundary behavior beyond the values lives in `invite_window_expiry.rs`;
-//! done TOG-30364 pins saturation behavior, not these values.
+//! Boundary behavior beyond the values lives in `invite_window_expiry.rs`,
+//! which pins saturation behavior, not these values.
 //!
 //! Sensitivity (what each pin kills; implementation stays untouched):
 //!
