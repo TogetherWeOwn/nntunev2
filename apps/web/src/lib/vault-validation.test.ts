@@ -85,6 +85,42 @@ describe('validateProviderConfig', () => {
 		).toEqual([]);
 	});
 
+	it('pins the exact provider hostname and TLS acknowledgement copy', () => {
+		const HOSTNAME_ONLY = 'Enter a hostname only, without scheme or path.';
+		const NOT_ALLOWED = 'That IP address is not allowed; use your provider hostname.';
+		const LITERAL_IP = 'Use your provider hostname, not a literal IP address.';
+		const INVALID = 'That hostname does not look valid.';
+		const CLEARTEXT =
+			'Disabling TLS sends your password in cleartext. Tick the acknowledgement to continue without TLS.';
+
+		// Scheme/path input shows the hostname-only copy.
+		for (const host of ['https://news.example.com/', 'news.example.com/x']) {
+			expect(validateProviderConfig({ ...good, host }), `host copy: ${host}`).toContain(
+				HOSTNAME_ONLY
+			);
+		}
+
+		// Blocked IPs (one v4, one v6) show the not-allowed copy.
+		for (const host of ['10.1.2.3', '::1']) {
+			expect(validateProviderConfig({ ...good, host }), `host copy: ${host}`).toContain(
+				NOT_ALLOWED
+			);
+		}
+
+		// Public numeric literal shows the literal-IP copy.
+		expect(validateProviderConfig({ ...good, host: '8.8.8.8' })).toContain(LITERAL_IP);
+
+		// Malformed hostnames show the invalid copy.
+		for (const host of ['not_a_host', 'news..example.com']) {
+			expect(validateProviderConfig({ ...good, host }), `host copy: ${host}`).toContain(INVALID);
+		}
+
+		// TLS-off without acknowledgement shows the cleartext copy.
+		expect(
+			validateProviderConfig({ ...good, tls: false, allowInsecurePlaintext: false })
+		).toContain(CLEARTEXT);
+	});
+
 	it('requires a username and a password', () => {
 		expect(validateProviderConfig({ ...good, username: '' }).length).toBeGreaterThan(0);
 		expect(validateProviderConfig({ ...good, password: '' }).length).toBeGreaterThan(0);
