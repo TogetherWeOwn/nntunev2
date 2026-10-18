@@ -5,23 +5,28 @@
 //! caller only as usage counters; this module never reads a clock, a DB, or
 //! the environment, so the caps matrix is unit-testable without staging.
 //!
-//! Caps mirror ADR 0004 (Base / 5x / 20x) and the frontend fallback
-//! (`apps/web/src/lib/billing/plans.ts`): prices and quotas are plan data,
-//! and the literals below change only together with both of those sources.
+//! Caps mirror the ADR 0004 decision table (Base / 5x / 20x); the
+//! `caps_match_adr_0004_decision_table` test parses that table via
+//! `include_str!` so drift fails instead of silently re-capping. The
+//! frontend fallback (`apps/web/src/lib/billing/plans.ts`) carries the same
+//! numbers for display only — enforcement never reads client values.
 //! Enforcement reads plan metadata the meter harness stages (the caller
-//! supplies the resolved [`PlanId`] and [`UsageSnapshot`]); DB wiring
+//! supplies the resolved [`PlanId`] plus usage counters); DB wiring
 //! (subscriptions + usage_ledger reads via Hyperdrive) lands in a later
 //! slice and calls these same pure checks.
 //!
 //! Decision rule (fail-closed, `>=` denies: at-cap is over-cap):
-//! - monthly stream seconds, daily ingest jobs, library tracks → 402
-//!   `plan_limit_exceeded` (terminal: only an upgrade or the period reset
-//!   changes the answer, `retryable: false`);
+//! - daily ingest jobs, library tracks → 402 `plan_limit_exceeded`
+//!   (terminal: only an upgrade or the period reset changes the answer,
+//!   `retryable: false`);
 //! - concurrent streams → 429 `rate_limited` (retryable: release or wait,
 //!   `retryable: true` with `Retry-After`).
 //!
-//! On the combined stream path the monthly 402 takes precedence over the
-//! concurrent 429: a terminal exhaustion must never read as retryable.
+//! Monthly stream seconds never refuse: exhaustion degrades to a lower
+//! bitrate until the next calendar month (ADR 0004 Overage, the pricing page
+//! and `usage.ts`), so new playback is still admitted. The stream path
+//! therefore guards only concurrency; [`stream_degraded`] reports the
+//! quality state the bitrate decision reads.
 //!
 //! Refusal wire (pinned by `docs/api-errors.md`, asserted end to end by
 //! `assertPlanLimitRefusal` in `e2e/helpers/contract.ts`):
@@ -139,21 +144,10 @@ pub struct PlanCaps {
     pub ingest_jobs_day: u32,
 }
 
-/// Usage counters for one account (same four dimensions as the frontend
-/// `UsageSnapshot`; the caller stages these from the meter harness today
-/// and from usage_ledger reads once DB wiring lands).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UsageSnapshot {
-    pub stream_seconds_month: u64,
-    pub concurrent_now: u32,
-    pub library_tracks: u64,
-    pub ingest_today: u32,
-}
-
-/// Which cap refused the attempt.
+/// Which cap refused the attempt. Monthly stream exhaustion is deliberately
+/// absent: it degrades quality (see [`stream_degraded`]) and never refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitDimension {
-    StreamMonth,
     IngestDay,
     Library,
     Concurrent,
@@ -163,7 +157,6 @@ impl LimitDimension {
     /// Stable dimension name carried in the `x-plan-limit` header value.
     pub fn name(self) -> &'static str {
         match self {
-            LimitDimension::StreamMonth => "stream_seconds_month",
             LimitDimension::IngestDay => "ingest_today",
             LimitDimension::Library => "library_tracks",
             LimitDimension::Concurrent => "concurrent_streams",
@@ -175,7 +168,6 @@ impl LimitDimension {
     /// CTA from this plus `upgrade_url`, never a timestamp it must parse.
     pub fn reset_hint(self) -> &'static str {
         match self {
-            LimitDimension::StreamMonth => "next-calendar-month",
             LimitDimension::IngestDay => "next-utc-day",
             LimitDimension::Library => "on-upgrade-or-remove",
             LimitDimension::Concurrent => "on-release",
@@ -184,7 +176,6 @@ impl LimitDimension {
 
     fn cap_value(self, caps: &PlanCaps) -> u64 {
         match self {
-            LimitDimension::StreamMonth => caps.stream_seconds_month,
             LimitDimension::IngestDay => u64::from(caps.ingest_jobs_day),
             LimitDimension::Library => caps.max_library_tracks,
             LimitDimension::Concurrent => u64::from(caps.max_concurrent_streams),
@@ -325,15 +316,12 @@ pub fn check_library(plan: PlanId, library_tracks: u64, adding: u64) -> Decision
     }
 }
 
-/// Monthly stream guard: the stream path calls this before serving new
-/// playback. At-cap denies: the month's allowance is spent.
-pub fn check_stream_month(plan: PlanId, stream_seconds_month: u64) -> Decision {
-    let caps = plan.caps();
-    if stream_seconds_month >= caps.stream_seconds_month {
-        deny_plan(LimitDimension::StreamMonth, &caps)
-    } else {
-        Decision::Allow
-    }
+/// Monthly stream state: exhaustion degrades to a lower bitrate until the
+/// next calendar month (ADR 0004 Overage) — it never refuses new playback.
+/// At-cap counts as degraded (`>=`): the month's full-quality allowance is
+/// spent, but acquisition still admits.
+pub fn stream_degraded(plan: PlanId, stream_seconds_month: u64) -> bool {
+    stream_seconds_month >= plan.caps().stream_seconds_month
 }
 
 /// Concurrency guard: the per-user pool calls this at lease acquisition.
@@ -352,35 +340,13 @@ pub fn check_concurrent(plan: PlanId, concurrent_now: u32) -> Decision {
     }
 }
 
-/// Stream-path guard: monthly exhaustion (402, terminal) takes precedence
-/// over concurrency (429, retryable), so a spent month never reads as
-/// "try again soon".
-pub fn check_stream(plan: PlanId, stream_seconds_month: u64, concurrent_now: u32) -> Decision {
-    match check_stream_month(plan, stream_seconds_month) {
-        Decision::Deny(denial) => Decision::Deny(denial),
-        Decision::Allow => check_concurrent(plan, concurrent_now),
-    }
-}
-
-/// Combined guard across one usage snapshot plus the pending library
-/// addition for this attempt. Terminal 402s win over the retryable 429 in
-/// this order: stream month, ingest day, library, then concurrency. The
-/// first denial names its own dimension. Snapshot-only callers pass
-/// `library_adding: 0`.
-pub fn evaluate(plan: PlanId, usage: &UsageSnapshot, library_adding: u64) -> Decision {
-    let month = check_stream_month(plan, usage.stream_seconds_month);
-    if !month.is_allow() {
-        return month;
-    }
-    let ingest = check_ingest_write(plan, usage.ingest_today);
-    if !ingest.is_allow() {
-        return ingest;
-    }
-    let library = check_library(plan, usage.library_tracks, library_adding);
-    if !library.is_allow() {
-        return library;
-    }
-    check_concurrent(plan, usage.concurrent_now)
+/// Stream-path guard: the stream path refuses only on concurrency (429,
+/// retryable). Monthly exhaustion degrades quality via [`stream_degraded`]
+/// and never refuses, so each operation checks only its own dimension:
+/// playback uses this, intake uses [`check_ingest_write`], and writes use
+/// [`check_library`].
+pub fn check_stream(plan: PlanId, concurrent_now: u32) -> Decision {
+    check_concurrent(plan, concurrent_now)
 }
 
 #[cfg(test)]
@@ -388,36 +354,59 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    fn usage_zero() -> UsageSnapshot {
-        UsageSnapshot {
-            stream_seconds_month: 0,
-            concurrent_now: 0,
-            library_tracks: 0,
-            ingest_today: 0,
-        }
-    }
-
     #[test]
-    fn caps_match_adr_0004_and_frontend_plans() {
-        // ADR 0004 matrix (hours) × 3600, plus the exact per-tier counts the
-        // frontend PLANS table pins. Any tier/price change updates all three
-        // together — a drift here fails instead of silently re-capping.
-        let cases = [
-            (PlanId::Free, "free", 10 * 3600, 1, 1_000, 5),
-            (PlanId::Plus, "plus", 100 * 3600, 2, 25_000, 25),
-            (PlanId::Pro5x, "pro-5x", 500 * 3600, 4, 100_000, 100),
-            (PlanId::Pro20x, "pro-20x", 2000 * 3600, 8, 500_000, 400),
-        ];
-        assert_eq!(PlanId::all().len(), 4);
-        for (plan, id, stream_s, concurrent, library, ingest) in cases {
-            assert_eq!(plan.as_str(), id);
-            assert_eq!(PlanId::parse_id(id), Some(plan));
-            let caps = plan.caps();
-            assert_eq!(caps.stream_seconds_month, stream_s, "{id} stream");
-            assert_eq!(caps.max_concurrent_streams, concurrent, "{id} concurrent");
-            assert_eq!(caps.max_library_tracks, library, "{id} library");
-            assert_eq!(caps.ingest_jobs_day, ingest, "{id} ingest");
+    fn caps_match_adr_0004_decision_table() {
+        // The ADR decision table is the single source: parse it and assert
+        // every tier's four caps, so editing the table without this module
+        // fails instead of silently re-capping. (The frontend PLANS table is
+        // display-only and not parsed here — enforcement never reads client
+        // values.) Same include_str! doc-parity pattern as
+        // api_error::registry_matches_docs_api_errors.
+        let doc = include_str!("../../../docs/adr/0004-plan-matrix.md");
+        // Canonical ids still resolve both ways.
+        for plan in PlanId::all() {
+            assert_eq!(PlanId::parse_id(plan.as_str()), Some(plan));
         }
+        let mut seen = HashSet::new();
+        for line in doc.lines().filter(|l| l.starts_with('|')) {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            // cells: ["", plan, price, stream hrs, concurrent, library,
+            //          ingest, ...]. Header/separator rows lack a `$` price.
+            if cells.len() < 7 || !cells[2].starts_with('$') {
+                continue;
+            }
+            let plan = match cells[1] {
+                p if p.starts_with("Free") => PlanId::Free,
+                "Plus" => PlanId::Plus,
+                "Pro 5x" => PlanId::Pro5x,
+                "Pro 20x" => PlanId::Pro20x,
+                _ => continue,
+            };
+            let stream_hrs: u64 = cells[3]
+                .replace(',', "")
+                .parse()
+                .expect("ADR stream hrs parses");
+            let concurrent: u32 = cells[4].parse().expect("ADR concurrent parses");
+            let library: u64 = cells[5]
+                .replace(',', "")
+                .parse()
+                .expect("ADR library parses");
+            let ingest: u32 = cells[6].parse().expect("ADR ingest parses");
+            let caps = plan.caps();
+            assert_eq!(
+                caps.stream_seconds_month,
+                stream_hrs * 3600,
+                "{plan:?} stream"
+            );
+            assert_eq!(
+                caps.max_concurrent_streams, concurrent,
+                "{plan:?} concurrent"
+            );
+            assert_eq!(caps.max_library_tracks, library, "{plan:?} library");
+            assert_eq!(caps.ingest_jobs_day, ingest, "{plan:?} ingest");
+            seen.insert(plan);
+        }
+        assert_eq!(seen.len(), 4, "ADR table must pin all four tiers");
     }
 
     #[test]
@@ -440,7 +429,8 @@ mod tests {
     #[test]
     fn caps_matrix_under_at_over_per_dimension() {
         // Under allows; at-cap and over-cap deny. Covers every tier × every
-        // guarded dimension: the matrix the acceptance criterion requires.
+        // refusing dimension (monthly stream degrades via `stream_degraded`
+        // and never refuses, so it is pinned separately below).
         for plan in PlanId::all() {
             let caps = plan.caps();
             // Ingest day (402).
@@ -458,16 +448,6 @@ mod tests {
             assert!(!check_library(plan, caps.max_library_tracks.saturating_add(1), 0).is_allow());
             assert!(!check_library(plan, u64::MAX, 0).is_allow());
             assert!(!check_library(plan, u64::MAX, u64::MAX).is_allow());
-            // Stream month (402).
-            assert!(check_stream_month(plan, 0).is_allow());
-            assert!(
-                check_stream_month(plan, caps.stream_seconds_month.saturating_sub(1)).is_allow()
-            );
-            assert!(!check_stream_month(plan, caps.stream_seconds_month).is_allow());
-            assert!(
-                !check_stream_month(plan, caps.stream_seconds_month.saturating_add(1)).is_allow()
-            );
-            assert!(!check_stream_month(plan, u64::MAX).is_allow());
             // Concurrent (429).
             assert!(check_concurrent(plan, 0).is_allow());
             if caps.max_concurrent_streams > 1 {
@@ -508,98 +488,42 @@ mod tests {
     }
 
     #[test]
-    fn stream_path_monthly_402_beats_concurrent_429() {
-        let caps = PlanId::Free.caps();
-        // Both exhausted: the terminal monthly denial wins.
-        let both = check_stream(
-            plan_of(),
-            caps.stream_seconds_month,
-            caps.max_concurrent_streams,
-        );
-        let denial = both.denial().expect("both over must deny");
-        assert_eq!((denial.status, denial.code), (402, "plan_limit_exceeded"));
-        assert_eq!(denial.dimension, LimitDimension::StreamMonth);
-        // Only concurrent exhausted: the retryable denial.
-        let conc = check_stream(plan_of(), 0, caps.max_concurrent_streams);
-        let denial = conc.denial().expect("concurrent over must deny");
-        assert_eq!((denial.status, denial.code), (429, "rate_limited"));
-        // Neither exhausted: allow.
-        assert!(check_stream(plan_of(), 0, 0).is_allow());
-    }
-
-    fn plan_of() -> PlanId {
-        PlanId::Free
+    fn stream_month_degrades_never_refuses() {
+        // ADR 0004 Overage: monthly exhaustion degrades bitrate until the
+        // next calendar month — it never refuses. At-cap counts as degraded.
+        for plan in PlanId::all() {
+            let caps = plan.caps();
+            assert!(!stream_degraded(plan, 0));
+            assert!(!stream_degraded(
+                plan,
+                caps.stream_seconds_month.saturating_sub(1)
+            ));
+            assert!(stream_degraded(plan, caps.stream_seconds_month));
+            assert!(stream_degraded(
+                plan,
+                caps.stream_seconds_month.saturating_add(1)
+            ));
+            assert!(stream_degraded(plan, u64::MAX));
+        }
     }
 
     #[test]
-    fn combined_evaluate_names_first_terminal_denial() {
-        let caps = PlanId::Plus.caps();
-        // All clear allows.
-        assert!(evaluate(PlanId::Plus, &usage_zero(), 0).is_allow());
-        // Each dimension alone denies with its own status/dimension.
-        let month = UsageSnapshot {
-            stream_seconds_month: caps.stream_seconds_month,
-            ..usage_zero()
-        };
-        assert_eq!(
-            evaluate(PlanId::Plus, &month, 0)
+    fn stream_path_guards_concurrency_only() {
+        // A spent month still admits when a concurrent slot is free
+        // (quality degrades via `stream_degraded`); a full pool refuses 429.
+        for plan in PlanId::all() {
+            let caps = plan.caps();
+            assert!(stream_degraded(plan, caps.stream_seconds_month));
+            assert!(check_stream(plan, 0).is_allow());
+            if caps.max_concurrent_streams > 1 {
+                assert!(check_stream(plan, caps.max_concurrent_streams - 1).is_allow());
+            }
+            let denial = check_stream(plan, caps.max_concurrent_streams)
                 .denial()
-                .map(|d| (d.status, d.dimension)),
-            Some((402, LimitDimension::StreamMonth))
-        );
-        let ingest = UsageSnapshot {
-            ingest_today: caps.ingest_jobs_day,
-            ..usage_zero()
-        };
-        assert_eq!(
-            evaluate(PlanId::Plus, &ingest, 0)
-                .denial()
-                .map(|d| (d.status, d.dimension)),
-            Some((402, LimitDimension::IngestDay))
-        );
-        let library = UsageSnapshot {
-            library_tracks: caps.max_library_tracks,
-            ..usage_zero()
-        };
-        assert_eq!(
-            evaluate(PlanId::Plus, &library, 0)
-                .denial()
-                .map(|d| (d.status, d.dimension)),
-            Some((402, LimitDimension::Library))
-        );
-        // A batch that crosses the library cap denies even though the
-        // snapshot count alone is under it; zero-addition below cap allows.
-        let batch = UsageSnapshot {
-            library_tracks: caps.max_library_tracks.saturating_sub(10),
-            ..usage_zero()
-        };
-        assert!(evaluate(PlanId::Plus, &batch, 0).is_allow());
-        assert_eq!(
-            evaluate(PlanId::Plus, &batch, 11)
-                .denial()
-                .map(|d| (d.status, d.dimension)),
-            Some((402, LimitDimension::Library))
-        );
-        let conc = UsageSnapshot {
-            concurrent_now: caps.max_concurrent_streams,
-            ..usage_zero()
-        };
-        assert_eq!(
-            evaluate(PlanId::Plus, &conc, 0)
-                .denial()
-                .map(|d| (d.status, d.dimension)),
-            Some((429, LimitDimension::Concurrent))
-        );
-        // Month beats concurrent when both are over.
-        let both = UsageSnapshot {
-            stream_seconds_month: caps.stream_seconds_month,
-            concurrent_now: caps.max_concurrent_streams,
-            ..usage_zero()
-        };
-        assert_eq!(
-            evaluate(PlanId::Plus, &both, 0).denial().map(|d| d.status),
-            Some(402)
-        );
+                .expect("concurrent over must deny");
+            assert_eq!((denial.status, denial.code), (429, "rate_limited"));
+            assert_eq!(denial.dimension, LimitDimension::Concurrent);
+        }
     }
 
     #[test]
@@ -641,8 +565,6 @@ mod tests {
                 check_ingest_write(plan, u32::MAX),
                 check_library(plan, caps.max_library_tracks, 0),
                 check_library(plan, u64::MAX, u64::MAX),
-                check_stream_month(plan, caps.stream_seconds_month),
-                check_stream_month(plan, u64::MAX),
                 check_concurrent(plan, caps.max_concurrent_streams),
                 check_concurrent(plan, u32::MAX),
             ];

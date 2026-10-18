@@ -63,15 +63,14 @@ A downgrade preserves library metadata, blocks additions over the new limit, and
 makes excess cache grants eligible for eviction.
 
 **Enforcement wire (2026-10-18):** at the API boundary, new acquisition over
-cap is refused rather than degraded: monthly stream seconds, daily ingest jobs
-and library tracks refuse with `402 plan_limit_exceeded` (`retryable: false`);
-concurrent-stream exhaustion refuses with `429 rate_limited` (`retryable: true`
-plus `Retry-After`). Every refusal carries `x-plan-limit` / `x-plan-reset`
-headers and an `upgrade_url: /pricing` body pointer, names-only with no PII,
-and never a 500. The lower-bitrate degraded mode above describes the
-sustained quality of playback already admitted when the cap is reached —
-not a right to start new playback, which the over-limit e2e legs assert is
-refused with 402 until the next calendar month. Checks are `>=` (at-cap
+cap is refused: daily ingest jobs and library tracks refuse with
+`402 plan_limit_exceeded` (`retryable: false`); concurrent-stream exhaustion
+refuses with `429 rate_limited` (`retryable: true` plus `Retry-After`).
+Every refusal carries `x-plan-limit` / `x-plan-reset` headers and an
+`upgrade_url: /pricing` body pointer, names-only with no PII, and never a
+500. Monthly stream-hour exhaustion never refuses: playback past the cap
+continues at the lower-bitrate degraded mode above until the next calendar
+month (the stream path guards only concurrency). Checks are `>=` (at-cap
 denies); unknown plan ids fail closed to the free caps.
 
 ### Trial and payment gate
