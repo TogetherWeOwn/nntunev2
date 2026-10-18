@@ -250,7 +250,10 @@ test('login: retry after dismissal signs in', async ({ page }) => {
 	await expect(page.getByRole('alert')).toContainText(DISMISSAL);
 
 	await page.getByRole('button', { name: /sign in with passkey/i }).click();
-	await page.waitForURL('/onboarding/provider');
+	// Sign-in navigates to /onboarding/provider, whose GET 307-redirects
+	// to /onboarding/byop (see routes/onboarding/provider/+server.ts), so
+	// the settled URL — like every other sign-in spec — is /onboarding/byop.
+	await page.waitForURL('/onboarding/byop');
 
 	expect(traffic.finishPosts).toBe(1);
 });
