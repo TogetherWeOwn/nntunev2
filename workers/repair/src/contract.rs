@@ -263,6 +263,152 @@ pub struct RepairReply {
     pub file_count: usize,
 }
 
+/// Validate the set of outputs a `Repaired` result claims against the
+/// manifest. The wasm runtime calls this before copying any output or
+/// writing the durable result marker; rejections are the retryable
+/// 502 `container_unavailable` fault the runtime already uses for a
+/// Container reply it cannot trust. A non-`Repaired` result carries
+/// no output set to validate.
+///
+/// The rule is set equality with the manifest's Data files: exactly
+/// one output per Data file, with unique file names and unique
+/// canonical object keys. Sizes are deliberately not compared — a
+/// recreated zero-length Data target carries its repaired on-disk
+/// size, not the manifest's 0.
+pub fn validate_repaired_output_set(
+    manifest: &ScratchManifest,
+    result: &RepairResult,
+) -> Result<(), ApiFault> {
+    if result.status != RepairStatus::Repaired {
+        return Ok(());
+    }
+    let invalid = || ApiFault::new(502, "container_unavailable");
+    let data_names: HashSet<&str> = manifest
+        .files
+        .iter()
+        .filter(|f| f.role == FileRole::Data)
+        .map(|f| f.file_name.as_str())
+        .collect();
+    if result.files.len() != data_names.len() {
+        return Err(invalid());
+    }
+    let mut seen_names = HashSet::with_capacity(result.files.len());
+    let mut seen_keys = HashSet::with_capacity(result.files.len());
+    for output in &result.files {
+        if !data_names.contains(output.file_name.as_str())
+            || output.key != object_key_for_file_name(&output.file_name)
+            || !seen_names.insert(output.file_name.as_str())
+            || !seen_keys.insert(output.key.as_str())
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod output_set_guard_regression {
+    //! Pin each guard of [`validate_repaired_output_set`] in
+    //! isolation: removing any single check must turn its test red.
+    //! These live next to the validator — not in the acceptance
+    //! suite — because that file is Test Author-owned and frozen
+    //! for this change.
+
+    use super::*;
+
+    fn data_file(file_name: &str, size: u64) -> ScratchFile {
+        ScratchFile {
+            file_name: file_name.to_string(),
+            key: object_key_for_file_name(file_name),
+            size,
+            role: FileRole::Data,
+        }
+    }
+
+    fn two_data_manifest() -> ScratchManifest {
+        ScratchManifest {
+            staging_id: "staging-0000000000000001".to_string(),
+            files: vec![
+                data_file("track01.flac", 7),
+                data_file("track02.flac", 9),
+                ScratchFile {
+                    file_name: "set.par2".to_string(),
+                    key: object_key_for_file_name("set.par2"),
+                    size: 8,
+                    role: FileRole::Par2,
+                },
+            ],
+        }
+    }
+
+    fn output(file_name: &str, size: u64) -> OutputFile {
+        OutputFile {
+            file_name: file_name.to_string(),
+            key: object_key_for_file_name(file_name),
+            size,
+        }
+    }
+
+    fn repaired(files: Vec<OutputFile>) -> RepairResult {
+        RepairResult {
+            status: RepairStatus::Repaired,
+            exit_code: Some(0),
+            files,
+            manifest_digest: String::new(),
+        }
+    }
+
+    fn assert_rejected_502(manifest: &ScratchManifest, result: &RepairResult, context: &str) {
+        match validate_repaired_output_set(manifest, result) {
+            Err(err) => assert_eq!(
+                (err.status, err.code),
+                (502, "container_unavailable"),
+                "{context}: rejection must keep the retryable 502 contract"
+            ),
+            Ok(()) => panic!("{context}: invalid output set was accepted"),
+        }
+    }
+
+    #[test]
+    fn unique_but_noncanonical_key_is_rejected() {
+        // Count matches, names are unique manifest members, keys are
+        // unique — only the canonical-key guard can reject this. The
+        // forged key is unique across the set on purpose: sharing
+        // another file's key would let the duplicate-key guard fire
+        // first and leave this guard unpinned.
+        let manifest = two_data_manifest();
+        let forged_key = "0".repeat(64);
+        assert_ne!(forged_key, object_key_for_file_name("track01.flac"));
+        assert_ne!(forged_key, object_key_for_file_name("track02.flac"));
+        let forged = OutputFile {
+            file_name: "track02.flac".to_string(),
+            key: forged_key,
+            size: 9,
+        };
+        let result = repaired(vec![output("track01.flac", 7), forged]);
+        assert_rejected_502(&manifest, &result, "unique but noncanonical key");
+    }
+
+    #[test]
+    fn same_count_swap_with_unknown_file_is_rejected() {
+        // Count matches, names are unique, keys are unique and each
+        // canonical for its own name — only the manifest-membership
+        // guard can reject this. A third output would let the count
+        // guard fire first and leave this guard unpinned.
+        let manifest = two_data_manifest();
+        assert_ne!(
+            object_key_for_file_name("extra.flac"),
+            object_key_for_file_name("track01.flac")
+        );
+        assert_ne!(
+            object_key_for_file_name("extra.flac"),
+            object_key_for_file_name("track02.flac")
+        );
+        let result = repaired(vec![output("track01.flac", 7), output("extra.flac", 3)]);
+        assert_rejected_502(&manifest, &result, "same-count swap with unknown file");
+    }
+}
+
 pub fn ingest_reply_body(result: &RepairResult) -> Vec<u8> {
     let reply = RepairReply {
         status: result.status,
