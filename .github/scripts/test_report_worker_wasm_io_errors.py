@@ -220,20 +220,33 @@ class MainIsolationTests(unittest.TestCase):
             later = WORKERS[1]["worker"]
             failing_artifact_abs = os.path.abspath(wasm_path(root, WORKERS[0]))
             real_stat = Path.stat
+            real_is_file = Path.is_file
+
+            def fake_is_file(self, *args, **kwargs):
+                # Python 3.12's is_file() calls self.stat() with no kwargs,
+                # which would hit the stat mock below; bypass it so the
+                # existence check succeeds and the failure lands in
+                # measure_worker's try block (all artifacts exist here).
+                # NOTE: os.path.abspath is lexical (no stat), so no recursion.
+                if os.path.abspath(self) == failing_artifact_abs:
+                    return True
+                return real_is_file(self, *args, **kwargs)
 
             def fake_stat(self, *args, **kwargs):
-                # is_file() calls stat(follow_symlinks=...): let those
-                # through so the existence check succeeds, then fail the
-                # bare stat() inside measure_worker for the victim only.
+                # Fail the bare stat() inside measure_worker for the victim
+                # only; is_file() is patched above so no kwargs sniffing.
                 # NOTE: never call .resolve() here: it stats the path and
                 # would recurse into this mock. os.path.abspath is lexical.
-                if "follow_symlinks" in kwargs:
-                    return real_stat(self, *args, **kwargs)
                 if os.path.abspath(self) == failing_artifact_abs:
                     raise OSError(STAT_SENTINEL)
                 return real_stat(self, *args, **kwargs)
 
-            with patch.object(Path, "stat", autospec=True, side_effect=fake_stat):
+            with (
+                patch.object(
+                    Path, "is_file", autospec=True, side_effect=fake_is_file
+                ),
+                patch.object(Path, "stat", autospec=True, side_effect=fake_stat),
+            ):
                 rc, out, err = _run_main(root, "--skip-build")
         self.assertEqual(rc, 0)
         self.assertEqual(err, "")
