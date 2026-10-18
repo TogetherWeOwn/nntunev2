@@ -11,6 +11,18 @@ compatibility_date = "2026-10-01"
 # SEARCH_RATE_LIMIT_MAX = "10"
 # SEARCH_RATE_LIMIT_WINDOW_SECS = "60"
 
+# Build identity for log lines (public, non-secret): the 40-char lowercase
+# hex commit SHA supplied at deploy time by the deploy lane (for example
+# `--var BUILD_SHA:$GITHUB_SHA`). No workflow wires it for the ingest Worker
+# yet (backend Worker deploys are intentionally not wired; see
+# `.github/workflows/deploy.yml`), so until the future ingest deploy job adds
+# it every ingest line renders the explicit string "unknown".
+# Workers log it as the `build_sha` field on every record; an absent or
+# invalid value renders as "unknown" (never a missing key, never
+# fail-closed), which means the lane did not supply it. Leave unset for
+# local dev.
+# BUILD_SHA = "unknown"
+
 # Slice 2: Queue producer (code: src/dispatch.rs, src/queue.rs). The routes
 # produce; the consumer below stays disabled, so every accepted enqueue
 # waits in the queue until it is enabled.

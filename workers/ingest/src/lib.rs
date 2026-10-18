@@ -132,6 +132,29 @@ fn inbound_trace_id(req: &Request) -> String {
     nntune_logging::resolve_trace_id(header.as_deref())
 }
 
+/// Read a deploy-time plain var, ignoring empty values. `BUILD_SHA` is
+/// public build identity (see `wrangler.toml.example`): a secret binding
+/// is tried first so an operator-supplied value wins, then a plain var,
+/// mirroring the api worker's reader.
+fn env_string(env: &Env, name: &str) -> Option<String> {
+    env.secret(name)
+        .ok()
+        .map(|s| s.to_string())
+        .or_else(|| env.var(name).ok().map(|s| s.to_string()))
+        .filter(|s| !s.is_empty())
+}
+
+/// Build identity for log lines: the 40-char lowercase hex commit supplied
+/// at deploy time by the deploy lane via the public `BUILD_SHA` var (no
+/// workflow wires it for the ingest Worker yet), or the explicit
+/// `"unknown"` marker when absent or invalid (dev, preview without env,
+/// unwired lane). Normalized through the shared validator, never logged
+/// raw; never fail-closed, so a missing identity degrades the line instead
+/// of the request.
+pub(crate) fn build_sha_from_env(env: &Env) -> String {
+    nntune_logging::parse_build_sha(env_string(env, "BUILD_SHA").as_deref())
+}
+
 /// Emit one structured log line for this request (`docs/logging-standard.md`).
 /// Field validation runs at construction: a banned key or secret-like value
 /// drops the line instead of leaking it. All call-site fields are constants
@@ -1162,13 +1185,16 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>, trace_id: &str) -> Re
         Err(message) => return json_error(ApiError::invalid_request(message)),
     };
     msg.trace_id = Some(trace_id.to_string());
+    // Build identity rides every line (mirrors the api worker): the deploy
+    // lane's public BUILD_SHA var, or explicit "unknown" when unwired.
+    let build_sha = build_sha_from_env(&ctx.env);
     // Operational facts only: opaque job ID plus the query length. The query
     // text, user handle, and indexer handle never enter a log line.
     emit(
         Level::Info,
         trace_id,
         "ingest.search.received",
-        serde_json::json!({"job_id": msg.job_id, "q_len": q.len()}),
+        serde_json::json!({"job_id": msg.job_id, "q_len": q.len(), "build_sha": build_sha}),
     );
     // Durable idempotent admission: the (job_id, stage) ledger owns the
     // enqueue + meter outbox, fail-closed. A 503 here means nothing was
@@ -1223,6 +1249,9 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>, trace_id: &str) -
                 Err(message) => return json_error(ApiError::invalid_request(message)),
             };
             msg.trace_id = Some(trace_id.to_string());
+            // Build identity rides every line (mirrors the api worker): the deploy
+            // lane's public BUILD_SHA var, or explicit "unknown" when unwired.
+            let build_sha = build_sha_from_env(&ctx.env);
             // The bytes must be durably stored before the job exists: an
             // enqueued job without retrievable bytes can never run.
             let payload_ref = msg.payload_ref.clone().unwrap_or_default();
@@ -1235,7 +1264,7 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>, trace_id: &str) -
                     Level::Error,
                     trace_id,
                     "ingest.payload.store_failed",
-                    serde_json::json!({"source": "nzb_upload"}),
+                    serde_json::json!({"source": "nzb_upload", "build_sha": build_sha}),
                 );
                 return service_unavailable("payload store unavailable; nothing was accepted");
             }
@@ -1248,6 +1277,7 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>, trace_id: &str) -
                     "job_id": msg.job_id,
                     "file_count": est.file_count,
                     "segment_count": est.segment_count,
+                    "build_sha": build_sha,
                 }),
             );
             // Durable idempotent admission after the payload store (bytes are
@@ -1291,11 +1321,14 @@ async fn job_status(ctx: &RouteContext<()>, trace_id: &str) -> Result<Response> 
     if !validate_job_id(&id) {
         return json_error(ApiError::not_found("unknown job id"));
     }
+    // Build identity rides every line (mirrors the api worker): the deploy
+    // lane's public BUILD_SHA var, or explicit "unknown" when unwired.
+    let build_sha = build_sha_from_env(&ctx.env);
     emit(
         Level::Info,
         trace_id,
         "ingest.job.status_checked",
-        serde_json::json!({"job_id": id}),
+        serde_json::json!({"job_id": id, "build_sha": build_sha}),
     );
     match checkpoint::get(&ctx.env, &id).await {
         Ok(Some(cp)) => Response::from_json(&cp),
@@ -2825,5 +2858,98 @@ mod logging_trace_tests {
                 "emitter accepted a banned shape"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod build_sha_tests {
+    use super::*;
+
+    const TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// Every ingest line carries the normalized build identity through the
+    /// REAL emitter (`nntune-logging`), not a hand-written fixture: a known
+    /// SHA and the explicit unknown marker both survive validation and keep
+    /// the six-key envelope.
+    #[test]
+    fn emitted_lines_carry_build_sha_known_or_unknown() {
+        for sha in [SHA, nntune_logging::BUILD_SHA_UNKNOWN] {
+            let normalized = nntune_logging::parse_build_sha(Some(sha));
+            let record = LogRecord::new(
+                LogWorker::Ingest,
+                Level::Info,
+                TRACE,
+                "ingest.search.received",
+                nntune_logging::fields_from_json(serde_json::json!({
+                    "job_id": "job_01",
+                    "q_len": 9,
+                    "build_sha": normalized,
+                }))
+                .unwrap(),
+                1_792_094_400_123,
+            )
+            .expect("ingest line with build_sha must render");
+            let parsed: serde_json::Value = serde_json::from_str(&record.to_json_line())
+                .expect("record must be one JSON object");
+            let object = parsed.as_object().expect("record must be an object");
+            assert_eq!(object.len(), 6, "exactly the six envelope keys");
+            assert_eq!(object["fields"]["build_sha"], sha);
+        }
+    }
+
+    #[test]
+    fn every_emit_site_wires_build_sha() {
+        // `build_sha_from_env` needs a wasm Env, so pin the call sites in
+        // source the way the throttle-gate test pins the route shape: slice
+        // the pre-test source so this test's own literals cannot satisfy it.
+        // All four fetch lines plus the queue-consumer line must carry the
+        // normalized key — never a missing key or a raw var.
+        let source = include_str!("lib.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        assert!(
+            production.contains("fn build_sha_from_env("),
+            "the BUILD_SHA reader must exist"
+        );
+        assert!(
+            production.contains("nntune_logging::parse_build_sha"),
+            "the reader must normalize through the shared validator"
+        );
+        for event in [
+            "ingest.search.received",
+            "ingest.payload.store_failed",
+            "ingest.upload.received",
+            "ingest.job.status_checked",
+        ] {
+            assert!(production.contains(event), "fetch entry must emit {event}");
+        }
+        // Match the key literal inside the `json!` fields, not the bare
+        // substring: `let build_sha = …` alone must never satisfy this.
+        // Four fetch emit sites carry the key, so a dropped key at any one
+        // of them drops the count below four.
+        assert_eq!(
+            production.matches("\"build_sha\": build_sha").count(),
+            4,
+            "all four fetch lines must carry the build_sha key"
+        );
+        let consumer = include_str!("queue_consumer.rs");
+        let consumer_production = consumer
+            .split_once("#[cfg(test)]")
+            .expect("consumer test module must exist")
+            .0;
+        assert!(
+            consumer_production.contains("ingest.job.consumed"),
+            "consumer must emit ingest.job.consumed"
+        );
+        assert_eq!(
+            consumer_production
+                .matches("\"build_sha\": build_sha")
+                .count(),
+            1,
+            "the consumed line must carry the build_sha key"
+        );
     }
 }
