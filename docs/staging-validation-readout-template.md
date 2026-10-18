@@ -69,11 +69,14 @@ exactly these fields:
 | Result | `PASS`, `FAIL`, or `SKIPPED`. `SKIPPED` never counts as a pass; a skipped must-pass step makes its row `INCONCLUSIVE`. |
 | Verified by | Role + date of the person who opened the link and confirmed it proves the claim. The author of a row does not verify their own evidence. |
 
-Same-build rule: if the deployed build identity cannot be compared with the
-promoted SHA (for example a health endpoint that returns no build identity),
-the affected rows are `INCONCLUSIVE` and the readout says so explicitly —
-deploy-run success alone is not same-build evidence (see the staging
-promotion checklist in `docs/ops.md`).
+Same-build rule: compare the promoted SHA against the deployed-build
+identity on `GET /api/build` (exactly `{ sha }`, per
+`apps/web/src/routes/api/build/+server.ts`; `/api/health` stays
+package-only and carries no build identity, so a health response alone
+never proves which build is serving). If the identity cannot be compared
+(`unknown`, absent, or unreachable), the affected rows are `INCONCLUSIVE`
+and the readout says so explicitly — deploy-run success alone is not
+same-build evidence (see the staging promotion checklist in `docs/ops.md`).
 
 ## Kill-rule verdict format
 
@@ -300,7 +303,7 @@ not an all-in bill.
 
 | ID | Claim proven | Build + environment | Link | Observed | Result | Verified by |
 |---|---|---|---|---|---|---|
-| E1 | Deployed staging build identity equals the promoted SHA `0123456789ab` in the synthetic health response | `0123456789ab` · staging | <https://example.invalid/runs/build-identity/1> | 2026-01-14 | PASS | QA, 2026-01-15 |
+| E1 | Deployed staging build identity equals the promoted SHA `0123456789ab` in the synthetic `/api/build` response | `0123456789ab` · staging | <https://example.invalid/runs/build-identity/1> | 2026-01-14 | PASS | QA, 2026-01-15 |
 | E2 | Unauthenticated staging request receives an Access challenge | `0123456789ab` · staging | <https://example.invalid/runs/access-check/2> | 2026-01-14 | PASS | QA, 2026-01-15 |
 | E3 | Access audit for the run window shows no bypass policy was used | `0123456789ab` · staging | <https://example.invalid/logs/access-audit/3> | 2026-01-14 | PASS | QA, 2026-01-15 |
 | E4 | Synthetic user creates an account and signs in end to end | `0123456789ab` · staging | <https://example.invalid/runs/e2e-staging/4> | 2026-01-14 | PASS | QA, 2026-01-15 |
