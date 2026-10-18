@@ -102,8 +102,10 @@ pub enum FileRole {
 /// `in/manifest.json`: everything verify staged for this repair round.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScratchManifest {
-    /// Fresh random id minted by verify for this staging (never
-    /// reused across restagings; see `nntune_core::par2::scratch`).
+    /// Content-derived id for this staging (verify derives it from
+    /// every staged file's content hash, so identical bytes keep the
+    /// id and any byte change yields a new one; see
+    /// `nntune_core::par2::scratch`).
     /// Required: without it a stored result cannot be proven to
     /// belong to these inputs — names and sizes repeat across a
     /// redrive even when the bytes changed.
@@ -202,10 +204,10 @@ pub struct RepairResult {
 /// JSON — `staging_id` plus the file list (struct field order and
 /// list order are the canonical form, so two serialisations of the
 /// same staging agree). The `staging_id` is what binds the digest to
-/// one staging event: a redrive re-stages the same file names at the
-/// same sizes with different bytes, and only the fresh `staging_id`
-/// distinguishes it from the generation that produced a stored
-/// result.
+/// one staging's bytes: a redrive re-stages the same file names at
+/// the same sizes with different bytes, and only the content-derived
+/// `staging_id` distinguishes it from the generation that produced a
+/// stored result.
 pub fn manifest_digest(manifest: &ScratchManifest) -> String {
     let canonical = serde_json::to_vec(manifest).unwrap_or_default();
     sha256_hex(&canonical)
