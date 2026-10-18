@@ -74,4 +74,17 @@ SESSION_TTL_SECS = "86400"
 #                                 never two live minting secrets.
 #   SESSION_SECRET_ROTATION         "1" only for the deploy(s) covering a
 #                                 recorded rotation window; unset otherwise.
+#   NATIVE_REST_PEPPER_BASE64       HMAC pepper for scoped native REST bearer
+#                                 credentials (ADR 0010, migration 0018),
+#                                 32+ bytes unpadded base64url. Dedicated
+#                                 keyring, separate from SUBSONIC_INDEX_PEPPER
+#                                 so either surface rotates without forcing
+#                                 the other. BOTH pepper vars set, or neither:
+#                                 unset, issuance endpoints fail closed
+#                                 per-request and bearer routes 401 while
+#                                 every other route keeps serving; half-set
+#                                 refuses to start (fail closed).
+#   NATIVE_REST_PEPPER_VERSION      integer version bound to the pepper above
+#                                 (stored per row; lookup is by the exact
+#                                 composite (pepper_version, key_hmac)).
 #   EMAIL_API_KEY                 transactional email provider key (magic-link delivery)

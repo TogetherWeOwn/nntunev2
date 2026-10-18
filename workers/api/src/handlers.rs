@@ -162,6 +162,18 @@ pub struct Config {
     /// recorded rotation window, `None` in steady state. Never mints;
     /// length-checked like the primary (a short previous fails closed).
     pub session_previous_secret: Option<Vec<u8>>,
+    /// Dedicated native-REST bearer keyring (ADR 0010): the HMAC pepper
+    /// bytes plus their version. `None` until the operator provisions
+    /// `NATIVE_REST_PEPPER_BASE64` + `NATIVE_REST_PEPPER_VERSION` (see the
+    /// Worker entry and `wrangler.toml.example`). Unprovisioned, issuance
+    /// endpoints fail closed per-request (generic 500) and bearer routes
+    /// fail closed (401); every other route keeps serving, so
+    /// provisioning the keyring is never a flag-day.
+    pub native_rest_pepper: Option<Vec<u8>>,
+    /// Version bound to [`Config::native_rest_pepper`]; stored per row and
+    /// looked up by exact version (composite `UNIQUE (pepper_version,
+    /// key_hmac)`, migration 0019).
+    pub native_rest_pepper_version: u32,
     /// Rate-limit tunables for the auth-start burst and vault
     /// test-connection budgets. `Config::new` uses the documented
     /// defaults; the Worker entry overlays [vars] via
@@ -208,6 +220,8 @@ impl Config {
             session_ttl_secs: session_ttl_secs.min(session::MAX_SESSION_SECS),
             invites_required,
             session_previous_secret,
+            native_rest_pepper: None,
+            native_rest_pepper_version: 0,
             rate_limits: crate::rate_limit::RateLimitConfig::default(),
         })
     }
@@ -218,6 +232,33 @@ impl Config {
     pub fn with_rate_limits(mut self, rate_limits: crate::rate_limit::RateLimitConfig) -> Self {
         self.rate_limits = rate_limits;
         self
+    }
+
+    /// Provision the native-REST bearer keyring. The Worker entry calls
+    /// this only after strict validation (unpadded-base64url decode plus
+    /// the 32-byte minimum, version parses as `u32`); a half-configured
+    /// keyring refuses to start there, so this setter never sees bad
+    /// input in production. Native tests pass synthetic peppers directly.
+    pub fn with_native_rest_pepper(mut self, pepper: Vec<u8>, version: u32) -> Self {
+        self.native_rest_pepper = Some(pepper);
+        self.native_rest_pepper_version = version;
+        self
+    }
+
+    /// Authorizing pepper set for bearer verification: exactly the
+    /// configured version, or empty when unprovisioned (empty fails
+    /// closed inside `authorize`). A rotation adds the previous entry
+    /// here without touching the handlers: dual-version lookup already
+    /// tries every listed version.
+    pub fn native_rest_peppers(&self) -> Vec<crate::native_rest::Pepper<'_>> {
+        self.native_rest_pepper
+            .as_deref()
+            .map(|bytes| crate::native_rest::Pepper {
+                version: self.native_rest_pepper_version,
+                bytes,
+            })
+            .into_iter()
+            .collect()
     }
 
     /// Signing/verification keys for this worker: rotation (the primary
@@ -287,6 +328,29 @@ pub struct VaultRow {
     pub blob: VaultBlob,
     pub indexer_configured: bool,
     pub updated_at: u64,
+}
+
+/// Stored native REST credential (ADR 0010, migration 0019): the core
+/// [`crate::native_rest::NativeRestRecord`] (HMAC-only, never the secret)
+/// plus HTTP-layer metadata. `Clone`; manual `Debug` reuses the record's
+/// redacted form and names the label, but never the client IP or any key
+/// material — diagnostics name names, never values or addresses.
+#[derive(Clone)]
+pub struct NativeCredentialRow {
+    pub record: crate::native_rest::NativeRestRecord,
+    pub label: String,
+    pub created_from_ip: String,
+    pub last_used_at: Option<u64>,
+}
+
+impl std::fmt::Debug for NativeCredentialRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeCredentialRow")
+            .field("record", &self.record)
+            .field("label", &self.label)
+            .field("last_used_at", &self.last_used_at)
+            .finish()
+    }
 }
 
 /// One durable rate-limit budget: `limit` slots for
@@ -500,6 +564,75 @@ pub trait Store {
         async { Ok(false) }
     }
     fn insert_audit(&self, event: &AuditEvent) -> impl Future<Output = Result<(), StoreError>>;
+    /// Persist a freshly issued native REST credential row (migration
+    /// 0018). Fail-closed default (`Err`) so an unprovisioned store can
+    /// never report a mint it did not durably record; production and the
+    /// test fake override it.
+    fn insert_native_credential(
+        &self,
+        _row: &NativeCredentialRow,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Every credential row owned by `user_id`, for the
+    /// session-authenticated listing (never carries secret material: the
+    /// row holds the HMAC only). Fail-closed default is empty; production
+    /// and the test fake override it.
+    fn native_credentials_for_user(
+        &self,
+        _user_id: &str,
+    ) -> impl Future<Output = Result<Vec<NativeCredentialRow>, StoreError>> {
+        async { Ok(Vec::new()) }
+    }
+    /// Bearer lookup by the composite identity `(pepper_version,
+    /// key_hmac)`: the gate HMACs the presented secret under each listed
+    /// pepper and looks the digest up here. Fail-closed default is
+    /// absent; production and the test fake override it.
+    fn native_credential_by_hmac(
+        &self,
+        _pepper_version: u32,
+        _key_hmac: &str,
+    ) -> impl Future<Output = Result<Option<NativeCredentialRow>, StoreError>> {
+        async { Ok(None) }
+    }
+    /// Owner-scoped single revoke: marks the row `revoked_at = now` when
+    /// it belongs to `user_id` and is still live (sticky — an
+    /// already-revoked row keeps its original timestamp), and reports
+    /// whether such a row exists at all (unknown or foreign ids report
+    /// `false`, which the handler answers 404). Fail-closed default is
+    /// `false`; production and the test fake override it.
+    fn revoke_native_credential(
+        &self,
+        _id: &str,
+        _user_id: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Ok(false) }
+    }
+    /// Bulk revoke for the recovery/revoke-all path (ADR 0010: the
+    /// session-compromise response revokes every unrevoked row alongside
+    /// the sessions): transitions each live row for `user_id`, stamps the
+    /// transition with the store's wall-clock `now`, and returns how many
+    /// transitioned. An empty user id revokes nothing. Fail-closed
+    /// default is `0`; production and the test fake override it.
+    fn revoke_all_native_credentials(
+        &self,
+        _user_id: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<u64, StoreError>> {
+        async { Ok(0) }
+    }
+    /// Best-effort successful-use accounting (`last_used_at`): called by
+    /// the bearer gate after authorization, its outcome never changes the
+    /// decision (like `audit`). Default no-op keeps out-of-tree `Store`
+    /// impls compiling; production and the test fake override it.
+    fn record_native_credential_use(
+        &self,
+        _id: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async { Ok(()) }
+    }
 }
 
 /// Magic-link delivery. The token is passed only to the mailer; it must
@@ -2001,7 +2134,24 @@ where
     {
         return internal();
     }
+    // ADR 0010 session-compromise response: the same event revokes every
+    // unrevoked native REST credential alongside the sessions (production
+    // does both against one connection; a store failure fails closed
+    // before the cookie clears). Bulk revocations audit without key
+    // material — the id-carrying single revokes stay on their own route.
+    let revoked_native = match ctx
+        .store
+        .revoke_all_native_credentials(&claims.user_id, ctx.now)
+        .await
+    {
+        Ok(revoked) => revoked,
+        Err(_) => return internal(),
+    };
     ctx.audit(&claims.user_id, "session.revoke_all", true).await;
+    if revoked_native > 0 {
+        ctx.audit(&claims.user_id, "native_credentials_revoked_all", true)
+            .await;
+    }
     let mut resp = json_response(200, serde_json::json!({"ok": true}));
     resp.set_cookie = Some(session::clear_cookie_header());
     resp
@@ -2277,6 +2427,308 @@ where
     json_response(200, serde_json::json!({"ok": result}))
 }
 
+// --- Native REST credentials (ADR 0010) ------------------------------------------------------
+//
+// Session-authenticated issuance surface only: `POST /v1/credentials`
+// (fresh session, 600 s privilege gate — the step-up for this credential
+// class), `GET /v1/credentials` (ordinary session), `DELETE
+// /v1/credentials/{id}` (fresh session: revocation is privilege-changing).
+// The route map marks all three `SessionOnly`, so bearer keys can never
+// reach them; the `Authorization` header is ignored here exactly like
+// cookies are ignored on bearer routes. The plaintext secret is rendered
+// into the mint response once and never stored, listed, logged, or
+// audited — audit rows carry the credential id only.
+
+/// Mint request: human label for listing, exact ADR scope strings, and a
+/// TTL in seconds (clamped fail-safe to the 365-day cap at issue, so even
+/// `u64::MAX` can never mint a forever key).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialsMintBody {
+    label: Option<String>,
+    scopes: Vec<String>,
+    ttl_secs: u64,
+}
+
+/// Listing label: trimmed, at most 64 chars (mirrors the migration 0019
+/// `CHECK`), no control characters. Empty means "no label". `None`
+/// rejects the request.
+fn normalize_credential_label(raw: Option<&str>) -> Option<String> {
+    let label = raw.unwrap_or("").trim();
+    if label.len() > 64 || label.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(label.to_string())
+}
+
+fn validation_failed(message: &str) -> Response {
+    let error = crate::api_error::ApiError::validation_failed(message);
+    Response {
+        status: error.status,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    }
+}
+
+fn credential_unauthorized() -> Response {
+    // Generic by construction: never says which check failed, never any
+    // secret material. Same outcome class as the core `CredentialError`.
+    let error = crate::api_error::ApiError::by_code("unauthorized", "invalid credential");
+    Response {
+        status: error.status,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    }
+}
+
+fn scope_forbidden() -> Response {
+    // Names the outcome only: authenticated, wrong scope.
+    let error = crate::api_error::ApiError::by_code("forbidden", "insufficient scope");
+    Response {
+        status: error.status,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    }
+}
+
+fn not_found() -> Response {
+    json_response(404, serde_json::json!({"error": "not found"}))
+}
+
+async fn credentials_mint<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    // Issuance-time freshness IS the step-up (ADR 0010): a stale session
+    // is denied with the registered `reauth_required` response before any
+    // key material exists. The origin pin inside `authenticate_privileged`
+    // is the CSRF guard for this mutation.
+    let (claims, _token) = match ctx.authenticate_privileged(req).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let Some(body) = parse_body::<CredentialsMintBody>(req) else {
+        return validation_failed("invalid request");
+    };
+    let Some(label) = normalize_credential_label(body.label.as_deref()) else {
+        return validation_failed("invalid label");
+    };
+    // Exact scope strings only: unknown, cross-surface (`"subsonic"`),
+    // case or whitespace variants reject — the allowlist never trims or
+    // folds.
+    let mut scopes = Vec::with_capacity(body.scopes.len());
+    for name in &body.scopes {
+        match crate::native_rest::Scope::parse(name) {
+            Some(scope) => scopes.push(scope),
+            None => return validation_failed("unknown scope"),
+        }
+    }
+    // Unprovisioned keyring fails closed per-request (generic 500, never
+    // which secret is missing): without a pepper there is nothing to HMAC
+    // with, so no credential may be minted.
+    let peppers = ctx.cfg.native_rest_peppers();
+    let Some(pepper) = peppers.first() else {
+        return internal();
+    };
+    let issued = crate::native_rest::issue_credential(
+        &claims.user_id,
+        &scopes,
+        body.ttl_secs,
+        ctx.now,
+        pepper,
+    );
+    let id = issued.record.id.clone();
+    let row = NativeCredentialRow {
+        record: issued.record,
+        label,
+        created_from_ip: ctx.source_ip.clone(),
+        last_used_at: None,
+    };
+    if ctx.store.insert_native_credential(&row).await.is_err() {
+        return internal();
+    }
+    // Audit names the id only — never the secret, the HMAC, or the IP.
+    ctx.audit(
+        &claims.user_id,
+        &format!("native_credential_created:{id}"),
+        true,
+    )
+    .await;
+    // The one and only time the plaintext exists outside the client's
+    // hands: this 201 body. Nothing below stores, logs, or re-renders it.
+    Response {
+        status: 201,
+        body: serde_json::json!({
+            "id": id,
+            "secret": issued.display_once,
+            "key_prefix": row.record.key_prefix,
+            "scopes": scopes.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            "expires_at": row.record.expires_at,
+        })
+        .to_string(),
+        set_cookie: None,
+        retry_after: None,
+    }
+}
+
+/// One listed credential: routing and lifecycle facts only. There is no
+/// `secret` (or HMAC) key on this shape by construction — a serializer
+/// cannot leak what the struct does not carry.
+fn listed_credential(row: &NativeCredentialRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": row.record.id,
+        "label": row.label,
+        "key_prefix": row.record.key_prefix,
+        "scopes": row.record.scopes.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        "created_at": row.record.created_at,
+        "expires_at": row.record.expires_at,
+        "revoked_at": row.record.revoked_at,
+        "last_used_at": row.last_used_at,
+    })
+}
+
+async fn credentials_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match ctx.authenticate(req, false).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    match ctx.store.native_credentials_for_user(&claims.user_id).await {
+        Ok(rows) => json_response(
+            200,
+            serde_json::json!({
+                "credentials": rows.iter().map(listed_credential).collect::<Vec<_>>(),
+            }),
+        ),
+        Err(_) => internal(),
+    }
+}
+
+async fn credentials_revoke<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    // Fresh session like issuance: revocation is privilege-changing, and
+    // the origin pin is the CSRF guard.
+    let (claims, _token) = match ctx.authenticate_privileged(req).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    // Single-segment id only: deeper shapes are not credential ids and
+    // stay 404, so no id parser can be tricked by a path.
+    let id = req.path.strip_prefix("/v1/credentials/").unwrap_or("");
+    if id.is_empty() || id.contains('/') {
+        return not_found();
+    }
+    match ctx
+        .store
+        .revoke_native_credential(id, &claims.user_id, ctx.now)
+        .await
+    {
+        // Owner-scoped and sticky: unknown or foreign ids report `false`
+        // and answer the same 404 (no existence oracle across users).
+        // Revoking an already-revoked row still answers `ok: true`
+        // (idempotent), keeping the original timestamp in the store.
+        Ok(true) => {
+            ctx.audit(
+                &claims.user_id,
+                &format!("native_credential_revoked:{id}"),
+                true,
+            )
+            .await;
+            json_response(200, serde_json::json!({"ok": true}))
+        }
+        Ok(false) => not_found(),
+        Err(_) => internal(),
+    }
+}
+
+/// Bearer gate for `RouteDecision::Bearer` routes: header-only,
+/// cookie-blind. The `Authorization` header is the ONLY input — no
+/// session cookie is consulted here (no session-cookie fallback), and
+/// there is intentionally no query-string credential reader (query
+/// strings land in logs).
+///
+/// Failures map exactly like the core: unknown/tampered/revoked/expired
+/// (or an unprovisioned keyring) is the generic 401; a valid credential
+/// lacking the route's scope is the names-only 403. Successful use
+/// records `last_used_at` best-effort — its outcome never changes the
+/// decision, like audit writes.
+async fn authorize_bearer<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    authorization: Option<&str>,
+    required: crate::native_rest::Scope,
+) -> Result<NativeCredentialRow, Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use crate::native_rest::{authorize, credential_hmac, extract_bearer_key, CredentialError};
+    let token = match extract_bearer_key(authorization) {
+        Ok(token) => token,
+        Err(_) => return Err(credential_unauthorized()),
+    };
+    let peppers = ctx.cfg.native_rest_peppers();
+    // Dual-pepper lookup: the presented secret is HMACed under each listed
+    // version and looked up by the composite identity, so a transitioning
+    // record authorizes while both versions are listed.
+    let mut found = None;
+    for pepper in &peppers {
+        let hmac = credential_hmac(token, pepper.bytes);
+        match ctx
+            .store
+            .native_credential_by_hmac(pepper.version, &hmac)
+            .await
+        {
+            Ok(Some(row)) => {
+                found = Some(row);
+                break;
+            }
+            Ok(None) => {}
+            Err(_) => return Err(credential_unauthorized()),
+        }
+    }
+    let Some(row) = found else {
+        return Err(credential_unauthorized());
+    };
+    // The credential IS the identity on bearer routes: the owner check
+    // runs against the row's own owner, and every downstream path
+    // re-checks ownership (defense in depth, ADR 0010 §6).
+    match authorize(
+        &row.record,
+        token,
+        required,
+        ctx.now,
+        &row.record.user_id,
+        &peppers,
+    ) {
+        Ok(()) => {}
+        Err(CredentialError::Unauthenticated) => return Err(credential_unauthorized()),
+        Err(CredentialError::Forbidden) => return Err(scope_forbidden()),
+    }
+    let _ = ctx
+        .store
+        .record_native_credential_use(&row.record.id, ctx.now)
+        .await;
+    Ok(row)
+}
+
 // --- Dispatch ------------------------------------------------------------------------------
 
 /// Every path the router serves. The Worker answers `OPTIONS` on exactly
@@ -2301,6 +2753,7 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/vault"
             | "/v1/vault/test"
             | "/v1/vault/test-connection"
+            | "/v1/credentials"
     )
 }
 
@@ -2325,8 +2778,39 @@ where
     D: Dialer,
     N: AsyncDns,
 {
+    handle_with_auth(ctx, req, None).await
+}
+
+/// Route one request with an explicit `Authorization` header value. `handle`
+/// passes `None` (no bearer input); the Worker entry passes the real
+/// header. The split keeps `handle`'s signature stable for existing
+/// callers while bearer routes get header-only input with no new `Request`
+/// field.
+pub async fn handle_with_auth<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    authorization: Option<&str>,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
     if req.body.len() > MAX_BODY_BYTES {
         return invalid_request();
+    }
+    // Bearer-only routes authenticate here and never consult cookies or
+    // sessions (no session-cookie fallback); session-only and denied
+    // shapes fall through to the dispatch below. Data routes for the
+    // bearer scopes do not exist yet, so an authorized bearer still lands
+    // on the 404 below — default-deny holds until those routes land.
+    if let crate::native_rest::RouteDecision::Bearer(required) =
+        crate::native_rest::scope_for_operation(&req.method, &req.path)
+    {
+        if let Err(resp) = authorize_bearer(ctx, authorization, required).await {
+            return resp;
+        }
     }
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/healthz") => json_response(200, serde_json::json!({"ok": true})),
@@ -2347,7 +2831,26 @@ where
         ("POST", "/v1/vault/test") | ("POST", "/v1/vault/test-connection") => {
             vault_test_connection(ctx, req).await
         }
-        ("OPTIONS", path) if is_known_path(path) => preflight_response(),
+        ("POST", "/v1/credentials") => credentials_mint(ctx, req).await,
+        ("GET", "/v1/credentials") => credentials_list(ctx, req).await,
+        // Single-segment credential ids only; deeper shapes 404 inside
+        // the handler. The OPTIONS prefix below keeps browser preflights
+        // working for these dynamic paths (exact-path `is_known_path`
+        // cannot name them).
+        ("DELETE", path) if path.starts_with("/v1/credentials/") => {
+            credentials_revoke(ctx, req).await
+        }
+        // The revoke id is dynamic, so its preflight cannot be an exact
+        // `is_known_path` entry: match the same single-segment shape the
+        // handler serves (deeper shapes stay 404 on preflight too).
+        ("OPTIONS", path)
+            if is_known_path(path)
+                || path
+                    .strip_prefix("/v1/credentials/")
+                    .is_some_and(|rest| !rest.is_empty() && !rest.contains('/')) =>
+        {
+            preflight_response()
+        }
         _ => json_response(404, serde_json::json!({"error": "not found"})),
     }
 }
@@ -2460,6 +2963,7 @@ mod tests {
         magic: RefCell<HashMap<String, MagicLinkRecord>>,
         invites: RefCell<HashMap<String, InviteRecord>>,
         sessions: RefCell<HashMap<String, SessionRecord>>,
+        native_credentials: RefCell<HashMap<String, NativeCredentialRow>>,
         vaults: RefCell<HashMap<String, VaultRow>>,
         audits: RefCell<Vec<AuditEvent>>,
         rate_limit_slots: RefCell<HashMap<(String, String, u32), u64>>,
@@ -2860,6 +3364,98 @@ mod tests {
             }
             Ok(())
         }
+        async fn insert_native_credential(
+            &self,
+            row: &NativeCredentialRow,
+        ) -> Result<(), StoreError> {
+            let mut rows = self.native_credentials.borrow_mut();
+            // Mirror the migration 0019 composite UNIQUE: neither the id
+            // nor the (pepper_version, key_hmac) identity may repeat.
+            if rows.contains_key(&row.record.id)
+                || rows.values().any(|existing| {
+                    existing.record.pepper_version == row.record.pepper_version
+                        && existing.record.key_hmac == row.record.key_hmac
+                })
+            {
+                return Err(StoreError);
+            }
+            rows.insert(row.record.id.clone(), row.clone());
+            Ok(())
+        }
+        async fn native_credentials_for_user(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<NativeCredentialRow>, StoreError> {
+            let mut rows: Vec<NativeCredentialRow> = self
+                .native_credentials
+                .borrow()
+                .values()
+                .filter(|row| row.record.user_id == user_id)
+                .cloned()
+                .collect();
+            rows.sort_by(|a, b| {
+                (a.record.created_at, &a.record.id).cmp(&(b.record.created_at, &b.record.id))
+            });
+            Ok(rows)
+        }
+        async fn native_credential_by_hmac(
+            &self,
+            pepper_version: u32,
+            key_hmac: &str,
+        ) -> Result<Option<NativeCredentialRow>, StoreError> {
+            Ok(self
+                .native_credentials
+                .borrow()
+                .values()
+                .find(|row| {
+                    row.record.pepper_version == pepper_version && row.record.key_hmac == key_hmac
+                })
+                .cloned())
+        }
+        async fn revoke_native_credential(
+            &self,
+            id: &str,
+            user_id: &str,
+            now: u64,
+        ) -> Result<bool, StoreError> {
+            let mut rows = self.native_credentials.borrow_mut();
+            match rows.get_mut(id) {
+                // Owner-scoped and sticky: a foreign id reports absence,
+                // an already-revoked row keeps its original timestamp.
+                Some(row) if row.record.user_id == user_id => {
+                    if row.record.revoked_at.is_none() {
+                        row.record.revoked_at = Some(now);
+                    }
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
+        async fn revoke_all_native_credentials(
+            &self,
+            user_id: &str,
+            now: u64,
+        ) -> Result<u64, StoreError> {
+            // Mirror the production statement: empty user revokes nothing
+            // (an upstream bug must never become a mass revocation).
+            if user_id.is_empty() {
+                return Ok(0);
+            }
+            let mut revoked = 0;
+            for row in self.native_credentials.borrow_mut().values_mut() {
+                if row.record.user_id == user_id && row.record.revoked_at.is_none() {
+                    row.record.revoked_at = Some(now);
+                    revoked += 1;
+                }
+            }
+            Ok(revoked)
+        }
+        async fn record_native_credential_use(&self, id: &str, now: u64) -> Result<(), StoreError> {
+            if let Some(row) = self.native_credentials.borrow_mut().get_mut(id) {
+                row.last_used_at = Some(now);
+            }
+            Ok(())
+        }
         async fn vault_by_user(&self, user_id: &str) -> Result<Option<VaultRow>, StoreError> {
             Ok(self.vaults.borrow().get(user_id).cloned())
         }
@@ -3088,6 +3684,25 @@ mod tests {
                 body: body.map(|b| b.into_bytes()).unwrap_or_default(),
             };
             block_on(handle(&ctx, &req))
+        }
+
+        /// Bearer-route call with an explicit `Authorization` header value
+        /// and no session cookie: the shape the header-only transport
+        /// requires. Pass `origin: None` unless the case needs otherwise —
+        /// bearer routes never read it.
+        fn call_bearer(&self, method: &str, path: &str, authorization: Option<String>) -> Response {
+            let req = Request {
+                method: method.to_string(),
+                path: path.to_string(),
+                cookie: None,
+                origin: None,
+                body: Vec::new(),
+            };
+            block_on(handle_with_auth(
+                &self.ctx(),
+                &req,
+                authorization.as_deref(),
+            ))
         }
     }
 
@@ -3758,6 +4373,487 @@ mod tests {
             r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
         );
         assert!(h.store.vaults.borrow().contains_key("u1"));
+    }
+
+    // --- Native REST credentials (ADR 0010) -------------------------------------
+
+    fn peppered_cfg() -> Config {
+        cfg().with_native_rest_pepper(vec![7u8; 32], 1)
+    }
+
+    fn peppered_harness() -> Harness {
+        let mut h = harness();
+        h.config = peppered_cfg();
+        h
+    }
+
+    fn mint_call(h: &Harness, cookie: &str, body: serde_json::Value) -> Response {
+        h.call_full(
+            "POST",
+            "/v1/credentials",
+            Some(body.to_string()),
+            Some(cookie.to_string()),
+            Some(ORIGIN),
+        )
+    }
+
+    fn mint_secret(body: &serde_json::Value) -> String {
+        body["secret"]
+            .as_str()
+            .expect("mint returns secret")
+            .to_string()
+    }
+
+    fn mint_id(body: &serde_json::Value) -> String {
+        body["id"].as_str().expect("mint returns id").to_string()
+    }
+
+    #[test]
+    fn credentials_mint_list_revoke_round_trip() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+
+        let resp = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"label": "cli", "scopes": ["library:read"], "ttl_secs": 3600}),
+        );
+        assert_eq!(resp.status, 201, "{}", resp.body);
+        let minted: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let id = mint_id(&minted);
+        let secret = mint_secret(&minted);
+        assert!(
+            secret.starts_with("ntk_"),
+            "display form carries the class prefix"
+        );
+        assert_eq!(
+            minted["key_prefix"],
+            secret[..crate::native_rest::CREDENTIAL_PREFIX.len()
+                + crate::native_rest::KEY_PREFIX_LEN]
+                .to_string()
+        );
+        assert_eq!(minted["scopes"], serde_json::json!(["library:read"]));
+        assert_eq!(minted["expires_at"], NOW + 3600);
+
+        // Stored HMAC-only: the row verifies against the secret but never
+        // contains it, and the audit row names the id (never key material).
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record.id, id);
+        assert_eq!(rows[0].label, "cli");
+        assert_eq!(rows[0].created_from_ip, "198.51.100.9");
+        assert_ne!(rows[0].record.key_hmac, secret);
+        assert_eq!(
+            rows[0].record.key_hmac,
+            crate::native_rest::credential_hmac(&secret, &[7u8; 32])
+        );
+        assert!(
+            h.store
+                .audits
+                .borrow()
+                .iter()
+                .any(|e| e.action == format!("native_credential_created:{id}")),
+            "issuance audits the credential id"
+        );
+
+        // Listing carries routing facts with no `secret` key anywhere.
+        let list = h.call_full("GET", "/v1/credentials", None, Some(cookie.clone()), None);
+        assert_eq!(list.status, 200, "{}", list.body);
+        assert!(!list.body.contains(&secret));
+        assert!(!list.body.contains(&rows[0].record.key_hmac));
+        let listed: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        assert_eq!(listed["credentials"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["credentials"][0]["id"], id);
+        assert_eq!(
+            listed["credentials"][0]["revoked_at"],
+            serde_json::Value::Null
+        );
+
+        // Revoke is immediate and sticky-idempotent: twice still `ok: true`.
+        for _ in 0..2 {
+            let revoke = h.call_full(
+                "DELETE",
+                &format!("/v1/credentials/{id}"),
+                None,
+                Some(cookie.clone()),
+                Some(ORIGIN),
+            );
+            assert_eq!(revoke.status, 200, "{}", revoke.body);
+            assert_eq!(revoke.body, r#"{"ok":true}"#);
+        }
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert!(rows[0].record.revoked_at.is_some());
+        let list = h.call_full("GET", "/v1/credentials", None, Some(cookie), None);
+        let listed: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        assert!(listed["credentials"][0]["revoked_at"].is_number());
+    }
+
+    #[test]
+    fn credentials_mint_and_revoke_require_fresh_session_but_list_does_not() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let stale_ctx = Ctx {
+            cfg: &h.config,
+            store: &h.store,
+            mailer: &h.mailer,
+            dialer: &h.dialer,
+            dns: &h.dns,
+            now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
+            source_ip: "198.51.100.9".to_string(),
+        };
+
+        // Fresh issuance works (pins the 201 for the stale contrast below).
+        let fresh = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(fresh.status, 201, "{}", fresh.body);
+        let id = mint_id(&serde_json::from_str::<serde_json::Value>(&fresh.body).unwrap());
+
+        // Stale sessions are denied the step-up with the CISO-approved
+        // `reauth_required` response before any key material exists — and
+        // mint nothing.
+        let stale_mint_req = Request {
+            method: "POST".to_string(),
+            path: "/v1/credentials".to_string(),
+            cookie: Some(cookie.clone()),
+            origin: Some(ORIGIN.to_string()),
+            body: serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60})
+                .to_string()
+                .into_bytes(),
+        };
+        let stale_mint = block_on(handle(&stale_ctx, &stale_mint_req));
+        assert_eq!(stale_mint.status, 401);
+        assert_eq!(
+            stale_mint.body,
+            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
+        );
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert_eq!(rows.len(), 1, "stale issuance must mint nothing");
+
+        // Stale revocation is denied the same way; ordinary listing still
+        // serves on the stale-but-valid session.
+        let stale_revoke_req = Request {
+            method: "DELETE".to_string(),
+            path: format!("/v1/credentials/{id}"),
+            cookie: Some(cookie.clone()),
+            origin: Some(ORIGIN.to_string()),
+            body: Vec::new(),
+        };
+        let stale_revoke = block_on(handle(&stale_ctx, &stale_revoke_req));
+        assert_eq!(stale_revoke.status, 401);
+        assert_eq!(
+            stale_revoke.body,
+            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
+        );
+        let stale_list_req = Request {
+            method: "GET".to_string(),
+            path: "/v1/credentials".to_string(),
+            cookie: Some(cookie),
+            origin: None,
+            body: Vec::new(),
+        };
+        let stale_list = block_on(handle(&stale_ctx, &stale_list_req));
+        assert_eq!(stale_list.status, 200, "{}", stale_list.body);
+    }
+
+    #[test]
+    fn credentials_mint_rejects_unknown_scopes_and_bad_labels() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+
+        // Cross-surface, case, and whitespace variants are not scopes.
+        for scopes in [
+            serde_json::json!(["subsonic"]),
+            serde_json::json!(["Library:Read"]),
+            serde_json::json!(["library:read "]),
+            serde_json::json!(["library:read", "admin"]),
+        ] {
+            let resp = mint_call(
+                &h,
+                &cookie,
+                serde_json::json!({"scopes": scopes, "ttl_secs": 60}),
+            );
+            assert_eq!(resp.status, 422, "scopes={scopes}: {}", resp.body);
+            assert!(
+                resp.body.contains("\"code\":\"validation_failed\""),
+                "{}",
+                resp.body
+            );
+        }
+        // Unknown wire keys, over-long labels, and control characters fail
+        // the same way (deny_unknown_fields + the 64-char CHECK mirror).
+        for body in [
+            serde_json::json!({"label": "cli", "scopes": ["library:read"], "ttl_secs": 60, "extra": 1}),
+            serde_json::json!({"label": "l".repeat(65), "scopes": ["library:read"], "ttl_secs": 60}),
+            serde_json::json!({"label": "cli\ninjected", "scopes": ["library:read"], "ttl_secs": 60}),
+            serde_json::json!({"label": "cli", "scopes": ["library:read"]}),
+        ] {
+            let resp = mint_call(&h, &cookie, body);
+            assert_eq!(resp.status, 422, "{}", resp.body);
+        }
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert!(rows.is_empty(), "rejected mints store nothing");
+
+        // The empty scope set is issuable (least-privilege floor) and the
+        // TTL clamps fail-safe to the 365-day cap, even for `u64::MAX`.
+        let bare = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": [], "ttl_secs": 60}),
+        );
+        assert_eq!(bare.status, 201, "{}", bare.body);
+        let capped = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": u64::MAX}),
+        );
+        assert_eq!(capped.status, 201, "{}", capped.body);
+        let capped_body: serde_json::Value = serde_json::from_str(&capped.body).unwrap();
+        assert_eq!(
+            capped_body["expires_at"],
+            NOW + crate::native_rest::MAX_CREDENTIAL_TTL_SECS
+        );
+    }
+
+    #[test]
+    fn credentials_mint_fails_closed_without_a_provisioned_keyring() {
+        // The default test config provisions no pepper: issuance must fail
+        // closed (generic 500, never which secret is missing) while every
+        // other route keeps serving.
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let resp = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(resp.status, 500);
+        assert_eq!(resp.body, r#"{"error":"internal error"}"#);
+        let vault = h.call_full("GET", "/v1/vault", None, Some(cookie), None);
+        assert_eq!(vault.status, 200, "unrelated routes keep serving");
+    }
+
+    #[test]
+    fn credentials_revoke_is_owner_scoped_and_shape_checked() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        seed_user(&h, "u2", "b@example.com");
+        let cookie_a = magic_login(&h, "a@example.com");
+        let cookie_b = magic_login(&h, "b@example.com");
+        let minted = mint_call(
+            &h,
+            &cookie_a,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(minted.status, 201, "{}", minted.body);
+        let id = mint_id(&serde_json::from_str(&minted.body).unwrap());
+
+        // Another user's id, an unknown id, an empty id, and a nested path
+        // are all the same 404 — no oracle distinguishes them.
+        for (cookie, path) in [
+            (cookie_b.clone(), format!("/v1/credentials/{id}")),
+            (cookie_a.clone(), "/v1/credentials/cred_missing".to_string()),
+            (cookie_a.clone(), "/v1/credentials/".to_string()),
+            (cookie_a.clone(), "/v1/credentials/a/b".to_string()),
+        ] {
+            let resp = h.call_full("DELETE", &path, None, Some(cookie), Some(ORIGIN));
+            assert_eq!(resp.status, 404, "{path}: {}", resp.body);
+        }
+        // The victim row is untouched by the foreign probe.
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert_eq!(rows[0].record.revoked_at, None);
+    }
+
+    #[test]
+    fn bearer_gate_enforces_scope_without_session_fallback() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let mint = |scopes: serde_json::Value| {
+            let resp = mint_call(
+                &h,
+                &cookie,
+                serde_json::json!({"scopes": scopes, "ttl_secs": 3600}),
+            );
+            assert_eq!(resp.status, 201, "{}", resp.body);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            mint_secret(&body)
+        };
+        let library_secret = mint(serde_json::json!(["library:read"]));
+        let stream_secret = mint(serde_json::json!(["stream:read"]));
+
+        // In-scope bearer passes the gate (and then 404s: data routes do
+        // not exist yet, so default-deny holds). The 404 still proves the
+        // gate ran — `last_used_at` is recorded.
+        let ok = h.call_bearer(
+            "GET",
+            "/v1/search",
+            Some(format!("Bearer {library_secret}")),
+        );
+        assert_eq!(ok.status, 404, "{}", ok.body);
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert!(
+            rows.iter().any(|r| r.last_used_at == Some(NOW)),
+            "successful bearer use records last_used_at"
+        );
+
+        // Wrong scope is the names-only 403, never the 401 (which would
+        // claim the credential itself was bad).
+        let forbidden = h.call_bearer("GET", "/v1/search", Some(format!("Bearer {stream_secret}")));
+        assert_eq!(forbidden.status, 403);
+        assert_eq!(
+            forbidden.body,
+            r#"{"code":"forbidden","message":"insufficient scope","retryable":false}"#
+        );
+
+        // Unknown, malformed, and missing headers are the generic 401.
+        for header in [
+            None,
+            Some("Bearer ntk_no-such-credential-000000000000000000".to_string()),
+            Some("Bearer".to_string()),
+            Some("Basic abc123".to_string()),
+            Some("__Host-nntune-session=abc123".to_string()),
+        ] {
+            let resp = h.call_bearer("GET", "/v1/search", header);
+            assert_eq!(resp.status, 401, "{}", resp.body);
+            assert_eq!(
+                resp.body,
+                r#"{"code":"unauthorized","message":"invalid credential","retryable":false}"#
+            );
+        }
+
+        // A valid session cookie with no bearer header is still 401 on a
+        // bearer route: cookies never authenticate as bearer credentials.
+        let cookie_only = h.call_full(
+            "GET",
+            "/v1/search",
+            None,
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(cookie_only.status, 401, "{}", cookie_only.body);
+
+        // And a valid bearer can never mint: issuance stays session-only.
+        let bearer_mint_req = Request {
+            method: "POST".to_string(),
+            path: "/v1/credentials".to_string(),
+            cookie: None,
+            origin: Some(ORIGIN.to_string()),
+            body: serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60})
+                .to_string()
+                .into_bytes(),
+        };
+        let bearer_mint = block_on(handle_with_auth(
+            &h.ctx(),
+            &bearer_mint_req,
+            Some(&format!("Bearer {library_secret}")),
+        ));
+        assert_eq!(bearer_mint.status, 401, "{}", bearer_mint.body);
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert_eq!(rows.len(), 2, "bearer mint attempt stores nothing");
+    }
+
+    #[test]
+    fn session_revoke_all_revokes_native_credentials_too() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        for scopes in [["library:read"], ["stream:read"]] {
+            let resp = mint_call(
+                &h,
+                &cookie,
+                serde_json::json!({"scopes": scopes, "ttl_secs": 3600}),
+            );
+            assert_eq!(resp.status, 201, "{}", resp.body);
+        }
+        // One row pre-revoked: the sweep transitions only the live one.
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        block_on(
+            h.store
+                .revoke_native_credential(&rows[0].record.id, "u1", NOW),
+        )
+        .unwrap();
+
+        let resp = h.call_full(
+            "POST",
+            "/v1/session/revoke-all",
+            None,
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert!(rows.iter().all(|r| r.record.revoked_at.is_some()));
+        assert!(
+            h.store
+                .audits
+                .borrow()
+                .iter()
+                .any(|e| e.action == "native_credentials_revoked_all"),
+            "bulk revocation audits without key material"
+        );
+
+        // A second sweep is a quiet no-op (still 200, nothing new).
+        let cookie2 = magic_login(&h, "a@example.com");
+        let resp = h.call_full(
+            "POST",
+            "/v1/session/revoke-all",
+            None,
+            Some(cookie2),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+    }
+
+    #[test]
+    fn credential_diagnostics_carry_no_secret_ip_or_hmac() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let resp = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"label": "cli", "scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(resp.status, 201, "{}", resp.body);
+        let minted: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let secret = mint_secret(&minted);
+        // The mint body shows the secret exactly once, by design — and
+        // nothing else sensitive travels with it.
+        assert_eq!(resp.body.matches(&secret).count(), 1);
+        assert!(!resp.body.contains("key_hmac"));
+
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        let debug = format!("{:?}", rows[0]);
+        assert!(debug.contains(&rows[0].record.id), "Debug names the id");
+        assert!(debug.contains("cli"), "Debug names the label");
+        for needle in [
+            secret.as_str(),
+            secret.trim_start_matches("ntk_"),
+            rows[0].record.key_hmac.as_str(),
+            "198.51.100.9",
+        ] {
+            assert!(!debug.contains(needle), "diagnostic leaked {needle:?}");
+        }
+    }
+
+    #[test]
+    fn credentials_preflight_covers_the_dynamic_revoke_path() {
+        let h = peppered_harness();
+        for path in ["/v1/credentials", "/v1/credentials/cred_1"] {
+            let resp = h.call_full("OPTIONS", path, None, None, Some(ORIGIN));
+            assert_eq!(resp.status, 204, "{path}");
+            assert!(resp.body.is_empty(), "{path}");
+        }
+        // Nested shapes are not credential ids: preflight stays 404 there.
+        let resp = h.call_full("OPTIONS", "/v1/credentials/a/b", None, None, Some(ORIGIN));
+        assert_eq!(resp.status, 404);
     }
 
     #[test]
