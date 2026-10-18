@@ -94,8 +94,36 @@ fn check_base_url(base_url: &str) -> Result<String, &'static str> {
     Ok(base_url.trim_end_matches('/').to_string())
 }
 
-/// Build `https://{indexer}/api?apikey=…` query URL **without** the key.
+/// Endpoint for a validated base URL: a base whose final path segment is
+/// exactly `api` (lowercase) already ends at the Newznab endpoint and is
+/// preserved verbatim, so a saved `https://host/api` never becomes
+/// `/api/api`. Every other base gains exactly one `/api` segment, which
+/// composes deployment prefixes (`/newznab` -> `/newznab/api`) while leaving
+/// deeper paths otherwise untouched.
 ///
+/// Only an exact, lowercase, final `api` segment counts: `capi`, `apiary`,
+/// `apis`, `API`, a non-final `/api/…`, and an `api` host label all still
+/// gain `/api`. The input must already be trimmed of trailing slashes (see
+/// [`check_base_url`]).
+fn endpoint_for_base(base: &str) -> String {
+    let after_scheme = &base["https://".len()..];
+    match after_scheme.find('/') {
+        None => format!("{base}/api"),
+        Some(i) => {
+            let path = &after_scheme[i..];
+            if path.rsplit('/').next() == Some("api") {
+                base.to_string()
+            } else {
+                format!("{base}/api")
+            }
+        }
+    }
+}
+
+/// Build the `https://{indexer}/api?...` query URL **without** the key.
+///
+/// A saved base URL that already ends at the API endpoint is preserved (see
+/// [`endpoint_for_base`]); otherwise one `/api` segment is appended.
 /// Returns an error for empty queries, out-of-range limits, http URLs,
 /// and credential-embedding hosts.
 pub fn build_search_url(params: &SearchParams<'_>) -> Result<String, &'static str> {
@@ -113,8 +141,9 @@ pub fn build_search_url(params: &SearchParams<'_>) -> Result<String, &'static st
     if params.categories.len() > MAX_CATEGORIES {
         return Err("too many categories (max 16)");
     }
+    let endpoint = endpoint_for_base(&base);
     let mut url = format!(
-        "{base}/api?t={SEARCH_TYPE}&o=json&q={}&limit={}&offset={}",
+        "{endpoint}?t={SEARCH_TYPE}&o=json&q={}&limit={}&offset={}",
         percent_encode(q),
         params.limit,
         params.offset
@@ -126,9 +155,12 @@ pub fn build_search_url(params: &SearchParams<'_>) -> Result<String, &'static st
 }
 
 /// Append the vault-resolved key at request time. Never log the result.
+///
+/// Honors the saved-key contract the vault and setup wizard enforce: a
+/// nonempty key of at most 1024 UTF-8 bytes (`str::len` is byte length).
 pub fn inject_api_key(url_without_key: &str, api_key: &str) -> Result<String, &'static str> {
-    if api_key.is_empty() || api_key.len() > 256 {
-        return Err("api key must be 1..=256 chars");
+    if api_key.is_empty() || api_key.len() > 1024 {
+        return Err("api key must be 1..=1024 bytes");
     }
     Ok(format!(
         "{url_without_key}&apikey={}",

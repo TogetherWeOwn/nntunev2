@@ -68,7 +68,7 @@
 //! through the shared retry budget. The consumer therefore stays
 //! disabled in `wrangler.toml.example` until that boundary lands.
 
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use worker::{console_log, Date, Env, MessageBuilder, MessageExt, QueueRetryOptionsBuilder};
 
 use crate::dispatch::{
@@ -941,6 +941,43 @@ const MAX_MB_RESPONSE_BYTES: usize = 64 * 1024;
 /// as transient like the search cap).
 const MAX_MB_RECORDINGS_RESPONSE_BYTES: usize = 1024 * 1024;
 
+/// Total deadline for one MB body read (ms): exactly the indexer client's
+/// total (`crate::indexer_fetch::FETCH_TIMEOUT_MS`, the reused vault
+/// total), so both untrusted-upstream reads share one budget that composes
+/// with the existing retry budget instead of inventing a second number.
+/// Armed in `fetch_mb_body` before the fetch is issued, so slow headers
+/// count against the same total as a stalled body.
+pub const MB_FETCH_DEADLINE_MS: u64 = 15_000;
+
+/// Why an MB body read failed. Every variant classifies as `Transient`
+/// (see [`MbFetchFailure::match_failure`]): a stalled mirror may answer
+/// on redelivery, exactly like a 5xx, an oversize body, or a non-UTF-8
+/// body today — never `Permanent`, never a partial body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MbFetchFailure {
+    /// The body was still incomplete when the total deadline fired.
+    Deadline,
+    /// A chunk would have pushed the buffered total over `max_bytes`.
+    Oversize,
+    /// The buffered bytes are not valid UTF-8.
+    NonUtf8,
+    /// A chunk-level transport error mid-body.
+    Transport,
+}
+
+impl MbFetchFailure {
+    /// Every MB fetch failure stays retryable through the existing retry
+    /// budget, never quarantined as permanent.
+    pub fn match_failure(self) -> crate::matching::MatchFailure {
+        match self {
+            MbFetchFailure::Deadline
+            | MbFetchFailure::Oversize
+            | MbFetchFailure::NonUtf8
+            | MbFetchFailure::Transport => crate::matching::MatchFailure::Transient,
+        }
+    }
+}
+
 /// Load the upload payload for match-query derivation only (it was
 /// digest-checked and parsed in `Parsing`). Absence is distinguished
 /// from failure: a genuinely missing payload (its 30-day TTL expired
@@ -994,26 +1031,117 @@ async fn match_query(env: &Env, msg: &QueueMsg) -> Result<Option<String>, JobErr
 }
 
 /// One fetch through the `MB_API` service binding, body capped at
-/// `max_bytes`. Every failure mode (missing binding, transport, oversize
-/// body, non-UTF-8) collapses to `Err(())`: callers classify all of them
+/// `max_bytes` and aborted at [`MB_FETCH_DEADLINE_MS`]. Every failure mode
+/// (missing binding, transport, oversize body, non-UTF-8, stalled body
+/// past the deadline) collapses to `Err(())`: callers classify all of them
 /// as transient, matching the retry-budget split in `matching`.
 async fn fetch_mb_body(env: &Env, url: String, max_bytes: usize) -> Result<(u16, String), ()> {
+    // Arm the total deadline BEFORE issuing the fetch so slow headers
+    // count against the same budget as a stalled body. `worker::Delay`
+    // only registers its `setTimeout` on the first `poll`, so merely
+    // constructing it before the service-binding fetch is issued would
+    // leave the headers wait unbounded; racing both futures here polls
+    // (arms) the deadline from the start and reuses the same deadline
+    // for the body drain below, so one 15 s budget spans headers plus
+    // body.
+    let mut deadline = Box::pin(worker::Delay::from(std::time::Duration::from_millis(
+        MB_FETCH_DEADLINE_MS,
+    )));
     let fetcher = env
         .service(crate::matching::MB_API_BINDING)
         .map_err(|_| ())?;
-    let response = fetcher.fetch(url, None).await.map_err(|_| ())?;
+    let mut fetch = Box::pin(fetcher.fetch(url, None));
+    let response = std::future::poll_fn(|cx| {
+        use std::task::Poll;
+        // Deadline first: an already-fired deadline aborts even when
+        // headers are also ready, matching `collect_mb_body` below.
+        // (Fully qualified: `Future` is not imported in this module, the
+        // same reason `collect_mb_body` calls `Stream::poll_next` by path.)
+        if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        match std::future::Future::poll(fetch.as_mut(), cx) {
+            Poll::Ready(response) => Poll::Ready(Some(response)),
+            Poll::Pending => Poll::Pending,
+        }
+    })
+    .await;
+    let response = match response {
+        Some(Ok(response)) => response,
+        Some(Err(_)) | None => return Err(()),
+    };
     let status = response.status().as_u16();
-    let mut body = response.into_body();
-    let mut bytes = Vec::new();
-    while let Some(chunk) = body.next().await {
-        let chunk = chunk.map_err(|_| ())?;
-        if bytes.len() + chunk.len() > max_bytes {
+    let body = response
+        .into_body()
+        .map(|chunk| chunk.map(|bytes| bytes.to_vec()).map_err(|_| ()));
+    let text = match collect_mb_body(Box::pin(body), max_bytes, deadline).await {
+        Ok(text) => text,
+        Err(_) => {
             return Err(());
         }
-        bytes.extend_from_slice(&chunk);
-    }
-    let text = String::from_utf8(bytes).map_err(|_| ())?;
+    };
     Ok((status, text))
+}
+
+/// Drain one MB body stream with a byte cap and a total deadline: the seam
+/// `fetch_mb_body` drains through, proven by the `mb_fetch_deadline`
+/// acceptance suite.
+///
+/// The deadline is TOTAL for the whole drain, not per-chunk idle time: one
+/// `deadline` future spans every chunk, partial progress never re-arms it,
+/// and a body still incomplete when `deadline` resolves aborts whole with
+/// [`MbFetchFailure::Deadline`] — never a partial body, never `Ok`.
+///
+/// Before the deadline fires the behavior is byte-for-byte the old inline
+/// loop: chunks accumulate (multi-byte UTF-8 split across chunks decodes),
+/// the exact `max_bytes` fit is admitted, the chunk that would cross
+/// `max_bytes` fails [`MbFetchFailure::Oversize`], invalid UTF-8 fails
+/// [`MbFetchFailure::NonUtf8`], a chunk-level transport error fails
+/// [`MbFetchFailure::Transport`], and an empty body is `Ok("")`.
+pub async fn collect_mb_body<S, D>(
+    body: S,
+    max_bytes: usize,
+    deadline: D,
+) -> Result<String, MbFetchFailure>
+where
+    S: Stream<Item = Result<Vec<u8>, ()>> + Unpin,
+    D: std::future::Future<Output = ()> + Unpin,
+{
+    use std::task::Poll;
+    let mut body = body;
+    let mut deadline = deadline;
+    let mut bytes = Vec::new();
+    loop {
+        enum Turn {
+            Chunk(Option<Result<Vec<u8>, ()>>),
+            Deadline,
+        }
+        let turn = std::future::poll_fn(|cx| {
+            // Deadline first: an already-fired deadline aborts even when a
+            // chunk is also ready, so no completed prefix escapes as a
+            // truncated body.
+            if std::pin::Pin::new(&mut deadline).poll(cx).is_ready() {
+                return Poll::Ready(Turn::Deadline);
+            }
+            match Stream::poll_next(std::pin::Pin::new(&mut body), cx) {
+                Poll::Ready(chunk) => Poll::Ready(Turn::Chunk(chunk)),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await;
+        match turn {
+            Turn::Deadline => return Err(MbFetchFailure::Deadline),
+            Turn::Chunk(None) => break,
+            Turn::Chunk(Some(Ok(chunk))) => {
+                if bytes.len() + chunk.len() > max_bytes {
+                    return Err(MbFetchFailure::Oversize);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Turn::Chunk(Some(Err(()))) => return Err(MbFetchFailure::Transport),
+        }
+    }
+    String::from_utf8(bytes).map_err(|_| MbFetchFailure::NonUtf8)
 }
 
 /// One MB release search through the `MB_API` service binding, classified

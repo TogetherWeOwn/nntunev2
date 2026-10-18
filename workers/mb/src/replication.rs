@@ -39,12 +39,17 @@ pub struct PendingPacket {
     pub published_at: i64,
 }
 
-/// Per-packet ledger. Recording a sequence again replaces its prior record,
-/// making a retried applier write idempotent.
+/// Per-packet ledger. Recording a sequence again with the same `packet_id`
+/// replaces its prior record, making a retried applier write idempotent. A
+/// re-record with a *different* `packet_id` is rejected: the first record
+/// (id, timestamps, lag) is left untouched and the sequence is pinned as a
+/// `packet_id_conflict` the SLO probe surfaces, so probe health cannot read
+/// green while the ledger has seen a conflicting identity.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PacketLedger {
     records: Vec<PacketRecord>,
     pending: Vec<PendingPacket>,
+    conflicts: Vec<i64>,
 }
 
 impl PacketLedger {
@@ -61,6 +66,13 @@ impl PacketLedger {
     /// them; in particular clock skew (`applied_at < published_at`) clamps
     /// `lag_secs` to 0 here while the applier's insert is rejected by the
     /// SQL `CHECK`, so pre-validate before recording.
+    ///
+    /// A re-record with a different `packet_id` than the one already stored
+    /// for `sequence` is rejected: the original record is left untouched,
+    /// pending state is undisturbed, and the sequence is pinned in
+    /// [`Self::packet_id_conflicts`] for the SLO probe to surface. A
+    /// re-record with the same `packet_id` keeps today's replacement and
+    /// lag recomputation and is never a conflict.
     pub fn record_packet(
         &mut self,
         packet_id: String,
@@ -68,17 +80,28 @@ impl PacketLedger {
         published_at: i64,
         applied_at: i64,
     ) {
-        let record = PacketRecord {
-            packet_id,
-            sequence,
-            published_at,
-            applied_at,
-            lag_secs: applied_at.saturating_sub(published_at),
-        };
         if let Some(existing) = self.records.iter_mut().find(|r| r.sequence == sequence) {
-            *existing = record;
+            if existing.packet_id != packet_id {
+                if !self.conflicts.contains(&sequence) {
+                    self.conflicts.push(sequence);
+                }
+                return;
+            }
+            *existing = PacketRecord {
+                packet_id,
+                sequence,
+                published_at,
+                applied_at,
+                lag_secs: applied_at.saturating_sub(published_at),
+            };
         } else {
-            self.records.push(record);
+            self.records.push(PacketRecord {
+                packet_id,
+                sequence,
+                published_at,
+                applied_at,
+                lag_secs: applied_at.saturating_sub(published_at),
+            });
         }
         self.pending.retain(|p| p.sequence != sequence);
     }
@@ -105,6 +128,15 @@ impl PacketLedger {
             .iter()
             .find(|p| p.sequence == sequence)
             .map(|p| p.published_at)
+    }
+
+    /// Sequences that have seen a conflicting `packet_id` re-record, in
+    /// packet-sequence order. The conflict is sticky: later re-records
+    /// (even with the original id) do not clear it.
+    pub fn packet_id_conflicts(&self) -> Vec<i64> {
+        let mut conflicts = self.conflicts.clone();
+        conflicts.sort_unstable();
+        conflicts
     }
 
     /// Return records in packet-sequence order, independent of insertion order.
@@ -183,6 +215,13 @@ impl ReplicationSloProbe {
         let pending = ledger.pending();
         let mut breaches = Vec::new();
         let mut pending_count = 0usize;
+        for sequence in ledger.packet_id_conflicts() {
+            breaches.push(ReplicationBreach {
+                kind: "packet_id_conflict",
+                sequence: Some(sequence),
+                lag_secs: None,
+            });
+        }
         for record in &records {
             if record.lag_secs > self.slo_secs {
                 breaches.push(ReplicationBreach {

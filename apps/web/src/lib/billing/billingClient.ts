@@ -104,6 +104,19 @@ function isValidUsagePayload(data: unknown): data is UsageSnapshot & { period: s
 	return true;
 }
 
+/**
+ * Successful GET /v1/plans DTO guard. The body must be an object whose
+ * `plans` field is an array (possibly empty). Unknown extra envelope
+ * fields are allowed and entries pass through verbatim; per-plan field
+ * validation is out of scope. Anything else rejects into the existing
+ * recoverable loader path instead of reaching pricing rendering as
+ * `undefined`, a string, or any other non-array value.
+ */
+function isValidPlansPayload(data: unknown): data is { plans: PlanDTO[] } {
+	if (typeof data !== 'object' || data === null || Array.isArray(data)) return false;
+	return Array.isArray((data as Record<string, unknown>).plans);
+}
+
 async function readJson<T>(res: Response, label: string): Promise<T> {
 	if (!res.ok) {
 		let body: unknown = null;
@@ -120,12 +133,27 @@ async function readJson<T>(res: Response, label: string): Promise<T> {
 		const hint = parsed.message ? `: ${parsed.message}` : '';
 		throw new BillingApiError(res.status, label, hint, parsed.code, parsed.retryable, paywall);
 	}
-	return (await res.json()) as T;
+	try {
+		return (await res.json()) as T;
+	} catch (error) {
+		// A 2xx whose body is not JSON is a backend contract violation, not
+		// a usable result: surface the typed error keeping the caller's
+		// label — never a bare SyntaxError, and never a downstream TypeError
+		// from reading fields off an undecodable body. Same generic fallback
+		// as undecodable error bodies, but never retryable and never a paywall.
+		// Only decode failures are rewrapped: transport errors rethrow
+		// untouched so they stay distinguishable.
+		if (!(error instanceof SyntaxError)) throw error;
+		const parsed = parseErrorBody(null, res.status);
+		const hint = parsed.message ? `: ${parsed.message}` : '';
+		throw new BillingApiError(res.status, label, hint, parsed.code, false, null);
+	}
 }
 
 export async function fetchPlans(fetchFn: typeof fetch = fetch): Promise<PlanDTO[]> {
 	const res = await fetchFn('/v1/plans', { credentials: 'include' });
-	const data = await readJson<{ plans: PlanDTO[] }>(res, 'Load plans');
+	const data = await readJson<unknown>(res, 'Load plans');
+	if (!isValidPlansPayload(data)) throw new Error('Invalid plans payload');
 	return data.plans;
 }
 
@@ -143,6 +171,44 @@ export async function fetchSubscription(fetchFn: typeof fetch = fetch): Promise<
 	return await readJson(res, 'Load subscription');
 }
 
+/**
+ * Authorized Stripe redirect hosts for checkout/portal 2xx bodies. Any
+ * allowlisted `https:` target resolves verbatim; everything else rejects
+ * with the typed client error so an off-allowlist or malformed target never
+ * reaches a `window.location.href` assignment (open-redirect guard).
+ */
+const STRIPE_REDIRECT_HOSTS = new Set(['checkout.stripe.com', 'billing.stripe.com']);
+
+function isAllowlistedRedirectUrl(value: unknown): value is string {
+	if (typeof value !== 'string' || value.trim() === '') return false;
+	// WHATWG URL parsing recovers an allowlisted host from a scheme without
+	// an explicit authority (`https:checkout.stripe.com/...` parses with
+	// hostname checkout.stripe.com), but a `window.location.href` assignment
+	// of that same string resolves against the app origin instead — so the
+	// raw string must carry the explicit `https://` authority up front.
+	if (!value.startsWith('https://')) return false;
+	let parsed: URL;
+	try {
+		parsed = new URL(value);
+	} catch {
+		return false;
+	}
+	return parsed.protocol === 'https:' && STRIPE_REDIRECT_HOSTS.has(parsed.hostname.toLowerCase());
+}
+
+function redirectUrlOrThrow(
+	data: unknown,
+	status: number,
+	label: string,
+	hint: string
+): string {
+	if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
+		const url = (data as Record<string, unknown>).url;
+		if (isAllowlistedRedirectUrl(url)) return url;
+	}
+	throw new BillingApiError(status, label, hint);
+}
+
 export async function startCheckout(
 	planId: string,
 	fetchFn: typeof fetch = fetch
@@ -154,9 +220,8 @@ export async function startCheckout(
 		headers: { 'content-type': 'application/json' },
 		body: JSON.stringify({ planId })
 	});
-	const data = await readJson<{ url: string }>(res, 'Start checkout');
-	if (!data.url.startsWith('https://')) throw new Error('Invalid checkout URL');
-	return data.url;
+	const data = await readJson<unknown>(res, 'Start checkout');
+	return redirectUrlOrThrow(data, res.status, 'Start checkout', ': Invalid checkout URL');
 }
 
 /**
@@ -178,7 +243,6 @@ export async function openPortal(fetchFn: typeof fetch = fetch): Promise<string>
 		headers: { 'content-type': 'application/json' },
 		body: '{}'
 	});
-	const data = await readJson<{ url: string }>(res, 'Open billing portal');
-	if (!data.url.startsWith('https://')) throw new Error('Invalid portal URL');
-	return data.url;
+	const data = await readJson<unknown>(res, 'Open billing portal');
+	return redirectUrlOrThrow(data, res.status, 'Open billing portal', ': Invalid portal URL');
 }
