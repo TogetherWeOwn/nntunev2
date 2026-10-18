@@ -2,9 +2,16 @@
 
 The `api`, `ingest`, `mb`, and `stream` crates define mappings to the same
 JSON error envelope. In this slice, `ingest` and `mb` serialize the envelope
-on their wired HTTP error paths. The API emits `reauth_required` from
-privilege-gated vault mutations and `account_deleting` when a vault save is
-refused by the account-deletion fence; other API and stream mappings are pinned
+on their wired HTTP error paths, except ingest's search-throttle 429, which
+stays a legacy `{"error":"too many requests"}` body with `Retry-After`
+(`search_rate_limited_body` in `workers/ingest/src/rate_limit.rs`, served by
+`search_rate_limited_response` in `workers/ingest/src/lib.rs`). The API emits
+`reauth_required` from privilege-gated vault mutations (`vault_put` and
+`vault_delete` via `authenticate_privileged`) and `account_deleting` when a
+vault write is refused by the account-deletion fence (the `vault_put` save and
+the test-connection lease path); a misconfigured session service additionally
+surfaces as the `internal_error` envelope via `session_error_response`
+(`workers/api/src/handlers.rs`). Other API and stream mappings are pinned
 for future HTTP wiring, not emitted by reachable HTTP paths here. Clients can
 handle auth, validation, billing limits, and upstream failures without
 per-worker special cases.
@@ -115,7 +122,7 @@ missing or unparseable code, or a status outside that list, becomes 502
 container-origin repair-only codes with no registry row (two of the
 six — `invalid_manifest` and `scratch_input_mismatch` — are also
 emitted directly by the repair worker itself:
-`workers/repair/src/contract.rs:121,127` and
+`workers/repair/src/contract.rs:123,129` and
 `workers/repair/src/runtime.rs:325,356`). The repair worker also emits
 `container_unavailable` (502), `scratch_unavailable` (503),
 `repair_unavailable` (500/503), and `scratch_missing` (404) directly
@@ -194,6 +201,41 @@ dead-end error — asserted end to end by the over-limit e2e legs
 Refusal bodies stay names-only: no account, credential, or provider
 material — the e2e legs fail a refusal that echoes the capped account's
 email/session or carries credential-shaped keys.
+
+## Sources
+
+Each rule above traces to these worker sources (verified at the current
+head; the per-worker `registry_matches_docs_api_errors` tests fail on
+code, status, or retryable drift):
+
+- Envelope and fallback: `workers/api/src/api_error.rs`,
+  `workers/ingest/src/api_error.rs`, `workers/mb/src/api_error.rs`,
+  `workers/stream/src/api_error.rs` (`ApiError::body_json`, `by_code`,
+  `spec`/`FALLBACK`), pinned by each module's
+  `envelope_is_exactly_code_message_retryable`,
+  `server_error_messages_are_sealed_to_public_text` (stream:
+  `registered_server_errors_use_fixed_public_messages`; mb: sealing is
+  asserted inside `envelope_is_exactly_code_message_retryable`), and
+  `unknown_code_falls_back_to_the_documented_generic` tests.
+- Intake refusals and ingest extras: `workers/ingest/src/nzb_intake.rs`
+  (intake codes and caps), `intake_rejection_parts` and `queued_body` in
+  `workers/ingest/src/lib.rs`, and the legacy 429 in
+  `workers/ingest/src/rate_limit.rs`.
+- API and stream wiring scope: `authenticate_privileged`,
+  `account_deleting_response`, and `session_error_response` in
+  `workers/api/src/handlers.rs`; stream serves pre-wiring bodies from
+  `workers/stream/src/routes.rs` while `PlayError::api_error` in
+  `workers/stream/src/play.rs` is covered by tests only.
+- Client fallback: `apps/web/src/lib/api/errors.ts`
+  (`KNOWN_ERROR_CODES`, `codeFromStatus`, `parseErrorBody`); the
+  provider/indexer signals in `workers/api/src/vault.rs`
+  (`PROVIDER_AUTH_EXPIRED_CODE`) and `workers/ingest/src/newznab.rs`
+  (`INDEXER_AUTH_EXPIRED_CODE`).
+- Limit refusal: `assertPlanLimitRefusal` in `e2e/helpers/contract.ts`,
+  pinned offline in `e2e/tests/helpers.spec.ts`.
+- Repair: `workers/repair/src/contract.rs`,
+  `workers/repair/src/runtime.rs`, and `classify_repair_reply` in
+  `workers/ingest/src/repair.rs`.
 
 ## Adding a code
 

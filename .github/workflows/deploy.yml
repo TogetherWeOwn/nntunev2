@@ -117,7 +117,9 @@ jobs:
   # skipped whenever `staging-web` is skipped (gate disabled / non-push) or
   # fails, so it can never report a full-journey PASS without a successful
   # deploy first. Secrets are passed explicitly (never `inherit`) and match
-  # exactly the names e2e-staging.yml reads.
+  # exactly the names e2e-staging.yml reads. The promotion SHA (github.sha)
+  # is passed as expected_sha so the build-identity spec can prove the
+  # serving build is the promoted one — never a source checkout.
   post-deploy-e2e:
     name: post-deploy-e2e
     needs: [staging-web]
@@ -127,6 +129,7 @@ jobs:
     uses: ./.github/workflows/e2e-staging.yml
     with:
       post_deploy: true
+      expected_sha: ${{ github.sha }}
     secrets:
       STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
       CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
