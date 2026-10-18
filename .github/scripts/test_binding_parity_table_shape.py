@@ -1,12 +1,12 @@
 """Pin binding-parity malformed table-shape exit 2.
 
-Covers the ``except (AttributeError, TypeError)`` guard in
-``binding_parity.parse_config``: well-formed TOML whose top-level shapes
-are not tables (``env`` as a string, ``env`` as a list, and the same
-string shape alongside an unknown-table ``bindings`` list) must fail
-closed with ``malformed wrangler table shape`` and exit 2 via ``main``,
-never exit 1 and never an uncaught traceback. A valid-config control
-proves the harness itself passes.
+Covers both halves of the ``except (AttributeError, TypeError)`` guard in
+``binding_parity.parse_config``: well-formed TOML whose shapes are not
+tables (``env`` as a string or list trips ``.items()`` -> AttributeError;
+top-level ``r2_buckets`` as an int trips ``for item in 5`` -> TypeError)
+must fail closed with ``malformed wrangler table shape`` and exit 2 via
+``main``, never exit 1 and never an uncaught traceback. A valid-config
+control proves the harness itself passes.
 
 Temporary mini-repo configs only; no fixture changes. Manifest and ops
 fixtures carry synthetic resource ids, and the failure output is
@@ -96,9 +96,11 @@ ENV_STRING_WRANGLER = CONFIG_HEAD + 'env = "staging"\n'
 
 ENV_LIST_WRANGLER = CONFIG_HEAD + 'env = ["staging"]\n'
 
-ENV_STRING_WITH_BINDINGS_LIST_WRANGLER = (
-    CONFIG_HEAD + 'env = "staging"\nbindings = ["AUDIO_CACHE"]\n'
-)
+# ``r2_buckets`` as an int trips the TypeError half of the guard
+# (``for item in data.get("r2_buckets", [])`` with an int is not iterable),
+# where the ``env`` non-table shapes below trip the AttributeError half
+# (``.items()`` on a str/list).
+R2_INT_WRANGLER = CONFIG_HEAD + "r2_buckets = 5\n"
 
 
 def make_repo(tmp, wrangler=MATCHING_WRANGLER):
@@ -123,13 +125,16 @@ def run_check(root):
 class TestMalformedTableShape(unittest.TestCase):
     """Well-formed TOML with non-table shapes fails closed via exit 2."""
 
-    def assert_malformed_shape_fails_closed(self, wrangler):
+    def assert_malformed_shape_fails_closed(self, wrangler, expect_cause):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_repo(tmp, wrangler=wrangler)
             with self.assertRaisesRegex(
                 ParityError, r"malformed wrangler table shape"
-            ):
+            ) as ctx:
                 run_check(root)
+            # Pin which half of the ``except (AttributeError, TypeError)``
+            # tuple fired, so narrowing the guard either way goes red.
+            self.assertIsInstance(ctx.exception.__cause__, expect_cause)
             stdout = io.StringIO()
             stderr = io.StringIO()
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
@@ -147,17 +152,15 @@ class TestMalformedTableShape(unittest.TestCase):
             self.assertNotIn("fx-", combined)
 
     def test_env_string_malformed_shape_exits_two(self):
-        self.assert_malformed_shape_fails_closed(ENV_STRING_WRANGLER)
+        self.assert_malformed_shape_fails_closed(
+            ENV_STRING_WRANGLER, AttributeError
+        )
 
     def test_env_list_malformed_shape_exits_two(self):
-        self.assert_malformed_shape_fails_closed(ENV_LIST_WRANGLER)
+        self.assert_malformed_shape_fails_closed(ENV_LIST_WRANGLER, AttributeError)
 
-    def test_env_string_with_bindings_list_malformed_shape_exits_two(self):
-        # The unknown-table ``bindings`` list is ignored by design; the
-        # ``env`` string is what trips the malformed-shape guard.
-        self.assert_malformed_shape_fails_closed(
-            ENV_STRING_WITH_BINDINGS_LIST_WRANGLER
-        )
+    def test_r2_int_malformed_shape_exits_two(self):
+        self.assert_malformed_shape_fails_closed(R2_INT_WRANGLER, TypeError)
 
     def test_valid_config_control_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
