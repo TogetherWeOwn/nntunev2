@@ -151,6 +151,45 @@ test('failed logout keeps the sign-out action and reports the failure', async ({
 	await expect(page.getByRole('button', { name: /sign out/i })).toBeEnabled();
 });
 
+test('magic-link paywall preserves the token for a successful retry', async ({ page }) => {
+	let finishPosts = 0;
+	await page.route('**/v1/auth/magic/finish', async (route) => {
+		finishPosts += 1;
+		if (finishPosts === 1) {
+			await route.fulfill({
+				status: 429,
+				headers: { 'content-type': 'application/json', 'Retry-After': '300' },
+				body: JSON.stringify({ code: 'rate_limited' })
+			});
+		} else {
+			await route.fulfill({
+				status: 200,
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ ok: true, email: 'alice@example.com' })
+			});
+		}
+	});
+
+	await page.goto('/auth/magic?token=fixture-limited-token');
+	await page.getByRole('button', { name: /sign in with this link/i }).click();
+
+	const dialog = page.getByRole('dialog');
+	await expect(dialog).toBeVisible();
+	await expect(page.getByRole('alert')).toHaveCount(0);
+	await expect(dialog.getByRole('link', { name: /upgrade your plan/i })).toHaveAttribute(
+		'href',
+		'/pricing'
+	);
+	await expect(page.getByRole('button', { name: /sign in with this link/i })).toBeVisible();
+	await expect(page.getByTestId('paywall-countdown')).toContainText(/try again/i);
+
+	await dialog.getByRole('button', { name: 'Not now' }).click();
+	await expect(dialog).toBeHidden();
+	await page.getByRole('button', { name: /sign in with this link/i }).click();
+	await page.waitForURL('/onboarding/byop');
+	expect(finishPosts).toBe(2);
+});
+
 test('401 logout clears a stale account label and leaves the link retryable', async ({ page }) => {
 	let finishPosts = 0;
 	let logoutPosts = 0;

@@ -1,7 +1,9 @@
 //! Worker runtime wiring: env config, Hyperdrive Postgres store,
 //! DNS-over-HTTPS resolution, pinned-address socket probing, and the
-//! magic-link mailer webhook. Everything here adapts `handlers` traits
-//! to Cloudflare bindings; no security decisions live in this module.
+//! magic-link mailer webhook. Request security decisions live in
+//! `handlers`; startup fail-closed gates (env config plus the Hyperdrive
+//! caching-disabled attestation below) live here and refuse to serve
+//! traffic when the operator has not attested a cache-disabled config.
 //!
 //! Failures are opaque by construction: driver/DB errors map to
 //! [`handlers::StoreError`] without detail, and nothing in this module
@@ -22,7 +24,8 @@ use crate::auth::{
     SingleUseStore,
 };
 use crate::handlers::{
-    self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, Store, StoreError, UserRecord, VaultRow,
+    self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, PairAdmission, QaIssuedCode,
+    RateLimitBudget, Store, StoreError, UserRecord, VaultRow,
 };
 use crate::session::SessionRecord;
 use crate::vault::{
@@ -45,6 +48,17 @@ fn env_string(env: &Env, name: &str) -> Option<String> {
 }
 
 fn config_from_env(env: &Env) -> Option<Config> {
+    // Runtime fail-closed gate for the Hyperdrive caching finding: auth
+    // reads are plain SELECTs through the HYPERDRIVE binding, so a
+    // caching-enabled config would serve stale sessions/credentials for
+    // up to ~75s. The Worker cannot inspect the Hyperdrive config at
+    // runtime, so the operator attests `HYPERDRIVE_CACHING_DISABLED=1`
+    // (set only after `check_hyperdrive_cache.sh` passes for that env).
+    // Without the attestation the Worker answers the same generic 500 as
+    // any other misconfiguration and serves no auth traffic.
+    if !hyperdrive_caching_disabled_attested(env_string(env, "HYPERDRIVE_CACHING_DISABLED")) {
+        return None;
+    }
     let rp_id = env_string(env, "RP_ID")?;
     let origin = env_string(env, "RP_ORIGIN")?;
     // Strict unpadded base64url for both secrets (`crate::b64`, F-HARD-01):
@@ -75,7 +89,7 @@ fn config_from_env(env: &Env) -> Option<Config> {
         Ok(previous) => previous,
         Err(()) => return None,
     };
-    Config::new(
+    let mut config = Config::new(
         &rp_id,
         &origin,
         session_secret,
@@ -86,7 +100,68 @@ fn config_from_env(env: &Env) -> Option<Config> {
         truthy("ALLOW_LOOPBACK_DEV"),
         session_previous_secret,
     )
-    .ok()
+    .ok()?;
+    // Staging-only emailed-code retrieval seam (`POST /api/test-codes`):
+    // armed ONLY by the explicit staging flag, and usable only with the
+    // staged QA bearer. Both default off/absent, so production serves the
+    // seam path as a plain 404. The token is read only when the flag is
+    // armed — an unflagged env never holds it in config.
+    if truthy("QA_CODE_SEAM") {
+        config = config.with_qa_code_seam(true);
+        if let Some(token) =
+            env_string(env, "QA_AUTH_TOKEN").filter(|token| !token.trim().is_empty())
+        {
+            config = config.with_qa_auth_token(&token);
+        }
+    }
+    Some(apply_rate_limit_overlay(config, |name| {
+        env_string(env, name)
+    }))
+}
+
+/// The [vars] names `RateLimitConfig::from_vars` reads. One const
+/// list so the overlay test can pin every name against its field.
+const RATE_LIMIT_VAR_NAMES: [&str; 5] = [
+    "AUTH_RATE_LIMIT_MAX",
+    "AUTH_RATE_LIMIT_WINDOW_SECS",
+    "VAULT_TEST_RATE_LIMIT_MAX",
+    "VAULT_TEST_RATE_LIMIT_WINDOW_SECS",
+    "VAULT_TEST_IP_RATE_LIMIT_MAX",
+];
+
+/// Pure [vars] overlay: collect whichever of [`RATE_LIMIT_VAR_NAMES`]
+/// the lookup resolves and hand them to `from_vars`, which fails safe
+/// to the documented defaults on anything missing or invalid, so a
+/// typo'd override keeps limiting on (never unlimited, never
+/// deny-all). Unit-tested below; the wasm wrapper only supplies the
+/// `env_string` closure.
+fn rate_limits_from_lookup(
+    get: impl Fn(&str) -> Option<String>,
+) -> crate::rate_limit::RateLimitConfig {
+    let vars: HashMap<String, String> = RATE_LIMIT_VAR_NAMES
+        .iter()
+        .filter_map(|name| get(name).map(|v| ((*name).to_string(), v)))
+        .collect();
+    crate::rate_limit::RateLimitConfig::from_vars(&vars)
+}
+
+/// Apply the [vars] overlay to a built `Config`: the one place the
+/// operator overrides replace the compiled rate-limit defaults.
+/// Pure over the lookup closure so a native test drives the exact
+/// function `config_from_env` calls with a real `Config` and asserts
+/// the resulting field — dropping the `with_rate_limits` call (or
+/// feeding it defaults) fails behaviorally, not just textually.
+fn apply_rate_limit_overlay(config: Config, get: impl Fn(&str) -> Option<String>) -> Config {
+    config.with_rate_limits(rate_limits_from_lookup(get))
+}
+
+/// Pure Hyperdrive caching attestation decision: `Some("1"/"true"/"TRUE")`
+/// in `HYPERDRIVE_CACHING_DISABLED` means the operator verified that env's
+/// Hyperdrive config has query caching disabled; anything else (missing,
+/// empty, any other value) refuses to start. Unit-tested below; the same
+/// truthy spelling as the other feature flags.
+fn hyperdrive_caching_disabled_attested(raw: Option<String>) -> bool {
+    matches!(raw.as_deref(), Some("1") | Some("true") | Some("TRUE"))
 }
 
 /// Pure rotation-matrix decision: the staged `SESSION_SECRET_PREVIOUS_BASE64`
@@ -187,6 +262,108 @@ fn u64_of(v: i64) -> Result<u64, StoreError> {
 
 fn u32_of(v: i64) -> Result<u32, StoreError> {
     u32::try_from(v).map_err(|_| StoreError)
+}
+
+/// Durable-slot budgets are bounded: a zero limit/window admits
+/// nothing, and the slot scan is capped at
+/// [`crate::rate_limit::MAX_BUDGET_SLOTS`] (the largest in-tree
+/// budget). Configured maxima clamp to that cap in `from_vars`, so
+/// this gate only refuses hand-built budgets, never operator config.
+fn rate_limit_budget_admissible(budget: &RateLimitBudget<'_>) -> bool {
+    budget.limit != 0
+        && budget.window_secs != 0
+        && budget.limit <= u64::from(crate::rate_limit::MAX_BUDGET_SLOTS)
+}
+
+async fn delete_expired_rate_limit_slots(
+    client: &tokio_postgres::Client,
+    now: i64,
+) -> Result<(), StoreError> {
+    client
+        .execute(
+            "DELETE FROM auth_rate_limit_slots WHERE expires_at <= $1",
+            &[&now],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    Ok(())
+}
+
+/// Claim one slot of `budget` on `client`; `Ok(Some(slot))` is the
+/// claimed slot index (the pair path needs it for its compensating
+/// release), `Ok(None)` is an exhausted budget. Caller has already
+/// deleted expired rows for `now_i`.
+async fn claim_rate_limit_slot(
+    client: &tokio_postgres::Client,
+    budget: &RateLimitBudget<'_>,
+    now: u64,
+    now_i: i64,
+) -> Result<Option<i32>, StoreError> {
+    let expires_at = i64_of(now.saturating_add(budget.window_secs))?;
+    // O(1) fast-fail on the exhausted path (single source of truth:
+    // `handlers::RATE_LIMIT_EXHAUSTED_SQL`, pinned by statement-shape
+    // test): without this guard every denied request pays one DELETE
+    // plus `limit` conflicting upserts (~101 statements with 100 row
+    // locks for the 100-slot finish lookup budget). The slot loop below
+    // still claims atomically, so a concurrent race that passes this
+    // snapshot simply fails closed there.
+    let exhausted = client
+        .query_one(
+            handlers::RATE_LIMIT_EXHAUSTED_SQL,
+            &[&budget.scope_key, &budget.action, &now_i],
+        )
+        .await
+        .map_err(|_| StoreError)?
+        .get::<_, i64>(0);
+    if exhausted >= i64::try_from(budget.limit).map_err(|_| StoreError)? {
+        return Ok(None);
+    }
+    for slot in 0..budget.limit {
+        let slot = i32::try_from(slot).map_err(|_| StoreError)?;
+        let rows = client
+            .query(
+                "INSERT INTO auth_rate_limit_slots (scope_key, action, slot, expires_at) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (scope_key, action, slot) DO UPDATE \
+                 SET expires_at = EXCLUDED.expires_at \
+                 WHERE auth_rate_limit_slots.expires_at <= $5 \
+                 RETURNING slot",
+                &[
+                    &budget.scope_key,
+                    &budget.action,
+                    &slot,
+                    &expires_at,
+                    &now_i,
+                ],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        if !rows.is_empty() {
+            return Ok(Some(slot));
+        }
+    }
+    Ok(None)
+}
+
+/// Release the exact slot `claim_rate_limit_slot` took for `budget`
+/// at `now` (same scope, action, slot and expiry), so the pair
+/// path's compensation can never free another request's slot.
+async fn release_rate_limit_slot(
+    client: &tokio_postgres::Client,
+    budget: &RateLimitBudget<'_>,
+    slot: i32,
+    now: u64,
+) -> Result<(), StoreError> {
+    let expires_at = i64_of(now.saturating_add(budget.window_secs))?;
+    client
+        .execute(
+            "DELETE FROM auth_rate_limit_slots \
+             WHERE scope_key = $1 AND action = $2 AND slot = $3 AND expires_at = $4",
+            &[&budget.scope_key, &budget.action, &slot, &expires_at],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    Ok(())
 }
 
 struct PgStore {
@@ -387,11 +564,13 @@ impl Store for PgStore {
         Ok(rows.len() == 1)
     }
 
+    // Per-user prune: magic_link_tokens has no expires_at index, so a global sweep would scan.
     async fn insert_magic(&self, record: &MagicLinkRecord) -> Result<(), StoreError> {
         let client = self.connect().await?;
         client
             .execute(
-                "INSERT INTO magic_link_tokens (token_hash, user_id, email, issued_at, expires_at, used) \
+                "WITH pruned AS (DELETE FROM magic_link_tokens WHERE user_id = $2 AND expires_at <= $4) \
+                 INSERT INTO magic_link_tokens (token_hash, user_id, email, issued_at, expires_at, used) \
                  VALUES ($1, $2, $3, $4, $5, FALSE)",
                 &[
                     &record.token_hash,
@@ -424,6 +603,45 @@ impl Store for PgStore {
                 issued_at: u64_of(r.try_get("issued_at").map_err(|_| StoreError)?)?,
                 expires_at: u64_of(r.try_get("expires_at").map_err(|_| StoreError)?)?,
                 used: r.try_get("used").map_err(|_| StoreError)?,
+            })
+        })
+        .transpose()
+    }
+
+    // Staging-only code-seam outbox (migration 0018): one latest-token
+    // row per synthetic mailbox. Read-only retrieval never touches this
+    // table beyond the SELECT below.
+    async fn record_qa_issued_code(
+        &self,
+        email: &str,
+        token: &str,
+        now: u64,
+    ) -> Result<(), StoreError> {
+        let client = self.connect().await?;
+        client
+            .execute(
+                "INSERT INTO qa_issued_codes (email, token, issued_at) VALUES ($1, $2, $3) \
+                 ON CONFLICT (email) DO UPDATE SET token = EXCLUDED.token, issued_at = EXCLUDED.issued_at",
+                &[&email, &token, &i64_of(now)?],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        Ok(())
+    }
+
+    async fn qa_issued_code(&self, email: &str) -> Result<Option<QaIssuedCode>, StoreError> {
+        let client = self.connect().await?;
+        let row = client
+            .query_opt(
+                "SELECT token, issued_at FROM qa_issued_codes WHERE email = $1",
+                &[&email],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        row.map(|r| {
+            Ok(QaIssuedCode {
+                token: r.try_get("token").map_err(|_| StoreError)?,
+                issued_at: u64_of(r.try_get("issued_at").map_err(|_| StoreError)?)?,
             })
         })
         .transpose()
@@ -515,6 +733,53 @@ impl Store for PgStore {
         Ok(rows.len() == 1)
     }
 
+    async fn replace_session_after_reauthentication(
+        &self,
+        replacement: &crate::session::ReauthenticatedSession,
+    ) -> Result<bool, StoreError> {
+        let claim = replacement.revocation_claim();
+        let params = claim.params();
+        let rotation_counter =
+            i32::try_from(claim.rotation_counter().ok_or(StoreError)?).map_err(|_| StoreError)?;
+        let created_at = i64_of(replacement.new_record.created_at)?;
+        let expires_at = i64_of(replacement.new_record.expires_at)?;
+        let new_counter =
+            i32::try_from(replacement.new_record.rotation_counter).map_err(|_| StoreError)?;
+        let mut client = self.connect().await?;
+        let transaction = client.transaction().await.map_err(|_| StoreError)?;
+        let rows = transaction
+            .query(
+                claim.statement(),
+                &[&params[0], &params[1], &rotation_counter],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        if rows.len() != 1 {
+            transaction.rollback().await.map_err(|_| StoreError)?;
+            return Ok(false);
+        }
+        if transaction
+            .execute(
+                "INSERT INTO sessions (id, user_id, created_at, expires_at, rotation_counter, revoked) \
+                 VALUES ($1, $2, $3, $4, $5, FALSE)",
+                &[
+                    &replacement.new_record.id,
+                    &replacement.new_record.user_id,
+                    &created_at,
+                    &expires_at,
+                    &new_counter,
+                ],
+            )
+            .await
+            .is_err()
+        {
+            transaction.rollback().await.map_err(|_| StoreError)?;
+            return Err(StoreError);
+        }
+        transaction.commit().await.map_err(|_| StoreError)?;
+        Ok(true)
+    }
+
     async fn revoke_session(&self, id: &str) -> Result<(), StoreError> {
         let client = self.connect().await?;
         client
@@ -567,11 +832,21 @@ impl Store for PgStore {
 
     async fn upsert_vault(&self, user_id: &str, row: &VaultRow) -> Result<(), StoreError> {
         let client = self.connect().await?;
-        client
+        // Account-deletion fence (ADR 0002 rule 3): the upsert only lands
+        // while the owner's deleting_at is NULL, holding the user row
+        // FOR SHARE through the statement, so saving provider credentials
+        // cannot repopulate user-owned state behind the deletion marker.
+        // A fenced (0-row) upsert fails closed as StoreError; the
+        // handler classifies it through `account_deleting` into the
+        // typed 409. delete_vault below is deliberately not fenced:
+        // removal cannot restore state, and the executor deletes the
+        // row anyway.
+        let affected = client
             .execute(
                 "INSERT INTO provider_vaults (user_id, kek_version, dek_wrapped_nonce, dek_wrapped, \
                  payload_nonce, payload, indexer_configured, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 SELECT $1, $2, $3, $4, $5, $6, $7, $8 \
+                 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence \
                  ON CONFLICT (user_id) DO UPDATE SET kek_version = EXCLUDED.kek_version, \
                  dek_wrapped_nonce = EXCLUDED.dek_wrapped_nonce, dek_wrapped = EXCLUDED.dek_wrapped, \
                  payload_nonce = EXCLUDED.payload_nonce, payload = EXCLUDED.payload, \
@@ -589,6 +864,9 @@ impl Store for PgStore {
             )
             .await
             .map_err(|_| StoreError)?;
+        if affected == 0 {
+            return Err(StoreError);
+        }
         Ok(())
     }
 
@@ -602,6 +880,23 @@ impl Store for PgStore {
             .await
             .map_err(|_| StoreError)?;
         Ok(())
+    }
+
+    async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
+        let client = self.connect().await?;
+        let row = client
+            .query_opt(
+                crate::account_deletion::ACCOUNT_DELETING_PROBE_SQL,
+                &[&user_id],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        match row {
+            Some(row) => row.try_get("deleting").map_err(|_| StoreError),
+            // The user row is gone (erased or reaped): not a fenced
+            // write, so the handler keeps its generic failure.
+            None => Ok(false),
+        }
     }
 
     async fn insert_audit(&self, event: &AuditEvent) -> Result<(), StoreError> {
@@ -630,38 +925,59 @@ impl Store for PgStore {
         now: u64,
         window_secs: u64,
     ) -> Result<bool, StoreError> {
-        if limit == 0 || window_secs == 0 || limit > 100 {
+        let budget = RateLimitBudget {
+            scope_key,
+            action,
+            limit,
+            window_secs,
+        };
+        if !rate_limit_budget_admissible(&budget) {
             return Ok(false);
         }
         let client = self.connect().await?;
-        let expires_at = i64_of(now.saturating_add(window_secs))?;
-        let now = i64_of(now)?;
-        client
-            .execute(
-                "DELETE FROM auth_rate_limit_slots WHERE expires_at <= $1",
-                &[&now],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        for slot in 0..limit {
-            let slot = i32::try_from(slot).map_err(|_| StoreError)?;
-            let rows = client
-                .query(
-                    "INSERT INTO auth_rate_limit_slots (scope_key, action, slot, expires_at) \
-                     VALUES ($1, $2, $3, $4) \
-                     ON CONFLICT (scope_key, action, slot) DO UPDATE \
-                     SET expires_at = EXCLUDED.expires_at \
-                     WHERE auth_rate_limit_slots.expires_at <= $5 \
-                     RETURNING slot",
-                    &[&scope_key, &action, &slot, &expires_at, &now],
-                )
-                .await
-                .map_err(|_| StoreError)?;
-            if !rows.is_empty() {
-                return Ok(true);
+        let now_i = i64_of(now)?;
+        delete_expired_rate_limit_slots(&client, now_i).await?;
+        Ok(claim_rate_limit_slot(&client, &budget, now, now_i)
+            .await?
+            .is_some())
+    }
+
+    async fn reserve_rate_limit_pair(
+        &self,
+        first: RateLimitBudget<'_>,
+        second: RateLimitBudget<'_>,
+        now: u64,
+    ) -> Result<PairAdmission, StoreError> {
+        if !rate_limit_budget_admissible(&first) {
+            return Ok(PairAdmission::DeniedFirst);
+        }
+        if !rate_limit_budget_admissible(&second) {
+            return Ok(PairAdmission::DeniedSecond);
+        }
+        // All-or-none on one connection: claim the first slot, then the
+        // second; if the second does not admit, release the first by
+        // its exact identity (scope, action, slot, expiry). A live
+        // slot cannot be overwritten by another claim (reuse requires
+        // an expired row), so the compensating DELETE can only remove
+        // the slot this call just took — a denied attempt ends up
+        // consuming neither budget.
+        let client = self.connect().await?;
+        let now_i = i64_of(now)?;
+        delete_expired_rate_limit_slots(&client, now_i).await?;
+        let Some(first_slot) = claim_rate_limit_slot(&client, &first, now, now_i).await? else {
+            return Ok(PairAdmission::DeniedFirst);
+        };
+        match claim_rate_limit_slot(&client, &second, now, now_i).await {
+            Ok(Some(_)) => Ok(PairAdmission::Allowed),
+            Ok(None) => {
+                release_rate_limit_slot(&client, &first, first_slot, now).await?;
+                Ok(PairAdmission::DeniedSecond)
+            }
+            Err(err) => {
+                let _ = release_rate_limit_slot(&client, &first, first_slot, now).await;
+                Err(err)
             }
         }
-        Ok(false)
     }
 
     async fn prune_expired_challenges(&self, now: u64) -> Result<(), StoreError> {
@@ -670,6 +986,29 @@ impl Store for PgStore {
             .execute(
                 "DELETE FROM auth_challenges WHERE expires_at <= $1",
                 &[&i64_of(now)?],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        Ok(())
+    }
+
+    async fn reap_unverified_users(
+        &self,
+        now: u64,
+        ttl_secs: u64,
+        protected_user_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        // Single source of truth lives in `handlers` (statement-shape test
+        // pins the purpose literal and the vault/session/magic exemptions):
+        // magic-only accounts and vault owners are never reaped, so a vault
+        // saved under a magic session cannot cascade-delete 24h later.
+        let cutoff = i64_of(now.saturating_sub(ttl_secs))?;
+        let now = i64_of(now)?;
+        let client = self.connect().await?;
+        client
+            .execute(
+                &handlers::reap_unverified_users_sql(),
+                &[&cutoff, &protected_user_id, &now],
             )
             .await
             .map_err(|_| StoreError)?;
@@ -698,10 +1037,14 @@ impl Store for PgStore {
             .map_err(|_| StoreError)?;
         for slot in 0..max_concurrency {
             let slot = i16::try_from(slot).map_err(|_| StoreError)?;
+            // Fenced like the vault upsert (ADR 0002 rule 3): a deleting
+            // account acquires no new lease rows; every slot probe then
+            // returns no row and the lease is simply denied.
             let rows = client
                 .query(
                     "INSERT INTO vault_test_leases (user_id, slot, token, expires_at) \
-                     VALUES ($1, $2, $3, FLOOR(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT + $4) \
+                     SELECT $1, $2, $3, FLOOR(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT + $4 \
+                     FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence \
                      ON CONFLICT (user_id, slot) DO UPDATE \
                      SET token = EXCLUDED.token, expires_at = EXCLUDED.expires_at \
                      WHERE vault_test_leases.expires_at <= FLOOR(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT \
@@ -797,7 +1140,7 @@ async fn doh_query(host: &str, rrtype: &str) -> Vec<IpAddr> {
     url.query_pairs_mut()
         .append_pair("name", host)
         .append_pair("type", rrtype);
-    let mut headers = Headers::new();
+    let headers = Headers::new();
     if headers.set("accept", "application/dns-json").is_err() {
         return Vec::new();
     }
@@ -925,7 +1268,7 @@ impl Mailer for WebhookMailer {
             return Err(StoreError);
         }
         let body = magic_link_payload(&self.origin, email, token).to_string();
-        let mut headers = Headers::new();
+        let headers = Headers::new();
         headers
             .set("content-type", "application/json")
             .map_err(|_| StoreError)?;
@@ -953,22 +1296,45 @@ impl Mailer for WebhookMailer {
 
 // --- Fetch dispatch ------------------------------------------------------------------------------------
 
-fn render(
+fn render_header_pairs(
     response: &handlers::Response,
     cors: &[(&'static str, String)],
-) -> WorkerResult<Response> {
-    let mut headers = Headers::new();
-    headers.append("content-type", "application/json; charset=utf-8")?;
-    headers.append("cache-control", "no-store")?;
-    headers.append("x-content-type-options", "nosniff")?;
+) -> Vec<(&'static str, String)> {
+    let mut pairs = vec![
+        (
+            "content-type",
+            "application/json; charset=utf-8".to_string(),
+        ),
+        (
+            "content-security-policy",
+            "default-src 'none'; frame-ancestors 'none'".to_string(),
+        ),
+        ("cache-control", "no-store".to_string()),
+        ("x-content-type-options", "nosniff".to_string()),
+    ];
     if let Some(cookie) = &response.set_cookie {
-        headers.append("set-cookie", cookie)?;
+        pairs.push(("set-cookie", cookie.clone()));
+    }
+    if let Some(retry_after) = response.retry_after {
+        pairs.push((
+            crate::rate_limit::RETRY_AFTER_HEADER,
+            crate::rate_limit::retry_after_header_value(retry_after),
+        ));
     }
     // Credentialed CORS for the configured origin only: the exact header
     // set is decided by the unit-tested `cors_headers`; render only
     // appends it.
-    for (name, value) in cors {
-        headers.append(name, value)?;
+    pairs.extend(cors.iter().cloned());
+    pairs
+}
+
+fn render(
+    response: &handlers::Response,
+    cors: &[(&'static str, String)],
+) -> WorkerResult<Response> {
+    let headers = Headers::new();
+    for (name, value) in render_header_pairs(response, cors) {
+        headers.append(name, &value)?;
     }
     Ok(
         Response::from_body(ResponseBody::Body(response.body.clone().into_bytes()))?
@@ -983,9 +1349,167 @@ fn internal_render() -> WorkerResult<Response> {
             status: 500,
             body: r#"{"error":"internal error"}"#.to_string(),
             set_cookie: None,
+            retry_after: None,
         },
         &[],
     )
+}
+
+// --- Request-body collection & dispatch gate --------------------------------
+//
+// A body *transport* failure (stream setup or a chunk read) must never be
+// converted into an empty or truncated body the handlers then act on: an
+// empty body is meaningful downstream (stored-credential vault testing
+// dials the saved provider for an empty `POST /v1/vault/test` body), so a
+// swallowed failure could invoke the handler, store writes, the mailer or
+// the vault dialer on input the client never successfully sent. Collection
+// therefore returns an explicit decision and only `Complete` may dispatch.
+
+/// Opaque chunk-read failure. Carries no message by construction, so no
+/// internal/runtime error detail can ever reach a response body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyReadError;
+
+/// One pollable source of body chunks (std-only so fake streams are
+/// native-testable; the Worker adapter wraps the runtime byte stream
+/// and maps every runtime chunk error to `BodyReadError`).
+pub trait BodyChunkStream {
+    fn poll_next_chunk(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Vec<u8>, BodyReadError>>>;
+}
+
+/// Where the body comes from, classified by the Worker entry using the
+/// actual workers-rs contract:
+/// - `Bodyless`: the edge request has no body at all
+///   (`req.inner().body().is_none()`) — a legitimate bodyless request
+///   (e.g. GET/DELETE, or a POST sent without a body). `req.stream()`
+///   errors for such requests too, so this check must come first.
+/// - `SetupFailed`: a body IS present but obtaining its stream failed
+///   (`req.stream()` returned `Err`).
+/// - `Stream(s)`: a body is present and its stream was obtained.
+pub enum BodySource<S> {
+    Bodyless,
+    SetupFailed,
+    Stream(S),
+}
+
+/// The collection decision. Only `Complete` may reach the handlers.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CollectedBody {
+    Complete(Vec<u8>),
+    Oversized,
+    TransportFailure,
+}
+
+/// Adapter from the runtime byte stream to [`BodyChunkStream`]: every
+/// runtime chunk error becomes the opaque [`BodyReadError`].
+struct WorkerBodyStream<S> {
+    inner: std::pin::Pin<Box<S>>,
+}
+
+impl<S> BodyChunkStream for WorkerBodyStream<S>
+where
+    S: futures_util::Stream<Item = WorkerResult<Vec<u8>>>,
+{
+    fn poll_next_chunk(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Vec<u8>, BodyReadError>>> {
+        match self.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(chunk))) => std::task::Poll::Ready(Some(Ok(chunk))),
+            std::task::Poll::Ready(Some(Err(_))) => {
+                std::task::Poll::Ready(Some(Err(BodyReadError)))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// Collect one request body with the existing hard cap
+/// (`handlers::MAX_BODY_BYTES`, the single source of truth — no second
+/// size constant). Rules:
+/// - `declared_len` is the parsed `Content-Length` (`None` when absent
+///   or unparsable). `Some(len) if len > MAX` is `Oversized` and the
+///   stream is not polled at all.
+/// - `Bodyless` is `Complete(vec![])`; an empty stream is too when no
+///   positive length was declared (an explicitly sent empty body stays
+///   valid vault-test input).
+/// - `SetupFailed` is `TransportFailure`.
+/// - Any chunk `Err` is `TransportFailure`, however many valid bytes
+///   (even a complete valid JSON document) arrived before it. Partial
+///   bytes are dropped, never returned.
+/// - A stream that ends after fewer bytes than `declared_len` is
+///   `TransportFailure`: the runtime adapter maps a client abort to a
+///   clean end-of-stream below this seam, so the declared length is the
+///   only abort signal available here. With no declared length
+///   (chunked), such an abort is undetectable at this seam — a runtime
+///   limit, not a case this function can distinguish from a body that
+///   legitimately ends where it ends.
+/// - Buffering is bounded: once the cap would be exceeded the result is
+///   `Oversized` and collection stops pulling chunks.
+/// - `Poll::Pending` is awaited, never treated as end-of-body.
+pub async fn collect_body<S: BodyChunkStream>(
+    declared_len: Option<usize>,
+    source: BodySource<S>,
+) -> CollectedBody {
+    if declared_len.is_some_and(|len| len > handlers::MAX_BODY_BYTES) {
+        return CollectedBody::Oversized;
+    }
+    let mut stream = match source {
+        BodySource::Bodyless => return CollectedBody::Complete(Vec::new()),
+        BodySource::SetupFailed => return CollectedBody::TransportFailure,
+        BodySource::Stream(stream) => stream,
+    };
+    let mut body = Vec::new();
+    loop {
+        let next = std::future::poll_fn(|cx| stream.poll_next_chunk(cx)).await;
+        match next {
+            None => {
+                if declared_len.is_some_and(|len| body.len() < len) {
+                    return CollectedBody::TransportFailure;
+                }
+                return CollectedBody::Complete(body);
+            }
+            Some(Err(BodyReadError)) => return CollectedBody::TransportFailure,
+            Some(Ok(chunk)) => {
+                // `body.len() <= MAX` is invariant, so this never overflows
+                // and never buffers past the cap.
+                if chunk.len() > handlers::MAX_BODY_BYTES - body.len() {
+                    return CollectedBody::Oversized;
+                }
+                body.extend_from_slice(&chunk);
+            }
+        }
+    }
+}
+
+/// The dispatch gate. `Complete(bytes)` replaces `request.body` with
+/// exactly `bytes` and invokes `handler` once. `Oversized` and
+/// `TransportFailure` invoke NOTHING and answer the handlers' existing
+/// uniform pre-routing rejection (`handlers::invalid_request`: status
+/// 400, body `{"error":"invalid request"}`, no `set_cookie`), so the
+/// gate can never drift from it. The Worker entry passes a handler that
+/// calls `handlers::handle`, so a rejected body can cause no store,
+/// mailer, DNS, or dialer side effect.
+pub async fn dispatch_collected<F, Fut>(
+    collected: CollectedBody,
+    mut request: handlers::Request,
+    handler: F,
+) -> handlers::Response
+where
+    F: FnOnce(handlers::Request) -> Fut,
+    Fut: std::future::Future<Output = handlers::Response>,
+{
+    match collected {
+        CollectedBody::Complete(bytes) => {
+            request.body = bytes;
+            handler(request).await
+        }
+        CollectedBody::Oversized | CollectedBody::TransportFailure => handlers::invalid_request(),
+    }
 }
 
 /// Worker `fetch` entry: adapts the runtime request into the handlers'
@@ -998,40 +1522,34 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         console_log!("api worker misconfigured");
         return internal_render();
     };
-    // Bound the body read: an oversized declared length short-circuits
-    // into the handler's uniform size rejection without buffering it.
+    // Classify the body source from the actual runtime request, then
+    // collect through the tested seam: a legitimate bodyless request
+    // (`inner().body()` is `None`; `stream()` would error for it too) is
+    // dispatchable empty input, while a present body whose stream cannot
+    // be obtained — or whose chunks fail mid-read — is a transport
+    // failure that the gate below rejects before any handler runs. The
+    // declared length short-circuits oversized bodies and exposes a
+    // short read (the runtime adapter hides a client abort as a clean
+    // end-of-stream); chunked (length-less) oversized bodies stop
+    // buffering at the same cap, and a chunked abort the adapter hides
+    // is undetectable at this seam.
     let declared_len = req
         .headers()
         .get("content-length")
         .ok()
         .flatten()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    let body = if declared_len > handlers::MAX_BODY_BYTES {
-        vec![0u8; handlers::MAX_BODY_BYTES + 1]
+        .and_then(|v| v.parse::<usize>().ok());
+    let source = if req.inner().body().is_none() {
+        BodySource::Bodyless
     } else {
-        // Stream with a hard cap: a chunked (length-less) oversized body
-        // stops buffering one byte past the limit and the handler's
-        // uniform size rejection takes it from there.
-        let mut body = Vec::new();
-        if let Ok(mut stream) = req.stream() {
-            use futures_util::StreamExt;
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(chunk) => {
-                        let room = handlers::MAX_BODY_BYTES + 1
-                            - body.len().min(handlers::MAX_BODY_BYTES + 1);
-                        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
-                        if body.len() > handlers::MAX_BODY_BYTES {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
+        match req.stream() {
+            Ok(stream) => BodySource::Stream(WorkerBodyStream {
+                inner: Box::pin(stream),
+            }),
+            Err(_) => BodySource::SetupFailed,
         }
-        body
     };
+    let collected = collect_body(declared_len, source).await;
     let headers_map: HashMap<String, String> = req
         .headers()
         .entries()
@@ -1042,7 +1560,10 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         path: req.path(),
         cookie: headers_map.get("cookie").cloned(),
         origin: headers_map.get("origin").cloned(),
-        body,
+        authorization: headers_map.get("authorization").cloned(),
+        // Template only: the gate replaces this with the collected bytes
+        // on `Complete` and never dispatches it otherwise.
+        body: Vec::new(),
     };
     let ctx = handlers::Ctx {
         cfg: &config,
@@ -1054,12 +1575,12 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         dialer: &SocketDialer,
         dns: &DohDns,
         now: worker::Date::now().as_millis() / 1000,
-        source_ip: headers_map
-            .get("cf-connecting-ip")
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string()),
+        source_ip: client_source_ip(&headers_map),
     };
-    let response = handlers::handle(&ctx, &request).await;
+    let response = dispatch_collected(collected, request, |collected_request| async move {
+        handlers::handle(&ctx, &collected_request).await
+    })
+    .await;
     // Exact match only: the configured origin is the one frontend origin
     // this Worker trusts with credentialed cross-origin calls. The raw
     // request Origin goes into the tested `cors_headers` decision — never
@@ -1072,13 +1593,177 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     render(&response, &cors)
 }
 
+/// Client address for audit rows and rate-limit keys. Header data is not
+/// trusted: only a canonical IP literal survives, else `unknown`
+/// (`vault::sanitize_source_ip`). `headers` keys are lowercased.
+fn client_source_ip(headers: &HashMap<String, String>) -> String {
+    crate::vault::sanitize_source_ip(headers.get("cf-connecting-ip").map(String::as_str))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn client_source_ip_takes_only_a_clean_cf_connecting_ip() {
+        let headers = |value: Option<&str>| -> HashMap<String, String> {
+            value
+                .map(|v| ("cf-connecting-ip".to_string(), v.to_string()))
+                .into_iter()
+                .collect()
+        };
+        assert_eq!(
+            client_source_ip(&headers(Some("203.0.113.7"))),
+            "203.0.113.7"
+        );
+        assert_eq!(client_source_ip(&headers(None)), "unknown");
+        assert_eq!(
+            client_source_ip(&headers(Some("203.0.113.7\nINJECTED"))),
+            "unknown"
+        );
+        // Only the Cloudflare-set header counts, never a client-forgeable one.
+        let mut forged = HashMap::new();
+        forged.insert("x-forwarded-for".to_string(), "203.0.113.7".to_string());
+        assert_eq!(client_source_ip(&forged), "unknown");
+    }
+
     fn previous_43() -> String {
         // 32 bytes as unpadded base64url (43 chars), like the template.
         crate::b64::encode(&[7u8; 32])
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn assert_render_security_headers(response: &handlers::Response) {
+        let rendered = render(response, &[]).expect("response renders");
+        let headers = rendered.headers();
+        assert_eq!(rendered.status_code(), response.status);
+        assert_eq!(
+            headers
+                .get("content-type")
+                .expect("content-type header is readable")
+                .as_deref(),
+            Some("application/json; charset=utf-8")
+        );
+        assert_eq!(
+            headers
+                .get("content-security-policy")
+                .expect("CSP header is readable")
+                .as_deref(),
+            Some("default-src 'none'; frame-ancestors 'none'")
+        );
+        assert_eq!(
+            headers
+                .get("x-content-type-options")
+                .expect("nosniff header is readable")
+                .as_deref(),
+            Some("nosniff")
+        );
+        assert_eq!(
+            headers
+                .get("cache-control")
+                .expect("cache-control header is readable")
+                .as_deref(),
+            Some("no-store")
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn assert_render_security_headers(response: &handlers::Response) {
+        // wasm-bindgen Response accessors cannot run on native targets.
+        let headers = render_header_pairs(response, &[]);
+        assert!(headers.contains(&(
+            "content-security-policy",
+            "default-src 'none'; frame-ancestors 'none'".to_string()
+        )));
+        assert!(headers.contains(&("x-content-type-options", "nosniff".to_string())));
+        assert!(headers.contains(&("cache-control", "no-store".to_string())));
+    }
+
+    #[test]
+    fn render_adds_security_headers_to_successful_json() {
+        let response = handlers::Response {
+            status: 200,
+            body: r#"{"ok":true}"#.to_string(),
+            set_cookie: None,
+            retry_after: None,
+        };
+        let headers = render_header_pairs(&response, &[]);
+
+        assert!(headers.contains(&(
+            "content-type",
+            "application/json; charset=utf-8".to_string()
+        )));
+        assert_render_security_headers(&response);
+    }
+
+    #[test]
+    fn render_adds_security_headers_to_json_errors() {
+        let response = handlers::Response {
+            status: 400,
+            body: r#"{"error":"invalid request"}"#.to_string(),
+            set_cookie: None,
+            retry_after: None,
+        };
+
+        assert_render_security_headers(&response);
+    }
+
+    #[test]
+    fn render_preserves_empty_preflight_response() {
+        // OPTIONS preflight is an empty 204, not a JSON body. It shares
+        // render by design, so its response headers remain consistent too.
+        let response = handlers::Response {
+            status: 204,
+            body: String::new(),
+            set_cookie: None,
+            retry_after: None,
+        };
+        assert!(response.body.is_empty());
+        assert_render_security_headers(&response);
+    }
+
+    #[test]
+    fn render_includes_retry_after_only_when_set() {
+        let throttled = handlers::Response {
+            status: crate::rate_limit::RATE_LIMIT_STATUS,
+            body: r#"{"error":"rate_limited"}"#.to_string(),
+            set_cookie: None,
+            retry_after: Some(3600),
+        };
+        let headers = render_header_pairs(&throttled, &[]);
+        assert!(headers.contains(&(crate::rate_limit::RETRY_AFTER_HEADER, "3600".to_string())));
+        let plain = handlers::Response {
+            status: 200,
+            body: r#"{"ok":true}"#.to_string(),
+            set_cookie: None,
+            retry_after: None,
+        };
+        let headers = render_header_pairs(&plain, &[]);
+        assert!(!headers
+            .iter()
+            .any(|(name, _)| *name == crate::rate_limit::RETRY_AFTER_HEADER));
+    }
+
+    #[test]
+    fn hyperdrive_attestation_fails_closed_without_explicit_opt_in() {
+        // The Worker must not serve auth reads unless the operator
+        // attested a cache-disabled Hyperdrive config for that env.
+        assert!(hyperdrive_caching_disabled_attested(Some("1".to_string())));
+        assert!(hyperdrive_caching_disabled_attested(Some(
+            "true".to_string()
+        )));
+        assert!(hyperdrive_caching_disabled_attested(Some(
+            "TRUE".to_string()
+        )));
+        for raw in [
+            None,
+            Some(String::new()),
+            Some("0".to_string()),
+            Some("false".to_string()),
+            Some("yes".to_string()),
+        ] {
+            assert!(!hyperdrive_caching_disabled_attested(raw));
+        }
     }
 
     #[test]
@@ -1200,6 +1885,303 @@ mod tests {
             assert!(cors_headers(200, origin, cfg).is_empty(), "{origin:?}");
             assert!(cors_headers(204, origin, cfg).is_empty(), "{origin:?}");
         }
+    }
+
+    #[test]
+    fn rate_limit_overlay_maps_each_var_name_to_its_field() {
+        // The overlay is the only link between operator [vars] and the
+        // live budgets: a renamed or typo'd key must fail here, not
+        // silently revert operators to defaults.
+        use crate::rate_limit::RateLimitConfig;
+        let only = |name: &'static str, value: &'static str| {
+            rate_limits_from_lookup(|key| (key == name).then(|| value.to_string()))
+        };
+        let defaults = RateLimitConfig::default();
+        assert_eq!(rate_limits_from_lookup(|_| None), defaults);
+        assert_eq!(
+            only("AUTH_RATE_LIMIT_MAX", "3"),
+            RateLimitConfig {
+                auth_max_attempts: 3,
+                ..defaults
+            }
+        );
+        assert_eq!(
+            only("AUTH_RATE_LIMIT_WINDOW_SECS", "120"),
+            RateLimitConfig {
+                auth_window_secs: 120,
+                ..defaults
+            }
+        );
+        assert_eq!(
+            only("VAULT_TEST_RATE_LIMIT_MAX", "4"),
+            RateLimitConfig {
+                vault_test_max_attempts: 4,
+                // The unset IP cap scales at 5x the configured
+                // account cap (see `from_vars`), so it moves too.
+                vault_test_ip_max_attempts: 20,
+                ..defaults
+            }
+        );
+        assert_eq!(
+            only("VAULT_TEST_RATE_LIMIT_WINDOW_SECS", "90"),
+            RateLimitConfig {
+                vault_test_window_secs: 90,
+                ..defaults
+            }
+        );
+        assert_eq!(
+            only("VAULT_TEST_IP_RATE_LIMIT_MAX", "40"),
+            RateLimitConfig {
+                vault_test_ip_max_attempts: 40,
+                ..defaults
+            }
+        );
+        // Every name in the const list is one of the five pinned above:
+        // growing the list without a field pin fails this count.
+        assert_eq!(RATE_LIMIT_VAR_NAMES.len(), 5);
+    }
+
+    #[test]
+    fn config_from_env_applies_the_rate_limit_overlay() {
+        use crate::rate_limit::RateLimitConfig;
+        // Behavioral half: drive the exact fn `config_from_env` calls
+        // with a real Config and a stub lookup. Dropping the
+        // `with_rate_limits` call inside `apply_rate_limit_overlay`
+        // (or feeding it defaults) leaves `rate_limits` at the
+        // compiled defaults and fails here.
+        let base = Config::new(
+            "example.com",
+            "https://example.com",
+            b"test-session-secret-32-bytes-long!!".to_vec(),
+            [9u8; 32],
+            1,
+            3600,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(base.rate_limits, RateLimitConfig::default());
+        let overlaid = apply_rate_limit_overlay(base, |key| {
+            (key == "AUTH_RATE_LIMIT_MAX").then(|| "3".to_string())
+        });
+        assert_eq!(
+            overlaid.rate_limits,
+            RateLimitConfig {
+                auth_max_attempts: 3,
+                ..RateLimitConfig::default()
+            }
+        );
+        // Call-site half: `config_from_env` itself needs a wasm Env,
+        // so pin that it calls the overlay — but slice ONLY its body
+        // out of the pre-test source. Searching the whole file would
+        // match this test's own string literal and pass vacuously
+        // even with the call dropped.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let body = production
+            .split_once("fn config_from_env(")
+            .expect("config_from_env must exist")
+            .1
+            .split_once("\nfn ")
+            .expect("a following fn must bound the body")
+            .0;
+        assert!(
+            body.contains("apply_rate_limit_overlay(config"),
+            "config_from_env must apply the [vars] rate-limit overlay"
+        );
+        // Forbid the bare-config return outright: an early
+        // `Some(config)` above the overlay call would keep the
+        // substring in place while skipping the overlay.
+        assert!(
+            !body.contains("Some(config)"),
+            "config_from_env must not return the un-overlaid config"
+        );
+    }
+
+    #[test]
+    fn config_from_env_arms_qa_seam_only_behind_the_flag() {
+        // The staging-only code seam must never arm by default: slice ONLY
+        // the `config_from_env` body out of the pre-test source (so this
+        // test's own literals cannot satisfy the assertions) and require
+        // the explicit-flag gate plus both builder calls. Dropping the
+        // flag check — or staging the bearer unconditionally — fails here.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let body = production
+            .split_once("fn config_from_env(")
+            .expect("config_from_env must exist")
+            .1
+            .split_once("\nfn ")
+            .expect("a following fn must bound the body")
+            .0;
+        assert!(
+            body.contains("if truthy(\"QA_CODE_SEAM\")"),
+            "config_from_env must gate the seam behind the explicit staging flag"
+        );
+        assert!(
+            body.contains("with_qa_code_seam(true)"),
+            "config_from_env must arm the seam inside the flag gate"
+        );
+        assert!(
+            body.contains("with_qa_auth_token(") && body.contains("\"QA_AUTH_TOKEN\""),
+            "config_from_env must stage the QA bearer from the secret inside the flag gate"
+        );
+        assert!(
+            body.contains("trim().is_empty()"),
+            "config_from_env must reject whitespace-only QA bearer values"
+        );
+    }
+
+    #[test]
+    fn qa_outbox_statements_key_by_email() {
+        // `PgStore` QA methods only compile into the wasm Worker, so pin
+        // their statement text natively: the upsert must target the
+        // migration 0018 table with a per-mailbox conflict key (one
+        // latest-token row per synthetic mailbox), and retrieval must
+        // filter by that same mailbox — never a full-table read.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let fn_body = |name: &str| {
+            production
+                .split_once(name)
+                .unwrap_or_else(|| panic!("{name} must exist"))
+                .1
+                .split_once("\n    async fn ")
+                .expect("a following fn must bound the body")
+                .0
+        };
+        let record = fn_body("async fn record_qa_issued_code(");
+        assert!(
+            record.contains("INSERT INTO qa_issued_codes (email, token, issued_at)")
+                && record.contains("ON CONFLICT (email) DO UPDATE"),
+            "record_qa_issued_code must upsert one latest-token row per mailbox"
+        );
+        let lookup = fn_body("async fn qa_issued_code(");
+        assert!(
+            lookup.contains("SELECT token, issued_at FROM qa_issued_codes WHERE email = $1"),
+            "qa_issued_code must read exactly one mailbox row"
+        );
+    }
+
+    #[test]
+    fn insert_magic_prune_is_per_user_and_expired_only() {
+        // `PgStore::insert_magic` only compiles into the wasm Worker, so
+        // pin its statement text natively the same way the
+        // `config_from_env` test pins its call site: slice ONLY the fn
+        // body out of the pre-test source, so this test's own literals
+        // cannot satisfy the assertions. Keyed to `$5` (the new row's
+        // expiry) or missing either predicate, the prune would delete
+        // still-valid links or other users' rows and fail here.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let body = production
+            .split_once("async fn insert_magic(")
+            .expect("insert_magic must exist")
+            .1
+            .split_once("\n    async fn ")
+            .expect("a following fn must bound the body")
+            .0;
+        assert!(
+            body.contains("DELETE FROM magic_link_tokens WHERE user_id = $2 AND expires_at <= $4"),
+            "insert_magic must prune only the issuing user's expired rows"
+        );
+        // `$4` is only issued_at if the binds stay in column order:
+        // token_hash, user_id, email, issued_at, expires_at.
+        let bind_pos = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("insert_magic must bind {needle}"))
+        };
+        assert!(
+            bind_pos("&record.token_hash") < bind_pos("&record.user_id")
+                && bind_pos("&record.user_id") < bind_pos("&record.email")
+                && bind_pos("&record.email") < bind_pos("&i64_of(record.issued_at)?")
+                && bind_pos("&i64_of(record.issued_at)?") < bind_pos("&i64_of(record.expires_at)?"),
+            "insert_magic binds must keep issued_at as $4 and expires_at as $5"
+        );
+    }
+
+    #[test]
+    fn fenced_vault_statements_pin_the_owner_fence_and_zero_row_guard() {
+        // ADR 0002 rule 3: PUT /v1/vault is reachable today, and the vault
+        // upsert fence, its zero-row guard, and the test-lease fence are the
+        // only things stopping credential writes behind the deletion marker.
+        // Pin them the same way `insert_magic_prune_is_per_user_and_expired_only`
+        // pins its statement: slice ONLY each fn body out of the pre-test
+        // source, so this test's own literals cannot satisfy the assertions.
+        // Dropping `AND deleting_at IS NULL` from either statement, or the
+        // `affected == 0` guard from the upsert, must fail here.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let fn_body = |name: &str| {
+            production
+                .split_once(name)
+                .unwrap_or_else(|| panic!("{name} must exist"))
+                .1
+                .split_once("\n    async fn ")
+                .expect("a following fn must bound the body")
+                .0
+                .to_string()
+        };
+        const FENCE: &str = "FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence";
+        // Vault upsert: the fence, the owner binding, and the fail-closed guard.
+        let upsert = fn_body("async fn upsert_vault(");
+        assert!(
+            upsert.contains(FENCE),
+            "upsert_vault must select its row through the owner fence"
+        );
+        assert!(
+            !upsert.contains("WHERE id = $2"),
+            "upsert_vault fence binds the owner ($1), never a column value"
+        );
+        assert!(
+            upsert.contains("SELECT $1, $2"),
+            "upsert_vault must keep SELECT $1 bound to the owner id"
+        );
+        let guard = upsert
+            .find("if affected == 0")
+            .expect("upsert_vault must fail closed on 0 rows");
+        let ok = upsert
+            .find("Ok(())")
+            .expect("upsert_vault must return Ok on the write path");
+        assert!(
+            guard < ok,
+            "the zero-row guard must precede the success return"
+        );
+        // Test-connection lease: the same fence on the same owner parameter,
+        // denied (not granted) when the fence returns no row.
+        let lease = fn_body("async fn acquire_test_connection_lease(");
+        assert!(
+            lease.contains(FENCE),
+            "acquire_test_connection_lease must select its row through the owner fence"
+        );
+        assert!(
+            lease.contains("SELECT $1, $2, $3"),
+            "lease must keep SELECT $1 bound to the owner id"
+        );
+        assert!(
+            lease.contains("RETURNING slot"),
+            "lease must only succeed on a returned slot row"
+        );
+        assert!(
+            lease.contains("if !rows.is_empty()"),
+            "lease must deny when the fence returns no row"
+        );
     }
 
     #[test]

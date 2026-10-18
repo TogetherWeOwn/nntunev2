@@ -26,6 +26,8 @@ fn served_event(user: &str, track: &str, bytes: u64) -> MeterEvent {
         track_id: track.to_string(),
         bytes,
         seconds: stream_seconds_for_bytes(bytes),
+        lane: None,
+        backoff_ms: 0,
     }
 }
 

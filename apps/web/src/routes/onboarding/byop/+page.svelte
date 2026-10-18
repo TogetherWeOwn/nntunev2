@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { readSignedInEmail } from '#lib/signed-in-email.js';
+	import { serializePublicKeyCredential, toRequestOptions } from '#lib/webauthn.js';
 	import {
 		ApiClient,
 		ApiError,
@@ -45,6 +46,8 @@
 	let testDetail = $state('');
 	let reauthRequired = $state(false);
 	let reauthPasswordInput = $state<HTMLInputElement | null>(null);
+	let saveReauthRequired = $state(false);
+	let reauthState = $state<'idle' | 'working' | 'failed'>('idle');
 	let saveState = $state<'idle' | 'saving' | 'saved' | 'failed'>('idle');
 	let testedConfigKey = $state<string | null>(null);
 	let testRunId = 0;
@@ -79,6 +82,8 @@
 		testState = 'idle';
 		testDetail = '';
 		reauthRequired = false;
+		saveReauthRequired = false;
+		reauthState = 'idle';
 		saveState = 'idle';
 	}
 
@@ -136,6 +141,13 @@
 			}
 		} catch (error) {
 			if (runId !== testRunId || inputKey !== currentTestKey()) return;
+			if (error instanceof ApiError && error.paywall) {
+				// The global paywall owns the limit response; avoid a duplicate
+				// inline failure state beneath the modal.
+				testState = 'idle';
+				testDetail = '';
+				return;
+			}
 			testState = 'failed';
 			// Stale stored credential: inline re-auth prompt (S7), never a
 			// generic error page. The step-3 prompt renders its own password
@@ -159,6 +171,58 @@
 		}
 	}
 
+	async function reauthenticateAndSave() {
+		if (reauthState === 'working') return;
+		const inputKey = currentTestKey();
+		if (testState !== 'ok' || testedConfigKey !== inputKey) return;
+		if (typeof PublicKeyCredential === 'undefined') {
+			reauthState = 'failed';
+			return;
+		}
+		reauthState = 'working';
+		try {
+			const options = await client.reauthenticateStart();
+			const assertion = await navigator.credentials.get({
+				publicKey: toRequestOptions({
+					challenge: options.challenge,
+					rpId: options.rp_id,
+					allowCredentials: []
+				})
+			});
+			if (!(assertion instanceof PublicKeyCredential)) throw new Error('no public-key credential');
+			const serialized = serializePublicKeyCredential(assertion);
+			const response = serialized.response as Record<string, unknown>;
+			const authenticatorData = response.authenticatorData;
+			const clientDataJson = response.clientDataJSON;
+			const signature = response.signature;
+			if (
+				typeof authenticatorData !== 'string' ||
+				typeof clientDataJson !== 'string' ||
+				typeof signature !== 'string' ||
+				typeof serialized.id !== 'string'
+			) {
+				throw new Error('credential missing assertion fields');
+			}
+			await client.reauthenticateFinish({
+				challenge: options.challenge,
+				credentialId: serialized.id,
+				authenticatorData,
+				clientDataJson,
+				signature
+			});
+			if (currentTestKey() !== inputKey || testedConfigKey !== inputKey) {
+				throw new Error('provider configuration changed after testing');
+			}
+		} catch {
+			reauthState = 'failed';
+			return;
+		}
+
+		// Reuse the normal save path so the in-flight state, tested-input guard,
+		// and paywall/error handling stay identical after reauthentication.
+		await save();
+	}
+
 	async function save() {
 		const input = currentTestInput();
 		const inputKey = JSON.stringify(input);
@@ -168,6 +232,8 @@
 		}
 
 		const runId = testRunId;
+		saveReauthRequired = false;
+		reauthState = 'idle';
 		saveState = 'saving';
 		try {
 			await client.saveProviderConfig(input);
@@ -175,8 +241,14 @@
 				saveState = 'saved';
 				window.location.href = '/library';
 			}
-		} catch {
-			if (runId === testRunId && inputKey === currentTestKey()) saveState = 'failed';
+		} catch (error) {
+			if (runId !== testRunId || inputKey !== currentTestKey()) return;
+			if (error instanceof ApiError && error.paywall) {
+				saveState = 'idle';
+				return;
+			}
+			saveReauthRequired = error instanceof ApiError && error.code === 'reauth_required';
+			saveState = 'failed';
 		}
 	}
 </script>
@@ -285,7 +357,7 @@
 				class="nt-button nt-button--ghost"
 				type="button"
 				onclick={() => backTo(2)}
-				disabled={saveState === 'saving'}
+				disabled={saveState === 'saving' || reauthState === 'working'}
 			>
 				Back
 			</button>
@@ -305,7 +377,7 @@
 					type="button"
 					onclick={save}
 						data-testid="byop-save"
-					disabled={saveState === 'saving' || saveState === 'saved'}
+					disabled={saveState === 'saving' || saveState === 'saved' || reauthState === 'working'}
 				>
 					{saveState === 'saved'
 						? 'Saved'
@@ -347,6 +419,21 @@
 			{/if}
 			{#if saveState === 'saved'}
 				<p role="status">Saved. Your credentials are sealed in the encrypted vault.</p>
+			{:else if saveState === 'failed' && saveReauthRequired}
+				<div role="alert">
+					<p>Your session is too old to save provider details. Reauthenticate with your passkey to continue.</p>
+					<button
+						class="nt-button"
+						type="button"
+						onclick={reauthenticateAndSave}
+						disabled={reauthState === 'working'}
+					>
+						{reauthState === 'working' ? 'Verifying…' : 'Reauthenticate and save'}
+					</button>
+					{#if reauthState === 'failed'}
+						<p role="status">Reauthentication failed. <a href="/login">Sign in again</a> to continue.</p>
+					{/if}
+				</div>
 			{:else if saveState === 'failed'}
 				<p role="alert">Could not save. Your details were not stored — try again.</p>
 			{/if}

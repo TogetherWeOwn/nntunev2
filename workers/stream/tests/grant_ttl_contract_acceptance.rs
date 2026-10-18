@@ -136,6 +136,7 @@ fn play_path_reports_over_cap_grants_as_unauthorized_ttl_too_long() {
     let mut cache = ContentCache::new();
     let mut meter = MemoryMeter::default();
     let input = PlayInput {
+        trace_id: None,
         token: &token,
         track_id: "track-9",
         range: None,
@@ -144,6 +145,7 @@ fn play_path_reports_over_cap_grants_as_unauthorized_ttl_too_long() {
         cipher_key: 0,
         now_unix: NOW,
         up_next: None,
+        segment_ranges: None,
     };
     assert!(matches!(
         play(&mut pool, &mut cache, &mut meter, SECRET, &input),

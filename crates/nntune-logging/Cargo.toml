@@ -1,0 +1,14 @@
+[package]
+name = "nntune-logging"
+version = "0.1.0"
+edition = "2021"
+description = "Structured worker log emitter and trace-ID propagation per docs/logging-standard.md (native + wasm32)"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# wasm32-unknown-unknown has no OS RNG: the `js` feature routes getrandom
+# through Web Crypto on wasm targets (native builds unaffected). Same pattern
+# as workers/api.
+getrandom = { version = "0.2", features = ["js"] }

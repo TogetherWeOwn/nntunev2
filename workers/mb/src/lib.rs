@@ -1,25 +1,35 @@
 //! NNTune v2 MusicBrainz mirror read API.
 //!
 //! Routes (all JSON, all read-only):
+//! - `GET /healthz` — unauthenticated Worker health check; no bindings.
 //! - `GET /v1/mb/artist/:mbid` — artist lookup by MBID.
 //! - `GET /v1/mb/release/:mbid` — release lookup by MBID.
 //! - `GET /v1/mb/recording/:mbid` — recording lookup by MBID.
+//! - `GET /v1/mb/release/:mbid/recordings` — a release's recordings, in
+//!   track order.
 //! - `GET /v1/mb/search?q=&type=artist|release|recording` — trigram search.
 //!
 //! Data comes from PlanetScale Postgres (`nntunev2-mb`) via the Hyperdrive
 //! binding `MB_DB`; successful responses are cached in KV (`MB_CACHE`) and
 //! at the edge via the Cache API / `Cache-Control`. Failures (400/404/500)
 //! are `no-store` and are never written to either cache. Interactive reads
-//! never call musicbrainz.org. Cover art bytes live in the per-environment
-//! R2 art buckets (`nntunev2-art-staging` / `nntunev2-art-prod`); this
-//! worker serves cacheable URLs, never secrets. See `README.md` and
+//! never call musicbrainz.org. Cover art bytes are intended for the
+//! per-environment R2 buckets (`nntunev2-art-staging` / `nntunev2-art-prod`,
+//! see `docs/ops.md`). Public release URLs are deferred until bucket
+//! bindings and public hosts are activated. See `README.md` and
 //! `migrations/0001_mb_mirror.sql`.
 //!
 //! Structure: [`handle_lookup`] / [`handle_search`] are the testable core
 //! over the [`MbRepo`] and [`SuccessCache`] traits. The HTTP layer at the bottom wires them to a per-request
 //! `tokio-postgres` client over the Hyperdrive socket and to the KV binding.
 
+use nntune_logging::{Level, LogRecord, Worker as LogWorker};
 use serde::Serialize;
+
+mod api_error;
+use api_error::ApiError;
+
+pub mod replication;
 
 /// Cache TTLs: lookups are immutable-ish (long TTL), search is short TTL.
 /// They apply to successful responses only; failures serve `no-store`.
@@ -30,12 +40,49 @@ const SEARCH_CACHE_TTL_S: u32 = 300;
 /// truncation in [`handle_search`]).
 const SEARCH_LIMIT: usize = 25;
 
+/// A release's recordings listing returns at most this many rows (SQL
+/// `LIMIT` and a defensive truncation in [`handle_release_recordings`]).
+/// Sized for box sets while keeping one response bounded; the ingest
+/// library write accepts up to 10k recording MBIDs, so this cap is the
+/// tighter of the two.
+const RELEASE_RECORDINGS_LIMIT: usize = 1000;
+
 /// Upper bound on `q` length, in chars. Bounds trigram work and KV keys.
 const MAX_QUERY_CHARS: usize = 100;
 
 /// Hyperdrive / KV binding names: must match `wrangler.toml.example`.
 const MB_DB_BINDING: &str = "MB_DB";
 const MB_CACHE_BINDING: &str = "MB_CACHE";
+
+/// R2 cover-art buckets per `docs/ops.md` ("R2 buckets", "Environments
+/// matrix"): one bucket per concern per environment. There is no shared
+/// unsuffixed art bucket; always use one of the two names below.
+pub const ART_BUCKET_STAGING: &str = "nntunev2-art-staging";
+pub const ART_BUCKET_PROD: &str = "nntunev2-art-prod";
+
+/// Resolve the cover-art bucket for an environment name: `"staging"` maps
+/// to the staging bucket; `"prod"` and `"production"` (the wrangler env
+/// name) map to the prod bucket. Anything else (including empty) resolves
+/// to `None` so a missing or mistyped env can never silently target prod
+/// art. Release responses do not use this mapping until a public host is
+/// configured.
+pub fn art_bucket_for_env(env: &str) -> Option<&'static str> {
+    match env {
+        "staging" => Some(ART_BUCKET_STAGING),
+        "prod" | "production" => Some(ART_BUCKET_PROD),
+        _ => None,
+    }
+}
+
+/// Build an internal object URI for an art key (for example
+/// `art/ab/cd/<sha>-500`, ADR 0003) in the given bucket. This `r2://` URI
+/// is not a public HTTP URL and must not be sent to clients. This helper is
+/// not used by runtime response handling; release reads pass the stored
+/// `caa_url` through unchanged until a custom domain or r2.dev host is configured.
+pub fn caa_url_for_art(bucket: &str, key: &str) -> String {
+    let key = key.trim_start_matches('/');
+    format!("r2://{bucket}/{key}")
+}
 
 /// Entity selector. The only route into SQL: each variant maps to a
 /// static, parameterized statement (see [`lookup_sql`]/[`search_sql`]), so
@@ -86,30 +133,63 @@ fn lookup_sql(kind: Kind) -> &'static str {
              FROM mb_release WHERE mbid = $1::text::uuid"
         }
         Kind::Recording => {
+            // A bare recording lookup has no release context, so it has
+            // no medium: NULL keeps the shared row shape (the canonical
+            // mb_recording row stores neither medium nor a complete
+            // release list; mb_track does).
             "SELECT mbid::text AS mbid, release_mbid::text AS release_mbid, title, \
-             track_no, duration_ms \
+             track_no, duration_ms, NULL::smallint AS medium_no \
              FROM mb_recording WHERE mbid = $1::text::uuid"
         }
     }
 }
 
+/// Existence probe for a release MBID. The recordings listing must tell
+/// "no such release" (404) apart from "release with no recordings yet"
+/// (200, empty list), which the recordings query alone cannot.
+const RELEASE_EXISTS_SQL: &str = "SELECT 1 FROM mb_release WHERE mbid = $1::text::uuid";
+
+/// Recordings of one release, in album order with a deterministic
+/// tiebreak and a hard limit. Listed from `mb_track` (migration 0016),
+/// not from `mb_recording.release_mbid`: the mirror keeps only one
+/// canonical release per recording there, so a reissue or compilation
+/// would silently miss its shared tracks, and `mb_recording.track_no`
+/// is the position within one medium, which interleaves the discs of
+/// a multi-medium release. `mb_track` holds every track appearance
+/// with its medium position, so ordering by (medium_no, track_no) is
+/// true album order. Both positions are NOT NULL in `mb_track`.
+const RELEASE_RECORDINGS_SQL: &str =
+    "SELECT r.mbid::text AS mbid, t.release_mbid::text AS release_mbid, r.title, \
+     t.track_no AS track_no, r.duration_ms, t.medium_no AS medium_no \
+     FROM mb_track t JOIN mb_recording r ON r.mbid = t.recording_mbid \
+     WHERE t.release_mbid = $1::text::uuid \
+     ORDER BY t.medium_no ASC, t.track_no ASC, r.mbid ASC LIMIT 1000";
+
 /// Trigram search statement per kind. `$1` is the normalized query; `%` is
 /// the `pg_trgm` similarity predicate (GIN index in migration 0001),
 /// ordered by score with a deterministic tiebreak and a hard limit.
+/// Release hits also carry the release's artist (`artist_mbid` /
+/// `artist_name`, NULL when the release has none) so callers can verify
+/// an "Artist - Album" query against the artist instead of trusting a
+/// title-only score; other kinds select NULLs for the same columns.
 fn search_sql(kind: Kind) -> &'static str {
     match kind {
         Kind::Artist => {
-            "SELECT mbid::text AS mbid, name AS label, similarity(name, $1) AS score \
+            "SELECT mbid::text AS mbid, name AS label, similarity(name, $1) AS score, \
+             NULL::text AS artist_mbid, NULL::text AS artist_name \
              FROM mb_artist WHERE name % $1 \
              ORDER BY score DESC, label ASC, mbid ASC LIMIT 25"
         }
         Kind::Release => {
-            "SELECT mbid::text AS mbid, title AS label, similarity(title, $1) AS score \
-             FROM mb_release WHERE title % $1 \
-             ORDER BY score DESC, label ASC, mbid ASC LIMIT 25"
+            "SELECT r.mbid::text AS mbid, r.title AS label, similarity(r.title, $1) AS score, \
+             r.artist_mbid::text AS artist_mbid, a.name AS artist_name \
+             FROM mb_release r LEFT JOIN mb_artist a ON a.mbid = r.artist_mbid \
+             WHERE r.title % $1 \
+             ORDER BY score DESC, label ASC, r.mbid ASC LIMIT 25"
         }
         Kind::Recording => {
-            "SELECT mbid::text AS mbid, title AS label, similarity(title, $1) AS score \
+            "SELECT mbid::text AS mbid, title AS label, similarity(title, $1) AS score, \
+             NULL::text AS artist_mbid, NULL::text AS artist_name \
              FROM mb_recording WHERE title % $1 \
              ORDER BY score DESC, label ASC, mbid ASC LIMIT 25"
         }
@@ -155,6 +235,12 @@ fn lookup_cache_key(kind: Kind, mbid: &str) -> String {
     format!("mb:lookup:{}:{}", kind.as_str(), mbid.to_lowercase())
 }
 
+/// Stable KV key for a release-recordings success:
+/// `mb:release-recordings:<release mbid>`.
+fn release_recordings_cache_key(release_mbid: &str) -> String {
+    format!("mb:release-recordings:{}", release_mbid.to_lowercase())
+}
+
 /// Stable KV key for a search success: `mb:search:<kind>:<normalized q>`.
 fn search_cache_key(kind: Kind, raw_q: &str) -> String {
     format!("mb:search:{}:{}", kind.as_str(), normalize_query(raw_q))
@@ -194,6 +280,10 @@ struct Recording {
     title: String,
     track_no: Option<i16>,
     duration_ms: Option<i32>,
+    /// Medium (disc) position within the release, from `mb_track`.
+    /// Only the release-recordings listing sets it; a bare recording
+    /// lookup answers `null`.
+    medium_no: Option<i16>,
 }
 
 /// One lookup row, tagged by [`Kind`] again at serialization time so the
@@ -228,6 +318,9 @@ struct SearchHit {
     mbid: String,
     label: String,
     score: f32,
+    /// Release hits only: the release's artist, when it has one.
+    artist_mbid: Option<String>,
+    artist_name: Option<String>,
 }
 
 impl SearchHit {
@@ -238,11 +331,26 @@ impl SearchHit {
             Kind::Artist => "name",
             Kind::Release | Kind::Recording => "title",
         };
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "mbid": self.mbid,
             label_key: self.label,
             "score": self.score,
-        })
+        });
+        // Release hits always carry the artist keys (null when the
+        // release has no artist) so consumers can require them.
+        if kind == Kind::Release {
+            if let serde_json::Value::Object(map) = &mut value {
+                map.insert(
+                    "artist_mbid".to_string(),
+                    serde_json::json!(self.artist_mbid),
+                );
+                map.insert(
+                    "artist_name".to_string(),
+                    serde_json::json!(self.artist_name),
+                );
+            }
+        }
+        value
     }
 }
 
@@ -257,6 +365,13 @@ struct RepoError;
 trait MbRepo {
     async fn lookup(&self, kind: Kind, mbid: &str) -> Result<Option<Entity>, RepoError>;
     async fn search(&self, kind: Kind, normalized_q: &str) -> Result<Vec<SearchHit>, RepoError>;
+    /// Recordings of one release in album order (medium, then track).
+    /// `None` means the release itself does not exist; `Some(empty)`
+    /// is a release with no recordings in the mirror yet.
+    async fn release_recordings(
+        &self,
+        release_mbid: &str,
+    ) -> Result<Option<Vec<Recording>>, RepoError>;
 }
 
 /// Success-only response cache (KV in production). Deliberately
@@ -277,11 +392,10 @@ struct ApiResponse {
     cache_ttl: Option<u32>,
 }
 
-fn error_response(message: &str, status: u16) -> ApiResponse {
-    let body = serde_json::json!({ "error": message }).to_string();
+fn error_response(err: ApiError) -> ApiResponse {
     ApiResponse {
-        status,
-        body,
+        status: err.status,
+        body: err.body_json(),
         cache_ttl: None,
     }
 }
@@ -294,6 +408,42 @@ fn success_response(body: String, ttl_s: u32) -> ApiResponse {
     }
 }
 
+fn health_response() -> http::Response<Vec<u8>> {
+    http::Response::builder()
+        .status(http::StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .body(r#"{"ok":true}"#.as_bytes().to_vec())
+        .expect("static health response is valid")
+}
+
+struct HealthResponseParts {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+fn health_response_parts() -> HealthResponseParts {
+    let response = health_response();
+    HealthResponseParts {
+        status: response.status().as_u16(),
+        headers: response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value
+                        .to_str()
+                        .expect("static health header is valid")
+                        .to_owned(),
+                )
+            })
+            .collect(),
+        body: response.into_body(),
+    }
+}
+
 /// Lookup core: validate → KV → DB. Only a found row is written to the
 /// cache; missing rows (404) and read failures (500) never are.
 async fn handle_lookup<R: MbRepo, C: SuccessCache>(
@@ -303,7 +453,7 @@ async fn handle_lookup<R: MbRepo, C: SuccessCache>(
     mbid: &str,
 ) -> ApiResponse {
     if !is_valid_mbid(mbid) {
-        return error_response("invalid mbid (must be UUID)", 400);
+        return error_response(ApiError::invalid_request("invalid mbid (must be UUID)"));
     }
     let key = lookup_cache_key(kind, mbid);
     if let Some(body) = cache.get(&key).await {
@@ -315,8 +465,41 @@ async fn handle_lookup<R: MbRepo, C: SuccessCache>(
             cache.put(&key, &body, LOOKUP_CACHE_TTL_S).await;
             success_response(body, LOOKUP_CACHE_TTL_S)
         }
-        Ok(None) => error_response("not found", 404),
-        Err(_) => error_response("internal error", 500),
+        Ok(None) => error_response(ApiError::not_found("not found")),
+        Err(_) => error_response(ApiError::internal_error()),
+    }
+}
+
+/// Release-recordings core: validate → KV → DB. A listing for an
+/// existing release (including an empty one) is a cacheable success at
+/// the lookup TTL; a missing release is a 404 and a read failure a 500,
+/// neither cached.
+async fn handle_release_recordings<R: MbRepo, C: SuccessCache>(
+    repo: &R,
+    cache: &C,
+    release_mbid: &str,
+) -> ApiResponse {
+    if !is_valid_mbid(release_mbid) {
+        return error_response(ApiError::invalid_request("invalid mbid (must be UUID)"));
+    }
+    let key = release_recordings_cache_key(release_mbid);
+    if let Some(body) = cache.get(&key).await {
+        return success_response(body, LOOKUP_CACHE_TTL_S);
+    }
+    let release_mbid = release_mbid.to_lowercase();
+    match repo.release_recordings(&release_mbid).await {
+        Ok(Some(mut recordings)) => {
+            recordings.truncate(RELEASE_RECORDINGS_LIMIT);
+            let body = serde_json::json!({
+                "release_mbid": release_mbid,
+                "recordings": recordings,
+            })
+            .to_string();
+            cache.put(&key, &body, LOOKUP_CACHE_TTL_S).await;
+            success_response(body, LOOKUP_CACHE_TTL_S)
+        }
+        Ok(None) => error_response(ApiError::not_found("not found")),
+        Err(_) => error_response(ApiError::internal_error()),
     }
 }
 
@@ -332,17 +515,23 @@ async fn handle_search<R: MbRepo, C: SuccessCache>(
     let q = raw_q.trim();
     let q_chars = q.chars().count();
     if q_chars < 2 {
-        return error_response("query too short (min 2 chars)", 400);
+        return error_response(ApiError::invalid_request("query too short (min 2 chars)"));
     }
     if q_chars > MAX_QUERY_CHARS {
-        return error_response("query too long (max 100 chars)", 400);
+        return error_response(ApiError::invalid_request("query too long (max 100 chars)"));
     }
     if q.chars().any(char::is_control) {
-        return error_response("query contains control characters", 400);
+        return error_response(ApiError::invalid_request(
+            "query contains control characters",
+        ));
     }
     let kind = match Kind::parse(raw_kind) {
         Some(kind) => kind,
-        None => return error_response("type must be one of artist|release|recording", 400),
+        None => {
+            return error_response(ApiError::invalid_request(
+                "type must be one of artist|release|recording",
+            ))
+        }
     };
     let key = search_cache_key(kind, q);
     if let Some(body) = cache.get(&key).await {
@@ -366,7 +555,7 @@ async fn handle_search<R: MbRepo, C: SuccessCache>(
             cache.put(&key, &body, SEARCH_CACHE_TTL_S).await;
             success_response(body, SEARCH_CACHE_TTL_S)
         }
-        Err(_) => error_response("internal error", 500),
+        Err(_) => error_response(ApiError::internal_error()),
     }
 }
 
@@ -379,6 +568,57 @@ mod http_layer {
         console_log, Cache, Env, Headers, Request, Response, ResponseBody, Result as WorkerResult,
         RouteContext,
     };
+
+    /// Resolve the request trace from the inbound `x-trace-id` header: a
+    /// valid 128-bit ID is kept, anything else is replaced with a fresh
+    /// random ID. The invalid value is never logged.
+    fn inbound_trace_id(req: &Request) -> String {
+        let header = req
+            .headers()
+            .get(nntune_logging::TRACE_HEADER)
+            .ok()
+            .flatten();
+        nntune_logging::resolve_trace_id(header.as_deref())
+    }
+
+    /// Emit one structured log line for this request
+    /// (`docs/logging-standard.md`). Field validation runs at construction:
+    /// a banned key or secret-like value drops the line instead of leaking
+    /// it. All call-site fields are constants plus opaque kinds and status
+    /// codes, so the drop branch only fires on a code bug.
+    fn emit(level: Level, trace_id: &str, event: &str, fields: serde_json::Value) {
+        let ts_millis = worker::Date::now().as_millis();
+        let Ok(field_map) = nntune_logging::fields_from_json(fields) else {
+            return;
+        };
+        let Ok(record) =
+            LogRecord::new(LogWorker::Mb, level, trace_id, event, field_map, ts_millis)
+        else {
+            return;
+        };
+        console_log!("{}", record.to_json_line());
+    }
+
+    /// Outcome severity: successes are info, client errors warn, server
+    /// errors are errors — so the trace stream stays signal, not noise.
+    pub(crate) fn outcome_level(status: u16) -> Level {
+        match status {
+            200 => Level::Info,
+            400 | 404 => Level::Warn,
+            _ => Level::Error,
+        }
+    }
+
+    /// Echo the request trace on a live response so callers can correlate.
+    /// The edge-cache copy stays untraced: a cached trace would replay one
+    /// request's ID to later clients. Best-effort: a header failure must not
+    /// fail the request itself.
+    fn with_trace(mut response: Response, trace_id: &str) -> Response {
+        let _ = response
+            .headers_mut()
+            .append(nntune_logging::TRACE_HEADER, trace_id);
+        response
+    }
 
     /// KV-backed [`SuccessCache`]; degrades to no-op when the binding is
     /// absent so a misconfigured cache never blocks DB reads.
@@ -417,9 +657,11 @@ mod http_layer {
 
     /// [`MbRepo`] over Hyperdrive. Lazy: the Postgres connection is opened
     /// per query (Hyperdrive pools underneath), so a KV/edge cache hit
-    /// never connects.
+    /// never connects. Carries the request trace so the detached
+    /// connection-error log still correlates.
     struct PgRepo {
         env: Env,
+        trace_id: String,
     }
 
     impl PgRepo {
@@ -437,11 +679,17 @@ mod http_layer {
                 .connect_raw(socket, worker::postgres_tls::PassthroughTls)
                 .await
                 .map_err(|_| RepoError)?;
+            let trace_id = self.trace_id.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 // Detail stays out of logs: driver errors can carry
                 // host/role strings that are not needed to triage.
                 if connection.await.is_err() {
-                    console_log!("mb db connection error");
+                    emit(
+                        Level::Error,
+                        &trace_id,
+                        "mb.db.connect_failed",
+                        serde_json::json!({"stage": "connect"}),
+                    );
                 }
             });
             Ok(client)
@@ -470,6 +718,29 @@ mod http_layer {
                 .map_err(|_| RepoError)?;
             rows.iter().map(hit_from_row).collect()
         }
+
+        async fn release_recordings(
+            &self,
+            release_mbid: &str,
+        ) -> Result<Option<Vec<Recording>>, RepoError> {
+            let client = self.connect().await?;
+            let exists = client
+                .query_opt(RELEASE_EXISTS_SQL, &[&release_mbid])
+                .await
+                .map_err(|_| RepoError)?;
+            if exists.is_none() {
+                return Ok(None);
+            }
+            let rows = client
+                .query(RELEASE_RECORDINGS_SQL, &[&release_mbid])
+                .await
+                .map_err(|_| RepoError)?;
+            let recordings = rows
+                .iter()
+                .map(recording_from_row)
+                .collect::<Result<_, _>>()?;
+            Ok(Some(recordings))
+        }
     }
 
     fn entity_from_row(kind: Kind, row: &tokio_postgres::Row) -> Result<Entity, RepoError> {
@@ -491,15 +762,20 @@ mod http_layer {
                 year: row.try_get("year").map_err(|_| RepoError)?,
                 caa_url: row.try_get("caa_url").map_err(|_| RepoError)?,
             }),
-            Kind::Recording => Entity::Recording(Recording {
-                mbid: row.try_get("mbid").map_err(|_| RepoError)?,
-                release_mbid: row.try_get("release_mbid").map_err(|_| RepoError)?,
-                title: row.try_get("title").map_err(|_| RepoError)?,
-                track_no: row.try_get("track_no").map_err(|_| RepoError)?,
-                duration_ms: row.try_get("duration_ms").map_err(|_| RepoError)?,
-            }),
+            Kind::Recording => Entity::Recording(recording_from_row(row)?),
         };
         Ok(entity)
+    }
+
+    fn recording_from_row(row: &tokio_postgres::Row) -> Result<Recording, RepoError> {
+        Ok(Recording {
+            mbid: row.try_get("mbid").map_err(|_| RepoError)?,
+            release_mbid: row.try_get("release_mbid").map_err(|_| RepoError)?,
+            title: row.try_get("title").map_err(|_| RepoError)?,
+            track_no: row.try_get("track_no").map_err(|_| RepoError)?,
+            duration_ms: row.try_get("duration_ms").map_err(|_| RepoError)?,
+            medium_no: row.try_get("medium_no").map_err(|_| RepoError)?,
+        })
     }
 
     fn hit_from_row(row: &tokio_postgres::Row) -> Result<SearchHit, RepoError> {
@@ -507,6 +783,8 @@ mod http_layer {
             mbid: row.try_get("mbid").map_err(|_| RepoError)?,
             label: row.try_get("label").map_err(|_| RepoError)?,
             score: row.try_get("score").map_err(|_| RepoError)?,
+            artist_mbid: row.try_get("artist_mbid").map_err(|_| RepoError)?,
+            artist_name: row.try_get("artist_name").map_err(|_| RepoError)?,
         })
     }
 
@@ -529,9 +807,10 @@ mod http_layer {
     }
 
     /// Render a core result and, for successes only, store a copy in
-    /// the edge Cache API keyed by the request URL.
-    async fn serve(req_url: String, api: ApiResponse) -> WorkerResult<Response> {
-        let response = render(&api)?;
+    /// the edge Cache API keyed by the request URL. Only the served copy
+    /// carries the `x-trace-id` echo (see [`with_trace`]).
+    async fn serve(req_url: String, api: ApiResponse, trace_id: &str) -> WorkerResult<Response> {
+        let response = with_trace(render(&api)?, trace_id);
         if api.cache_ttl.is_some() {
             let edge_copy = render(&api)?;
             // Best-effort: an edge-cache failure must not fail the read.
@@ -550,27 +829,111 @@ mod http_layer {
         req: &Request,
         ctx: &RouteContext<()>,
     ) -> WorkerResult<Response> {
+        // Resolve before the edge lookup: cache hits are the hot path, and
+        // they still echo the trace and log one line. The cached copy itself
+        // stays untraced (wrapping only mutates the served clone).
+        let trace_id = inbound_trace_id(req);
         if let Some(hit) = edge_hit(req).await {
-            return Ok(hit);
+            emit(
+                Level::Info,
+                &trace_id,
+                "mb.lookup.completed",
+                serde_json::json!({"kind": kind.as_str(), "status_code": 200, "cache": "edge"}),
+            );
+            return Ok(with_trace(hit, &trace_id));
         }
         let mbid = ctx.param("mbid").map(String::as_str).unwrap_or("");
         let repo = PgRepo {
             env: ctx.env.clone(),
+            trace_id: trace_id.clone(),
         };
         let cache = EdgeCache::from_env(&ctx.env);
         let api = handle_lookup(&repo, &cache, kind, mbid).await;
-        serve(req.url()?.to_string(), api).await
+        // Entity fields never log (names/titles are personal data); the line
+        // carries the entity kind plus the outcome status only.
+        emit(
+            outcome_level(api.status),
+            &trace_id,
+            "mb.lookup.completed",
+            serde_json::json!({"kind": kind.as_str(), "status_code": api.status}),
+        );
+        serve(req.url()?.to_string(), api, &trace_id).await
+    }
+
+    pub async fn release_recordings_route(
+        req: &Request,
+        ctx: &RouteContext<()>,
+    ) -> WorkerResult<Response> {
+        // Same trace contract as the other routes: resolve before the edge
+        // lookup so cache hits still echo the trace and log one line.
+        let trace_id = inbound_trace_id(req);
+        if let Some(hit) = edge_hit(req).await {
+            emit(
+                Level::Info,
+                &trace_id,
+                "mb.release_recordings.completed",
+                serde_json::json!({"status_code": 200, "cache": "edge"}),
+            );
+            return Ok(with_trace(hit, &trace_id));
+        }
+        let mbid = ctx.param("mbid").map(String::as_str).unwrap_or("");
+        let repo = PgRepo {
+            env: ctx.env.clone(),
+            trace_id: trace_id.clone(),
+        };
+        let cache = EdgeCache::from_env(&ctx.env);
+        let api = handle_release_recordings(&repo, &cache, mbid).await;
+        // The mbid is an opaque UUID, but the line stays minimal (kind plus
+        // outcome status) like the sibling routes.
+        emit(
+            outcome_level(api.status),
+            &trace_id,
+            "mb.release_recordings.completed",
+            serde_json::json!({"status_code": api.status}),
+        );
+        serve(req.url()?.to_string(), api, &trace_id).await
+    }
+
+    pub fn healthz_route() -> WorkerResult<Response> {
+        let health = health_response_parts();
+        let headers = Headers::new();
+        for (name, value) in health.headers {
+            headers.append(&name, &value)?;
+        }
+        Ok(Response::from_body(ResponseBody::Body(health.body))?
+            .with_status(health.status)
+            .with_headers(headers))
     }
 
     pub async fn search_route(req: &Request, ctx: &RouteContext<()>) -> WorkerResult<Response> {
+        let trace_id = inbound_trace_id(req);
+        // Parsed-or-unknown: the raw `type` query value is untrusted input
+        // and never reaches a log line verbatim.
+        let kind_label = |query: &std::collections::HashMap<String, String>| {
+            query
+                .get("type")
+                .and_then(|raw| Kind::parse(Some(raw.clone())))
+                .map(|kind| kind.as_str())
+                .unwrap_or("unknown")
+        };
         if let Some(hit) = edge_hit(req).await {
-            return Ok(hit);
+            let url = req.url()?;
+            let query: std::collections::HashMap<String, String> =
+                url.query_pairs().into_owned().collect();
+            emit(
+                Level::Info,
+                &trace_id,
+                "mb.search.completed",
+                serde_json::json!({"kind": kind_label(&query), "status_code": 200, "cache": "edge"}),
+            );
+            return Ok(with_trace(hit, &trace_id));
         }
         let url = req.url()?;
         let query: std::collections::HashMap<String, String> =
             url.query_pairs().into_owned().collect();
         let repo = PgRepo {
             env: ctx.env.clone(),
+            trace_id: trace_id.clone(),
         };
         let cache = EdgeCache::from_env(&ctx.env);
         let api = handle_search(
@@ -580,11 +943,29 @@ mod http_layer {
             query.get("q").map(String::as_str).unwrap_or(""),
         )
         .await;
-        serve(url.to_string(), api).await
+        // The raw query text never logs (free-form user input); the line
+        // carries the parsed kind plus the outcome status only.
+        emit(
+            outcome_level(api.status),
+            &trace_id,
+            "mb.search.completed",
+            serde_json::json!({"kind": kind_label(&query), "status_code": api.status}),
+        );
+        serve(url.to_string(), api, &trace_id).await
     }
 
-    pub async fn not_found() -> WorkerResult<Response> {
-        render(&error_response("not found", 404))
+    pub async fn not_found(req: &Request) -> WorkerResult<Response> {
+        let trace_id = inbound_trace_id(req);
+        emit(
+            Level::Warn,
+            &trace_id,
+            "mb.request.not_found",
+            serde_json::json!({"status_code": 404}),
+        );
+        Ok(with_trace(
+            render(&error_response(ApiError::not_found("not found")))?,
+            &trace_id,
+        ))
     }
 }
 
@@ -595,11 +976,15 @@ pub async fn main(
     _ctx: worker::Context,
 ) -> worker::Result<worker::Response> {
     worker::Router::new()
+        .get_async("/healthz", |_, _| async { http_layer::healthz_route() })
         .get_async("/v1/mb/artist/:mbid", |req, ctx| async move {
             http_layer::lookup_route(Kind::Artist, &req, &ctx).await
         })
         .get_async("/v1/mb/release/:mbid", |req, ctx| async move {
             http_layer::lookup_route(Kind::Release, &req, &ctx).await
+        })
+        .get_async("/v1/mb/release/:mbid/recordings", |req, ctx| async move {
+            http_layer::release_recordings_route(&req, &ctx).await
         })
         .get_async("/v1/mb/recording/:mbid", |req, ctx| async move {
             http_layer::lookup_route(Kind::Recording, &req, &ctx).await
@@ -607,7 +992,9 @@ pub async fn main(
         .get_async("/v1/mb/search", |req, ctx| async move {
             http_layer::search_route(&req, &ctx).await
         })
-        .or_else_any_method_async("/*catchall", |_, _| async { http_layer::not_found().await })
+        .or_else_any_method_async("/*catchall", |req, _| async move {
+            http_layer::not_found(&req).await
+        })
         .run(req, env)
         .await
 }
@@ -637,9 +1024,12 @@ mod tests {
     struct FakeRepo {
         lookup_calls: RefCell<u32>,
         search_calls: RefCell<u32>,
+        recordings_calls: RefCell<u32>,
+        last_recordings_mbid: RefCell<String>,
         last_search_q: RefCell<String>,
         entity: Option<Entity>,
         hits: Vec<SearchHit>,
+        recordings: Option<Vec<Recording>>,
         fail: bool,
     }
 
@@ -659,6 +1049,18 @@ mod tests {
                 return Err(RepoError);
             }
             Ok(self.hits.clone())
+        }
+
+        async fn release_recordings(
+            &self,
+            release_mbid: &str,
+        ) -> Result<Option<Vec<Recording>>, RepoError> {
+            *self.recordings_calls.borrow_mut() += 1;
+            *self.last_recordings_mbid.borrow_mut() = release_mbid.to_string();
+            if self.fail {
+                return Err(RepoError);
+            }
+            Ok(self.recordings.clone())
         }
     }
 
@@ -698,7 +1100,76 @@ mod tests {
             mbid: format!("123e4567-e89b-12d3-a456-42661417{n:04}"),
             label: format!("Hit {n}"),
             score: 1.0 - (n as f32 / 100.0),
+            artist_mbid: None,
+            artist_name: None,
         }
+    }
+
+    #[test]
+    fn health_response_is_uncached_json_without_dependencies() {
+        let response = health_response_parts();
+        assert_eq!(response.status, http::StatusCode::OK.as_u16());
+        assert_eq!(response.headers.len(), 2);
+        assert!(response
+            .headers
+            .contains(&("content-type".to_owned(), "application/json".to_owned())));
+        assert!(response
+            .headers
+            .contains(&("cache-control".to_owned(), "no-store".to_owned())));
+        assert_eq!(response.body, br#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn healthz_route_contract_precedes_the_catchall() {
+        // Worker Response/Headers require wasm-bindgen, so pin the production
+        // route and adapter source while testing the HTTP contract natively.
+        let source = include_str!("lib.rs");
+        let router = source
+            .split_once("\n#[worker::event(fetch)]\npub async fn main")
+            .expect("worker entrypoint must exist")
+            .1
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .expect("test module must follow the worker entrypoint")
+            .0;
+        let route = router
+            .find(".get_async(\"/healthz\", |_, _| async { http_layer::healthz_route() })")
+            .expect("GET /healthz must dispatch to its handler");
+        let catchall = router
+            .find(".or_else_any_method_async")
+            .expect("router must retain its catch-all");
+        assert!(
+            route < catchall,
+            "healthz must be registered before catch-all"
+        );
+        assert_eq!(router.matches("\"/healthz\"").count(), 1);
+
+        let handler = source
+            .split_once("pub fn healthz_route() -> WorkerResult<Response> {")
+            .expect("healthz handler must exist")
+            .1
+            .split_once("\n    }\n")
+            .expect("healthz handler must close")
+            .0;
+        let compact = |text: &str| {
+            text.chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+        };
+        assert_eq!(
+            compact(handler),
+            compact(
+                r#"let health = health_response_parts();
+        let headers = Headers::new();
+        for (name, value) in health.headers {
+            headers.append(&name, &value)?;
+        }
+        Ok(
+            Response::from_body(ResponseBody::Body(health.body))?
+                .with_status(health.status)
+                .with_headers(headers)
+        )"#
+            )
+        );
     }
 
     #[test]
@@ -727,8 +1198,62 @@ mod tests {
             assert!(sql.contains("similarity("), "{sql}");
             assert!(sql.contains("ORDER BY score DESC"), "{sql}");
             assert!(sql.contains("LIMIT 25"), "{sql}");
+            // Every kind selects the artist columns hit_from_row reads.
+            assert!(sql.contains("AS artist_mbid"), "{sql}");
+            assert!(sql.contains("AS artist_name"), "{sql}");
         }
         assert_eq!(SEARCH_LIMIT, 25);
+        // Release search is artist-aware: the artist comes from the
+        // joined mb_artist row, not from the title score.
+        let release_sql = search_sql(Kind::Release);
+        assert!(
+            release_sql.contains("LEFT JOIN mb_artist a ON a.mbid = r.artist_mbid"),
+            "{release_sql}"
+        );
+        assert!(
+            release_sql.contains("a.name AS artist_name"),
+            "{release_sql}"
+        );
+    }
+
+    #[test]
+    fn search_release_hits_carry_the_artist_other_kinds_do_not() {
+        let repo = FakeRepo {
+            hits: vec![SearchHit {
+                mbid: MBID.to_string(),
+                label: "Load".to_string(),
+                score: 0.333,
+                artist_mbid: Some("65f4f0c5-ef9e-490c-aee3-909e7ae6b2ab".to_string()),
+                artist_name: Some("Metallica".to_string()),
+            }],
+            ..Default::default()
+        };
+        let cache = FakeCache::default();
+        let resp = block_on(handle_search(
+            &repo,
+            &cache,
+            Some("release".to_string()),
+            "Metallica - Load",
+        ));
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let first = &body["results"][0];
+        assert_eq!(first["title"], "Load");
+        assert_eq!(first["artist_name"], "Metallica");
+        assert_eq!(first["artist_mbid"], "65f4f0c5-ef9e-490c-aee3-909e7ae6b2ab");
+
+        // A release without an artist still carries the keys, as null.
+        let no_artist = SearchHit {
+            artist_mbid: None,
+            artist_name: None,
+            ..hit(0)
+        }
+        .to_json(Kind::Release);
+        assert!(no_artist["artist_mbid"].is_null());
+        assert!(no_artist["artist_name"].is_null());
+        // Non-release hits do not carry the keys at all.
+        let artist_hit = hit(0).to_json(Kind::Artist);
+        assert!(artist_hit.get("artist_name").is_none());
     }
 
     #[test]
@@ -803,6 +1328,79 @@ mod tests {
     }
 
     #[test]
+    fn error_routes_return_the_shared_envelope() {
+        // Representative error routes: validation (400), missing (404), and
+        // repository failure (500) all carry {code, message, retryable}.
+        let repo = FakeRepo::default();
+        let cache = FakeCache::default();
+        let bad = block_on(handle_lookup(&repo, &cache, Kind::Artist, "nope"));
+        let body: serde_json::Value = serde_json::from_str(&bad.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"code":"invalid_request","message":"invalid mbid (must be UUID)","retryable":false})
+        );
+        let missing = block_on(handle_lookup(&repo, &cache, Kind::Artist, MBID));
+        let body: serde_json::Value = serde_json::from_str(&missing.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"code":"not_found","message":"not found","retryable":false})
+        );
+        let short_q = block_on(handle_search(
+            &repo,
+            &cache,
+            Some("artist".to_string()),
+            "x",
+        ));
+        let body: serde_json::Value = serde_json::from_str(&short_q.body).unwrap();
+        assert_eq!(body["code"], "invalid_request");
+        assert_eq!(body["retryable"], false);
+    }
+
+    #[test]
+    fn art_bucket_env_matrix_matches_ops_inventory() {
+        assert_eq!(ART_BUCKET_STAGING, "nntunev2-art-staging");
+        assert_eq!(ART_BUCKET_PROD, "nntunev2-art-prod");
+        assert_ne!(ART_BUCKET_STAGING, ART_BUCKET_PROD);
+        assert_eq!(art_bucket_for_env("staging"), Some(ART_BUCKET_STAGING));
+        assert_eq!(art_bucket_for_env("prod"), Some(ART_BUCKET_PROD));
+        assert_eq!(art_bucket_for_env("production"), Some(ART_BUCKET_PROD));
+        // Unknown or missing env resolves to nothing: never silently prod.
+        assert_eq!(art_bucket_for_env(""), None);
+        assert_eq!(art_bucket_for_env("dev"), None);
+    }
+
+    #[test]
+    fn caa_url_builder_embeds_bucket_and_key() {
+        let url = caa_url_for_art(ART_BUCKET_STAGING, "art/ab/cd/0123456789abcdef-500");
+        assert!(url.contains(ART_BUCKET_STAGING), "{url}");
+        assert!(url.contains("art/ab/cd/0123456789abcdef-500"), "{url}");
+        assert!(!url.contains(ART_BUCKET_PROD), "{url}");
+        // Leading slashes do not produce an empty path segment.
+        let slashed = caa_url_for_art(ART_BUCKET_PROD, "/art/ab/cd/key-250");
+        assert_eq!(slashed, "r2://nntunev2-art-prod/art/ab/cd/key-250");
+    }
+
+    #[test]
+    fn lookup_release_preserves_stored_caa_url_until_public_host_is_configured() {
+        let stored = "https://coverartarchive.org/release/abc/front-500";
+        let repo = FakeRepo {
+            entity: Some(Entity::Release(Release {
+                mbid: MBID.to_string(),
+                artist_mbid: None,
+                title: "Blue Monday".to_string(),
+                release_type: Some("Single".to_string()),
+                year: Some(1983),
+                caa_url: Some(stored.to_string()),
+            })),
+            ..Default::default()
+        };
+        let cache = FakeCache::default();
+        let response = block_on(handle_lookup(&repo, &cache, Kind::Release, MBID));
+        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(body["caa_url"], stored);
+    }
+
+    #[test]
     fn lookup_missing_is_404_and_not_cached() {
         let repo = FakeRepo::default();
         let cache = FakeCache::default();
@@ -821,7 +1419,10 @@ mod tests {
         let cache = FakeCache::default();
         let resp = block_on(handle_lookup(&repo, &cache, Kind::Artist, MBID));
         assert_eq!(resp.status, 500);
-        assert_eq!(resp.body, r#"{"error":"internal error"}"#);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"internal_error","message":"unexpected error","retryable":true}"#
+        );
         assert_eq!(resp.cache_ttl, None);
         assert!(cache.puts.borrow().is_empty());
     }
@@ -834,6 +1435,176 @@ mod tests {
         assert_eq!(resp.status, 400);
         assert_eq!(*repo.lookup_calls.borrow(), 0);
         assert_eq!(*cache.gets.borrow(), 0);
+    }
+
+    fn recording(n: u32, track_no: Option<i16>) -> Recording {
+        Recording {
+            mbid: format!("123e4567-e89b-12d3-a456-42661417{n:04}"),
+            release_mbid: Some(MBID.to_string()),
+            title: format!("Track {n}"),
+            track_no,
+            duration_ms: Some(180_000),
+            medium_no: Some(1),
+        }
+    }
+
+    #[test]
+    fn release_recordings_sql_is_track_ordered_bounded_and_parameterized() {
+        // Listed from mb_track membership (every appearance, with the
+        // medium position), never from the canonical
+        // mb_recording.release_mbid, which omits shared recordings.
+        assert!(
+            RELEASE_RECORDINGS_SQL.contains("FROM mb_track t JOIN mb_recording r"),
+            "{RELEASE_RECORDINGS_SQL}"
+        );
+        assert!(
+            RELEASE_RECORDINGS_SQL.contains("t.release_mbid = $1::text::uuid"),
+            "{RELEASE_RECORDINGS_SQL}"
+        );
+        assert!(
+            !RELEASE_RECORDINGS_SQL.contains("= $1::uuid"),
+            "{RELEASE_RECORDINGS_SQL}"
+        );
+        assert!(
+            RELEASE_RECORDINGS_SQL.contains("ORDER BY t.medium_no ASC, t.track_no ASC, r.mbid ASC"),
+            "{RELEASE_RECORDINGS_SQL}"
+        );
+        assert!(
+            RELEASE_RECORDINGS_SQL.contains("LIMIT 1000"),
+            "{RELEASE_RECORDINGS_SQL}"
+        );
+        assert_eq!(RELEASE_RECORDINGS_LIMIT, 1000);
+        assert!(
+            RELEASE_EXISTS_SQL.contains("FROM mb_release"),
+            "{RELEASE_EXISTS_SQL}"
+        );
+        assert!(
+            RELEASE_EXISTS_SQL.contains("mbid = $1::text::uuid"),
+            "{RELEASE_EXISTS_SQL}"
+        );
+    }
+
+    #[test]
+    fn release_recordings_found_returns_rows_in_repo_order_and_caches_success() {
+        let repo = FakeRepo {
+            recordings: Some(vec![recording(1, Some(1)), recording(2, Some(2))]),
+            ..Default::default()
+        };
+        let cache = FakeCache::default();
+        let resp = block_on(handle_release_recordings(
+            &repo,
+            &cache,
+            "123E4567-E89B-12D3-A456-426614174000",
+        ));
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.cache_ttl, Some(LOOKUP_CACHE_TTL_S));
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["release_mbid"], MBID);
+        let recordings = body["recordings"].as_array().unwrap();
+        assert_eq!(recordings.len(), 2);
+        assert_eq!(recordings[0]["track_no"], 1);
+        assert_eq!(recordings[0]["medium_no"], 1);
+        assert_eq!(recordings[0]["title"], "Track 1");
+        assert_eq!(recordings[1]["track_no"], 2);
+        // The repo sees the normalized (lowercase) MBID, matching the key.
+        assert_eq!(repo.last_recordings_mbid.borrow().as_str(), MBID);
+        let puts = cache.puts.borrow();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].0, format!("mb:release-recordings:{MBID}"));
+        assert_eq!(puts[0].1, LOOKUP_CACHE_TTL_S);
+    }
+
+    #[test]
+    fn release_recordings_empty_success_is_200_and_cacheable() {
+        let repo = FakeRepo {
+            recordings: Some(vec![]),
+            ..Default::default()
+        };
+        let cache = FakeCache::default();
+        let resp = block_on(handle_release_recordings(&repo, &cache, MBID));
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.cache_ttl, Some(LOOKUP_CACHE_TTL_S));
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["recordings"].as_array().unwrap().len(), 0);
+        assert_eq!(cache.puts.borrow().len(), 1);
+    }
+
+    #[test]
+    fn release_recordings_are_capped_at_the_hard_limit() {
+        let repo = FakeRepo {
+            recordings: Some(
+                (0..(RELEASE_RECORDINGS_LIMIT as u32 + 5))
+                    .map(|n| recording(n, Some(1)))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let cache = FakeCache::default();
+        let resp = block_on(handle_release_recordings(&repo, &cache, MBID));
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(
+            body["recordings"].as_array().unwrap().len(),
+            RELEASE_RECORDINGS_LIMIT
+        );
+    }
+
+    #[test]
+    fn release_recordings_missing_release_is_404_and_not_cached() {
+        let repo = FakeRepo::default(); // recordings: None => no such release
+        let cache = FakeCache::default();
+        let resp = block_on(handle_release_recordings(&repo, &cache, MBID));
+        assert_eq!(resp.status, 404);
+        assert_eq!(resp.cache_ttl, None);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"code":"not_found","message":"not found","retryable":false})
+        );
+        assert!(cache.puts.borrow().is_empty());
+    }
+
+    #[test]
+    fn release_recordings_invalid_mbid_is_400_before_cache_or_repo() {
+        let repo = FakeRepo::default();
+        let cache = FakeCache::default();
+        let resp = block_on(handle_release_recordings(&repo, &cache, "nope"));
+        assert_eq!(resp.status, 400);
+        assert_eq!(resp.cache_ttl, None);
+        assert_eq!(*repo.recordings_calls.borrow(), 0);
+        assert_eq!(*cache.gets.borrow(), 0);
+    }
+
+    #[test]
+    fn release_recordings_repo_error_is_generic_500_and_not_cached() {
+        let repo = FakeRepo {
+            fail: true,
+            ..Default::default()
+        };
+        let cache = FakeCache::default();
+        let resp = block_on(handle_release_recordings(&repo, &cache, MBID));
+        assert_eq!(resp.status, 500);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"internal_error","message":"unexpected error","retryable":true}"#
+        );
+        assert_eq!(resp.cache_ttl, None);
+        assert!(cache.puts.borrow().is_empty());
+    }
+
+    #[test]
+    fn release_recordings_cache_hit_skips_repo() {
+        let cache = FakeCache::default();
+        cache.stored.borrow_mut().insert(
+            release_recordings_cache_key(MBID),
+            r#"{"release_mbid":"x","cached":true}"#.to_string(),
+        );
+        let repo = FakeRepo::default();
+        let resp = block_on(handle_release_recordings(&repo, &cache, MBID));
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.cache_ttl, Some(LOOKUP_CACHE_TTL_S));
+        assert!(resp.body.contains("cached"));
+        assert_eq!(*repo.recordings_calls.borrow(), 0);
     }
 
     #[test]
@@ -1001,5 +1772,78 @@ mod tests {
         assert!(!is_valid_mbid("123e4567-e89b-12d3-a456-4266141740000"));
         assert!(!is_valid_mbid("123e4567_e89b_12d3_a456_426614174000"));
         assert!(!is_valid_mbid("gggggggg-hhhh-iiii-jjjj-kkkkkkkkkkkk"));
+    }
+
+    const TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
+
+    #[test]
+    fn outcome_levels_favour_signal_over_noise() {
+        assert_eq!(super::http_layer::outcome_level(200), Level::Info);
+        assert_eq!(super::http_layer::outcome_level(400), Level::Warn);
+        assert_eq!(super::http_layer::outcome_level(404), Level::Warn);
+        assert_eq!(super::http_layer::outcome_level(500), Level::Error);
+        assert_eq!(super::http_layer::outcome_level(503), Level::Error);
+    }
+
+    /// The route's `completed` line goes through the REAL emitter, not a
+    /// hand-written fixture: same constructor and renderer production uses.
+    #[test]
+    fn structured_completed_lines_conform_to_the_standard() {
+        for (event, kind) in [
+            ("mb.lookup.completed", "artist"),
+            ("mb.search.completed", "release"),
+        ] {
+            let fields = nntune_logging::fields_from_json(
+                serde_json::json!({"kind": kind, "status_code": 200}),
+            )
+            .unwrap();
+            let record = LogRecord::new(
+                LogWorker::Mb,
+                Level::Info,
+                TRACE,
+                event,
+                fields,
+                1_792_094_400_123,
+            )
+            .unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&record.to_json_line()).unwrap();
+            let object = parsed.as_object().unwrap();
+            assert_eq!(object.len(), 6);
+            assert_eq!(object["worker"], "mb");
+            assert_eq!(object["trace_id"], TRACE);
+            assert_eq!(object["event"], event);
+            assert_eq!(object["ts"], "2026-10-15T20:00:00.123Z");
+            assert_eq!(record.trace_id(), TRACE);
+        }
+    }
+
+    /// Negative privacy coverage: the only shapes routes emit are kinds and
+    /// status codes — entity content (names, titles) and raw query text never
+    /// reach the emitter, and identity/credential/network shapes are rejected
+    /// outright when they do.
+    #[test]
+    fn completed_lines_carry_no_entity_content() {
+        for value in [
+            serde_json::json!({"kind": "artist", "status_code": 200}),
+            serde_json::json!({"kind": "unknown", "status_code": 400}),
+            serde_json::json!({"status_code": 404}),
+        ] {
+            let fields = nntune_logging::fields_from_json(value).unwrap();
+            assert!(
+                fields.keys().all(|k| k == "kind" || k == "status_code"),
+                "route shape carries more than kind + status"
+            );
+        }
+        for value in [
+            serde_json::json!({"name": "Test Artist"}),
+            serde_json::json!({"email": "a@example.com"}),
+            serde_json::json!({"client_ip": "192.0.2.1"}),
+            serde_json::json!({"token": "tok_abc"}),
+        ] {
+            assert!(
+                nntune_logging::fields_from_json(value).is_err(),
+                "emitter accepted identity content"
+            );
+        }
     }
 }

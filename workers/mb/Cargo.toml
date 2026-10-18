@@ -6,13 +6,19 @@ description = "NNTune v2 MusicBrainz mirror read API (Cloudflare Worker, Rust wo
 license = "MIT"
 
 [lib]
-crate-type = ["cdylib"]
+# `cdylib` is the Worker deploy target; `rlib` lets integration tests
+# (workers/mb/tests) link the crate (workers/api precedent).
+name = "nntune_mb"
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 worker = { version = "0.8", features = ["http", "tokio-postgres"] }
+http = "1"
 # Hyperdrive Postgres client: `connect_raw` over the Worker socket with
 # the generated connection string (workers-rs `tokio-postgres` example).
 tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
 wasm-bindgen-futures = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Structured log emitter + trace-ID propagation (docs/logging-standard.md).
+nntune-logging = { version = "0.1.0", path = "../../crates/nntune-logging" }

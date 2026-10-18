@@ -3,7 +3,8 @@ import { describe, expect, it } from 'vitest';
 // Single source of truth lives in the e2e harness: if the app drifts
 // (renamed hook), this test names the missing contract key — the failure
 // IS the signal, not noise. Test-only import; never bundled into the app.
-import { TESTIDS } from '../../../../e2e/helpers/contract.js';
+import { SUPPORTED_NNTP_PORTS, TESTIDS } from '../../../../e2e/helpers/contract.js';
+import { ALLOWED_NNTP_PORTS } from './vault-validation.js';
 
 // Raw route markup via Vite glob: no node:fs, no @types/node needed.
 const sources = import.meta.glob('../routes/**/*.svelte', {
@@ -28,10 +29,18 @@ const routeForTestId: Record<keyof typeof TESTIDS, string> = {
 	importFile: '../routes/library/import/+page.svelte',
 	importStatus: '../routes/library/import/+page.svelte',
 	libraryItem: '../routes/library/+page.svelte',
+	libraryList: '../routes/library/+page.svelte',
+	libraryStaleBadge: '../routes/library/+page.svelte',
 	audioPlayer: '../routes/library/+page.svelte',
 	usageMeter: '../routes/library/+page.svelte',
 	planLimitNotice: '../routes/library/+page.svelte'
 };
+
+describe('e2e NNTP port allowlist', () => {
+	it('matches the app/API allowlist (no drift between the copies)', () => {
+		expect([...SUPPORTED_NNTP_PORTS]).toEqual([...ALLOWED_NNTP_PORTS]);
+	});
+});
 
 describe('e2e contract hooks', () => {
 	for (const [key, testid] of Object.entries(TESTIDS) as [keyof typeof TESTIDS, string][]) {

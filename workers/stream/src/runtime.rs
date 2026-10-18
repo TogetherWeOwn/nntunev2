@@ -1,11 +1,12 @@
 //! Workers runtime entry (wasm32 only): the per-user `NntpPool` Durable
-//! Object and its probe route.
+//! Object and its ingest routes.
 //!
 //! - `POST /probe` on the Durable Object runs one ingest probe batch
-//!   ([`crate::probe`]). There is no public route to it: callers reach the
-//!   object through a Durable Object binding (`NNTP_POOL`, cross-script from
-//!   the ingest Worker), addressed by `id_from_name(user_id)`, and the object
-//!   refuses envelopes naming any other user.
+//!   ([`crate::probe`]); `POST /body` fetches one article body
+//!   ([`crate::body`]). There is no public route to either: callers reach
+//!   the object through a Durable Object binding (`NNTP_POOL`, cross-script
+//!   from the ingest Worker), addressed by `id_from_name(user_id)`, and the
+//!   object refuses envelopes naming any other user.
 //! - The Worker's own `fetch` answers `404` until the play routes land.
 //!
 //! I/O objects belong to the Durable Object rather than to one request, so a
@@ -21,11 +22,12 @@ use worker::{
     State,
 };
 
+use crate::body::{parse_body_request, run_body, BodyReply, MAX_BODY_REQUEST_BYTES};
 use crate::pool::Pool;
 use crate::probe::{
     parse_request, run_probe, PoolProvider, ProbeError, ProbeReply, WallClock, MAX_PROBE_BODY_BYTES,
 };
-use crate::routes::{self, ProbeDecision};
+use crate::routes::{self, PoolAction, ProbeDecision};
 
 /// Durable Object route for one probe batch.
 pub const PROBE_PATH: &str = routes::PROBE_PATH;
@@ -59,18 +61,18 @@ impl DurableObject for NntpPool {
         }
     }
 
-    /// Serves `POST /probe`; any other method or path is a 404.
+    /// Serves `POST /probe` and `POST /body`; any other method or path is a 404.
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         let has_owner_name = self.state.id().name().is_some();
-        routes::dispatch_probe(
-            routes::decide_probe_action(req.method().as_ref(), &req.path(), has_owner_name),
-            |decision| match decision {
-                ProbeDecision::NotFound => Response::error(decision.body(), decision.status()),
-                _ => respond(route_reply(decision)),
-            },
-            || async { respond(self.probe(&mut req).await) },
-        )
-        .await
+        match routes::decide_pool_action(req.method().as_ref(), &req.path(), has_owner_name) {
+            PoolAction::Respond(ProbeDecision::NotFound) => Response::error(
+                ProbeDecision::NotFound.body(),
+                ProbeDecision::NotFound.status(),
+            ),
+            PoolAction::Respond(decision) => respond(route_reply(decision)),
+            PoolAction::RunProbe => respond(self.probe(&mut req).await),
+            PoolAction::RunBody => respond_body(self.body(&mut req).await),
+        }
     }
 }
 
@@ -118,6 +120,42 @@ impl NntpPool {
             clock.sync(pool, Date::now().as_millis());
         };
         ProbeReply::from(run_probe(pool, dial, tick, &probe).await)
+    }
+
+    /// Reads, validates and runs one body envelope against this object's pool.
+    async fn body(&self, req: &mut Request) -> BodyReply {
+        let Some(pool_user) = self.state.id().name() else {
+            return BodyReply::from(Err(ProbeError::BadRequest("pool has no owner")));
+        };
+        let body = match read_capped(req, MAX_BODY_REQUEST_BYTES).await {
+            Ok(body) => body,
+            Err(e) => return BodyReply::from(Err(e)),
+        };
+        let fetch = match parse_body_request(&body, &pool_user) {
+            Ok(fetch) => fetch,
+            Err(e) => return BodyReply::from(Err(e)),
+        };
+        let provider = match self.provider(&pool_user).await {
+            Ok(provider) => provider,
+            Err(e) => return BodyReply::from(Err(e)),
+        };
+        let pool = self
+            .pool
+            .get_or_init(|| RefCell::new(Pool::new(provider.capacity)));
+        let config = provider.config;
+        let dial = || {
+            let config = config.clone();
+            async move {
+                let transport = WorkerTransport::connect(&config)
+                    .map_err(|e| nntune_core::Error::Io(std::io::Error::other(e.to_string())))?;
+                NntpClient::connect(transport, &config).await
+            }
+        };
+        let clock = &self.clock;
+        let tick = |pool: &mut Pool<NntpClient<WorkerTransport>>| {
+            clock.sync(pool, Date::now().as_millis());
+        };
+        BodyReply::from(run_body(pool, dial, tick, &fetch).await)
     }
 
     /// The user's provider settings and connection cap.
@@ -170,6 +208,19 @@ fn respond(reply: ProbeReply) -> Result<Response> {
         headers.set("retry-after", &secs.to_string())?;
     }
     Ok(Response::ok(reply.body)?
+        .with_status(reply.status)
+        .with_headers(headers))
+}
+
+/// Turns a [`BodyReply`] into the `Response`: raw article bytes on `200`,
+/// the JSON error object otherwise, adding `Retry-After` when carried.
+fn respond_body(reply: BodyReply) -> Result<Response> {
+    let headers = Headers::new();
+    headers.set("content-type", reply.content_type)?;
+    if let Some(secs) = reply.retry_after_secs {
+        headers.set("retry-after", &secs.to_string())?;
+    }
+    Ok(Response::from_bytes(reply.body)?
         .with_status(reply.status)
         .with_headers(headers))
 }

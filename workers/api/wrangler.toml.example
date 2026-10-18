@@ -5,7 +5,9 @@ main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
 
 [build]
-command = "cargo install -q worker-build --locked && worker-build --release"
+# `--locked` (after `--`, forwarded to `cargo build`) builds exactly the
+# committed, audited workers/api/Cargo.lock and fails if it is stale.
+command = "cargo install -q worker-build --locked && worker-build --release -- --locked"
 
 [vars]
 # Public, non-secret config only. RP_ORIGIN must be the canonical
@@ -17,6 +19,23 @@ SESSION_TTL_SECS = "86400"
 # INVITES_REQUIRED = "true"
 # ALLOW_LOOPBACK_DEV = "true"          # local dev only, never staging/prod
 # EMAIL_WEBHOOK_URL = "https://<mail-provider-webhook>"  # magic-link delivery
+# Staging-only emailed-code retrieval seam (POST /api/test-codes, returns
+# the issued code for example.test mailboxes without minting; see
+# docs/security/threat-model.md). Staging env ONLY — never set on prod:
+# QA_CODE_SEAM = "1" arms capture + retrieval, and QA_AUTH_TOKEN (secret,
+# below) authenticates retrieval. Either missing answers the seam path
+# with the plain unknown-route 404.
+# QA_CODE_SEAM = "1"
+# Rate-limit defaults live in src/rate_limit.rs (documented there: auth
+# 10/60s, vault test-connection 5/60s per account and 25/60s per IP,
+# single-sourced with src/vault.rs). The Worker entry reads these
+# [vars] overrides at startup via RateLimitConfig::from_vars (invalid
+# values fall back to the defaults; a max over 100 clamps to 100, the
+# durable slot store's cap):
+# AUTH_RATE_LIMIT_MAX / AUTH_RATE_LIMIT_WINDOW_SECS /
+# VAULT_TEST_RATE_LIMIT_MAX / VAULT_TEST_RATE_LIMIT_WINDOW_SECS /
+# VAULT_TEST_IP_RATE_LIMIT_MAX. Unset, the IP cap defaults to 5x the
+# configured VAULT_TEST_RATE_LIMIT_MAX (clamped to 100).
 
 # Hyperdrive binding for PlanetScale Postgres (ID filled per environment).
 # The binding name must stay HYPERDRIVE (see src/worker_entry.rs).
@@ -29,9 +48,17 @@ SESSION_TTL_SECS = "86400"
 #   wrangler hyperdrive update <id> --caching-disabled
 # Deploy gate: ./check_hyperdrive_cache.sh --config-id <id> (asserts
 # caching.disabled == true). The gate fails closed without Cloudflare
-# credentials (exit 3); --allow-skip is only for secret-less CI.
+# credentials (exit 3); --allow-skip is only for secret-less CI and MUST
+# NOT be used in real deploys. Runtime attestation: the Worker refuses to
+# serve traffic unless HYPERDRIVE_CACHING_DISABLED=1 is set for that env —
+# set it only after the gate passes for that Hyperdrive config id.
 # If cached reads are wanted elsewhere, bind a
 # second cache-disabled config for auth reads.
+# Runtime attestation (fail-closed): uncomment ONLY after
+# ./check_hyperdrive_cache.sh passes for that env's Hyperdrive config id.
+# Shipping it preset would attest a cache-disabled config without ever
+# running the gate, defeating the startup refusal in src/worker_entry.rs.
+# HYPERDRIVE_CACHING_DISABLED = "1"
 # [[hyperdrive]]
 # binding = "HYPERDRIVE"
 # id = "<fill in staging/prod id>"
@@ -55,3 +82,8 @@ SESSION_TTL_SECS = "86400"
 #   SESSION_SECRET_ROTATION         "1" only for the deploy(s) covering a
 #                                 recorded rotation window; unset otherwise.
 #   EMAIL_API_KEY                 transactional email provider key (magic-link delivery)
+#   QA_AUTH_TOKEN                 bearer for POST /api/test-codes (staging QA
+#                                 seam only). High-entropy; same value as the
+#                                 e2e-staging QA_AUTH_TOKEN secret. Staged only
+#                                 together with QA_CODE_SEAM=1 (staging env);
+#                                 never on prod.

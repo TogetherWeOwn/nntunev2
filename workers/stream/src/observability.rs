@@ -4,8 +4,8 @@
 //! The play path ([`crate::play`]) already emits [`crate::meter`] events for
 //! the usage ledger. This module is the Analytics Engine projection of the
 //! same outcome: a single [`CacheObserveEvent`] per play carrying the cache
-//! hit/miss signal, time-to-first-byte, bytes served and the pool error code
-//! (M4 metering builds on this row shape).
+//! hit/miss/stale signal, time-to-first-byte, bytes served and the pool error
+//! code (M4 metering builds on this row shape).
 //!
 //! Wiring status: [`CacheObserveEvent::from_play`] and
 //! [`crate::play::PlayStream::observe_event`] build events from started
@@ -24,7 +24,7 @@
 //! `workers/stream/wrangler.toml`):
 //!
 //! ```text
-//! blob1 = cache_status  ('hit' | 'miss')
+//! blob1 = cache_status  ('hit' | 'miss' | 'stale')
 //! blob2 = user_hash     (SHA-256 hex, 64 chars)
 //! blob3 = request_id
 //! blob4 = pool_error_code ('' when the play had no pool error)
@@ -53,19 +53,24 @@
 use crate::grant::sha256;
 use crate::play::PlayError;
 
-/// Whether the play was served from the R2 cache.
+/// Whether the play was served from the R2 cache. Stale is its own value:
+/// a stale serve carries `Cache-Status: STALE` on the wire, so the row must
+/// say `stale` too — projecting it as `hit` makes the header and the row
+/// disagree for one play and hides stale traffic from the dashboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheStatus {
     Hit,
     Miss,
+    Stale,
 }
 
 impl CacheStatus {
-    /// Analytics Engine / log spelling: lowercase `hit` / `miss`.
+    /// Analytics Engine / log spelling: lowercase `hit` / `miss` / `stale`.
     pub fn as_str(self) -> &'static str {
         match self {
             CacheStatus::Hit => "hit",
             CacheStatus::Miss => "miss",
+            CacheStatus::Stale => "stale",
         }
     }
 }
@@ -111,15 +116,16 @@ impl CacheObserveEvent {
         }
     }
 
-    /// Project a finished play outcome to an event: `cache_hit` selects the
-    /// status, `bytes` is what the client was served, and a pool-level
+    /// Project a finished play outcome to an event: `cache_status` is the
+    /// row status (fresh → `Hit`, miss → `Miss`, stale-while-revalidate →
+    /// `Stale`), `bytes` is what the client was served, and a pool-level
     /// `error` is mapped through [`PlayError::pool_error_code`] (non-pool
     /// errors and `None` carry no code). `ttft_ms` is measured by the caller
     /// around the first served byte — this crate owns no clock.
     pub fn from_play(
         request_id: impl Into<String>,
         user_id: &str,
-        cache_hit: bool,
+        cache_status: CacheStatus,
         ttft_ms: u64,
         bytes: u64,
         error: Option<&PlayError>,
@@ -127,11 +133,7 @@ impl CacheObserveEvent {
         Self::new(
             request_id,
             user_id,
-            if cache_hit {
-                CacheStatus::Hit
-            } else {
-                CacheStatus::Miss
-            },
+            cache_status,
             ttft_ms,
             bytes,
             error.and_then(PlayError::pool_error_code).map(String::from),
@@ -177,7 +179,7 @@ impl CacheObserveEvent {
     }
 
     /// The `writeDataPoint` index (sampling key) for this row: the stable
-    /// per-user hash. Never `cache_status` — a two-value index makes
+    /// per-user hash. Never `cache_status` — a low-cardinality index makes
     /// Analytics Engine sample all hits as a single bucket (see module docs).
     pub fn analytics_index(&self) -> &str {
         &self.user_hash
@@ -223,6 +225,7 @@ fn escape_json_str(s: &str) -> String {
 /// starts.
 pub const STAGING_QUERY_TEMPLATE: &str = "\
 -- nntune stream cache hit-rate + TTFT (staging evidence query).\n\
+-- Stale-while-revalidate serves group as their own `stale` blob1 row.\n\
 -- Column mapping: blob1 = cache_status, blob2 = user_hash,\n\
 -- blob3 = request_id, blob4 = pool_error_code; double1 = ttft_ms,\n\
 -- double2 = bytes. Dataset `nntune_meter` is the METER binding in\n\
@@ -340,21 +343,23 @@ mod tests {
 
     #[test]
     fn from_play_maps_status_and_pool_error_codes() {
-        let ev = CacheObserveEvent::from_play("req-001", "user-1", true, 12, 40_000, None);
+        let ev =
+            CacheObserveEvent::from_play("req-001", "user-1", CacheStatus::Hit, 12, 40_000, None);
         assert_eq!(ev.cache_status, CacheStatus::Hit);
         assert_eq!(ev.pool_error_code, None);
 
         let err = PlayError::PoolQuarantined {
             retry_after_ms: 500,
         };
-        let ev = CacheObserveEvent::from_play("req-002", "user-1", false, 0, 0, Some(&err));
+        let ev =
+            CacheObserveEvent::from_play("req-002", "user-1", CacheStatus::Miss, 0, 0, Some(&err));
         assert_eq!(ev.cache_status, CacheStatus::Miss);
         assert_eq!(ev.pool_error_code.as_deref(), Some("POOL_QUARANTINED"));
 
         let ev = CacheObserveEvent::from_play(
             "req-003",
             "user-1",
-            false,
+            CacheStatus::Miss,
             0,
             0,
             Some(&PlayError::PoolExhausted),
@@ -365,12 +370,25 @@ mod tests {
         let ev = CacheObserveEvent::from_play(
             "req-004",
             "user-1",
-            false,
+            CacheStatus::Miss,
             0,
             0,
             Some(&PlayError::WrongTrack),
         );
         assert_eq!(ev.pool_error_code, None);
+    }
+
+    #[test]
+    fn stale_projects_to_a_stale_row_and_column_not_hit() {
+        let ev =
+            CacheObserveEvent::from_play("req-004", "user-1", CacheStatus::Stale, 9, 10_000, None);
+        assert_eq!(ev.cache_status, CacheStatus::Stale);
+        assert_eq!(ev.cache_status.as_str(), "stale");
+        assert_eq!(
+            ev.analytics_blobs(),
+            vec!["stale", ev.user_hash.as_str(), "req-004", ""]
+        );
+        assert!(ev.to_json_log().contains("\"cache_status\":\"stale\""));
     }
 
     #[test]

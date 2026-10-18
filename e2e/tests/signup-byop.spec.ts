@@ -1,9 +1,11 @@
 import { test, expect } from '@playwright/test';
-import { TESTIDS, uniqueTestEmail } from '../helpers/contract.js';
+import { TESTIDS } from '../helpers/contract.js';
 import { stagingBaseUrl } from '../helpers/access.js';
 import {
+  annotateSignupPath,
   applyAccountToPage,
   completeByopWizard,
+  submitPublicUiSignup,
   tryMintTestAccount,
   type TestAccount,
 } from '../helpers/accounts.js';
@@ -14,7 +16,10 @@ import {
 let sharedAccount: TestAccount | null = null;
 
 // Golden path part 1: signup → BYOP wizard pointing at the synthetic NNTP
-// endpoint. Each run mints a fresh account so reruns never collide.
+// endpoint. Each run mints a fresh account so reruns never collide. The
+// seam-absent fallback submits the real /signup form and asserts the
+// emailed-code step (the full code-plus-passkey finish needs a staging
+// code-retrieval seam that does not exist yet).
 //
 // File-level skip: pre-deploy (no STAGING_BASE_URL) the whole file skips
 // without launching a browser. See health.spec.ts.
@@ -24,13 +29,16 @@ test.skip(
 );
 
 test.describe.serial('signup → BYOP wizard', () => {
-  test('signup creates an account and lands on the BYOP wizard', async ({ page, request }) => {
+  test('signup creates an account and lands on the BYOP wizard', async ({ page, request }, testInfo) => {
     const baseURL = stagingBaseUrl('skip', 'signup');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
     const minted = await tryMintTestAccount(request, baseURL);
+    // Evidence provenance: record which signup path this run exercises
+    // (bounded label only — no account data) before either branch runs.
+    annotateSignupPath(testInfo, minted);
     // Authenticate before the first navigation: the origin-scoped route
     // applies to subsequent loads only, so this must precede every goto.
     await applyAccountToPage(page, minted, baseURL);
@@ -48,23 +56,7 @@ test.describe.serial('signup → BYOP wizard', () => {
       return;
     }
 
-    const email = uniqueTestEmail();
-    await page.goto(`${baseURL}/signup`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    await expect(page.getByTestId(TESTIDS.signupEmail)).toBeVisible({ timeout: 15_000 });
-    await page.getByTestId(TESTIDS.signupEmail).fill(email);
-    await page.getByTestId(TESTIDS.signupSubmit).click();
-    // Either we land on the wizard, or an inline error explains why.
-    const wizard = page.getByTestId(TESTIDS.byopHost);
-    const error = page.getByTestId(TESTIDS.signupError);
-    await expect(async () => {
-      const onWizard = await wizard.isVisible().catch(() => false);
-      const onError = await error.isVisible().catch(() => false);
-      expect(onWizard || onError, 'neither BYOP wizard nor signup error appeared').toBe(true);
-    }).toPass({ timeout: 30_000 });
-    expect(await error.isVisible().catch(() => false), 'signup rejected the test mailbox').toBe(
-      false,
-    );
-    expect(page.url()).toContain('/onboarding/byop');
+    await submitPublicUiSignup(page, baseURL);
   });
 
   test('BYOP wizard connects to the synthetic NNTP endpoint and saves', async ({
@@ -84,4 +76,29 @@ test.describe.serial('signup → BYOP wizard', () => {
     // Fails closed when SYNTHETIC_NNTP_PASS is missing.
     await completeByopWizard(page, baseURL);
   });
+});
+
+// Dedicated public-form coverage, deliberately outside the serial describe
+// above: it shares no account with the BYOP test and never consults the
+// account seam, so it exercises the real /signup submission on every
+// configured-staging run — including seam-backed ones, where the first
+// test takes the API path. Playwright gives each test a fresh context, so
+// no session from an earlier test can leak into this one. The helper asserts
+// the emailed-code step, not wizard arrival: the code-plus-passkey finish
+// needs a staging code-retrieval seam that does not exist yet (row 1 of
+// docs/m1-exit-traceability.md names the gap). The offline pin in
+// workflows.spec.ts isolates this case by title and forbids a mint in it.
+test('public UI signup succeeds even when the test-account seam is configured', async ({ page }) => {
+  const baseURL = stagingBaseUrl('skip', 'ui-signup');
+  if (!baseURL) {
+    test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+    return;
+  }
+  // Null identity: Access pair only, no account session. The page starts
+  // unauthenticated regardless of seam configuration, so the form below is
+  // the only account-creation path. Must precede the first navigation.
+  await applyAccountToPage(page, null, baseURL);
+  // Asserts: unique synthetic identity submitted, no inline signup error,
+  // emailed-code step reached. Diagnostics name no values.
+  await submitPublicUiSignup(page, baseURL);
 });

@@ -14,6 +14,13 @@
 //!   converges exact redeliveries to one entry, first write wins, and
 //!   reports [`RecordOutcome::Conflict`] instead of converging when a
 //!   redelivery disagrees or the key does not bind its identity fields.
+//!   The production sink is an account-owned writer, so it must also
+//!   carry the ADR 0002 rule 3 deletion fence: [`LEDGER_WRITE_FENCE_SQL`]
+//!   is the in-statement fence its INSERT must select through, and
+//!   [`UsageLedger::record_fenced`] is the portable-core mirror (a
+//!   fenced play reports [`RecordOutcome::AccountDeleting`] and appends
+//!   nothing, so a play can never repopulate a deleting account's
+//!   ledger/play-event rows).
 //! - [`reconcile`] compares each distinct metered play against the ledger
 //!   and flags (never silently adjusts) every mismatch with one
 //!   [`MeterKind::ReconcileMismatch`] event and a single-line log
@@ -26,6 +33,8 @@
 /// Event name for the mismatch representation emitted by [`reconcile`].
 /// Wiring this event to Analytics Engine remains a production integration task.
 pub const RECONCILE_MISMATCH_METRIC: &str = "play_reconcile_mismatch";
+
+use crate::pool::Lane;
 
 /// Analytics Engine binding name: must match `[analytics_engine_datasets]`
 /// in `workers/stream/wrangler.toml`.
@@ -55,6 +64,26 @@ pub enum MeterKind {
     BytesServed,
     PrefetchEnqueued,
     ProviderError,
+    /// A play was rejected because its grant had expired
+    /// (`GrantError::Expired`). Carries the requested track and the granted
+    /// user only; never secret or token material.
+    GrantRejectedExpired,
+    /// A play was rejected because its grant's remaining lifetime exceeded
+    /// `MAX_GRANT_TTL + CLOCK_SKEW_SECS` (`GrantError::TtlTooLong`).
+    /// Same payload shape as the other rejection events.
+    GrantRejectedExcessiveExpiry,
+    /// A play was rejected because a valid grant was presented for the
+    /// wrong track (`PlayError::WrongTrack`). `track_id` is the requested
+    /// track, not the granted one.
+    GrantRejectedWrongTrack,
+    /// A provider-level failure quarantined the pool; the event carries the
+    /// failed call's lane and the backoff just applied.
+    QuarantineEntered,
+    /// A successful call cleared a pending quarantine (no backoff).
+    QuarantineExited,
+    /// A pooled connection the provider silently closed was transparently
+    /// redialed (no backoff, no quarantine).
+    WarmRedial,
     /// A flagged reconciliation mismatch. Non-serving: its [`MeterEvent`]
     /// always carries `bytes = 0`; the flagged counts stay on the
     /// [`ReconcileMismatch`] record returned by [`reconcile`].
@@ -71,6 +100,12 @@ pub fn kind_slug(kind: MeterKind) -> &'static str {
         MeterKind::BytesServed => "bytes_served",
         MeterKind::PrefetchEnqueued => "prefetch_enqueued",
         MeterKind::ProviderError => "provider_error",
+        MeterKind::GrantRejectedExpired => "grant_rejected_expired",
+        MeterKind::GrantRejectedExcessiveExpiry => "grant_rejected_excessive_expiry",
+        MeterKind::GrantRejectedWrongTrack => "grant_rejected_wrong_track",
+        MeterKind::QuarantineEntered => "quarantine_entered",
+        MeterKind::QuarantineExited => "quarantine_exited",
+        MeterKind::WarmRedial => "warm_redial",
         MeterKind::ReconcileMismatch => "play_reconcile_mismatch",
     }
 }
@@ -86,6 +121,12 @@ pub struct MeterEvent {
     /// Stream seconds attributed ([`stream_seconds_for_bytes`]); 0 for
     /// non-serving events.
     pub seconds: u64,
+    /// Pool lane of the call a pool-health event belongs to; `None` for
+    /// events unrelated to pool state.
+    pub lane: Option<Lane>,
+    /// Quarantine backoff in milliseconds for
+    /// [`MeterKind::QuarantineEntered`]; 0 otherwise.
+    pub backoff_ms: u64,
 }
 
 pub trait Meter {
@@ -187,6 +228,11 @@ pub struct LedgerEntry {
 pub enum RecordOutcome {
     Recorded,
     Duplicate,
+    /// The play's account is being deleted (`users.deleting_at` is set),
+    /// so the fenced ledger write was refused and nothing was appended
+    /// (ADR 0002 rule 3). Only [`UsageLedger::record_fenced`] reports
+    /// this; the stable wire/job code is `account_deleting`.
+    AccountDeleting,
     /// The play was not converged: either its idempotency key does not
     /// bind its `(user_id, track_id)` identity fields (the key must be
     /// exactly `play:{user_id}:{track_id}:{play_id}` with valid fields),
@@ -219,6 +265,21 @@ fn key_binds_identity(play: &CompletePlay) -> bool {
         _ => false,
     }
 }
+
+/// The account-deletion fence the production ledger INSERT must select
+/// its row through (ADR 0002 rule 3): bind the play owner's user id to
+/// `$1`; the derived `writer_fence` row exists only while that account's
+/// `deleting_at IS NULL`, and the `FOR SHARE` lock is held until the
+/// INSERT commits, so the scheduling `UPDATE users` either waits for
+/// the play-event/ledger write or fences it. A fenced INSERT affects 0
+/// rows and must be classified as `account_deleting`, never retried
+/// behind the delete. Zero rows is ambiguous under `DO NOTHING`, though:
+/// a duplicate redelivery with an open fence also affects 0 rows. The
+/// production sink must converge with `DO UPDATE` (like the ingest
+/// library upsert) or probe the fence first, so healthy duplicates never
+/// read as `account_deleting`.
+pub const LEDGER_WRITE_FENCE_SQL: &str =
+    "(SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence";
 
 /// Portable-core model of the Hyperdrive usage-ledger table.
 ///
@@ -264,6 +325,23 @@ impl UsageLedger {
             bytes: play.bytes,
         });
         RecordOutcome::Recorded
+    }
+
+    /// Record a complete play through the account-deletion fence.
+    ///
+    /// `account_deleting` is the fence state the production sink obtains
+    /// from [`LEDGER_WRITE_FENCE_SQL`] in the same statement as its
+    /// INSERT (`true` when the fence row is absent because
+    /// `users.deleting_at` is set). A fenced play is refused before any
+    /// identity/dedup work and appends nothing — the mirror of the
+    /// production INSERT affecting 0 rows — so neither a first play nor
+    /// a redelivery can repopulate the ledger behind the marker. With
+    /// the fence open this is exactly [`UsageLedger::record`].
+    pub fn record_fenced(&mut self, play: &CompletePlay, account_deleting: bool) -> RecordOutcome {
+        if account_deleting {
+            return RecordOutcome::AccountDeleting;
+        }
+        self.record(play)
     }
 
     /// Ledger rows in first-record order.
@@ -399,6 +477,8 @@ pub fn reconcile(
             track_id: play.track_id.clone(),
             bytes: 0,
             seconds: 0,
+            lane: None,
+            backoff_ms: 0,
         });
     };
 
@@ -496,9 +576,15 @@ mod tests {
                 track_id: "t".to_string(),
                 bytes: 7,
                 seconds: stream_seconds_for_bytes(7),
+                lane: None,
+                backoff_ms: 0,
             });
         }
         assert_eq!(meter.events.len(), 2);
+        assert!(meter
+            .events
+            .iter()
+            .all(|e| e.lane.is_none() && e.backoff_ms == 0));
         assert!(meter.has_kind(MeterKind::PlayStart));
         assert!(!meter.has_kind(MeterKind::CacheHit));
     }
@@ -589,6 +675,44 @@ mod tests {
         };
         assert_eq!(ledger.record(&empty), RecordOutcome::Conflict);
         assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn fenced_record_refuses_deleting_accounts_and_records_normal_plays() {
+        let play = CompletePlay::new("user-1", "track-9", "play-7", 40_000).unwrap();
+        let mut ledger = UsageLedger::default();
+        // Fence open: identical to record, including dedup convergence.
+        assert_eq!(ledger.record_fenced(&play, false), RecordOutcome::Recorded);
+        assert_eq!(ledger.record_fenced(&play, false), RecordOutcome::Duplicate);
+        assert_eq!(ledger.len(), 1);
+        // Fence closed: a later play for a new key appends nothing and
+        // does not disturb the entry recorded before scheduling.
+        let later = CompletePlay::new("user-1", "track-9", "play-8", 40_000).unwrap();
+        assert_eq!(
+            ledger.record_fenced(&later, true),
+            RecordOutcome::AccountDeleting
+        );
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger.total_bytes_for_user("user-1"), 40_000);
+        // A fenced redelivery is refused as deleting, never converged
+        // as a duplicate: the fence runs before identity/dedup.
+        assert_eq!(
+            ledger.record_fenced(&play, true),
+            RecordOutcome::AccountDeleting
+        );
+        assert_eq!(ledger.len(), 1);
+    }
+
+    #[test]
+    fn ledger_write_fence_sql_locks_only_a_non_deleting_owner_row() {
+        assert_eq!(
+            LEDGER_WRITE_FENCE_SQL,
+            "(SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence"
+        );
+        assert!(!LEDGER_WRITE_FENCE_SQL.contains("FOR UPDATE"));
+        assert!(!LEDGER_WRITE_FENCE_SQL.contains("NOWAIT"));
+        assert!(!LEDGER_WRITE_FENCE_SQL.contains("SKIP LOCKED"));
+        assert!(!LEDGER_WRITE_FENCE_SQL.contains("IS NOT NULL"));
     }
 
     #[test]
@@ -815,6 +939,12 @@ mod tests {
             kind_slug(MeterKind::BytesServed),
             kind_slug(MeterKind::PrefetchEnqueued),
             kind_slug(MeterKind::ProviderError),
+            kind_slug(MeterKind::GrantRejectedExpired),
+            kind_slug(MeterKind::GrantRejectedExcessiveExpiry),
+            kind_slug(MeterKind::GrantRejectedWrongTrack),
+            kind_slug(MeterKind::QuarantineEntered),
+            kind_slug(MeterKind::QuarantineExited),
+            kind_slug(MeterKind::WarmRedial),
             kind_slug(MeterKind::ReconcileMismatch),
         ];
         assert_eq!(
@@ -826,6 +956,12 @@ mod tests {
                 "bytes_served",
                 "prefetch_enqueued",
                 "provider_error",
+                "grant_rejected_expired",
+                "grant_rejected_excessive_expiry",
+                "grant_rejected_wrong_track",
+                "quarantine_entered",
+                "quarantine_exited",
+                "warm_redial",
                 "play_reconcile_mismatch"
             ]
         );
@@ -843,6 +979,8 @@ mod tests {
             track_id: "track-9".to_string(),
             bytes: 100_000,
             seconds: stream_seconds_for_bytes(100_000),
+            lane: None,
+            backoff_ms: 0,
         };
         let point = analytics_point(&event);
         assert_eq!(point.dataset, "nntune_meter");
@@ -868,6 +1006,8 @@ mod tests {
                 // Deliberately non-zero to make kind-filtering observable.
                 bytes: 1,
                 seconds: 1,
+                lane: None,
+                backoff_ms: 0,
             },
             MeterEvent {
                 kind: MeterKind::BytesServed,
@@ -875,6 +1015,8 @@ mod tests {
                 track_id: "t".to_string(),
                 bytes: 16_384,
                 seconds: 1,
+                lane: None,
+                backoff_ms: 0,
             },
             MeterEvent {
                 kind: MeterKind::BytesServed,
@@ -882,6 +1024,8 @@ mod tests {
                 track_id: "t".to_string(),
                 bytes: 100_000,
                 seconds: 3,
+                lane: None,
+                backoff_ms: 0,
             },
             MeterEvent {
                 kind: MeterKind::BytesServed,
@@ -889,6 +1033,8 @@ mod tests {
                 track_id: "other".to_string(),
                 bytes: 50_000,
                 seconds: 2,
+                lane: None,
+                backoff_ms: 0,
             },
             MeterEvent {
                 kind: MeterKind::BytesServed,
@@ -896,6 +1042,8 @@ mod tests {
                 track_id: "t".to_string(),
                 bytes: 60_000,
                 seconds: 2,
+                lane: None,
+                backoff_ms: 0,
             },
         ];
         assert_eq!(served_bytes(&events, "u", "t"), 116_384);
@@ -976,6 +1124,8 @@ mod tests {
                 track_id: "t".to_string(),
                 bytes,
                 seconds: stream_seconds_for_bytes(bytes),
+                lane: None,
+                backoff_ms: 0,
             };
             let point = analytics_point(&event);
             assert_eq!(point.doubles[0] as u64, bytes);

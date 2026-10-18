@@ -8,7 +8,9 @@
  * sites, because all requests flow through {@link ApiClient}.
  */
 
+import { paywallFromResponse, type PaywallModel } from '../billing/planLimit.js';
 import type { ProviderForm } from '../vault-validation.js';
+import { parseErrorBody } from './errors.js';
 
 export type FetchFn = typeof fetch;
 
@@ -19,13 +21,30 @@ export interface ApiClientOptions {
 
 export class ApiError extends Error {
 	readonly status: number;
+	/** Registry code from the error envelope (`docs/api-errors.md`). */
 	readonly code: string;
+	/**
+	 * Paywall model for 402/429 plan-limit responses (already shown via the
+	 * layout listener); null for every other failure. Callers that also
+	 * render an inline error can use this to avoid duplicating the paywall.
+	 */
+	readonly paywall: PaywallModel | null;
+	/** Whether retrying the same request may succeed (envelope flag). */
+	readonly retryable: boolean;
 
-	constructor(status: number, code: string, message: string) {
+	constructor(
+		status: number,
+		code: string,
+		message: string,
+		paywall: PaywallModel | null = null,
+		retryable = false
+	) {
 		super(message);
 		this.name = 'ApiError';
 		this.status = status;
 		this.code = code;
+		this.paywall = paywall;
+		this.retryable = retryable;
 	}
 }
 
@@ -239,6 +258,11 @@ export class ApiClient {
 		await this.post<unknown>('/v1/session/logout', {});
 	}
 
+	/** Revoke every session for the authenticated account. */
+	async revokeAllSessions(): Promise<{ ok: true }> {
+		return this.post<{ ok: true }>('/v1/session/revoke-all', {});
+	}
+
 	/** Start passkey enrollment; the API also mails the inbox-proof code. */
 	async registerStart(email: string): Promise<RegisterStartResponse> {
 		return this.post<RegisterStartResponse>('/v1/auth/passkey/register/start', { email });
@@ -261,6 +285,19 @@ export class ApiClient {
 	async loginFinish(input: LoginFinishInput): Promise<MagicLinkResult> {
 		return this.post<MagicLinkResult>(
 			'/v1/auth/passkey/login/finish',
+			toLoginFinishBody(input)
+		);
+	}
+
+	/** Start a passkey proof bound to the currently authenticated session. */
+	async reauthenticateStart(): Promise<LoginStartResponse> {
+		return this.post<LoginStartResponse>('/v1/session/reauthenticate/start', {});
+	}
+
+	/** Complete proof-bound reauthentication without affecting ordinary login. */
+	async reauthenticateFinish(input: LoginFinishInput): Promise<MagicLinkResult> {
+		return this.post<MagicLinkResult>(
+			'/v1/session/reauthenticate/finish',
 			toLoginFinishBody(input)
 		);
 	}
@@ -296,40 +333,17 @@ export class ApiClient {
 			credentials: 'include'
 		});
 		if (!response.ok) {
-			const body = await this.readErrorBody(response);
-			throw new ApiError(response.status, this.errorCode(response.status, body), this.message(response.status, body));
+			// Read once so the paywall and typed error share the structured contract.
+			let body: unknown = null;
+			try {
+				body = await response.json();
+			} catch {
+				/* non-JSON error body: use status-based defaults */
+			}
+			const parsed = parseErrorBody(body, response.status);
+			const paywall = paywallFromResponse({ status: response.status, headers: response.headers, body });
+			throw new ApiError(response.status, parsed.code, parsed.message, paywall, parsed.retryable);
 		}
 		return (await response.json()) as T;
-	}
-
-	private errorCode(status: number, body: { error?: unknown; code?: unknown }): string {
-		// The re-auth codes travel in the body (`{ error: "provider_auth_expired" }`
-		// or `{ error: "indexer_auth_expired" }` with HTTP 401); they take
-		// precedence over the status mapping so the UI renders the inline
-		// re-auth prompt instead of a generic signed-out page.
-		for (const field of [body.code, body.error] as unknown[]) {
-			if (field === PROVIDER_AUTH_EXPIRED_CODE) return PROVIDER_AUTH_EXPIRED_CODE;
-			if (field === INDEXER_AUTH_EXPIRED_CODE) return INDEXER_AUTH_EXPIRED_CODE;
-		}
-		if (status === 401) return 'unauthorized';
-		if (status === 403) return 'forbidden';
-		if (status === 404) return 'not_found';
-		if (status === 429) return 'rate_limited';
-		return 'request_failed';
-	}
-
-	private async readErrorBody(response: Response): Promise<{ error?: unknown; code?: unknown }> {
-		try {
-			const body = (await response.json()) as { error?: unknown; code?: unknown };
-			if (body !== null && typeof body === 'object') return body;
-		} catch {
-			// Fall through to the empty body below.
-		}
-		return {};
-	}
-
-	private message(status: number, body: { error?: unknown }): string {
-		if (typeof body.error === 'string' && body.error.length > 0) return body.error;
-		return `request failed with status ${status}`;
 	}
 }

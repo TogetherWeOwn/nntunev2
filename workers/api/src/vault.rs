@@ -94,6 +94,8 @@ pub fn provider_auth_expired_body() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VaultError {
     Invalid,
+    /// Malformed persisted ciphertext or metadata: server-side stored data is corrupt.
+    CorruptStoredData,
     Crypto,
 }
 
@@ -486,8 +488,9 @@ fn random_nonce() -> [u8; 12] {
 }
 
 // Unpadded-base64url lives in one place: [`crate::b64`] over the `base64`
-// crate (F-HARD-01). The per-module hand-rolled copies are deleted; decode
-// errors map to generic [`VaultError::Invalid`] at each call site.
+// crate (F-HARD-01). The per-module hand-rolled copies are deleted; input
+// decode failures map to [`VaultError::Invalid`], stored-blob failures to
+// [`VaultError::CorruptStoredData`].
 fn dek_aad(user_id: &str, kek_version: u32) -> String {
     format!("v1|dek|{}|{}", user_id, kek_version)
 }
@@ -553,10 +556,11 @@ pub fn decrypt_vault(
 ) -> Result<Vec<u8>, VaultError> {
     let kek_cipher = Aes256Gcm::new_from_slice(kek).map_err(|_| VaultError::Crypto)?;
     let wrap_nonce: [u8; 12] = crate::b64::decode(&blob.dek_wrapped_nonce_b64url)
-        .map_err(|_| VaultError::Invalid)?
+        .map_err(|_| VaultError::CorruptStoredData)?
         .try_into()
-        .map_err(|_| VaultError::Invalid)?;
-    let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url).map_err(|_| VaultError::Invalid)?;
+        .map_err(|_| VaultError::CorruptStoredData)?;
+    let wrapped =
+        crate::b64::decode(&blob.dek_wrapped_b64url).map_err(|_| VaultError::CorruptStoredData)?;
     let mut dek_bytes = kek_cipher
         .decrypt(
             &Nonce::from(wrap_nonce),
@@ -578,10 +582,11 @@ pub fn decrypt_vault(
 
     let dek_cipher = Aes256Gcm::new_from_slice(&dek.0).map_err(|_| VaultError::Crypto)?;
     let payload_nonce: [u8; 12] = crate::b64::decode(&blob.payload_nonce_b64url)
-        .map_err(|_| VaultError::Invalid)?
+        .map_err(|_| VaultError::CorruptStoredData)?
         .try_into()
-        .map_err(|_| VaultError::Invalid)?;
-    let payload = crate::b64::decode(&blob.payload_b64url).map_err(|_| VaultError::Invalid)?;
+        .map_err(|_| VaultError::CorruptStoredData)?;
+    let payload =
+        crate::b64::decode(&blob.payload_b64url).map_err(|_| VaultError::CorruptStoredData)?;
     dek_cipher
         .decrypt(
             &Nonce::from(payload_nonce),
@@ -605,10 +610,11 @@ pub fn rewrap_dek(
     // Unwrap with the old KEK (old AAD: old version).
     let old_cipher = Aes256Gcm::new_from_slice(old_kek).map_err(|_| VaultError::Crypto)?;
     let wrap_nonce: [u8; 12] = crate::b64::decode(&blob.dek_wrapped_nonce_b64url)
-        .map_err(|_| VaultError::Invalid)?
+        .map_err(|_| VaultError::CorruptStoredData)?
         .try_into()
-        .map_err(|_| VaultError::Invalid)?;
-    let wrapped = crate::b64::decode(&blob.dek_wrapped_b64url).map_err(|_| VaultError::Invalid)?;
+        .map_err(|_| VaultError::CorruptStoredData)?;
+    let wrapped =
+        crate::b64::decode(&blob.dek_wrapped_b64url).map_err(|_| VaultError::CorruptStoredData)?;
     let mut dek_bytes = old_cipher
         .decrypt(
             &Nonce::from(wrap_nonce),
@@ -806,6 +812,24 @@ pub struct AuditEvent {
     pub at: u64,
 }
 
+/// Placeholder for the audit `source_ip` when the client address is
+/// missing or not a literal IP address.
+pub const UNKNOWN_SOURCE_IP: &str = "unknown";
+
+/// Normalize a client address (the `cf-connecting-ip` header) to its
+/// canonical IP literal, or [`UNKNOWN_SOURCE_IP`] when absent or not
+/// exactly one IP address. The value is request-header data that is stored
+/// in `audit_log.source_ip` and used in rate-limit keys, so anything with
+/// control characters, separators, markup or oversize collapses to
+/// `unknown` instead of being persisted. Parsing is strict (no trimming,
+/// no zone ids, no lists), and the canonical form is what is stored, so one
+/// address always maps to one string. Idempotent.
+pub fn sanitize_source_ip(raw: Option<&str>) -> String {
+    raw.and_then(|value| value.parse::<std::net::IpAddr>().ok())
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| UNKNOWN_SOURCE_IP.to_string())
+}
+
 /// Audit log event. By construction there is no field for secret material:
 /// callers pass ids and results only. `now` is Unix epoch seconds — the
 /// audit row's ordering depends on it, so it is a required parameter.
@@ -814,7 +838,7 @@ pub fn audit_event(user_id: &str, action: &str, ok: bool, source_ip: &str, now: 
         user_id: user_id.to_string(),
         action: action.to_string(),
         ok,
-        source_ip: source_ip.to_string(),
+        source_ip: sanitize_source_ip(Some(source_ip)),
         at: now,
     }
 }
@@ -822,6 +846,53 @@ pub fn audit_event(user_id: &str, action: &str, ok: bool, source_ip: &str, now: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cf-connecting-ip` is request-header data
+    /// that lands in `audit_log.source_ip`. Anything that is not a literal
+    /// IP address (control characters, separators, markup, oversize) must
+    /// collapse to `unknown` so a log/CSV/HTML consumer never sees it.
+    #[test]
+    fn source_ip_sanitizer_keeps_only_canonical_ip_literals() {
+        assert_eq!(sanitize_source_ip(Some("198.51.100.9")), "198.51.100.9");
+        assert_eq!(sanitize_source_ip(Some("2001:db8::1")), "2001:db8::1");
+        // Canonicalized: same address, same stored string (stable rate keys).
+        assert_eq!(
+            sanitize_source_ip(Some("2001:DB8:0:0:0:0:0:1")),
+            "2001:db8::1"
+        );
+        assert_eq!(
+            sanitize_source_ip(Some("::ffff:198.51.100.9")),
+            "::ffff:198.51.100.9"
+        );
+        let hostile = [
+            "198.51.100.9\nFORGED ok=true",
+            "198.51.100.9\r\n",
+            "198.51.100.9\0",
+            "198.51.100.9, 203.0.113.1",
+            " 198.51.100.9",
+            "198.51.100.9 ",
+            "fe80::1%eth0",
+            "999.1.1.1",
+            "<script>alert(1)</script>",
+            "'; DROP TABLE audit_log;--",
+            "\u{202e}198.51.100.9",
+            "",
+            "unknown",
+        ];
+        for raw in hostile {
+            assert_eq!(sanitize_source_ip(Some(raw)), "unknown", "{raw:?}");
+        }
+        assert_eq!(sanitize_source_ip(Some(&"1".repeat(4096))), "unknown");
+        assert_eq!(sanitize_source_ip(None), "unknown");
+    }
+
+    #[test]
+    fn audit_event_never_stores_a_hostile_source_ip() {
+        let ev = audit_event("u1", "vault.update", true, "203.0.113.7\nINJECTED", 7);
+        assert_eq!(ev.source_ip, "unknown");
+        let ev = audit_event("u1", "vault.update", true, "203.0.113.7", 7);
+        assert_eq!(ev.source_ip, "203.0.113.7");
+    }
 
     struct EmptyDns;
     impl DnsResolver for EmptyDns {
@@ -946,6 +1017,44 @@ mod tests {
     }
 
     #[test]
+    fn malformed_nonce_lengths_are_rejected() {
+        let kek = [0x11u8; 32];
+        let new_kek = [0x22u8; 32];
+        let blob = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+
+        // Stored-blob nonce length mismatches are server-side corruption,
+        // not caller-input validation errors.
+        for len in [0, 1, 11, 13, 16, 24] {
+            let nonce = crate::b64::encode(&vec![7u8; len]);
+
+            let mut bad_wrap_nonce = blob.clone();
+            bad_wrap_nonce.dek_wrapped_nonce_b64url = nonce.clone();
+            assert_eq!(
+                decrypt_vault(&kek, "user-1", &bad_wrap_nonce),
+                Err(VaultError::CorruptStoredData),
+                "decrypt accepted a wrapped nonce of length {len}"
+            );
+            // `VaultBlob` has no `PartialEq`, so match on the error instead
+            // of comparing the whole `Result` with `assert_eq!`.
+            assert!(
+                matches!(
+                    rewrap_dek(&kek, &new_kek, 2, "user-1", &bad_wrap_nonce),
+                    Err(VaultError::CorruptStoredData)
+                ),
+                "rewrap accepted a wrapped nonce of length {len}"
+            );
+
+            let mut bad_payload_nonce = blob.clone();
+            bad_payload_nonce.payload_nonce_b64url = nonce;
+            assert_eq!(
+                decrypt_vault(&kek, "user-1", &bad_payload_nonce),
+                Err(VaultError::CorruptStoredData),
+                "decrypt accepted a payload nonce of length {len}"
+            );
+        }
+    }
+
+    #[test]
     fn debug_redacts_credential_material() {
         // Threat-model §3: no log line may contain credential material.
         // A `{:#?}`/`dbg!`/assert dump of these configs must not carry
@@ -1051,6 +1160,75 @@ mod tests {
             crate::b64::encode(&[0u8; 12])
         );
         assert_ne!(rotated.dek_wrapped_b64url, blob.dek_wrapped_b64url);
+    }
+
+    #[test]
+    fn malformed_stored_blobs_are_classified_as_corrupt_at_the_vault_boundary() {
+        let kek = [0x11u8; 32];
+        let new_kek = [0x33u8; 32];
+        // Every stored-blob decode site in `decrypt_vault` must map to
+        // `CorruptStoredData` (never caller-input `Invalid`): a regression of
+        // any one site to `Invalid` would surface stored corruption as a
+        // fix-your-request 422 instead of a 500.
+        for field in [
+            "dek_wrapped_nonce_b64url",
+            "dek_wrapped_b64url",
+            "payload_nonce_b64url",
+            "payload_b64url",
+        ] {
+            let mut blob = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+            match field {
+                "dek_wrapped_nonce_b64url" => blob.dek_wrapped_nonce_b64url = "!".into(),
+                "dek_wrapped_b64url" => blob.dek_wrapped_b64url = "!".into(),
+                "payload_nonce_b64url" => blob.payload_nonce_b64url = "!".into(),
+                "payload_b64url" => blob.payload_b64url = "!".into(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                decrypt_vault(&kek, "user-1", &blob),
+                Err(VaultError::CorruptStoredData),
+                "field {field} must classify as corrupt stored data"
+            );
+        }
+        // A well-formed base64 nonce of the wrong length is corrupt stored
+        // data too, not caller input: this pins the `try_into` length branch
+        // distinctly from the base64-decode branch above.
+        let mut short_nonce = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+        short_nonce.payload_nonce_b64url = crate::b64::encode(&[0u8; 5]);
+        assert_eq!(
+            decrypt_vault(&kek, "user-1", &short_nonce),
+            Err(VaultError::CorruptStoredData)
+        );
+
+        // A well-formed but short wrapped-DEK nonce must hit the length
+        // classification branch in `decrypt_vault` too.
+        let mut short_wrapped_nonce = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+        short_wrapped_nonce.dek_wrapped_nonce_b64url = crate::b64::encode(&[0u8; 5]);
+        assert_eq!(
+            decrypt_vault(&kek, "user-1", &short_wrapped_nonce),
+            Err(VaultError::CorruptStoredData)
+        );
+
+        // Both wrapped-DEK decode sites in `rewrap_dek` pin the same way.
+        let mut short_rewrap_nonce = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+        short_rewrap_nonce.dek_wrapped_nonce_b64url = crate::b64::encode(&[0u8; 5]);
+        assert!(matches!(
+            rewrap_dek(&kek, &new_kek, 2, "user-1", &short_rewrap_nonce),
+            Err(VaultError::CorruptStoredData)
+        ));
+
+        let mut malformed_wrap = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+        malformed_wrap.dek_wrapped_nonce_b64url = "!".into();
+        assert!(matches!(
+            rewrap_dek(&kek, &new_kek, 2, "user-1", &malformed_wrap),
+            Err(VaultError::CorruptStoredData)
+        ));
+        let mut malformed_wrapped = encrypt_vault(&kek, 1, "user-1", b"secret").expect("encrypt");
+        malformed_wrapped.dek_wrapped_b64url = "!".into();
+        assert!(matches!(
+            rewrap_dek(&kek, &new_kek, 2, "user-1", &malformed_wrapped),
+            Err(VaultError::CorruptStoredData)
+        ));
     }
 
     #[test]

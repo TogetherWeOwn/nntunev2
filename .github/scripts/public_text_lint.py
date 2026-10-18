@@ -78,6 +78,13 @@ Reports print file:line + rule id only — never the matched bytes. CI
 logs on this repo are public (threat-model section 2), so the report
 itself must not re-publish the leak.
 
+An input that cannot be read or scanned fails the run (nonzero exit):
+an incomplete scan is never reported as a successful check. Scanning
+continues for the remaining inputs so a failure hides no findings.
+Failure diagnostics name the input and a stable failure category only
+— never file contents or raw exception details — and filenames are
+escaped so unusual names cannot break or spoof workflow annotations.
+
 Usage:
   python3 .github/scripts/public_text_lint.py [PATH ...]
   No PATHs: scan all git-tracked files. Explicit PATHs (e.g. new files
@@ -110,6 +117,8 @@ HOST_FIXTURE_EXCLUSIONS = frozenset(
         # asserted rejected (DNS-guard fake resolver, dial-prefix validation).
         "workers/api/src/handlers.rs",
         "workers/api/src/vault.rs",
+        # Ingest SSRF tests assert link-local and RFC-1918 addresses rejected.
+        "workers/ingest/tests/nzb_fetch_ssrf_guard.rs",
     }
 )
 
@@ -216,22 +225,77 @@ def scan_path(path):
     return find_violations(data.decode("latin-1"), path)
 
 
+def _escape_annotation_property(value):
+    """Render a filename safely for a workflow-command property value.
+
+    ``%`` introduces workflow-command escapes, ``,`` and ``:`` delimit
+    properties, and control characters (including a newline) could
+    split the annotation and spoof a second command. Encode all of
+    them percent-style; ``%`` first so existing text stays literal.
+    Lone surrogates from filesystem decoding are backslash-escaped so
+    printing the diagnostic can never itself raise.
+    """
+    safe = value.encode("utf-8", "backslashreplace").decode("utf-8")
+    escaped = []
+    for char in safe:
+        if char == "%":
+            escaped.append("%25")
+        elif char == ":":
+            escaped.append("%3A")
+        elif char == ",":
+            escaped.append("%2C")
+        elif ord(char) < 0x20 or ord(char) == 0x7F:
+            escaped.append(f"%{ord(char):02X}")
+        else:
+            escaped.append(char)
+    return "".join(escaped)
+
+
+def _failure_category(exc):
+    """Stable category token for a read/scan failure.
+
+    Deliberately coarse: OS error text is locale-dependent and raw
+    exception details must never reach a public CI log, so the
+    diagnostic carries this fixed token instead of the exception.
+    """
+    if isinstance(exc, UnicodeError):
+        return "decode-error"
+    return "read-error"
+
+
 def main(argv):
     paths = argv[1:] or tracked_files()
     total_hits = 0
     per_rule = {}
+    scanned = 0
+    failed = 0
     for path in paths:
         try:
             hits = scan_path(path)
         except (OSError, UnicodeError) as exc:
-            print(f"::warning file={path}::public-text: unreadable, skipped ({exc})")
+            # Fail closed: an incomplete scan must not pass. Keep going
+            # so findings in other inputs are not hidden, and report
+            # the input plus a stable category only — no contents, no
+            # raw exception details (CI logs here are public).
+            failed += 1
+            print(
+                f"::error file={_escape_annotation_property(path)}"
+                f"::public-text: {_failure_category(exc)}"
+            )
             continue
+        scanned += 1
         for lineno, rule_id in hits:
-            print(f"::error file={path},line={lineno}::public-text: {rule_id}")
+            print(
+                f"::error file={_escape_annotation_property(path)},line={lineno}"
+                f"::public-text: {rule_id}"
+            )
             total_hits += 1
             per_rule[rule_id] = per_rule.get(rule_id, 0) + 1
-    print(f"public-text: scanned {len(paths)} files, {total_hits} hits {per_rule}")
-    return 1 if total_hits else 0
+    print(
+        f"public-text: scanned {scanned} files, {failed} failed, "
+        f"{total_hits} hits {per_rule}"
+    )
+    return 1 if total_hits or failed else 0
 
 
 if __name__ == "__main__":

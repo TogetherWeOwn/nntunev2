@@ -45,10 +45,10 @@ pub enum JobSource {
 
 /// Durable resume point written after every completed step.
 ///
-/// `attempt` is the Queue-delivery attempt (1-based): the consumer increments
-/// it on redelivery and [`can_retry`] gates another try. [`advance`] never
-/// touches it, so per-state retries cannot silently reset the job-level
-/// budget. `repair_rounds` counts started `Verifying -> Repairing` rounds and
+/// `attempt` is the Queue-delivery attempt (1-based), persisted by the
+/// consumer in `INGEST_STATE`; Queue message bodies are immutable on redelivery.
+/// [`advance`] never touches it, so per-state retries cannot silently reset the
+/// job-level budget. `repair_rounds` counts started `Verifying -> Repairing` rounds and
 /// bounds the verify↔repair loop (see [`advance_checkpoint`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobCheckpoint {
@@ -63,11 +63,25 @@ pub struct JobCheckpoint {
     #[serde(default)]
     pub repair_rounds: u32,
     /// Probe answers collected while `Probing`, keyed by batch index (see
-    /// [`ProbeTally`](crate::probe::ProbeTally)). `None` outside `Probing`;
-    /// `#[serde(default)]` keeps pre-tally checkpoints readable (a crash
-    /// before this field existed resumes probing from batch zero).
+    /// [`ProbeTally`](crate::probe::ProbeTally)). The completed tally is
+    /// retained into `Verifying` (its missing-segment total is that step's
+    /// input) and cleared on redrive; `None` before `Probing` is first
+    /// entered. `#[serde(default)]` keeps pre-tally checkpoints readable
+    /// (a crash before this field existed resumes probing from batch zero).
     #[serde(default)]
     pub probe_tally: Option<ProbeTally>,
+    /// PAR2 set covering the damaged files, recorded by `Verifying`
+    /// before it hands off to `Repairing`. `None` until verify runs;
+    /// `#[serde(default)]` keeps pre-existing checkpoints readable.
+    #[serde(default)]
+    pub par2_set_id: Option<String>,
+    /// Blocks verify found missing, recorded alongside `par2_set_id`;
+    /// the `Repairing` step dispatches exactly this repair request.
+    #[serde(default)]
+    pub missing_blocks: u32,
+    /// Stable machine-readable failure category, retained for DLQ redelivery.
+    #[serde(default)]
+    pub failure_code: Option<String>,
     pub failure_reason: Option<String>,
 }
 
@@ -109,6 +123,7 @@ pub fn advance_checkpoint(cp: &mut JobCheckpoint, repair_needed: bool) -> JobSta
     match cp.state {
         JobState::Verifying if repair_needed => {
             if cp.repair_rounds >= MAX_REPAIR_ROUNDS {
+                cp.failure_code = Some("repair_budget_exhausted".to_string());
                 cp.failure_reason = Some("repair budget exhausted".to_string());
                 cp.state = JobState::Failed;
             } else {
@@ -292,6 +307,9 @@ mod tests {
             attempt: 1,
             repair_rounds: 0,
             probe_tally: None,
+            par2_set_id: None,
+            missing_blocks: 0,
+            failure_code: None,
             failure_reason: None,
         }
     }
@@ -309,6 +327,7 @@ mod tests {
         assert_eq!(cp.attempt, 1);
         assert_eq!(cp.repair_rounds, MAX_REPAIR_ROUNDS);
         assert!(is_terminal(cp.state));
+        assert_eq!(cp.failure_code.as_deref(), Some("repair_budget_exhausted"));
         assert_eq!(
             cp.failure_reason.as_deref(),
             Some("repair budget exhausted")

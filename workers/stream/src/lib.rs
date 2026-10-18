@@ -5,7 +5,9 @@
 //!
 //! - [`pool`]: one pool per user, capped at the user's provider connection
 //!   cap (from BYOP settings and plan), with leases, priority lanes
-//!   (playback > prefetch > ingest) and quarantine/backoff on provider errors.
+//!   (playback > prefetch > ingest) and a circuit breaker on provider errors
+//!   (3-in-30s opens for 30s with `503` + `Retry-After`; half-open probe
+//!   recovers).
 //! - [`grant`]: signed play grants issued by the `api` Worker; the stream
 //!   Worker authorizes every play against them.
 //! - [`range`]: HTTP `Range` parsing / `206` resolution for seeking.
@@ -23,6 +25,11 @@
 //! - [`prefetch`]: next-track prefetch on spare pool capacity (never the last connection).
 //! - [`probe`]: ingest segment-availability probe (`STAT` on the ingest
 //!   lane), served by the `NntpPool` Durable Object.
+//! - [`body`]: ingest article-body fetch (`BODY`, one segment per call on
+//!   the ingest lane), served by the same Durable Object.
+//! - `stampede` (native only, compiled out on wasm32): singleflight
+//!   stampede-guard primitive (one upstream fetch per concurrent segment)
+//!   with waiter-timeout re-election. Not yet wired into the play path.
 //! - [`routes`]: fail-closed public fetch and probe routing decisions, natively
 //!   tested and rendered by the wasm32 [`runtime`] adapter.
 //!
@@ -31,6 +38,8 @@
 //! exports the `NntpPool` Durable Object with its probe route. Native builds
 //! and `cargo test` never link the Workers runtime.
 
+pub mod api_error;
+pub mod body;
 pub mod cache;
 pub mod grant;
 pub mod meter;
@@ -42,7 +51,13 @@ pub mod prefetch;
 pub mod probe;
 pub mod range;
 pub mod routes;
+pub mod trace;
 pub mod yenc;
 
+// Native only: the Mutex/Condvar waiter path traps on wasm32-unknown-unknown
+// (and a single-threaded isolate cannot park a waiter anyway). The Worker
+// entry point gets an async shared-future equivalent; see the module docs.
 #[cfg(target_arch = "wasm32")]
 pub mod runtime;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod stampede;

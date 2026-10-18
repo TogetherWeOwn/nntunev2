@@ -17,6 +17,8 @@ pub const DO_CLASS_NAME: &str = "NntpPool";
 pub const PROBE_METHOD: &str = "POST";
 /// Probe route: method and path the pool Durable Object serves.
 pub const PROBE_PATH: &str = "/probe";
+/// Body route: path the pool Durable Object serves (same `POST` method).
+pub const BODY_PATH: &str = "/body";
 
 /// Public Worker fetch decision until the play adapters are wired.
 pub const PUBLIC_FETCH_STATUS: u16 = 404;
@@ -76,6 +78,34 @@ impl ProbeDecision {
     }
 }
 
+/// Adapter action for one Durable Object request, across both pool routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolAction {
+    /// Return the supplied portable route decision without running anything.
+    Respond(ProbeDecision),
+    /// Run request validation and probe execution (`POST /probe`).
+    RunProbe,
+    /// Run request validation and body execution (`POST /body`).
+    RunBody,
+}
+
+/// Decide what one Durable Object request runs: the probe route, the body
+/// route, or a portable refusal. Exact method+path only, and a right-route
+/// request on an owner-less instance is refused before any dial.
+pub fn decide_pool_action(method: &str, path: &str, has_owner_name: bool) -> PoolAction {
+    if method != PROBE_METHOD || (path != PROBE_PATH && path != BODY_PATH) {
+        return PoolAction::Respond(ProbeDecision::NotFound);
+    }
+    if !has_owner_name {
+        return PoolAction::Respond(ProbeDecision::OwnerMissing);
+    }
+    if path == BODY_PATH {
+        PoolAction::RunBody
+    } else {
+        PoolAction::RunProbe
+    }
+}
+
 /// Decide whether the adapter returns a route response or executes a probe.
 pub fn decide_probe_action(method: &str, path: &str, has_owner_name: bool) -> ProbeAction {
     match decide_probe(method, path, has_owner_name) {
@@ -124,6 +154,14 @@ mod tests {
 
     fn has_line(text: &str, line: &str) -> bool {
         text.lines().any(|candidate| candidate.trim() == line)
+    }
+
+    fn non_doc_attributes(attrs: &[syn::Attribute]) -> Vec<String> {
+        attrs
+            .iter()
+            .filter(|attribute| !attribute.path().is_ident("doc"))
+            .map(tokens)
+            .collect()
     }
 
     #[test]
@@ -193,6 +231,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pool_action_routes_probe_and_body_and_nothing_else() {
+        assert_eq!(
+            decide_pool_action("POST", "/probe", true),
+            PoolAction::RunProbe
+        );
+        assert_eq!(
+            decide_pool_action("POST", "/body", true),
+            PoolAction::RunBody
+        );
+        for (method, path) in [
+            ("GET", "/body"),
+            ("POST", "/body/"),
+            ("POST", "/BODY"),
+            ("POST", "/other"),
+        ] {
+            assert_eq!(
+                decide_pool_action(method, path, true),
+                PoolAction::Respond(ProbeDecision::NotFound),
+                "{method} {path}"
+            );
+        }
+        assert_eq!(
+            decide_pool_action("POST", "/body", false),
+            PoolAction::Respond(ProbeDecision::OwnerMissing)
+        );
+        assert_eq!(BODY_PATH, "/body");
+    }
+
     #[tokio::test]
     async fn dispatch_runs_the_selected_response_or_probe_handler() {
         let render = |decision: ProbeDecision| (decision.status(), decision.body());
@@ -222,14 +289,163 @@ mod tests {
         );
     }
 
+    fn tokens<T: quote::ToTokens>(value: &T) -> String {
+        value.to_token_stream().to_string()
+    }
+
     #[test]
     fn wasm_adapter_uses_dispatch_and_preserves_worker_status_rendering() {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let runtime = std::fs::read_to_string(dir.join("src/runtime.rs")).expect("read runtime.rs");
-        assert!(runtime.contains("routes::dispatch_probe("));
-        assert!(runtime.contains("|| async { respond(self.probe(&mut req).await) }"));
-        assert!(runtime.contains("Response::error(decision.body(), decision.status())"));
-        assert!(runtime.contains(".with_status(reply.status)"));
+        let parsed = syn::parse_file(&runtime).expect("parse runtime.rs");
+        assert!(
+            non_doc_attributes(&parsed.attrs).is_empty(),
+            "runtime.rs must not have inner attributes that can disable its Worker exports"
+        );
+
+        let lib = std::fs::read_to_string(dir.join("src/lib.rs")).expect("read lib.rs");
+        let parsed_lib = syn::parse_file(&lib).expect("parse lib.rs");
+        let runtime_module = parsed_lib
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Mod(module) if module.ident == "runtime" => Some(module),
+                _ => None,
+            })
+            .expect("runtime module declaration");
+        let wasm_cfg: syn::Attribute = syn::parse_quote!(#[cfg(target_arch = "wasm32")]);
+        assert_eq!(
+            non_doc_attributes(&runtime_module.attrs),
+            vec![tokens(&wasm_cfg)],
+            "runtime module must be enabled only by the wasm32 target cfg"
+        );
+
+        let public_fetch = parsed
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(function) if function.sig.ident == "fetch" => Some(function),
+                _ => None,
+            })
+            .expect("public fetch handler");
+        let expected_public_fetch = syn::parse_str::<syn::ItemFn>(
+            "async fn fetch(_req: Request, _env: Env, _ctx: Context) -> Result<Response> {\n                let (status, body) = routes::decide_public_fetch();\n                Response::error(body, status)\n            }",
+        )
+        .expect("parse expected public fetch handler");
+        assert_eq!(
+            tokens(&public_fetch.sig),
+            tokens(&expected_public_fetch.sig)
+        );
+        assert_eq!(
+            tokens(&public_fetch.block),
+            tokens(&expected_public_fetch.block)
+        );
+        let event_attribute: syn::Attribute = syn::parse_quote!(#[event(fetch)]);
+        assert_eq!(
+            non_doc_attributes(&public_fetch.attrs),
+            vec![tokens(&event_attribute)],
+            "public fetch must have exactly its Worker event binding and no cfg/other attributes"
+        );
+
+        let durable_object_fetch = parsed
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Impl(implementation)
+                    if implementation.trait_.as_ref().is_some_and(|(path, _)| {
+                        path.segments
+                            .last()
+                            .is_some_and(|s| s.ident == "DurableObject")
+                    }) =>
+                {
+                    implementation.items.iter().find_map(|item| match item {
+                        syn::ImplItem::Fn(function) if function.sig.ident == "fetch" => {
+                            Some(function)
+                        }
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .expect("NntpPool Durable Object fetch handler");
+        assert!(
+            non_doc_attributes(&durable_object_fetch.attrs).is_empty(),
+            "Durable Object fetch handler must not carry cfg/other attributes"
+        );
+        let expected_durable_object_fetch = syn::parse_str::<syn::ImplItemFn>(
+            "async fn fetch(&self, mut req: Request) -> Result<Response> {\n                let has_owner_name = self.state.id().name().is_some();\n                match routes::decide_pool_action(req.method().as_ref(), &req.path(), has_owner_name) {\n                    PoolAction::Respond(ProbeDecision::NotFound) => Response::error(ProbeDecision::NotFound.body(), ProbeDecision::NotFound.status(),),\n                    PoolAction::Respond(decision) => respond(route_reply(decision)),\n                    PoolAction::RunProbe => respond(self.probe(&mut req).await),\n                    PoolAction::RunBody => respond_body(self.body(&mut req).await),\n                }\n            }",
+        )
+        .expect("parse expected Durable Object handler");
+        assert_eq!(
+            tokens(&durable_object_fetch.sig),
+            tokens(&expected_durable_object_fetch.sig)
+        );
+        assert_eq!(
+            tokens(&durable_object_fetch.block),
+            tokens(&expected_durable_object_fetch.block),
+            "Durable Object fetch must keep each decision on its intended response path"
+        );
+
+        let durable_object = parsed
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Struct(item) if item.ident == "NntpPool" => Some(item),
+                _ => None,
+            })
+            .expect("NntpPool Durable Object");
+        let fetch_attribute: syn::Attribute = syn::parse_quote!(#[durable_object(fetch)]);
+        assert_eq!(
+            non_doc_attributes(&durable_object.attrs),
+            vec![tokens(&fetch_attribute)],
+            "NntpPool must have exactly its Durable Object fetch binding"
+        );
+
+        let route_reply = parsed
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(function) if function.sig.ident == "route_reply" => Some(function),
+                _ => None,
+            })
+            .expect("route_reply function");
+        assert!(
+            non_doc_attributes(&route_reply.attrs).is_empty(),
+            "route_reply must not carry cfg/other attributes"
+        );
+        let expected_route_reply = syn::parse_str::<syn::ItemFn>(
+            "fn route_reply(decision: ProbeDecision) -> ProbeReply {\n                ProbeReply {\n                    status: decision.status(),\n                    body: decision.body().to_string(),\n                    retry_after_secs: None,\n                }\n            }",
+        )
+        .expect("parse expected route_reply");
+        assert_eq!(tokens(&route_reply.sig), tokens(&expected_route_reply.sig));
+        assert_eq!(
+            tokens(&route_reply.block),
+            tokens(&expected_route_reply.block),
+            "route_reply must preserve portable status and body"
+        );
+
+        let respond = parsed
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(function) if function.sig.ident == "respond" => Some(function),
+                _ => None,
+            })
+            .expect("respond function");
+        assert!(
+            non_doc_attributes(&respond.attrs).is_empty(),
+            "respond must not carry cfg/other attributes"
+        );
+        let expected_respond = syn::parse_str::<syn::ItemFn>(
+            "fn respond(reply: ProbeReply) -> Result<Response> {\n                let headers = Headers::new();\n                headers.set(\"content-type\", \"application/json\")?;\n                if let Some(secs) = reply.retry_after_secs {\n                    headers.set(\"retry-after\", &secs.to_string())?;\n                }\n                Ok(Response::ok(reply.body)?\n                    .with_status(reply.status)\n                    .with_headers(headers))\n            }",
+        )
+        .expect("parse expected respond");
+        assert_eq!(tokens(&respond.sig), tokens(&expected_respond.sig));
+        assert_eq!(
+            tokens(&respond.block),
+            tokens(&expected_respond.block),
+            "respond must preserve its reply status and retry metadata"
+        );
     }
 
     #[test]

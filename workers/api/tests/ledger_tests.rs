@@ -333,7 +333,7 @@ fn migration_pins_rate_and_persisted_caps() {
     // the DB, or corrupt rows are accepted. Dropping the CHECK has the same
     // effect. This test reads the migration file so either mutant fails the
     // suite.
-    const MIGRATION: &str = include_str!("../../../migrations/0006_usage_ledger.sql");
+    const MIGRATION: &str = include_str!("../../../migrations/0019_usage_ledger.sql");
     let rate = ledger::STREAM_BYTES_PER_SEC.to_string();
     assert!(
         MIGRATION.contains(&format!("bytes_served / {rate}")),

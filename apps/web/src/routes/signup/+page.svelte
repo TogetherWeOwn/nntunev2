@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
-	import { ApiClient, type RegisterStartResponse } from '#lib/api/client.js';
+	import { invalidateLibraryCache } from '#lib/library/cache.js';
+	import { ApiClient, ApiError, type RegisterStartResponse } from '#lib/api/client.js';
 	import { stashSignedInEmail } from '#lib/signed-in-email.js';
 	import {
 		serializePublicKeyCredential,
@@ -43,7 +44,11 @@
 			// address can still enroll.
 			pending = await client.registerStart(email.trim());
 			status = 'code-sent';
-		} catch {
+		} catch (error) {
+			if (error instanceof ApiError && error.paywall) {
+				status = 'idle';
+				return;
+			}
 			// Generic: account creation never says which step failed.
 			status = 'error';
 		}
@@ -97,10 +102,16 @@
 				magicToken: magicCode.trim(),
 				...(inviteCode.trim().length > 0 ? { inviteCode: inviteCode.trim() } : {})
 			});
+			invalidateLibraryCache();
 			status = 'created';
 			stashSignedInEmail(email.trim());
 			window.location.href = '/onboarding/byop';
-		} catch {
+		} catch (error) {
+			if (error instanceof ApiError && error.paywall) {
+				// Keep the retryable code form and single-use challenge available.
+				status = 'code-sent';
+				return;
+			}
 			// Generic: account creation never says which step failed. Stay
 			// on the code step: a mistyped code is rejected before the
 			// challenge is spent, so the same emailed code can simply be

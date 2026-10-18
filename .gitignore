@@ -6,6 +6,17 @@
 /workers/ingest/target/
 **/*.rs.bk
 Cargo.lock
+# The API Worker deploys auth/vault crypto: its lockfile is committed so CI
+# and deploys resolve the exact audited dependency set (built with --locked).
+!/workers/api/Cargo.lock
+# The dependency/security gate audits exact resolved sets, so the workspace
+# root and the remaining standalone Worker lockfiles are committed too.
+# Every lock below is verified fresh in CI (`cargo metadata --locked`) and
+# audited by the cargo-deny job; update them with cargo, never by hand.
+!/Cargo.lock
+!/workers/ingest/Cargo.lock
+!/workers/mb/Cargo.lock
+!/workers/repair/Cargo.lock
 .cargo/
 
 # Rust wasm / workers
@@ -16,7 +27,14 @@ Cargo.lock
 # Node / SvelteKit
 node_modules/
 .svelte-kit/
-build/
+# Rooted: a bare `build/` would also swallow source dirs named `build`
+# (e.g. `apps/web/src/routes/api/build/`), so generated per-worker and
+# per-app build output is ignored explicitly instead (workers/stream and
+# workers/repair emit build/worker/shim.mjs via worker-build; see their
+# wrangler.toml [build] commands).
+/build/
+/workers/*/build/
+/apps/*/build/
 dist/
 package-lock.json
 yarn.lock

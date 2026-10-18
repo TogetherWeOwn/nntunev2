@@ -2,17 +2,52 @@ name: e2e-staging
 
 # Staging E2E + synthetic smoke for NNTune v2.
 # Runs the Playwright suite in e2e/ against STAGING_BASE_URL (behind
-# Cloudflare Access via the QA service-token pair). The deployment lane must
-# sequence this after staging deploy and require its result on the deployed
-# SHA for prod promotion. That integration is not established by this file.
+# Cloudflare Access via the QA service-token pair).
+#
+# Sequencing: this workflow no longer triggers on push. The full journey
+# (`e2e` job) runs only when deploy.yml calls this workflow with
+# `post_deploy: true` from a job that `needs` a successful `staging-web`
+# deploy of the same run/revision — a skipped or failed deploy therefore
+# cannot produce a full-journey PASS. Scheduled and manually dispatched
+# runs are monitoring only: they run the synthetic smoke and never the
+# full journey, so they cannot be cited as post-deploy promotion
+# evidence. A source SHA is not deployed-build identity (no build ID is
+# exposed through any public health endpoint), so even a post-deploy PASS
+# does not by itself prove which build is serving (see docs/ops.md).
 #
 # Pre-deploy there is no staging yet: jobs skip at step level with a notice
 # when secrets.STAGING_BASE_URL is unset. Once staging is configured the
 # same file fails closed — no workflow change needed for activation.
 
 on:
-  push:
-    branches: [main]
+  workflow_call:
+    inputs:
+      post_deploy:
+        # Set only by deploy.yml, from a job that needs staging-web.
+        # workflow_dispatch defines no such input, so a manual run cannot
+        # mint post-deploy evidence.
+        description: Run the full journey as post-deploy evidence
+        type: boolean
+        required: true
+    secrets:
+      STAGING_BASE_URL:
+        required: false
+      CF_ACCESS_CLIENT_ID:
+        required: false
+      CF_ACCESS_CLIENT_SECRET:
+        required: false
+      QA_AUTH_TOKEN:
+        required: false
+      SYNTHETIC_NNTP_HOST:
+        required: false
+      SYNTHETIC_NNTP_PORT:
+        required: false
+      SYNTHETIC_NNTP_USER:
+        required: false
+      SYNTHETIC_NNTP_TLS:
+        required: false
+      SYNTHETIC_NNTP_PASS:
+        required: false
   workflow_dispatch:
   schedule:
     # Synthetic monitor cadence (off-minute to avoid thundering herd).
@@ -82,7 +117,51 @@ jobs:
           QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
         run: npm run e2e:smoke
 
+      - name: Publish signup-path evidence summary
+        id: signup-path-summary
+        if: always() && steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        run: |
+          set -euo pipefail
+          # Green runs upload nothing, and the list reporter does not print
+          # test annotations, so without this step a passing run would retain
+          # no record of which signup path produced it. Publish only the
+          # bounded signup-path labels (fixed values, never account data) plus
+          # static test names to the run summary. Whitelist-only output: even
+          # though this reads pre-sanitize junit.xml, no other file content
+          # (and no secret) can pass through. Never fails the job.
+          {
+            echo "## Signup-path evidence"
+            echo ""
+            if [ ! -f test-results/junit.xml ]; then
+              echo "No junit evidence (test-results/junit.xml absent) — no signup-path label recorded."
+            else
+              python3 - <<'PY' || echo "Could not parse junit evidence — no signup-path label recorded."
+          import xml.etree.ElementTree as ET
+          allowed = {'public-ui-signup', 'api-minted-account'}
+          rows = []
+          for case in ET.parse('test-results/junit.xml').getroot().iter('testcase'):
+              name = case.get('name', '(unnamed test)')
+              label = None
+              props = case.find('properties')
+              if props is not None:
+                  for prop in props.findall('property'):
+                      if prop.get('name') == 'signup-path' and prop.get('value') in allowed:
+                          label = prop.get('value')
+              rows.append(f"- {name}: `{label}`" if label else f"- {name}: (no signup-path label)")
+          if rows:
+              print('Signup-path labels recorded at the test-account seam branch (fixed values only):')
+              print()
+              for row in rows:
+                  print(row)
+          else:
+              print('No test cases in junit evidence — no signup-path label recorded.')
+          PY
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Sanitize failure artifacts (strip credential-bearing snapshots)
+        id: sanitize
         if: failure() && steps.staging.outputs.configured == 'true'
         working-directory: e2e
         env:
@@ -102,11 +181,23 @@ jobs:
           # playwright-report/ dir, then scrub secret values from every remaining
           # file under test-results/ (junit.xml) so the uploaded artifact can
           # never carry secrets. Only test-results/ (junit) is uploaded below.
-          find test-results -name 'error-context.md' -delete 2>/dev/null || true
-          rm -rf playwright-report 2>/dev/null || true
+          # Fail closed: any cleanup/read/write failure exits nonzero, and the
+          # upload step gates on steps.sanitize.outcome == 'success', so a
+          # failed, skipped or cancelled sanitizer can never publish.
+          rm -rf playwright-report
+          if [ ! -e test-results ]; then
+            echo "test-results absent: nothing to sanitize or upload"
+            exit 0
+          fi
+          if [ ! -d test-results ]; then
+            echo "::error::test-results exists but is not a directory; failing closed"
+            exit 1
+          fi
           python3 - <<'PY'
           import os
           import pathlib
+          import shutil
+          import sys
           root = pathlib.Path("test-results")
           values = [
               os.environ.get("CF_ACCESS_CLIENT_ID", ""),
@@ -117,22 +208,47 @@ jobs:
               os.environ.get("SYNTHETIC_NNTP_PASS", ""),
           ]
           values = [v for v in values if v]
-          if root.is_dir() and values:
-              for path in root.rglob("*"):
-                  if not path.is_file():
-                      continue
-                  try:
-                      data = path.read_bytes()
-                  except OSError:
-                      continue
-                  for value in values:
-                      data = data.replace(value.encode(), b"***REDACTED***")
+          def fail_closed(action, path, exc):
+              # Names and error codes only — never file contents or secret values.
+              print(f"::error::sanitize {action} failed for {path} ({type(exc).__name__} errno={exc.errno}); failing closed", file=sys.stderr)
+              sys.exit(1)
+          def glob_all(pattern):
+              try:
+                  return list(root.rglob(pattern))
+              except OSError as exc:
+                  fail_closed("scan", root, exc)
+          for path in glob_all("error-context.md"):
+              try:
+                  if path.is_dir() and not path.is_symlink():
+                      shutil.rmtree(path)
+                  else:
+                      path.unlink()
+              except OSError as exc:
+                  fail_closed("cleanup", path, exc)
+          if glob_all("error-context.md"):
+              print("::error::error-context.md remains after cleanup; failing closed", file=sys.stderr)
+              sys.exit(1)
+          if pathlib.Path("playwright-report").exists():
+              print("::error::playwright-report remains after cleanup; failing closed", file=sys.stderr)
+              sys.exit(1)
+          for path in glob_all("*"):
+              if not path.is_file():
+                  continue
+              try:
+                  data = path.read_bytes()
+              except OSError as exc:
+                  fail_closed("read", path, exc)
+              for value in values:
+                  data = data.replace(value.encode(), b"***REDACTED***")
+              try:
                   path.write_bytes(data)
+              except OSError as exc:
+                  fail_closed("write", path, exc)
           PY
           echo "sanitized: error-context.md and playwright-report/ removed, test-results scrubbed"
 
       - name: Upload failure artifacts
-        if: failure() && steps.staging.outputs.configured == 'true'
+        if: failure() && steps.staging.outputs.configured == 'true' && steps.sanitize.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-synthetic-report
@@ -140,9 +256,16 @@ jobs:
             e2e/test-results/
           retention-days: 7
 
+  # Full-journey promotion evidence. Runs only on the post-deploy call
+  # from deploy.yml (inputs.post_deploy); scheduled/manual runs skip this
+  # job entirely. Never add always()/!cancelled() here: the implicit
+  # success() on `needs` is what stops a failed synthetic smoke — and,
+  # through the deploy.yml caller, a skipped/failed deploy — from
+  # producing a full-journey PASS.
   e2e:
     name: full journey (signup → byop → ingest → meter → limits)
     needs: [synthetic]
+    if: ${{ inputs.post_deploy }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -202,7 +325,51 @@ jobs:
           SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
         run: npm run e2e:staging
 
+      - name: Publish signup-path evidence summary
+        id: signup-path-summary
+        if: always() && steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        run: |
+          set -euo pipefail
+          # Green runs upload nothing, and the list reporter does not print
+          # test annotations, so without this step a passing run would retain
+          # no record of which signup path produced it. Publish only the
+          # bounded signup-path labels (fixed values, never account data) plus
+          # static test names to the run summary. Whitelist-only output: even
+          # though this reads pre-sanitize junit.xml, no other file content
+          # (and no secret) can pass through. Never fails the job.
+          {
+            echo "## Signup-path evidence"
+            echo ""
+            if [ ! -f test-results/junit.xml ]; then
+              echo "No junit evidence (test-results/junit.xml absent) — no signup-path label recorded."
+            else
+              python3 - <<'PY' || echo "Could not parse junit evidence — no signup-path label recorded."
+          import xml.etree.ElementTree as ET
+          allowed = {'public-ui-signup', 'api-minted-account'}
+          rows = []
+          for case in ET.parse('test-results/junit.xml').getroot().iter('testcase'):
+              name = case.get('name', '(unnamed test)')
+              label = None
+              props = case.find('properties')
+              if props is not None:
+                  for prop in props.findall('property'):
+                      if prop.get('name') == 'signup-path' and prop.get('value') in allowed:
+                          label = prop.get('value')
+              rows.append(f"- {name}: `{label}`" if label else f"- {name}: (no signup-path label)")
+          if rows:
+              print('Signup-path labels recorded at the test-account seam branch (fixed values only):')
+              print()
+              for row in rows:
+                  print(row)
+          else:
+              print('No test cases in junit evidence — no signup-path label recorded.')
+          PY
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Sanitize failure artifacts (strip credential-bearing snapshots)
+        id: sanitize
         if: failure() && steps.staging.outputs.configured == 'true'
         working-directory: e2e
         env:
@@ -220,11 +387,23 @@ jobs:
           # values. Strip error-context.md plus the whole playwright-report/
           # dir, then scrub secret values from test-results/ (junit.xml)
           # before upload (junit-only evidence in test-results/).
-          find test-results -name 'error-context.md' -delete 2>/dev/null || true
-          rm -rf playwright-report 2>/dev/null || true
+          # Fail closed: any cleanup/read/write failure exits nonzero, and the
+          # upload step gates on steps.sanitize.outcome == 'success', so a
+          # failed, skipped or cancelled sanitizer can never publish.
+          rm -rf playwright-report
+          if [ ! -e test-results ]; then
+            echo "test-results absent: nothing to sanitize or upload"
+            exit 0
+          fi
+          if [ ! -d test-results ]; then
+            echo "::error::test-results exists but is not a directory; failing closed"
+            exit 1
+          fi
           python3 - <<'PY'
           import os
           import pathlib
+          import shutil
+          import sys
           root = pathlib.Path("test-results")
           values = [
               os.environ.get("CF_ACCESS_CLIENT_ID", ""),
@@ -235,22 +414,47 @@ jobs:
               os.environ.get("SYNTHETIC_NNTP_PASS", ""),
           ]
           values = [v for v in values if v]
-          if root.is_dir() and values:
-              for path in root.rglob("*"):
-                  if not path.is_file():
-                      continue
-                  try:
-                      data = path.read_bytes()
-                  except OSError:
-                      continue
-                  for value in values:
-                      data = data.replace(value.encode(), b"***REDACTED***")
+          def fail_closed(action, path, exc):
+              # Names and error codes only — never file contents or secret values.
+              print(f"::error::sanitize {action} failed for {path} ({type(exc).__name__} errno={exc.errno}); failing closed", file=sys.stderr)
+              sys.exit(1)
+          def glob_all(pattern):
+              try:
+                  return list(root.rglob(pattern))
+              except OSError as exc:
+                  fail_closed("scan", root, exc)
+          for path in glob_all("error-context.md"):
+              try:
+                  if path.is_dir() and not path.is_symlink():
+                      shutil.rmtree(path)
+                  else:
+                      path.unlink()
+              except OSError as exc:
+                  fail_closed("cleanup", path, exc)
+          if glob_all("error-context.md"):
+              print("::error::error-context.md remains after cleanup; failing closed", file=sys.stderr)
+              sys.exit(1)
+          if pathlib.Path("playwright-report").exists():
+              print("::error::playwright-report remains after cleanup; failing closed", file=sys.stderr)
+              sys.exit(1)
+          for path in glob_all("*"):
+              if not path.is_file():
+                  continue
+              try:
+                  data = path.read_bytes()
+              except OSError as exc:
+                  fail_closed("read", path, exc)
+              for value in values:
+                  data = data.replace(value.encode(), b"***REDACTED***")
+              try:
                   path.write_bytes(data)
+              except OSError as exc:
+                  fail_closed("write", path, exc)
           PY
           echo "sanitized: error-context.md and playwright-report/ removed, test-results scrubbed"
 
       - name: Upload failure artifacts
-        if: failure() && steps.staging.outputs.configured == 'true'
+        if: failure() && steps.staging.outputs.configured == 'true' && steps.sanitize.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-journey-report

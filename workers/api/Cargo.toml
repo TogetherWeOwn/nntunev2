@@ -11,7 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # Keys and nonces use getrandom below, not aead's optional OsRng backend.
-aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 # Shared unpadded-base64url over this crate (F-HARD-01): one audited
 # implementation for vault/auth/session. Pure Rust, wasm32-compatible.
 base64 = "0.23"
@@ -24,21 +24,29 @@ sha2 = "0.11"
 getrandom = { version = "0.4", features = ["wasm_js"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Structured log emitter + trace-ID propagation (docs/logging-standard.md).
+# The api Worker's HTTP entry (fetch boundary) lands in a follow-up slice;
+# this exposes the emitter the entry will use.
+nntune-logging = { version = "0.1.0", path = "../../crates/nntune-logging" }
 zeroize = { version = "1", features = ["derive"] }
 url = "2"
 subtle = "2"
 # WebAuthn signature verification (pure-Rust, wasm32-compatible):
 # ES256 (COSE alg -7) and EdDSA (COSE alg -8) credential public keys.
-p256 = { version = "0.13", default-features = false, features = ["alloc", "arithmetic", "ecdsa"] }
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+p256 = { version = "0.14", default-features = false, features = ["alloc", "arithmetic", "ecdsa"] }
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc"] }
 # Worker HTTP + Hyperdrive entry (same versions as workers/mb). These
 # compile natively so `cargo test` keeps covering the core handlers;
 # the runtime-only paths live in `worker_entry`.
-worker = { version = "0.3", features = ["http", "tokio-postgres"] }
+worker = { version = "0.8", features = ["http", "tokio-postgres"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
 wasm-bindgen-futures = "0.4"
 # Only for the capped request-body stream read in the Worker entry.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1"
+# Test-only RNG for the KEK rotation acceptance fixtures (native tests only;
+# the crate itself uses getrandom, so this never ships to wasm32).
+rand = "0.8"

@@ -7,11 +7,15 @@
 //!   path): [`Pool::release`] takes the connection back, [`Pool::take_idle`]
 //!   hands it to the next play, so a steady stream never reconnects per play.
 //! - [`Lane`]s are enforced at acquire time: playback may use every
-//!   connection; prefetch and ingest must leave one free for playback.
-//! - Provider errors drive exponential quarantine/backoff; success resets it.
+//!   connection; prefetch and ingest leave one free for playback except that
+//!   ingest may use the single half-open recovery probe.
+//! - Provider errors drive a circuit breaker ([`CIRCUIT_FAILURE_THRESHOLD`]
+//!   consecutive failures inside [`CIRCUIT_WINDOW_MS`] opens it for
+//!   [`CIRCUIT_OPEN_MS`], then a single half-open probe); success closes it.
 //!
 //! Time is a virtual millisecond clock ([`Pool::advance`]) so tests are
-//! deterministic; the Durable Object drives it with wall-clock time.
+//! deterministic. The embedding Durable Object must advance it from wall-clock
+//! deltas; this crate has no runtime loop that does so automatically.
 //!
 //! Leases are drop-safe: the slot count lives in shared state behind the
 //! [`Lease`]'s guard, so a play that is dropped without `release` (client
@@ -20,9 +24,11 @@
 //! stream's connection is discarded, because its read position is unknown
 //! and re-parking it could attribute one article's bytes to another play.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Priority lane. Ordering is priority order: `Playback < Prefetch < Ingest`.
+/// Priority lane. Ordering is priority order: `Playback < Prefetch < Ingest`;
+/// only Playback and Ingest may use the half-open recovery probe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Lane {
     Playback,
@@ -45,11 +51,16 @@ pub struct Lease {
 /// `abort`, on either the miss or the hit path). The play path pushes these
 /// into pool-level shared state; the pool owner drains them via
 /// [`Pool::take_orphaned`] and emits one `BytesServed` event each.
+///
+/// `trace_id` is the normalized request trace for log correlation only: it
+/// never enters the Analytics Engine row (see `MeterEvent`, which is
+/// unchanged). `None` means the play carried no valid trace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrphanedPlay {
     pub user_id: String,
     pub track_id: String,
     pub bytes: u64,
+    pub trace_id: Option<String>,
 }
 
 /// Slot bookkeeping shared between the pool and outstanding leases, so a
@@ -57,6 +68,7 @@ pub struct OrphanedPlay {
 #[derive(Debug, Default)]
 struct SlotState {
     in_use: u32,
+    probe_in_flight: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -64,6 +76,7 @@ struct SlotGuard {
     /// `None` once [`Pool::release`] took the slot back explicitly; `Drop`
     /// only acts on a still-armed guard.
     slots: Option<Arc<Mutex<SlotState>>>,
+    id: u64,
 }
 
 impl SlotGuard {
@@ -80,6 +93,9 @@ impl Drop for SlotGuard {
         if let Some(slots) = self.slots.take() {
             if let Ok(mut state) = slots.lock() {
                 state.in_use = state.in_use.saturating_sub(1);
+                if state.probe_in_flight == Some(self.id) {
+                    state.probe_in_flight = None;
+                }
             }
         }
     }
@@ -88,7 +104,9 @@ impl Drop for SlotGuard {
 /// Why an acquire failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PoolError {
-    /// Pool is quarantined after provider errors; retry after the backoff.
+    /// The circuit breaker is open, a half-open probe is already in flight,
+    /// or the probe cannot run yet; retry after `retry_after_ms`.
+    /// The play path maps this to `503` with a `Retry-After` header.
     Quarantined { retry_after_ms: u64 },
     /// All connections are leased out.
     Exhausted,
@@ -104,16 +122,28 @@ pub fn effective_cap(provider_cap: u32, plan_cap: u32) -> u32 {
     provider_cap.min(plan_cap).clamp(1, HARD_MAX_CONNS)
 }
 
-/// Backoff after `consecutive_errors` provider failures: 1s, 5s, 30s, then
-/// 5min capped.
-pub fn backoff_ms(consecutive_errors: u32) -> u64 {
-    match consecutive_errors {
-        0 => 0,
-        1 => 1_000,
-        2 => 5_000,
-        3 => 30_000,
-        _ => 300_000,
-    }
+/// Circuit-breaker tuning (see the crate README for the documented values).
+///
+/// The breaker opens after [`CIRCUIT_FAILURE_THRESHOLD`] consecutive provider
+/// failures whose first-to-last span fits inside [`CIRCUIT_WINDOW_MS`]; while
+/// open every acquire fails with `Retry-After: CIRCUIT_OPEN_MS`. Once the open
+/// interval elapses the breaker is half-open: exactly one probe acquire is
+/// admitted. A provider response closes it; a provider failure re-opens it.
+pub const CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
+/// Failures whose first-to-last span exceeds this window count as a fresh
+/// streak (the count restarts at 1).
+pub const CIRCUIT_WINDOW_MS: u64 = 30_000;
+/// How long the breaker stays open before admitting a half-open probe.
+pub const CIRCUIT_OPEN_MS: u64 = 30_000;
+/// Retry hint while the single half-open probe is still running.
+pub const HALF_OPEN_PROBE_RETRY_MS: u64 = 1_000;
+
+/// Circuit-breaker state, derived from the failure count and the virtual clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CircuitState {
+    Closed,
+    Open,
+    HalfOpen,
 }
 
 pub struct Pool<C> {
@@ -130,6 +160,12 @@ pub struct Pool<C> {
     reuses: u64,
     next_id: u64,
     consecutive_errors: u32,
+    /// Shared with active streams so a deferred success cannot clear a later error.
+    provider_error_epoch: Arc<AtomicU64>,
+    /// Virtual time of the first failure in the current streak; `None` when
+    /// the streak is empty. Failures older than [`CIRCUIT_WINDOW_MS`] restart
+    /// the streak instead of extending it.
+    window_start_ms: Option<u64>,
     quarantined_until_ms: Option<u64>,
     now_ms: u64,
 }
@@ -145,6 +181,8 @@ impl<C> Pool<C> {
             reuses: 0,
             next_id: 0,
             consecutive_errors: 0,
+            provider_error_epoch: Arc::new(AtomicU64::new(0)),
+            window_start_ms: None,
             quarantined_until_ms: None,
             now_ms: 0,
         }
@@ -166,44 +204,86 @@ impl<C> Pool<C> {
 
     /// Would [`Pool::try_acquire`] succeed on `lane` right now?
     pub fn can_acquire(&self, lane: Lane) -> bool {
-        !self.quarantined() && self.in_use_locked() + Self::reserve(lane) < self.capacity
+        let circuit_state = self.circuit_state();
+        if circuit_state == CircuitState::Open {
+            return false;
+        }
+        let Ok(state) = self.slots.lock() else {
+            return false;
+        };
+        let is_probe = circuit_state == CircuitState::HalfOpen
+            && matches!(lane, Lane::Playback | Lane::Ingest)
+            && state.probe_in_flight.is_none();
+        if circuit_state == CircuitState::HalfOpen && !is_probe {
+            return false;
+        }
+        let reserve = if is_probe { 0 } else { Self::reserve(lane) };
+        state.in_use + reserve < self.capacity
     }
 
     /// Try to lease one connection slot on `lane`.
+    ///
+    /// While the breaker is open this fails with [`PoolError::Quarantined`]
+    /// (the play path maps that to `503` + `Retry-After`) without dialing out.
+    /// While half-open exactly one probe is admitted, tracked by its lease id;
+    /// further acquires get a non-zero retry hint while that probe runs.
     pub fn try_acquire(&mut self, lane: Lane) -> Result<Lease, PoolError> {
-        if let Some(until) = self.quarantined_until_ms {
+        let is_probe = if let Some(until) = self.quarantined_until_ms {
             if self.now_ms < until {
                 return Err(PoolError::Quarantined {
                     retry_after_ms: until - self.now_ms,
                 });
             }
-        }
+            self.consecutive_errors >= CIRCUIT_FAILURE_THRESHOLD
+        } else {
+            false
+        };
         let mut state = match self.slots.lock() {
             Ok(state) => state,
             Err(_) => return Err(PoolError::Exhausted),
         };
-        if state.in_use + Self::reserve(lane) >= self.capacity {
-            return Err(PoolError::Exhausted);
+        if is_probe
+            && (!matches!(lane, Lane::Playback | Lane::Ingest) || state.probe_in_flight.is_some())
+        {
+            return Err(PoolError::Quarantined {
+                retry_after_ms: HALF_OPEN_PROBE_RETRY_MS,
+            });
         }
+        let reserve = if is_probe { 0 } else { Self::reserve(lane) };
+        if state.in_use + reserve >= self.capacity {
+            return if is_probe {
+                Err(PoolError::Quarantined {
+                    retry_after_ms: HALF_OPEN_PROBE_RETRY_MS,
+                })
+            } else {
+                Err(PoolError::Exhausted)
+            };
+        }
+        let id = self.next_id;
         let lease = Lease {
-            id: self.next_id,
+            id,
             lane,
             guard: Some(SlotGuard {
                 slots: Some(Arc::clone(&self.slots)),
+                id,
             }),
         };
         self.next_id += 1;
         state.in_use += 1;
+        if is_probe {
+            state.probe_in_flight = Some(id);
+        }
         Ok(lease)
     }
 
     /// Take a warm connection for a fresh lease, if one is idle.
     pub fn take_idle(&mut self) -> Option<C> {
-        let conn = self.idle.pop();
-        if conn.is_some() {
-            self.reuses += 1;
-        }
-        conn
+        self.idle.pop()
+    }
+
+    /// A warm connection passed peer and timeout validation for reuse.
+    pub(crate) fn record_reuse(&mut self) {
+        self.reuses += 1;
     }
 
     /// The caller dialed a new physical connection.
@@ -221,6 +301,9 @@ impl<C> Pool<C> {
             if let Ok(mut state) = self.slots.lock() {
                 debug_assert!(state.in_use > 0, "released without a matching acquire");
                 state.in_use = state.in_use.saturating_sub(1);
+                if state.probe_in_flight == Some(lease.id) {
+                    state.probe_in_flight = None;
+                }
             }
         }
         if let Some(conn) = conn {
@@ -257,20 +340,163 @@ impl<C> Pool<C> {
             .unwrap_or_default()
     }
 
-    /// A provider call failed: count it and (re)start quarantine backoff.
+    /// A provider call failed: extend the streak (restarting it when the
+    /// previous failures are older than [`CIRCUIT_WINDOW_MS`]) and open the
+    /// breaker for [`CIRCUIT_OPEN_MS`] once the streak reaches
+    /// [`CIRCUIT_FAILURE_THRESHOLD`]. A failure in half-open re-opens for a
+    /// fresh interval without resetting the streak. A failure while open is
+    /// held: the breaker already knows the provider is down, so the streak
+    /// and the window are left alone and the original open interval still
+    /// half-opens for exactly one probe instead of silently closing (a
+    /// window reset here would drop the count to 1 and report Closed).
     pub fn record_provider_error(&mut self) {
+        self.advance_provider_error_epoch();
+        self.record_provider_error_state();
+    }
+
+    fn record_provider_error_state(&mut self) {
+        match self.circuit_state() {
+            CircuitState::HalfOpen => self.reopen_after_probe(),
+            CircuitState::Open => {
+                // Late failure from a pre-outage lease: hold the open interval.
+            }
+            CircuitState::Closed => self.record_failure_in_window(),
+        }
+    }
+
+    fn advance_provider_error_epoch(&self) {
+        self.provider_error_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn provider_error_epoch_source(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.provider_error_epoch)
+    }
+
+    pub(crate) fn provider_error_epoch(&self) -> u64 {
+        self.provider_error_epoch.load(Ordering::Acquire)
+    }
+
+    /// Record a provider failure associated with a lease. When that lease is
+    /// the half-open probe, re-open immediately instead of applying the
+    /// original failure-window reset.
+    pub fn record_provider_error_for(&mut self, lease_id: u64) {
+        self.advance_provider_error_epoch();
+        if self.clear_probe(lease_id) {
+            self.reopen_after_probe();
+        } else {
+            self.record_provider_error_state();
+        }
+    }
+
+    /// A non-provider result still proves that the half-open probe reached the
+    /// provider (for example, an article-missing or decode response).
+    pub fn record_non_provider_result_for(&mut self, lease_id: u64) -> bool {
+        if self.probe_in_flight() == Some(lease_id) {
+            self.record_success()
+        } else {
+            false
+        }
+    }
+
+    fn record_failure_in_window(&mut self) {
+        if let Some(start) = self.window_start_ms {
+            if self.now_ms.saturating_sub(start) > CIRCUIT_WINDOW_MS {
+                self.consecutive_errors = 0;
+                self.window_start_ms = None;
+            }
+        }
+        if self.consecutive_errors == 0 {
+            self.window_start_ms = Some(self.now_ms);
+        }
         self.consecutive_errors = self.consecutive_errors.saturating_add(1);
-        let backoff = backoff_ms(self.consecutive_errors);
-        self.quarantined_until_ms = Some(self.now_ms.saturating_add(backoff));
+        if self.consecutive_errors >= CIRCUIT_FAILURE_THRESHOLD {
+            self.quarantined_until_ms = Some(self.now_ms.saturating_add(CIRCUIT_OPEN_MS));
+        }
     }
 
-    /// A provider call succeeded: clear errors and quarantine.
-    pub fn record_success(&mut self) {
+    fn reopen_after_probe(&mut self) {
+        self.consecutive_errors = self.consecutive_errors.max(CIRCUIT_FAILURE_THRESHOLD);
+        self.quarantined_until_ms = Some(self.now_ms.saturating_add(CIRCUIT_OPEN_MS));
+    }
+
+    fn clear_probe(&self, lease_id: u64) -> bool {
+        let Ok(mut state) = self.slots.lock() else {
+            return false;
+        };
+        if state.probe_in_flight == Some(lease_id) {
+            state.probe_in_flight = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn probe_in_flight(&self) -> Option<u64> {
+        self.slots.lock().ok()?.probe_in_flight
+    }
+
+    /// Settle a successful lease only when no newer provider failure has been
+    /// recorded since the operation began.
+    pub(crate) fn record_success_for_if_epoch_matches(
+        &mut self,
+        lease_id: u64,
+        epoch: u64,
+    ) -> bool {
+        if self.provider_error_epoch() == epoch {
+            self.record_success_for(lease_id)
+        } else {
+            false
+        }
+    }
+
+    /// A provider call succeeded: clear the streak and close the breaker
+    /// (including after a half-open probe).
+    pub fn record_success(&mut self) -> bool {
+        let cleared_quarantine = self.quarantined_until_ms.is_some();
         self.consecutive_errors = 0;
+        self.window_start_ms = None;
         self.quarantined_until_ms = None;
+        if let Ok(mut state) = self.slots.lock() {
+            state.probe_in_flight = None;
+        }
+        cleared_quarantine
     }
 
-    /// Advance the virtual clock (test seam; the DO uses wall-clock time).
+    /// A provider call succeeded on `lease_id`. Only the admitted half-open
+    /// probe closes the breaker; a stale lease's success clears a
+    /// closed-state streak but can never close an open breaker or release
+    /// another play's probe.
+    pub fn record_success_for(&mut self, lease_id: u64) -> bool {
+        if self.probe_in_flight() == Some(lease_id) {
+            self.record_success()
+        } else if self.quarantined_until_ms.is_none() {
+            self.consecutive_errors = 0;
+            self.window_start_ms = None;
+            false
+        } else {
+            false
+        }
+    }
+
+    /// A first-segment success on `lease_id`: settles only the admitted
+    /// half-open probe (closing the breaker, so recovery still works) and
+    /// leaves a closed-state streak untouched. Mid-track provider failures
+    /// are then counted against the streak the first segment did not erase,
+    /// so a provider that serves segment 0 and dies afterwards still trips
+    /// the breaker. The closed-state streak is cleared only when the play
+    /// completes cleanly (`finalize` success or an `abort` with no failure,
+    /// via [`Pool::record_success_for`]).
+    pub fn record_probe_success_for(&mut self, lease_id: u64) -> bool {
+        if self.probe_in_flight() == Some(lease_id) {
+            self.record_success()
+        } else {
+            false
+        }
+    }
+
+    /// Advance the virtual clock by elapsed milliseconds. The embedding
+    /// runtime must call this with wall-clock deltas before time-based pool
+    /// operations; the pool does not advance time automatically.
     pub fn advance(&mut self, ms: u64) {
         self.now_ms = self.now_ms.saturating_add(ms);
     }
@@ -293,7 +519,7 @@ impl<C> Pool<C> {
         self.connects
     }
 
-    /// Plays served from a warm connection (no reconnect).
+    /// First-segment fetches served from a validated warm connection.
     pub fn reuses(&self) -> u64 {
         self.reuses
     }
@@ -302,6 +528,19 @@ impl<C> Pool<C> {
         match self.quarantined_until_ms {
             Some(until) => self.now_ms < until,
             None => false,
+        }
+    }
+
+    /// Current breaker state: open while the quarantine interval runs,
+    /// half-open once it has elapsed with the failure streak still at
+    /// threshold (exactly one probe acquire is admitted), closed otherwise.
+    pub fn circuit_state(&self) -> CircuitState {
+        match self.quarantined_until_ms {
+            Some(until) if self.now_ms < until => CircuitState::Open,
+            Some(_) if self.consecutive_errors >= CIRCUIT_FAILURE_THRESHOLD => {
+                CircuitState::HalfOpen
+            }
+            _ => CircuitState::Closed,
         }
     }
 }
@@ -334,6 +573,8 @@ mod tests {
         assert_eq!(pool.idle(), 1);
         let lease2 = pool.try_acquire(Lane::Playback).expect("second acquire");
         assert_eq!(pool.take_idle(), Some(7), "same connection comes back");
+        assert_eq!(pool.reuses(), 0, "take alone is not a successful reuse");
+        pool.record_reuse();
         assert_eq!((pool.connects(), pool.reuses()), (1, 1));
         pool.release(lease2, Some(7));
     }
@@ -412,35 +653,208 @@ mod tests {
     }
 
     #[test]
-    fn provider_errors_quarantine_with_exponential_backoff() {
+    fn open_breaker_holds_for_the_open_interval_then_admits_a_probe() {
+        use super::CIRCUIT_OPEN_MS;
+        let mut pool = TestPool::new(2);
+        for _ in 0..super::CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        assert!(pool.quarantined());
+        let err = pool.try_acquire(Lane::Playback).expect_err("quarantined");
+        assert_eq!(
+            err,
+            PoolError::Quarantined {
+                retry_after_ms: CIRCUIT_OPEN_MS
+            }
+        );
+        pool.advance(CIRCUIT_OPEN_MS - 1);
+        assert!(pool.quarantined());
+        assert_eq!(pool.circuit_state(), super::CircuitState::Open);
+        pool.advance(1);
+        assert!(!pool.quarantined());
+        assert_eq!(pool.circuit_state(), super::CircuitState::HalfOpen);
+        let probe = pool.try_acquire(Lane::Playback).expect("probe admitted");
+
+        // A failed probe after the original window expired still re-opens.
+        pool.advance(1);
+        pool.record_provider_error_for(probe.id);
+        pool.release(probe, None);
+        assert_eq!(pool.circuit_state(), super::CircuitState::Open);
+        let err = pool
+            .try_acquire(Lane::Playback)
+            .expect_err("failed probe keeps the breaker open");
+        assert_eq!(
+            err,
+            PoolError::Quarantined {
+                retry_after_ms: CIRCUIT_OPEN_MS
+            }
+        );
+    }
+
+    #[test]
+    fn half_open_gate_tracks_the_probe_not_unrelated_leases() {
+        use super::{CIRCUIT_OPEN_MS, HALF_OPEN_PROBE_RETRY_MS};
+        let mut pool = TestPool::new(3);
+        let existing = pool.try_acquire(Lane::Playback).expect("existing lease");
+        for _ in 0..super::CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        pool.advance(CIRCUIT_OPEN_MS);
+
+        {
+            let probe = pool.try_acquire(Lane::Playback).expect("probe admitted");
+            assert_eq!(pool.in_use(), 2, "existing lease does not block probe");
+            let err = pool
+                .try_acquire(Lane::Playback)
+                .expect_err("only one half-open probe may be in flight");
+            assert_eq!(
+                err,
+                PoolError::Quarantined {
+                    retry_after_ms: HALF_OPEN_PROBE_RETRY_MS
+                }
+            );
+            assert!(!pool.can_acquire(Lane::Playback));
+            drop(probe);
+        }
+
+        let next_probe = pool
+            .try_acquire(Lane::Playback)
+            .expect("dropping the probe clears its in-flight marker");
+        pool.record_success();
+        pool.release(next_probe, None);
+        pool.release(existing, None);
+    }
+
+    #[test]
+    fn ingest_half_open_probe_may_use_playback_reserved_slot() {
+        use super::{CIRCUIT_OPEN_MS, HALF_OPEN_PROBE_RETRY_MS};
+
+        let mut pool = TestPool::new(2);
+        let playback = pool.try_acquire(Lane::Playback).expect("playback lease");
+        for _ in 0..super::CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        pool.advance(CIRCUIT_OPEN_MS);
+
+        assert!(pool.can_acquire(Lane::Ingest));
+        let probe = pool
+            .try_acquire(Lane::Ingest)
+            .expect("ingest probe uses reserved slot");
+        assert!(!pool.can_acquire(Lane::Prefetch));
+        assert_eq!(
+            pool.try_acquire(Lane::Playback)
+                .expect_err("one probe at a time"),
+            PoolError::Quarantined {
+                retry_after_ms: HALF_OPEN_PROBE_RETRY_MS
+            }
+        );
+
+        pool.release(probe, None);
+        pool.release(playback, None);
+    }
+
+    #[test]
+    fn half_open_probe_waits_for_capacity_with_a_retry_hint() {
+        use super::{CIRCUIT_OPEN_MS, HALF_OPEN_PROBE_RETRY_MS};
+
+        let mut pool = TestPool::new(1);
+        let existing = pool.try_acquire(Lane::Playback).expect("existing lease");
+        for _ in 0..super::CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        pool.advance(CIRCUIT_OPEN_MS);
+
+        assert!(!pool.can_acquire(Lane::Playback));
+        assert_eq!(
+            pool.try_acquire(Lane::Playback)
+                .expect_err("full pool cannot run the probe"),
+            PoolError::Quarantined {
+                retry_after_ms: HALF_OPEN_PROBE_RETRY_MS
+            }
+        );
+
+        pool.release(existing, None);
+        let probe = pool
+            .try_acquire(Lane::Playback)
+            .expect("probe runs once capacity is available");
+        pool.record_success();
+        pool.release(probe, None);
+    }
+
+    #[test]
+    fn expired_failure_window_restarts_then_counts_the_new_streak() {
+        use super::{CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_WINDOW_MS};
         let mut pool = TestPool::new(2);
         pool.record_provider_error();
-        assert!(pool.quarantined());
-        let err = pool.try_acquire(Lane::Playback).expect_err("quarantined");
-        assert_eq!(
-            err,
-            PoolError::Quarantined {
-                retry_after_ms: backoff_ms(1)
-            }
-        );
-        assert_eq!(backoff_ms(1), 1_000);
-        assert_eq!(backoff_ms(2), 5_000);
-        assert_eq!(backoff_ms(3), 30_000);
-        assert_eq!(backoff_ms(4), 300_000);
-        assert_eq!(backoff_ms(99), 300_000);
-        // Backoff has not elapsed yet: still quarantined.
-        pool.advance(backoff_ms(1) - 1);
-        assert!(pool.quarantined());
-        // After the backoff elapses a second error backs off further.
-        pool.advance(1);
         pool.record_provider_error();
-        let err = pool.try_acquire(Lane::Playback).expect_err("quarantined");
+        pool.advance(CIRCUIT_WINDOW_MS + 1);
+        pool.record_provider_error();
+        assert!(!pool.quarantined(), "the stale streak restarts at one");
+        pool.record_provider_error();
+        assert!(!pool.quarantined());
+        pool.record_provider_error();
+        assert_eq!(CIRCUIT_FAILURE_THRESHOLD, 3);
+        assert!(pool.quarantined(), "three new-window failures open");
+    }
+
+    #[test]
+    fn breaker_opens_only_after_threshold_failures_inside_window() {
+        use super::{CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_OPEN_MS, CIRCUIT_WINDOW_MS};
+        assert_eq!(CIRCUIT_FAILURE_THRESHOLD, 3);
+        assert_eq!(CIRCUIT_WINDOW_MS, 30_000);
+        assert_eq!(CIRCUIT_OPEN_MS, 30_000);
+        let mut pool = TestPool::new(4);
+        // Below threshold: counted but the pool still serves.
+        pool.record_provider_error();
+        assert!(!pool.quarantined(), "1 failure must not open the breaker");
+        pool.try_acquire(Lane::Playback)
+            .expect("below threshold still acquires");
+        pool.record_provider_error();
+        assert!(!pool.quarantined(), "2 failures must not open the breaker");
+        // Threshold reached: open with a Retry-After.
+        pool.record_provider_error();
+        assert!(pool.quarantined(), "3 consecutive failures must open");
+        let err = pool.try_acquire(Lane::Playback).expect_err("open breaker");
         assert_eq!(
             err,
             PoolError::Quarantined {
-                retry_after_ms: backoff_ms(2)
+                retry_after_ms: CIRCUIT_OPEN_MS
             }
         );
+        // Stale failures outside the window do not count: advance past the
+        // window, let the open expire, recover, then one fresh failure alone
+        // must not reopen.
+        pool.advance(CIRCUIT_OPEN_MS);
+        pool.record_success();
+        assert!(!pool.quarantined());
+        pool.advance(CIRCUIT_WINDOW_MS + 1);
+        pool.record_provider_error();
+        assert!(!pool.quarantined(), "window expired: count restarts at 1");
+    }
+
+    #[test]
+    fn half_open_probe_recovers_to_closed_on_success() {
+        use super::CIRCUIT_OPEN_MS;
+        let mut pool = TestPool::new(2);
+        for _ in 0..super::CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        assert!(pool.quarantined());
+        assert_eq!(pool.circuit_state(), super::CircuitState::Open);
+        // Open duration elapses: half-open, exactly one probe is admitted.
+        pool.advance(CIRCUIT_OPEN_MS);
+        assert_eq!(pool.circuit_state(), super::CircuitState::HalfOpen);
+        let _probe = pool.try_acquire(Lane::Playback).expect("probe admitted");
+        assert!(
+            pool.try_acquire(Lane::Playback).is_err(),
+            "half-open admits a single probe"
+        );
+        // Probe success closes the breaker.
+        pool.record_success();
+        assert_eq!(pool.circuit_state(), super::CircuitState::Closed);
+        assert!(!pool.quarantined());
+        pool.try_acquire(Lane::Playback)
+            .expect("closed breaker serves");
     }
 
     #[test]
@@ -450,6 +864,7 @@ mod tests {
             user_id: "u".into(),
             track_id: "t".into(),
             bytes: 7,
+            trace_id: None,
         });
         // Streams record through the shared sink without holding the pool
         // (this is how `Drop` meters a lease-less cache-hit stream).
@@ -460,6 +875,7 @@ mod tests {
                 user_id: "u".into(),
                 track_id: "t".into(),
                 bytes: 8,
+                trace_id: None,
             });
         let drained = pool.take_orphaned();
         assert_eq!(
@@ -473,11 +889,166 @@ mod tests {
     #[test]
     fn success_clears_quarantine() {
         let mut pool = TestPool::new(2);
-        pool.record_provider_error();
+        for _ in 0..super::CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
         assert!(pool.quarantined());
         pool.record_success();
         assert!(!pool.quarantined());
+        assert_eq!(pool.circuit_state(), super::CircuitState::Closed);
         pool.try_acquire(Lane::Playback)
             .expect("acquire after reset");
+    }
+
+    #[test]
+    fn closed_streak_clear_is_not_reported_as_quarantine_exit() {
+        let mut pool = TestPool::new(2);
+        let lease = pool.try_acquire(Lane::Playback).expect("lease");
+        pool.record_provider_error();
+
+        assert!(!pool.record_success_for(lease.id));
+        assert_eq!(pool.consecutive_errors, 0);
+        assert_eq!(pool.circuit_state(), super::CircuitState::Closed);
+        pool.release(lease, None);
+    }
+
+    #[test]
+    fn stale_lease_success_while_open_leaves_the_breaker_open() {
+        use super::{CircuitState, CIRCUIT_OPEN_MS};
+        let mut pool = TestPool::new(2);
+        let stale = pool.try_acquire(Lane::Playback).expect("stale lease");
+        for _ in 0..super::CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        assert!(pool.quarantined());
+        pool.record_success_for(stale.id);
+        assert!(
+            pool.quarantined(),
+            "a stale lease must not close an open breaker"
+        );
+        assert_eq!(pool.circuit_state(), CircuitState::Open);
+        pool.release(stale, None);
+        // The streak is untouched too: expiry still half-opens for a probe.
+        pool.advance(CIRCUIT_OPEN_MS);
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn probe_success_closes_but_unrelated_success_does_not() {
+        use super::{CircuitState, CIRCUIT_OPEN_MS};
+        let mut pool = TestPool::new(3);
+        let stale = pool.try_acquire(Lane::Playback).expect("stale lease");
+        for _ in 0..super::CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        pool.advance(CIRCUIT_OPEN_MS);
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+        let probe = pool.try_acquire(Lane::Playback).expect("probe admitted");
+
+        // A concurrent stale success leaves the half-open breaker alone.
+        pool.record_success_for(stale.id);
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+
+        // The probe's own success closes it.
+        pool.record_success_for(probe.id);
+        assert_eq!(pool.circuit_state(), CircuitState::Closed);
+        pool.release(probe, None);
+        pool.release(stale, None);
+    }
+
+    #[test]
+    fn closed_state_success_still_clears_the_streak() {
+        let mut pool = TestPool::new(2);
+        let lease = pool.try_acquire(Lane::Playback).expect("lease");
+        pool.record_provider_error();
+        pool.record_provider_error();
+        pool.record_success_for(lease.id);
+        pool.release(lease, None);
+        pool.record_provider_error();
+        pool.record_provider_error();
+        assert!(
+            !pool.quarantined(),
+            "a closed-state success restarts the streak"
+        );
+    }
+
+    #[test]
+    fn stale_success_does_not_clear_a_newer_closed_state_failure() {
+        let mut pool = TestPool::new(2);
+        let lease = pool.try_acquire(Lane::Playback).expect("lease");
+        let success_epoch = pool.provider_error_epoch();
+        pool.record_provider_error();
+
+        assert!(!pool.record_success_for_if_epoch_matches(lease.id, success_epoch));
+        assert_eq!(pool.consecutive_errors, 1);
+        pool.release(lease, None);
+    }
+
+    #[test]
+    fn late_failure_while_open_holds_the_breaker_for_its_probe() {
+        use super::{CircuitState, PoolError, CIRCUIT_OPEN_MS};
+        let mut pool = TestPool::new(4);
+        // A play that took its lease before the outage fails late, after
+        // the breaker already opened.
+        let stale = pool.try_acquire(Lane::Playback).expect("pre-outage lease");
+        pool.record_provider_error();
+        pool.advance(10_000);
+        pool.record_provider_error();
+        pool.advance(10_000);
+        pool.record_provider_error();
+        assert_eq!(pool.circuit_state(), CircuitState::Open);
+        pool.advance(CIRCUIT_OPEN_MS - 5_000);
+        pool.record_provider_error_for(stale.id);
+        pool.release(stale, None);
+        // The original open interval still half-opens for exactly one probe:
+        // without the Open hold the window reset would drop the streak to 1
+        // and report Closed here, admitting every play to the dead upstream.
+        pool.advance(5_000);
+        assert!(!pool.quarantined());
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+        let probe = pool.try_acquire(Lane::Playback).expect("probe admitted");
+        assert!(
+            matches!(
+                pool.try_acquire(Lane::Playback),
+                Err(PoolError::Quarantined { .. })
+            ),
+            "half-open still admits only one probe"
+        );
+        pool.record_success_for(probe.id);
+        assert_eq!(pool.circuit_state(), CircuitState::Closed);
+        pool.release(probe, None);
+    }
+
+    #[test]
+    fn first_segment_probe_success_only_settles_the_probe() {
+        use super::{CircuitState, CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_OPEN_MS};
+        let mut pool = TestPool::new(4);
+        // Two provider failures on the streak, then a play whose first
+        // segment serves fine: the streak must survive the first segment so
+        // a later mid-track failure still reaches the threshold.
+        pool.record_provider_error();
+        pool.record_provider_error();
+        let lease = pool.try_acquire(Lane::Playback).expect("lease");
+        pool.record_probe_success_for(lease.id);
+        assert_eq!(pool.circuit_state(), CircuitState::Closed);
+        pool.release(lease, None);
+        pool.record_provider_error();
+        assert!(
+            pool.quarantined(),
+            "2 failures + mid-track failure must open the breaker"
+        );
+        assert_eq!(
+            pool.circuit_state(),
+            CircuitState::Open,
+            "streak reaches the threshold"
+        );
+        assert_eq!(CIRCUIT_FAILURE_THRESHOLD, 3);
+        // And a probe's own first segment still closes the breaker.
+        pool.advance(CIRCUIT_OPEN_MS);
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+        let probe = pool.try_acquire(Lane::Playback).expect("probe admitted");
+        pool.record_probe_success_for(probe.id);
+        assert_eq!(pool.circuit_state(), CircuitState::Closed);
+        pool.release(probe, None);
     }
 }
