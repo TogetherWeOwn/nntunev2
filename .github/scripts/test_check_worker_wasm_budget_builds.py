@@ -11,6 +11,7 @@ temporary directories only.
 from __future__ import annotations
 
 import io
+import os
 import subprocess
 import sys
 import unittest
@@ -26,11 +27,76 @@ from check_worker_wasm_budget import (
     BUILD_TIMEOUT_SECONDS,
     WORKERS,
     build_worker,
-    cargo_args,
     collect_rows,
     main,
     wasm_path,
 )
+
+# Independently pinned cargo argv per worker (literals, never cargo_args()).
+# Changing TARGET, a manifest path, the -p selector or --locked must fail.
+EXPECTED_API_ARGV = [
+    "cargo",
+    "build",
+    "--release",
+    "--target",
+    "wasm32-unknown-unknown",
+    "--manifest-path",
+    "workers/api/Cargo.toml",
+    "--locked",
+]
+
+EXPECTED_ALL_ARGV = [
+    [
+        "cargo",
+        "build",
+        "--release",
+        "--target",
+        "wasm32-unknown-unknown",
+        "--manifest-path",
+        "workers/api/Cargo.toml",
+        "--locked",
+    ],
+    [
+        "cargo",
+        "build",
+        "--release",
+        "--target",
+        "wasm32-unknown-unknown",
+        "--manifest-path",
+        "workers/ingest/Cargo.toml",
+        "--locked",
+    ],
+    [
+        "cargo",
+        "build",
+        "--release",
+        "--target",
+        "wasm32-unknown-unknown",
+        "--manifest-path",
+        "workers/mb/Cargo.toml",
+        "--locked",
+    ],
+    [
+        "cargo",
+        "build",
+        "--release",
+        "--target",
+        "wasm32-unknown-unknown",
+        "--manifest-path",
+        "workers/repair/Cargo.toml",
+        "--locked",
+    ],
+    [
+        "cargo",
+        "build",
+        "--release",
+        "--target",
+        "wasm32-unknown-unknown",
+        "-p",
+        "nntune-stream",
+        "--locked",
+    ],
+]
 
 TINY_WASM = b"\x00asm" + b"\x00" * 64
 
@@ -65,7 +131,7 @@ class BuildWorkerContractTests(unittest.TestCase):
         self.assertIn(str(BUILD_TIMEOUT_SECONDS), detail)
         fake.assert_called_once()
         argv, kwargs = fake.call_args.args[0], fake.call_args.kwargs
-        self.assertEqual(argv, cargo_args(api))
+        self.assertEqual(argv, EXPECTED_API_ARGV)
         self.assertEqual(kwargs["cwd"], root)
         self.assertEqual(kwargs["timeout"], BUILD_TIMEOUT_SECONDS)
         self.assertEqual(kwargs["timeout"], 1800)
@@ -80,7 +146,7 @@ class BuildWorkerContractTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("cargo not runnable", detail)
         fake.assert_called_once()
-        self.assertEqual(fake.call_args.args[0], cargo_args(api))
+        self.assertEqual(fake.call_args.args[0], EXPECTED_API_ARGV)
         self.assertEqual(fake.call_args.kwargs["cwd"], root)
         self.assertEqual(fake.call_args.kwargs["timeout"], BUILD_TIMEOUT_SECONDS)
 
@@ -92,7 +158,7 @@ class BuildWorkerContractTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("exit 1", detail)
         fake.assert_called_once()
-        self.assertEqual(fake.call_args.args[0], cargo_args(api))
+        self.assertEqual(fake.call_args.args[0], EXPECTED_API_ARGV)
         self.assertEqual(fake.call_args.kwargs["timeout"], BUILD_TIMEOUT_SECONDS)
 
     def test_successful_execution(self):
@@ -103,7 +169,7 @@ class BuildWorkerContractTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(detail, "ok")
         fake.assert_called_once()
-        self.assertEqual(fake.call_args.args[0], cargo_args(api))
+        self.assertEqual(fake.call_args.args[0], EXPECTED_API_ARGV)
         self.assertEqual(fake.call_args.kwargs["timeout"], BUILD_TIMEOUT_SECONDS)
 
 
@@ -153,13 +219,23 @@ class CollectRowsBuildTests(unittest.TestCase):
                 collect_rows(root, skip_build=False)
 
             self.assertEqual(len(seen), len(WORKERS))
-            for spec, (argv, kwargs) in zip(WORKERS, seen):
-                self.assertEqual(argv, cargo_args(spec))
+            self.assertEqual(len(EXPECTED_ALL_ARGV), len(WORKERS))
+            for (argv, kwargs), expected in zip(seen, EXPECTED_ALL_ARGV):
+                self.assertEqual(argv, expected)
                 self.assertEqual(kwargs["cwd"], root)
                 self.assertEqual(kwargs["timeout"], BUILD_TIMEOUT_SECONDS)
 
 
 class MainExitTests(unittest.TestCase):
+    def run_main_isolated(self, argv):
+        """Run main() without touching the real CI job-summary file."""
+        with patch.dict(os.environ):
+            os.environ.pop("GITHUB_STEP_SUMMARY", None)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = main(argv)
+        return code, buf.getvalue()
+
     def test_main_returns_1_on_build_failure(self):
         import tempfile
 
@@ -176,12 +252,10 @@ class MainExitTests(unittest.TestCase):
                 return ok_proc()
 
             with patch.object(checker.subprocess, "run", side_effect=fake_run):
-                buf = io.StringIO()
-                with redirect_stdout(buf):
-                    code = main(["--root", tmp])
+                code, output = self.run_main_isolated(["--root", tmp])
             self.assertEqual(code, 1)
-            self.assertIn("FAIL", buf.getvalue())
-            self.assertIn("api", buf.getvalue())
+            self.assertIn("FAIL", output)
+            self.assertIn("api", output)
 
     def test_main_returns_0_when_all_five_pass(self):
         import tempfile
@@ -193,14 +267,12 @@ class MainExitTests(unittest.TestCase):
             with patch.object(
                 checker.subprocess, "run", return_value=ok_proc()
             ) as fake:
-                buf = io.StringIO()
-                with redirect_stdout(buf):
-                    code = main(["--root", tmp])
+                code, output = self.run_main_isolated(["--root", tmp])
             self.assertEqual(code, 0)
-            self.assertIn("PASS", buf.getvalue())
+            self.assertIn("PASS", output)
             self.assertEqual(fake.call_count, len(WORKERS))
             for spec in WORKERS:
-                self.assertIn(f"| `{spec['worker']}` |", buf.getvalue())
+                self.assertIn(f"| `{spec['worker']}` |", output)
 
 
 if __name__ == "__main__":

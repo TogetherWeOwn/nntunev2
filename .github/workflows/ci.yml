@@ -149,6 +149,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Unit-test the budget check
         run: python3 .github/scripts/test_check_worker_wasm_budget.py
+      - name: Unit-test the budget check build paths
+        run: python3 .github/scripts/test_check_worker_wasm_budget_builds.py
       - name: Build Workers and enforce the compressed-size budget
         run: python3 .github/scripts/check_worker_wasm_budget.py
 
