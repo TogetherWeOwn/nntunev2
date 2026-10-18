@@ -86,23 +86,41 @@ The repair worker defines its own stable fault shape in
 for logs and operators, carrying no user data. Ingest maps those faults
 in `workers/ingest/src/repair.rs` (`classify_repair_reply`): replies
 with status 400, 404, 409, or 413 are `Unrepairable` (permanent — a
-retry would send the same bytes, so the job fails terminally), and
-every other status is `Retry` (transient — retried through the shared
+retry would send the same bytes, so the job fails terminally); a 200
+reply is decided by its `status` field (`repaired` -> `Repaired`,
+`unrepairable` -> `Unrepairable` which is also terminal, anything else
+or a malformed or oversized body -> `Retry`); every other (non-200)
+status is `Retry` (transient — retried through the shared
 job attempt budget). Container replies are classified in
 `workers/repair/src/contract.rs` (`classify_container_reply`,
-`ContainerOutcome::Forward`): only a well-formed 200 result is
-terminal; known 4xx/503 container codes forward to ingest with their
-stable code unchanged, and anything else forwards as 502
+`ContainerOutcome::Forward`): only a well-formed 200 result completes
+the repair worker's request (`Done` — persist outputs and reply 200);
+on 400/404/409/413/503 any container `error` code of at most 64
+lowercase/digit/underscore characters is forwarded unchanged (it is not
+checked against any registry), and everything else forwards as 502
 `container_unavailable`.
 
 This registry currently carries no repair rows: every row in the table
 above names an owning worker drawn from api, ingest, mb, and stream,
 and none names repair. That is a status fact, not a registry change.
+Two qualifications apply to that fact. Repair replies use a bare
+`{"error": <code>}` body (`workers/repair/src/runtime.rs`,
+`fault_response`), not the `{code, message, retryable}` envelope, and
+already reuse the registered strings `invalid_request`,
+`payload_too_large`, and `not_found` without being listed as an owning
+worker on those rows — so the `Owning worker lists every worker that
+may emit the code` header is incomplete for those three codes. There is
+also no repair-side `api_error` registry or doc-lint test
+(`workers/repair/src` holds only `contract.rs`, `lib.rs`, `runtime.rs`;
+the `api_error` registries live under api, ingest, mb, and stream), so
+step 2 of `Adding a code` and its drift guard cannot be followed for
+repair as written.
 
-A future repair row follows the same `Adding a code` rule below with
-no exception: one registry row here (code, status, retryable, owning
-worker `repair`) plus the same entry in the owning worker's error
-registry; never rename or reuse a code, and never change a code's
+A future repair row follows the same `Adding a code` rule below once
+those prerequisites exist: one registry row here (code, status,
+retryable, owning worker `repair`) plus the same entry in a repair-side
+error registry covered by a doc-lint test (or an explicit exemption
+recorded here); never rename or reuse a code, and never change a code's
 status or retryable flag in place. No such row is added by this
 note.
 
