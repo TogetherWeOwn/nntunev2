@@ -57,12 +57,6 @@ DELTA_TITLES = [
     "delta five",
 ]
 
-ZETA_TITLES = [
-    "zeta one",
-    "zeta two",
-]
-
-
 def write_tree(root, matrix, listed):
     root = Path(root)
     (root / "docs").mkdir(parents=True, exist_ok=True)
@@ -140,28 +134,27 @@ class DriftStringsTest(unittest.TestCase):
             ],
         )
 
-    def test_two_uncited_specs_are_sorted(self):
-        # zeta lines come first in `e2e:list` output, but drifts must be
-        # sorted, so gamma sorts first; pins the sorted() on the loop.
+    def test_six_uncited_specs_are_sorted(self):
+        # Six uncited files listed in reverse alphabetical order, but drifts
+        # must be sorted ascending; pins the sorted() on the loop. Six files
+        # make an accidental sorted set order negligible (1/720 per run), so
+        # a sorted()-removal mutant fails on any PYTHONHASHSEED.
+        ordered = ["fig", "gamma", "kilo", "mango", "tango", "zeta"]
         lines = ["Listing tests:"]
         lines.append("  [staging] › alpha.spec.ts:10:3 › group › first title")
         lines.append("  [staging] › alpha.spec.ts:20:3 › group › second title")
         lines.append("  [staging] › beta.spec.ts:5:3 › solo title")
-        for i, title in enumerate(ZETA_TITLES, start=1):
-            lines.append(f"  [staging] › zeta.spec.ts:{i}:3 › group › {title}")
-        for i, title in enumerate(GAMMA_TITLES, start=1):
-            lines.append(f"  [staging] › gamma.spec.ts:{i}:3 › group › {title}")
-        lines.append("Total: 12 tests in 4 files")
+        for name in reversed(ordered):
+            lines.append(f"  [staging] › {name}.spec.ts:1:3 › group › {name} title")
+        lines.append("Total: 9 tests in 8 files")
         listed = "\n".join(lines) + "\n"
         drifts = self.run_check(MATRIX_COVERING_BOTH, listed)
         self.assertEqual(
             drifts,
             [
-                "uncited spec file e2e/tests/gamma.spec.ts (7 tests: "
-                "'gamma one', 'gamma two', 'gamma three', 'gamma four', "
-                "'gamma five' (+2 more)); cite it in the matrix",
-                "uncited spec file e2e/tests/zeta.spec.ts (2 tests: "
-                "'zeta one', 'zeta two'); cite it in the matrix",
+                f"uncited spec file e2e/tests/{name}.spec.ts (1 tests: "
+                f"'{name} title'); cite it in the matrix"
+                for name in ordered
             ],
         )
 
