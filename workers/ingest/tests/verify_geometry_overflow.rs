@@ -16,16 +16,21 @@
 //!   prove no length, so there is no match (fail closed, no panic).
 //!
 //! This file pins the observable behavior through `run_verifying_step`
-//! with inputs where the arithmetic is load-bearing (each case fails under
-//! the corresponding wrapping-arithmetic mutant):
+//! with inputs where the geometry arithmetic is load-bearing (each geometry
+//! case fails under its wrapping-arithmetic mutant):
 //!
-//! - two segments `[2^63 present, missing]`: checked geometry is `None`
-//!   (error); wrapping would yield total 0 and pass every cap.
-//! - all-present `[2^63, 2^63, 1]`: checked sum is `None` (error, no panic);
-//!   wrapping would yield 1 and hide the overflow.
-//! - a par2 stream starting with a whole 64-byte packet followed by an
-//!   overflowing header reaches the packet walk (>= 64 bytes, so `peek_set_id`
-//!   routes it) and is dropped safely in both assembled and spooled caps.
+//! - two segments `[2^63 present, missing]`: the final checked add overflows
+//!   to `None` (error); wrapping would yield total 0 and pass every cap.
+//! - three segments `[2^63 present, missing, 5]`: the checked mul overflows
+//!   to `None` (error); wrapping would yield 5 and pass every cap.
+//! - all-present `[2^63, 2^63, 1]`: the checked sum is `None` (error, no
+//!   panic); wrapping would yield 1 and hide the overflow.
+//!
+//! A par2 stream starting with a whole 64-byte packet followed by an
+//! overflowing header is a no-panic smoke test: it reaches the packet walk
+//! (>= 64 bytes, so `peek_set_id` routes it) and is dropped safely in both
+//! assembled and spooled caps. The exact walk boundary is pinned directly
+//! in `verify.rs` `mod tests`, which kills the walk wrapping mutants.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -224,6 +229,21 @@ async fn geometry_overflow_present_missing_two_pow_63_fails_closed() {
     // kills the `implied_len` wrapping mutant.
     assert_eq!(TWO_POW_63.wrapping_add(TWO_POW_63), 0);
     let err = geometry_err(vec![srec(TWO_POW_63), smissing()], 2).await;
+    match err {
+        VerifyError::Permanent(msg) => assert_eq!(msg, GEOMETRY_MSG),
+        other => panic!("want permanent geometry error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn geometry_overflow_checked_mul_fails_closed() {
+    // [2^63 present, missing, 5] over 3 segments: part size 2^63, last
+    // length 5, and 2^63 * 2 overflows u64, so the loader reports no
+    // geometry and the step maps it to the exact permanent error. Wrapping
+    // would yield 5 (passes every cap), so this case kills the
+    // `implied_len` checked-mul -> wrapping-mul mutant.
+    assert_eq!(TWO_POW_63.wrapping_mul(2).wrapping_add(5), 5);
+    let err = geometry_err(vec![srec(TWO_POW_63), smissing(), srec(5)], 3).await;
     match err {
         VerifyError::Permanent(msg) => assert_eq!(msg, GEOMETRY_MSG),
         other => panic!("want permanent geometry error, got {other:?}"),

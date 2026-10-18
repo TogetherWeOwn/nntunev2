@@ -1807,8 +1807,7 @@ fn match_set_file<'a>(
         }
     }
     // Length fallback needs the true assembled length: only meaningful
-    // when every segment decoded. The sum is checked: overflowing part
-    // sizes prove no length, so there is no match (fail closed, no panic).
+    // when every segment decoded.
     if segs.len() >= total_segments && segs.iter().all(|s| !s.missing) {
         // Checked sum: on overflow there is no true assembled length, so
         // skip the length fallback (no match) and let the loader fail
@@ -2699,7 +2698,25 @@ mod tests {
         assert_eq!(bytes.len(), 80);
         assert_eq!(complete_packet_prefix(&bytes), 64);
         assert_eq!(64usize.wrapping_add(ALIGNED_MAX as usize), 60);
+        // This buffer alone does not pin `packets_within_bound`'s
+        // checked-add (wrapping still returns false, via an unrelated
+        // misread at offset 60); the dedicated buffer below does.
         assert!(!packets_within_bound(&bytes, u64::MAX));
+
+        // Killing buffer for `packets_within_bound`'s checked-add: first
+        // packet declares 64, second declares MAX - 55 (aligned and within
+        // the u64::MAX bound, so only the overflow arm can stop the walk).
+        // Checked stops at 64; wrapping advances 64 -> 8, reads
+        // bytes[16..24] (= 72) as a length, lands at 80 and returns true.
+        const WRAPPING_LEN: u64 = u64::MAX - 55;
+        assert_eq!(WRAPPING_LEN % 4, 0);
+        let mut first = valid_64b_packet();
+        first[16..24].copy_from_slice(&72u64.to_le_bytes());
+        let mut bound_bytes = first;
+        bound_bytes.extend_from_slice(&header_with_len(WRAPPING_LEN));
+        assert_eq!(bound_bytes.len(), 80);
+        assert_eq!(64usize.wrapping_add(WRAPPING_LEN as usize), 8);
+        assert!(!packets_within_bound(&bound_bytes, u64::MAX));
     }
 
     #[test]
@@ -2713,6 +2730,20 @@ mod tests {
         assert_eq!(uniform_part_size(&segs, 2), Some(TWO_POW_63));
         assert_eq!(implied_len(&segs, 2), None);
         assert_eq!(TWO_POW_63.wrapping_add(TWO_POW_63), 0);
+    }
+
+    #[test]
+    fn implied_len_checked_mul_overflow_is_none() {
+        // [2^63 present, missing, 5] over 3 segments: part size 2^63, last
+        // length 5, and 2^63 * 2 overflows u64, so no geometry is proven.
+        // Wrapping would yield 0 + 5 = 5 (passes every cap, judging the
+        // file on a 5-byte geometry), so this pin kills the
+        // checked-mul -> wrapping-mul mutant.
+        const TWO_POW_63: u64 = 1 << 63;
+        let segs = vec![srec(TWO_POW_63), smissing(), srec(5)];
+        assert_eq!(uniform_part_size(&segs, 3), Some(TWO_POW_63));
+        assert_eq!(implied_len(&segs, 3), None);
+        assert_eq!(TWO_POW_63.wrapping_mul(2).wrapping_add(5), 5);
     }
 
     #[test]
