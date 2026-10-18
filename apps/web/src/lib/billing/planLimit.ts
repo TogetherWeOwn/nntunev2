@@ -136,18 +136,29 @@ function usageDetail(body: unknown, terminal: boolean): string {
 }
 
 /**
+ * Upper bound (one hour) for any `Retry-After` wait. The server should never
+ * send a longer wait, but a stale cache, a misbehaving proxy, or a far-future
+ * HTTP-date could; without a cap the paywall countdown would render a
+ * non-finite wait (`Infinity minutes NaN seconds`) and its per-second timer
+ * would never reach try-again-now. Every parsed wait above this clamps to it.
+ */
+export const MAX_RETRY_AFTER_SECONDS = 3600;
+
+/**
  * Parse `Retry-After` (delta-seconds or HTTP-date) into whole seconds from
  * `nowMs`. Returns null when the header is absent or unparseable; a date in
- * the past clamps to 0 (retry immediately).
+ * the past clamps to 0 (retry immediately). Waits above
+ * {@link MAX_RETRY_AFTER_SECONDS} clamp to it so the countdown text stays
+ * finite and the per-second timer always terminates.
  */
 export function parseRetryAfter(headers: Headers, nowMs: number = Date.now()): number | null {
 	const raw = headers.get('Retry-After') ?? headers.get('retry-after');
 	if (raw === null) return null;
 	const trimmed = raw.trim();
-	if (/^\d+$/.test(trimmed)) return Number.parseInt(trimmed, 10);
+	if (/^\d+$/.test(trimmed)) return Math.min(Number.parseInt(trimmed, 10), MAX_RETRY_AFTER_SECONDS);
 	const at = Date.parse(trimmed);
 	if (Number.isNaN(at)) return null;
-	return Math.max(0, Math.ceil((at - nowMs) / 1000));
+	return Math.min(MAX_RETRY_AFTER_SECONDS, Math.max(0, Math.ceil((at - nowMs) / 1000)));
 }
 
 /** `45` -> "Try again in 45 seconds."; `125` -> minutes + seconds; `0` -> now. */
