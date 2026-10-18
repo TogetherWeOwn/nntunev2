@@ -12,9 +12,9 @@ which buckets a Worker may never consume.
 
 | Bucket | Env | Consumer | Edge `Cache-Control` on reads | R2 object lifetime / eviction |
 |---|---|---|---|---|
-| `nntunev2-audio-staging` | staging | stream Worker (`AUDIO_CACHE`) | prescribed `no-store`; not yet wired (see deltas) | persistent content-addressed blobs (`audio/<sha256>` + `track/<id>` pointers); no object expiry (multipart abort observed only on archive buckets — see TTL section) |
+| `nntunev2-audio-staging` | staging | stream Worker (`AUDIO_CACHE`) | prescribed `no-store`; not yet wired (see deltas) | content-addressed blobs per `workers/stream/src/cache.rs` (`audio/<sha256>` + `track/<id>` pointers; ADR-0003 prescribes `{hh}/{hh}/{sha}` and replaces `track` lookups — see sources); R2 lifecycle metadata not reported in `docs/ops.md` (see TTL section); timed `track` pointers hard-miss after 3,900 s (see TTL section) |
 | `nntunev2-audio-prod` | prod | stream Worker (`AUDIO_CACHE`) | prescribed `no-store`; not yet wired (see deltas) | same as staging |
-| `nntunev2-art-staging` | staging | MusicBrainz Worker artwork cache (`ART_CACHE`) | `public, max-age=86400, immutable` prescribed where art bytes are served; lookup/search JSON headers below are implemented | persistent immutable objects (`art/{hh}/{hh}/{sha}-{size}`); no object expiry (multipart abort observed only on archive buckets — see TTL section) |
+| `nntunev2-art-staging` | staging | MusicBrainz Worker artwork cache (`ART_CACHE`) | `public, max-age=86400, immutable` prescribed where art bytes are served; lookup/search JSON headers below are implemented | immutable objects per mb test fixture (`art/{hh}/{hh}/{sha}-{size}`; ADR-0003 prescribes `{hh}/{hh}/{sha}` with no prefix/suffix — see sources); R2 lifecycle metadata not reported in `docs/ops.md` (see TTL section) |
 | `nntunev2-art-prod` | prod | MusicBrainz Worker artwork cache (`ART_CACHE`) | same as staging | same as staging |
 | `nntunev2-archive-staging` | staging | **none — reserved; no Worker binding in this repo (CI-enforced)** | n/a (no reads) | reserved; no bucket lock configured; no object expiry |
 | `nntunev2-archive-prod` | prod | **none — reserved; no Worker binding in this repo (CI-enforced)** | n/a (no reads) | reserved; no bucket lock configured; no object expiry |
@@ -26,15 +26,29 @@ which buckets a Worker may never consume.
   `env.staging` staging binding, `env.production` prod binding) and the
   `docs/ops.md` environments matrix plus worker-bindings row for `stream`.
   Object shape (`audio/<sha256>` blobs plus `track/<id>` pointers, deduped,
-  immutable, no background reaper) per `workers/stream/src/cache.rs`. Edge
-  `no-store` is prescribed but unwired: no `Cache-Control` string exists in
-  `workers/stream/src`; the fetch entry answers `404` via
+  immutable) per `workers/stream/src/cache.rs`, which describes
+  `ContentCache` as the in-memory stand-in that production swaps for R2
+  calls with identical semantics. This shape is unreconciled with
+  `docs/adr/0003-cache-scope.md`: the ADR R2 layout is
+  `{sha256hex[0:2]}/{sha256hex[2:4]}/{sha256hex}` with no `audio/` prefix,
+  and Stream readers must replace global `track/<track_id>` lookups with
+  per-user mapping and grant checks (ADR-0003 R2 layout and consequences
+  sections). Edge `no-store` is prescribed but unwired: no `Cache-Control`
+  string exists in `workers/stream/src`; the fetch entry answers `404` via
   `routes::decide_public_fetch` and `respond`/`respond_body` set only
   `content-type` (plus `retry-after` when carried); the portable
   `PlayResponse::cache_headers` emits only `Cache-Status` plus `Age`
-  telemetry (see prescribed-vs-wired evidence). Lifetime (no object expiry;
-  the only lifecycle rule observed in `docs/ops.md` is the archive-bucket
-  multipart abort — see TTL section).
+  telemetry (see prescribed-vs-wired evidence). Application freshness
+  (distinct from R2 lifecycle): timed `track/<id>` entries serve fresh for
+  `CACHE_FRESH_TTL_SECS = 300`, then stale for `CACHE_SWR_WINDOW_SECS =
+  3_600` while owing background revalidation, then hard-miss past 3,900 s
+  (`get_track_at` returns `None`; `play.rs` falls through to the miss path
+  and re-fetches upstream; `workers/stream/README.md` documents the MISS).
+  Untimed `put_track` entries never go stale. R2 lifetime: no lifecycle is
+  configured in any checked-in manifest (lifecycle is Cloudflare-side, not
+  a Wrangler field), and `docs/ops.md` does not report lifecycle metadata
+  for the audio buckets, so this doc claims no R2 lifecycle state for audio
+  beyond "not reported" — see TTL section.
 - `nntunev2-art-staging` / `nntunev2-art-prod`: env and `ART_CACHE`
   consumer per `workers/mb/wrangler.toml.example` (commented template:
   top-level plus `env.staging` staging name, `env.production` prod name;
@@ -46,10 +60,16 @@ which buckets a Worker may never consume.
   `mb:lookup:<kind>:<mbid>` and `mb:search:<kind>:<normalized q>` with
   matching TTLs). Art-byte `public, max-age=86400, immutable` is prescribed
   where unauthenticated serving lands; no R2 image-body serving path exists
-  yet (entities carry `caa_url`; see deltas). Object shape
-  (`art/{hh}/{hh}/{sha}-{size}`, immutable) per `caa_url_for_art` plus its
-  tests and the `docs/adr/0003-cache-scope.md` R2 layout. Lifetime per the
-  TTL section and `docs/ops.md`.
+  yet (entities carry `caa_url`; see deltas). Object shape unreconciled
+  (both recorded, neither authoritative here): the mb test fixture uses
+  `art/ab/cd/<sha>-500` (`workers/mb/src/lib.rs`
+  `caa_url_builder_embeds_bucket_and_key`); `caa_url_for_art`
+  (`workers/mb/src/lib.rs`) only formats `r2://{bucket}/{key}` on a
+  caller-supplied key and is unused by runtime response handling; ADR-0003
+  prescribes `{sha256hex[0:2]}/{sha256hex[2:4]}/{sha256hex}` with no `art/`
+  prefix and no `-{size}` suffix, original only at launch (ADR-0003 R2
+  layout section). R2 lifetime: `docs/ops.md` does not report lifecycle
+  metadata for the art buckets — see TTL section.
 - `nntunev2-archive-staging` / `nntunev2-archive-prod`: reserved with no
   Worker consumer per the reservation guard below (CI-enforced). No
   `archive` `bucket_name` appears in `workers/stream/wrangler.toml`,
@@ -63,23 +83,38 @@ which buckets a Worker may never consume.
 
 ## What "TTL" means here
 
-No object-expiry lifecycle rule is configured on the six table buckets:
-stored objects live until
-explicitly deleted. Lifecycle is Cloudflare-side, not a Wrangler field,
-so no checked-in manifest configures it; `docs/ops.md` records no object
-expiry for the six. The only lifecycle rule observed in `docs/ops.md`
-(metadata GETs 2026-10-17) is the enabled `Default Multipart Abort Rule`
-on the archive buckets (age `604800` seconds, no prefix condition; it
-aborts incomplete multipart uploads after 7 days and
+No R2 object-expiry lifecycle state is asserted here beyond what
+`docs/ops.md` reports. Lifecycle is Cloudflare-side, not a Wrangler field,
+so no checked-in manifest configures it. The observed archive-bucket
+metadata (`docs/ops.md`, metadata GETs 2026-10-17) shows no
+completed-object expiry on the archive buckets. `docs/ops.md` does not
+report lifecycle metadata for the audio or art buckets, so this doc claims
+no R2 lifecycle state for audio/art beyond "not reported" and does not
+assert an unwired multipart-abort rule there. Among the six table buckets,
+the only lifecycle rule observed in `docs/ops.md` is the enabled `Default
+Multipart Abort Rule` on the archive buckets (age `604800` seconds, no
+prefix condition; it aborts incomplete multipart uploads after 7 days and
 does not expire completed objects). The two ingest-scratch buckets are
-outside this table: they carry the enabled 7-day delete rule
+outside this table and keep their own rule: the enabled 7-day delete rule
 `expire-ingest-scratch-after-7-days` on `ingest-scratch/` (age `604800`
 seconds, action `deleteObjectsTransition`); `docs/ops.md` reports no
 expiry outside that prefix. The TTL column therefore governs
 **downstream copies only** (edge Cache API, KV, browser/CDN via
-`Cache-Control`), never completed R2 objects. Deleting or overwriting an
+`Cache-Control`), never R2 lifecycle state. Deleting or overwriting an
 R2 object does not purge edge/client copies already served; those linger
 up to their served `max-age`.
+
+Application freshness and retention are separate from R2 lifecycle. Timed
+`track/<id>` entries hard-miss after 3,900 s of age
+(`CACHE_FRESH_TTL_SECS = 300` fresh plus `CACHE_SWR_WINDOW_SECS = 3_600`
+stale-while-revalidate in `workers/stream/src/cache.rs`; `get_track_at`
+returns `None` past both and `workers/stream/src/play.rs` falls through to
+the miss path and re-fetches upstream; `workers/stream/README.md`
+documents the MISS). Separately, ADR-0003 prescribes a 30-day idle
+art-pointer clear plus a GC sweep that deletes R2 objects once zero grants,
+mappings, and art pointers reference a hash (ADR-0003 retention and
+accounting sections). "Lives until explicitly deleted" in this doc refers
+to R2 lifecycle only, not to those freshness/GC paths.
 
 Implemented edge headers (verified in code):
 
@@ -95,11 +130,17 @@ Sources: `workers/mb/src/lib.rs` (`LOOKUP_CACHE_TTL_S`, `SEARCH_CACHE_TTL_S`,
 success-path `cache.put` with matching TTLs, `cache_ttl: None` for
 failures).
 
-Audio objects are content-addressed and immutable: identical plaintext
+Audio blobs are content-addressed and immutable: identical plaintext
 uploaded for two tracks is stored once, and a `track/<id>` pointer swap
-never mutates a blob. Eviction is therefore always safe to defer —
-stale pointers cannot exist, only orphaned blobs, which an explicit
-operator pass reclaims. There is no background reaper.
+never mutates a blob. R2 eviction is therefore safe to defer at the
+lifecycle layer (no completed-object expiry observed on archive buckets;
+audio/art R2 lifecycle not reported — see above). Timed `track/<id>`
+pointers still go cold at the application layer: past the 300 s fresh plus
+3,600 s SWR windows the entry hard-misses and the play path re-fetches
+upstream, so "no stale pointers" is not claimed. Orphaned blobs are
+reclaimed by an explicit operator pass; the stream Worker runs no
+background reaper (ADR-0003 prescribes its own GC-sweep lane that deletes
+R2 objects once unreferenced).
 
 ## Archive reservation guard
 
