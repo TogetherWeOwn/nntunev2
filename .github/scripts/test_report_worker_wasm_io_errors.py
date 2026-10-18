@@ -180,10 +180,6 @@ class MainIsolationTests(unittest.TestCase):
             failing = WORKERS[0]["worker"]
             later = WORKERS[1]["worker"]
 
-            real_run = __import__(
-                "report_worker_wasm_sizes", fromlist=["subprocess"]
-            ).subprocess.run
-
             def fake_run(*args, **kwargs):
                 # First build raises OSError (cargo not runnable);
                 # later builds succeed without invoking cargo.
@@ -205,7 +201,6 @@ class MainIsolationTests(unittest.TestCase):
                 side_effect=fake_run,
             ):
                 rc, out, err = _run_main(root)
-            _ = real_run
         self.assertEqual(rc, 0)
         self.assertEqual(err, "")
         failing_lines = [ln for ln in out.splitlines() if f"`{failing}`" in ln]
