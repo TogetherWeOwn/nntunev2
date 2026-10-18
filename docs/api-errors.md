@@ -78,6 +78,34 @@ emit the code.
 | `upstream_circuit_open` | 503 | true | stream | The user's provider pool circuit breaker is open; retry after the supplied `Retry-After` delay. |
 | `service_unavailable` | 503 | true | api, ingest | A backing binding (queue, payload store) is unavailable; nothing was accepted. |
 
+## Repair taxonomy status (no registry rows)
+
+The repair worker defines its own stable fault shape in
+`workers/repair/src/contract.rs` (`ApiFault { status, code }`,
+`ApiFault::new`/`invalid`): an HTTP status plus a machine-readable code
+for logs and operators, carrying no user data. Ingest maps those faults
+in `workers/ingest/src/repair.rs` (`classify_repair_reply`): replies
+with status 400, 404, 409, or 413 are `Unrepairable` (permanent — a
+retry would send the same bytes, so the job fails terminally), and
+every other status is `Retry` (transient — retried through the shared
+job attempt budget). Container replies are classified in
+`workers/repair/src/contract.rs` (`classify_container_reply`,
+`ContainerOutcome::Forward`): only a well-formed 200 result is
+terminal; known 4xx/503 container codes forward to ingest with their
+stable code unchanged, and anything else forwards as 502
+`container_unavailable`.
+
+This registry currently carries no repair rows: every row in the table
+above names an owning worker drawn from api, ingest, mb, and stream,
+and none names repair. That is a status fact, not a registry change.
+
+A future repair row follows the same `Adding a code` rule below with
+no exception: one registry row here (code, status, retryable, owning
+worker `repair`) plus the same entry in the owning worker's error
+registry; never rename or reuse a code, and never change a code's
+status or retryable flag in place. No such row is added by this
+note.
+
 ## Billing-limit shapes (402 / 429)
 
 Server-side limit enforcement lands separately, but the wire shapes are
