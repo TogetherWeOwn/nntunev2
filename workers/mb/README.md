@@ -82,8 +82,10 @@ Hyperdrive-only reads `lib.rs:668-720`.)
   helper unused by responses `lib.rs:77-85`; env-free keys `lib.rs:233-247`.)
 - Cover art bytes are intended for the per-environment R2 art buckets
   (`nntunev2-art-staging` / `nntunev2-art-prod`, `docs/ops.md` inventory;
-  key form `art/{hh}/{hh}/{sha}-{size}` per the `caa_url_for_art` helper
-  doc, base hash layout in ADR 0003). Public release `caa_url`
+  key form `art/{hh}/{hh}/{sha}-{size}` per `docs/cache-policy.md:17` and
+  the `caa_url_for_art` helper doc example `art/ab/cd/<sha>-500`
+  `lib.rs:77-83`; ADR 0003 shows only the base hash layout without the
+  `art/` prefix and `-{size}` suffix). Public release `caa_url`
   generation remains deferred until bucket bindings and public hosts are
   activated; this worker never proxies full images inline.
   (Sources: buckets `workers/mb/src/lib.rs:57-75`;
@@ -107,13 +109,16 @@ once staging measures exist.)
 ### Replication SLO
 
 The SLO contract is the per-packet rule from ADR 0007: **each packet must
-be applied within 2 hours of publication**. The **p95 source** for
-replication lag is the `lag_secs` value of each applied packet in
-`mb_replication_packet`, not the aggregate `mb_import_state` snapshot; p95
-over the observed packet records in the reporting window is only a
-reporting statistic, never the alert rule (a p95 under 2 hours would
-tolerate 5% of packets over budget). Published but not-yet-applied packets
-have no `lag_secs` yet, so p95 excludes them. The **breach definition** is any packet with `lag_secs > 7200` seconds (exactly 7200 passes), or any missing sequence between the lowest observed packet and the reported latest packet sequence whose publication is either unknown or more than 7200 seconds before evaluation. A missing sequence recorded as pending
+be applied within 2 hours of publication**. The evaluator does not calculate
+or report a replication-lag p95. The **p95 source**, if a manual p95
+statistic is computed per the operational procedure (which must define its
+population and reporting window), is the `lag_secs` value of each applied
+packet in `mb_replication_packet`, not the aggregate `mb_import_state`
+snapshot; a manual p95 over the observed packet records in the reporting
+window is only a reporting statistic, never the alert rule (a p95 under 2
+hours would tolerate 5% of packets over budget). Published but
+not-yet-applied packets have no `lag_secs` yet, so a manual p95 excludes
+them. The **breach definition** is any packet with `lag_secs > 7200` seconds (exactly 7200 passes), or any missing sequence between the lowest observed packet and the reported latest packet sequence whose publication is either unknown or more than 7200 seconds before evaluation. A missing sequence recorded as pending
 (`record_published`) that is still inside its 2-hour budget is in flight,
 not a breach: it counts as `pending_count` instead, so a normal hourly
 apply window does not fire the breach counter. Missing packets cannot be
@@ -140,9 +145,10 @@ bounded to stay well under the 256 KB Workers per-request log limit:
 contiguous unknown-publication missing sequences compress into one
 `missing_sequence_range` entry (`first`/`last`/`count`) and at most 100
 entries are logged, so the truncation evidence is never the part cut off.
-The report carries `metric_name` (`mb_replication_slo_breach_total`), so the
-probe runner increments that counter by `breach_count` when non-zero; this
-worker only evaluates and logs. The durable
+The report carries `metric_name` (`mb_replication_slo_breach_total`). No
+runner exists yet: a scheduled runner must call `evaluate`, emit
+`structured_log`, and increment that counter by `breach_count` when
+non-zero. This crate only provides the evaluation. The durable
 ledger schema is `migrations/0017_mb_replication_packet_ledger.sql`; packet
 application remains the separate replication-applier responsibility.
 (Sources: event/log builder `workers/mb/src/replication.rs:335-411`;
