@@ -26,8 +26,15 @@ metering primitives below are built to support them from day one.
 | Object cache | **R2** for audio / artwork cache |
 | Ingest | **Queues + Workflows** |
 | Config | **KV** |
-| Metering | **Analytics Engine** |
+| Usage enforcement (designed) | **Postgres** daily flow ledger and live cache-grant gauge; pool Durable Object leases for concurrency (`docs/adr/0009-stack.md:30`, pool semantics in `docs/adr/0004-plan-matrix.md`) |
+| Observability | **Analytics Engine**, sampled telemetry only — never a billing/cap authority (`docs/adr/0009-stack.md:31`) |
 | Batch only | **Containers** — MusicBrainz import, par2 repair (everything interactive stays serverless) |
+
+This is the accepted design (`docs/adr/0009-stack.md:3`), not deployed
+billing evidence: plan prices are launch proposals, not permission to
+activate live billing (`docs/adr/0004-plan-matrix.md:12-13`). The decided
+subscription mechanism lives in `docs/adr/0005-billing.md`; no vendor is
+chosen or changed here.
 
 ```text
 crates/nntune-core   # NNTP client, SIMD yEnc, NZB, decrypt, par2-verify (wasm32 + native)
@@ -78,9 +85,15 @@ dev dependencies the harness needs — install it with
 ```sh
 # Rust workspace (core, config, stream, containers/repair, test fixtures)
 cargo test --workspace
-# Standalone Worker crates (outside the workspace, as in CI:
-# api is locked via its committed Cargo.lock; mb, ingest and repair
-# resolve fresh)
+# Standalone Worker crates (excluded from the workspace in Cargo.toml; each
+# carries a committed lockfile: Cargo.lock plus workers/{api,ingest,mb,
+# repair}/Cargo.lock, apps/web/pnpm-lock.yaml, e2e/package-lock.json).
+# Committed lockfiles are not the same as --locked enforcement: the
+# cargo-deny job's `Prove committed lockfiles are fresh` step proves all
+# five Cargo lockfiles fresh (.github/workflows/ci.yml), but only the api
+# job passes --locked to test/clippy/check (.github/workflows/ci.yml);
+# the rust (workers/mb), rust (workers/ingest) and rust (workers/repair)
+# jobs resolve without --locked (.github/workflows/ci.yml).
 cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets
 cargo test --manifest-path workers/mb/Cargo.toml --all-targets
 cargo test --manifest-path workers/ingest/Cargo.toml --all-targets
@@ -94,8 +107,12 @@ npm run test:unit
 npm run e2e:list
 ```
 
-`npm run e2e:list` compiles the suite and lists the specs (202 tests across
-11 files) with no staging needed. Live staging runs stay in CI — see below.
+`npm run e2e:list` compiles the suite and lists the specs with no staging
+needed. Discovery snapshot, verified 2026-10-17 via
+`npm --prefix e2e run e2e:list` (with dev dependencies installed): 265
+tests in 17 files. Totals drift as specs land — re-run the command for a
+fresh count rather than quoting this one. Live staging runs stay in
+CI — see below.
 
 Public-repo hygiene gate (part of `ci-ok`, from the repo root):
 

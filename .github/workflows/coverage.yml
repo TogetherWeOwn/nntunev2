@@ -33,16 +33,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # `--locked` for api and repair: the committed workers/api/Cargo.lock
-          # and workers/repair/Cargo.lock are the audited dependency sets,
-          # enforced the same way as in the required api CI lane. ingest and
-          # mb have no committed lockfile, so they keep resolving without one.
+          # `--locked` for api, ingest, mb and repair: each committed
+          # workers/<crate>/Cargo.lock is the audited dependency set,
+          # enforced the same way as in the required CI lanes.
           cargo llvm-cov --locked --manifest-path workers/api/Cargo.toml \
             --lcov --output-path coverage-api.lcov
           cargo llvm-cov --locked --manifest-path workers/repair/Cargo.toml \
             --lcov --output-path coverage-repair.lcov
           for crate in ingest mb; do
-            cargo llvm-cov --manifest-path "workers/${crate}/Cargo.toml" \
+            cargo llvm-cov --locked --manifest-path "workers/${crate}/Cargo.toml" \
               --lcov --output-path "coverage-${crate}.lcov"
           done
 

@@ -7,13 +7,14 @@ with Access enabled, and rollback evidence is recorded.
 
 Re-verified against the merged `e2e/` tree on 2026-10-18 with the public
 UI-signup case, the signup wizard-arrival spec, the browser-playback spec, the player-UI-seek spec, the
-Media Session spec, the queue-order spec (#202), the two-track fixture spec, the recording-mbids
+Media Session spec, the queue-order spec (#202), the two-track fixture spec, the cost-basis
+worksheet spec, the recording-mbids
 assertion, the staging demo-audio contract spec, the demo-media
 sessionless spec, the PWA manifest spec (#211), the anonymous-Access
 denial specs (#185, #188), the branded-error-page specs (#203), the
 security-headers staging probe, and the deployed-build identity route
 (#196) merged:
-`npm --prefix e2e run e2e:list` lists 295 tests in 19 files, and
+`npm --prefix e2e run e2e:list` lists 332 tests in 20 files, and
 `(cd apps/web && pnpm exec playwright test --list)` lists 94 tests in
 21 files (91 in 20 files plus #196's 3-test build-identity spec). Line numbers
 below are from that head; re-verify with the commands at the end of this
@@ -160,6 +161,16 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   signal, never a timeout). Fixture support for the row 4 queue-order leg, not
   an M1 exit step — and never the no-auth demo-audio route or its
   `second-signal` track ids.
+- `e2e/tests/cost-basis.spec.ts` pins the cost-basis worksheet arithmetic
+  offline (run on every PR via `test:unit` with no staging):
+  `e2e/tests/cost-basis.spec.ts:172` "§8 illustrative volumes total $6.00"
+  plus the sibling §8 row totals ($15.45 R2, $3.00 KV, $2.00 Queues, $0.50
+  prospective Analytics Engine, $13.75 PlanetScale storage, $6.60 egress,
+  $56.80 current total / $57.30 with prospective) and the
+  allowance-boundary cases, with `e2e/tests/cost-basis.spec.ts:436`
+  "expected totals cover §8 services only — no §10 measured rows" pinning
+  that the §10 measured bill stays evidence, not asserted arithmetic. Cost
+  documentation, not journey coverage.
 - The `apps/web/tests/` offline specs below run in the `web-e2e` CI job
   on every PR. Backend API calls are intercepted and fulfilled locally,
   while a few specs additionally assert against the real local
