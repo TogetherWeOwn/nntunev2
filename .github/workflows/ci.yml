@@ -219,6 +219,7 @@ jobs:
       - name: Unit-test the parity check
         run: |
           python3 .github/scripts/test_binding_parity.py
+          python3 .github/scripts/test_binding_parity_missing_config.py
           python3 .github/scripts/test_binding_parity_unknown_envs.py
           python3 .github/scripts/test_binding_parity_table_shape.py
           python3 .github/scripts/test_binding_parity_known_drift_guards.py
@@ -262,6 +263,7 @@ jobs:
           python3 .github/scripts/test_migrations_gate_unreadable_sql.py
           python3 .github/scripts/test_migrations_gate_manifest_shape.py
           python3 .github/scripts/test_migrations_gate_root_traversal.py
+          python3 .github/scripts/test_migrations_gate_root_validity.py
 
   test-nntp:
     name: test-nntp
@@ -415,6 +417,10 @@ jobs:
         run: python3 .github/scripts/test_config_parity_check.py
       - name: Parity checker duplicate-member tests
         run: python3 .github/scripts/test_config_duplicate_members.py
+      - name: Parity checker empty-schema-keys tests
+        run: python3 .github/scripts/test_config_empty_schema_keys.py
+      - name: Parity checker environment-IO tests
+        run: python3 .github/scripts/test_config_parity_environment_io.py
 
   rust-ingest:
     name: rust (workers/ingest)
@@ -541,7 +547,11 @@ jobs:
       - name: Archive reservation guard
         run: python3 .github/scripts/check_archive_bindings.py
       - name: Unit-test the guard
-        run: python3 .github/scripts/test_check_archive_bindings.py
+        run: |
+          python3 .github/scripts/test_check_archive_bindings.py
+          python3 .github/scripts/test_archive_json_inspection_errors.py
+      - name: Unit-test the guard byte paths
+        run: python3 .github/scripts/test_archive_manifest_byte_paths.py
       - name: Unit-test the guard case folding
         run: python3 .github/scripts/test_archive_binding_casefold.py
 
@@ -567,7 +577,9 @@ jobs:
       - name: Check internal links in changed docs
         run: python3 .github/scripts/docs_link_lint.py --root . --base-ref "$DOCS_LINKS_BASE_REF"
       - name: Run docs-link lint self-tests
-        run: python3 .github/scripts/test_docs_link_lint.py
+        run: |
+          python3 .github/scripts/test_docs_link_lint.py
+          python3 .github/scripts/test_docs_link_diff_path_bytes.py
       - name: Run docs-link directory-anchor self-tests
         run: python3 .github/scripts/test_docs_link_directories.py
       - name: Run docs-link diff-failure self-tests
