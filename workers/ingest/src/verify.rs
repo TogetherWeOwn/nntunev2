@@ -1810,6 +1810,10 @@ fn match_set_file<'a>(
     // when every segment decoded. The sum is checked: overflowing part
     // sizes prove no length, so there is no match (fail closed, no panic).
     if segs.len() >= total_segments && segs.iter().all(|s| !s.missing) {
+        // Checked sum: on overflow there is no true assembled length, so
+        // skip the length fallback (no match) and let the loader fail
+        // closed with the permanent geometry error. An unchecked sum would
+        // panic in debug and could match a wrapped length in release.
         let len = segs
             .iter()
             .try_fold(0u64, |acc, s| acc.checked_add(s.size))?;

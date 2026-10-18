@@ -25,8 +25,8 @@ six shared fields — no more, no fewer:
 | `event` | string | Worker-namespaced event name (legacy `stream` vocabulary excepted). |
 | `fields` | object | Flat map of string, number, boolean, or `null`; no nesting. |
 
-(Sources: record struct `src/lib.rs:439-446`, six-key render
-`src/lib.rs:479-502`, levels `src/lib.rs:65-93`, worker names
+(Sources: record struct `src/lib.rs:467-474`, six-key render
+`src/lib.rs:507-530`, levels `src/lib.rs:65-93`, worker names
 `src/lib.rs:30-61`.)
 
 - `level` parses only the four lowercase names; anything else is `None`,
@@ -38,9 +38,9 @@ six shared fields — no more, no fewer:
   with no leading/trailing `.`/`_`. `api`, `ingest`, and `mb` events
   additionally require their `<worker>.` namespace prefix; `stream`
   keeps its legacy vocabulary with no dot required during migration
-  (`src/lib.rs:227-256`).
+  (`src/lib.rs:255-284`).
 - `fields` must be a JSON object whose values are flat primitives only;
-  nested objects and arrays are rejected (`src/lib.rs:395-419,424-433`).
+  nested objects and arrays are rejected (`src/lib.rs:423-447,452-461`).
 
 ## Trace-ID propagation
 
@@ -61,28 +61,28 @@ six shared fields — no more, no fewer:
   the weakness so a flood of them points at the RNG, and a process-local
   counter keeps IDs distinct on every target (`src/lib.rs:175-188`).
 - A built record exposes its trace via `trace_id()` (and its event via
-  `event()`) for downstream propagation (`src/lib.rs:504-514`).
+  `event()`) for downstream propagation (`src/lib.rs:532-542`).
 
 ## Privacy validation at construction
 
 Validation runs at construction: `LogRecord::new` checks the trace ID,
 the worker-namespaced event, and every field, so anything invalid is an
-`Err`, never a log line (`src/lib.rs:435-474`).
+`Err`, never a log line (`src/lib.rs:463-502`).
 
 - A `fields` key is banned when it names personal data or credentials:
   an `ip` path component (without flagging `ship_id`), a name component
   (`name`, `*_name`, known full-name variants), or any credential
-  fragment from the banned list (`src/lib.rs:258-330`). The list
+  fragment from the banned list (`src/lib.rs:286-358`). The list
   deliberately has no bare `payment` entry so `payment_id` stays loggable
-  (`src/lib.rs:283`).
+  (`src/lib.rs:311`).
 - A string value is rejected when it opens with a known credential prefix
   or embeds a `key=value` credential marker; benign labels such as
-  `task-queued` pass (`src/lib.rs:346-358`).
+  `task-queued` pass (`src/lib.rs:374-386`).
 - Email-shaped values (`addr@domain.tld`) are rejected as personal data
-  (`src/lib.rs:368-381`); dotted-quads of valid octets are rejected as
-  IPv4 (`src/lib.rs:360-366`); hex-colon literals are rejected as IPv6
+  (`src/lib.rs:396-409`); dotted-quads of valid octets are rejected as
+  IPv4 (`src/lib.rs:388-394`); hex-colon literals are rejected as IPv6
   while colon-joined operational refs (`nzb:sha256:…`, `12:00:00`) still
-  pass (`src/lib.rs:383-393`).
+  pass (`src/lib.rs:411-421`).
 - Failure variants name the offending key or event only — values are
   never echoed, so an error path cannot leak what it rejected
   (`src/lib.rs:95-134`).
@@ -98,10 +98,10 @@ takes `ts_millis` (unix millis — production workers pass their runtime
 clock, tests pass fixed values) and renders an RFC 3339 UTC timestamp
 ending in `Z` with millisecond precision (`2026-10-15T20:00:00.123Z`)
 via pure civil-date math with no date library, so native and wasm
-targets behave identically (`src/lib.rs:190-225,449-474`).
+targets behave identically (`src/lib.rs:218-253,477-502`).
 
 `to_json_line` returns one line with no trailing newline; the caller
-joins lines (`src/lib.rs:476-479`).
+joins lines (`src/lib.rs:504-507`).
 
 ## Checks
 
