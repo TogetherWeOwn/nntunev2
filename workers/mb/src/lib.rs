@@ -49,7 +49,10 @@ const RELEASE_RECORDINGS_LIMIT: usize = 1000;
 /// Matches the trigram `LIMIT 25` and the README's documented limit:
 /// `None` defaults to this, `1..=MAX_PAGE_SIZE` is honored, anything above
 /// is clamped (never rejected), and `Some(0)` is a 400.
-const MAX_PAGE_SIZE: usize = 25;
+///
+/// `pub` for the `tests/` integration pin (`search_validation`); the value
+/// and every use are unchanged.
+pub const MAX_PAGE_SIZE: usize = 25;
 
 /// Upper bound on `q` length, in chars. Bounds trigram work and KV keys.
 const MAX_QUERY_CHARS: usize = 100;
@@ -92,14 +95,14 @@ pub fn caa_url_for_art(bucket: &str, key: &str) -> String {
 /// static, parameterized statement (see [`lookup_sql`]/[`search_sql`]), so
 /// no user input ever reaches a table or column name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub enum Kind {
     Artist,
     Release,
     Recording,
 }
 
 impl Kind {
-    fn parse(raw: Option<String>) -> Option<Kind> {
+    pub fn parse(raw: Option<String>) -> Option<Kind> {
         match raw.as_deref() {
             Some("artist") => Some(Kind::Artist),
             Some("release") => Some(Kind::Release),
@@ -108,7 +111,7 @@ impl Kind {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Kind::Artist => "artist",
             Kind::Release => "release",
@@ -258,7 +261,7 @@ fn cache_control(ttl_s: u32) -> String {
 // --- JSON entities --------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
-struct Artist {
+pub struct Artist {
     mbid: String,
     name: String,
     sort_name: String,
@@ -268,7 +271,7 @@ struct Artist {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct Release {
+pub struct Release {
     mbid: String,
     artist_mbid: Option<String>,
     title: String,
@@ -278,7 +281,7 @@ struct Release {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct Recording {
+pub struct Recording {
     mbid: String,
     release_mbid: Option<String>,
     title: String,
@@ -293,7 +296,7 @@ struct Recording {
 /// One lookup row, tagged by [`Kind`] again at serialization time so the
 /// JSON carries `"kind"` alongside the flat entity fields.
 #[derive(Debug, Clone)]
-enum Entity {
+pub enum Entity {
     Artist(Artist),
     Release(Release),
     Recording(Recording),
@@ -318,13 +321,13 @@ impl Entity {
 }
 
 #[derive(Debug, Clone)]
-struct SearchHit {
-    mbid: String,
-    label: String,
-    score: f32,
+pub struct SearchHit {
+    pub mbid: String,
+    pub label: String,
+    pub score: f32,
     /// Release hits only: the release's artist, when it has one.
-    artist_mbid: Option<String>,
-    artist_name: Option<String>,
+    pub artist_mbid: Option<String>,
+    pub artist_name: Option<String>,
 }
 
 impl SearchHit {
@@ -363,12 +366,15 @@ impl SearchHit {
 /// Opaque repository failure. Carries no detail on purpose: handler
 /// responses must never leak DB/driver internals to clients.
 #[derive(Debug)]
-struct RepoError;
+pub struct RepoError;
 
 /// Read-only mirror repository over the `MB_DB` Hyperdrive binding.
 /// `search` takes the resolved page so SQL applies `LIMIT`/`OFFSET`
 /// directly; callers pass the clamped limit, never the raw request value.
-trait MbRepo {
+/// `pub` for the `tests/` integration pin (`search_validation`): the
+/// contract and every implementation are unchanged.
+#[allow(async_fn_in_trait)]
+pub trait MbRepo {
     async fn lookup(&self, kind: Kind, mbid: &str) -> Result<Option<Entity>, RepoError>;
     async fn search(
         &self,
@@ -389,7 +395,10 @@ trait MbRepo {
 /// Success-only response cache (KV in production). Deliberately
 /// infallible: a failed `get` is a miss and a failed `put` is dropped,
 /// so cache problems degrade to plain DB reads instead of errors.
-trait SuccessCache {
+/// `pub` for the `tests/` integration pin (`search_validation`): the
+/// contract and every implementation are unchanged.
+#[allow(async_fn_in_trait)]
+pub trait SuccessCache {
     async fn get(&self, key: &str) -> Option<String>;
     async fn put(&self, key: &str, body: &str, ttl_s: u32);
 }
@@ -398,10 +407,10 @@ trait SuccessCache {
 /// cacheable successes (status 200); the HTTP layer renders `Some(ttl)`
 /// as `Cache-Control: public, max-age=<ttl>` and `None` as `no-store`.
 #[derive(Debug, PartialEq, Eq)]
-struct ApiResponse {
-    status: u16,
-    body: String,
-    cache_ttl: Option<u32>,
+pub struct ApiResponse {
+    pub status: u16,
+    pub body: String,
+    pub cache_ttl: Option<u32>,
 }
 
 fn error_response(err: ApiError) -> ApiResponse {
@@ -541,7 +550,9 @@ fn search_paged_cache_key(kind: Kind, normalized_q: &str, limit: u32, offset: u3
 /// HTTP layer, unparsable) defaults to `0`; past the end of the result set is
 /// a 200 with `"results": []`. Successes echo the effective `limit`/`offset`
 /// alongside the normalized `q`, `type` and `results`.
-async fn handle_search_paged<R: MbRepo, C: SuccessCache>(
+/// `pub` for the `tests/` integration pin (`search_validation`): the
+/// validation, clamp and truncate contract is unchanged.
+pub async fn handle_search_paged<R: MbRepo, C: SuccessCache>(
     repo: &R,
     cache: &C,
     raw_kind: Option<String>,
