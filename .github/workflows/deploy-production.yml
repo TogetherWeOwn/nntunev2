@@ -17,9 +17,12 @@ name: deploy-production
 # - preflight resolves and validates the SHA, the enabled flag, and the
 #   production hostname variable.
 # - staging-evidence requires a real post-deploy staging run on the exact
-#   SHA: the push-triggered deploy run must have staging-web success (never
-#   skipped) and its post-deploy full-journey job success. Scheduled or
-#   manual monitoring runs never count (see docs/ops.md staging checklist).
+#   SHA: the push-triggered deploy run (event=push; manual dispatches never
+#   count and can never shadow evidence) must have staging-web success (never
+#   skipped) and its post-deploy full-journey job success. The called
+#   workflow reports its jobs under the "post-deploy-e2e / ..." prefix, so
+#   every matching job must conclude success. Scheduled or manual monitoring
+#   runs never count (see docs/ops.md staging checklist).
 # - deploy-production uploads one Worker version without mutating routes,
 #   custom domains or triggers, then calls the shared central
 #   gradual-promote action (pinned below): 5% -> 50% -> 100% with per-stage
@@ -134,14 +137,21 @@ jobs:
               with urllib.request.urlopen(req, timeout=15) as res:
                   return json.load(res)
 
-          runs = api(f"/actions/workflows/deploy.yml/runs?branch=main&per_page=100")["workflow_runs"]
+          # Only push-triggered deploy runs carry staging evidence: staging-web
+          # and post-deploy-e2e run on push alone, so a later manual dispatch
+          # on the same SHA must neither create nor shadow evidence.
+          runs = api(f"/actions/workflows/deploy.yml/runs?branch=main&event=push&per_page=100")["workflow_runs"]
           same = [r for r in runs if r.get("head_sha") == sha]
           if not same:
-              print(f"::error::No deploy run on main for {sha}; promote what staging verified, never an unverified SHA")
+              print(f"::error::No push-triggered deploy run on main for {sha}; promote what staging verified, never an unverified SHA")
               sys.exit(1)
           latest = max(same, key=lambda r: r["id"])
+          if latest.get("event") != "push":
+              print(f"::error::Deploy run {latest['id']} on {sha} is not push-triggered "
+                    f"(got event {latest.get('event')}); manual dispatches are never evidence")
+              sys.exit(1)
           if latest.get("status") != "completed" or latest.get("conclusion") != "success":
-              print(f"::error::Latest deploy run {latest['id']} on {sha} is not successful "
+              print(f"::error::Latest push-triggered deploy run {latest['id']} on {sha} is not successful "
                     f"({latest.get('status')}/{latest.get('conclusion')})")
               sys.exit(1)
           jobs = api(f"/actions/runs/{latest['id']}/jobs?per_page=100")["jobs"]
@@ -150,9 +160,21 @@ jobs:
               print(f"::error::Deploy run {latest['id']} has no staging-web success "
                     f"(got {by_name.get('staging-web')}); a skipped deploy is not evidence")
               sys.exit(1)
-          if by_name.get("post-deploy-e2e") != "success":
+          # The post-deploy-e2e job calls e2e-staging.yml as a reusable
+          # workflow, so the jobs API reports each called job under the
+          # "post-deploy-e2e / <called job name>" prefix instead of a bare
+          # "post-deploy-e2e" entry. Require at least one such job and require
+          # every one of them to conclude success.
+          e2e = [(name, conclusion) for name, conclusion in by_name.items()
+                 if name == "post-deploy-e2e" or name.startswith("post-deploy-e2e / ")]
+          if not e2e:
               print(f"::error::Deploy run {latest['id']} has no post-deploy-e2e success "
                     f"(got {by_name.get('post-deploy-e2e')}); scheduled/manual monitoring never counts")
+              sys.exit(1)
+          bad = sorted(name for name, conclusion in e2e if conclusion != "success")
+          if bad:
+              print(f"::error::Deploy run {latest['id']} post-deploy-e2e jobs are not all success "
+                    f"(not success: {', '.join(bad)}); scheduled/manual monitoring never counts")
               sys.exit(1)
           print(f"staging evidence ok: deploy run {latest['id']} staging-web + post-deploy-e2e success on {sha}")
           PY
@@ -212,6 +234,56 @@ jobs:
             exit 1
           fi
           echo "production credentials present (names only)"
+      # One-time production seed precondition (see docs/ops.md). The shared
+      # gradual-promote action records its rollback target from the latest
+      # production deployment and refuses unless that deployment is a single
+      # version at 100%. Check that here, before uploading, so the first
+      # promotion fails with seed instructions instead of orphaning an
+      # uploaded version inside the action.
+      - name: Require one-time production seed deployment
+        working-directory: apps/web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
+          WORKER_NAME: ${{ env.PRODUCTION_WORKER_NAME }}
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@${{ env.WRANGLER_VERSION }} deployments list --env production --name "$WORKER_NAME" --json \
+            | node -e '
+              let raw = "";
+              process.stdin.on("data", (c) => { raw += c; });
+              process.stdin.on("end", () => {
+                const seed = "one-time production seed required: make one full deploy of the web frontend " +
+                  "to production (e.g. wrangler deploy --env production from the launch SHA) with the " +
+                  "production custom domain attached, leaving a single 100% deployment; then re-dispatch " +
+                  "this lane. See docs/ops.md production seed precondition.";
+                let parsed;
+                try {
+                  parsed = JSON.parse(raw);
+                } catch (e) {
+                  console.error("::error::could not parse deployments list output: " + e.message);
+                  process.exit(1);
+                }
+                const deployments = Array.isArray(parsed) ? parsed : (parsed.result ?? parsed.deployments);
+                if (!Array.isArray(deployments) || deployments.length === 0) {
+                  console.error("::error::No production deployments found. " + seed);
+                  process.exit(1);
+                }
+                let newest = deployments[0];
+                for (const entry of deployments.slice(1)) {
+                  if (String(entry?.created_on ?? "") > String(newest?.created_on ?? "")) newest = entry;
+                }
+                const versions = newest?.versions;
+                const id = Array.isArray(versions) && versions.length === 1 && versions[0]?.percentage === 100
+                  ? versions[0]?.version_id
+                  : undefined;
+                if (typeof id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) {
+                  console.error("::error::Latest production deployment is not a single-version 100% deployment. " + seed);
+                  process.exit(1);
+                }
+                console.log("production seed ok: rollback target " + id);
+              });
+            '
       # Uploading a version does not mutate routes, custom domains or cron
       # triggers. Never use a full deploy or a trigger-syncing subcommand
       # here: those re-provision the production hostname and fail or drift.
