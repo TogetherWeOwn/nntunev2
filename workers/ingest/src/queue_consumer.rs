@@ -812,6 +812,15 @@ impl BodySource for PoolBodySource<'_> {
     }
 }
 
+/// Largest scratch object read back through [`R2Scratch::get`]: 32 MiB,
+/// the largest object the pipeline itself stages (an assembled file of
+/// `VerifyCaps::max_file_bytes`; spool segments are one decoded article
+/// each, ≤ `max_article_bytes`). Checked against the R2 metadata size
+/// before the body is materialised, à la repair's `read_object_capped` —
+/// an oversize object is refused from metadata alone and fails transient,
+/// like every other scratch failure, never quarantined as permanent.
+const MAX_SCRATCH_OBJECT_BYTES: u64 = 32 << 20;
+
 /// [`ScratchStore`] over the `INGEST_SCRATCH` R2 bucket. The staged
 /// judgement rides the object's custom metadata, so a resume can adopt
 /// a staged file without re-reading its bytes.
@@ -872,6 +881,9 @@ impl ScratchStore for R2Scratch {
         let Some(object) = object else {
             return Ok(None);
         };
+        if object.size() > MAX_SCRATCH_OBJECT_BYTES {
+            return Err(VerifyError::Transient("scratch object oversize".into()));
+        }
         let Some(body) = object.body() else {
             return Ok(None);
         };
