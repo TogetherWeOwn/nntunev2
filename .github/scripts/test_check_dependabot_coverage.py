@@ -5,8 +5,9 @@ The shipped repo must stay green; deleting any expected entry (repair
 cargo/docker, npm, github-actions) must turn the check red, as must an
 unlisted new standalone crate in either the `exclude` form or the
 own-`[workspace]` form. Structural breaks (`version`/`updates`), a missing
-`.gitignore`, stale cargo entries, and uncovered tracked lockfiles are
-input errors or drift. Run from the repo root:
+`.gitignore`, stale cargo entries, uncovered tracked lockfiles, and
+digest-less external FROMs (stage refs exempt) are input errors or drift.
+Run from the repo root:
 
   python3 .github/scripts/test_check_dependabot_coverage.py
 """
@@ -25,6 +26,7 @@ from check_dependabot_coverage import (
     check_coverage,
     normalize_directory,
     parse_dependabot_entries,
+    unpinned_from_refs,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -64,7 +66,11 @@ def make_fixture(extra_updates=""):
     write(tmp / "Cargo.lock", "lock")
     write(tmp / "workers" / "repair" / "Cargo.toml", "[package]\nname = \"x\"\n")
     write(tmp / "workers" / "repair" / "Cargo.lock", "lock")
-    write(tmp / "containers" / "repair" / "Dockerfile", "FROM debian:bookworm-slim\n")
+    write(
+        tmp / "containers" / "repair" / "Dockerfile",
+        "FROM debian:bookworm-slim@sha256:"
+        "7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587\n",
+    )
     write(tmp / "e2e" / "package.json", "{}\n")
     (tmp / ".github" / "workflows").mkdir(parents=True)
     write(tmp / ".github" / "dependabot.yml", DEPENDABOT + extra_updates)
@@ -134,6 +140,68 @@ class DependabotCoverageTests(unittest.TestCase):
             )
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_unpinned_from_fails(self):
+        # The revert mutant: strip the digest and the check must go red.
+        tmp = make_fixture()
+        try:
+            dockerfile = tmp / "containers" / "repair" / "Dockerfile"
+            text = dockerfile.read_text(encoding="utf-8")
+            dockerfile.write_text(
+                text.split("@sha256:")[0] + "\n", encoding="utf-8"
+            )
+            drift, err = check_coverage(tmp)
+            self.assertIsNone(err, err)
+            self.assertTrue(
+                any("Dockerfile" in d and "FROM" in d for d in drift), drift
+            )
+            code, out, _ = run_check(tmp)
+            self.assertEqual(code, 1, out)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_stage_from_ref_is_allowed(self):
+        # Internal stage refs (`FROM base`) carry no digest by design.
+        tmp = make_fixture()
+        try:
+            dockerfile = tmp / "containers" / "repair" / "Dockerfile"
+            pinned = dockerfile.read_text(encoding="utf-8")
+            dockerfile.write_text(
+                pinned.replace("\n", " AS base\n", 1)
+                + "RUN echo build\n"
+                + "FROM base AS runtime\n",
+                encoding="utf-8",
+            )
+            drift, err = check_coverage(tmp)
+            self.assertIsNone(err, err)
+            self.assertEqual(drift, [], drift)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_unpinned_from_refs_unit(self):
+        digest = "0" * 64
+        self.assertEqual(
+            unpinned_from_refs(f"FROM img:tag@sha256:{digest} AS build\n"), []
+        )
+        self.assertEqual(
+            unpinned_from_refs(
+                f"from --platform=linux/amd64 img@sha256:{digest}\n"
+            ),
+            [],
+        )
+        self.assertEqual(
+            unpinned_from_refs("FROM img:tag\n"), [(1, "img:tag")]
+        )
+        self.assertEqual(
+            unpinned_from_refs(f"FROM img:tag@sha256:{'0' * 63}\n"),
+            [(1, f"img:tag@sha256:{'0' * 63}")],
+        )
+        self.assertEqual(
+            unpinned_from_refs(
+                f"FROM img@sha256:{digest} AS base\nFROM BASE AS rt\n"
+            ),
+            [],
+        )
 
     def test_new_standalone_crate_without_entry_fails(self):
         # A new excluded crate with no entry must turn the check red.

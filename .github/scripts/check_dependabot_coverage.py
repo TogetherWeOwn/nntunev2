@@ -24,6 +24,14 @@ header and negated back into tracking in the root `.gitignore`, so the
 header cannot go stale again the way it did when the worker lockfiles
 were committed.
 
+It also pins every external `FROM` in every `Dockerfile` (outside the
+same skip dirs) to a `tag@sha256:<64hex>` pin: a digest-less FROM keeps
+Dependabot from emitting digest-refresh PRs, and the header comment in
+`dependabot.yml` asserts the pins hold, so an unpinned FROM is drift.
+Stage refs (`FROM base`, where `base` was named by an earlier
+`FROM ... AS base`) are internal and exempt. The match is a regex, not
+literal digests, so Dependabot digest-refresh PRs stay green.
+
 Stdlib only (no PyYAML: the two fields are extracted with a line scan).
 Exit 0 = covered; 1 = drift found; 2 = unusable input.
 
@@ -52,6 +60,14 @@ ECOSYSTEM_RE = re.compile(
 DIRECTORY_RE = re.compile(
     r"""^[ \t]*directory:[ \t]*["']?([^"'#\s]+)"""
 )
+FROM_RE = re.compile(r"^[ \t]*FROM[ \t]+(.+)$", re.IGNORECASE)
+# Trailing `AS <stage>` on a FROM line (Docker keywords case-insensitive).
+FROM_STAGE_RE = re.compile(
+    r"[ \t]+AS[ \t]+([A-Za-z][A-Za-z0-9_.-]*)[ \t]*(#.*)?$", re.IGNORECASE
+)
+# External image ref with a tag+digest pin (`#` cannot appear in a ref,
+# so anything after it is a trailing comment and stripped before matching).
+FROM_DIGEST_RE = re.compile(r"\S+@sha256:[0-9a-f]{64}")
 
 
 def fail_input(message):
@@ -218,6 +234,54 @@ def expected_entries(root):
     return expected, None
 
 
+def walk_dockerfiles(root):
+    """All `Dockerfile` paths, relative POSIX form, outside SKIP_DIRS."""
+    found = []
+    for candidate in root.rglob("Dockerfile"):
+        try:
+            rel = candidate.relative_to(root)
+        except ValueError:
+            continue
+        if any(part in SKIP_DIRS for part in rel.parts):
+            continue
+        found.append(rel.as_posix())
+    return sorted(found)
+
+
+def unpinned_from_refs(text):
+    """`(lineno, ref)` for each external FROM lacking a tag+digest pin.
+
+    Stage refs are exempt: a FROM whose ref was named by an earlier
+    `FROM ... AS <stage>` in the same file is internal (stage names match
+    case-insensitively, like Docker itself). Leading `--platform=...`
+    flags are skipped to reach the ref. An empty or unparseable ref is
+    reported, not skipped: the gate stays fail-closed.
+    """
+    problems = []
+    stages = set()
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        match = FROM_RE.match(line)
+        if not match:
+            continue
+        rest = match.group(1).strip()
+        staged = FROM_STAGE_RE.search(rest)
+        if staged:
+            stages.add(staged.group(1).lower())
+            rest = rest[:staged.start()].strip()
+        tokens = rest.split()
+        ref = next((t for t in tokens if not t.startswith("--")), "")
+        ref = ref.split("#", 1)[0].strip()
+        if not ref:
+            problems.append((lineno, line.strip()))
+        elif ref.lower() in stages:
+            continue
+        elif FROM_DIGEST_RE.fullmatch(ref):
+            continue
+        else:
+            problems.append((lineno, ref))
+    return problems
+
+
 def tracked_lockfiles(root):
     """All `Cargo.lock` paths, relative POSIX form, outside SKIP_DIRS."""
     locks = []
@@ -278,6 +342,18 @@ def check_coverage(root):
             drift.append(
                 f"stale cargo entry for directory {directory!r} "
                 f"(no Cargo.toml there)"
+            )
+    # Pin the FROM lines: every external FROM must carry a tag+digest pin
+    # so Dependabot emits digest-refresh PRs (see the dependabot.yml header).
+    for dockerfile in walk_dockerfiles(root):
+        try:
+            docker_text = (root / dockerfile).read_text(encoding="utf-8")
+        except OSError as exc:
+            return None, f"{dockerfile} unreadable: {exc}"
+        for lineno, ref in unpinned_from_refs(docker_text):
+            drift.append(
+                f"{dockerfile}:{lineno}: external FROM {ref!r} lacks a "
+                f"tag@sha256 pin (Dependabot cannot track it)"
             )
     # Pin the lockfile header: every Cargo.lock must be named in the
     # header comment and negated back into tracking in .gitignore.
