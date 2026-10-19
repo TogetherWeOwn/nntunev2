@@ -382,6 +382,26 @@ impl IndexerConfig {
         if parsed.scheme() != "https" {
             return Err(VaultError::Invalid);
         }
+        // Saved indexer URLs carry no credentials (the API key travels
+        // separately) and userinfo disguises the real host
+        // (`host@evil` parses host as `evil`), so refuse any of it.
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(VaultError::Invalid);
+        }
+        // Only the HTTPS default may be addressed: an explicit non-443
+        // port is an alternate-service probe. `port()` yields `None` for
+        // both the default and an explicit `:443` (default-port
+        // normalization), so both still validate.
+        if let Some(port) = parsed.port() {
+            if port != 443 {
+                return Err(VaultError::Invalid);
+            }
+        }
+        // A fragment is never sent to a server; in a stored base URL it
+        // is smuggled data or a copy-paste error.
+        if parsed.fragment().is_some() {
+            return Err(VaultError::Invalid);
+        }
         let host = parsed
             .host_str()
             .filter(|h| !h.is_empty())
