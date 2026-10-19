@@ -493,3 +493,89 @@ pub fn classify_container_reply(status: u16, body: &[u8]) -> ContainerOutcome {
         _ => ContainerOutcome::Forward(502, "container_unavailable".to_string()),
     }
 }
+
+/// Append one response chunk only when it fits under `cap`.
+///
+/// Check-before-extend: a chunk that would push the accumulated body
+/// over `cap` is rejected and the retained body is left untouched, so
+/// an oversized reply is never materialised in full. Exactly-at-`cap`
+/// stays admissible (`>` rejects, never `>=`). The wasm runtime
+/// streams both container result replies through this.
+pub fn push_chunk_capped(body: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
+    if body.len() + chunk.len() > cap {
+        return false;
+    }
+    body.extend_from_slice(chunk);
+    true
+}
+
+/// Fault for a Durable Object reply the front door cannot trust
+/// (unreadable or over `MAX_RESULT_BYTES`): retryable 503, the same
+/// mapping the front door already uses for its other failure arms.
+pub fn repair_unavailable_fault() -> ApiFault {
+    ApiFault::new(503, "repair_unavailable")
+}
+
+/// Fault for a Container reply `container_json` cannot trust
+/// (unreadable or over `MAX_RESULT_BYTES`): retryable 502, the same
+/// mapping `container_json` already uses for its other failure arms.
+pub fn container_unavailable_fault() -> ApiFault {
+    ApiFault::new(502, "container_unavailable")
+}
+
+#[cfg(test)]
+mod capped_reply_read_tests {
+    //! Pin the capped reply-read building blocks in isolation: the
+    //! accumulator must check before extending (never retaining the
+    //! excess) with exactly-at-cap admissible, and both reply-site
+    //! faults must keep their existing status mapping. These live
+    //! next to the helpers — not in the acceptance suite — because
+    //! that file is Test Author-owned and frozen for this change.
+
+    use super::*;
+
+    #[test]
+    fn accepts_chunk_landing_exactly_at_cap() {
+        let mut body = vec![0u8; MAX_RESULT_BYTES - 3];
+        assert!(push_chunk_capped(&mut body, &[1, 2, 3], MAX_RESULT_BYTES));
+        assert_eq!(body.len(), MAX_RESULT_BYTES);
+    }
+
+    #[test]
+    fn rejects_chunk_crossing_cap_by_one_byte_without_retaining_it() {
+        let mut body = vec![0u8; MAX_RESULT_BYTES - 3];
+        assert!(!push_chunk_capped(
+            &mut body,
+            &[1, 2, 3, 4],
+            MAX_RESULT_BYTES
+        ));
+        assert_eq!(body.len(), MAX_RESULT_BYTES - 3);
+        assert!(body.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn accumulates_sequence_up_to_cap_then_rejects() {
+        let mut body = Vec::new();
+        assert!(push_chunk_capped(
+            &mut body,
+            &vec![7u8; MAX_RESULT_BYTES - 1],
+            MAX_RESULT_BYTES
+        ));
+        assert!(push_chunk_capped(&mut body, &[8], MAX_RESULT_BYTES));
+        assert_eq!(body.len(), MAX_RESULT_BYTES);
+        assert!(!push_chunk_capped(&mut body, &[9], MAX_RESULT_BYTES));
+        assert_eq!(body.len(), MAX_RESULT_BYTES);
+    }
+
+    #[test]
+    fn reply_site_faults_keep_existing_mapping() {
+        assert_eq!(
+            repair_unavailable_fault(),
+            ApiFault::new(503, "repair_unavailable")
+        );
+        assert_eq!(
+            container_unavailable_fault(),
+            ApiFault::new(502, "container_unavailable")
+        );
+    }
+}

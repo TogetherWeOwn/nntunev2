@@ -22,10 +22,11 @@ use worker::{
 };
 
 use crate::contract::{
-    classify_container_reply, container_repair_body, in_key, ingest_reply_body, manifest_digest,
-    manifest_key, out_key, parse_manifest, parse_request, plan, result_key,
-    validate_repaired_output_set, ApiFault, ContainerOutcome, FileRole, Plan, RepairRequest,
-    RepairStatus, MAX_REQUEST_BYTES, MAX_RESULT_BYTES,
+    classify_container_reply, container_repair_body, container_unavailable_fault, in_key,
+    ingest_reply_body, manifest_digest, manifest_key, out_key, parse_manifest, parse_request, plan,
+    push_chunk_capped, repair_unavailable_fault, result_key, validate_repaired_output_set,
+    ApiFault, ContainerOutcome, FileRole, Plan, RepairRequest, RepairStatus, MAX_REQUEST_BYTES,
+    MAX_RESULT_BYTES,
 };
 
 /// Durable Object binding + class fronting the Container.
@@ -69,18 +70,19 @@ async fn read_capped(req: &mut Request, cap: usize) -> Result<Vec<u8>, ApiFault>
 }
 
 /// Read a response body with a hard cap (streamed, never unbounded).
-/// Mirrors `read_capped`: the chunk that would cross the cap aborts the
-/// read, so at most `cap` bytes are ever materialised and the excess is
-/// never retained. Callers map the unit error to their own fault.
+/// Each chunk goes through `push_chunk_capped`, so the chunk that
+/// would cross the cap aborts the read with the accumulated body
+/// untouched: at most `cap` bytes are ever materialised and the
+/// excess is never retained. Callers map the unit error to their own
+/// fault.
 async fn read_response_capped(response: &mut Response, cap: usize) -> Result<Vec<u8>, ()> {
     let mut stream = response.stream().map_err(|_| ())?;
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| ())?;
-        if body.len() + chunk.len() > cap {
+        if !push_chunk_capped(&mut body, &chunk, cap) {
             return Err(());
         }
-        body.extend_from_slice(&chunk);
     }
     Ok(body)
 }
@@ -107,7 +109,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
         Ok(stub) => stub,
         Err(error) => {
             console_log!("repair DO unavailable: {:?}", error);
-            return fault_response(&ApiFault::new(503, "repair_unavailable"));
+            return fault_response(&repair_unavailable_fault());
         }
     };
     let headers = Headers::new();
@@ -118,13 +120,13 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
         .with_body(Some(JsValue::from_str(&String::from_utf8_lossy(&body))));
     let request = match Request::new_with_init("https://repair-do/repair", &init) {
         Ok(request) => request,
-        Err(_) => return fault_response(&ApiFault::new(503, "repair_unavailable")),
+        Err(_) => return fault_response(&repair_unavailable_fault()),
     };
     let mut response = match stub.fetch_with_request(request).await {
         Ok(response) => response,
         Err(error) => {
             console_log!("repair DO call failed job={}: {:?}", parsed.job_id, error);
-            return fault_response(&ApiFault::new(503, "repair_unavailable"));
+            return fault_response(&repair_unavailable_fault());
         }
     };
     let status = response.status_code();
@@ -434,11 +436,11 @@ async fn container_json(
         init.with_body(Some(JsValue::from_str(&String::from_utf8_lossy(&body))));
     }
     let request = Request::new_with_init(&format!("http://container{path}"), &init)
-        .map_err(|_| ApiFault::new(502, "container_unavailable"))?;
+        .map_err(|_| container_unavailable_fault())?;
     let mut response = port
         .fetch_request(request)
         .await
-        .map_err(|_| ApiFault::new(502, "container_unavailable"))?;
+        .map_err(|_| container_unavailable_fault())?;
     let status = response.status_code();
     let bytes = read_response_capped(&mut response, MAX_RESULT_BYTES)
         .await
