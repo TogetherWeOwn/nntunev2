@@ -11,6 +11,9 @@ import {
 
 export const LIBRARY_REQUEST_TIMEOUT_MS = 10_000;
 
+/** Largest library JSON body retained in memory (1 MiB, counted in UTF-8 bytes). */
+export const LIBRARY_BODY_MAX_BYTES = 1_048_576;
+
 export interface LibraryRefreshState {
 	items: LibraryItem[];
 	staleAt: string | null;
@@ -120,8 +123,18 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 					const { done, value } = await reader.read();
 					if (done) break;
 					if (value) {
-						chunks.push(value);
 						totalLength += value.length;
+						if (totalLength > LIBRARY_BODY_MAX_BYTES) {
+							// Stop at the cap: cancel the reader so the
+							// producer stops and the trailing bytes are never
+							// retained, then reject through the same failure
+							// shape as a timeout (first load: unreachable;
+							// after an authenticated success: snapshot
+							// fallback). Chunk lengths are UTF-8 bytes.
+							cancelReader(reader);
+							throw new Error('library request timed out');
+						}
+						chunks.push(value);
 					}
 				}
 				const combined = new Uint8Array(totalLength);
