@@ -418,20 +418,35 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
     try {
       const fixture = join(scratch, 'deployments.json');
       writeFileSync(fixture, rawOutput);
+      const argvFile = join(scratch, 'npx-argv');
       const stub = join(bin, 'npx');
-      writeFileSync(stub, '#!/bin/bash\ncat "$SEED_FIXTURE"\n');
+      // The stub records its argv so the tests can see exactly which worker
+      // the gate queries; a gate repointed at staging must fail, not replay
+      // the production fixture silently.
+      writeFileSync(
+        stub,
+        '#!/bin/bash\nprintf \'%s\\n\' "$@" > "$SEED_ARGV"\ncat "$SEED_FIXTURE"\n',
+      );
       chmodSync(stub, 0o755);
-      return await runChild(
+      const result = await runChild(
         '/bin/bash',
         ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', runnable],
         {
           SEED_FIXTURE: fixture,
+          SEED_ARGV: argvFile,
           WORKER_NAME: 'nntune-web',
           CLOUDFLARE_API_TOKEN: 'dummy-token',
           CLOUDFLARE_ACCOUNT_ID: 'dummy-account',
         },
         60_000,
       );
+      let argv = '';
+      try {
+        argv = readFileSync(argvFile, 'utf8');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      return { ...result, argv };
     } finally {
       rmSync(bin, { recursive: true, force: true });
       rmSync(scratch, { recursive: true, force: true });
@@ -446,11 +461,27 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
   test('the seed block is present and runs before the version upload', () => {
     expect(script, 'seed run block missing').toBeDefined();
     expect(script).toContain('deployments list');
+    // Pin the exact deployments-list target so a repoint at staging fails
+    // without executing anything: production env, bound worker name, --json.
+    expect(script).toContain('--env production');
+    expect(script).toContain('--name "$WORKER_NAME"');
+    expect(script).toContain('--json');
     // The offline runner evaluates this one Actions expression to the pinned
     // value; pin both sides so the substitution cannot drift.
     expect(script).toContain('wrangler@${{ env.WRANGLER_VERSION }}');
     expect(productionWorkflow.split('\njobs:\n')[0]!).toContain(
       'WRANGLER_VERSION: 4.150.0',
+    );
+    // Pin the WORKER_NAME the seed step binds, the same way WRANGLER_VERSION
+    // is pinned: the step must wire the production worker name, and the
+    // workflow-level default must be the production worker.
+    const seedStep = productionWorkflow.match(
+      /- name: Require one-time production seed deployment\n([\s\S]*?)        run: \|\n/,
+    )?.[1];
+    expect(seedStep, 'seed step env block missing').toBeDefined();
+    expect(seedStep).toContain('WORKER_NAME: ${{ env.PRODUCTION_WORKER_NAME }}');
+    expect(productionWorkflow.split('\njobs:\n')[0]!).toContain(
+      'PRODUCTION_WORKER_NAME: "nntune-web"',
     );
     const seedAt = productionWorkflow.indexOf(
       'Require one-time production seed deployment',
@@ -460,6 +491,28 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
     );
     expect(seedAt).toBeGreaterThan(-1);
     expect(seedAt).toBeLessThan(uploadAt);
+  });
+
+  test('seed queries the production worker deployments list', async () => {
+    // The stub records the exact argv the gate passes to npx; assert the full
+    // deployments-list invocation so a gate repointed at staging (or at a
+    // hardcoded staging worker name) fails instead of replaying the fixture.
+    const result = await runSeed(
+      JSON.stringify([singleAt('2026-10-18T00:00:00Z')]),
+    );
+    expect(result.status).toBe(0);
+    const args = result.argv.trim().split('\n');
+    expect(args).toEqual([
+      '--yes',
+      'wrangler@4.150.0',
+      'deployments',
+      'list',
+      '--env',
+      'production',
+      '--name',
+      'nntune-web',
+      '--json',
+    ]);
   });
 
   test('seed accepts a single-version 100% deployment', async () => {
