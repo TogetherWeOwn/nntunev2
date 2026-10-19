@@ -237,10 +237,13 @@ mod tests {
             }
             if c == '\'' {
                 // Char literal on one line: blank its body so a `?` inside
-                // cannot satisfy the pin. Narrow chars are at most 4 wide
-                // incl. quotes; escape-led bodies (`'\..'`) are accepted at
-                // any width because lifetimes never contain a backslash.
-                // Lifetimes fall through as plain code.
+                // cannot satisfy the pin. Non-escape bodies are exactly one
+                // character (quotes exactly 2 apart); a 2-3 char body is
+                // never a valid char, only a lifetime/label quote reaching
+                // a later quote (e.g. `break 'a "'...'"` spans exactly 4).
+                // Escape-led bodies (`'\..'`) are accepted at any width
+                // because lifetimes never contain a backslash. Lifetimes
+                // and labels fall through as plain code.
                 let mut j = i + 1;
                 let mut closed = false;
                 while j < chars.len() && chars[j] != '\n' {
@@ -255,7 +258,7 @@ mod tests {
                     j += 1;
                 }
                 let escape_led = chars.get(i + 1).copied() == Some('\\');
-                if closed && (j.saturating_sub(i) <= 4 || escape_led) {
+                if closed && (j.saturating_sub(i) == 2 || escape_led) {
                     // Blank via the escape-aware lookahead endpoint `j`:
                     // rescanning for the first `'` would stop at an escaped
                     // quote (`'\''`) and reinterpret the real closer as a new
@@ -748,6 +751,46 @@ mod tests {
                 "wide-escape {prefix} adjacent string statement must not satisfy the pin"
             );
         }
+    }
+
+    #[test]
+    fn stripper_blanks_one_letter_label_before_quote_led_string() {
+        // Direct pin for the non-escape char width rule: a one-letter label
+        // on a break followed by a quote-led string (`break 'a "'...'`)
+        // spans exactly 4 chars from the label quote to the string body's
+        // leading `'`. An at-most-4 guard misreads that span as a char
+        // literal, blanking the label letter, the space and the string's
+        // opening `"` as char body, so the string body leaks as code.
+        let src = "break 'a \"' .map_err(|_| CryptoError::RandomnessUnavailable)?;\";";
+        let stripped = strip_code_for_propagation_pin(src);
+        assert!(
+            !stripped.contains(".map_err"),
+            "label-adjacent string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("RandomnessUnavailable"),
+            "label-adjacent string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains('?'),
+            "label-adjacent string ? must be blanked: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn pin_rejects_label_before_quote_led_string_carried_statement() {
+        // Checker-level regression for the same bug: a labelled break whose
+        // value is a quote-led string carrying the exact expected statement.
+        // It never executes `getrandom::fill` — zero-filled bytes returned
+        // as `Ok` — yet the at-most-4 stripper reports `Ok(())`.
+        let gr = "getrandom";
+        let mutant = format!(
+            "'a: loop {{ break 'a \"'{gr}::fill(&mut bytes).map_err(|_| CryptoError::RandomnessUnavailable)?;\"; }}"
+        );
+        assert!(
+            check_secure_random_propagation(&mutant).is_err(),
+            "label-adjacent string statement must not satisfy the pin"
+        );
     }
 
     #[test]
