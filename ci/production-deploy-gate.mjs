@@ -28,23 +28,23 @@ import { pathToFileURL } from "node:url";
 export const SHA40_PATTERN = /^[0-9a-f]{40}$/;
 
 // Values that are never a real production hostname. Compared
-// case-insensitively against the whole value and as substrings, so an
-// unset variable, a documented example, or a "fill in later" marker all
-// refuse with the variable named.
-const PLACEHOLDER_HOSTNAME_PATTERNS = [
+// case-insensitively, so an unset variable, a documented example, or a
+// "fill in later" marker all refuse with the variable named. Substring
+// patterns stay reserved for strings that never occur inside a real
+// hostname; bare words (test, todo, tbd, invalid) match only as a full
+// dot/hyphen-delimited label, so a real name merely containing them
+// (fastest-nntune.com) still passes. Any IPv4 literal (loopback,
+// private ranges, or otherwise) refuses: the production target is a DNS
+// name, never a literal address.
+const PLACEHOLDER_HOSTNAME_SUBSTRINGS = [
   "example",
   "placeholder",
   "changeme",
-  "todo",
-  "tbd",
   "localhost",
-  "test",
-  "invalid",
-  "127.",
-  "10.",
-  "192.168",
   "ubuntu",
 ];
+const PLACEHOLDER_HOSTNAME_LABELS = ["todo", "tbd", "test", "invalid"];
+const IPV4_LITERAL = /^\d{1,3}(\.\d{1,3}){3}$/;
 const HOSTNAME_SHAPE = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/i;
 
 export function isPlaceholderHostname(value) {
@@ -57,7 +57,9 @@ export function isPlaceholderHostname(value) {
     return true;
   }
   const lowered = host.toLowerCase();
-  return PLACEHOLDER_HOSTNAME_PATTERNS.some((pattern) => lowered.includes(pattern));
+  if (IPV4_LITERAL.test(lowered)) return true;
+  if (PLACEHOLDER_HOSTNAME_SUBSTRINGS.some((pattern) => lowered.includes(pattern))) return true;
+  return PLACEHOLDER_HOSTNAME_LABELS.some((label) => lowered.split(/[.-]/).includes(label));
 }
 
 export function assertProductionRequest(env) {
