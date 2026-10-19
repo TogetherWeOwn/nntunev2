@@ -109,8 +109,29 @@ fn parse_pool_table(doc: &str) -> Vec<PoolRow> {
     rows
 }
 
+/// Status for the `internal` serialization-failure answer, read from the
+/// paired source block (`probe.rs:148-152`) so a status change there fails
+/// the EXPECTED comparison in `runtime_mappings_match_the_expected_wire_codes`
+/// until docs follow. The `Err(_)` arm is infallible for `Vec<String>`
+/// outcomes, so no runtime value can supply this.
+fn internal_status_from_source() -> u16 {
+    const LITERAL: &str = r#"{"error":"internal"}"#;
+    let at = PROBE_RS
+        .find(LITERAL)
+        .unwrap_or_else(|| panic!("probe.rs serves the internal literal"));
+    let window = &PROBE_RS[at.saturating_sub(400)..at];
+    let status_at = window
+        .rfind("status:")
+        .unwrap_or_else(|| panic!("probe.rs:148-152 pairs status with the internal literal"));
+    let after = window[status_at + "status:".len()..].trim_start();
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits
+        .parse()
+        .unwrap_or_else(|_| panic!("probe.rs internal status parses"))
+}
+
 /// Served codes from the runtime mappings themselves (plus `internal`, whose
-/// serialization-failure path is pinned by source presence below).
+/// serialization-failure path contributes its paired status from source).
 fn served_from_runtime() -> Vec<(&'static str, u16, bool)> {
     let busy = ProbeError::Busy {
         retry_after_ms: 5_000,
@@ -145,10 +166,10 @@ fn served_from_runtime() -> Vec<(&'static str, u16, bool)> {
     let mut served = cases;
     served.push(("missing", missing.status, false));
     // `internal` is the `ProbeOutcome` serialization-failure answer
-    // (`probe.rs:148-152`): status 500, `{"error":"internal"}`. The
-    // serialization itself is infallible for `Vec<String>` outcomes, so pin
-    // the served literal by source presence, not by triggering it.
-    served.push(("internal", 500, true));
+    // (`probe.rs:148-152`): the paired `status` plus `{"error":"internal"}`.
+    // The serialization itself is infallible for `Vec<String>` outcomes, so
+    // the status comes from the source block, not by triggering it.
+    served.push(("internal", internal_status_from_source(), true));
     served
 }
 
@@ -184,19 +205,33 @@ fn code_arm_codes() -> Vec<String> {
     codes
 }
 
-/// Collect every `{"error":"<code>"}` literal in the pool sources. `code()`
-/// arms render through `json!({ "error": ... })`, so their codes are covered
-/// by `code_arm_codes` above; this scan guards the literal bodies (`missing`,
-/// `internal`, route constants) against a new literal landing without docs.
+/// Collect every `"error": "<code>"` string-literal body in the pool sources,
+/// tolerant of whitespace and macro form (`{"error":"x"}`,
+/// `{"error": "x"}`, `json!({ "error": "x" })`, raw strings). `code()` arms
+/// render through `json!({ "error": error.code() })`, so their codes are
+/// covered by `code_arm_codes` above; this scan guards the literal bodies
+/// (`missing`, `internal`, route constants) against a new literal landing
+/// without docs. Non-literal values (`error.code()`, `<code>` prose) are
+/// skipped.
 fn literal_wire_codes() -> Vec<String> {
     let mut codes = Vec::new();
     for src in [PROBE_RS, BODY_RS, ROUTES_RS, RUNTIME_RS] {
         let mut rest = src;
-        while let Some(at) = rest.find("{\"error\":\"") {
-            let after = &rest[at + "{\"error\":\"".len()..];
-            if let Some(end) = after.find('"') {
-                codes.push(after[..end].to_string());
-                rest = &after[end..];
+        while let Some(at) = rest.find("\"error\"") {
+            let after = rest[at + "\"error\"".len()..].trim_start();
+            let Some(value) = after.strip_prefix(':') else {
+                rest = after;
+                continue;
+            };
+            let value = value.trim_start();
+            let Some(literal) = value.strip_prefix('"') else {
+                // Non-literal value (e.g. `error.code()` or `<code>` prose).
+                rest = value;
+                continue;
+            };
+            if let Some(end) = literal.find('"') {
+                codes.push(literal[..end].to_string());
+                rest = &literal[end + 1..];
             } else {
                 break;
             }
@@ -234,10 +269,21 @@ fn runtime_mappings_match_the_expected_wire_codes() {
     );
     assert_eq!(ProbeError::TooLarge.status(), 413);
     assert_eq!(busy_retry_secs(), Some(5));
-    assert!(
-        PROBE_RS.contains(r#"{"error":"internal"}"#),
-        "probe.rs:150 serves the internal literal"
-    );
+    // The `internal` status and literal are one paired block: a status-only
+    // change must fail here even though the arm never runs.
+    {
+        const LITERAL: &str = r#"{"error":"internal"}"#;
+        let at = PROBE_RS
+            .find(LITERAL)
+            .unwrap_or_else(|| panic!("probe.rs:150 serves the internal literal"));
+        let start = at.saturating_sub(400);
+        let end = (at + LITERAL.len() + 50).min(PROBE_RS.len());
+        let paired = &PROBE_RS[start..end];
+        assert!(
+            paired.contains("status: 500"),
+            "probe.rs:148-152 pairs status 500 with the internal literal"
+        );
+    }
     assert!(
         BODY_RS.contains(r#"{"error":"missing"}"#),
         "body.rs:87 serves the missing literal"
