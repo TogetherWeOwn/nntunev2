@@ -626,6 +626,23 @@ pub trait Store {
         async { Err(StoreError) }
     }
     fn revoke_session(&self, id: &str) -> impl Future<Output = Result<(), StoreError>>;
+    /// Conditional single-session revoke matching
+    /// [`session::SessionRevokeClaim::Single`]: `UPDATE ... WHERE id = $1
+    /// AND user_id = $2 AND revoked = FALSE`. Returns true iff exactly one
+    /// row transitioned, so concurrent logouts cannot double-count. The
+    /// default preserves legacy behavior for out-of-tree impls by delegating
+    /// to [`Store::revoke_session`]; production and updated fakes override
+    /// with the conditional write.
+    fn revoke_single_session(
+        &self,
+        id: &str,
+        user_id: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let _ = user_id;
+            self.revoke_session(id).await.map(|_| true)
+        }
+    }
     fn revoke_all_sessions(&self, user_id: &str) -> impl Future<Output = Result<(), StoreError>>;
     fn vault_by_user(
         &self,
@@ -2312,8 +2329,22 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
-    if ctx.store.revoke_session(&claims.session_id).await.is_err() {
-        return internal();
+    // Conditional revoke: concurrent logouts of the same session race here
+    // after both authenticating on the pre-revoke snapshot. Only the winner
+    // transitions the row and audits; the loser still clears its (now dead)
+    // cookie but writes no second `session.logout` row.
+    match ctx
+        .store
+        .revoke_single_session(&claims.session_id, &claims.user_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            let mut resp = json_response(200, serde_json::json!({"ok": true}));
+            resp.set_cookie = Some(session::clear_cookie_header());
+            return resp;
+        }
+        Err(_) => return internal(),
     }
     ctx.audit(&claims.user_id, session::LOGOUT_AUDIT_ACTION, true)
         .await;
@@ -3711,6 +3742,16 @@ mod tests {
                 row.revoked = true;
             }
             Ok(())
+        }
+        async fn revoke_single_session(&self, id: &str, user_id: &str) -> Result<bool, StoreError> {
+            let mut sessions = self.sessions.borrow_mut();
+            match sessions.get_mut(id) {
+                Some(row) if row.user_id == user_id && !row.revoked => {
+                    row.revoked = true;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
         }
         async fn revoke_all_sessions(&self, user_id: &str) -> Result<(), StoreError> {
             for row in self.sessions.borrow_mut().values_mut() {
