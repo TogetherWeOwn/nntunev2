@@ -2810,7 +2810,7 @@ mod tests {
             .find('}')
             .expect("the zero-row guard arm must close");
         assert!(
-            upsert[guard..guard + arm_end].contains("Err"),
+            upsert[guard..guard + arm_end].contains("return Err"),
             "the zero-row guard must fail closed (return Err), not Ok"
         );
         // Test-connection lease: the same fence on the same owner parameter,
@@ -2865,7 +2865,7 @@ mod tests {
             .find('}')
             .expect("the zero-row guard arm must close");
         assert!(
-            mint[mint_guard..mint_guard + mint_arm_end].contains("Err"),
+            mint[mint_guard..mint_guard + mint_arm_end].contains("return Err"),
             "the zero-row guard must fail closed (return Err), not Ok"
         );
     }

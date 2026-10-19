@@ -170,10 +170,16 @@ variant instead (see also §7).
 - **Body (running):** Erasure of your account has started, so changes
   are no longer possible. This can no longer be cancelled. We will email
   {{email}} when erasure is complete.
-- **Default (state unknown):** if the operation read fails, or the state
-  is anything other than `scheduled` or `running`, treat it as running —
-  never offer cancel. Only an operation read as `scheduled` may show the
-  scheduled body.
+- **Default (state unknown):** if the state is anything other than
+  `scheduled` or `running`, treat it as running — never offer cancel.
+  Only an operation read as `scheduled` may show the scheduled body.
+- **Body (status unavailable):** if the operation read itself fails, the
+  client does not know the state — do not show the running body. It
+  claims erasure has started and can no longer be cancelled, which is
+  false when the operation is still `scheduled` and cancelling still
+  works. Show neutral copy instead: "We could not load your deletion
+  status, so changes stay paused for now. Try again." Keep cancel
+  unavailable until the state is confirmed, and offer a retry.
 
 ## 6. State: cancel the deletion
 

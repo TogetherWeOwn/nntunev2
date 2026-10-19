@@ -54,6 +54,15 @@ fn without_ypart(article: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The article with its `=yend` line (and CRLF) removed.
+fn without_yend(article: &[u8]) -> Vec<u8> {
+    let start = find(article, b"=yend");
+    let end = start + find(&article[start..], b"\r\n") + 2;
+    let mut out = article[..start].to_vec();
+    out.extend_from_slice(&article[end..]);
+    out
+}
+
 fn multipart(data: &[u8], offset: u64, file_size: u64) -> Vec<u8> {
     encode_part(
         data,
@@ -161,7 +170,10 @@ fn ypart_before_ybegin_is_rejected() {
 fn yend_before_ybegin_is_rejected() {
     let article = encode(PAYLOAD, "a.bin");
     let mut mutated = format!("=yend size={}\r\n", PAYLOAD.len()).into_bytes();
-    mutated.extend_from_slice(&article);
+    // Strip the article's real trailer so only the order guard can reject
+    // this input: with it present, a dropped !seen_begin check still fails
+    // on the duplicate trailer (seen_trailer) and the pin proves nothing.
+    mutated.extend_from_slice(&without_yend(&article));
     assert!(
         decode_part(&mutated).is_err(),
         "=yend before =ybegin is out of order"
