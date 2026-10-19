@@ -356,8 +356,11 @@ behavior changes here.
 - **Per-play stream ledger (`stream_play_ledger`, not the ADR daily
   `usage_ledger`):** one row per billed play window. Stream plays derive a
   deterministic `play:{user}:{track}:{play}` key (same derivation as the
-  stream worker; 128/512/512 limits, alphabet `[A-Za-z0-9_:-]`); non-play
-  windows use a fresh 128-bit key minted once and reused across retries. The
+  stream worker; 128/512/512-byte field limits). Both derivation helpers
+  reject empty fields or anything outside ASCII `[A-Za-z0-9_-]`, without
+  rewriting identities; colons are structural delimiters only. Accepted keys
+  therefore match the persisted ledger alphabet. Non-play windows use a fresh
+  128-bit key minted once and reused across retries. The
   insert is fenced `ON CONFLICT DO NOTHING` through the play owner's
   `users` row (`FOR SHARE`, ADR 0002 rule 3), so a play finalized behind
   the account-deletion marker inserts nothing — then the Worker selects
