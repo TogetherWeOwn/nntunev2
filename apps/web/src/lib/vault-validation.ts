@@ -123,6 +123,36 @@ export function validateIndexerUrl(url: string, apiKey: string): string | null {
 	if (value.length === 0) {
 		return apiKey.trim().length === 0 ? null : 'Clear the indexer key or enter an indexer URL.';
 	}
+	// Mirror workers/ingest check_base_url on the raw trimmed value: the
+	// client sends the raw string (not the normalized href), so WHATWG
+	// normalization must not hide a form the fetch builder rejects. Require
+	// the literal `https://` prefix, a non-empty non-slash remainder, no
+	// `@`/`?`/`#`, and no whitespace (including U+0085 NEL, which JS \s
+	// misses but Rust is_whitespace rejects) — before parsing.
+	if (!value.startsWith('https://')) {
+		try {
+			const probe = new URL(value);
+			if (probe.protocol !== 'https:') {
+				return 'Indexer URLs must use https.';
+			}
+		} catch {
+			return 'That indexer URL does not look valid.';
+		}
+		// Parses as https but without the literal prefix (uppercase scheme,
+		// missing slash, backslash slashes, …) — downstream requires the
+		// literal bytes, so reject here instead of reporting success.
+		return 'Indexer URLs must use https.';
+	}
+	const rest = value.slice('https://'.length);
+	if (rest.length === 0 || rest.startsWith('/')) {
+		return 'That indexer URL does not look valid.';
+	}
+	if (rest.includes('@') || rest.includes('?') || rest.includes('#')) {
+		return 'Put the API key in the key field, not the URL';
+	}
+	if (/[\s\u0085]/.test(rest)) {
+		return 'That indexer URL does not look valid.';
+	}
 	let parsed: URL;
 	try {
 		parsed = new URL(value);

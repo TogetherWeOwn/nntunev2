@@ -873,6 +873,7 @@ dependencies = [
  "md5",
  "nntune-core",
  "nntune-logging",
+ "nntune-ssrf-guard",
  "nntune-test-nntp",
  "serde",
  "serde-wasm-bindgen",
@@ -892,6 +893,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "nntune-ssrf-guard"
+version = "0.1.0"
 
 [[package]]
 name = "nntune-test-nntp"

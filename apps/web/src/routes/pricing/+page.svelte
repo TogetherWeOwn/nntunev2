@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { listPlans, formatPricePerMonth } from '#lib/billing/plans.js';
+	import { listPlans, formatPricePerMonth, planButtonName } from '#lib/billing/plans.js';
 	import {
 		BillingApiError,
 		startCheckout,
@@ -88,7 +88,11 @@
 						{#if plan.id === 'free'}
 							<a href="/signup?plan=free">Start trial</a>
 						{:else}
-							<button disabled={pendingPlan !== null} onclick={() => choose(plan.id)}>
+							<button
+								aria-label={planButtonName(plan, pendingPlan)}
+								disabled={pendingPlan !== null}
+								onclick={() => choose(plan.id)}
+							>
 								{pendingPlan === plan.id ? 'Starting…' : 'Choose'}
 							</button>
 						{/if}

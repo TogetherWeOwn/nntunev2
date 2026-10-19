@@ -215,6 +215,7 @@ use nntune_ingest::indexer_fetch::{
     DIAL_TIMEOUT_MS, FETCH_TIMEOUT_MS, MAX_REDIRECTS,
 };
 use nntune_ingest::newznab::{build_search_url, inject_api_key, SearchParams};
+use nntune_ssrf_guard::{FORBIDDEN_VECTORS, PUBLIC_CONTROL_VECTORS};
 
 const HOST: &str = "indexer.example";
 const OTHER_HOST: &str = "api.other.example";
@@ -431,10 +432,10 @@ fn forbidden_ip_literals_blocked_before_fetch() {
             "https://[fd00::1]/api?t=music",
             "https://[fc00::1]/api?t=music",
             "https://[ff02::1]/api?t=music",
-            "https://[64:ff9b::5db8:d822]/api?t=music",
-            "https://[::ffff:93.184.216.34]/api?t=music",
-            "https://[2002:a00:1::1]/api?t=music",
-            "https://[2001:db8::1]/api?t=music",
+            // Transition/special families (mapped, 6to4, documentation,
+            // Teredo, NAT64) live in the shared table and are covered by
+            // `shared_transition_vectors_blocked_before_fetch` below —
+            // never copy those literals here.
         ]
         .iter()
         .map(|u| u.to_string()),
@@ -448,6 +449,71 @@ fn forbidden_ip_literals_blocked_before_fetch() {
     }
     assert!(transport.dials.is_empty(), "blocked before any dial");
     assert!(dns.lookups().is_empty(), "IP literals never hit DNS");
+}
+
+/// Shared transition/special vectors (single owner:
+/// `nntune_ssrf_guard::FORBIDDEN_VECTORS`): mapped, 6to4, documentation,
+/// Teredo and NAT64 literals are blocked with a stable 4xx before any
+/// dial, and literals never hit DNS. No literal here may be copied from
+/// the shared table: every address comes from the import above.
+#[test]
+fn shared_transition_vectors_blocked_before_fetch() {
+    let dns = FakeDns::default();
+    let mut transport = FakeTransport::default();
+    for raw in FORBIDDEN_VECTORS {
+        let url = format!("https://[{raw}]/api?t=music");
+        let err = fetch_indexer(&url, &FetchConfig::default(), &dns, &mut transport)
+            .expect_err("shared forbidden literal must be blocked");
+        assert_eq!(err, FetchRejection::ForbiddenAddress, "vector {raw}");
+        assert_eq!(
+            err.code(),
+            "indexer_fetch_forbidden_address",
+            "vector {raw}"
+        );
+        assert!((400..500).contains(&err.http_status()), "vector {raw}");
+
+        // DNS seam: a public-looking name resolving to the vector is blocked.
+        let ip: IpAddr = raw.parse().expect("shared vector must parse");
+        let dns = FakeDns::with(HOST, &[ip]);
+        let mut transport = FakeTransport::default();
+        let err = fetch_indexer(SEARCH_URL, &FetchConfig::default(), &dns, &mut transport)
+            .expect_err("shared forbidden DNS answer must be blocked");
+        assert_eq!(err, FetchRejection::ForbiddenAddress, "vector {raw}");
+        assert!(transport.dials.is_empty(), "blocked before any dial: {raw}");
+    }
+    assert!(transport.dials.is_empty(), "blocked before any dial");
+    assert!(dns.lookups().is_empty(), "IP literals never hit DNS");
+}
+
+/// Shared public controls (single owner:
+/// `nntune_ssrf_guard::PUBLIC_CONTROL_VECTORS`): public addresses must
+/// NOT be blocked, via both the literal and DNS seams.
+#[test]
+fn shared_public_controls_are_not_blocked() {
+    for raw in PUBLIC_CONTROL_VECTORS {
+        let ip: IpAddr = raw.parse().expect("public control must parse");
+        // Literal seam validates with itself and no DNS call.
+        let url = if raw.contains(':') {
+            format!("https://[{raw}]/api?t=music")
+        } else {
+            format!("https://{raw}/api?t=music")
+        };
+        let literal_dns = FakeDns::default();
+        let target = validate_indexer_url(&url, &FetchConfig::default(), &literal_dns)
+            .expect("public control literal must validate");
+        assert_eq!(target.addresses, vec![ip], "control {raw}");
+        assert!(
+            literal_dns.lookups().is_empty(),
+            "literals never hit DNS: {raw}"
+        );
+
+        // DNS seam fetches through the pin.
+        let dns = FakeDns::with(HOST, &[ip]);
+        let mut transport = FakeTransport::default().serve(SEARCH_URL, ok_response(BODY));
+        let bytes = fetch_indexer(SEARCH_URL, &FetchConfig::default(), &dns, &mut transport)
+            .expect("public control DNS answer must fetch");
+        assert_eq!(bytes, BODY, "control {raw}");
+    }
 }
 
 /// DNS-based SSRF: a public-looking name that resolves (in whole or in
@@ -526,14 +592,12 @@ fn public_host_validates_with_all_vetted_addresses() {
     assert_eq!(target.port, 443);
     assert_eq!(target.addresses, expected);
 
-    // A public IP literal validates with itself and no DNS call.
+    // A public IP literal validates with itself and no DNS call (shared
+    // public control, no literal copy).
     let literal_dns = FakeDns::default();
-    let target = validate_indexer_url(
-        "https://93.184.216.34/api?t=music",
-        &FetchConfig::default(),
-        &literal_dns,
-    )
-    .expect("public literal must validate");
+    let public_literal_url = format!("https://{}/api?t=music", PUBLIC_CONTROL_VECTORS[0]);
+    let target = validate_indexer_url(&public_literal_url, &FetchConfig::default(), &literal_dns)
+        .expect("public literal must validate");
     assert_eq!(target.addresses, vec![IpAddr::V4(PUBLIC_V4)]);
     assert!(literal_dns.lookups().is_empty());
 }
@@ -545,15 +609,20 @@ fn public_host_validates_with_all_vetted_addresses() {
 fn port_allowlist_is_https_443_only() {
     let dns = public_dns();
     let mut transport = FakeTransport::default();
-    for url in [
-        "https://indexer.example:8443/api?t=music",
-        "https://indexer.example:80/api?t=music",
-        "https://indexer.example:22/api?t=music",
-        "https://indexer.example:25/api?t=music",
-        "https://indexer.example:65535/api?t=music",
-        "https://93.184.216.34:8443/api?t=music",
-        "https://[2606:4700:4700::1111]:8443/api?t=music",
-    ] {
+    // Public-literal cases reuse the shared public controls (no literal
+    // copies): the address is public, so the block must be the port.
+    let public_v4_url = format!("https://{}:8443/api?t=music", PUBLIC_CONTROL_VECTORS[0]);
+    let public_v6_url = format!("https://[{}]:8443/api?t=music", PUBLIC_CONTROL_VECTORS[1]);
+    let urls = [
+        "https://indexer.example:8443/api?t=music".to_string(),
+        "https://indexer.example:80/api?t=music".to_string(),
+        "https://indexer.example:22/api?t=music".to_string(),
+        "https://indexer.example:25/api?t=music".to_string(),
+        "https://indexer.example:65535/api?t=music".to_string(),
+        public_v4_url,
+        public_v6_url,
+    ];
+    for url in &urls {
         let err = fetch_indexer(url, &FetchConfig::default(), &dns, &mut transport)
             .expect_err("non-443 port must be blocked");
         assert_eq!(err, FetchRejection::PortNotAllowed, "url {url}");

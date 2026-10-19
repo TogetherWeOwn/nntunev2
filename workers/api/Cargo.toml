@@ -28,6 +28,9 @@ serde_json = "1"
 # The api Worker's HTTP entry (fetch boundary) lands in a follow-up slice;
 # this exposes the emitter the entry will use.
 nntune-logging = { version = "0.1.0", path = "../../crates/nntune-logging" }
+# Shared SSRF address guard + test vectors (single owner with the ingest
+# fetch guards; never fork the predicate).
+nntune-ssrf-guard = { version = "0.1.0", path = "../../crates/nntune-ssrf-guard" }
 zeroize = { version = "1", features = ["derive"] }
 url = "2"
 subtle = "2"
@@ -49,7 +52,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 futures-timer = "3"
 
 [dev-dependencies]
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde_json = "1"
 # Test-only RNG for the KEK rotation acceptance fixtures (native tests only;
 # the crate itself uses getrandom, so this never ships to wasm32).

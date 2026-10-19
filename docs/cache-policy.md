@@ -12,7 +12,7 @@ which buckets a Worker may never consume.
 
 | Bucket | Env | Consumer | Edge `Cache-Control` on reads | R2 object lifetime / eviction |
 |---|---|---|---|---|
-| `nntunev2-audio-staging` | staging | stream Worker (`AUDIO_CACHE`) | prescribed `no-store`; not yet wired (see deltas) | content-addressed blobs per `workers/stream/src/cache.rs` (`audio/<sha256>` + `track/<id>` pointers; ADR-0003 prescribes `{hh}/{hh}/{sha}` and replaces `track` lookups — see sources); R2 lifecycle metadata not reported in `docs/ops.md` (see TTL section); timed `track` pointers hard-miss after 3,900 s (see TTL section) |
+| `nntunev2-audio-staging` | staging | stream Worker (`AUDIO_CACHE`) | prescribed `no-store`; not yet wired (see deltas) | content-addressed blobs per `workers/stream/src/cache.rs` (`audio/<sha256>` + `track/<id>` pointers; ADR-0003 prescribes `{hh}/{hh}/{sha}` and replaces `track` lookups — see sources); no R2 lifecycle rule reported for this bucket (`docs/ops.md` audio-bucket R2 lifecycle subsection; see TTL section); timed `track` pointers hard-miss after 3,900 s (see TTL section) |
 | `nntunev2-audio-prod` | prod | stream Worker (`AUDIO_CACHE`) | prescribed `no-store`; not yet wired (see deltas) | same as staging |
 | `nntunev2-art-staging` | staging | MusicBrainz Worker artwork cache (`ART_CACHE`) | `public, max-age=86400, immutable` prescribed where art bytes are served; lookup/search JSON headers below are implemented | immutable objects per mb test fixture (`art/{hh}/{hh}/{sha}-{size}`; ADR-0003 prescribes `{hh}/{hh}/{sha}` with no prefix/suffix — see sources); R2 lifecycle metadata not reported in `docs/ops.md` (see TTL section) |
 | `nntunev2-art-prod` | prod | MusicBrainz Worker artwork cache (`ART_CACHE`) | same as staging | same as staging |
@@ -46,9 +46,10 @@ which buckets a Worker may never consume.
   and re-fetches upstream; `workers/stream/README.md` documents the MISS).
   Untimed `put_track` entries never go stale. R2 lifetime: no lifecycle is
   configured in any checked-in manifest (lifecycle is Cloudflare-side, not
-  a Wrangler field), and `docs/ops.md` does not report lifecycle metadata
-  for the audio buckets, so this doc claims no R2 lifecycle state for audio
-  beyond "not reported" — see TTL section.
+  a Wrangler field), and `docs/ops.md` (audio-bucket R2 lifecycle
+  subsection) reports no lifecycle rule for the audio buckets — verified
+  absence of any reported rule, not an assertion of live Cloudflare-side
+  state — see TTL section.
 - `nntunev2-art-staging` / `nntunev2-art-prod`: env and `ART_CACHE`
   consumer per `workers/mb/wrangler.toml.example` (commented template:
   top-level plus `env.staging` staging name, `env.production` prod name;
@@ -88,10 +89,14 @@ No R2 object-expiry lifecycle state is asserted here beyond what
 `docs/ops.md` reports. Lifecycle is Cloudflare-side, not a Wrangler field,
 so no checked-in manifest configures it. The observed archive-bucket
 metadata (`docs/ops.md`, metadata GETs 2026-10-17) shows no
-completed-object expiry on the archive buckets. `docs/ops.md` does not
-report lifecycle metadata for the audio or art buckets, so this doc claims
-no R2 lifecycle state for audio/art beyond "not reported" and does not
-assert an unwired multipart-abort rule there. Among the six table buckets,
+completed-object expiry on the archive buckets. `docs/ops.md`
+(audio-bucket R2 lifecycle subsection) reports no lifecycle rule for the
+audio buckets — verified absence of any reported rule, not an assertion of
+live Cloudflare-side state — and no lifecycle metadata for the art
+buckets, so this doc claims no R2 object-expiry lifecycle state for audio
+beyond that subsection and none for art beyond "not reported", and does
+not assert an unwired multipart-abort rule on audio/art. Among the six
+table buckets,
 the only lifecycle rule observed in `docs/ops.md` is the enabled `Default
 Multipart Abort Rule` on the archive buckets (age `604800` seconds, no
 prefix condition; it aborts incomplete multipart uploads after 7 days and
@@ -135,7 +140,8 @@ Audio blobs are content-addressed and immutable: identical plaintext
 uploaded for two tracks is stored once, and a `track/<id>` pointer swap
 never mutates a blob. R2 eviction is therefore safe to defer at the
 lifecycle layer (no completed-object expiry observed on archive buckets;
-audio/art R2 lifecycle not reported — see above). Timed `track/<id>`
+no audio-bucket rule reported and art R2 lifecycle not reported — see
+above). Timed `track/<id>`
 pointers still go cold at the application layer: past the 300 s fresh plus
 3,600 s SWR windows the entry hard-misses and the play path re-fetches
 upstream, so "no stale pointers" is not claimed. Orphaned blobs are
