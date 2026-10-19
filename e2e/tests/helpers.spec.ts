@@ -17,6 +17,7 @@ import {
   anonymousGet,
   annotateSignupPath,
   apiGet,
+  apiOptions,
   apiPost,
   applyAccountToPage,
   requireApiAccount,
@@ -749,12 +750,12 @@ test.describe('applyAccountToPage redirect scope (browser)', () => {
   });
 });
 
-test.describe('apiGet/apiPost redirect scope (no-follow)', () => {
+test.describe('apiGet/apiPost/apiOptions redirect scope (no-follow)', () => {
   // API repro for the redirect leak: Playwright's APIRequestContext follows
   // redirects by default and forwards custom headers to the target. apiGet/
-  // apiPost fetch with maxRedirects: 0 so a staging 302 to another origin is
-  // returned as-is (foreign origin receives zero requests) and the 3xx fails
-  // by name instead of a bare status mismatch.
+  // apiPost/apiOptions fetch with maxRedirects: 0 so a staging 302 to another
+  // origin is returned as-is (foreign origin receives zero requests) and the
+  // 3xx fails by name instead of a bare status mismatch.
   test('credentialed 302 to a foreign origin is not followed and fails by name', async ({
     request,
   }) => {
@@ -821,6 +822,17 @@ test.describe('apiGet/apiPost redirect scope (no-follow)', () => {
         'apiPost followed a cross-origin 302 with credentials instead of failing',
       ).rejects.toThrow(/unexpected redirect.*HTTP 302/);
       expect(foreignHits, 'foreign origin received a credentialed follow-up to POST 302').toHaveLength(
+        0,
+      );
+
+      // OPTIONS 302 (the preflight path) behaves the same: apiOptions is the
+      // only no-follow OPTIONS wrapper, so it gets its own executed leg —
+      // removing its maxRedirects: 0 must fail here, not ride on apiGet's.
+      await expect(
+        apiOptions(request, `${stagingOrigin}/redir`, credentialed, 'probe'),
+        'apiOptions followed a cross-origin 302 with credentials instead of failing',
+      ).rejects.toThrow(/unexpected redirect.*HTTP 302/);
+      expect(foreignHits, 'foreign origin received a credentialed follow-up to OPTIONS 302').toHaveLength(
         0,
       );
 
