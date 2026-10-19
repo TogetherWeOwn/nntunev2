@@ -187,7 +187,11 @@ class DependabotCoverageTests(unittest.TestCase):
             unpinned_from_refs(
                 f"from --platform=linux/amd64 img@sha256:{digest}\n"
             ),
-            [],
+            [(1, f"img@sha256:{digest}")],
+        )
+        self.assertEqual(
+            unpinned_from_refs(f"FROM img@sha256:{digest}\n"),
+            [(1, f"img@sha256:{digest}")],
         )
         self.assertEqual(
             unpinned_from_refs("FROM img:tag\n"), [(1, "img:tag")]
@@ -198,10 +202,35 @@ class DependabotCoverageTests(unittest.TestCase):
         )
         self.assertEqual(
             unpinned_from_refs(
-                f"FROM img@sha256:{digest} AS base\nFROM BASE AS rt\n"
+                f"FROM img:tag@sha256:{digest} AS base\nFROM BASE AS rt\n"
             ),
             [],
         )
+        # A self-named stage must not exempt its own floating ref: the
+        # name exists for later lines only, like Docker itself.
+        self.assertEqual(
+            unpinned_from_refs("FROM debian AS debian\n"), [(1, "debian")]
+        )
+        self.assertEqual(
+            unpinned_from_refs("FROM postgres AS postgres\n"),
+            [(1, "postgres")],
+        )
+        # Registry ports are not tags: a port without a tag stays drift.
+        self.assertEqual(
+            unpinned_from_refs(
+                f"FROM registry:5000/org/img@sha256:{digest}\n"
+            ),
+            [(1, f"registry:5000/org/img@sha256:{digest}")],
+        )
+        self.assertEqual(
+            unpinned_from_refs(
+                f"FROM registry:5000/org/img:tag@sha256:{digest}\n"
+            ),
+            [],
+        )
+        # `scratch` takes no tag and cannot be pinned, so it is exempt.
+        self.assertEqual(unpinned_from_refs("FROM scratch\n"), [])
+        self.assertEqual(unpinned_from_refs("FROM SCRATCH\n"), [])
 
     def test_new_standalone_crate_without_entry_fails(self):
         # A new excluded crate with no entry must turn the check red.

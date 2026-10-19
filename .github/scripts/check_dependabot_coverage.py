@@ -29,8 +29,10 @@ same skip dirs) to a `tag@sha256:<64hex>` pin: a digest-less FROM keeps
 Dependabot from emitting digest-refresh PRs, and the header comment in
 `dependabot.yml` asserts the pins hold, so an unpinned FROM is drift.
 Stage refs (`FROM base`, where `base` was named by an earlier
-`FROM ... AS base`) are internal and exempt. The match is a regex, not
-literal digests, so Dependabot digest-refresh PRs stay green.
+`FROM ... AS base`) are internal and exempt, as is `FROM scratch`
+(the empty base image takes no tag and cannot be pinned). The match
+is a regex, not literal digests, so Dependabot digest-refresh PRs
+stay green.
 
 Stdlib only (no PyYAML: the two fields are extracted with a line scan).
 Exit 0 = covered; 1 = drift found; 2 = unusable input.
@@ -65,9 +67,11 @@ FROM_RE = re.compile(r"^[ \t]*FROM[ \t]+(.+)$", re.IGNORECASE)
 FROM_STAGE_RE = re.compile(
     r"[ \t]+AS[ \t]+([A-Za-z][A-Za-z0-9_.-]*)[ \t]*(#.*)?$", re.IGNORECASE
 )
-# External image ref with a tag+digest pin (`#` cannot appear in a ref,
-# so anything after it is a trailing comment and stripped before matching).
-FROM_DIGEST_RE = re.compile(r"\S+@sha256:[0-9a-f]{64}")
+# External image ref with a tag+digest pin: the tag before `@sha256` is
+# required, so digest-only refs (`img@sha256:...`) are drift, not pins.
+# (`#` cannot appear in a ref, so anything after it is a trailing comment
+# and stripped before matching).
+FROM_DIGEST_RE = re.compile(r"[^@\s]+:[^/:@\s]+@sha256:[0-9a-f]{64}")
 
 
 def fail_input(message):
@@ -253,9 +257,10 @@ def unpinned_from_refs(text):
 
     Stage refs are exempt: a FROM whose ref was named by an earlier
     `FROM ... AS <stage>` in the same file is internal (stage names match
-    case-insensitively, like Docker itself). Leading `--platform=...`
-    flags are skipped to reach the ref. An empty or unparseable ref is
-    reported, not skipped: the gate stays fail-closed.
+    case-insensitively, like Docker itself). `FROM scratch` is exempt: the
+    empty base image takes no tag and cannot be pinned. Leading
+    `--platform=...` flags are skipped to reach the ref. An empty or
+    unparseable ref is reported, not skipped: the gate stays fail-closed.
     """
     problems = []
     stages = set()
@@ -265,20 +270,23 @@ def unpinned_from_refs(text):
             continue
         rest = match.group(1).strip()
         staged = FROM_STAGE_RE.search(rest)
+        stage_name = None
         if staged:
-            stages.add(staged.group(1).lower())
+            stage_name = staged.group(1).lower()
             rest = rest[:staged.start()].strip()
         tokens = rest.split()
         ref = next((t for t in tokens if not t.startswith("--")), "")
         ref = ref.split("#", 1)[0].strip()
         if not ref:
             problems.append((lineno, line.strip()))
-        elif ref.lower() in stages:
-            continue
-        elif FROM_DIGEST_RE.fullmatch(ref):
-            continue
-        else:
-            problems.append((lineno, ref))
+        elif ref.lower() != "scratch" and ref.lower() not in stages:
+            if not FROM_DIGEST_RE.fullmatch(ref):
+                problems.append((lineno, ref))
+        if stage_name is not None:
+            # Docker defines the name for later lines only: recording it
+            # before the check would let `FROM debian AS debian` exempt
+            # its own floating ref.
+            stages.add(stage_name)
     return problems
 
 
