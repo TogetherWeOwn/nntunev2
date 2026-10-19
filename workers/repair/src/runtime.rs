@@ -353,12 +353,17 @@ impl RepairContainer {
         );
         let request = Request::new_with_init(&url, &init)
             .map_err(|_| ApiFault::new(502, "container_unavailable"))?;
-        let mut response = container
+        let response = container
             .fetch_request(request)
             .await
             .map_err(|_| ApiFault::new(502, "container_unavailable"))?;
         let status = response.status_code();
-        let _ = response.bytes().await;
+        // The PUT reply carries no verdict beyond its status: cancel the
+        // body instead of collecting bytes that are never read, so a
+        // misbehaving container cannot make us buffer an unbounded reply.
+        if let ResponseBody::Stream(stream) = response.body() {
+            let _ = stream.cancel();
+        }
         match status {
             201 => Ok(()),
             400 | 413 => Err(ApiFault::new(status, "scratch_input_mismatch")),

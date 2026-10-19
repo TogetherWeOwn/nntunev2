@@ -11,6 +11,9 @@ import {
 
 export const LIBRARY_REQUEST_TIMEOUT_MS = 10_000;
 
+/** Largest library JSON body retained in memory (1 MiB, counted in UTF-8 bytes). */
+export const LIBRARY_BODY_MAX_BYTES = 1_048_576;
+
 export interface LibraryRefreshState {
 	items: LibraryItem[];
 	staleAt: string | null;
@@ -110,7 +113,29 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 
 		async function readJsonBody(resp: Response): Promise<unknown> {
 			const body = resp.body;
-			if (!body) return resp.json();
+			if (!body) {
+				// No readable stream to bound; fall back to a length-checked
+				// read so an over-cap payload cannot bypass the cap via
+				// `resp.json()`. Rejects through the same failure shape as a
+				// timeout so the refresher falls back to unreachable/snapshot.
+				if (typeof resp.arrayBuffer === 'function') {
+					const buffer = await resp.arrayBuffer();
+					if (buffer.byteLength > LIBRARY_BODY_MAX_BYTES) {
+						throw new Error('library request timed out');
+					}
+					return JSON.parse(new TextDecoder().decode(new Uint8Array(buffer)));
+				}
+				// Runtimes (and injected test fetches) without `arrayBuffer`
+				// cannot be measured before parsing; enforce the cap on the
+				// serialized UTF-8 byte size instead so this path matches the
+				// byte-counted streamed and arrayBuffer paths.
+				const data = await resp.json();
+				const serialized = JSON.stringify(data) ?? '';
+				if (new TextEncoder().encode(serialized).length > LIBRARY_BODY_MAX_BYTES) {
+					throw new Error('library request timed out');
+				}
+				return data;
+			}
 			const reader = body.getReader() as ReadableStreamDefaultReader<Uint8Array>;
 			activeReader = reader;
 			try {
@@ -120,8 +145,18 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 					const { done, value } = await reader.read();
 					if (done) break;
 					if (value) {
-						chunks.push(value);
 						totalLength += value.length;
+						if (totalLength > LIBRARY_BODY_MAX_BYTES) {
+							// Stop at the cap: cancel the reader so the
+							// producer stops and the trailing bytes are never
+							// retained, then reject through the same failure
+							// shape as a timeout (first load: unreachable;
+							// after an authenticated success: snapshot
+							// fallback). Chunk lengths are UTF-8 bytes.
+							cancelReader(reader);
+							throw new Error('library request timed out');
+						}
+						chunks.push(value);
 					}
 				}
 				const combined = new Uint8Array(totalLength);
@@ -191,6 +226,12 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				return;
 			}
 			activeResponse = response;
+			if (!response.ok) {
+				// Refusal bodies are never read. Detach before best-effort cleanup
+				// so abort/disposal cannot cancel them again; never await cleanup.
+				activeResponse = null;
+				cancelResponse(response);
+			}
 			if (response.status === 404) {
 				// The list endpoint has not landed yet. Do not treat a 404 as
 				// session verification or expose a previously saved snapshot.

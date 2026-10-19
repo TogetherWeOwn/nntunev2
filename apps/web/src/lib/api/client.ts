@@ -10,6 +10,7 @@
 
 import { paywallFromResponse, type PaywallModel } from '../billing/planLimit.js';
 import type { ProviderForm } from '../vault-validation.js';
+import { isJsonBodyTooLarge, readCappedJson } from './cappedJson.js';
 import { parseErrorBody } from './errors.js';
 
 export type FetchFn = typeof fetch;
@@ -357,15 +358,23 @@ export class ApiClient {
 				credentials: 'include'
 			});
 			if (!response.ok) {
-				// Read once so the paywall and typed error share the structured contract.
+				// Read once (capped at 1 MiB) so the paywall and typed error
+				// share the structured contract.
 				let body: unknown = null;
 				try {
-					body = await response.json();
-				} catch {
+					body = await readCappedJson(response);
+				} catch (error) {
 					// A body read cut short by the deadline surfaces the
-					// timeout, not a status default; anything else keeps the
-					// existing non-JSON fallback below.
+					// timeout, not a status default.
 					if (timedOut) throw this.timeoutError();
+					// An over-cap error body is never parsed: the generic
+					// status fallback applies, never retryable (an over-cap
+					// body does not become acceptable on retry), with no
+					// paywall model emitted.
+					if (isJsonBodyTooLarge(error)) {
+						const parsed = parseErrorBody(null, response.status);
+						throw new ApiError(response.status, parsed.code, parsed.message, null, false);
+					}
 					/* non-JSON error body: use status-based defaults */
 				}
 				const parsed = parseErrorBody(body, response.status);
@@ -373,9 +382,16 @@ export class ApiClient {
 				throw new ApiError(response.status, parsed.code, parsed.message, paywall, parsed.retryable);
 			}
 			try {
-				return (await response.json()) as T;
+				return (await readCappedJson(response)) as T;
 			} catch (error) {
 				if (timedOut) throw this.timeoutError();
+				// An over-cap 2xx never parses: surface the typed error, never
+				// a bare SyntaxError, never retryable, never a paywall, and
+				// never leaking body bytes (generic status message).
+				if (isJsonBodyTooLarge(error)) {
+					const parsed = parseErrorBody(null, response.status);
+					throw new ApiError(response.status, parsed.code, parsed.message, null, false);
+				}
 				// A 2xx whose body is not JSON is a backend contract violation,
 				// not a usable result: surface the typed error, never a bare
 				// SyntaxError. Same generic fallback as undecodable error

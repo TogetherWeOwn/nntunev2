@@ -2,16 +2,20 @@
 
 The `api`, `ingest`, `mb`, and `stream` crates define mappings to the same
 JSON error envelope. In this slice, `ingest` and `mb` serialize the envelope
-on their wired HTTP error paths, except ingest's search-throttle 429, which
-stays a legacy `{"error":"too many requests"}` body with `Retry-After`
-(`search_rate_limited_body` in `workers/ingest/src/rate_limit.rs`, served by
+on their wired HTTP error paths, including ingest's search-throttle 429,
+which carries `{code: rate_limited, message, retryable: true}` with
+`Retry-After` (`search_rate_limited_body` in
+`workers/ingest/src/rate_limit.rs`, served by
 `search_rate_limited_response` in `workers/ingest/src/lib.rs`). The API emits
 `reauth_required` from privilege-gated vault mutations (`vault_put` and
 `vault_delete` via `authenticate_privileged`) and `account_deleting` when a
 vault write is refused by the account-deletion fence (the `vault_put` save and
 the test-connection lease path); a misconfigured session service additionally
 surfaces as the `internal_error` envelope via `session_error_response`
-(`workers/api/src/handlers.rs`). Other API and stream mappings are pinned
+(`workers/api/src/handlers.rs`). The API's auth-throttle 429 likewise
+carries `{code: rate_limited, message, retryable: true}` with `Retry-After`
+(`throttled` in `workers/api/src/handlers.rs`, rendering
+`ApiError::rate_limited`). Other API and stream mappings are pinned
 for future HTTP wiring, not emitted by reachable HTTP paths here. Clients can
 handle auth, validation, billing limits, and upstream failures without
 per-worker special cases.
@@ -123,7 +127,7 @@ container-origin repair-only codes with no registry row (two of the
 six — `invalid_manifest` and `scratch_input_mismatch` — are also
 emitted directly by the repair worker itself:
 `workers/repair/src/contract.rs:123,129` and
-`workers/repair/src/runtime.rs:325,356`). The repair worker also emits
+`workers/repair/src/runtime.rs:314,345`). The repair worker also emits
 `container_unavailable` (502), `scratch_unavailable` (503),
 `repair_unavailable` (500/503), and `scratch_missing` (404) directly
 (not through `leak_code`); those have no registry row either.
@@ -219,10 +223,11 @@ code, status, or retryable drift):
   `unknown_code_falls_back_to_the_documented_generic` tests.
 - Intake refusals and ingest extras: `workers/ingest/src/nzb_intake.rs`
   (intake codes and caps), `intake_rejection_parts` and `queued_body` in
-  `workers/ingest/src/lib.rs`, and the legacy 429 in
+  `workers/ingest/src/lib.rs`, and the search-throttle 429 envelope in
   `workers/ingest/src/rate_limit.rs`.
 - API and stream wiring scope: `authenticate_privileged`,
-  `account_deleting_response`, and `session_error_response` in
+  `account_deleting_response`, `throttled` (the auth-throttle 429
+  envelope), and `session_error_response` in
   `workers/api/src/handlers.rs`; stream serves pre-wiring bodies from
   `workers/stream/src/routes.rs` while `PlayError::api_error` in
   `workers/stream/src/play.rs` is covered by tests only.

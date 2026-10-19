@@ -138,6 +138,22 @@ lane skips until they are.
   boundary only and changes no vault, dial, TLS, pool, or credential
   behavior.
 
+### Inline magic-link delivery deadline
+
+After admission and token storage, registration/magic-start wait at most five
+seconds for one mail send. Expiry cancels the send future; the Worker mailer
+attaches an AbortSignal and aborts its fetch when that future is dropped
+(including cancellation of the enclosing request). Fast success and failure
+still return immediately. Delivery errors and timeouts remain ignored, with
+the same generic public envelope and no retry, replacement token, or refund
+of the per-IP/global/per-address admission slots. A timeout does not revoke
+the issued token: abort cannot retract a request already accepted by the
+provider. Synthetic staging-code capture still happens before delivery.
+
+This bounds only the admitted send, not preceding storage operations, and
+is not a delivery guarantee. Native pending-mail tests prove cancellation of
+the Rust future; wasm compilation alone does not prove runtime fetch abort.
+
 ### Staging-only test-code seam (not part of the production surface)
 
 Shipped by the staging-seam build slice — this note records guardrails
@@ -279,11 +295,13 @@ behavior changes here.
   global slot at start, so exhaustion cannot block challenge issuance),
   and every mail send reserves a per-IP (30/hour) plus global (100/5 min)
   issuance slot in front of the per-email window — distinct-email loops
-  stop with a fixed email-independent `429 {"error":"rate_limited"}` on
-  `register/start` (never an email-derived stand-in, which would oracle
-  taken vs fresh across the denial boundary) and with unchanged response
-  shapes on login/magic starts, while victim-list email-bombing stops with
-  no further mail. Exhausted budgets fast-fail with one `SELECT count(*)`
+  stop with a fixed email-independent `429` carrying the standard
+  `rate_limited` error envelope
+  (`{"code":"rate_limited","message":"too many requests","retryable":true}`,
+  plus `Retry-After`) on `register/start` (never an email-derived
+  stand-in, which would oracle taken vs fresh across the denial boundary)
+  and with unchanged response shapes on login/magic starts, while
+  victim-list email-bombing stops with no further mail. Exhausted budgets fast-fail with one `SELECT count(*)`
   before the slot loop, so denial costs O(1) statements, not one upsert per
   slot. `register_start` also reaps never-completed signups older than
   24 h only when they have no credential, vault, session, unexpired magic
@@ -301,7 +319,7 @@ behavior changes here.
   pruned, and login options omit `allow_credentials` to avoid leaking
   variable-length credential IDs. (Sources: `workers/api/src/handlers.rs` —
   `admit_auth_start`, `send_magic_link_if_allowed`, `rate_limit_ip_key`,
-  `throttled` (429 `{"error":"rate_limited"}`), `RATE_LIMIT_EXHAUSTED_SQL`,
+  `throttled` (429 `rate_limited` envelope), `RATE_LIMIT_EXHAUSTED_SQL`,
   finish-budget consts; `workers/api/src/rate_limit.rs` defaults +
   `RateLimitConfig::from_vars`; atomic claim/pair in
   `workers/api/src/worker_entry.rs` (`claim_rate_limit_slot`,
@@ -356,8 +374,11 @@ behavior changes here.
 - **Per-play stream ledger (`stream_play_ledger`, not the ADR daily
   `usage_ledger`):** one row per billed play window. Stream plays derive a
   deterministic `play:{user}:{track}:{play}` key (same derivation as the
-  stream worker; 128/512/512 limits, alphabet `[A-Za-z0-9_:-]`); non-play
-  windows use a fresh 128-bit key minted once and reused across retries. The
+  stream worker; 128/512/512-byte field limits). Both derivation helpers
+  reject empty fields or anything outside ASCII `[A-Za-z0-9_-]`, without
+  rewriting identities; colons are structural delimiters only. Accepted keys
+  therefore match the persisted ledger alphabet. Non-play windows use a fresh
+  128-bit key minted once and reused across retries. The
   insert is fenced `ON CONFLICT DO NOTHING` through the play owner's
   `users` row (`FOR SHARE`, ADR 0002 rule 3), so a play finalized behind
   the account-deletion marker inserts nothing — then the Worker selects
