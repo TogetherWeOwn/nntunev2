@@ -30,7 +30,7 @@
 //!   `nine_named_files_no_expect_on_getrandom`, which lists every
 //!   offending `file:line` it finds;
 //! - moving the nine fills behind a shared helper that still panics fails
-//!   `crate_wide_no_expect_on_getrandom_outside_ledger`: the scan covers
+//!   `crate_wide_no_expect_on_getrandom_including_ledger`: the scan covers
 //!   every `.rs` file under `src/`, not just the six named files, so
 //!   relocating the panic does not evade it;
 //! - swapping `.expect(..)` for `.unwrap()` / `.unwrap_or(..)` /
@@ -46,14 +46,15 @@
 //! statement window at its `;` so a later statement's `.expect(..)` is
 //! never charged to a `getrandom` call.
 //!
-//! Boundary: a tenth site, `workers/api/src/ledger.rs:114`, carries the
-//! same `.expect("secure randomness unavailable")` today but is *not* one
-//! of the nine named on the acceptance card, so the crate-wide scan
-//! excludes `ledger.rs` by name and this suite neither requires nor
-//! forbids fixing it. Behavioral error-path tests (forcing an OS RNG
-//! failure) are out of scope: `getrandom` failure cannot be induced
-//! portably in a unit test, which is why the card specifies a source
-//! assertion. Tests only; no production code is touched.
+//! Boundary: a tenth site in `workers/api/src/ledger.rs` (the
+//! idempotency-key mint) was once excluded from the crate-wide scan by
+//! name; that exclusion is lifted — the scan now covers `ledger.rs`
+//! like every other file, and `ledger_mint_shared_randomness` pins the
+//! mint's routing through the shared helper. Behavioral error-path
+//! tests (forcing an OS RNG failure) are out of scope: `getrandom`
+//! failure cannot be induced portably in a unit test, which is why the
+//! card specifies a source assertion. Tests only; no production code
+//! is touched.
 //!
 //! Run only this file:
 //!
@@ -73,10 +74,6 @@ const NAMED_FILES: &[&str] = &[
     "vault.rs",
     "native_rest.rs",
 ];
-
-/// The one `src/` file excluded from the crate-wide scan: it holds a
-/// tenth `getrandom` site outside this card's nine (see module docs).
-const OUT_OF_SCOPE_FILE: &str = "ledger.rs";
 
 const EXPECT_BAN: &[&str] = &[".expect("];
 const UNWRAP_BAN: &[&str] = &[
@@ -169,17 +166,20 @@ fn nine_named_files_no_unwrap_on_getrandom() {
 }
 
 #[test]
-fn crate_wide_no_expect_on_getrandom_outside_ledger() {
+fn crate_wide_no_expect_on_getrandom_including_ledger() {
     // Catches the nine fills being moved behind a shared helper that
-    // still panics: the whole crate is scanned, with ledger.rs excluded
-    // by name (its tenth site is outside this card's nine).
+    // still panics: the whole crate is scanned, ledger.rs included —
+    // no file is excluded by name.
     let mut files = Vec::new();
     collect_rs_files(&src_dir(), &mut files);
+    assert!(
+        files
+            .iter()
+            .any(|p| p.file_name().is_some_and(|n| n == "ledger.rs")),
+        "crate-wide scan must cover ledger.rs (no exclusion)"
+    );
     let mut offenders = Vec::new();
     for path in files {
-        if path.file_name().is_some_and(|n| n == OUT_OF_SCOPE_FILE) {
-            continue;
-        }
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
         let label = path
@@ -191,8 +191,9 @@ fn crate_wide_no_expect_on_getrandom_outside_ledger() {
     }
     assert!(
         offenders.is_empty(),
-        "no getrandom statement anywhere in the crate (ledger.rs excepted, \
-         out of scope) may .expect(..); offending statements:\n{}",
+        "no getrandom statement anywhere in the crate — ledger.rs \
+         included, no exclusions — may .expect(..); offending \
+         statements:\n{}",
         offenders.join("\n")
     );
 }

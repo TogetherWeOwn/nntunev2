@@ -15,12 +15,15 @@
 //!   the existing 503 shape (`ApiError::service_unavailable`: status 503,
 //!   code `service_unavailable`, retryable, message sealed to
 //!   `service unavailable`). `Invalid` stays 422 / `invalid usage row`.
-//! - The mint body propagates the entropy failure, verbatim in shape:
+//! - The mint body draws entropy through the shared helper and
+//!   propagates its failure, verbatim in shape (no direct
+//!   `getrandom::` in `ledger.rs`; the sole fill lives in
+//!   `crate::random`):
 //!
 //!   ```ignore
 //!   pub fn new_idempotency_key() -> Result<String, LedgerError> {
-//!       let mut bytes = [0u8; 16];
-//!       getrandom::fill(&mut bytes).map_err(|_| LedgerError::RandomnessUnavailable)?;
+//!       let bytes = crate::random::secure_random_bytes::<16>()
+//!           .map_err(|_| LedgerError::RandomnessUnavailable)?;
 //!       Ok(crate::b64::encode(&bytes))
 //!   }
 //!   ```
@@ -39,8 +42,10 @@
 //! hook, and process-wide syscall fault injection is not portable to
 //! CI/wasm). The failure path is therefore pinned by (a) the fallible
 //! signature, observed at a real call site through the `MintOutcome`
-//! shim below, (b) the sole `getrandom::fill` in `ledger.rs` propagating
-//! with `map_err(...)?` to the dedicated variant, and (c) a ban on every
+//! shim below, (b) the mint's sole helper call
+//! (`crate::random::secure_random_bytes::<16>()`, no direct
+//! `getrandom::` in `ledger.rs`) propagating with `map_err(...)?` to
+//! the dedicated variant, and (c) a ban on every
 //! panic/fallback token in the mint body. The shim has one impl for
 //! today's infallible `String` and one for the required
 //! `Result<String, LedgerError>`, so this file compiles on the RED base
@@ -53,9 +58,11 @@
 //!
 //! - Keeping `.expect("secure randomness unavailable")`, or swapping in
 //!   `.unwrap()`, breaks the no-expect and body-ban pins.
-//! - Ignoring the error (`let _ = getrandom::fill(...)`) or encoding the
-//!   buffer anyway drops the `map_err(...)?` propagation pin and adds a
-//!   second (or loses the only) `Ok(` in the body.
+//! - Ignoring the error (`let _ = secure_random_bytes::<16>()`) or
+//!   encoding a zero buffer anyway drops the `map_err(...)?`
+//!   propagation pin and adds a second (or loses the only) `Ok(` in
+//!   the body; restoring a direct `getrandom::fill` breaks the
+//!   no-direct-getrandom count pins.
 //! - `unwrap_or_default()` / a fixed fallback / a `static` cached key
 //!   trips the fallback-token ban; returning the all-zero encoding
 //!   `AAAAAAAAAAAAAAAAAAAAAA` is also rejected behaviourally.
@@ -174,14 +181,17 @@ fn randomness_failure_propagates_instead_of_panicking_or_falling_back() {
     let body = mint_body();
     assert!(
         body.contains(
-            "getrandom::fill(&mut bytes).map_err(|_| LedgerError::RandomnessUnavailable)?;"
+            "crate::random::secure_random_bytes::<16>() \
+             .map_err(|_| LedgerError::RandomnessUnavailable)?;"
         ),
-        "entropy failure must propagate as LedgerError::RandomnessUnavailable \
-         via map_err(...)?, body was: {body}"
+        "entropy must come from the shared helper and its failure must \
+         propagate as LedgerError::RandomnessUnavailable via \
+         map_err(...)?, body was: {body}"
     );
     assert!(
-        body.contains("let mut bytes = [0u8; 16];"),
-        "success path must still draw exactly 16 entropy bytes, body was: {body}"
+        !body.contains("[0u8;"),
+        "the helper owns the entropy buffer: no local zero buffer may be \
+         encoded on any path, body was: {body}"
     );
     assert!(
         body.contains("Ok(crate::b64::encode(&bytes))"),
@@ -195,14 +205,21 @@ fn randomness_failure_propagates_instead_of_panicking_or_falling_back() {
          minted without entropy, body was: {body}"
     );
     assert_eq!(
-        body.matches("getrandom::fill").count(),
+        body.matches("secure_random_bytes").count(),
         1,
         "the mint must draw entropy exactly once, body was: {body}"
     );
     assert_eq!(
+        body.matches("getrandom::").count(),
+        0,
+        "the mint must not bypass the shared helper with a direct fill, \
+         body was: {body}"
+    );
+    assert_eq!(
         LEDGER_SRC.matches("getrandom::fill").count(),
-        1,
-        "ledger.rs must contain exactly one getrandom::fill (the mint's)"
+        0,
+        "ledger.rs must contain no direct getrandom::fill (sole fill is \
+         the shared helper in random.rs)"
     );
     for banned in [
         ".expect(",
