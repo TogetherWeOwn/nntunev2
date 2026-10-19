@@ -85,7 +85,8 @@
 //! /// exactly `bytes` and invokes `handler` once. `Oversized` and
 //! /// `TransportFailure` invoke NOTHING and answer the handlers' existing
 //! /// uniform pre-routing rejection: status 400, body
-//! /// `{"error":"invalid request"}`, no `set_cookie`. The Worker entry
+//! /// `{"code":"invalid_request","message":"invalid request","retryable":false}`,
+//! /// no `set_cookie`. The Worker entry
 //! /// passes a handler that calls `handlers::handle`, so a rejected body
 //! /// can cause no store, mailer, DNS, or dialer side effect.
 //! pub async fn dispatch_collected<F, Fut>(
@@ -131,7 +132,8 @@ const SECRET: &[u8] = b"acceptance-primary-secret-fits-32-bytes!";
 const MAX: usize = handlers::MAX_BODY_BYTES;
 
 const REJECT_STATUS: u16 = 400;
-const REJECT_BODY: &str = r#"{"error":"invalid request"}"#;
+const REJECT_BODY: &str =
+    r#"{"code":"invalid_request","message":"invalid request","retryable":false}"#;
 const TEMPLATE_BODY: &[u8] = b"TEMPLATE-BODY-MUST-BE-REPLACED";
 
 // --- async helper ------------------------------------------------------------
