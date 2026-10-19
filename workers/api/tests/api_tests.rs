@@ -104,7 +104,8 @@ fn session_rotation_bumps_counter_and_stays_valid() {
 #[test]
 fn magic_link_issue_consume_and_replay_rejected() {
     let now = 1_700_000_000u64;
-    let (plaintext, record) = auth::issue_magic_link("user-1", "alice@example.com", now);
+    let (plaintext, record) =
+        auth::issue_magic_link("user-1", "alice@example.com", now).expect("issue");
     // Hash at rest: the stored record must not contain the plaintext token.
     assert!(!record.token_hash.contains(&plaintext));
     let consumed = auth::consume_magic_link(record, &plaintext, now + 60).expect("first use works");
@@ -114,7 +115,8 @@ fn magic_link_issue_consume_and_replay_rejected() {
 #[test]
 fn magic_link_replay_rejected() {
     let now = 1_700_000_000u64;
-    let (plaintext, record) = auth::issue_magic_link("user-1", "alice@example.com", now);
+    let (plaintext, record) =
+        auth::issue_magic_link("user-1", "alice@example.com", now).expect("issue");
     let record2 = auth::consume_magic_link(record, &plaintext, now + 60)
         .expect("first use works")
         .into_record_for_replay_test();
@@ -124,11 +126,12 @@ fn magic_link_replay_rejected() {
 #[test]
 fn magic_link_expired_and_wrong_token_rejected_with_generic_error() {
     let now = 1_700_000_000u64;
-    let (plaintext, record) = auth::issue_magic_link("user-1", "alice@example.com", now);
+    let (plaintext, record) =
+        auth::issue_magic_link("user-1", "alice@example.com", now).expect("issue");
     // >15 min: expired.
     let err = auth::consume_magic_link(record, &plaintext, now + 901).unwrap_err();
     assert_eq!(err, auth::AuthError::Invalid, "login errors stay generic");
-    let (_, record2) = auth::issue_magic_link("user-1", "alice@example.com", now);
+    let (_, record2) = auth::issue_magic_link("user-1", "alice@example.com", now).expect("issue");
     let err2 = auth::consume_magic_link(record2, "wrong-token", now + 60).unwrap_err();
     assert_eq!(err2, auth::AuthError::Invalid, "no user-enumeration oracle");
 }

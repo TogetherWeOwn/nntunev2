@@ -1120,7 +1120,7 @@ fn invite_budget_denies_eleventh_attempt_with_generic_error() {
         config: test_config(true, None),
         ..harness()
     };
-    let code = auth::generate_invite_code();
+    let code = auth::generate_invite_code().expect("issue");
     harness.store.seed_invite(&code);
 
     // Positive control first: a fresh account redeems the same code shape.
@@ -1155,7 +1155,7 @@ fn invite_budget_denies_eleventh_attempt_with_generic_error() {
     }
 
     // One more attempt with a VALID code is still denied, generically.
-    let fresh_code = auth::generate_invite_code();
+    let fresh_code = auth::generate_invite_code().expect("issue");
     harness.store.seed_invite(&fresh_code);
     let magic = harness
         .mailer
