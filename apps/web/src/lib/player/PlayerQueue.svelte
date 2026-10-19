@@ -27,7 +27,9 @@
 <button type="button" data-testid="player-next" disabled={!current}> Next </button>
 
 <ol>
-	{#each state.tracks as track, i (track.id)}
+	<!-- Keyed by queue position: createQueue permits repeated track ids, and
+		keying on track.id raises each_key_duplicate on the client. -->
+	{#each state.tracks as track, i (i)}
 		<li
 			data-testid="queue-item"
 			data-track-id={track.id}
