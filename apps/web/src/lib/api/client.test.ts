@@ -545,6 +545,23 @@ describe('ApiClient', () => {
 			const seen: { url: unknown; init: RequestInit }[] = [];
 			const fetchFn = (async (url: unknown, init: RequestInit) => {
 				seen.push({ url, init });
+				// The passkey-start calls shape-check their success body, so
+				// their rows need shape-valid bodies; every other route still
+				// accepts the generic envelope.
+				if (String(url).endsWith('/v1/auth/passkey/register/start')) {
+					return jsonResponse({
+						challenge: 'AQID',
+						user_id: 'Bwg',
+						rp_id: 'example.com'
+					});
+				}
+				if (String(url).endsWith('/v1/auth/passkey/login/start')) {
+					return jsonResponse({
+						challenge: 'AQID',
+						rp_id: 'example.com',
+						allow_credentials: []
+					});
+				}
 				return jsonResponse({ ok: true });
 			}) as unknown as typeof fetch;
 			const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });

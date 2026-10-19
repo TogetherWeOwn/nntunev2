@@ -190,6 +190,64 @@ export interface LoginStartResponse {
 	rp_id: string;
 }
 
+/** Typed shape failure for a malformed passkey-start success body. */
+function passkeyStartShapeFailure(status: number): ApiError {
+	const parsed = parseErrorBody(null, status);
+	return new ApiError(status, 'request_failed', parsed.message, null, false);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+	return typeof value === 'string' && value.length > 0;
+}
+
+/**
+ * Guard the register-start success body before any ceremony can begin: the
+ * body must be a plain object whose `challenge`, `user_id` and `rp_id` are
+ * each a non-empty string. A malformed `challenge` would otherwise throw
+ * inside base64url decoding mid-ceremony as a generic ceremony error instead
+ * of a typed contract failure.
+ */
+function validateRegisterStart(data: unknown, status: number): RegisterStartResponse {
+	if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+		throw passkeyStartShapeFailure(status);
+	}
+	const record = data as Record<string, unknown>;
+	if (
+		!isNonEmptyString(record.challenge) ||
+		!isNonEmptyString(record.user_id) ||
+		!isNonEmptyString(record.rp_id)
+	) {
+		throw passkeyStartShapeFailure(status);
+	}
+	return {
+		challenge: record.challenge,
+		user_id: record.user_id,
+		rp_id: record.rp_id
+	};
+}
+
+/**
+ * Guard the login-start (and session-reauth-start) success body the same way:
+ * a plain object whose `challenge` and `rp_id` are each a non-empty string.
+ * The server-provided `allow_credentials` list passes through untouched.
+ */
+function validateLoginStart(data: unknown, status: number): LoginStartResponse {
+	if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+		throw passkeyStartShapeFailure(status);
+	}
+	const record = data as Record<string, unknown>;
+	if (!isNonEmptyString(record.challenge) || !isNonEmptyString(record.rp_id)) {
+		throw passkeyStartShapeFailure(status);
+	}
+	return {
+		challenge: record.challenge,
+		allow_credentials: Array.isArray(record.allow_credentials)
+			? record.allow_credentials
+			: [],
+		rp_id: record.rp_id
+	};
+}
+
 /**
  * Inputs for the passkey finish calls. Pages pass camelCase fields and the
  * builders below emit the snake_case wire body the Worker parses
@@ -304,9 +362,21 @@ export class ApiClient {
 		return this.post<{ ok: true }>('/v1/session/revoke-all', {});
 	}
 
-	/** Start passkey enrollment; the API also mails the inbox-proof code. */
+	/**
+	 * Start passkey enrollment; the API also mails the inbox-proof code. The
+	 * success body is shape-checked before it returns so a malformed
+	 * `challenge` surfaces as a typed `ApiError`, never a mid-ceremony throw.
+	 */
 	async registerStart(email: string): Promise<RegisterStartResponse> {
-		return this.post<RegisterStartResponse>('/v1/auth/passkey/register/start', { email });
+		const { data, status } = await this.requestWithStatus<unknown>(
+			'/v1/auth/passkey/register/start',
+			{
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ email })
+			}
+		);
+		return validateRegisterStart(data, status);
 	}
 
 	/** Finish passkey enrollment with the attestation + emailed code. */
@@ -317,9 +387,20 @@ export class ApiClient {
 		);
 	}
 
-	/** Start passkey login for an email (empty allow-list response). */
+	/**
+	 * Start passkey login for an email (empty allow-list response). The
+	 * success body is shape-checked before it returns, as in `registerStart`.
+	 */
 	async loginStart(email: string): Promise<LoginStartResponse> {
-		return this.post<LoginStartResponse>('/v1/auth/passkey/login/start', { email });
+		const { data, status } = await this.requestWithStatus<unknown>(
+			'/v1/auth/passkey/login/start',
+			{
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ email })
+			}
+		);
+		return validateLoginStart(data, status);
 	}
 
 	/** Finish passkey login with the assertion. */
@@ -330,9 +411,20 @@ export class ApiClient {
 		);
 	}
 
-	/** Start a passkey proof bound to the currently authenticated session. */
+	/**
+	 * Start a passkey proof bound to the currently authenticated session. The
+	 * success body carries the login-start shape and is checked the same way.
+	 */
 	async reauthenticateStart(): Promise<LoginStartResponse> {
-		return this.post<LoginStartResponse>('/v1/session/reauthenticate/start', {});
+		const { data, status } = await this.requestWithStatus<unknown>(
+			'/v1/session/reauthenticate/start',
+			{
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({})
+			}
+		);
+		return validateLoginStart(data, status);
 	}
 
 	/** Complete proof-bound reauthentication without affecting ordinary login. */
