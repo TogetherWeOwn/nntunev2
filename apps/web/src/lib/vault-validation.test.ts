@@ -216,7 +216,8 @@ describe('validateIndexerUrl', () => {
 			'https:///index.example.com/api',
 			'https:\\\\index.example.com/api',
 			'https://index.example.com/a pi',
-			'https://index.example.com/a\tpi'
+			'https://index.example.com/a\tpi',
+			'https://index.example.com/a\u0085pi'
 		]) {
 			expect(validateIndexerUrl(url, KEY), `url rejected: ${url}`).not.toBeNull();
 		}

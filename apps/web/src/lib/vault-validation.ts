@@ -127,7 +127,8 @@ export function validateIndexerUrl(url: string, apiKey: string): string | null {
 	// client sends the raw string (not the normalized href), so WHATWG
 	// normalization must not hide a form the fetch builder rejects. Require
 	// the literal `https://` prefix, a non-empty non-slash remainder, no
-	// `@`/`?`/`#`, and no whitespace — before parsing.
+	// `@`/`?`/`#`, and no whitespace (including U+0085 NEL, which JS \s
+	// misses but Rust is_whitespace rejects) — before parsing.
 	if (!value.startsWith('https://')) {
 		try {
 			const probe = new URL(value);
@@ -149,7 +150,7 @@ export function validateIndexerUrl(url: string, apiKey: string): string | null {
 	if (rest.includes('@') || rest.includes('?') || rest.includes('#')) {
 		return 'Put the API key in the key field, not the URL';
 	}
-	if (/\s/.test(rest)) {
+	if (/[\s\u0085]/.test(rest)) {
 		return 'That indexer URL does not look valid.';
 	}
 	let parsed: URL;
