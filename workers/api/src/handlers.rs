@@ -8611,7 +8611,7 @@ mod tests {
 
     #[test]
     fn probe_dials_the_validated_target_port() {
-        // TOG-31994: `Dialer::probe` takes no caller-supplied port, so the
+        // `Dialer::probe` takes no caller-supplied port, so the
         // only port any dialer can reach is `target.port()` — vetted by
         // `ProviderConfig::validate` against the NNTP allowlist. A
         // recording dialer over both allowlisted ports must observe
@@ -8656,7 +8656,7 @@ mod tests {
 
     #[test]
     fn probe_takes_no_caller_supplied_port() {
-        // Shape pin for TOG-31994: the trait, the handler call site, and
+        // Shape pin: the trait, the handler call site, and
         // the production dialer must never carry a caller-supplied port
         // again — a reintroduced `port: u16` parameter would let a caller
         // smuggle a substitute past the validated target. Slice ONLY the
