@@ -236,9 +236,11 @@ mod tests {
                 continue;
             }
             if c == '\'' {
-                // Char literal on one line (at most 4 chars wide incl.
-                // quotes): blank its body so a `?` inside cannot satisfy
-                // the pin. Lifetimes fall through as plain code.
+                // Char literal on one line: blank its body so a `?` inside
+                // cannot satisfy the pin. Narrow chars are at most 4 wide
+                // incl. quotes; escape-led bodies (`'\..'`) are accepted at
+                // any width because lifetimes never contain a backslash.
+                // Lifetimes fall through as plain code.
                 let mut j = i + 1;
                 let mut closed = false;
                 while j < chars.len() && chars[j] != '\n' {
@@ -252,7 +254,8 @@ mod tests {
                     }
                     j += 1;
                 }
-                if closed && j.saturating_sub(i) <= 4 {
+                let escape_led = chars.get(i + 1).copied() == Some('\\');
+                if closed && (j.saturating_sub(i) <= 4 || escape_led) {
                     // Blank via the escape-aware lookahead endpoint `j`:
                     // rescanning for the first `'` would stop at an escaped
                     // quote (`'\''`) and reinterpret the real closer as a new
@@ -644,6 +647,107 @@ mod tests {
             check_secure_random_propagation(&mutant).is_err(),
             "escaped-char-adjacent string statement must not satisfy the pin"
         );
+    }
+
+    #[test]
+    fn stripper_blanks_hex_escape_char_before_string() {
+        // Wide escape char (`'\x3f'`, 6 wide incl. quotes) paired with a
+        // quote-led string: the old `<= 4` width guard fell through as a
+        // lifetime, letting the string body leak as code.
+        let src = "let _t = ('\\x3f', \"' .map_err(|_| CryptoError::RandomnessUnavailable)?;\");";
+        let stripped = strip_code_for_propagation_pin(src);
+        assert!(
+            !stripped.contains(".map_err"),
+            "hex-escape-adjacent string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("RandomnessUnavailable"),
+            "hex-escape-adjacent string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains('?'),
+            "hex-escape-adjacent string ? must be blanked: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn stripper_blanks_unicode_escape_char_before_string() {
+        // `'\u{3f}'` is 8 wide incl. quotes: same lifetime-fallthrough leak
+        // class as the hex form.
+        let src = "let _t = ('\\u{3f}', \"' .map_err(|_| CryptoError::RandomnessUnavailable)?;\");";
+        let stripped = strip_code_for_propagation_pin(src);
+        assert!(
+            !stripped.contains(".map_err"),
+            "unicode-escape-adjacent string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("RandomnessUnavailable"),
+            "unicode-escape-adjacent string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains('?'),
+            "unicode-escape-adjacent string ? must be blanked: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn stripper_blanks_long_unicode_escape_char_before_string() {
+        // Long unicode escape (`'\u{10FFFF}'`): widest valid char spelling.
+        let src =
+            "let _t = ('\\u{10FFFF}', \"' .map_err(|_| CryptoError::RandomnessUnavailable)?;\");";
+        let stripped = strip_code_for_propagation_pin(src);
+        assert!(
+            !stripped.contains(".map_err"),
+            "long-unicode-adjacent string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("RandomnessUnavailable"),
+            "long-unicode-adjacent string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains('?'),
+            "long-unicode-adjacent string ? must be blanked: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn stripper_blanks_hex_byte_char_before_string() {
+        // Byte char (`b'\x3f'`): the quote after `b` opens an escape-led
+        // body at width 5, same fallthrough class.
+        let src = "let _t = (b'\\x3f', \"' .map_err(|_| CryptoError::RandomnessUnavailable)?;\");";
+        let stripped = strip_code_for_propagation_pin(src);
+        assert!(
+            !stripped.contains(".map_err"),
+            "byte-char-adjacent string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("RandomnessUnavailable"),
+            "byte-char-adjacent string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains('?'),
+            "byte-char-adjacent string ? must be blanked: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn pin_rejects_wide_escape_adjacent_string_carried_statement() {
+        // Checker-level regression for the width-guard class: compilable
+        // tuples pairing each wide escape char with a quote-led string
+        // carrying the exact expected statement. Each never executes
+        // `getrandom::fill` — zero-filled bytes returned as `Ok` — yet the
+        // guarded stripper reports `Ok(())`.
+        let gr = "getrandom";
+        let prefixes = ["'\\x3f'", "'\\u{3f}'", "'\\u{10FFFF}'", "b'\\x3f'"];
+        for prefix in prefixes {
+            let mutant = format!(
+                "let _t = ({prefix}, \"'{gr}::fill(&mut bytes).map_err(|_| CryptoError::RandomnessUnavailable)?;\");"
+            );
+            assert!(
+                check_secure_random_propagation(&mutant).is_err(),
+                "wide-escape {prefix} adjacent string statement must not satisfy the pin"
+            );
+        }
     }
 
     #[test]
