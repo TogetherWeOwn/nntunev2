@@ -19,10 +19,10 @@ the deployed-build identity route
 (`e2e/tests/build-identity.spec.ts`), and the closing same-build
 re-read (`e2e/tests/zz-build-identity-final.spec.ts`) added:
 `npm --prefix e2e run e2e:list` lists 379 tests in 25 files, and
-`(cd apps/web && pnpm exec playwright test --list)` lists 110 tests in
-23 files (94 in 21 files as previously verified, plus the 5-test
-paywall-elapsed-time spec and the 11-test passkey-dismissal spec; the
-`apps/web` tree is untouched by this change). Line numbers
+`(cd apps/web && pnpm exec playwright test --list)` lists 120 tests in
+25 files (110 in 23 files as previously documented — 113 in 24 at this
+base — plus the 7-test byop-reauth-paywall-dismissal spec added here).
+Line numbers
 below are from that head; re-verify with the commands at the end of this
 document whenever a spec is added, renamed, or retitled, and update this
 matrix in the same PR. CI enforces the file and title citations on
@@ -334,6 +334,13 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
     still applies), while genuine finish failures and other ceremony
     errors keep their exact current messages and login stays
     non-enumerating.
+  - `apps/web/tests/byop-reauth-paywall-dismissal.spec.ts` — pins BYOP
+    reauth paywall and dismissal handling: paywalled start/finish show
+    the paywall modal with no failure banner and no vault-save retry,
+    an interrupted ceremony (NotAllowedError/AbortError) shows a
+    retryable dismissed notice enumerating the possible reasons with
+    in-place retry, and genuine finish/ceremony failures keep the exact
+    current banner with the sign-in-again link.
   - `apps/web/tests/smoke.spec.ts` — pins the landing BYOP copy with
     working signup/pricing CTAs, the health/readiness endpoints,
     contract routes rendering their e2e hooks, signup/login/magic-link

@@ -452,7 +452,7 @@
 						{reauthState === 'working' ? 'Verifying…' : 'Reauthenticate and save'}
 					</button>
 					{#if reauthState === 'dismissed'}
-						<p role="status">You dismissed the passkey prompt — try again when ready.</p>
+						<p role="status">Passkey reauthentication didn't complete. Possible reasons: You dismissed the passkey prompt, it timed out, or no usable passkey was available. Try again when ready.</p>
 					{:else if reauthState === 'failed'}
 						<p role="status">Reauthentication failed. <a href="/login">Sign in again</a> to continue.</p>
 					{/if}
