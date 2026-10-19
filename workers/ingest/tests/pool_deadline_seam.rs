@@ -228,11 +228,25 @@ fn body_races_both_stages_and_expires_to_retry() {
         ),
         "body expiry must reuse the existing Retry variant with DEFAULT_RETRY_SECS"
     );
+    // The drain is streamed under the reply cap (no whole-body buffer), so
+    // each chunk read races the shared deadline in a loop: a fired deadline
+    // mid-stream maps to the same expired `Retry` as stalled headers, and a
+    // chunk transport failure maps to `Retry` without growing the budget.
+    // Indented arm: the headers stage shares the `None => return Err(expired)`
+    // text on one line, so the pin names the loop-indented arm (rustfmt keeps
+    // that indentation stable) plus the stream-end arm beside it. Swapping the
+    // body expiry for `break` fails here.
     assert!(
-        prod.matches("Some(Err(_)) | None => return Err(expired)")
-            .count()
-            >= 2,
-        "BOTH body stages (headers + body) must map expiry/transport failure to expired Retry"
+        prod.contains("\n                    None => return Err(expired),\n"),
+        "body drain must map a fired mid-stream deadline to expired Retry"
+    );
+    assert!(
+        prod.contains("Some(None) => break,"),
+        "body drain must end the chunk loop on stream end (not on expiry)"
+    );
+    assert!(
+        prod.contains("Some(Some(Err(_))) => return Err(unavailable)"),
+        "body drain must map chunk transport failure to Retry (same value, no new variant)"
     );
 }
 

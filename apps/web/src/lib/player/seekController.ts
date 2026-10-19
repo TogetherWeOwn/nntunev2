@@ -17,10 +17,10 @@ export interface SeekResult {
 }
 
 export function buildRangeHeader(start: number, end?: number): string {
-	if (!Number.isFinite(start)) {
+	if (!Number.isFinite(start) || !Number.isSafeInteger(Math.floor(start))) {
 		throw new RangeError(`Invalid seek start: ${String(start)}`);
 	}
-	if (end !== undefined && !Number.isFinite(end)) {
+	if (end !== undefined && (!Number.isFinite(end) || !Number.isSafeInteger(Math.floor(end)))) {
 		throw new RangeError(`Invalid seek end: ${String(end)}`);
 	}
 	const safeStart = Math.max(0, Math.floor(start));

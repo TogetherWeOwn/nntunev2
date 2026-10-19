@@ -31,7 +31,8 @@
 //!   (== 429) / RETRY_AFTER_HEADER (== "retry-after")`,
 //!   `search_retry_after_header(secs: u64) -> String` (decimal seconds),
 //!   `search_rate_limited_body() -> String` (ZERO args: no per-request data
-//!   can leak in; must be `{"error":"too many requests"}`).
+//!   can leak in; must be the `rate_limited` error envelope
+//!   `{"code":"rate_limited","message":"too many requests","retryable":true}`).
 //! - `SearchThrottleKey::new(ip: &str, account: &str)` with a `Debug` impl
 //!   that NEVER prints the IP in cleartext (keys are vault-resolved
 //!   server-side; logs carry the redacted URL only).
@@ -265,7 +266,9 @@ fn rate_limited_body_is_generic_and_leaks_nothing() {
     // and the caller identity cannot flow into this body.
     let body = search_rate_limited_body();
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("body must be JSON");
-    assert_eq!(parsed["error"], "too many requests");
+    assert_eq!(parsed["code"], "rate_limited");
+    assert_eq!(parsed["message"], "too many requests");
+    assert_eq!(parsed["retryable"], true);
     for secret in [
         TEST_IP,
         TEST_ACCOUNT,
