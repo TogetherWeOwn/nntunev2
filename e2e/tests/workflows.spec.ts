@@ -1170,16 +1170,21 @@ test.describe('locked-dependency ci builds (static pin)', () => {
   // then split on the full shell separator set (&&, ||, ;, bare & for
   // background, bare | for pipe, which also covers |& pipe-stderr) so each
   // chained `cargo` invocation is asserted on its own — one --locked token
-  // must not credit a sibling invocation on the same run line. Only cargo
-  // in executable position counts: after the YAML `run:` prefix or at the
-  // start of a chained segment (optional leading VAR=value assignments
-  // allowed), so `echo "cargo test ..."` printed text is not mistaken for
-  // an executed invocation.
+  // must not credit a sibling invocation on the same run line. Search for
+  // cargo anywhere in each segment: timeout/env, grouping, negation and
+  // quoted assignments can all precede executed cargo. This is a conservative
+  // static pin, not a shell parser. Only a whole literal echo is ignored;
+  // never strip quoted strings wholesale, since double quotes can execute
+  // $(cargo ...) and backticks. Ambiguous forms remain fail-closed.
   const jobCargoSteps = (workflow: string, job: string, verb: string): string[] => {
     const section = jobSection(stripFullLineComments(workflow), job).replace(/\\\r?\n\s*/g, ' ');
-    const executableCargo = new RegExp(`^(?:[A-Za-z_][A-Za-z0-9_]*=\\S+\\s+)*cargo\\s+${verb}\\b`);
+    // Cargo's global arguments (including rustup's +toolchain selector)
+    // can also sit between the binary and verb. Do not allowlist options:
+    // an unfamiliar one must not hide a sibling invocation from this pin.
+    const cargoVerb = new RegExp(`\\bcargo(?:\\s+\\S+)*?\\s+${verb}\\b`);
     const stripRunPrefix = (invocation: string): string =>
       invocation.replace(/^\s*(?:-\s*)?run:\s*/, '').trim();
+    const literalEcho = /^echo(?:\s+(?:'[^']*'|"[^"$`\\]*"|[\w./=-]+))+\s*$/;
     return section
       .split('\n')
       .map((line) => line.split(/\s+#.*$/)[0]!)
@@ -1187,7 +1192,8 @@ test.describe('locked-dependency ci builds (static pin)', () => {
       // separator. Splitting inside redirections such as 2>&1 is harmless:
       // the cargo segment keeps its flags and the fragments match no verb.
       .flatMap((line) => line.split(/\s*(?:&&|\|\||;|&|\|)\s*/))
-      .filter((invocation) => executableCargo.test(stripRunPrefix(invocation)));
+      .filter((invocation) => !literalEcho.test(stripRunPrefix(invocation)))
+      .filter((invocation) => cargoVerb.test(invocation));
   };
   // `--frozen` is cargo's alias for `--locked --offline` (cargo --help), so
   // it resolves locked and the unlocked pin must see it. Token boundaries
@@ -1326,6 +1332,49 @@ test.describe('locked-dependency ci builds (static pin)', () => {
       'cargo test --locked --manifest-path workers/api/Cargo.toml',
       'cargo test --locked --manifest-path workers/api/Cargo.toml --lib && echo "cargo test --manifest-path workers/api/Cargo.toml --doc"',
     );
+    // Wrappers must not hide a sibling invocation while a plain command
+    // still satisfies the verb-presence check. Exercise both policy sides,
+    // and keep correctly locked/unlocked wrappers valid (not blanket-red).
+    const wrappers: Array<(command: string) => string> = [
+      (command) => `timeout 600 ${command}`,
+      (command) => `(${command})`,
+      (command) => `env ${command}`,
+      (command) => `RUSTFLAGS="-C target-feature=+simd128" ${command}`,
+      (command) => `{ ${command}; }`,
+      (command) => `! ${command}`,
+      (command) => `echo "$(${command})"`,
+      (command) => `echo "\`${command}\`"`,
+      (command) => command.replace(/^cargo /, 'cargo +stable '),
+      (command) => command.replace(/^cargo /, 'cargo --offline '),
+      (command) => command.replace(/^cargo /, 'cargo -q '),
+      (command) => command.replace(/^cargo /, 'cargo --config net.offline=true '),
+    ];
+    for (const wrap of wrappers) {
+      for (const locked of [false, true]) {
+        const apiCommand = `cargo test ${locked ? '--locked ' : ''}--manifest-path workers/api/Cargo.toml --doc`;
+        const apiSibling = ciCode.replace(
+          'cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets',
+          `cargo test --locked --manifest-path workers/api/Cargo.toml --lib && ${wrap(apiCommand)}`,
+        );
+        const mbCommand = `cargo test ${locked ? '--locked ' : ''}--manifest-path workers/mb/Cargo.toml --doc`;
+        const mbSibling = ciCode.replace(
+          'cargo test --manifest-path workers/mb/Cargo.toml --all-targets',
+          `cargo test --manifest-path workers/mb/Cargo.toml --lib && ${wrap(mbCommand)}`,
+        );
+        if (locked) {
+          expect(() => assertApiLocked(apiSibling), wrap(apiCommand)).not.toThrow();
+          expect(() => assertJobUnlocked(mbSibling, 'rust-mb', 'mb'), wrap(mbCommand)).toThrow();
+        } else {
+          expect(() => assertApiLocked(apiSibling), wrap(apiCommand)).toThrow();
+          expect(() => assertJobUnlocked(mbSibling, 'rust-mb', 'mb'), wrap(mbCommand)).not.toThrow();
+        }
+      }
+    }
+    const echoPrintsSingleQuoted = ciCode.replace(
+      'cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets',
+      "cargo test --locked --manifest-path workers/api/Cargo.toml --lib && echo 'cargo test --manifest-path workers/api/Cargo.toml --doc'",
+    );
+    expect(() => assertApiLocked(echoPrintsSingleQuoted)).not.toThrow();
     // Policy drift the other way: locking an unlocked job without updating
     // the README asymmetry must trip the unlocked pin.
     const lockMb = ciCode.replace(
