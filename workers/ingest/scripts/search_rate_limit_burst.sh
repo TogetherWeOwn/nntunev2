@@ -10,6 +10,8 @@
 # that is the dual gate working; run it after the window (60s default) to
 # see a legit request pass again.
 #
+# Never point this script at production. Do not retry: 429/503 are observations,
+# and replaying a request changes both the burst count and the throttle result.
 # Usage: INGEST_URL=https://<worker-host> ./search_rate_limit_burst.sh
 set -euo pipefail
 : "${INGEST_URL:?set INGEST_URL to the ingest worker base URL}"
