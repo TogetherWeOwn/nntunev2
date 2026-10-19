@@ -264,6 +264,29 @@ Job properties:
 
 ## 7. Runbook (operator copy-paste)
 
+> **NOT EXECUTABLE — design only. Do not run the steps below in an
+> incident.** The re-wrap job (§6 runner: no Cloudflare Workflow/Queue
+> consumer is implemented, §8) and the versioned KEK map (a
+> `kek_by_version` selector over `VAULT_KEK_V<N>` per-version secrets +
+> `VAULT_KEK_CURRENT` write-version var, plus the `rotation_runs`
+> progress table — none of which exist in Worker code or migrations)
+> have not landed: the Worker reads only `VAULT_KEK_BASE64` +
+> `VAULT_KEK_VERSION` (`workers/api/src/worker_entry.rs`). Until those
+> land, routine KEK rotation cannot be executed. On suspected or
+> confirmed KEK exposure, follow the compromise path in §10 (fresh
+> single KEK, per-row re-key, credential re-entry) — never the steps
+> below.
+
+### Rotation executability today (Worker code as merged)
+
+| Rotation | Executable today? | Worker env vars (grep proof) |
+|---|---|---|
+| Session secret (routine window) | ✅ Yes — dual-accept window per `docs/security/session-secret-rotation.md` | `SESSION_SECRET_BASE64`, `SESSION_SECRET_PREVIOUS_BASE64`, `SESSION_SECRET_ROTATION` — all read in `workers/api/src/worker_entry.rs` |
+| Session secret (compromise) | ✅ Yes — single-secret cutover + `UPDATE sessions SET revoked = TRUE` (§6 of that doc) | same vars as above |
+| KEK (routine re-wrap, §§5–6 below) | ❌ No — re-wrap job and versioned KEK map not implemented | `VAULT_KEK_BASE64` + `VAULT_KEK_VERSION` read in `worker_entry.rs`; `VAULT_KEK_V<N>`, `VAULT_KEK_CURRENT`, and `rotation_runs` appear nowhere in code or migrations (**not implemented**) |
+| KEK (compromise re-key, §10) | ❌ No runner — incident path is design until the §8 gate items land | same as above |
+| Native REST pepper | ⚠️ Reissue only — no rotation window; rotating the pepper means provisioning a new pair and reissuing credentials (rows pinned to the old `pepper_version` fail closed) | single `NATIVE_REST_PEPPER_BASE64` + `NATIVE_REST_PEPPER_VERSION` pair in `worker_entry.rs`; no second pair / previous-pepper var (**not implemented**) |
+
 Preconditions: staging bake ≥24h on the new version; backup verified
 (ciphertext restores); two operators aware (one executes, one can flip
 back); rotation window announced.
