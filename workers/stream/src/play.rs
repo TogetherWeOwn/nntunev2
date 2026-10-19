@@ -1012,7 +1012,7 @@ impl Live {
             return Err((
                 PlayError::Decode(YencError::SizeMismatch {
                     expected: self.total,
-                    actual: self.staged_bytes as usize,
+                    actual: self.staged_bytes,
                 }),
                 Conn::KeepWarm,
             ));
@@ -1409,19 +1409,33 @@ impl Iterator for PlayStream {
         }
         let chunk = match self.source.as_mut() {
             Some(Source::Cached(bytes)) => {
-                let to = (self.pos as usize + CHUNK).min(self.end as usize);
-                bytes[self.pos as usize..to].to_vec()
+                // Offsets stay `u64` until the final bounded index: narrowing
+                // `pos`/`end` to `usize` first would truncate multi-GiB file
+                // offsets on 32-bit targets before the clamp.
+                let buf_len = bytes.len() as u64;
+                let start_u64 = self.pos.min(self.end).min(buf_len);
+                let end_u64 = self.end.min(buf_len).max(start_u64);
+                let take = (end_u64 - start_u64).min(CHUNK as u64);
+                let from = start_u64 as usize;
+                let to = (start_u64 + take) as usize;
+                bytes[from..to].to_vec()
             }
             Some(Source::Live(live)) => loop {
                 if live.failed.is_some() {
                     return None;
                 }
-                let buf_end = live.buf_start + live.buf.len() as u64;
+                let buf_len = live.buf.len() as u64;
+                let buf_end = live.buf_start + buf_len;
                 if self.pos >= live.buf_start && self.pos < buf_end {
-                    let from = (self.pos - live.buf_start) as usize;
-                    let to = (from + CHUNK)
-                        .min(live.buf.len())
-                        .min((self.end - live.buf_start) as usize);
+                    // Differences stay `u64` and clamp against the in-memory
+                    // buffer length in `u64`; only the bounded locals become
+                    // `usize` slice indices.
+                    let from_u64 = self.pos - live.buf_start;
+                    let avail = buf_len - from_u64;
+                    let remaining = self.end.saturating_sub(self.pos).min(avail);
+                    let take = remaining.min(CHUNK as u64);
+                    let from = from_u64 as usize;
+                    let to = (from_u64 + take) as usize;
                     break live.buf[from..to].to_vec();
                 }
                 if live.next_seg >= live.segments.len() {

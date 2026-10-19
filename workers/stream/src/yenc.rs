@@ -19,7 +19,7 @@ pub enum YencError {
     BadFraming,
     SizeMismatch {
         expected: u64,
-        actual: usize,
+        actual: u64,
     },
     CrcMismatch {
         expected: u32,
@@ -253,7 +253,7 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
     if yend_size != out.len() as u64 {
         return Err(YencError::SizeMismatch {
             expected: yend_size,
-            actual: out.len(),
+            actual: out.len() as u64,
         });
     }
     let offset = if multipart {
@@ -266,7 +266,7 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
         if file_size != out.len() as u64 {
             return Err(YencError::SizeMismatch {
                 expected: file_size,
-                actual: out.len(),
+                actual: out.len() as u64,
             });
         }
         0
