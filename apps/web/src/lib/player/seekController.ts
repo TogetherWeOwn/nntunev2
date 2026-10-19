@@ -48,6 +48,10 @@ function abortError(): DOMException {
 	return new DOMException('Seek superseded by a newer seek', 'AbortError');
 }
 
+function timeoutError(): DOMException {
+	return new DOMException('Seek timed out before completion', 'TimeoutError');
+}
+
 /**
  * Release a response discarded before body consumption. A rejected
  * streaming response must not keep producing into nothing: cancel its
@@ -72,6 +76,38 @@ async function releaseRejectedBody(response: Response): Promise<void> {
 }
 
 /**
+ * Race a signal-unaware body read against `signal` so the deadline (or a
+ * supersede) settles even when the producer ignores the request signal.
+ * Neither `readOpenEnded206` nor `readFiniteBody` is changed: this only
+ * bounds the wait at the call site. On abort the unread body is cancelled
+ * best-effort (a locked stream rejects cancel, swallowed here) and the
+ * read rejects with `AbortError`, which the caller converts to
+ * `TimeoutError` when its own deadline fired.
+ */
+function raceSignalAbort<T>(read: Promise<T>, response: Response, signal: AbortSignal): Promise<T> {
+	if (signal.aborted) return Promise.reject(abortError());
+	let onAbort: (() => void) | undefined;
+	const gate = new Promise<never>((_resolve, reject) => {
+		onAbort = () => {
+			let body: ReadableStream<Uint8Array> | null = null;
+			try {
+				body = response.body;
+			} catch {
+				body = null;
+			}
+			if (body !== null) {
+				body.cancel().catch(() => undefined);
+			}
+			reject(abortError());
+		};
+		signal.addEventListener('abort', onAbort, { once: true });
+	});
+	return Promise.race([read, gate]).finally(() => {
+		if (onAbort !== undefined) signal.removeEventListener('abort', onAbort);
+	});
+}
+
+/**
  * Read at most `expectedLength` body bytes incrementally, so a finite
  * range never accumulates an oversized response before validation.
  * Accumulated buffers are bounded by `expectedLength` (a boundary
@@ -89,8 +125,9 @@ async function readFiniteBody(
 ): Promise<Uint8Array> {
 	if (signal.aborted) throw abortError();
 	if (response.body === null) {
-		// No readable stream to bound; fall back to a length-checked read.
-		const buffer = await response.arrayBuffer();
+		// No readable stream to bound; fall back to a length-checked read,
+		// still bounded by the seek deadline at the call site.
+		const buffer = await raceSignalAbort(response.arrayBuffer(), response, signal);
 		if (signal.aborted) throw abortError();
 		if (buffer.byteLength < expectedLength) throw new Error(options.shortMessage);
 		if (options.exact && buffer.byteLength !== expectedLength) {
@@ -172,6 +209,7 @@ export class SeekController {
 	private current: AbortController | null = null;
 	private fetchFn: SeekFetch;
 	readonly url: string;
+	private deadlineMs?: number;
 
 	/** Seeks started (monotonic). */
 	generation = 0;
@@ -180,11 +218,12 @@ export class SeekController {
 	/** Requests that completed with a validated range body. */
 	completed = 0;
 
-	constructor(url: string, fetchFn?: SeekFetch) {
+	constructor(url: string, fetchFn?: SeekFetch, options?: { deadlineMs?: number }) {
 		this.url = url;
 		this.fetchFn =
 			fetchFn ??
 			((requestUrl, init) => fetch(requestUrl, init as RequestInit) as Promise<Response>);
+		this.deadlineMs = options?.deadlineMs;
 	}
 
 	get pending(): boolean {
@@ -194,7 +233,10 @@ export class SeekController {
 	/**
 	 * Seek to `[start, end]`. Aborts any in-flight seek, then issues a
 	 * `Range` request. Throws fetch and invalid-response errors, including
-	 * `AbortError` when this seek is itself superseded.
+	 * `AbortError` when this seek is itself superseded. When a
+	 * constructor-injected `deadlineMs` elapses before the seek settles,
+	 * the request signal is aborted, any unread body is released, and the
+	 * seek rejects with a `TimeoutError` DOMException.
 	 */
 	async seek(start: number, end?: number): Promise<SeekResult> {
 		// Validate before any state change or fetch so non-finite
@@ -208,18 +250,45 @@ export class SeekController {
 		const requestedStart = Number(/^bytes=(\d+)-/.exec(rangeHeader)?.[1]);
 		const requestedEndText = /-(\d+)$/.exec(rangeHeader)?.[1];
 		const requestedEnd = requestedEndText === undefined ? undefined : Number(requestedEndText);
+		// Deadline: abort only this seek's signal. A superseded seek already
+		// has an aborted signal, so the timer yields to the supersede path
+		// and never converts an AbortError into a TimeoutError.
+		let timeoutId: ReturnType<typeof setTimeout> | undefined;
+		let timedOut = false;
+		const deadlineMs = this.deadlineMs;
+		if (deadlineMs !== undefined && Number.isFinite(deadlineMs)) {
+			timeoutId = setTimeout(
+				() => {
+					if (controller.signal.aborted) return;
+					timedOut = true;
+					controller.abort();
+				},
+				Math.max(0, deadlineMs)
+			);
+		}
+		const throwSupersededOrTimeout = (): never => {
+			if (timedOut) throw timeoutError();
+			throw abortError();
+		};
 		try {
-			const response = await this.fetchFn(this.url, {
-				headers: { range: rangeHeader },
-				signal: controller.signal
-			});
+			let response: Response;
+			try {
+				response = await this.fetchFn(this.url, {
+					headers: { range: rangeHeader },
+					signal: controller.signal
+				});
+			} catch (error) {
+				if (timedOut) throw timeoutError();
+				throw error;
+			}
 			if (controller.signal.aborted) {
 				await releaseRejectedBody(response);
-				throw new DOMException('Seek superseded by a newer seek', 'AbortError');
+				throwSupersededOrTimeout();
 			}
 
 			if (response.status !== 206 && response.status !== 200) {
 				await releaseRejectedBody(response);
+				if (timedOut) throw timeoutError();
 				throw new Error(`Range request failed with HTTP ${response.status}`);
 			}
 			if (response.status === 206) {
@@ -231,18 +300,31 @@ export class SeekController {
 					(requestedEnd === undefined && range.end !== range.total - 1)
 				) {
 					await releaseRejectedBody(response);
+					if (timedOut) throw timeoutError();
 					throw new Error('Range response does not satisfy the requested byte range');
 				}
 				const expectedLength = range.end - range.start + 1;
-				const bytes =
-					requestedEnd === undefined
-						? await this.readOpenEnded206(response, expectedLength, controller.signal)
-						: await readFiniteBody(response, expectedLength, controller.signal, {
-								exact: true,
-								shortMessage: 'Range response body length does not match Content-Range',
-								lengthMessage: 'Range response body length does not match Content-Range'
-							});
-				if (controller.signal.aborted) throw abortError();
+				let bytes: Uint8Array;
+				try {
+					bytes =
+						requestedEnd === undefined
+							? await raceSignalAbort(
+									this.readOpenEnded206(response, expectedLength, controller.signal),
+									response,
+									controller.signal
+								)
+							: await readFiniteBody(response, expectedLength, controller.signal, {
+									exact: true,
+									shortMessage: 'Range response body length does not match Content-Range',
+									lengthMessage: 'Range response body length does not match Content-Range'
+								});
+				} catch (error) {
+					// Finite-range reads cancel their reader and release the
+					// lock in their finally; surface the timeout identity.
+					if (timedOut) throw timeoutError();
+					throw error;
+				}
+				if (controller.signal.aborted) throwSupersededOrTimeout();
 				this.completed += 1;
 				return { status: response.status, bytes, generation };
 			}
@@ -251,25 +333,39 @@ export class SeekController {
 			// starting at byte zero. Slice only when the caller asked for an end.
 			if (requestedStart !== 0) {
 				await releaseRejectedBody(response);
+				if (timedOut) throw timeoutError();
 				throw new Error('Server ignored a non-zero byte range');
 			}
 			if (requestedEnd !== undefined) {
 				// Finite prefix: collect only the requested bytes and cancel
 				// the unused remainder instead of buffering the whole body.
-				const bytes = await readFiniteBody(response, requestedEnd + 1, controller.signal, {
-					exact: false,
-					shortMessage: 'Full response is shorter than the requested byte range',
-					lengthMessage: 'Full response is shorter than the requested byte range'
-				});
-				if (controller.signal.aborted) throw abortError();
+				let bytes: Uint8Array;
+				try {
+					bytes = await readFiniteBody(response, requestedEnd + 1, controller.signal, {
+						exact: false,
+						shortMessage: 'Full response is shorter than the requested byte range',
+						lengthMessage: 'Full response is shorter than the requested byte range'
+					});
+				} catch (error) {
+					if (timedOut) throw timeoutError();
+					throw error;
+				}
+				if (controller.signal.aborted) throwSupersededOrTimeout();
 				this.completed += 1;
 				return { status: response.status, bytes, generation };
 			}
-			const buffer = await response.arrayBuffer();
-			if (controller.signal.aborted) throw abortError();
+			let buffer: ArrayBuffer;
+			try {
+				buffer = await raceSignalAbort(response.arrayBuffer(), response, controller.signal);
+			} catch (error) {
+				if (timedOut) throw timeoutError();
+				throw error;
+			}
+			if (controller.signal.aborted) throwSupersededOrTimeout();
 			this.completed += 1;
 			return { status: response.status, bytes: new Uint8Array(buffer), generation };
 		} finally {
+			if (timeoutId !== undefined) clearTimeout(timeoutId);
 			if (this.current === controller) {
 				this.current = null;
 			}
