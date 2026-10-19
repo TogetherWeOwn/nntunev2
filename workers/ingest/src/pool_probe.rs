@@ -38,8 +38,9 @@ pub enum PoolProbeError {
     /// Pool busy or quarantined, provider down or not loaded, or the call
     /// itself failed: redeliver after `after_secs`.
     Retry { after_secs: u32 },
-    /// The pool refused the envelope (`400`/`413`) or answered something
-    /// that does not match it. A contract bug: retrying cannot help.
+    /// The pool refused the envelope (`400`/`413`), refused this caller
+    /// (`401`/`403`), or answered something that does not match it. A
+    /// contract bug or an auth refusal: retrying cannot help.
     Rejected,
 }
 
@@ -83,6 +84,12 @@ pub fn classify_reply(
             Ok(outcome)
         }
         400 | 413 => Err(PoolProbeError::Rejected),
+        // The pool wire never emits 401/403 today (auth collapses to 502
+        // `provider_error`), but a refusal of this caller can never be
+        // fixed by redelivery: fail closed so a future auth refusal does
+        // not burn all 5 job attempts plus DLQ. Any `Retry-After` is
+        // deliberately unread here.
+        401 | 403 => Err(PoolProbeError::Rejected),
         _ => Err(PoolProbeError::Retry {
             after_secs: retry_after
                 .and_then(|v| v.trim().parse::<u32>().ok())
@@ -191,7 +198,8 @@ pub async fn call_pool_probe_with_deadline(
     // source pin (cap precedes classify) keeps holding. A non-200 verdict
     // never reads the body: the classifier ignores the body for non-200, so
     // an oversized, non-UTF-8, or unreadable body keeps exactly its
-    // status-based verdict (400/413 stay Rejected; a 503 keeps Retry-After).
+    // status-based verdict (400/401/403/413 stay Rejected; a 503 keeps
+    // Retry-After).
     let reply_cap = MAX_PROBE_REPLY_BYTES;
     if status != 200 {
         return classify_reply(req, status, retry_after.as_deref(), "");
