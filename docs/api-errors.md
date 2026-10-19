@@ -12,7 +12,10 @@ which carries `{code: rate_limited, message, retryable: true}` with
 vault write is refused by the account-deletion fence (the `vault_put` save and
 the test-connection lease path); a misconfigured session service additionally
 surfaces as the `internal_error` envelope via `session_error_response`
-(`workers/api/src/handlers.rs`). Other API and stream mappings are pinned
+(`workers/api/src/handlers.rs`). The API's auth-throttle 429 likewise
+carries `{code: rate_limited, message, retryable: true}` with `Retry-After`
+(`throttled` in `workers/api/src/handlers.rs`, rendering
+`ApiError::rate_limited`). Other API and stream mappings are pinned
 for future HTTP wiring, not emitted by reachable HTTP paths here. Clients can
 handle auth, validation, billing limits, and upstream failures without
 per-worker special cases.
@@ -223,7 +226,8 @@ code, status, or retryable drift):
   `workers/ingest/src/lib.rs`, and the search-throttle 429 envelope in
   `workers/ingest/src/rate_limit.rs`.
 - API and stream wiring scope: `authenticate_privileged`,
-  `account_deleting_response`, and `session_error_response` in
+  `account_deleting_response`, `throttled` (the auth-throttle 429
+  envelope), and `session_error_response` in
   `workers/api/src/handlers.rs`; stream serves pre-wiring bodies from
   `workers/stream/src/routes.rs` while `PlayError::api_error` in
   `workers/stream/src/play.rs` is covered by tests only.

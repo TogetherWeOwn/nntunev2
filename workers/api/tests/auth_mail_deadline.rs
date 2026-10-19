@@ -684,7 +684,7 @@ fn ip_budget_still_denies_before_mail_and_recovers_after_its_window() {
         );
         assert_eq!(
             serde_json::from_str::<Value>(&response.body).unwrap(),
-            json!({"error": "rate_limited"})
+            json!({"code": "rate_limited", "message": "too many requests", "retryable": true})
         );
         assert_public(&h.start(false, email, IP, NOW + 29 * 61), false);
     }
