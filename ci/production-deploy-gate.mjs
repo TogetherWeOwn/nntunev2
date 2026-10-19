@@ -255,16 +255,19 @@ export async function requireStagingEvidence(
 // dotted keys (production.vars.X under [env]), and inline tables
 // (env = { production = { vars = ... } }, including multi-line) all
 // resolve to the same key paths before the beyond-`name` check. Basic-string
-// escapes (\uXXXX, \UXXXXXXXX, short escapes) in quoted keys decode before
-// comparison, and triple-quoted multi-line strings are skipped whole, so
-// neither spelling can hide a production table. Reads
+// escapes (\uXXXX, \UXXXXXXXX, \xHH, short escapes) in quoted keys decode
+// before comparison, and triple-quoted multi-line strings are skipped whole,
+// so neither spelling can hide a production table. \xHH is TOML 1.1: python
+// tomllib (1.0) rejects it, but wrangler's parser decodes it, so the gate
+// must too. Reads
 // names only; values are never read or printed.
 // Split a TOML key (table-header inner text or dotted key) into segments,
 // honouring single/double-quoted segments and whitespace around dots, so
 // ["env"."production"."vars"], [ env . production . vars ], and dotted or
 // inline spellings compare equal to their plain form. Unquoted whitespace
 // is insignificant; escape sequences inside basic strings decode per TOML
-// (a "\U00000070roduction" segment compares equal to "production").
+// (a "\U00000070roduction" or "\x70roduction" segment compares equal to
+// "production").
 // Anything after a backslash that is not a TOML escape is invalid TOML
 // (wrangler rejects it), so it stays literal.
 const TOML_SHORT_ESCAPES = {
@@ -279,8 +282,8 @@ const TOML_SHORT_ESCAPES = {
 
 function decodeTomlKeyEscape(text, i) {
   const next = text[i + 1];
-  if (next === "u" || next === "U") {
-    const width = next === "u" ? 4 : 8;
+  if (next === "u" || next === "U" || next === "x") {
+    const width = next === "u" ? 4 : next === "U" ? 8 : 2;
     const hex = text.slice(i + 2, i + 2 + width);
     if (hex.length === width && /^[0-9a-fA-F]+$/.test(hex)) {
       try {
@@ -334,6 +337,33 @@ function splitTomlKey(text) {
   return segments;
 }
 
+// Locate a multi-line string closer per TOML: in basic strings a backslash
+// escapes the next character, so `\"` never forms a delimiter; literal
+// strings have no escapes. Returns -1 when the string continues past this
+// line.
+function findTripleCloser(line, triple, from) {
+  if (triple[0] === "'") return line.indexOf(triple, from);
+  for (let i = from; i + 2 < line.length; i += 1) {
+    if (line[i] === "\\") {
+      i += 1;
+      continue;
+    }
+    if (line[i] === '"' && line[i + 1] === '"' && line[i + 2] === '"') return i;
+  }
+  return -1;
+}
+
+// A multi-line string may end with one or two content quotes immediately
+// inside its closing delimiter (the TOML spec's `"""foo""""` form), so the
+// closer search lands on the first triple of a 4-5 quote run: consume the
+// whole run, otherwise the stray quote flips single-quote state and a
+// following production table is swallowed instead of refused.
+function consumeTripleCloser(line, closer, quote) {
+  let end = closer + 3;
+  while (end < closer + 5 && end < line.length && line[end] === quote) end += 1;
+  return end;
+}
+
 // Strip a `#` comment and drop triple-quoted multi-line strings (values are
 // opaque to the shape check). `state.long` persists across lines: it holds
 // the `"""`/`'''` opener when a previous line left a string unclosed, so an
@@ -343,10 +373,10 @@ function stripTomlComment(line, state) {
   let i = 0;
   if (state.long) {
     const opener = state.long;
-    const end = line.indexOf(opener);
+    const end = findTripleCloser(line, opener, 0);
     if (end === -1) return "";
     state.long = null;
-    i = end + opener.length;
+    i = consumeTripleCloser(line, end, opener[0]);
   }
   let quote = null;
   while (i < line.length) {
@@ -366,12 +396,12 @@ function stripTomlComment(line, state) {
     if (ch === '"' || ch === "'") {
       const triple = ch.repeat(3);
       if (line.startsWith(triple, i)) {
-        const closer = line.indexOf(triple, i + 3);
+        const closer = findTripleCloser(line, triple, i + 3);
         if (closer === -1) {
           state.long = triple;
           break;
         }
-        i = closer + 3;
+        i = consumeTripleCloser(line, closer, ch);
         continue;
       }
       quote = ch;
