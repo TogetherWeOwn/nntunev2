@@ -577,6 +577,49 @@ mod capped_reply_read_tests {
     }
 
     #[test]
+    fn fast_path_arms_keep_bodyless_empty_and_materialised_boundary() {
+        let helper = capped_reader_helper();
+        // A bodyless reply (e.g. a bare 200 from `/health`) must keep
+        // reading as empty — the value the previous whole-body `bytes()`
+        // path returned for it. Turning this arm into an error would 502
+        // the `container_port` health poll (502 in `container_json`,
+        // 503 at the front door).
+        assert!(
+            helper.contains("ResponseBody::Empty => return Ok(Vec::new())"),
+            "read_response_capped must keep reading a bodyless reply as empty: \
+             `ResponseBody::Empty => return Ok(Vec::new())`"
+        );
+        // An already-materialised reply over the cap must be rejected
+        // before cloning: the boundary is strict `>`, so exactly-at-cap
+        // stays admissible, and neutering the guard would forward an
+        // over-cap body verbatim (the front door has no second size gate).
+        assert!(
+            helper.contains("ResponseBody::Body(body) if body.len() > cap => return Err(())"),
+            "read_response_capped must reject an over-cap materialised body \
+             before cloning: `ResponseBody::Body(body) if body.len() > cap => return Err(())`"
+        );
+        // The admissible materialised body must still be returned as-is.
+        assert!(
+            helper.contains("ResponseBody::Body(body) => return Ok(body.clone())"),
+            "read_response_capped must return an in-cap materialised body: \
+             `ResponseBody::Body(body) => return Ok(body.clone())`"
+        );
+        // Order matters: the guarded arm must precede the plain clone arm,
+        // otherwise the guard is dead code and every materialised body is
+        // cloned without a cap check.
+        let guarded = helper
+            .find("ResponseBody::Body(body) if body.len() > cap")
+            .expect("guarded Body arm must exist");
+        let plain = helper
+            .find("ResponseBody::Body(body) => return Ok(body.clone())")
+            .expect("plain Body clone arm must exist");
+        assert!(
+            guarded < plain,
+            "the over-cap guard must precede the plain clone arm"
+        );
+    }
+
+    #[test]
     fn accepts_chunk_landing_exactly_at_cap() {
         let mut body = vec![0u8; MAX_RESULT_BYTES - 3];
         assert!(push_chunk_capped(&mut body, &[1, 2, 3], MAX_RESULT_BYTES));
