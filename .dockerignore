@@ -13,6 +13,7 @@ crates/*/
 !crates/nntune-config/
 !crates/nntune-core/
 !crates/nntune-logging/
+!crates/nntune-ssrf-guard/
 !crates/nntune-test-nntp/
 workers/*
 !workers/stream/
