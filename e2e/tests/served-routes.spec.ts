@@ -4,7 +4,7 @@ import { API } from '../helpers/contract.js';
 import { accessHeaders, assertNoAccessWall, stagingBaseUrl } from '../helpers/access.js';
 import { apiGet, applyAccountToPage } from '../helpers/accounts.js';
 
-// Served web routes with no staging spec (TOG-31922): the app serves these
+// Served web routes with no staging spec: the app serves these
 // routes on every deploy, but no staging assertion proved they survived
 // promotion — the manifest was pinned only by the `apps/web` unit spec
 // (`pwa-manifest.spec.ts`, not staging evidence), and `/pricing` appeared
