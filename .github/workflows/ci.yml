@@ -534,7 +534,11 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:18-bookworm
+        # Digest-pinned to the same postgres:18-bookworm as the shipped
+        # image (containers/mb-import/Dockerfile:3) so the integration
+        # suite never tests against a newer Postgres than the image
+        # ships; re-pin both deliberately.
+        image: postgres:18-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
         ports:
