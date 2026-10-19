@@ -55,6 +55,21 @@ export const API = {
   // bytes pinned by `helpers/demo-audio.ts`). A renamed path fails the
   // demo-audio specs with this key named.
   demoAudio: '/api/demo/audio',
+  // Synthetic no-auth artwork placeholder (`apps/web/src/routes/api/demo/artwork/+server.ts`,
+  // served with long-lived immutable caching). A renamed path fails the
+  // served-routes spec with this key named.
+  demoArtwork: '/api/demo/artwork',
+  // PWA install manifest (`apps/web/src/routes/manifest.webmanifest/+server.ts`,
+  // served as `application/manifest+json`). A renamed path fails the
+  // served-routes spec with this key named.
+  manifest: '/manifest.webmanifest',
+  // Legacy provider-setup entry point (`apps/web/src/routes/onboarding/provider/+server.ts`,
+  // 307-redirects to `/onboarding/byop`). A renamed path fails the
+  // served-routes spec with this key named.
+  onboardingProvider: '/onboarding/provider',
+  // Public plans page (`apps/web/src/routes/pricing/+page.svelte`).
+  // A renamed path fails the served-routes spec with this key named.
+  pricing: '/pricing',
 } as const;
 
 /** HTTP statuses the API uses to signal plan-limit enforcement. */
