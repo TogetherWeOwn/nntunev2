@@ -101,12 +101,17 @@ complete served set; they intentionally carry no `api_error` registry entry
 (`registry_matches_docs_api_errors`, `docs_registry_matches_all_worker_registries`)
 ignore this table by design: its rows use bare codes, never the `| \``
 envelope-registry prefix. Ingest consumes them through `classify_reply` in
-`workers/ingest/src/pool_probe.rs:69-92` (400/413 are `Rejected`, everything
-else is `Retry` with clamped `Retry-After`) and `classify_body_reply` in
-`workers/ingest/src/pool_body.rs:83-111` (exact `{"error":"missing"}` 404 is
-`Missing` data, 413 is `TooLarge` data, 400 is `Rejected`, everything else is
-`Retry`). `retryable` below mirrors that ingest verdict: 4xx request/data
-answers are `false`, redeliverable 5xx answers are `true`.
+`workers/ingest/src/pool_probe.rs:69-99` (400/413/401/403 are `Rejected`,
+everything else is `Retry` with clamped `Retry-After`; a 401/403's
+`Retry-After` is deliberately unread) and `classify_body_reply` in
+`workers/ingest/src/pool_body.rs:83-118` (exact `{"error":"missing"}` 404 is
+`Missing` data, 413 is `TooLarge` data, 400/401/403 are `Rejected`,
+everything else is `Retry` with clamped `Retry-After`, including non-exact
+404s at the default delay). The pool wire never emits 401/403 today (auth
+collapses to 502 `provider_error`); the 401/403 arms fail closed so a
+future auth refusal does not burn all 5 job attempts plus DLQ. `retryable`
+below mirrors that ingest verdict: 4xx request/data answers are `false`,
+redeliverable 5xx answers are `true`.
 
 | code | HTTP status | retryable | owning lane | meaning | served by |
 | --- | --- | --- | --- | --- | --- |
@@ -273,9 +278,9 @@ code, status, or retryable drift):
   in `workers/stream/src/probe.rs:98-161`, `BodyReply::from` in
   `workers/stream/src/body.rs:73-101`, route constants and decisions in
   `workers/stream/src/routes.rs:29-107`, pool fetch in
-  `workers/stream/src/runtime.rs:79-200`, consumed by `classify_reply` in
-  `workers/ingest/src/pool_probe.rs:69-92` and `classify_body_reply` in
-  `workers/ingest/src/pool_body.rs:83-111`, pinned by
+  `workers/stream/src/runtime.rs:79-206`, consumed by `classify_reply` in
+  `workers/ingest/src/pool_probe.rs:69-99` and `classify_body_reply` in
+  `workers/ingest/src/pool_body.rs:83-118`, pinned by
   `workers/stream/tests/pool_error_wire_codes.rs` (served set ⊆ pool table).
 
 ## Adding a code
