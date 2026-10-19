@@ -33,9 +33,10 @@ Stage refs (`FROM base`, where `base` was named by an earlier
 (the empty base image takes no tag and cannot be pinned). The match
 is a regex, not literal digests, so Dependabot digest-refresh PRs
 stay green. The scan mirrors the production parser (moby/buildkit):
-one file-start BOM is stripped, backslash-continued lines join before
-parsing, and heredoc bodies on RUN/COPY/ADD are content -- a
-`FROM ... AS x` inside one registers no stage.
+one file-start BOM is stripped, physical lines split LF-only,
+backslash-continued lines join before parsing, and heredoc bodies on
+RUN/COPY/ADD -- attached (`<<EOF`) and spaced (`<< EOF`) openers alike
+-- are content: a `FROM ... AS x` inside one registers no stage.
 
 Stdlib only (no PyYAML: the two fields are extracted with a line scan).
 Exit 0 = covered; 1 = drift found; 2 = unusable input.
@@ -68,9 +69,11 @@ DIRECTORY_RE = re.compile(
 )
 # Leading whitespace matches BuildKit's strings.TrimSpace (Unicode-wide: a
 # pasted NBSP before FROM is still an instruction), while the FROM-to-ref
-# separator stays ASCII space/tab like BuildKit's reWhitespace tokenizer
-# (splitlines already removed \v \f \r, so [ \t] is exact per line).
-FROM_RE = re.compile(r"^\s*FROM[ \t]+(.+)$", re.IGNORECASE)
+# separator is BuildKit's reWhitespace (space/tab/VT/FF/CR). NBSP and U+2028
+# are not separators, so `FROM\xa0debian` is one token, not an instruction.
+# Physical lines split LF-only (see _physical_lines), so \v \f and lone \r
+# can appear mid-line but never split one.
+FROM_RE = re.compile(r"^\s*FROM[\t\v\f\r ]+(.+)$", re.IGNORECASE)
 # Trailing `AS <stage>` on a FROM line (Docker keywords case-insensitive).
 FROM_STAGE_RE = re.compile(
     r"[ \t]+AS[ \t]+([A-Za-z][A-Za-z0-9_.-]*)[ \t]*(#.*)?$", re.IGNORECASE
@@ -91,12 +94,22 @@ _COMMENT_RE = re.compile(r"^\s*#")
 # heredocDirectives plus ONBUILD-wrapped ones). `<<` anywhere else --
 # another instruction, a comment, a JSON-form arg -- opens nothing.
 _HEREDOC_INSTR_RE = re.compile(
-    r"^\s*(?:ONBUILD[ \t]+)?(?:RUN|COPY|ADD)[ \t]+(.*)$", re.IGNORECASE
+    r"^\s*(?:ONBUILD[\t\v\f\r ]+)?(?:RUN|COPY|ADD)[\t\v\f\r ]+(.*)$",
+    re.IGNORECASE,
 )
-# Heredoc opener word (BuildKit reHeredoc, minus its vacuous `\s*`: a shell
-# word never holds unquoted whitespace). Attached form only: `<< EOF`
-# opens nothing, `<<<` never matches, `\d<<` is an fd redirect.
+# Heredoc opener word (BuildKit reHeredoc, minus its vacuous `\s*`: within
+# one shell word the gap holds no unquoted whitespace -- spaced openers are
+# glued by the lexer and handled via _HEREDOC_LONE_RE plus the gap test).
+# Attached form only here: `<<<` never matches, `\d<<` is an fd redirect.
 _HEREDOC_WORD_RE = re.compile(r"^\d*<<(-?)([^<]+)$")
+# Lone `<<`/`N<<` word: opens with the NEXT word as delimiter when the gap is
+# tab/CR/space (BuildKit processPossibleHeredoc glue), so `<< EOF`, `<<\tEOF`
+# and `2<< EOF` open. NBSP/VT/FF/U+2028 gaps split the word instead
+# (`<<\xa0EOF` opens nothing), and `<<- EOF` opens nothing: the dash blocks
+# the glue, the space splits, and `<<-` alone has an empty rest, which
+# heredocFromMatch rejects.
+_HEREDOC_LONE_RE = re.compile(r"^\d*<<$")
+_HEREDOC_GAP_RE = re.compile(r"[ \t\r]+")
 
 
 def _strip_continuation(line):
@@ -114,11 +127,16 @@ def _shell_words(text):
 
     Mirrors BuildKit's heredoc word scan (shlex with RawQuotes+RawEscapes,
     whose word splitter is unicode.IsSpace): quote characters stay in the
-    word, so a quoted `<<` never matches the opener pattern, and an
-    opener's delimiter never spans words.
+    word, so a quoted `<<` never matches the opener pattern.
+
+    Returns `(word, start, end)` spans (`text[start:end]` holds the word) so
+    callers can inspect the gap between consecutive words: an attached
+    opener's delimiter never spans words, while a spaced opener's gap decides
+    whether the lexer glues the delimiter on (see _HEREDOC_GAP_RE).
     """
     words = []
     current = []
+    start = 0
     quote = None
     started = False
     i = 0
@@ -130,26 +148,32 @@ def _shell_words(text):
                 quote = None
             i += 1
         elif ch in ("'", '"'):
+            if not started:
+                start = i
             quote = ch
             current.append(ch)
             started = True
             i += 1
         elif ch == "\\" and i + 1 < len(text):
+            if not started:
+                start = i
             current.append(text[i:i + 2])
             started = True
             i += 2
         elif ch.isspace():
             if started:
-                words.append("".join(current))
+                words.append(("".join(current), start, i))
                 current = []
                 started = False
             i += 1
         else:
+            if not started:
+                start = i
             current.append(ch)
             started = True
             i += 1
     if started:
-        words.append("".join(current))
+        words.append(("".join(current), start, len(text)))
     return words
 
 
@@ -193,20 +217,25 @@ def _heredoc_openers(logical):
 
     Only RUN/COPY/ADD (optionally ONBUILD-wrapped) qualify, after leading
     `--...` builder flags; JSON-form args (`RUN [".."]`) carry no heredocs.
+    Attached openers (`<<EOF`, `<<-EOF`, `2<<EOF`) match per word; a lone
+    `<<`/`N<<` word opens with the next word as delimiter when the gap is
+    tab/CR/space like BuildKit's lexer glue (`<< EOF` opens; NBSP-gapped
+    and `<<- EOF` forms do not).
     """
     match = _HEREDOC_INSTR_RE.match(logical)
     if not match:
         return []
-    words = _shell_words(match.group(1))
+    argline = match.group(1)
+    spans = _shell_words(argline)
     index = 0
-    while index < len(words) and words[index].startswith("--"):
+    while index < len(spans) and spans[index][0].startswith("--"):
         index += 1
-        if words[index - 1] == "--":
+        if spans[index - 1][0] == "--":
             break
-    words = words[index:]
-    if not words:
+    spans = spans[index:]
+    if not spans:
         return []
-    remainder = " ".join(words)
+    remainder = " ".join(word for word, _, _ in spans)
     if "<<" not in remainder:
         return []
     if remainder.startswith("["):
@@ -221,13 +250,32 @@ def _heredoc_openers(logical):
             if isinstance(parsed, list):
                 return []
     openers = []
-    for word in words:
+    k = 0
+    while k < len(spans):
+        word, _, end = spans[k]
         opener = _HEREDOC_WORD_RE.match(word)
-        if not opener:
+        if opener:
+            name = _heredoc_delimiter(opener.group(2))
+            if name is not None:
+                openers.append((name, opener.group(1) == "-"))
+            k += 1
             continue
-        name = _heredoc_delimiter(opener.group(2))
-        if name is not None:
-            openers.append((name, opener.group(1) == "-"))
+        if (
+            _HEREDOC_LONE_RE.match(word)
+            and k + 1 < len(spans)
+            and _HEREDOC_GAP_RE.fullmatch(argline[end:spans[k + 1][1]])
+        ):
+            # In BuildKit the gap glues both words into one, so the delimiter
+            # word is consumed even when it opens nothing: a `<` in it voids
+            # the whole word (reHeredoc's rest is `[^<]*`).
+            delimiter = spans[k + 1][0]
+            k += 2
+            if "<" not in delimiter:
+                name = _heredoc_delimiter(delimiter)
+                if name is not None:
+                    openers.append((name, False))
+            continue
+        k += 1
     return openers
 
 
@@ -409,6 +457,21 @@ def walk_dockerfiles(root):
     return sorted(found)
 
 
+def _physical_lines(text):
+    """Split Dockerfile text into physical lines exactly like BuildKit.
+
+    BuildKit's scanLines splits only on `\\n` and trimNewline strips trailing
+    `\\r`s; `str.splitlines()` also breaks on \\v \\f \\x1c-\\x1e \\x85
+    \\u2028 \\u2029, which would expose a fake `FROM ... AS x` hidden after
+    one of those inside a comment. A single trailing empty chunk (the file
+    ends with `\\n`) is dropped, matching splitlines.
+    """
+    lines = [chunk.rstrip("\r") for chunk in text.split("\n")]
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
 def unpinned_from_refs(text):
     """`(lineno, ref)` for each external FROM lacking a tag+digest pin.
 
@@ -420,9 +483,12 @@ def unpinned_from_refs(text):
     unparseable ref is reported, not skipped: the gate stays fail-closed.
 
     The scan mirrors the production parser (moby/buildkit): one file-start
-    BOM is stripped, leading whitespace is Unicode-wide, `\\`-continued
-    lines join before parsing, and heredoc bodies on RUN/COPY/ADD are
-    content -- neither stages nor pins are read inside them.
+    BOM is stripped, physical lines split LF-only, leading whitespace is
+    Unicode-wide, separators are ASCII reWhitespace, `\\`-continued lines
+    join before parsing, and heredoc bodies on RUN/COPY/ADD are content --
+    neither stages nor pins are read inside them. Spaced `<< EOF` openers
+    glue like the shell lexer; NBSP-gapped and `<<- `-spaced forms open
+    nothing.
     """
     if text.startswith("\ufeff"):
         # BuildKit strips one file-start BOM before parsing (discardBOM).
@@ -430,7 +496,7 @@ def unpinned_from_refs(text):
     problems = []
     stages = set()
     pending = []  # (delimiter, chomp_tabs) heredocs awaiting terminators
-    physical = text.splitlines()
+    physical = _physical_lines(text)
     i = 0
     while i < len(physical):
         if pending:
@@ -551,7 +617,10 @@ def check_coverage(root):
     # so Dependabot emits digest-refresh PRs (see the dependabot.yml header).
     for dockerfile in walk_dockerfiles(root):
         try:
-            docker_text = (root / dockerfile).read_text(encoding="utf-8")
+            # Bytes, not read_text: universal-newline translation would turn
+            # a lone \r into \n before the LF-only split (BuildKit reads raw
+            # bytes; the BOM survives utf-8 decoding for the scan to strip).
+            docker_text = (root / dockerfile).read_bytes().decode("utf-8")
         except OSError as exc:
             return None, f"{dockerfile} unreadable: {exc}"
         for lineno, ref in unpinned_from_refs(docker_text):

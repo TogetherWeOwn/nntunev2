@@ -203,6 +203,32 @@ class DependabotCoverageTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_cr_hidden_fake_stage_fails(self):
+        # A lone CR inside a comment must not expose a fake stage end to
+        # end: the Dockerfile is read as bytes (no newline translation) and
+        # split LF-only, so the later floating FROM is still flagged.
+        tmp = make_fixture()
+        try:
+            dockerfile = tmp / "containers" / "repair" / "Dockerfile"
+            pinned = dockerfile.read_text(encoding="utf-8")
+            dockerfile.write_bytes(
+                (
+                    "# note\r"
+                    + pinned.replace("\n", " AS base\n", 1)
+                    + "FROM base\n"
+                ).encode("utf-8")
+            )
+            drift, err = check_coverage(tmp)
+            self.assertIsNone(err, err)
+            self.assertTrue(
+                any("Dockerfile" in d and "'base'" in d for d in drift),
+                drift,
+            )
+            code, out, _ = run_check(tmp)
+            self.assertEqual(code, 1, out)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_stage_from_ref_is_allowed(self):
         # Internal stage refs (`FROM base`) carry no digest by design.
         tmp = make_fixture()
@@ -347,6 +373,55 @@ class DependabotCoverageTests(unittest.TestCase):
             ),
             [(4, "base")],
         )
+        # Spaced openers glue like BuildKit's lexer (gap of space/tab/CR):
+        # `<< EOF`, tab, multi-space, quoted-delimiter and fd-prefixed forms
+        # all open, so the body FROM..AS must not exempt the later FROM.
+        for opener in ["<< EOF", "<<\tEOF", "<<   EOF", '<< "EOF"',
+                       "2<< EOF"]:
+            with self.subTest(opener=opener):
+                self.assertEqual(
+                    unpinned_from_refs(
+                        f"RUN {opener}\n"
+                        f"FROM img:tag@sha256:{digest} AS base\n"
+                        "EOF\n"
+                        "FROM base\n"
+                    ),
+                    [(4, "base")],
+                )
+        # But an NBSP-gapped `<<` opens nothing (the lexer glue accepts
+        # tab/CR/space only), and `<<- EOF` opens nothing (the dash blocks
+        # the glue, the space splits, `<<-` alone has an empty rest): the
+        # body FROM..AS is then a real instruction registering a real stage.
+        self.assertEqual(
+            unpinned_from_refs(
+                "RUN <<\xa0EOF\n"
+                f"FROM img:tag@sha256:{digest} AS base\n"
+                "EOF\n"
+                "FROM base\n"
+            ),
+            [],
+        )
+        self.assertEqual(
+            unpinned_from_refs(
+                "RUN <<- EOF\n"
+                f"FROM img:tag@sha256:{digest} AS base\n"
+                "EOF\n"
+                "FROM base\n"
+            ),
+            [],
+        )
+        # A `<` in the spaced delimiter word voids the whole glued word
+        # (reHeredoc's rest is `[^<]*`), and the word is consumed: neither a
+        # stage nor a second opener comes out of `<< <<EOF`.
+        self.assertEqual(
+            unpinned_from_refs(
+                "RUN << <<EOF\n"
+                f"FROM img:tag@sha256:{digest} AS base\n"
+                "EOF\n"
+                "FROM base\n"
+            ),
+            [],
+        )
         # Terminators match exactly: trailing content keeps the heredoc open.
         self.assertEqual(
             unpinned_from_refs(
@@ -391,7 +466,7 @@ class DependabotCoverageTests(unittest.TestCase):
             ),
             [],
         )
-        # `<<` outside RUN/COPY/ADD (or quoted, spaced, or JSON-form) opens
+        # `<<` outside RUN/COPY/ADD (or quoted, or JSON-form) opens
         # nothing: later FROMs are still scanned.
         self.assertEqual(
             unpinned_from_refs('RUN ["echo", "<<EOF"]\nFROM debian\n'),
@@ -403,10 +478,6 @@ class DependabotCoverageTests(unittest.TestCase):
         )
         self.assertEqual(
             unpinned_from_refs("RUN echo '<<EOF'\nFROM debian\n"),
-            [(2, "debian")],
-        )
-        self.assertEqual(
-            unpinned_from_refs("RUN << EOF\nFROM debian\n"),
             [(2, "debian")],
         )
         self.assertEqual(
@@ -447,6 +518,50 @@ class DependabotCoverageTests(unittest.TestCase):
                 "FROM base\n"
             ),
             [(5, "base")],
+        )
+        # Physical lines split LF-only like BuildKit's scanLines: \v \f \r
+        # U+001C U+0085 U+2028 U+2029 never split a line, so a fake FROM..AS
+        # after one of those inside a comment stays hidden in the comment and
+        # the later floating FROM is still flagged.
+        for sep in ["\v", "\f", "\r", "\x1c", "\x85", "\u2028", "\u2029"]:
+            with self.subTest(sep=repr(sep)):
+                self.assertEqual(
+                    unpinned_from_refs(
+                        f"# note{sep}FROM img:tag@sha256:{digest} AS debian\n"
+                        "FROM debian\n"
+                    ),
+                    [(2, "debian")],
+                )
+        # ...while a Unicode-space-split opener stays on its RUN line: the
+        # heredoc opens and the later floating FROM is flagged.
+        for sep in ["\u2028", "\x85", "\v", "\f"]:
+            with self.subTest(sep=repr(sep)):
+                self.assertEqual(
+                    unpinned_from_refs(
+                        f"RUN echo{sep}<<EOF\n"
+                        f"FROM img:tag@sha256:{digest} AS base\n"
+                        "EOF\n"
+                        "FROM base\n"
+                    ),
+                    [(4, "base")],
+                )
+        # Instruction separators are BuildKit reWhitespace (space/tab/VT/FF/
+        # CR): an unpinned FROM after any of those is still an instruction,
+        # and a RUN heredoc after one still opens.
+        for sep in ["\v", "\f", "\r"]:
+            with self.subTest(sep=repr(sep)):
+                self.assertEqual(
+                    unpinned_from_refs(f"FROM{sep}img:tag\n"),
+                    [(1, "img:tag")],
+                )
+        self.assertEqual(
+            unpinned_from_refs(
+                "RUN\v<<EOF\n"
+                f"FROM img:tag@sha256:{digest} AS base\n"
+                "EOF\n"
+                "FROM base\n"
+            ),
+            [(4, "base")],
         )
 
     def test_new_standalone_crate_without_entry_fails(self):
