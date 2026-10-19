@@ -110,7 +110,7 @@ mod tests {
     /// failure cannot be induced portably in a unit test, so this source
     /// shape is the regression protection for the fail-closed claim
     /// (complementing the paired `randomness_fail_closed_nine` suite,
-    /// owned by TOG-31633, which scans the six caller files).
+    /// which scans the six caller files).
     #[test]
     fn helper_propagates_randomness_failure() {
         // Slice ONLY the pre-test production source first: the banned
