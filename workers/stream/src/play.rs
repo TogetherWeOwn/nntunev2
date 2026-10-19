@@ -43,6 +43,8 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use nntune_core::pinned_transport::TransportRejection;
+
 use crate::api_error::ApiError;
 use crate::cache::{CacheServe, CacheStatus, ContentCache, MultipartUpload};
 use crate::grant::{self, GrantError};
@@ -92,6 +94,15 @@ pub enum PlayError {
     /// the desynchronized connection is dropped. Carries the segment id for
     /// debugging; it never reaches the wire (see [`PlayError::api_error`]).
     ArticleTooLarge(String),
+    /// The pinned NNTP endpoint policy refused the play's provider dial on
+    /// an off-allowlist port before any TCP dial. A local policy verdict,
+    /// not provider ill-health — the provider was never contacted — so the
+    /// pool is never quarantined and no provider-error meter fires (like
+    /// [`PlayError::ProviderAuthExpired`); redialing the same endpoint can
+    /// never succeed, so the envelope is non-retryable. Carries the
+    /// offending port (addressing only); it never reaches the wire (see
+    /// [`PlayError::api_error`]).
+    TransportPortNotAllowed(u16),
     /// A segment could not be decoded (corrupt or mis-placed yEnc part).
     Decode(YencError),
 }
@@ -112,6 +123,7 @@ impl PlayError {
             PlayError::ArticleMissing(_) => ApiError::not_found(),
             PlayError::InvalidSegment(_) => ApiError::invalid_request(),
             PlayError::Upstream(_) => ApiError::upstream_unavailable(),
+            PlayError::TransportPortNotAllowed(_) => ApiError::transport_port_not_allowed(),
             PlayError::ArticleTooLarge(_) | PlayError::Decode(_) => ApiError::corrupt_content(),
         }
     }
@@ -131,7 +143,8 @@ impl PlayError {
     /// HTTP status for the Worker shim: an open breaker is `503` (with
     /// [`PlayError::retry_after_header`]); an exhausted pool is `429`
     /// (`rate_limited`); auth, range, missing-article, and invalid-segment
-    /// failures use their shared-envelope statuses; provider failures are `502`.
+    /// failures use their shared-envelope statuses; provider failures and
+    /// the endpoint-policy port refusal are `502`.
     pub fn http_status(&self) -> u16 {
         match self {
             PlayError::Unauthorized(_) | PlayError::ProviderAuthExpired => 401,
@@ -141,7 +154,10 @@ impl PlayError {
             PlayError::PoolQuarantined { .. } => 503,
             PlayError::ArticleMissing(_) => 404,
             PlayError::InvalidSegment(_) => 400,
-            PlayError::Upstream(_) | PlayError::ArticleTooLarge(_) | PlayError::Decode(_) => 502,
+            PlayError::Upstream(_)
+            | PlayError::ArticleTooLarge(_)
+            | PlayError::TransportPortNotAllowed(_)
+            | PlayError::Decode(_) => 502,
         }
     }
 
@@ -158,10 +174,15 @@ impl PlayError {
         }
     }
 
-    /// Stable worker/API code for stale provider credentials.
+    /// Stable worker/API code for stale provider credentials and the
+    /// endpoint-policy port refusal (which reuses the pinned-transport code
+    /// by construction, so the play path and the pool path cannot drift).
     pub fn code(&self) -> &'static str {
         match self {
             PlayError::ProviderAuthExpired => PROVIDER_AUTH_EXPIRED_CODE,
+            PlayError::TransportPortNotAllowed(port) => {
+                TransportRejection::PortNotAllowed(*port).code()
+            }
             _ => "request_failed",
         }
     }
@@ -896,6 +917,10 @@ fn nntp_failure(e: NntpError, message_id: &str) -> Failure {
         // it is dropped, but the provider is healthy so the pool is never
         // quarantined (unlike a true provider failure).
         NntpError::ArticleTooLarge => Conn::Drop,
+        // Endpoint-policy refusal: no dial happened, so there is nothing to
+        // park warm; the provider was never contacted, so the pool is never
+        // quarantined and no provider-error meter fires.
+        NntpError::PortNotAllowed(_) => Conn::Drop,
         ref other if other.is_provider_failure() => Conn::ProviderFailure,
         _ => Conn::KeepWarm,
     };
@@ -903,6 +928,7 @@ fn nntp_failure(e: NntpError, message_id: &str) -> Failure {
         NntpError::NoSuchArticle(_) => PlayError::ArticleMissing(message_id.to_string()),
         NntpError::AuthExpired => PlayError::ProviderAuthExpired,
         NntpError::ArticleTooLarge => PlayError::ArticleTooLarge(message_id.to_string()),
+        NntpError::PortNotAllowed(port) => PlayError::TransportPortNotAllowed(port),
         NntpError::InvalidMessageId(id) => PlayError::InvalidSegment(id),
         other => PlayError::Upstream(format!("{other:?}")),
     };
@@ -911,7 +937,8 @@ fn nntp_failure(e: NntpError, message_id: &str) -> Failure {
 
 /// Return the lease (and the connection, if still healthy) and account for
 /// the failure: only provider-level trouble quarantines the pool; a stale
-/// auth session is dropped without either. Terminal content failures
+/// auth session is dropped without either. Local port-policy refusals do not
+/// record provider recovery. Terminal content failures
 /// (`ArticleMissing`/`Decode`) emit their meter-only signal here — one event
 /// per terminal play — on every `settle` path (first-segment `play()` errors
 /// and later-segment `finalize` errors alike). Background fill work never
@@ -949,7 +976,9 @@ fn settle(
                 crate::pool::CIRCUIT_OPEN_MS,
             ));
         }
-    } else {
+    } else if !matches!(err, PlayError::TransportPortNotAllowed(_)) {
+        // A port-policy refusal never reached the provider, so it must not
+        // settle a half-open probe as successful provider contact.
         // One oversize article refuses only its fetch: signal it without
         // touching the breaker (no `ProviderError`, no quarantine entry).
         if matches!(err, PlayError::ArticleTooLarge(_)) {
@@ -1386,8 +1415,11 @@ impl PlayStream {
             let conn = live.failed.as_ref().map(|(_, conn)| *conn);
             if conn == Some(Conn::ProviderFailure) {
                 pool.record_provider_error_for(live.lease.id);
-            } else if conn.is_some() {
-                pool.record_non_provider_result_for(live.lease.id);
+            } else if let Some((err, _)) = &live.failed {
+                // Local port refusals prove nothing about provider recovery.
+                if !matches!(err, PlayError::TransportPortNotAllowed(_)) {
+                    pool.record_non_provider_result_for(live.lease.id);
+                }
             } else if live.last_success_epoch == Some(pool.provider_error_epoch()) {
                 // Clean abort: the first segment served fine and no later
                 // fetch failed, so clear a closed-state failure streak unless
@@ -1789,6 +1821,87 @@ mod tests {
         assert_eq!(pool.circuit_state(), CircuitState::Closed);
         pool.try_acquire(Lane::Playback)
             .expect("a provider response closes the breaker");
+    }
+
+    #[test]
+    fn port_refusal_leaves_a_half_open_probe_unresolved() {
+        use crate::pool::{CircuitState, CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_OPEN_MS};
+
+        let mut pool = StreamPool::new(2);
+        for _ in 0..CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        pool.advance(CIRCUIT_OPEN_MS);
+        let probe = pool.try_acquire(Lane::Playback).expect("probe admitted");
+        let epoch = pool.provider_error_epoch();
+        let mut meter = crate::meter::MemoryMeter::default();
+
+        let error = settle(
+            &mut pool,
+            &mut meter,
+            probe,
+            None,
+            nntp_failure(NntpError::PortNotAllowed(8119), "segment"),
+            "u",
+            "track",
+        );
+
+        assert_eq!(error, PlayError::TransportPortNotAllowed(8119));
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+        assert_eq!(pool.provider_error_epoch(), epoch);
+        assert_eq!(pool.in_use(), 0);
+        assert_eq!(pool.idle(), 0);
+        assert!(
+            meter.events.is_empty(),
+            "a refusal is not provider recovery"
+        );
+        let next = pool.try_acquire(Lane::Playback).expect("probe slot freed");
+        assert!(pool.try_acquire(Lane::Playback).is_err());
+        pool.release(next, None);
+    }
+
+    #[test]
+    fn aborted_port_refusal_leaves_a_half_open_probe_unresolved() {
+        use crate::pool::{CircuitState, CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_OPEN_MS};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider");
+        let address = listener.local_addr().expect("provider address");
+        let (_, article) = test_article();
+        let server = serve_article(listener, article, false);
+        let secret = b"s";
+        let token = grant::issue("u", "track", GRANT_EXP_UNIX, secret);
+        let segments = vec!["segment@synthetic.test".to_string()];
+        let mut pool = StreamPool::new(2);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+        let input = test_input(&token, "track", address, &segments);
+        let mut response = play(&mut pool, &mut cache, &mut meter, secret, &input)
+            .expect("initial segment fetched");
+        // A successful first segment settles its probe immediately. Give the
+        // abort fixture a fresh, unresolved probe after that provider contact.
+        for _ in 0..CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        pool.advance(CIRCUIT_OPEN_MS);
+        let epoch = pool.provider_error_epoch();
+        let probe = pool.try_acquire(Lane::Playback).expect("probe admitted");
+        let Some(Source::Live(live)) = response.stream.source.as_mut() else {
+            panic!("cache miss must hold a live lease");
+        };
+        let previous = std::mem::replace(&mut live.lease, probe);
+        pool.release(previous, None);
+        live.failed = Some(nntp_failure(NntpError::PortNotAllowed(8119), "segment"));
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+        response.stream.abort(&mut pool);
+
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+        assert_eq!(pool.provider_error_epoch(), epoch);
+        assert_eq!(pool.in_use(), 0);
+        assert_eq!(pool.idle(), 0);
+        let next = pool.try_acquire(Lane::Playback).expect("probe slot freed");
+        assert!(pool.try_acquire(Lane::Playback).is_err());
+        pool.release(next, None);
+        server.join().expect("provider thread");
     }
 
     #[test]
