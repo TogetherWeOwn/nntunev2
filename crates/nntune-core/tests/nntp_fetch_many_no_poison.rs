@@ -75,3 +75,46 @@ async fn fetch_many_validation_failure_leaves_connection_usable() {
     // The connection must still be usable: a plain valid STAT succeeds.
     assert_eq!(client.stat("one@x").await.unwrap(), 42);
 }
+
+#[tokio::test]
+async fn validation_diagnostic_does_not_echo_argument() {
+    // Pins the generic no-echo diagnostic: an NZB-supplied id carrying ESC
+    // and CRLF must be refused without reaching logs verbatim via Display
+    // or Debug (log forgery / terminal escape). Would go green under an
+    // echo mutant like `format!("bad NNTP argument: {arg}")`.
+    let readable = "200 ready\r\n200 mode ok\r\n";
+    let config = NntpConfig {
+        host: "nntp.example.com".into(),
+        tls: false,
+        timeout: std::time::Duration::from_secs(5),
+        ..NntpConfig::default()
+    };
+    let mut client = NntpClient::connect(Recorder::new(readable), &config)
+        .await
+        .expect("handshake");
+    let sentinel = "evil\x1b[31mINJECTED\r\nSECOND@x";
+    let err = client
+        .stat(sentinel)
+        .await
+        .expect_err("escaping id must be refused");
+    match &err {
+        Error::Malformed(msg) => assert_eq!(
+            msg, "NNTP command argument contains a delimiter-escaping character",
+            "diagnostic must stay generic, got {msg:?}"
+        ),
+        other => panic!("expected Malformed, got {other:?}"),
+    }
+    let rendered = format!("{err} {err:?}");
+    assert!(
+        !rendered.contains("INJECTED"),
+        "diagnostic echoed caller input: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains('\x1b'),
+        "diagnostic carried ESC verbatim: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains(sentinel),
+        "diagnostic echoed full argument: {rendered:?}"
+    );
+}
