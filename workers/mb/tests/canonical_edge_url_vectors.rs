@@ -21,9 +21,10 @@
 //! see it. Output, two cases:
 //!
 //! - A SERVED SEARCH — path exactly `/v1/mb/search` AND the query decodes
-//!   (form-urlencoded query parsing, first value per key — mirroring the
-//!   `HashMap` collection in `search_route`, where duplicates collapse
-//!   unpredictably and are out of contract) to parameters the handler
+//!   (form-urlencoded query parsing; a repeated decoded served key
+//!   (`q`/`type`/`limit`/`offset` — decoded, so `%71=` counts as `q` — is
+//!   UNSERVED and returns the input unchanged, while duplicate unknown
+//!   keys stay allowed and are dropped) to parameters the handler
 //!   would serve as a cacheable search:
 //!   - `q` present, non-empty once trimmed, 2..=100 chars (chars, not
 //!     bytes, counted on the trimmed value — the handler's rule), no
@@ -279,6 +280,15 @@ fn unserved_requests_are_returned_unchanged() {
         // serve a real page's body for the wrong offset (and vice versa).
         "https://mb.test/v1/mb/search?q=blue+monday&type=artist&offset=1001".to_string(),
         "https://mb.test/v1/mb/search?q=blue+monday&type=artist&offset=4294967295".to_string(),
+        // A repeated decoded served key is UNSERVED: the handler's last-wins
+        // `HashMap` would serve a different body than the canonical key's
+        // first-wins spelling, so the edge must not canonicalize. Encoded
+        // spellings (`%71=` = `q`) count since keys compare after decoding.
+        "https://mb.test/v1/mb/search?q=ab&type=artist&q=zzzz".to_string(),
+        "https://mb.test/v1/mb/search?q=ab&%71=zz&type=artist".to_string(),
+        "https://mb.test/v1/mb/search?q=ab&type=artist&offset=0&offset=1001".to_string(),
+        "https://mb.test/v1/mb/search?q=ab&type=artist&limit=10&limit=0".to_string(),
+        "https://mb.test/v1/mb/search?q=ab&type=artist&type=release".to_string(),
     ];
     for raw in &unchanged {
         let expected = raw.clone();
