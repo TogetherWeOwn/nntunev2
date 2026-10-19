@@ -181,11 +181,23 @@ test('a new limit response while the modal stays open establishes a fresh deadli
 	});
 
 	await page.goto('/account/billing');
+	// Settle the initial load BEFORE freezing the clock. `goto` resolves at
+	// the load event, which fires before SvelteKit hydration completes the
+	// loader's subscription/usage fetches — and `pauseAt` jumps 5 minutes
+	// forward, firing due timers. Pausing while the subscription is in flight
+	// trips its 30s request deadline and aborts it, sometimes before route
+	// interception, which leaves the subscriptionCalls counter off by one so
+	// the retried fetch gets a 500 instead of the 429 and no modal ever
+	// mounts (twice on CI; #541's waitForResponse could not catch it). The
+	// Retry control renders only from loader data, which exists after both
+	// fetches settled and their deadline timers cleared — so its visibility
+	// proves nothing is in flight when the clock jumps.
 	// Freeze after the initial load and before either billing action. The
 	// portal response stays held until the modal is open; jumping the clock
 	// while that request is in flight expires its deadline, and a late 429
 	// must not publish a paywall. Both actions therefore run at this frozen
 	// instant, inside the request deadline.
+	await expect(page.getByRole('button', { name: 'Retry', exact: true })).toBeVisible();
 	await pauseClock(page);
 	await page.getByRole('button', { name: 'Manage billing', exact: true }).click();
 	await portalSeen;
@@ -193,11 +205,16 @@ test('a new limit response while the modal stays open establishes a fresh deadli
 	// The Retry control re-runs the loader (subscription, then usage). Wait
 	// for the loader's subscription round-trip — the response that must
 	// precede the modal — instead of racing the 5s dialog assertion against
-	// a cold invalidateAll round-trip on a loaded runner (seen once on CI:
-	// the dialog never mounted within the default timeout).
+	// a cold invalidateAll round-trip on a loaded runner.
 	const retriedSubscription = page.waitForResponse('**/v1/me/subscription', { timeout: 15_000 });
 	await page.getByRole('button', { name: 'Retry', exact: true }).click();
-	await retriedSubscription;
+	const retriedResponse = await retriedSubscription;
+	// Tripwire for the root-cause invariant: the retried fetch must see the
+	// 429. A 500 here means the initial load's subscription never reached
+	// its route (the pauseAt-abort race the settle-wait above closes), in
+	// which case no modal would ever mount and the dialog assertion below
+	// would time out opaquely.
+	expect(retriedResponse.status()).toBe(429);
 	const dialog = page.getByRole('dialog');
 	await expect(dialog).toBeVisible();
 	await expect(page.getByTestId('paywall-countdown')).toHaveText(/Try again in \d+ seconds\./);
