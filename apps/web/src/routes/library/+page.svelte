@@ -62,6 +62,7 @@
 	// The player block renders off the queue's current track; the <audio>
 	// src stays an empty placeholder until the streaming slice wires it.
 	const currentTrack = $derived(queueCurrentTrack(queue));
+	const queuedIds = $derived(new Set(queue.tracks.map((track) => track.id)));
 
 	function displayTitle(track: LibraryItem): string {
 		const title = track.title;
@@ -141,6 +142,7 @@
 						<button
 							type="button"
 							class="nt-library-row"
+							aria-pressed={queuedIds.has(track.id)}
 							onclick={() => selectTrack(track.id)}
 						>
 							{displayTitle(track)}
