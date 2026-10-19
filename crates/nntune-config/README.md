@@ -64,8 +64,8 @@ Implementation: [src/lib.rs](src/lib.rs).
   exit 0, so it must track the accepted version) and the `schema_version`
   literals in `test_duplicate_schema_version_with_valid_final_value_rejected`
   in `../../.github/scripts/test_config_duplicate_members.py:170-178`
-  (currently matching `"schema_version": 1` at `:168` and injecting version 2
-  at `:169`, so both sides must shift on a bump or the duplicate-input case
+  (currently matching `"schema_version": 1` at `:172` and injecting version 2
+  at `:173`, so both sides must shift on a bump or the duplicate-input case
   stops triggering). Adding a key follows the procedure in the
   [config dir README](../../config/README.md) (schema file, both env
   fixtures, and the `KEYS` table together).
