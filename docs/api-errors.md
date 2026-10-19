@@ -86,6 +86,7 @@ emit the code.
 | `rate_limited` | 429 | true | api, ingest, stream | Too many requests or no pool connection free right now; retry after backoff. |
 | `internal_error` | 500 | true | api, ingest, mb, stream | Generic unexpected failure, including the unknown-code fallback. |
 | `corrupt_content` | 502 | false | stream | A fetched segment could not be decoded; retrying the same bytes will not help. |
+| `transport_port_not_allowed` | 502 | false | stream | The pinned NNTP endpoint policy refused the provider dial (off-allowlist port) before any connection; redialing the same endpoint can never succeed. |
 | `upstream_unavailable` | 502 | true | ingest, stream | A provider/indexer connection failed or an upstream request failed. |
 | `upstream_circuit_open` | 503 | true | stream | The user's provider pool circuit breaker is open; retry after the supplied `Retry-After` delay. |
 | `service_unavailable` | 503 | true | api, ingest | A backing binding (queue, payload store) is unavailable; nothing was accepted. |

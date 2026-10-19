@@ -43,6 +43,8 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use nntune_core::pinned_transport::TransportRejection;
+
 use crate::api_error::ApiError;
 use crate::cache::{CacheServe, CacheStatus, ContentCache, MultipartUpload};
 use crate::grant::{self, GrantError};
@@ -92,6 +94,15 @@ pub enum PlayError {
     /// the desynchronized connection is dropped. Carries the segment id for
     /// debugging; it never reaches the wire (see [`PlayError::api_error`]).
     ArticleTooLarge(String),
+    /// The pinned NNTP endpoint policy refused the play's provider dial on
+    /// an off-allowlist port before any TCP dial. A local policy verdict,
+    /// not provider ill-health — the provider was never contacted — so the
+    /// pool is never quarantined and no provider-error meter fires (like
+    /// [`PlayError::ProviderAuthExpired`); redialing the same endpoint can
+    /// never succeed, so the envelope is non-retryable. Carries the
+    /// offending port (addressing only); it never reaches the wire (see
+    /// [`PlayError::api_error`]).
+    TransportPortNotAllowed(u16),
     /// A segment could not be decoded (corrupt or mis-placed yEnc part).
     Decode(YencError),
 }
@@ -112,6 +123,7 @@ impl PlayError {
             PlayError::ArticleMissing(_) => ApiError::not_found(),
             PlayError::InvalidSegment(_) => ApiError::invalid_request(),
             PlayError::Upstream(_) => ApiError::upstream_unavailable(),
+            PlayError::TransportPortNotAllowed(_) => ApiError::transport_port_not_allowed(),
             PlayError::ArticleTooLarge(_) | PlayError::Decode(_) => ApiError::corrupt_content(),
         }
     }
@@ -131,7 +143,8 @@ impl PlayError {
     /// HTTP status for the Worker shim: an open breaker is `503` (with
     /// [`PlayError::retry_after_header`]); an exhausted pool is `429`
     /// (`rate_limited`); auth, range, missing-article, and invalid-segment
-    /// failures use their shared-envelope statuses; provider failures are `502`.
+    /// failures use their shared-envelope statuses; provider failures and
+    /// the endpoint-policy port refusal are `502`.
     pub fn http_status(&self) -> u16 {
         match self {
             PlayError::Unauthorized(_) | PlayError::ProviderAuthExpired => 401,
@@ -141,7 +154,10 @@ impl PlayError {
             PlayError::PoolQuarantined { .. } => 503,
             PlayError::ArticleMissing(_) => 404,
             PlayError::InvalidSegment(_) => 400,
-            PlayError::Upstream(_) | PlayError::ArticleTooLarge(_) | PlayError::Decode(_) => 502,
+            PlayError::Upstream(_)
+            | PlayError::ArticleTooLarge(_)
+            | PlayError::TransportPortNotAllowed(_)
+            | PlayError::Decode(_) => 502,
         }
     }
 
@@ -158,10 +174,15 @@ impl PlayError {
         }
     }
 
-    /// Stable worker/API code for stale provider credentials.
+    /// Stable worker/API code for stale provider credentials and the
+    /// endpoint-policy port refusal (which reuses the pinned-transport code
+    /// by construction, so the play path and the pool path cannot drift).
     pub fn code(&self) -> &'static str {
         match self {
             PlayError::ProviderAuthExpired => PROVIDER_AUTH_EXPIRED_CODE,
+            PlayError::TransportPortNotAllowed(port) => {
+                TransportRejection::PortNotAllowed(*port).code()
+            }
             _ => "request_failed",
         }
     }
@@ -896,6 +917,10 @@ fn nntp_failure(e: NntpError, message_id: &str) -> Failure {
         // it is dropped, but the provider is healthy so the pool is never
         // quarantined (unlike a true provider failure).
         NntpError::ArticleTooLarge => Conn::Drop,
+        // Endpoint-policy refusal: no dial happened, so there is nothing to
+        // park warm; the provider was never contacted, so the pool is never
+        // quarantined and no provider-error meter fires.
+        NntpError::PortNotAllowed(_) => Conn::Drop,
         ref other if other.is_provider_failure() => Conn::ProviderFailure,
         _ => Conn::KeepWarm,
     };
@@ -903,6 +928,7 @@ fn nntp_failure(e: NntpError, message_id: &str) -> Failure {
         NntpError::NoSuchArticle(_) => PlayError::ArticleMissing(message_id.to_string()),
         NntpError::AuthExpired => PlayError::ProviderAuthExpired,
         NntpError::ArticleTooLarge => PlayError::ArticleTooLarge(message_id.to_string()),
+        NntpError::PortNotAllowed(port) => PlayError::TransportPortNotAllowed(port),
         NntpError::InvalidMessageId(id) => PlayError::InvalidSegment(id),
         other => PlayError::Upstream(format!("{other:?}")),
     };
