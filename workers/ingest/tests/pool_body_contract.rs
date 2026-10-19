@@ -89,6 +89,38 @@ fn busy_and_provider_replies_retry_with_the_hint() {
 }
 
 #[test]
+fn unauthorized_and_forbidden_replies_are_rejected_not_retried() {
+    // A 401/403 is the pool refusing this caller, not a transient
+    // provider state: redelivering the same message would only repeat
+    // the refusal, so the outcome is `Rejected` whatever body or
+    // retry hint accompanies the status.
+    for (status, retry_after, body) in [
+        (401, None, br#"{"error":"unauthorized"}"#.as_slice()),
+        (403, None, br#"{"error":"forbidden"}"#.as_slice()),
+        (401, None, b"".as_slice()),
+        (403, None, b"forbidden".as_slice()),
+        (401, Some("17"), br#"{"error":"unauthorized"}"#.as_slice()),
+        (403, Some("17"), br#"{"error":"forbidden"}"#.as_slice()),
+    ] {
+        assert_eq!(
+            classify_body_reply(status, retry_after, body),
+            Err(PoolBodyError::Rejected),
+            "status {status} must be rejected, not retried"
+        );
+    }
+}
+
+#[test]
+fn provider_unavailable_reply_with_hint_still_retries_with_the_hint() {
+    // Control: the 401/403 rejection must not swallow transient
+    // unavailability — a 503 still retries, honouring its hint.
+    assert_eq!(
+        classify_body_reply(503, Some("19"), br#"{"error":"provider_unavailable"}"#),
+        Err(PoolBodyError::Retry { after_secs: 19 })
+    );
+}
+
+#[test]
 fn refused_and_oversize_replies_are_rejected() {
     assert_eq!(
         classify_body_reply(400, None, br#"{"error":"bad_request"}"#),
