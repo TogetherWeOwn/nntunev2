@@ -207,8 +207,11 @@ fn stage_input_put_request_shape_is_unchanged() {
         "the PUT must still target the per-job/per-round input path"
     );
     assert!(
-        body.contains("container .fetch_request(request)"),
-        "the PUT must still go through the Container fetcher"
+        body.contains(".fetch_request(request)"),
+        "the PUT must still go through the Container fetcher (the call may \
+         be wrapped, e.g. in a deadline race's Box::pin, so only the \
+         `.fetch_request(request)` suffix is pinned, not the exact \
+         `container .fetch_request(request)` spacing)"
     );
 }
 

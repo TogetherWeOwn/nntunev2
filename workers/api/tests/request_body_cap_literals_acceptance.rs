@@ -50,7 +50,8 @@ use nntune_api::{auth, handlers, session, vault};
 const CAP: usize = 32_768;
 
 const REJECT_STATUS: u16 = 400;
-const REJECT_BODY: &str = r#"{"error":"invalid request"}"#;
+const REJECT_BODY: &str =
+    r#"{"code":"invalid_request","message":"invalid request","retryable":false}"#;
 
 fn block_on<F: Future>(future: F) -> F::Output {
     let waker = std::task::Waker::noop();

@@ -78,7 +78,7 @@ emit the code.
 | `not_found` | 404 | false | api, ingest, mb, stream | No such (visible) resource. Invisible private rows are 404, never 403. |
 | `conflict` | 409 | false | ingest | The request is valid but the resource already exists in a state that refuses it (for example re-posting an ingest job whose previous run failed inside its replay window). Nothing was accepted; inspect the existing resource instead of retrying unchanged. |
 | `account_deleting` | 409 | false | api | The caller's account is being deleted (`users.deleting_at` is set), so the write is fenced off (ADR 0002 rule 3). Nothing was written; do not retry unchanged. |
-| `invalid_request` | 400 | false | ingest, mb, stream | Malformed body, bad identifier shape, or out-of-range parameter. |
+| `invalid_request` | 400 | false | api, ingest, mb, stream | Malformed body, bad identifier shape, or out-of-range parameter. |
 | `MB_SEARCH_EMPTY_QUERY` | 400 | false | mb | Empty or whitespace-only `q` on `GET /v1/mb/search`; returned before `type` validation without touching the mirror or the cache. Send a non-empty `q` of at least 2 chars. |
 | `payload_too_large` | 413 | false | ingest | Body, NZB, or element counts exceed the intake caps. |
 | `range_not_satisfiable` | 416 | false | stream | The requested byte range lies outside the track. |
