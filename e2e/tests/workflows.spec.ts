@@ -1275,9 +1275,12 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     expect(section).toContain('binding_manifest.toml');
     expect(section).toContain('HYPERDRIVE_ID_STAGING must equal the api staging inventory id');
     // Workers Logs persistence: the generated staging config must enable
-    // observability, otherwise the deployed Worker persists no records and
-    // the build_sha log evidence can never be read back.
-    expect(section).toMatch(/\[env\.staging\.observability\]\n\s+enabled = true\n/);
+    // observability at full head sampling, otherwise the deployed Worker
+    // persists no records (or a sampled subset) and the build_sha log
+    // evidence can never be read back reliably.
+    expect(section).toMatch(
+      /\[env\.staging\.observability\]\n\s+enabled = true\n\s+head_sampling_rate = 1\n/,
+    );
   };
 
   const assertDeployGuard = (body: string) => {
@@ -1363,6 +1366,12 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     // Api lane whose generated config drops the observability block: the
     // Worker deploys with observability=null and persists no Workers Logs.
     const noObservabilityMutant = jobsBody.replace('enabled = true', 'enabled = false');
+    // Api lane whose generated config zeroes head sampling: the Worker keeps
+    // the block but persists no records, so the build_sha evidence is unread.
+    const zeroSamplingMutant = jobsBody.replace('head_sampling_rate = 1', 'head_sampling_rate = 0');
+    // Api lane whose generated config drops the sampling line: the default
+    // rate applies instead of the evidenced full sampling.
+    const droppedSamplingMutant = jobsBody.replace('          head_sampling_rate = 1\n', '');
 
     for (const mutant of [
       workerMutant,
@@ -1378,6 +1387,8 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       sharedGroupMutant,
       noParityMutant,
       noObservabilityMutant,
+      zeroSamplingMutant,
+      droppedSamplingMutant,
     ]) {
       expect(() => assertDeployGuard(mutant), 'mutant must violate the deploy guard').toThrow();
     }
@@ -1399,6 +1410,8 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     expect(() => assertStagingApi(sharedGroupMutant)).toThrow();
     expect(() => assertStagingApi(noParityMutant)).toThrow();
     expect(() => assertStagingApi(noObservabilityMutant)).toThrow();
+    expect(() => assertStagingApi(zeroSamplingMutant)).toThrow();
+    expect(() => assertStagingApi(droppedSamplingMutant)).toThrow();
   });
 });
 
