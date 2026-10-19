@@ -857,6 +857,19 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn revoke_single_session(&self, id: &str, user_id: &str) -> Result<bool, StoreError> {
+        let client = self.connect().await?;
+        let claim = crate::session::SessionRevokeClaim::Single {
+            session_id: id,
+            user_id,
+        };
+        let rows = client
+            .query(claim.statement(), &[&id, &user_id])
+            .await
+            .map_err(|_| StoreError)?;
+        Ok(rows.len() == 1)
+    }
+
     async fn revoke_all_sessions(&self, user_id: &str) -> Result<(), StoreError> {
         let client = self.connect().await?;
         client

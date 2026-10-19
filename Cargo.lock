@@ -952,6 +952,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nntune-ssrf-guard"
+version = "0.1.0"
+
+[[package]]
 name = "nntune-stream"
 version = "0.1.0"
 dependencies = [

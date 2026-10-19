@@ -25,8 +25,9 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
+use nntune_ssrf_guard::ip_is_forbidden;
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Overall DNS resolution timeout per host (ms), including A + AAAA
@@ -197,38 +198,9 @@ fn host_shape_ok(host: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
 }
 
-fn v4_is_forbidden(o: &[u8; 4]) -> bool {
-    let v4 = Ipv4Addr::from(*o);
-    v4.is_loopback()         // 127/8
-        || v4.is_multicast() // 224.0.0.0/4
-        || v4.is_link_local() // 169.254/16
-        || v4.is_private() // 10/8, 172.16/12, 192.168/16
-        || v4.is_broadcast()
-        || v4.is_documentation() // 192.0.2/24, 198.51.100/24, 203.0.113/24
-        || o[0] == 0 // 0.0.0.0/8 ("this network")
-        || (o[0] == 100 && (o[1] & 0xC0) == 64) // 100.64/10 carrier-grade NAT
-        || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 (IETF protocol assignments)
-        || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // 198.18.0.0/15 benchmarking
-        || o[0] >= 240 // 240.0.0.0/4 reserved + 255.255.255.255 broadcast
-}
-
-fn ip_is_forbidden(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4_is_forbidden(&v4.octets()),
-        IpAddr::V6(v6) => {
-            let s = v6.segments();
-            // Only native global unicast (2000::/3). This excludes NAT64,
-            // mapped/translated/compatible IPv4, site-local and discard.
-            // Also reject transition and special-use space inside that range
-            // rather than trusting a translator's embedded IPv4 destination.
-            (s[0] & 0xE000) != 0x2000
-                || s[0] == 0x2002 // 6to4 (2002::/16)
-                || (s[0] == 0x2001 && s[1] < 0x0200) // IETF special-use, incl. Teredo/ORCHID
-                || (s[0] == 0x2001 && s[1] == 0x0DB8) // documentation
-                || (s[0] == 0x3FFF && (s[1] & 0xF000) == 0) // documentation (3fff::/20)
-        }
-    }
-}
+// Address guard is single-owned by `nntune_ssrf_guard::ip_is_forbidden`
+// (imported above); semantics are pinned by that crate plus the shared
+// vector reuse in `tests/security_regressions.rs`. Do not fork it here.
 
 /// Vetted destination for one immediate outbound connection. Do not store
 /// this across requests: validate again at dial/fetch time, connect only to

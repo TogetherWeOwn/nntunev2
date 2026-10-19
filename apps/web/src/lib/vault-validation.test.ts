@@ -188,6 +188,60 @@ describe('validateIndexerUrl', () => {
 		}
 	});
 
+	it('rejects credentials and fragments in the indexer URL', () => {
+		const KEY = 'indexer-key';
+		const MESSAGE = 'Put the API key in the key field, not the URL';
+		for (const url of [
+			'https://user@index.example.com/api',
+			'https://user:pass@index.example.com/api',
+			'https://:pass@index.example.com/api',
+			'https://@index.example.com/api',
+			'https://index.example.com/api#section',
+			'https://index.example.com/api#',
+			'https://index.example.com/api?t=search',
+			'https://index.example.com/api?apikey=secret123',
+			'https://index.example.com/api?'
+		]) {
+			expect(validateIndexerUrl(url, KEY), `url rejected: ${url}`).toBe(MESSAGE);
+		}
+	});
+
+	it('rejects scheme-form and whitespace URLs the fetch builder rejects', () => {
+		const KEY = 'indexer-key';
+		for (const url of [
+			'HTTPS://index.example.com/api',
+			'Https://index.example.com/api',
+			'https:/index.example.com/api',
+			'https:index.example.com/api',
+			'https:///index.example.com/api',
+			'https:\\\\index.example.com/api',
+			'https://index.example.com/a pi',
+			'https://index.example.com/a\tpi',
+			'https://index.example.com/a\u0085pi'
+		]) {
+			expect(validateIndexerUrl(url, KEY), `url rejected: ${url}`).not.toBeNull();
+		}
+		expect(validateIndexerUrl('HTTPS://index.example.com/api', KEY)).toBe(
+			'Indexer URLs must use https.'
+		);
+		expect(validateIndexerUrl('https:///index.example.com/api', KEY)).toBe(
+			'That indexer URL does not look valid.'
+		);
+		expect(validateIndexerUrl('https://index.example.com/a pi', KEY)).toBe(
+			'That indexer URL does not look valid.'
+		);
+	});
+
+	it('accepts plain https URLs with ports and paths', () => {
+		const KEY = 'indexer-key';
+		for (const url of [
+			'https://index.example.com/api',
+			'https://index.example.com:8443/api/v1'
+		]) {
+			expect(validateIndexerUrl(url, KEY), `url accepted: ${url}`).toBeNull();
+		}
+	});
+
 	it('pins the exact indexer diagnostic strings', () => {
 		const URL = 'https://index.example.com/api';
 		const KEY = 'indexer-key';

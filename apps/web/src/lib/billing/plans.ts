@@ -95,6 +95,15 @@ export function formatPricePerMonth(plan: Plan): string {
 	return `$${plan.priceCents / 100}/mo`;
 }
 
+/**
+ * Exposed accessible name for a paid plan's pricing-table button. The name
+ * always carries the plan, so assistive tech can tell the tiers apart even
+ * though the visible label stays a shared "Choose" / "Starting…".
+ */
+export function planButtonName(plan: Plan, pendingPlanId: string | null): string {
+	return pendingPlanId === plan.id ? `Starting ${plan.name}…` : `Choose ${plan.name}`;
+}
+
 /** Stream cap in seconds (plans table stores hours). */
 export function streamCapSeconds(plan: Plan): number {
 	return plan.streamHoursMonth * 3600;

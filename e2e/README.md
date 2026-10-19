@@ -194,7 +194,13 @@ How the suite uses them:
   input, so it cannot mint that evidence by hand.
   Missing `STAGING_BASE_URL` → step-level skip with notice (pre-deploy).
   Both jobs require the Access pair in preflight before activating tests;
-  configured staging never skips for missing credentials. Failure artifacts
+  configured staging never skips for missing credentials. The full journey
+  additionally runs the evidence gate
+  (`e2e/scripts/enforce-journey-evidence.mjs`): a configured run with no
+  junit evidence, zero journeys ran, every journey skipped, more skips than
+  the two documented `test.fixme` legs (player queue order, recording_mbids),
+  any skip outside that allow-list, any failure, or a missing `QA_AUTH_TOKEN`
+  fails the job instead of passing silently. Failure artifacts
   are kept 7 days.
 - `e2e-lint` inside `ci.yml` (part of `ci-ok`) — `npm ci`, Playwright
   chromium install (`--with-deps`), `tsc --noEmit`,
@@ -247,5 +253,7 @@ bounded `signup-path` test annotation — exactly `public-ui-signup` or
 Both staging jobs publish those labels to the run's step summary on every
 configured run (pass or fail), because green runs upload no artifacts and
 the list reporter does not print annotations; the sanitized junit upload
-stays failure-only (7 days). A seam-backed (`api-minted-account`) run
+stays failure-only (7 days). The full journey's evidence gate publishes the
+ran / skipped / failed counts beside those labels on every configured run,
+so a PASS always names how many journeys actually ran. A seam-backed (`api-minted-account`) run
 never counts as proof of the public UI signup.
