@@ -53,6 +53,12 @@ use crate::webauthn;
 pub const MAX_BODY_BYTES: usize = 32 * 1024;
 /// Magic links issuable per email inside the link TTL window.
 pub const MAGIC_LINKS_PER_WINDOW: u64 = 3;
+/// Admitted inline auth-mail send budget (client-visible auth-start contract:
+/// registration and known-user magic-start race the mail send against this
+/// deadline, then follow the ordinary ignored delivery-error path with the
+/// unchanged generic envelope). Drift must be a deliberate slice with README
+/// and caller updates, not a silent edit.
+pub const AUTH_MAIL_SEND_DEADLINE_SECS: u64 = 5;
 // Test-connection budget lives in one place: `vault::TEST_CONNECTION_MAX_ATTEMPTS`
 // per `vault::TEST_CONNECTION_WINDOW_SECS`. No handler-level copy: the two
 // once disagreed (10 vs 5) with both test suites green.
@@ -714,13 +720,38 @@ pub trait Store {
 }
 
 /// Magic-link delivery. The token is passed only to the mailer; it must
-/// never be logged by implementations.
+/// never be logged by implementations. Dropping the returned future must
+/// cancel the underlying I/O, not just stop polling it.
 pub trait Mailer {
     fn send_magic_link(
         &self,
         email: &str,
         token: &str,
     ) -> impl Future<Output = Result<(), StoreError>>;
+}
+
+// Only the admitted send is timed: issuance and staging capture have already
+// completed. A timeout follows the ordinary ignored delivery-error path.
+pub(crate) async fn deliver_mail_with_deadline(
+    send: impl Future<Output = Result<(), StoreError>>,
+) -> Result<(), StoreError> {
+    let duration = std::time::Duration::from_secs(AUTH_MAIL_SEND_DEADLINE_SECS);
+    #[cfg(target_arch = "wasm32")]
+    let deadline = worker::Delay::from(duration);
+    #[cfg(not(target_arch = "wasm32"))]
+    let deadline = futures_timer::Delay::new(duration);
+    let mut deadline = std::pin::pin!(deadline);
+    let mut send = std::pin::pin!(send);
+    std::future::poll_fn(|cx| {
+        // Worker Delay arms on first poll, so poll it before starting I/O.
+        // Expiry wins if both become ready together; there is no late retry.
+        if deadline.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(Err(StoreError));
+        }
+        send.as_mut().poll(cx)
+    })
+    .await
+    // Both futures are dropped here, before the public response is built.
 }
 
 /// Bounded outbound probe for `test connection`. Implementations dial
@@ -735,9 +766,33 @@ pub trait Dialer {
 
 /// Async DNS for handler-time resolution (the sync core guard consumes
 /// the result via a static adapter, so exactly the resolved set is what
-/// gets vetted and dialed).
+/// gets vetted and dialed). The caller bounds the ENTIRE resolution using
+/// `vault::RESOLUTION_TIMEOUT_MS`, separately from the socket budgets.
+/// Implementations must cancel underlying I/O when their future is dropped;
+/// dropping a Rust future alone does not abort a JavaScript fetch/body.
 pub trait AsyncDns {
     fn resolve<'a>(&'a self, host: &'a str) -> Pin<Box<dyn Future<Output = Vec<IpAddr>> + 'a>>;
+}
+
+pub(crate) async fn resolve_bounded(dns: &impl AsyncDns, host: &str) -> Vec<IpAddr> {
+    let duration = std::time::Duration::from_millis(vault::RESOLUTION_TIMEOUT_MS);
+    #[cfg(not(target_arch = "wasm32"))]
+    let deadline = futures_timer::Delay::new(duration);
+    #[cfg(target_arch = "wasm32")]
+    let deadline = worker::Delay::from(duration);
+
+    let mut deadline = std::pin::pin!(deadline);
+    let mut resolution = dns.resolve(host);
+    std::future::poll_fn(|cx| {
+        // Expiry wins even if answers become ready in the same poll. Never
+        // return a partial family: all answers must reach the core SSRF guard.
+        if deadline.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(Vec::new());
+        }
+        resolution.as_mut().poll(cx)
+    })
+    .await
+    // Both losing futures drop before the caller can validate or dial.
 }
 
 struct StaticDns {
@@ -1248,13 +1303,13 @@ where
                     .record_qa_issued_code(email, &token, self.now)
                     .await;
             }
-            let _ = self.mailer.send_magic_link(email, &token).await;
+            let _ = deliver_mail_with_deadline(self.mailer.send_magic_link(email, &token)).await;
         }
     }
 
     async fn resolve_all(&self, host: &str) -> StaticDns {
         StaticDns {
-            addresses: self.dns.resolve(host).await,
+            addresses: resolve_bounded(self.dns, host).await,
         }
     }
 }
@@ -8562,6 +8617,63 @@ mod tests {
         assert_eq!(
             pinned, 10,
             "every body-bearing route (incl. the invite variant) is pinned"
+        );
+    }
+
+    #[test]
+    fn auth_mail_send_deadline_is_five_seconds_both_directions() {
+        // Deadline-value pin: the README promises at most five seconds, but the
+        // acceptance suite only bounds it by a 30s watchdog, so 100ms (mail
+        // never delivers) and 12s (documented bound drifts) both stayed green.
+        // Pin the literal and the elapsed behavior here, in builder-owned unit
+        // code — the acceptance file is untouched.
+        assert_eq!(
+            AUTH_MAIL_SEND_DEADLINE_SECS, 5,
+            "auth-mail send deadline must stay exactly 5s; a new budget needs \
+             README + caller updates plus this pin"
+        );
+
+        fn drive<F: Future>(mut future: F) -> F::Output {
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            // SAFETY: test-only poll loop; the future is stack-owned and never
+            // moved after pinning.
+            let mut future = unsafe { std::pin::Pin::new_unchecked(&mut future) };
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+                    return output;
+                }
+                assert!(
+                    std::time::Instant::now() < until,
+                    "mail deadline helper still pending past its test ceiling"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        // Permanently pending send must settle at ~5s, not immediately and not
+        // at the watchdog: catches both 100ms and 12s drift.
+        let started = std::time::Instant::now();
+        let outcome = drive(deliver_mail_with_deadline(std::future::pending()));
+        assert!(outcome.is_err(), "pending mail must time out, not succeed");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_secs(4),
+            "pending send finished in {elapsed:?}; the 5s deadline must actually wait"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "pending send took {elapsed:?}; the documented at-most-5s bound must hold"
+        );
+
+        // Fast sends must not wait for the deadline.
+        let started = std::time::Instant::now();
+        let outcome = drive(deliver_mail_with_deadline(async { Ok(()) }));
+        assert!(outcome.is_ok(), "fast success must pass through");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "fast send must not wait for the deadline"
         );
     }
 }

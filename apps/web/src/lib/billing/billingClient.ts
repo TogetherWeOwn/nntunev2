@@ -16,6 +16,7 @@
  */
 
 import { paywallFromResponse, type PaywallModel } from './planLimit.js';
+import { isJsonBodyTooLarge, readCappedJson } from '../api/cappedJson.js';
 import { parseErrorBody } from '../api/errors.js';
 import type { UsageSnapshot } from './usage';
 
@@ -252,10 +253,20 @@ async function requestJson<T>(
 		if (!res.ok) {
 			let body: unknown = null;
 			try {
-				body = await Promise.race([res.json(), deadline]);
-			} catch {
+				// Time bounds the read; the byte cap bounds how much is
+				// buffered before parsing. Both apply to error bodies.
+				body = await Promise.race([readCappedJson(res), deadline]);
+			} catch (error) {
 				// Expiry is an outage, not a signed-out or paywall response.
 				if (timedOut) throw timeoutError();
+				// An over-cap error body is never parsed: the generic status
+				// fallback applies, never retryable, with no paywall model
+				// emitted.
+				if (isJsonBodyTooLarge(error)) {
+					const parsed = parseErrorBody(null, res.status);
+					const hint = parsed.message ? `: ${parsed.message}` : '';
+					throw new BillingApiError(res.status, label, hint, parsed.code, false, null);
+				}
 				/* non-JSON error body: use status-based defaults */
 			}
 			const parsed = parseErrorBody(body, res.status);
@@ -267,9 +278,18 @@ async function requestJson<T>(
 			throw new BillingApiError(res.status, label, hint, parsed.code, parsed.retryable, paywall);
 		}
 		try {
-			return { data: (await Promise.race([res.json(), deadline])) as T, status: res.status };
+			// Time bounds the read; the byte cap bounds how much is buffered.
+			return { data: (await Promise.race([readCappedJson(res), deadline])) as T, status: res.status };
 		} catch (error) {
 			if (timedOut) throw timeoutError();
+			// An over-cap 2xx never parses: surface the typed error, never a bare
+			// SyntaxError, never retryable, never a paywall, and never leaking
+			// body bytes (generic status message).
+			if (isJsonBodyTooLarge(error)) {
+				const parsed = parseErrorBody(null, res.status);
+				const hint = parsed.message ? `: ${parsed.message}` : '';
+				throw new BillingApiError(res.status, label, hint, parsed.code, false, null);
+			}
 			// A 2xx whose body is not JSON is a backend contract violation, not
 			// a usable result: surface the typed error keeping the caller's
 			// label — never a bare SyntaxError, and never a downstream TypeError

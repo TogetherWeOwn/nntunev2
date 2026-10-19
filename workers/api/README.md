@@ -138,6 +138,22 @@ lane skips until they are.
   boundary only and changes no vault, dial, TLS, pool, or credential
   behavior.
 
+### Inline magic-link delivery deadline
+
+After admission and token storage, registration/magic-start wait at most five
+seconds for one mail send. Expiry cancels the send future; the Worker mailer
+attaches an AbortSignal and aborts its fetch when that future is dropped
+(including cancellation of the enclosing request). Fast success and failure
+still return immediately. Delivery errors and timeouts remain ignored, with
+the same generic public envelope and no retry, replacement token, or refund
+of the per-IP/global/per-address admission slots. A timeout does not revoke
+the issued token: abort cannot retract a request already accepted by the
+provider. Synthetic staging-code capture still happens before delivery.
+
+This bounds only the admitted send, not preceding storage operations, and
+is not a delivery guarantee. Native pending-mail tests prove cancellation of
+the Rust future; wasm compilation alone does not prove runtime fetch abort.
+
 ### Staging-only test-code seam (not part of the production surface)
 
 Shipped by the staging-seam build slice — this note records guardrails
@@ -356,8 +372,11 @@ behavior changes here.
 - **Per-play stream ledger (`stream_play_ledger`, not the ADR daily
   `usage_ledger`):** one row per billed play window. Stream plays derive a
   deterministic `play:{user}:{track}:{play}` key (same derivation as the
-  stream worker; 128/512/512 limits, alphabet `[A-Za-z0-9_:-]`); non-play
-  windows use a fresh 128-bit key minted once and reused across retries. The
+  stream worker; 128/512/512-byte field limits). Both derivation helpers
+  reject empty fields or anything outside ASCII `[A-Za-z0-9_-]`, without
+  rewriting identities; colons are structural delimiters only. Accepted keys
+  therefore match the persisted ledger alphabet. Non-play windows use a fresh
+  128-bit key minted once and reused across retries. The
   insert is fenced `ON CONFLICT DO NOTHING` through the play owner's
   `users` row (`FOR SHARE`, ADR 0002 rule 3), so a play finalized behind
   the account-deletion marker inserts nothing — then the Worker selects
@@ -389,12 +408,21 @@ behavior changes here.
   3-hop redirect following is an unresolved discrepancy (see
   `workers/ingest/README.md`). Test-connection attempts atomically
   reserve shared-store rate slots, acquire one of two per-user expiring
-  leases, dial at most four addresses with a 5-second per-address timeout,
-  and stop the complete probe at 15 seconds. (Sources:
+  leases. Each handler-time DNS resolution has one 5-second lifetime covering
+  both A and AAAA response headers and JSON bodies, not 5 seconds per family
+  or per phase. Expiry drops pending resolver work, aborts the Worker fetch/body
+  with its AbortSignal, discards partial answers, and fails closed before any
+  socket dial. Caller cancellation also aborts pending DoH work. Fast literal
+  and dual-family results retain the same all-address validation. This DNS
+  budget applies to save/test validation (provider and indexer), separately
+  per host; it is not an overall HTTP-request deadline. After successful DNS
+  validation, the unchanged socket budgets dial at most four addresses with a
+  5-second per-address timeout and stop the socket attempts at 15 seconds.
+  (Sources:
   `workers/api/src/vault.rs` — `host_shape_ok`, `ip_is_forbidden`,
   `resolve_public_target`, `ProviderConfig::validate`,
   `authorize_pool_dial`, `ALLOWED_NNTP_PORTS`, `MAX_DIAL_ADDRESSES`,
-  `DIAL_TIMEOUT_MS`/`TOTAL_TIMEOUT_MS`, `MAX_TEST_CONCURRENCY`,
+  `RESOLUTION_TIMEOUT_MS`, `DIAL_TIMEOUT_MS`/`TOTAL_TIMEOUT_MS`, `MAX_TEST_CONCURRENCY`,
   `INDEXER_ALLOW_REDIRECTS`; pinned dial in
   `workers/api/src/worker_entry.rs` (`SocketDialer::probe`, `probe_one`);
   slots/leases in `workers/api/src/handlers.rs` (`vault_test_connection`)

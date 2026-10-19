@@ -155,33 +155,31 @@ impl MemoryMeter {
 fn is_valid_key_field(field: &str, max_bytes: usize) -> bool {
     !field.is_empty()
         && field.len() <= max_bytes
-        && !field.contains(':')
-        && !field.contains('=')
-        && !field
-            .chars()
-            .any(|ch| ch.is_whitespace() || ch.is_control())
+        && field
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Derive the idempotency key for one play: `play:{user}:{track}:{play}`.
 ///
 /// Mirrors the `ingest:{user}:{sha}:{ref}` vocabulary of
-/// `derive_idempotency_key` in the ingest Worker. Rejects (Err, no panic)
-/// any field that is empty, over its byte limit, or contains `:`, `=`,
-/// whitespace, or control characters, so keys remain unambiguous and safe
-/// to emit as single-line structured logs.
+/// `derive_idempotency_key` in the ingest Worker. Each field must be non-empty,
+/// within its byte limit, and contain only ASCII alphanumerics, `-`, or `_`,
+/// matching the persisted ledger key alphabet. Rejects invalid fields (Err,
+/// no panic), without rewriting identities; `:` is only a structural delimiter.
 pub fn derive_play_idempotency_key(
     user_id: &str,
     track_id: &str,
     play_id: &str,
 ) -> Result<String, &'static str> {
     if !is_valid_key_field(user_id, 128) {
-        return Err("user id must be 1-128 bytes without ':', '=', whitespace, or controls");
+        return Err("user id must be 1-128 bytes of ASCII alphanumerics, '-', or '_'");
     }
     if !is_valid_key_field(track_id, 512) {
-        return Err("track id must be 1-512 bytes without ':', '=', whitespace, or controls");
+        return Err("track id must be 1-512 bytes of ASCII alphanumerics, '-', or '_'");
     }
     if !is_valid_key_field(play_id, 512) {
-        return Err("play id must be 1-512 bytes without ':', '=', whitespace, or controls");
+        return Err("play id must be 1-512 bytes of ASCII alphanumerics, '-', or '_'");
     }
     Ok(format!("play:{user_id}:{track_id}:{play_id}"))
 }
@@ -752,9 +750,9 @@ mod tests {
         let key = derive_play_idempotency_key(&user, &track, &play_id).unwrap();
         assert_eq!(key, format!("play:{user}:{track}:{play_id}"));
 
-        // The limits count bytes, not chars: 64 two-byte chars are exactly
-        // 128 bytes, 65 are 130.
-        assert!(derive_play_idempotency_key(&"\u{e9}".repeat(64), "t", "p").is_ok());
+        // Non-ASCII identities are refused even at the byte limit:
+        // 64 two-byte chars are exactly 128 bytes, 65 are 130.
+        assert!(derive_play_idempotency_key(&"\u{e9}".repeat(64), "t", "p").is_err());
         assert!(derive_play_idempotency_key(&"\u{e9}".repeat(65), "t", "p").is_err());
 
         // The ledger accepts exact-limit fields too, so its identity re-check

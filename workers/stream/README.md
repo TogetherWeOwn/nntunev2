@@ -318,10 +318,14 @@ and `reconcile` does not currently emit to Analytics Engine or call
 `ReconcileMismatch::log_line`.
 
 - Idempotency key: `derive_play_idempotency_key(user_id, track_id,
-  play_id)` returns `play:{user}:{track}:{play}`. It rejects empty fields,
-  unsafe log/key characters, and fields longer than 128 bytes for user IDs
-  or 512 bytes for track and play IDs. Redelivery derives the same key; a
-  genuine second listen carries a different `play_id`.
+  play_id)` returns `play:{user}:{track}:{play}`. Each field must contain only
+  ASCII alphanumerics, hyphen, or underscore (`[A-Za-z0-9_-]`); colons are
+  structural delimiters only. It rejects empty fields, punctuation/Unicode
+  outside that alphabet, and fields longer than 128 bytes for user IDs or
+  512 bytes for track and play IDs, before constructing a `CompletePlay`.
+  Identities are never rewritten. Accepted keys match the API ledger's
+  persisted alphabet. Redelivery derives the same key; a genuine second
+  listen carries a different `play_id`.
 - Dedup rule: `UsageLedger::record` converges exact redeliveries to one
   in-memory entry — first write wins, mismatch is flagged, never silently
   adjusted. A redelivery that disagrees on user, track, or bytes, or a play

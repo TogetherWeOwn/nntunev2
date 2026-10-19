@@ -29,9 +29,13 @@ use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// Dial timeout for `test connection` (ms).
+/// Overall DNS resolution timeout per host (ms), including A + AAAA
+/// response headers and bodies. Expiry discards all answers before dialing.
+/// Separate from, and prior to, the unchanged socket budgets below.
+pub const RESOLUTION_TIMEOUT_MS: u64 = 5_000;
+/// Per-address socket dial timeout for `test connection` (ms), after DNS.
 pub const DIAL_TIMEOUT_MS: u64 = 5_000;
-/// Total timeout for `test connection` (ms).
+/// Total socket-attempt timeout for `test connection` (ms), after DNS.
 pub const TOTAL_TIMEOUT_MS: u64 = 15_000;
 /// Per-user concurrent `test connection` cap.
 pub const MAX_TEST_CONCURRENCY: u32 = 2;
