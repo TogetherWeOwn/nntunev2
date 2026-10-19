@@ -73,9 +73,15 @@ async fn read_capped(req: &mut Request, cap: usize) -> Result<Vec<u8>, ApiFault>
 /// Each chunk goes through `push_chunk_capped`, so the chunk that
 /// would cross the cap aborts the read with the accumulated body
 /// untouched: at most `cap` bytes are ever materialised and the
-/// excess is never retained. Callers map the unit error to their own
+/// excess is never retained. A bodyless response (`ResponseBody::Empty`,
+/// e.g. a bare 200 from `/health`) reads as empty — the same value the
+/// previous whole-body `bytes()` path returned for it, since `stream()`
+/// rejects non-stream bodies. Callers map the unit error to their own
 /// fault.
 async fn read_response_capped(response: &mut Response, cap: usize) -> Result<Vec<u8>, ()> {
+    if matches!(response.body(), ResponseBody::Empty) {
+        return Ok(Vec::new());
+    }
     let mut stream = response.stream().map_err(|_| ())?;
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {

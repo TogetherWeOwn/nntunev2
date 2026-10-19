@@ -534,6 +534,48 @@ mod capped_reply_read_tests {
 
     use super::*;
 
+    /// `runtime.rs` source, read as text (NOT a crate import — the module is
+    /// `cfg(target_arch = "wasm32")` and unreachable from native tests).
+    /// Lives here, next to the helpers it pins, because the acceptance
+    /// suites are Test Author-owned and frozen for this change.
+    const RUNTIME_RS: &str = include_str!("runtime.rs");
+
+    /// Whitespace-normalised text of `read_response_capped`: from its
+    /// signature up to (not including) the front-door `fetch`.
+    fn capped_reader_helper() -> String {
+        let start = RUNTIME_RS
+            .find("async fn read_response_capped")
+            .expect("runtime.rs no longer contains `read_response_capped`");
+        let rest = &RUNTIME_RS[start..];
+        let end = rest
+            .find("async fn fetch")
+            .expect("runtime.rs no longer contains `fetch` after `read_response_capped`");
+        rest[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn capped_reader_forwards_cap_and_aborts_on_refusal() {
+        let helper = capped_reader_helper();
+        // The reader must forward its own `cap` to the accumulator — a
+        // hardcoded or unbounded limit here would restore the unbounded
+        // materialisation this change removes while every accumulator pin
+        // above still passes.
+        assert!(
+            helper.contains("push_chunk_capped(&mut body, &chunk, cap)"),
+            "read_response_capped must forward its cap: \
+             `push_chunk_capped(&mut body, &chunk, cap)`"
+        );
+        // The accumulator's refusal must abort the read — ignoring the
+        // boolean silently truncates an over-cap reply to a cap-length
+        // prefix and returns it Ok, feeding a partial body to the
+        // classifier (or the front door) as if complete.
+        assert!(
+            helper.contains("if !push_chunk_capped(&mut body, &chunk, cap) { return Err(()); }"),
+            "read_response_capped must abort on refusal: \
+             `if !push_chunk_capped(&mut body, &chunk, cap) {{ return Err(()); }}`"
+        );
+    }
+
     #[test]
     fn accepts_chunk_landing_exactly_at_cap() {
         let mut body = vec![0u8; MAX_RESULT_BYTES - 3];
