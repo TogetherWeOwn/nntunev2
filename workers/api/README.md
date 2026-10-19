@@ -295,11 +295,13 @@ behavior changes here.
   global slot at start, so exhaustion cannot block challenge issuance),
   and every mail send reserves a per-IP (30/hour) plus global (100/5 min)
   issuance slot in front of the per-email window — distinct-email loops
-  stop with a fixed email-independent `429 {"error":"rate_limited"}` on
-  `register/start` (never an email-derived stand-in, which would oracle
-  taken vs fresh across the denial boundary) and with unchanged response
-  shapes on login/magic starts, while victim-list email-bombing stops with
-  no further mail. Exhausted budgets fast-fail with one `SELECT count(*)`
+  stop with a fixed email-independent `429` carrying the standard
+  `rate_limited` error envelope
+  (`{"code":"rate_limited","message":"too many requests","retryable":true}`,
+  plus `Retry-After`) on `register/start` (never an email-derived
+  stand-in, which would oracle taken vs fresh across the denial boundary)
+  and with unchanged response shapes on login/magic starts, while
+  victim-list email-bombing stops with no further mail. Exhausted budgets fast-fail with one `SELECT count(*)`
   before the slot loop, so denial costs O(1) statements, not one upsert per
   slot. `register_start` also reaps never-completed signups older than
   24 h only when they have no credential, vault, session, unexpired magic
@@ -317,7 +319,7 @@ behavior changes here.
   pruned, and login options omit `allow_credentials` to avoid leaking
   variable-length credential IDs. (Sources: `workers/api/src/handlers.rs` —
   `admit_auth_start`, `send_magic_link_if_allowed`, `rate_limit_ip_key`,
-  `throttled` (429 `{"error":"rate_limited"}`), `RATE_LIMIT_EXHAUSTED_SQL`,
+  `throttled` (429 `rate_limited` envelope), `RATE_LIMIT_EXHAUSTED_SQL`,
   finish-budget consts; `workers/api/src/rate_limit.rs` defaults +
   `RateLimitConfig::from_vars`; atomic claim/pair in
   `workers/api/src/worker_entry.rs` (`claim_rate_limit_slot`,

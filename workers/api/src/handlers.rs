@@ -1027,17 +1027,21 @@ fn rate_limit_ip_key(source_ip: &str) -> String {
     }
 }
 
-/// Uniform per-IP throttle response: fixed 429 body independent of the
+/// Uniform per-IP throttle response: the standard `rate_limited` error
+/// envelope (`docs/api-errors.md`) with a fixed message independent of the
 /// request email, because the budget is keyed only on the client prefix.
 /// Callers must not return email-derived stand-ins on this path (that would
 /// be an account-existence oracle across the denial boundary).
 /// `retry_after_secs` is the budget window: slot expiries are staggered, so
 /// the next slot frees no later than one full window out.
 fn throttled(retry_after_secs: u64) -> Response {
-    let mut resp = json_response(
-        crate::rate_limit::RATE_LIMIT_STATUS,
-        serde_json::json!({"error":"rate_limited"}),
-    );
+    let error = crate::api_error::ApiError::rate_limited("too many requests");
+    let mut resp = Response {
+        status: crate::rate_limit::RATE_LIMIT_STATUS,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    };
     resp.retry_after = Some(retry_after_secs);
     resp
 }
@@ -6734,7 +6738,11 @@ mod tests {
                 assert!(body["user_id"].is_string(), "iteration {i}: {}", resp.body);
             } else {
                 assert_eq!(resp.status, 429, "iteration {i}: {}", resp.body);
-                assert_eq!(resp.body, r#"{"error":"rate_limited"}"#, "iteration {i}");
+                assert_eq!(
+                    resp.body,
+                    crate::api_error::ApiError::rate_limited("too many requests").body_json(),
+                    "iteration {i}"
+                );
             }
         }
         assert_eq!(
@@ -6812,7 +6820,10 @@ mod tests {
             taken_denied.body, fresh_denied.body,
             "throttled bodies must be identical across emails"
         );
-        assert_eq!(taken_denied.body, r#"{"error":"rate_limited"}"#);
+        assert_eq!(
+            taken_denied.body,
+            crate::api_error::ApiError::rate_limited("too many requests").body_json()
+        );
     }
 
     #[test]
@@ -6840,7 +6851,10 @@ mod tests {
             serde_json::json!({"email": "burst-over@example.com"}),
         );
         assert_eq!(denied.status, 429, "{}", denied.body);
-        assert_eq!(denied.body, r#"{"error":"rate_limited"}"#);
+        assert_eq!(
+            denied.body,
+            crate::api_error::ApiError::rate_limited("too many requests").body_json()
+        );
         // Handler-level Retry-After pin: a BURST denial reports the
         // burst window (60s default), not the hourly window — clients
         // must not back off for an hour over a one-minute budget. The
@@ -7099,7 +7113,10 @@ mod tests {
             "second address in the same /64 must hit the shared budget: {}",
             denied.body
         );
-        assert_eq!(denied.body, r#"{"error":"rate_limited"}"#);
+        assert_eq!(
+            denied.body,
+            crate::api_error::ApiError::rate_limited("too many requests").body_json()
+        );
         let other = h.call_with_ip(
             ip_other,
             "POST",
