@@ -138,7 +138,7 @@ describe("production hostname", () => {
       "",
       "   ",
       "example.com",
-      "prod-placeholder.internal",
+      "prod-placeholder.example.com",
       "changeme.nntune.io",
       "localhost",
       "web.localhost",
@@ -146,7 +146,7 @@ describe("production hostname", () => {
       "test.nntune.io",
       "web.tbd",
       "invalid.nntune.io",
-      "192.168.1.10",
+      "203.0.113.10",
       "not a host",
       "no-tld",
     ]) {
