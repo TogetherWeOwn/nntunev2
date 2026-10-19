@@ -262,17 +262,34 @@ pub fn recording_mbids_or_fallback(
     }
 }
 
-/// Normalize text for exact match comparison: lowercased, every
-/// non-alphanumeric run collapsed to single spaces. "Don't Stop!" and
-/// "dont stop" compare equal; different words never do.
+/// Normalize text for exact match comparison: lowercase, ignore ASCII
+/// (`'`, U+0027) and typographic (`’`, U+2019) contraction apostrophes,
+/// and collapse other non-alphanumeric runs to single spaces.
+/// "Don't Stop!" and "dont stop" compare equal, while `don t stop`
+/// keeps its spaces. An isolated apostrophe-delimited `n` is an elided
+/// word, not a contraction: `Rock'n'Roll`, `Rock'n Roll` and `Rock n'Roll`
+/// all normalize to `rock n roll`, never `rocknroll`. Other punctuation
+/// still separates words, so `ab cd` never equals `abcd`.
 fn normalize_match_text(raw: &str) -> String {
-    raw.to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let chars: Vec<char> = raw.to_lowercase().chars().collect();
+    let is_apostrophe = |c| matches!(c, '\'' | '\u{2019}');
+    let mut normalized = String::with_capacity(raw.len());
+    for (i, &c) in chars.iter().enumerate() {
+        if c == 'n' && i > 0 && i + 1 < chars.len() {
+            let (before, after) = (chars[i - 1], chars[i + 1]);
+            if !before.is_alphanumeric()
+                && !after.is_alphanumeric()
+                && (is_apostrophe(before) || is_apostrophe(after))
+            {
+                normalized.push_str(" n ");
+                continue;
+            }
+        }
+        if !is_apostrophe(c) {
+            normalized.push(if c.is_alphanumeric() { c } else { ' ' });
+        }
+    }
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Fold separator dashes (en/em dash, minus sign — as pasted from the
