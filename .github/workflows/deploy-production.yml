@@ -167,6 +167,21 @@ jobs:
           packageManager: pnpm
           workingDirectory: apps/web
           command: versions upload --env production --tag ${{ needs.preflight.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+      # The central gradual-promote action runs `npx wrangler` from the
+      # workspace root, which has no node_modules: without a resolvable
+      # install npx would download floating latest at promotion time
+      # (including for its automatic rollback). Pin the workflow wrangler
+      # globally first and prove the resolved version equals the pin, so
+      # promotion and rollback both run the reviewed CLI.
+      - name: Pin wrangler for gradual promotion and rollback
+        run: |
+          npm install -g "wrangler@$WRANGLER_VERSION"
+          RESOLVED="$(npx --yes wrangler --version)"
+          if [ "$RESOLVED" != "$WRANGLER_VERSION" ]; then
+            echo "::error::resolved wrangler $RESOLVED does not equal pinned $WRANGLER_VERSION"
+            exit 1
+          fi
+          echo "gradual promotion uses pinned wrangler $RESOLVED"
       # Gradual promotion lives in the shared central composite action:
       # 5% -> 50% -> 100% with per-stage health/SLO gates pinned to the new
       # version, and automatic rollback to the recorded pre-promote version

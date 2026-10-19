@@ -12,11 +12,13 @@
 //      with prevent-self-review plus a main-only deployment branch policy
 //      (read through GITHUB_TOKEN; unreadable fails closed);
 //   6. exact-SHA staging evidence: the newest push-triggered deploy.yml run
-//      on the dispatch SHA completed with success, and its full-journey
-//      staging job completed with success. A skipped full journey is
-//      missing evidence, never a pass. Once the staging lane publishes
+//      on the dispatch SHA completed with success, and its expanded
+//      full-journey staging job ("post-deploy-e2e / full journey ...")
+//      completed with success with exactly one green "Run full journey"
+//      step. A skipped journey or a skipped journey step is missing
+//      evidence, never a pass. Once the staging lane publishes
 //      ran/skipped/failed journey counts, a counts step must also have
-//      run green; until then the job success above is the evidence.
+//      run green; until then the green journey step above is the evidence.
 //
 // Only node builtins plus fetch: the preflight job runs this with no
 // install step. Request/response bodies and credentials are never printed.
@@ -130,10 +132,17 @@ export function assertProductionProtection(environment) {
 }
 
 // Caller-side reusable-call job plus the inner full-journey job name. The
-// reusable workflow's jobs surface under "<caller> / <called job>", so the
-// inner match anchors on that prefix and the full-journey label.
+// Jobs API expands the reusable workflow's jobs to "<caller> / <called
+// job>", so no job is ever named exactly "post-deploy-e2e": caller success
+// is derived from the expanded jobs (plus the run conclusion checked by
+// the callers) instead of an exact caller job name, and the inner match
+// anchors on that prefix and the full-journey label.
 const POST_DEPLOY_CALLER_JOB = "post-deploy-e2e";
 const FULL_JOURNEY_LABEL = /full journey/i;
+// The e2e-staging.yml step that executes the journey. A success job
+// conclusion does not prove the journey ran: when staging is unconfigured
+// this step is skipped while the job still concludes success.
+const RUN_FULL_JOURNEY_STEP = /^run full journey$/i;
 
 export function newestRunOnSha(runs, sha) {
   const matching = (runs ?? []).filter(
@@ -157,12 +166,6 @@ export function findJourneyCountStep(steps) {
 }
 
 export function assertJobsEvidence(jobs, runId) {
-  const caller = (jobs ?? []).filter((job) => job.name === POST_DEPLOY_CALLER_JOB);
-  if (caller.length !== 1 || caller[0].conclusion !== "success") {
-    throw new Error(
-      `deploy.yml run ${runId} has no successful post-deploy staging evidence`,
-    );
-  }
   const journeys = (jobs ?? []).filter(
     (job) => job.name.startsWith(`${POST_DEPLOY_CALLER_JOB} / `) && FULL_JOURNEY_LABEL.test(job.name),
   );
@@ -177,6 +180,12 @@ export function assertJobsEvidence(jobs, runId) {
   }
   if (job.conclusion !== "success") {
     throw new Error(`deploy.yml run ${runId} did not pass the full journey`);
+  }
+  const journeySteps = (job.steps ?? []).filter((step) => RUN_FULL_JOURNEY_STEP.test(step.name ?? ""));
+  if (journeySteps.length !== 1 || journeySteps[0].conclusion !== "success") {
+    throw new Error(
+      `deploy.yml run ${runId} did not execute the full journey: its Run full journey step is not green`,
+    );
   }
   const countStep = findJourneyCountStep(job.steps);
   if (countStep && countStep.conclusion !== "success") {
@@ -241,17 +250,225 @@ export async function requireStagingEvidence(
 // production var or secret requirement must be reviewed here first
 // (declare the required secret NAMES and verify them), so a config that
 // grows an env.production table beyond its name refuses before any
-// deploy. Reads names only; values are never read or printed.
-export function assertProductionSecretsShape(configText) {
-  for (const line of String(configText).split("\n")) {
-    const header = /^\s*\[{1,2}\s*([^\]]+?)\s*\]{1,2}\s*(?:#.*)?$/.exec(line);
-    if (!header) continue;
-    const table = header[1].trim();
-    if (table !== "env.production" && table.startsWith("env.production")) {
-      throw new Error(
-        `apps/web wrangler.toml declares [${table}]: review production secret requirements in ci/production-deploy-gate.mjs before promoting`,
-      );
+// deploy. Parsed TOML-aware with no dependencies: quoted or spaced table
+// headers (["env"."production"."vars"], [ env . production . vars ]),
+// dotted keys (production.vars.X under [env]), and inline tables
+// (env = { production = { vars = ... } }, including multi-line) all
+// resolve to the same key paths before the beyond-`name` check. Reads
+// names only; values are never read or printed.
+// Split a TOML key (table-header inner text or dotted key) into segments,
+// honouring single/double-quoted segments and whitespace around dots, so
+// ["env"."production"."vars"], [ env . production . vars ], and dotted or
+// inline spellings compare equal to their plain form. Unquoted whitespace
+// is insignificant; escape sequences inside basic strings are unescaped.
+function splitTomlKey(text) {
+  const segments = [];
+  let buf = "";
+  let quote = null;
+  const push = () => {
+    segments.push(buf);
+    buf = "";
+  };
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === "\\" && quote === '"' && i + 1 < text.length) {
+        buf += text[i + 1];
+        i += 1;
+        continue;
+      }
+      if (ch === quote) {
+        quote = null;
+        continue;
+      }
+      buf += ch;
+      continue;
     }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === ".") {
+      push();
+      continue;
+    }
+    if (/\s/.test(ch)) continue;
+    buf += ch;
+  }
+  push();
+  return segments;
+}
+
+function stripTomlComment(line) {
+  let quote = null;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (quote) {
+      if (ch === "\\" && quote === '"') i += 1;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === "#") return line.slice(0, i);
+  }
+  return line;
+}
+
+// First "=" outside quotes and outside nested tables/arrays.
+function splitTomlAssignment(statement) {
+  let quote = null;
+  let depth = 0;
+  for (let i = 0; i < statement.length; i += 1) {
+    const ch = statement[i];
+    if (quote) {
+      if (ch === "\\" && quote === '"') i += 1;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === "{" || ch === "[") depth += 1;
+    else if (ch === "}" || ch === "]") depth = Math.max(0, depth - 1);
+    else if (ch === "=" && depth === 0) return [statement.slice(0, i), statement.slice(i + 1)];
+  }
+  return null;
+}
+
+// Join lines while inside a multi-line inline table/array so every
+// statement parses whole. Comment stripping is quote-aware per line.
+function joinTomlStatements(text) {
+  const statements = [];
+  let buf = "";
+  let depth = 0;
+  let quote = null;
+  const scan = (fragment) => {
+    for (let i = 0; i < fragment.length; i += 1) {
+      const ch = fragment[i];
+      if (quote) {
+        if (ch === "\\" && quote === '"') i += 1;
+        else if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === '"' || ch === "'") quote = ch;
+      else if (ch === "{" || ch === "[") depth += 1;
+      else if (ch === "}" || ch === "]") depth = Math.max(0, depth - 1);
+    }
+  };
+  for (const line of String(text).split("\n")) {
+    const code = stripTomlComment(line);
+    buf += (buf ? " " : "") + code;
+    scan(code);
+    if (depth === 0 && !quote) {
+      statements.push(buf);
+      buf = "";
+    }
+  }
+  if (buf.trim()) statements.push(buf);
+  return statements;
+}
+
+function assignTomlPath(root, segments, value) {
+  let node = root;
+  for (let i = 0; i < segments.length - 1; i += 1) {
+    const key = segments[i];
+    if (!node[key] || typeof node[key] !== "object" || Array.isArray(node[key])) node[key] = {};
+    node = node[key];
+  }
+  node[segments[segments.length - 1]] = value;
+}
+
+// Structural value parse: inline tables become key objects (recursively,
+// honouring dotted keys); everything else is opaque. Only key names are
+// ever inspected; values are never read or printed.
+function parseTomlValue(text) {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return { scalar: true };
+  const inner = trimmed.slice(1, -1);
+  const entries = [];
+  let quote = null;
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < inner.length; i += 1) {
+    const ch = inner[i];
+    if (quote) {
+      if (ch === "\\" && quote === '"') i += 1;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === "{" || ch === "[") depth += 1;
+    else if (ch === "}" || ch === "]") depth = Math.max(0, depth - 1);
+    else if (ch === "," && depth === 0) {
+      entries.push(inner.slice(start, i));
+      start = i + 1;
+    }
+  }
+  entries.push(inner.slice(start));
+  const table = {};
+  for (const entry of entries) {
+    if (!entry.trim()) continue;
+    const assignment = splitTomlAssignment(entry);
+    if (!assignment) continue;
+    const segments = splitTomlKey(assignment[0]).filter((s) => s !== "");
+    if (segments.length === 0) continue;
+    assignTomlPath(table, segments, parseTomlValue(assignment[1]));
+  }
+  return table;
+}
+
+function productionBeyondName(root) {
+  const production = root?.env?.production;
+  if (!production || typeof production !== "object") return null;
+  const nodes = Array.isArray(production) ? production : [production];
+  for (const node of nodes) {
+    if (!node || typeof node !== "object" || Array.isArray(node)) return "env.production";
+    const extra = Object.keys(node).filter((key) => key !== "name");
+    if (extra.length > 0) return `env.production.${extra[0]}`;
+  }
+  return null;
+}
+
+function refuseProductionTable(label) {
+  throw new Error(
+    `apps/web wrangler.toml declares [${label}]: review production secret requirements in ci/production-deploy-gate.mjs before promoting`,
+  );
+}
+
+export function assertProductionSecretsShape(configText) {
+  const root = {};
+  let current = [];
+  for (const statement of joinTomlStatements(configText)) {
+    const trimmed = statement.trim();
+    if (!trimmed) continue;
+    const header = /^\s*\[{1,2}\s*(.+?)\s*\]{1,2}\s*$/.exec(trimmed);
+    if (header) {
+      const segments = splitTomlKey(header[1]).filter((s) => s !== "");
+      if (segments.length === 0) continue;
+      if (
+        segments.length > 2 &&
+        segments[0] === "env" &&
+        segments[1] === "production"
+      ) {
+        refuseProductionTable(segments.join("."));
+      }
+      current = segments;
+      assignTomlPath(root, segments, {});
+      continue;
+    }
+    const assignment = splitTomlAssignment(trimmed);
+    if (!assignment) continue;
+    const segments = splitTomlKey(assignment[0]).filter((s) => s !== "");
+    if (segments.length === 0) continue;
+    const full = [...current, ...segments];
+    // The `name` leaf itself (e.g. `name = "..."` under [env.production])
+    // is the allowed production name; anything else beyond env.production
+    // needs gate review first.
+    const beyondName = full.length > 2 && (full[2] !== "name" || full.length > 3);
+    if (beyondName && full[0] === "env" && full[1] === "production") {
+      refuseProductionTable(full.join("."));
+    }
+    assignTomlPath(root, full, parseTomlValue(assignment[1]));
+    const beyond = productionBeyondName(root);
+    if (beyond) refuseProductionTable(beyond);
   }
 }
 
