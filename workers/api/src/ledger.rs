@@ -122,8 +122,8 @@ impl std::fmt::Display for LedgerError {
 /// key, never a reused key. The success path is byte-identical: the same 16
 /// entropy bytes through the same [`crate::b64::encode`].
 pub fn new_idempotency_key() -> Result<String, LedgerError> {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).map_err(|_| LedgerError::RandomnessUnavailable)?;
+    let bytes = crate::random::secure_random_bytes::<16>()
+        .map_err(|_| LedgerError::RandomnessUnavailable)?;
     Ok(crate::b64::encode(&bytes))
 }
 
