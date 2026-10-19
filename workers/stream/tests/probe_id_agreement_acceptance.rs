@@ -12,14 +12,16 @@
 //!
 //! - the shared vector table below drives `valid_probe_id` directly: every
 //!   vector pins its expected verdict (empty, 513-byte, space, `<`/`>`,
-//!   double-`@`, NUL, non-printable, plus valid controls including the exact
-//!   512-byte boundary);
+//!   double-`@`, NUL, non-printable, non-ASCII, plus valid controls
+//!   including the exact 512-byte boundary and the `!`/`~` charset edges);
 //! - `ingest_validator_body_matches_stream` extracts both validator bodies
-//!   as source text and requires them identical modulo the function name.
-//!   Identical bodies agree on every input, so the behavioral vectors pin
-//!   ingest transitively: any unilateral rule change on either side breaks
-//!   the body equality, and any stream-side semantic change also breaks the
-//!   vectors.
+//!   as source text, requires each to stay self-contained (the `> 512` cap
+//!   and `(0x21..=0x7E)` range as literals inside the body, never an
+//!   external const/helper), and requires them identical modulo the
+//!   function name. Identical self-contained bodies agree on every input,
+//!   so the behavioral vectors pin ingest transitively: any unilateral rule
+//!   change on either side breaks the body equality, and any stream-side
+//!   semantic change also breaks the vectors.
 //!
 //! Sensitivity (what each pin kills; implementation stays untouched):
 //!
@@ -93,8 +95,10 @@ fn agreement_vectors() -> Vec<(String, bool)> {
     assert_eq!(at_cap.len(), 512, "exactly-at-cap control must be 512 B");
     assert_eq!(over_cap.len(), 513, "over-cap vector must be 513 B");
     vec![
-        // Valid controls.
+        // Valid controls (including the 0x21/0x7E printable-ASCII edges).
         ("seg-one@synthetic.invalid".to_string(), true),
+        ("!a@synthetic.invalid".to_string(), true),
+        ("~a@synthetic.invalid".to_string(), true),
         (at_cap, true),
         // Empty and overlong.
         (String::new(), false),
@@ -118,6 +122,8 @@ fn agreement_vectors() -> Vec<(String, bool)> {
         ("x@sy\rthetic.invalid".to_string(), false),
         ("a\x01b@synthetic.invalid".to_string(), false),
         ("a\x7fb@synthetic.invalid".to_string(), false),
+        // Non-ASCII (>= 0x80) is outside printable ASCII.
+        ("caf\u{e9}@synthetic.invalid".to_string(), false),
         // Empty sides of a single `@`.
         ("@synthetic.invalid".to_string(), false),
         ("local@".to_string(), false),
@@ -131,9 +137,10 @@ fn shared_vectors_cover_every_required_shape() {
     let vectors = agreement_vectors();
     assert_eq!(
         vectors.len(),
-        18,
-        "agreement table must keep all 18 vectors \
-         (empty, 513 B, space, brackets, double-@, NUL, non-printable, controls)"
+        21,
+        "agreement table must keep all 21 vectors \
+         (empty, 513 B, space, brackets, double-@, NUL, non-printable, \
+         non-ASCII, controls incl. !/~ edges)"
     );
     assert!(
         vectors.iter().any(|(_, ok)| *ok),
@@ -155,10 +162,27 @@ fn stream_validator_matches_every_shared_vector() {
 
 #[test]
 fn ingest_validator_body_matches_stream() {
-    let stream = validator_body(STREAM_PROBE_RS, "workers/stream/src/probe.rs", STREAM_SIG)
-        .replace("valid_probe_id", "VALIDATOR");
-    let ingest = validator_body(INGEST_PROBE_RS, "workers/ingest/src/probe.rs", INGEST_SIG)
-        .replace("validate_message_id", "VALIDATOR");
+    let stream_raw = validator_body(STREAM_PROBE_RS, "workers/stream/src/probe.rs", STREAM_SIG);
+    let ingest_raw = validator_body(INGEST_PROBE_RS, "workers/ingest/src/probe.rs", INGEST_SIG);
+    for (label, body) in [
+        ("valid_probe_id", stream_raw),
+        ("validate_message_id", ingest_raw),
+    ] {
+        assert!(
+            body.contains("> 512"),
+            "{label} body must keep the `> 512` cap literal inline: \
+             extracting it to a const would let the two caps drift \
+             while the bodies still match"
+        );
+        assert!(
+            body.contains("(0x21..=0x7E)"),
+            "{label} body must keep the `(0x21..=0x7E)` range literal inline: \
+             extracting it would let the charsets drift \
+             while the bodies still match"
+        );
+    }
+    let stream = stream_raw.replace("valid_probe_id", "VALIDATOR");
+    let ingest = ingest_raw.replace("validate_message_id", "VALIDATOR");
     assert_eq!(
         stream, ingest,
         "probe/ingest message-id validators drifted: change both \
