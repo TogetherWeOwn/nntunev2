@@ -128,6 +128,303 @@ fn minted_key() -> String {
         .expect("minting with a working OS RNG must succeed")
 }
 
+// --- Spelling-insensitive scan helpers ---------------------------------------
+//
+// The scanners below never match raw source text. They first blank comments
+// and string/char/raw-string contents with `strip_code_for_scan` (mirrored
+// from `strip_code_for_propagation_pin` in `src/random.rs`; tests cannot
+// reach that `#[cfg(test)]` helper, so keep the copies in sync), then anchor
+// on the bare `getrandom` word token. That makes the scans insensitive to
+// fmt-clean rewrites a raw `getrandom::` needle misses: a crate alias
+// (`use getrandom as gr; gr::fill(..)`), whitespace or a block comment
+// around the path separator (`getrandom /* entropy */ ::fill(..)`), and a
+// leading `::`. Statement windows are located on the stripped text, so a
+// `;` inside a string no longer terminates a statement early. Prose on
+// comment lines and inside strings stays invisible, as before.
+
+/// Identifier-continue for literal suffixes and raw identifiers
+/// (conservative XID-Continue: non-ASCII in code outside strings and
+/// comments only occurs in identifiers, and `is_alphanumeric` misses
+/// XID-Continue chars like U+203F and U+0301 that rustc eats as suffix).
+fn ident_continue(c: char) -> bool {
+    c == '_' || c.is_alphanumeric() || !c.is_ascii()
+}
+
+/// Identifier-start for raw identifiers (`r#ident`, possibly multi-`#`).
+fn ident_start(c: char) -> bool {
+    c == '_' || c.is_alphabetic() || !c.is_ascii()
+}
+
+/// True when the `r` at `chars[i]` starts a raw-string prefix at a token
+/// boundary (mirrors `rustc_lexer`): the maximal identifier-char run
+/// ending at this `r` must be exactly `r`, `br` or `cr` — a digit-led run
+/// like `1r` is excluded by the exact-run rule — and the char before that
+/// run must not be a quote, so a literal suffix (`"a"r`, `'a'r`) never
+/// counts as a raw prefix. The run walk uses [`ident_continue`] so
+/// XID-Continue suffixes (`"a"e<U+203F>r`) are read as one suffix, not
+/// as a bare `r`. Hash-closed raw suffixes (`r#"a"#r`) and raw
+/// identifiers (`r#r`) are handled by forward token consumption in the
+/// stripper, not by this backward check.
+fn is_raw_prefix_at(chars: &[char], i: usize) -> bool {
+    let mut run_start = i;
+    while run_start > 0 {
+        let prev = chars[run_start - 1];
+        if ident_continue(prev) {
+            run_start -= 1;
+        } else {
+            break;
+        }
+    }
+    let run: String = chars[run_start..=i].iter().collect();
+    if run != "r" && run != "br" && run != "cr" {
+        return false;
+    }
+    if run_start > 0 {
+        let before = chars[run_start - 1];
+        if before == '"' || before == '\'' {
+            return false;
+        }
+    }
+    true
+}
+
+fn strip_code_for_scan(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        // Raw string `r#"..."#` / `r"..."` (and `br`/`cr` forms): `r` +
+        // hashes + `"` only at a token boundary, so a literal suffix `r`
+        // never blanks a following plain string with raw rules.
+        if c == 'r' && (next == Some('"') || next == Some('#')) && is_raw_prefix_at(&chars, i) {
+            let mut j = i + 1;
+            let mut hashes = 0usize;
+            while chars.get(j).copied() == Some('#') {
+                hashes += 1;
+                j += 1;
+            }
+            if chars.get(j).copied() == Some('"') {
+                for ch in chars.iter().take(j + 1).skip(i) {
+                    out.push(*ch);
+                }
+                i = j + 1;
+                // Blank the raw-string body; preserve newlines.
+                loop {
+                    if i >= chars.len() {
+                        break;
+                    }
+                    if chars[i] == '"'
+                        && (0..hashes).all(|h| chars.get(i + 1 + h).copied() == Some('#'))
+                    {
+                        out.push('"');
+                        for h in 0..hashes {
+                            out.push(chars[i + 1 + h]);
+                        }
+                        i += 1 + hashes;
+                        break;
+                    }
+                    if chars[i] == '\n' {
+                        out.push('\n');
+                    } else {
+                        out.push(' ');
+                    }
+                    i += 1;
+                }
+                // Consume a following literal suffix (`r#"a"#r`) as part of
+                // this literal, so its trailing `r` never re-enters the
+                // raw branch with `#` before it.
+                while i < chars.len() && ident_continue(chars[i]) {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                continue;
+            }
+            // Raw identifier `r#ident` (possibly multi-`#`): consume `r` +
+            // hashes + identifier as one token, so the identifier's
+            // trailing `r` (as in `r#r`) never re-enters the raw branch.
+            // Only bare `r` starts a raw identifier; `br`/`cr` + `#` is an
+            // identifier plus `#` and correctly falls through.
+            if hashes >= 1 && chars.get(j).is_some_and(|&d| ident_start(d)) {
+                let mut run_start = i;
+                while run_start > 0 && ident_continue(chars[run_start - 1]) {
+                    run_start -= 1;
+                }
+                let run: String = chars[run_start..=i].iter().collect();
+                if run == "r" {
+                    while i < j {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                    while i < chars.len() && ident_continue(chars[i]) {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+        }
+        if c == '/' && next == Some('/') {
+            out.push(' ');
+            out.push(' ');
+            i += 2;
+            while i < chars.len() && chars[i] != '\n' {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && next == Some('*') {
+            out.push(' ');
+            out.push(' ');
+            i += 2;
+            let mut depth = 1usize;
+            while i < chars.len() && depth > 0 {
+                let d = chars[i];
+                let dn = chars.get(i + 1).copied();
+                if d == '/' && dn == Some('*') {
+                    depth += 1;
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                    continue;
+                }
+                if d == '*' && dn == Some('/') {
+                    depth -= 1;
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                    continue;
+                }
+                if d == '\n' {
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == '"' {
+            out.push('"');
+            i += 1;
+            while i < chars.len() {
+                let d = chars[i];
+                if d == '\\' {
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                    continue;
+                }
+                if d == '"' {
+                    out.push('"');
+                    i += 1;
+                    break;
+                }
+                if d == '\n' {
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+                i += 1;
+            }
+            // Consume a following literal suffix (`"a"e<U+203F>r`) as part
+            // of this literal, so its trailing `r` never re-enters the raw
+            // branch.
+            while i < chars.len() && ident_continue(chars[i]) {
+                out.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if c == '\'' {
+            // Char literal on one line: blank its body so a `?` inside
+            // cannot satisfy the scan. Non-escape bodies are exactly one
+            // character (quotes exactly 2 apart); a 2-3 char body is
+            // never a valid char, only a lifetime/label quote reaching
+            // a later quote (e.g. `break 'a "'...'"` spans exactly 4).
+            // Escape-led bodies (`'\..'`) are accepted at any width
+            // because lifetimes never contain a backslash. Lifetimes
+            // and labels fall through as plain code.
+            let mut j = i + 1;
+            let mut closed = false;
+            while j < chars.len() && chars[j] != '\n' {
+                if chars[j] == '\\' {
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == '\'' {
+                    closed = true;
+                    break;
+                }
+                j += 1;
+            }
+            let escape_led = chars.get(i + 1).copied() == Some('\\');
+            if closed && (j.saturating_sub(i) == 2 || escape_led) {
+                // Blank via the escape-aware lookahead endpoint `j`:
+                // rescanning for the first `'` would stop at an escaped
+                // quote (`'\''`) and reinterpret the real closer as a new
+                // char start, leaking a following string as code.
+                out.push('\'');
+                i += 1;
+                while i < j {
+                    if chars[i] == '\n' {
+                        out.push('\n');
+                    } else {
+                        out.push(' ');
+                    }
+                    i += 1;
+                }
+                out.push('\'');
+                i += 1;
+                // Consume a following literal suffix as part of this char
+                // literal, mirroring the string branches.
+                while i < chars.len() && ident_continue(chars[i]) {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                continue;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Byte offsets of every whole-word occurrence of `word` in `haystack`:
+/// the neighbouring characters (if any) must not continue an identifier,
+/// so `my_getrandom_x` never matches but `::getrandom`, `r#getrandom` and
+/// a bare `getrandom` in a `use` all do.
+fn word_indices(haystack: &str, word: &str) -> Vec<usize> {
+    let chars: Vec<(usize, char)> = haystack.char_indices().collect();
+    let want: Vec<char> = word.chars().collect();
+    let mut out = Vec::new();
+    if want.is_empty() || chars.len() < want.len() {
+        return out;
+    }
+    for i in 0..=chars.len() - want.len() {
+        if (0..want.len()).all(|k| chars[i + k].1 == want[k]) {
+            let before_ok = i == 0 || !ident_continue(chars[i - 1].1);
+            let after = i + want.len();
+            let after_ok = after >= chars.len() || !ident_continue(chars[after].1);
+            if before_ok && after_ok {
+                out.push(chars[i].0);
+            }
+        }
+    }
+    out
+}
+
+/// Whole-word `getrandom` tokens in the stripped code of `source`.
+fn getrandom_word_count(source: &str) -> usize {
+    word_indices(&strip_code_for_scan(source), "getrandom").len()
+}
+
 fn normalized(source: &str) -> String {
     source.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -209,18 +506,40 @@ fn randomness_failure_propagates_instead_of_panicking_or_falling_back() {
         1,
         "the mint must draw entropy exactly once, body was: {body}"
     );
+    // Spelling-insensitive counts: the stripped whole-word token catches
+    // a crate alias (`use getrandom as gr;`), a comment/whitespace-
+    // separated path (`getrandom /* entropy */ ::fill`) and a leading
+    // `::`, all of which a raw `getrandom::` needle misses, while prose
+    // in comments/strings cannot false-positive.
     assert_eq!(
-        body.matches("getrandom::").count(),
+        getrandom_word_count(&body),
         0,
-        "the mint must not bypass the shared helper with a direct fill, \
-         body was: {body}"
+        "the mint must not bypass the shared helper with a direct fill \
+         under any spelling, body was: {body}"
     );
     assert_eq!(
-        LEDGER_SRC.matches("getrandom::fill").count(),
+        getrandom_word_count(LEDGER_SRC),
         0,
-        "ledger.rs must contain no direct getrandom::fill (sole fill is \
-         the shared helper in random.rs)"
+        "ledger.rs must contain no getrandom token under any spelling \
+         (sole fill is the shared helper in random.rs)"
     );
+    // Scanner self-checks for those families, on synthetic sources.
+    for src in [
+        "use getrandom as gr;\ngr::fill(&mut b).expect(\"probe\");",
+        "getrandom /* entropy */ ::fill(&mut b).expect(\"probe\");",
+        "::getrandom::fill(&mut b).expect(\"probe\");",
+        "getrandom :: fill (&mut b).expect(\"probe\");",
+    ] {
+        assert!(getrandom_word_count(src) > 0, "must count: {src}");
+    }
+    for src in [
+        "// getrandom::fill(&mut b).expect(\"gone\");",
+        "/* getrandom::fill(&mut b).expect(\"gone\"); */",
+        "let s = \"getrandom::fill(&mut b)\";",
+        "let my_getrandom_x = 1;",
+    ] {
+        assert_eq!(getrandom_word_count(src), 0, "must ignore: {src}");
+    }
     for banned in [
         ".expect(",
         ".unwrap(",
