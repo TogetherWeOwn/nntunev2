@@ -16,7 +16,7 @@ Decision: `docs/adr/0007-mb-mirror.md`.
 | `GET` | `/v1/mb/release/:mbid` | Release lookup (includes the stored `caa_url`); same caching as artist |
 | `GET` | `/v1/mb/recording/:mbid` | Recording lookup; same caching as artist |
 | `GET` | `/v1/mb/release/:mbid/recordings` | Recordings of a release in album order (`medium_no`, then `track_no`, then MBID), listed from `mb_track` membership, `LIMIT 1000`; existing release with no recordings is `200` with an empty list, missing release is `404`; same caching as lookups |
-| `GET` | `/v1/mb/search?q=&type=&limit=&offset=` | `type` in `artist\|release\|recording`; `q` 2-100 chars; trigram (`pg_trgm`) ordered by similarity; paged: `limit` defaults to `MAX_PAGE_SIZE` (25), over-limit clamped (never rejected), `limit=0` is `400`, `offset` defaults to 0, past-the-end is a 200 with `"results": []`; success `Cache-Control: public, max-age=300` |
+| `GET` | `/v1/mb/search?q=&type=&limit=&offset=` | `type` in `artist\|release\|recording`; `q` 2-100 chars; trigram (`pg_trgm`) ordered by similarity; paged: `limit` defaults to `MAX_PAGE_SIZE` (25), over-limit clamped (never rejected), `limit=0` is `400`, `offset` defaults to 0 and is capped at `MAX_SEARCH_OFFSET` (1000, 40 pages at 25) — above the cap short-circuits to a 200 with `"results": []` and the effective offset echoed without touching KV or Postgres, at or below the cap queries as before; past-the-end (at or below the cap) is a 200 with `"results": []`; success `Cache-Control: public, max-age=300` |
 
 (Table sources: routes `workers/mb/src/lib.rs:1035-1062`; healthz
 `lib.rs:423-430,952-961`; lookup SQL/TTL `lib.rs:38-39,128-150`;
