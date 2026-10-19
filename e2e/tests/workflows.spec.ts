@@ -1401,6 +1401,39 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       '          HYPERDRIVE_CACHING_DISABLED = "1"\n',
       '',
     );
+    // Semantic vars mutants: each line stays present, so only the exact
+    // literal / repo-var name / header anchor in the pin catches them — a
+    // pin broadened to a generic quoted value or RP name, or one missing
+    // its header anchor, would keep rejecting the drop mutants above yet
+    // accept these.
+    // Shorter session TTL literal than the evidenced one day.
+    const shortSessionTtlMutant = jobsBody.replace(
+      '          SESSION_TTL_SECS = "86400"\n',
+      '          SESSION_TTL_SECS = "3600"\n',
+    );
+    // Cache-disabled attestation flipped off: the Worker would serve with
+    // Hyperdrive caching enabled against the evidenced disabled posture.
+    const cachingNotDisabledMutant = jobsBody.replace(
+      '          HYPERDRIVE_CACHING_DISABLED = "1"\n',
+      '          HYPERDRIVE_CACHING_DISABLED = "0"\n',
+    );
+    // RP_ID wired to the origin repo var (and the converse for RP_ORIGIN):
+    // each exact repo-var name is protected independently.
+    const rpIdSwappedMutant = jobsBody.replace(
+      '          RP_ID = "${API_RP_ID_STAGING}"\n',
+      '          RP_ID = "${API_RP_ORIGIN_STAGING}"\n',
+    );
+    const rpOriginSwappedMutant = jobsBody.replace(
+      '          RP_ORIGIN = "${API_RP_ORIGIN_STAGING}"\n',
+      '          RP_ORIGIN = "${API_RP_ID_STAGING}"\n',
+    );
+    // Commented vars header: the TOML then defines no env.staging.vars
+    // table at all, and an unanchored pin would keep matching the bracket
+    // text inside the comment.
+    const commentedVarsHeaderMutant = jobsBody.replace(
+      '          [env.staging.vars]\n',
+      '          # [env.staging.vars]\n',
+    );
 
     for (const mutant of [
       workerMutant,
@@ -1423,6 +1456,11 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       droppedRpOriginMutant,
       droppedSessionTtlMutant,
       droppedCachingDisabledMutant,
+      shortSessionTtlMutant,
+      cachingNotDisabledMutant,
+      rpIdSwappedMutant,
+      rpOriginSwappedMutant,
+      commentedVarsHeaderMutant,
     ]) {
       expect(() => assertDeployGuard(mutant), 'mutant must violate the deploy guard').toThrow();
     }
@@ -1451,6 +1489,11 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     expect(() => assertStagingApi(droppedRpOriginMutant)).toThrow();
     expect(() => assertStagingApi(droppedSessionTtlMutant)).toThrow();
     expect(() => assertStagingApi(droppedCachingDisabledMutant)).toThrow();
+    expect(() => assertStagingApi(shortSessionTtlMutant)).toThrow();
+    expect(() => assertStagingApi(cachingNotDisabledMutant)).toThrow();
+    expect(() => assertStagingApi(rpIdSwappedMutant)).toThrow();
+    expect(() => assertStagingApi(rpOriginSwappedMutant)).toThrow();
+    expect(() => assertStagingApi(commentedVarsHeaderMutant)).toThrow();
   });
 });
 
