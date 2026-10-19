@@ -1,13 +1,16 @@
-//! Builder-owned supplemental pin: no Debug-format specifier on the
-//! admission-ledger commit path.
+//! Builder-owned supplemental pin: no Debug-format specifier and no raw-error
+//! interpolation on the admission-ledger commit path.
 //!
 //! The acceptance pin in `admission_commit_sqlstate_acceptance.rs` bans the
 //! literal `"{:?}"` spelling; captured (`{e:?}`) and alternate (`{:#?}`,
 //! `{e:#?}`) Debug spellings slip that ban while leaking the same server
-//! message/detail/hint via `tokio_postgres::Error`'s Debug render. This file
-//! bans the Debug format specifier itself in the commit context (the
-//! `mark_queued` body plus any one-level helper it calls, sliced from
-//! production pre-`#[cfg(test)]` source so test literals cannot satisfy it).
+//! message/detail/hint via `tokio_postgres::Error`'s Debug render. Its raw
+//! Display list (`{e}`, `{error}`, `, e)`, ...) likewise misses multi-line
+//! positional args (`, e` followed by a newline, not `)`) and empty-spec
+//! captures (`{e:}`), which render the server message via Display. This file
+//! closes both gaps in the commit context (the `mark_queued` body plus any
+//! one-level helper it calls, sliced from production pre-`#[cfg(test)]`
+//! source so test literals cannot satisfy it).
 //!
 //! Detection parses `{...}` placeholders inside string literals (normal and
 //! raw) rather than banning substrings: a placeholder whose spec — the text
@@ -301,6 +304,119 @@ fn commit_context_uses_no_debug_format_specifier() {
          `{{e:x?}}`/`{{e:10?}}`, and whitespace-padded forms like \
          `{{e:x? }}` — all render the server message/detail via \
          tokio_postgres::Error Debug) — found:\n{}\nin:\n{context}",
+        offenders.join("\n")
+    );
+}
+
+/// Statement text of each `console_log!` in `context`, sliced like the
+/// acceptance file (from the macro to the first `");`).
+fn console_log_statements(context: &str) -> Vec<&str> {
+    context
+        .match_indices("console_log!")
+        .map(|(i, _)| context[i..].split(");").next().unwrap_or(&context[i..]))
+        .collect()
+}
+
+/// `statement` with every `admission_commit_sqlstate(&e)` / `(&error)` call
+/// replaced by a space. That call is the only sanctioned use of the raw
+/// error binding inside a commit-site log; any bare `e`/`error` left is a
+/// Display render of the server message.
+fn scrub_sqlstate_calls(statement: &str) -> String {
+    const HELPER: &str = "admission_commit_sqlstate";
+    let mut out = String::with_capacity(statement.len());
+    let mut rest = statement;
+    while let Some(i) = rest.find(HELPER) {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + HELPER.len()..];
+        match sqlstate_call_len(after) {
+            Some(len) => {
+                out.push(' ');
+                rest = &after[len..];
+            }
+            None => {
+                // Not the sanctioned call shape (e.g. the helper's own
+                // definition); keep the name so the token scan still sees
+                // whatever follows it.
+                out.push_str(HELPER);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Length of `(&e)` / `(&error)` (whitespace-tolerant) at the start of `s`,
+/// if that is what follows the helper name.
+fn sqlstate_call_len(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if b.get(i) != Some(&b'(') {
+        return None;
+    }
+    i += 1;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if b.get(i) != Some(&b'&') {
+        return None;
+    }
+    i += 1;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let start = i;
+    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+        i += 1;
+    }
+    if &s[start..i] != "e" && &s[start..i] != "error" {
+        return None;
+    }
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if b.get(i) != Some(&b')') {
+        return None;
+    }
+    Some(i + 1)
+}
+
+/// Bare `e` / `error` identifier tokens in `statement`, if any. Matching on
+/// whole tokens (not substrings) keeps `MeterWriteError`, `as_db_error`,
+/// `sqlstate` and message words from tripping the pin, while catching
+/// positional Display args (`, e` on its own line), mid-argument uses, and
+/// captured Display placeholders (`{e}`, `{e:}`, `{error}`) inside the
+/// format string.
+fn raw_error_tokens(statement: &str) -> Vec<&str> {
+    statement
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|tok| *tok == "e" || *tok == "error")
+        .collect()
+}
+
+#[test]
+fn commit_log_never_interpolates_the_raw_error() {
+    let context = commit_context();
+    let mut offenders = Vec::new();
+    for stmt in console_log_statements(&context) {
+        let scrubbed = scrub_sqlstate_calls(stmt);
+        let tokens = raw_error_tokens(&scrubbed);
+        if !tokens.is_empty() {
+            offenders.push(format!(
+                "{} in scrubbed statement:\n{scrubbed}",
+                tokens.join(", ")
+            ));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "commit failure log must not interpolate the raw error binding — \
+         Display (`{{}}` with `e`, `{{e}}`, `{{e:}}`) renders the server \
+         message just like Debug; only `admission_commit_sqlstate(&e)` may \
+         use it — found:\n{}\nin:\n{context}",
         offenders.join("\n")
     );
 }
