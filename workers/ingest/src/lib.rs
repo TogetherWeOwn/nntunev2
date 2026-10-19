@@ -754,6 +754,20 @@ fn admission_release_sql() -> &'static str {
      WHERE job_id = $1 AND stage = $2 AND state = 'claimed' AND claim_epoch = $3"
 }
 
+/// SQLSTATE code for an admission-ledger commit failure, for logging only.
+///
+/// Returns the Postgres SQLSTATE (`error.as_db_error().map(|db|
+/// db.code().code())`) or `"none"` for non-DB errors. The Debug/Display of
+/// `tokio_postgres::Error` can embed server detail (constraint names, key
+/// values, connection context), so the commit path logs this code only —
+/// mirroring the library-upsert precedent in `queue_consumer.rs`.
+fn admission_commit_sqlstate(error: &tokio_postgres::Error) -> &str {
+    error
+        .as_db_error()
+        .map(|db| db.code().code())
+        .unwrap_or("none")
+}
+
 /// [`AdmissionLedger`] over the `LIBRARY_DB` Hyperdrive database.
 ///
 /// Every method opens a short-lived connection, runs one autocommit
@@ -869,7 +883,10 @@ impl AdmissionLedger for PgAdmissionLedger {
             )
             .await
             .map_err(|e| {
-                console_log!("admission ledger commit failed: {:?}", e);
+                console_log!(
+                    "admission ledger commit failed: sqlstate={}",
+                    admission_commit_sqlstate(&e)
+                );
                 MeterWriteError::Transport("admission ledger unavailable".to_string())
             })?;
         if updated != 1 {
