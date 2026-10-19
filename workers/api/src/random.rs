@@ -12,9 +12,9 @@
 //! same `N` entropy bytes from the same `getrandom` backend, encoded by the
 //! caller exactly as before.
 //!
-//! [`crate::ledger`] is intentionally untouched: that module's
-//! `RandomnessUnavailable` path (PR #516) can adopt this helper on rebase
-//! with `secure_random_bytes::<16>().map_err(|_| LedgerError::..)?`.
+//! [`crate::ledger`]'s `new_idempotency_key` also mints through this
+//! helper, mapping failure to `LedgerError::RandomnessUnavailable`
+//! (HTTP 503 `service_unavailable`).
 
 use crate::api_error::ApiError;
 
