@@ -1842,3 +1842,101 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   });
 
 });
+
+// mb-import postgres parity: the integration job's service image must stay
+// the same postgres build the shipped image is based on. ci.yml carries a
+// tying comment (re-pin both deliberately) but no enforcement, so a
+// one-sided re-pin would silently test against a newer Postgres than the
+// image ships. This pin asserts exact digest equality (after the `@`)
+// between the mb-import job's service image and the Dockerfile's runtime
+// base FROM, plus tag equality so a tag-only drift cannot hide behind a
+// matching digest. Deliberate bumps change both sides together and stay
+// green; changing either side alone reds.
+const mbImportDockerfile = readFileSync(
+  new URL('../../containers/mb-import/Dockerfile', import.meta.url),
+  'utf8',
+);
+
+function mbImportBaseDigest(dockerfile: string): { tag: string; digest: string } {
+  // Anchored `FROM … AS base`: the runtime base, never the rust validator
+  // stage and never a commented-out line (`# FROM` cannot match `^\s*FROM`).
+  const matches = [
+    ...dockerfile.matchAll(
+      /^\s*FROM\s+postgres:([^\s@]+)@(sha256:[0-9a-f]{64})\s+AS\s+base\b/gim,
+    ),
+  ];
+  expect(matches, 'mb-import Dockerfile must carry exactly one postgres AS base FROM').toHaveLength(1);
+  return { tag: matches[0]![1]!, digest: matches[0]![2]! };
+}
+
+function mbImportServiceDigest(mbImportSection: string): { tag: string; digest: string } {
+  // Anchored `image:` so a commented-out service line cannot satisfy the pin.
+  const matches = [
+    ...mbImportSection.matchAll(
+      /^\s*image:\s*postgres:([^\s@]+)@(sha256:[0-9a-f]{64})\b/gim,
+    ),
+  ];
+  expect(matches, 'mb-import job must carry exactly one postgres service image').toHaveLength(1);
+  return { tag: matches[0]![1]!, digest: matches[0]![2]! };
+}
+
+function assertMbImportPostgresParity(ciWorkflowText: string, dockerfileText: string): void {
+  const service = mbImportServiceDigest(jobSection(ciWorkflowText, 'mb-import'));
+  const base = mbImportBaseDigest(dockerfileText);
+  expect(
+    service.tag,
+    `mb-import postgres tag drift: CI services ${service.tag} vs Dockerfile FROM ${base.tag} (re-pin both deliberately)`,
+  ).toBe(base.tag);
+  expect(
+    service.digest,
+    `mb-import postgres digest drift: CI services ${service.digest} vs Dockerfile FROM ${base.digest} (re-pin both deliberately)`,
+  ).toBe(base.digest);
+}
+
+test.describe('mb-import postgres parity (static pin)', () => {
+  test('CI service image digest equals the shipped Dockerfile base digest', () => {
+    assertMbImportPostgresParity(ciWorkflow, mbImportDockerfile);
+  });
+
+  test('single-side digest or tag mutants fail the pin', () => {
+    // Regression proof for the shared guard: each mutant changes one side
+    // alone (valid hex/tag so extraction still succeeds) and must throw
+    // the same assert the real pin calls, not a restated copy.
+    const base = mbImportBaseDigest(mbImportDockerfile);
+    const flippedLast = base.digest.endsWith('0') ? '1' : '0';
+    const mutantDigest = base.digest.slice(0, -1) + flippedLast;
+    // Derived from the live tag so a deliberate re-tag never turns the tag
+    // mutants into no-ops that red on a correct change.
+    const mutantTag = `${base.tag}-mutant`;
+    const ciImageLine = `image: postgres:${base.tag}@${base.digest}`;
+    const dockerFromLine = `FROM postgres:${base.tag}@${base.digest} AS base`;
+    expect(ciWorkflow, 'CI fixture line for the mutant is missing').toContain(ciImageLine);
+    expect(mbImportDockerfile, 'Dockerfile fixture line for the mutant is missing').toContain(
+      dockerFromLine,
+    );
+    const ciDigestMutant = ciWorkflow.replace(
+      ciImageLine,
+      `image: postgres:${base.tag}@${mutantDigest}`,
+    );
+    const dockerDigestMutant = mbImportDockerfile.replace(
+      dockerFromLine,
+      `FROM postgres:${base.tag}@${mutantDigest} AS base`,
+    );
+    const ciTagMutant = ciWorkflow.replace(
+      ciImageLine,
+      `image: postgres:${mutantTag}@${base.digest}`,
+    );
+    const dockerTagMutant = mbImportDockerfile.replace(
+      dockerFromLine,
+      `FROM postgres:${mutantTag}@${base.digest} AS base`,
+    );
+    for (const [name, ci, docker] of [
+      ['CI digest', ciDigestMutant, mbImportDockerfile],
+      ['Dockerfile digest', ciWorkflow, dockerDigestMutant],
+      ['CI tag', ciTagMutant, mbImportDockerfile],
+      ['Dockerfile tag', ciWorkflow, dockerTagMutant],
+    ] as const) {
+      expect(() => assertMbImportPostgresParity(ci, docker), `${name} mutant must fail the pin`).toThrow();
+    }
+  });
+});
