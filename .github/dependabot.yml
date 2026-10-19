@@ -11,18 +11,18 @@
 # One entry per manifest directory: Dependabot takes no globs, and each
 # ecosystem looks only in its configured directory. The root workspace
 # (`Cargo.toml`, members: `crates/nntune-core`) does NOT cover
-# `workers/api`, `workers/ingest` or `workers/mb` (excluded standalone
-# crates), so they get their own cargo entries. The batch import image
-# (`containers/mb-import/Dockerfile`, FROM postgres) gets its own docker
-# entry. npm watches the SvelteKit app (`apps/web`) and the e2e harness
-# (`e2e`), not a top-level `web/`.
+# `workers/api`, `workers/ingest`, `workers/mb` or `workers/repair`
+# (excluded standalone crates), so they get their own cargo entries. The batch
+# import image (`containers/mb-import/Dockerfile`, FROM postgres) and the
+# repair image (`containers/repair/Dockerfile`, FROM debian/rust) each get
+# their own docker entry. npm watches the SvelteKit app (`apps/web`) and the
+# e2e harness (`e2e`), not a top-level `web/`.
 #
-# Lockfiles: the repo ignores `Cargo.lock` (see root `.gitignore`) except
-# `workers/api/Cargo.lock`, which is committed (auth/vault crypto) and built
-# with `--locked`, so the `/workers/api` entry sees transitive dependencies
-# and its updates are reviewed lockfile changes. The other cargo entries
-# still update direct dependencies without transitive visibility; committing
-# their lockfiles is a scaffold-wide decision for the owning card.
+# Lockfiles: tracked at the root and for every standalone Worker crate (see
+# root `.gitignore` negations): `Cargo.lock`, `workers/api/Cargo.lock`,
+# `workers/ingest/Cargo.lock`, `workers/mb/Cargo.lock` and
+# `workers/repair/Cargo.lock`. Each cargo entry therefore sees transitive
+# dependencies and its updates are reviewed lockfile changes.
 #
 # First Dependabot PR: confirm the required checks (`ci-ok`, `gitleaks`,
 # `pr-lint`, Paperclip Review) all appear on it before relying on them —
@@ -136,9 +136,52 @@ updates:
       prefix: "chore"
       include: "scope"
 
+  # Repair worker (standalone crate, streams staged scratch objects into
+  # the par2 repair Container and back).
+  - package-ecosystem: "cargo"
+    directory: "/workers/repair"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
   # Batch import image (FROM postgres).
   - package-ecosystem: "docker"
     directory: "/containers/mb-import"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # Repair image (FROM debian, rust).
+  - package-ecosystem: "docker"
+    directory: "/containers/repair"
     groups:
       minor-and-patch:
         applies-to: version-updates
