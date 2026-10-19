@@ -4,6 +4,7 @@
 		browserStorage,
 		clearSnapshot,
 		invalidateLibraryCache,
+		LIBRARY_AUTH_TRANSITION_KEY,
 		staleLabel,
 		type LibraryItem
 	} from '#lib/library/cache.js';
@@ -25,6 +26,13 @@
 			loading = state.loading;
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
+			// Selections are per-account: drop ids the new library no longer
+			// contains, so a 401/403/404 or auth transition cannot leak the
+			// previous account's queue into the next session's Retry.
+			if (selectedIds.length > 0) {
+				const ids = new Set(state.items.map((track) => track.id));
+				selectedIds = selectedIds.filter((id) => ids.has(id));
+			}
 		}
 	});
 
@@ -59,6 +67,9 @@
 	}
 
 	function handleAuthTransition(event: StorageEvent): void {
+		// Clear selections at the auth boundary even before the refresher's
+		// state lands; the onStateChange reconcile above is the backstop.
+		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) selectedIds = [];
 		refresher.handleAuthTransition(event);
 	}
 
@@ -104,7 +115,6 @@
 						<button
 							type="button"
 							class="nt-library-row"
-							aria-label={`Select ${displayTitle(track)}`}
 							onclick={() => selectTrack(track.id)}
 						>
 							{displayTitle(track)}
