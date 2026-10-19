@@ -127,9 +127,11 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				}
 				// Runtimes (and injected test fetches) without `arrayBuffer`
 				// cannot be measured before parsing; enforce the cap on the
-				// serialized size instead so this path is still bounded.
+				// serialized UTF-8 byte size instead so this path matches the
+				// byte-counted streamed and arrayBuffer paths.
 				const data = await resp.json();
-				if (JSON.stringify(data)?.length > LIBRARY_BODY_MAX_BYTES) {
+				const serialized = JSON.stringify(data) ?? '';
+				if (new TextEncoder().encode(serialized).length > LIBRARY_BODY_MAX_BYTES) {
 					throw new Error('library request timed out');
 				}
 				return data;

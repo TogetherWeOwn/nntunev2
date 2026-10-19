@@ -111,4 +111,98 @@ describe('library refresh null-body cap', () => {
 		expect(refresher.state.loadError).toBe('Library is not reachable right now.');
 		expect(refresher.state.loading).toBe(false);
 	});
+
+	it('parses a null-body payload of exactly cap bytes', async () => {
+		const refresher = createLibraryRefresher({
+			sessionStorage: () => null,
+			invalidateLibraryCache: () => {},
+			timeoutMs: SLOW_TIMEOUT_MS
+		});
+
+		await refresher.refresh(nullBodyFetch(payloadOfBytes(CAP, 'exact')));
+
+		expect(refresher.state.items.map((i) => i.id)).toEqual(['exact']);
+		expect(refresher.state.loadError).toBeNull();
+		expect(refresher.state.loading).toBe(false);
+	});
+
+	it('rejects a null-body payload of cap + 1 bytes', async () => {
+		const refresher = createLibraryRefresher({
+			sessionStorage: () => null,
+			invalidateLibraryCache: () => {},
+			timeoutMs: SLOW_TIMEOUT_MS
+		});
+
+		await refresher.refresh(nullBodyFetch(payloadOfBytes(CAP + 1, 'one-over')));
+
+		expect(refresher.state.items.map((i) => i.id)).toEqual([]);
+		expect(refresher.state.loadError).toBe('Library is not reachable right now.');
+		expect(refresher.state.loading).toBe(false);
+	});
+
+	it('parses a json-only payload of exactly cap bytes', async () => {
+		const refresher = createLibraryRefresher({
+			sessionStorage: () => null,
+			invalidateLibraryCache: () => {},
+			timeoutMs: SLOW_TIMEOUT_MS
+		});
+
+		await refresher.refresh(jsonOnlyFetch(payloadOfBytes(CAP, 'exact')));
+
+		expect(refresher.state.items.map((i) => i.id)).toEqual(['exact']);
+		expect(refresher.state.loadError).toBeNull();
+		expect(refresher.state.loading).toBe(false);
+	});
+
+	it('rejects a json-only payload of cap + 1 bytes', async () => {
+		const refresher = createLibraryRefresher({
+			sessionStorage: () => null,
+			invalidateLibraryCache: () => {},
+			timeoutMs: SLOW_TIMEOUT_MS
+		});
+
+		await refresher.refresh(jsonOnlyFetch(payloadOfBytes(CAP + 1, 'one-over')));
+
+		expect(refresher.state.items.map((i) => i.id)).toEqual([]);
+		expect(refresher.state.loadError).toBe('Library is not reachable right now.');
+		expect(refresher.state.loading).toBe(false);
+	});
+
+	it('counts UTF-8 bytes, not characters, on the json-only path', async () => {
+		// '♪' is 1 character but 3 UTF-8 bytes: under the cap in characters,
+		// well over it in bytes — the streamed-path multibyte case mirrored
+		// here so a char-counting regression turns this red.
+		const title = '♪'.repeat(600_000);
+		const payload = JSON.stringify([{ id: 'notes', title }]);
+		expect(payload.length).toBeLessThan(CAP);
+		expect(new TextEncoder().encode(payload).length).toBeGreaterThan(CAP);
+
+		const refresher = createLibraryRefresher({
+			sessionStorage: () => null,
+			invalidateLibraryCache: () => {},
+			timeoutMs: SLOW_TIMEOUT_MS
+		});
+
+		await refresher.refresh(jsonOnlyFetch(payload));
+
+		expect(refresher.state.items.map((i) => i.id)).toEqual([]);
+		expect(refresher.state.loadError).toBe('Library is not reachable right now.');
+		expect(refresher.state.loading).toBe(false);
+	});
+
+	it('parses a small multibyte json-only payload', async () => {
+		const refresher = createLibraryRefresher({
+			sessionStorage: () => null,
+			invalidateLibraryCache: () => {},
+			timeoutMs: SLOW_TIMEOUT_MS
+		});
+
+		await refresher.refresh(
+			jsonOnlyFetch(JSON.stringify([{ id: 'multibyte-small', title: 'Café ♪' }]))
+		);
+
+		expect(refresher.state.items).toEqual([{ id: 'multibyte-small', title: 'Café ♪' }]);
+		expect(refresher.state.loadError).toBeNull();
+		expect(refresher.state.loading).toBe(false);
+	});
 });
