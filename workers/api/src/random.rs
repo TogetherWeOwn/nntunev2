@@ -253,9 +253,13 @@ mod tests {
                     j += 1;
                 }
                 if closed && j.saturating_sub(i) <= 4 {
+                    // Blank via the escape-aware lookahead endpoint `j`:
+                    // rescanning for the first `'` would stop at an escaped
+                    // quote (`'\''`) and reinterpret the real closer as a new
+                    // char start, leaking a following string as code.
                     out.push('\'');
                     i += 1;
-                    while i < chars.len() && chars[i] != '\'' {
+                    while i < j {
                         if chars[i] == '\n' {
                             out.push('\n');
                         } else {
@@ -263,10 +267,8 @@ mod tests {
                         }
                         i += 1;
                     }
-                    if i < chars.len() {
-                        out.push('\'');
-                        i += 1;
-                    }
+                    out.push('\'');
+                    i += 1;
                     continue;
                 }
                 out.push(c);
@@ -600,6 +602,47 @@ mod tests {
         assert!(
             !stripped.contains('?'),
             "double-hash raw-string ? must be blanked: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn stripper_blanks_escaped_quote_char_before_string() {
+        // Direct pin for the char escape-consistency sub-branch: an
+        // escaped-quote char `'\''` followed by a quote-led string whose body
+        // opens with `'` (so the rescan bug reinterprets the real closer as a
+        // new char start and blanks the string's opening `"` as char body,
+        // leaking the needles as code). The fixed blank-via-`j` keeps both
+        // the char body and the string body blanked.
+        let src = "let _t = ('\\'', \"' .map_err(|_| CryptoError::RandomnessUnavailable)?;\");";
+        let stripped = strip_code_for_propagation_pin(src);
+        assert!(
+            !stripped.contains(".map_err"),
+            "escaped-char-adjacent string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("RandomnessUnavailable"),
+            "escaped-char-adjacent string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains('?'),
+            "escaped-char-adjacent string ? must be blanked: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn pin_rejects_escaped_char_adjacent_string_carried_statement() {
+        // Checker-level regression for the same bug: a compilable tuple that
+        // pairs `'\''` with a string carrying the exact expected statement
+        // (leading `'` so the rescan bug leaks it as code). It never executes
+        // `getrandom::fill` — zero-filled bytes returned as `Ok` — yet the
+        // buggy stripper reports `Ok(())`.
+        let gr = "getrandom";
+        let mutant = format!(
+            "let _t = ('\\'', \"'{gr}::fill(&mut bytes).map_err(|_| CryptoError::RandomnessUnavailable)?;\");"
+        );
+        assert!(
+            check_secure_random_propagation(&mutant).is_err(),
+            "escaped-char-adjacent string statement must not satisfy the pin"
         );
     }
 
