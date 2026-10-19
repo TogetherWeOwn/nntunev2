@@ -539,6 +539,71 @@ mod tests {
     }
 
     #[test]
+    fn stripper_blanks_escaped_quote_in_plain_string() {
+        // Direct pin for the plain-string escape skip (`\\` at the `"`
+        // branch): the body holds an escaped quote before the needles. With
+        // the skip disabled, the escaped quote ends the string early and the
+        // needles leak as code.
+        let src = "let _note = \"a\\\"b .map_err(|_| CryptoError::RandomnessUnavailable)?;\";";
+        let stripped = strip_code_for_propagation_pin(src);
+        assert!(
+            !stripped.contains(".map_err"),
+            "escaped-quote string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("RandomnessUnavailable"),
+            "escaped-quote string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains('?'),
+            "escaped-quote string ? must be blanked: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn stripper_blanks_nested_block_comment_needles() {
+        // Direct pin for block-comment nesting (`depth += 1`): needles sit
+        // after the inner close but before the outer close. Without nesting
+        // the inner close ends the comment early and the needles leak.
+        let src =
+            "let x = 1; /* outer /* inner */ .map_err(|_| CryptoError::RandomnessUnavailable)?; */";
+        let stripped = strip_code_for_propagation_pin(src);
+        assert!(
+            !stripped.contains(".map_err"),
+            "nested block-comment body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("RandomnessUnavailable"),
+            "nested block-comment body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains('?'),
+            "nested block-comment ? must be blanked: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn stripper_blanks_double_hash_raw_string_with_inner_hash() {
+        // Direct pin for raw-string hash counting: an `r##` body holding a
+        // quote-plus-one-hash (`"#`) must not close early. Capping hashes at
+        // one would end at the inner `"#` and leak the needles.
+        let src = "let _note = r##\"a\"#b .map_err(|_| CryptoError::RandomnessUnavailable)?;\"##;";
+        let stripped = strip_code_for_propagation_pin(src);
+        assert!(
+            !stripped.contains(".map_err"),
+            "double-hash raw-string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("RandomnessUnavailable"),
+            "double-hash raw-string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains('?'),
+            "double-hash raw-string ? must be blanked: {stripped:?}"
+        );
+    }
+
+    #[test]
     fn pin_accepts_propagating_helper_shape() {
         let gr = "getrandom";
         let good =
