@@ -348,19 +348,19 @@ impl RepairContainer {
         );
         let request = Request::new_with_init(&url, &init)
             .map_err(|_| ApiFault::new(502, "container_unavailable"))?;
-        // One cancellable deadline spans headers plus the body drain,
-        // armed before the fetch is issued so slow headers count against
-        // the same budget as a stalled body (same shape as the ingest
-        // pool-stub deadline). The upload rides inside `fetch_request`:
-        // the Container only answers 201 after reading and storing the
-        // streamed R2 body, so the total scales with `file.size` atop
-        // the 10 s base (~1 MB/s floor) instead of expiring a large
-        // healthy transfer mid-upload; retries still restart from byte
-        // 0 but no longer hit the same wall. `Delay` only registers its
-        // timer on first poll, so racing both futures below polls (arms)
-        // the deadline from the start. Dropping the pinned `Delay`
-        // releases its timer, and every return below drops it: expiry,
-        // transport failure, and success all release the timer.
+        // One cancellable deadline spans the upload headers plus the
+        // Container's reply headers, armed before the fetch is issued so
+        // slow headers count against the same budget as a stalled upload
+        // (same shape as the ingest pool-stub deadline). The upload rides
+        // inside `fetch_request`: the Container only answers 201 after
+        // reading and storing the streamed R2 body, so the total scales
+        // with `file.size` atop the 10 s base (~1 MB/s floor) instead of
+        // expiring a large healthy transfer mid-upload; retries still
+        // restart from byte 0 but no longer hit the same wall. `Delay`
+        // only registers its timer on first poll, so racing both futures
+        // below polls (arms) the deadline from the start. Dropping the
+        // pinned `Delay` releases its timer, and every return below drops
+        // it: expiry, transport failure, and success all release the timer.
         let budget_ms = CONTAINER_FETCH_DEADLINE_MS.saturating_add(file.size.saturating_div(1024));
         let mut deadline = Box::pin(Delay::from(Duration::from_millis(budget_ms)));
         let mut fetch = Box::pin(container.fetch_request(request));
@@ -377,35 +377,23 @@ impl RepairContainer {
             }
         })
         .await;
-        let mut response = match response {
+        let response = match response {
             Some(Ok(response)) => response,
             Some(Err(_)) | None => return Err(ApiFault::new(502, "container_unavailable")),
         };
         let status = response.status_code();
-        // Reuse the same deadline for the body drain: partial progress
-        // never re-arms it, so headers plus body share one total budget.
-        // A drain still incomplete at expiry fails the whole stage as
-        // 502 container_unavailable, the fault this site already returns.
-        let mut body_read = Box::pin(response.bytes());
-        let drained = std::future::poll_fn(|cx| {
-            use std::task::Poll;
-            if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
-                return Poll::Ready(None);
-            }
-            match std::future::Future::poll(body_read.as_mut(), cx) {
-                Poll::Ready(drained) => Poll::Ready(Some(drained)),
-                Poll::Pending => Poll::Pending,
-            }
-        })
-        .await;
-        // Expiry alone fails the stage: a drain transport error falls
-        // through to the status match below (base `let _ = ...`
-        // semantics), so a known 400/413 stays terminal and a stored 201
-        // stays success instead of becoming a retryable 502.
-        if drained.is_none() {
-            return Err(ApiFault::new(502, "container_unavailable"));
-        }
+        // The PUT reply carries no verdict beyond its status: cancel the
+        // body instead of collecting bytes that are never read, so a
+        // misbehaving container cannot make us buffer an unbounded reply
+        // or stall the round until a discarded body arrives. Expiry
+        // already failed the fetch above as 502 container_unavailable;
+        // the known status below keeps its mapping (a stored 201 stays
+        // success, 400/413 stay terminal) instead of becoming a
+        // retryable 502.
         drop(deadline);
+        if let ResponseBody::Stream(stream) = response.body() {
+            let _ = stream.cancel();
+        }
         match status {
             201 => Ok(()),
             400 | 413 => Err(ApiFault::new(status, "scratch_input_mismatch")),
@@ -561,30 +549,54 @@ async fn container_json(
         Some(Err(_)) | None => return Err(ApiFault::new(502, "container_unavailable")),
     };
     let status = response.status_code();
-    // Reuse the same deadline for the body read: partial progress never
-    // re-arms it, so headers plus body share one total budget. A read
-    // still incomplete at expiry fails the whole exchange as the
-    // existing 502 container_unavailable; no new fault variant.
-    let mut body_read = Box::pin(response.bytes());
+    // Cap while streaming under the same deadline: an oversize
+    // Container-chosen body to /health, /repair or /cleanup must abort at
+    // MAX_RESULT_BYTES instead of being buffered whole before rejection
+    // (`Response::bytes` folds every chunk into one Vec). Non-stream
+    // bodies are already materialised by the platform: check the length
+    // before cloning; stream bodies are read chunk by chunk with the same
+    // 502 past the cap. Partial progress never re-arms the deadline, so
+    // headers plus body share one total budget; a read still incomplete
+    // at expiry fails the whole exchange as the existing 502
+    // container_unavailable, and every return below drops the timer.
+    match response.body() {
+        ResponseBody::Empty => return Ok((status, Vec::new())),
+        ResponseBody::Body(body) if body.len() > MAX_RESULT_BYTES => {
+            return Err(ApiFault::new(502, "container_unavailable"))
+        }
+        ResponseBody::Body(body) => return Ok((status, body.clone())),
+        ResponseBody::Stream(_) => {}
+    }
+    let mut stream = response
+        .stream()
+        .map_err(|_| ApiFault::new(502, "container_unavailable"))?;
+    let mut read = Box::pin(async move {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| ApiFault::new(502, "container_unavailable"))?;
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > MAX_RESULT_BYTES {
+                return Err(ApiFault::new(502, "container_unavailable"));
+            }
+        }
+        Ok(bytes)
+    });
     let bytes = std::future::poll_fn(|cx| {
         use std::task::Poll;
         if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
             return Poll::Ready(None);
         }
-        match std::future::Future::poll(body_read.as_mut(), cx) {
+        match std::future::Future::poll(read.as_mut(), cx) {
             Poll::Ready(bytes) => Poll::Ready(Some(bytes)),
             Poll::Pending => Poll::Pending,
         }
     })
     .await;
+    drop(deadline);
     let bytes = match bytes {
         Some(Ok(bytes)) => bytes,
         Some(Err(_)) | None => return Err(ApiFault::new(502, "container_unavailable")),
     };
-    drop(deadline);
-    if bytes.len() > MAX_RESULT_BYTES {
-        return Err(ApiFault::new(502, "container_unavailable"));
-    }
     Ok((status, bytes))
 }
 
