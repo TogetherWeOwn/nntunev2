@@ -14,6 +14,18 @@
 //! pins the stable codes/messages of that matrix together with the
 //! never-a-scan property (`search_calls == 0`, no cache writes).
 //!
+//! The offset-bound section at the end pins the documented
+//! `MAX_SEARCH_OFFSET` contract: an offset above the cap is a past-the-end
+//! page (200, `"results": []`, effective offset echoed) decided BEFORE the
+//! cache lookup and the repository call, so a caller walking offsets toward
+//! `u32::MAX` can neither mint unbounded cache keys nor force deep
+//! `OFFSET` scans. The cap value is pinned as a literal here (see
+//! `DOCUMENTED_MAX_SEARCH_OFFSET` below) rather than imported, so the RED
+//! state on a tree without the bound is an assertion failure, never a
+//! compile error. The implementation must introduce
+//! `pub const MAX_SEARCH_OFFSET` with exactly this value and document it
+//! in `workers/mb/README.md`.
+//!
 //! Standalone integration target: no existing suite is edited.
 
 use nntune_mb::{
@@ -301,4 +313,235 @@ fn bad_query_matrix_is_400_with_stable_codes_and_no_repo_scan() {
         assert_eq!(*cache.gets.borrow(), 0, "q={q:?}");
         assert_eq!(*cache.puts.borrow(), 0, "q={q:?}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Offset bound (`MAX_SEARCH_OFFSET`)
+//
+// The documented cap the implementation must introduce as
+// `pub const MAX_SEARCH_OFFSET`. 1,000 rows is 40 full pages at
+// `MAX_PAGE_SIZE` (25) — far deeper than any UI page walk — and matches the
+// existing 1,000-row recordings bound in this worker. Pinned as a literal
+// (not an import of the not-yet-existing constant) so RED on an unbounded
+// tree is an assertion failure, not a compile error.
+// ---------------------------------------------------------------------------
+
+const DOCUMENTED_MAX_SEARCH_OFFSET: u32 = 1_000;
+
+/// Above the cap the handler must short-circuit BEFORE the cache and the
+/// repo: a well-formed past-the-end success page (200, empty results,
+/// effective offset echoed) with zero cache reads/writes and zero repo
+/// calls. On an unbounded tree the hostile repo is actually queried and
+/// its 30 hits come back truncated — that is the intended RED.
+#[test]
+fn offset_above_cap_short_circuits_before_cache_and_repo() {
+    for offset in [
+        DOCUMENTED_MAX_SEARCH_OFFSET + 1,
+        10_000,
+        1_000_000,
+        u32::MAX,
+    ] {
+        let repo = HostileRepo::default();
+        let cache = FakeCache::default();
+        let resp = block_on(handle_search_paged(
+            &repo,
+            &cache,
+            Some("artist".to_string()),
+            "  Hostile   Query ",
+            Some(10),
+            Some(offset),
+        ));
+        assert_eq!(resp.status, 200, "offset {offset}");
+        let body = parse_body(&resp);
+        assert_eq!(
+            body["results"].as_array().unwrap().len(),
+            0,
+            "offset {offset} above the cap must be an empty page"
+        );
+        // The short-circuit page is a well-formed search success body with
+        // the effective coordinates echoed, not an error shape.
+        assert_eq!(body["offset"], offset as u64, "offset {offset}");
+        assert_eq!(body["limit"], 10, "offset {offset}");
+        assert_eq!(body["q"], "hostile query", "offset {offset}");
+        assert_eq!(body["type"], "artist", "offset {offset}");
+        assert_eq!(
+            *repo.search_calls.borrow(),
+            0,
+            "offset {offset} must never reach the repo (no deep OFFSET scan)"
+        );
+        assert_eq!(
+            *cache.gets.borrow(),
+            0,
+            "offset {offset} must never read the cache"
+        );
+        assert_eq!(
+            *cache.puts.borrow(),
+            0,
+            "offset {offset} must never mint a cache key"
+        );
+        assert!(cache.stored.borrow().is_empty(), "offset {offset}");
+    }
+}
+
+/// The boundary itself: exactly at the cap the search runs exactly as
+/// today (cache miss, one repo call at the requested offset, page capped
+/// at the effective limit, result cached); cap+1 short-circuits.
+#[test]
+fn offset_at_cap_queries_and_cap_plus_one_short_circuits() {
+    // At the cap: queried as before.
+    let repo = HostileRepo::default();
+    let cache = FakeCache::default();
+    let resp = block_on(handle_search_paged(
+        &repo,
+        &cache,
+        Some("artist".to_string()),
+        "hostile query",
+        Some(10),
+        Some(DOCUMENTED_MAX_SEARCH_OFFSET),
+    ));
+    assert_eq!(resp.status, 200);
+    let body = parse_body(&resp);
+    assert_eq!(body["results"].as_array().unwrap().len(), 10);
+    assert_eq!(body["offset"], DOCUMENTED_MAX_SEARCH_OFFSET as u64);
+    assert_eq!(body["limit"], 10);
+    assert_eq!(*repo.search_calls.borrow(), 1);
+    assert_eq!(*repo.last_offset.borrow(), DOCUMENTED_MAX_SEARCH_OFFSET);
+    assert_eq!(*cache.gets.borrow(), 1);
+    assert_eq!(*cache.puts.borrow(), 1);
+
+    // Cap+1: short-circuits with zero calls.
+    let repo = HostileRepo::default();
+    let cache = FakeCache::default();
+    let resp = block_on(handle_search_paged(
+        &repo,
+        &cache,
+        Some("artist".to_string()),
+        "hostile query",
+        Some(10),
+        Some(DOCUMENTED_MAX_SEARCH_OFFSET + 1),
+    ));
+    assert_eq!(resp.status, 200);
+    let body = parse_body(&resp);
+    assert_eq!(body["results"].as_array().unwrap().len(), 0);
+    assert_eq!(body["offset"], (DOCUMENTED_MAX_SEARCH_OFFSET + 1) as u64);
+    assert_eq!(*repo.search_calls.borrow(), 0);
+    assert_eq!(*cache.gets.borrow(), 0);
+    assert_eq!(*cache.puts.borrow(), 0);
+}
+
+/// Below the cap — including an explicit 0 and cap-1 — behavior is exactly
+/// as today: one repo call forwarding the requested offset, the page
+/// capped at the effective limit, coordinates echoed.
+#[test]
+fn offsets_below_cap_including_zero_behave_as_today() {
+    for offset in [0, 1, DOCUMENTED_MAX_SEARCH_OFFSET - 1] {
+        let repo = HostileRepo::default();
+        let cache = FakeCache::default();
+        let resp = block_on(handle_search_paged(
+            &repo,
+            &cache,
+            Some("release".to_string()),
+            "hostile query",
+            Some(10),
+            Some(offset),
+        ));
+        assert_eq!(resp.status, 200, "offset {offset}");
+        let body = parse_body(&resp);
+        assert_eq!(
+            body["results"].as_array().unwrap().len(),
+            10,
+            "offset {offset}"
+        );
+        assert_eq!(body["offset"], offset as u64, "offset {offset}");
+        assert_eq!(*repo.search_calls.borrow(), 1, "offset {offset}");
+        assert_eq!(*repo.last_offset.borrow(), offset, "offset {offset}");
+        assert_eq!(*cache.gets.borrow(), 1, "offset {offset}");
+        assert_eq!(*cache.puts.borrow(), 1, "offset {offset}");
+    }
+}
+
+/// The short-circuit composes with the existing coordinate rules: with no
+/// explicit limit the echoed limit is still the default page size, and an
+/// over-limit request is still clamped (never rejected) on the empty page.
+#[test]
+fn offset_above_cap_echoes_effective_limit() {
+    for (raw_limit, expected_limit) in [
+        (None, MAX_PAGE_SIZE),
+        (Some(1000), MAX_PAGE_SIZE),
+        (Some(7), 7),
+    ] {
+        let repo = HostileRepo::default();
+        let cache = FakeCache::default();
+        let resp = block_on(handle_search_paged(
+            &repo,
+            &cache,
+            Some("recording".to_string()),
+            "hostile query",
+            raw_limit,
+            Some(DOCUMENTED_MAX_SEARCH_OFFSET + 1),
+        ));
+        assert_eq!(resp.status, 200, "raw limit {raw_limit:?}");
+        let body = parse_body(&resp);
+        assert_eq!(
+            body["results"].as_array().unwrap().len(),
+            0,
+            "raw limit {raw_limit:?}"
+        );
+        assert_eq!(
+            body["limit"], expected_limit as u64,
+            "raw limit {raw_limit:?}"
+        );
+        assert_eq!(
+            body["offset"],
+            (DOCUMENTED_MAX_SEARCH_OFFSET + 1) as u64,
+            "raw limit {raw_limit:?}"
+        );
+        assert_eq!(*repo.search_calls.borrow(), 0, "raw limit {raw_limit:?}");
+        assert_eq!(*cache.gets.borrow(), 0, "raw limit {raw_limit:?}");
+        assert_eq!(*cache.puts.borrow(), 0, "raw limit {raw_limit:?}");
+    }
+}
+
+/// The offset bound must not bypass query validation: a bad query (or a
+/// zero limit) with an above-cap offset is still the same 400 as today,
+/// still before any cache or repo call. This passes on an unbounded tree
+/// and guards the validation-before-short-circuit ordering.
+#[test]
+fn offset_above_cap_does_not_bypass_validation() {
+    // Empty query + above-cap offset: still 400 MB_SEARCH_EMPTY_QUERY.
+    let repo = HostileRepo::default();
+    let cache = FakeCache::default();
+    let resp = block_on(handle_search_paged(
+        &repo,
+        &cache,
+        Some("artist".to_string()),
+        "   ",
+        Some(10),
+        Some(DOCUMENTED_MAX_SEARCH_OFFSET + 1),
+    ));
+    assert_eq!(resp.status, 400);
+    let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+    assert_eq!(body["code"], "MB_SEARCH_EMPTY_QUERY");
+    assert_eq!(*repo.search_calls.borrow(), 0);
+    assert_eq!(*cache.gets.borrow(), 0);
+    assert_eq!(*cache.puts.borrow(), 0);
+
+    // Zero limit + above-cap offset: still 400, not an empty 200 page.
+    let repo = HostileRepo::default();
+    let cache = FakeCache::default();
+    let resp = block_on(handle_search_paged(
+        &repo,
+        &cache,
+        Some("artist".to_string()),
+        "hostile query",
+        Some(0),
+        Some(DOCUMENTED_MAX_SEARCH_OFFSET + 1),
+    ));
+    assert_eq!(resp.status, 400);
+    let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(body["message"], "limit must be 1..=25");
+    assert_eq!(*repo.search_calls.borrow(), 0);
+    assert_eq!(*cache.gets.borrow(), 0);
+    assert_eq!(*cache.puts.borrow(), 0);
 }
