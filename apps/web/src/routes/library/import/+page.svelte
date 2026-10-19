@@ -9,19 +9,19 @@
 		const input = event.currentTarget as HTMLInputElement;
 		status =
 			input.files && input.files.length > 0
-				? 'NZB ingest lands with the ingest slice — file received, not yet processed.'
+				? 'NZB file selected locally only. This page does not upload or process the file or add tracks to your library.'
 				: null;
 	}
 </script>
 
 <svelte:head>
-	<title>NNTune — import</title>
-	<meta name="description" content="Import an NZB into your NNTune library." />
+	<title>NNTune — local NZB selection</title>
+	<meta name="description" content="Select an NZB file locally only. No upload, processing or tracks added." />
 </svelte:head>
 
 <main class="nt-wrap">
 	<h1>Import</h1>
-	<p>Choose an NZB file to add its tracks to your library.</p>
+	<p>Choose an NZB file locally only. This page does not upload or process the file or add tracks to your library.</p>
 	<label>
 		NZB file
 		<input data-testid="import-file" type="file" accept=".nzb" onchange={onFile} />
