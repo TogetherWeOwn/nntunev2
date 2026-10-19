@@ -53,6 +53,12 @@ use crate::webauthn;
 pub const MAX_BODY_BYTES: usize = 32 * 1024;
 /// Magic links issuable per email inside the link TTL window.
 pub const MAGIC_LINKS_PER_WINDOW: u64 = 3;
+/// Admitted inline auth-mail send budget (client-visible auth-start contract:
+/// registration and known-user magic-start race the mail send against this
+/// deadline, then follow the ordinary ignored delivery-error path with the
+/// unchanged generic envelope). Drift must be a deliberate slice with README
+/// and caller updates, not a silent edit.
+pub const AUTH_MAIL_SEND_DEADLINE_SECS: u64 = 5;
 // Test-connection budget lives in one place: `vault::TEST_CONNECTION_MAX_ATTEMPTS`
 // per `vault::TEST_CONNECTION_WINDOW_SECS`. No handler-level copy: the two
 // once disagreed (10 vs 5) with both test suites green.
@@ -729,7 +735,7 @@ pub trait Mailer {
 pub(crate) async fn deliver_mail_with_deadline(
     send: impl Future<Output = Result<(), StoreError>>,
 ) -> Result<(), StoreError> {
-    let duration = std::time::Duration::from_secs(5);
+    let duration = std::time::Duration::from_secs(AUTH_MAIL_SEND_DEADLINE_SECS);
     #[cfg(target_arch = "wasm32")]
     let deadline = worker::Delay::from(duration);
     #[cfg(not(target_arch = "wasm32"))]
@@ -8611,6 +8617,63 @@ mod tests {
         assert_eq!(
             pinned, 10,
             "every body-bearing route (incl. the invite variant) is pinned"
+        );
+    }
+
+    #[test]
+    fn auth_mail_send_deadline_is_five_seconds_both_directions() {
+        // Deadline-value pin: the README promises at most five seconds, but the
+        // acceptance suite only bounds it by a 30s watchdog, so 100ms (mail
+        // never delivers) and 12s (documented bound drifts) both stayed green.
+        // Pin the literal and the elapsed behavior here, in builder-owned unit
+        // code — the acceptance file is untouched.
+        assert_eq!(
+            AUTH_MAIL_SEND_DEADLINE_SECS, 5,
+            "auth-mail send deadline must stay exactly 5s; a new budget needs \
+             README + caller updates plus this pin"
+        );
+
+        fn drive<F: Future>(mut future: F) -> F::Output {
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            // SAFETY: test-only poll loop; the future is stack-owned and never
+            // moved after pinning.
+            let mut future = unsafe { std::pin::Pin::new_unchecked(&mut future) };
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+                    return output;
+                }
+                assert!(
+                    std::time::Instant::now() < until,
+                    "mail deadline helper still pending past its test ceiling"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        // Permanently pending send must settle at ~5s, not immediately and not
+        // at the watchdog: catches both 100ms and 12s drift.
+        let started = std::time::Instant::now();
+        let outcome = drive(deliver_mail_with_deadline(std::future::pending()));
+        assert!(outcome.is_err(), "pending mail must time out, not succeed");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_secs(4),
+            "pending send finished in {elapsed:?}; the 5s deadline must actually wait"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "pending send took {elapsed:?}; the documented at-most-5s bound must hold"
+        );
+
+        // Fast sends must not wait for the deadline.
+        let started = std::time::Instant::now();
+        let outcome = drive(deliver_mail_with_deadline(async { Ok(()) }));
+        assert!(outcome.is_ok(), "fast success must pass through");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "fast send must not wait for the deadline"
         );
     }
 }
