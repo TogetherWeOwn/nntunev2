@@ -37,7 +37,11 @@
 //! named above — never cast `self.pos` / `self.end` / a `buf_start`
 //! difference (under any alias or parenthesisation: the gate walks each
 //! `as usize` cast's operand for `self.pos`, `self.end` or a `buf_start*`
-//! identifier) / `staged_bytes` directly, and never do arithmetic after a
+//! identifier, recognises `usize` by its last path segment so qualified
+//! spellings like `::std::primitive::usize` count, and propagates taint
+//! through intermediate `let` locals — `let lim = self.end -
+//! live.buf_start; lim as usize` narrows just as surely) /
+//! `staged_bytes` directly, and never do arithmetic after a
 //! narrowing cast (`as usize +`). Deliberately unpinned: the exact
 //! widening syntax, local variable names, helper extraction, and the
 //! chunk size.
@@ -161,132 +165,351 @@ fn narrowing_operand(expr: &syn::Expr) -> Option<&'static str> {
     }
 }
 
+/// True when `text` (a token-stream string) contains `name` as a whole
+/// identifier token, not merely as a substring of a longer name.
+fn contains_ident(text: &str, name: &str) -> bool {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|token| token == name)
+}
+
+/// A cast target is `usize` when the *last segment* of its path is
+/// `usize`, so qualified spellings (`::std::primitive::usize`,
+/// `core::primitive::usize`, `std::primitive::usize`) count too — an
+/// exact-string compare against `"usize"` missed all of those.
+fn is_usize_type(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Path(type_path) => type_path
+            .path
+            .segments
+            .last()
+            .is_some_and(|seg| seg.ident == "usize"),
+        syn::Type::Paren(paren) => is_usize_type(&paren.elem),
+        syn::Type::Group(group) => is_usize_type(&group.elem),
+        _ => false,
+    }
+}
+
+/// Unwrap parentheses/groups so shape checks see the inner expression.
+fn unparen(mut expr: &syn::Expr) -> &syn::Expr {
+    loop {
+        match expr {
+            syn::Expr::Paren(paren) => expr = &paren.expr,
+            syn::Expr::Group(group) => expr = &group.expr,
+            _ => return expr,
+        }
+    }
+}
+
+/// Whether `expr` is already bounded by an in-memory length (or a small
+/// constant), so casting it to `usize` is the legitimate final-index
+/// step rather than a truncation. `bounded` names locals already proven
+/// bounded in this block.
+/// - `.len()` and casts of it (`bytes.len() as u64`) are lengths;
+/// - `a.min(b)` / `a.clamp(.., b)` is bounded when either side is;
+/// - `a.max(b)` is bounded when both sides are;
+/// - `len - x` is bounded by `len`;
+/// - a bounded local or a `SCREAMING_CASE` constant (`CHUNK`) is.
+fn expr_is_bounded(expr: &syn::Expr, bounded: &[String]) -> bool {
+    use syn::Expr;
+    match unparen(expr) {
+        Expr::Lit(_) => true,
+        Expr::Path(path) => path.path.segments.last().is_some_and(|seg| {
+            let name = seg.ident.to_string();
+            bounded.iter().any(|b| b == &name)
+                || (name.len() > 1
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+        }),
+        Expr::Cast(cast) => expr_is_bounded(&cast.expr, bounded),
+        Expr::MethodCall(call) => {
+            let method = call.method.to_string();
+            match method.as_str() {
+                "len" => true,
+                "min" | "clamp" => {
+                    expr_is_bounded(&call.receiver, bounded)
+                        || call.args.iter().any(|a| expr_is_bounded(a, bounded))
+                }
+                "max" => {
+                    expr_is_bounded(&call.receiver, bounded)
+                        && call.args.iter().all(|a| expr_is_bounded(a, bounded))
+                }
+                "saturating_sub" | "min_by" => expr_is_bounded(&call.receiver, bounded),
+                _ => false,
+            }
+        }
+        Expr::Binary(binary) => match binary.op {
+            syn::BinOp::Sub(_) => expr_is_bounded(&binary.left, bounded),
+            syn::BinOp::Add(_) => {
+                expr_is_bounded(&binary.left, bounded) && expr_is_bounded(&binary.right, bounded)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Identifiers bound by a `let` pattern (simple, typed, tuple/or/ref).
+fn pat_idents(pat: &syn::Pat, names: &mut Vec<String>) {
+    match pat {
+        syn::Pat::Ident(ident) => names.push(ident.ident.to_string()),
+        syn::Pat::Type(typed) => pat_idents(&typed.pat, names),
+        syn::Pat::Tuple(tuple) => {
+            for elem in &tuple.elems {
+                pat_idents(elem, names);
+            }
+        }
+        syn::Pat::TupleStruct(tuple) => {
+            for elem in &tuple.elems {
+                pat_idents(elem, names);
+            }
+        }
+        syn::Pat::Or(or) => {
+            for case in &or.cases {
+                pat_idents(case, names);
+            }
+        }
+        syn::Pat::Reference(reference) => pat_idents(&reference.pat, names),
+        syn::Pat::Slice(slice) => {
+            for elem in &slice.elems {
+                pat_idents(elem, names);
+            }
+        }
+        syn::Pat::Struct(strct) => {
+            for field in &strct.fields {
+                pat_idents(&field.pat, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Taint state threaded through a block, in statement order.
+/// - `tainted`: locals derived from an unbounded u64 play offset
+///   (`self.pos`/`self.end`/`buf_start*`, or another tainted local)
+///   whose value has not yet been bounded by a length clamp. Casting
+///   one to `usize` is the truncation this gate forbids — even after
+///   the offset is laundered through an intermediate name such as
+///   `let lim = self.end - live.buf_start; lim as usize`.
+/// - `bounded`: locals proven `<=` a buffer length (or chunk constant)
+///   by `expr_is_bounded`, e.g. `start_u64 = self.pos.min(buf_len)`.
+/// - `avail_of`: `(avail, offset)` pairs from `let avail = buf_len -
+///   offset;`. The clean live serve then bounds its take with
+///   `.min(avail)`; once that min is seen, `offset` is the established
+///   in-buffer index and moves from tainted to bounded. A mutant that
+///   casts the offset (or an end-derived `lim`) before any such clamp
+///   never earns that move.
+#[derive(Clone, Default)]
+struct GateState {
+    tainted: Vec<String>,
+    bounded: Vec<String>,
+    avail_of: Vec<(String, String)>,
+}
+
+impl GateState {
+    fn taint_of(&self, expr: &syn::Expr) -> Option<String> {
+        let text = expr.to_token_stream().to_string();
+        self.tainted
+            .iter()
+            .find(|name| contains_ident(&text, name))
+            .cloned()
+    }
+
+    /// Record `names = init` after init's own casts have been checked:
+    /// a bounded init clears taint, a taint-sourced unbounded init
+    /// propagates it, and a plain shadowing removes stale state.
+    fn record_binding(&mut self, names: &[String], init: &syn::Expr) {
+        let text = init.to_token_stream().to_string();
+        // `let avail = <bounded length> - <tainted offset>;`
+        if let syn::Expr::Binary(binary) = unparen(init) {
+            if matches!(binary.op, syn::BinOp::Sub(_))
+                && expr_is_bounded(&binary.left, &self.bounded)
+            {
+                if let Some(offset) = self.taint_of(&binary.right) {
+                    for name in names {
+                        self.avail_of.push((name.clone(), offset.clone()));
+                    }
+                }
+            }
+        }
+        // Once an avail local is consumed by a `.min(...)` clamp, the
+        // offset it was derived from is bounded by construction.
+        if text.contains("min (") {
+            let pairs = self.avail_of.clone();
+            for (avail, offset) in pairs {
+                if contains_ident(&text, &avail) {
+                    self.tainted.retain(|t| t != &offset);
+                    if !self.bounded.iter().any(|b| b == &offset) {
+                        self.bounded.push(offset);
+                    }
+                }
+            }
+        }
+        let bounded_init = expr_is_bounded(init, &self.bounded);
+        let tainted_init = narrowing_operand(init).is_some() || self.taint_of(init).is_some();
+        for name in names {
+            self.tainted.retain(|t| t != name);
+            self.bounded.retain(|b| b != name);
+            self.avail_of.retain(|(a, _)| a != name || bounded_init);
+            if bounded_init {
+                self.bounded.push(name.clone());
+            } else if tainted_init {
+                self.tainted.push(name.clone());
+            }
+        }
+    }
+}
+
 /// `expr as usize` violations inside one expression: a cast whose operand
-/// token subtree still mentions an unbounded u64 offset. Hand-rolled
-/// `syn::Expr` recursion (this crate's `syn` dev-dependency does not
-/// enable the `visit` feature, and only this test file may change).
-/// Casts inside macro-invocation tokens are not parsed as `Expr` and so
-/// are out of reach here; the literal token patterns in the gate below
-/// still cover their direct spellings.
-fn collect_narrowing_casts(expr: &syn::Expr, violations: &mut Vec<String>) {
+/// token subtree still mentions an unbounded u64 offset, or a local
+/// tainted by one (see `GateState`). A cast target counts as `usize` by
+/// its last path segment. Hand-rolled `syn::Expr` recursion (this crate's
+/// `syn` dev-dependency does not enable the `visit` feature, and only this
+/// test file may change). Casts inside macro-invocation tokens are not
+/// parsed as `Expr` and so are out of reach here; the literal token
+/// patterns in the gate below still cover their direct spellings.
+fn collect_narrowing_casts(expr: &syn::Expr, violations: &mut Vec<String>, state: &mut GateState) {
     use syn::Expr;
     if let Expr::Cast(cast) = expr {
-        if cast.ty.to_token_stream().to_string() == "usize" {
+        if is_usize_type(&cast.ty) {
             if let Some(what) = narrowing_operand(&cast.expr) {
                 violations.push(format!(
                     "`{} as usize` (narrows {what} before the buffer-length clamp)",
                     cast.expr.to_token_stream()
                 ));
+            } else if !expr_is_bounded(&cast.expr, &state.bounded) {
+                if let Some(name) = state.taint_of(&cast.expr) {
+                    violations.push(format!(
+                        "`{} as usize` (narrows tainted local `{name}` derived \
+                         from an unbounded u64 play offset before the \
+                         buffer-length clamp)",
+                        cast.expr.to_token_stream()
+                    ));
+                }
             }
         }
     }
     match expr {
         Expr::Array(array) => {
             for elem in &array.elems {
-                collect_narrowing_casts(elem, violations);
+                collect_narrowing_casts(elem, violations, state);
             }
         }
         Expr::Assign(assign) => {
-            collect_narrowing_casts(&assign.left, violations);
-            collect_narrowing_casts(&assign.right, violations);
+            collect_narrowing_casts(&assign.left, violations, state);
+            collect_narrowing_casts(&assign.right, violations, state);
+            if let Expr::Path(path) = unparen(&assign.left) {
+                if let Some(seg) = path.path.segments.last() {
+                    if path.path.segments.len() == 1 {
+                        let name = seg.ident.to_string();
+                        state.record_binding(&[name], &assign.right);
+                    }
+                }
+            }
         }
-        Expr::Async(expr) => collect_narrowing_casts_in_block(&expr.block, violations),
-        Expr::Await(expr) => collect_narrowing_casts(&expr.base, violations),
+        Expr::Async(expr) => collect_narrowing_casts_in_block(&expr.block, violations, state),
+        Expr::Await(expr) => collect_narrowing_casts(&expr.base, violations, state),
         Expr::Binary(expr) => {
-            collect_narrowing_casts(&expr.left, violations);
-            collect_narrowing_casts(&expr.right, violations);
+            collect_narrowing_casts(&expr.left, violations, state);
+            collect_narrowing_casts(&expr.right, violations, state);
         }
-        Expr::Block(expr) => collect_narrowing_casts_in_block(&expr.block, violations),
+        Expr::Block(expr) => collect_narrowing_casts_in_block(&expr.block, violations, state),
         Expr::Break(expr) => {
             if let Some(inner) = &expr.expr {
-                collect_narrowing_casts(inner, violations);
+                collect_narrowing_casts(inner, violations, state);
             }
         }
         Expr::Call(call) => {
-            collect_narrowing_casts(&call.func, violations);
+            collect_narrowing_casts(&call.func, violations, state);
             for arg in &call.args {
-                collect_narrowing_casts(arg, violations);
+                collect_narrowing_casts(arg, violations, state);
             }
         }
-        Expr::Cast(cast) => collect_narrowing_casts(&cast.expr, violations),
-        Expr::Closure(closure) => collect_narrowing_casts(&closure.body, violations),
-        Expr::Const(expr) => collect_narrowing_casts_in_block(&expr.block, violations),
-        Expr::Field(expr) => collect_narrowing_casts(&expr.base, violations),
-        Expr::ForLoop(expr) => {
-            collect_narrowing_casts(&expr.expr, violations);
-            collect_narrowing_casts_in_block(&expr.body, violations);
+        Expr::Cast(cast) => collect_narrowing_casts(&cast.expr, violations, state),
+        Expr::Closure(closure) => {
+            let saved = state.clone();
+            collect_narrowing_casts(&closure.body, violations, state);
+            *state = saved;
         }
-        Expr::Group(group) => collect_narrowing_casts(&group.expr, violations),
+        Expr::Const(expr) => collect_narrowing_casts_in_block(&expr.block, violations, state),
+        Expr::Field(expr) => collect_narrowing_casts(&expr.base, violations, state),
+        Expr::ForLoop(expr) => {
+            collect_narrowing_casts(&expr.expr, violations, state);
+            collect_narrowing_casts_in_block(&expr.body, violations, state);
+        }
+        Expr::Group(group) => collect_narrowing_casts(&group.expr, violations, state),
         Expr::If(expr) => {
-            collect_narrowing_casts(&expr.cond, violations);
-            collect_narrowing_casts_in_block(&expr.then_branch, violations);
+            collect_narrowing_casts(&expr.cond, violations, state);
+            collect_narrowing_casts_in_block(&expr.then_branch, violations, state);
             if let Some((_, else_branch)) = &expr.else_branch {
-                collect_narrowing_casts(else_branch, violations);
+                collect_narrowing_casts(else_branch, violations, state);
             }
         }
         Expr::Index(expr) => {
-            collect_narrowing_casts(&expr.expr, violations);
-            collect_narrowing_casts(&expr.index, violations);
+            collect_narrowing_casts(&expr.expr, violations, state);
+            collect_narrowing_casts(&expr.index, violations, state);
         }
-        Expr::Let(expr) => collect_narrowing_casts(&expr.expr, violations),
-        Expr::Loop(expr) => collect_narrowing_casts_in_block(&expr.body, violations),
+        Expr::Let(expr) => collect_narrowing_casts(&expr.expr, violations, state),
+        Expr::Loop(expr) => collect_narrowing_casts_in_block(&expr.body, violations, state),
         Expr::Match(expr) => {
-            collect_narrowing_casts(&expr.expr, violations);
+            collect_narrowing_casts(&expr.expr, violations, state);
             for arm in &expr.arms {
-                collect_narrowing_casts_in_pat(&arm.pat, violations);
-                collect_narrowing_casts(&arm.body, violations);
+                let saved = state.clone();
+                collect_narrowing_casts_in_pat(&arm.pat, violations, state);
+                collect_narrowing_casts(&arm.body, violations, state);
+                *state = saved;
             }
         }
         Expr::MethodCall(call) => {
-            collect_narrowing_casts(&call.receiver, violations);
+            collect_narrowing_casts(&call.receiver, violations, state);
             for arg in &call.args {
-                collect_narrowing_casts(arg, violations);
+                collect_narrowing_casts(arg, violations, state);
             }
         }
-        Expr::Paren(expr) => collect_narrowing_casts(&expr.expr, violations),
+        Expr::Paren(expr) => collect_narrowing_casts(&expr.expr, violations, state),
         Expr::Range(range) => {
             if let Some(start) = &range.start {
-                collect_narrowing_casts(start, violations);
+                collect_narrowing_casts(start, violations, state);
             }
             if let Some(end) = &range.end {
-                collect_narrowing_casts(end, violations);
+                collect_narrowing_casts(end, violations, state);
             }
         }
-        Expr::RawAddr(expr) => collect_narrowing_casts(&expr.expr, violations),
-        Expr::Reference(expr) => collect_narrowing_casts(&expr.expr, violations),
+        Expr::RawAddr(expr) => collect_narrowing_casts(&expr.expr, violations, state),
+        Expr::Reference(expr) => collect_narrowing_casts(&expr.expr, violations, state),
         Expr::Repeat(expr) => {
-            collect_narrowing_casts(&expr.expr, violations);
-            collect_narrowing_casts(&expr.len, violations);
+            collect_narrowing_casts(&expr.expr, violations, state);
+            collect_narrowing_casts(&expr.len, violations, state);
         }
         Expr::Return(expr) => {
             if let Some(inner) = &expr.expr {
-                collect_narrowing_casts(inner, violations);
+                collect_narrowing_casts(inner, violations, state);
             }
         }
         Expr::Struct(expr) => {
             for field in &expr.fields {
-                collect_narrowing_casts(&field.expr, violations);
+                collect_narrowing_casts(&field.expr, violations, state);
             }
             if let Some(rest) = &expr.rest {
-                collect_narrowing_casts(rest, violations);
+                collect_narrowing_casts(rest, violations, state);
             }
         }
-        Expr::Try(expr) => collect_narrowing_casts(&expr.expr, violations),
-        Expr::TryBlock(expr) => collect_narrowing_casts_in_block(&expr.block, violations),
+        Expr::Try(expr) => collect_narrowing_casts(&expr.expr, violations, state),
+        Expr::TryBlock(expr) => collect_narrowing_casts_in_block(&expr.block, violations, state),
         Expr::Tuple(expr) => {
             for elem in &expr.elems {
-                collect_narrowing_casts(elem, violations);
+                collect_narrowing_casts(elem, violations, state);
             }
         }
-        Expr::Unary(expr) => collect_narrowing_casts(&expr.expr, violations),
-        Expr::Unsafe(expr) => collect_narrowing_casts_in_block(&expr.block, violations),
+        Expr::Unary(expr) => collect_narrowing_casts(&expr.expr, violations, state),
+        Expr::Unsafe(expr) => collect_narrowing_casts_in_block(&expr.block, violations, state),
         Expr::While(expr) => {
-            collect_narrowing_casts(&expr.cond, violations);
-            collect_narrowing_casts_in_block(&expr.body, violations);
+            collect_narrowing_casts(&expr.cond, violations, state);
+            collect_narrowing_casts_in_block(&expr.body, violations, state);
         }
         Expr::Yield(expr) => {
             if let Some(inner) = &expr.expr {
-                collect_narrowing_casts(inner, violations);
+                collect_narrowing_casts(inner, violations, state);
             }
         }
         Expr::Continue(_)
@@ -301,39 +524,56 @@ fn collect_narrowing_casts(expr: &syn::Expr, violations: &mut Vec<String>) {
 
 /// Match-arm guards are `Pat::Guard` in this `syn` version; a cast in a
 /// guard is an expression too.
-fn collect_narrowing_casts_in_pat(pat: &syn::Pat, violations: &mut Vec<String>) {
+fn collect_narrowing_casts_in_pat(
+    pat: &syn::Pat,
+    violations: &mut Vec<String>,
+    state: &mut GateState,
+) {
     match pat {
         syn::Pat::Guard(guard) => {
-            collect_narrowing_casts_in_pat(&guard.pat, violations);
-            collect_narrowing_casts(&guard.guard, violations);
+            collect_narrowing_casts_in_pat(&guard.pat, violations, state);
+            collect_narrowing_casts(&guard.guard, violations, state);
         }
         syn::Pat::Or(or) => {
             for case in &or.cases {
-                collect_narrowing_casts_in_pat(case, violations);
+                collect_narrowing_casts_in_pat(case, violations, state);
             }
         }
         _ => {}
     }
 }
 
-fn collect_narrowing_casts_in_block(block: &syn::Block, violations: &mut Vec<String>) {
+fn collect_narrowing_casts_in_block(
+    block: &syn::Block,
+    violations: &mut Vec<String>,
+    state: &mut GateState,
+) {
+    // Locals bound inside this block do not escape it: restore the
+    // caller's taint/bounded sets on exit, but thread them statement
+    // by statement so `let` taint propagates to later casts here.
+    let saved = state.clone();
     for stmt in &block.stmts {
         match stmt {
             syn::Stmt::Local(local) => {
                 if let Some(init) = &local.init {
-                    collect_narrowing_casts(&init.expr, violations);
+                    collect_narrowing_casts(&init.expr, violations, state);
                     if let Some((_, diverge)) = &init.diverge {
-                        collect_narrowing_casts(diverge, violations);
+                        collect_narrowing_casts(diverge, violations, state);
                     }
+                    let mut names = Vec::new();
+                    pat_idents(&local.pat, &mut names);
+                    state.record_binding(&names, &init.expr);
                 }
             }
-            syn::Stmt::Expr(expr, _) => collect_narrowing_casts(expr, violations),
+            syn::Stmt::Expr(expr, _) => collect_narrowing_casts(expr, violations, state),
             syn::Stmt::Item(syn::Item::Fn(item_fn)) => {
-                collect_narrowing_casts_in_block(&item_fn.block, violations)
+                let mut inner = GateState::default();
+                collect_narrowing_casts_in_block(&item_fn.block, violations, &mut inner)
             }
             syn::Stmt::Item(_) | syn::Stmt::Macro(_) => {}
         }
     }
+    *state = saved;
 }
 
 /// Every `as usize` narrowing of a u64 play offset in
@@ -346,7 +586,8 @@ fn play_stream_narrowing_casts() -> Vec<String> {
     let mut violations = Vec::new();
     for item in &item_impl.items {
         if let syn::ImplItem::Fn(method) = item {
-            collect_narrowing_casts_in_block(&method.block, &mut violations);
+            let mut state = GateState::default();
+            collect_narrowing_casts_in_block(&method.block, &mut violations, &mut state);
         }
     }
     violations
