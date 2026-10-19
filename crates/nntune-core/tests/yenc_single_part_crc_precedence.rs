@@ -146,6 +146,34 @@ fn single_matching_crc_with_mismatching_pcrc_decodes_pcrc_first() {
 }
 
 #[test]
+fn single_mismatching_crc_with_matching_pcrc_is_rejected() {
+    // `crc32=` is the selected single-part field: a valid-but-mismatching
+    // `crc32=` must be rejected even when `pcrc32=` matches. The selected
+    // field governs and never falls through to the other field.
+    let good = crc32(WHOLE);
+    let bad = good ^ 1;
+    for trailer in [
+        format!(
+            "=yend size={} crc32={bad:08x} pcrc32={good:08x}\r\n",
+            WHOLE.len()
+        ),
+        format!(
+            "=yend size={} pcrc32={good:08x} crc32={bad:08x}\r\n",
+            WHOLE.len()
+        ),
+    ] {
+        let article = with_trailer(&single(WHOLE), &trailer);
+        assert_crc_mismatch(
+            &article,
+            WHOLE.len(),
+            bad,
+            good,
+            &format!("single-part mismatching crc32 with matching pcrc32: {trailer}"),
+        );
+    }
+}
+
+#[test]
 fn multipart_matching_pcrc_with_differing_whole_crc_decodes() {
     // `pcrc32=` governs the part; the whole-file `crc32=` must not veto it.
     for (part, payload) in [(1, PART1), (2, PART2)] {

@@ -158,6 +158,31 @@ fn single_matching_crc_with_mismatching_pcrc_decodes_pcrc_first() {
 }
 
 #[test]
+fn single_mismatching_crc_with_matching_pcrc_is_rejected() {
+    // `crc32=` is the selected single-part field: a mismatching `crc32=`
+    // must be rejected even when `pcrc32=` matches (no fall-through to the
+    // other field). Replace `crc32=` before adding `pcrc32=` so the `crc32=`
+    // needle cannot match inside `pcrc32=`.
+    let crc_first = add_tag(
+        &replace_tag(&single(), "crc32", mismatching().as_bytes()),
+        "pcrc32",
+        matching().as_bytes(),
+    );
+    assert_rejected(
+        &crc_first,
+        "single-part mismatching crc32 with matching pcrc32, crc first",
+    );
+    // Rebuild as `pcrc32=` then `crc32=` order.
+    let base = remove_tag(&single(), "crc32");
+    let base = add_tag(&base, "pcrc32", matching().as_bytes());
+    let pcrc_first = add_tag(&base, "crc32", mismatching().as_bytes());
+    assert_rejected(
+        &pcrc_first,
+        "single-part mismatching crc32 with matching pcrc32, pcrc first",
+    );
+}
+
+#[test]
 fn multipart_matching_pcrc_with_differing_whole_crc_decodes() {
     // `pcrc32=` governs the part; the whole-file `crc32=` must not veto it.
     let whole = 0xDEAD_BEEFu32;
