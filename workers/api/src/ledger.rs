@@ -84,12 +84,17 @@ pub enum LedgerError {
     /// oversized bytes, seconds disagreeing with bytes, play key not binding
     /// its identity): HTTP 422.
     Invalid,
+    /// Secure randomness unavailable while minting a fresh idempotency key:
+    /// HTTP 503. Callers map this to the existing `service_unavailable`
+    /// shape (retryable); never a panic, fallback, or reused key.
+    RandomnessUnavailable,
 }
 
 impl LedgerError {
     pub fn http_status(&self) -> u16 {
         match self {
             LedgerError::Invalid => 422,
+            LedgerError::RandomnessUnavailable => 503,
         }
     }
 }
@@ -98,6 +103,7 @@ impl std::fmt::Display for LedgerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LedgerError::Invalid => write!(f, "invalid usage row"),
+            LedgerError::RandomnessUnavailable => write!(f, "secure randomness unavailable"),
         }
     }
 }
@@ -109,10 +115,16 @@ impl std::fmt::Display for LedgerError {
 /// deduplicate retries. Stream plays MUST use
 /// [`derive_play_idempotency_key`] instead — a fresh random key per retry
 /// cannot deduplicate a redelivery.
-pub fn new_idempotency_key() -> String {
+///
+/// Fail-closed: secure-randomness failure returns
+/// [`LedgerError::RandomnessUnavailable`] (HTTP 503) so callers emit the
+/// existing `service_unavailable` shape. Never a panic, never a fallback
+/// key, never a reused key. The success path is byte-identical: the same 16
+/// entropy bytes through the same [`crate::b64::encode`].
+pub fn new_idempotency_key() -> Result<String, LedgerError> {
     let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).expect("secure randomness unavailable");
-    crate::b64::encode(&bytes)
+    getrandom::fill(&mut bytes).map_err(|_| LedgerError::RandomnessUnavailable)?;
+    Ok(crate::b64::encode(&bytes))
 }
 
 /// Byte-based key-field check mirroring the stream worker's
@@ -492,10 +504,10 @@ mod tests {
 
     #[test]
     fn idempotency_keys_are_fresh_22_char_base64url() {
-        let key = new_idempotency_key();
+        let key = new_idempotency_key().expect("mint with working RNG");
         assert_eq!(key.len(), 22);
         assert!(check_key(&key).is_ok());
-        let other = new_idempotency_key();
+        let other = new_idempotency_key().expect("mint with working RNG");
         assert_ne!(key, other, "keys must not repeat");
     }
 
@@ -539,7 +551,7 @@ mod tests {
         let row = prepare_ledger_row(
             "user-alice",
             "track-1",
-            &new_idempotency_key(),
+            &new_idempotency_key().expect("mint with working RNG"),
             1,
             1,
             MAX_RECORDED_AT,
@@ -551,7 +563,7 @@ mod tests {
                 prepare_ledger_row(
                     "user-alice",
                     "track-1",
-                    &new_idempotency_key(),
+                    &new_idempotency_key().expect("mint with working RNG"),
                     1,
                     1,
                     recorded_at,
@@ -576,7 +588,7 @@ mod tests {
             let row = prepare_ledger_row(
                 "user-alice",
                 "track-1",
-                &new_idempotency_key(),
+                &new_idempotency_key().expect("mint with working RNG"),
                 bytes,
                 seconds,
                 1_767_225_600,
@@ -591,7 +603,7 @@ mod tests {
                 prepare_ledger_row(
                     "user-alice",
                     "track-1",
-                    &new_idempotency_key(),
+                    &new_idempotency_key().expect("mint with working RNG"),
                     48_001,
                     bad_seconds,
                     1_767_225_600,
