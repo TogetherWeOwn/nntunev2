@@ -40,7 +40,7 @@
 //! Fixtures are synthetic only (public repo: never real secrets,
 //! peppers, or credential material).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::IpAddr;
@@ -85,6 +85,9 @@ struct FakeStore {
     audits: RefCell<Vec<vault::AuditEvent>>,
     native_credentials: RefCell<HashMap<String, handlers::NativeCredentialRow>>,
     rate_limit_slots: RefCell<HashMap<(String, String, u32), u64>>,
+    rate_limit_calls: Cell<usize>,
+    native_lookup_calls: Cell<usize>,
+    native_use_calls: Cell<usize>,
 }
 
 impl handlers::Store for FakeStore {
@@ -205,6 +208,7 @@ impl handlers::Store for FakeStore {
         now: u64,
         window_secs: u64,
     ) -> Result<bool, handlers::StoreError> {
+        self.rate_limit_calls.set(self.rate_limit_calls.get() + 1);
         if limit == 0 || window_secs == 0 {
             return Ok(false);
         }
@@ -358,6 +362,51 @@ impl handlers::Store for FakeStore {
         Ok(())
     }
 
+    async fn native_credential_by_hmac(
+        &self,
+        pepper_version: u32,
+        key_hmac: &str,
+    ) -> Result<Option<handlers::NativeCredentialRow>, handlers::StoreError> {
+        self.native_lookup_calls
+            .set(self.native_lookup_calls.get() + 1);
+        Ok(self
+            .native_credentials
+            .borrow()
+            .values()
+            .find(|row| {
+                row.record.pepper_version == pepper_version && row.record.key_hmac == key_hmac
+            })
+            .cloned())
+    }
+
+    async fn record_native_credential_use(
+        &self,
+        id: &str,
+        now: u64,
+    ) -> Result<(), handlers::StoreError> {
+        self.native_use_calls.set(self.native_use_calls.get() + 1);
+        if let Some(row) = self.native_credentials.borrow_mut().get_mut(id) {
+            row.last_used_at = Some(now);
+        }
+        Ok(())
+    }
+
+    async fn revoke_native_credential(
+        &self,
+        id: &str,
+        user_id: &str,
+        now: u64,
+    ) -> Result<bool, handlers::StoreError> {
+        let mut rows = self.native_credentials.borrow_mut();
+        match rows.get_mut(id) {
+            Some(row) if row.record.user_id == user_id => {
+                row.record.revoked_at.get_or_insert(now);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     async fn native_credentials_for_user(
         &self,
         user_id: &str,
@@ -456,6 +505,310 @@ struct FakeDns;
 impl handlers::AsyncDns for FakeDns {
     fn resolve<'a>(&'a self, _host: &'a str) -> Pin<Box<dyn Future<Output = Vec<IpAddr>> + 'a>> {
         Box::pin(async { Vec::new() })
+    }
+}
+
+// --- Native REST surface acceptance ---------------------------------------------
+
+mod surface_acceptance {
+    use super::*;
+
+    fn request(
+        h: &Harness,
+        method: &str,
+        path: &str,
+        authorization: Option<&str>,
+        cookie: Option<&str>,
+    ) -> handlers::Response {
+        block_on(handlers::handle(
+            &h.ctx(),
+            &handlers::Request {
+                method: method.to_string(),
+                path: path.to_string(),
+                cookie: cookie.map(str::to_string),
+                origin: Some(ORIGIN.to_string()),
+                authorization: authorization.map(str::to_string),
+                body: Vec::new(),
+            },
+        ))
+    }
+
+    fn bearer_harness() -> (Harness, String, String, String) {
+        let (h, cookie) = logged_in_harness();
+        let minted = h.mint(&cookie, serde_json::json!({
+            "label": "synthetic surface acceptance",
+            "scopes": ["library:read", "playlists:write", "plays:write", "stream:read", "ingest:submit"],
+            "ttl_secs": 3600
+        }));
+        assert_eq!(minted.status, 201, "synthetic setup must mint");
+        let body: serde_json::Value = serde_json::from_str(&minted.body).unwrap();
+        let authorization = format!("Bearer {}", body["secret"].as_str().unwrap());
+        let id = body["id"].as_str().unwrap().to_string();
+        (h, cookie, authorization, id)
+    }
+
+    fn spend(h: &Harness) -> (usize, usize, usize) {
+        (
+            h.store.rate_limit_calls.get(),
+            h.store.native_lookup_calls.get(),
+            h.store.native_use_calls.get(),
+        )
+    }
+
+    #[test]
+    fn invalid_and_absent_bearers_have_the_same_plain_not_found_surface() {
+        // Catch mapped-path disclosure by malformed, unknown, revoked or expired keys,
+        // including an attempted rescue by an otherwise valid session cookie.
+        let paths = [
+            ("GET", "/v1/library"),
+            ("GET", "/v1/artists"),
+            ("GET", "/v1/releases"),
+            ("GET", "/v1/tracks"),
+            ("GET", "/v1/search"),
+            ("GET", "/v1/playlists"),
+            ("POST", "/v1/playlists"),
+            ("PATCH", "/v1/playlists/synthetic"),
+            ("POST", "/v1/plays"),
+            ("GET", "/v1/stream"),
+            ("POST", "/v1/ingest"),
+            ("GET", "/v1/not-a-route"),
+            ("DELETE", "/v1/tracks"),
+        ];
+        for (method, path) in paths {
+            for state in ["malformed", "unknown", "revoked", "expired"] {
+                let (h, cookie, bearer, id) = bearer_harness();
+                if state == "revoked" {
+                    h.store
+                        .native_credentials
+                        .borrow_mut()
+                        .get_mut(&id)
+                        .unwrap()
+                        .record
+                        .revoked_at = Some(NOW - 1);
+                } else if state == "expired" {
+                    h.store
+                        .native_credentials
+                        .borrow_mut()
+                        .get_mut(&id)
+                        .unwrap()
+                        .record
+                        .expires_at = NOW - 1;
+                }
+                let header = match state {
+                    "malformed" => "Bearer ",
+                    "unknown" => "Bearer ntk_syntheticUnknownKey0000000000000000000000000",
+                    _ => &bearer,
+                };
+                for cookie in [None, Some(cookie.as_str())] {
+                    let absent = request(&h, method, path, None, cookie);
+                    let invalid = request(&h, method, path, Some(header), cookie);
+                    assert_eq!(absent.status, 404, "{method} {path}: absent posture");
+                    assert_eq!(
+                        invalid.status, 404,
+                        "{method} {path}: {state} must not disclose route existence"
+                    );
+                    assert_eq!(
+                        invalid.body, absent.body,
+                        "{method} {path}: generic body equality"
+                    );
+                    assert!(invalid.set_cookie.is_none(), "no session rescue/refresh");
+                    assert_eq!(
+                        h.store.native_use_calls.get(),
+                        0,
+                        "invalid keys cannot record successful use"
+                    );
+                    assert!(
+                        !invalid.body.contains("ntk_"),
+                        "no credential material in refusal"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn valid_bearer_and_session_and_anonymous_routing_remain_distinct() {
+        let (h, cookie, bearer, id) = bearer_harness();
+        let before = spend(&h);
+        let valid = request(&h, "GET", "/v1/search", Some(&bearer), None);
+        assert_eq!(
+            valid.status, 404,
+            "data dispatch remains outside this slice"
+        );
+        assert!(
+            h.store.native_lookup_calls.get() > before.1,
+            "real bearer lookup must run"
+        );
+        assert_eq!(h.store.native_use_calls.get(), before.2 + 1);
+        assert_eq!(
+            h.store.native_credentials.borrow()[&id].last_used_at,
+            Some(NOW)
+        );
+        // A valid credential without the required scope stays forbidden, not hidden.
+        h.store
+            .native_credentials
+            .borrow_mut()
+            .get_mut(&id)
+            .unwrap()
+            .record
+            .scopes = vec![Scope::LibraryRead];
+        assert_eq!(
+            request(&h, "POST", "/v1/plays", Some(&bearer), None).status,
+            403
+        );
+        assert_eq!(
+            request(&h, "GET", "/v1/me", None, Some(&cookie)).status,
+            200
+        );
+        assert_eq!(request(&h, "GET", "/v1/me", None, None).status, 401);
+        assert_eq!(
+            request(&h, "GET", "/v1/credentials", Some(&bearer), None).status,
+            401
+        );
+        assert_eq!(request(&h, "GET", "/healthz", None, None).status, 200);
+    }
+
+    #[test]
+    fn nested_playlist_writes_are_rejected_before_any_bearer_store_spend() {
+        for method in ["PUT", "PATCH", "DELETE"] {
+            let (h, _cookie, bearer, _id) = bearer_harness();
+            for path in [
+                "/v1/playlists/synthetic/tracks",
+                "/v1/playlists/synthetic/tracks/child",
+                "/v1/playlists/synthetic/",
+                "/v1/playlists//",
+            ] {
+                let before = spend(&h);
+                let response = request(&h, method, path, Some(&bearer), None);
+                assert_eq!(response.status, 404, "{method} {path}: reject nested shape");
+                assert_eq!(
+                    spend(&h),
+                    before,
+                    "{method} {path}: no admission, lookup or last-used write"
+                );
+            }
+            let before = spend(&h);
+            let response = request(&h, method, "/v1/playlists/synthetic", Some(&bearer), None);
+            assert_eq!(
+                response.status, 404,
+                "single-item data dispatch is unchanged"
+            );
+            assert!(
+                h.store.rate_limit_calls.get() > before.0,
+                "positive budget control"
+            );
+            assert!(
+                h.store.native_lookup_calls.get() > before.1,
+                "positive lookup control"
+            );
+            assert_eq!(
+                h.store.native_use_calls.get(),
+                before.2 + 1,
+                "single-item route remains authorized"
+            );
+        }
+    }
+
+    #[test]
+    fn credentials_golden_fixture_covers_served_routes_in_both_directions() {
+        // Catch a served credentials operation missing from the fixture, as well
+        // as a fixture row that names an unserved operation or invalid mint body.
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/api-web-contract.json")).unwrap();
+        let routes = fixture["routes"].as_array().unwrap();
+        let credentials: Vec<_> = routes
+            .iter()
+            .filter(|row| row["path"].as_str().unwrap().starts_with("/v1/credentials"))
+            .collect();
+        assert_eq!(
+            credentials.len(),
+            3,
+            "mint, list and single revoke must all be represented"
+        );
+        for (method, path) in [
+            ("POST", "/v1/credentials"),
+            ("GET", "/v1/credentials"),
+            ("DELETE", "/v1/credentials/{id}"),
+        ] {
+            let matching: Vec<_> = credentials
+                .iter()
+                .filter(|row| {
+                    let actual = row["path"].as_str().unwrap();
+                    let shape = if actual
+                        .strip_prefix("/v1/credentials/")
+                        .is_some_and(|tail| !tail.is_empty() && !tail.contains('/'))
+                    {
+                        "/v1/credentials/{id}"
+                    } else {
+                        actual
+                    };
+                    row["method"] == method && shape == path
+                })
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "missing or duplicate fixture operation {method} {path}"
+            );
+        }
+        let (h, cookie) = logged_in_harness();
+        for row in credentials {
+            let method = row["method"].as_str().unwrap();
+            let path = row["path"].as_str().unwrap();
+            assert!(
+                row["web"].as_str().is_some_and(|name| !name.is_empty()),
+                "every credentials route needs a web builder"
+            );
+            let body = row.get("wire");
+            if method == "POST" {
+                let wire = body.expect("mint wire body required");
+                let mut fields: Vec<_> = wire
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                fields.sort_unstable();
+                assert_eq!(fields, ["label", "scopes", "ttl_secs"], "mint wire shape");
+                assert!(row.get("input").is_some(), "mint builder input required");
+                let minted = h.call(method, path, body, Some(&cookie));
+                assert_eq!(minted.status, 201, "fixture mint must be accepted");
+                let value: serde_json::Value = serde_json::from_str(&minted.body).unwrap();
+                let id = value["id"].as_str().unwrap();
+                let listed = h.call("GET", "/v1/credentials", None, Some(&cookie));
+                assert_eq!(listed.status, 200);
+                assert!(
+                    !listed.body.contains(value["secret"].as_str().unwrap()),
+                    "one-time secret not listed"
+                );
+                let revoked = h.call(
+                    "DELETE",
+                    &format!("/v1/credentials/{id}"),
+                    None,
+                    Some(&cookie),
+                );
+                assert_eq!(revoked.status, 200);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&revoked.body).unwrap(),
+                    serde_json::json!({"ok": true})
+                );
+                let mut unknown = wire.clone();
+                unknown["unexpected"] = serde_json::json!(true);
+                let before = h.rows().len();
+                assert_eq!(
+                    h.call(method, path, Some(&unknown), Some(&cookie)).status,
+                    422,
+                    "mint denies unknown fields"
+                );
+                assert_eq!(h.rows().len(), before, "unknown field cannot mint");
+            } else {
+                let response = h.call(method, path, body, None);
+                assert_eq!(
+                    response.status, 401,
+                    "fixture route must be served and session-only: {method} {path}"
+                );
+            }
+        }
     }
 }
 
