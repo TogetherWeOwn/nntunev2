@@ -69,6 +69,9 @@ pub enum LibraryError {
     AccountDeleting,
     /// Shape violation (blank/overlong name or items): HTTP layer returns 422.
     Invalid,
+    /// Secure randomness unavailable while minting an opaque public id:
+    /// HTTP 503 `service_unavailable`. Never a panic, fallback, or reused id.
+    RandomnessUnavailable,
 }
 
 impl LibraryError {
@@ -79,6 +82,7 @@ impl LibraryError {
             LibraryError::NotFound => 404,
             LibraryError::AccountDeleting => 409,
             LibraryError::Invalid => 422,
+            LibraryError::RandomnessUnavailable => 503,
         }
     }
 }
@@ -91,7 +95,15 @@ impl std::fmt::Display for LibraryError {
             LibraryError::NotFound => write!(f, "not found"),
             LibraryError::AccountDeleting => write!(f, "account is being deleted"),
             LibraryError::Invalid => write!(f, "invalid genre or playlist"),
+            // Sealed public text: matches the `service_unavailable` envelope.
+            LibraryError::RandomnessUnavailable => write!(f, "service unavailable"),
         }
+    }
+}
+
+impl From<crate::random::CryptoError> for LibraryError {
+    fn from(_: crate::random::CryptoError) -> Self {
+        LibraryError::RandomnessUnavailable
     }
 }
 
@@ -122,10 +134,14 @@ pub fn fenced_write_outcome(
 /// [`crate::b64`] helper). Never sequential, never derived from the internal
 /// row id. Sorts arbitrarily: list order is by this handle, not by recency
 /// (see the list pages).
-pub fn new_public_id() -> String {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).expect("secure randomness unavailable");
-    crate::b64::encode(&bytes)
+///
+/// Fail-closed: secure-randomness failure returns
+/// [`LibraryError::RandomnessUnavailable`] (HTTP 503). The success path is
+/// byte-identical: the same 16 entropy bytes through the same
+/// [`crate::b64::encode`].
+pub fn new_public_id() -> Result<String, LibraryError> {
+    let bytes = crate::random::secure_random_bytes::<16>()?;
+    Ok(crate::b64::encode(&bytes))
 }
 
 fn require_caller(caller: Option<&str>) -> Result<&str, LibraryError> {
@@ -487,7 +503,7 @@ pub fn prepare_genre_insert(
 ) -> Result<NewGenre, LibraryError> {
     let caller = require_caller(caller)?;
     Ok(NewGenre {
-        public_id: new_public_id(),
+        public_id: new_public_id()?,
         owner_user_id: caller.to_string(),
         name: check_name(name)?,
         is_public,
@@ -504,7 +520,7 @@ pub fn prepare_playlist_insert(
 ) -> Result<NewPlaylist, LibraryError> {
     let caller = require_caller(caller)?;
     Ok(NewPlaylist {
-        public_id: new_public_id(),
+        public_id: new_public_id()?,
         owner_user_id: caller.to_string(),
         name: check_name(name)?,
         items: check_items(items)?,
@@ -838,11 +854,28 @@ mod tests {
 
     #[test]
     fn new_public_id_is_22_char_unpadded_base64url() {
-        let id = new_public_id();
+        let id = new_public_id().expect("issue");
         assert_eq!(id.len(), 22);
         assert!(id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+    }
+
+    #[test]
+    fn randomness_unavailable_is_503_service_unavailable() {
+        let err = LibraryError::RandomnessUnavailable;
+        assert_eq!(err.http_status(), 503);
+        assert_eq!(err.to_string(), "service unavailable");
+        let api = crate::api_error::ApiError::from(err);
+        assert_eq!(
+            (api.code, api.status, api.retryable),
+            ("service_unavailable", 503, true)
+        );
+        assert_eq!(api.message, "service unavailable");
+        assert_eq!(
+            LibraryError::from(crate::random::CryptoError::RandomnessUnavailable),
+            LibraryError::RandomnessUnavailable
+        );
     }
 
     #[test]

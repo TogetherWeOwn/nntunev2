@@ -65,7 +65,7 @@ fn challenge_ttl_is_300_secs() {
 fn issue_magic_link_expires_now_plus_900() {
     // Through issuance, not just the bare constant: a TTL edit or a
     // rewiring of the `expires_at` computation fails this pin.
-    let (_, record) = issue_magic_link("u", "a@b.c", NOW);
+    let (_, record) = issue_magic_link("u", "a@b.c", NOW).expect("issue");
     assert_eq!(record.issued_at, NOW, "magic link must be issued at now");
     assert_eq!(
         record.expires_at,

@@ -19,7 +19,7 @@ const ORIGIN: &str = "https://nntune.example.com";
 
 #[test]
 fn magic_link_at_max_saturates_to_max() {
-    let (_, record) = issue_magic_link("u", "a@b.c", u64::MAX);
+    let (_, record) = issue_magic_link("u", "a@b.c", u64::MAX).expect("issue");
     assert_eq!(record.issued_at, u64::MAX);
     assert_eq!(record.expires_at, u64::MAX);
 }
@@ -34,7 +34,7 @@ fn registration_challenge_at_max_saturates_to_max() {
 #[test]
 fn magic_link_at_max_minus_ttl_yields_exact_max() {
     let now = u64::MAX - MAGIC_LINK_TTL_SECS;
-    let (_, record) = issue_magic_link("u", "a@b.c", now);
+    let (_, record) = issue_magic_link("u", "a@b.c", now).expect("issue");
     assert_eq!(record.issued_at, now);
     assert_eq!(record.expires_at, u64::MAX);
 }
@@ -50,7 +50,7 @@ fn registration_challenge_at_max_minus_ttl_yields_exact_max() {
 #[test]
 fn small_now_control_keeps_now_plus_ttl() {
     let now = 1_700_000_000u64;
-    let (_, magic) = issue_magic_link("u", "a@b.c", now);
+    let (_, magic) = issue_magic_link("u", "a@b.c", now).expect("issue");
     assert_eq!(magic.expires_at, now + MAGIC_LINK_TTL_SECS);
 
     let challenge = new_registration_challenge(RP_ID, ORIGIN, now).expect("challenge");

@@ -888,6 +888,18 @@ fn internal() -> Response {
     json_response(500, serde_json::json!({"error": "internal error"}))
 }
 
+/// Fail-closed secure-randomness response: the existing 503
+/// `service_unavailable` envelope (retryable, sealed public text).
+fn unavailable() -> Response {
+    let error = crate::api_error::ApiError::service_unavailable("service unavailable");
+    Response {
+        status: error.status,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    }
+}
+
 fn session_error_response(error: session::SessionError) -> Response {
     match error {
         session::SessionError::Invalid => generic_auth(),
@@ -980,10 +992,14 @@ where
 
 // --- Helpers ---------------------------------------------------------------------------
 
-fn random_id(bytes: usize) -> String {
-    let mut buf = vec![0u8; bytes];
-    getrandom::fill(&mut buf).expect("secure randomness unavailable");
-    b64url_encode(&buf)
+/// Random opaque id of `N` entropy bytes (unpadded base64url). Fail-closed:
+/// secure-randomness failure propagates [`crate::random::CryptoError`]
+/// (HTTP 503 `service_unavailable`) so the caller fails the request closed.
+/// The success path is byte-identical: the same `N` entropy bytes through
+/// the same `b64url_encode`.
+fn random_id<const N: usize>() -> Result<String, crate::random::CryptoError> {
+    let bytes = crate::random::secure_random_bytes::<N>()?;
+    Ok(b64url_encode(&bytes))
 }
 
 /// Deterministic stand-in ids for auth-start response shapes: stable
@@ -1143,7 +1159,10 @@ where
             self.now,
             self.cfg.session_ttl_secs,
         )
-        .map_err(|_| internal())?;
+        .map_err(|e| match e {
+            session::SessionError::RandomnessUnavailable => unavailable(),
+            _ => internal(),
+        })?;
         let claims = session::verify_session(&self.cfg.session_secret, &token, self.now)
             .map_err(|_| internal())?;
         self.store
@@ -1319,7 +1338,12 @@ where
         if !admitted {
             return;
         }
-        let (token, record) = auth::issue_magic_link(user_id, email, self.now);
+        // Fail closed on randomness: mint nothing, send nothing. The
+        // caller already returned the identical admitted 200, so skipping
+        // issuance here preserves the no-oracle shape.
+        let Ok((token, record)) = auth::issue_magic_link(user_id, email, self.now) else {
+            return;
+        };
         if self.store.insert_magic(&record).await.is_ok() {
             // Staging-only code seam: remember the raw token for synthetic
             // mailboxes so `POST /api/test-codes` can return the issued
@@ -1419,6 +1443,7 @@ where
     let challenge = match auth::new_registration_challenge(&ctx.cfg.rp_id, &ctx.cfg.origin, ctx.now)
     {
         Ok(challenge) => challenge,
+        Err(auth::AuthError::RandomnessUnavailable) => return unavailable(),
         Err(_) => return internal(),
     };
     let shape = |user_id: String| {
@@ -1479,8 +1504,14 @@ where
             }
         }
         None => {
+            // Fail closed on randomness: no id means no user row, no
+            // challenge insert, no mail. A 503 (not a stand-in 200) is
+            // correct here — the request minted nothing.
+            let Ok(user_id) = random_id::<16>() else {
+                return unavailable();
+            };
             let user = UserRecord {
-                id: random_id(16),
+                id: user_id,
                 email: email.clone(),
                 created_at: ctx.now,
             };
@@ -1797,6 +1828,7 @@ where
     let challenge = match auth::new_registration_challenge(&ctx.cfg.rp_id, &ctx.cfg.origin, ctx.now)
     {
         Ok(challenge) => challenge,
+        Err(auth::AuthError::RandomnessUnavailable) => return unavailable(),
         Err(_) => return internal(),
     };
     // Per-IP admission before maintenance or lookup: unknown emails would
@@ -1873,6 +1905,7 @@ where
     let challenge = match auth::new_registration_challenge(&ctx.cfg.rp_id, &ctx.cfg.origin, ctx.now)
     {
         Ok(challenge) => challenge,
+        Err(auth::AuthError::RandomnessUnavailable) => return unavailable(),
         Err(_) => return internal(),
     };
     let admitted = ctx
@@ -2493,6 +2526,7 @@ where
         &plaintext,
     ) {
         Ok(blob) => blob,
+        Err(vault::VaultError::RandomnessUnavailable) => return unavailable(),
         Err(_) => return generic_vault(),
     };
     let row = VaultRow {
@@ -2613,6 +2647,13 @@ where
     };
     // The attempt slot is reserved before any potentially slow lookup or
     // dial, so concurrent requests cannot pass a count-then-act check.
+    // Fail closed on randomness before the lease: no token means no lease
+    // is acquired and no dial runs — the request ends 503, never a
+    // boolean that pretends the test ran.
+    let lease_token = match random_id::<16>() {
+        Ok(token) => token,
+        Err(_) => return unavailable(),
+    };
     let result = async {
         // Resolve all records immediately before the dial and hand the
         // dialer only the vetted, bounded address set.
@@ -2636,7 +2677,6 @@ where
                 return Some(false);
             }
         }
-        let lease_token = random_id(16);
         let lease_acquired = ctx
             .store
             .acquire_test_connection_lease(
@@ -2816,13 +2856,18 @@ where
     let Some(pepper) = peppers.first() else {
         return internal();
     };
-    let issued = crate::native_rest::issue_credential(
+    // The only mint failure is unavailable randomness: fail closed 503.
+    // No credential row is persisted and no secret is rendered.
+    let issued = match crate::native_rest::issue_credential(
         &claims.user_id,
         &scopes,
         body.ttl_secs,
         ctx.now,
         pepper,
-    );
+    ) {
+        Ok(issued) => issued,
+        Err(_) => return unavailable(),
+    };
     let id = issued.record.id.clone();
     let row = NativeCredentialRow {
         record: issued.record,
@@ -3054,6 +3099,9 @@ where
         Ok(()) => {}
         Err(CredentialError::Unauthenticated) => return Err(credential_unauthorized()),
         Err(CredentialError::Forbidden) => return Err(scope_forbidden()),
+        // Unreachable: `authorize` is pure verification and never mints.
+        // Fail closed 503 if that ever changes.
+        Err(CredentialError::RandomnessUnavailable) => return Err(unavailable()),
     }
     let _ = ctx
         .store
@@ -4762,7 +4810,7 @@ mod tests {
                 Ok(if set.insert(key) { 1 } else { 0 })
             }
         }
-        let (token, record) = auth::issue_magic_link("u1", "a@example.com", NOW);
+        let (token, record) = auth::issue_magic_link("u1", "a@example.com", NOW).expect("issue");
         let store = Arc::new(ClaimStore {
             claimed: Mutex::new(HashSet::new()),
         });
@@ -6413,7 +6461,8 @@ mod tests {
                 .insert_challenge(&challenge, Some("victim"), PURPOSE_LOGIN),
         )
         .unwrap();
-        let (token, record) = auth::issue_magic_link("victim", "victim@example.com", NOW);
+        let (token, record) =
+            auth::issue_magic_link("victim", "victim@example.com", NOW).expect("issue");
         block_on(h.store.insert_magic(&record)).unwrap();
 
         let attacker_cred = b"attacker-cred";
@@ -7378,21 +7427,24 @@ mod tests {
         // `expired_other`, and not pruning would leave the 50 spaced rows.
         let h = harness();
         let spacing = auth::MAGIC_LINK_TTL_SECS + 1;
-        let (_, expired_other) = auth::issue_magic_link("other", "other@example.com", NOW);
+        let (_, expired_other) =
+            auth::issue_magic_link("other", "other@example.com", NOW).expect("issue");
         block_on(h.store.insert_magic(&expired_other)).unwrap();
         let mut first_live_hash = String::new();
         for i in 0..50u64 {
-            let (_, record) = auth::issue_magic_link("live", "live@example.com", NOW + i * spacing);
+            let (_, record) = auth::issue_magic_link("live", "live@example.com", NOW + i * spacing)
+                .expect("issue");
             if i == 0 {
                 first_live_hash.clone_from(&record.token_hash);
             }
             block_on(h.store.insert_magic(&record)).unwrap();
         }
         let (_, live_unexpired) =
-            auth::issue_magic_link("live", "live@example.com", NOW + 50 * spacing);
+            auth::issue_magic_link("live", "live@example.com", NOW + 50 * spacing).expect("issue");
         block_on(h.store.insert_magic(&live_unexpired)).unwrap();
         let (_, newest_live) =
-            auth::issue_magic_link("live", "live@example.com", NOW + 50 * spacing + 1);
+            auth::issue_magic_link("live", "live@example.com", NOW + 50 * spacing + 1)
+                .expect("issue");
         block_on(h.store.insert_magic(&newest_live)).unwrap();
         let rows = h.store.magic.borrow();
         assert_eq!(
@@ -7653,7 +7705,7 @@ mod tests {
             .unwrap();
         }
         let (_, magic_only_record) =
-            auth::issue_magic_link("magic-only", "magic-only@example.com", NOW);
+            auth::issue_magic_link("magic-only", "magic-only@example.com", NOW).expect("issue");
         block_on(h.store.insert_magic(&magic_only_record)).unwrap();
         block_on(h.store.insert_session(&SessionRecord {
             id: "sess-magic-only".to_string(),
@@ -7678,7 +7730,8 @@ mod tests {
                 updated_at: NOW,
             },
         );
-        let (_, inbox_record) = auth::issue_magic_link("inbox-only", "inbox-only@example.com", NOW);
+        let (_, inbox_record) =
+            auth::issue_magic_link("inbox-only", "inbox-only@example.com", NOW).expect("issue");
         block_on(h.store.insert_magic(&inbox_record)).unwrap();
         let resp = h.call(
             "POST",
@@ -8315,7 +8368,7 @@ mod tests {
                     .insert_challenge(&challenge, Some(user_id), PURPOSE_REGISTER),
             )
             .unwrap();
-            let (token, record) = auth::issue_magic_link(user_id, email, NOW);
+            let (token, record) = auth::issue_magic_link(user_id, email, NOW).expect("issue");
             block_on(h.store.insert_magic(&record)).unwrap();
             let att = fx_none_attestation(cred_id, &fx_es256_cose(77));
             h.call(
@@ -8396,7 +8449,7 @@ mod tests {
                 .insert_challenge(&challenge, Some("u1"), PURPOSE_REGISTER),
         )
         .unwrap();
-        let (token, record) = auth::issue_magic_link("u1", "a@example.com", NOW);
+        let (token, record) = auth::issue_magic_link("u1", "a@example.com", NOW).expect("issue");
         block_on(h.store.insert_magic(&record)).unwrap();
         let cred_id = b"budget-cred";
         let att = fx_none_attestation(cred_id, &fx_es256_cose(61));
@@ -8441,7 +8494,7 @@ mod tests {
                 .insert_challenge(&challenge2, Some("u1"), PURPOSE_REGISTER),
         )
         .unwrap();
-        let (token2, record2) = auth::issue_magic_link("u1", "a@example.com", NOW);
+        let (token2, record2) = auth::issue_magic_link("u1", "a@example.com", NOW).expect("issue");
         block_on(h.store.insert_magic(&record2)).unwrap();
         let client_json2 = fx_client_json("webauthn.create", &challenge_id2);
         let resp = h.call(
@@ -8542,7 +8595,7 @@ mod tests {
         // the login-CSRF pin) so rejections prove the budget, not the pin.
         let h = harness();
         seed_user(&h, "u1", "a@example.com");
-        let (token, record) = auth::issue_magic_link("u1", "a@example.com", NOW);
+        let (token, record) = auth::issue_magic_link("u1", "a@example.com", NOW).expect("issue");
         block_on(h.store.insert_magic(&record)).unwrap();
         for i in 0..MAGIC_FINISH_ATTEMPTS_PER_IP {
             let resp = h.call(

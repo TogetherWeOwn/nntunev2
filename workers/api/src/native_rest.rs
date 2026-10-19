@@ -220,32 +220,35 @@ pub fn credential_hmac(secret: &str, pepper: &[u8]) -> String {
     lowercase_hex(&mac.finalize().into_bytes())
 }
 
-fn new_secret() -> String {
-    let mut entropy = [0u8; SECRET_ENTROPY_BYTES];
-    getrandom::fill(&mut entropy).expect("secure randomness unavailable");
-    format!("{CREDENTIAL_PREFIX}{}", base62_encode(&entropy))
+fn new_secret() -> Result<String, CredentialError> {
+    let entropy = crate::random::secure_random_bytes::<SECRET_ENTROPY_BYTES>()?;
+    Ok(format!("{CREDENTIAL_PREFIX}{}", base62_encode(&entropy)))
 }
 
-fn new_id() -> String {
-    let mut bytes = [0u8; ID_BYTES];
-    getrandom::fill(&mut bytes).expect("secure randomness unavailable");
-    crate::b64::encode(&bytes)
+fn new_id() -> Result<String, CredentialError> {
+    let bytes = crate::random::secure_random_bytes::<ID_BYTES>()?;
+    Ok(crate::b64::encode(&bytes))
 }
 
 /// Mint a credential for `user_id` with exactly `scopes` (including the
 /// empty set, which authorizes nothing). The display secret is unique per
 /// issue; `expires_at` clamps fail-safe to the 365-day cap so even
 /// `u64::MAX` TTLs can never mint a forever key.
+///
+/// Fail-closed: secure-randomness failure returns
+/// [`CredentialError::RandomnessUnavailable`] (HTTP 503). The success path
+/// is byte-identical: the same 32 secret bytes (base62) and 16 id bytes
+/// (base64url) through the same encodings.
 pub fn issue_credential(
     user_id: &str,
     scopes: &[Scope],
     ttl_secs: u64,
     now: u64,
     pepper: &Pepper<'_>,
-) -> IssuedCredential {
-    let display_once = new_secret();
+) -> Result<IssuedCredential, CredentialError> {
+    let display_once = new_secret()?;
     let record = NativeRestRecord {
-        id: new_id(),
+        id: new_id()?,
         user_id: user_id.to_string(),
         key_prefix: display_once[..CREDENTIAL_PREFIX.len() + KEY_PREFIX_LEN].to_string(),
         key_hmac: credential_hmac(&display_once, pepper.bytes),
@@ -255,19 +258,23 @@ pub fn issue_credential(
         expires_at: now.saturating_add(ttl_secs.min(MAX_CREDENTIAL_TTL_SECS)),
         revoked_at: None,
     };
-    IssuedCredential {
+    Ok(IssuedCredential {
         display_once,
         record,
-    }
+    })
 }
 
 /// Credential failure taxonomy. Reuses the repo registry
-/// (`docs/api-errors.md`) — no new codes. `Display` is generic on purpose:
+/// (`docs/api-errors.md`) — no new codes: randomness failures map to the
+/// existing `service_unavailable` entry. `Display` is generic on purpose:
 /// clients match the outcome class, attackers learn nothing beyond it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialError {
     Unauthenticated,
     Forbidden,
+    /// Secure randomness unavailable while minting a credential: HTTP 503
+    /// `service_unavailable`. Never a panic, fallback, or reused secret/id.
+    RandomnessUnavailable,
 }
 
 impl CredentialError {
@@ -276,6 +283,7 @@ impl CredentialError {
         match self {
             CredentialError::Unauthenticated => "unauthorized",
             CredentialError::Forbidden => "forbidden",
+            CredentialError::RandomnessUnavailable => "service_unavailable",
         }
     }
 
@@ -284,6 +292,7 @@ impl CredentialError {
         match self {
             CredentialError::Unauthenticated => 401,
             CredentialError::Forbidden => 403,
+            CredentialError::RandomnessUnavailable => 503,
         }
     }
 }
@@ -294,7 +303,15 @@ impl std::fmt::Display for CredentialError {
             // Generic: never says which check failed, never any secret material.
             CredentialError::Unauthenticated => write!(f, "invalid credential"),
             CredentialError::Forbidden => write!(f, "insufficient scope"),
+            // Sealed public text: matches the `service_unavailable` envelope.
+            CredentialError::RandomnessUnavailable => write!(f, "service unavailable"),
         }
+    }
+}
+
+impl From<crate::random::CryptoError> for CredentialError {
+    fn from(_: crate::random::CryptoError) -> Self {
+        CredentialError::RandomnessUnavailable
     }
 }
 
@@ -561,8 +578,21 @@ mod tests {
     }
 
     #[test]
+    fn randomness_unavailable_is_503_service_unavailable() {
+        let err = CredentialError::RandomnessUnavailable;
+        assert_eq!(err.code(), "service_unavailable");
+        assert_eq!(err.http_status(), 503);
+        assert_eq!(err.to_string(), "service unavailable");
+        assert_eq!(
+            CredentialError::from(crate::random::CryptoError::RandomnessUnavailable),
+            CredentialError::RandomnessUnavailable
+        );
+    }
+
+    #[test]
     fn display_secret_shape_holds_class_prefix_and_fixed_entropy() {
-        let cred = issue_credential(USER, &[Scope::LibraryRead], 60, NOW, &pepper());
+        let cred =
+            issue_credential(USER, &[Scope::LibraryRead], 60, NOW, &pepper()).expect("issue");
         assert!(cred.display_once.starts_with(CREDENTIAL_PREFIX));
         assert_eq!(
             cred.display_once.len(),
@@ -579,7 +609,8 @@ mod tests {
 
     #[test]
     fn issued_wrapper_debug_names_record_without_secret() {
-        let cred = issue_credential(USER, &[Scope::LibraryRead], 60, NOW, &pepper());
+        let cred =
+            issue_credential(USER, &[Scope::LibraryRead], 60, NOW, &pepper()).expect("issue");
         let debug = format!("{:?}", cred);
         assert!(debug.contains(&cred.record.id));
         assert!(!debug.contains(&cred.display_once));
@@ -592,7 +623,8 @@ mod tests {
         // regression here reopens the unauthenticated DB-amplification the
         // gate exists to close. Pin the exact minted form and each
         // rejection class: removing the guard must fail here.
-        let minted = issue_credential(USER, &[Scope::LibraryRead], 60, NOW, &pepper());
+        let minted =
+            issue_credential(USER, &[Scope::LibraryRead], 60, NOW, &pepper()).expect("issue");
         assert!(
             is_plausible_credential_shape(&minted.display_once),
             "a freshly minted secret must pass the shape gate"
