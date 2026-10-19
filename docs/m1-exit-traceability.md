@@ -22,13 +22,14 @@ scoped-credentials spec (#239), the api-staging-lane workflow pins
 (#407), the journey-evidence-gate pins (#548), and the served-routes
 staging spec (`e2e/tests/served-routes.spec.ts`) added:
 `npm --prefix e2e run e2e:list` lists 399 tests in 26 files, and
-`(cd apps/web && pnpm exec playwright test --list)` lists 113 tests in
-24 files (94 in 21 files as previously verified, plus the 5-test
-paywall-elapsed-time spec, the 11-test passkey-dismissal spec, and the
-3-test cache-headers spec (#551); the rest of the merged main adds no
-other playwright specs — only worker/API changes, unit tests,
-dependency bumps, and docs — and this change adds no `apps/web` specs,
-so every other cited line below is
+`(cd apps/web && pnpm exec playwright test --list)` lists 120 tests in
+26 files (94 in 21 files as previously verified, plus the 5-test
+paywall-elapsed-time spec, the 11-test passkey-dismissal spec, the
+3-test cache-headers spec (#551), the 5-test passkey-in-flight spec
+(#573), and the 2-test pricing-plan-button-names spec (#577); the rest
+of the merged main adds no other playwright specs — only worker/API
+changes, unit tests, dependency bumps, and docs — and this change adds
+no `apps/web` specs, so every other cited line below is
 unchanged). Line numbers
 below are from that head; re-verify with the commands at the end of this
 document whenever a spec is added, renamed, or retitled, and update this
@@ -224,11 +225,11 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   `apps/web/tests/pwa-manifest.spec.ts` unit pin is not staging evidence),
   `e2e/tests/served-routes.spec.ts:67` "GET /api/demo/artwork serves
   image/svg+xml with immutable caching",
-  `e2e/tests/served-routes.spec.ts:104` "GET /onboarding/provider redirects
+  `e2e/tests/served-routes.spec.ts:108` "GET /onboarding/provider redirects
   to /onboarding/byop (307)" (the 307 observed plus wizard arrival — the
   no-follow wrapper throws on 3xx without naming the target, so the target
   is asserted through the browser), and
-  `e2e/tests/served-routes.spec.ts:149` "GET /pricing serves the plans page".
+  `e2e/tests/served-routes.spec.ts:161` "GET /pricing serves the plans page".
   All four probes carry the Access pair only (never an account session) with
   names-only diagnostics, and the paths live in `e2e/helpers/contract.ts`
   (`manifest`, `demoArtwork`, `onboardingProvider`, `pricing`), so a rename

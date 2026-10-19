@@ -99,6 +99,10 @@ test.describe('served web routes (no-auth, staging)', () => {
       body.length,
       '[served-artwork] artwork body is empty (not placeholder bytes)',
     ).toBeGreaterThan(0);
+    expect(
+      body.subarray(0, 4).toString('ascii'),
+      '[served-artwork] artwork body is not SVG (missing <svg)',
+    ).toBe('<svg');
   });
 
   test('GET /onboarding/provider redirects to /onboarding/byop (307)', async ({ page }) => {
@@ -141,9 +145,17 @@ test.describe('served web routes (no-auth, staging)', () => {
       '[served-provider-redirect] expected an HTTP 307 from the provider route (names only — no location logged)',
     ).toBe(true);
     expect(
-      page.url(),
+      new URL(page.url()).href,
       '[served-provider-redirect] provider route did not land on the BYOP wizard',
-    ).toMatch(/\/onboarding\/byop$/);
+    ).toBe(new URL('/onboarding/byop', baseURL).href);
+    expect(
+      response?.status(),
+      '[served-provider-redirect] provider redirect did not land on a live page',
+    ).toBe(200);
+    await expect(
+      page.getByRole('heading', { level: 1 }),
+      '[served-provider-redirect] BYOP wizard not visible after provider redirect',
+    ).toContainText(/connect your provider/i, { timeout: 15_000 });
   });
 
   test('GET /pricing serves the plans page', async ({ page }) => {
