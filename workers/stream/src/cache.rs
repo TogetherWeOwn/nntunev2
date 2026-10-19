@@ -41,6 +41,15 @@ pub const CACHE_SWR_WINDOW_SECS: u64 = 3_600;
 /// its owner disappears without completing or explicitly releasing it.
 pub const REVALIDATE_CLAIM_TTL_SECS: u64 = 300;
 
+/// Hard cap on the total blob bytes a default [`ContentCache`] holds: 64 MiB,
+/// about half a 128 MiB Worker isolate, leaving room for several whole
+/// tracks plus the runtime. Byte accounting is over distinct blobs — a blob
+/// shared by several tracks counts once — and an over-cap insert evicts
+/// track entries oldest-first (last-write order) until the cache is back at
+/// or under the cap, never evicting the just-written entry. Documented in
+/// `workers/stream/README.md` like the TTL constants.
+pub const MAX_CONTENT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
 /// How a cached entry served a read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheServe {
@@ -101,6 +110,10 @@ struct TrackEntry {
     /// `None` for untimed [`ContentCache::put_track`] writes, which never go
     /// stale.
     stored_at_secs: Option<u64>,
+    /// Monotonic last-write order (see [`ContentCache::write_seq`]): a
+    /// rewrite restamps this, so eviction order treats a rewrite as the
+    /// newest write even when the blob content is unchanged.
+    last_write_seq: u64,
 }
 
 pub struct ContentCache {
@@ -109,32 +122,70 @@ pub struct ContentCache {
     /// Tracks with a background revalidation already claimed, with claim time
     /// so an abandoned claim can expire (see [`ContentCache::try_begin_revalidate`]).
     revalidating: HashMap<String, u64>,
+    /// Byte cap enforced on insert (see [`MAX_CONTENT_CACHE_BYTES`]).
+    max_bytes: usize,
+    /// Monotonic counter stamping each write's eviction rank.
+    write_seq: u64,
+    /// Track entries evicted for capacity so far (the countable probe the
+    /// observability path reports; time-expiry prunes are not evictions).
+    evictions: u64,
 }
 
 impl ContentCache {
     pub fn new() -> Self {
+        Self::with_max_bytes(MAX_CONTENT_CACHE_BYTES)
+    }
+
+    /// A cache capped at `max_bytes` instead of [`MAX_CONTENT_CACHE_BYTES`]
+    /// (the acceptance tests pin small caps against this constructor).
+    pub fn with_max_bytes(max_bytes: usize) -> Self {
         Self {
             blobs: HashMap::new(),
             index: HashMap::new(),
             revalidating: HashMap::new(),
+            max_bytes,
+            write_seq: 0,
+            evictions: 0,
         }
+    }
+
+    /// The configured byte cap.
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// Sum of the lengths of the distinct blobs currently held. A blob
+    /// shared (via `Arc`) by several tracks counts once; a blob no track
+    /// points at any more is dropped on rewrite/evict and counts zero.
+    pub fn total_bytes(&self) -> usize {
+        self.blobs.values().map(|b| b.data.len()).sum()
+    }
+
+    /// Track entries evicted for capacity so far. Time-expiry prunes
+    /// ([`ContentCache::get_track_at`]) never increment this.
+    pub fn eviction_count(&self) -> u64 {
+        self.evictions
     }
 
     /// Store `plaintext` for `track_id`; returns the blob hash hex.
     /// Overwriting with different bytes evicts the old blob once its last
     /// track stops pointing at it; a blob still referenced by another track
-    /// survives.
+    /// survives. An over-cap insert evicts track entries oldest-first (see
+    /// [`MAX_CONTENT_CACHE_BYTES`]); the just-written entry is exempt.
     pub fn put_track(&mut self, track_id: &str, plaintext: Vec<u8>) -> String {
         let hash = Self::hex_hash(&plaintext);
         let old_hash = self.index.get(track_id).map(|e| e.hash.clone());
         self.blobs.entry(hash.clone()).or_insert_with(|| BlobEntry {
             data: Arc::from(plaintext),
         });
+        self.write_seq += 1;
+        let seq = self.write_seq;
         self.index.insert(
             track_id.to_string(),
             TrackEntry {
                 hash: hash.clone(),
                 stored_at_secs: None,
+                last_write_seq: seq,
             },
         );
         self.revalidating.remove(track_id);
@@ -143,13 +194,16 @@ impl ContentCache {
                 self.remove_blob_if_unreferenced(&old);
             }
         }
+        self.evict_over_cap(track_id);
         hash
     }
 
     /// Store `plaintext` for `track_id` at time `now_secs` (unix seconds);
     /// returns the blob hash hex. Rewriting a track repoints it and restarts
     /// its freshness clock — this is also how a background revalidation
-    /// refreshes a stale entry.
+    /// refreshes a stale entry. An over-cap insert evicts track entries
+    /// oldest-first (see [`MAX_CONTENT_CACHE_BYTES`]); the just-written
+    /// entry is exempt.
     pub fn put_track_at(&mut self, track_id: &str, plaintext: Vec<u8>, now_secs: u64) -> String {
         let hash = Self::hex_hash(&plaintext);
         let old_hash = self.index.get(track_id).map(|e| e.hash.clone());
@@ -159,11 +213,14 @@ impl ContentCache {
         self.blobs.entry(hash.clone()).or_insert_with(|| BlobEntry {
             data: Arc::from(plaintext),
         });
+        self.write_seq += 1;
+        let seq = self.write_seq;
         self.index.insert(
             track_id.to_string(),
             TrackEntry {
                 hash: hash.clone(),
                 stored_at_secs: Some(now_secs),
+                last_write_seq: seq,
             },
         );
         // The rewrite *is* the revalidation landing: release the claim so a
@@ -174,6 +231,7 @@ impl ContentCache {
                 self.remove_blob_if_unreferenced(&old);
             }
         }
+        self.evict_over_cap(track_id);
         hash
     }
 
@@ -260,13 +318,46 @@ impl ContentCache {
         }
     }
 
-    /// Drop the blob under `hash` once no track in the index references it.
-    /// A blob still shared by another track survives.
-    fn remove_blob_if_unreferenced(&mut self, hash: &str) {
-        if self.index.values().any(|t| t.hash == hash) {
-            return;
+    /// Evict track entries oldest-first (last-write order) while the cache
+    /// holds more than [`ContentCache::max_bytes`] blob bytes. Exactly at
+    /// the cap is not over it. `just_written` is exempt: a lone over-cap
+    /// entry serves alone rather than the write vanishing into its own
+    /// eviction pass. Each evicted track counts one eviction even when its
+    /// blob is shared and frees no bytes, so eviction continues past
+    /// surviving sharers until the cache is back at or under the cap.
+    fn evict_over_cap(&mut self, just_written: &str) {
+        let mut total = self.total_bytes();
+        while total > self.max_bytes {
+            let oldest = self
+                .index
+                .iter()
+                .filter(|(id, _)| id.as_str() != just_written)
+                .min_by_key(|(_, entry)| entry.last_write_seq)
+                .map(|(id, _)| id.clone());
+            let Some(victim) = oldest else {
+                break;
+            };
+            let hash = self
+                .index
+                .remove(&victim)
+                .map(|entry| entry.hash)
+                .unwrap_or_default();
+            // The evicted track can never serve or revalidate again: drop
+            // its claim so the map cannot grow on dead entries.
+            self.revalidating.remove(&victim);
+            self.evictions += 1;
+            total = total.saturating_sub(self.remove_blob_if_unreferenced(&hash));
         }
-        self.blobs.remove(hash);
+    }
+
+    /// Drop the blob under `hash` once no track in the index references it.
+    /// A blob still shared by another track survives. Returns the bytes
+    /// freed (the blob's length, or zero when it survives).
+    fn remove_blob_if_unreferenced(&mut self, hash: &str) -> usize {
+        if self.index.values().any(|t| t.hash == hash) {
+            return 0;
+        }
+        self.blobs.remove(hash).map(|b| b.data.len()).unwrap_or(0)
     }
 
     /// Distinct blobs held (dedup probe).
