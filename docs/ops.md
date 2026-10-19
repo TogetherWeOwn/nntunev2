@@ -77,6 +77,50 @@ UNDO (decommissioning reference, not an instruction to execute):
 consumer removal and data-retention checks. Never delete cached/archive data as
 part of a documentation fix.
 
+#### Audio-bucket R2 lifecycle and track-pointer TTL (reported 2026-10-19)
+
+Reported R2 lifecycle rules per audio bucket, from checked-in manifests plus
+prior observations in this runbook's R2 section above. The scratch 7-day
+`ingest-scratch/` rule and the archive `Default Multipart Abort Rule` recorded
+in `docs/ops.md` are the only live bucket-lifecycle observations in this
+runbook, so no live bucket-lifecycle GET is recorded here for either audio
+bucket:
+
+| Bucket | Reported R2 lifecycle rules |
+|---|---|
+| `nntunev2-audio-staging` | none reported — no object-expiry or multipart-abort rule recorded for this bucket in `docs/ops.md` or `docs/cache-policy.md`; `workers/stream/wrangler.toml:47-49` declares only the staging `AUDIO_CACHE` binding |
+| `nntunev2-audio-prod` | none reported — same evidence as staging; `workers/stream/wrangler.toml:34-36,59-61` declare only the prod `AUDIO_CACHE` bindings |
+
+No `lifecycle` field appears in the checked-in Worker/app Wrangler manifests
+(`workers/stream/wrangler.toml`, `workers/mb/wrangler.toml.example`,
+`workers/repair/wrangler.toml`, `workers/ingest/wrangler.toml.example`,
+`workers/api/wrangler.toml.example`, `apps/web/wrangler.toml`) — lifecycle is
+Cloudflare-side, not a Wrangler field, per the audio bucket sources in
+`docs/cache-policy.md` — and the only `lifecycle` string in those manifests is
+the scratch-prefix cleanup comment at
+`workers/ingest/wrangler.toml.example:129`. "None reported" records the
+verified absence of any reported rule for these two audio buckets
+(`workers/stream/wrangler.toml:47-49,59-61`); it does not assert the live
+Cloudflare-side state, which remains unverified for the audio buckets.
+Physical-bucket and binding alignment stays with the owning lanes per the
+reconciliation table in `docs/ops.md` (R2 section above); this subsection
+records lifecycle status only and changes no bucket, binding, TTL, or header
+behavior.
+
+Timed `track/<id>` pointer freshness is application behavior, distinct from R2
+lifecycle per the TTL section of `docs/cache-policy.md`: entries serve fresh
+for `CACHE_FRESH_TTL_SECS = 300` (`workers/stream/src/cache.rs:33`), then
+stale for `CACHE_SWR_WINDOW_SECS = 3_600` (`workers/stream/src/cache.rs:38`)
+while owing background revalidation, then hard-miss past 3,900 s of age
+(`get_track_at` returns `None` past fresh + SWR at
+`workers/stream/src/cache.rs:250-258`, within
+`workers/stream/src/cache.rs:229-261`; `workers/stream/src/play.rs:502-527`
+falls through to the miss path and re-fetches upstream;
+`workers/stream/README.md:157-168` documents HIT, STALE, and MISS). Untimed
+`put_track` entries never go stale (`workers/stream/src/cache.rs:127-147`
+writes `stored_at_secs: None`, served fresh at
+`workers/stream/src/cache.rs:246-247`).
+
 ### Queues (metadata GET-verified 2026-10-17)
 
 Read-only Cloudflare Queues API list/get and consumer-list responses on
@@ -446,6 +490,23 @@ Notes, all referencing (not changing) owning-lane state:
 
 Promotion is `main` HEAD → staging; production promotion is a later gated
 lane. Complete every box on the exact head being promoted.
+
+### Production seed precondition (one-time)
+
+The production lane (`.github/workflows/deploy-production.yml`) promotes
+through the shared gradual-promote action, whose automatic-rollback target is
+the latest production deployment and which refuses unless that deployment is
+a single Worker version at 100%. There is currently no active production
+NNTune Worker deployment, so the very first promotion cannot satisfy that
+precondition on its own. Before the first promotion, an authorized executor
+must seed production once: make one full deploy of the web frontend to
+production (for example `wrangler deploy --env production` from the launch
+SHA, run from `apps/web`) with the launch custom domain (`PRODUCTION_DOMAIN`)
+attached, leaving a single 100% deployment. The lane enforces this before
+uploading anything: its seed step lists production deployments and refuses
+with these instructions when no single-version 100% deployment exists, so a
+first run fails with guidance instead of orphaning an uploaded version inside
+the promotion action. Re-dispatch the lane after seeding.
 
 - [ ] Exact-head CI: `ci-ok`, `gitleaks` and `pr-lint` green on the promotion
   SHA, plus Paperclip Review 5/5 on that head (merge policy in

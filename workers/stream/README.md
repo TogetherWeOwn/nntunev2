@@ -166,6 +166,14 @@ behaviour.
   play path re-fetches upstream. Cache writes are stamped with the play
   time on `finalize`, so the SWR clock runs from when the bytes were
   fetched.
+- Capacity (`src/cache.rs`): `MAX_CONTENT_CACHE_BYTES = 64 MiB` caps the
+  distinct blob bytes a default `ContentCache` holds (a blob shared by
+  several tracks counts once). An over-cap insert evicts track entries
+  oldest-first in last-write order until the cache is back at or under
+  the cap — exactly at the cap evicts nothing — and never evicts the
+  just-written entry, which serves alone when it exceeds the cap by
+  itself. Capacity evictions increment `eviction_count` (the probe the
+  observability path reports); time-expiry prunes are not evictions.
 - Headers: every play carries `Cache-Status: HIT|MISS|STALE` and
   `Age: <seconds-since-write>` (see `PlayResponse::cache_headers`).
 
