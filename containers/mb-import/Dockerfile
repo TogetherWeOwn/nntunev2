@@ -34,10 +34,16 @@ COPY containers/mb-import/etl.py /job/etl.py
 COPY containers/mb-import/replicate.sh /job/replicate.sh
 COPY containers/mb-import/pg-env.sh /job/pg-env.sh
 COPY --from=validator /src/target/release/mb-validate /usr/local/bin/mb-validate
-RUN chmod 0755 /job/import.sh /job/etl.sh /job/etl.py /job/replicate.sh /job/pg-env.sh
+RUN chmod 0755 /job/import.sh /job/etl.sh /job/etl.py /job/replicate.sh /job/pg-env.sh \
+    && chown -R postgres:postgres /job
 # Keep the ETL test stage in the default build graph without shipping tests.
 COPY --from=test /tmp/mb-import-tests-passed /tmp/mb-import-tests-passed
 RUN rm /tmp/mb-import-tests-passed
+
+# Run the job as the image's existing non-root postgres user. /job is owned
+# by it (the CI integration suite writes fixtures under /job); script
+# scratch goes to world-writable /tmp via mktemp, or the mounted dump dir.
+USER postgres
 
 # Default: show usage; the scheduler overrides CMD per run.
 CMD ["bash", "/job/import.sh", "--help"]

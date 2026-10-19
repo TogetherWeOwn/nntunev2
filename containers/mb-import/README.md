@@ -7,7 +7,7 @@ Container image for the two batch jobs behind `nntunev2-mb`
 
 | Job | Trigger | Script | SLO |
 |---|---|---|---|
-| Initial import | manual Container run | `import.sh <curated-dir>` (`mbdump-<table>.tsv`; missing input is fatal; optional `DUMP_SEQ=<n>` seeds `mb_import_state.last_packet` forward-only; `MB_IMPORT_CHUNK_LINES=<n>` sizes chunks, default 2000) | kill-safe and idempotent: each file is keyed by its SHA-256 in `mb_import_cursor`, then applied in one-transaction chunks (validate via `mb-validate` -> `COPY` -> typed upsert -> cursor advance). The same dump resumes after its last committed chunk; a changed dump gets a fresh cursor even if it has the same or fewer lines. Poison rows land in `mb_import_dlq` per dump with reason + raw line instead of aborting the run. Duplicate valid keys within one dump — MBIDs on the entity tables, the `(release, medium, track)` position on `mbdump-track.tsv` — or a cursor ahead of that dump are fatal; the same MBID in a later dump is allowed and uses the forward-only upsert (`WHERE updated_at < EXCLUDED.updated_at`). `DUMP_SEQ` seeds `last_packet` only when it advances the cursor, never touches `last_applied_at`/`lag_seconds`, so an older dump never rolls back newer rows or rewinds replication. Seed `last_packet` via `DUMP_SEQ` (or manually) before replication or `replicate.sh` keeps refusing packets. (Sources: `import.sh:76-80` (`MB_IMPORT_CHUNK_LINES`, default 2000); `:121-126` (missing input fatal); `:182-210` (SHA-256 `dump_id`, whole-file dupe / cursor-ahead refusal); `:270-279` (per-chunk dupe check); `:387-404` (one-transaction chunk); `:416-442` (`DUMP_SEQ` forward-only seed); `Dockerfile:40-41` (scheduler overrides default CMD).) |
+| Initial import | manual Container run | `import.sh <curated-dir>` (`mbdump-<table>.tsv`; missing input is fatal; optional `DUMP_SEQ=<n>` seeds `mb_import_state.last_packet` forward-only; `MB_IMPORT_CHUNK_LINES=<n>` sizes chunks, default 2000) | kill-safe and idempotent: each file is keyed by its SHA-256 in `mb_import_cursor`, then applied in one-transaction chunks (validate via `mb-validate` -> `COPY` -> typed upsert -> cursor advance). The same dump resumes after its last committed chunk; a changed dump gets a fresh cursor even if it has the same or fewer lines. Poison rows land in `mb_import_dlq` per dump with reason + raw line instead of aborting the run. Duplicate valid keys within one dump — MBIDs on the entity tables, the `(release, medium, track)` position on `mbdump-track.tsv` — or a cursor ahead of that dump are fatal; the same MBID in a later dump is allowed and uses the forward-only upsert (`WHERE updated_at < EXCLUDED.updated_at`). `DUMP_SEQ` seeds `last_packet` only when it advances the cursor, never touches `last_applied_at`/`lag_seconds`, so an older dump never rolls back newer rows or rewinds replication. Seed `last_packet` via `DUMP_SEQ` (or manually) before replication or `replicate.sh` keeps refusing packets. (Sources: `import.sh:76-80` (`MB_IMPORT_CHUNK_LINES`, default 2000); `:121-126` (missing input fatal); `:182-210` (SHA-256 `dump_id`, whole-file dupe / cursor-ahead refusal); `:270-279` (per-chunk dupe check); `:387-404` (one-transaction chunk); `:416-442` (`DUMP_SEQ` forward-only seed); `Dockerfile:48-49` (scheduler overrides default CMD).) |
 | Replication | hourly schedule (Container / Workflow cron) | `replicate.sh` with `PACKET_SEQ` + `PACKET_URL` | **lag < 2 h** SLO (each packet applied within 2 h of publication); per-packet evidence is `mb_replication_packet.lag_secs`, not the aggregate snapshot — `mb_import_state.lag_seconds` is written only by the pending apply step. Packets must arrive in sequence (`PACKET_SEQ = last_packet + 1`), and until the apply step lands the script exits non-zero without touching state. (Sources: `docs/adr/0007-mb-mirror.md:24-26` (hourly schedule, SLO); `replicate.sh:2-9` (SLO + pending apply), `:16-19,36-44` (integer + sequence gate), `:46-51` (exit 2, no state write); `migrations/0017_mb_replication_packet_ledger.sql`; `workers/mb/README.md:74-81` (SLO evidence); `migrations/0001_mb_mirror.sql:57-65` (state columns).) |
 
 ## Initial dump ETL
@@ -29,7 +29,7 @@ the Dockerfile's test stage runs them during the normal image build without
 shipping fixtures in the runtime image. (Sources: `etl.sh:1-14`;
 `etl.py:141-160` (`DUMP_TS`, temp SQLite projection), `:319-335` (immutable
 snapshot + atomic `curated` swap, previous snapshots retained);
-`tests/test_etl.sh`; `Dockerfile:9-17,27-38`;
+`tests/test_etl.sh`; `Dockerfile:9-17,40-41`;
 `.github/workflows/ci.yml:298-313`.)
 
 The ETL's positional mapping follows the official
@@ -108,7 +108,9 @@ it copies the full workspace and builds the single validator package):
 docker build -f containers/mb-import/Dockerfile .
 ```
 
-(Sources: `Dockerfile:19-25` (validator stage), `:27-38` (runtime stage).)
+(Sources: `Dockerfile:19-25` (validator stage), `:29-49` (runtime stage).)
+
+The runtime stage runs the jobs as the non-root `postgres` user (`Dockerfile:43-46`).
 
 `test-import.sh` runs the integration suite (chunked import, kill-resume,
 same-dump rerun, newer-dump upsert, DLQ, FK orphans, all-poison and
