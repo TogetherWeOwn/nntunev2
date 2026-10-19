@@ -132,6 +132,9 @@ export function validateIndexerUrl(url: string, apiKey: string): string | null {
 	if (parsed.protocol !== 'https:') {
 		return 'Indexer URLs must use https.';
 	}
+	if (parsed.username.length > 0 || parsed.password.length > 0 || parsed.hash.length > 0) {
+		return 'Put the API key in the key field, not the URL';
+	}
 
 	const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
 	if (

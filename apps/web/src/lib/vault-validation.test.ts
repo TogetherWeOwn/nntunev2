@@ -188,6 +188,29 @@ describe('validateIndexerUrl', () => {
 		}
 	});
 
+	it('rejects credentials and fragments in the indexer URL', () => {
+		const KEY = 'indexer-key';
+		const MESSAGE = 'Put the API key in the key field, not the URL';
+		for (const url of [
+			'https://user@index.example.com/api',
+			'https://user:pass@index.example.com/api',
+			'https://:pass@index.example.com/api',
+			'https://index.example.com/api#section'
+		]) {
+			expect(validateIndexerUrl(url, KEY), `url rejected: ${url}`).toBe(MESSAGE);
+		}
+	});
+
+	it('accepts plain https URLs with ports and paths', () => {
+		const KEY = 'indexer-key';
+		for (const url of [
+			'https://index.example.com/api',
+			'https://index.example.com:8443/api/v1'
+		]) {
+			expect(validateIndexerUrl(url, KEY), `url accepted: ${url}`).toBeNull();
+		}
+	});
+
 	it('pins the exact indexer diagnostic strings', () => {
 		const URL = 'https://index.example.com/api';
 		const KEY = 'indexer-key';
