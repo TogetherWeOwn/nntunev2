@@ -8,6 +8,7 @@
 //! `body::BodyRequest`; unknown response fields never appear because a
 //! `200` body is the article bytes themselves.
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use worker::{wasm_bindgen::JsValue, Env, Headers, Method, Request, RequestInit};
 
@@ -110,6 +111,12 @@ pub fn classify_body_reply(
 }
 
 /// Send one body request to the user's pool and classify the answer.
+///
+/// The reply body is never buffered past `MAX_BODY_REPLY_BYTES`: a truthful
+/// declared length over the cap fails closed before any byte is read, and an
+/// undeclared or lying length is stopped on the chunk that would cross the
+/// cap. Oversize is `Rejected` because more bytes existed, never a truncated
+/// prefix handed to the classifier, and the excess is dropped unretained.
 pub async fn call_pool_body(env: &Env, req: &BodyRequest) -> Result<BodyFetch, PoolBodyError> {
     let unavailable = PoolBodyError::Retry {
         after_secs: DEFAULT_RETRY_SECS,
@@ -134,6 +141,41 @@ pub async fn call_pool_body(env: &Env, req: &BodyRequest) -> Result<BodyFetch, P
         .map_err(|_| unavailable)?;
     let status = response.status_code();
     let retry_after = response.headers().get("retry-after").ok().flatten();
-    let bytes = response.bytes().await.map_err(|_| unavailable)?;
+    if let Ok(Some(declared)) = response.headers().get("content-length") {
+        if let Ok(len) = declared.trim().parse::<usize>() {
+            if len > MAX_BODY_REPLY_BYTES {
+                return Err(PoolBodyError::Rejected);
+            }
+        }
+    }
+    let is_empty = matches!(response.body(), worker::ResponseBody::Empty);
+    let bytes = if is_empty {
+        Vec::new()
+    } else {
+        let buffered_len = match response.body() {
+            worker::ResponseBody::Body(buffered) => Some(buffered.len()),
+            _ => None,
+        };
+        if let Some(len) = buffered_len {
+            if len > MAX_BODY_REPLY_BYTES {
+                return Err(PoolBodyError::Rejected);
+            }
+            match response.body() {
+                worker::ResponseBody::Body(buffered) => buffered.clone(),
+                _ => Vec::new(),
+            }
+        } else {
+            let mut buf = Vec::new();
+            let mut stream = response.stream().map_err(|_| unavailable)?;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|_| unavailable)?;
+                if buf.len().saturating_add(chunk.len()) > MAX_BODY_REPLY_BYTES {
+                    return Err(PoolBodyError::Rejected);
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            buf
+        }
+    };
     classify_body_reply(status, retry_after.as_deref(), &bytes)
 }
