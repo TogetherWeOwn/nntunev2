@@ -32,9 +32,9 @@ The no-route Worker that fronts the par2 repair Container
   then is `out/result.json` written. Ingest receives a small status
   reply (`{status, exit_code, file_count}`); the full per-file
   result document stays in `out/result.json`.
-  (Sources: `src/contract.rs:209-212,227-251,264-271`
+  (Sources: `src/contract.rs:210-212,234-251,412-419`
   (`manifest_digest`, `plan`, `ingest_reply_body`);
-  `src/runtime.rs:164-260` (`stage_input`, `/repair` call,
+  `src/runtime.rs:343-432` (`stage_input`, `/repair` call,
   result-marker-last); `workers/ingest/src/verify.rs:270-277,2071-2083`
   — `staging_id` derived from content hashes.)
 - **Container isolation.** The Container is started with internet
@@ -59,7 +59,7 @@ confirmation and the deploy itself are operator actions. Until then
 finish a `Repairing` job (its consumer also remains disabled).
 (Sources: `wrangler.toml:11-13`;
 `workers/ingest/wrangler.toml.example:30-31,52-56`;
-`workers/ingest/src/repair.rs:105-143` (`call_repair`) — binding,
+`workers/ingest/src/repair.rs:146-187` (`call_repair`) — binding,
 transport and body-read failure is `Retry`, never a terminal outcome.)
 
 ## Checks

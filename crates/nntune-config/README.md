@@ -28,7 +28,7 @@ Implementation: [src/lib.rs](src/lib.rs).
   pinned by `defaults_apply_for_unset_keys`,
   `missing_required_key_without_default_fails`, `invalid_types_rejected`,
   `unknown_kv_key_rejected` in `src/lib.rs:356-427`, and
-  `empty_and_blank_strings_rejected` in `src/lib.rs:481-517` for the
+  `empty_and_blank_strings_rejected` in `src/lib.rs:538-575` for the
   empty/whitespace-string rejection matching the CI parity checker.)
 - **Env overlay is scoped and atomic.** `Config::apply_env` consults only keys
   declared `env_overridable`, and only through their documented `env_var`
@@ -40,7 +40,7 @@ Implementation: [src/lib.rs](src/lib.rs).
   (Sources: `src/lib.rs:289-309`; pinned by
   `env_overlay_only_touches_overridable_keys`,
   `env_overlay_type_errors_fail_closed`, and
-  `env_overlay_is_atomic_across_vars` in `src/lib.rs:430-478`.)
+  `env_overlay_is_atomic_across_vars` in `src/lib.rs:517-536`.)
 - **Never secrets.** Secret values are never config keys: Worker secrets and
   rotation live outside KV config entirely. Error text reports key names
   only, never values, so it is safe for CI logs. This holds by construction
@@ -54,23 +54,23 @@ Implementation: [src/lib.rs](src/lib.rs).
   `schema_version` when you change the meaning of an existing key, not when
   you add one; a supported version bump updates the schema file,
   `SCHEMA_VERSION`, the accepted version in `validate_schema` in
-  `../../.github/scripts/config_parity_check.py:119`, its self-test (which
+  `../../.github/scripts/config_parity_check.py:114-119`, its self-test (which
   must then reject the next unsupported version, currently pinned at
   `../../.github/scripts/test_config_parity_check.py:113` rejecting version
   2), and the `VALID_SCHEMA` fixture in
   `../../.github/scripts/test_config_duplicate_members.py:36` (whose positive
   control `test_valid_distinct_per_environment_values_accepted` in
-  `../../.github/scripts/test_config_duplicate_members.py:245-251` asserts
+  `../../.github/scripts/test_config_duplicate_members.py:254-261` asserts
   exit 0, so it must track the accepted version) and the `schema_version`
   literals in `test_duplicate_schema_version_with_valid_final_value_rejected`
-  in `../../.github/scripts/test_config_duplicate_members.py:166-170`
+  in `../../.github/scripts/test_config_duplicate_members.py:170-178`
   (currently matching `"schema_version": 1` at `:168` and injecting version 2
   at `:169`, so both sides must shift on a bump or the duplicate-input case
   stops triggering). Adding a key follows the procedure in the
   [config dir README](../../config/README.md) (schema file, both env
   fixtures, and the `KEYS` table together).
   (Sources: `src/lib.rs:19-21`, `src/lib.rs:88-91`; pinned by
-  `schema_file_matches_code_table` in `src/lib.rs:558-638`, which also checks
+  `schema_file_matches_code_table` in `src/lib.rs:615-696`, which also checks
   key set, types, required flags, env-overridability, env vars, and defaults.)
 
 ## Reading values
@@ -80,14 +80,14 @@ absent (only possible for non-required keys without a default) or held under
 another type, which cannot happen after `Config::load` validated the set.
 (Sources: `src/lib.rs:311-333`; pinned by
 `typed_getters_return_none_for_absent_or_other_typed_keys` in
-`src/lib.rs:550-555`. Bool parsing/getter coverage is kept via a synthetic
+`src/lib.rs:607-613`. Bool parsing/getter coverage is kept via a synthetic
 spec while the shipped schema has no bool key — see
-`synthetic_bool_key_parses_and_is_read_by_get_bool` in `src/lib.rs:520-547`;
+`synthetic_bool_key_parses_and_is_read_by_get_bool` in `src/lib.rs:577-605`;
 that spec must not become a production key.)
 
 The shipped staging/prod fixtures load through this same typed path (see
 `shipped_fixtures_load_through_typed_getters` and
-`shipped_fixture_mutations_fail_closed` in `src/lib.rs:663-792`); fixture and
+`shipped_fixture_mutations_fail_closed` in `src/lib.rs:721-850`); fixture and
 parity rules live in the [config dir README](../../config/README.md).
 
 ## Checks
