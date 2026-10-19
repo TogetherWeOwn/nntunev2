@@ -85,7 +85,39 @@ pub fn classify_reply(
 /// cancellable deadline. Overridable in tests via
 /// [`call_pool_probe_with_deadline`]; production callers use
 /// [`call_pool_probe`].
-pub const POOL_PROBE_DEADLINE_MS: u64 = 10_000;
+///
+/// Sized from the batch arithmetic in `queue_consumer`: one probe batch is
+/// up to [`crate::probe::MAX_PROBE_SEGMENTS`] (500) sequential `STAT`
+/// round-trips on the pool side, nominally 15 ms each (7.5 s per batch).
+/// The per-STAT allowance below (50 ms, over 3x nominal) covers a
+/// slow-but-healthy provider at 25 ms per `STAT` (12.5 s per batch) with 2x
+/// headroom, plus one dial (`UpstreamTimeouts::connect`, 5 s in
+/// `workers/stream/src/nntp.rs`). A warm-stale redial fails fast on the
+/// first `Io` (closed-while-idle) before the fresh dial, so a single batch
+/// allowance plus one dial covers the rerun path too. The total (30 s)
+/// equals [`crate::queue_consumer`] `PROBE_DELIVERY_BUDGET_MS`, so one hung
+/// batch holds at most one delivery budget — the same overshoot the driver
+/// already allows for one in-flight batch.
+pub const POOL_PROBE_DEADLINE_MS: u64 = 30_000;
+
+/// Per-`STAT` allowance inside [`POOL_PROBE_DEADLINE_MS`]: 50 ms covers the
+/// 15 ms nominal round-trip with over 3x headroom (25 ms slow-healthy with
+/// 2x).
+const PROBE_PER_STAT_ALLOWANCE_MS: u64 = 50;
+
+/// One dial allowance inside [`POOL_PROBE_DEADLINE_MS`]: matches the
+/// stream client's 5 s connect timeout.
+const PROBE_DIAL_ALLOWANCE_MS: u64 = 5_000;
+
+// Compile-time: the deadline is exactly one full 500-`STAT` batch at the
+// per-`STAT` allowance plus one dial, and stays above a slow-healthy batch
+// (500 `STAT`s at 25 ms plus one dial = 17.5 s).
+const _: () = assert!(
+    POOL_PROBE_DEADLINE_MS
+        == crate::probe::MAX_PROBE_SEGMENTS as u64 * PROBE_PER_STAT_ALLOWANCE_MS
+            + PROBE_DIAL_ALLOWANCE_MS
+);
+const _: () = assert!(POOL_PROBE_DEADLINE_MS >= 500 * 25 + 5_000);
 
 /// Send one probe batch to the user's pool and check the answer.
 pub async fn call_pool_probe(
@@ -132,20 +164,8 @@ pub async fn call_pool_probe_with_deadline(
     let mut deadline = Box::pin(worker::Delay::from(std::time::Duration::from_millis(
         deadline_ms,
     )));
-    let mut fetch = Box::pin(stub.fetch_with_request(request));
-    let response = std::future::poll_fn(|cx| {
-        use std::task::Poll;
-        // Deadline first: an already-fired deadline aborts even when
-        // headers are also ready.
-        if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
-            return Poll::Ready(None);
-        }
-        match std::future::Future::poll(fetch.as_mut(), cx) {
-            Poll::Ready(response) => Poll::Ready(Some(response)),
-            Poll::Pending => Poll::Pending,
-        }
-    })
-    .await;
+    let fetch = Box::pin(stub.fetch_with_request(request));
+    let response = crate::pool_deadline::race_against_deadline(fetch, &mut deadline).await;
     let mut response = match response {
         Some(Ok(response)) => response,
         Some(Err(_)) | None => return Err(expired),
@@ -154,18 +174,8 @@ pub async fn call_pool_probe_with_deadline(
     let retry_after = response.headers().get("retry-after").ok().flatten();
     // Reuse the same deadline for the body drain: partial progress never
     // re-arms it, so headers plus body share one total budget.
-    let mut body_read = Box::pin(response.text());
-    let text = std::future::poll_fn(|cx| {
-        use std::task::Poll;
-        if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
-            return Poll::Ready(None);
-        }
-        match std::future::Future::poll(body_read.as_mut(), cx) {
-            Poll::Ready(text) => Poll::Ready(Some(text)),
-            Poll::Pending => Poll::Pending,
-        }
-    })
-    .await;
+    let body_read = Box::pin(response.text());
+    let text = crate::pool_deadline::race_against_deadline(body_read, &mut deadline).await;
     let text = match text {
         Some(Ok(text)) => text,
         Some(Err(_)) | None => return Err(expired),

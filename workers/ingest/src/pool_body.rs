@@ -113,7 +113,34 @@ pub fn classify_body_reply(
 /// cancellable deadline. Overridable in tests via
 /// [`call_pool_body_with_deadline`]; production callers use
 /// [`call_pool_body`].
-pub const POOL_BODY_DEADLINE_MS: u64 = 10_000;
+///
+/// Sized separately from the probe: one body call is a single article, not
+/// a 500-`STAT` batch. The pool side needs at most one dial
+/// (`UpstreamTimeouts::connect`, 5 s in `workers/stream/src/nntp.rs`) plus
+/// one `BODY` response budget (`UpstreamTimeouts::read`, 10 s total for the
+/// article in `workers/stream/src/nntp.rs`), with one warm-stale redial
+/// (closed-while-idle fails fast on the first `Io`, then a fresh dial)
+/// and 5 s of headroom for DO overhead and the 16 MiB reply transfer:
+/// 5 + 10 + 5 + 5 = 25 s. Well above a cold dial plus a full-budget `BODY`
+/// (15 s) while still bounding a hang.
+pub const POOL_BODY_DEADLINE_MS: u64 = 25_000;
+
+/// One dial allowance inside [`POOL_BODY_DEADLINE_MS`]: matches the stream
+/// client's 5 s connect timeout (counted twice: initial dial plus one
+/// warm-stale redial).
+const BODY_DIAL_ALLOWANCE_MS: u64 = 5_000;
+
+/// One article budget inside [`POOL_BODY_DEADLINE_MS`]: matches the stream
+/// client's 10 s total `BODY`-response budget.
+const BODY_READ_BUDGET_MS: u64 = 10_000;
+
+// Compile-time: the deadline is exactly dial + article + redial-dial +
+// headroom, and stays above a cold dial plus a full-budget article.
+const _: () = assert!(
+    POOL_BODY_DEADLINE_MS
+        == BODY_DIAL_ALLOWANCE_MS + BODY_READ_BUDGET_MS + BODY_DIAL_ALLOWANCE_MS + 5_000
+);
+const _: () = assert!(POOL_BODY_DEADLINE_MS >= 5_000 + 10_000);
 
 /// Send one body request to the user's pool and classify the answer.
 pub async fn call_pool_body(env: &Env, req: &BodyRequest) -> Result<BodyFetch, PoolBodyError> {
@@ -157,20 +184,8 @@ pub async fn call_pool_body_with_deadline(
     let mut deadline = Box::pin(worker::Delay::from(std::time::Duration::from_millis(
         deadline_ms,
     )));
-    let mut fetch = Box::pin(stub.fetch_with_request(request));
-    let response = std::future::poll_fn(|cx| {
-        use std::task::Poll;
-        // Deadline first: an already-fired deadline aborts even when
-        // headers are also ready.
-        if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
-            return Poll::Ready(None);
-        }
-        match std::future::Future::poll(fetch.as_mut(), cx) {
-            Poll::Ready(response) => Poll::Ready(Some(response)),
-            Poll::Pending => Poll::Pending,
-        }
-    })
-    .await;
+    let fetch = Box::pin(stub.fetch_with_request(request));
+    let response = crate::pool_deadline::race_against_deadline(fetch, &mut deadline).await;
     let mut response = match response {
         Some(Ok(response)) => response,
         Some(Err(_)) | None => return Err(expired),
@@ -179,18 +194,8 @@ pub async fn call_pool_body_with_deadline(
     let retry_after = response.headers().get("retry-after").ok().flatten();
     // Reuse the same deadline for the body drain: partial progress never
     // re-arms it, so headers plus body share one total budget.
-    let mut body_read = Box::pin(response.bytes());
-    let bytes = std::future::poll_fn(|cx| {
-        use std::task::Poll;
-        if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
-            return Poll::Ready(None);
-        }
-        match std::future::Future::poll(body_read.as_mut(), cx) {
-            Poll::Ready(bytes) => Poll::Ready(Some(bytes)),
-            Poll::Pending => Poll::Pending,
-        }
-    })
-    .await;
+    let body_read = Box::pin(response.bytes());
+    let bytes = crate::pool_deadline::race_against_deadline(body_read, &mut deadline).await;
     let bytes = match bytes {
         Some(Ok(bytes)) => bytes,
         Some(Err(_)) | None => return Err(expired),
