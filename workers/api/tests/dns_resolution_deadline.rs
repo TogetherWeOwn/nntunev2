@@ -241,10 +241,12 @@ struct Dialer {
     calls: RefCell<Vec<(Vec<IpAddr>, u16, bool)>>,
 }
 impl handlers::Dialer for Dialer {
-    async fn probe(&self, target: &vault::ValidatedTarget, port: u16, tls: bool) -> bool {
+    async fn probe(&self, target: &vault::ValidatedTarget, tls: bool) -> bool {
+        // The dialer receives no caller-supplied port: the only port it can
+        // record is the validated target's own allowlisted port.
         self.calls
             .borrow_mut()
-            .push((target.addresses().to_vec(), port, tls));
+            .push((target.addresses().to_vec(), target.port(), tls));
         true
     }
 }
