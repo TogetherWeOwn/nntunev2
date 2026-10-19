@@ -485,6 +485,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Pin the RUN line itself (anchored ^RUN): the comments above the COPY
+      # also name --locked, so a file-wide contains check would stay green
+      # after a revert that drops the flag from the build command.
+      - name: Pin repair image build uses --locked
+        run: grep -q '^RUN cargo build --locked --release -p nntune-repair-server' containers/repair/Dockerfile
       - name: Build repair image from clean checkout
         run: docker build -f containers/repair/Dockerfile -t nntune-repair:ci .
       - name: Smoke the shipped server and pinned par2 binary
@@ -521,6 +526,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Pin the RUN line itself (anchored ^RUN): the comments above the COPY
+      # also name --locked, so a file-wide contains check would stay green
+      # after a revert that drops the flag from the build command.
+      - name: Pin validator build uses --locked
+        run: grep -q '^RUN cargo build --locked --release -p mb-import-validate' containers/mb-import/Dockerfile
       - name: Build importer image from clean checkout
         run: docker build -f containers/mb-import/Dockerfile -t mb-import:ci .
       # Apply only the mirror-target migrations (base 0001 + importer 0014
