@@ -145,6 +145,33 @@ export interface ProviderTestResult {
 	error?: string;
 }
 
+/** Redacted vault metadata only; never return credentials or endpoint details. */
+export interface SavedProviderSummary {
+	provider_configured: boolean;
+	indexer_configured: boolean;
+	/** Unix seconds, or zero when no configuration is stored. */
+	updated_at: number;
+}
+
+function validateSavedProviderSummary(data: unknown, status: number): SavedProviderSummary {
+	if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+		throw vaultTestShapeFailure(status);
+	}
+	const record = data as Record<string, unknown>;
+	if (
+		typeof record.provider_configured !== 'boolean' ||
+		typeof record.indexer_configured !== 'boolean' ||
+		!isFiniteNonNegativeNumber(record.updated_at)
+	) {
+		throw vaultTestShapeFailure(status);
+	}
+	return {
+		provider_configured: record.provider_configured,
+		indexer_configured: record.indexer_configured,
+		updated_at: record.updated_at
+	};
+}
+
 function isFiniteNonNegativeNumber(value: unknown): value is number {
 	return typeof value === 'number' && Number.isFinite(value) && value >= 0;
 }
@@ -415,10 +442,11 @@ export class ApiClient {
 	 * Start a passkey proof bound to the currently authenticated session. The
 	 * success body carries the login-start shape and is checked the same way.
 	 */
-	async reauthenticateStart(): Promise<LoginStartResponse> {
+	async reauthenticateStart(signal?: AbortSignal): Promise<LoginStartResponse> {
 		const { data, status } = await this.requestWithStatus<unknown>(
 			'/v1/session/reauthenticate/start',
 			{
+				signal,
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
 				body: JSON.stringify({})
@@ -428,11 +456,41 @@ export class ApiClient {
 	}
 
 	/** Complete proof-bound reauthentication without affecting ordinary login. */
-	async reauthenticateFinish(input: LoginFinishInput): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>(
-			'/v1/session/reauthenticate/finish',
-			toLoginFinishBody(input)
-		);
+	async reauthenticateFinish(input: LoginFinishInput, signal?: AbortSignal): Promise<MagicLinkResult> {
+		return this.request<MagicLinkResult>('/v1/session/reauthenticate/finish', {
+			method: 'POST',
+			signal,
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify(toLoginFinishBody(input))
+		});
+	}
+
+	/** Read a validated, allowlisted summary of the saved vault. */
+	async getSavedProviderSummary(signal?: AbortSignal): Promise<SavedProviderSummary> {
+		const { data, status } = await this.requestWithStatus<unknown>('/v1/vault', {
+			method: 'GET', signal
+		});
+		return validateSavedProviderSummary(data, status);
+	}
+
+	/** Reachability only, not provider authentication. An empty body selects the stored vault. */
+	async testSavedProviderConnection(signal?: AbortSignal): Promise<ProviderTestResult> {
+		const { data, status } = await this.requestWithStatus<unknown>('/v1/vault/test', {
+			method: 'POST', signal
+		});
+		return validateVaultTestResult(data, status);
+	}
+
+	/** No automatic retries: only a validated both-false summary proves removal. */
+	async deleteSavedProviderConfig(signal?: AbortSignal): Promise<SavedProviderSummary> {
+		const { data, status } = await this.requestWithStatus<unknown>('/v1/vault', {
+			method: 'DELETE', signal
+		});
+		const summary = validateSavedProviderSummary(data, status);
+		if (summary.provider_configured || summary.indexer_configured) {
+			throw vaultTestShapeFailure(status);
+		}
+		return summary;
 	}
 
 	/**

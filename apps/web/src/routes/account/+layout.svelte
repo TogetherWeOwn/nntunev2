@@ -8,6 +8,7 @@
 	<nav aria-label="Account">
 		<a href="/account/billing">Billing</a>
 		<a href="/account/security">Security</a>
+		<a href="/account/provider">Provider</a>
 	</nav>
 
 	{@render children()}
