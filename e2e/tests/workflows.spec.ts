@@ -1176,6 +1176,60 @@ test.describe('locked-dependency ci builds (static pin)', () => {
   // static pin, not a shell parser. Only a whole literal echo is ignored;
   // never strip quoted strings wholesale, since double quotes can execute
   // $(cargo ...) and backticks. Ambiguous forms remain fail-closed.
+  const stripTrailingComment = (line: string): string => {
+    type Context = { quote?: "'" | '"'; end?: ')' | '`'; depth: number; wordStart: boolean };
+    const contexts: Context[] = [{ depth: 0, wordStart: true }];
+    for (let index = 0; index < line.length; index += 1) {
+      const char = line[index]!;
+      const context = contexts[contexts.length - 1]!;
+      if (context.quote === "'") {
+        if (char === "'") context.quote = undefined;
+        continue;
+      }
+      if (char === '\\') {
+        index += 1;
+        context.wordStart = false;
+        continue;
+      }
+      // Substitutions have their own quotes: the inner double quotes in
+      // `echo "$(echo "step #2")"` must not close the outer quoted string.
+      if (char === '$' && line[index + 1] === '(') {
+        context.wordStart = false;
+        contexts.push({ end: ')', depth: 1, wordStart: true });
+        index += 1;
+        continue;
+      }
+      if (char === '`') {
+        if (context.end === '`' && !context.quote) contexts.pop();
+        else {
+          context.wordStart = false;
+          contexts.push({ end: '`', depth: 0, wordStart: true });
+        }
+        continue;
+      }
+      if (context.quote === '"') {
+        if (char === '"') context.quote = undefined;
+        continue;
+      }
+      if (char === "'" || char === '"') {
+        context.quote = char;
+        context.wordStart = false;
+      } else if (char === '(' && context.end === ')') {
+        context.depth += 1;
+        context.wordStart = true;
+      } else if (char === ')' && context.end === ')') {
+        context.depth -= 1;
+        if (context.depth === 0) contexts.pop();
+        else context.wordStart = true;
+      } else if (char === '#' && context.wordStart) {
+        return line.slice(0, index);
+      } else {
+        // A shell comment starts a word, not an escaped space or `step#2`.
+        context.wordStart = /[\s;&|()]/.test(char);
+      }
+    }
+    return line;
+  };
   const jobCargoSteps = (workflow: string, job: string, verb: string): string[] => {
     const section = jobSection(stripFullLineComments(workflow), job).replace(/\\\r?\n\s*/g, ' ');
     // Cargo's global arguments (including rustup's +toolchain selector)
@@ -1187,7 +1241,7 @@ test.describe('locked-dependency ci builds (static pin)', () => {
     const literalEcho = /^echo(?:\s+(?:'[^']*'|"[^"$`\\]*"|[\w./=-]+))+\s*$/;
     return section
       .split('\n')
-      .map((line) => line.split(/\s+#.*$/)[0]!)
+      .map(stripTrailingComment)
       // && / || precede their bare prefixes so each pair splits as one
       // separator. Splitting inside redirections such as 2>&1 is harmless:
       // the cargo segment keeps its flags and the fragments match no verb.
@@ -1348,6 +1402,26 @@ test.describe('locked-dependency ci builds (static pin)', () => {
       (command) => command.replace(/^cargo /, 'cargo --offline '),
       (command) => command.replace(/^cargo /, 'cargo -q '),
       (command) => command.replace(/^cargo /, 'cargo --config net.offline=true '),
+      // Literal hashes must not truncate the line before a chained sibling.
+      // Cover quote/escape states as well as a # inside an unquoted word.
+      (command) => `echo "step #2" && ${command}`,
+      (command) => `echo 'step #2' && ${command}`,
+      (command) => `echo \`echo "step #2"\` && ${command}`,
+      (command) => `echo "$(echo 'step #2')" && ${command}`,
+      (command) => `echo "\`echo 'step #2'\`" && ${command}`,
+      (command) => `echo "$(echo "step #2")" && ${command}`,
+      (command) => `echo "\`echo "step #2"\`" && ${command}`,
+      (command) => `echo "$( (echo "step #2") )" && ${command}`,
+      (command) => `${String.raw`echo "step \" #2"`} && ${command}`,
+      (command) => `${String.raw`echo 'step \ #2'`} && ${command}`,
+      (command) => `${String.raw`echo step \#2`} && ${command}`,
+      (command) => `${String.raw`echo step\ #2`} && ${command}`,
+      (command) => `echo step#2 && ${command}`,
+      // Actual comments still cannot supply a flag, even after quoted hashes.
+      (command) => `${command} # --locked`,
+      (command) => `echo "step #2" && ${command} # --locked`,
+      (command) => `${command};# --locked`,
+      (command) => `echo "step #2" && ${command} # "unterminated --locked`,
     ];
     for (const wrap of wrappers) {
       for (const locked of [false, true]) {
