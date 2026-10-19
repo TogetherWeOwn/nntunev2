@@ -32,7 +32,10 @@ Stage refs (`FROM base`, where `base` was named by an earlier
 `FROM ... AS base`) are internal and exempt, as is `FROM scratch`
 (the empty base image takes no tag and cannot be pinned). The match
 is a regex, not literal digests, so Dependabot digest-refresh PRs
-stay green.
+stay green. The scan mirrors the production parser (moby/buildkit):
+one file-start BOM is stripped, backslash-continued lines join before
+parsing, and heredoc bodies on RUN/COPY/ADD are content -- a
+`FROM ... AS x` inside one registers no stage.
 
 Stdlib only (no PyYAML: the two fields are extracted with a line scan).
 Exit 0 = covered; 1 = drift found; 2 = unusable input.
@@ -42,6 +45,7 @@ Usage:
 """
 
 import argparse
+import json
 import re
 import sys
 import tomllib
@@ -62,7 +66,11 @@ ECOSYSTEM_RE = re.compile(
 DIRECTORY_RE = re.compile(
     r"""^[ \t]*directory:[ \t]*["']?([^"'#\s]+)"""
 )
-FROM_RE = re.compile(r"^[ \t]*FROM[ \t]+(.+)$", re.IGNORECASE)
+# Leading whitespace matches BuildKit's strings.TrimSpace (Unicode-wide: a
+# pasted NBSP before FROM is still an instruction), while the FROM-to-ref
+# separator stays ASCII space/tab like BuildKit's reWhitespace tokenizer
+# (splitlines already removed \v \f \r, so [ \t] is exact per line).
+FROM_RE = re.compile(r"^\s*FROM[ \t]+(.+)$", re.IGNORECASE)
 # Trailing `AS <stage>` on a FROM line (Docker keywords case-insensitive).
 FROM_STAGE_RE = re.compile(
     r"[ \t]+AS[ \t]+([A-Za-z][A-Za-z0-9_.-]*)[ \t]*(#.*)?$", re.IGNORECASE
@@ -72,6 +80,155 @@ FROM_STAGE_RE = re.compile(
 # (`#` cannot appear in a ref, so anything after it is a trailing comment
 # and stripped before matching).
 FROM_DIGEST_RE = re.compile(r"[^@\s]+:[^/:@\s]+@sha256:[0-9a-f]{64}")
+# Line continuation with the default `\` escape token (BuildKit's
+# lineContinuationRegex): a lone trailing backslash, trailing spaces/tabs
+# allowed, joins the next line directly; `\\` at end of line is literal.
+_CONT_RE = re.compile(r"(?:[^\\]\\|^\\\\)[ \t]*$")
+# Full-line comment (BuildKit isComment: first non-space char is `#`,
+# Unicode-wide). Inline `#` is literal and never stripped.
+_COMMENT_RE = re.compile(r"^\s*#")
+# Instructions whose args BuildKit scans for heredoc openers (its
+# heredocDirectives plus ONBUILD-wrapped ones). `<<` anywhere else --
+# another instruction, a comment, a JSON-form arg -- opens nothing.
+_HEREDOC_INSTR_RE = re.compile(
+    r"^\s*(?:ONBUILD[ \t]+)?(?:RUN|COPY|ADD)[ \t]+(.*)$", re.IGNORECASE
+)
+# Heredoc opener word (BuildKit reHeredoc, minus its vacuous `\s*`: a shell
+# word never holds unquoted whitespace). Attached form only: `<< EOF`
+# opens nothing, `<<<` never matches, `\d<<` is an fd redirect.
+_HEREDOC_WORD_RE = re.compile(r"^\d*<<(-?)([^<]+)$")
+
+
+def _strip_continuation(line):
+    """`(content, continues)`, mirroring trimContinuationCharacter."""
+    match = _CONT_RE.search(line)
+    if not match:
+        return line, False
+    if match.start() == 0 and line.startswith("\\"):
+        return "", True  # lone-backslash line contributes nothing
+    return line[:match.start()] + line[match.start()], True
+
+
+def _shell_words(text):
+    """Split on Unicode whitespace honoring quotes, preserving quote/escapes.
+
+    Mirrors BuildKit's heredoc word scan (shlex with RawQuotes+RawEscapes,
+    whose word splitter is unicode.IsSpace): quote characters stay in the
+    word, so a quoted `<<` never matches the opener pattern, and an
+    opener's delimiter never spans words.
+    """
+    words = []
+    current = []
+    quote = None
+    started = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote is not None:
+            current.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+        elif ch in ("'", '"'):
+            quote = ch
+            current.append(ch)
+            started = True
+            i += 1
+        elif ch == "\\" and i + 1 < len(text):
+            current.append(text[i:i + 2])
+            started = True
+            i += 2
+        elif ch.isspace():
+            if started:
+                words.append("".join(current))
+                current = []
+                started = False
+            i += 1
+        else:
+            current.append(ch)
+            started = True
+            i += 1
+    if started:
+        words.append("".join(current))
+    return words
+
+
+def _heredoc_delimiter(rest):
+    """Delimiter name for a heredoc opener tail, or None when it opens nothing.
+
+    Mirrors BuildKit's heredocFromMatch: quotes group and are removed,
+    backslash escapes collapse (literal inside single quotes); an unclosed
+    quote or an empty name opens nothing.
+    """
+    out = []
+    quote = None
+    i = 0
+    while i < len(rest):
+        ch = rest[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            else:
+                out.append(ch)
+            i += 1
+        elif ch == "\\" and quote != "'" and i + 1 < len(rest):
+            out.append(rest[i + 1])
+            i += 2
+        elif quote == '"' and ch != '"':
+            out.append(ch)
+            i += 1
+        elif ch in ("'", '"'):
+            quote = ch if quote is None else None
+            i += 1
+        else:
+            out.append(ch)
+            i += 1
+    if quote is not None:
+        return None
+    return "".join(out) or None
+
+
+def _heredoc_openers(logical):
+    """`(delimiter, chomp_tabs)` pairs opened by a logical instruction line.
+
+    Only RUN/COPY/ADD (optionally ONBUILD-wrapped) qualify, after leading
+    `--...` builder flags; JSON-form args (`RUN [".."]`) carry no heredocs.
+    """
+    match = _HEREDOC_INSTR_RE.match(logical)
+    if not match:
+        return []
+    words = _shell_words(match.group(1))
+    index = 0
+    while index < len(words) and words[index].startswith("--"):
+        index += 1
+        if words[index - 1] == "--":
+            break
+    words = words[index:]
+    if not words:
+        return []
+    remainder = " ".join(words)
+    if "<<" not in remainder:
+        return []
+    if remainder.startswith("["):
+        try:
+            parsed = json.loads(remainder)
+        except ValueError:
+            pass  # not JSON: shell form, heredocs apply
+        else:
+            # A JSON array is exec form (or a build error for non-strings):
+            # either way BuildKit scans no heredocs. Any other valid JSON
+            # is not exec form, so fall through to the word scan.
+            if isinstance(parsed, list):
+                return []
+    openers = []
+    for word in words:
+        opener = _HEREDOC_WORD_RE.match(word)
+        if not opener:
+            continue
+        name = _heredoc_delimiter(opener.group(2))
+        if name is not None:
+            openers.append((name, opener.group(1) == "-"))
+    return openers
 
 
 def fail_input(message):
@@ -261,32 +418,71 @@ def unpinned_from_refs(text):
     empty base image takes no tag and cannot be pinned. Leading
     `--platform=...` flags are skipped to reach the ref. An empty or
     unparseable ref is reported, not skipped: the gate stays fail-closed.
+
+    The scan mirrors the production parser (moby/buildkit): one file-start
+    BOM is stripped, leading whitespace is Unicode-wide, `\\`-continued
+    lines join before parsing, and heredoc bodies on RUN/COPY/ADD are
+    content -- neither stages nor pins are read inside them.
     """
+    if text.startswith("\ufeff"):
+        # BuildKit strips one file-start BOM before parsing (discardBOM).
+        text = text[1:]
     problems = []
     stages = set()
-    for lineno, line in enumerate(text.splitlines(), start=1):
-        match = FROM_RE.match(line)
-        if not match:
+    pending = []  # (delimiter, chomp_tabs) heredocs awaiting terminators
+    physical = text.splitlines()
+    i = 0
+    while i < len(physical):
+        if pending:
+            name, chomp = pending[0]
+            candidate = physical[i].lstrip("\t") if chomp else physical[i]
+            if candidate == name:
+                pending.pop(0)
+            i += 1
             continue
-        rest = match.group(1).strip()
-        staged = FROM_STAGE_RE.search(rest)
-        stage_name = None
-        if staged:
-            stage_name = staged.group(1).lower()
-            rest = rest[:staged.start()].strip()
-        tokens = rest.split()
-        ref = next((t for t in tokens if not t.startswith("--")), "")
-        ref = ref.split("#", 1)[0].strip()
-        if not ref:
-            problems.append((lineno, line.strip()))
-        elif ref.lower() != "scratch" and ref.lower() not in stages:
-            if not FROM_DIGEST_RE.fullmatch(ref):
-                problems.append((lineno, ref))
-        if stage_name is not None:
-            # Docker defines the name for later lines only: recording it
-            # before the check would let `FROM debian AS debian` exempt
-            # its own floating ref.
-            stages.add(stage_name)
+        first = physical[i].lstrip()
+        if first.startswith("#") or first == "":
+            i += 1
+            continue
+        lineno = i + 1
+        content, continued = _strip_continuation(first)
+        chunks = [content]
+        while continued:
+            i += 1
+            if i >= len(physical):
+                break
+            nxt = physical[i]
+            # Comments and blanks inside a continuation are skipped,
+            # never joined (BuildKit's inner scan loop).
+            if _COMMENT_RE.match(nxt) or nxt.strip() == "":
+                continue
+            content, continued = _strip_continuation(nxt)
+            chunks.append(content)
+        i += 1
+        logical = "".join(chunks)
+        match = FROM_RE.match(logical)
+        if match:
+            rest = match.group(1).strip()
+            staged = FROM_STAGE_RE.search(rest)
+            stage_name = None
+            if staged:
+                stage_name = staged.group(1).lower()
+                rest = rest[:staged.start()].strip()
+            tokens = rest.split()
+            ref = next((t for t in tokens if not t.startswith("--")), "")
+            ref = ref.split("#", 1)[0].strip()
+            if not ref:
+                problems.append((lineno, logical.strip()))
+            elif ref.lower() != "scratch" and ref.lower() not in stages:
+                if not FROM_DIGEST_RE.fullmatch(ref):
+                    problems.append((lineno, ref))
+            if stage_name is not None:
+                # Docker defines the name for later lines only: recording it
+                # before the check would let `FROM debian AS debian` exempt
+                # its own floating ref.
+                stages.add(stage_name)
+        for name, chomp in _heredoc_openers(logical):
+            pending.append((name, chomp))
     return problems
 
 

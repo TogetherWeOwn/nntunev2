@@ -160,6 +160,49 @@ class DependabotCoverageTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_bom_prefixed_unpinned_from_fails(self):
+        # A file-start BOM (editor artifact) must not hide an unpinned
+        # FROM end to end: the utf-8 read preserves it, the scan strips it.
+        tmp = make_fixture()
+        try:
+            dockerfile = tmp / "containers" / "repair" / "Dockerfile"
+            text = dockerfile.read_text(encoding="utf-8")
+            dockerfile.write_text(
+                "\ufeff" + text.split("@sha256:")[0] + "\n", encoding="utf-8"
+            )
+            drift, err = check_coverage(tmp)
+            self.assertIsNone(err, err)
+            self.assertTrue(
+                any("Dockerfile" in d and "FROM" in d for d in drift), drift
+            )
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_heredoc_from_does_not_register_stage(self):
+        # Heredoc bodies are content end to end: a pinned FROM..AS inside
+        # one must not exempt a later floating FROM of that name.
+        tmp = make_fixture()
+        try:
+            dockerfile = tmp / "containers" / "repair" / "Dockerfile"
+            pinned = dockerfile.read_text(encoding="utf-8")
+            dockerfile.write_text(
+                "RUN <<EOF\n"
+                + pinned.replace("\n", " AS base\n", 1)
+                + "EOF\n"
+                + "FROM base\n",
+                encoding="utf-8",
+            )
+            drift, err = check_coverage(tmp)
+            self.assertIsNone(err, err)
+            self.assertTrue(
+                any("Dockerfile" in d and "'base'" in d for d in drift),
+                drift,
+            )
+            code, out, _ = run_check(tmp)
+            self.assertEqual(code, 1, out)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_stage_from_ref_is_allowed(self):
         # Internal stage refs (`FROM base`) carry no digest by design.
         tmp = make_fixture()
@@ -231,6 +274,180 @@ class DependabotCoverageTests(unittest.TestCase):
         # `scratch` takes no tag and cannot be pinned, so it is exempt.
         self.assertEqual(unpinned_from_refs("FROM scratch\n"), [])
         self.assertEqual(unpinned_from_refs("FROM SCRATCH\n"), [])
+        # A file-start BOM (editor artifact) must not hide an unpinned FROM:
+        # BuildKit strips it before parsing.
+        self.assertEqual(
+            unpinned_from_refs("\ufeffFROM debian\n"), [(1, "debian")]
+        )
+        self.assertEqual(
+            unpinned_from_refs(f"\ufeffFROM img:tag@sha256:{digest}\n"), []
+        )
+        # A pasted NBSP before FROM is still an instruction (BuildKit trims
+        # Unicode whitespace), but between FROM and the ref it is not a
+        # separator, so that line is not a FROM at all.
+        self.assertEqual(
+            unpinned_from_refs("\xa0FROM debian\n"), [(1, "debian")]
+        )
+        self.assertEqual(unpinned_from_refs("FROM\xa0debian\n"), [])
+        # Heredoc bodies are content: a FROM..AS inside one must not
+        # register a stage that exempts a later floating FROM.
+        self.assertEqual(
+            unpinned_from_refs(
+                "RUN <<EOF\n"
+                f"FROM img:tag@sha256:{digest} AS base\n"
+                "EOF\n"
+                "FROM base\n"
+            ),
+            [(4, "base")],
+        )
+        self.assertEqual(
+            unpinned_from_refs(
+                "COPY <<EOF /fixture\n"
+                f"FROM img:tag@sha256:{digest} AS base\n"
+                "EOF\n"
+                "FROM base\n"
+            ),
+            [(4, "base")],
+        )
+        self.assertEqual(
+            unpinned_from_refs(
+                "ADD <<EOF /fixture\n"
+                f"FROM img:tag@sha256:{digest} AS base\n"
+                "EOF\n"
+                "FROM base\n"
+            ),
+            [(4, "base")],
+        )
+        # `<<-` strips leading tabs from the terminator; quoted delimiters
+        # unquote to the same terminator; `2<<` is an fd redirect opener.
+        self.assertEqual(
+            unpinned_from_refs(
+                "RUN <<-EOF\n"
+                f"\tFROM img:tag@sha256:{digest} AS base\n"
+                "\tEOF\n"
+                "FROM base\n"
+            ),
+            [(4, "base")],
+        )
+        self.assertEqual(
+            unpinned_from_refs(
+                'RUN <<"EOF"\n'
+                f"FROM img:tag@sha256:{digest} AS base\n"
+                "EOF\n"
+                "FROM base\n"
+            ),
+            [(4, "base")],
+        )
+        self.assertEqual(
+            unpinned_from_refs(
+                "RUN cat 2<<EOF\n"
+                f"FROM img:tag@sha256:{digest} AS base\n"
+                "EOF\n"
+                "FROM base\n"
+            ),
+            [(4, "base")],
+        )
+        # Terminators match exactly: trailing content keeps the heredoc open.
+        self.assertEqual(
+            unpinned_from_refs(
+                "RUN <<EOF\n"
+                f"FROM img:tag@sha256:{digest} AS base\n"
+                "EOF \n"
+                "EOF\n"
+                "FROM base\n"
+            ),
+            [(5, "base")],
+        )
+        # Multiple openers on one line consume sequential bodies.
+        self.assertEqual(
+            unpinned_from_refs(
+                "RUN <<A echo hi <<B echo yo\n"
+                f"FROM img:tag@sha256:{digest} AS base\n"
+                "A\n"
+                "echo body\n"
+                "B\n"
+                "FROM base\n"
+            ),
+            [(6, "base")],
+        )
+        # ONBUILD-wrapped RUN/COPY/ADD open heredocs like BuildKit's
+        # compound directives; a real stage still exempts across one.
+        self.assertEqual(
+            unpinned_from_refs(
+                "ONBUILD RUN <<EOF\n"
+                f"FROM img:tag@sha256:{digest} AS base\n"
+                "EOF\n"
+                "FROM base\n"
+            ),
+            [(4, "base")],
+        )
+        self.assertEqual(
+            unpinned_from_refs(
+                f"FROM img:tag@sha256:{digest} AS base\n"
+                "RUN <<EOF\n"
+                "echo hi\n"
+                "EOF\n"
+                "FROM base\n"
+            ),
+            [],
+        )
+        # `<<` outside RUN/COPY/ADD (or quoted, spaced, or JSON-form) opens
+        # nothing: later FROMs are still scanned.
+        self.assertEqual(
+            unpinned_from_refs('RUN ["echo", "<<EOF"]\nFROM debian\n'),
+            [(2, "debian")],
+        )
+        self.assertEqual(
+            unpinned_from_refs("ENV X=<<EOF\nFROM debian\n"),
+            [(2, "debian")],
+        )
+        self.assertEqual(
+            unpinned_from_refs("RUN echo '<<EOF'\nFROM debian\n"),
+            [(2, "debian")],
+        )
+        self.assertEqual(
+            unpinned_from_refs("RUN << EOF\nFROM debian\n"),
+            [(2, "debian")],
+        )
+        self.assertEqual(
+            unpinned_from_refs("# RUN <<EOF\nFROM debian\n"),
+            [(2, "debian")],
+        )
+        # Dockerfile word splitting is Unicode-wide like BuildKit's shell
+        # lexer: an NBSP separates an opener word too.
+        self.assertEqual(
+            unpinned_from_refs(
+                "RUN echo\xa0<<EOF\n"
+                f"FROM img:tag@sha256:{digest} AS base\n"
+                "EOF\n"
+                "FROM base\n"
+            ),
+            [(4, "base")],
+        )
+        # Continuations join before parsing (no space inserted): an opener
+        # glued to the previous word is not an opener, indented it is.
+        # (No space before the backslash: `foo \` would keep its space and
+        # still open, exactly like BuildKit's continuation replacement.)
+        self.assertEqual(
+            unpinned_from_refs(
+                "RUN echo foo\\\n"
+                "<<EOF\n"
+                f"FROM img:tag@sha256:{digest} AS base\n"
+                "EOF\n"
+                "FROM base\n"
+            ),
+            [],
+        )
+        self.assertEqual(
+            unpinned_from_refs(
+                "RUN echo foo \\\n"
+                "  <<EOF\n"
+                f"FROM img:tag@sha256:{digest} AS base\n"
+                "EOF\n"
+                "FROM base\n"
+            ),
+            [(5, "base")],
+        )
 
     def test_new_standalone_crate_without_entry_fails(self):
         # A new excluded crate with no entry must turn the check red.
