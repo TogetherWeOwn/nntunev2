@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
 
 /**
- * Cacheability contract for operational endpoints (TOG-31795).
+ * Cacheability contract for operational endpoints.
  *
  * `GET /api/health`, `/api/ready` and `/api/build` are per-request
  * operational signals (liveness, readiness, deployed-build identity). They
