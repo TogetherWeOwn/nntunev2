@@ -181,6 +181,12 @@ test('a new limit response while the modal stays open establishes a fresh deadli
 	});
 
 	await page.goto('/account/billing');
+	// Freeze after the initial load and before either billing action. The
+	// portal response stays held until the modal is open; jumping the clock
+	// while that request is in flight expires its deadline, and a late 429
+	// must not publish a paywall. Both actions therefore run at this frozen
+	// instant, inside the request deadline.
+	await pauseClock(page);
 	await page.getByRole('button', { name: 'Manage billing', exact: true }).click();
 	await portalSeen;
 
@@ -189,9 +195,10 @@ test('a new limit response while the modal stays open establishes a fresh deadli
 	await expect(dialog).toBeVisible();
 	await expect(page.getByTestId('paywall-countdown')).toHaveText(/Try again in \d+ seconds\./);
 
-	// Freeze time, then deliver the second limit: the fresh 30s wait is
-	// measured from this response, not from the first model's deadline.
-	await pauseClock(page);
+	// The portal request is still inside its deadline. Delivering it now
+	// replaces the open modal with a fresh 30s wait, measured from this
+	// response rather than the first model's deadline. The suspension jump
+	// below stays after this request completes.
 	releasePortal();
 	const countdown = page.getByTestId('paywall-countdown');
 	await expect(countdown).toHaveText('Try again in 30 seconds.');

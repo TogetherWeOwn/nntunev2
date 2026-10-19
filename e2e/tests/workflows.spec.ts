@@ -162,6 +162,7 @@ test.describe('credential scope (static pins)', () => {
       'ingest-play-meter.spec.ts',
       'signup-byop.spec.ts',
       'signup-wizard-arrival.spec.ts',
+      'login-magic-link.spec.ts',
       'player-queue-order.spec.ts',
       'demo-audio-contract.spec.ts',
       'demo-media-sessionless.spec.ts',
@@ -369,6 +370,90 @@ test.describe('public UI signup coverage (static pin)', () => {
     // The contract carries the seam path so a rename fails by name.
     const contract = readFileSync(new URL('../helpers/contract.ts', import.meta.url), 'utf8');
     expect(contract).toContain("testCodes: '/api/test-codes'");
+  });
+});
+
+test.describe('returning-user login coverage (static pin)', () => {
+  // The login spec proves a minted (existing) account signs in through the
+  // real `/login` form, redeeming the staged code on the `/auth/magic`
+  // confirm page. These pins keep it honest offline: still seam-backed
+  // where a seam is needed, still skip-green pre-deploy, still names-only
+  // diagnostics — while the generic sent/error states stay asserted at
+  // runtime in the spec, not as source text here.
+  test('login live case mints the returning account and redeems via the code seam', () => {
+    const spec = readFileSync(new URL('../tests/login-magic-link.spec.ts', import.meta.url), 'utf8');
+    const marker = "test('returning user signs in with an emailed magic link and lands on provider setup'";
+    const start = spec.indexOf(marker);
+    expect(start, 'returning-user login case is missing').toBeGreaterThan(-1);
+    const rest = spec.slice(start + marker.length);
+    const nextTest = rest.search(/\ntest(?:\(|\.describe)/);
+    const live = nextTest === -1 ? spec.slice(start) : spec.slice(start, start + marker.length + nextTest);
+    // The returning account comes from the mint seam; the code from the
+    // retrieval seam through the shared reader (never fabricated, never a
+    // raw endpoint call).
+    expect(live).toContain('tryMintTestAccount(request, baseURL)');
+    expect(live).toContain('retrieveStagedSignupCode(request, baseURL');
+    // Null identity = Access pair only: the page starts unauthenticated, so
+    // the form is the only sign-in path even with QA_AUTH_TOKEN set.
+    expect(live).toContain('applyAccountToPage(page, null, baseURL)');
+    // Real form plus the explicit-confirm landing: email submit, generic
+    // sent state, confirm redeem, provider-setup arrival as the session
+    // proof (a failed finish stays on `/auth/magic`).
+    expect(live).toContain('`${baseURL}/login`');
+    expect(live).toContain('input[name="email"]');
+    expect(live).toContain('check your inbox');
+    expect(live).toContain('`${baseURL}/auth/magic?token=');
+    expect(live).toContain('sign in with this link');
+    expect(live).toContain("'/onboarding/byop'");
+    // Skip-green pre-deploy (file-level + in-test guards); the seam-token
+    // guard skips locally and fails closed on CI.
+    expect(spec).toContain('STAGING_BASE_URL');
+    expect(live).toContain('requireSeamToken(');
+    expect(spec).toContain('QA_AUTH_TOKEN');
+    // Never raw endpoint or header access in the spec: both seams stay
+    // behind their helpers (which carry the fail-closed + names-only
+    // contract pinned above).
+    expect(live).not.toContain('API.testAccounts');
+    expect(live).not.toContain('API.testCodes');
+    expect(live).not.toContain('qaAuthHeader');
+    // Names-only diagnostics: neither the mailbox nor the code value may be
+    // interpolated into an error or assertion message.
+    expect(live).not.toContain('${email}');
+    expect(live).not.toContain('${code}');
+    expect(live).not.toContain('${minted');
+  });
+
+  test('login generic states are asserted at runtime with no seam mint', () => {
+    const spec = readFileSync(new URL('../tests/login-magic-link.spec.ts', import.meta.url), 'utf8');
+    const sentMarker = "test('login shows the same generic sent state for an unknown address'";
+    const sentStart = spec.indexOf(sentMarker);
+    expect(sentStart, 'login unknown-address case is missing').toBeGreaterThan(-1);
+    const sentRest = spec.slice(sentStart + sentMarker.length);
+    const sentNext = sentRest.search(/\ntest(?:\(|\.describe)/);
+    const sent = sentNext === -1 ? spec.slice(sentStart) : spec.slice(sentStart, sentStart + sentMarker.length + sentNext);
+    // Never-registered mailbox, same sent copy: a distinct answer here
+    // would be an enumeration oracle. No seam is needed — the API answers
+    // the same shape for unknown addresses.
+    expect(sent).toContain("uniqueTestEmail('e2e-unknown')");
+    expect(sent).toContain('check your inbox');
+    expect(sent).toContain('applyAccountToPage(page, null, baseURL)');
+    expect(sent).not.toContain('tryMintTestAccount');
+    expect(sent).not.toContain('retrieveStagedSignupCode');
+    expect(sent).not.toContain('QA_AUTH_TOKEN');
+
+    const errMarker = "test('login surfaces a generic error when the magic-link request fails'";
+    const errStart = spec.indexOf(errMarker);
+    expect(errStart, 'login error-state case is missing').toBeGreaterThan(-1);
+    const errRest = spec.slice(errStart + errMarker.length);
+    const errNext = errRest.search(/\ntest(?:\(|\.describe)/);
+    const err = errNext === -1 ? spec.slice(errStart) : spec.slice(errStart, errStart + errMarker.length + errNext);
+    // Forced backend failure is a local route stub, never a staging outage
+    // and never a seam call — the error state renders with no token.
+    expect(err).toContain("page.route('**/v1/auth/magic/start'");
+    expect(err).toContain('something went wrong');
+    expect(err).not.toContain('tryMintTestAccount');
+    expect(err).not.toContain('retrieveStagedSignupCode');
+    expect(err).not.toContain('QA_AUTH_TOKEN');
   });
 });
 

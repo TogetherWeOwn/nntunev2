@@ -1498,6 +1498,20 @@ struct WebhookMailer {
     origin: String,
 }
 
+// Dropping a Rust fetch future alone does not cancel its JavaScript promise.
+// Keep the controller in the send future so the handler's deadline (or any
+// enclosing cancellation) actually aborts the webhook. The guard also aborts
+// on normal completion; only the response status is used by this mailer.
+struct AbortMailOnDrop(Option<worker::AbortController>);
+
+impl Drop for AbortMailOnDrop {
+    fn drop(&mut self) {
+        if let Some(controller) = self.0.take() {
+            controller.abort();
+        }
+    }
+}
+
 impl Mailer for WebhookMailer {
     async fn send_magic_link(&self, email: &str, token: &str) -> Result<(), StoreError> {
         let url = env_string(&self.env, "EMAIL_WEBHOOK_URL").ok_or(StoreError)?;
@@ -1521,8 +1535,11 @@ impl Mailer for WebhookMailer {
             .with_headers(headers)
             .with_body(Some(body.into()));
         let request = Request::new_with_init(&url, &init).map_err(|_| StoreError)?;
+        let controller = worker::AbortController::default();
+        let signal = controller.signal();
+        let _abort = AbortMailOnDrop(Some(controller));
         let response = Fetch::Request(request)
-            .send()
+            .send_with_signal(&signal)
             .await
             .map_err(|_| StoreError)?;
         if (200..300).contains(&response.status_code()) {
