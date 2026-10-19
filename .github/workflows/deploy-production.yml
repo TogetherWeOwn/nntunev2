@@ -1,0 +1,217 @@
+name: deploy-production
+
+# Production promotion for the web frontend (apps/web -> nntune-web).
+# Cutover only: workflow_dispatch, never push/PR/schedule. Disabled by
+# default: the preflight gate refuses unless the repo variable
+# PRODUCTION_DEPLOY_ENABLED is exactly "true" (plus a decided production
+# hostname, human reviewers on the production Environment, and exact-SHA
+# staging evidence). No staging lane is touched here.
+#
+# Shape (modeled on two-web-next deploy-production.yml):
+#   preflight (resolve SHA + gate)
+#     -> deploy-production (environment: production, build -> dry-run ->
+#        production-credentials check -> secret-names check ->
+#        versions upload -> central gradual-promote 5/50/100 with automatic
+#        rollback -> post-promotion verify, no inline rollback)
+# There is no release/tag lane: nntunev2 has no release.yml, and none is
+# invented here. A manual rollback lane is a follow-up, not this slice:
+# on verify failure the job prints the live candidate plus the recorded
+# rollback target and stops; the operator restores it through the
+# follow-up rollback lane.
+#
+# Public repo: ubuntu-latest everywhere, never self-hosted.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full 40-hex main commit to deploy. Empty promotes the newest commit whose post-deploy staging evidence passed (ci/resolve-promotion-sha.mjs). Always set it explicitly to redeploy a prior good commit"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "24"
+  PNPM_VERSION: 10.34.7
+  WRANGLER_VERSION: 4.150.0
+
+jobs:
+  preflight:
+    name: production-preflight
+    outputs:
+      sha: ${{ steps.target.outputs.sha }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Promote what staging last verified: merges keep landing on main, so
+      # the newest main SHA is rarely staged yet. The gate below still
+      # requires exact-SHA staging evidence for the resolved commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            /ci/
+          sparse-checkout-cone-mode: false
+      - name: Resolve the commit to promote
+        id: target
+        run: node ci/resolve-promotion-sha.mjs
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            /ci/
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Refuse disabled, non-main, unprotected, untested or placeholder deployment
+        run: node ci/production-deploy-gate.mjs
+        env:
+          PRODUCTION_DEPLOY_ENABLED: ${{ vars.PRODUCTION_DEPLOY_ENABLED }}
+          PRODUCTION_AUTO_APPROVE: ${{ vars.PRODUCTION_AUTO_APPROVE }}
+          PRODUCTION_HOSTNAME: ${{ vars.PRODUCTION_HOSTNAME }}
+          GITHUB_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: ${{ steps.target.outputs.sha }}
+
+  deploy-production:
+    name: deploy-production
+    needs: preflight
+    runs-on: ubuntu-latest
+    # 30 minutes: the gradual stages soak and judge the new version's live
+    # error rate on top of the per-stage smoke gates.
+    timeout-minutes: 30
+    # Shared production Worker mutation lock: one static non-cancelling
+    # group serializes promotion mutations to the same Worker. The
+    # follow-up rollback lane must use this same group. The workflow-level
+    # group above stays distinct so this run never nests it.
+    concurrency:
+      group: production-worker-mutation
+      cancel-in-progress: false
+    # Required reviewers + prevent-self-review are live repo settings
+    # (Operator-owned). Preflight refuses a missing/unprotected
+    # Environment before GitHub can auto-create it.
+    environment:
+      name: production
+      url: https://${{ vars.PRODUCTION_HOSTNAME }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Deploy the dispatch SHA that passed preflight, not a newer main head.
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+      - name: Recheck production gate after Environment approval
+        run: node ci/production-deploy-gate.mjs
+        env:
+          PRODUCTION_DEPLOY_ENABLED: ${{ vars.PRODUCTION_DEPLOY_ENABLED }}
+          PRODUCTION_AUTO_APPROVE: ${{ vars.PRODUCTION_AUTO_APPROVE }}
+          PRODUCTION_HOSTNAME: ${{ vars.PRODUCTION_HOSTNAME }}
+          GITHUB_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+      - name: Install and build the promoted commit
+        working-directory: apps/web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+        env:
+          # Bake the promoted SHA into GET /api/build (never the dispatch
+          # tip): the post-promotion verify proves this exact build serves.
+          BUILD_SHA: ${{ needs.preflight.outputs.sha }}
+      - name: Build production target without deploying
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
+        with:
+          apiToken: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: ${{ env.WRANGLER_VERSION }}
+          packageManager: pnpm
+          workingDirectory: apps/web
+          command: deploy --dry-run --env production --outdir dist-production
+      - name: Require production-only Cloudflare credentials
+        run: node ci/production-deploy-gate.mjs --credentials
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
+      - name: Require production Worker secrets (names only, before any deploy)
+        # Offline shape check, not a secret read: the web Worker ships no
+        # bindings and needs no secrets, so any production vars table in
+        # its wrangler config must be reviewed in the gate script first.
+        # Values are never read or printed.
+        run: node ci/production-deploy-gate.mjs --secrets
+      # Uploading a version does not mutate routes or custom domains.
+      - name: Upload reviewed production version without changing routing
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
+        with:
+          apiToken: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: ${{ env.WRANGLER_VERSION }}
+          packageManager: pnpm
+          workingDirectory: apps/web
+          command: versions upload --env production --tag ${{ needs.preflight.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+      # Gradual promotion lives in the shared central composite action:
+      # 5% -> 50% -> 100% with per-stage health/SLO gates pinned to the new
+      # version, and automatic rollback to the recorded pre-promote version
+      # on any stage failure. Repo-specific build/upload stays above.
+      - name: Gradual promotion 5-50-100 with automatic rollback
+        id: gradual
+        uses: TogetherWeOwn/.github/actions/gradual-promote@89c290be20c0044efaf6916f28341c76e75fff06
+        with:
+          worker-name: nntune-web
+          version-tag: ${{ needs.preflight.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          domain: ${{ vars.PRODUCTION_HOSTNAME }}
+          api-token: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
+          account-id: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
+      - name: Verify public routes on the promoted version
+        # Post-promotion verification: after the gradual promotion reaches
+        # 100%, probe the same GET-only public-route set as the gradual live
+        # gate (bin/smoke.mjs) against the production hostname on ordinary
+        # (unpinned) routing. Identity is the gate: the promoted version
+        # UUID travels steps.gradual.outputs.promoted-version-id into
+        # --expected-version-id, and the promoted commit travels
+        # preflight.outputs.sha into --expected-build-sha, so the probe
+        # proves the recorded target serves normal traffic with the exact
+        # promoted build (GET /api/build equals the dispatch SHA; an
+        # "unknown" build never passes). No automatic restore here: the
+        # gradual action's rollback steps only fire on failures inside the
+        # promotion, so a failed verification leaves the promoted candidate
+        # live at 100% and prints the live candidate plus PREV_VERSION as
+        # the recorded restoration target; the operator restores it through
+        # the follow-up rollback lane with that id. An inline wrangler
+        # rollback must stay out of this workflow.
+        run: |
+          for i in 1 2 3 4 5 6; do
+            if node bin/smoke.mjs "https://$PRODUCTION_HOSTNAME" --allow-indexable --expected-version-id "$PROMOTED_VERSION_ID" --expected-build-sha "$DEPLOY_SHA"; then
+              echo "post-promotion production smoke ok (attempt $i)"
+              exit 0
+            fi
+            if [ "$i" -lt 6 ]; then
+              echo "attempt $i failed, retrying in 10s..."
+              sleep 10
+            fi
+          done
+          echo "::error::post-promotion public-route smoke failed; promoted candidate ${PROMOTED_VERSION_ID:-unknown} remains live at 100%; release is not tagged; recorded restoration target ${PREV_VERSION:-unknown} - restore it with the follow-up rollback lane using that version id"
+          exit 1
+        env:
+          PRODUCTION_HOSTNAME: ${{ vars.PRODUCTION_HOSTNAME }}
+          PROMOTED_VERSION_ID: ${{ steps.gradual.outputs.promoted-version-id }}
+          PREV_VERSION: ${{ steps.gradual.outputs.rollback-version-id }}
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
