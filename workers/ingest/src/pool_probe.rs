@@ -19,6 +19,11 @@ pub const POOL_BINDING: &str = "NNTP_POOL";
 /// fetch is delivered to the object and never leaves the runtime.
 pub const POOL_PROBE_URL: &str = "https://nntp-pool/probe";
 
+/// Largest pool probe reply accepted before classification. An over-cap
+/// reply fails closed as rejected because more bytes existed; it is never
+/// truncated and parsed.
+pub const MAX_PROBE_REPLY_BYTES: usize = 1024 * 1024;
+
 /// Redelivery delay when the pool gives no `Retry-After`.
 pub const DEFAULT_RETRY_SECS: u32 = 5;
 
@@ -65,6 +70,9 @@ pub fn classify_reply(
     retry_after: Option<&str>,
     body: &str,
 ) -> Result<ProbeOutcome, PoolProbeError> {
+    if body.len() > MAX_PROBE_REPLY_BYTES {
+        return Err(PoolProbeError::Rejected);
+    }
     match status {
         200 => {
             let outcome: ProbeOutcome =
@@ -109,7 +117,11 @@ pub async fn call_pool_probe(
         .map_err(|_| unavailable)?;
     let status = response.status_code();
     let retry_after = response.headers().get("retry-after").ok().flatten();
-    let text = response.text().await.map_err(|_| unavailable)?;
+    let bytes = response.bytes().await.map_err(|_| unavailable)?;
+    if bytes.len() > MAX_PROBE_REPLY_BYTES {
+        return Err(PoolProbeError::Rejected);
+    }
+    let text = String::from_utf8(bytes).map_err(|_| PoolProbeError::Rejected)?;
     classify_reply(req, status, retry_after.as_deref(), &text)
 }
 
