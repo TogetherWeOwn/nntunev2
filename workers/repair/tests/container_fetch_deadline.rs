@@ -40,8 +40,29 @@
 //!   (success, transport error, expiry): no leaked, forgotten or
 //!   spawned timers.
 //!
-//! Out of scope: `fetch_output`'s R2 streaming fetch, the result-byte
-//! cap values, and the 500 ms health-pacing sleep (all unchanged).
+//! Scoped follow-up semantics, now pinned per site (not just the flat
+//! 10 s shape above):
+//!
+//! - Each site derives a `budget_ms` and arms exactly one
+//!   `Duration::from_millis(budget_ms)` from it — never
+//!   `from_secs(budget_ms)`, which would be 1000x the budget.
+//! - `container_json` selects the budget by path: `path == "/repair"`
+//!   arms `CONTAINER_REPAIR_DEADLINE_MS` (`150_000`, covering the
+//!   Container's 120 s par2 budget), every other path keeps
+//!   `CONTAINER_FETCH_DEADLINE_MS`.
+//! - `stage_input` and `fetch_output` scale with transfer size atop
+//!   the 10 s base (`size.saturating_div(1024)` ms, a ~1 MB/s floor)
+//!   so a large healthy transfer is not expired mid-stream.
+//! - `stage_input`'s reply-body drain fails as 502 on expiry only
+//!   (`drained.is_none()`); a drain transport error falls through to
+//!   the status match, so a stored 201 and a known 400/413 keep their
+//!   mapping.
+//! - `fetch_output` races BOTH its Container fetch and the relaying
+//!   R2 put against that one armed deadline; its output never passes
+//!   through `.bytes()`.
+//!
+//! Out of scope: the result-byte cap values and the 500 ms
+//! health-pacing sleep (all unchanged).
 //!
 //! Why source text: `runtime` compiles only for `wasm32`, so a native
 //! integration target cannot call it; the pins read `runtime.rs` via
@@ -184,6 +205,18 @@ fn container_json_code(code: &str) -> &str {
     )
 }
 
+/// `fetch_output` runs to `leak_code`, the next definition.
+fn fetch_output_code(code: &str) -> &str {
+    fn_slice(code, "async fn fetch_output", "fn leak_code")
+}
+
+/// Collapse every run of whitespace (including newlines) to one
+/// space, so a pin matches the arming expression whether rustfmt
+/// keeps it on one line or breaks it across lines.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Every `fn name` definition with the source segment up to the next
 /// definition, so a shared deadline helper can be recognised by what
 /// its own body contains rather than by a pinned helper name.
@@ -252,7 +285,13 @@ fn site_races_deadline(slice: &str, code: &str) -> bool {
 /// before `fetch_request(` is issued, so slow headers count against
 /// the same total as the body.
 fn armed_before_fetch(slice: &str, code: &str) -> bool {
-    let Some(fetch_at) = slice.find("fetch_request(") else {
+    armed_before_token(slice, code, "fetch_request(")
+}
+
+/// Same arm-before-issue check for a site whose fetch is spelled
+/// differently (`fetch_output` calls `.fetch(url, ...)`).
+fn armed_before_token(slice: &str, code: &str, fetch_token: &str) -> bool {
+    let Some(fetch_at) = slice.find(fetch_token) else {
         return false;
     };
     let mut arms: Vec<usize> = [DEADLINE_CONST, "Delay::from"]
@@ -476,5 +515,161 @@ fn deadline_at_both_sites_covers_the_body_read_not_only_headers() {
         body_covered(container_json_code(&code), &code),
         "container_json's `response.bytes()` read must be inside the deadline, \
          not a bare await after a headers-only race"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scoped budgets: each pin below fails on one single-site revert of
+// the per-operation semantics (repair path selection, size scaling,
+// expiry-only drain, unit of the arming expression) that the flat
+// races-a-timer pins above cannot see.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn each_site_arms_once_from_its_budget_in_millis() {
+    // `Duration::from_millis(budget_ms)` exactly once per site: the
+    // arming expression and its unit are the pin. `from_secs(...)`
+    // would arm 1000x the budget while still naming the constants
+    // and racing, so the race pins above cannot see it.
+    let code = code();
+    for (name, slice) in [
+        ("stage_input", stage_input_code(&code)),
+        ("container_json", container_json_code(&code)),
+        ("fetch_output", fetch_output_code(&code)),
+    ] {
+        let flat = collapse_ws(slice);
+        assert_eq!(
+            flat.matches("Duration::from_millis(budget_ms)").count(),
+            1,
+            "{name} must arm its deadline exactly once as \
+             `Duration::from_millis(budget_ms)`"
+        );
+        assert!(
+            !flat.contains("Duration::from_secs("),
+            "{name} must not arm with from_secs: budget_ms is already milliseconds"
+        );
+    }
+}
+
+#[test]
+fn container_json_selects_the_repair_budget_by_path() {
+    // `/repair` runs par2 under the Container's 120 s budget: only
+    // the path selection keeps a legitimate repair from expiring at
+    // the 10 s base. Stripping blanks string literals, so `/repair`
+    // itself is invisible in `code()`; the selection is therefore
+    // pinned on the raw source, and the constant order on `code`
+    // (repair budget first, base as the else arm) is pinned here so
+    // a swapped-arm rewrite still fails.
+    let code = code();
+    assert!(
+        code.contains("const CONTAINER_REPAIR_DEADLINE_MS: u64 = 150_000;"),
+        "runtime.rs must declare `const CONTAINER_REPAIR_DEADLINE_MS: u64 = 150_000;`"
+    );
+    let raw = fn_slice(
+        RUNTIME_RS,
+        "async fn container_json",
+        "async fn read_object_capped",
+    );
+    assert!(
+        collapse_ws(raw).contains("let budget_ms = if path == \"/repair\" {"),
+        "container_json must derive budget_ms by selecting on `path == \"/repair\"`"
+    );
+    let slice = container_json_code(&code);
+    let repair_at = slice
+        .find("CONTAINER_REPAIR_DEADLINE_MS")
+        .expect("container_json must reference CONTAINER_REPAIR_DEADLINE_MS");
+    let base_at = slice
+        .find(DEADLINE_CONST)
+        .expect("container_json must keep CONTAINER_FETCH_DEADLINE_MS as the base arm");
+    assert!(
+        repair_at < base_at,
+        "container_json must arm CONTAINER_REPAIR_DEADLINE_MS for /repair with \
+         CONTAINER_FETCH_DEADLINE_MS as the other (else) arm, in that order"
+    );
+}
+
+#[test]
+fn stage_and_output_budgets_scale_with_transfer_size() {
+    // The streamed upload/download rides inside the fetch, so a flat
+    // 10 s expiry kills large healthy transfers mid-stream; the
+    // budget must add `size/1024` ms atop the base.
+    let code = code();
+    let stage = collapse_ws(stage_input_code(&code));
+    assert!(
+        stage.contains(
+            "let budget_ms = CONTAINER_FETCH_DEADLINE_MS.saturating_add(file.size.saturating_div(1024));"
+        ),
+        "stage_input must derive budget_ms as the 10 s base plus file.size/1024 ms"
+    );
+    let output = collapse_ws(fetch_output_code(&code));
+    assert!(
+        output.contains(
+            "let budget_ms = CONTAINER_FETCH_DEADLINE_MS.saturating_add(output.size.saturating_div(1024));"
+        ),
+        "fetch_output must derive budget_ms as the 10 s base plus output.size/1024 ms"
+    );
+}
+
+#[test]
+fn stage_input_drain_transport_error_falls_through_to_status() {
+    // Only expiry (`drained.is_none()`) fails the stage as 502; a
+    // drain transport error keeps the known status mapping, so the
+    // combined `Some(Err(_)) | None => 502` drain-override form must
+    // not come back. (The headers race above this one legitimately
+    // keeps the combined form; the ban is scoped to the drain tail.)
+    let code = code();
+    let slice = stage_input_code(&code);
+    assert!(
+        slice.contains("if drained.is_none() {"),
+        "stage_input must fail the drain on expiry only, via `if drained.is_none()`"
+    );
+    let drain_tail = slice
+        .split_once("let drained")
+        .expect("stage_input must name its drained body result")
+        .1;
+    assert!(
+        !drain_tail.contains("Some(Err"),
+        "stage_input's drain must not map a transport error to 502: it falls \
+         through to the status match"
+    );
+    assert!(
+        slice.contains("201 =>") && slice.contains("400 | 413"),
+        "stage_input must keep mapping the known status after the drain"
+    );
+}
+
+#[test]
+fn fetch_output_races_fetch_and_put_against_the_deadline() {
+    // `fetch_output` had no slice at all: its Container fetch and
+    // the relaying R2 put must both race the one armed deadline,
+    // and its streamed output must never be materialised via
+    // `.bytes()`.
+    let code = code();
+    let slice = fetch_output_code(&code);
+    assert!(
+        site_races_deadline(slice, &code),
+        "fetch_output must race its Container fetch against a Delay armed \
+         from CONTAINER_FETCH_DEADLINE_MS"
+    );
+    assert!(
+        armed_before_token(slice, &code, ".fetch(url,"),
+        "fetch_output must arm the deadline before issuing its Container fetch"
+    );
+    assert!(
+        slice.matches("poll_fn").count() >= 2,
+        "fetch_output must race BOTH the fetch and the R2 put against the \
+         deadline (one race each)"
+    );
+    let put_at = slice
+        .find(".put(")
+        .expect("fetch_output must relay the output into R2 with .put(");
+    assert!(
+        slice[put_at..].contains("poll_fn"),
+        "fetch_output's R2 put must itself be raced against the deadline, \
+         not awaited bare after a headers-only race"
+    );
+    assert!(
+        !slice.contains(".bytes()"),
+        "fetch_output streams its output; it must not materialise it via .bytes()"
     );
 }
