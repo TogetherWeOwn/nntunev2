@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onDestroy } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { invalidateLibraryCache } from '#lib/library/cache.js';
 	import { ApiClient, ApiError } from '#lib/api/client.js';
@@ -6,6 +7,10 @@
 	import { serializePublicKeyCredential, toRequestOptions } from '#lib/webauthn.js';
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
+	// Teardown is permanent even when a transport or authenticator ignores abort.
+	const attempt = new AbortController();
+	onDestroy(() => attempt.abort());
+	let emailInput = $state<HTMLInputElement>();
 
 	let email = $state('');
 	let status = $state<'idle' | 'sending' | 'sent' | 'error'>('idle');
@@ -19,13 +24,15 @@
 
 	async function sendMagicLink(event: SubmitEvent) {
 		event.preventDefault();
-		if (status === 'sending') return;
+		if (attempt.signal.aborted || status === 'sending') return;
 		status = 'sending';
 		try {
-			await client.requestMagicLink(email.trim());
+			await client.requestMagicLink(email.trim(), attempt.signal);
+			if (attempt.signal.aborted) return;
 			// Generic either way: the API never reveals which emails exist.
 			status = 'sent';
 		} catch (error) {
+			if (attempt.signal.aborted) return;
 			status = error instanceof ApiError && error.paywall ? 'idle' : 'error';
 		}
 	}
@@ -43,8 +50,10 @@
 
 	async function signInWithPasskey() {
 		if (passkeyStatus === 'working') return;
-		if (email.trim().length === 0) {
-			passkeyStatus = 'email-required';
+		if (attempt.signal.aborted) return;
+		if (!emailInput?.reportValidity() || email.trim().length === 0) {
+			passkeyStatus = email.trim().length === 0 ? 'email-required' : 'idle';
+			emailInput?.focus();
 			return;
 		}
 		if (!passkeysSupported) {
@@ -56,14 +65,17 @@
 			// Email-first login: the API answers the same shape for known
 			// and unknown addresses (never an oracle) with an empty
 			// allow-list, and the browser offers any local credential.
-			const options = await client.loginStart(email.trim());
+			const options = await client.loginStart(email.trim(), attempt.signal);
+			if (attempt.signal.aborted) return;
 			const assertion = await navigator.credentials.get({
+				signal: attempt.signal,
 				publicKey: toRequestOptions({
 					challenge: options.challenge,
 					rpId: options.rp_id,
 					allowCredentials: []
 				})
 			});
+			if (attempt.signal.aborted) return;
 			if (!(assertion instanceof PublicKeyCredential)) {
 				throw new Error('no public-key credential');
 			}
@@ -82,17 +94,22 @@
 				throw new Error('credential missing assertion fields');
 			}
 			// Exact finish shape (the API rejects unknown fields).
-			await client.loginFinish({
-				challenge: options.challenge,
-				credentialId,
-				authenticatorData,
-				clientDataJson: clientDataJSON,
-				signature
-			});
+			await client.loginFinish(
+				{
+					challenge: options.challenge,
+					credentialId,
+					authenticatorData,
+					clientDataJson: clientDataJSON,
+					signature
+				},
+				attempt.signal
+			);
+			if (attempt.signal.aborted) return;
 			stashSignedInEmail(email.trim());
 			invalidateLibraryCache();
 			window.location.href = '/onboarding/provider';
 		} catch (error) {
+			if (attempt.signal.aborted) return;
 			if (error instanceof ApiError && error.paywall) {
 				passkeyStatus = 'idle';
 				return;
@@ -154,6 +171,7 @@
 					name="email"
 					required
 					autocomplete="email"
+					bind:this={emailInput}
 					bind:value={email}
 					disabled={status === 'sending'}
 				/>

@@ -317,10 +317,15 @@ export class ApiClient {
 	}
 
 	async post<T>(path: string, body: unknown): Promise<T> {
+		return this.postWithSignal<T>(path, body);
+	}
+
+	private async postWithSignal<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
 		return this.request<T>(path, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify(body)
+			body: JSON.stringify(body),
+			signal
 		});
 	}
 
@@ -336,8 +341,8 @@ export class ApiClient {
 	 * Request an email magic link. Always resolves the same way for unknown
 	 * and known addresses (the API never reveals which emails exist).
 	 */
-	async requestMagicLink(email: string): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>('/v1/auth/magic/start', { email });
+	async requestMagicLink(email: string, signal?: AbortSignal): Promise<MagicLinkResult> {
+		return this.postWithSignal<MagicLinkResult>('/v1/auth/magic/start', { email }, signal);
 	}
 
 	/** Redeem an emailed magic-link token (the `/auth/magic` page). */
@@ -367,23 +372,25 @@ export class ApiClient {
 	 * success body is shape-checked before it returns so a malformed
 	 * `challenge` surfaces as a typed `ApiError`, never a mid-ceremony throw.
 	 */
-	async registerStart(email: string): Promise<RegisterStartResponse> {
+	async registerStart(email: string, signal?: AbortSignal): Promise<RegisterStartResponse> {
 		const { data, status } = await this.requestWithStatus<unknown>(
 			'/v1/auth/passkey/register/start',
 			{
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ email })
+				body: JSON.stringify({ email }),
+				signal
 			}
 		);
 		return validateRegisterStart(data, status);
 	}
 
 	/** Finish passkey enrollment with the attestation + emailed code. */
-	async registerFinish(input: RegisterFinishInput): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>(
+	async registerFinish(input: RegisterFinishInput, signal?: AbortSignal): Promise<MagicLinkResult> {
+		return this.postWithSignal<MagicLinkResult>(
 			'/v1/auth/passkey/register/finish',
-			toRegisterFinishBody(input)
+			toRegisterFinishBody(input),
+			signal
 		);
 	}
 
@@ -391,23 +398,25 @@ export class ApiClient {
 	 * Start passkey login for an email (empty allow-list response). The
 	 * success body is shape-checked before it returns, as in `registerStart`.
 	 */
-	async loginStart(email: string): Promise<LoginStartResponse> {
+	async loginStart(email: string, signal?: AbortSignal): Promise<LoginStartResponse> {
 		const { data, status } = await this.requestWithStatus<unknown>(
 			'/v1/auth/passkey/login/start',
 			{
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ email })
+				body: JSON.stringify({ email }),
+				signal
 			}
 		);
 		return validateLoginStart(data, status);
 	}
 
 	/** Finish passkey login with the assertion. */
-	async loginFinish(input: LoginFinishInput): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>(
+	async loginFinish(input: LoginFinishInput, signal?: AbortSignal): Promise<MagicLinkResult> {
+		return this.postWithSignal<MagicLinkResult>(
 			'/v1/auth/passkey/login/finish',
-			toLoginFinishBody(input)
+			toLoginFinishBody(input),
+			signal
 		);
 	}
 
@@ -486,12 +495,15 @@ export class ApiClient {
 			controller.abort(new DOMException(`request timed out after ${API_REQUEST_TIMEOUT_MS}ms`, 'TimeoutError'));
 		}, API_REQUEST_TIMEOUT_MS);
 		try {
+			callerSignal?.throwIfAborted();
 			const response = await this.fetchFn(`${this.baseUrl}${path}`, {
 				...init,
 				signal: controller.signal,
 				headers,
 				credentials: 'include'
 			});
+			// A transport may ignore abort; never publish an abandoned response.
+			callerSignal?.throwIfAborted();
 			if (!response.ok) {
 				// Read once (capped at 1 MiB) so the paywall and typed error
 				// share the structured contract.
@@ -512,12 +524,15 @@ export class ApiClient {
 					}
 					/* non-JSON error body: use status-based defaults */
 				}
+				callerSignal?.throwIfAborted();
 				const parsed = parseErrorBody(body, response.status);
 				const paywall = paywallFromResponse({ status: response.status, headers: response.headers, body });
 				throw new ApiError(response.status, parsed.code, parsed.message, paywall, parsed.retryable);
 			}
 			try {
-				return { data: (await readCappedJson(response)) as T, status: response.status };
+				const data = (await readCappedJson(response)) as T;
+				callerSignal?.throwIfAborted();
+				return { data, status: response.status };
 			} catch (error) {
 				if (timedOut) throw this.timeoutError();
 				// An over-cap 2xx never parses: surface the typed error, never
