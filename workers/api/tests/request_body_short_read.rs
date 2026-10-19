@@ -136,6 +136,9 @@ fn short_read_dispatches_nothing_through_the_gate() {
     ));
     assert_eq!(calls.get(), 0, "a short read must never invoke the handler");
     assert_eq!(response.status, 400);
-    assert_eq!(response.body, r#"{"error":"invalid request"}"#);
+    assert_eq!(
+        response.body,
+        r#"{"code":"invalid_request","message":"invalid request","retryable":false}"#
+    );
     assert_eq!(response.set_cookie, None);
 }

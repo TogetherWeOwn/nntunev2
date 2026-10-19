@@ -54,6 +54,18 @@ const RELEASE_RECORDINGS_LIMIT: usize = 1000;
 /// and every use are unchanged.
 pub const MAX_PAGE_SIZE: usize = 25;
 
+/// Documented max search offset for `GET /v1/mb/search`. Offsets above this
+/// short-circuit to a past-the-end 200 with `"results": []` (effective offset
+/// echoed) BEFORE the KV lookup and the repository call, so a caller walking
+/// offsets toward `u32::MAX` can neither mint unbounded cache keys nor force
+/// deep `OFFSET` scans on the trigram queries. 1,000 rows is 40 full pages at
+/// [`MAX_PAGE_SIZE`] — far deeper than any UI page walk — and matches the
+/// 1,000-row [`RELEASE_RECORDINGS_LIMIT`] in this worker.
+///
+/// `pub` for the `tests/` integration pin (`search_validation`); the value is
+/// part of the documented contract in `README.md`.
+pub const MAX_SEARCH_OFFSET: u32 = 1_000;
+
 /// Upper bound on `q` length, in chars. Bounds trigram work and KV keys.
 const MAX_QUERY_CHARS: usize = 100;
 
@@ -180,7 +192,8 @@ const RELEASE_RECORDINGS_SQL: &str =
 /// against the artist instead of trusting a title-only score; other kinds
 /// select NULLs for the same columns. `LIMIT`/`OFFSET` are interpolated
 /// from `u32` values already resolved by [`handle_search_paged`] (an
-/// effective limit in `1..=MAX_PAGE_SIZE` and any `u32` offset): plain
+/// effective limit in `1..=MAX_PAGE_SIZE` and an offset in
+/// `0..=MAX_SEARCH_OFFSET`): plain
 /// integers cannot inject SQL, while binding them as `$2`/`$3` would
 /// reintroduce the parameter-typing pitfalls documented on [`lookup_sql`].
 fn search_sql(kind: Kind, limit: u32, offset: u32) -> String {
@@ -748,12 +761,16 @@ fn is_valid_cached_search(
     true
 }
 
-/// Search core: validate → KV → DB serving `GET /v1/mb/search` with
+/// Search core: validate → bound → KV → DB serving `GET /v1/mb/search` with
 /// `limit`/`offset`. `limit`: `None` defaults to
 /// [`MAX_PAGE_SIZE`]; `Some(0)` is a 400; `1..=MAX_PAGE_SIZE` is honored;
 /// anything above is clamped, never rejected. `offset`: `None` (and, at the
-/// HTTP layer, unparsable) defaults to `0`; past the end of the result set is
-/// a 200 with `"results": []`. Successes echo the effective `limit`/`offset`
+/// HTTP layer, unparsable) defaults to `0`; `0..=MAX_SEARCH_OFFSET` queries
+/// as before; anything above short-circuits to a 200 with `"results": []`
+/// (effective `limit`/`offset` echoed) BEFORE the KV lookup and the repo
+/// call, so no cache key is minted and no `OFFSET` scan runs. Past the end
+/// of the result set (at or below the cap) is likewise a 200 with
+/// `"results": []`. Successes echo the effective `limit`/`offset`
 /// alongside the normalized `q`, `type` and `results`.
 /// `pub` for the `tests/` integration pin (`search_validation`): the
 /// validation, clamp and truncate contract is unchanged.
@@ -798,6 +815,21 @@ pub async fn handle_search_paged<R: MbRepo, C: SuccessCache>(
     };
     let effective_offset = offset.unwrap_or(0);
     let normalized_q = normalize_query(q);
+    // Bound before cache and SQL: above-cap offsets are a well-formed
+    // past-the-end page with zero KV reads/writes and zero repo calls.
+    // Validation already ran above, so a bad query or `limit=0` with a
+    // huge offset is still the same 400, never this 200.
+    if effective_offset > MAX_SEARCH_OFFSET {
+        let body = serde_json::json!({
+            "q": normalized_q,
+            "type": kind.as_str(),
+            "limit": effective_limit,
+            "offset": effective_offset,
+            "results": [],
+        })
+        .to_string();
+        return success_response(body, SEARCH_CACHE_TTL_S);
+    }
     let key = search_paged_cache_key(kind, &normalized_q, effective_limit, effective_offset);
     if let Some(body) = cache.get(&key).await {
         if is_valid_cached_search(

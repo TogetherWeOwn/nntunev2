@@ -1,7 +1,20 @@
 # ADR 0008: Accounts, Auth, Sessions, BYOP Vault
 
-- **Status:** Accepted (implementation slice 1; CISO review gates the PR before merge)
+- **Status:** Accepted (slice 1 implemented; slice 2 shipped 2026-10-19 — see status note)
 - **Date:** 2026-10-13
+
+## Status note — 2026-10-19: slice 2 shipped
+
+Slice 2 is implemented at `origin/main`: the Worker HTTP entry
+(`workers/api/src/worker_entry.rs:1869`, `pub async fn dispatch`,
+reachable from the `#[worker::event(fetch)]` entry in
+`workers/api/src/lib.rs`) serves auth traffic over the Hyperdrive
+Postgres store, and WebAuthn signature verification is live via
+`workers/api/src/webauthn.rs:444` (`verify_attestation`) and
+`workers/api/src/webauthn.rs:505` (`verify_assertion`), called from the
+passkey handlers. The "no Worker runtime yet" / "follow-up slice"
+statements in Context/Decision/Consequences below describe slice-1 time
+and are superseded by this note; each carries a pointer back here.
 
 ## Context
 
@@ -18,7 +31,8 @@ Hyperdrive. The STRIDE threat model (§3–§4) is the binding security spec.
 
 1. **Slice 1 (this change):** pure-Rust core (`workers/api`: `session`,
    `auth`, `vault`) + Postgres schema (`migrations/0002_auth_vault.sql`),
-   native-tested, wasm32-compatible. No Worker runtime imports yet.
+   native-tested, wasm32-compatible. No Worker runtime imports yet
+   (slice-1 time; the Worker entry has since shipped — see status note).
 2. **Vault:** AES-256-GCM envelope (per-user DEK; KEK versioned, staging and
    prod never shared); AAD binds `user_id` (+ KEK version on the wrap);
    reads return booleans only; `test connection` returns a boolean only;
@@ -38,17 +52,20 @@ Hyperdrive. The STRIDE threat model (§3–§4) is the binding security spec.
    an in-memory flag: the atomic entry points require `SingleUseStore`
    conditional UPDATE/RETURNING and exactly one returned row. The Worker
    adapter must commit that claim (with session/signup insertion where
-   applicable) before returning success; database wiring is still slice 2.
+   applicable) before returning success; database wiring was slice 2
+   (shipped — see status note).
 5. **Passkeys:** challenge lifecycle (RP equals exact host, canonical
    serialized origin; http only on exact loopback dev hosts; 5-minute
    single-use) + credential storage shapes now; attestation/assertion
    signature verification + HTTP/Hyperdrive Worker entry in the follow-up
-   slice (child card) once staging secrets are provisioned.
+   slice (shipped in slice 2 — see status note).
 
 ## Consequences
 
 - Slice 1 is verifiable today (`cargo test`, clippy, fmt) with zero secret
   handling in CI (synthetic fixtures only).
-- The follow-up slice adds the Worker HTTP entry, Hyperdrive queries
-  (parameterized only), WebAuthn signature verification, and the pool-backed
-  `test connection`; it re-requests CISO review as a vault/auth-touching PR.
+- The follow-up slice added the Worker HTTP entry, Hyperdrive queries
+  (parameterized only), WebAuthn signature verification, and the bounded
+  direct-socket `test connection` probe (`SocketDialer`, vetted IP literals
+  only — not routed through the stream pool; all shipped in slice 2 — see
+  status note); it re-requests CISO review as a vault/auth-touching PR.

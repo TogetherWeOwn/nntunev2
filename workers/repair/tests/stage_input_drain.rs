@@ -128,32 +128,41 @@ fn stage_input_cancels_or_caps_the_put_reply_body() {
 
 #[test]
 fn runtime_has_no_fourth_whole_body_collect() {
-    // The two legitimate whole-body collects, each under an explicit
-    // size contract: the DO reply forwarded to ingest (rejected over
-    // MAX_RESULT_BYTES) and read_object_capped (R2 size checked
-    // against its cap before the read). container_json is no longer a
-    // whole-body collect: it reads the Container-chosen reply via
-    // `.stream()` and aborts past MAX_RESULT_BYTES while streaming.
-    // A third `.bytes()` is the stage_input drain — possibly moved
-    // into a helper — or a container_json regression, and must go.
+    // The single legitimate whole-body collect, under an explicit
+    // size contract: read_object_capped (R2 size checked against
+    // its cap before the read). Both result replies — the front-door
+    // DO reply and container_json — stream through the shared
+    // read_response_capped helper (check-before-extend via
+    // push_chunk_capped), so neither keeps a `.bytes()` by design.
+    // A second `.bytes()` is the stage_input drain — possibly moved
+    // into a helper — or a front-door/container_json regression,
+    // and must go.
     let collects = RUNTIME_RS.matches(".bytes()").count();
     assert_eq!(
-        collects, 2,
-        "runtime.rs must keep exactly the 2 capped `.bytes()` collects \
-         (DO reply, read_object_capped); a 3rd is an uncapped collect \
-         (stage_input drain) or container_json regressing to whole-body \
-         buffering instead of streaming under the cap"
+        collects, 1,
+        "runtime.rs must keep exactly the 1 capped `.bytes()` collect \
+         (read_object_capped); a 2nd is an uncapped collect \
+         (stage_input drain) or a front-door/container_json regression \
+         to whole-body buffering instead of streaming under the cap"
     );
     let body = container_json();
     assert!(
-        body.contains(".stream()") && body.contains("if bytes.len() > MAX_RESULT_BYTES"),
-        "container_json must be the streamed reader: `.stream()` chunks \
-         aborted early past MAX_RESULT_BYTES, not a post-collect check"
+        body.contains("read_response_capped") && body.contains("MAX_RESULT_BYTES"),
+        "container_json must read the Container-chosen reply through the \
+         shared capped reader bounded by MAX_RESULT_BYTES, not a \
+         whole-body collect"
     );
     assert!(
-        !body.contains(".bytes()"),
+        !body.contains(".bytes()") && !body.contains(".text()"),
         "container_json must not whole-collect the Container-chosen reply \
-         with `.bytes()` before checking the cap"
+         with `.bytes()`/`.text()` before checking the cap"
+    );
+    let helper = fn_text("async fn read_response_capped", "async fn fetch");
+    assert!(
+        helper.contains(".stream()") && helper.contains("push_chunk_capped"),
+        "read_response_capped must be the streamed reader: `.stream()` chunks \
+         admitted via push_chunk_capped (check-before-extend), so at most \
+         the cap is ever materialised"
     );
 }
 
@@ -198,32 +207,46 @@ fn stage_input_put_request_shape_is_unchanged() {
         "the PUT must still target the per-job/per-round input path"
     );
     assert!(
-        body.contains("container .fetch_request(request)"),
-        "the PUT must still go through the Container fetcher"
+        body.contains(".fetch_request(request)"),
+        "the PUT must still go through the Container fetcher (the call may \
+         be wrapped, e.g. in a deadline race's Box::pin, so only the \
+         `.fetch_request(request)` suffix is pinned, not the exact \
+         `container .fetch_request(request)` spacing)"
     );
 }
 
 #[test]
 fn neighbouring_body_readers_still_collect_under_their_caps() {
     let whole = normalized(RUNTIME_RS);
+    // The front-door DO reply streams through the shared capped
+    // reader instead of an inline whole-body guard.
+    let front = fn_text("#[event(fetch)]", "pub struct RepairContainer");
     assert!(
-        whole.contains("Ok(bytes) if bytes.len() <= MAX_RESULT_BYTES"),
-        "the DO reply forwarded to ingest must stay size-checked"
+        front.contains("read_response_capped") && front.contains("MAX_RESULT_BYTES"),
+        "the DO reply forwarded to ingest must stay size-checked: read it \
+         through the shared capped reader bounded by MAX_RESULT_BYTES"
+    );
+    assert!(
+        !front.contains(".bytes()") && !front.contains(".text()"),
+        "the front-door DO reply must stream under the cap, not buffer \
+         whole with `.bytes()`/`.text()` before checking it"
+    );
+    let helper = fn_text("async fn read_response_capped", "async fn fetch");
+    assert!(
+        helper.contains(".stream()") && helper.contains("push_chunk_capped"),
+        "read_response_capped must cap while streaming: read chunks via \
+         `.stream()` and admit them via push_chunk_capped so the cap \
+         bounds the read itself"
     );
     let container_json = container_json();
     assert!(
-        container_json.contains(".stream()")
-            && container_json.contains("while let Some(chunk) = stream.next().await")
-            && container_json
-                .contains("if bytes.len() > MAX_RESULT_BYTES { return Err(ApiFault::new(502, \"container_unavailable\")); }"),
-        "container_json must cap while streaming: read chunks via \
-         `.stream()` and abort with 502 container_unavailable as soon as \
-         the accumulated body passes MAX_RESULT_BYTES"
-    );
-    assert!(
-        container_json.contains("ResponseBody::Body(body) if body.len() > MAX_RESULT_BYTES"),
-        "container_json must length-check an already-materialised body \
-         against MAX_RESULT_BYTES before cloning it"
+        container_json.contains("read_response_capped")
+            && container_json.contains("MAX_RESULT_BYTES")
+            && container_json.contains("502")
+            && container_json.contains("container_unavailable"),
+        "container_json must cap while streaming: delegate to \
+         read_response_capped bounded by MAX_RESULT_BYTES and map \
+         over-cap/unreadable to 502 container_unavailable"
     );
     assert!(
         !container_json.contains(".bytes()") && !container_json.contains(".text()"),
