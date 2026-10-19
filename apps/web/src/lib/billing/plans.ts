@@ -116,6 +116,8 @@ export function streamCapSeconds(plan: Plan): number {
 export interface SubscriptionRef {
 	planId: string;
 	status: string;
+	/** Trial deadline (ADR 0004); null/omitted cannot confirm a trial. */
+	trialEndsAt?: string | null;
 	/** End of the past-due grace window (ADR 0002 rule 4); null/omitted when none. */
 	graceUntil?: string | null;
 }
@@ -130,7 +132,12 @@ export interface EffectivePlan {
 	planUnknown: boolean;
 }
 
-const ENTITLED_STATUSES = new Set(['active', 'trialing']);
+/** A trial is confirmed for display only before a known deadline (ADR 0004). */
+function inTrialWindow(subscription: SubscriptionRef, now: Date): boolean {
+	if (subscription.status !== 'trialing') return false;
+	if (!subscription.trialEndsAt) return false;
+	return new Date(subscription.trialEndsAt).getTime() > now.getTime();
+}
 
 /**
  * True while a past-due subscription is still inside its grace window
@@ -145,10 +152,10 @@ function inGraceWindow(subscription: SubscriptionRef, now: Date): boolean {
 }
 
 /**
- * Effective plan per ADR 0004: the subscription's plan while it grants
- * entitlement (`active`/`trialing`, plus `past_due` inside its grace
- * window per ADR 0002 rule 4) and names a known tier; the free trial
- * row otherwise. Never invents a paid tier for an unknown state.
+ * Display plan per ADR 0004: a known paid tier while active, a known
+ * trial tier strictly before its deadline, or `past_due` inside its grace
+ * window per ADR 0002 rule 4; the unconfirmed free-trial row otherwise.
+ * This does not enforce access: the server remains authoritative.
  */
 export function resolveEffectivePlan(
 	subscription: SubscriptionRef | null,
@@ -158,7 +165,9 @@ export function resolveEffectivePlan(
 	if (
 		subscription &&
 		plan &&
-		(ENTITLED_STATUSES.has(subscription.status) || inGraceWindow(subscription, now))
+		((subscription.status === 'active' && plan.id !== 'free') ||
+			inTrialWindow(subscription, now) ||
+			inGraceWindow(subscription, now))
 	) {
 		return { plan, planUnknown: false };
 	}
