@@ -47,7 +47,7 @@
 	let reauthRequired = $state(false);
 	let reauthPasswordInput = $state<HTMLInputElement | null>(null);
 	let saveReauthRequired = $state(false);
-	let reauthState = $state<'idle' | 'working' | 'failed'>('idle');
+	let reauthState = $state<'idle' | 'working' | 'dismissed' | 'failed'>('idle');
 	let saveState = $state<'idle' | 'saving' | 'saved' | 'failed'>('idle');
 	let testedConfigKey = $state<string | null>(null);
 	let testRunId = 0;
@@ -171,6 +171,17 @@
 		}
 	}
 
+	/**
+	 * Retryable ceremony interruption: `NotAllowedError` / `AbortError`
+	 * can mean dismissal, timeout, or an unavailable passkey. The name
+	 * alone cannot identify the cause. Server (`ApiError`) paths never
+	 * carry these names.
+	 */
+	function isPasskeyDismissal(error: unknown): boolean {
+		const name = (error as { name?: unknown } | null)?.name;
+		return name === 'NotAllowedError' || name === 'AbortError';
+	}
+
 	async function reauthenticateAndSave() {
 		if (reauthState === 'working') return;
 		const inputKey = currentTestKey();
@@ -213,7 +224,17 @@
 			if (currentTestKey() !== inputKey || testedConfigKey !== inputKey) {
 				throw new Error('provider configuration changed after testing');
 			}
-		} catch {
+		} catch (error) {
+			if (error instanceof ApiError && error.paywall) {
+				// The global paywall owns the limit response; avoid a duplicate
+				// inline failure state beneath the modal.
+				reauthState = 'idle';
+				return;
+			}
+			if (isPasskeyDismissal(error)) {
+				reauthState = 'dismissed';
+				return;
+			}
 			reauthState = 'failed';
 			return;
 		}
@@ -430,7 +451,9 @@
 					>
 						{reauthState === 'working' ? 'Verifying…' : 'Reauthenticate and save'}
 					</button>
-					{#if reauthState === 'failed'}
+					{#if reauthState === 'dismissed'}
+						<p role="status">Passkey reauthentication didn't complete. Possible reasons: You dismissed the passkey prompt, it timed out, or no usable passkey was available. Try again when ready.</p>
+					{:else if reauthState === 'failed'}
 						<p role="status">Reauthentication failed. <a href="/login">Sign in again</a> to continue.</p>
 					{/if}
 				</div>

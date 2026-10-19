@@ -771,7 +771,7 @@ struct CountingDialer {
 }
 
 impl handlers::Dialer for CountingDialer {
-    async fn probe(&self, _target: &vault::ValidatedTarget, _port: u16, _tls: bool) -> bool {
+    async fn probe(&self, _target: &vault::ValidatedTarget, _tls: bool) -> bool {
         self.probes.set(self.probes.get() + 1);
         true
     }

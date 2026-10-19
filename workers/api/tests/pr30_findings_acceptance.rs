@@ -499,7 +499,7 @@ struct FakeDialer {
 }
 
 impl handlers::Dialer for FakeDialer {
-    async fn probe(&self, target: &vault::ValidatedTarget, _port: u16, _tls: bool) -> bool {
+    async fn probe(&self, target: &vault::ValidatedTarget, _tls: bool) -> bool {
         self.seen.borrow_mut().push(target.addresses().to_vec());
         self.ok
     }

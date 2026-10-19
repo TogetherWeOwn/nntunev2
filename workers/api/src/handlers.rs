@@ -772,13 +772,15 @@ pub(crate) async fn deliver_mail_with_deadline(
 }
 
 /// Bounded outbound probe for `test connection`. Implementations dial
-/// ONLY addresses from `target` (never re-resolve `target.host()`),
+/// ONLY addresses from `target` (never re-resolve `target.host()`), at
+/// exactly `target.port()` (the allowlisted port the target was vetted
+/// for — callers pass no port, so a substitute can never be smuggled in),
 /// keep the hostname for TLS SNI/certificate checks where the runtime
 /// supports it, apply the per-address and total `vault` timeout constants,
 /// attempt no more than `vault::MAX_DIAL_ADDRESSES`, follow no redirects, and return a
 /// bare boolean — banners/errors never leave the dialer.
 pub trait Dialer {
-    fn probe(&self, target: &ValidatedTarget, port: u16, tls: bool) -> impl Future<Output = bool>;
+    fn probe(&self, target: &ValidatedTarget, tls: bool) -> impl Future<Output = bool>;
 }
 
 /// Async DNS for handler-time resolution (the sync core guard consumes
@@ -2650,7 +2652,7 @@ where
         if !lease_acquired {
             return None;
         }
-        let ok = ctx.dialer.probe(&target, provider.port, provider.tls).await;
+        let ok = ctx.dialer.probe(&target, provider.tls).await;
         let _ = ctx
             .store
             .release_test_connection_lease(&claims.user_id, &lease_token)
@@ -3988,7 +3990,7 @@ mod tests {
     }
 
     impl Dialer for FakeDialer {
-        async fn probe(&self, target: &ValidatedTarget, _port: u16, _tls: bool) -> bool {
+        async fn probe(&self, target: &ValidatedTarget, _tls: bool) -> bool {
             self.seen.borrow_mut().push(target.addresses().to_vec());
             self.ok
         }
@@ -8673,6 +8675,93 @@ mod tests {
         );
         assert_eq!(resp.body, r#"{"ok":false}"#);
         assert!(h.dialer.seen.borrow().is_empty());
+    }
+
+    #[test]
+    fn probe_dials_the_validated_target_port() {
+        // `Dialer::probe` takes no caller-supplied port, so the
+        // only port any dialer can reach is `target.port()` — vetted by
+        // `ProviderConfig::validate` against the NNTP allowlist. A
+        // recording dialer over both allowlisted ports must observe
+        // exactly the validated port (with the provider's own `tls` flag).
+        struct PortDialer {
+            seen: RefCell<Vec<(u16, bool)>>,
+        }
+
+        impl Dialer for PortDialer {
+            async fn probe(&self, target: &ValidatedTarget, tls: bool) -> bool {
+                self.seen.borrow_mut().push((target.port(), tls));
+                true
+            }
+        }
+
+        for (port, tls) in [(119u16, true), (563u16, true)] {
+            let config = ProviderConfig {
+                host: "news.example.com".to_string(),
+                port,
+                tls,
+                username: "synthetic-user".to_string(),
+                password: "synthetic-pass".to_string(),
+                max_connections: 4,
+                allow_insecure_plaintext: false,
+            };
+            let dns = StaticDns {
+                addresses: vec!["93.184.216.34".parse().unwrap()],
+            };
+            let target = config.validate(&dns).expect("allowlisted port validates");
+            assert_eq!(target.port(), port);
+            let dialer = PortDialer {
+                seen: RefCell::new(Vec::new()),
+            };
+            assert!(block_on(dialer.probe(&target, tls)));
+            assert_eq!(
+                dialer.seen.borrow().as_slice(),
+                [(port, tls)],
+                "dialed port must equal the validated target port"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_takes_no_caller_supplied_port() {
+        // Shape pin: the trait, the handler call site, and
+        // the production dialer must never carry a caller-supplied port
+        // again — a reintroduced `port: u16` parameter would let a caller
+        // smuggle a substitute past the validated target. Slice ONLY the
+        // pre-test production source first: this test's own `PortDialer`
+        // above uses the two-argument shape, so searching the whole file
+        // would match the test itself. Comments are stripped next so prose
+        // mentioning a port cannot satisfy the pins.
+        let source = include_str!("handlers.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let code = strip_line_comments(production);
+        let norm = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            norm.contains("fn probe(&self, target: &ValidatedTarget, tls: bool)"),
+            "Dialer::probe must take only (target, tls) — no caller-supplied port",
+        );
+        assert!(
+            !norm.contains("port: u16"),
+            "handler production code must not carry a caller-supplied port anywhere",
+        );
+        assert!(
+            norm.contains("ctx.dialer.probe(&target, provider.tls).await"),
+            "handler must probe with the validated target only (plus its own tls flag)",
+        );
+        let entry = include_str!("worker_entry.rs");
+        let entry_code = strip_line_comments(entry);
+        let entry_norm = entry_code.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            entry_norm.contains("async fn probe(&self, target: &ValidatedTarget, tls: bool)"),
+            "SocketDialer::probe must take only (target, tls)",
+        );
+        assert!(
+            entry_norm.contains("let port = target.port();"),
+            "SocketDialer must dial the validated target's own port",
+        );
     }
 
     #[test]

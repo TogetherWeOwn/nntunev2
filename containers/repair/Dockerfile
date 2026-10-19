@@ -4,7 +4,7 @@
 
 # Pinned par2cmdline-turbo, built from the release tarball and verified
 # by sha256. Re-pin deliberately; the digest is the release asset digest.
-FROM debian:bookworm-slim AS par2
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS par2
 ARG PAR2_VERSION=1.5.0
 ARG PAR2_SHA256=035584144d3ac3b08fb5d7d4b844f60cf97404b6469f6aed7d9b9430a25bef0e
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -19,7 +19,7 @@ RUN curl -fsSL -o par2.tar.xz \
  && make -j"$(nproc)" --quiet \
  && install -m0755 par2 /usr/local/bin/par2
 
-FROM rust:1-bookworm AS server
+FROM rust:1-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29 AS server
 WORKDIR /src
 # The root Cargo.lock is tracked, proven fresh in CI (`cargo metadata
 # --locked`) and audited by cargo-deny. Copy the full (dockerignored)
@@ -30,7 +30,7 @@ COPY . .
 RUN cargo build --locked --release -p nntune-repair-server \
  && install -m0755 target/release/nntune-repair-server /usr/local/bin/nntune-repair-server
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
 # util-linux provides /usr/bin/prlimit, the kernel resource limiter the
 # bounded repair runner always wraps the binary in (fail-closed without).
 RUN apt-get update && apt-get install -y --no-install-recommends util-linux \
