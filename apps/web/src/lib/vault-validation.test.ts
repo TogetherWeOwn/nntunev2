@@ -195,7 +195,12 @@ describe('validateIndexerUrl', () => {
 			'https://user@index.example.com/api',
 			'https://user:pass@index.example.com/api',
 			'https://:pass@index.example.com/api',
-			'https://index.example.com/api#section'
+			'https://@index.example.com/api',
+			'https://index.example.com/api#section',
+			'https://index.example.com/api#',
+			'https://index.example.com/api?t=search',
+			'https://index.example.com/api?apikey=secret123',
+			'https://index.example.com/api?'
 		]) {
 			expect(validateIndexerUrl(url, KEY), `url rejected: ${url}`).toBe(MESSAGE);
 		}
