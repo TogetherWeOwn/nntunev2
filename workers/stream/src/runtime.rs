@@ -110,7 +110,7 @@ impl NntpPool {
         let dial = || {
             let config = config.clone();
             async move {
-                let transport = WorkerTransport::connect(&config)
+                let transport = WorkerTransport::connect_pinned(&config)
                     .map_err(|e| nntune_core::Error::Io(std::io::Error::other(e.to_string())))?;
                 NntpClient::connect(transport, &config).await
             }
@@ -146,7 +146,7 @@ impl NntpPool {
         let dial = || {
             let config = config.clone();
             async move {
-                let transport = WorkerTransport::connect(&config)
+                let transport = WorkerTransport::connect_pinned(&config)
                     .map_err(|e| nntune_core::Error::Io(std::io::Error::other(e.to_string())))?;
                 NntpClient::connect(transport, &config).await
             }
@@ -170,6 +170,12 @@ impl NntpPool {
     /// first provider's cap and parked connections carry no provider identity,
     /// so a changed host or credential would keep answering from the old
     /// connection until the instance is evicted.
+    ///
+    /// Copy the row's `allow_insecure_plaintext` acknowledgment onto the
+    /// returned config: the pool dials through the pinned gate, which
+    /// rejects unacknowledged TLS-off configs, so dropping the flag would
+    /// lock out providers the vault accepted with the cleartext
+    /// acknowledgment.
     async fn provider(&self, _user_id: &str) -> core::result::Result<PoolProvider, ProbeError> {
         Err(ProbeError::ProviderUnavailable)
     }
