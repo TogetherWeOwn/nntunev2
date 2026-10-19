@@ -130,8 +130,11 @@ The repair worker defines its own stable fault shape in
 `ApiFault::new`/`invalid`): an HTTP status plus a machine-readable code
 for logs and operators, carrying no user data. Ingest maps those faults
 in `workers/ingest/src/repair.rs` (`classify_repair_reply`): replies
-with status 400, 404, 409, or 413 are `Unrepairable` (permanent — a
-retry would send the same bytes, so the job fails terminally), provided
+with status 400, 401, 403, 404, 409, or 413 are `Unrepairable`
+(permanent — a retry would send the same bytes, so the job fails
+terminally; the 401/403 arms are auth parity with the pool
+classifiers, since a refusal of the repair caller can never be fixed
+by redelivery), provided
 the reply body does not exceed `MAX_REPAIR_REPLY_BYTES` (oversized
 bodies are `Retry` before the status is checked); a 200
 reply is decided by its `status` field (`repaired` -> `Repaired`,
@@ -160,7 +163,7 @@ container-origin repair-only codes with no registry row (two of the
 six — `invalid_manifest` and `scratch_input_mismatch` — are also
 emitted directly by the repair worker itself:
 `workers/repair/src/contract.rs:123,129` and
-`workers/repair/src/runtime.rs:314,345`). The repair worker also emits
+`workers/repair/src/runtime.rs:358,429`). The repair worker also emits
 `container_unavailable` (502), `scratch_unavailable` (503),
 `repair_unavailable` (500/503), and `scratch_missing` (404) directly
 (not through `leak_code`); those have no registry row either.
