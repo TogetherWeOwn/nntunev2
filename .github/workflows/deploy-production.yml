@@ -223,6 +223,15 @@ jobs:
       - name: Build production target without deploying
         working-directory: apps/web
         run: npx --yes wrangler@${{ env.WRANGLER_VERSION }} deploy --dry-run --env production --outdir dist-production
+      - name: Require production Worker secret shape before upload
+        # Offline shape check, not a secret read: the web Worker ships no
+        # bindings and needs no secrets, so any production vars table in
+        # its wrangler config must be reviewed in
+        # ci/check-production-secrets-shape.mjs first. Values are never
+        # read or printed. Runs here, not in preflight: preflight checks
+        # out the dispatch tip, while this job checked out the validated
+        # promotion SHA above.
+        run: node ci/check-production-secrets-shape.mjs
       - name: Require production-only Cloudflare credentials
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}

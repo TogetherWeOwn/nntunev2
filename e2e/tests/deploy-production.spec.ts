@@ -557,6 +557,28 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
   });
 });
 
+test.describe('production secret-shape gate (workflow wiring pin)', () => {
+  test('the secret-shape step runs after the dry-run and before the version upload', () => {
+    // The checker itself is covered by ci/test-check-production-secrets-shape.mjs
+    // (ci-ok job); this pins the wiring: offline shape proof on the validated
+    // SHA after wrangler accepts the config, before any version upload.
+    const stepAt = productionWorkflow.indexOf(
+      'node ci/check-production-secrets-shape.mjs',
+    );
+    expect(stepAt).toBeGreaterThan(-1);
+    const dryRunAt = productionWorkflow.indexOf(
+      'Build production target without deploying',
+    );
+    const uploadAt = productionWorkflow.indexOf(
+      'Upload reviewed production version',
+    );
+    expect(dryRunAt).toBeGreaterThan(-1);
+    expect(uploadAt).toBeGreaterThan(-1);
+    expect(stepAt).toBeGreaterThan(dryRunAt);
+    expect(stepAt).toBeLessThan(uploadAt);
+  });
+});
+
 test.describe('smoke checker (fixture server, CLI contract)', () => {
   let server: Server;
   let base: string;
