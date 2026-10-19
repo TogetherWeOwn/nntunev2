@@ -1,0 +1,340 @@
+name: deploy-production
+
+# Production promotion for the web frontend (apps/web only).
+#
+# Cutover only. Never runs on push, PR, release, or another workflow.
+# Disabled by default: the preflight job refuses unless the repo variable
+# PRODUCTION_DEPLOY_ENABLED is exactly "true". The production hostname is
+# decided at launch; until then the workflow builds against the placeholder
+# domain below and refuses to promote to it. Backend Workers (api, ingest,
+# mb, stream, repair) each add their own lane as follow-ups; the reserved
+# production data-plane bindings stay untouched by this lane (see docs/ops.md
+# environments matrix: the clean launch database is deferred, so no
+# production migration or binding enablement happens here).
+#
+# Shape (modeled on the proven single-Worker production lane):
+# - workflow_dispatch with an explicit full 40-hex main SHA.
+# - preflight resolves and validates the SHA, the enabled flag, and the
+#   production hostname variable.
+# - staging-evidence requires a real post-deploy staging run on the exact
+#   SHA: the push-triggered deploy run (event=push; manual dispatches never
+#   count and can never shadow evidence) must have staging-web success (never
+#   skipped) and its post-deploy full-journey job success. The called
+#   workflow reports its jobs under the "post-deploy-e2e / ..." prefix, so
+#   every matching job must conclude success. Scheduled or manual monitoring
+#   runs never count (see docs/ops.md staging checklist).
+# - deploy-production uploads one Worker version without mutating routes,
+#   custom domains or triggers, then calls the shared central
+#   gradual-promote action (pinned below): 5% -> 50% -> 100% with per-stage
+#   health gates pinned to the new version and automatic rollback to the
+#   recorded pre-promote version on any stage failure.
+# - Post-promotion verification probes the same public-route set as the
+#   stage gates against the production origin and proves the serving build
+#   is the promoted one (GET /api/build equals the deploy SHA).
+#
+# Secrets (names only): production-only Cloudflare credentials live in the
+# production Environment (PRODUCTION_CLOUDFLARE_API_TOKEN,
+# PRODUCTION_CLOUDFLARE_ACCOUNT_ID). Staging credentials are never accepted
+# here. No secret value is ever printed or committed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full 40-hex main commit to deploy (explicit; empty refuses)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "24"
+  PNPM_VERSION: 10.34.7
+  WRANGLER_VERSION: 4.150.0
+  # Placeholder production hostname until the launch decision lands in the
+  # repo variable PRODUCTION_DOMAIN. ".invalid" never resolves, so a
+  # misconfigured run cannot send traffic anywhere real; the preflight job
+  # refuses a placeholder domain even when the lane is enabled.
+  PRODUCTION_DOMAIN_DEFAULT: "production-placeholder.example.invalid"
+  PRODUCTION_WORKER_NAME: "nntune-web"
+
+jobs:
+  preflight:
+    name: production-preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.target.outputs.sha }}
+      domain: ${{ steps.target.outputs.domain }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve and validate the promotion target
+        id: target
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+          PRODUCTION_DEPLOY_ENABLED: ${{ vars.PRODUCTION_DEPLOY_ENABLED }}
+          PRODUCTION_DOMAIN: ${{ vars.PRODUCTION_DOMAIN }}
+        run: |
+          set -euo pipefail
+          if [ "${PRODUCTION_DEPLOY_ENABLED:-}" != "true" ]; then
+            echo "::error::Production lane disabled: repo variable PRODUCTION_DEPLOY_ENABLED must be exactly true"
+            exit 1
+          fi
+          if ! printf '%s' "${INPUT_SHA:-}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::sha input must be a full 40-char lowercase hex main commit (explicit; empty refuses)"
+            exit 1
+          fi
+          domain="${PRODUCTION_DOMAIN:-$PRODUCTION_DOMAIN_DEFAULT}"
+          if [ "$domain" = "$PRODUCTION_DOMAIN_DEFAULT" ] || [ -z "$domain" ]; then
+            echo "::error::Production hostname not decided: set repo variable PRODUCTION_DOMAIN to the launch hostname first"
+            exit 1
+          fi
+          case "$domain" in
+            *\ *|*/*|*:*) echo "::error::PRODUCTION_DOMAIN must be a bare hostname (no scheme, path, port or spaces)"; exit 1;;
+          esac
+          echo "sha=$INPUT_SHA" >> "$GITHUB_OUTPUT"
+          echo "domain=$domain" >> "$GITHUB_OUTPUT"
+          echo "Promotion target: $INPUT_SHA -> $domain (lane enabled)"
+
+  staging-evidence:
+    name: staging-evidence
+    needs: [preflight]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require real post-deploy staging evidence on the exact SHA
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys, urllib.request
+
+          repo = os.environ["REPO"]
+          sha = os.environ["DEPLOY_SHA"]
+          token = os.environ["GITHUB_TOKEN"]
+
+          def api(path):
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}{path}",
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=15) as res:
+                  return json.load(res)
+
+          # Only push-triggered deploy runs carry staging evidence: staging-web
+          # and post-deploy-e2e run on push alone, so a later manual dispatch
+          # on the same SHA must neither create nor shadow evidence.
+          runs = api(f"/actions/workflows/deploy.yml/runs?branch=main&event=push&per_page=100")["workflow_runs"]
+          same = [r for r in runs if r.get("head_sha") == sha]
+          if not same:
+              print(f"::error::No push-triggered deploy run on main for {sha}; promote what staging verified, never an unverified SHA")
+              sys.exit(1)
+          latest = max(same, key=lambda r: r["id"])
+          if latest.get("event") != "push":
+              print(f"::error::Deploy run {latest['id']} on {sha} is not push-triggered "
+                    f"(got event {latest.get('event')}); manual dispatches are never evidence")
+              sys.exit(1)
+          if latest.get("status") != "completed" or latest.get("conclusion") != "success":
+              print(f"::error::Latest push-triggered deploy run {latest['id']} on {sha} is not successful "
+                    f"({latest.get('status')}/{latest.get('conclusion')})")
+              sys.exit(1)
+          jobs = api(f"/actions/runs/{latest['id']}/jobs?per_page=100")["jobs"]
+          by_name = {j["name"]: j.get("conclusion") for j in jobs}
+          if by_name.get("staging-web") != "success":
+              print(f"::error::Deploy run {latest['id']} has no staging-web success "
+                    f"(got {by_name.get('staging-web')}); a skipped deploy is not evidence")
+              sys.exit(1)
+          # The post-deploy-e2e job calls e2e-staging.yml as a reusable
+          # workflow, so the jobs API reports each called job under the
+          # "post-deploy-e2e / <called job name>" prefix instead of a bare
+          # "post-deploy-e2e" entry. Require at least one such job and require
+          # every one of them to conclude success.
+          e2e = [(name, conclusion) for name, conclusion in by_name.items()
+                 if name == "post-deploy-e2e" or name.startswith("post-deploy-e2e / ")]
+          if not e2e:
+              print(f"::error::Deploy run {latest['id']} has no post-deploy-e2e success "
+                    f"(got {by_name.get('post-deploy-e2e')}); scheduled/manual monitoring never counts")
+              sys.exit(1)
+          bad = sorted(name for name, conclusion in e2e if conclusion != "success")
+          if bad:
+              print(f"::error::Deploy run {latest['id']} post-deploy-e2e jobs are not all success "
+                    f"(not success: {', '.join(bad)}); scheduled/manual monitoring never counts")
+              sys.exit(1)
+          print(f"staging evidence ok: deploy run {latest['id']} staging-web + post-deploy-e2e success on {sha}")
+          PY
+
+  deploy-production:
+    name: deploy-production
+    needs: [preflight, staging-evidence]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # One static non-cancelling group serializes production Worker
+    # mutations (promotion and any future rollback lane share it).
+    concurrency:
+      group: production-worker-mutation
+      cancel-in-progress: false
+    # Required reviewers are live repo settings unless auto-approve is on;
+    # the preflight gate already refused a disabled lane or a placeholder
+    # hostname before this job could start.
+    environment:
+      name: production
+      url: ${{ format('https://{0}', needs.preflight.outputs.domain) }}
+    # NOTE: no job-level working directory here. The shared gradual-promote
+    # action below calls the caller's bin/smoke.mjs from the repo root, so
+    # build/upload run steps set working-directory apps/web individually
+    # instead of defaulting the whole job there.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Deploy the validated dispatch SHA, never a newer main head.
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: apps/web
+      - name: Build the promotion SHA
+        working-directory: apps/web
+        env:
+          BUILD_SHA: ${{ needs.preflight.outputs.sha }}
+        run: pnpm build
+      - name: Build production target without deploying
+        working-directory: apps/web
+        run: npx --yes wrangler@${{ env.WRANGLER_VERSION }} deploy --dry-run --env production --outdir dist-production
+      - name: Require production-only Cloudflare credentials
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "::error::Production-only Cloudflare credentials must be configured in the production Environment"
+            exit 1
+          fi
+          echo "production credentials present (names only)"
+      # One-time production seed precondition (see docs/ops.md). The shared
+      # gradual-promote action records its rollback target from the latest
+      # production deployment and refuses unless that deployment is a single
+      # version at 100%. Check that here, before uploading, so the first
+      # promotion fails with seed instructions instead of orphaning an
+      # uploaded version inside the action.
+      - name: Require one-time production seed deployment
+        working-directory: apps/web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
+          WORKER_NAME: ${{ env.PRODUCTION_WORKER_NAME }}
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@${{ env.WRANGLER_VERSION }} deployments list --env production --name "$WORKER_NAME" --json \
+            | node -e '
+              let raw = "";
+              process.stdin.on("data", (c) => { raw += c; });
+              process.stdin.on("end", () => {
+                const seed = "one-time production seed required: make one full deploy of the web frontend " +
+                  "to production (e.g. wrangler deploy --env production from the launch SHA) with the " +
+                  "production custom domain attached, leaving a single 100% deployment; then re-dispatch " +
+                  "this lane. See docs/ops.md production seed precondition.";
+                let parsed;
+                try {
+                  parsed = JSON.parse(raw);
+                } catch (e) {
+                  console.error("::error::could not parse deployments list output: " + e.message);
+                  process.exit(1);
+                }
+                const deployments = Array.isArray(parsed) ? parsed : (parsed.result ?? parsed.deployments);
+                if (!Array.isArray(deployments) || deployments.length === 0) {
+                  console.error("::error::No production deployments found. " + seed);
+                  process.exit(1);
+                }
+                let newest = deployments[0];
+                for (const entry of deployments.slice(1)) {
+                  if (String(entry?.created_on ?? "") > String(newest?.created_on ?? "")) newest = entry;
+                }
+                const versions = newest?.versions;
+                const id = Array.isArray(versions) && versions.length === 1 && versions[0]?.percentage === 100
+                  ? versions[0]?.version_id
+                  : undefined;
+                if (typeof id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) {
+                  console.error("::error::Latest production deployment is not a single-version 100% deployment. " + seed);
+                  process.exit(1);
+                }
+                console.log("production seed ok: rollback target " + id);
+              });
+            '
+      # Uploading a version does not mutate routes, custom domains or cron
+      # triggers. Never use a full deploy or a trigger-syncing subcommand
+      # here: those re-provision the production hostname and fail or drift.
+      - name: Upload reviewed production version without changing triggers
+        working-directory: apps/web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@${{ env.WRANGLER_VERSION }} versions upload --env production \
+            --tag "${DEPLOY_SHA:?}-${GITHUB_RUN_ID:?}-${GITHUB_RUN_ATTEMPT:?}"
+      # Gradual promotion lives in the shared central composite action
+      # (pinned below): 5% -> 50% -> 100% with per-stage health gates pinned
+      # to the new version, and automatic rollback to the recorded
+      # pre-promote version on any stage failure. Repo-specific build/upload
+      # stays above; only versions promote/rollback runs here.
+      - name: Gradual promotion 5-50-100 with automatic rollback
+        id: gradual
+        uses: TogetherWeOwn/.github/actions/gradual-promote@89c290be20c0044efaf6916f28341c76e75fff06
+        with:
+          worker-name: ${{ env.PRODUCTION_WORKER_NAME }}
+          version-tag: ${{ needs.preflight.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          domain: ${{ needs.preflight.outputs.domain }}
+          api-token: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
+          account-id: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
+      - name: Verify production serves the promoted build
+        # Post-promotion verification: after the gradual promotion reaches
+        # 100%, probe the public-route set against the production origin and
+        # prove the serving build is the promoted SHA (GET /api/build). Same
+        # retry contract as the stage gates (6 attempts, 10s sleeps, fail
+        # closed). No automatic restore here: a failed verification leaves
+        # the promoted candidate live at 100% and prints the recorded
+        # restoration target; the operator restores it with a wrangler
+        # rollback to that version id.
+        env:
+          DOMAIN: ${{ needs.preflight.outputs.domain }}
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          PREV_VERSION: ${{ steps.gradual.outputs.rollback-version-id }}
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5 6; do
+            if node bin/smoke.mjs "https://$DOMAIN" --allow-indexable --expected-sha "$DEPLOY_SHA"; then
+              echo "post-promotion production smoke ok (attempt $i)"
+              exit 0
+            fi
+            if [ "$i" -lt 6 ]; then
+              echo "attempt $i failed, retrying in 10s..."
+              sleep 10
+            fi
+          done
+          echo "::error::post-promotion smoke failed; promoted candidate remains live at 100%; recorded restoration target ${PREV_VERSION:-unknown} - restore it with a wrangler rollback to that version id"
+          exit 1

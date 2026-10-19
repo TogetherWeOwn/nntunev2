@@ -8,7 +8,7 @@
     "e2e:staging": "playwright test --config=playwright.config.ts",
     "e2e:smoke": "playwright test --config=playwright.config.ts --project=staging tests/health.spec.ts",
     "e2e:list": "playwright test --config=playwright.config.ts --list",
-    "test:unit": "playwright test --config=playwright.config.ts tests/helpers.spec.ts tests/readiness.spec.ts tests/workflows.spec.ts tests/redirect-diagnostics.spec.ts tests/account-identity.spec.ts tests/byop-transport.spec.ts tests/byop-tls-setting.spec.ts tests/playback.spec.ts tests/media-session.spec.ts tests/queue-order.spec.ts tests/demo-audio-contract.spec.ts tests/scoped-credentials.spec.ts tests/cost-basis.spec.ts tests/two-track-fixture.spec.ts tests/build-identity.spec.ts tests/zz-build-identity-final.spec.ts",
+    "test:unit": "playwright test --config=playwright.config.ts tests/helpers.spec.ts tests/readiness.spec.ts tests/workflows.spec.ts tests/deploy-production.spec.ts tests/redirect-diagnostics.spec.ts tests/account-identity.spec.ts tests/byop-transport.spec.ts tests/byop-tls-setting.spec.ts tests/playback.spec.ts tests/media-session.spec.ts tests/queue-order.spec.ts tests/demo-audio-contract.spec.ts tests/scoped-credentials.spec.ts tests/cost-basis.spec.ts tests/two-track-fixture.spec.ts tests/build-identity.spec.ts tests/zz-build-identity-final.spec.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

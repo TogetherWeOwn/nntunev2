@@ -166,6 +166,14 @@ behaviour.
   play path re-fetches upstream. Cache writes are stamped with the play
   time on `finalize`, so the SWR clock runs from when the bytes were
   fetched.
+- Capacity (`src/cache.rs`): `MAX_CONTENT_CACHE_BYTES = 64 MiB` caps the
+  distinct blob bytes a default `ContentCache` holds (a blob shared by
+  several tracks counts once). An over-cap insert evicts track entries
+  oldest-first in last-write order until the cache is back at or under
+  the cap — exactly at the cap evicts nothing — and never evicts the
+  just-written entry, which serves alone when it exceeds the cap by
+  itself. Capacity evictions increment `eviction_count` (the probe the
+  observability path reports); time-expiry prunes are not evictions.
 - Headers: every play carries `Cache-Status: HIT|MISS|STALE` and
   `Age: <seconds-since-write>` (see `PlayResponse::cache_headers`).
 
@@ -262,6 +270,7 @@ ingest consumer ── NNTP_POOL stub (id_from_name(user_id)) ── POST /probe
 |---|---|---|---|
 | 200 | | outcome | check partition, fold into the tally |
 | 400 / 413 | `bad_request` / `too_large` | envelope refused | contract bug, no retry |
+| 401 / 403 | | pool refused this caller (ingest-side fail-closed; the wire never emits these today) | `Rejected` on `/probe` and `/body`, no redelivery, `Retry-After` ignored |
 | 503 | `busy` | ingest lane full or pool quarantined; `Retry-After` set | redeliver |
 | 503 | `provider_unavailable` | provider settings not loaded | redeliver |
 | 502 | `provider_error` | connection, auth or protocol failure; pool quarantined | redeliver |

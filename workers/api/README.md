@@ -58,6 +58,9 @@ the core and require exactly one row before any response.
 | `POST /v1/session/reauthenticate/start` / `finish` | current-session-bound passkey proof and atomic single-session replacement |
 | `GET` / `PUT` / `DELETE /v1/vault` | booleans-only summary / encrypted upsert / delete |
 | `POST /v1/vault/test` (`/v1/vault/test-connection` compatibility alias) | `{"ok": bool}` only; atomically rate-limited, per-user concurrency lease, bounded pinned-address dial; empty body tests the stored vault, a `{provider, indexer}` envelope tests a candidate without persisting it |
+| `POST /v1/credentials` | mint a native REST credential (session-only, fresh-session step-up; secret rendered once in the 201 body, never stored or listed) |
+| `GET /v1/credentials` | list the caller's native REST credentials (session-only, ordinary session; ids and metadata only, no secrets) |
+| `DELETE /v1/credentials/{id}` | revoke one credential by id (session-only, fresh-session step-up; single-segment id, idempotent) |
 | `POST /api/test-codes` (staging-only seam, no `OPTIONS` arm — see below) | returns the issued signup code for an `example.test` mailbox without minting; fail-closed 404/401 outside the staging posture |
 
 `OPTIONS` on any listed route except the staging-only `POST /api/test-codes`

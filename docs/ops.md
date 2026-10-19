@@ -491,6 +491,23 @@ Notes, all referencing (not changing) owning-lane state:
 Promotion is `main` HEAD → staging; production promotion is a later gated
 lane. Complete every box on the exact head being promoted.
 
+### Production seed precondition (one-time)
+
+The production lane (`.github/workflows/deploy-production.yml`) promotes
+through the shared gradual-promote action, whose automatic-rollback target is
+the latest production deployment and which refuses unless that deployment is
+a single Worker version at 100%. There is currently no active production
+NNTune Worker deployment, so the very first promotion cannot satisfy that
+precondition on its own. Before the first promotion, an authorized executor
+must seed production once: make one full deploy of the web frontend to
+production (for example `wrangler deploy --env production` from the launch
+SHA, run from `apps/web`) with the launch custom domain (`PRODUCTION_DOMAIN`)
+attached, leaving a single 100% deployment. The lane enforces this before
+uploading anything: its seed step lists production deployments and refuses
+with these instructions when no single-version 100% deployment exists, so a
+first run fails with guidance instead of orphaning an uploaded version inside
+the promotion action. Re-dispatch the lane after seeding.
+
 - [ ] Exact-head CI: `ci-ok`, `gitleaks` and `pr-lint` green on the promotion
   SHA, plus Paperclip Review 5/5 on that head (merge policy in
   `CONTRIBUTING.md`). A red required check is fixed in code or recorded as
