@@ -329,7 +329,7 @@ impl handlers::Mailer for FakeMailer {
 
 struct NoNetwork;
 impl handlers::Dialer for NoNetwork {
-    async fn probe(&self, _: &vault::ValidatedTarget, _: u16, _: bool) -> bool {
+    async fn probe(&self, _: &vault::ValidatedTarget, _: bool) -> bool {
         panic!("auth-start must not dial a provider")
     }
 }

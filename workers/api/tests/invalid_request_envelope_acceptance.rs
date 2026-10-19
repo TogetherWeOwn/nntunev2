@@ -242,7 +242,7 @@ impl handlers::Mailer for UnreachableMailer {
 struct UnreachableDialer;
 
 impl handlers::Dialer for UnreachableDialer {
-    async fn probe(&self, _target: &vault::ValidatedTarget, _port: u16, _tls: bool) -> bool {
+    async fn probe(&self, _target: &vault::ValidatedTarget, _tls: bool) -> bool {
         panic!("oversize gate / healthz must not touch the dialer");
     }
 }

@@ -4,6 +4,7 @@
 		browserStorage,
 		clearSnapshot,
 		invalidateLibraryCache,
+		LIBRARY_AUTH_TRANSITION_KEY,
 		staleLabel,
 		type LibraryItem
 	} from '#lib/library/cache.js';
@@ -14,6 +15,7 @@
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
 	let libraryUnavailable = $state(false);
+	let selectedIds: string[] = $state([]);
 
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
@@ -24,6 +26,13 @@
 			loading = state.loading;
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
+			// Selections are per-account: drop ids the new library no longer
+			// contains, so a 401/403/404 or auth transition cannot leak the
+			// previous account's queue into the next session's Retry.
+			if (selectedIds.length > 0) {
+				const ids = new Set(state.items.map((track) => track.id));
+				selectedIds = selectedIds.filter((id) => ids.has(id));
+			}
 		}
 	});
 
@@ -45,11 +54,22 @@
 		return typeof artist === 'string' && artist.trim().length > 0 ? artist : null;
 	}
 
+	function selectTrack(id: string): void {
+		if (!selectedIds.includes(id)) selectedIds = [...selectedIds, id];
+	}
+
+	function selectedTrack(id: string): LibraryItem {
+		return items.find((track) => track.id === id) ?? { id };
+	}
+
 	function refresh(): Promise<void> {
 		return refresher.refresh();
 	}
 
 	function handleAuthTransition(event: StorageEvent): void {
+		// Clear selections at the auth boundary even before the refresher's
+		// state lands; the onStateChange reconcile above is the backstop.
+		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) selectedIds = [];
 		refresher.handleAuthTransition(event);
 	}
 
@@ -91,14 +111,32 @@
 		{:else}
 			<ul data-testid="library-list">
 				{#each items as track (track.id)}
-					<li data-testid="library-item" data-id={track.id}>
-						{displayTitle(track)}
-						{#if displayArtist(track)}
-							<span> — {displayArtist(track)}</span>
-						{/if}
+					<li class="nt-library-item" data-testid="library-item" data-id={track.id}>
+						<button
+							type="button"
+							class="nt-library-row"
+							onclick={() => selectTrack(track.id)}
+						>
+							{displayTitle(track)}
+							{#if displayArtist(track)}
+								<span> — {displayArtist(track)}</span>
+							{/if}
+						</button>
 					</li>
 				{/each}
-				</ul>
+			</ul>
+			{#if selectedIds.length > 0}
+				<section aria-label="Selected tracks">
+					<h2>Selected</h2>
+					<ol data-testid="queue-list">
+						{#each selectedIds as id (id)}
+							<li data-testid="queue-item" data-track-id={id} data-id={id}>
+								{displayTitle(selectedTrack(id))}
+							</li>
+						{/each}
+					</ol>
+				</section>
+			{/if}
 		{/if}
 
 		<button class="nt-button nt-button--ghost" type="button" onclick={() => void refresh()}>
@@ -129,3 +167,20 @@
 		</section>
 	{/if}
 </main>
+
+<style>
+	.nt-library-item {
+		padding: 0;
+	}
+	.nt-library-row {
+		display: block;
+		width: 100%;
+		text-align: left;
+		background: none;
+		border: 0;
+		padding: 0.5rem 0.75rem;
+		cursor: pointer;
+		font: inherit;
+		color: inherit;
+	}
+</style>
