@@ -689,7 +689,140 @@ fn fetch_output_races_fetch_and_put_against_the_deadline() {
          not awaited bare after a headers-only race"
     );
     assert!(
+        slice[put_at..].contains("deadline.as_mut()"),
+        "fetch_output's R2 put race must poll the armed deadline, not race \
+         the put against anything else"
+    );
+    assert!(
         !slice.contains(".bytes()"),
         "fetch_output streams its output; it must not materialise it via .bytes()"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Expiry consequences: every deadline race yields `None` on expiry and
+// every `None` maps to the existing 502. The race-shape pins above
+// cannot see a gutted consequence: returning an empty `Ok` on expiry
+// or softening a `None` arm to `Ok` keeps every race token, timer and
+// budget pin green while silently succeeding a timed-out call.
+// Pinned on the collapsed raw source (string literals are blanked in
+// `code()`, so the 502 text is only visible raw).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn deadline_expiry_yields_none_at_every_race() {
+    // M-A: the `container_json` body race expiry (`runtime.rs:587`)
+    // returning `Some(Ok(Vec::new()))` turns a `/repair` body still
+    // incomplete at 150 s into `Ok((status, empty))`. The count below
+    // drops from 2 to 1 and this pin turns red.
+    for (name, start, next, expected) in [
+        (
+            "stage_input",
+            "async fn stage_input",
+            "async fn fetch_output",
+            1,
+        ),
+        (
+            "container_json",
+            "async fn container_json",
+            "async fn read_object_capped",
+            2,
+        ),
+        ("fetch_output", "async fn fetch_output", "fn leak_code", 2),
+    ] {
+        let flat = collapse_ws(fn_slice(RUNTIME_RS, start, next));
+        assert_eq!(
+            flat.matches("return Poll::Ready(None);").count(),
+            expected,
+            "{name} must yield `None` on deadline expiry at every race \
+             ({expected}x `return Poll::Ready(None);`): an expired race \
+             must never succeed with an empty body"
+        );
+        assert!(
+            !flat.contains("Some(Ok(Vec::new()))"),
+            "{name} must not succeed an expired race with an empty body"
+        );
+    }
+    // Body-race-specific: the `container_json` body poll itself
+    // (`runtime.rs:584-594`) yields `None` on expiry.
+    let json_flat = collapse_ws(fn_slice(
+        RUNTIME_RS,
+        "async fn container_json",
+        "async fn read_object_capped",
+    ));
+    let body_race = json_flat
+        .split_once("let bytes = std::future::poll_fn")
+        .expect("container_json must race its body read via `let bytes = std::future::poll_fn`")
+        .1;
+    assert!(
+        body_race.contains("return Poll::Ready(None);"),
+        "container_json body race must yield `None` on expiry, not an empty Ok body"
+    );
+}
+
+#[test]
+fn deadline_expiry_maps_none_to_502_container_unavailable() {
+    // M-B: the `fetch_output` put match (`runtime.rs:478`)
+    // `None => Ok(())` reports a stalled R2 put as stored. The put-tail
+    // pin below turns red; softening any fetch/body `None` arm the same
+    // way breaks its count.
+    let stage_flat = collapse_ws(fn_slice(
+        RUNTIME_RS,
+        "async fn stage_input",
+        "async fn fetch_output",
+    ));
+    assert_eq!(
+        stage_flat
+            .matches("Some(Err(_)) | None => return Err(ApiFault::new(502,")
+            .count(),
+        1,
+        "stage_input must map fetch expiry (`None`) to 502 container_unavailable"
+    );
+    let json_flat = collapse_ws(fn_slice(
+        RUNTIME_RS,
+        "async fn container_json",
+        "async fn read_object_capped",
+    ));
+    assert_eq!(
+        json_flat
+            .matches("Some(Err(_)) | None => return Err(ApiFault::new(502,")
+            .count(),
+        2,
+        "container_json must map BOTH fetch and body expiry to 502 \
+         (one `Some(Err(_)) | None` arm each)"
+    );
+    let body_tail = json_flat
+        .split_once("let bytes = std::future::poll_fn")
+        .expect("container_json must race its body read via `let bytes = std::future::poll_fn`")
+        .1;
+    assert!(
+        body_tail.contains("Some(Err(_)) | None => return Err(ApiFault::new(502,"),
+        "container_json body race (`runtime.rs:584-599`) must map expiry \
+         (`None`) to 502 container_unavailable"
+    );
+    let output_flat = collapse_ws(fn_slice(
+        RUNTIME_RS,
+        "async fn fetch_output",
+        "fn leak_code",
+    ));
+    assert_eq!(
+        output_flat
+            .matches("Some(Err(_)) | None => return Err(ApiFault::new(502,")
+            .count(),
+        1,
+        "fetch_output must map fetch expiry (`None`) to 502 container_unavailable"
+    );
+    let put_tail = output_flat
+        .split_once(".put(")
+        .expect("fetch_output must relay the output into R2 with .put(")
+        .1;
+    assert!(
+        put_tail.contains("None => Err(ApiFault::new(502,"),
+        "fetch_output R2 put race (`runtime.rs:463-479`) must map expiry \
+         (`None`) to 502 container_unavailable, not Ok"
+    );
+    assert!(
+        !put_tail.contains("None => Ok(())"),
+        "fetch_output R2 put must not report an expired put as stored"
     );
 }
