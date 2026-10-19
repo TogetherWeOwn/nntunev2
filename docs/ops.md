@@ -609,9 +609,17 @@ Worker deploy or rollback. Worker source and Wrangler configs existing in
 the repo are not deployment. Therefore **no backend-Worker deploy,
 rollback, activation, or staging acceptance is currently claimed**, for any
 Worker in any environment, until that Worker's lane exists and its gates
-pass on the exact head being promoted — for the api Worker that means a
-`staging-api` job conclusion `success` (not `skipped`) on the promotion
-run. The web checklist above is unchanged by this section and remains in
+pass on the exact head being promoted — for the api Worker that requires a
+`staging-api` job conclusion `success`, successful **executed** `Hyperdrive
+cache-disabled gate` and `Deploy api to staging` steps, and the job output
+`deployed=true` (`outcome=deployed`) on the promotion run. Its `source_sha`
+output must match the promotion SHA and the deploy's `BUILD_SHA` argument.
+A missing-config job can conclude `success` while reporting
+`deployed=false`, `outcome=unconfigured`, and an empty `source_sha`; it is
+not deploy evidence. The names-only deployment summary also reports failed
+or cancelled paths without attributing a deployed source SHA. This marker
+alone proves neither health, rollback nor full staging acceptance.
+The web checklist above is unchanged by this section and remains in
 force alongside the per-Worker evidence table below. The web frontend's
 production lane (`.github/workflows/deploy-production.yml`, disabled by
 default until the launch hostname decision:
@@ -627,7 +635,7 @@ be called accepted:
 |---|---|---|
 | 1 | Deployed Worker and version | Worker (script) name and the version reported by the deploy tooling for the version now serving, plus the environment deployed to. |
 | 2 | Source revision | The exact commit SHA that version was built from. Where the Worker exposes a deployed-build identity, record it and require it to match this SHA; without one, do not claim same-build evidence (the web checklist above verifies this via `GET /api/build`; a Worker with no such surface cannot claim it). |
-| 3 | Deploy run | URL of the workflow run (or equivalent executed deploy record) that produced item 1, with the Worker deploy job's conclusion `success`. A `skipped` job, a skipped gate, or overall workflow success without that job succeeding is not deploy evidence. Any pre-deploy gate the lane requires — for the API Worker, the Hyperdrive cache-disabled check described in `deploy.yml` — records its pass/fail result here, by name and outcome only. |
+| 3 | Deploy run | URL of the workflow run (or equivalent executed deploy record) that produced item 1, with the Worker deploy job's conclusion `success`. A `skipped` job, a skipped gate, or overall workflow success without that job succeeding is not deploy evidence. For the API Worker, retain successful executed `Hyperdrive cache-disabled gate` and `Deploy api to staging` step outcomes plus `staging-api` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2; a config-skipped `success` does not qualify. Record gate results by name and outcome only. |
 | 4 | Prior known-good version | Recorded **before** the new deploy: the previously serving Worker's name, version and source SHA, its own successful deploy run (item 3 bar), and its last passing health result. A first deploy has no prior known-good version, so rollback acceptance cannot be claimed for it; removing or disabling a first deployment is a separate gated action, not defined here. |
 | 5 | Rollback action and run | Which mechanism was used (redeploy of the prior known-good source revision, or activation of the prior version, whichever the lane implements), the target it restored (item 4's version and SHA), and the URL of the rollback run with the rollback/deploy job's conclusion `success` (not `skipped`). |
 | 6 | Post-rollback health result | The lane's health/readiness check for that Worker, run after item 5, with its result and run URL recorded. Where a deployed-build identity exists, it must match the rollback target; a green rollback run or a bare `ok` response without that identity does not by itself prove the prior version is serving. |
