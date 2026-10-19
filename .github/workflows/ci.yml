@@ -428,6 +428,26 @@ jobs:
       - name: Parity checker environment-IO tests
         run: python3 .github/scripts/test_config_parity_environment_io.py
 
+  # Dependabot coverage: every manifest directory (cargo standalone
+  # crates, Dockerfiles, package.json dirs, Actions) must have a matching
+  # entry in .github/dependabot.yml, and the lockfile header must name
+  # every tracked Cargo.lock. Keeps the repair omission from recurring
+  # silently for the next worker or container. Keep this job id in
+  # ci-ok's needs.
+  dependabot-coverage:
+    name: dependabot-coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check Dependabot covers every manifest directory
+        run: python3 .github/scripts/check_dependabot_coverage.py --root .
+      - name: Coverage-checker self-tests (match + drifted fixtures)
+        run: python3 .github/scripts/test_check_dependabot_coverage.py
+
   rust-ingest:
     name: rust (workers/ingest)
     runs-on: ubuntu-latest
@@ -793,7 +813,7 @@ jobs:
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, mb-import, config-parity, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links]
+    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
