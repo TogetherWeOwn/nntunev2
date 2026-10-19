@@ -937,7 +937,8 @@ fn nntp_failure(e: NntpError, message_id: &str) -> Failure {
 
 /// Return the lease (and the connection, if still healthy) and account for
 /// the failure: only provider-level trouble quarantines the pool; a stale
-/// auth session is dropped without either. Terminal content failures
+/// auth session is dropped without either. Local port-policy refusals do not
+/// record provider recovery. Terminal content failures
 /// (`ArticleMissing`/`Decode`) emit their meter-only signal here — one event
 /// per terminal play — on every `settle` path (first-segment `play()` errors
 /// and later-segment `finalize` errors alike). Background fill work never
@@ -975,7 +976,9 @@ fn settle(
                 crate::pool::CIRCUIT_OPEN_MS,
             ));
         }
-    } else {
+    } else if !matches!(err, PlayError::TransportPortNotAllowed(_)) {
+        // A port-policy refusal never reached the provider, so it must not
+        // settle a half-open probe as successful provider contact.
         // One oversize article refuses only its fetch: signal it without
         // touching the breaker (no `ProviderError`, no quarantine entry).
         if matches!(err, PlayError::ArticleTooLarge(_)) {
@@ -1412,8 +1415,11 @@ impl PlayStream {
             let conn = live.failed.as_ref().map(|(_, conn)| *conn);
             if conn == Some(Conn::ProviderFailure) {
                 pool.record_provider_error_for(live.lease.id);
-            } else if conn.is_some() {
-                pool.record_non_provider_result_for(live.lease.id);
+            } else if let Some((err, _)) = &live.failed {
+                // Local port refusals prove nothing about provider recovery.
+                if !matches!(err, PlayError::TransportPortNotAllowed(_)) {
+                    pool.record_non_provider_result_for(live.lease.id);
+                }
             } else if live.last_success_epoch == Some(pool.provider_error_epoch()) {
                 // Clean abort: the first segment served fine and no later
                 // fetch failed, so clear a closed-state failure streak unless
@@ -1815,6 +1821,87 @@ mod tests {
         assert_eq!(pool.circuit_state(), CircuitState::Closed);
         pool.try_acquire(Lane::Playback)
             .expect("a provider response closes the breaker");
+    }
+
+    #[test]
+    fn port_refusal_leaves_a_half_open_probe_unresolved() {
+        use crate::pool::{CircuitState, CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_OPEN_MS};
+
+        let mut pool = StreamPool::new(2);
+        for _ in 0..CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        pool.advance(CIRCUIT_OPEN_MS);
+        let probe = pool.try_acquire(Lane::Playback).expect("probe admitted");
+        let epoch = pool.provider_error_epoch();
+        let mut meter = crate::meter::MemoryMeter::default();
+
+        let error = settle(
+            &mut pool,
+            &mut meter,
+            probe,
+            None,
+            nntp_failure(NntpError::PortNotAllowed(8119), "segment"),
+            "u",
+            "track",
+        );
+
+        assert_eq!(error, PlayError::TransportPortNotAllowed(8119));
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+        assert_eq!(pool.provider_error_epoch(), epoch);
+        assert_eq!(pool.in_use(), 0);
+        assert_eq!(pool.idle(), 0);
+        assert!(
+            meter.events.is_empty(),
+            "a refusal is not provider recovery"
+        );
+        let next = pool.try_acquire(Lane::Playback).expect("probe slot freed");
+        assert!(pool.try_acquire(Lane::Playback).is_err());
+        pool.release(next, None);
+    }
+
+    #[test]
+    fn aborted_port_refusal_leaves_a_half_open_probe_unresolved() {
+        use crate::pool::{CircuitState, CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_OPEN_MS};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider");
+        let address = listener.local_addr().expect("provider address");
+        let (_, article) = test_article();
+        let server = serve_article(listener, article, false);
+        let secret = b"s";
+        let token = grant::issue("u", "track", GRANT_EXP_UNIX, secret);
+        let segments = vec!["segment@synthetic.test".to_string()];
+        let mut pool = StreamPool::new(2);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+        let input = test_input(&token, "track", address, &segments);
+        let mut response = play(&mut pool, &mut cache, &mut meter, secret, &input)
+            .expect("initial segment fetched");
+        // A successful first segment settles its probe immediately. Give the
+        // abort fixture a fresh, unresolved probe after that provider contact.
+        for _ in 0..CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        pool.advance(CIRCUIT_OPEN_MS);
+        let epoch = pool.provider_error_epoch();
+        let probe = pool.try_acquire(Lane::Playback).expect("probe admitted");
+        let Some(Source::Live(live)) = response.stream.source.as_mut() else {
+            panic!("cache miss must hold a live lease");
+        };
+        let previous = std::mem::replace(&mut live.lease, probe);
+        pool.release(previous, None);
+        live.failed = Some(nntp_failure(NntpError::PortNotAllowed(8119), "segment"));
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+        response.stream.abort(&mut pool);
+
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+        assert_eq!(pool.provider_error_epoch(), epoch);
+        assert_eq!(pool.in_use(), 0);
+        assert_eq!(pool.idle(), 0);
+        let next = pool.try_acquire(Lane::Playback).expect("probe slot freed");
+        assert!(pool.try_acquire(Lane::Playback).is_err());
+        pool.release(next, None);
+        server.join().expect("provider thread");
     }
 
     #[test]
