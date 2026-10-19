@@ -124,6 +124,35 @@ mod tests {
     /// `getrandom::` occurrences beyond production; synthetic mutant
     /// sources are likewise built with `format!`, keeping their banned
     /// spellings outside any scanned statement window.
+    /// True when the `r` at `chars[i]` starts a raw-string prefix at a token
+    /// boundary (mirrors `rustc_lexer`): the maximal identifier-char run
+    /// ending at this `r` must be exactly `r`, `br` or `cr` — a digit-led run
+    /// like `1r` is excluded by the exact-run rule — and the char before that
+    /// run must not be a quote, so a literal suffix (`"a"r`, `'a'r`) never
+    /// counts as a raw prefix.
+    fn is_raw_prefix_at(chars: &[char], i: usize) -> bool {
+        let mut run_start = i;
+        while run_start > 0 {
+            let prev = chars[run_start - 1];
+            if prev.is_alphanumeric() || prev == '_' {
+                run_start -= 1;
+            } else {
+                break;
+            }
+        }
+        let run: String = chars[run_start..=i].iter().collect();
+        if run != "r" && run != "br" && run != "cr" {
+            return false;
+        }
+        if run_start > 0 {
+            let before = chars[run_start - 1];
+            if before == '"' || before == '\'' {
+                return false;
+            }
+        }
+        true
+    }
+
     fn strip_code_for_propagation_pin(source: &str) -> String {
         let chars: Vec<char> = source.chars().collect();
         let mut out = String::with_capacity(source.len());
@@ -131,8 +160,10 @@ mod tests {
         while i < chars.len() {
             let c = chars[i];
             let next = chars.get(i + 1).copied();
-            // Raw string `r#"..."#` / `r"..."`: detect `r` + hashes + `"`.
-            if c == 'r' && (next == Some('"') || next == Some('#')) {
+            // Raw string `r#"..."#` / `r"..."` (and `br`/`cr` forms): `r` +
+            // hashes + `"` only at a token boundary, so a literal suffix `r`
+            // never blanks a following plain string with raw rules.
+            if c == 'r' && (next == Some('"') || next == Some('#')) && is_raw_prefix_at(&chars, i) {
                 let mut j = i + 1;
                 let mut hashes = 0usize;
                 while chars.get(j).copied() == Some('#') {
@@ -790,6 +821,47 @@ mod tests {
         assert!(
             check_secure_random_propagation(&mutant).is_err(),
             "label-adjacent string statement must not satisfy the pin"
+        );
+    }
+
+    #[test]
+    fn stripper_blanks_suffixed_literal_before_plain_string() {
+        // Direct pin for the raw-branch token-boundary rule: `"a"r` is one
+        // suffixed string literal, so the `r` is a suffix, not a raw prefix.
+        // The following plain string opens with an escaped quote plus hash;
+        // raw-rules blanking (no escape handling) would close at that inner
+        // `"#` and leak the needles as code.
+        let src =
+            "stringify!(\"a\"r#\"\\\"# .map_err(|_| CryptoError::RandomnessUnavailable)?;\");";
+        let stripped = strip_code_for_propagation_pin(src);
+        assert!(
+            !stripped.contains(".map_err"),
+            "suffix-adjacent string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("RandomnessUnavailable"),
+            "suffix-adjacent string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains('?'),
+            "suffix-adjacent string ? must be blanked: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn pin_rejects_suffixed_literal_string_carried_statement() {
+        // Checker-level regression for the same bug: a `stringify!` line whose
+        // token stream is a suffixed literal `"a"r#` plus a plain string
+        // carrying the exact expected statement after an escaped quote+hash.
+        // It never executes `getrandom::fill` — zero-filled bytes returned
+        // as `Ok` — yet the boundary-free stripper reports `Ok(())`.
+        let gr = "getrandom";
+        let mutant = format!(
+            "stringify!(\"a\"r#\"\\\"# {gr}::fill(&mut bytes).map_err(|_| CryptoError::RandomnessUnavailable)?;\");"
+        );
+        assert!(
+            check_secure_random_propagation(&mutant).is_err(),
+            "suffix-adjacent string statement must not satisfy the pin"
         );
     }
 
