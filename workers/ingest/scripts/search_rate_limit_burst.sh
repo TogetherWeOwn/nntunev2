@@ -11,12 +11,12 @@
 # see a legit request pass again.
 #
 # Usage: INGEST_URL=https://<worker-host> ./search_rate_limit_burst.sh
-set -u
+set -euo pipefail
 : "${INGEST_URL:?set INGEST_URL to the ingest worker base URL}"
 
 for i in $(seq 1 11); do
   printf 'attempt %02d: ' "$i"
-  curl -s -o /dev/null -D - -w '%{http_code}\n' \
+  curl -s --connect-timeout 10 -m 30 -o /dev/null -D - -w '%{http_code}\n' \
     -H 'content-type: application/json' \
     -d '{"user_id":"burst-probe","query":"burst probe","indexer_ref":"vault_idx_01-ab","categories":[],"limit":25,"page":0}' \
     "$INGEST_URL/v1/ingest/search" \
