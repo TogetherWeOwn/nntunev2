@@ -419,7 +419,7 @@ impl PgStore {
                     crate::logging::Level::Error,
                     "api.db.connection_error",
                     &crate::logging::resolve_trace_id(None),
-                    serde_json::json!({"error_class": "service_unavailable", "build_sha": build_sha}),
+                    serde_json::json!({"error_class": "service_unavailable", "build_sha": build_sha, "release": build_sha}),
                 );
             }
         });
@@ -1904,7 +1904,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             crate::logging::Level::Error,
             "api.start.misconfigured",
             &trace_id,
-            serde_json::json!({"error_class": "internal_error", "build_sha": build_sha}),
+            serde_json::json!({"error_class": "internal_error", "build_sha": build_sha, "release": build_sha}),
         );
         return internal_render();
     };
@@ -1987,6 +1987,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         "status_code": response.status,
         "duration_ms": now_millis().saturating_sub(start_ms),
         "build_sha": build_sha,
+        "release": build_sha,
     });
     if response.status >= 400 {
         if let Some(code) = response_error_code(response.status, &response.body) {
