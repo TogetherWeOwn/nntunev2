@@ -74,8 +74,9 @@ pub enum PoolBodyError {
     /// Pool busy or quarantined, provider down or not loaded, or the
     /// call itself failed: redeliver after `after_secs`.
     Retry { after_secs: u32 },
-    /// The pool refused the envelope (`400`), or a `200` broke the size
-    /// contract. Retrying the same fetch cannot help.
+    /// The pool refused the envelope (`400`), refused this caller
+    /// (`401`/`403`), or a `200` broke the size contract. Retrying the
+    /// same fetch cannot help.
     Rejected,
 }
 
@@ -102,6 +103,12 @@ pub fn classify_body_reply(
         }),
         413 => Ok(BodyFetch::TooLarge),
         400 => Err(PoolBodyError::Rejected),
+        // The pool wire never emits 401/403 today (auth collapses to 502
+        // `provider_error`), but a refusal of this caller can never be
+        // fixed by redelivery: fail closed so a future auth refusal does
+        // not burn all 5 job attempts plus DLQ. Any `Retry-After` is
+        // deliberately unread here.
+        401 | 403 => Err(PoolBodyError::Rejected),
         _ => Err(PoolBodyError::Retry {
             after_secs: retry_after
                 .and_then(|v| v.trim().parse::<u32>().ok())
