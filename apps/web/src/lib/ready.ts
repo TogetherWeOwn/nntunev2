@@ -10,7 +10,10 @@
  */
 
 export function readyResponse(): Response {
-	return Response.json({ ok: true }, { status: 200 });
+	return Response.json(
+		{ ok: true },
+		{ status: 200, headers: { 'cache-control': 'no-store' } }
+	);
 }
 
 export function notReadyResponse(retryAfterSeconds: number): Response {
@@ -18,7 +21,10 @@ export function notReadyResponse(retryAfterSeconds: number): Response {
 		{ ok: false },
 		{
 			status: 503,
-			headers: { 'retry-after': String(Math.max(0, Math.floor(retryAfterSeconds))) }
+			headers: {
+				'cache-control': 'no-store',
+				'retry-after': String(Math.max(0, Math.floor(retryAfterSeconds)))
+			}
 		}
 	);
 }

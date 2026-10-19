@@ -5,6 +5,7 @@
 //! credentials only (public repo: never real secrets).
 
 use nntune_api::{auth, session, vault};
+use nntune_ssrf_guard::FORBIDDEN_VECTORS;
 use std::net::IpAddr;
 
 // --- Sessions: signed cookies, rotation ------------------------------------
@@ -249,7 +250,9 @@ impl vault::DnsResolver for FakeDns {
             // Attacker-controlled name resolving to an IPv4-mapped IPv6
             // address hiding a private target: must still be rejected.
             "mapped.example.com" => vec!["::ffff:10.0.0.5".parse().unwrap()],
-            "doc.example.com" => vec!["2001:db8::1".parse().unwrap()],
+            // Shared documentation vector (single owner:
+            // `nntune_ssrf_guard::FORBIDDEN_VECTORS`): no literal copy.
+            "doc.example.com" => vec![FORBIDDEN_VECTORS[2].parse().unwrap()],
             _ => vec![],
         }
     }
@@ -319,6 +322,36 @@ fn vault_ssrf_guard_rejects_private_and_loopback() {
             ..base.clone()
         };
         assert!(c.validate(&FakeDns).is_err(), "host rejected: {host}");
+    }
+}
+
+/// Shared transition/special vectors (single owner:
+/// `nntune_ssrf_guard::FORBIDDEN_VECTORS`): every required family is
+/// rejected by the vault provider guard. No literal here may be copied
+/// from the shared table.
+#[test]
+fn vault_ssrf_guard_rejects_shared_transition_vectors() {
+    struct SharedDns(IpAddr);
+    impl vault::DnsResolver for SharedDns {
+        fn resolve(&self, _host: &str) -> Vec<IpAddr> {
+            vec![self.0]
+        }
+    }
+    for raw in FORBIDDEN_VECTORS {
+        let ip: IpAddr = raw.parse().expect("shared vector must parse");
+        let cfg = vault::ProviderConfig {
+            host: "service.example.com".into(),
+            port: 563,
+            tls: true,
+            username: "alice".into(),
+            password: "s3cret".into(),
+            max_connections: 4,
+            allow_insecure_plaintext: false,
+        };
+        assert!(
+            cfg.validate(&SharedDns(ip)).is_err(),
+            "shared vector must be rejected: {raw}"
+        );
     }
 }
 

@@ -8,6 +8,7 @@
 use base64::Engine as _;
 use hmac::{Hmac, KeyInit, Mac};
 use nntune_api::{auth, session, vault};
+use nntune_ssrf_guard::{FORBIDDEN_VECTORS, PUBLIC_CONTROL_VECTORS};
 use sha2::Sha256;
 use std::{cell::RefCell, future::Future, net::IpAddr, task::Poll};
 
@@ -62,38 +63,66 @@ fn assert_rejected_targets(addresses: &[&str]) {
     );
 }
 
+/// Shared vectors (single owner `nntune_ssrf_guard`): every required
+/// family is rejected by both the provider and indexer validators, and
+/// every public control validates. No literal here may be copied from the
+/// shared table: forbidden and public addresses come from the imports
+/// above; the family-specific tests below keep only non-overlapping variants.
 #[test]
-fn targets_reject_six_to_four() {
-    for address in ["2002::1", "2002:a00:1::1", "2002:ffff:ffff:ffff::1"] {
-        assert_rejected_targets(&[address]);
+fn shared_vectors_reject_forbidden_and_allow_public() {
+    for raw in FORBIDDEN_VECTORS {
+        assert_rejected_targets(&[raw]);
+    }
+    for raw in PUBLIC_CONTROL_VECTORS {
+        let resolver = dns(&[raw]);
+        assert!(
+            provider().validate(&resolver).is_ok(),
+            "public control rejected: {raw}"
+        );
+        assert!(
+            indexer().validate(&resolver).is_ok(),
+            "public control rejected: {raw}"
+        );
     }
 }
 
 #[test]
+fn targets_reject_six_to_four() {
+    // The shared 6to4 vector (`FORBIDDEN_VECTORS`) is covered by
+    // `shared_vectors_reject_forbidden_and_allow_public`; keep only
+    // non-overlapping variants here.
+    for address in ["2002::1", "2002:ffff:ffff:ffff::1"] {
+        assert_rejected_targets(&[address]);
+    }
+    assert_rejected_targets(&[FORBIDDEN_VECTORS[1]]);
+}
+
+#[test]
 fn targets_reject_teredo_and_orchid_special_use_block() {
+    // The shared Teredo vector is covered by the shared test; keep only
+    // non-overlapping variants here.
     for address in [
         "2001::1",
-        "2001:0:4136:e378:8000:63bf:3fff:fdd2",
         "2001:10::1",
         "2001:20::1",
         "2001:1ff:ffff:ffff::1",
     ] {
         assert_rejected_targets(&[address]);
     }
+    assert_rejected_targets(&[FORBIDDEN_VECTORS[3]]);
 }
 
 #[test]
 fn targets_reject_other_ipv6_transition_and_special_use_ranges() {
+    // Shared mapped / NAT64 / documentation vectors are covered by the
+    // shared test; keep only non-overlapping variants here.
     for address in [
-        "64:ff9b::5db8:d822",   // NAT64 well-known prefix, public IPv4 payload.
-        "64:ff9b:1::a00:1",     // NAT64 local-use prefix.
-        "::ffff:93.184.216.34", // IPv4-mapped, even with a public payload.
+        "64:ff9b:1::a00:1", // NAT64 local-use prefix.
         "::ffff:10.0.0.1",
         "::ffff:0:5db8:d822", // IPv4-translated.
         "::93.184.216.34",    // IPv4-compatible.
         "fec0::1",            // Deprecated site-local.
         "100::1",             // Discard-only.
-        "2001:db8::1",        // Documentation.
         "3fff::1",            // Documentation.
         "::",
         "::1",
@@ -103,16 +132,25 @@ fn targets_reject_other_ipv6_transition_and_special_use_ranges() {
     ] {
         assert_rejected_targets(&[address]);
     }
+    for raw in [
+        FORBIDDEN_VECTORS[0],
+        FORBIDDEN_VECTORS[2],
+        FORBIDDEN_VECTORS[4],
+    ] {
+        assert_rejected_targets(&[raw]);
+    }
 }
 
 #[test]
 fn targets_reject_mixed_public_and_private_dns_answers() {
+    // Public controls and the shared 6to4 vector come from the shared
+    // table (no literal copies); the private partners stay literal.
     for addresses in [
-        ["93.184.216.34", "10.0.0.5"],
-        ["10.0.0.5", "93.184.216.34"],
-        ["2606:4700:4700::1111", "fe80::1"],
-        ["fe80::1", "2606:4700:4700::1111"],
-        ["93.184.216.34", "2002:a00:1::1"],
+        [PUBLIC_CONTROL_VECTORS[0], "10.0.0.5"],
+        ["10.0.0.5", PUBLIC_CONTROL_VECTORS[0]],
+        [PUBLIC_CONTROL_VECTORS[1], "fe80::1"],
+        ["fe80::1", PUBLIC_CONTROL_VECTORS[1]],
+        [PUBLIC_CONTROL_VECTORS[0], FORBIDDEN_VECTORS[1]],
     ] {
         assert_rejected_targets(&addresses);
     }
@@ -165,7 +203,8 @@ fn pool_dial_guard_rejects_bad_shape_and_private_targets_at_connect_time() {
     let public = dns(&["93.184.216.34"]);
     assert!(vault::authorize_pool_dial("https://service.example.com/", 563, &public).is_err());
     assert!(vault::authorize_pool_dial("", 563, &public).is_err());
-    for private in [["10.0.0.5"], ["127.0.0.1"], ["::1"], ["2002:a00:1::1"]] {
+    // Shared 6to4 vector comes from the shared table (no literal copy).
+    for private in [["10.0.0.5"], ["127.0.0.1"], ["::1"], [FORBIDDEN_VECTORS[1]]] {
         assert!(
             vault::authorize_pool_dial(HOST, 119, &dns(&private)).is_err(),
             "dial allowed a non-public target: {private:?}"
@@ -233,11 +272,13 @@ fn test_connection_budget_fires_dial_and_total_timeouts() {
 
 #[test]
 fn targets_preserve_hostname_and_every_vetted_public_address() {
+    // Shared public controls come from the shared table (no literal
+    // copies); the other two public addresses stay literal.
     let addresses = [
-        "93.184.216.34",
+        PUBLIC_CONTROL_VECTORS[0],
         "8.8.8.8",
         "2001:4860:4860::8888",
-        "2606:4700:4700::1111",
+        PUBLIC_CONTROL_VECTORS[1],
     ];
     let expected: Vec<IpAddr> = addresses.iter().map(|ip| ip.parse().unwrap()).collect();
     for target in [

@@ -22,10 +22,11 @@ use worker::{
 };
 
 use crate::contract::{
-    classify_container_reply, container_repair_body, in_key, ingest_reply_body, manifest_digest,
-    manifest_key, out_key, parse_manifest, parse_request, plan, result_key,
-    validate_repaired_output_set, ApiFault, ContainerOutcome, FileRole, Plan, RepairRequest,
-    RepairStatus, MAX_REQUEST_BYTES, MAX_RESULT_BYTES,
+    classify_container_reply, container_repair_body, container_unavailable_fault, in_key,
+    ingest_reply_body, manifest_digest, manifest_key, out_key, parse_manifest, parse_request, plan,
+    push_chunk_capped, repair_unavailable_fault, result_key, validate_repaired_output_set,
+    ApiFault, ContainerOutcome, FileRole, Plan, RepairRequest, RepairStatus, MAX_REQUEST_BYTES,
+    MAX_RESULT_BYTES,
 };
 
 /// Durable Object binding + class fronting the Container.
@@ -82,6 +83,35 @@ async fn read_capped(req: &mut Request, cap: usize) -> Result<Vec<u8>, ApiFault>
     Ok(body)
 }
 
+/// Read a response body with a hard cap (streamed, never unbounded).
+/// Each chunk goes through `push_chunk_capped`, so the chunk that
+/// would cross the cap aborts the read with the accumulated body
+/// untouched: at most `cap` bytes are ever materialised and the
+/// excess is never retained. A bodyless response (`ResponseBody::Empty`,
+/// e.g. a bare 200 from `/health`) reads as empty — the same value the
+/// previous whole-body `bytes()` path returned for it, since `stream()`
+/// rejects non-stream bodies. An already-materialised
+/// (`ResponseBody::Body`) reply is length-checked before cloning, so it
+/// never buffers past the cap either. Callers map the unit error to
+/// their own fault.
+async fn read_response_capped(response: &mut Response, cap: usize) -> Result<Vec<u8>, ()> {
+    match response.body() {
+        ResponseBody::Empty => return Ok(Vec::new()),
+        ResponseBody::Body(body) if body.len() > cap => return Err(()),
+        ResponseBody::Body(body) => return Ok(body.clone()),
+        ResponseBody::Stream(_) => {}
+    }
+    let mut stream = response.stream().map_err(|_| ())?;
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| ())?;
+        if !push_chunk_capped(&mut body, &chunk, cap) {
+            return Err(());
+        }
+    }
+    Ok(body)
+}
+
 /// The Worker's only route. Reachable in production solely through the
 /// ingest `REPAIR_CONTAINER` service binding.
 #[event(fetch)]
@@ -104,7 +134,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
         Ok(stub) => stub,
         Err(error) => {
             console_log!("repair DO unavailable: {:?}", error);
-            return fault_response(&ApiFault::new(503, "repair_unavailable"));
+            return fault_response(&repair_unavailable_fault());
         }
     };
     let headers = Headers::new();
@@ -115,19 +145,19 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
         .with_body(Some(JsValue::from_str(&String::from_utf8_lossy(&body))));
     let request = match Request::new_with_init("https://repair-do/repair", &init) {
         Ok(request) => request,
-        Err(_) => return fault_response(&ApiFault::new(503, "repair_unavailable")),
+        Err(_) => return fault_response(&repair_unavailable_fault()),
     };
     let mut response = match stub.fetch_with_request(request).await {
         Ok(response) => response,
         Err(error) => {
             console_log!("repair DO call failed job={}: {:?}", parsed.job_id, error);
-            return fault_response(&ApiFault::new(503, "repair_unavailable"));
+            return fault_response(&repair_unavailable_fault());
         }
     };
     let status = response.status_code();
-    match response.bytes().await {
-        Ok(bytes) if bytes.len() <= MAX_RESULT_BYTES => json_response(status, bytes),
-        _ => fault_response(&ApiFault::new(503, "repair_unavailable")),
+    match read_response_capped(&mut response, MAX_RESULT_BYTES).await {
+        Ok(bytes) => json_response(status, bytes),
+        Err(()) => fault_response(&ApiFault::new(503, "repair_unavailable")),
     }
 }
 
@@ -514,7 +544,7 @@ async fn container_json(
         init.with_body(Some(JsValue::from_str(&String::from_utf8_lossy(&body))));
     }
     let request = Request::new_with_init(&format!("http://container{path}"), &init)
-        .map_err(|_| ApiFault::new(502, "container_unavailable"))?;
+        .map_err(|_| container_unavailable_fault())?;
     // One cancellable deadline spans headers plus the body read, armed
     // before the fetch is issued so slow headers count against the same
     // budget as a stalled body (same shape as `stage_input` above and
@@ -549,38 +579,17 @@ async fn container_json(
         Some(Err(_)) | None => return Err(ApiFault::new(502, "container_unavailable")),
     };
     let status = response.status_code();
-    // Cap while streaming under the same deadline: an oversize
-    // Container-chosen body to /health, /repair or /cleanup must abort at
-    // MAX_RESULT_BYTES instead of being buffered whole before rejection
-    // (`Response::bytes` folds every chunk into one Vec). Non-stream
-    // bodies are already materialised by the platform: check the length
-    // before cloning; stream bodies are read chunk by chunk with the same
-    // 502 past the cap. Partial progress never re-arms the deadline, so
-    // headers plus body share one total budget; a read still incomplete
-    // at expiry fails the whole exchange as the existing 502
-    // container_unavailable, and every return below drops the timer.
-    match response.body() {
-        ResponseBody::Empty => return Ok((status, Vec::new())),
-        ResponseBody::Body(body) if body.len() > MAX_RESULT_BYTES => {
-            return Err(ApiFault::new(502, "container_unavailable"))
-        }
-        ResponseBody::Body(body) => return Ok((status, body.clone())),
-        ResponseBody::Stream(_) => {}
-    }
-    let mut stream = response
-        .stream()
-        .map_err(|_| ApiFault::new(502, "container_unavailable"))?;
-    let mut read = Box::pin(async move {
-        let mut bytes = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| ApiFault::new(502, "container_unavailable"))?;
-            bytes.extend_from_slice(&chunk);
-            if bytes.len() > MAX_RESULT_BYTES {
-                return Err(ApiFault::new(502, "container_unavailable"));
-            }
-        }
-        Ok(bytes)
-    });
+    // Cap while streaming under the same deadline: the Container-chosen
+    // reply to /health, /repair or /cleanup must abort at
+    // MAX_RESULT_BYTES instead of being buffered whole before rejection.
+    // `read_response_capped` streams via `push_chunk_capped`
+    // (check-before-extend, never retaining the excess) and handles the
+    // already-materialised cases check-before-clone; partial progress
+    // never re-arms the deadline, so headers plus body share one total
+    // budget. A read still incomplete at expiry fails the whole exchange
+    // as the existing 502 container_unavailable, and every return below
+    // drops the timer.
+    let mut read = Box::pin(read_response_capped(&mut response, MAX_RESULT_BYTES));
     let bytes = std::future::poll_fn(|cx| {
         use std::task::Poll;
         if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
