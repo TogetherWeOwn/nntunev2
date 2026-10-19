@@ -6,10 +6,17 @@
 // a production vars/secrets table is reviewed here first. Names only; values
 // are never read or printed.
 //
-// Usage: node ci/check-production-secrets-shape.mjs (exit 0 ok, 1 refuse).
+// Usage: node ci/check-production-secrets-shape.mjs [--root <repo-root>]
+// (exit 0 ok, 1 refuse). --root exists for the CLI-level suite, which
+// spawns the checker against temp trees; the deploy step passes no args
+// and the checker resolves its own repo root. Refuses when a
+// wrangler.json/jsonc shadows apps/web/wrangler.toml (wrangler prefers
+// JSON over TOML, searching parent directories), so an unreviewed JSON
+// production config can never slip past the TOML shape check.
 // Tested by ci/test-check-production-secrets-shape.mjs (node --test, no install).
-import { readFileSync } from "node:fs";
-import { pathToFileURL } from "node:url";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // Offline production secret-shape check (no credentials, no network).
 // The web Worker ships no bindings and needs no secrets: its committed
@@ -341,11 +348,56 @@ export function assertProductionSecretsShape(configText) {
   }
 }
 
+// Config names wrangler prefers over wrangler.toml, in wrangler's own
+// resolution order (wrangler.json, then wrangler.jsonc, then wrangler.toml,
+// searching parent directories from the invocation cwd).
+const SHADOW_CONFIG_NAMES = ["wrangler.json", "wrangler.jsonc"];
+
+// Mirror wrangler's upward config search (deploy-production.yml runs
+// wrangler without --config from apps/web): any JSON config in appDir or
+// an ancestor up to and including stopDir shadows the TOML shape check.
+// Returns the shadowing path, or null when the TOML is authoritative.
+// Paths only; file bodies are never read here.
+export function findShadowWranglerConfig(appDir, stopDir) {
+  let dir = resolve(appDir);
+  const stop = resolve(stopDir);
+  while (dir === stop || dir.startsWith(stop + sep)) {
+    for (const name of SHADOW_CONFIG_NAMES) {
+      const candidate = join(dir, name);
+      if (existsSync(candidate)) return candidate;
+    }
+    if (dir === stop) return null;
+    dir = dirname(dir);
+  }
+  return null;
+}
+
+function resolveCliRoot(argv) {
+  let root = null;
+  for (let i = 0; i < argv.length; i += 1) {
+    if (argv[i] === "--root" && i + 1 < argv.length) {
+      root = argv[i + 1];
+      i += 1;
+    } else {
+      throw new Error(
+        `unknown argument "${argv[i]}": usage: node ci/check-production-secrets-shape.mjs [--root <repo-root>]`,
+      );
+    }
+  }
+  return root === null ? fileURLToPath(new URL("..", import.meta.url)) : resolve(root);
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
-    assertProductionSecretsShape(
-      readFileSync(new URL("../apps/web/wrangler.toml", import.meta.url), "utf8"),
-    );
+    const repoRoot = resolveCliRoot(process.argv.slice(2));
+    const appDir = join(repoRoot, "apps", "web");
+    const shadow = findShadowWranglerConfig(appDir, repoRoot);
+    if (shadow) {
+      throw new Error(
+        `${shadow} shadows apps/web/wrangler.toml: wrangler prefers wrangler.json/jsonc over wrangler.toml, so review JSON production config support in ci/check-production-secrets-shape.mjs before promoting`,
+      );
+    }
+    assertProductionSecretsShape(readFileSync(join(appDir, "wrangler.toml"), "utf8"));
     console.log("Production Worker secret shape ok: no production vars or secret tables");
   } catch (error) {
     // Names only: never print values or file bodies on a failed check.

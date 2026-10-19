@@ -4,8 +4,45 @@
 // `production-secrets-shape` job, so removing any guard below goes red.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { assertProductionSecretsShape } from "./check-production-secrets-shape.mjs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  assertProductionSecretsShape,
+  findShadowWranglerConfig,
+} from "./check-production-secrets-shape.mjs";
+
+const checkerCli = fileURLToPath(new URL("./check-production-secrets-shape.mjs", import.meta.url));
+
+// Build a scratch repo-root tree ({ "apps/web/wrangler.toml": ... }) for
+// CLI-level tests, removed afterwards. No network, no credentials.
+function withTempRoot(files, fn) {
+  const root = mkdtempSync(
+    join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), "secrets-shape-cli-"),
+  );
+  try {
+    for (const [rel, content] of Object.entries(files)) {
+      const full = join(root, rel);
+      mkdirSync(dirname(full), { recursive: true });
+      writeFileSync(full, content);
+    }
+    return fn(root);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function runChecker(root) {
+  const result = spawnSync(process.execPath, [checkerCli, "--root", root], { encoding: "utf8" });
+  assert.equal(result.error, undefined);
+  assert.equal(result.signal, null);
+  return result;
+}
+
+const CLEAN_TOML = '[env.production]\nname = "nntune-web"\n';
+const BAD_TOML = '[env.production.vars]\nFOO = "x"\n';
 
 describe("assertProductionSecretsShape", () => {
   it("accepts the committed config: [env.production] with only a name", () => {
@@ -82,5 +119,78 @@ describe("assertProductionSecretsShape", () => {
     for (const [spelling, config] of Object.entries(bypasses)) {
       assert.throws(() => assertProductionSecretsShape(config), /review production secret requirements/, spelling);
     }
+  });
+
+  it("refuses empty production subtables (header alone, no keys)", () => {
+    // Keyless on purpose: with no assignment anywhere, only the
+    // header-refusal branch can refuse, so deleting it goes red here.
+    const bypasses = {
+      emptyVarsHeader: "[env.production.vars]\n",
+      emptyVarsThenKeylessHeader: "[env.production.vars]\n[other]\n",
+      emptyD1ArrayHeader: "[[env.production.d1_databases]]\n",
+      emptyQuotedHeader: '["env"."production"."vars"]\n',
+    };
+    for (const [spelling, config] of Object.entries(bypasses)) {
+      assert.throws(() => assertProductionSecretsShape(config), /review production secret requirements/, spelling);
+    }
+    // A keyless non-production header stays accepted.
+    assertProductionSecretsShape("[env.staging.vars]\n[other]\n");
+  });
+
+  it("CLI exits 1 on a temp tree whose toml declares production vars", () => {
+    // Pins the entrypoint's refusal exit code: deleting
+    // `process.exitCode = 1` prints ::error:: but exits 0, going red here.
+    withTempRoot({ "apps/web/wrangler.toml": BAD_TOML }, (root) => {
+      const result = runChecker(root);
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /::error::.*review production secret requirements/);
+    });
+  });
+
+  it("CLI exits 0 on a clean temp tree", () => {
+    withTempRoot({ "apps/web/wrangler.toml": CLEAN_TOML }, (root) => {
+      const result = runChecker(root);
+      assert.equal(result.status, 0);
+      assert.match(result.stdout, /secret shape ok/);
+    });
+  });
+
+  it("CLI exits 1 when wrangler.json/jsonc shadows the toml", () => {
+    const shadowToml = { "apps/web/wrangler.toml": CLEAN_TOML };
+    const shadows = {
+      appJsonc: "apps/web/wrangler.jsonc",
+      appJson: "apps/web/wrangler.json",
+      midLevelJson: "apps/wrangler.json",
+      repoRootJson: "wrangler.json",
+    };
+    for (const [where, rel] of Object.entries(shadows)) {
+      withTempRoot(
+        { ...shadowToml, [rel]: '{"env":{"production":{"vars":{"FOO":"x"}}}}\n' },
+        (root) => {
+          const result = runChecker(root);
+          assert.equal(result.status, 1, where);
+          assert.match(result.stderr, /shadows apps\/web\/wrangler\.toml/, where);
+        },
+      );
+    }
+    // A JSON config that is NOT on wrangler's upward search path from
+    // apps/web must not refuse.
+    withTempRoot(
+      { ...shadowToml, "docs/wrangler.json": "{}\n" },
+      (root) => {
+        assert.equal(runChecker(root).status, 0);
+      },
+    );
+  });
+
+  it("shadow search stops at the repo root", () => {
+    withTempRoot({ "apps/web/wrangler.toml": CLEAN_TOML }, (root) => {
+      const appDir = join(root, "apps", "web");
+      assert.equal(findShadowWranglerConfig(appDir, root), null);
+      writeFileSync(join(root, "wrangler.jsonc"), "{}\n");
+      assert.equal(findShadowWranglerConfig(appDir, root), join(root, "wrangler.jsonc"));
+      // Above the root is out of scope even if a shadow sits there.
+      assert.equal(findShadowWranglerConfig(appDir, appDir), null);
+    });
   });
 });

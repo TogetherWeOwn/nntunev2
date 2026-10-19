@@ -595,8 +595,11 @@ jobs:
   # gate): the checker stays dependency-free, so node --test runs it with
   # no install. The suite pins every refusal spelling (quoted/spaced
   # headers, dotted keys, inline tables, unicode/hex escapes, triple-quote
-  # closers) plus acceptance of the committed config, so removing a guard
-  # goes red. Keep this job id in ci-ok's needs.
+  # closers, empty headers), the CLI refusal exit code, and the
+  # wrangler.json/jsonc shadow refusal, plus acceptance of the committed
+  # config, so removing a guard goes red. The run step below executes the
+  # checker itself, so a broken entrypoint goes red too. Keep this job id
+  # in ci-ok's needs.
   production-secrets-shape:
     name: production-secrets-shape
     runs-on: ubuntu-latest
@@ -610,6 +613,8 @@ jobs:
           node-version: 24
       - name: Unit-test the production secret-shape guard
         run: node --test ci/test-check-production-secrets-shape.mjs
+      - name: Run the production secret-shape gate on the committed config
+        run: node ci/check-production-secrets-shape.mjs
       - name: Production secret-shape scripts parse clean
         run: |
           node --check ci/check-production-secrets-shape.mjs

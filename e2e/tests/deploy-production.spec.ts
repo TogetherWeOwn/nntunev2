@@ -576,6 +576,27 @@ test.describe('production secret-shape gate (workflow wiring pin)', () => {
     expect(uploadAt).toBeGreaterThan(-1);
     expect(stepAt).toBeGreaterThan(dryRunAt);
     expect(stepAt).toBeLessThan(uploadAt);
+    // A position check alone cannot prove the step blocks the job (`|| true`,
+    // continue-on-error, if: false, or the command demoted to a comment all
+    // keep it green), so extract the exact step block and require the run
+    // line to be exactly the checker with no neutralizer.
+    const stepBlock = productionWorkflow.match(
+      /      - name: Require production Worker secret shape before upload\n((?:(?!      - ).*\n)+)/,
+    )?.[1];
+    expect(stepBlock, 'secret-shape step block missing').toBeDefined();
+    const runLine = stepBlock!.match(/^\s*run:\s*(.+?)\s*$/m)?.[1];
+    expect(runLine).toBe('node ci/check-production-secrets-shape.mjs');
+    const codeLines = stepBlock!.split('\n').filter(
+      (line) => !/^\s*#/.test(line),
+    );
+    expect(
+      codeLines.some((line) => /^\s*continue-on-error\s*:/.test(line)),
+      'secret-shape step must not set continue-on-error',
+    ).toBe(false);
+    expect(
+      codeLines.some((line) => /^\s*if\s*:/.test(line)),
+      'secret-shape step must not set if:',
+    ).toBe(false);
   });
 });
 
