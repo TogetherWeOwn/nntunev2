@@ -29,10 +29,9 @@ production secret-shape gate pin (`e2e/tests/deploy-production.spec.ts`,
 `npm --prefix e2e run e2e:list` lists 434 tests in 28 files (433 in 28
 as previously verified, plus the 1-test secret-shape gate pin in the
 deploy-production spec, now 25 tests), and
-`(cd apps/web && pnpm exec playwright test --list)` lists 146 tests in
-31 files (139 in 29 as previously verified, plus the 5-test
-library-player-queue spec and the 2-test library-player-queue-pins
-spec from #590); both re-verified at the current main. Line numbers
+`(cd apps/web && pnpm exec playwright test --list)` lists 151 tests in
+32 files (146 in 31 as previously verified, plus the 5-test
+signup-start-over spec); both re-verified at the current main. Line numbers
 below are from that head; re-verify with the commands at the end of this
 document whenever a spec is added, renamed, or retitled, and update this
 matrix in the same PR. CI enforces the file and title citations on
@@ -372,6 +371,11 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   - `apps/web/tests/signup-paywall.spec.ts` — pins the signup start limit
     showing the paywall without a duplicate inline alert, and the finish
     limit preserving the code and challenge for retry.
+  - `apps/web/tests/signup-start-over.spec.ts` — pins Start over being
+    offered in the code-sent, dismissed, and code-error states (never
+    while finishing), the reset alone sending no request and clearing
+    both typed codes, and the next start finishing with the fresh
+    challenge instead of the discarded one.
   - `apps/web/tests/paywall-elapsed-time.spec.ts` — pins the paywall
     retry countdown measuring elapsed wall-clock time from a per-model
     deadline, with unknown and zero waits never auto-retrying and a

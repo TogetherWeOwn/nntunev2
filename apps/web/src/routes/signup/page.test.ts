@@ -3,16 +3,17 @@ import { render } from 'svelte/server';
 import SignupPage from './+page.svelte';
 
 /**
- * Pins the signup wrong/expired-code rendering: the `code-error` alert
- * plus the Start over button, and the Start over return to a fresh-code
- * state. Invite-field behavior on retry is recorded as implemented (no
- * redesign).
+ * Pins the signup wrong/expired-code rendering: the `code-error` alert,
+ * the Start over availability across the code states, and the Start over
+ * return to a fresh-code state. Invite-field behavior on retry is
+ * recorded as implemented (no redesign).
  *
  * SSR `render` only produces the initial (`idle`) state — the code-error
  * alert appears after a client-side finish failure — so the interactive
  * states are pinned against the route source (same raw-glob approach as
  * `src/routes/error.test.ts`; no `node:` imports, so `svelte-check` stays
- * green).
+ * green). Behavioral twins live in
+ * `apps/web/tests/signup-start-over.spec.ts`.
  */
 const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw',
@@ -42,16 +43,15 @@ describe('signup page initial state', () => {
 });
 
 describe('signup code-error and start-over rendering', () => {
-	it('renders the code-error alert plus the Start over button on a wrong/expired code', () => {
+	it('renders the code-error alert on a wrong/expired code', () => {
 		const source = readSignupPage();
 
 		// The generic finish catch lands on `code-error` (account creation
 		// never says which step failed).
 		expect(source).toMatch(/status\s*=\s*'code-error'/);
-		// Scope the alert, copy, and button to the captured code-error
-		// branch so a role change (alert -> status, matching the later
-		// signup-error alert) or moving the button out of the branch turns
-		// the spec red.
+		// Scope the alert and copy to the captured code-error branch so a
+		// role change (alert -> status, matching the later signup-error
+		// alert) or moving the copy out of the branch turns the spec red.
 		const codeErrorBlock = source.match(
 			/\{#if status === 'code-error'\}([\s\S]*?)\{\/if\}/
 		)?.[1];
@@ -61,10 +61,6 @@ describe('signup code-error and start-over rendering', () => {
 		expect(block).toMatch(/role="alert"/);
 		expect(block).toMatch(/That didn't work/);
 		expect(block).toMatch(/start over to get a fresh code/i);
-		// ... plus a Start over button wired to the reset, inside the branch.
-		expect(block).toMatch(
-			/<button[^>]*onclick=\{startOver\}[^>]*>[\s\S]*?Start over[\s\S]*?<\/button>/
-		);
 		// The outer code step still renders on code-error and gates the
 		// retry form: both statuses must appear inside the SAME {#if ...}
 		// tag (no `}` allowed between), so dropping code-error from the
@@ -73,6 +69,37 @@ describe('signup code-error and start-over rendering', () => {
 		expect(source).toMatch(
 			/\{#if status === 'code-sent'[^}]*\|\| status === 'code-error'[^}]*\}[\s\S]*?<form onsubmit=\{finishAccount\}[\s\S]*?name="magic_code"/
 		);
+	});
+
+	it('offers Start over in code-sent, dismissed and code-error — never while finishing or after creation', () => {
+		const source = readSignupPage();
+
+		const buttonAt = source.indexOf('onclick={startOver}');
+		expect(buttonAt, 'expected a Start over control wired to startOver()').toBeGreaterThan(0);
+		// A mistyped-email user tabs to it: the control is a native button
+		// (keyboard-activatable by default), never a submit.
+		const buttonOpen = source.slice(0, buttonAt).match(/<button[^>]*$/)?.[0];
+		expect(buttonOpen, 'expected the Start over control to be a native <button>').toBeDefined();
+		expect(buttonOpen!).toContain('type="button"');
+		expect(source.slice(buttonAt, buttonAt + 200)).toMatch(
+			/>[\s\S]*?Start over[\s\S]*?<\/button>/
+		);
+		// The innermost {#if} gating the button (no {/if} may close between
+		// its open tag and the button) covers exactly the retryable code
+		// states: confining the button to code-error again, or leaking it
+		// into finishing/created, turns the spec red.
+		const gateOpen = source.lastIndexOf('{#if', buttonAt);
+		expect(gateOpen, 'expected the Start over button to sit inside an {#if}').toBeGreaterThan(
+			0
+		);
+		expect(source.slice(gateOpen, buttonAt)).not.toContain('{/if}');
+		const gate = source.slice(gateOpen).match(/\{#if ([^}]*)\}/)?.[1];
+		expect(gate, 'expected the gating {#if} condition').toBeDefined();
+		expect(gate!).toMatch(/status === 'code-sent'/);
+		expect(gate!).toMatch(/status === 'dismissed'/);
+		expect(gate!).toMatch(/status === 'code-error'/);
+		expect(gate!).not.toMatch(/status === 'finishing'/);
+		expect(gate!).not.toMatch(/status === 'created'/);
 	});
 
 	it('Start over returns to a fresh-code state', () => {
