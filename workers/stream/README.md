@@ -270,6 +270,7 @@ ingest consumer ── NNTP_POOL stub (id_from_name(user_id)) ── POST /probe
 |---|---|---|---|
 | 200 | | outcome | check partition, fold into the tally |
 | 400 / 413 | `bad_request` / `too_large` | envelope refused | contract bug, no retry |
+| 401 / 403 | | pool refused this caller (ingest-side fail-closed; the wire never emits these today) | `Rejected` on `/probe` and `/body`, no redelivery, `Retry-After` ignored |
 | 503 | `busy` | ingest lane full or pool quarantined; `Retry-After` set | redeliver |
 | 503 | `provider_unavailable` | provider settings not loaded | redeliver |
 | 502 | `provider_error` | connection, auth or protocol failure; pool quarantined | redeliver |
