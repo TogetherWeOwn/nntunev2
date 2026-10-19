@@ -392,12 +392,24 @@ impl IndexerConfig {
         if !parsed.username().is_empty() || parsed.password().is_some() {
             return Err(VaultError::Invalid);
         }
-        if let Some(scheme_end) = self.url.find("://") {
-            let after = &self.url[scheme_end + 3..];
-            let authority = after.split(['/', '?', '#']).next().unwrap_or_default();
-            if authority.contains('@') {
-                return Err(VaultError::Invalid);
-            }
+        // The url crate strips ASCII tab/newline and treats backslashes as
+        // slashes for https, so obfuscated shapes (`https:` + newline +
+        // `//@host`, `https:\\@host`, single-slash `https:/@host`) parse
+        // with empty userinfo while carrying a raw `@`. The fetch-time
+        // guards reject whitespace and require a literal `https://`
+        // prefix, so mirror them: refuse raw whitespace/backslash and
+        // fail closed when `://` is absent, otherwise the config saves
+        // here and is rejected on every fetch.
+        if self.url.chars().any(|c| c.is_whitespace() || c == '\\') {
+            return Err(VaultError::Invalid);
+        }
+        let Some(scheme_end) = self.url.find("://") else {
+            return Err(VaultError::Invalid);
+        };
+        let after = &self.url[scheme_end + 3..];
+        let authority = after.split(['/', '?', '#']).next().unwrap_or_default();
+        if authority.contains('@') {
+            return Err(VaultError::Invalid);
         }
         // Only the HTTPS default may be addressed: an explicit non-443
         // port is an alternate-service probe. `port()` yields `None` for
