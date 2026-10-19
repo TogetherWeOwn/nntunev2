@@ -10,6 +10,8 @@
 
 use worker::{wasm_bindgen::JsValue, Env, Headers, Method, Request, RequestInit};
 
+use futures_util::StreamExt;
+
 use nntune_core::par2::scratch::scratch_prefix;
 
 use crate::jobs::MAX_REPAIR_ROUNDS;
@@ -27,6 +29,41 @@ pub const REPAIR_URL: &str = "https://repair-worker/repair";
 /// in `out/result.json`), so anything larger is not a repair reply
 /// we can trust.
 const MAX_REPAIR_REPLY_BYTES: usize = 64 << 10;
+
+/// Fold one more reply chunk into the buffer, enforcing `cap` on the running
+/// total. Pure so the streaming policy is unit-tested without a service
+/// binding: the chunk that would cross the cap is refused and the capped
+/// prefix stays intact, never a truncated body handed to the classifier
+/// afterwards.
+fn push_repair_chunk(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
+    if buf.len().saturating_add(chunk.len()) > cap {
+        return false;
+    }
+    buf.extend_from_slice(chunk);
+    true
+}
+
+/// Drain a reply chunk stream within `cap`. A chunk-level transport error
+/// fails closed to `Retry`, and the chunk that would cross the ceiling fails
+/// closed to `Retry` from its length: the remainder is never retained and no
+/// truncated prefix escapes for classification.
+async fn drain_repair_stream<S, C, E>(mut stream: S, cap: usize) -> Result<Vec<u8>, RepairCall>
+where
+    S: futures_util::Stream<Item = Result<C, E>> + Unpin,
+    C: AsRef<[u8]>,
+{
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => return Err(RepairCall::Retry),
+        };
+        if !push_repair_chunk(&mut buf, chunk.as_ref(), cap) {
+            return Err(RepairCall::Retry);
+        }
+    }
+    Ok(buf)
+}
 
 /// Decide the `Verifying` handoff: `Ok(Some(_))` dispatches to the repair
 /// Worker, `Ok(None)` skips repair, `Err` means unrepairable (fail the job).
@@ -102,6 +139,11 @@ pub fn classify_repair_reply(status: u16, body: &[u8]) -> RepairCall {
 
 /// Dispatch one repair request through the service binding. Transport
 /// or binding failures are `Retry`, never a guessed terminal outcome.
+///
+/// The reply body streams within `MAX_REPAIR_REPLY_BYTES`: the chunk that
+/// would cross the ceiling returns `Retry` from the length. The remainder
+/// is never retained and no truncated prefix reaches
+/// `classify_repair_reply`.
 pub async fn call_repair(env: &Env, req: &RepairRequest) -> RepairCall {
     let Ok(body) = serde_json::to_string(req) else {
         return RepairCall::Retry;
@@ -125,23 +167,23 @@ pub async fn call_repair(env: &Env, req: &RepairRequest) -> RepairCall {
         Ok(request) => request,
         Err(_) => return RepairCall::Retry,
     };
-    // With the `http` feature the fetcher answers `http::Response`;
-    // convert back to the classic response for a bounded body read.
-    let mut response = match fetcher.fetch_request(request).await {
-        Ok(response) => match worker::Response::try_from(response) {
-            Ok(response) => response,
-            Err(_) => return RepairCall::Retry,
-        },
+    // With the `http` feature the fetcher answers `http::Response`; drain
+    // its body stream within the ceiling so an oversized reply fails closed
+    // from its length instead of buffering the whole body first.
+    let response = match fetcher.fetch_request(request).await {
+        Ok(response) => response,
         Err(error) => {
             worker::console_log!("repair call failed job={}: {:?}", req.job_id, error);
             return RepairCall::Retry;
         }
     };
-    let status = response.status_code();
-    match response.bytes().await {
-        Ok(bytes) => classify_repair_reply(status, &bytes),
-        Err(_) => RepairCall::Retry,
-    }
+    let status = response.status().as_u16();
+    let stream = response.into_body();
+    let buf = match drain_repair_stream(stream, MAX_REPAIR_REPLY_BYTES).await {
+        Ok(buf) => buf,
+        Err(retry) => return retry,
+    };
+    classify_repair_reply(status, &buf)
 }
 
 #[cfg(test)]
@@ -235,6 +277,125 @@ mod tests {
                 br#"{"status":"unrepairable","exit_code":6,"file_count":0}"#
             ),
             RepairCall::Unrepairable
+        );
+    }
+
+    fn repaired_body_of_len(total_len: usize) -> Vec<u8> {
+        const PREFIX: &[u8] = br#"{"status":"repaired","pad":""#;
+        const SUFFIX: &[u8] = br#""}"#;
+        assert!(
+            total_len >= PREFIX.len() + SUFFIX.len(),
+            "body must fit the repaired envelope"
+        );
+        let mut body = Vec::with_capacity(total_len);
+        body.extend_from_slice(PREFIX);
+        body.extend_from_slice(&vec![b'x'; total_len - PREFIX.len() - SUFFIX.len()]);
+        body.extend_from_slice(SUFFIX);
+        body
+    }
+
+    #[test]
+    fn repair_chunk_fold_keeps_capped_prefix() {
+        // No stream involved: chunks summing past the cap must fail while
+        // only the capped prefix is buffered, never after a full read.
+        let mut buf = Vec::new();
+        assert!(push_repair_chunk(
+            &mut buf,
+            b"hello",
+            MAX_REPAIR_REPLY_BYTES
+        ));
+        assert!(push_repair_chunk(
+            &mut buf,
+            b" world!",
+            MAX_REPAIR_REPLY_BYTES
+        ));
+        assert_eq!(buf, b"hello world!");
+        assert!(!push_repair_chunk(
+            &mut buf,
+            &vec![b'x'; MAX_REPAIR_REPLY_BYTES],
+            MAX_REPAIR_REPLY_BYTES
+        ));
+        // The failed push leaves the capped prefix intact.
+        assert_eq!(buf, b"hello world!");
+        // An exact fit is accepted; one byte more is not.
+        let mut exact = Vec::new();
+        assert!(push_repair_chunk(
+            &mut exact,
+            &vec![0u8; MAX_REPAIR_REPLY_BYTES],
+            MAX_REPAIR_REPLY_BYTES
+        ));
+        assert_eq!(exact.len(), MAX_REPAIR_REPLY_BYTES);
+        assert!(!push_repair_chunk(
+            &mut exact,
+            &[0u8; 1],
+            MAX_REPAIR_REPLY_BYTES
+        ));
+        assert_eq!(exact.len(), MAX_REPAIR_REPLY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn repair_stream_pins_exact_ceiling_across_chunks() {
+        use futures_util::stream::{self};
+        let body = repaired_body_of_len(MAX_REPAIR_REPLY_BYTES);
+        assert_eq!(body.len(), 65_536);
+        // Split across chunks so the boundary is exercised by the drain,
+        // not by a single whole-body buffer.
+        let mid = body.len() / 2;
+        let chunks = vec![
+            Ok::<Vec<u8>, ()>(body[..mid].to_vec()),
+            Ok(body[mid..].to_vec()),
+        ];
+        let drained = drain_repair_stream(stream::iter(chunks), MAX_REPAIR_REPLY_BYTES)
+            .await
+            .expect("exact ceiling across chunks must drain");
+        assert_eq!(drained.len(), MAX_REPAIR_REPLY_BYTES);
+        assert_eq!(
+            classify_repair_reply(200, &drained),
+            RepairCall::Repaired,
+            "a well-formed repaired reply at exactly 65,536 bytes must stay Repaired"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_stream_rejects_ceiling_plus_one_from_length() {
+        use futures_util::stream::{self};
+        let body = repaired_body_of_len(MAX_REPAIR_REPLY_BYTES + 1);
+        assert_eq!(body.len(), 65_537);
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("body must stay well-formed JSON");
+        assert_eq!(
+            value.get("status").and_then(|s| s.as_str()),
+            Some("repaired"),
+            "body must keep status=repaired so only the byte ceiling flips the verdict"
+        );
+        let mid = body.len() / 2;
+        let chunks = vec![
+            Ok::<Vec<u8>, ()>(body[..mid].to_vec()),
+            Ok(body[mid..].to_vec()),
+        ];
+        // The drain itself must refuse the 65,537th byte: asserting only the
+        // classifier afterwards would stay green even if the loop cap were
+        // raised, because the classifier also rejects over-ceiling bodies.
+        assert_eq!(
+            drain_repair_stream(stream::iter(chunks), MAX_REPAIR_REPLY_BYTES).await,
+            Err(RepairCall::Retry),
+            "the 65,537th byte must fail closed from its length without retaining it"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_stream_chunk_error_fails_closed() {
+        use futures_util::stream::{self};
+        let chunks = vec![
+            Ok::<Vec<u8>, ()>(br#"{"status":"repaired"}"#.to_vec()),
+            Err(()),
+        ];
+        // A stream that yields a complete chunk and then errors must not fall
+        // through to classify the partial body as Repaired.
+        assert_eq!(
+            drain_repair_stream(stream::iter(chunks), MAX_REPAIR_REPLY_BYTES).await,
+            Err(RepairCall::Retry),
+            "a chunk error after a complete prefix must fail closed to Retry"
         );
     }
 
