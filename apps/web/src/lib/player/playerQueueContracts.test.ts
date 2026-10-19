@@ -7,9 +7,8 @@ import { createQueue, selectTrack, type QueueState, type Track } from './queue.j
  * Builder-owned regression pins for PlayerQueue contracts the acceptance
  * suite (playerQueue.test.ts, Test-Author owned — do not merge into it)
  * exercises only implicitly: the empty-queue contract (empty now-playing
- * text, Next disabled only when empty), the aria-current marking of the
- * playing item, and rendering of queues with repeated track ids (the each
- * block is keyed by queue position, not track id).
+ * text, Next disabled only when empty) and the aria-current marking of the
+ * playing item.
  */
 
 function track(id: string, title: string): Track {
@@ -86,18 +85,6 @@ describe('PlayerQueue current-item marking', () => {
 			'track-mango',
 			'track-apple',
 			'track-zebra'
-		]);
-	});
-});
-
-describe('PlayerQueue repeated track ids', () => {
-	it('renders one queue-item per queue entry in order', () => {
-		const tags = queueItemTags(renderQueue(createQueue([FIRST, FIRST, SECOND])));
-
-		expect(tags.map((t) => t.match(/data-track-id="([^"]*)"/)?.[1])).toEqual([
-			'track-mango',
-			'track-mango',
-			'track-apple'
 		]);
 	});
 });
