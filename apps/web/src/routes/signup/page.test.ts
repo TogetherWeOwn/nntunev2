@@ -48,17 +48,30 @@ describe('signup code-error and start-over rendering', () => {
 		// The generic finish catch lands on `code-error` (account creation
 		// never says which step failed).
 		expect(source).toMatch(/status\s*=\s*'code-error'/);
+		// Scope the alert, copy, and button to the captured code-error
+		// branch so a role change (alert -> status, matching the later
+		// signup-error alert) or moving the button out of the branch turns
+		// the spec red.
+		const codeErrorBlock = source.match(
+			/\{#if status === 'code-error'\}([\s\S]*?)\{\/if\}/
+		)?.[1];
+		expect(codeErrorBlock, "expected a {#if status === 'code-error'} block").toBeDefined();
+		const block = codeErrorBlock!;
 		// The code-error branch renders an alert with the exact current copy.
-		expect(source).toMatch(/\{#if status === 'code-error'\}[\s\S]*?role="alert"/);
-		expect(source).toMatch(/That didn't work/);
-		expect(source).toMatch(/start over to get a fresh code/i);
-		// ... plus a Start over button wired to the reset.
-		expect(source).toMatch(
+		expect(block).toMatch(/role="alert"/);
+		expect(block).toMatch(/That didn't work/);
+		expect(block).toMatch(/start over to get a fresh code/i);
+		// ... plus a Start over button wired to the reset, inside the branch.
+		expect(block).toMatch(
 			/<button[^>]*onclick=\{startOver\}[^>]*>[\s\S]*?Start over[\s\S]*?<\/button>/
 		);
-		// The alert and button live on the code step, next to the retry form.
+		// The outer code step still renders on code-error and gates the
+		// retry form: both statuses must appear inside the SAME {#if ...}
+		// tag (no `}` allowed between), so dropping code-error from the
+		// outer condition turns the spec red instead of matching the inner
+		// alert condition.
 		expect(source).toMatch(
-			/\{#if status === 'code-sent'[\s\S]*?status === 'code-error'[\s\S]*?\}[\s\S]*?name="magic_code"/
+			/\{#if status === 'code-sent'[^}]*\|\| status === 'code-error'[^}]*\}[\s\S]*?<form onsubmit=\{finishAccount\}[\s\S]*?name="magic_code"/
 		);
 	});
 
