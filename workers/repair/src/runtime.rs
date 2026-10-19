@@ -68,6 +68,23 @@ async fn read_capped(req: &mut Request, cap: usize) -> Result<Vec<u8>, ApiFault>
     Ok(body)
 }
 
+/// Read a response body with a hard cap (streamed, never unbounded).
+/// Mirrors `read_capped`: the chunk that would cross the cap aborts the
+/// read, so at most `cap` bytes are ever materialised and the excess is
+/// never retained. Callers map the unit error to their own fault.
+async fn read_response_capped(response: &mut Response, cap: usize) -> Result<Vec<u8>, ()> {
+    let mut stream = response.stream().map_err(|_| ())?;
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| ())?;
+        if body.len() + chunk.len() > cap {
+            return Err(());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// The Worker's only route. Reachable in production solely through the
 /// ingest `REPAIR_CONTAINER` service binding.
 #[event(fetch)]
@@ -111,9 +128,9 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
         }
     };
     let status = response.status_code();
-    match response.bytes().await {
-        Ok(bytes) if bytes.len() <= MAX_RESULT_BYTES => json_response(status, bytes),
-        _ => fault_response(&ApiFault::new(503, "repair_unavailable")),
+    match read_response_capped(&mut response, MAX_RESULT_BYTES).await {
+        Ok(bytes) => json_response(status, bytes),
+        Err(()) => fault_response(&ApiFault::new(503, "repair_unavailable")),
     }
 }
 
@@ -423,13 +440,9 @@ async fn container_json(
         .await
         .map_err(|_| ApiFault::new(502, "container_unavailable"))?;
     let status = response.status_code();
-    let bytes = response
-        .bytes()
+    let bytes = read_response_capped(&mut response, MAX_RESULT_BYTES)
         .await
         .map_err(|_| ApiFault::new(502, "container_unavailable"))?;
-    if bytes.len() > MAX_RESULT_BYTES {
-        return Err(ApiFault::new(502, "container_unavailable"));
-    }
     Ok((status, bytes))
 }
 
