@@ -235,6 +235,8 @@ jobs:
               pool.mkdir()
               policy = json.loads(Path('scripts/cargo_pool_policy.json').read_text())
               policy.pop('_note', None)
+              policy['quota_receipt'] = 'ci synthetic receipt'
+              policy['scratch_coverage_receipt'] = 'ci synthetic receipt'
               (pool / 'policy.json').write_text(json.dumps(policy))
               for n in range(policy['slots']):
                   slot = pool / f'slot-{n}'

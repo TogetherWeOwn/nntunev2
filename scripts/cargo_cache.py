@@ -1,4 +1,4 @@
- #!/usr/bin/env python3
+#!/usr/bin/env python3
 """NNTune v2 Cargo admission, read-only retention audit, and filesystem alarm.
 
 No deletion, mounting, credential access, or service control. Linux + stdlib only.
@@ -20,6 +20,10 @@ import time
 GIB = 1024 ** 3
 DEFAULT_POOL = Path('/paperclip/.cache/nntunev2-bounded')
 TERMINAL = {'done', 'cancelled'}
+# Shipped placeholder prefix in scripts/cargo_pool_policy.json. load_policy
+# refuses it: a verbatim copy without Operator quota evidence must never
+# admit builds claiming the attested hard limit.
+PLACEHOLDER_RECEIPT = 'OPERATOR FILLS AT PROVISIONING'
 
 
 class Refusal(Exception):
@@ -34,8 +38,17 @@ def real_directory(path):
     return path
 
 
-def usage(path):
-    """Allocated blocks, not logical lengths (sparse files do not fake usage)."""
+def usage(path, *, allow_symlinks=False):
+    """Allocated blocks, not logical lengths (sparse files do not fake usage).
+
+    Strict by default: any symlink refuses, so admission and retention scans
+    fail closed. In-run sampling passes allow_symlinks=True: this repo's
+    repair tests create fixture symlinks under slot scratch (via
+    PAPERCLIP_RUN_SCRATCH_DIR), and killing the whole Cargo group on a
+    1s-poll overlap would make `run -- test` flaky. Allowed symlinks are
+    counted by their own lstat blocks (walk uses followlinks=False, never
+    followed); the next strict admission scan still flags leftovers.
+    """
     path = real_directory(path)
     total = 0
     seen = set()
@@ -49,7 +62,7 @@ def usage(path):
                 info = item.lstat()
             except FileNotFoundError:
                 continue  # Cargo renamed/removed a temporary output during sampling.
-            if stat.S_ISLNK(info.st_mode):
+            if stat.S_ISLNK(info.st_mode) and not allow_symlinks:
                 raise Refusal(f'symlink in cache: {item}')
             key = (info.st_dev, info.st_ino)
             if key not in seen:
@@ -79,6 +92,9 @@ def load_policy(pool):
     if (not isinstance(policy.get('scratch_coverage_receipt'), str)
             or not policy['scratch_coverage_receipt'].strip()):
         raise Refusal('Operator scratch coverage receipt required; container /tmp is not covered by target audit')
+    for field in ('quota_receipt', 'scratch_coverage_receipt'):
+        if policy[field].strip().startswith(PLACEHOLDER_RECEIPT):
+            raise Refusal(f'{field} is still the shipped placeholder')
     expected = {'policy.json'} | {f'slot-{n}' for n in range(policy['slots'])}
     if {p.name for p in pool.iterdir()} != expected:
         raise Refusal('pool contents do not match immutable policy')
@@ -99,6 +115,13 @@ def acquire(pool, policy):
             os.close(fd)
             continue
         try:
+            try:
+                measured = usage(slot)
+            except Refusal as error:
+                print(json.dumps({'finding': 'slot_unmeasurable', 'slot': slot.name,
+                                  'reason': str(error)}, sort_keys=True), file=sys.stderr)
+                os.close(fd)
+                continue  # Operator must inspect this slot; others stay usable.
             if (slot / 'lease.json').exists():
                 # The slot flock is the liveness proof: it is passed to Cargo
                 # through pass_fds, so holding it means no wrapper, Cargo, or
@@ -111,7 +134,7 @@ def acquire(pool, policy):
                     lease = None
                 pgid = lease.get('cargo_pgid') if isinstance(lease, dict) else None
                 if (isinstance(pgid, int) and not isinstance(pgid, bool) and pgid > 0
-                        and usage(slot) < policy['slot_budget_bytes']
+                        and measured < policy['slot_budget_bytes']
                         and not group_alive(pgid)):
                     print(json.dumps({'finding': 'stale_lease_recovered',
                                       'slot': slot.name, **lease}, sort_keys=True),
@@ -120,7 +143,7 @@ def acquire(pool, policy):
                     return slot, target, fd
                 os.close(fd)
                 continue  # Interrupted/oversized/live run: Operator must inspect it.
-            if usage(slot) >= policy['slot_budget_bytes']:
+            if measured >= policy['slot_budget_bytes']:
                 os.close(fd)
                 continue  # Oversized retained output: Operator must inspect it.
             return slot, target, fd
@@ -273,7 +296,9 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
         if pending_signal is not None:
             raise Refusal(f'build interrupted by signal {pending_signal}; lease retained')
         while True:
-            if usage(slot) >= policy['slot_budget_bytes']:
+            # Tolerant: child test fixtures may hold scratch symlinks
+            # mid-run (see usage()); admission/retention stay strict.
+            if usage(slot, allow_symlinks=True) >= policy['slot_budget_bytes']:
                 raise Refusal('slot reached sampled byte budget; lease retained')
             if available(pool) < policy['min_available_bytes']:
                 raise Refusal('filesystem available-byte floor reached; lease retained')
@@ -512,13 +537,37 @@ PROTECTED_DIR_NAMES = frozenset(
      'incident', 'incidents', 'receipt', 'receipts'})
 
 
+def _is_cargo_triple_dir(target, name):
+    """True when target/<name>/ is a Cargo target-triple tree.
+
+    `cargo check --target wasm32-unknown-unknown` creates
+    target/wasm32-unknown-unknown/debug/...: the triple directory itself is
+    Cargo output, not foreign material. Admit a non-protected directory
+    whose name is triple-like (contains a dash) and whose immediate
+    children are all Cargo profile entries. Anything else stays a veto;
+    nested protected-name checks below still apply inside admitted trees.
+    """
+    if '-' not in name or name.lower() in PROTECTED_DIR_NAMES:
+        return False
+    full = Path(target) / name
+    try:
+        if full.is_symlink() or not full.is_dir():
+            return False
+        children = os.listdir(full)
+    except OSError:
+        raise Refusal(f'incomplete target scan: {name}')
+    return all(child in CARGO_TARGET_TOP_LEVEL for child in children)
+
+
 def preservation_veto(target):
     """Reason a target's contents veto retention, or None when build-output-only.
 
     Calibrated against real Cargo output: a genuine target holds only
-    debug/release/doc/package/tmp trees at top level. Nested build-script
-    codegen (debug/build/*/out/*.rs) is expected; .rs anywhere else is not
-    Cargo output. Unknown foreign top-level entries fail closed to a veto.
+    debug/release/doc/package/tmp trees at top level, plus per-triple
+    directories (target/<triple>/debug/...) for cross-target builds.
+    Nested build-script codegen (debug/build/*/out/*.rs) is expected; .rs
+    anywhere else is not Cargo output. Unknown foreign top-level entries
+    fail closed to a veto.
     """
     def unreadable(error):
         raise Refusal(f'incomplete target scan: {error.filename}')
@@ -528,6 +577,8 @@ def preservation_veto(target):
         if first:
             for name in dirs + files:
                 if name not in CARGO_TARGET_TOP_LEVEL:
+                    if name in dirs and _is_cargo_triple_dir(target, name):
+                        continue
                     return f'preserved foreign top-level entry: {name}'
             first = False
         under_codegen_out = (

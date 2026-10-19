@@ -474,6 +474,81 @@ class CacheTests(unittest.TestCase):
         with self.assertRaisesRegex(cache.Refusal, 'symlink'):
             cache.usage(target)
 
+    def test_unmeasurable_slot_is_skipped_not_pool_aborting(self):
+        (self.pool / 'slot-0' / 'scratch' / 'escape.par2').symlink_to(
+            self.root / 'outside.par2')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            slot, _, fd = cache.acquire(self.pool, self.policy)
+        try:
+            self.assertEqual(slot.name, 'slot-1')
+        finally:
+            os.close(fd)
+        self.assertIn('slot_unmeasurable', err.getvalue())
+
+    def test_shipped_placeholder_receipts_are_refused(self):
+        shipped = json.loads((SCRIPT.parent / 'cargo_pool_policy.json').read_text())
+        self.policy['quota_receipt'] = shipped['quota_receipt']
+        self.policy['scratch_coverage_receipt'] = shipped['scratch_coverage_receipt']
+        self.save_policy()
+        with self.assertRaisesRegex(cache.Refusal, 'shipped placeholder'):
+            cache.load_policy(self.pool)
+        self.policy['quota_receipt'] = 'ci synthetic receipt'
+        self.policy['scratch_coverage_receipt'] = 'ci synthetic receipt'
+        self.save_policy()
+        self.assertEqual(cache.load_policy(self.pool)['slots'], 2)
+
+    def test_usage_allow_symlinks_counts_link_blocks(self):
+        scratch = self.pool / 'slot-0' / 'scratch'
+        (scratch / 'outside.par2').write_bytes(b'x' * 64)
+        (scratch / 'escape.par2').symlink_to(scratch / 'outside.par2')
+        with self.assertRaisesRegex(cache.Refusal, 'symlink'):
+            cache.usage(scratch)
+        self.assertGreater(cache.usage(scratch, allow_symlinks=True), 0)
+
+    def test_run_tolerates_child_scratch_symlinks(self):
+        self.fake.write_text('#!' + sys.executable + '\n'
+                             'import os,pathlib,time\n'
+                             'scratch=pathlib.Path(os.environ["TMPDIR"])\n'
+                             '(scratch/"outside.par2").write_bytes(b"x"*64)\n'
+                             '(scratch/"escape.par2").symlink_to(scratch/"outside.par2")\n'
+                             'target=pathlib.Path(os.environ["CARGO_TARGET_DIR"])\n'
+                             '(target/"ready").write_text("ready")\n'
+                             'while not (target/"release").exists(): time.sleep(.01)\n'
+                             '(scratch/"escape.par2").unlink()\n')
+        child = self.start_fake(self.root)
+        self.wait_ready(1)
+        time.sleep(0.3)  # symlink exists; the 20ms sampler must overlap it
+        for slot in self.pool.glob('slot-*'):
+            (slot / 'target' / 'release').touch()
+        _, error = child.communicate(timeout=10)
+        self.assertEqual(child.returncode, 0, error)
+        self.assertEqual(list(self.pool.glob('slot-*/lease.json')), [])
+
+    def test_triple_target_dirs_do_not_veto_retention(self):
+        target = self.pool / 'slot-0' / 'target'
+        triple = target / 'wasm32-unknown-unknown'
+        (triple / 'debug' / 'deps').mkdir(parents=True)
+        (triple / 'debug' / 'deps' / 'libfixture.rlib').write_bytes(b'x' * 64)
+        self.assertIsNone(cache.preservation_veto(target))
+        (triple / 'debug' / 'stashed-source.rs').write_bytes(b'x' * 64)
+        self.assertIn('preserved', cache.preservation_veto(target))
+        (triple / 'debug' / 'stashed-source.rs').unlink()
+        shutil.rmtree(triple)
+        (target / 'debug').mkdir(exist_ok=True)
+        self.assertIsNone(cache.preservation_veto(target))
+        (target / 'foreign-top').write_text('foreign')
+        self.assertIn('foreign', cache.preservation_veto(target))
+        (target / 'foreign-top').unlink()
+        impostor = target / 'not-a-profile'
+        impostor.mkdir()
+        (impostor / 'evil.txt').write_text('x')
+        self.assertIn('foreign', cache.preservation_veto(target))
+
+    def test_wrapper_shebang_has_no_leading_space(self):
+        first = SCRIPT.read_bytes().splitlines()[0]
+        self.assertTrue(first.startswith(b'#!'), first)
+
     def test_filesystem_uses_user_available_not_root_free(self):
         class FakeFS:
             f_bavail = 2
