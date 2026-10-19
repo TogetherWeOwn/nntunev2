@@ -66,4 +66,49 @@ describe('library refresh null-body cap', () => {
 		expect(refresher.state.loadError).toBeNull();
 		expect(refresher.state.loading).toBe(false);
 	});
+
+	/**
+	 * Legacy fallback: a response with neither a readable stream nor
+	 * `arrayBuffer` (e.g. an injected fetch mock, as in the auth-transition
+	 * e2e spec) still parses via `resp.json()` so in-flight bodies settle
+	 * through the normal generation race — but stays bounded by the cap.
+	 */
+	function jsonOnlyFetch(payloadText: string): typeof fetch {
+		const data = JSON.parse(payloadText) as unknown;
+		const resp = {
+			ok: true,
+			status: 200,
+			body: null,
+			json: async () => data
+		} as unknown as Response;
+		return (async () => resp) as unknown as typeof fetch;
+	}
+
+	it('parses a json-only within-cap payload (no arrayBuffer)', async () => {
+		const refresher = createLibraryRefresher({
+			sessionStorage: () => null,
+			invalidateLibraryCache: () => {},
+			timeoutMs: SLOW_TIMEOUT_MS
+		});
+
+		await refresher.refresh(jsonOnlyFetch(JSON.stringify([{ id: 'legacy', title: 'ok' }])));
+
+		expect(refresher.state.items.map((i) => i.id)).toEqual(['legacy']);
+		expect(refresher.state.loadError).toBeNull();
+		expect(refresher.state.loading).toBe(false);
+	});
+
+	it('rejects a json-only over-cap payload as unreachable', async () => {
+		const refresher = createLibraryRefresher({
+			sessionStorage: () => null,
+			invalidateLibraryCache: () => {},
+			timeoutMs: SLOW_TIMEOUT_MS
+		});
+
+		await refresher.refresh(jsonOnlyFetch(payloadOfBytes(2 * CAP, 'over')));
+
+		expect(refresher.state.items.map((i) => i.id)).toEqual([]);
+		expect(refresher.state.loadError).toBe('Library is not reachable right now.');
+		expect(refresher.state.loading).toBe(false);
+	});
 });

@@ -118,11 +118,21 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				// read so an over-cap payload cannot bypass the cap via
 				// `resp.json()`. Rejects through the same failure shape as a
 				// timeout so the refresher falls back to unreachable/snapshot.
-				const buffer = await resp.arrayBuffer();
-				if (buffer.byteLength > LIBRARY_BODY_MAX_BYTES) {
+				if (typeof resp.arrayBuffer === 'function') {
+					const buffer = await resp.arrayBuffer();
+					if (buffer.byteLength > LIBRARY_BODY_MAX_BYTES) {
+						throw new Error('library request timed out');
+					}
+					return JSON.parse(new TextDecoder().decode(new Uint8Array(buffer)));
+				}
+				// Runtimes (and injected test fetches) without `arrayBuffer`
+				// cannot be measured before parsing; enforce the cap on the
+				// serialized size instead so this path is still bounded.
+				const data = await resp.json();
+				if (JSON.stringify(data)?.length > LIBRARY_BODY_MAX_BYTES) {
 					throw new Error('library request timed out');
 				}
-				return JSON.parse(new TextDecoder().decode(new Uint8Array(buffer)));
+				return data;
 			}
 			const reader = body.getReader() as ReadableStreamDefaultReader<Uint8Array>;
 			activeReader = reader;
