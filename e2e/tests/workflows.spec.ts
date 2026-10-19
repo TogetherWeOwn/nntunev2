@@ -1682,6 +1682,9 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     const required = runGateScript(xml, { REQUIRE_QA_AUTH_TOKEN: 'true', QA_AUTH_TOKEN: '' });
     expect(required.status).not.toBe(0);
     expect(required.output).toContain('QA_AUTH_TOKEN is not set');
+    // A token-missing red run still publishes the counts receipt.
+    expect(required.summary).toContain('| 1 | 1 | 0 | 0 |');
+    expect(required.summary).toContain('seam token: missing');
     const provided = runGateScript(xml, {
       REQUIRE_QA_AUTH_TOKEN: 'true',
       QA_AUTH_TOKEN: 'dummy-qa-token',
@@ -1695,6 +1698,110 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(gateScriptSource).toContain('player-queue-order');
     expect(gateScriptSource).toContain('ingest-play-meter');
     expect(gateScriptSource).toContain('reason');
+  });
+
+  // Reporter-shaped fixtures below mirror the exact @playwright/test 1.64
+  // junit reporter: a <testsuites> root carrying tests/failures/skipped/errors
+  // counts, one <testsuite> per spec file, name-before-classname attributes,
+  // describe-prefixed test names ("suite › test"), <properties> fixme markers
+  // and paired <skipped></skipped> elements. Synthetic suiteXml() above uses
+  // none of that shape, so without these a parser regression against the real
+  // reporter would stay green here while misreading staging evidence.
+  const REPORTER_GREEN =
+    '<?xml version="1.0" encoding="UTF-8"?>\n' +
+    '<testsuites id="" name="" tests="4" failures="0" skipped="2" errors="0" time="0.27">\n' +
+    '<testsuite name="ingest-play-meter.spec.ts" timestamp="2026-10-19T03:09:03.424Z" hostname="" tests="2" failures="0" skipped="1" time="0.002" errors="0">\n' +
+    '<testcase name="ingest play meter browser › passing journey" classname="ingest-play-meter.spec.ts" time="0.002">\n' +
+    '<properties>\n<property name="serial" value="">\n</property>\n</properties>\n' +
+    '</testcase>\n' +
+    '<testcase name="ingest play meter browser › ingested track carries recording_mbids" classname="ingest-play-meter.spec.ts">\n' +
+    '<properties>\n<property name="serial" value="">\n</property>\n<property name="fixme" value="">\n</property>\n</properties>\n' +
+    '<skipped>\n</skipped>\n' +
+    '</testcase>\n' +
+    '</testsuite>\n' +
+    '<testsuite name="player-queue-order.spec.ts" timestamp="2026-10-19T03:09:03.424Z" hostname="" tests="2" failures="0" skipped="1" time="0" errors="0">\n' +
+    '<testcase name="queue order › passing journey" classname="player-queue-order.spec.ts" time="0.001">\n' +
+    '<properties>\n<property name="serial" value="">\n</property>\n</properties>\n' +
+    '</testcase>\n' +
+    '<testcase name="player queue follows library-selection order › player queue advances in library-selection order" classname="player-queue-order.spec.ts">\n' +
+    '<properties>\n<property name="serial" value="">\n</property>\n<property name="fixme" value="">\n</property>\n</properties>\n' +
+    '<skipped>\n</skipped>\n' +
+    '</testcase>\n' +
+    '</testsuite>\n' +
+    '</testsuites>\n';
+
+  const REPORTER_THROWN_ERROR_MARKER = 'SENTINEL-THROWN-VALUE-GATE';
+  const REPORTER_THROWN_ERROR =
+    '<?xml version="1.0" encoding="UTF-8"?>\n' +
+    '<testsuites id="" name="" tests="3" failures="0" skipped="1" errors="1" time="0.28">\n' +
+    '<testsuite name="ingest-play-meter.spec.ts" timestamp="2026-10-19T03:09:03.424Z" hostname="" tests="3" failures="0" skipped="1" time="0.002" errors="1">\n' +
+    '<testcase name="ingest play meter browser › passing journey" classname="ingest-play-meter.spec.ts" time="0.002">\n' +
+    '</testcase>\n' +
+    '<testcase name="ingest play meter browser › ingested track carries recording_mbids" classname="ingest-play-meter.spec.ts">\n' +
+    '<properties>\n<property name="fixme" value="">\n</property>\n</properties>\n' +
+    '<skipped>\n</skipped>\n' +
+    '</testcase>\n' +
+    `<testcase name="thrown error journey" classname="ingest-play-meter.spec.ts" time="0">\n` +
+    '<system-out>\n<![CDATA[\n[[ATTACHMENT|../../test-results/sample-thrown-error-journey/error-context.md]]\n]]>\n</system-out>\n' +
+    `<error message="boom" type="Error">\n<![CDATA[thrown error journey ${REPORTER_THROWN_ERROR_MARKER} in error text]]>\n</error>\n` +
+    '</testcase>\n' +
+    '</testsuite>\n' +
+    '</testsuites>\n';
+
+  test('reporter-shaped green evidence with root counts and paired skips passes', () => {
+    const result = runGateScript(REPORTER_GREEN);
+    expect(result.status).toBe(0);
+    expect(result.summary).toContain('| 4 | 2 | 2 | 0 |');
+    expect(result.summary).toContain('PASS');
+  });
+
+  test('a thrown Error (errors=1, failures=0) fails without leaking error text', () => {
+    const result = runGateScript(REPORTER_THROWN_ERROR);
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('failing test(s)');
+    expect(result.output).not.toContain(REPORTER_THROWN_ERROR_MARKER);
+    expect(result.summary).not.toContain(REPORTER_THROWN_ERROR_MARKER);
+    expect(result.summary).toContain('| 3 | 2 | 1 | 1 |');
+  });
+
+  test('a same-titled skip from another file fails outside the allow-list', () => {
+    const xml = suiteXml(
+      PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
+        '<testcase classname="other.spec.ts" name="player queue advances in library-selection order"><skipped/></testcase>',
+    );
+    const result = runGateScript(xml);
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('outside the allow-list');
+  });
+
+  test('one allow-list entry cannot cover two skips', () => {
+    const xml = suiteXml(
+      PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
+        FIXME_QUEUE +
+        FIXME_QUEUE,
+    );
+    const result = runGateScript(xml);
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('outside the allow-list');
+  });
+
+  test('unattributed skips fail closed when the count exceeds listed cases', () => {
+    const listed = suiteXml(
+      PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
+        FIXME_QUEUE +
+        FIXME_MBIDS,
+    );
+    const xml = listed.replace('tests="3"', 'tests="4"').replace('skipped="2"', 'skipped="3"');
+    const result = runGateScript(xml, { MAX_ALLOWED_SKIPS: '5' });
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('could not be identified');
+  });
+
+  test('non-numeric counts fail closed as unparseable', () => {
+    const xml = suiteXml(FIXME_QUEUE).replace('skipped="1"', 'skipped="x"');
+    const result = runGateScript(xml);
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('could not parse');
   });
 
 });

@@ -13,11 +13,16 @@
  *   2. zero journeys ran (no test cases at all);
  *   3. every journey skipped (ran == 0);
  *   4. skip count above MAX_ALLOWED_SKIPS;
- *   5. any skipped test outside the allow-list below;
- *   6. any failure or error;
+ *   5. any skipped test outside the allow-list below (each entry binds to
+ *      its owning spec file and is consumed once, so a same-titled skip
+ *      from another file cannot take its budget slot);
+ *   6. any failure or error (including errors="1" with failures="0" from a
+ *      thrown non-expect Error, the dominant seam-helper failure mode);
  *   7. REQUIRE_QA_AUTH_TOKEN=true with QA_AUTH_TOKEN unset: the full journey
  *      needs the QA test-account seam token, so a configured run without it
- *      stays red instead of passing silently.
+ *      stays red instead of passing silently. The token is checked for
+ *      presence after evidence is parsed, so the counts table is still
+ *      published on a token-missing red run.
  *
  * Skip allow-list (each entry carries its reason). Only these skips are
  * accepted, and only up to MAX_ALLOWED_SKIPS of them:
@@ -50,13 +55,16 @@ const SUMMARY_PATH = process.env.GITHUB_STEP_SUMMARY || null;
 const TAG = '[journey-gate]';
 
 // Allow-list: every skipped test's "classname name" must contain one entry's
-// match string. Reasons live next to the entries so the budget is auditable.
+// owning spec file AND match string, and each entry is consumed at most
+// once. Reasons live next to the entries so the budget is auditable.
 const ALLOWED_SKIPS = [
   {
+    file: 'player-queue-order.spec.ts',
     match: 'player queue advances in library-selection order',
     reason: 'test.fixme in e2e/tests/player-queue-order.spec.ts (player queue order not implemented)',
   },
   {
+    file: 'ingest-play-meter.spec.ts',
     match: 'ingested track carries recording_mbids',
     reason: 'test.fixme in e2e/tests/ingest-play-meter.spec.ts (recording_mbids contract pending)',
   },
@@ -137,26 +145,34 @@ function appendSummary({ verdict }) {
   process.stdout.write(`${text}\n`);
 }
 
-// 1. Seam-token prerequisite (presence only; the value is never touched).
-if (REQUIRE_QA_AUTH_TOKEN && !process.env.QA_AUTH_TOKEN) {
-  summaryLines = ['- seam token: missing (QA_AUTH_TOKEN unset)', ''];
-  fail(
-    'QA_AUTH_TOKEN is not set. The full journey requires the QA test-account ' +
-      'seam token, so this configured run stays red instead of passing silently ' +
-      '(secret names only — never values).',
-  );
-}
-
+// 1. Config validation (workflow misconfiguration, not journey evidence).
 if (!Number.isInteger(MAX_ALLOWED_SKIPS) || MAX_ALLOWED_SKIPS < 0) {
   fail(`MAX_ALLOWED_SKIPS must be a non-negative integer, got ${process.env.MAX_ALLOWED_SKIPS ?? '(unset)'}.`);
 }
+
+// Seam-token state (presence only; the value is never touched). The failure
+// is reported after evidence is parsed so the counts table is still
+// published on a token-missing red run.
+const tokenMissing = REQUIRE_QA_AUTH_TOKEN && !process.env.QA_AUTH_TOKEN;
+const tokenLine = '- seam token: missing (QA_AUTH_TOKEN unset)';
 
 // 2. Evidence must exist and parse.
 let xml;
 try {
   xml = readFileSync(JUNIT_PATH, 'utf8');
 } catch {
-  summaryLines = [`- junit evidence: absent (${JUNIT_PATH})`, ''];
+  summaryLines = [
+    `- junit evidence: absent (${JUNIT_PATH})`,
+    '',
+    ...(tokenMissing ? [tokenLine, ''] : []),
+  ];
+  if (tokenMissing) {
+    fail(
+      'QA_AUTH_TOKEN is not set. The full journey requires the QA test-account ' +
+        'seam token, so this configured run stays red instead of passing silently ' +
+        '(secret names only — never values).',
+    );
+  }
   fail(
     `no junit evidence at ${JUNIT_PATH} on a configured run — refusing to pass ` +
       'without journey evidence.',
@@ -165,7 +181,18 @@ try {
 
 const counts = parseCounts(xml);
 if (!counts) {
-  summaryLines = [`- junit evidence: unparseable (${JUNIT_PATH})`, ''];
+  summaryLines = [
+    `- junit evidence: unparseable (${JUNIT_PATH})`,
+    '',
+    ...(tokenMissing ? [tokenLine, ''] : []),
+  ];
+  if (tokenMissing) {
+    fail(
+      'QA_AUTH_TOKEN is not set. The full journey requires the QA test-account ' +
+        'seam token, so this configured run stays red instead of passing silently ' +
+        '(secret names only — never values).',
+    );
+  }
   fail(
     `could not parse testsuite counts from ${JUNIT_PATH} — refusing to pass ` +
       'without legible journey evidence.',
@@ -177,9 +204,18 @@ const { skipped } = counts;
 const failed = failures + errors;
 const ran = tests - skipped;
 const skippedNames = parseSkippedNames(xml);
-const unknownSkips = skippedNames.filter(
-  (title) => !ALLOWED_SKIPS.some((entry) => title.includes(entry.match)),
-);
+// Each allow-list entry binds to its owning spec file and is consumed at
+// most once: a same-titled skip from another file cannot take its slot,
+// and one entry cannot cover two skips.
+const consumedAllowances = new Set();
+const unknownSkips = skippedNames.filter((title) => {
+  const idx = ALLOWED_SKIPS.findIndex(
+    (entry, i) => !consumedAllowances.has(i) && title.includes(entry.file) && title.includes(entry.match),
+  );
+  if (idx === -1) return true;
+  consumedAllowances.add(idx);
+  return false;
+});
 
 summaryLines = [
   '| total | ran | skipped | failed |',
@@ -193,8 +229,16 @@ summaryLines = [
   `Skip budget: at most ${MAX_ALLOWED_SKIPS} from the documented allow-list ` +
     `(${ALLOWED_SKIPS.map((e) => `"${e.match}"`).join('; ')}).`,
   '',
+  ...(tokenMissing ? [tokenLine, ''] : []),
 ];
 
+if (tokenMissing) {
+  fail(
+    'QA_AUTH_TOKEN is not set. The full journey requires the QA test-account ' +
+      'seam token, so this configured run stays red instead of passing silently ' +
+      '(secret names only — never values).',
+  );
+}
 if (tests === 0) fail('zero journeys ran (no test cases in junit evidence).');
 if (ran === 0) {
   fail(`every journey skipped (0 ran, ${skipped} skipped) — staging evidence is empty.`);
