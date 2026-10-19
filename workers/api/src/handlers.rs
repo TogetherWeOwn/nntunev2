@@ -626,6 +626,23 @@ pub trait Store {
         async { Err(StoreError) }
     }
     fn revoke_session(&self, id: &str) -> impl Future<Output = Result<(), StoreError>>;
+    /// Conditional single-session revoke matching
+    /// [`session::SessionRevokeClaim::Single`]: `UPDATE ... WHERE id = $1
+    /// AND user_id = $2 AND revoked = FALSE`. Returns true iff exactly one
+    /// row transitioned, so concurrent logouts cannot double-count. The
+    /// default preserves legacy behavior for out-of-tree impls by delegating
+    /// to [`Store::revoke_session`]; production and updated fakes override
+    /// with the conditional write.
+    fn revoke_single_session(
+        &self,
+        id: &str,
+        user_id: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let _ = user_id;
+            self.revoke_session(id).await.map(|_| true)
+        }
+    }
     fn revoke_all_sessions(&self, user_id: &str) -> impl Future<Output = Result<(), StoreError>>;
     fn vault_by_user(
         &self,
@@ -885,7 +902,13 @@ fn session_error_response(error: session::SessionError) -> Response {
 }
 
 pub(crate) fn invalid_request() -> Response {
-    json_response(400, serde_json::json!({"error": "invalid request"}))
+    let error = crate::api_error::ApiError::invalid_request("invalid request");
+    Response {
+        status: error.status,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    }
 }
 
 // --- Staging-only QA code seam ----------------------------------------------------------
@@ -2312,9 +2335,25 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
-    if ctx.store.revoke_session(&claims.session_id).await.is_err() {
-        return internal();
+    // Conditional revoke: concurrent logouts of the same session race here
+    // after both authenticating on the pre-revoke snapshot. Only the winner
+    // transitions the row and audits; the loser still clears its (now dead)
+    // cookie but writes no second `session.logout` row.
+    match ctx
+        .store
+        .revoke_single_session(&claims.session_id, &claims.user_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            let mut resp = json_response(200, serde_json::json!({"ok": true}));
+            resp.set_cookie = Some(session::clear_cookie_header());
+            return resp;
+        }
+        Err(_) => return internal(),
     }
+    ctx.audit(&claims.user_id, session::LOGOUT_AUDIT_ACTION, true)
+        .await;
     let mut resp = json_response(200, serde_json::json!({"ok": true}));
     resp.set_cookie = Some(session::clear_cookie_header());
     resp
@@ -2733,6 +2772,13 @@ where
     let Some(label) = normalize_credential_label(body.label.as_deref()) else {
         return validation_failed("invalid label");
     };
+    // Zero TTL would mint a credential already expired at issuance
+    // (`expires_at == now`) while still returning a one-time secret (ADR
+    // 0010 requires meaningful expiry): reject before any row, audit entry,
+    // or secret exists.
+    if body.ttl_secs == 0 {
+        return validation_failed("invalid ttl");
+    }
     // Exact scope strings only: unknown, cross-surface (`"subsonic"`),
     // case or whitespace variants reject — the allowlist never trims or
     // folds.
@@ -2742,6 +2788,24 @@ where
             Some(scope) => scopes.push(scope),
             None => return validation_failed("unknown scope"),
         }
+    }
+    // Raw length past the defined vocabulary can only be duplicates (only
+    // `ALL_SCOPES.len()` distinct scopes exist): reject before any row,
+    // audit entry, or secret exists, so an arbitrarily long duplicate list
+    // can never mint.
+    if scopes.len() > crate::native_rest::ALL_SCOPES.len() {
+        return validation_failed("too many scopes");
+    }
+    // Duplicates within the cap collapse to first-seen order, so the 201
+    // body and the stored row carry the same deduplicated set.
+    {
+        let mut deduped = Vec::with_capacity(scopes.len());
+        for scope in scopes {
+            if !deduped.contains(&scope) {
+                deduped.push(scope);
+            }
+        }
+        scopes = deduped;
     }
     // Unprovisioned keyring fails closed per-request (generic 500, never
     // which secret is missing): without a pepper there is nothing to HMAC
@@ -3709,6 +3773,16 @@ mod tests {
                 row.revoked = true;
             }
             Ok(())
+        }
+        async fn revoke_single_session(&self, id: &str, user_id: &str) -> Result<bool, StoreError> {
+            let mut sessions = self.sessions.borrow_mut();
+            match sessions.get_mut(id) {
+                Some(row) if row.user_id == user_id && !row.revoked => {
+                    row.revoked = true;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
         }
         async fn revoke_all_sessions(&self, user_id: &str) -> Result<(), StoreError> {
             for row in self.sessions.borrow_mut().values_mut() {

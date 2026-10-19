@@ -78,7 +78,7 @@ emit the code.
 | `not_found` | 404 | false | api, ingest, mb, stream | No such (visible) resource. Invisible private rows are 404, never 403. |
 | `conflict` | 409 | false | ingest | The request is valid but the resource already exists in a state that refuses it (for example re-posting an ingest job whose previous run failed inside its replay window). Nothing was accepted; inspect the existing resource instead of retrying unchanged. |
 | `account_deleting` | 409 | false | api | The caller's account is being deleted (`users.deleting_at` is set), so the write is fenced off (ADR 0002 rule 3). Nothing was written; do not retry unchanged. |
-| `invalid_request` | 400 | false | ingest, mb, stream | Malformed body, bad identifier shape, or out-of-range parameter. |
+| `invalid_request` | 400 | false | api, ingest, mb, stream | Malformed body, bad identifier shape, or out-of-range parameter. |
 | `MB_SEARCH_EMPTY_QUERY` | 400 | false | mb | Empty or whitespace-only `q` on `GET /v1/mb/search`; returned before `type` validation without touching the mirror or the cache. Send a non-empty `q` of at least 2 chars. |
 | `payload_too_large` | 413 | false | ingest | Body, NZB, or element counts exceed the intake caps. |
 | `range_not_satisfiable` | 416 | false | stream | The requested byte range lies outside the track. |
@@ -89,6 +89,34 @@ emit the code.
 | `upstream_unavailable` | 502 | true | ingest, stream | A provider/indexer connection failed or an upstream request failed. |
 | `upstream_circuit_open` | 503 | true | stream | The user's provider pool circuit breaker is open; retry after the supplied `Retry-After` delay. |
 | `service_unavailable` | 503 | true | api, ingest | A backing binding (queue, payload store) is unavailable; nothing was accepted. |
+
+## Pool error-wire codes (stream NntpPool → ingest, Lane::Ingest)
+
+The stream `NntpPool` Durable Object serves the ingest pipeline on
+`Lane::Ingest` (`POST /probe` in `workers/stream/src/probe.rs`, `POST /body`
+in `workers/stream/src/body.rs`) with legacy `{"error": <code>}` bodies, not
+the `{code, message, retryable}` envelope above. These seven codes are the
+complete served set; they intentionally carry no `api_error` registry entry
+(no prod-code change on this card), so the envelope doc-lint tests
+(`registry_matches_docs_api_errors`, `docs_registry_matches_all_worker_registries`)
+ignore this table by design: its rows use bare codes, never the `| \``
+envelope-registry prefix. Ingest consumes them through `classify_reply` in
+`workers/ingest/src/pool_probe.rs:69-92` (400/413 are `Rejected`, everything
+else is `Retry` with clamped `Retry-After`) and `classify_body_reply` in
+`workers/ingest/src/pool_body.rs:83-111` (exact `{"error":"missing"}` 404 is
+`Missing` data, 413 is `TooLarge` data, 400 is `Rejected`, everything else is
+`Retry`). `retryable` below mirrors that ingest verdict: 4xx request/data
+answers are `false`, redeliverable 5xx answers are `true`.
+
+| code | HTTP status | retryable | owning lane | meaning | served by |
+| --- | --- | --- | --- | --- | --- |
+| bad_request | 400 | false | Ingest | Malformed envelope: bad JSON, batch size, ids, wrong user, unreadable body, or owner-less instance. Ingest treats it as `Rejected`. | probe.rs:111 `ProbeError::BadRequest`, status probe.rs:100; parse probe.rs:185-208; capped read runtime.rs:188-200 maps unreadable/over-cap to `BadRequest`/`TooLarge`; route OWNER_MISSING routes.rs:33-35 served routes.rs:75 and runtime.rs:84-86 |
+| too_large | 413 | false | Ingest | Body over `MAX_PROBE_BODY_BYTES` (probe) / `MAX_BODY_REQUEST_BYTES` / `MAX_BODY_ARTICLE_BYTES` (body). Ingest treats probe 413 as `Rejected` and body 413 as `TooLarge` data. | probe.rs:112, status probe.rs:101; body.rs:233/275; capped reads runtime.rs:194-196 and runtime.rs:130-133 |
+| busy | 503 | true | Ingest | Ingest lane full (`PoolError::Exhausted`) or pool quarantined (`PoolError::Quarantined`); carries `Retry-After` (`retry_after_secs`, at least 1 s). Ingest redelivers after the hint. | probe.rs:113, status probe.rs:102; run_probe probe.rs:280-285, run_body body.rs:194-199; hint LANE_FULL_RETRY_MS probe.rs:57, clamp pool_probe.rs:87-89 |
+| provider_unavailable | 503 | true | Ingest | The user's provider settings could not be loaded (pre-wiring `provider()` stub). Ingest retries after `DEFAULT_RETRY_SECS`. | probe.rs:114, status probe.rs:102; runtime.rs:95-103 and runtime.rs:173-175; pre-wiring route PROVIDER_UNAVAILABLE routes.rs:37-39 served routes.rs:76 |
+| provider_error | 502 | true | Ingest | Provider failure (connection, auth, protocol): the pool is quarantined, the connection dropped, provider text never leaves the module. Ingest retries through the job attempt budget. | probe.rs:115, status probe.rs:103; provider_failed probe.rs:357-367 called from run_probe probe.rs:316/322/342 and run_body body.rs:247/283 |
+| missing | 404 | false | Ingest | Provider answered `430`: the article is gone. Data for the par2 block count, not an error; ingest folds it as `Missing`, never a retry. | body.rs:85-90 `BodyOutcome::Missing`; fetched body.rs:159-162 |
+| internal | 500 | true | Ingest | `ProbeOutcome` serialization failure (infallible for `Vec<String>` outcomes; fail-closed generic). Ingest classifies any other 5xx as `Retry`. | probe.rs:148-152 `ProbeReply::from` `Err` arm on `serde_json::to_string` failure |
 
 ## Repair taxonomy status (no registry rows)
 
@@ -241,6 +269,14 @@ code, status, or retryable drift):
 - Repair: `workers/repair/src/contract.rs`,
   `workers/repair/src/runtime.rs`, and `classify_repair_reply` in
   `workers/ingest/src/repair.rs`.
+- Pool error-wire codes: `ProbeError::status`/`code` and `ProbeReply::from`
+  in `workers/stream/src/probe.rs:98-161`, `BodyReply::from` in
+  `workers/stream/src/body.rs:73-101`, route constants and decisions in
+  `workers/stream/src/routes.rs:29-107`, pool fetch in
+  `workers/stream/src/runtime.rs:79-200`, consumed by `classify_reply` in
+  `workers/ingest/src/pool_probe.rs:69-92` and `classify_body_reply` in
+  `workers/ingest/src/pool_body.rs:83-111`, pinned by
+  `workers/stream/tests/pool_error_wire_codes.rs` (served set ⊆ pool table).
 
 ## Adding a code
 

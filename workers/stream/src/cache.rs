@@ -121,8 +121,12 @@ impl ContentCache {
     }
 
     /// Store `plaintext` for `track_id`; returns the blob hash hex.
+    /// Overwriting with different bytes evicts the old blob once its last
+    /// track stops pointing at it; a blob still referenced by another track
+    /// survives.
     pub fn put_track(&mut self, track_id: &str, plaintext: Vec<u8>) -> String {
         let hash = Self::hex_hash(&plaintext);
+        let old_hash = self.index.get(track_id).map(|e| e.hash.clone());
         self.blobs.entry(hash.clone()).or_insert_with(|| BlobEntry {
             data: Arc::from(plaintext),
         });
@@ -134,6 +138,11 @@ impl ContentCache {
             },
         );
         self.revalidating.remove(track_id);
+        if let Some(old) = old_hash {
+            if old != hash {
+                self.remove_blob_if_unreferenced(&old);
+            }
+        }
         hash
     }
 
@@ -143,6 +152,7 @@ impl ContentCache {
     /// refreshes a stale entry.
     pub fn put_track_at(&mut self, track_id: &str, plaintext: Vec<u8>, now_secs: u64) -> String {
         let hash = Self::hex_hash(&plaintext);
+        let old_hash = self.index.get(track_id).map(|e| e.hash.clone());
         // A revalidation may race a content change: always restamp this
         // track, so its age counts from the latest write without affecting
         // other tracks that share the deduplicated blob.
@@ -159,6 +169,11 @@ impl ContentCache {
         // The rewrite *is* the revalidation landing: release the claim so a
         // later stale serve can claim the next one.
         self.revalidating.remove(track_id);
+        if let Some(old) = old_hash {
+            if old != hash {
+                self.remove_blob_if_unreferenced(&old);
+            }
+        }
         hash
     }
 
@@ -206,12 +221,29 @@ impl ContentCache {
     /// seconds) with its freshness. Fresh entries serve as-is; stale entries
     /// serve immediately while owing a background revalidation (see
     /// [`CacheServe`]); expired entries (past fresh + SWR) and unknown
-    /// tracks return `None` so the caller re-fetches upstream.
-    pub fn get_track_at(&self, track_id: &str, now_secs: u64) -> Option<(Arc<[u8]>, CacheServe)> {
-        let track = self.index.get(track_id)?;
-        let blob = self.blobs.get(&track.hash)?;
-        let data = Arc::clone(&blob.data);
-        match track.stored_at_secs {
+    /// tracks return `None` so the caller re-fetches upstream. An expired
+    /// access also prunes the track pointer and evicts its blob once no
+    /// remaining track references it; fresh and stale accesses evict
+    /// nothing. Takes `&mut` for that prune-on-access (the play path already
+    /// holds `&mut ContentCache`).
+    pub fn get_track_at(
+        &mut self,
+        track_id: &str,
+        now_secs: u64,
+    ) -> Option<(Arc<[u8]>, CacheServe)> {
+        let (hash, stored_at_secs) = {
+            let track = self.index.get(track_id)?;
+            (track.hash.clone(), track.stored_at_secs)
+        };
+        let data = match self.blobs.get(&hash) {
+            Some(blob) => Arc::clone(&blob.data),
+            None => {
+                // Dangling pointer: no blob behind it, so drop the pointer.
+                self.index.remove(track_id);
+                return None;
+            }
+        };
+        match stored_at_secs {
             None => Some((data, CacheServe::Fresh { age_secs: 0 })),
             Some(stored) => {
                 let age = now_secs.saturating_sub(stored);
@@ -220,10 +252,21 @@ impl ContentCache {
                 } else if age <= CACHE_FRESH_TTL_SECS + CACHE_SWR_WINDOW_SECS {
                     Some((data, CacheServe::Stale { age_secs: age }))
                 } else {
+                    self.index.remove(track_id);
+                    self.remove_blob_if_unreferenced(&hash);
                     None
                 }
             }
         }
+    }
+
+    /// Drop the blob under `hash` once no track in the index references it.
+    /// A blob still shared by another track survives.
+    fn remove_blob_if_unreferenced(&mut self, hash: &str) {
+        if self.index.values().any(|t| t.hash == hash) {
+            return;
+        }
+        self.blobs.remove(hash);
     }
 
     /// Distinct blobs held (dedup probe).

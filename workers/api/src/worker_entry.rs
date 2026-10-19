@@ -857,6 +857,19 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn revoke_single_session(&self, id: &str, user_id: &str) -> Result<bool, StoreError> {
+        let client = self.connect().await?;
+        let claim = crate::session::SessionRevokeClaim::Single {
+            session_id: id,
+            user_id,
+        };
+        let rows = client
+            .query(claim.statement(), &[&id, &user_id])
+            .await
+            .map_err(|_| StoreError)?;
+        Ok(rows.len() == 1)
+    }
+
     async fn revoke_all_sessions(&self, user_id: &str) -> Result<(), StoreError> {
         let client = self.connect().await?;
         client
@@ -1746,7 +1759,8 @@ pub async fn collect_body<S: BodyChunkStream>(
 /// exactly `bytes` and invokes `handler` once. `Oversized` and
 /// `TransportFailure` invoke NOTHING and answer the handlers' existing
 /// uniform pre-routing rejection (`handlers::invalid_request`: status
-/// 400, body `{"error":"invalid request"}`, no `set_cookie`), so the
+/// 400, body `{"code":"invalid_request","message":"invalid request",
+/// "retryable":false}`, no `set_cookie`), so the
 /// gate can never drift from it. The Worker entry passes a handler that
 /// calls `handlers::handle`, so a rejected body can cause no store,
 /// mailer, DNS, or dialer side effect.

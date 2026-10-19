@@ -493,3 +493,174 @@ pub fn classify_container_reply(status: u16, body: &[u8]) -> ContainerOutcome {
         _ => ContainerOutcome::Forward(502, "container_unavailable".to_string()),
     }
 }
+
+/// Append one response chunk only when it fits under `cap`.
+///
+/// Check-before-extend: a chunk that would push the accumulated body
+/// over `cap` is rejected and the retained body is left untouched, so
+/// an oversized reply is never materialised in full. Exactly-at-`cap`
+/// stays admissible (`>` rejects, never `>=`). The wasm runtime
+/// streams both container result replies through this.
+pub fn push_chunk_capped(body: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
+    if body.len() + chunk.len() > cap {
+        return false;
+    }
+    body.extend_from_slice(chunk);
+    true
+}
+
+/// Fault for a Durable Object reply the front door cannot trust
+/// (unreadable or over `MAX_RESULT_BYTES`): retryable 503, the same
+/// mapping the front door already uses for its other failure arms.
+pub fn repair_unavailable_fault() -> ApiFault {
+    ApiFault::new(503, "repair_unavailable")
+}
+
+/// Fault for a Container reply `container_json` cannot trust
+/// (unreadable or over `MAX_RESULT_BYTES`): retryable 502, the same
+/// mapping `container_json` already uses for its other failure arms.
+pub fn container_unavailable_fault() -> ApiFault {
+    ApiFault::new(502, "container_unavailable")
+}
+
+#[cfg(test)]
+mod capped_reply_read_tests {
+    //! Pin the capped reply-read building blocks in isolation: the
+    //! accumulator must check before extending (never retaining the
+    //! excess) with exactly-at-cap admissible, and both reply-site
+    //! faults must keep their existing status mapping. These live
+    //! next to the helpers — not in the acceptance suite — because
+    //! that file is Test Author-owned and frozen for this change.
+
+    use super::*;
+
+    /// `runtime.rs` source, read as text (NOT a crate import — the module is
+    /// `cfg(target_arch = "wasm32")` and unreachable from native tests).
+    /// Lives here, next to the helpers it pins, because the acceptance
+    /// suites are Test Author-owned and frozen for this change.
+    const RUNTIME_RS: &str = include_str!("runtime.rs");
+
+    /// Whitespace-normalised text of `read_response_capped`: from its
+    /// signature up to (not including) the front-door `fetch`.
+    fn capped_reader_helper() -> String {
+        let start = RUNTIME_RS
+            .find("async fn read_response_capped")
+            .expect("runtime.rs no longer contains `read_response_capped`");
+        let rest = &RUNTIME_RS[start..];
+        let end = rest
+            .find("async fn fetch")
+            .expect("runtime.rs no longer contains `fetch` after `read_response_capped`");
+        rest[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn capped_reader_forwards_cap_and_aborts_on_refusal() {
+        let helper = capped_reader_helper();
+        // The reader must forward its own `cap` to the accumulator — a
+        // hardcoded or unbounded limit here would restore the unbounded
+        // materialisation this change removes while every accumulator pin
+        // above still passes.
+        assert!(
+            helper.contains("push_chunk_capped(&mut body, &chunk, cap)"),
+            "read_response_capped must forward its cap: \
+             `push_chunk_capped(&mut body, &chunk, cap)`"
+        );
+        // The accumulator's refusal must abort the read — ignoring the
+        // boolean silently truncates an over-cap reply to a cap-length
+        // prefix and returns it Ok, feeding a partial body to the
+        // classifier (or the front door) as if complete.
+        assert!(
+            helper.contains("if !push_chunk_capped(&mut body, &chunk, cap) { return Err(()); }"),
+            "read_response_capped must abort on refusal: \
+             `if !push_chunk_capped(&mut body, &chunk, cap) {{ return Err(()); }}`"
+        );
+    }
+
+    #[test]
+    fn fast_path_arms_keep_bodyless_empty_and_materialised_boundary() {
+        let helper = capped_reader_helper();
+        // A bodyless reply (e.g. a bare 200 from `/health`) must keep
+        // reading as empty — the value the previous whole-body `bytes()`
+        // path returned for it. Turning this arm into an error would 502
+        // the `container_port` health poll (502 in `container_json`,
+        // 503 at the front door).
+        assert!(
+            helper.contains("ResponseBody::Empty => return Ok(Vec::new())"),
+            "read_response_capped must keep reading a bodyless reply as empty: \
+             `ResponseBody::Empty => return Ok(Vec::new())`"
+        );
+        // An already-materialised reply over the cap must be rejected
+        // before cloning: the boundary is strict `>`, so exactly-at-cap
+        // stays admissible, and neutering the guard would forward an
+        // over-cap body verbatim (the front door has no second size gate).
+        assert!(
+            helper.contains("ResponseBody::Body(body) if body.len() > cap => return Err(())"),
+            "read_response_capped must reject an over-cap materialised body \
+             before cloning: `ResponseBody::Body(body) if body.len() > cap => return Err(())`"
+        );
+        // The admissible materialised body must still be returned as-is.
+        assert!(
+            helper.contains("ResponseBody::Body(body) => return Ok(body.clone())"),
+            "read_response_capped must return an in-cap materialised body: \
+             `ResponseBody::Body(body) => return Ok(body.clone())`"
+        );
+        // Order matters: the guarded arm must precede the plain clone arm,
+        // otherwise the guard is dead code and every materialised body is
+        // cloned without a cap check.
+        let guarded = helper
+            .find("ResponseBody::Body(body) if body.len() > cap")
+            .expect("guarded Body arm must exist");
+        let plain = helper
+            .find("ResponseBody::Body(body) => return Ok(body.clone())")
+            .expect("plain Body clone arm must exist");
+        assert!(
+            guarded < plain,
+            "the over-cap guard must precede the plain clone arm"
+        );
+    }
+
+    #[test]
+    fn accepts_chunk_landing_exactly_at_cap() {
+        let mut body = vec![0u8; MAX_RESULT_BYTES - 3];
+        assert!(push_chunk_capped(&mut body, &[1, 2, 3], MAX_RESULT_BYTES));
+        assert_eq!(body.len(), MAX_RESULT_BYTES);
+    }
+
+    #[test]
+    fn rejects_chunk_crossing_cap_by_one_byte_without_retaining_it() {
+        let mut body = vec![0u8; MAX_RESULT_BYTES - 3];
+        assert!(!push_chunk_capped(
+            &mut body,
+            &[1, 2, 3, 4],
+            MAX_RESULT_BYTES
+        ));
+        assert_eq!(body.len(), MAX_RESULT_BYTES - 3);
+        assert!(body.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn accumulates_sequence_up_to_cap_then_rejects() {
+        let mut body = Vec::new();
+        assert!(push_chunk_capped(
+            &mut body,
+            &vec![7u8; MAX_RESULT_BYTES - 1],
+            MAX_RESULT_BYTES
+        ));
+        assert!(push_chunk_capped(&mut body, &[8], MAX_RESULT_BYTES));
+        assert_eq!(body.len(), MAX_RESULT_BYTES);
+        assert!(!push_chunk_capped(&mut body, &[9], MAX_RESULT_BYTES));
+        assert_eq!(body.len(), MAX_RESULT_BYTES);
+    }
+
+    #[test]
+    fn reply_site_faults_keep_existing_mapping() {
+        assert_eq!(
+            repair_unavailable_fault(),
+            ApiFault::new(503, "repair_unavailable")
+        );
+        assert_eq!(
+            container_unavailable_fault(),
+            ApiFault::new(502, "container_unavailable")
+        );
+    }
+}
