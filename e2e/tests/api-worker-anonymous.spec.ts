@@ -36,9 +36,13 @@ const UNKNOWN_PATH = '/v1/e2e-probe-no-such-route';
 /** Known-path preflight probes: liveness plus the authed surface. */
 const PREFLIGHT_PATHS = ['/healthz', '/v1/vault'] as const;
 
-/** Key shapes that must never appear in an anonymous denial body. */
-const CREDENTIAL_KEY_RE =
-  /password|passwd|secret|api[_-]?key|private[_-]?key|session|token|credential|passkey|cookie|authorization/i;
+/**
+ * The Worker's single generic anonymous-denial message, pinned in
+ * `generic_auth` (`workers/api/src/handlers.rs`): every anonymous 401 body
+ * is exactly `{error: <this string>}`. Any other message is a distinguishing
+ * oracle; any extra key is an account-data oracle.
+ */
+const GENERIC_ANONYMOUS_401_MESSAGE = 'check your email and try again';
 
 export interface DenialProbe {
   status: number;
@@ -58,11 +62,12 @@ function assertNoSetCookie(headers: Record<string, string>, context: string): vo
 }
 
 /**
- * The generic anonymous 401 verdict: exactly 401, a JSON body carrying a
- * non-empty `error` message (the Worker's generic shape, never the typed
- * `{code, message, retryable}` envelope and never a per-gate message), no
- * credential-shaped keys, and no cookie. Every failure names the gate
- * (fixed context + status), never a value.
+ * The generic anonymous 401 verdict: exactly 401, a JSON body that is
+ * exactly the single `error` key carrying the generic denial message (the
+ * Worker's `generic_auth` shape — never the typed `{code, message,
+ * retryable}` envelope, never a per-gate message, never a superset with
+ * account fields), and no cookie. Every failure names the gate (fixed
+ * context + status) and key names only, never a value.
  */
 export function assertGenericAnonymous401(probe: DenialProbe): void {
   const { status, headers, bodyText, context } = probe;
@@ -90,28 +95,18 @@ export function assertGenericAnonymous401(probe: DenialProbe): void {
     );
   }
   const record = parsed as Record<string, unknown>;
-  const message = record.error;
-  if (typeof message !== 'string' || message.length === 0) {
+  const keys = Object.keys(record).sort();
+  if (keys.join(',') !== 'error') {
     throw new Error(
-      `[${context}] anonymous 401 body carries no generic error message: expected a non-empty ` +
-        `string error key, got keys: ${Object.keys(record).join(', ') || '(empty)'}.`,
+      `[${context}] anonymous 401 body must be exactly the single error key, ` +
+        `got keys: ${keys.join(', ') || '(empty)'}.`,
     );
   }
-  for (const key of ['code', 'message', 'retryable']) {
-    if (key in record) {
-      throw new Error(
-        `[${context}] anonymous 401 body carries typed-envelope key '${key}': ` +
-          'expected the generic error shape (names only — no values logged).',
-      );
-    }
-  }
-  for (const key of Object.keys(record)) {
-    if (key !== 'error' && CREDENTIAL_KEY_RE.test(key)) {
-      throw new Error(
-        `[${context}] anonymous 401 body carries a credential-shaped key '${key}': ` +
-          'denials stay generic (names only — no values logged).',
-      );
-    }
+  if (record.error !== GENERIC_ANONYMOUS_401_MESSAGE) {
+    throw new Error(
+      `[${context}] anonymous 401 body carries a non-generic error message: ` +
+        'expected the generic denial (names only — no values logged).',
+    );
   }
 }
 
@@ -199,34 +194,78 @@ test.describe('anonymous worker verdicts (offline, no staging)', () => {
     expect(
       () => assertGenericAnonymous401({ ...ok, bodyText: '{"code":"unauthorized"}' }),
       'typed envelope without the generic error key must fail',
-    ).toThrow(/no generic error message/);
-    expect(() => assertGenericAnonymous401({ ...ok, bodyText: '{"error":""}' })).toThrow(
-      /no generic error message/,
+    ).toThrow(/exactly the single error key/);
+    expect(
+      () => assertGenericAnonymous401({ ...ok, bodyText: '{"error":""}' }),
+      'empty error message must fail as non-generic',
+    ).toThrow(/non-generic error message/);
+    for (const key of ['code', 'message', 'retryable']) {
+      const bodyText =
+        key === 'retryable'
+          ? '{"error":"check your email and try again","retryable":false}'
+          : `{"error":"check your email and try again","${key}":"x"}`;
+      expect(
+        () => assertGenericAnonymous401({ ...ok, bodyText }),
+        `generic error mixed with typed-envelope key '${key}' must fail`,
+      ).toThrow(/exactly the single error key/);
+    }
+    // A distinguishing per-gate message is an existence oracle even with the
+    // right keys: only the exact generic denial passes, and the failure must
+    // not echo the distinguishing text.
+    let distinguishing = '';
+    try {
+      assertGenericAnonymous401({ ...ok, bodyText: '{"error":"vault not found for this user"}' });
+    } catch (error) {
+      distinguishing = (error as Error).message;
+    }
+    expect(distinguishing, 'distinguishing message must fail').toMatch(/non-generic error message/);
+    expect(distinguishing).not.toContain('vault not found for this user');
+    // A superset carrying account fields is an account-data oracle even with
+    // the right message: only the single error key passes.
+    expect(
+      () =>
+        assertGenericAnonymous401({
+          ...ok,
+          bodyText:
+            '{"error":"check your email and try again",' +
+            '"provider_configured":true,"user_id":"u","updated_at":"t"}',
+        }),
+      'superset body with account fields must fail',
+    ).toThrow(/exactly the single error key/);
+    expect(
+      () =>
+        assertGenericAnonymous401({
+          ...ok,
+          bodyText: '{"error":"check your email and try again","extra":"x"}',
+        }),
+      'extra non-credential key must fail',
+    ).toThrow(/exactly the single error key/);
+    // The failure names the offending key but never its value.
+    let credentialed = '';
+    try {
+      assertGenericAnonymous401({
+        ...ok,
+        bodyText: '{"error":"check your email and try again","session":"SENTINEL_SESSION_VALUE"}',
+      });
+    } catch (error) {
+      credentialed = (error as Error).message;
+    }
+    expect(credentialed, 'credential-shaped keys must fail without echoing values').toMatch(
+      /exactly the single error key/,
     );
-    expect(
-      () =>
-        assertGenericAnonymous401({
-          ...ok,
-          bodyText: '{"error":"denied","code":"unauthorized"}',
-        }),
-      'generic error mixed with the typed envelope must fail',
-    ).toThrow(/typed-envelope key 'code'/);
-    expect(
-      () =>
-        assertGenericAnonymous401({
-          ...ok,
-          bodyText: '{"error":"denied","session":"SENTINEL_SESSION_VALUE"}',
-        }),
-      'credential-shaped keys must fail without echoing values',
-    ).toThrow(/credential-shaped key 'session'/);
-    expect(
-      () =>
-        assertGenericAnonymous401({
-          ...ok,
-          headers: { 'set-cookie': '__Host-nntune-session=SENTINEL' },
-        }),
-      'denials must not set cookies',
-    ).toThrow(/must not set a cookie/);
+    expect(credentialed).toContain('session');
+    expect(credentialed).not.toContain('SENTINEL_SESSION_VALUE');
+    let cookie = '';
+    try {
+      assertGenericAnonymous401({
+        ...ok,
+        headers: { 'set-cookie': '__Host-nntune-session=SENTINEL' },
+      });
+    } catch (error) {
+      cookie = (error as Error).message;
+    }
+    expect(cookie, 'denials must not set cookies').toMatch(/must not set a cookie/);
+    expect(cookie).not.toContain('SENTINEL');
   });
 
   test('not_found verdict accepts the envelope and rejects the rest', () => {
@@ -272,14 +311,17 @@ test.describe('anonymous worker verdicts (offline, no staging)', () => {
         }),
       'empty message must fail',
     ).toThrow(/non-empty string/);
-    expect(
-      () =>
-        assertNotFoundEnvelope({
-          ...ok,
-          headers: { 'set-cookie': 'a=SENTINEL' },
-        }),
-      'denials must not set cookies',
-    ).toThrow(/must not set a cookie/);
+    let cookie = '';
+    try {
+      assertNotFoundEnvelope({
+        ...ok,
+        headers: { 'set-cookie': 'a=SENTINEL' },
+      });
+    } catch (error) {
+      cookie = (error as Error).message;
+    }
+    expect(cookie, 'denials must not set cookies').toMatch(/must not set a cookie/);
+    expect(cookie).not.toContain('SENTINEL');
   });
 
   test('probe paths stay pinned to the anonymous Worker contract', () => {
@@ -433,12 +475,17 @@ test.describe('anonymous API Worker contract (staging)', () => {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
-    // Browser-faithful preflight: exact Origin, no credentials. The Worker
-    // answers 204 for known paths regardless; credentialed CORS headers are
-    // an entry concern, not asserted here.
+    // Same-origin preflight (not a cross-origin CORS probe): the Worker
+    // answers 204 with an empty body for known paths regardless of Origin.
+    // The credentialed CORS header contract (exact-Origin allow-list) is
+    // unit-tested in `workers/api/src/worker_entry.rs` (`cors_headers_*`);
+    // the E2E job does not receive the Worker's configured origin, so no
+    // Allow-* headers are asserted here.
     const headers: Record<string, string> = {
       ...accessHeaders(),
       Origin: new URL(baseURL).origin,
+      'Access-Control-Request-Method': 'GET',
+      'Access-Control-Request-Headers': 'content-type',
     };
     expect(headers['Authorization'], 'worker probe must carry no app session').toBeUndefined();
 

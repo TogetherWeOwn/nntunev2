@@ -199,18 +199,18 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
 - `e2e/tests/api-worker-anonymous.spec.ts` pins the anonymous API Worker
   contract both offline and live: the offline describe pins the verdict
   shapes on every PR via `test:unit` with no staging
-  (`e2e/tests/api-worker-anonymous.spec.ts:179` "generic 401 verdict accepts the documented shape and rejects the rest",
-  `e2e/tests/api-worker-anonymous.spec.ts:232` "not_found verdict accepts the envelope and rejects the rest",
-  `e2e/tests/api-worker-anonymous.spec.ts:285` "probe paths stay pinned to the anonymous Worker contract",
-  `e2e/tests/api-worker-anonymous.spec.ts:297` "preflight probes cover liveness and the authed surface"),
+  (`e2e/tests/api-worker-anonymous.spec.ts:174` "generic 401 verdict accepts the documented shape and rejects the rest",
+  `e2e/tests/api-worker-anonymous.spec.ts:271` "not_found verdict accepts the envelope and rejects the rest",
+  `e2e/tests/api-worker-anonymous.spec.ts:327` "probe paths stay pinned to the anonymous Worker contract",
+  `e2e/tests/api-worker-anonymous.spec.ts:339` "preflight probes cover liveness and the authed surface"),
   while the staging legs prove liveness and fail-closed denial behind the
   Access edge with the Access pair only and no app session
-  (`e2e/tests/api-worker-anonymous.spec.ts:303` "GET /healthz answers 200 with ok:true and no session",
-  `e2e/tests/api-worker-anonymous.spec.ts:337` "anonymous GET /v1/vault answers the generic 401",
-  `e2e/tests/api-worker-anonymous.spec.ts:358` "anonymous POST /v1/session/refresh answers the generic 401",
-  `e2e/tests/api-worker-anonymous.spec.ts:385` "anonymous POST /v1/session/revoke-all answers the generic 401",
-  `e2e/tests/api-worker-anonymous.spec.ts:409` "GET unknown worker path answers the 404 not_found envelope",
-  `e2e/tests/api-worker-anonymous.spec.ts:428` "OPTIONS preflight on known worker paths answers 204 with an empty body"):
+  (`e2e/tests/api-worker-anonymous.spec.ts:345` "GET /healthz answers 200 with ok:true and no session",
+  `e2e/tests/api-worker-anonymous.spec.ts:379` "anonymous GET /v1/vault answers the generic 401",
+  `e2e/tests/api-worker-anonymous.spec.ts:400` "anonymous POST /v1/session/refresh answers the generic 401",
+  `e2e/tests/api-worker-anonymous.spec.ts:427` "anonymous POST /v1/session/revoke-all answers the generic 401",
+  `e2e/tests/api-worker-anonymous.spec.ts:451` "GET unknown worker path answers the 404 not_found envelope",
+  `e2e/tests/api-worker-anonymous.spec.ts:470` "OPTIONS preflight on known worker paths answers 204 with an empty body"):
   `GET /healthz` answers 200 with ok true, the vault read and both session
   mutations answer the generic 401 with no cookie set, the unknown path
   answers the not_found envelope, and known-path preflights answer an empty

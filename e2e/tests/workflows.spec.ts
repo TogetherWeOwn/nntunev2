@@ -139,6 +139,7 @@ test.describe('credential scope (static pins)', () => {
     expect(accounts).toContain('maxRedirects: 0');
     expect(accounts).toContain('export async function apiGet');
     expect(accounts).toContain('export async function apiPost');
+    expect(accounts).toContain('export async function apiOptions');
     expect(accounts).toContain('unexpected redirect');
   });
 
