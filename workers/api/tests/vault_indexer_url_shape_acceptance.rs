@@ -26,7 +26,11 @@
 //! extra-slash pins (the parser skips any number of slashes after the
 //! HTTPS scheme, so the raw authority between `://` and the next `/`
 //! is empty and its `@` is never seen; the no-`@` extra-slash sibling
-//! pins the empty-authority refusal itself); treating an empty
+//! pins the empty-authority refusal itself); letting a decoy `://`
+//! later in the string (path or query) anchor the authority scan
+//! instead of the scheme prefix breaks the decoy pins (the real
+//! authority's `@` sits before the decoy, so a scan anchored there
+//! never sees it); treating an empty
 //! fragment as absent
 //! (only rejecting non-empty fragments) breaks the bare-`#` pin;
 //! ignoring the parsed fragment breaks the fragment pins. Note the
@@ -35,7 +39,13 @@
 //! pass; the obfuscated password-only pins catch a missing
 //! fail-closed rule once `password()` is gone, and with the
 //! empty-authority refusal in place the extra-slash password-only pin
-//! is caught by that rule too, leaving `password()` again pure
+//! is caught by that rule too. The decoy password-only pins are
+//! different before the scheme-prefix anchor lands: only
+//! `password()` rejects them there, so dropping it leaves them
+//! validating. Once the anchor lands (reject unless the text before
+//! `://` is exactly `https`), it rejects the decoy password-only
+//! pins independently of `password()` — they stay rejected under a
+//! `password()` mutant — leaving `password()` again pure
 //! defense-in-depth.
 //!
 //! Run only this file:
@@ -123,6 +133,20 @@ fn embedded_userinfo_is_invalid() {
         // this one, but under a `password()` mutant only the
         // empty-authority refusal still rejects it.
         "https:///:secret@index.example.com/api",
+        // Decoy-`://` empty userinfo: no literal `://` follows the
+        // scheme, so a scan anchored to the first `://` it finds later
+        // in the path or query starts after the real authority and
+        // never sees its `@`; parsed username/password are `""`/`None`.
+        "https:@index.example.com/api://x",
+        "https:/@index.example.com/api://x",
+        "https:@index.example.com/api?q=://x",
+        "https::@index.example.com/api://x",
+        "https:@index.example.com:443/api://x",
+        // Decoy password-only: the parsed-password check catches these
+        // before the scheme-prefix anchor lands, but under a
+        // `password()` mutant only that anchor still rejects them.
+        "https::secret@index.example.com/api://x",
+        "https:/:secret@index.example.com/api://x",
     ] {
         assert!(
             matches!(indexer(url).validate(&PublicDns), Err(VaultError::Invalid)),
