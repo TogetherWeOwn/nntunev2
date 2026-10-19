@@ -333,6 +333,48 @@ fn stream_body_covered(slice: &str, code: &str) -> bool {
     tokens.iter().any(|t| *t > stream_at)
 }
 
+/// Body of the shared capped reader, so delegation can be verified
+/// as genuinely streamed + capped rather than a renamed
+/// whole-body collect (same shape as `result_reply_cap` and
+/// `stage_input_drain`: `.stream()` chunks admitted via
+/// `push_chunk_capped`, check-before-extend).
+fn capped_reader_body(code: &str) -> &str {
+    fn_defs(code)
+        .into_iter()
+        .find(|(name, _)| name == "read_response_capped")
+        .map(|(_, body)| body)
+        .expect("read_response_capped must exist in runtime.rs")
+}
+
+/// Delegated cap: the site reads through `read_response_capped`
+/// bounded by `MAX_RESULT_BYTES`, and the helper really streams
+/// under the cap. Accepts exactly what `result_reply_cap` accepts.
+fn capped_delegation(slice: &str, code: &str) -> bool {
+    if !(slice.contains("read_response_capped") && slice.contains("MAX_RESULT_BYTES")) {
+        return false;
+    }
+    let helper = capped_reader_body(code);
+    helper.contains(".stream()") && helper.contains("push_chunk_capped")
+}
+
+/// Delegated body read is inside the bound: `container_json`
+/// constructs a `read_response_capped(..., MAX_RESULT_BYTES)` future
+/// and races it against the same armed deadline (a race token
+/// polling `deadline` after the read is constructed), instead of an
+/// inline `.stream()` loop. The delegation itself must be the
+/// genuinely streamed + capped helper (see `capped_delegation`).
+fn delegated_body_covered(slice: &str, code: &str) -> bool {
+    if !capped_delegation(slice, code) {
+        return false;
+    }
+    let Some(read_at) = slice.find("read_response_capped") else {
+        return false;
+    };
+    let tail = &slice[read_at..];
+    let race_after = RACE_TOKENS.iter().any(|t| tail.contains(t));
+    race_after && tail.contains("deadline.as_mut()")
+}
+
 // ---------------------------------------------------------------------------
 // Controls: adjacent behaviour that must stay green before and after.
 // ---------------------------------------------------------------------------
@@ -383,17 +425,25 @@ fn container_json_still_caps_the_reply_bytes() {
     let code = code();
     let slice = container_json_code(&code);
     assert!(
-        slice.contains("fetch_request(") && slice.contains(".stream()"),
-        "container_json must keep exchanging through the port fetcher and reading the body as a stream"
-    );
-    assert!(
-        slice.contains("> MAX_RESULT_BYTES"),
-        "container_json must keep rejecting replies over MAX_RESULT_BYTES"
+        slice.contains("fetch_request("),
+        "container_json must keep exchanging through the port fetcher"
     );
     assert!(
         !slice.contains(".bytes()"),
         "container_json must stream the Container-chosen reply under the \
          cap, not collect it whole with `.bytes()` before rejecting it"
+    );
+    // Inline streamed shape (`.stream()` loop aborting past the cap)
+    // or delegation to the shared capped reader (the shape
+    // `result_reply_cap` accepts): `read_response_capped` bounded by
+    // `MAX_RESULT_BYTES`, with the helper itself streaming via
+    // `push_chunk_capped`.
+    let inline = slice.contains(".stream()") && slice.contains("> MAX_RESULT_BYTES");
+    assert!(
+        inline || capped_delegation(slice, &code),
+        "container_json must keep rejecting replies over MAX_RESULT_BYTES, \
+         either with an inline `.stream()` read aborting past the cap or \
+         by delegating to read_response_capped bounded by MAX_RESULT_BYTES"
     );
 }
 
@@ -529,10 +579,13 @@ fn deadline_at_both_sites_covers_the_body_read_not_only_headers() {
         stage.contains("cancel"),
         "stage_input must still dispose of the PUT reply by cancelling it"
     );
+    let json = container_json_code(&code);
     assert!(
-        stream_body_covered(container_json_code(&code), &code),
-        "container_json's streamed `.stream()` read must be inside the deadline, \
-         not a bare await after a headers-only race"
+        stream_body_covered(json, &code) || delegated_body_covered(json, &code),
+        "container_json's body read must be inside the deadline, not a bare \
+         await after a headers-only race: either a streamed `.stream()` read \
+         raced against it, or a read_response_capped(..., MAX_RESULT_BYTES) \
+         future raced against the same deadline"
     );
 }
 
