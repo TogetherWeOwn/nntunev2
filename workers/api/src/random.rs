@@ -101,4 +101,71 @@ mod tests {
         assert_eq!(api.message, "service unavailable");
         assert_eq!(crate::api_error::spec("service_unavailable").status, 503);
     }
+
+    /// Structural pin: the single audited `getrandom` call site must
+    /// propagate failure as `RandomnessUnavailable` — never panic
+    /// (`.expect(`/unwrap spellings), never discard the result
+    /// (`let _ =` / `.ok()`), which would serve zero-filled key material
+    /// as constant tokens, session ids, vault DEK and nonces. OS RNG
+    /// failure cannot be induced portably in a unit test, so this source
+    /// shape is the regression protection for the fail-closed claim
+    /// (complementing the paired `randomness_fail_closed_nine` suite,
+    /// owned by TOG-31633, which scans the six caller files).
+    #[test]
+    fn helper_propagates_randomness_failure() {
+        // Slice ONLY the pre-test production source first: the banned
+        // needles below appear verbatim in this test's own literals, so
+        // searching the whole file would match the test itself.
+        let source = include_str!("random.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        // Strip `//` line comments (incl. `///` / `//!` docs) so prose
+        // about the old `.expect(..)` spelling cannot satisfy the pin.
+        let mut code = String::with_capacity(production.len());
+        for line in production.lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            code.push_str(line);
+            code.push('\n');
+        }
+        let norm = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        // Anti-vacuity: the helper must still draw from the OS CSPRNG.
+        assert!(
+            norm.contains("getrandom::fill"),
+            "helper must still draw randomness via getrandom::fill",
+        );
+        // No discarding spelling: `let _ =` would serve zero buffers.
+        assert!(
+            !norm.contains("let _ = getrandom"),
+            "getrandom result must be propagated, never discarded with let _ =",
+        );
+        for (idx, _) in norm.match_indices("getrandom::") {
+            let end = norm[idx..]
+                .find(';')
+                .map_or(norm.len(), |semi| idx + semi + 1);
+            let stmt = &norm[idx..end];
+            for banned in [
+                ".expect(",
+                ".unwrap(",
+                ".unwrap_or(",
+                ".unwrap_or_else(",
+                ".unwrap_or_default(",
+                ".ok()",
+            ] {
+                assert!(
+                    !stmt.contains(banned),
+                    "getrandom statement must propagate, found banned {banned}: {stmt}",
+                );
+            }
+            assert!(
+                stmt.contains(".map_err")
+                    && stmt.contains("RandomnessUnavailable")
+                    && stmt.contains('?'),
+                "getrandom statement must map failure to RandomnessUnavailable with ?: {stmt}",
+            );
+        }
+    }
 }
