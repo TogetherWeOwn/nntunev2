@@ -214,7 +214,10 @@ export function validateIndexerUrl(url: string, apiKey: string): string | null {
 		if (explicitPort === '' || !/^\d+$/.test(explicitPort)) {
 			return 'That indexer URL does not look valid.';
 		}
-		if (explicitPort !== '443') {
+		// Numeric compare, mirroring the fetch builder's parse_port (digits
+		// parsed as u16 before comparing against 443): leading-zero
+		// spellings such as `:0443` are port 443 downstream too.
+		if (Number(explicitPort) !== 443) {
 			return 'Indexer URLs must use port 443.';
 		}
 	} else if (parsed.port !== '') {

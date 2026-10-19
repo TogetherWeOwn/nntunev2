@@ -43,4 +43,25 @@ describe('validateIndexerUrl: raw-authority port forms', () => {
 		expect(validateIndexerUrl('https://index.example.com:443', KEY)).toBeNull();
 		expect(validateIndexerUrl('https://index.example.com:8443', KEY)).toBe(PORT_MESSAGE);
 	});
+
+	it('accepts leading-zero spellings of port 443', () => {
+		// The fetch builder parses port digits as a u16 (parse_port) before
+		// comparing against 443, so leading zeros are still port 443
+		// downstream — the client must judge the numeric value, not the digit
+		// string. Leading-zero non-443 ports stay rejected.
+		for (const url of [
+			'https://index.example.com:0443/api',
+			'https://index.example.com:000443/api',
+			'https://index.example.com:0443',
+			'https://[2001:4860:4860::8888]:0443/api'
+		]) {
+			expect(validateIndexerUrl(url, KEY), `url accepted: ${url}`).toBeNull();
+		}
+		for (const url of [
+			'https://index.example.com:080/api',
+			'https://index.example.com:0444/api'
+		]) {
+			expect(validateIndexerUrl(url, KEY), `url rejected: ${url}`).toBe(PORT_MESSAGE);
+		}
+	});
 });
