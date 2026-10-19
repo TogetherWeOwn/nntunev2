@@ -329,7 +329,11 @@ fn form_encode_component(value: &str) -> String {
 /// limit/offset spellings share one edge entry. Everything else returns
 /// the input unchanged, byte for byte, so `edge_hit` (which runs before
 /// validation) can never serve a request the handler would reject, nor a
-/// real page's body for an above-cap offset.
+/// real page's body for an above-cap offset. A repeated served parameter
+/// (`q`, `type`, `limit` or `offset`, compared after decoding so encoded
+/// spellings count) is also unserved: `search_route` collects into a
+/// `HashMap` where the last value wins, so keying on any one occurrence
+/// could store a body under another occurrence's identity.
 pub fn canonical_edge_url(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
         return url.to_string();
@@ -370,7 +374,14 @@ pub fn canonical_edge_url(url: &str) -> String {
         ) else {
             return url.to_string();
         };
-        params.entry(key).or_insert(value);
+        // `search_route` collects into a HashMap (last value wins). A
+        // repeated served key would make this key and the served body
+        // disagree, so leave such URLs on their raw key. Duplicate
+        // unknown keys stay allowed: they are dropped either way.
+        let served = matches!(key.as_str(), "q" | "type" | "limit" | "offset");
+        if params.insert(key, value).is_some() && served {
+            return url.to_string();
+        }
     }
     let Some(raw_q) = params.get("q") else {
         return url.to_string();
