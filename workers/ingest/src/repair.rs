@@ -148,6 +148,17 @@ pub fn classify_repair_reply(status: u16, body: &[u8]) -> RepairCall {
     }
 }
 
+/// Dispatch one repair request through the service binding. Transport
+/// or binding failures are `Retry`, never a guessed terminal outcome.
+///
+/// The reply body streams within `MAX_REPAIR_REPLY_BYTES`: the chunk that
+/// would cross the ceiling returns `Retry` from the length. The remainder
+/// is never retained and no truncated prefix reaches
+/// `classify_repair_reply`.
+pub async fn call_repair(env: &Env, req: &RepairRequest) -> RepairCall {
+    call_repair_with_deadline(env, req, REPAIR_CALL_DEADLINE_MS).await
+}
+
 /// Settle headers and the capped reply under one owned, cancellable deadline.
 /// The same deadline is polled first at both stages; body progress never
 /// replenishes it. Ownership releases the timer on every return (including
@@ -172,17 +183,6 @@ where
         Some(Err(_)) | None => return RepairCall::Retry,
     };
     classify_repair_reply(status, &body)
-}
-
-/// Dispatch one repair request through the service binding. Transport
-/// or binding failures are `Retry`, never a guessed terminal outcome.
-///
-/// The reply body streams within `MAX_REPAIR_REPLY_BYTES`: the chunk that
-/// would cross the ceiling returns `Retry` from the length. The remainder
-/// is never retained and no truncated prefix reaches
-/// `classify_repair_reply`.
-pub async fn call_repair(env: &Env, req: &RepairRequest) -> RepairCall {
-    call_repair_with_deadline(env, req, REPAIR_CALL_DEADLINE_MS).await
 }
 
 /// Dispatch with an injectable total headers-plus-body budget in milliseconds.
