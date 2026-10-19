@@ -36,6 +36,11 @@ pub const SCRATCH_BINDING: &str = "INGEST_SCRATCH";
 const CONTAINER_PORT: u16 = 8080;
 /// Container cold-start budget: poll `/health` every 500 ms.
 const HEALTH_ATTEMPTS: u32 = 60;
+/// Longest one Container fetch may take, headers plus body sharing one
+/// cancellable deadline. Both `stage_input` and `container_json` arm
+/// from this constant only, so the budget is overridable in exactly one
+/// place (same `*_MS: u64` shape as the sibling ingest MB deadline).
+const CONTAINER_FETCH_DEADLINE_MS: u64 = 10_000;
 
 fn json_response(status: u16, body: Vec<u8>) -> WorkerResult<Response> {
     let headers = Headers::new();
@@ -334,12 +339,57 @@ impl RepairContainer {
         );
         let request = Request::new_with_init(&url, &init)
             .map_err(|_| ApiFault::new(502, "container_unavailable"))?;
-        let mut response = container
-            .fetch_request(request)
-            .await
-            .map_err(|_| ApiFault::new(502, "container_unavailable"))?;
+        // One cancellable deadline spans headers plus the body drain,
+        // armed before the fetch is issued so slow headers count against
+        // the same budget as a stalled body (same shape as the ingest
+        // pool-stub deadline). `Delay` only registers its timer on first
+        // poll, so racing both futures below polls (arms) the deadline
+        // from the start. Dropping the pinned `Delay` releases its timer,
+        // and every return below drops it: expiry, transport failure, and
+        // success all release the timer.
+        let mut deadline = Box::pin(Delay::from(Duration::from_millis(
+            CONTAINER_FETCH_DEADLINE_MS,
+        )));
+        let mut fetch = Box::pin(container.fetch_request(request));
+        let response = std::future::poll_fn(|cx| {
+            use std::task::Poll;
+            // Deadline first: an already-fired deadline aborts even when
+            // headers are also ready.
+            if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+                return Poll::Ready(None);
+            }
+            match std::future::Future::poll(fetch.as_mut(), cx) {
+                Poll::Ready(response) => Poll::Ready(Some(response)),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await;
+        let mut response = match response {
+            Some(Ok(response)) => response,
+            Some(Err(_)) | None => return Err(ApiFault::new(502, "container_unavailable")),
+        };
         let status = response.status_code();
-        let _ = response.bytes().await;
+        // Reuse the same deadline for the body drain: partial progress
+        // never re-arms it, so headers plus body share one total budget.
+        // A drain still incomplete at expiry fails the whole stage as
+        // 502 container_unavailable, the fault this site already returns.
+        let mut body_read = Box::pin(response.bytes());
+        let drained = std::future::poll_fn(|cx| {
+            use std::task::Poll;
+            if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+                return Poll::Ready(None);
+            }
+            match std::future::Future::poll(body_read.as_mut(), cx) {
+                Poll::Ready(drained) => Poll::Ready(Some(drained)),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await;
+        let _ = match drained {
+            Some(Ok(drained)) => drained,
+            Some(Err(_)) | None => return Err(ApiFault::new(502, "container_unavailable")),
+        };
+        drop(deadline);
         match status {
             201 => Ok(()),
             400 | 413 => Err(ApiFault::new(status, "scratch_input_mismatch")),
@@ -418,15 +468,55 @@ async fn container_json(
     }
     let request = Request::new_with_init(&format!("http://container{path}"), &init)
         .map_err(|_| ApiFault::new(502, "container_unavailable"))?;
-    let mut response = port
-        .fetch_request(request)
-        .await
-        .map_err(|_| ApiFault::new(502, "container_unavailable"))?;
+    // One cancellable deadline spans headers plus the body read, armed
+    // before the fetch is issued so slow headers count against the same
+    // budget as a stalled body (same shape as `stage_input` above and
+    // the ingest pool-stub deadline). Dropping the pinned `Delay`
+    // releases its timer, and every return below drops it: expiry,
+    // transport failure, and success all release the timer.
+    let mut deadline = Box::pin(Delay::from(Duration::from_millis(
+        CONTAINER_FETCH_DEADLINE_MS,
+    )));
+    let mut fetch = Box::pin(port.fetch_request(request));
+    let response = std::future::poll_fn(|cx| {
+        use std::task::Poll;
+        // Deadline first: an already-fired deadline aborts even when
+        // headers are also ready.
+        if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        match std::future::Future::poll(fetch.as_mut(), cx) {
+            Poll::Ready(response) => Poll::Ready(Some(response)),
+            Poll::Pending => Poll::Pending,
+        }
+    })
+    .await;
+    let mut response = match response {
+        Some(Ok(response)) => response,
+        Some(Err(_)) | None => return Err(ApiFault::new(502, "container_unavailable")),
+    };
     let status = response.status_code();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|_| ApiFault::new(502, "container_unavailable"))?;
+    // Reuse the same deadline for the body read: partial progress never
+    // re-arms it, so headers plus body share one total budget. A read
+    // still incomplete at expiry fails the whole exchange as the
+    // existing 502 container_unavailable; no new fault variant.
+    let mut body_read = Box::pin(response.bytes());
+    let bytes = std::future::poll_fn(|cx| {
+        use std::task::Poll;
+        if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        match std::future::Future::poll(body_read.as_mut(), cx) {
+            Poll::Ready(bytes) => Poll::Ready(Some(bytes)),
+            Poll::Pending => Poll::Pending,
+        }
+    })
+    .await;
+    let bytes = match bytes {
+        Some(Ok(bytes)) => bytes,
+        Some(Err(_)) | None => return Err(ApiFault::new(502, "container_unavailable")),
+    };
+    drop(deadline);
     if bytes.len() > MAX_RESULT_BYTES {
         return Err(ApiFault::new(502, "container_unavailable"));
     }
