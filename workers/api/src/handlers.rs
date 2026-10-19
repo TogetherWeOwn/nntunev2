@@ -2733,6 +2733,13 @@ where
     let Some(label) = normalize_credential_label(body.label.as_deref()) else {
         return validation_failed("invalid label");
     };
+    // Zero TTL would mint a credential already expired at issuance
+    // (`expires_at == now`) while still returning a one-time secret (ADR
+    // 0010 requires meaningful expiry): reject before any row, audit entry,
+    // or secret exists.
+    if body.ttl_secs == 0 {
+        return validation_failed("invalid ttl");
+    }
     // Exact scope strings only: unknown, cross-surface (`"subsonic"`),
     // case or whitespace variants reject — the allowlist never trims or
     // folds.
@@ -2742,6 +2749,24 @@ where
             Some(scope) => scopes.push(scope),
             None => return validation_failed("unknown scope"),
         }
+    }
+    // Raw length past the defined vocabulary can only be duplicates (only
+    // `ALL_SCOPES.len()` distinct scopes exist): reject before any row,
+    // audit entry, or secret exists, so an arbitrarily long duplicate list
+    // can never mint.
+    if scopes.len() > crate::native_rest::ALL_SCOPES.len() {
+        return validation_failed("too many scopes");
+    }
+    // Duplicates within the cap collapse to first-seen order, so the 201
+    // body and the stored row carry the same deduplicated set.
+    {
+        let mut deduped = Vec::with_capacity(scopes.len());
+        for scope in scopes {
+            if !deduped.contains(&scope) {
+                deduped.push(scope);
+            }
+        }
+        scopes = deduped;
     }
     // Unprovisioned keyring fails closed per-request (generic 500, never
     // which secret is missing): without a pepper there is nothing to HMAC
