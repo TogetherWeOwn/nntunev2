@@ -285,11 +285,12 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   `second-signal` track ids.
 - `e2e/tests/cost-basis.spec.ts` pins the cost-basis worksheet arithmetic
   offline (run on every PR via `test:unit` with no staging):
-  `e2e/tests/cost-basis.spec.ts:172` "§8 illustrative volumes total $6.00"
+  `e2e/tests/cost-basis.spec.ts:189` "§8 illustrative volumes total $6.00"
   plus the sibling §8 row totals ($15.45 R2, $3.00 KV, $2.00 Queues, $0.50
-  prospective Analytics Engine, $13.75 PlanetScale storage, $6.60 egress,
-  $56.80 current total / $57.30 with prospective) and the
-  allowance-boundary cases, with `e2e/tests/cost-basis.spec.ts:436`
+  prospective Analytics Engine, $3.00 prospective Workers Logs, $13.75
+  PlanetScale storage, $6.60 egress, $56.80 current total / $57.30 with
+  prospective AE / $60.30 with all prospectives) and the
+  allowance-boundary cases, with `e2e/tests/cost-basis.spec.ts:479`
   "expected totals cover §8 services only — no §10 measured rows" pinning
   that the §10 measured bill stays evidence, not asserted arithmetic. Cost
   documentation, not journey coverage.

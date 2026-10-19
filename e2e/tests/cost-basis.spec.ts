@@ -4,7 +4,8 @@ import { readFileSync } from 'node:fs';
 // Cost-basis worksheet arithmetic pins (offline, no staging).
 //
 // `docs/cost-basis.md` §1–§7 define the Cloudflare Workers / R2 / KV /
-// Queues / Analytics Engine / PlanetScale formulas and the §7 total; §8
+// Queues / Analytics Engine / Workers Logs / PlanetScale formulas and the
+// §7 total (Workers Logs lives in §5b so §6–§8 keep their numbers); §8
 // works them through with invented illustrative volumes. Nothing on
 // staging is touched: these tests re-encode each formula in the helpers
 // below and assert the §8 row totals plus the `max(0, x)` / `ceil(x)`
@@ -78,6 +79,12 @@ function analyticsEngineProspective(dataPointsWritten: number, readQueries: numb
   return clamp(dataPointsWritten / 1e6 - 10) * 0.25 + clamp(readQueries / 1e6 - 1) * 1.0;
 }
 
+// §5b (prospective, excluded from the §7 current total):
+// workers_logs_prospective = max(0, L/1e6 - 20) * 0.60
+function workersLogsProspective(logEventsWritten: number): number {
+  return clamp(logEventsWritten / 1e6 - 20) * 0.6;
+}
+
 // §6 per cluster: SKU + max(0, D - 10) * 0.125 * N + D * 0.125 * X
 // + max(0, Bak - 2*D) * 0.023 + max(0, E - EA) * 0.06
 function planetscaleClusterCost(args: {
@@ -108,11 +115,13 @@ const section8ExpectedTotals = {
   kv: 3,
   queues: 2,
   analyticsEngineProspective: 0.5,
+  workersLogsProspective: 3,
   planetscaleCompute: 10,
   planetscaleStorage: 13.75,
   planetscaleEgress: 6.6,
   totalCurrent: 56.8,
   totalWithProspectiveAe: 57.3,
+  totalWithAllProspectives: 60.3,
 };
 
 // Worksheet text the helpers must stay in sync with. Read with the same
@@ -138,6 +147,9 @@ test.describe('Worksheet drift guard (docs/cost-basis.md)', () => {
     expect(worksheetNorm).toContain(
       'analytics_engine_prospective = max(0, W/1e6 - 10) * 0.25 + max(0, Q/1e6 - 1) * 1.00',
     );
+    expect(worksheetNorm).toContain(
+      'workers_logs_prospective = max(0, L/1e6 - 20) * 0.60',
+    );
     expect(worksheetNorm).toContain('planetscale_cluster = SKU');
     expect(worksheetNorm).toContain('max(0, D - 10) * 0.125 * N');
     expect(worksheetNorm).toContain('D * 0.125 * X');
@@ -149,6 +161,9 @@ test.describe('Worksheet drift guard (docs/cost-basis.md)', () => {
     expect(worksheetNorm).toContain(
       'monthly_total_with_prospective_ae = monthly_total_current + analytics_engine_prospective',
     );
+    expect(worksheetNorm).toContain(
+      'monthly_total_with_all_prospectives = monthly_total_with_prospective_ae + workers_logs_prospective',
+    );
   });
 
   test('§8 illustrative rows still carry their $ amounts', () => {
@@ -157,14 +172,16 @@ test.describe('Worksheet drift guard (docs/cost-basis.md)', () => {
     expect(worksheetDoc).toMatch(/\|\s*KV\s*\|[^|]*\|\s*3\.00\s*\|/);
     expect(worksheetDoc).toMatch(/\|\s*Queues\s*\|[^|]*\|\s*2\.00\s*\|/);
     expect(worksheetDoc).toMatch(/\|\s*Analytics Engine[^\n|]*\|[^|]*\|\s*0\.50\s*\|/);
+    expect(worksheetDoc).toMatch(/\|\s*Workers Logs[^\n|]*\|[^|]*\|\s*3\.00\s*\|/);
     expect(worksheetDoc).toMatch(/\|\s*PlanetScale compute\s*\|[^|]*\|\s*10\.00\s*\|/);
     expect(worksheetDoc).toMatch(/\|\s*PlanetScale storage\s*\|[^|]*\|\s*13\.75\s*\|/);
     expect(worksheetDoc).toMatch(/\|\s*PlanetScale egress\s*\|[^|]*\|\s*6\.60\s*\|/);
   });
 
-  test('§8 totals still read 56.80 / 57.30', () => {
+  test('§8 totals still read 56.80 / 57.30 / 60.30', () => {
     expect(worksheetDoc).toMatch(/\*\*56\.80\*\*/);
     expect(worksheetDoc).toMatch(/\|\s*Total including prospective Analytics Engine\s*\|[^|]*\|\s*57\.30\s*\|/);
+    expect(worksheetDoc).toMatch(/\|\s*Total including all prospectives[^\n|]*\|[^|]*\|\s*60\.30\s*\|/);
   });
 });
 
@@ -279,6 +296,25 @@ test.describe('Analytics Engine formula (§5, prospective)', () => {
 
   test('read queries over allowance bill $1.00 per million', () => {
     expect(analyticsEngineProspective(0, 2e6)).toBe(1);
+  });
+});
+
+test.describe('Workers Logs formula (§5b, prospective)', () => {
+  test('§8 illustrative volumes total $3.00, kept out of the current total', () => {
+    // (25−20)×0.60 = 3.00.
+    expect(workersLogsProspective(25e6)).toBeCloseTo(section8ExpectedTotals.workersLogsProspective, 9);
+  });
+
+  test('usage exactly at the allowance costs nothing', () => {
+    expect(workersLogsProspective(20e6)).toBe(0);
+  });
+
+  test('one million events over allowance adds $0.60', () => {
+    expect(workersLogsProspective(21e6)).toBeCloseTo(0.6, 9);
+  });
+
+  test('zero usage costs nothing', () => {
+    expect(workersLogsProspective(0)).toBe(0);
   });
 });
 
@@ -422,6 +458,13 @@ test.describe('Total (§7)', () => {
         analyticsEngineProspective(12e6, 0.5e6),
     ).toBeCloseTo(section8ExpectedTotals.totalWithProspectiveAe, 9);
   });
+
+  test('§8 total including all prospectives is $60.30', () => {
+    expect(
+      section8ExpectedTotals.totalWithProspectiveAe +
+        workersLogsProspective(25e6),
+    ).toBeCloseTo(section8ExpectedTotals.totalWithAllProspectives, 9);
+  });
 });
 
 test.describe('§10 measured bill is evidence, not arithmetic', () => {
@@ -444,8 +487,10 @@ test.describe('§10 measured bill is evidence, not arithmetic', () => {
         'queues',
         'r2',
         'totalCurrent',
+        'totalWithAllProspectives',
         'totalWithProspectiveAe',
         'workers',
+        'workersLogsProspective',
       ].sort(),
     );
     // The §10 measured total exists in the worksheet but stays out of the fixture.
