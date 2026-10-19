@@ -18,9 +18,11 @@
 //! Sensitivity (mutants this file catches): accepting any explicit port
 //! breaks the non-443 pins; rejecting an explicit `:443` (e.g. by
 //! string-matching a `:NNNN` suffix instead of the parsed port) breaks
-//! the `:443` pin; checking only `username()` and missing a password-only
-//! authority is not pinned — user and user:password forms are; ignoring
-//! the parsed fragment breaks the fragment pins.
+//! the `:443` pin; checking only `username()` without `password()`
+//! breaks the password-only pin; missing an empty userinfo (`@host`,
+//! `:@host`) breaks those pins; treating an empty fragment as absent
+//! (only rejecting non-empty fragments) breaks the bare-`#` pin;
+//! ignoring the parsed fragment breaks the fragment pins.
 //!
 //! Run only this file:
 //!
@@ -72,6 +74,12 @@ fn embedded_userinfo_is_invalid() {
     for url in [
         "https://user@index.example.com/api",
         "https://user:secret@index.example.com/api",
+        // Password-only: empty username, so a `username()`-only check passes.
+        "https://:secret@index.example.com/api",
+        // Empty userinfo: parsed username/password are `""`/`None`, but
+        // the raw authority still carries an `@`.
+        "https://@index.example.com/api",
+        "https://:@index.example.com/api",
         "https://index.example.com@evil.example.com/api",
     ] {
         assert!(
@@ -89,6 +97,8 @@ fn fragment_is_invalid() {
         "https://index.example.com/api#section",
         "https://index.example.com/api#t=1",
         "https://index.example.com/#frag",
+        // Bare trailing hash: `fragment()` is `Some("")`, not `None`.
+        "https://index.example.com/api#",
     ] {
         assert!(
             matches!(indexer(url).validate(&PublicDns), Err(VaultError::Invalid)),
