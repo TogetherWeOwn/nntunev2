@@ -100,8 +100,8 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   green without staging and fail closed once configured.
 - Returning-user login magic link (`e2e/tests/login-magic-link.spec.ts:45`
   "returning user signs in with an emailed magic link and lands on provider setup",
-  `:118` "login shows the same generic sent state for an unknown address",
-  `:138` "login surfaces a generic error when the magic-link request fails") is
+  `:120` "login shows the same generic sent state for an unknown address",
+  `:140` "login surfaces a generic error when the magic-link request fails") is
   auth-journey support, not an M1 exit step: the live case mints the returning
   account via `POST /api/test-accounts` (`tryMintTestAccount`,
   `e2e/helpers/accounts.ts:335`), submits the real `/login` form from a null
