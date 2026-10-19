@@ -408,6 +408,16 @@ impl IndexerConfig {
         };
         let after = &self.url[scheme_end + 3..];
         let authority = after.split(['/', '?', '#']).next().unwrap_or_default();
+        // The url crate skips any number of slashes after the scheme for
+        // https, so extra-slash shapes (`https:///@host`, `https:///host`)
+        // parse with a real host while the raw authority above is empty and
+        // its `@` is never seen. Both fetch-time guards reject an empty
+        // computed authority (`split_authority`, `check_base_url`), so
+        // mirror them: an empty authority saves here and is rejected on
+        // every fetch.
+        if authority.is_empty() {
+            return Err(VaultError::Invalid);
+        }
         if authority.contains('@') {
             return Err(VaultError::Invalid);
         }
