@@ -97,6 +97,14 @@ export function assertGenericAnonymous401(probe: DenialProbe): void {
         `string error key, got keys: ${Object.keys(record).join(', ') || '(empty)'}.`,
     );
   }
+  for (const key of ['code', 'message', 'retryable']) {
+    if (key in record) {
+      throw new Error(
+        `[${context}] anonymous 401 body carries typed-envelope key '${key}': ` +
+          'expected the generic error shape (names only — no values logged).',
+      );
+    }
+  }
   for (const key of Object.keys(record)) {
     if (key !== 'error' && CREDENTIAL_KEY_RE.test(key)) {
       throw new Error(
@@ -199,6 +207,14 @@ test.describe('anonymous worker verdicts (offline, no staging)', () => {
       () =>
         assertGenericAnonymous401({
           ...ok,
+          bodyText: '{"error":"denied","code":"unauthorized"}',
+        }),
+      'generic error mixed with the typed envelope must fail',
+    ).toThrow(/typed-envelope key 'code'/);
+    expect(
+      () =>
+        assertGenericAnonymous401({
+          ...ok,
           bodyText: '{"error":"denied","session":"SENTINEL_SESSION_VALUE"}',
         }),
       'credential-shaped keys must fail without echoing values',
@@ -266,9 +282,9 @@ test.describe('anonymous worker verdicts (offline, no staging)', () => {
     ).toThrow(/must not set a cookie/);
   });
 
-  test('probe route table stays on the served worker surface', () => {
-    // A renamed Worker route must fail here by name, not drift silently:
-    // the live legs below probe exactly these paths.
+  test('probe paths stay pinned to the anonymous Worker contract', () => {
+    // These assertions pin the paths used by the live probes.
+    // Configured staging legs check them against the served Worker.
     expect(HEALTHZ_PATH).toBe('/healthz');
     expect([...ANONYMOUS_401_GET_PATHS]).toEqual(['/v1/vault']);
     expect([...ANONYMOUS_401_POST_PATHS]).toEqual([
