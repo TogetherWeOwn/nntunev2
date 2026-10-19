@@ -557,6 +557,49 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
   });
 });
 
+test.describe('production secret-shape gate (workflow wiring pin)', () => {
+  test('the secret-shape step runs after the dry-run and before the version upload', () => {
+    // The checker itself is covered by ci/test-check-production-secrets-shape.mjs
+    // (ci-ok job); this pins the wiring: offline shape proof on the validated
+    // SHA after wrangler accepts the config, before any version upload.
+    const stepAt = productionWorkflow.indexOf(
+      'node ci/check-production-secrets-shape.mjs',
+    );
+    expect(stepAt).toBeGreaterThan(-1);
+    const dryRunAt = productionWorkflow.indexOf(
+      'Build production target without deploying',
+    );
+    const uploadAt = productionWorkflow.indexOf(
+      'Upload reviewed production version',
+    );
+    expect(dryRunAt).toBeGreaterThan(-1);
+    expect(uploadAt).toBeGreaterThan(-1);
+    expect(stepAt).toBeGreaterThan(dryRunAt);
+    expect(stepAt).toBeLessThan(uploadAt);
+    // A position check alone cannot prove the step blocks the job (`|| true`,
+    // continue-on-error, if: false, or the command demoted to a comment all
+    // keep it green), so extract the exact step block and require the run
+    // line to be exactly the checker with no neutralizer.
+    const stepBlock = productionWorkflow.match(
+      /      - name: Require production Worker secret shape before upload\n((?:(?!      - ).*\n)+)/,
+    )?.[1];
+    expect(stepBlock, 'secret-shape step block missing').toBeDefined();
+    const runLine = stepBlock!.match(/^\s*run:\s*(.+?)\s*$/m)?.[1];
+    expect(runLine).toBe('node ci/check-production-secrets-shape.mjs');
+    const codeLines = stepBlock!.split('\n').filter(
+      (line) => !/^\s*#/.test(line),
+    );
+    expect(
+      codeLines.some((line) => /^\s*continue-on-error\s*:/.test(line)),
+      'secret-shape step must not set continue-on-error',
+    ).toBe(false);
+    expect(
+      codeLines.some((line) => /^\s*if\s*:/.test(line)),
+      'secret-shape step must not set if:',
+    ).toBe(false);
+  });
+});
+
 test.describe('smoke checker (fixture server, CLI contract)', () => {
   let server: Server;
   let base: string;

@@ -595,6 +595,35 @@ jobs:
       - name: Unit-test the guard case folding
         run: python3 .github/scripts/test_archive_binding_casefold.py
 
+  # Production Worker secret-shape guard (deploy-production.yml upload
+  # gate): the checker stays dependency-free, so node --test runs it with
+  # no install. The suite pins every refusal spelling (quoted/spaced
+  # headers, dotted keys, inline tables, unicode/hex escapes, triple-quote
+  # closers, empty headers), the CLI refusal exit code, and the
+  # wrangler.json/jsonc shadow refusal, plus acceptance of the committed
+  # config, so removing a guard goes red. The run step below executes the
+  # checker itself, so a broken entrypoint goes red too. Keep this job id
+  # in ci-ok's needs.
+  production-secrets-shape:
+    name: production-secrets-shape
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Unit-test the production secret-shape guard
+        run: node --test ci/test-check-production-secrets-shape.mjs
+      - name: Run the production secret-shape gate on the committed config
+        run: node ci/check-production-secrets-shape.mjs
+      - name: Production secret-shape scripts parse clean
+        run: |
+          node --check ci/check-production-secrets-shape.mjs
+          node --check ci/test-check-production-secrets-shape.mjs
+
   # Docs internal-link lint: broken file links/anchors in changed markdown
   # (roadmap, matrix, ops, ADRs) fail the build. The lint step is scoped to
   # changed files and the self-test step pins the whole tree clean, so only
@@ -827,7 +856,7 @@ jobs:
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links]
+    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
