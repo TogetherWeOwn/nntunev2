@@ -25,13 +25,16 @@
 //!   `from_millis(10_000)` / `from_secs(10)` copies — so the budget is
 //!   overridable in exactly one place.
 //! - At EACH site the deadline is armed BEFORE the fetch is issued
-//!   and spans headers AND the body read as one total: race the
-//!   fetch+`bytes()` sequence against a `Delay::from(
+//!   and spans headers AND the body handling as one total: race the
+//!   fetch against a `Delay::from(
 //!   Duration::from_millis(CONTAINER_FETCH_DEADLINE_MS))` future
 //!   (the codebase `std::future::poll_fn` race, deadline polled
 //!   first, or a `select`), either inline at the site or in one
 //!   shared helper both sites call. Partial progress never re-arms
 //!   it, and a body still incomplete at expiry fails whole.
+//!   `stage_input` never reads its PUT reply (it cancels the
+//!   unread body after the race); `container_json` reads its
+//!   streamed reply under the same deadline.
 //! - Expiry maps to the EXISTING `ApiFault::new(502,
 //!   "container_unavailable")` each site already returns for a
 //!   failed fetch. No new fault code (`container_timeout`,
@@ -53,10 +56,16 @@
 //! - `stage_input` and `fetch_output` scale with transfer size atop
 //!   the 10 s base (`size.saturating_div(1024)` ms, a ~1 MB/s floor)
 //!   so a large healthy transfer is not expired mid-stream.
-//! - `stage_input`'s reply-body drain fails as 502 on expiry only
-//!   (`drained.is_none()`); a drain transport error falls through to
-//!   the status match, so a stored 201 and a known 400/413 keep their
-//!   mapping.
+//! - `stage_input` never reads its reply body: it cancels the
+//!   streamed body (`let _ = stream.cancel();`, the result ignored)
+//!   after the fetch race, so no drain transport error can override
+//!   the verdict — only the fetch race itself (expiry or transport
+//!   failure) fails as 502, and a stored 201 and a known 400/413
+//!   keep their mapping.
+//! - `container_json` reads its reply as a raced stream: chunks via
+//!   `.stream()` (`while let Some(chunk) = stream.next().await`)
+//!   aborted past `MAX_RESULT_BYTES` as 502, under the same
+//!   deadline — never a whole-body `.bytes()` collect.
 //! - `fetch_output` races BOTH its Container fetch and the relaying
 //!   R2 put against that one armed deadline; its output never passes
 //!   through `.bytes()`.
@@ -302,13 +311,12 @@ fn armed_before_token(slice: &str, code: &str, fetch_token: &str) -> bool {
     arms.iter().any(|arm| *arm < fetch_at)
 }
 
-/// The body read is inside the bound, not a bare await after a
-/// headers-only race. Accepts: the `.bytes()` future is constructed
-/// inside work that a later race polls; a helper wrapping an
-/// `async` block containing `.bytes()`; or a helper invoked
-/// separately for headers and body.
-fn body_covered(slice: &str, code: &str) -> bool {
-    let Some(bytes_at) = slice.find(".bytes()") else {
+/// The streamed body read is inside the bound, not a bare await
+/// after a headers-only race: a `.stream()`-fed read raced against
+/// the deadline (a race token, or a shared-helper call doing the
+/// racing, positioned after the stream read is constructed).
+fn stream_body_covered(slice: &str, code: &str) -> bool {
+    let Some(stream_at) = slice.find(".stream()") else {
         return false;
     };
     let helpers = helper_call_positions(slice, code);
@@ -322,15 +330,7 @@ fn body_covered(slice: &str, code: &str) -> bool {
         })
         .collect();
     tokens.extend(helpers.iter().copied());
-    if tokens.iter().any(|t| *t > bytes_at) {
-        return true;
-    }
-    if let Some(async_at) = slice.find("async") {
-        if async_at < bytes_at && helpers.iter().any(|h| *h < async_at) {
-            return true;
-        }
-    }
-    helpers.len() >= 2
+    tokens.iter().any(|t| *t > stream_at)
 }
 
 // ---------------------------------------------------------------------------
@@ -368,8 +368,13 @@ fn stage_input_still_puts_the_staged_object_via_fetch_request() {
         "stage_input must keep accepting only the Container's 201"
     );
     assert!(
-        slice.contains(".bytes()"),
-        "stage_input must keep draining the reply body"
+        !slice.contains(".bytes()"),
+        "stage_input disposes of the PUT reply by cancelling it, not by \
+         collecting it with `.bytes()`"
+    );
+    assert!(
+        slice.contains("cancel"),
+        "stage_input must keep cancelling the unread PUT reply body"
     );
 }
 
@@ -378,12 +383,17 @@ fn container_json_still_caps_the_reply_bytes() {
     let code = code();
     let slice = container_json_code(&code);
     assert!(
-        slice.contains("fetch_request(") && slice.contains(".bytes()"),
-        "container_json must keep exchanging through the port fetcher and reading the body"
+        slice.contains("fetch_request(") && slice.contains(".stream()"),
+        "container_json must keep exchanging through the port fetcher and reading the body as a stream"
     );
     assert!(
         slice.contains("> MAX_RESULT_BYTES"),
         "container_json must keep rejecting replies over MAX_RESULT_BYTES"
+    );
+    assert!(
+        !slice.contains(".bytes()"),
+        "container_json must stream the Container-chosen reply under the \
+         cap, not collect it whole with `.bytes()` before rejecting it"
     );
 }
 
@@ -506,14 +516,22 @@ fn container_json_races_its_container_fetch_against_the_deadline() {
 #[test]
 fn deadline_at_both_sites_covers_the_body_read_not_only_headers() {
     let code = code();
+    // `stage_input` performs no body read at all: the fetch race
+    // covers the upload plus the reply headers, and the unread reply
+    // is cancelled. Any `.bytes()` here would sit outside that bound.
+    let stage = stage_input_code(&code);
     assert!(
-        body_covered(stage_input_code(&code), &code),
-        "stage_input's `response.bytes()` drain must be inside the deadline, \
-         not a bare await after a headers-only race"
+        !stage.contains(".bytes()"),
+        "stage_input must perform no body read outside the deadline: the \
+         PUT reply is cancelled, not collected"
     );
     assert!(
-        body_covered(container_json_code(&code), &code),
-        "container_json's `response.bytes()` read must be inside the deadline, \
+        stage.contains("cancel"),
+        "stage_input must still dispose of the PUT reply by cancelling it"
+    );
+    assert!(
+        stream_body_covered(container_json_code(&code), &code),
+        "container_json's streamed `.stream()` read must be inside the deadline, \
          not a bare await after a headers-only race"
     );
 }
@@ -612,25 +630,27 @@ fn stage_and_output_budgets_scale_with_transfer_size() {
 
 #[test]
 fn stage_input_drain_transport_error_falls_through_to_status() {
-    // Only expiry (`drained.is_none()`) fails the stage as 502; a
-    // drain transport error keeps the known status mapping, so the
-    // combined `Some(Err(_)) | None => 502` drain-override form must
-    // not come back. (The headers race above this one legitimately
-    // keeps the combined form; the ban is scoped to the drain tail.)
+    // The PUT reply is never read: it is cancelled with its result
+    // ignored, so no drain transport error can override the verdict
+    // — mapping a cancel failure to 502 (the drain-override shape)
+    // must not come back. Only the fetch race itself (expiry or
+    // transport failure) fails as 502; the known status below keeps
+    // its mapping.
     let code = code();
     let slice = stage_input_code(&code);
     assert!(
-        slice.contains("if drained.is_none() {"),
-        "stage_input must fail the drain on expiry only, via `if drained.is_none()`"
+        collapse_ws(slice).contains("let _ = stream.cancel();"),
+        "stage_input must cancel the unread PUT reply with its result ignored, \
+         via `let _ = stream.cancel();`"
     );
-    let drain_tail = slice
-        .split_once("let drained")
-        .expect("stage_input must name its drained body result")
-        .1;
     assert!(
-        !drain_tail.contains("Some(Err"),
-        "stage_input's drain must not map a transport error to 502: it falls \
-         through to the status match"
+        !slice.contains(".bytes()"),
+        "stage_input must not read the PUT reply it cancels"
+    );
+    assert!(
+        !slice.contains("cancel().map_err") && !slice.contains("cancel()?"),
+        "stage_input's cancel must not map a disposal failure to a fault: \
+         the status match owns the verdict"
     );
     assert!(
         slice.contains("201 =>") && slice.contains("400 | 413"),
