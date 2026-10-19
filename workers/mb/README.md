@@ -125,7 +125,12 @@ not-yet-applied packets have no `lag_secs` yet, so a manual p95 excludes
 them. The **breach definition** is any packet with `lag_secs > 7200` seconds (exactly 7200 passes), or any missing sequence between the lowest observed packet and the reported latest packet sequence whose publication is either unknown or more than 7200 seconds before evaluation. A missing sequence recorded as pending
 (`record_published`) that is still inside its 2-hour budget is in flight,
 not a breach: it counts as `pending_count` instead, so a normal hourly
-apply window does not fire the breach counter. Missing packets cannot be
+apply window does not fire the breach counter. A sequence re-recorded
+with a different `packet_id` is rejected (first record wins) and reported
+as a sticky `packet_id_conflict` breach carrying the sequence only (never
+the `packet_id` values): the conflict persists for the lifetime of the
+ledger — later re-records (even with the original id) do not clear it —
+and fires on every evaluation. Missing packets cannot be
 dropped from the accounting: each breaching one is returned as a
 `missing_sequence` breach, capped at 10,000 enumerated breaches per
 evaluation (with one `missing_sequence_truncated` breach past the cap, so
@@ -136,7 +141,9 @@ healthy.
 (Sources: per-packet rule `docs/adr/0007-mb-mirror.md:24-26`; lag check
 `workers/mb/src/replication.rs:186-194` (`>` so exactly 7200 passes);
 gap enumeration `replication.rs:205-274`; pending in-budget
-`replication.rs:231-242`; 10,000 cap `replication.rs:8-21,288-326`;
+`replication.rs:231-242`; conflict rejection and sticky pin
+`replication.rs:42-47,76-89`, ordered accessor `replication.rs:133-140`,
+conflict breach `replication.rs:218-224`; 10,000 cap `replication.rs:8-21,288-326`;
 empty ledger `replication.rs:196-204`; ledger schema
 `migrations/0017_mb_replication_packet_ledger.sql:3-14` versus the
 single-row snapshot `migrations/0001_mb_mirror.sql:57-66`.)
@@ -149,6 +156,9 @@ bounded to stay well under the 256 KB Workers per-request log limit:
 contiguous unknown-publication missing sequences compress into one
 `missing_sequence_range` entry (`first`/`last`/`count`) and at most 100
 entries are logged, so the truncation evidence is never the part cut off.
+`packet_id_conflict` breaches are logged individually (`kind` + `sequence`,
+no `packet_id` values) ahead of lag breaches and count toward
+`breach_count` like every other kind.
 The report carries `metric_name` (`mb_replication_slo_breach_total`). No
 runner exists yet: a scheduled runner must call `evaluate`, emit
 `structured_log`, and increment that counter by `breach_count` when

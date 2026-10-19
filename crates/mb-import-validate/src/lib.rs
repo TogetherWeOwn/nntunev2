@@ -165,8 +165,11 @@ pub fn plan_chunks(completed: u64, total: u64, size: u64) -> Vec<(u64, u64)> {
     let mut chunks = Vec::new();
     let mut start = completed + 1;
     while start <= total {
-        let end = (start + size - 1).min(total);
+        let end = start.saturating_add(size - 1).min(total);
         chunks.push((start, end));
+        if end == total {
+            break;
+        }
         start = end + 1;
     }
     chunks

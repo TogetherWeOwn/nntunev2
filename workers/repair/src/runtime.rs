@@ -23,9 +23,9 @@ use worker::{
 
 use crate::contract::{
     classify_container_reply, container_repair_body, in_key, ingest_reply_body, manifest_digest,
-    manifest_key, out_key, parse_manifest, parse_request, plan, result_key, ApiFault,
-    ContainerOutcome, FileRole, Plan, RepairRequest, RepairStatus, MAX_REQUEST_BYTES,
-    MAX_RESULT_BYTES,
+    manifest_key, out_key, parse_manifest, parse_request, plan, result_key,
+    validate_repaired_output_set, ApiFault, ContainerOutcome, FileRole, Plan, RepairRequest,
+    RepairStatus, MAX_REQUEST_BYTES, MAX_RESULT_BYTES,
 };
 
 /// Durable Object binding + class fronting the Container.
@@ -230,19 +230,8 @@ impl RepairContainer {
         result.manifest_digest = digest;
 
         if result.status == RepairStatus::Repaired {
-            let data_names: std::collections::HashSet<&str> = manifest
-                .files
-                .iter()
-                .filter(|f| f.role == FileRole::Data)
-                .map(|f| f.file_name.as_str())
-                .collect();
+            validate_repaired_output_set(&manifest, &result)?;
             for output in &result.files {
-                if !data_names.contains(output.file_name.as_str())
-                    || output.key
-                        != nntune_core::par2::scratch::object_key_for_file_name(&output.file_name)
-                {
-                    return Err(ApiFault::new(502, "container_unavailable"));
-                }
                 self.fetch_output(&bucket, &container, req, output).await?;
             }
         }

@@ -13,9 +13,12 @@
 //! recordings (`GET /v1/mb/release/:mbid/recordings`) to fill
 //! `recording_mbids`. A recordings-fetch failure never loses the release
 //! match: transient failures retry the job (the match is re-resolved on
-//! redelivery), and permanent failures write the matched release with an
-//! empty list — the library upsert converges (`ON CONFLICT DO UPDATE`),
-//! so a later replay can still fill them in. See
+//! redelivery), and permanent (non-404 4xx) failures write the matched
+//! release with an empty list — the library upsert converges
+//! (`ON CONFLICT DO UPDATE`), so a later replay can still fill them in.
+//! A 404 is transient on both routes: the canonical `not_found` body is
+//! shared by route misses and genuinely missing releases, so it retries
+//! rather than DLQ-ing the match or wiping recordings. See
 //! [`recording_mbids_or_fallback`].
 
 use serde::Deserialize;
@@ -100,9 +103,12 @@ pub enum MatchFailure {
     /// Binding/transport failure, a 5xx, or an unreadable body: the same
     /// lookup may succeed on redelivery.
     Transient,
-    /// The MB worker rejected the request itself (4xx). The query is
-    /// pre-validated against the MB contract ([`validate_match_query`]),
-    /// so a 4xx is a contract bug, not a retry.
+    /// The MB worker rejected the request itself (a 4xx other than 404).
+    /// The query is pre-validated against the MB contract
+    /// ([`validate_match_query`]), so such a 4xx is a contract bug, not
+    /// a retry. A 404 is `Transient` instead: the canonical
+    /// `not_found` body is shared by route misses and genuinely missing
+    /// releases, so it proves neither.
     Permanent,
 }
 
@@ -133,20 +139,35 @@ fn encode_query_value(value: &str) -> String {
 }
 
 /// Absolute MB release-search URL for the `MB_API` service binding.
+///
+/// The `q=` value is the album-title retrieval text (see
+/// [`album_retrieval_query`]): for an "Artist - Album" query the album
+/// side alone, otherwise the query unchanged. Verification still uses
+/// the original query in [`pick_release_mbid`] — the queue caller
+/// passes the same query to both — so retrieval widens while the pick
+/// stays exact and nothing is ever accepted on title alone.
 pub fn mb_search_url(query: &str) -> String {
+    let retrieval = album_retrieval_query(query);
+    let text = retrieval.as_deref().unwrap_or(query);
     format!(
         "{MB_SERVICE_HOST}/v1/mb/search?type=release&q={}",
-        encode_query_value(query)
+        encode_query_value(text)
     )
 }
 
 /// Classify one MB search response. Only a 200 with the documented body
 /// shape is a result; an empty result list is a successful no-match.
+///
+/// A 404 is `Transient`, never a no-match: the legitimate no-match is a
+/// 200 with an empty `results` list, so a search 404 can only be a route
+/// miss / version skew (e.g. a rolling MB deploy with no search route
+/// yet). It retries with backoff; every other 4xx stays `Permanent`.
 pub fn parse_mb_search_response(status: u16, body: &str) -> Result<Vec<MbSearchHit>, MatchFailure> {
     match status {
         200 => serde_json::from_str::<MbSearchBody>(body)
             .map(|parsed| parsed.results)
             .map_err(|_| MatchFailure::Transient),
+        404 => Err(MatchFailure::Transient),
         400..=499 => Err(MatchFailure::Permanent),
         _ => Err(MatchFailure::Transient),
     }
@@ -167,15 +188,20 @@ pub fn mb_release_recordings_url(release_mbid: &str) -> String {
 /// MBIDs are dropped, duplicates keep their first position, and the
 /// list is capped at [`MAX_RECORDING_MBIDS`]. An empty recordings list
 /// is a successful empty result. Status classification mirrors
-/// [`parse_mb_search_response`]; note a 404 here is `Permanent` (the
-/// release vanished between search and this fetch, or a contract bug),
-/// and [`recording_mbids_or_fallback`] decides what that means for the
+/// [`parse_mb_search_response`]: a 404 is `Transient`, retrying instead
+/// of writing a zero-recording success. The MB worker renders the same
+/// `{"code":"not_found",...}` body for a route miss and for a genuinely
+/// missing release, so no 404 body proves the release has no recordings;
+/// a genuinely missing release therefore retries until the normal retry
+/// budget is exhausted rather than converging to an empty write.
+/// [`recording_mbids_or_fallback`] decides what that means for the
 /// write.
 pub fn parse_mb_recordings_response(status: u16, body: &str) -> Result<Vec<String>, MatchFailure> {
     match status {
         200 => serde_json::from_str::<MbRecordingsBody>(body)
             .map(|parsed| recording_mbids_in_track_order(&parsed.recordings))
             .map_err(|_| MatchFailure::Transient),
+        404 => Err(MatchFailure::Transient),
         400..=499 => Err(MatchFailure::Permanent),
         _ => Err(MatchFailure::Transient),
     }
@@ -236,17 +262,46 @@ pub fn recording_mbids_or_fallback(
     }
 }
 
-/// Normalize text for exact match comparison: lowercased, every
-/// non-alphanumeric run collapsed to single spaces. "Don't Stop!" and
-/// "dont stop" compare equal; different words never do.
+/// Normalize text for exact match comparison: lowercase, ignore ASCII
+/// (`'`, U+0027) and typographic (`’`, U+2019) contraction apostrophes,
+/// and collapse other non-alphanumeric runs to single spaces.
+/// "Don't Stop!" and "dont stop" compare equal, while `don t stop`
+/// keeps its spaces. An isolated apostrophe-delimited `n` is an elided
+/// word, not a contraction: `Rock'n'Roll`, `Rock'n Roll` and `Rock n'Roll`
+/// all normalize to `rock n roll`, never `rocknroll`. Other punctuation
+/// still separates words, so `ab cd` never equals `abcd`.
 fn normalize_match_text(raw: &str) -> String {
-    raw.to_lowercase()
+    let chars: Vec<char> = raw.to_lowercase().chars().collect();
+    let is_apostrophe = |c| matches!(c, '\'' | '\u{2019}');
+    let mut normalized = String::with_capacity(raw.len());
+    for (i, &c) in chars.iter().enumerate() {
+        if c == 'n' && i > 0 && i + 1 < chars.len() {
+            let (before, after) = (chars[i - 1], chars[i + 1]);
+            if !before.is_alphanumeric()
+                && !after.is_alphanumeric()
+                && (is_apostrophe(before) || is_apostrophe(after))
+            {
+                normalized.push_str(" n ");
+                continue;
+            }
+        }
+        if !is_apostrophe(c) {
+            normalized.push(if c.is_alphanumeric() { c } else { ' ' });
+        }
+    }
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Fold separator dashes (en/em dash, minus sign — as pasted from the
+/// web) to the ASCII hyphen so they count as the " - " separator.
+fn fold_separator_dashes(query: &str) -> String {
+    query
         .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+        .map(|c| match c {
+            '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
+            _ => c,
+        })
+        .collect()
 }
 
 /// Split an "Artist - Album" query into its normalized parts, when it
@@ -255,13 +310,7 @@ fn normalize_match_text(raw: &str) -> String {
 /// count as the separator hyphen. A query without " - ", or with an
 /// empty side, has no artist part.
 fn split_artist_album(query: &str) -> Option<(String, String)> {
-    let folded: String = query
-        .chars()
-        .map(|c| match c {
-            '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
-            _ => c,
-        })
-        .collect();
+    let folded = fold_separator_dashes(query);
     let (artist, album) = folded.split_once(" - ")?;
     let artist = normalize_match_text(artist);
     let album = normalize_match_text(album);
@@ -269,6 +318,32 @@ fn split_artist_album(query: &str) -> Option<(String, String)> {
         return None;
     }
     Some((artist, album))
+}
+
+/// Album-title retrieval text for an "Artist - Album" query.
+///
+/// The MB release search is a title-only predicate (`workers/mb`
+/// `Kind::Release`: `WHERE r.title % $1`, scored by
+/// `similarity(r.title, $1)`), so sending the whole `Artist - Album`
+/// identity lets a long artist push a short correct title below the
+/// retrieval bar before verification ever runs. For the shape
+/// [`split_artist_album`] already recognizes — the shape the pick
+/// verifies — send the album side alone, edition text such as `(Live)`
+/// / `[Remastered]` included, while the caller keeps passing the
+/// original identity to [`pick_release_mbid`].
+///
+/// Returns `None` when the query has no recognized shape (plain titles
+/// are sent unchanged) or when the album side would by itself be an
+/// invalid MB query (see [`validate_match_query`], e.g. a
+/// one-character title); the caller then sends the original query it
+/// already validated. Query limits are not widened and no SQL changes.
+fn album_retrieval_query(query: &str) -> Option<String> {
+    // Only the shape the pick verifies as Artist - Album: a query the
+    // pick treats as a plain title stays on the plain-title path.
+    split_artist_album(query)?;
+    let folded = fold_separator_dashes(query);
+    let album = folded.split_once(" - ")?.1;
+    validate_match_query(album)
 }
 
 /// Deterministic, ambiguity-rejecting release pick. What it can and
@@ -286,7 +361,11 @@ fn split_artist_album(query: &str) -> Option<(String, String)> {
 /// - Plain-title queries keep the scored pick, tightened to hits whose
 ///   normalized title is exactly the normalized query: the highest
 ///   score at or above [`MIN_MATCH_SCORE`], leading the runner-up by
-///   more than [`MIN_MATCH_MARGIN`]. Fuzzy near-misses write unmatched.
+///   more than [`MIN_MATCH_MARGIN`]. The floor gates the winner only:
+///   the runner-up is the next distinct MBID with a matching
+///   normalized title even when it scores below the floor, so a
+///   below-floor near-tie stays ambiguous instead of looking like a
+///   lone winner. Fuzzy near-misses write unmatched.
 ///
 /// Anything else — extra words in the query, edition suffixes, a
 /// featured-artist credit — yields `None` (unmatched) rather than a
@@ -316,19 +395,20 @@ pub fn pick_release_mbid(query: &str, hits: &[MbSearchHit]) -> Option<String> {
     if normalized_query.is_empty() {
         return None;
     }
-    let mut candidates: Vec<&MbSearchHit> = valid
-        .filter(|hit| {
-            hit.score >= MIN_MATCH_SCORE && normalize_match_text(&hit.title) == normalized_query
-        })
+    let mut matching: Vec<&MbSearchHit> = valid
+        .filter(|hit| normalize_match_text(&hit.title) == normalized_query)
         .collect();
-    candidates.sort_by(|a, b| {
+    matching.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(core::cmp::Ordering::Equal)
             .then_with(|| a.mbid.cmp(&b.mbid))
     });
-    let top = candidates.first()?;
-    if let Some(runner_up) = candidates.get(1) {
+    let top = matching.first()?;
+    if top.score < MIN_MATCH_SCORE {
+        return None;
+    }
+    if let Some(runner_up) = matching.iter().skip(1).find(|hit| hit.mbid != top.mbid) {
         if top.score - runner_up.score <= MIN_MATCH_MARGIN {
             return None;
         }
@@ -336,15 +416,102 @@ pub fn pick_release_mbid(query: &str, hits: &[MbSearchHit]) -> Option<String> {
     Some(top.mbid.clone())
 }
 
+/// A recognized numeric part counter is exactly `digits/digits` with no
+/// extra characters: the documented `[01/05]` / `(1/3)` scene forms.
+/// Anything else (`[aa/bb]`, `[01/]`, `[1/2/3]`, `[01/05 Live]`,
+/// `(Live)`, `(2024)`, `(Disc 1)`, format/bitrate tags such as `[FLAC]`,
+/// `(MP3)` or `[320]`) is release identity and is preserved. This is
+/// deliberately conservative: non-counter trailing groups fail closed to
+/// unmatched (see [`derive_upload_query`]) rather than risk a wrong
+/// studio-release pick.
+fn is_part_counter_content(inner: &str) -> bool {
+    let Some((numerator, denominator)) = inner.split_once('/') else {
+        return false;
+    };
+    if denominator.contains('/') {
+        return false;
+    }
+    !numerator.is_empty()
+        && !denominator.is_empty()
+        && numerator.bytes().all(|b| b.is_ascii_digit())
+        && denominator.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Index of the bracket that matches the trailing close bracket,
+/// scanning backwards so nested same-form pairs (`[[01/05]]`) resolve
+/// to the outer opener. Other bracket forms are ignored at this level.
+fn find_matching_open(text: &str, open: u8, close: u8) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0;
+    for (index, &byte) in bytes.iter().enumerate().rev() {
+        if byte == close {
+            depth += 1;
+        } else if byte == open {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+            if depth < 0 {
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// Strip one trailing recognized counter (`[01/05]`, `(1/3)`, or one of
+/// those wrapped in a single extra bracket pair such as `[(1/3)]` or
+/// `[[01/05]]`). Returns the text before the counter, or `None` when
+/// the trailing bracketed group is identity and stripping must stop.
+fn strip_trailing_counter(trimmed: &str) -> Option<&str> {
+    let (open, close) = if trimmed.ends_with(']') {
+        (b'[', b']')
+    } else if trimmed.ends_with(')') {
+        (b'(', b')')
+    } else {
+        return None;
+    };
+    let open_index = find_matching_open(trimmed, open, close)?;
+    let inner = &trimmed[open_index + 1..trimmed.len() - 1];
+    if is_part_counter_content(inner) {
+        return Some(&trimmed[..open_index]);
+    }
+    // One extra wrapping pair: the outer content is itself a bracketed
+    // counter in either form.
+    if inner.len() >= 2
+        && ((inner.starts_with('[') && inner.ends_with(']'))
+            || (inner.starts_with('(') && inner.ends_with(')')))
+    {
+        let wrapped = &inner[1..inner.len() - 1];
+        if is_part_counter_content(wrapped) {
+            return Some(&trimmed[..open_index]);
+        }
+    }
+    None
+}
+
 /// Derive a candidate release query from NZB file subjects.
 ///
 /// Scene-style subjects look like
 /// `Artist - Album [01/05] - "01 track.flac" yEnc (1/3)`: the release
-/// title is the text before the quoted file name, minus trailing part
-/// counters. Dots/underscores become spaces and one trailing file-type
+/// title is the text before the quoted file name, minus trailing numeric
+/// part counters. Only recognized `digits/digits` counters (repeated,
+/// stacked across bracket forms, or wrapped in one extra bracket pair)
+/// and a trailing `yEnc` token strip; edition suffixes are preserved.
+/// Dots/underscores become spaces and one trailing file-type
 /// token is dropped for bare-filename subjects. Anything that does not
 /// survive [`validate_match_query`] yields `None` (the job is then written
 /// unmatched rather than guessed at).
+///
+/// Intended narrowing: every other trailing bracket
+/// group is kept as identity, not just editions — format/bitrate tags
+/// (`[FLAC]`, `(MP3)`, `[320]`), years (`(2024)`), disc markers and
+/// malformed counter look-alikes all survive, so such subjects fail
+/// closed to unmatched (`None`) where the old strip-everything behavior
+/// matched the studio release. That is the accepted tradeoff: an
+/// unmatched write converges cleanly on replay (the library upsert is
+/// `DO UPDATE` on the idempotency key and re-resolves deterministically),
+/// while a wrong studio MBID would persist as a false match.
 pub fn derive_upload_query(subjects: &[String]) -> Option<String> {
     let first = subjects.first()?;
     let before_quote = first.split('"').next().unwrap_or(first);
@@ -353,21 +520,21 @@ pub fn derive_upload_query(subjects: &[String]) -> Option<String> {
         .map(|c| if c == '.' || c == '_' { ' ' } else { c })
         .collect();
     let mut candidate = spaced.trim().trim_end_matches('-').trim().to_string();
-    // Drop trailing "[01/05]" / "(1/3)" / "yEnc" groups, repeatedly.
+    // Drop trailing recognized counters and "yEnc", repeatedly, stopping
+    // at the first trailing bracketed group that is not a counter.
     loop {
-        let trimmed = candidate.trim_end();
-        let stripped = match trimmed.chars().last() {
-            Some(']') => trimmed.rfind('[').map(|i| &trimmed[..i]),
-            Some(')') => trimmed.rfind('(').map(|i| &trimmed[..i]),
-            _ if trimmed
+        let trimmed = candidate.trim_end().to_string();
+        let stripped: Option<String> = if let Some(head) = strip_trailing_counter(&trimmed) {
+            Some(head.to_string())
+        } else if trimmed
+            .rsplit_once(char::is_whitespace)
+            .is_some_and(|(_, tail)| tail.eq_ignore_ascii_case("yenc"))
+        {
+            trimmed
                 .rsplit_once(char::is_whitespace)
-                .is_some_and(|(_, tail)| tail.eq_ignore_ascii_case("yenc")) =>
-            {
-                trimmed
-                    .rsplit_once(char::is_whitespace)
-                    .map(|(head, _)| head)
-            }
-            _ => None,
+                .map(|(head, _)| head.to_string())
+        } else {
+            None
         };
         let Some(head) = stripped else { break };
         let next = head.trim().trim_end_matches('-').trim().to_string();
@@ -477,6 +644,12 @@ mod tests {
             parse_mb_search_response(200, r#"{"q":"x","type":"release","results":[]}"#)
                 .unwrap()
                 .is_empty()
+        );
+        // A search 404 is a route miss / version skew, never a
+        // no-match (the no-match is a 200 with empty results): retry.
+        assert_eq!(
+            parse_mb_search_response(404, "{}"),
+            Err(MatchFailure::Transient)
         );
         assert_eq!(
             parse_mb_search_response(400, "{}"),
@@ -620,6 +793,45 @@ mod tests {
     }
 
     #[test]
+    fn upload_query_preserves_format_and_year_tags_fail_closed() {
+        // Pinned tradeoff: non-counter trailing groups are identity, so
+        // these subjects keep the tag and fail closed to unmatched rather
+        // than matching the studio release as strip-everything did.
+        for (subject, expected) in [
+            (
+                r#"Artist - Album [FLAC] [01/05] - "01.flac" yEnc (1/3)"#,
+                "Artist - Album [FLAC]",
+            ),
+            (
+                r#"Artist - Album (2024) [01/05] - "01.flac""#,
+                "Artist - Album (2024)",
+            ),
+            (
+                r#"Artist - Album [320] [01/05] - "01.flac""#,
+                "Artist - Album [320]",
+            ),
+            (
+                r#"Artist - Album (MP3) [01/05] - "01.flac""#,
+                "Artist - Album (MP3)",
+            ),
+            (
+                r#"Artist - Album [01/05] [FLAC] - "01.flac""#,
+                "Artist - Album [01/05] [FLAC]",
+            ),
+        ] {
+            let query = derive_upload_query(&[subject.to_string()])
+                .expect("tagged subject must still derive its tagged query");
+            assert_eq!(query.as_str(), expected, "subject {subject:?}");
+            let studio_only = vec![hit_by(MBID_A, "Album", Some("Artist"), 0.99)];
+            assert_eq!(
+                pick_release_mbid(&query, &studio_only),
+                None,
+                "query {query:?} must stay unmatched, never pick studio"
+            );
+        }
+    }
+
+    #[test]
     fn library_write_carries_job_identity() {
         let msg =
             build_search_dispatch("user_01", "animals", "vault_idx_01", &[3000], 25, 0).unwrap();
@@ -672,9 +884,19 @@ mod tests {
         )
         .unwrap()
         .is_empty());
+        // A 404 retries: the canonical `not_found` body is shared by
+        // route misses and genuinely missing releases, so it proves
+        // neither. Every other 4xx stays permanent.
         assert_eq!(
             parse_mb_recordings_response(404, "{}"),
-            Err(MatchFailure::Permanent)
+            Err(MatchFailure::Transient)
+        );
+        assert_eq!(
+            parse_mb_recordings_response(
+                404,
+                r#"{"code":"not_found","message":"not found","retryable":false}"#
+            ),
+            Err(MatchFailure::Transient)
         );
         assert_eq!(
             parse_mb_recordings_response(400, "{}"),

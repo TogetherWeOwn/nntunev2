@@ -17,6 +17,12 @@ export interface SeekResult {
 }
 
 export function buildRangeHeader(start: number, end?: number): string {
+	if (!Number.isFinite(start)) {
+		throw new RangeError(`Invalid seek start: ${String(start)}`);
+	}
+	if (end !== undefined && !Number.isFinite(end)) {
+		throw new RangeError(`Invalid seek end: ${String(end)}`);
+	}
 	const safeStart = Math.max(0, Math.floor(start));
 	if (end === undefined) return `bytes=${safeStart}-`;
 	const safeEnd = Math.max(safeStart, Math.floor(end));
@@ -40,6 +46,29 @@ function parseContentRange(value: string | null): { start: number; end: number; 
 
 function abortError(): DOMException {
 	return new DOMException('Seek superseded by a newer seek', 'AbortError');
+}
+
+/**
+ * Release a response discarded before body consumption. A rejected
+ * streaming response must not keep producing into nothing: cancel its
+ * unused body so upstream work stops. Cleanup failures are swallowed
+ * so they never replace the original response error, and a missing
+ * body is a no-op. Never reads the body (no `arrayBuffer`) and never
+ * retains a reader lock.
+ */
+async function releaseRejectedBody(response: Response): Promise<void> {
+	let body: ReadableStream<Uint8Array> | null;
+	try {
+		body = response.body;
+	} catch {
+		return;
+	}
+	if (body === null) return;
+	try {
+		await body.cancel();
+	} catch {
+		// Cleanup failure contained; caller still throws the original error.
+	}
 }
 
 /**
@@ -168,12 +197,14 @@ export class SeekController {
 	 * `AbortError` when this seek is itself superseded.
 	 */
 	async seek(start: number, end?: number): Promise<SeekResult> {
+		// Validate before any state change or fetch so non-finite
+		// positions never abort in-flight work nor reach the wire.
+		const rangeHeader = buildRangeHeader(start, end);
 		this.abortInFlight();
 		const controller = new AbortController();
 		this.current = controller;
 		this.generation += 1;
 		const generation = this.generation;
-		const rangeHeader = buildRangeHeader(start, end);
 		const requestedStart = Number(/^bytes=(\d+)-/.exec(rangeHeader)?.[1]);
 		const requestedEndText = /-(\d+)$/.exec(rangeHeader)?.[1];
 		const requestedEnd = requestedEndText === undefined ? undefined : Number(requestedEndText);
@@ -183,10 +214,12 @@ export class SeekController {
 				signal: controller.signal
 			});
 			if (controller.signal.aborted) {
+				await releaseRejectedBody(response);
 				throw new DOMException('Seek superseded by a newer seek', 'AbortError');
 			}
 
 			if (response.status !== 206 && response.status !== 200) {
+				await releaseRejectedBody(response);
 				throw new Error(`Range request failed with HTTP ${response.status}`);
 			}
 			if (response.status === 206) {
@@ -197,6 +230,7 @@ export class SeekController {
 					(requestedEnd !== undefined && range.end !== Math.min(requestedEnd, range.total - 1)) ||
 					(requestedEnd === undefined && range.end !== range.total - 1)
 				) {
+					await releaseRejectedBody(response);
 					throw new Error('Range response does not satisfy the requested byte range');
 				}
 				const expectedLength = range.end - range.start + 1;
@@ -215,7 +249,10 @@ export class SeekController {
 
 			// A 200 is a full representation, so it only satisfies a range
 			// starting at byte zero. Slice only when the caller asked for an end.
-			if (requestedStart !== 0) throw new Error('Server ignored a non-zero byte range');
+			if (requestedStart !== 0) {
+				await releaseRejectedBody(response);
+				throw new Error('Server ignored a non-zero byte range');
+			}
 			if (requestedEnd !== undefined) {
 				// Finite prefix: collect only the requested bytes and cancel
 				// the unused remainder instead of buffering the whole body.

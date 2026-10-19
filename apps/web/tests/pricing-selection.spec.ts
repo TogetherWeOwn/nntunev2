@@ -27,7 +27,7 @@ import { expect, test, type Locator, type Page, type Route } from '@playwright/t
  */
 
 const CHECKOUT_ROUTE = '**/v1/billing/checkout';
-const MOCKED_CHECKOUT_URL = 'https://checkout.example.test/session/fixture';
+const MOCKED_CHECKOUT_URL = 'https://checkout.stripe.com/session/fixture';
 
 interface CheckoutRequestRecord {
 	method: string;
@@ -70,7 +70,7 @@ async function fulfill(route: Route, spec: FulfillSpec): Promise<void> {
 
 /** Fulfill the (mocked) external checkout navigation target locally. */
 async function mockCheckoutDestination(page: Page): Promise<void> {
-	await page.route('https://checkout.example.test/**', (route) =>
+	await page.route('https://checkout.stripe.com/**', (route) =>
 		route.fulfill({
 			status: 200,
 			headers: { 'content-type': 'text/html' },
@@ -128,7 +128,7 @@ async function holdCheckoutDestination(page: Page) {
 		openGate = resolve;
 	});
 
-	await page.route('https://checkout.example.test/**', async (route) => {
+	await page.route('https://checkout.stripe.com/**', async (route) => {
 		arrivals += 1;
 		await gate;
 		await route.fulfill({
@@ -343,7 +343,11 @@ test('held checkout destination: success keeps the lock until navigation commits
 	// exactly like a real user's click in that window.
 	const pro5xBox = await buttons.pro5x.boundingBox();
 	expect(pro5xBox, 'Pro 5x button is laid out before selection').not.toBeNull();
-	await buttons.plus.click();
+	// The destination stays held until this test releases it, and that
+	// release is sequenced after this click returns. Skip only the
+	// post-click navigation barrier; the pointer activation itself is
+	// unchanged, so a premature lock release still fails below.
+	await buttons.plus.click({ noWaitAfter: true });
 
 	// Checkout succeeded and `window.location.href` has started the
 	// cross-origin navigation, but the (held) checkout host has not

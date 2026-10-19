@@ -21,6 +21,7 @@
 		| 'code-sent'
 		| 'finishing'
 		| 'code-error'
+		| 'dismissed'
 		| 'created'
 		| 'unsupported'
 		| 'error'
@@ -52,6 +53,18 @@
 			// Generic: account creation never says which step failed.
 			status = 'error';
 		}
+	}
+
+	/**
+	 * Retryable ceremony interruption: `NotAllowedError` / `AbortError`
+	 * can mean dismissal, timeout, or an unavailable authenticator. No
+	 * finish call was sent, so the code and challenge are unconsumed
+	 * (their expiry still applies). Server (`ApiError`) paths never
+	 * carry these names.
+	 */
+	function isPasskeyDismissal(error: unknown): boolean {
+		const name = (error as { name?: unknown } | null)?.name;
+		return name === 'NotAllowedError' || name === 'AbortError';
 	}
 
 	function startOver() {
@@ -112,6 +125,12 @@
 				status = 'code-sent';
 				return;
 			}
+			if (isPasskeyDismissal(error)) {
+				// Interrupted before any finish call: keep the typed code
+				// and the pending challenge so the user retries in place.
+				status = 'dismissed';
+				return;
+			}
 			// Generic: account creation never says which step failed. Stay
 			// on the code step: a mistyped code is rejected before the
 			// challenge is spent, so the same emailed code can simply be
@@ -132,13 +151,20 @@
 		Create your account with a passkey — no password to phish or leak. Then connect your own
 		Usenet provider in the next step.
 	</p>
-	{#if status === 'code-sent' || status === 'finishing' || status === 'code-error' || status === 'created'}
+	{#if status === 'code-sent' || status === 'finishing' || status === 'code-error' || status === 'dismissed' || status === 'created'}
 		<form onsubmit={finishAccount}>
 			<p role="status">
 				We emailed a sign-in link and a code to {email.trim()} — enter the code here to
 				prove the address is yours, then touch your security key when asked. (Don't use
 				the link for this step; it signs you in instead.)
 			</p>
+			{#if status === 'dismissed'}
+				<p role="alert">
+					Passkey creation didn't complete. Possible reasons: You dismissed the passkey prompt,
+					it timed out, or no authenticator was available. Your code is still valid until it
+					expires. Try again when you're ready.
+				</p>
+			{/if}
 			{#if status === 'code-error'}
 				<p role="alert">
 					That didn't work — re-enter the code (and invite code, if you have one) from the

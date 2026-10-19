@@ -19,6 +19,7 @@
 use crate::jobs::validate_job_id;
 use crate::queue::{validate_mbid, LibraryWrite};
 use crate::retry::{JobError, ERR_ACCOUNT_DELETING};
+use std::collections::HashSet;
 
 /// Hyperdrive binding name: must match `[hyperdrive]` in
 /// `wrangler.toml.example`.
@@ -166,6 +167,15 @@ pub fn validate_library_write(write: &LibraryWrite) -> Result<(), &'static str> 
     }
     if write.recording_mbids.iter().any(|m| !validate_mbid(m)) {
         return Err("recording mbids must be canonical 8-4-4-4-12 hex");
+    }
+    if !write.recording_mbids.is_empty() && write.release_mbid.is_none() {
+        return Err("recordings require a release mbid");
+    }
+    {
+        let mut seen = HashSet::with_capacity(write.recording_mbids.len());
+        if write.recording_mbids.iter().any(|m| !seen.insert(m)) {
+            return Err("duplicate recording mbids");
+        }
     }
     Ok(())
 }
