@@ -5,8 +5,9 @@ explicit gap. M1 exits when the secure staging user journey
 (signup → BYOP → ingest → play/seek) passes on an exact-head staging deploy
 with Access enabled, and rollback evidence is recorded.
 
-Re-verified against the merged `e2e/` tree on 2026-10-18 with the public
-UI-signup case, the signup wizard-arrival spec, the browser-playback spec, the player-UI-seek spec, the
+Re-verified against the merged `e2e/` tree on 2026-10-19 with the public
+UI-signup case, the signup wizard-arrival spec, the returning-user login
+magic-link spec, the browser-playback spec, the player-UI-seek spec, the
 Media Session spec, the queue-order spec (#202), the two-track fixture spec, the cost-basis
 worksheet spec, the recording-mbids
 assertion, the staging demo-audio contract spec, the demo-media
@@ -16,10 +17,11 @@ security-headers staging probe, the deployed-build identity route
 (#196) merged, the deployed-build promotion-SHA opening assertion spec
 (`e2e/tests/build-identity.spec.ts`), and the closing same-build
 re-read (`e2e/tests/zz-build-identity-final.spec.ts`) added:
-`npm --prefix e2e run e2e:list` lists 364 tests in 22 files, and
+`npm --prefix e2e run e2e:list` lists 378 tests in 24 files, and
 `(cd apps/web && pnpm exec playwright test --list)` lists 110 tests in
 23 files (94 in 21 files as previously verified, plus the 5-test
-paywall-elapsed-time spec and the 11-test passkey-dismissal spec). Line numbers
+paywall-elapsed-time spec and the 11-test passkey-dismissal spec; the
+`apps/web` tree is untouched by this change). Line numbers
 below are from that head; re-verify with the commands at the end of this
 document whenever a spec is added, renamed, or retitled, and update this
 matrix in the same PR. CI enforces the file and title citations on
@@ -92,6 +94,33 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   bytes) at the no-auth demo-audio route, with the formula itself pinned
   offline in the same file (`:23`, run in `test:unit`). Live legs skip
   green without staging and fail closed once configured.
+- Returning-user login magic link (`e2e/tests/login-magic-link.spec.ts:45`
+  "returning user signs in with an emailed magic link and lands on provider setup",
+  `:118` "login shows the same generic sent state for an unknown address",
+  `:138` "login surfaces a generic error when the magic-link request fails") is
+  auth-journey support, not an M1 exit step: the live case mints the returning
+  account via `POST /api/test-accounts` (`tryMintTestAccount`,
+  `e2e/helpers/accounts.ts:335`), submits the real `/login` form from a null
+  identity (Access pair only, so the form is the only sign-in path), requires
+  the generic sent state, retrieves the issued code from the staging-only
+  `POST /api/test-codes` seam through the shared reader (`retrieveStagedSignupCode`,
+  `e2e/helpers/accounts.ts:526`; path pinned in `e2e/helpers/contract.ts`), confirms
+  on `/auth/magic` (which never redeems on load) and requires `/onboarding/byop`
+  plus the wizard heading as the session proof — provider setup is served at
+  `/onboarding/byop` (`/onboarding/provider` 307-redirects there), a failed
+  finish stays on `/auth/magic` with the generic error, so arrival is the
+  verdict — with
+  names-only diagnostics throughout (pinned offline by
+  `e2e/tests/workflows.spec.ts:383`, `:426`, plus the no-follow list). The
+  unknown-address case submits a never-registered mailbox and requires the
+  identical sent copy (a distinct answer would be an enumeration oracle; no seam
+  needed). The error case forces the backend failure with a local route stub and
+  requires the generic alert (no seam needed). The live case skips pre-deploy
+  and fails closed on CI without `QA_AUTH_TOKEN`. **Remaining gap:** the mint seam
+  has no server implementation yet and the code seam still awaits API Worker
+  staging deployment and activation — with the token set the live leg fails with
+  the documented `[seam] POST /api/test-accounts failed` or
+  `[code-seam] POST /api/test-codes failed` signature instead of passing.
 
 - `e2e/tests/helpers.spec.ts` and `e2e/tests/workflows.spec.ts` are
   offline self-tests (wall detection, credential scope, workflow

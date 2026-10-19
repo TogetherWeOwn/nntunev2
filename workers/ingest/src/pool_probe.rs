@@ -91,12 +91,68 @@ pub fn classify_reply(
     }
 }
 
+/// Longest one pool probe stub call may take, headers plus body sharing one
+/// cancellable deadline. Overridable in tests via
+/// [`call_pool_probe_with_deadline`]; production callers use
+/// [`call_pool_probe`].
+///
+/// Sized from the batch arithmetic in `queue_consumer`: one probe batch is
+/// up to [`crate::probe::MAX_PROBE_SEGMENTS`] (500) sequential `STAT`
+/// round-trips on the pool side, nominally 15 ms each (7.5 s per batch).
+/// The per-STAT allowance below (50 ms, over 3x nominal) covers a
+/// slow-but-healthy provider at 25 ms per `STAT` (12.5 s per batch) with 2x
+/// headroom, plus one nominal 5 s dial allowance. The pool path dials via
+/// `nntune_core` `WorkerTransport` (per-operation `config.timeout`, default
+/// 20 s in `crates/nntune-core/src/nntp.rs`) with the greeting + `MODE
+/// READER` + `AUTHINFO` handshake in `NntpClient::connect`; the 5 s is a
+/// nominal allowance for that handshake, not the transport timeout. A
+/// warm-stale redial fails fast on the first `Io` (closed-while-idle)
+/// before the fresh dial, so a single batch allowance plus one dial covers
+/// the rerun path too. The total (30 s) equals [`crate::queue_consumer`]
+/// `PROBE_DELIVERY_BUDGET_MS`, so one hung batch holds at most one
+/// delivery budget — the same overshoot the driver already allows for one
+/// in-flight batch.
+pub const POOL_PROBE_DEADLINE_MS: u64 = 30_000;
+
+/// Per-`STAT` allowance inside [`POOL_PROBE_DEADLINE_MS`]: 50 ms covers the
+/// 15 ms nominal round-trip with over 3x headroom (25 ms slow-healthy with
+/// 2x).
+const PROBE_PER_STAT_ALLOWANCE_MS: u64 = 50;
+
+/// One nominal dial allowance inside [`POOL_PROBE_DEADLINE_MS`]: 5 s for the
+/// pool handshake (`NntpClient::connect` over `WorkerTransport`; the
+/// transport's per-operation `config.timeout` defaults to 20 s).
+const PROBE_DIAL_ALLOWANCE_MS: u64 = 5_000;
+
+// Compile-time: the deadline is exactly one full 500-`STAT` batch at the
+// per-`STAT` allowance plus one dial, and stays above a slow-healthy batch
+// (500 `STAT`s at 25 ms plus one dial = 17.5 s).
+const _: () = assert!(
+    POOL_PROBE_DEADLINE_MS
+        == crate::probe::MAX_PROBE_SEGMENTS as u64 * PROBE_PER_STAT_ALLOWANCE_MS
+            + PROBE_DIAL_ALLOWANCE_MS
+);
+const _: () = assert!(POOL_PROBE_DEADLINE_MS >= 500 * 25 + 5_000);
+
 /// Send one probe batch to the user's pool and check the answer.
 pub async fn call_pool_probe(
     env: &Env,
     req: &ProbeRequest,
 ) -> Result<ProbeOutcome, PoolProbeError> {
+    call_pool_probe_with_deadline(env, req, POOL_PROBE_DEADLINE_MS).await
+}
+
+/// Probe-call worker behind [`call_pool_probe`] with an explicit per-call
+/// deadline, so tests can shrink the bound without waiting the default.
+pub async fn call_pool_probe_with_deadline(
+    env: &Env,
+    req: &ProbeRequest,
+    deadline_ms: u64,
+) -> Result<ProbeOutcome, PoolProbeError> {
     let unavailable = PoolProbeError::Retry {
+        after_secs: DEFAULT_RETRY_SECS,
+    };
+    let expired = PoolProbeError::Retry {
         after_secs: DEFAULT_RETRY_SECS,
     };
     let body = serde_json::to_string(req).map_err(|_| PoolProbeError::Rejected)?;
@@ -113,10 +169,22 @@ pub async fn call_pool_probe(
         .with_headers(headers)
         .with_body(Some(JsValue::from_str(&body)));
     let request = Request::new_with_init(POOL_PROBE_URL, &init).map_err(|_| unavailable)?;
-    let mut response = stub
-        .fetch_with_request(request)
-        .await
-        .map_err(|_| unavailable)?;
+    // One cancellable deadline spans headers plus the body drain, armed
+    // before the stub fetch so slow headers count against the same budget
+    // as a stalled body (same shape as the MusicBrainz body path).
+    // `worker::Delay` only registers its timer on first poll, so racing
+    // both futures here polls (arms) the deadline from the start. Dropping
+    // the pinned `Delay` releases its timer, and every return below drops
+    // it: expiry, transport failure, and success all release the timer.
+    let mut deadline = Box::pin(worker::Delay::from(std::time::Duration::from_millis(
+        deadline_ms,
+    )));
+    let fetch = Box::pin(stub.fetch_with_request(request));
+    let response = crate::pool_deadline::race_against_deadline(fetch, &mut deadline).await;
+    let mut response = match response {
+        Some(Ok(response)) => response,
+        Some(Err(_)) | None => return Err(expired),
+    };
     let status = response.status_code();
     let retry_after = response.headers().get("retry-after").ok().flatten();
     // Ceiling for the 200 reply read, bound before any classification so the
@@ -128,31 +196,43 @@ pub async fn call_pool_probe(
     if status != 200 {
         return classify_reply(req, status, retry_after.as_deref(), "");
     }
-    // Bounded 200 read: stream the body and fail closed on the chunk that
-    // would cross the cap, so no more than the cap is ever retained. A body
-    // that is not streamable falls back to one buffered read with the same
-    // ceiling.
-    let bytes = match response.stream() {
-        Ok(stream) => {
-            let mut stream = Box::pin(stream);
-            let mut buf = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|_| unavailable)?;
-                if buf.len().saturating_add(chunk.len()) > reply_cap {
+    // Bounded 200 read under the same deadline: stream the body and fail
+    // closed on the chunk that would cross the cap, so no more than the cap
+    // is ever retained. A body that is not streamable falls back to one
+    // buffered read with the same ceiling. The drain races the shared
+    // deadline (partial progress never re-arms it), so headers plus body
+    // share one total budget and a stalled body expires instead of hanging.
+    let bounded_read = async {
+        match response.stream() {
+            Ok(stream) => {
+                let mut stream = Box::pin(stream);
+                let mut buf = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|_| unavailable)?;
+                    if buf.len().saturating_add(chunk.len()) > reply_cap {
+                        return Err(PoolProbeError::Rejected);
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                Ok(buf)
+            }
+            Err(_) => {
+                let buf = response.bytes().await.map_err(|_| unavailable)?;
+                if buf.len() > reply_cap {
                     return Err(PoolProbeError::Rejected);
                 }
-                buf.extend_from_slice(&chunk);
+                Ok(buf)
             }
-            buf
-        }
-        Err(_) => {
-            let buf = response.bytes().await.map_err(|_| unavailable)?;
-            if buf.len() > reply_cap {
-                return Err(PoolProbeError::Rejected);
-            }
-            buf
         }
     };
+    let bounded_read = Box::pin(bounded_read);
+    let bytes = crate::pool_deadline::race_against_deadline(bounded_read, &mut deadline).await;
+    let bytes = match bytes {
+        Some(Ok(bytes)) => bytes,
+        Some(Err(read_error)) => return Err(read_error),
+        None => return Err(expired),
+    };
+    drop(deadline);
     let text = String::from_utf8(bytes).map_err(|_| PoolProbeError::Rejected)?;
     classify_reply(req, status, retry_after.as_deref(), &text)
 }

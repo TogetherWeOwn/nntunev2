@@ -250,7 +250,7 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
     if !seen_begin || !seen_trailer {
         return Err(YencError::Truncated);
     }
-    if yend_size as usize != out.len() {
+    if yend_size != out.len() as u64 {
         return Err(YencError::SizeMismatch {
             expected: yend_size,
             actual: out.len(),
@@ -263,7 +263,7 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
         }
         begin - 1
     } else {
-        if file_size as usize != out.len() {
+        if file_size != out.len() as u64 {
             return Err(YencError::SizeMismatch {
                 expected: file_size,
                 actual: out.len(),

@@ -41,6 +41,7 @@ pub mod nzb_fetch;
 pub mod nzb_intake;
 pub mod parse;
 pub mod pool_body;
+pub mod pool_deadline;
 pub mod pool_probe;
 pub mod probe;
 pub mod queue;
@@ -321,8 +322,9 @@ fn check_search_attempt(req: &Request, env: &Env, user_id: &str) -> rate_limit::
     })
 }
 
-/// 429 for a throttled search: generic zero-arg body (no query, key or
-/// caller identity can leak into it) plus `Retry-After`.
+/// 429 for a throttled search: the standard `rate_limited` envelope as a
+/// generic zero-arg body (no query, key or caller identity can leak into
+/// it) plus `Retry-After`.
 fn search_rate_limited_response(retry_after_secs: u64) -> Result<Response> {
     let headers = headers_json().unwrap_or_default();
     headers.append(

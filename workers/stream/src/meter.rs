@@ -65,6 +65,10 @@ pub enum MeterKind {
     BytesServed,
     PrefetchEnqueued,
     ProviderError,
+    /// One article exceeded the article byte cap and only that fetch was
+    /// refused: the provider is healthy, the pool is never quarantined, and
+    /// the desynchronized connection is dropped. Emitted once per refusal.
+    SizeRefused,
     /// A play was rejected because its grant had expired
     /// (`GrantError::Expired`). Carries the requested track and the granted
     /// user only; never secret or token material.
@@ -85,6 +89,14 @@ pub enum MeterKind {
     /// A pooled connection the provider silently closed was transparently
     /// redialed (no backoff, no quarantine).
     WarmRedial,
+    /// A play terminated because a segment article is gone (`430`/`423`,
+    /// [`crate::play::PlayError::ArticleMissing`]). Terminal content signal:
+    /// the track fails, the pool is fine. Non-serving (`bytes = 0`).
+    ArticleMissing,
+    /// A play terminated because a segment could not be decoded
+    /// ([`crate::play::PlayError::Decode`]). Terminal content signal:
+    /// the track fails, the pool is fine. Non-serving (`bytes = 0`).
+    DecodeFailed,
     /// A flagged reconciliation mismatch. Non-serving: its [`MeterEvent`]
     /// always carries `bytes = 0`; the flagged counts stay on the
     /// [`ReconcileMismatch`] record returned by [`reconcile`].
@@ -101,12 +113,15 @@ pub fn kind_slug(kind: MeterKind) -> &'static str {
         MeterKind::BytesServed => "bytes_served",
         MeterKind::PrefetchEnqueued => "prefetch_enqueued",
         MeterKind::ProviderError => "provider_error",
+        MeterKind::SizeRefused => "size_refused",
         MeterKind::GrantRejectedExpired => "grant_rejected_expired",
         MeterKind::GrantRejectedExcessiveExpiry => "grant_rejected_excessive_expiry",
         MeterKind::GrantRejectedWrongTrack => "grant_rejected_wrong_track",
         MeterKind::QuarantineEntered => "quarantine_entered",
         MeterKind::QuarantineExited => "quarantine_exited",
         MeterKind::WarmRedial => "warm_redial",
+        MeterKind::ArticleMissing => "article_missing",
+        MeterKind::DecodeFailed => "decode_failed",
         MeterKind::ReconcileMismatch => "play_reconcile_mismatch",
     }
 }
@@ -155,33 +170,31 @@ impl MemoryMeter {
 fn is_valid_key_field(field: &str, max_bytes: usize) -> bool {
     !field.is_empty()
         && field.len() <= max_bytes
-        && !field.contains(':')
-        && !field.contains('=')
-        && !field
-            .chars()
-            .any(|ch| ch.is_whitespace() || ch.is_control())
+        && field
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Derive the idempotency key for one play: `play:{user}:{track}:{play}`.
 ///
 /// Mirrors the `ingest:{user}:{sha}:{ref}` vocabulary of
-/// `derive_idempotency_key` in the ingest Worker. Rejects (Err, no panic)
-/// any field that is empty, over its byte limit, or contains `:`, `=`,
-/// whitespace, or control characters, so keys remain unambiguous and safe
-/// to emit as single-line structured logs.
+/// `derive_idempotency_key` in the ingest Worker. Each field must be non-empty,
+/// within its byte limit, and contain only ASCII alphanumerics, `-`, or `_`,
+/// matching the persisted ledger key alphabet. Rejects invalid fields (Err,
+/// no panic), without rewriting identities; `:` is only a structural delimiter.
 pub fn derive_play_idempotency_key(
     user_id: &str,
     track_id: &str,
     play_id: &str,
 ) -> Result<String, &'static str> {
     if !is_valid_key_field(user_id, 128) {
-        return Err("user id must be 1-128 bytes without ':', '=', whitespace, or controls");
+        return Err("user id must be 1-128 bytes of ASCII alphanumerics, '-', or '_'");
     }
     if !is_valid_key_field(track_id, 512) {
-        return Err("track id must be 1-512 bytes without ':', '=', whitespace, or controls");
+        return Err("track id must be 1-512 bytes of ASCII alphanumerics, '-', or '_'");
     }
     if !is_valid_key_field(play_id, 512) {
-        return Err("play id must be 1-512 bytes without ':', '=', whitespace, or controls");
+        return Err("play id must be 1-512 bytes of ASCII alphanumerics, '-', or '_'");
     }
     Ok(format!("play:{user_id}:{track_id}:{play_id}"))
 }
@@ -752,9 +765,9 @@ mod tests {
         let key = derive_play_idempotency_key(&user, &track, &play_id).unwrap();
         assert_eq!(key, format!("play:{user}:{track}:{play_id}"));
 
-        // The limits count bytes, not chars: 64 two-byte chars are exactly
-        // 128 bytes, 65 are 130.
-        assert!(derive_play_idempotency_key(&"\u{e9}".repeat(64), "t", "p").is_ok());
+        // Non-ASCII identities are refused even at the byte limit:
+        // 64 two-byte chars are exactly 128 bytes, 65 are 130.
+        assert!(derive_play_idempotency_key(&"\u{e9}".repeat(64), "t", "p").is_err());
         assert!(derive_play_idempotency_key(&"\u{e9}".repeat(65), "t", "p").is_err());
 
         // The ledger accepts exact-limit fields too, so its identity re-check
@@ -929,12 +942,15 @@ mod tests {
             kind_slug(MeterKind::BytesServed),
             kind_slug(MeterKind::PrefetchEnqueued),
             kind_slug(MeterKind::ProviderError),
+            kind_slug(MeterKind::SizeRefused),
             kind_slug(MeterKind::GrantRejectedExpired),
             kind_slug(MeterKind::GrantRejectedExcessiveExpiry),
             kind_slug(MeterKind::GrantRejectedWrongTrack),
             kind_slug(MeterKind::QuarantineEntered),
             kind_slug(MeterKind::QuarantineExited),
             kind_slug(MeterKind::WarmRedial),
+            kind_slug(MeterKind::ArticleMissing),
+            kind_slug(MeterKind::DecodeFailed),
             kind_slug(MeterKind::ReconcileMismatch),
         ];
         assert_eq!(
@@ -946,12 +962,15 @@ mod tests {
                 "bytes_served",
                 "prefetch_enqueued",
                 "provider_error",
+                "size_refused",
                 "grant_rejected_expired",
                 "grant_rejected_excessive_expiry",
                 "grant_rejected_wrong_track",
                 "quarantine_entered",
                 "quarantine_exited",
                 "warm_redial",
+                "article_missing",
+                "decode_failed",
                 "play_reconcile_mismatch"
             ]
         );

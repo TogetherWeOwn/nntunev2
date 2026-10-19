@@ -18,7 +18,7 @@ fn row_for(user: &str, track: &str, bytes: u64, recorded_at: u64) -> LedgerRow {
     prepare_ledger_row(
         user,
         track,
-        &new_idempotency_key(),
+        &new_idempotency_key().expect("mint with working RNG"),
         bytes,
         bytes.div_ceil(ledger::STREAM_BYTES_PER_SEC),
         recorded_at,
@@ -30,7 +30,7 @@ fn row_for(user: &str, track: &str, bytes: u64, recorded_at: u64) -> LedgerRow {
 
 #[test]
 fn prepare_builds_a_fully_specified_intent() {
-    let key = new_idempotency_key();
+    let key = new_idempotency_key().expect("mint with working RNG");
     let row = prepare_ledger_row(
         "user-alice",
         "track-opaque-1",
@@ -56,7 +56,7 @@ fn prepare_builds_a_fully_specified_intent() {
 
 #[test]
 fn prepare_rejects_empty_and_overlong_handles() {
-    let key = new_idempotency_key();
+    let key = new_idempotency_key().expect("mint with working RNG");
     let long_user = "x".repeat(129);
     let long_track = "x".repeat(513);
     for (user, track, k) in [
@@ -91,7 +91,7 @@ fn prepare_rejects_empty_and_overlong_handles() {
 
 #[test]
 fn prepare_rejects_bad_keys_zero_and_oversized_bytes() {
-    let good_key = new_idempotency_key();
+    let good_key = new_idempotency_key().expect("mint with working RNG");
     // `:` is allowed: stream play keys are `play:{user}:{track}:{play}`.
     // Length cap is 1159 (longest derivable play key), alphabet is
     // `[A-Za-z0-9_:-]` on both Rust and SQL sides.
@@ -278,7 +278,7 @@ fn fold_is_order_independent_and_split_preserving() {
                 prepare_ledger_row(
                     &first.user_id,
                     &first.track_id,
-                    &new_idempotency_key(),
+                    &new_idempotency_key().expect("mint with working RNG"),
                     bytes,
                     bytes.div_ceil(ledger::STREAM_BYTES_PER_SEC),
                     first.recorded_at,
