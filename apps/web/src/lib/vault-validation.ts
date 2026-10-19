@@ -172,6 +172,16 @@ export function validateIndexerUrl(url: string, apiKey: string): string | null {
 	) {
 		return 'That indexer address is not allowed; use a public host.';
 	}
+	// The ingest fetch model is 443-only: an explicit port other than 443
+	// must fail here with a port-specific message instead of passing client
+	// validation and failing later at the server / ingest boundary. Read the
+	// port from the parsed authority — WHATWG URL normalizes an explicit
+	// `:443` to the empty string (same as portless), while any other explicit
+	// port (including `:0`) survives; colons inside a bracketed IPv6 literal
+	// never surface as `port`.
+	if (parsed.port !== '') {
+		return 'Indexer URLs must use port 443.';
+	}
 	const key = apiKey.trim();
 	if (key.length === 0) return 'Enter your indexer API key.';
 	if (new TextEncoder().encode(key).byteLength > 1024) {
