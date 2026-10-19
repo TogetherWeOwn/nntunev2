@@ -168,6 +168,7 @@ test.describe('credential scope (static pins)', () => {
       'demo-media-sessionless.spec.ts',
       'build-identity.spec.ts',
       'zz-build-identity-final.spec.ts',
+      'api-worker-anonymous.spec.ts',
     ]) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must not carry credentials on a raw request call`).not.toMatch(
@@ -180,6 +181,7 @@ test.describe('credential scope (static pins)', () => {
       'player-queue-order.spec.ts',
       'demo-audio-contract.spec.ts',
       'demo-media-sessionless.spec.ts',
+      'api-worker-anonymous.spec.ts',
     ]) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must use the no-follow wrapper`).toContain('apiGet(');

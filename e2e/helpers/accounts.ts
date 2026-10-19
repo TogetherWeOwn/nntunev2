@@ -194,6 +194,30 @@ export async function apiPost(
 }
 
 /**
+ * No-follow OPTIONS for CORS preflight probes. Same contract as apiGet:
+ * fetches with maxRedirects: 0 so a staging 3xx is returned as-is (never
+ * followed with credentials); a 3xx throws via throwOnRedirect instead of
+ * surfacing as a bare status mismatch. Live specs must use this instead of
+ * a raw fetch with an OPTIONS method.
+ */
+export async function apiOptions(
+  request: APIRequestContext,
+  url: string,
+  headers: Record<string, string>,
+  context: string,
+  opts?: { timeout?: number },
+): Promise<APIResponse> {
+  const res = await request.fetch(url, {
+    method: 'OPTIONS',
+    headers,
+    timeout: opts?.timeout ?? 30_000,
+    maxRedirects: 0,
+  });
+  throwOnRedirect(res.status(), res.headers(), context);
+  return res;
+}
+
+/**
  * Anonymous GET in a fresh, isolated request context: no Access pair, no
  * bearer, no cookies or storage state — the context is created here, not
  * borrowed from a test fixture or browser context, and no headers are

@@ -16,9 +16,10 @@ denial specs (#185, #188), the branded-error-page specs (#203), the
 security-headers staging probe, the sign-out-everywhere revocation spec,
 the deployed-build identity route
 (#196) merged, the deployed-build promotion-SHA opening assertion spec
-(`e2e/tests/build-identity.spec.ts`), and the closing same-build
-re-read (`e2e/tests/zz-build-identity-final.spec.ts`) added:
-`npm --prefix e2e run e2e:list` lists 379 tests in 25 files, and
+(`e2e/tests/build-identity.spec.ts`), the closing same-build
+re-read (`e2e/tests/zz-build-identity-final.spec.ts`), and the anonymous API
+Worker contract spec (`e2e/tests/api-worker-anonymous.spec.ts`) added:
+`npm --prefix e2e run e2e:list` lists 389 tests in 26 files, and
 `(cd apps/web && pnpm exec playwright test --list)` lists 110 tests in
 23 files (94 in 21 files as previously verified, plus the 5-test
 paywall-elapsed-time spec and the 11-test passkey-dismissal spec; the
@@ -195,6 +196,28 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   everywhere except that final leg.
   Skips pre-deploy and fails closed on CI without `QA_AUTH_TOKEN`, mirroring
   `e2e/tests/login-magic-link.spec.ts`. Session hardening, not journey coverage.
+- `e2e/tests/api-worker-anonymous.spec.ts` pins the anonymous API Worker
+  contract both offline and live: the offline describe pins the verdict
+  shapes on every PR via `test:unit` with no staging
+  (`e2e/tests/api-worker-anonymous.spec.ts:171` "generic 401 verdict accepts the documented shape and rejects the rest",
+  `e2e/tests/api-worker-anonymous.spec.ts:216` "not_found verdict accepts the envelope and rejects the rest",
+  `e2e/tests/api-worker-anonymous.spec.ts:269` "probe route table stays on the served worker surface",
+  `e2e/tests/api-worker-anonymous.spec.ts:281` "preflight probes cover liveness and the authed surface"),
+  while the staging legs prove liveness and fail-closed denial behind the
+  Access edge with the Access pair only and no app session
+  (`e2e/tests/api-worker-anonymous.spec.ts:287` "GET /healthz answers 200 with ok:true and no session",
+  `e2e/tests/api-worker-anonymous.spec.ts:321` "anonymous GET /v1/vault answers the generic 401",
+  `e2e/tests/api-worker-anonymous.spec.ts:342` "anonymous POST /v1/session/refresh answers the generic 401",
+  `e2e/tests/api-worker-anonymous.spec.ts:369` "anonymous POST /v1/session/revoke-all answers the generic 401",
+  `e2e/tests/api-worker-anonymous.spec.ts:393` "GET unknown worker path answers the 404 not_found envelope",
+  `e2e/tests/api-worker-anonymous.spec.ts:412` "OPTIONS preflight on known worker paths answers 204 with an empty body"):
+  `GET /healthz` answers 200 with ok true, the vault read and both session
+  mutations answer the generic 401 with no cookie set, the unknown path
+  answers the not_found envelope, and known-path preflights answer an empty
+  204 — each leg first clears the Access-wall check so an edge denial can
+  never masquerade as Worker evidence, with names-only diagnostics
+  throughout. The legs skip green without staging and fail closed once
+  configured. Worker hardening, not journey coverage.
 - `e2e/tests/demo-media-sessionless.spec.ts` pins the sessionless invariant
   live: `e2e/tests/demo-media-sessionless.spec.ts:25` "sessionless GET
   /api/demo/audio serves synthetic bytes (200; 206 for Range)" plus the
