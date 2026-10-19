@@ -559,6 +559,10 @@ jobs:
       # after a revert that drops the flag from the build command.
       - name: Pin repair image build uses --locked
         run: grep -q '^RUN cargo build --locked --release -p nntune-repair-server' containers/repair/Dockerfile
+      - name: Run repair runtime-user pin test
+        run: bash containers/repair/tests/test_runtime_user.sh
+      - name: Run repair runtime-user pin self-test
+        run: bash containers/repair/tests/test_runtime_user.sh --self-test
       - name: Build repair image from clean checkout
         run: docker build -f containers/repair/Dockerfile -t nntune-repair:ci .
       - name: Smoke the shipped server and pinned par2 binary
