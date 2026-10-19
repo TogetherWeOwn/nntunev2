@@ -65,6 +65,7 @@ Hyperdrive. The STRIDE threat model (§3–§4) is the binding security spec.
 - Slice 1 is verifiable today (`cargo test`, clippy, fmt) with zero secret
   handling in CI (synthetic fixtures only).
 - The follow-up slice added the Worker HTTP entry, Hyperdrive queries
-  (parameterized only), WebAuthn signature verification, and the pool-backed
-  `test connection` (all shipped in slice 2 — see status note); it
-  re-requests CISO review as a vault/auth-touching PR.
+  (parameterized only), WebAuthn signature verification, and the bounded
+  direct-socket `test connection` probe (`SocketDialer`, vetted IP literals
+  only — not routed through the stream pool; all shipped in slice 2 — see
+  status note); it re-requests CISO review as a vault/auth-touching PR.
