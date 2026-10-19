@@ -264,6 +264,34 @@ Job properties:
 
 ## 7. Runbook (operator copy-paste)
 
+> **NOT EXECUTABLE — design only. Do not run the steps below in an
+> incident.** The re-wrap job (§6 runner: no Cloudflare Workflow/Queue
+> consumer is implemented, §8) and the versioned KEK map (a
+> `kek_by_version` selector over `VAULT_KEK_V<N>` per-version secrets +
+> `VAULT_KEK_CURRENT` write-version var, plus the `rotation_runs`
+> progress table — none of which exist in Worker code or migrations)
+> have not landed: the Worker reads only `VAULT_KEK_BASE64` +
+> `VAULT_KEK_VERSION` (`workers/api/src/worker_entry.rs`). Until those
+> land, routine KEK rotation cannot be executed. On suspected or
+> confirmed KEK exposure, report it through GitHub's private
+> vulnerability reporting (see `SECURITY.md`); §10 is design-only and
+> has no runner. Today's executable containment is: replace
+> `VAULT_KEK_BASE64`/`VAULT_KEK_VERSION` with a fresh single KEK so
+> rows pinned to the exposed version fail closed, treat all vaulted
+> credentials as exposed, and force credential re-entry — never the
+> steps below (the §10 per-row re-key needs the versioned KEK map +
+> runner that have not landed).
+
+### Rotation executability today (Worker code as merged)
+
+| Rotation | Executable today? | Worker env vars (grep proof) |
+|---|---|---|
+| Session secret (routine window) | ✅ Yes — dual-accept window per `docs/security/session-secret-rotation.md` | `SESSION_SECRET_BASE64`, `SESSION_SECRET_PREVIOUS_BASE64`, `SESSION_SECRET_ROTATION` — all read in `workers/api/src/worker_entry.rs` |
+| Session secret (compromise) | ✅ Yes — single-secret cutover + `UPDATE sessions SET revoked = TRUE` (§6 of that doc) | same vars as above |
+| KEK (routine re-wrap, §§5–6 below) | ❌ No — re-wrap job and versioned KEK map not implemented | `VAULT_KEK_BASE64` + `VAULT_KEK_VERSION` read in `worker_entry.rs`; `VAULT_KEK_V<N>`, `VAULT_KEK_CURRENT`, and `rotation_runs` appear nowhere in code or migrations (**not implemented**) |
+| KEK (compromise re-key, §10) | ❌ No runner — incident path is design until the §8 gate items land | same as above |
+| Native REST pepper | ⚠️ Reissue only — no rotation window; rotating the pepper means provisioning a new pair and reissuing credentials (rows pinned to the old `pepper_version` fail closed) | single `NATIVE_REST_PEPPER_BASE64` + `NATIVE_REST_PEPPER_VERSION` pair in `worker_entry.rs`; no second pair / previous-pepper var (**not implemented**) |
+
 Preconditions: staging bake ≥24h on the new version; backup verified
 (ciphertext restores); two operators aware (one executes, one can flip
 back); rotation window announced.
@@ -346,7 +374,15 @@ CISO gate verifies each at its exact head):
   the job has production history).
 - Cross-environment replication (explicitly forbidden — see §3).
 
-## 10. Compromise rotation (incident response)
+## 10. Compromise rotation (incident response) — DESIGN ONLY, no runner
+
+> **DESIGN ONLY — no runner.** Steps 1–2 below need the versioned KEK
+> map (`VAULT_KEK_V<N>` + `VAULT_KEK_CURRENT`) and the re-wrap runner,
+> neither of which exists in Worker code or migrations. On suspected or
+> confirmed exposure, report through GitHub's private vulnerability
+> reporting (see `SECURITY.md`) and apply today's executable
+> containment from §7 (fresh single KEK so exposed-version rows fail
+> closed, treat vaulted credentials as exposed, force re-entry).
 
 Routine re-wrap (§§5–6) rotates the WRAPPING, not the data key: anyone
 holding an exposed KEK[N] plus any pre-rotation snapshot still unwraps

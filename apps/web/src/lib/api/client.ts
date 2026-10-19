@@ -145,6 +145,37 @@ export interface ProviderTestResult {
 	error?: string;
 }
 
+function isFiniteNonNegativeNumber(value: unknown): value is number {
+	return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+/** Typed shape failure for a malformed vault-test success body. */
+function vaultTestShapeFailure(status: number): ApiError {
+	const parsed = parseErrorBody(null, status);
+	return new ApiError(status, 'request_failed', parsed.message, null, false);
+}
+
+/**
+ * Guard the `POST /v1/vault/test` success body before any caller can show
+ * "Connected": the body must be a plain object whose `ok` is a real boolean
+ * (so `{ok:"false"}` can never unlock Save via truthiness), while an invalid
+ * `latencyMs` is display-only and therefore omitted, never rejected. A string
+ * `error` passes through for logging; anything else is dropped.
+ */
+function validateVaultTestResult(data: unknown, status: number): ProviderTestResult {
+	if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+		throw vaultTestShapeFailure(status);
+	}
+	const record = data as Record<string, unknown>;
+	if (typeof record.ok !== 'boolean') throw vaultTestShapeFailure(status);
+	const result: ProviderTestResult = { ok: record.ok };
+	if (record.latencyMs !== undefined && isFiniteNonNegativeNumber(record.latencyMs)) {
+		result.latencyMs = record.latencyMs;
+	}
+	if (typeof record.error === 'string') result.error = record.error;
+	return result;
+}
+
 /** `POST /v1/auth/passkey/register/start` response (fixed shape, never an oracle). */
 export interface RegisterStartResponse {
 	challenge: string;
@@ -318,7 +349,12 @@ export class ApiClient {
 	 * secrets never come back in the response.
 	 */
 	async testProviderConnection(input: ProviderTestInput): Promise<ProviderTestResult> {
-		return this.post<ProviderTestResult>('/v1/vault/test', toVaultSaveBody(input));
+		const { data, status } = await this.requestWithStatus<unknown>('/v1/vault/test', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify(toVaultSaveBody(input))
+		});
+		return validateVaultTestResult(data, status);
 	}
 
 	/**
@@ -331,6 +367,13 @@ export class ApiClient {
 	}
 
 	private async request<T>(path: string, init: RequestInit): Promise<T> {
+		return (await this.requestWithStatus<T>(path, init)).data;
+	}
+
+	private async requestWithStatus<T>(
+		path: string,
+		init: RequestInit
+	): Promise<{ data: T; status: number }> {
 		const headers: Record<string, string> = {
 			...((init.headers as Record<string, string> | undefined) ?? {}),
 			accept: 'application/json'
@@ -382,7 +425,7 @@ export class ApiClient {
 				throw new ApiError(response.status, parsed.code, parsed.message, paywall, parsed.retryable);
 			}
 			try {
-				return (await readCappedJson(response)) as T;
+				return { data: (await readCappedJson(response)) as T, status: response.status };
 			} catch (error) {
 				if (timedOut) throw this.timeoutError();
 				// An over-cap 2xx never parses: surface the typed error, never

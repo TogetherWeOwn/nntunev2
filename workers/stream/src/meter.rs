@@ -65,6 +65,10 @@ pub enum MeterKind {
     BytesServed,
     PrefetchEnqueued,
     ProviderError,
+    /// One article exceeded the article byte cap and only that fetch was
+    /// refused: the provider is healthy, the pool is never quarantined, and
+    /// the desynchronized connection is dropped. Emitted once per refusal.
+    SizeRefused,
     /// A play was rejected because its grant had expired
     /// (`GrantError::Expired`). Carries the requested track and the granted
     /// user only; never secret or token material.
@@ -85,6 +89,14 @@ pub enum MeterKind {
     /// A pooled connection the provider silently closed was transparently
     /// redialed (no backoff, no quarantine).
     WarmRedial,
+    /// A play terminated because a segment article is gone (`430`/`423`,
+    /// [`crate::play::PlayError::ArticleMissing`]). Terminal content signal:
+    /// the track fails, the pool is fine. Non-serving (`bytes = 0`).
+    ArticleMissing,
+    /// A play terminated because a segment could not be decoded
+    /// ([`crate::play::PlayError::Decode`]). Terminal content signal:
+    /// the track fails, the pool is fine. Non-serving (`bytes = 0`).
+    DecodeFailed,
     /// A flagged reconciliation mismatch. Non-serving: its [`MeterEvent`]
     /// always carries `bytes = 0`; the flagged counts stay on the
     /// [`ReconcileMismatch`] record returned by [`reconcile`].
@@ -101,12 +113,15 @@ pub fn kind_slug(kind: MeterKind) -> &'static str {
         MeterKind::BytesServed => "bytes_served",
         MeterKind::PrefetchEnqueued => "prefetch_enqueued",
         MeterKind::ProviderError => "provider_error",
+        MeterKind::SizeRefused => "size_refused",
         MeterKind::GrantRejectedExpired => "grant_rejected_expired",
         MeterKind::GrantRejectedExcessiveExpiry => "grant_rejected_excessive_expiry",
         MeterKind::GrantRejectedWrongTrack => "grant_rejected_wrong_track",
         MeterKind::QuarantineEntered => "quarantine_entered",
         MeterKind::QuarantineExited => "quarantine_exited",
         MeterKind::WarmRedial => "warm_redial",
+        MeterKind::ArticleMissing => "article_missing",
+        MeterKind::DecodeFailed => "decode_failed",
         MeterKind::ReconcileMismatch => "play_reconcile_mismatch",
     }
 }
@@ -927,12 +942,15 @@ mod tests {
             kind_slug(MeterKind::BytesServed),
             kind_slug(MeterKind::PrefetchEnqueued),
             kind_slug(MeterKind::ProviderError),
+            kind_slug(MeterKind::SizeRefused),
             kind_slug(MeterKind::GrantRejectedExpired),
             kind_slug(MeterKind::GrantRejectedExcessiveExpiry),
             kind_slug(MeterKind::GrantRejectedWrongTrack),
             kind_slug(MeterKind::QuarantineEntered),
             kind_slug(MeterKind::QuarantineExited),
             kind_slug(MeterKind::WarmRedial),
+            kind_slug(MeterKind::ArticleMissing),
+            kind_slug(MeterKind::DecodeFailed),
             kind_slug(MeterKind::ReconcileMismatch),
         ];
         assert_eq!(
@@ -944,12 +962,15 @@ mod tests {
                 "bytes_served",
                 "prefetch_enqueued",
                 "provider_error",
+                "size_refused",
                 "grant_rejected_expired",
                 "grant_rejected_excessive_expiry",
                 "grant_rejected_wrong_track",
                 "quarantine_entered",
                 "quarantine_exited",
                 "warm_redial",
+                "article_missing",
+                "decode_failed",
                 "play_reconcile_mismatch"
             ]
         );

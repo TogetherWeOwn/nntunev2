@@ -41,6 +41,7 @@ pub mod nzb_fetch;
 pub mod nzb_intake;
 pub mod parse;
 pub mod pool_body;
+pub mod pool_deadline;
 pub mod pool_probe;
 pub mod probe;
 pub mod queue;

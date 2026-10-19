@@ -49,6 +49,17 @@ applies to the implementation PR).
   authenticate/migrate or explicitly reissue first. No time-based silent
   retirement.
 
+  **Implementation status: pepper rotation currently means reissuing
+  credentials.** The dual-version lookup above is design, not code: the
+  Worker wires exactly one pepper pair (`NATIVE_REST_PEPPER_BASE64` +
+  `NATIVE_REST_PEPPER_VERSION`, `workers/api/src/worker_entry.rs`) —
+  `authorize` accepts a pepper slice, but `Config::native_rest_peppers`
+  returns at most that single entry, so a running Worker has no
+  current+previous window. Replacing the pair orphans every row pinned
+  to the old `pepper_version` (exact-version lookup fails closed), so
+  operators rotate by provisioning a new pair and having holders reissue
+  (revoke + create), not by a dual-pepper transition.
+
 ### Additive schema (target; implementation work remains)
 
 ```text

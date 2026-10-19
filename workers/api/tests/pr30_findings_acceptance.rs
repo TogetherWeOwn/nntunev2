@@ -1654,7 +1654,10 @@ fn oversized_body_rejected_before_routing() {
     let big = "9".repeat(33 * 1024);
     let response = harness.call_full("PUT", "/v1/vault", Some(big), None, Some(ORIGIN));
     assert_eq!(response.status, 400, "{}", response.body);
-    assert_eq!(response.body, r#"{"error":"invalid request"}"#);
+    assert_eq!(
+        response.body,
+        r#"{"code":"invalid_request","message":"invalid request","retryable":false}"#
+    );
     assert!(
         harness.store.vaults.borrow().is_empty(),
         "oversized body must not reach storage"

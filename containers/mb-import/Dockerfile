@@ -18,11 +18,13 @@ RUN chmod 0755 /job/etl.sh /job/etl.py /job/tests/test_etl.sh /job/tests/test_et
 
 FROM rust:1-bookworm AS validator
 WORKDIR /src
-# Cargo.lock is intentionally not tracked for this workspace. Copy the full
-# (dockerignored) workspace so Cargo can resolve all member manifests on a
-# clean checkout, then build the single validator package online.
+# The root Cargo.lock is tracked, proven fresh in CI (`cargo metadata
+# --locked`) and audited by cargo-deny. Copy the full (dockerignored)
+# workspace so Cargo can resolve all member manifests on a clean checkout,
+# then build the single validator package --locked so the shipped binary
+# only ever links the audited dependency set.
 COPY . .
-RUN cargo build --release -p mb-import-validate
+RUN cargo build --locked --release -p mb-import-validate
 
 FROM base AS runtime
 WORKDIR /job

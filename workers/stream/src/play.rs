@@ -86,6 +86,12 @@ pub enum PlayError {
     InvalidSegment(String),
     /// The provider connection failed or misbehaved (quarantines the pool).
     Upstream(String),
+    /// One article exceeded the article byte cap: only this fetch is
+    /// refused, with the corrupt-content envelope and a `SizeRefused` meter
+    /// signal. The provider is healthy so the pool is never quarantined;
+    /// the desynchronized connection is dropped. Carries the segment id for
+    /// debugging; it never reaches the wire (see [`PlayError::api_error`]).
+    ArticleTooLarge(String),
     /// A segment could not be decoded (corrupt or mis-placed yEnc part).
     Decode(YencError),
 }
@@ -106,7 +112,7 @@ impl PlayError {
             PlayError::ArticleMissing(_) => ApiError::not_found(),
             PlayError::InvalidSegment(_) => ApiError::invalid_request(),
             PlayError::Upstream(_) => ApiError::upstream_unavailable(),
-            PlayError::Decode(_) => ApiError::corrupt_content(),
+            PlayError::ArticleTooLarge(_) | PlayError::Decode(_) => ApiError::corrupt_content(),
         }
     }
 
@@ -135,7 +141,7 @@ impl PlayError {
             PlayError::PoolQuarantined { .. } => 503,
             PlayError::ArticleMissing(_) => 404,
             PlayError::InvalidSegment(_) => 400,
-            PlayError::Upstream(_) | PlayError::Decode(_) => 502,
+            PlayError::Upstream(_) | PlayError::ArticleTooLarge(_) | PlayError::Decode(_) => 502,
         }
     }
 
@@ -886,12 +892,17 @@ fn nntp_failure(e: NntpError, message_id: &str) -> Failure {
         // Stale auth: drop the connection (it is no longer authenticated)
         // without quarantining or metering a provider outage.
         NntpError::AuthExpired => Conn::Drop,
+        // Oversize article: the connection desynchronized mid-dot-block so
+        // it is dropped, but the provider is healthy so the pool is never
+        // quarantined (unlike a true provider failure).
+        NntpError::ArticleTooLarge => Conn::Drop,
         ref other if other.is_provider_failure() => Conn::ProviderFailure,
         _ => Conn::KeepWarm,
     };
     let err = match e {
         NntpError::NoSuchArticle(_) => PlayError::ArticleMissing(message_id.to_string()),
         NntpError::AuthExpired => PlayError::ProviderAuthExpired,
+        NntpError::ArticleTooLarge => PlayError::ArticleTooLarge(message_id.to_string()),
         NntpError::InvalidMessageId(id) => PlayError::InvalidSegment(id),
         other => PlayError::Upstream(format!("{other:?}")),
     };
@@ -900,7 +911,12 @@ fn nntp_failure(e: NntpError, message_id: &str) -> Failure {
 
 /// Return the lease (and the connection, if still healthy) and account for
 /// the failure: only provider-level trouble quarantines the pool; a stale
-/// auth session is dropped without either.
+/// auth session is dropped without either. Terminal content failures
+/// (`ArticleMissing`/`Decode`) emit their meter-only signal here — one event
+/// per terminal play — on every `settle` path (first-segment `play()` errors
+/// and later-segment `finalize` errors alike). Background fill work never
+/// reaches `settle` (it finalizes `Ok`), so non-terminal fill failures stay
+/// silent.
 fn settle(
     pool: &mut StreamPool,
     meter: &mut dyn Meter,
@@ -911,6 +927,15 @@ fn settle(
     track: &str,
 ) -> PlayError {
     let lane = lease.lane;
+    match &err {
+        PlayError::ArticleMissing(_) => {
+            meter.emit(ev(MeterKind::ArticleMissing, user, track, 0));
+        }
+        PlayError::Decode(_) => {
+            meter.emit(ev(MeterKind::DecodeFailed, user, track, 0));
+        }
+        _ => {}
+    }
     if conn == Conn::ProviderFailure {
         let was_quarantined = pool.quarantined();
         pool.record_provider_error_for(lease.id);
@@ -924,8 +949,15 @@ fn settle(
                 crate::pool::CIRCUIT_OPEN_MS,
             ));
         }
-    } else if pool.record_non_provider_result_for(lease.id) {
-        meter.emit(ev_pool(MeterKind::QuarantineExited, user, track, lane, 0));
+    } else {
+        // One oversize article refuses only its fetch: signal it without
+        // touching the breaker (no `ProviderError`, no quarantine entry).
+        if matches!(err, PlayError::ArticleTooLarge(_)) {
+            meter.emit(ev(MeterKind::SizeRefused, user, track, 0));
+        }
+        if pool.record_non_provider_result_for(lease.id) {
+            meter.emit(ev_pool(MeterKind::QuarantineExited, user, track, lane, 0));
+        }
     }
     pool.release(lease, if conn == Conn::KeepWarm { client } else { None });
     err
@@ -980,7 +1012,7 @@ impl Live {
             return Err((
                 PlayError::Decode(YencError::SizeMismatch {
                     expected: self.total,
-                    actual: self.staged_bytes as usize,
+                    actual: self.staged_bytes,
                 }),
                 Conn::KeepWarm,
             ));
@@ -1290,7 +1322,7 @@ impl PlayStream {
             // desynchronized, so it is dropped rather than parked warm; any
             // other connection reuses `settle`'s warm/drop decision without
             // its breaker accounting.
-            Some((_, conn)) if !serve_failed && fully_served => {
+            Some((err, conn)) if !serve_failed && fully_served => {
                 let live = *live;
                 if conn == Conn::ProviderFailure {
                     meter.emit(ev(
@@ -1299,6 +1331,12 @@ impl PlayStream {
                         &self.track_id,
                         0,
                     ));
+                }
+                // Background-fill refusal of one over-cap article: the client
+                // already has its `206`, so this is meter-only — one
+                // `SizeRefused`, never a breaker signal (mirrors `settle`).
+                if matches!(err, PlayError::ArticleTooLarge(_)) {
+                    meter.emit(ev(MeterKind::SizeRefused, &self.user_id, &self.track_id, 0));
                 }
                 pool.release(
                     live.lease,
@@ -1371,19 +1409,33 @@ impl Iterator for PlayStream {
         }
         let chunk = match self.source.as_mut() {
             Some(Source::Cached(bytes)) => {
-                let to = (self.pos as usize + CHUNK).min(self.end as usize);
-                bytes[self.pos as usize..to].to_vec()
+                // Offsets stay `u64` until the final bounded index: narrowing
+                // `pos`/`end` to `usize` first would truncate multi-GiB file
+                // offsets on 32-bit targets before the clamp.
+                let buf_len = bytes.len() as u64;
+                let start_u64 = self.pos.min(self.end).min(buf_len);
+                let end_u64 = self.end.min(buf_len).max(start_u64);
+                let take = (end_u64 - start_u64).min(CHUNK as u64);
+                let from = start_u64 as usize;
+                let to = (start_u64 + take) as usize;
+                bytes[from..to].to_vec()
             }
             Some(Source::Live(live)) => loop {
                 if live.failed.is_some() {
                     return None;
                 }
-                let buf_end = live.buf_start + live.buf.len() as u64;
+                let buf_len = live.buf.len() as u64;
+                let buf_end = live.buf_start + buf_len;
                 if self.pos >= live.buf_start && self.pos < buf_end {
-                    let from = (self.pos - live.buf_start) as usize;
-                    let to = (from + CHUNK)
-                        .min(live.buf.len())
-                        .min((self.end - live.buf_start) as usize);
+                    // Differences stay `u64` and clamp against the in-memory
+                    // buffer length in `u64`; only the bounded locals become
+                    // `usize` slice indices.
+                    let from_u64 = self.pos - live.buf_start;
+                    let avail = buf_len - from_u64;
+                    let remaining = self.end.saturating_sub(self.pos).min(avail);
+                    let take = remaining.min(CHUNK as u64);
+                    let from = from_u64 as usize;
+                    let to = (from_u64 + take) as usize;
                     break live.buf[from..to].to_vec();
                 }
                 if live.next_seg >= live.segments.len() {
@@ -1575,6 +1627,12 @@ mod tests {
                 "upstream_unavailable",
                 502,
                 true,
+            ),
+            (
+                PlayError::ArticleTooLarge("big-seg0@synthetic.test".into()),
+                "corrupt_content",
+                502,
+                false,
             ),
             (
                 PlayError::Decode(YencError::Truncated),
@@ -2756,5 +2814,184 @@ mod tests {
             ));
         }
         assert_eq!(pool.connects(), 0);
+    }
+
+    #[test]
+    fn background_fill_over_cap_refusal_meters_size_refused_without_quarantine() {
+        use nntune_core::transport::MAX_ARTICLE_BYTES;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Two-segment track (total 200): segment 0 is a small valid yEnc
+        // part covering bytes 0-99; segment 1 is served as a finite over-cap
+        // dot-block (never decoded — refused during the article read). A
+        // `bytes=0-99` play is fully served from segment 0, so the over-cap
+        // is first hit by `finalize`'s post-range background fill, which must
+        // stay `Ok` and meter exactly one `SizeRefused` (never a breaker
+        // signal) per the `SizeRefused` once-per-refusal contract.
+        const SEG0_LEN: usize = 100;
+        const TOTAL: u64 = 200;
+        const LINE: usize = 8192;
+        let mut plain0 = Vec::with_capacity(SEG0_LEN);
+        for i in 0..SEG0_LEN {
+            plain0.push(((i * 7919 + 7) % 256) as u8);
+        }
+        let article0 = yenc::encode_part(
+            &plain0,
+            "fill-cap.flac",
+            yenc::PartSpec {
+                file_size: TOTAL,
+                part: 1,
+                total: 2,
+                offset: 0,
+                file_crc: None,
+            },
+        );
+        let segments = vec![
+            "fill-cap-seg0@unit.test".to_string(),
+            "fill-cap-seg1@unit.test".to_string(),
+        ];
+        let bodies = Arc::new(AtomicUsize::new(0));
+        let bodies_srv = Arc::clone(&bodies);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fill-cap stub");
+        let addr = listener.local_addr().expect("fill-cap addr");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("fill-cap accept");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone fill-cap"));
+            let mut writer = stream;
+            writer
+                .write_all(b"200 fill-cap stub ready\r\n")
+                .expect("greeting");
+            for _ in 0..2 {
+                let mut command = String::new();
+                if reader.read_line(&mut command).expect("BODY line") == 0 {
+                    break;
+                }
+                bodies_srv.fetch_add(1, Ordering::SeqCst);
+                if command.contains("fill-cap-seg0") {
+                    writer
+                        .write_all(b"222 0 <fill-cap-seg0@unit.test> follows\r\n")
+                        .expect("222 seg0");
+                    for raw_line in article0.split(|&b| b == b'\n') {
+                        let text_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+                        if text_line.first() == Some(&b'.') {
+                            let _ = writer.write_all(b".");
+                        }
+                        if writer.write_all(text_line).is_err() {
+                            break;
+                        }
+                        if writer.write_all(b"\r\n").is_err() {
+                            break;
+                        }
+                    }
+                    if writer.write_all(b".\r\n").is_err() {
+                        break;
+                    }
+                } else {
+                    // Finite over-cap dot-block: `LINE`-byte lines until the
+                    // client-side counted size passes the article cap.
+                    if writer
+                        .write_all(b"222 0 <fill-cap-seg1@unit.test> follows\r\n")
+                        .is_err()
+                    {
+                        break;
+                    }
+                    let counted_per_line = LINE + 1;
+                    let lines = MAX_ARTICLE_BYTES / counted_per_line + 2;
+                    let chunk = vec![b'A'; LINE];
+                    for _ in 0..lines {
+                        if writer.write_all(&chunk).is_err() {
+                            break;
+                        }
+                        if writer.write_all(b"\r\n").is_err() {
+                            break;
+                        }
+                    }
+                    let _ = writer.write_all(b".\r\n");
+                    break;
+                }
+            }
+        });
+
+        let secret = b"s";
+        let token = grant::issue("u", "track-fill-cap-over", 1 + grant::MAX_GRANT_TTL, secret);
+        let mut pool = Pool::new(4);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+        let input = PlayInput {
+            trace_id: None,
+            token: &token,
+            track_id: "track-fill-cap-over",
+            range: Some("bytes=0-99"),
+            server_addr: addr,
+            segments: &segments,
+            segment_ranges: None,
+            cipher_key: 0,
+            now_unix: 1,
+            up_next: None,
+        };
+        let resp =
+            play(&mut pool, &mut cache, &mut meter, secret, &input).expect("range play must start");
+        assert_eq!(resp.status, 206);
+        let mut body = Vec::new();
+        let mut stream = resp.stream;
+        for chunk in stream.by_ref() {
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, plain0, "client got its full range from segment 0");
+        assert!(
+            stream.error().is_none(),
+            "serving completed without error; got {:?}",
+            stream.error()
+        );
+        assert_eq!(
+            bodies.load(Ordering::SeqCst),
+            1,
+            "only the covering segment was fetched to serve; fill has not run yet"
+        );
+
+        let result = stream.finalize(&mut pool, &mut cache, &mut meter);
+        assert_eq!(
+            result,
+            Ok(()),
+            "a fill-phase over-cap refusal must not fail a fully-served play"
+        );
+        assert!(
+            bodies.load(Ordering::SeqCst) >= 2,
+            "finalize must still attempt the post-range fill"
+        );
+        let refused = meter
+            .events
+            .iter()
+            .filter(|e| e.kind == MeterKind::SizeRefused)
+            .count();
+        assert_eq!(refused, 1, "exactly one SizeRefused per refusal");
+        assert!(
+            !meter.has_kind(MeterKind::ProviderError),
+            "an over-cap refusal is never a provider error"
+        );
+        assert!(
+            !meter.has_kind(MeterKind::QuarantineEntered),
+            "background fill must not touch the breaker"
+        );
+        assert!(!pool.quarantined(), "pool stays reusable");
+        assert_eq!(pool.in_use(), 0, "the lease is returned");
+        assert_eq!(
+            pool.idle(),
+            0,
+            "a connection desynchronized mid-dot-block is dropped, never parked warm"
+        );
+        assert!(
+            cache.get_track("track-fill-cap-over").is_none(),
+            "an incomplete fill must not cache a partial track"
+        );
+        let served: u64 = meter
+            .events
+            .iter()
+            .filter(|e| e.kind == MeterKind::BytesServed)
+            .map(|e| e.bytes)
+            .sum();
+        assert_eq!(served, 100, "the served bytes are still metered");
+        server.join().expect("fill-cap stub served");
     }
 }
