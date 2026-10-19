@@ -2699,7 +2699,13 @@ fn scope_forbidden() -> Response {
 }
 
 fn not_found() -> Response {
-    json_response(404, serde_json::json!({"error": "not found"}))
+    let error = crate::api_error::ApiError::not_found("not found");
+    Response {
+        status: error.status,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    }
 }
 
 async fn credentials_mint<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
@@ -3005,7 +3011,15 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    let not_found = || json_response(404, serde_json::json!({"error": "not found"}));
+    let not_found = || {
+        let error = crate::api_error::ApiError::not_found("not found");
+        Response {
+            status: error.status,
+            body: error.body_json(),
+            set_cookie: None,
+            retry_after: None,
+        }
+    };
     let Some(expected) = ctx
         .cfg
         .qa_auth_token
@@ -3159,7 +3173,7 @@ where
         {
             preflight_response()
         }
-        _ => json_response(404, serde_json::json!({"error": "not found"})),
+        _ => not_found(),
     }
 }
 
@@ -4142,7 +4156,10 @@ mod tests {
             serde_json::json!({"email": "a@example.test"}),
         );
         assert_eq!(resp.status, 404);
-        assert_eq!(resp.body, r#"{"error":"not found"}"#);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
         let unknown = h.call(
             "POST",
             "/api/no-such-seam",
@@ -4155,7 +4172,10 @@ mod tests {
         // (the e2e seam client never sends a CORS preflight).
         let pre = h.call_full("OPTIONS", QA_TEST_CODES_PATH, None, None, Some(ORIGIN));
         assert_eq!(pre.status, 404);
-        assert_eq!(pre.body, r#"{"error":"not found"}"#);
+        assert_eq!(
+            pre.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
         let pre_unknown = h.call_full("OPTIONS", "/api/no-such-seam", None, None, Some(ORIGIN));
         assert_eq!(pre_unknown.status, 404);
         assert_eq!(pre_unknown.body, pre.body);
@@ -4175,7 +4195,10 @@ mod tests {
             Some(QA_TOKEN),
         );
         assert_eq!(resp.status, 404);
-        assert_eq!(resp.body, r#"{"error":"not found"}"#);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
     }
 
     #[test]
@@ -4220,7 +4243,10 @@ mod tests {
             Some(QA_TOKEN),
         );
         assert_eq!(resp.status, 404);
-        assert_eq!(resp.body, r#"{"error":"not found"}"#);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
         assert!(h.store.qa_codes.borrow().is_empty());
     }
 
@@ -4232,7 +4258,10 @@ mod tests {
             Some(QA_TOKEN),
         );
         assert_eq!(resp.status, 404);
-        assert_eq!(resp.body, r#"{"error":"not found"}"#);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
         // Malformed bodies and non-mailboxes miss the same indistinct way.
         for body in [
             serde_json::json!({}),
@@ -4242,7 +4271,10 @@ mod tests {
         ] {
             let resp = h.call_seam(body, Some(QA_TOKEN));
             assert_eq!(resp.status, 404);
-            assert_eq!(resp.body, r#"{"error":"not found"}"#);
+            assert_eq!(
+                resp.body,
+                r#"{"code":"not_found","message":"not found","retryable":false}"#
+            );
         }
     }
 
@@ -4299,7 +4331,10 @@ mod tests {
             Some(QA_TOKEN),
         );
         assert_eq!(resp.status, 404);
-        assert_eq!(resp.body, r#"{"error":"not found"}"#);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
     }
 
     #[test]
@@ -5336,7 +5371,10 @@ mod tests {
             Some(ORIGIN),
         );
         assert_eq!(cookie_only.status, 404, "{}", cookie_only.body);
-        assert_eq!(cookie_only.body, r#"{"error":"not found"}"#);
+        assert_eq!(
+            cookie_only.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
 
         // A presented bearer is never rescued by a session cookie: a valid
         // cookie plus an invalid bearer is still the bearer 401.
