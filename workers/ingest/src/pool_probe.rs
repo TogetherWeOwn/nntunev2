@@ -120,26 +120,42 @@ pub async fn call_pool_probe(
     let status = response.status_code();
     let retry_after = response.headers().get("retry-after").ok().flatten();
     // Bounded reply read: stream the body and fail closed on the chunk that
-    // would cross the cap, so an oversize reply is never fully retained. A
-    // body that is not streamable falls back to one buffered read with the
-    // same ceiling. Only a 200 is size-gated here; every other status keeps
-    // exactly the verdict classify_reply maps it to.
+    // would cross the cap, so no more than the cap is ever retained for any
+    // status. A body that is not streamable falls back to one buffered read
+    // with the same ceiling. A non-200 keeps exactly the verdict
+    // classify_reply maps it to via an empty body (the classifier ignores the
+    // body for non-200), so an over-cap or non-UTF-8 transient stays transient.
     let bytes = match response.stream() {
         Ok(stream) => {
             let mut stream = Box::pin(stream);
             let mut buf = Vec::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|_| unavailable)?;
-                if status == 200 && buf.len().saturating_add(chunk.len()) > MAX_PROBE_REPLY_BYTES {
-                    return Err(PoolProbeError::Rejected);
+                if buf.len().saturating_add(chunk.len()) > MAX_PROBE_REPLY_BYTES {
+                    if status == 200 {
+                        return Err(PoolProbeError::Rejected);
+                    }
+                    return classify_reply(req, status, retry_after.as_deref(), "");
                 }
                 buf.extend_from_slice(&chunk);
             }
             buf
         }
-        Err(_) => response.bytes().await.map_err(|_| unavailable)?,
+        Err(_) => {
+            let buf = response.bytes().await.map_err(|_| unavailable)?;
+            if buf.len() > MAX_PROBE_REPLY_BYTES {
+                if status == 200 {
+                    return Err(PoolProbeError::Rejected);
+                }
+                return classify_reply(req, status, retry_after.as_deref(), "");
+            }
+            buf
+        }
     };
-    if status == 200 && bytes.len() > MAX_PROBE_REPLY_BYTES {
+    if status != 200 {
+        return classify_reply(req, status, retry_after.as_deref(), "");
+    }
+    if bytes.len() > MAX_PROBE_REPLY_BYTES {
         return Err(PoolProbeError::Rejected);
     }
     let text = String::from_utf8(bytes).map_err(|_| PoolProbeError::Rejected)?;
