@@ -330,6 +330,8 @@ jobs:
         run: bash containers/mb-import/tests/test_pg_env.sh
       - name: Run mb-import runtime-user pin test
         run: bash containers/mb-import/tests/test_runtime_user.sh
+      - name: Run mb-import runtime-user pin self-test
+        run: bash containers/mb-import/tests/test_runtime_user.sh --self-test
 
   # Real-Postgres migration tests: applies every migrations/*.sql, in order,
   # to an empty throwaway database (twice, to prove idempotency) and runs
