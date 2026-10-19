@@ -25,6 +25,7 @@
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
 	let libraryUnavailable = $state(false);
+	let requiresSignIn = $state(false);
 	let queue: QueueState = $state(createQueue([]));
 
 	const refresher = createLibraryRefresher({
@@ -36,6 +37,7 @@
 			loading = state.loading;
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
+			requiresSignIn = state.requiresSignIn;
 			// The queue is per-account: drop tracks the new library no longer
 			// contains, so a 401/403/404 or auth transition cannot leak the
 			// previous account's queue into the next session's Retry. The
@@ -123,6 +125,9 @@
 		<p role="status">Loading your library…</p>
 	{:else if loadError && items.length === 0}
 		<p role="alert">{loadError}</p>
+		{#if requiresSignIn}
+			<a class="nt-button" href="/login">Sign in</a>
+		{/if}
 		<button class="nt-button" type="button" onclick={() => void refresh()}>Retry</button>
 	{:else}
 		{#if staleAt}
