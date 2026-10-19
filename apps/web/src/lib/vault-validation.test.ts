@@ -206,6 +206,31 @@ describe('validateIndexerUrl', () => {
 		}
 	});
 
+	it('rejects scheme-form and whitespace URLs the fetch builder rejects', () => {
+		const KEY = 'indexer-key';
+		for (const url of [
+			'HTTPS://index.example.com/api',
+			'Https://index.example.com/api',
+			'https:/index.example.com/api',
+			'https:index.example.com/api',
+			'https:///index.example.com/api',
+			'https:\\\\index.example.com/api',
+			'https://index.example.com/a pi',
+			'https://index.example.com/a\tpi'
+		]) {
+			expect(validateIndexerUrl(url, KEY), `url rejected: ${url}`).not.toBeNull();
+		}
+		expect(validateIndexerUrl('HTTPS://index.example.com/api', KEY)).toBe(
+			'Indexer URLs must use https.'
+		);
+		expect(validateIndexerUrl('https:///index.example.com/api', KEY)).toBe(
+			'That indexer URL does not look valid.'
+		);
+		expect(validateIndexerUrl('https://index.example.com/a pi', KEY)).toBe(
+			'That indexer URL does not look valid.'
+		);
+	});
+
 	it('accepts plain https URLs with ports and paths', () => {
 		const KEY = 'indexer-key';
 		for (const url of [

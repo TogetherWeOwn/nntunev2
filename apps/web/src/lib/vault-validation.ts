@@ -123,6 +123,35 @@ export function validateIndexerUrl(url: string, apiKey: string): string | null {
 	if (value.length === 0) {
 		return apiKey.trim().length === 0 ? null : 'Clear the indexer key or enter an indexer URL.';
 	}
+	// Mirror workers/ingest check_base_url on the raw trimmed value: the
+	// client sends the raw string (not the normalized href), so WHATWG
+	// normalization must not hide a form the fetch builder rejects. Require
+	// the literal `https://` prefix, a non-empty non-slash remainder, no
+	// `@`/`?`/`#`, and no whitespace — before parsing.
+	if (!value.startsWith('https://')) {
+		try {
+			const probe = new URL(value);
+			if (probe.protocol !== 'https:') {
+				return 'Indexer URLs must use https.';
+			}
+		} catch {
+			return 'That indexer URL does not look valid.';
+		}
+		// Parses as https but without the literal prefix (uppercase scheme,
+		// missing slash, backslash slashes, …) — downstream requires the
+		// literal bytes, so reject here instead of reporting success.
+		return 'Indexer URLs must use https.';
+	}
+	const rest = value.slice('https://'.length);
+	if (rest.length === 0 || rest.startsWith('/')) {
+		return 'That indexer URL does not look valid.';
+	}
+	if (rest.includes('@') || rest.includes('?') || rest.includes('#')) {
+		return 'Put the API key in the key field, not the URL';
+	}
+	if (/\s/.test(rest)) {
+		return 'That indexer URL does not look valid.';
+	}
 	let parsed: URL;
 	try {
 		parsed = new URL(value);
@@ -131,16 +160,6 @@ export function validateIndexerUrl(url: string, apiKey: string): string | null {
 	}
 	if (parsed.protocol !== 'https:') {
 		return 'Indexer URLs must use https.';
-	}
-	// Mirror workers/ingest check_base_url: the client sends the raw trimmed
-	// string (not the normalized href), so reject any @/?/# in the
-	// post-scheme remainder. This covers non-empty userinfo/query/fragment
-	// as well as empty markers (trailing ?/#, bare @) that WHATWG URL
-	// normalizes to empty parts but the fetch builder still rejects.
-	const sep = value.indexOf('://');
-	const rest = sep >= 0 ? value.slice(sep + 3) : value.slice(value.indexOf(':') + 1);
-	if (rest.includes('@') || rest.includes('?') || rest.includes('#')) {
-		return 'Put the API key in the key field, not the URL';
 	}
 
 	const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
