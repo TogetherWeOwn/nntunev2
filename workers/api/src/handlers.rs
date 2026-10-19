@@ -2699,7 +2699,13 @@ fn scope_forbidden() -> Response {
 }
 
 fn not_found() -> Response {
-    json_response(404, serde_json::json!({"error": "not found"}))
+    let error = crate::api_error::ApiError::not_found("not found");
+    Response {
+        status: error.status,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    }
 }
 
 async fn credentials_mint<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
@@ -3005,7 +3011,15 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    let not_found = || json_response(404, serde_json::json!({"error": "not found"}));
+    let not_found = || {
+        let error = crate::api_error::ApiError::not_found("not found");
+        Response {
+            status: error.status,
+            body: error.body_json(),
+            set_cookie: None,
+            retry_after: None,
+        }
+    };
     let Some(expected) = ctx
         .cfg
         .qa_auth_token
@@ -3159,7 +3173,7 @@ where
         {
             preflight_response()
         }
-        _ => json_response(404, serde_json::json!({"error": "not found"})),
+        _ => not_found(),
     }
 }
 
@@ -4142,7 +4156,10 @@ mod tests {
             serde_json::json!({"email": "a@example.test"}),
         );
         assert_eq!(resp.status, 404);
-        assert_eq!(resp.body, r#"{"error":"not found"}"#);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
         let unknown = h.call(
             "POST",
             "/api/no-such-seam",
@@ -4155,7 +4172,10 @@ mod tests {
         // (the e2e seam client never sends a CORS preflight).
         let pre = h.call_full("OPTIONS", QA_TEST_CODES_PATH, None, None, Some(ORIGIN));
         assert_eq!(pre.status, 404);
-        assert_eq!(pre.body, r#"{"error":"not found"}"#);
+        assert_eq!(
+            pre.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
         let pre_unknown = h.call_full("OPTIONS", "/api/no-such-seam", None, None, Some(ORIGIN));
         assert_eq!(pre_unknown.status, 404);
         assert_eq!(pre_unknown.body, pre.body);
@@ -4175,7 +4195,10 @@ mod tests {
             Some(QA_TOKEN),
         );
         assert_eq!(resp.status, 404);
-        assert_eq!(resp.body, r#"{"error":"not found"}"#);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
     }
 
     #[test]
@@ -4220,7 +4243,10 @@ mod tests {
             Some(QA_TOKEN),
         );
         assert_eq!(resp.status, 404);
-        assert_eq!(resp.body, r#"{"error":"not found"}"#);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
         assert!(h.store.qa_codes.borrow().is_empty());
     }
 
@@ -4232,7 +4258,10 @@ mod tests {
             Some(QA_TOKEN),
         );
         assert_eq!(resp.status, 404);
-        assert_eq!(resp.body, r#"{"error":"not found"}"#);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
         // Malformed bodies and non-mailboxes miss the same indistinct way.
         for body in [
             serde_json::json!({}),
@@ -4242,7 +4271,10 @@ mod tests {
         ] {
             let resp = h.call_seam(body, Some(QA_TOKEN));
             assert_eq!(resp.status, 404);
-            assert_eq!(resp.body, r#"{"error":"not found"}"#);
+            assert_eq!(
+                resp.body,
+                r#"{"code":"not_found","message":"not found","retryable":false}"#
+            );
         }
     }
 
@@ -4299,7 +4331,10 @@ mod tests {
             Some(QA_TOKEN),
         );
         assert_eq!(resp.status, 404);
-        assert_eq!(resp.body, r#"{"error":"not found"}"#);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
     }
 
     #[test]
@@ -5336,7 +5371,10 @@ mod tests {
             Some(ORIGIN),
         );
         assert_eq!(cookie_only.status, 404, "{}", cookie_only.body);
-        assert_eq!(cookie_only.body, r#"{"error":"not found"}"#);
+        assert_eq!(
+            cookie_only.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
 
         // A presented bearer is never rescued by a session cookie: a valid
         // cookie plus an invalid bearer is still the bearer 401.
@@ -8675,5 +8713,214 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(1),
             "fast send must not wait for the deadline"
         );
+    }
+
+    // --- 404 not_found envelope (acceptance; Builder must not edit) -------
+    //
+    // Every served 404 must be the canonical error envelope
+    // `{code: "not_found", message, retryable: false}` — exactly those
+    // three keys, no legacy `error` key — so clients can branch on `code`
+    // instead of matching prose. The three served sites are pinned
+    // separately because each can regress alone: the shared `not_found()`
+    // helper (reached here via credential revoke), the QA-seam guard, and
+    // the router catch-all. The sites must also stay byte-indistinguishable
+    // from one another: a distinct per-site body is an existence oracle.
+
+    fn assert_not_found_envelope(status: u16, body: &str, site: &str) {
+        assert_eq!(status, 404, "{site}: {body}");
+        let parsed: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("{site}: 404 body is not JSON ({e}): {body}"));
+        let obj = parsed
+            .as_object()
+            .unwrap_or_else(|| panic!("{site}: 404 body is not a JSON object: {body}"));
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["code", "message", "retryable"],
+            "{site}: 404 body must be exactly the envelope keys, got: {body}"
+        );
+        assert_eq!(
+            parsed["code"], "not_found",
+            "{site}: envelope code must be not_found, got: {body}"
+        );
+        assert_eq!(
+            parsed["retryable"], false,
+            "{site}: not_found must be non-retryable, got: {body}"
+        );
+        let message = parsed["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{site}: envelope message must be a string: {body}"));
+        assert!(
+            !message.is_empty(),
+            "{site}: envelope message must not be empty: {body}"
+        );
+    }
+
+    #[test]
+    fn not_found_envelope_shape_matches_the_api_error_registry() {
+        // Control: the canonical constructor already produces the exact
+        // shape the served sites must converge on. Green before and after
+        // the build; if this fails, the registry itself drifted and the
+        // acceptance expectation must be revisited, not the sites.
+        let err = crate::api_error::ApiError::not_found("not found");
+        assert_eq!(
+            (err.code, err.status, err.retryable),
+            ("not_found", 404, false)
+        );
+        assert_not_found_envelope(err.status, &err.body_json(), "ApiError::not_found");
+    }
+
+    #[test]
+    fn not_found_envelope_on_the_router_catch_all() {
+        let h = harness();
+        let post = h.call(
+            "POST",
+            "/api/no-such-route-canary",
+            serde_json::json!({"email": "a@example.test"}),
+        );
+        assert_not_found_envelope(post.status, &post.body, "catch-all POST");
+        assert!(
+            !post.body.contains("no-such-route-canary"),
+            "catch-all 404 must not echo the probed path: {}",
+            post.body
+        );
+        let pre = h.call_full(
+            "OPTIONS",
+            "/api/no-such-route-canary",
+            None,
+            None,
+            Some(ORIGIN),
+        );
+        assert_not_found_envelope(pre.status, &pre.body, "catch-all OPTIONS");
+        assert_eq!(
+            pre.body, post.body,
+            "catch-all bodies must not vary by method"
+        );
+    }
+
+    #[test]
+    fn not_found_envelope_on_the_qa_seam_guard() {
+        // Armed seam, valid bearer, no issuance behind the mailbox: a miss.
+        let h = qa_harness();
+        let miss = h.call_seam(
+            serde_json::json!({"email": "fresh-canary@example.test"}),
+            Some(QA_TOKEN),
+        );
+        assert_not_found_envelope(miss.status, &miss.body, "qa seam miss");
+        assert!(
+            !miss.body.contains("fresh-canary"),
+            "qa seam 404 must not echo the probed mailbox: {}",
+            miss.body
+        );
+        // Malformed seam bodies miss the same enveloped way.
+        for body in [serde_json::json!({}), serde_json::json!({"email": 1})] {
+            let resp = h.call_seam(body, Some(QA_TOKEN));
+            assert_not_found_envelope(resp.status, &resp.body, "qa seam malformed body");
+            assert_eq!(resp.body, miss.body);
+        }
+        // Flag armed with no staged bearer: fail closed, same envelope.
+        let mut unarmed = harness();
+        unarmed.config = cfg().with_qa_code_seam(true);
+        let closed = unarmed.call_seam(
+            serde_json::json!({"email": "a@example.test"}),
+            Some(QA_TOKEN),
+        );
+        assert_not_found_envelope(closed.status, &closed.body, "qa seam fail-closed");
+        assert_eq!(closed.body, miss.body);
+        // Production posture (seam off): the guard still answers, enveloped.
+        let off = harness().call(
+            "POST",
+            QA_TEST_CODES_PATH,
+            serde_json::json!({"email": "a@example.test"}),
+        );
+        assert_not_found_envelope(off.status, &off.body, "qa seam disabled");
+        assert_eq!(off.body, miss.body);
+    }
+
+    #[test]
+    fn not_found_envelope_on_credential_revoke_misses() {
+        // The shared not_found() helper, served via DELETE /v1/credentials/:id.
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        seed_user(&h, "u2", "b@example.com");
+        let cookie_a = magic_login(&h, "a@example.com");
+        let cookie_b = magic_login(&h, "b@example.com");
+        let minted = mint_call(
+            &h,
+            &cookie_a,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(minted.status, 201, "{}", minted.body);
+        let id = mint_id(&serde_json::from_str(&minted.body).unwrap());
+
+        // Another user's id and an unknown id: the same enveloped 404, and
+        // neither body leaks the probed id.
+        let foreign = h.call_full(
+            "DELETE",
+            &format!("/v1/credentials/{id}"),
+            None,
+            Some(cookie_b),
+            Some(ORIGIN),
+        );
+        assert_not_found_envelope(foreign.status, &foreign.body, "revoke foreign id");
+        assert!(
+            !foreign.body.contains(&id),
+            "revoke 404 must not echo the probed id: {}",
+            foreign.body
+        );
+        let unknown = h.call_full(
+            "DELETE",
+            "/v1/credentials/cred_missing_canary",
+            None,
+            Some(cookie_a),
+            Some(ORIGIN),
+        );
+        assert_not_found_envelope(unknown.status, &unknown.body, "revoke unknown id");
+        assert!(
+            !unknown.body.contains("cred_missing_canary"),
+            "revoke 404 must not echo the probed id: {}",
+            unknown.body
+        );
+        assert_eq!(
+            foreign.body, unknown.body,
+            "foreign and unknown revoke misses must be indistinguishable"
+        );
+        // The victim row is untouched by the foreign probe.
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert_eq!(rows[0].record.revoked_at, None);
+    }
+
+    #[test]
+    fn not_found_envelope_is_indistinguishable_across_all_three_sites() {
+        // One body per served site; all three must be byte-identical so no
+        // site can be fingerprinted (and route/mailbox/row existence cannot
+        // be read out of which 404 answered).
+        let h = qa_harness();
+        let catch_all = h.call(
+            "POST",
+            "/api/no-such-route-canary",
+            serde_json::json!({"email": "a@example.test"}),
+        );
+        assert_not_found_envelope(catch_all.status, &catch_all.body, "catch-all");
+        let seam = h.call_seam(
+            serde_json::json!({"email": "fresh@example.test"}),
+            Some(QA_TOKEN),
+        );
+        assert_not_found_envelope(seam.status, &seam.body, "qa seam");
+        assert_eq!(seam.body, catch_all.body, "qa seam vs catch-all");
+
+        let hp = peppered_harness();
+        seed_user(&hp, "u1", "a@example.com");
+        let cookie = magic_login(&hp, "a@example.com");
+        let revoke = hp.call_full(
+            "DELETE",
+            "/v1/credentials/cred_missing_canary",
+            None,
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_not_found_envelope(revoke.status, &revoke.body, "revoke");
+        assert_eq!(revoke.body, catch_all.body, "revoke vs catch-all");
     }
 }
