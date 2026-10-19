@@ -156,6 +156,14 @@ pub struct StagedFile {
     /// consumer only reads "damaged and uncovered" from it.
     #[serde(default)]
     pub missing_blocks: u32,
+    /// Segments refused for size in this file (pool `413`, the client
+    /// read limit, or the in-Worker article cap): segment-granular,
+    /// unlike `missing_blocks` which counts par2 blocks. A refetch
+    /// would be refused identically, so damage including any such
+    /// segment is unrepairable-by-size and never dispatches repair (see
+    /// `finalize`). 0 on every record written before this field existed.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub size_refused_blocks: u32,
     /// Hex set id of the recovery set covering this file, when one does.
     #[serde(default)]
     pub par2_set_id: Option<String>,
@@ -191,7 +199,11 @@ fn is_false(v: &bool) -> bool {
 /// them (decode-time CRC32 for the par2 precheck, length for geometry).
 /// A segment the provider no longer has (or that failed yEnc decode)
 /// records `missing` instead — an answered `430` is durable progress
-/// exactly like fetched bytes, and is never refetched pointlessly.
+/// exactly like fetched bytes, and is never refetched pointlessly. A
+/// segment refused for size keeps `missing` true (it is still judged
+/// absent) and additionally sets `size_refused`, so the judgement can
+/// tell "provider lost it" from "over cap" and skip the repair round a
+/// refetch-identical refusal could never satisfy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StagedSpoolSegment {
     pub key: String,
@@ -199,6 +211,8 @@ pub struct StagedSpoolSegment {
     pub crc32: u32,
     #[serde(default)]
     pub missing: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub size_refused: bool,
 }
 
 /// Resume cursor for one spooled file's streaming block judgement:
@@ -265,6 +279,14 @@ pub struct VerifyProgress {
     /// Blocks short in `par2_set_id`'s set once judged (0 before/complete).
     #[serde(default)]
     pub missing_blocks: u32,
+    /// Segments refused for size across this round's staged *data* files
+    /// (a par2 refusal only shrinks recovery and is recorded per file,
+    /// never here). Any non-zero total makes the round's damage
+    /// unrepairable-by-size: a refetch would be refused identically, so
+    /// `finalize` concludes `Unrecoverable` instead of spending a repair
+    /// round (see `finalize`). 0 before anything is judged.
+    #[serde(default)]
+    pub size_refused_blocks: u32,
 }
 
 /// The staged `in/manifest.json` document: the repair handoff's index
@@ -366,11 +388,19 @@ pub enum VerifyOutcome {
         par2_set_id: String,
         missing_blocks: u32,
     },
-    /// Blocks are missing beyond recovery (or no set covers them):
-    /// fail the job. `par2_set_id` is `None` for uncovered damage.
+    /// Blocks are missing beyond recovery (or no set covers them), or
+    /// some of the damage was refused for size: fail the job without
+    /// spending a repair round. `par2_set_id` is `None` for uncovered
+    /// damage. `size_refused_blocks` counts the refused-for-size
+    /// segments among the damage (segment-granular; see
+    /// [`StagedFile::size_refused_blocks`]): non-zero means a refetch
+    /// would be refused identically, which is why this is terminal
+    /// instead of `RepairNeeded` even when recovery would cover the
+    /// same block count. 0 for genuinely-missing damage.
     Unrecoverable {
         par2_set_id: Option<String>,
         missing_blocks: u32,
+        size_refused_blocks: u32,
     },
     /// A per-delivery cap stopped the step with work left; progress is
     /// recorded and the next delivery resumes.
@@ -378,8 +408,10 @@ pub enum VerifyOutcome {
 }
 
 /// What one article fetch found. `TooLarge` (the pool's `413`, or the
-/// NNTP client's own read limit) is per-article data like `Missing`:
-/// the segment is judged absent, never a job failure.
+/// NNTP client's own read limit) is judged absent like `Missing`, but
+/// flagged size-refused on the spool record: a refetch would be
+/// refused identically, so damage including it is terminal instead of
+/// repair-dispatched (see `finalize`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArticleFetch {
     Present(Vec<u8>),
@@ -442,6 +474,13 @@ pub struct ManifestEntry {
     /// ranges are part of the damage the repair side re-derives.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing: Vec<usize>,
+    /// Indexes (into `segments`) refused for size: the subset of
+    /// `missing` a refetch would be refused identically, so no repair
+    /// round can satisfy them. Empty for assembled files (no
+    /// per-segment record survives staging) and when nothing was
+    /// refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub size_refused: Vec<usize>,
 }
 
 /// How a fully spooled file's bytes are presented to the judgement.
@@ -614,6 +653,7 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
                                         );
                                 if spool_intact {
                                     adopted.missing_blocks = meta.missing_blocks;
+                                    adopted.size_refused_blocks = meta.size_refused_blocks;
                                     adopted.par2_set_id = meta.par2_set_id.clone();
                                     progress.staged.insert(idx, adopted);
                                     if !file.is_par2 {
@@ -653,6 +693,10 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
                             size: meta.size,
                             crc32: meta.crc32,
                             missing: meta.missing,
+                            // Refused segments stage no object, so a
+                            // rebuilt cursor never adopts one: any
+                            // object found here held real bytes.
+                            size_refused: false,
                         }),
                         None => break,
                     }
@@ -796,6 +840,11 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
                     sha256: content_sha256_hex(&bytes),
                     key: key.clone(),
                     missing_blocks,
+                    // The spool cursor is dropped once assembled, so the
+                    // per-file count is the only surviving refusal
+                    // record for this path (the manifest carries
+                    // per-segment indexes only for spooled files).
+                    size_refused_blocks: segs.iter().filter(|s| s.size_refused).count() as u32,
                     par2_set_id,
                     spool: Vec::new(),
                     crc32: 0,
@@ -852,6 +901,8 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
                             sha256,
                             key: key.clone(),
                             missing_blocks,
+                            size_refused_blocks: segs.iter().filter(|s| s.size_refused).count()
+                                as u32,
                             par2_set_id,
                             spool: segs.clone(),
                             crc32: 0,
@@ -879,16 +930,38 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
     Ok(finalize(files, &sets, progress))
 }
 
+/// The per-refusal triage event, as a pure host-testable line: the
+/// `worker::console_log!` emission at the refusal site logs exactly this
+/// (numeric job/segment facts only — never segment ids or file names, see
+/// [`VerifyError`]). Both refusal reasons (`fetch_too_large` for the
+/// pool/client refusal, `over_article_cap` for the in-Worker cap) render
+/// through here so the format is pinned once, off-wasm.
+pub(crate) fn format_size_refused_event(
+    job_id: &str,
+    round: u32,
+    file_index: usize,
+    segment: usize,
+    reason: &str,
+) -> String {
+    format!(
+        "article_size_refused job={job_id} round={round} file={file_index} segment={segment} reason={reason}"
+    )
+}
+
 /// Fetch, yEnc-decode and spool one segment, returning its durable
 /// cursor record. Present bytes go to scratch immediately (with their
 /// CRC32 in the object record, so a lost progress write can rebuild
-/// the cursor from metadata alone). A segment that is missing,
-/// undecodable, or refused for size (`413`, the client read limit, or
-/// the in-Worker article cap) records `missing` instead — it is judged
-/// absent, the cursor advances past it, and later segments still
-/// fetch: oversize is a property of this one article (a refetch would
-/// be refused identically), never a reason to count the file's whole
-/// tail as gone.
+/// the cursor from metadata alone). A segment that is missing or
+/// undecodable records `missing` — it is judged absent, the cursor
+/// advances past it, and later segments still fetch. A segment refused
+/// for size (`413`, the client read limit, or the in-Worker article
+/// cap) records `missing` *plus* `size_refused`, and emits an
+/// `article_size_refused` log line with the job/segment facts: oversize
+/// is a property of this one article (a refetch would be refused
+/// identically), never a reason to count the file's whole tail as
+/// gone, and the flag lets `finalize` skip the repair round no refetch
+/// could satisfy. The log carries numeric segment facts only — never
+/// segment ids or file names (see [`VerifyError`]).
 #[allow(clippy::too_many_arguments)]
 async fn spool_one<B: BodySource, S: ScratchStore>(
     job_id: &str,
@@ -908,18 +981,37 @@ async fn spool_one<B: BodySource, S: ScratchStore>(
         size: 0,
         crc32: 0,
         missing: true,
+        size_refused: false,
+    };
+    // A size refusal is judged absent exactly like a `430`, but flagged
+    // so triage can tell "provider lost it" from "over cap" — and so a
+    // refetch-identical refusal never spends a repair round. The event
+    // is worker-only (`console_log!` expands to a `web_sys` call, which
+    // aborts outside wasm where this module's host-side tests run);
+    // off-wasm the refusal is still recorded on the spool record, the
+    // progress counter, the manifest and the outcome.
+    let refused_rec = |reason: &'static str| {
+        let line = format_size_refused_event(job_id, round, file_index, segment, reason);
+        #[cfg(target_arch = "wasm32")]
+        worker::console_log!("{}", line);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = line.as_str();
+        StagedSpoolSegment {
+            size_refused: true,
+            ..missing_rec.clone()
+        }
     };
     let article = match source.fetch_body(segment_id).await? {
         ArticleFetch::Present(article) => article,
         ArticleFetch::Missing => return Ok(missing_rec),
         // The source refused the article for size (pool `413` / client
-        // read limit): judged absent like a `430`, same as the
-        // in-Worker cap below.
-        ArticleFetch::TooLarge => return Ok(missing_rec),
+        // read limit): same absent judgement as below the in-Worker cap,
+        // with the refusal flagged.
+        ArticleFetch::TooLarge => return Ok(refused_rec("fetch_too_large")),
     };
     spend.bytes = spend.bytes.saturating_add(article.len() as u64);
     if article.len() > caps.max_article_bytes {
-        return Ok(missing_rec);
+        return Ok(refused_rec("over_article_cap"));
     }
     let Some(bytes) = decode_segment(segment_id, &article) else {
         return Ok(missing_rec);
@@ -929,12 +1021,14 @@ async fn spool_one<B: BodySource, S: ScratchStore>(
         size: bytes.len() as u64,
         crc32: crc32fast::hash(&bytes),
         missing: false,
+        size_refused: false,
     };
     let meta = StagedFile {
         size: rec.size,
         sha256: content_sha256_hex(&bytes),
         key: key.clone(),
         missing_blocks: 0,
+        size_refused_blocks: 0,
         par2_set_id: None,
         spool: Vec::new(),
         crc32: rec.crc32,
@@ -1954,6 +2048,19 @@ fn count_bad_blocks(set: &RecoverySet, entry: &RecoveryFile, assembled: &[u8]) -
     bad
 }
 
+/// Refused-for-size segments among the staged *data* files: a par2
+/// refusal only shrinks recovery (judged normally), while a data
+/// refusal dooms the round no matter the coverage.
+fn data_size_refused(files: &[ParsedFile], progress: &VerifyProgress) -> u32 {
+    files
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| !file.is_par2)
+        .filter_map(|(idx, _)| progress.staged.get(&idx))
+        .map(|staged| staged.size_refused_blocks)
+        .sum()
+}
+
 /// Aggregate the per-file judgements once every file is staged.
 fn finalize(
     files: &[ParsedFile],
@@ -1981,9 +2088,11 @@ fn finalize(
             None => {
                 progress.par2_set_id = None;
                 progress.missing_blocks = staged.missing_blocks;
+                progress.size_refused_blocks = data_size_refused(files, progress);
                 return VerifyOutcome::Unrecoverable {
                     par2_set_id: None,
                     missing_blocks: staged.missing_blocks,
+                    size_refused_blocks: progress.size_refused_blocks,
                 };
             }
             Some(set_id) => {
@@ -2002,9 +2111,11 @@ fn finalize(
         if *missing > recovery {
             progress.par2_set_id = Some(set_id.clone());
             progress.missing_blocks = *missing;
+            progress.size_refused_blocks = data_size_refused(files, progress);
             return VerifyOutcome::Unrecoverable {
                 par2_set_id: Some(set_id.clone()),
                 missing_blocks: *missing,
+                size_refused_blocks: progress.size_refused_blocks,
             };
         }
     }
@@ -2017,6 +2128,13 @@ fn finalize(
     // `+`, with the full list kept in `repair_set_ids` — joining the
     // raw ids would exceed the bound at eight 32-char sets and fail a
     // fully repairable release as "no par2 set covers them".
+    //
+    // Unless some of the damage was refused for size: a refetch would
+    // be refused identically, so spending a repair round on it only
+    // delays the terminal verdict against `MAX_REPAIR_ROUNDS`. The
+    // round concludes `Unrecoverable` under the same set attribution
+    // the dispatch would have used, with the refusal count surfaced in
+    // the outcome.
     if !missing_by_set.is_empty() {
         let set_ids: Vec<String> = missing_by_set.keys().cloned().collect();
         let missing: u32 = missing_by_set.values().sum();
@@ -2030,6 +2148,14 @@ fn finalize(
         };
         progress.par2_set_id = Some(set_id.clone());
         progress.missing_blocks = missing;
+        progress.size_refused_blocks = data_size_refused(files, progress);
+        if progress.size_refused_blocks > 0 {
+            return VerifyOutcome::Unrecoverable {
+                par2_set_id: Some(set_id),
+                missing_blocks: missing,
+                size_refused_blocks: progress.size_refused_blocks,
+            };
+        }
         return VerifyOutcome::RepairNeeded {
             par2_set_id: set_id,
             missing_blocks: missing,
@@ -2038,6 +2164,7 @@ fn finalize(
     progress.repair_set_ids = Vec::new();
     progress.par2_set_id = sets.first().map(|s| hex::encode(s.set_id));
     progress.missing_blocks = 0;
+    progress.size_refused_blocks = data_size_refused(files, progress);
     VerifyOutcome::Complete
 }
 
@@ -2071,6 +2198,13 @@ async fn write_manifest<S: ScratchStore>(
                     .filter(|(_, s)| s.missing)
                     .map(|(i, _)| i)
                     .collect(),
+                size_refused: staged
+                    .spool
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.size_refused)
+                    .map(|(i, _)| i)
+                    .collect(),
             })
         })
         .collect();
@@ -2097,6 +2231,7 @@ async fn write_manifest<S: ScratchStore>(
         sha256: content_sha256_hex(json.as_bytes()),
         key: key.clone(),
         missing_blocks: 0,
+        size_refused_blocks: 0,
         par2_set_id: None,
         spool: Vec::new(),
         crc32: 0,
@@ -2115,6 +2250,7 @@ mod tests {
             size,
             crc32: 0,
             missing: false,
+            size_refused: false,
         }
     }
 
@@ -2194,6 +2330,7 @@ mod tests {
             size: 1,
             sha256: sha.into(),
             missing_blocks,
+            size_refused_blocks: 0,
             par2_set_id,
             spool: Vec::new(),
             crc32: 0,
@@ -2222,6 +2359,7 @@ mod tests {
             VerifyOutcome::Unrecoverable {
                 par2_set_id: Some(b_hex),
                 missing_blocks: 3,
+                size_refused_blocks: 0,
             }
         );
     }
@@ -2495,6 +2633,7 @@ mod tests {
             size,
             crc32: 0,
             missing: false,
+            size_refused: false,
         }
     }
 
@@ -2643,6 +2782,7 @@ mod tests {
                 size: 12,
                 crc32: 9,
                 missing: false,
+                size_refused: false,
             }],
         );
         progress.judging.insert(
@@ -2764,5 +2904,78 @@ mod tests {
         let file = parsed("track.flac", false);
         let mut claimed = std::collections::HashSet::new();
         assert!(match_set_file(&[], &file, &segs, 3, &mut claimed).is_none());
+    }
+
+    #[test]
+    fn size_refused_event_line_pins_job_facts_for_both_reasons() {
+        // The C3 triage signal's exact line, for both refusal reasons:
+        // rewriting the format (or dropping a fact) turns this red.
+        assert_eq!(
+            format_size_refused_event("job_0123456789abcdef", 0, 0, 1, "fetch_too_large"),
+            "article_size_refused job=job_0123456789abcdef round=0 file=0 segment=1 reason=fetch_too_large"
+        );
+        assert_eq!(
+            format_size_refused_event("job_0123456789abcdef", 2, 3, 7, "over_article_cap"),
+            "article_size_refused job=job_0123456789abcdef round=2 file=3 segment=7 reason=over_article_cap"
+        );
+    }
+
+    #[test]
+    fn size_refused_emission_calls_the_shared_formatter() {
+        // The emission must log the shared helper's line — not an inline
+        // duplicate: deleting the `console_log!` call (or inlining a
+        // diverging copy) turns this red, while the helper test above
+        // pins the line itself. Read the source rather than the log
+        // because `console_log!` expands to a `web_sys` call that aborts
+        // host tests.
+        let src = include_str!("verify.rs");
+        let marker = "fn format_size_refused_event(";
+        let def = src.find(marker).expect("helper must exist");
+        let call = "format_size_refused_event(job_id, round, file_index, segment, reason)";
+        let rel = src[def + marker.len()..]
+            .find(call)
+            .expect("the refusal site must render through the shared helper");
+        // The emission follows the formatting: the `console_log!` call
+        // must sit within a few lines after the helper call (the helper
+        // call builds `line`; the very next statement logs it).
+        let call_abs = def + marker.len() + rel;
+        let window = &src[call_abs..(call_abs + call.len() + 400).min(src.len())];
+        assert!(
+            window.contains("worker::console_log!"),
+            "the shared helper's line must be emitted via worker::console_log! at the refusal site"
+        );
+    }
+
+    #[test]
+    fn size_refused_total_excludes_par2_files() {
+        // A size-refused par2 segment (recovery volume refused for size)
+        // only shrinks recovery: with the set still covering, one
+        // genuinely missing data block still dispatches repair. Counting
+        // the par2 refusal in the refusal total would wrongly conclude
+        // Unrecoverable — deleting the `!file.is_par2` filter in
+        // `data_size_refused` turns this red.
+        let a = set(0x0a, 2);
+        let a_hex = hex::encode(a.set_id);
+        let files = vec![parsed("a.flac", false), parsed("a.par2", true)];
+        let mut progress = VerifyProgress::new(0);
+        progress
+            .staged
+            .insert(0, staged("sha", 1, Some(a_hex.clone())));
+        let mut par2_staged = staged("par2sha", 1, Some(a_hex.clone()));
+        // What one refused par2 segment stages as: absent, flagged.
+        par2_staged.size_refused_blocks = 1;
+        progress.staged.insert(1, par2_staged);
+        let outcome = finalize(&files, &[a], &mut progress);
+        assert_eq!(
+            outcome,
+            VerifyOutcome::RepairNeeded {
+                par2_set_id: a_hex,
+                missing_blocks: 1,
+            }
+        );
+        assert_eq!(
+            progress.size_refused_blocks, 0,
+            "par2 refusals must not enter the data refusal total"
+        );
     }
 }

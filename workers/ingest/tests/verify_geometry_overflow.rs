@@ -55,6 +55,7 @@ fn srec(size: u64) -> StagedSpoolSegment {
         size,
         crc32: 0,
         missing: false,
+        size_refused: false,
     }
 }
 
@@ -101,6 +102,7 @@ impl MemoryScratch {
             size: bytes.len() as u64,
             sha256: format!("synthetic-{key}"),
             missing_blocks: 0,
+            size_refused_blocks: 0,
             par2_set_id: None,
             spool: Vec::new(),
             crc32: 0,

@@ -1355,9 +1355,9 @@ async fn deadline_stopped_judging_resumes_and_finishes() {
 
 #[tokio::test]
 async fn too_large_article_counts_only_its_own_segment() {
-    // Middle article refused as too large: it records missing, the
-    // cursor advances, and the other two segments still fetch and
-    // vouch for their blocks.
+    // Middle article refused as too large: it records missing *plus*
+    // size-refused, the cursor advances, and the other two segments
+    // still fetch and vouch for their blocks.
     let data = payload(89, 768);
     let (articles, nzb) = three_part_case(&data);
     let server = spawn(articles).await;
@@ -1405,16 +1405,22 @@ async fn too_large_article_counts_only_its_own_segment() {
     )
     .await;
     assert_eq!(fetches, ["d3@synthetic.invalid"]);
+    // A refetch would be refused identically, so the round concludes
+    // terminally instead of spending a repair round: Unrecoverable with
+    // only the refused segment's block counted, and the refusal total
+    // surfaced in the outcome.
     assert!(
         matches!(
             outcome,
-            VerifyOutcome::RepairNeeded {
+            VerifyOutcome::Unrecoverable {
                 missing_blocks: 1,
+                size_refused_blocks: 1,
                 ..
             }
         ),
-        "only the refused segment's block counts, got {outcome:?}"
+        "only the refused segment's block counts, terminally, got {outcome:?}"
     );
+    assert_eq!(progress.size_refused_blocks, 1);
 }
 
 #[tokio::test]
@@ -1602,6 +1608,7 @@ async fn damaged_assembled_par2_volume_keeps_its_leading_slices() {
         VerifyOutcome::Unrecoverable {
             par2_set_id: Some(_),
             missing_blocks: 2,
+            size_refused_blocks: 0,
         } => {}
         other => panic!("leading slice must keep the set joined, got {other:?}"),
     }
