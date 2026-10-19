@@ -86,6 +86,12 @@ pub enum PlayError {
     InvalidSegment(String),
     /// The provider connection failed or misbehaved (quarantines the pool).
     Upstream(String),
+    /// One article exceeded the article byte cap: only this fetch is
+    /// refused, with the corrupt-content envelope and a `SizeRefused` meter
+    /// signal. The provider is healthy so the pool is never quarantined;
+    /// the desynchronized connection is dropped. Carries the segment id for
+    /// debugging; it never reaches the wire (see [`PlayError::api_error`]).
+    ArticleTooLarge(String),
     /// A segment could not be decoded (corrupt or mis-placed yEnc part).
     Decode(YencError),
 }
@@ -106,7 +112,7 @@ impl PlayError {
             PlayError::ArticleMissing(_) => ApiError::not_found(),
             PlayError::InvalidSegment(_) => ApiError::invalid_request(),
             PlayError::Upstream(_) => ApiError::upstream_unavailable(),
-            PlayError::Decode(_) => ApiError::corrupt_content(),
+            PlayError::ArticleTooLarge(_) | PlayError::Decode(_) => ApiError::corrupt_content(),
         }
     }
 
@@ -135,7 +141,7 @@ impl PlayError {
             PlayError::PoolQuarantined { .. } => 503,
             PlayError::ArticleMissing(_) => 404,
             PlayError::InvalidSegment(_) => 400,
-            PlayError::Upstream(_) | PlayError::Decode(_) => 502,
+            PlayError::Upstream(_) | PlayError::ArticleTooLarge(_) | PlayError::Decode(_) => 502,
         }
     }
 
@@ -886,12 +892,17 @@ fn nntp_failure(e: NntpError, message_id: &str) -> Failure {
         // Stale auth: drop the connection (it is no longer authenticated)
         // without quarantining or metering a provider outage.
         NntpError::AuthExpired => Conn::Drop,
+        // Oversize article: the connection desynchronized mid-dot-block so
+        // it is dropped, but the provider is healthy so the pool is never
+        // quarantined (unlike a true provider failure).
+        NntpError::ArticleTooLarge => Conn::Drop,
         ref other if other.is_provider_failure() => Conn::ProviderFailure,
         _ => Conn::KeepWarm,
     };
     let err = match e {
         NntpError::NoSuchArticle(_) => PlayError::ArticleMissing(message_id.to_string()),
         NntpError::AuthExpired => PlayError::ProviderAuthExpired,
+        NntpError::ArticleTooLarge => PlayError::ArticleTooLarge(message_id.to_string()),
         NntpError::InvalidMessageId(id) => PlayError::InvalidSegment(id),
         other => PlayError::Upstream(format!("{other:?}")),
     };
@@ -924,8 +935,15 @@ fn settle(
                 crate::pool::CIRCUIT_OPEN_MS,
             ));
         }
-    } else if pool.record_non_provider_result_for(lease.id) {
-        meter.emit(ev_pool(MeterKind::QuarantineExited, user, track, lane, 0));
+    } else {
+        // One oversize article refuses only its fetch: signal it without
+        // touching the breaker (no `ProviderError`, no quarantine entry).
+        if matches!(err, PlayError::ArticleTooLarge(_)) {
+            meter.emit(ev(MeterKind::SizeRefused, user, track, 0));
+        }
+        if pool.record_non_provider_result_for(lease.id) {
+            meter.emit(ev_pool(MeterKind::QuarantineExited, user, track, lane, 0));
+        }
     }
     pool.release(lease, if conn == Conn::KeepWarm { client } else { None });
     err
@@ -1575,6 +1593,12 @@ mod tests {
                 "upstream_unavailable",
                 502,
                 true,
+            ),
+            (
+                PlayError::ArticleTooLarge("big-seg0@synthetic.test".into()),
+                "corrupt_content",
+                502,
+                false,
             ),
             (
                 PlayError::Decode(YencError::Truncated),
