@@ -17,10 +17,9 @@
 # repair image (`containers/repair/Dockerfile`, FROM debian/rust) each get
 # their own docker entry. Rolling codename tags (`debian:bookworm-slim`,
 # `rust:1-bookworm`) carry no numeric version for Dependabot to compare,
-# so a docker entry only opens version-tag PRs: Debian/Rust base rebuilds
-# arrive when the image is rebuilt, not via a Dependabot PR. Digest-pinning
-# a FROM would enable digest-refresh PRs; until then the repair docker
-# entry does not deliver Debian security rebuilds on its own.
+# so a docker entry opens version-tag PRs plus digest-refresh PRs: every
+# FROM carries a tag+digest pin, so base rebuilds arrive as digest-update
+# PRs without changing the tag.
 # npm watches the SvelteKit app (`apps/web`) and the
 # e2e harness (`e2e`), not a top-level `web/`.
 #
@@ -164,7 +163,7 @@ updates:
       prefix: "chore"
       include: "scope"
 
-  # Batch import image (FROM postgres).
+  # Batch import image (FROM postgres, tag+digest pinned).
   - package-ecosystem: "docker"
     directory: "/containers/mb-import"
     groups:
@@ -185,9 +184,9 @@ updates:
       prefix: "chore"
       include: "scope"
 
-  # Repair image (FROM debian, rust): rolling codename tags, so this entry
-  # tracks version-tag bumps only; base rebuilds arrive via image rebuilds
-  # (see header). Pinned by .github/scripts/check_dependabot_coverage.py.
+  # Repair image (FROM debian, rust, both tag+digest pinned): rolling
+  # codename tags, so this entry tracks version-tag bumps plus digest
+  # refreshes for base rebuilds (see header). Pinned by .github/scripts/check_dependabot_coverage.py.
   - package-ecosystem: "docker"
     directory: "/containers/repair"
     groups:

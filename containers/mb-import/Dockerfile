@@ -1,6 +1,6 @@
 # mb-import: batch-only MusicBrainz dump import + replication applier.
 # Interactive traffic never touches this image (ADR 0001/0007).
-FROM postgres:18-bookworm AS base
+FROM postgres:18-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c AS base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates python3 \
@@ -16,7 +16,7 @@ RUN chmod 0755 /job/etl.sh /job/etl.py /job/tests/test_etl.sh /job/tests/test_et
  && bash /job/tests/test_etl_reference_graphs.sh \
  && touch /tmp/mb-import-tests-passed
 
-FROM rust:1-bookworm AS validator
+FROM rust:1-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29 AS validator
 WORKDIR /src
 # The root Cargo.lock is tracked, proven fresh in CI (`cargo metadata
 # --locked`) and audited by cargo-deny. Copy the full (dockerignored)
