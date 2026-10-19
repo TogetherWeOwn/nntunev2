@@ -3,17 +3,20 @@
 Read-only research artifact: public list prices plus formulas, so measured
 staging volumes can be plugged in later to get a monthly cost estimate.
 No environment was accessed or changed to produce this document, and no
-secret values appear in it. Prices were checked on **2026-10-17** against
+secret values appear in it. Prices were checked on **2026-10-17**
+(Workers Logs on **2026-10-19**) against
 the provider pages linked in each section; re-check before relying on any
 number, because list prices change.
 
 This worksheet covers only the services listed below. It is **not** an
 all-in bill: Durable Objects (the `stream` Worker's `NntpPool` pool and the
 repair Worker's `RepairContainer` class; see the non-storage bindings
-inventory in `docs/ops.md`), Containers (repair path), Workers Logs,
+inventory in `docs/ops.md`), Containers (repair path),
 Cloudflare Access (staging gate), domain/DNS and any non-Cloudflare,
 non-PlanetScale services are out of scope here and must be added before
-any total is quoted as complete. Hyperdrive itself carries no separate
+any total is quoted as complete. Workers Logs is priced prospectively in
+section 5b (no measured volume yet) and excluded from the current total
+in section 7. Hyperdrive itself carries no separate
 line item beyond the Workers plan per the Workers pricing page, but the
 database behind it is priced in the PlanetScale section.
 
@@ -165,6 +168,43 @@ The `stream` Worker writes metering points to the `nntune_meter` dataset
 points at volume, so use the billed data-point count from account usage,
 not the raw event count in the Worker.
 
+## 5b. Cloudflare Workers Logs
+
+Sources: [Workers Logs pricing](https://developers.cloudflare.com/workers/observability/logs/workers-logs/#pricing) and
+[Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/#workers-logs),
+checked 2026-10-19 (Workers Paid). Log events written are billed per event
+(20 million included per month, then $0.60 per additional million) with
+7-day retention. Beginning December 1, 2026, Workers Logs moves to
+[Cloudflare Observability pricing](https://developers.cloudflare.com/observability/pricing/)
+(Workers Paid there: 50 GB ingestion and 10 GB-month storage included per
+billing cycle, then $0.25 per GB ingested and $0.10 per GB-month stored);
+until then the per-event prices below apply. Treat this section as
+**prospective**: the `staging-api` lane's generated config enables log
+persistence (see `docs/runbook-observability.md`), but no measured log
+volume exists yet, so it is excluded from the current-cost total in
+section 7 and shown separately. The 5b number keeps the PlanetScale (§6),
+total (§7) and worked-example (§8) numbers — and every cross-reference to
+them — stable.
+
+| Item | Included / month | Overage unit price |
+|---|---|---|
+| Log events written | 20 million | $0.60 / million |
+| Retention | 7 days | — |
+
+Formula (`L` = log events written/month):
+
+```text
+workers_logs_prospective = max(0, L/1e6 - 20) * 0.60
+```
+
+Volume sources at staging time: per-Worker log-event counts in the
+Cloudflare dashboard (Workers & Pages → Observability) / GraphQL Analytics
+API, summed over every Worker with observability enabled (`api` first).
+Sampling (`head_sampling_rate`) reduces billed events, so use the billed
+event count from account usage, not the raw emission count in the Worker.
+Re-check the December 2026 Observability pricing move before relying on
+this formula past that date.
+
 ## 6. PlanetScale Postgres
 
 Sources: [PlanetScale pricing](https://planetscale.com/pricing) and
@@ -245,6 +285,10 @@ monthly_total_current = workers + r2 + kv + queues
 # Analytics Engine is not billed yet (section 5); quote it separately:
 monthly_total_with_prospective_ae = monthly_total_current
                                   + analytics_engine_prospective
+
+# Workers Logs has no measured volume yet (section 5b); quote it separately:
+monthly_total_with_all_prospectives = monthly_total_with_prospective_ae
+                                    + workers_logs_prospective
 ```
 
 Staging and production share one Cloudflare account and one PlanetScale
@@ -262,7 +306,8 @@ not measured staging data and not a demand or revenue estimate.
 Inputs: `R` = 12M requests, `C` = 50M CPU-ms; R2 `G` = 500 GB-months,
 `A` = 2M, `B` = 20M; KV `KR` = 15M, `KW` = 0.5M, `KD` = `KL` = 0,
 `KG` = 2 GB; Queues `M` = 2M messages ≤64 KB (`Ops` = 6M); Analytics
-Engine `W` = 12M, `Q` = 0.5M; PlanetScale: two PS-5 single-node clusters
+Engine `W` = 12M, `Q` = 0.5M; Workers Logs `L` = 25M log events;
+PlanetScale: two PS-5 single-node clusters
 at $5, app disk `D` = 20 GB, MusicBrainz disk `D` = 110 GB, backups
 inside 2× disk, egress `E` = 30 GB (app) + 100 GB (MusicBrainz) against
 `EA` = 10 GB each (PS-5 non-HA allowance, assumed for both branches).
@@ -274,11 +319,13 @@ inside 2× disk, egress `E` = 30 GB (app) + 100 GB (MusicBrainz) against
 | KV | (15−10)×0.50 + (2−1)×0.50 | 3.00 |
 | Queues | (6−1)×0.40 | 2.00 |
 | Analytics Engine (prospective; not billed yet, excluded from current total) | (12−10)×0.25 | 0.50 |
+| Workers Logs (prospective; no measured volume yet, excluded from current total) | (25−20)×0.60 | 3.00 |
 | PlanetScale compute | 2 × 5.00 | 10.00 |
 | PlanetScale storage | (20−10)×0.125 + (110−10)×0.125 = 1.25 + 12.50 | 13.75 |
 | PlanetScale egress | [(30−10) + (100−10)] × 0.06 | 6.60 |
-| **Total (currently billed)** | 57.30 − 0.50 prospective Analytics Engine | **56.80** |
+| **Total (currently billed)** | 60.30 − 0.50 prospective Analytics Engine − 3.00 prospective Workers Logs | **56.80** |
 | Total including prospective Analytics Engine | 56.80 + 0.50 | 57.30 |
+| Total including all prospectives (Analytics Engine + Workers Logs) | 57.30 + 3.00 | 60.30 |
 
 Spot-check (R2, by hand): 490 billable GB-months × $0.015 = $7.35;
 1M billable Class A × $4.50/M = $4.50; 10M billable Class B ×
