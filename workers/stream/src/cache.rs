@@ -697,4 +697,47 @@ mod tests {
         assert_eq!(full.len(), 16 * seg.len());
         assert!(full.iter().all(|&b| b == 0xAB));
     }
+
+    #[test]
+    fn capacity_eviction_drops_the_victims_revalidation_claim() {
+        let mut cache = ContentCache::with_max_bytes(10);
+        cache.put_track_at("victim", vec![1u8; 6], 1_000);
+        let stale_at = 1_000 + CACHE_FRESH_TTL_SECS + 10;
+        assert!(
+            cache.try_begin_revalidate("victim", stale_at),
+            "stale victim claims its revalidation"
+        );
+        // Over-cap insert: 6 + 6 bytes against a 10-byte cap evicts the
+        // victim (oldest write) while the just-written entry is exempt.
+        cache.put_track_at("newcomer", vec![2u8; 6], stale_at);
+        assert!(
+            cache.get_track("victim").is_none(),
+            "victim must be capacity-evicted"
+        );
+        assert!(
+            cache.try_begin_revalidate("victim", stale_at),
+            "eviction drops the claim: a re-cached track is reclaimable \
+             immediately instead of waiting out the claim TTL"
+        );
+    }
+
+    #[test]
+    fn time_expiry_prune_does_not_count_as_a_capacity_eviction() {
+        let mut cache = ContentCache::new();
+        cache.put_track_at("t1", b"audio-bytes".to_vec(), 1_000);
+        assert!(
+            cache
+                .get_track_at(
+                    "t1",
+                    1_000 + CACHE_FRESH_TTL_SECS + CACHE_SWR_WINDOW_SECS + 1
+                )
+                .is_none(),
+            "past fresh + SWR the entry expires"
+        );
+        assert_eq!(
+            cache.eviction_count(),
+            0,
+            "a time-expiry prune is not a capacity eviction"
+        );
+    }
 }
