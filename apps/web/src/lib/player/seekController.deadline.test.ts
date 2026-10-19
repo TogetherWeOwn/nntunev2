@@ -175,6 +175,152 @@ describe('SeekController deadline', () => {
 		expect(controller.completed).toBe(0);
 	});
 
+	it('releases a hanging open-ended 206 body on deadline (reader-cancelled, unlocked)', async () => {
+		let cancels = 0;
+		const stream = new ReadableStream<Uint8Array>({
+			pull() {
+				// Never enqueue and never close: `read()` pends until the deadline fires.
+			},
+			cancel() {
+				cancels += 1;
+				return undefined;
+			}
+		});
+		const signals: AbortSignal[] = [];
+		const fetchFn: SeekFetch = async (_url, { signal }) => {
+			signals.push(signal);
+			return new Response(stream, {
+				status: 206,
+				headers: { 'content-range': 'bytes 0-999/1000' }
+			});
+		};
+		const controller = withDeadline(URL, fetchFn, SHORT_DEADLINE_MS);
+
+		const pending = controller.seek(0);
+		void pending.catch(() => {});
+		let error: unknown;
+		try {
+			await withGuard(pending, GUARD_MS, 'open-ended 206 body hang');
+		} catch (caught) {
+			error = caught;
+		} finally {
+			controller.abort();
+		}
+
+		expect(error).toBeInstanceOf(DOMException);
+		expect((error as DOMException).name).toBe('TimeoutError');
+		expect(signals).toHaveLength(1);
+		expect(signals[0].aborted).toBe(true);
+		// The stalled unbounded read must be cancelled through its reader,
+		// not left buffering behind the TimeoutError.
+		await vi.waitFor(() => expect(cancels).toBeGreaterThanOrEqual(1), {
+			timeout: GUARD_MS,
+			interval: 10
+		});
+		expect(stream.locked).toBe(false);
+		expect(controller.pending).toBe(false);
+		expect(controller.completed).toBe(0);
+	});
+
+	it('releases a hanging full 200 body on deadline (reader-cancelled, unlocked)', async () => {
+		let cancels = 0;
+		const stream = new ReadableStream<Uint8Array>({
+			pull() {
+				// Never enqueue and never close: `read()` pends until the deadline fires.
+			},
+			cancel() {
+				cancels += 1;
+				return undefined;
+			}
+		});
+		const signals: AbortSignal[] = [];
+		const fetchFn: SeekFetch = async (_url, { signal }) => {
+			signals.push(signal);
+			return new Response(stream, { status: 200 });
+		};
+		const controller = withDeadline(URL, fetchFn, SHORT_DEADLINE_MS);
+
+		const pending = controller.seek(0);
+		void pending.catch(() => {});
+		let error: unknown;
+		try {
+			await withGuard(pending, GUARD_MS, 'full 200 body hang');
+		} catch (caught) {
+			error = caught;
+		} finally {
+			controller.abort();
+		}
+
+		expect(error).toBeInstanceOf(DOMException);
+		expect((error as DOMException).name).toBe('TimeoutError');
+		expect(signals).toHaveLength(1);
+		expect(signals[0].aborted).toBe(true);
+		await vi.waitFor(() => expect(cancels).toBeGreaterThanOrEqual(1), {
+			timeout: GUARD_MS,
+			interval: 10
+		});
+		expect(stream.locked).toBe(false);
+		expect(controller.pending).toBe(false);
+		expect(controller.completed).toBe(0);
+	});
+
+	it('rejects a hanging null-body read with TimeoutError (signal race fallback)', async () => {
+		const nullBodyHang = {
+			status: 206,
+			headers: new Headers({ 'content-range': 'bytes 0-99/100' }),
+			body: null,
+			arrayBuffer: () => new Promise<ArrayBuffer>(() => {})
+		} as unknown as Response;
+		const signals: AbortSignal[] = [];
+		const fetchFn: SeekFetch = async (_url, { signal }) => {
+			signals.push(signal);
+			return nullBodyHang;
+		};
+		const controller = withDeadline(URL, fetchFn, SHORT_DEADLINE_MS);
+
+		const pending = controller.seek(0, 99);
+		void pending.catch(() => {});
+		let error: unknown;
+		try {
+			await withGuard(pending, GUARD_MS, 'null-body read hang');
+		} catch (caught) {
+			error = caught;
+		} finally {
+			controller.abort();
+		}
+
+		expect(error).toBeInstanceOf(DOMException);
+		expect((error as DOMException).name).toBe('TimeoutError');
+		expect(signals).toHaveLength(1);
+		expect(signals[0].aborted).toBe(true);
+		expect(controller.pending).toBe(false);
+		expect(controller.completed).toBe(0);
+	});
+
+	it('rejects non-finite deadlineMs in the constructor and clamps negative to an immediate deadline', async () => {
+		const fetchFn: SeekFetch = async (_url, init) => rangeResponse(init.headers.range);
+		expect(() => withDeadline(URL, fetchFn, NaN)).toThrow(RangeError);
+		expect(() => withDeadline(URL, fetchFn, Number.POSITIVE_INFINITY)).toThrow(RangeError);
+
+		// Negative is an explicit immediate deadline, never a disabled one.
+		const signals: AbortSignal[] = [];
+		const controller = withDeadline(URL, headerHangFetch(signals), -5);
+		const pending = controller.seek(0, 99);
+		void pending.catch(() => {});
+		let error: unknown;
+		try {
+			await withGuard(pending, GUARD_MS, 'negative deadline');
+		} catch (caught) {
+			error = caught;
+		} finally {
+			controller.abort();
+		}
+		expect(error).toBeInstanceOf(DOMException);
+		expect((error as DOMException).name).toBe('TimeoutError');
+		expect(signals).toHaveLength(1);
+		expect(signals[0].aborted).toBe(true);
+	});
+
 	it('a newer seek still supersedes and rejects the older one with AbortError', async () => {
 		const signals: AbortSignal[] = [];
 		let calls = 0;
