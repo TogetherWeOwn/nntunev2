@@ -230,6 +230,13 @@ jobs:
           SESSION_TTL_SECS = "86400"
           HYPERDRIVE_CACHING_DISABLED = "1"
 
+          # Workers Logs persistence for the structured api records (the
+          # build_sha evidence is read there). Without this block the
+          # deployed Worker has observability=null and persists nothing.
+          [env.staging.observability]
+          enabled = true
+          head_sampling_rate = 1
+
           [[env.staging.hyperdrive]]
           binding = "HYPERDRIVE"
           id = "${HYPERDRIVE_ID_STAGING}"
