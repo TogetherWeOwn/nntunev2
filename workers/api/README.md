@@ -406,7 +406,16 @@ behavior changes here.
   another DNS lookup; retain the original hostname for TLS SNI/certificate
   checks and HTTP Host. Save-time validation is not a fetch authorization.
   This worker performs no indexer fetches; indexer URLs are validated at
-  save/test time only (`IndexerConfig::validate`). Indexer fetches must
+  save/test time only (`IndexerConfig::validate`). Saved indexer URLs are
+  refused with `VaultError::Invalid` when the shape is wrong: a non-`https`
+  scheme (`vault.rs:354-356`), parsed userinfo (`vault.rs:364-366`), raw
+  whitespace or backslash (`vault.rs:375-377`), a non-literal `https://`
+  scheme prefix (`vault.rs:378-391`), an empty authority or a raw `@` in
+  it — including empty `@host`/`:@host` and obfuscated shapes
+  (`https:/@host`, tab/newline splits, backslashes, extra slashes) that
+  the parser would strip or normalize (`vault.rs:401-406`), an explicit
+  non-443 port (`vault.rs:411-415`), or any fragment (`vault.rs:418-420`).
+  Indexer fetches must
   forbid redirects (`INDEXER_ALLOW_REDIRECTS = false`, threat-model
   F-INGEST-01). No live indexer fetch transport exists yet;
   `workers/ingest/src/indexer_fetch.rs` is a test-only policy model whose
