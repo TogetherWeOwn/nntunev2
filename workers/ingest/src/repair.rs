@@ -132,7 +132,7 @@ pub fn classify_repair_reply(status: u16, body: &[u8]) -> RepairCall {
                 _ => RepairCall::Retry,
             }
         }
-        400 | 404 | 409 | 413 => RepairCall::Unrepairable,
+        400 | 401 | 403 | 404 | 409 | 413 => RepairCall::Unrepairable,
         _ => RepairCall::Retry,
     }
 }
