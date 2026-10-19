@@ -8,6 +8,7 @@
 //! is checked against the request ([`check_outcome`]) before the tally may
 //! fold it.
 
+use futures_util::StreamExt;
 use worker::{wasm_bindgen::JsValue, Env, Headers, Method, Request, RequestInit};
 
 use crate::probe::{ProbeOutcome, ProbeRequest};
@@ -24,6 +25,12 @@ pub const DEFAULT_RETRY_SECS: u32 = 5;
 
 /// Longest `Retry-After` honored; the queue's own backoff caps the rest.
 pub const MAX_RETRY_SECS: u32 = 300;
+
+/// Largest pool probe reply accepted: a `ProbeOutcome` is two id lists plus
+/// the batch index, so anything larger is a contract bug, not bytes to
+/// retain. An oversize body is `Rejected` because more bytes existed, never
+/// parsed from a truncated prefix.
+pub const MAX_PROBE_REPLY_BYTES: usize = 1024 * 1024;
 
 /// Why a probe call produced no usable outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +74,9 @@ pub fn classify_reply(
 ) -> Result<ProbeOutcome, PoolProbeError> {
     match status {
         200 => {
+            if body.len() > MAX_PROBE_REPLY_BYTES {
+                return Err(PoolProbeError::Rejected);
+            }
             let outcome: ProbeOutcome =
                 serde_json::from_str(body).map_err(|_| PoolProbeError::Rejected)?;
             check_outcome(req, &outcome)?;
@@ -109,7 +119,30 @@ pub async fn call_pool_probe(
         .map_err(|_| unavailable)?;
     let status = response.status_code();
     let retry_after = response.headers().get("retry-after").ok().flatten();
-    let text = response.text().await.map_err(|_| unavailable)?;
+    // Bounded reply read: stream the body and fail closed on the chunk that
+    // would cross the cap, so an oversize reply is never fully retained. A
+    // body that is not streamable falls back to one buffered read with the
+    // same ceiling. Only a 200 is size-gated here; every other status keeps
+    // exactly the verdict classify_reply maps it to.
+    let bytes = match response.stream() {
+        Ok(stream) => {
+            let mut stream = Box::pin(stream);
+            let mut buf = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|_| unavailable)?;
+                if status == 200 && buf.len().saturating_add(chunk.len()) > MAX_PROBE_REPLY_BYTES {
+                    return Err(PoolProbeError::Rejected);
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            buf
+        }
+        Err(_) => response.bytes().await.map_err(|_| unavailable)?,
+    };
+    if status == 200 && bytes.len() > MAX_PROBE_REPLY_BYTES {
+        return Err(PoolProbeError::Rejected);
+    }
+    let text = String::from_utf8(bytes).map_err(|_| PoolProbeError::Rejected)?;
     classify_reply(req, status, retry_after.as_deref(), &text)
 }
 
