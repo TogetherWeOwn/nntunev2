@@ -125,6 +125,22 @@ describe('SeekController', () => {
 		expect(controller.completed).toBe(0);
 	});
 
+	it('rejects a partial response whose end disagrees with the requested range', async () => {
+		const controller = new SeekController(
+			'https://audio.example/track',
+			async () =>
+				new Response(new Uint8Array(51), {
+					status: 206,
+					headers: { 'content-range': 'bytes 200-250/1000' }
+				})
+		);
+
+		await expect(controller.seek(200, 299)).rejects.toThrow(
+			'Range response does not satisfy the requested byte range'
+		);
+		expect(controller.completed).toBe(0);
+	});
+
 	it('explicit abort leaves the controller reusable', async () => {
 		const fetchFn = vi.fn(hangingFetch());
 		const controller = new SeekController('https://audio.example/track', fetchFn);

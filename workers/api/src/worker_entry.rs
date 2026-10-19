@@ -2309,12 +2309,10 @@ mod tests {
     fn render_preserves_empty_preflight_response() {
         // OPTIONS preflight is an empty 204, not a JSON body. It shares
         // render by design, so its response headers remain consistent too.
-        let response = handlers::Response {
-            status: 204,
-            body: String::new(),
-            set_cookie: None,
-            retry_after: None,
-        };
+        // Render the real preflight, not a rebuilt literal, so a shape
+        // change fails here instead of silently testing a stale copy.
+        let response = handlers::preflight_response();
+        assert_eq!(response.status, 204);
         assert!(response.body.is_empty());
         assert_render_security_headers(&response);
     }
@@ -2808,6 +2806,13 @@ mod tests {
             guard < ok,
             "the zero-row guard must precede the success return"
         );
+        let arm_end = upsert[guard..]
+            .find('}')
+            .expect("the zero-row guard arm must close");
+        assert!(
+            upsert[guard..guard + arm_end].contains("Err"),
+            "the zero-row guard must fail closed (return Err), not Ok"
+        );
         // Test-connection lease: the same fence on the same owner parameter,
         // denied (not granted) when the fence returns no row.
         let lease = fn_body("async fn acquire_test_connection_lease(");
@@ -2855,6 +2860,13 @@ mod tests {
         assert!(
             mint_guard < mint_ok,
             "the zero-row guard must precede the success return"
+        );
+        let mint_arm_end = mint[mint_guard..]
+            .find('}')
+            .expect("the zero-row guard arm must close");
+        assert!(
+            mint[mint_guard..mint_guard + mint_arm_end].contains("Err"),
+            "the zero-row guard must fail closed (return Err), not Ok"
         );
     }
 

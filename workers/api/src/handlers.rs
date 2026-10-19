@@ -3159,8 +3159,9 @@ pub fn is_known_path(path: &str) -> bool {
 
 /// Empty 204 for a preflight against a known path. Carries no ACA headers
 /// itself: the entry appends them exactly when the request `Origin` equals
-/// the configured origin (never reflected, never `*`).
-fn preflight_response() -> Response {
+/// the configured origin (never reflected, never `*`). `pub(crate)` so the
+/// entry's render test pins the real preflight shape instead of rebuilding it.
+pub(crate) fn preflight_response() -> Response {
     Response {
         status: 204,
         body: String::new(),

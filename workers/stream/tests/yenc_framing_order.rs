@@ -158,6 +158,17 @@ fn ypart_before_ybegin_is_rejected() {
 }
 
 #[test]
+fn yend_before_ybegin_is_rejected() {
+    let article = encode(PAYLOAD, "a.bin");
+    let mut mutated = format!("=yend size={}\r\n", PAYLOAD.len()).into_bytes();
+    mutated.extend_from_slice(&article);
+    assert!(
+        decode_part(&mutated).is_err(),
+        "=yend before =ybegin is out of order"
+    );
+}
+
+#[test]
 fn ypart_after_body_is_rejected() {
     let article = multipart(PAYLOAD, 0, 1000);
     let rest = without_ypart(&article);

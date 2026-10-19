@@ -202,6 +202,14 @@ fn single_partially_hex_crc32_is_rejected() {
 }
 
 #[test]
+fn single_leading_plus_crc32_is_rejected() {
+    // `from_str_radix` accepts a leading `+`, so the plus carries the
+    // otherwise-matching CRC: without the syntax guard this would decode.
+    let plus_matching = format!("+{}", matching());
+    assert_rejected(&replace_tag(&single(), "crc32", plus_matching.as_bytes()));
+}
+
+#[test]
 fn single_non_utf8_crc32_is_rejected() {
     assert_rejected(&replace_tag(&single(), "crc32", &[0xff, 0xfe, 0xff, 0xfe]));
 }

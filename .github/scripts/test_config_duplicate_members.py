@@ -23,6 +23,7 @@ Run from the repo root:
   python3 .github/scripts/test_config_duplicate_members.py
 """
 
+import json
 import subprocess
 import sys
 import tempfile
@@ -69,9 +70,12 @@ VALID_PROD = """{
 
 def run_check(tmp, schema_text=VALID_SCHEMA, staging_text=VALID_STAGING,
               prod_text=VALID_PROD):
-    schema = Path(tmp) / "schema.json"
-    staging = Path(tmp) / "staging.json"
-    prod = Path(tmp) / "prod.json"
+    # Role-neutral file names: the diagnostic must name the input role
+    # itself — the tmp path is echoed after the message, so a role token
+    # matching only the file name would let a labelless diagnostic pass.
+    schema = Path(tmp) / "input-a.json"
+    staging = Path(tmp) / "input-b.json"
+    prod = Path(tmp) / "input-c.json"
     schema.write_text(schema_text, encoding="utf-8")
     staging.write_text(staging_text, encoding="utf-8")
     prod.write_text(prod_text, encoding="utf-8")
@@ -239,6 +243,11 @@ class DuplicateMemberTests(unittest.TestCase):
                        decoded_name,
                        long_run),
         )
+        # The escaped, bounded rendering must actually be shown: absence
+        # assertions alone pass even when the name is never displayed.
+        # (32 mirrors MEMBER_NAME_DISPLAY_MAX in config_parity_check.py;
+        # changing the bound must update this expectation deliberately.)
+        self.assertIn(json.dumps(decoded_name[:32]) + "...", out)
 
     # -- controls: existing exit-code contract is preserved ---------------
 
