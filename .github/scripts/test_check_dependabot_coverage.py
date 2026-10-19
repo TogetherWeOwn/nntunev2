@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Self-tests for check_dependabot_coverage.py.
 
-The shipped repo must stay green; deleting either repair entry (the exact
-omission this card fixes) must turn the check red, as must an unlisted new
-standalone crate. Run from the repo root:
+The shipped repo must stay green; deleting any expected entry (repair
+cargo/docker, npm, github-actions) must turn the check red, as must an
+unlisted new standalone crate in either the `exclude` form or the
+own-`[workspace]` form. Structural breaks (`version`/`updates`), a missing
+`.gitignore`, stale cargo entries, and uncovered tracked lockfiles are
+input errors or drift. Run from the repo root:
 
   python3 .github/scripts/test_check_dependabot_coverage.py
 """
@@ -144,6 +147,181 @@ class DependabotCoverageTests(unittest.TestCase):
             drift, err = check_coverage(tmp)
             self.assertIsNone(err, err)
             self.assertTrue(any("/workers/new" in d for d in drift), drift)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_own_workspace_crate_without_entry_fails(self):
+        # Own-[workspace] form: builds fine, not in exclude, no lockfile.
+        # The exclude list alone would miss it; the repo scan must catch it.
+        tmp = make_fixture()
+        try:
+            write(
+                tmp / "workers" / "solo" / "Cargo.toml",
+                "[package]\nname = \"solo\"\nversion = \"0.1.0\"\n\n[workspace]\n",
+            )
+            drift, err = check_coverage(tmp)
+            self.assertIsNone(err, err)
+            self.assertTrue(any("/workers/solo" in d for d in drift), drift)
+            code, out, _ = run_check(tmp)
+            self.assertEqual(code, 1, out)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_workspace_member_needs_no_entry(self):
+        # Members resolve to the root lockfile: no cargo entry required.
+        tmp = make_fixture()
+        try:
+            cargo = (tmp / "Cargo.toml").read_text(encoding="utf-8")
+            cargo = cargo.replace(
+                'members = []', 'members = ["workers/stream"]'
+            )
+            (tmp / "Cargo.toml").write_text(cargo, encoding="utf-8")
+            write(tmp / "workers" / "stream" / "Cargo.toml", "[package]\nname = \"s\"\n")
+            drift, err = check_coverage(tmp)
+            self.assertIsNone(err, err)
+            self.assertEqual(drift, [], drift)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_members_glob_is_input_error(self):
+        tmp = make_fixture()
+        try:
+            cargo = (tmp / "Cargo.toml").read_text(encoding="utf-8")
+            cargo = cargo.replace('members = []', 'members = ["crates/*"]')
+            (tmp / "Cargo.toml").write_text(cargo, encoding="utf-8")
+            drift, err = check_coverage(tmp)
+            self.assertIsNone(drift, err)
+            self.assertIn("glob", err)
+            code, _, err_out = run_check(tmp)
+            self.assertEqual(code, 2, err_out)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_missing_npm_entry_fails(self):
+        tmp = make_fixture()
+        try:
+            text = (tmp / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+            text = text.replace('directory: "/e2e"', 'directory: "/web"')
+            (tmp / ".github" / "dependabot.yml").write_text(text, encoding="utf-8")
+            drift, err = check_coverage(tmp)
+            self.assertIsNone(err, err)
+            self.assertTrue(any("/e2e" in d for d in drift), drift)
+            code, out, _ = run_check(tmp)
+            self.assertEqual(code, 1, out)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_missing_github_actions_entry_fails(self):
+        tmp = make_fixture()
+        try:
+            text = (tmp / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+            text = text.replace('- package-ecosystem: "github-actions"\n    directory: "/"', "")
+            (tmp / ".github" / "dependabot.yml").write_text(text, encoding="utf-8")
+            drift, err = check_coverage(tmp)
+            self.assertIsNone(err, err)
+            self.assertTrue(any("github-actions" in d for d in drift), drift)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_stale_cargo_entry_fails(self):
+        tmp = make_fixture()
+        try:
+            text = (tmp / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+            text += '  - package-ecosystem: "cargo"\n    directory: "/workers/ghost"\n'
+            (tmp / ".github" / "dependabot.yml").write_text(text, encoding="utf-8")
+            drift, err = check_coverage(tmp)
+            self.assertIsNone(err, err)
+            self.assertTrue(any("stale" in d for d in drift), drift)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_tracked_lockfile_without_entry_fails(self):
+        # Lockfile loop: a tracked lock whose dir has no cargo entry fails
+        # even when no Cargo.toml advertises the directory.
+        tmp = make_fixture()
+        try:
+            write(tmp / "workers" / "ghost" / "Cargo.lock", "lock")
+            gitignore = (tmp / ".gitignore").read_text(encoding="utf-8")
+            gitignore += "!/workers/ghost/Cargo.lock\n"
+            (tmp / ".gitignore").write_text(gitignore, encoding="utf-8")
+            dependabot = (tmp / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+            dependabot = dependabot.replace(
+                "# Lockfiles: Cargo.lock and workers/repair/Cargo.lock.",
+                "# Lockfiles: Cargo.lock, workers/repair/Cargo.lock and workers/ghost/Cargo.lock.",
+            )
+            (tmp / ".github" / "dependabot.yml").write_text(dependabot, encoding="utf-8")
+            drift, err = check_coverage(tmp)
+            self.assertIsNone(err, err)
+            self.assertTrue(any("/workers/ghost" in d for d in drift), drift)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_lockfile_without_negation_fails(self):
+        tmp = make_fixture()
+        try:
+            text = (tmp / ".gitignore").read_text(encoding="utf-8")
+            text = text.replace("!/workers/repair/Cargo.lock\n", "")
+            (tmp / ".gitignore").write_text(text, encoding="utf-8")
+            drift, err = check_coverage(tmp)
+            self.assertIsNone(err, err)
+            self.assertTrue(any("negat" in d for d in drift), drift)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_missing_gitignore_is_input_error(self):
+        tmp = make_fixture()
+        try:
+            (tmp / ".gitignore").unlink()
+            drift, err = check_coverage(tmp)
+            self.assertIsNone(drift, err)
+            self.assertIn(".gitignore", err)
+            code, _, err_out = run_check(tmp)
+            self.assertEqual(code, 2, err_out)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_malformed_version_is_input_error(self):
+        tmp = make_fixture()
+        try:
+            text = (tmp / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+            text = text.replace("version: 2", "version: [")
+            (tmp / ".github" / "dependabot.yml").write_text(text, encoding="utf-8")
+            drift, err = check_coverage(tmp)
+            self.assertIsNone(drift, err)
+            self.assertIn("version", err)
+            code, _, err_out = run_check(tmp)
+            self.assertEqual(code, 2, err_out)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_missing_updates_is_input_error(self):
+        tmp = make_fixture()
+        try:
+            text = (tmp / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+            text = text.replace("updates:\n", "")
+            (tmp / ".github" / "dependabot.yml").write_text(text, encoding="utf-8")
+            drift, err = check_coverage(tmp)
+            self.assertIsNone(drift, err)
+            self.assertIn("updates", err)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_root_lock_header_needs_word_match(self):
+        # Nested lock names all contain `Cargo.lock`: a header naming only
+        # the nested lock must not satisfy the root lock.
+        tmp = make_fixture()
+        try:
+            text = (tmp / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+            text = text.replace(
+                "# Lockfiles: Cargo.lock and workers/repair/Cargo.lock.",
+                "# Lockfiles: workers/repair/Cargo.lock.",
+            )
+            (tmp / ".github" / "dependabot.yml").write_text(text, encoding="utf-8")
+            drift, err = check_coverage(tmp)
+            self.assertIsNone(err, err)
+            self.assertTrue(
+                any("Cargo.lock" in d and "header" in d for d in drift), drift
+            )
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

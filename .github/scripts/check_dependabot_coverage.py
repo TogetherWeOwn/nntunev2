@@ -7,10 +7,13 @@ automated security updates (workers/repair shipped exactly this way).
 This script derives the expected (ecosystem, directory) set from the repo
 itself and fails when `.github/dependabot.yml` does not cover it:
 
-  cargo:  "/" plus every standalone crate listed in the root
-          `Cargo.toml` `exclude` that carries its own `Cargo.toml`
-          (workspace members resolve to the root lockfile and need no
-          entry of their own).
+  cargo:  "/" plus every Cargo.toml directory that is neither the root
+          nor a root workspace member (covers both the root `exclude`
+          form and the own-`[workspace]` form: a crate with its own
+          `[workspace]` table builds fine via `cargo metadata` yet would
+          otherwise be invisible to the exclude list alone).
+          Workspace members resolve to the root lockfile and need no
+          entry of their own.
   docker: every directory containing a `Dockerfile`.
   npm:    every directory containing a `package.json`.
   github-actions: "/" (`.github/workflows`).
@@ -67,6 +70,30 @@ def normalize_directory(directory):
     return directory
 
 
+VERSION_RE = re.compile(r"""^[ \t]*version:[ \t]*["']?2["']?[ \t]*(#.*)?$""")
+UPDATES_RE = re.compile(r"""^[ \t]*updates:[ \t]*(#.*)?$""")
+# Root `Cargo.lock` must match as a word, not as a substring of a nested
+# lock path (every nested lock name contains `Cargo.lock`).
+ROOT_LOCK_RE = re.compile(r"(?<![/\w])Cargo\.lock")
+
+
+def validate_dependabot_structure(text):
+    """Require the `version: 2` + `updates:` skeleton (exit-2 otherwise).
+
+    The entry extractor is a line scan (no PyYAML), so a structurally
+    broken file must not report OK: GitHub's Dependabot app check also
+    validates this file, but the coverage gate stays fail-closed on its
+    own. Returns an error string, or None when the skeleton is present.
+    """
+    has_version = any(VERSION_RE.match(line) for line in text.splitlines())
+    has_updates = any(UPDATES_RE.match(line) for line in text.splitlines())
+    if not has_version:
+        return "dependabot.yml is missing 'version: 2'"
+    if not has_updates:
+        return "dependabot.yml is missing 'updates:'"
+    return None
+
+
 def parse_dependabot_entries(text):
     """Extract the (ecosystem, directory) set from dependabot.yml text."""
     entries = set()
@@ -118,23 +145,62 @@ def walk_manifests(root, filename):
     return found
 
 
-def standalone_crate_dirs(root):
-    """Standalone cargo dirs from the root `Cargo.toml` exclude list."""
+GLOB_CHARS = frozenset("*?[]{}!")
+
+
+def read_root_workspace(root):
+    """Parse root `Cargo.toml` workspace members + exclude (input error else)."""
     try:
         data = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None, "root Cargo.toml not found"
     except (tomllib.TOMLDecodeError, OSError) as exc:
         return None, f"root Cargo.toml unreadable: {exc}"
-    exclude = data.get("workspace", {}).get("exclude", [])
+    workspace = data.get("workspace", {})
+    if not isinstance(workspace, dict):
+        return None, "root Cargo.toml [workspace] is not a table"
+    members = workspace.get("members", [])
+    exclude = workspace.get("exclude", [])
+    if not isinstance(members, list):
+        return None, "root Cargo.toml workspace.members is not a list"
     if not isinstance(exclude, list):
         return None, "root Cargo.toml workspace.exclude is not a list"
+    for entry in members:
+        if isinstance(entry, str) and any(c in GLOB_CHARS for c in entry):
+            return None, (
+                f"root Cargo.toml workspace.members contains a glob {entry!r}: "
+                "expand it to literal paths so the coverage check can resolve it"
+            )
+    return {"members": members, "exclude": exclude}, None
+
+
+def standalone_crate_dirs(root):
+    """Standalone cargo dirs: exclude list plus non-member manifest dirs.
+
+    The exclude list alone misses the own-`[workspace]` form (a crate with
+    its own `[workspace]` table builds fine yet is not in `exclude`), so
+    every `Cargo.toml` directory that is neither the root nor a workspace
+    member is also expected to have its own cargo entry.
+    """
+    workspace, err = read_root_workspace(root)
+    if err is not None:
+        return None, err
     dirs = set()
-    for entry in exclude:
+    for entry in workspace["exclude"]:
         if not isinstance(entry, str):
             continue
         if (root / entry / "Cargo.toml").is_file():
             dirs.add(normalize_directory(entry))
+    members = set()
+    for entry in workspace["members"]:
+        if isinstance(entry, str):
+            members.add(normalize_directory(entry))
+    for manifest_dir in walk_manifests(root, "Cargo.toml"):
+        if manifest_dir == "/":
+            continue
+        if manifest_dir in members:
+            continue
+        dirs.add(manifest_dir)
     return dirs, None
 
 
@@ -188,6 +254,9 @@ def check_coverage(root):
         return None, "dependabot.yml not found: .github/dependabot.yml"
     except OSError as exc:
         return None, f"dependabot.yml unreadable: {exc}"
+    struct_err = validate_dependabot_structure(text)
+    if struct_err is not None:
+        return None, struct_err
     actual = parse_dependabot_entries(text)
     expected, err = expected_entries(root)
     if err is not None:
@@ -217,21 +286,26 @@ def check_coverage(root):
     for lock in locks:
         # Nested lockfiles must be named by full relative path (a bare
         # `Cargo.lock` mention would match every lock's basename and let
-        # the header go stale again); the root lock is just `Cargo.lock`.
-        named = "Cargo.lock" in header if lock == "Cargo.lock" else lock in header
+        # the header go stale again); the root lock matches as a word so a
+        # header naming only `workers/api/Cargo.lock` does not satisfy it.
+        if lock == "Cargo.lock":
+            named = ROOT_LOCK_RE.search(header) is not None
+        else:
+            named = lock in header
         if not named:
             drift.append(
                 f"lockfile {lock} not named in the dependabot.yml header "
                 f"(update the Lockfiles comment)"
             )
     negated = gitignore_negations(root)
-    if negated is not None:
-        for lock in locks:
-            if lock not in negated:
-                drift.append(
-                    f"lockfile {lock} not negated back into tracking in "
-                    f".gitignore (add '!/{lock}')"
-                )
+    if negated is None:
+        return None, "root .gitignore not found"
+    for lock in locks:
+        if lock not in negated:
+            drift.append(
+                f"lockfile {lock} not negated back into tracking in "
+                f".gitignore (add '!/{lock}')"
+            )
     # Every cargo-covered lockfile directory needs its own entry, except
     # the root: workspace members resolve to the root lockfile.
     for lock in locks:
