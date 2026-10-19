@@ -2315,6 +2315,8 @@ where
     if ctx.store.revoke_session(&claims.session_id).await.is_err() {
         return internal();
     }
+    ctx.audit(&claims.user_id, session::LOGOUT_AUDIT_ACTION, true)
+        .await;
     let mut resp = json_response(200, serde_json::json!({"ok": true}));
     resp.set_cookie = Some(session::clear_cookie_header());
     resp
