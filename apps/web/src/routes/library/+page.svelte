@@ -9,13 +9,23 @@
 		type LibraryItem
 	} from '#lib/library/cache.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
+	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
+	import {
+		addTrack,
+		clearQueue,
+		createQueue,
+		currentTrack as queueCurrentTrack,
+		nextTrack,
+		selectTrack as selectQueueIndex,
+		type QueueState
+	} from '#lib/player/queue.js';
 
 	let items: LibraryItem[] = $state([]);
 	let staleAt: string | null = $state(null);
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
 	let libraryUnavailable = $state(false);
-	let selectedIds: string[] = $state([]);
+	let queue: QueueState = $state(createQueue([]));
 
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
@@ -26,22 +36,32 @@
 			loading = state.loading;
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
-			// Selections are per-account: drop ids the new library no longer
+			// The queue is per-account: drop tracks the new library no longer
 			// contains, so a 401/403/404 or auth transition cannot leak the
-			// previous account's queue into the next session's Retry.
-			if (selectedIds.length > 0) {
+			// previous account's queue into the next session's Retry. The
+			// current track stays current when it survives the refresh.
+			if (queue.tracks.length > 0) {
 				const ids = new Set(state.items.map((track) => track.id));
-				selectedIds = selectedIds.filter((id) => ids.has(id));
+				const kept = queue.tracks.filter((track) => ids.has(track.id));
+				if (kept.length !== queue.tracks.length) {
+					const currentId = queueCurrentTrack(queue)?.id ?? null;
+					const rebuilt = createQueue(kept);
+					const index =
+						currentId === null ? -1 : kept.findIndex((track) => track.id === currentId);
+					queue = index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt;
+				}
 			}
 		}
 	});
 
 	// e2e contract hooks (e2e/helpers/contract.ts TESTIDS) owned by sibling
-	// slices: usage metering, plan-limit enforcement and the player land with
-	// the venture slices that own them. Placeholders below keep the hooks
+	// slices: usage metering and plan-limit enforcement land with the
+	// venture slices that own them. The placeholder below keeps its hook
 	// rendered until then.
 	const overLimit = false;
-	const currentTrack: { id: string; title: string } | null = null;
+	// The player block renders off the queue's current track; the <audio>
+	// src stays an empty placeholder until the streaming slice wires it.
+	const currentTrack = $derived(queueCurrentTrack(queue));
 
 	function displayTitle(track: LibraryItem): string {
 		const title = track.title;
@@ -55,11 +75,17 @@
 	}
 
 	function selectTrack(id: string): void {
-		if (!selectedIds.includes(id)) selectedIds = [...selectedIds, id];
-	}
-
-	function selectedTrack(id: string): LibraryItem {
-		return items.find((track) => track.id === id) ?? { id };
+		const item = items.find((track) => track.id === id);
+		if (!item) return;
+		// No stream URL until the streaming slice: playback wiring is out of
+		// scope, so the queue carries library display fields only. addTrack
+		// dedupes, so re-selecting a queued row is a no-op.
+		queue = addTrack(queue, {
+			id: item.id,
+			title: displayTitle(item),
+			artist: displayArtist(item) ?? '',
+			streamUrl: ''
+		});
 	}
 
 	function refresh(): Promise<void> {
@@ -67,9 +93,9 @@
 	}
 
 	function handleAuthTransition(event: StorageEvent): void {
-		// Clear selections at the auth boundary even before the refresher's
+		// Clear the queue at the auth boundary even before the refresher's
 		// state lands; the onStateChange reconcile above is the backstop.
-		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) selectedIds = [];
+		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) queue = clearQueue(queue);
 		refresher.handleAuthTransition(event);
 	}
 
@@ -125,18 +151,7 @@
 					</li>
 				{/each}
 			</ul>
-			{#if selectedIds.length > 0}
-				<section aria-label="Selected tracks">
-					<h2>Selected</h2>
-					<ol data-testid="queue-list">
-						{#each selectedIds as id (id)}
-							<li data-testid="queue-item" data-track-id={id} data-id={id}>
-								{displayTitle(selectedTrack(id))}
-							</li>
-						{/each}
-					</ol>
-				</section>
-			{/if}
+			<PlayerQueue state={queue} onnext={() => (queue = nextTrack(queue))} />
 		{/if}
 
 		<button class="nt-button nt-button--ghost" type="button" onclick={() => void refresh()}>

@@ -48,6 +48,13 @@ function playerNextTag(body: string): string | null {
 	return body.match(/<[a-zA-Z][^>]*data-testid="player-next"[^>]*>/)?.[0] ?? null;
 }
 
+/** Text content of each `queue-item` hook, in document order. */
+function queueItemTexts(body: string): string[] {
+	return [
+		...body.matchAll(/<([a-zA-Z][\w-]*)\b[^>]*data-testid="queue-item"[^>]*>([\s\S]*?)<\/\1>/g)
+	].map((m) => (m[2] ?? '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim());
+}
+
 describe('PlayerQueue empty-queue contract', () => {
 	it('names the empty state and disables Next when the queue is empty', () => {
 		const body = renderQueue(createQueue([]));
@@ -86,5 +93,17 @@ describe('PlayerQueue current-item marking', () => {
 			'track-apple',
 			'track-zebra'
 		]);
+	});
+});
+
+describe('PlayerQueue artist-less tracks', () => {
+	it('omits the dangling separator when the track has no artist', () => {
+		// Library rows without an artist reach the panel as an empty artist
+		// string; the separator must go with the missing artist, not dangle.
+		const noArtist: Track = { ...FIRST, id: 'track-solo', title: 'Solo Song', artist: '' };
+		const body = renderQueue(createQueue([noArtist]));
+
+		expect(nowPlayingText(body)).toBe('Now playing: Solo Song');
+		expect(queueItemTexts(body)).toEqual(['Solo Song']);
 	});
 });
