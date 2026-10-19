@@ -16,6 +16,7 @@
  */
 
 import { paywallFromResponse, type PaywallModel } from './planLimit.js';
+import { isJsonBodyTooLarge, readCappedJson } from '../api/cappedJson.js';
 import { parseErrorBody } from '../api/errors.js';
 import type { UsageSnapshot } from './usage';
 
@@ -210,8 +211,16 @@ async function readJson<T>(res: Response, label: string): Promise<T> {
 	if (!res.ok) {
 		let body: unknown = null;
 		try {
-			body = await res.json();
-		} catch {
+			body = await readCappedJson(res);
+		} catch (error) {
+			// An over-cap error body is never parsed: the generic status
+			// fallback applies, never retryable, with no paywall model
+			// emitted.
+			if (isJsonBodyTooLarge(error)) {
+				const parsed = parseErrorBody(null, res.status);
+				const hint = parsed.message ? `: ${parsed.message}` : '';
+				throw new BillingApiError(res.status, label, hint, parsed.code, false, null);
+			}
 			/* non-JSON error body: use status-based defaults */
 		}
 		const parsed = parseErrorBody(body, res.status);
@@ -223,8 +232,16 @@ async function readJson<T>(res: Response, label: string): Promise<T> {
 		throw new BillingApiError(res.status, label, hint, parsed.code, parsed.retryable, paywall);
 	}
 	try {
-		return (await res.json()) as T;
+		return (await readCappedJson(res)) as T;
 	} catch (error) {
+		// An over-cap 2xx never parses: surface the typed error, never a bare
+		// SyntaxError, never retryable, never a paywall, and never leaking
+		// body bytes (generic status message).
+		if (isJsonBodyTooLarge(error)) {
+			const parsed = parseErrorBody(null, res.status);
+			const hint = parsed.message ? `: ${parsed.message}` : '';
+			throw new BillingApiError(res.status, label, hint, parsed.code, false, null);
+		}
 		// A 2xx whose body is not JSON is a backend contract violation, not
 		// a usable result: surface the typed error keeping the caller's
 		// label — never a bare SyntaxError, and never a downstream TypeError
