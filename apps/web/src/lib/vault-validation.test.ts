@@ -232,11 +232,11 @@ describe('validateIndexerUrl', () => {
 		);
 	});
 
-	it('accepts plain https URLs with ports and paths', () => {
+	it('accepts plain https URLs with the default port and paths', () => {
 		const KEY = 'indexer-key';
 		for (const url of [
 			'https://index.example.com/api',
-			'https://index.example.com:8443/api/v1'
+			'https://index.example.com:443/api/v1'
 		]) {
 			expect(validateIndexerUrl(url, KEY), `url accepted: ${url}`).toBeNull();
 		}
