@@ -138,6 +138,7 @@ impl MemoryScratch {
             size: bytes.len() as u64,
             sha256: sha256_hex(&bytes),
             missing_blocks: 0,
+            size_refused_blocks: 0,
             par2_set_id: None,
             spool: Vec::new(),
             crc32: 0,
@@ -193,6 +194,7 @@ fn stage_par2(scratch: &MemoryScratch, progress: &mut VerifyProgress, set_bytes:
         size: set_bytes.len() as u64,
         sha256: sha256_hex(set_bytes),
         missing_blocks: 0,
+        size_refused_blocks: 0,
         par2_set_id: None,
         spool: Vec::new(),
         crc32: 0,
@@ -223,6 +225,7 @@ fn prespool(
             size: *size,
             crc32: crc32fast::hash(body),
             missing: false,
+            size_refused: false,
         });
     }
     // The scratch objects stay tiny: the test never materializes the

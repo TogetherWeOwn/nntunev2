@@ -673,10 +673,33 @@ fn apply_verify_outcome(
             advance_checkpoint(cp, true);
             Err(JobError::progress(ERR_REPAIR_FAILED, "repair pending"))
         }
-        VerifyOutcome::Unrecoverable { .. } => Err(JobError::permanent(
-            ERR_VERIFY_FAILED,
-            "release is missing blocks beyond par2 recovery",
-        )),
+        VerifyOutcome::Unrecoverable {
+            size_refused_blocks,
+            ..
+        } => {
+            // Size-refused damage fails under its own reason: triage
+            // reads "over cap" here, not "provider lost it" — and no
+            // `decide_repair` dispatch is spent on either arm.
+            if size_refused_blocks > 0 {
+                // Worker-only line (`console_log!` aborts off-wasm):
+                // the terminal reason below already distinguishes the
+                // refusal class on every target.
+                #[cfg(target_arch = "wasm32")]
+                console_log!(
+                    "ingest verify unrecoverable: size-refused damage is terminal job={} refused={}",
+                    msg.job_id,
+                    size_refused_blocks
+                );
+                return Err(JobError::permanent(
+                    ERR_VERIFY_FAILED,
+                    "release has size-refused blocks beyond repair",
+                ));
+            }
+            Err(JobError::permanent(
+                ERR_VERIFY_FAILED,
+                "release is missing blocks beyond par2 recovery",
+            ))
+        }
         // A capped step that staged/spooled more is progress, not a
         // failure: redeliver without spending the retry budget, or a
         // valid large upload would be quarantined while every delivery
@@ -799,8 +822,10 @@ impl BodySource for PoolBodySource<'_> {
         match call_pool_body(self.env, &req).await {
             Ok(BodyFetch::Bytes(bytes)) => Ok(crate::verify::ArticleFetch::Present(bytes)),
             Ok(BodyFetch::Missing) => Ok(crate::verify::ArticleFetch::Missing),
-            // `413` is per-article data: the segment is judged absent,
-            // never a permanent job failure.
+            // `413` is per-article data: the segment is judged absent
+            // and flagged size-refused (never a permanent job failure
+            // by itself), so the round can skip the repair dispatch a
+            // refetch-identical refusal could never satisfy.
             Ok(BodyFetch::TooLarge) => Ok(crate::verify::ArticleFetch::TooLarge),
             Err(PoolBodyError::Retry { .. }) => {
                 Err(VerifyError::Transient("pool body fetch unavailable".into()))
@@ -837,8 +862,15 @@ fn staged_from_metadata(
         sha256: meta.get("sha256")?.clone(),
         // An absent/unparseable block count must not read as "intact":
         // refuse the record (`None`) so the file is fetched and judged
-        // again instead of adopted as healthy sight unseen.
+        // again instead of adopted as healthy sight unseen. The refusal
+        // count instead backfills 0: records written before the field
+        // existed predate refusal tracking, and 0 preserves their
+        // repair-eligible adoption exactly as judged then.
         missing_blocks: meta.get("missing_blocks")?.parse().ok()?,
+        size_refused_blocks: meta
+            .get("size_refused_blocks")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
         par2_set_id: meta.get("par2_set_id").cloned(),
         spool: Vec::new(),
         crc32: meta.get("crc32").and_then(|v| v.parse().ok()).unwrap_or(0),
@@ -892,6 +924,10 @@ impl ScratchStore for R2Scratch {
         md.insert(
             "missing_blocks".to_string(),
             meta.missing_blocks.to_string(),
+        );
+        md.insert(
+            "size_refused_blocks".to_string(),
+            meta.size_refused_blocks.to_string(),
         );
         if let Some(set_id) = &meta.par2_set_id {
             md.insert("par2_set_id".to_string(), set_id.clone());
@@ -1757,6 +1793,7 @@ mod tests {
             crate::verify::VerifyOutcome::Unrecoverable {
                 par2_set_id: None,
                 missing_blocks: 3,
+                size_refused_blocks: 0,
             },
             true,
         )
