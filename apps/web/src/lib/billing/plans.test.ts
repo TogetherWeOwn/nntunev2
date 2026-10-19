@@ -72,7 +72,11 @@ describe('resolveEffectivePlan', () => {
 	});
 
 	it('uses the subscription plan while trialing', () => {
-		const r = resolveEffectivePlan({ planId: 'pro-5x', status: 'trialing' });
+		const now = new Date('2026-10-15T12:00:00Z');
+		const r = resolveEffectivePlan(
+			{ planId: 'pro-5x', status: 'trialing', trialEndsAt: '2026-10-20T00:00:00Z' },
+			now
+		);
 		expect(r.plan.id).toBe('pro-5x');
 		expect(r.planUnknown).toBe(false);
 	});
