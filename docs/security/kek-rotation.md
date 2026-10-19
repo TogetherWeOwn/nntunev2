@@ -273,9 +273,14 @@ Job properties:
 > have not landed: the Worker reads only `VAULT_KEK_BASE64` +
 > `VAULT_KEK_VERSION` (`workers/api/src/worker_entry.rs`). Until those
 > land, routine KEK rotation cannot be executed. On suspected or
-> confirmed KEK exposure, follow the compromise path in §10 (fresh
-> single KEK, per-row re-key, credential re-entry) — never the steps
-> below.
+> confirmed KEK exposure, report it through GitHub's private
+> vulnerability reporting (see `SECURITY.md`); §10 is design-only and
+> has no runner. Today's executable containment is: replace
+> `VAULT_KEK_BASE64`/`VAULT_KEK_VERSION` with a fresh single KEK so
+> rows pinned to the exposed version fail closed, treat all vaulted
+> credentials as exposed, and force credential re-entry — never the
+> steps below (the §10 per-row re-key needs the versioned KEK map +
+> runner that have not landed).
 
 ### Rotation executability today (Worker code as merged)
 
@@ -369,7 +374,15 @@ CISO gate verifies each at its exact head):
   the job has production history).
 - Cross-environment replication (explicitly forbidden — see §3).
 
-## 10. Compromise rotation (incident response)
+## 10. Compromise rotation (incident response) — DESIGN ONLY, no runner
+
+> **DESIGN ONLY — no runner.** Steps 1–2 below need the versioned KEK
+> map (`VAULT_KEK_V<N>` + `VAULT_KEK_CURRENT`) and the re-wrap runner,
+> neither of which exists in Worker code or migrations. On suspected or
+> confirmed exposure, report through GitHub's private vulnerability
+> reporting (see `SECURITY.md`) and apply today's executable
+> containment from §7 (fresh single KEK so exposed-version rows fail
+> closed, treat vaulted credentials as exposed, force re-entry).
 
 Routine re-wrap (§§5–6) rotates the WRAPPING, not the data key: anyone
 holding an exposed KEK[N] plus any pre-rotation snapshot still unwraps
