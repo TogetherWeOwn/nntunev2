@@ -169,6 +169,16 @@ describe('testProviderConnection rejects malformed ok / non-object bodies', () =
 
 		expectTypedShapeFailure(failure);
 	});
+
+	it('rejects {ok:"false"} at 201 with the real status, not 200', async () => {
+		const client = clientReturning(JSON.stringify({ ok: 'false' }), 201);
+
+		const failure = await client
+			.testProviderConnection(INPUT)
+			.catch((error: unknown) => error);
+
+		expectTypedShapeFailure(failure, 201);
+	});
 });
 
 describe('testProviderConnection omits an invalid latencyMs (pinned rule)', () => {
