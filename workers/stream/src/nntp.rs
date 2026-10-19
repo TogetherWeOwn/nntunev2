@@ -36,20 +36,31 @@ pub enum NntpError {
     /// article — but the connection itself is stale and is dropped, never
     /// parked warm for reuse. Carries no credential material.
     AuthExpired,
+    /// One article exceeded `MAX_ARTICLE_BYTES` (counted on the
+    /// dot-unstuffed, LF-joined body). This is content-local — one oversize
+    /// article says nothing about provider health, exactly like a missing
+    /// article — so it must not quarantine the pool (see
+    /// [`NntpError::is_provider_failure`]). The connection itself is
+    /// desynchronized (the refusal lands mid-dot-block) and is dropped,
+    /// never parked warm for reuse.
+    ArticleTooLarge,
     /// The segment id failed RFC 5536 validation and was never sent.
     InvalidMessageId(String),
 }
 
 impl NntpError {
     /// True when the provider (or the connection to it) is unhealthy, as
-    /// opposed to one article being gone (`430`/`423`), stale credentials
-    /// (`480`/`481` → re-auth prompt, not an outage), or one id being
-    /// malformed, which say nothing about the provider and must not
-    /// quarantine the user's pool.
+    /// opposed to one article being gone (`430`/`423`), one article being
+    /// oversize (article cap), stale credentials (`480`/`481` → re-auth
+    /// prompt, not an outage), or one id being malformed, which say nothing
+    /// about the provider and must not quarantine the user's pool.
     pub fn is_provider_failure(&self) -> bool {
         !matches!(
             self,
-            NntpError::NoSuchArticle(_) | NntpError::AuthExpired | NntpError::InvalidMessageId(_)
+            NntpError::NoSuchArticle(_)
+                | NntpError::AuthExpired
+                | NntpError::ArticleTooLarge
+                | NntpError::InvalidMessageId(_)
         )
     }
 
@@ -290,9 +301,7 @@ impl NntpClient {
                     // Native output normalizes CRLF to LF. Count the retained
                     // unstuffed bytes plus that LF, not wire bytes or the final dot.
                     if data.len() + 1 > MAX_ARTICLE_BYTES - body.len() {
-                        return Err(NntpError::UnexpectedResponse(
-                            "NNTP article exceeds byte limit".into(),
-                        ));
+                        return Err(NntpError::ArticleTooLarge);
                     }
                     // Vec's default doubling could reserve beyond the article
                     // ceiling even while its length fits. Clamp requested growth.
@@ -415,6 +424,7 @@ mod tests {
     fn only_a_missing_article_is_not_a_provider_failure() {
         assert!(!NntpError::NoSuchArticle("m".into()).is_provider_failure());
         assert!(!NntpError::AuthExpired.is_provider_failure());
+        assert!(!NntpError::ArticleTooLarge.is_provider_failure());
         assert_eq!(NntpError::AuthExpired.code(), PROVIDER_AUTH_EXPIRED_CODE);
         assert!(!NntpError::InvalidMessageId("x".into()).is_provider_failure());
         assert!(NntpError::Io("reset".into()).is_provider_failure());

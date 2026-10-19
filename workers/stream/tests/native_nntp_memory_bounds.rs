@@ -440,7 +440,41 @@ fn many_short_body_lines_one_byte_over_article_cap_refuse() {
             .expect("greeting");
             // Do not use expect_err: its Debug of an accidental Ok(Vec) would dump
             // 64 MiB into the assertion log instead of reporting the missing bound.
-            assert_size_refusal(client.article(ID), "many short BODY lines at 64 MiB + 1");
+            let result = client.article(ID);
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("many short BODY lines at 64 MiB + 1: oversized input was accepted instead of refused"),
+            };
+            // An oversize article is content-local (one article too big says
+            // nothing about provider health), so it refuses with the dedicated
+            // non-provider error — never a provider failure — while staying
+            // bounded and distinct from EOF/timeout failures.
+            assert!(
+                matches!(error, NntpError::ArticleTooLarge),
+                "many short BODY lines at 64 MiB + 1: expected the dedicated article-cap refusal, got {error:?}"
+            );
+            assert!(
+                !error.is_provider_failure(),
+                "many short BODY lines at 64 MiB + 1: an oversize article must not indict the provider"
+            );
+            assert_eq!(error.code(), "request_failed", "not an auth-expiry signal");
+            let diagnostic = format!("{error:?}");
+            assert!(
+                diagnostic.len() <= DIAGNOSTIC_BYTES,
+                "diagnostic retained {} bytes; bound is {DIAGNOSTIC_BYTES}",
+                diagnostic.len()
+            );
+            for wrong_reason in [
+                "eof",
+                "timed out",
+                "temporarily unavailable",
+                "would block",
+                "deadline",
+            ] {
+                let lower = diagnostic.to_ascii_lowercase();
+                assert!(!lower.contains(wrong_reason),
+                    "many short BODY lines at 64 MiB + 1: expected byte-ceiling refusal, not EOF or a time-budget failure: {lower}");
+            }
         },
     );
 }
