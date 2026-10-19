@@ -503,13 +503,23 @@ async fn try_enqueue(env: &Env, msg: &QueueMsg) -> bool {
     match env.queue(dispatch::INGEST_QUEUE_BINDING) {
         Ok(queue) => match queue.send(msg.clone()).await {
             Ok(()) => true,
-            Err(e) => {
-                console_log!("ingest enqueue failed: {:?}", e);
+            Err(_) => {
+                emit(
+                    Level::Error,
+                    &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                    "ingest.queue.enqueue_failed",
+                    serde_json::json!({"build_sha": build_sha_from_env(env)}),
+                );
                 false
             }
         },
-        Err(e) => {
-            console_log!("ingest queue binding missing: {:?}", e);
+        Err(_) => {
+            emit(
+                Level::Error,
+                &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                "ingest.queue.binding_missing",
+                serde_json::json!({"build_sha": build_sha_from_env(env)}),
+            );
             false
         }
     }
@@ -553,7 +563,7 @@ impl MeterSink for EdgeMeterSink<'_> {
             .build();
         match self.dataset.write_data_point(&point) {
             Ok(()) => Ok(200),
-            Err(e) => Err(format!("{e:?}")),
+            Err(_) => Err("meter_write_failed".to_string()),
         }
     }
 }
@@ -573,18 +583,28 @@ pub(crate) fn try_meter(
 ) -> Result<(), MeterWriteError> {
     let dataset = match env.analytics_engine(METER_DATASET_BINDING) {
         Ok(dataset) => dataset,
-        Err(e) => {
-            console_log!("ingest meter binding missing: {:?}", e);
-            return Err(MeterWriteError::Transport(format!(
-                "meter binding {METER_DATASET_BINDING} missing: {e:?}"
-            )));
+        Err(_) => {
+            emit(
+                Level::Error,
+                &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                "ingest.meter.binding_missing",
+                serde_json::json!({"build_sha": build_sha_from_env(env)}),
+            );
+            return Err(MeterWriteError::Transport(
+                "meter_binding_missing".to_string(),
+            ));
         }
     };
     let mut sink = EdgeMeterSink { dataset: &dataset };
     match emit_meter(&mut sink, msg, stage, outcome) {
         Ok(()) => Ok(()),
         Err(e) => {
-            console_log!("ingest meter write failed: {}", e);
+            emit(
+                Level::Error,
+                &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                "ingest.meter.write_failed",
+                serde_json::json!({"build_sha": build_sha_from_env(env)}),
+            );
             Err(e)
         }
     }
@@ -776,6 +796,7 @@ fn admission_commit_sqlstate(error: &tokio_postgres::Error) -> &str {
 /// the isolate. Connection detail never reaches logs or errors.
 struct PgAdmissionLedger {
     env: Env,
+    trace_id: String,
     claim_epoch: Option<i64>,
 }
 
@@ -786,11 +807,19 @@ struct PgAdmissionLedger {
 /// state crosses an await. The error is deliberately detail-free —
 /// connection strings, hosts, and driver messages never reach logs or
 /// responses.
-pub(crate) async fn library_db_client(env: &Env) -> Result<tokio_postgres::Client, ()> {
+pub(crate) async fn library_db_client(
+    env: &Env,
+    trace_id: &str,
+) -> Result<tokio_postgres::Client, ()> {
     let hyperdrive = env
         .hyperdrive(crate::library::LIBRARY_DB_BINDING)
-        .map_err(|e| {
-            console_log!("library db binding missing: {:?}", e);
+        .map_err(|_| {
+            emit(
+                Level::Error,
+                trace_id,
+                "ingest.library_db.binding_missing",
+                serde_json::json!({"build_sha": build_sha_from_env(env)}),
+            );
         })?;
     let socket = worker::Socket::builder()
         .secure_transport(worker::SecureTransport::StartTls)
@@ -801,24 +830,32 @@ pub(crate) async fn library_db_client(env: &Env) -> Result<tokio_postgres::Clien
         .connect_raw(socket, worker::postgres_tls::PassthroughTls)
         .await
         .map_err(|_| ())?;
+    let trace_id = trace_id.to_string();
+    let connection_build_sha = build_sha_from_env(env);
     wasm_bindgen_futures::spawn_local(async move {
         if connection.await.is_err() {
-            console_log!("library db connection error");
+            emit(
+                Level::Error,
+                &trace_id,
+                "ingest.library_db.connection_failed",
+                serde_json::json!({"build_sha": connection_build_sha}),
+            );
         }
     });
     Ok(client)
 }
 
 impl PgAdmissionLedger {
-    fn from_env(env: &Env) -> Self {
+    fn from_env(env: &Env, trace_id: &str) -> Self {
         Self {
             env: env.clone(),
+            trace_id: trace_id.to_string(),
             claim_epoch: None,
         }
     }
 
     async fn client(&self) -> Result<tokio_postgres::Client, MeterWriteError> {
-        library_db_client(&self.env)
+        library_db_client(&self.env, &self.trace_id)
             .await
             .map_err(|()| MeterWriteError::Transport("admission ledger unavailable".to_string()))
     }
@@ -883,9 +920,14 @@ impl AdmissionLedger for PgAdmissionLedger {
             )
             .await
             .map_err(|e| {
-                console_log!(
-                    "admission ledger commit failed: sqlstate={}",
-                    admission_commit_sqlstate(&e)
+                emit(
+                    Level::Error,
+                    &self.trace_id,
+                    "ingest.admission.commit_failed",
+                    serde_json::json!({
+                        "build_sha": build_sha_from_env(&self.env),
+                        "sqlstate": admission_commit_sqlstate(&e),
+                    }),
                 );
                 MeterWriteError::Transport("admission ledger unavailable".to_string())
             })?;
@@ -997,15 +1039,25 @@ where
 async fn ensure_admission_checkpoint(env: &Env, msg: &QueueMsg) {
     let existing = match checkpoint::get(env, &msg.job_id).await {
         Ok(existing) => existing,
-        Err(e) => {
-            console_log!("ingest admission checkpoint read failed: {:?}", e);
+        Err(_) => {
+            emit(
+                Level::Error,
+                &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                "ingest.admission_checkpoint.read_failed",
+                serde_json::json!({"build_sha": build_sha_from_env(env)}),
+            );
             return;
         }
     };
     let plan = checkpoint::admission_plan(existing.as_ref(), msg);
     if let Some(cp) = &plan.write {
-        if let Err(e) = checkpoint::put(env, cp).await {
-            console_log!("ingest admission checkpoint write failed: {:?}", e);
+        if checkpoint::put(env, cp).await.is_err() {
+            emit(
+                Level::Error,
+                &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                "ingest.admission_checkpoint.write_failed",
+                serde_json::json!({"build_sha": build_sha_from_env(env)}),
+            );
             return;
         }
     }
@@ -1015,7 +1067,12 @@ async fn ensure_admission_checkpoint(env: &Env, msg: &QueueMsg) {
         // `Queued`; duplicate Queue messages are harmless by construction
         // (the consumer resumes from the durable checkpoint).
         if !try_enqueue(env, msg).await {
-            console_log!("ingest re-drive enqueue after checkpoint reset failed");
+            emit(
+                Level::Error,
+                &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                "ingest.admission_checkpoint.redrive_enqueue_failed",
+                serde_json::json!({"build_sha": build_sha_from_env(env)}),
+            );
         }
     }
 }
@@ -1062,8 +1119,13 @@ async fn admit_metered_job(
                     ))
                 }
                 Ok(_) => queued_envelope(msg, source, true, extra),
-                Err(e) => {
-                    console_log!("ingest replay checkpoint read failed: {:?}", e);
+                Err(_) => {
+                    emit(
+                        Level::Error,
+                        &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                        "ingest.replay_checkpoint.read_failed",
+                        serde_json::json!({"build_sha": build_sha_from_env(env)}),
+                    );
                     queued_envelope(msg, source, true, extra)
                 }
             }
@@ -1141,7 +1203,7 @@ fn queued_envelope(
 /// the key is the content hash, so a client retry inside a second — or a
 /// retry racing its own first write — can 429 even though the bytes are
 /// already stored. Bytes present means the job can run.
-async fn store_upload_payload(env: &Env, payload_ref: &str, nzb_xml: &str) -> bool {
+async fn store_upload_payload(env: &Env, payload_ref: &str, nzb_xml: &str, trace_id: &str) -> bool {
     match env.kv(dispatch::PAYLOAD_KV_BINDING) {
         Ok(store) => match store.put(payload_ref, nzb_xml.to_string()) {
             Ok(put) => match put
@@ -1150,18 +1212,33 @@ async fn store_upload_payload(env: &Env, payload_ref: &str, nzb_xml: &str) -> bo
                 .await
             {
                 Ok(()) => true,
-                Err(e) => {
-                    console_log!("ingest payload write failed: {:?}", e);
+                Err(_) => {
+                    emit(
+                        Level::Error,
+                        trace_id,
+                        "ingest.payload.write_failed",
+                        serde_json::json!({"build_sha": build_sha_from_env(env)}),
+                    );
                     matches!(store.get(payload_ref).text().await, Ok(Some(_)))
                 }
             },
-            Err(e) => {
-                console_log!("ingest payload put failed: {:?}", e);
+            Err(_) => {
+                emit(
+                    Level::Error,
+                    trace_id,
+                    "ingest.payload.put_failed",
+                    serde_json::json!({"build_sha": build_sha_from_env(env)}),
+                );
                 false
             }
         },
-        Err(e) => {
-            console_log!("ingest payload KV missing: {:?}", e);
+        Err(_) => {
+            emit(
+                Level::Error,
+                trace_id,
+                "ingest.payload.binding_missing",
+                serde_json::json!({"build_sha": build_sha_from_env(env)}),
+            );
             false
         }
     }
@@ -1219,7 +1296,7 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>, trace_id: &str) -> Re
     // enqueue + meter outbox, fail-closed. A 503 here means nothing was
     // accepted with its meter; the client retry converges on one `Ok`
     // meter event for one accepted job.
-    let mut ledger = PgAdmissionLedger::from_env(&ctx.env);
+    let mut ledger = PgAdmissionLedger::from_env(&ctx.env, trace_id);
     return admit_metered_job(
         &ctx.env,
         &mut ledger,
@@ -1275,7 +1352,7 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>, trace_id: &str) -
             // enqueued job without retrievable bytes can never run.
             let payload_ref = msg.payload_ref.clone().unwrap_or_default();
             if payload_ref.is_empty()
-                || !store_upload_payload(&ctx.env, &payload_ref, &parsed.nzb_xml).await
+                || !store_upload_payload(&ctx.env, &payload_ref, &parsed.nzb_xml, trace_id).await
             {
                 // KV/driver detail stays out of the line; the trace plus the
                 // failed stage is enough to correlate.
@@ -1303,7 +1380,7 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>, trace_id: &str) -
             // TTL-expired on failure): the (job_id, stage) ledger owns the
             // enqueue + meter outbox, fail-closed, so a retry converges on
             // one `Ok` meter event for one accepted job.
-            let mut ledger = PgAdmissionLedger::from_env(&ctx.env);
+            let mut ledger = PgAdmissionLedger::from_env(&ctx.env, trace_id);
             return admit_metered_job(
                 &ctx.env,
                 &mut ledger,
