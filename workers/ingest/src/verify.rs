@@ -930,6 +930,24 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
     Ok(finalize(files, &sets, progress))
 }
 
+/// The per-refusal triage event, as a pure host-testable line: the
+/// `worker::console_log!` emission at the refusal site logs exactly this
+/// (numeric job/segment facts only — never segment ids or file names, see
+/// [`VerifyError`]). Both refusal reasons (`fetch_too_large` for the
+/// pool/client refusal, `over_article_cap` for the in-Worker cap) render
+/// through here so the format is pinned once, off-wasm.
+pub(crate) fn format_size_refused_event(
+    job_id: &str,
+    round: u32,
+    file_index: usize,
+    segment: usize,
+    reason: &str,
+) -> String {
+    format!(
+        "article_size_refused job={job_id} round={round} file={file_index} segment={segment} reason={reason}"
+    )
+}
+
 /// Fetch, yEnc-decode and spool one segment, returning its durable
 /// cursor record. Present bytes go to scratch immediately (with their
 /// CRC32 in the object record, so a lost progress write can rebuild
@@ -973,17 +991,11 @@ async fn spool_one<B: BodySource, S: ScratchStore>(
     // off-wasm the refusal is still recorded on the spool record, the
     // progress counter, the manifest and the outcome.
     let refused_rec = |reason: &'static str| {
+        let line = format_size_refused_event(job_id, round, file_index, segment, reason);
         #[cfg(target_arch = "wasm32")]
-        worker::console_log!(
-            "article_size_refused job={} round={} file={} segment={} reason={}",
-            job_id,
-            round,
-            file_index,
-            segment,
-            reason
-        );
+        worker::console_log!("{}", line);
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = reason;
+        let _ = line.as_str();
         StagedSpoolSegment {
             size_refused: true,
             ..missing_rec.clone()
@@ -2892,5 +2904,78 @@ mod tests {
         let file = parsed("track.flac", false);
         let mut claimed = std::collections::HashSet::new();
         assert!(match_set_file(&[], &file, &segs, 3, &mut claimed).is_none());
+    }
+
+    #[test]
+    fn size_refused_event_line_pins_job_facts_for_both_reasons() {
+        // The C3 triage signal's exact line, for both refusal reasons:
+        // rewriting the format (or dropping a fact) turns this red.
+        assert_eq!(
+            format_size_refused_event("job_0123456789abcdef", 0, 0, 1, "fetch_too_large"),
+            "article_size_refused job=job_0123456789abcdef round=0 file=0 segment=1 reason=fetch_too_large"
+        );
+        assert_eq!(
+            format_size_refused_event("job_0123456789abcdef", 2, 3, 7, "over_article_cap"),
+            "article_size_refused job=job_0123456789abcdef round=2 file=3 segment=7 reason=over_article_cap"
+        );
+    }
+
+    #[test]
+    fn size_refused_emission_calls_the_shared_formatter() {
+        // The emission must log the shared helper's line — not an inline
+        // duplicate: deleting the `console_log!` call (or inlining a
+        // diverging copy) turns this red, while the helper test above
+        // pins the line itself. Read the source rather than the log
+        // because `console_log!` expands to a `web_sys` call that aborts
+        // host tests.
+        let src = include_str!("verify.rs");
+        let marker = "fn format_size_refused_event(";
+        let def = src.find(marker).expect("helper must exist");
+        let call = "format_size_refused_event(job_id, round, file_index, segment, reason)";
+        let rel = src[def + marker.len()..]
+            .find(call)
+            .expect("the refusal site must render through the shared helper");
+        // The emission follows the formatting: the `console_log!` call
+        // must sit within a few lines after the helper call (the helper
+        // call builds `line`; the very next statement logs it).
+        let call_abs = def + marker.len() + rel;
+        let window = &src[call_abs..(call_abs + call.len() + 400).min(src.len())];
+        assert!(
+            window.contains("worker::console_log!"),
+            "the shared helper's line must be emitted via worker::console_log! at the refusal site"
+        );
+    }
+
+    #[test]
+    fn size_refused_total_excludes_par2_files() {
+        // A size-refused par2 segment (recovery volume refused for size)
+        // only shrinks recovery: with the set still covering, one
+        // genuinely missing data block still dispatches repair. Counting
+        // the par2 refusal in the refusal total would wrongly conclude
+        // Unrecoverable — deleting the `!file.is_par2` filter in
+        // `data_size_refused` turns this red.
+        let a = set(0x0a, 2);
+        let a_hex = hex::encode(a.set_id);
+        let files = vec![parsed("a.flac", false), parsed("a.par2", true)];
+        let mut progress = VerifyProgress::new(0);
+        progress
+            .staged
+            .insert(0, staged("sha", 1, Some(a_hex.clone())));
+        let mut par2_staged = staged("par2sha", 1, Some(a_hex.clone()));
+        // What one refused par2 segment stages as: absent, flagged.
+        par2_staged.size_refused_blocks = 1;
+        progress.staged.insert(1, par2_staged);
+        let outcome = finalize(&files, &[a], &mut progress);
+        assert_eq!(
+            outcome,
+            VerifyOutcome::RepairNeeded {
+                par2_set_id: a_hex,
+                missing_blocks: 1,
+            }
+        );
+        assert_eq!(
+            progress.size_refused_blocks, 0,
+            "par2 refusals must not enter the data refusal total"
+        );
     }
 }

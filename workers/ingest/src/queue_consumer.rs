@@ -878,6 +878,32 @@ fn staged_from_metadata(
     })
 }
 
+/// The R2 custom-metadata map [`staged_from_metadata`] parses back: the
+/// refusal count rides alongside the judgement so a resume adopts it
+/// without re-reading bytes. Extracted so the write side is unit-pinned
+/// together with the parse side (see the round-trip tests).
+fn staged_to_metadata(meta: &StagedFile) -> std::collections::HashMap<String, String> {
+    let mut md = std::collections::HashMap::new();
+    md.insert("sha256".to_string(), meta.sha256.clone());
+    md.insert("size".to_string(), meta.size.to_string());
+    md.insert("crc32".to_string(), meta.crc32.to_string());
+    if meta.missing {
+        md.insert("missing".to_string(), "1".to_string());
+    }
+    md.insert(
+        "missing_blocks".to_string(),
+        meta.missing_blocks.to_string(),
+    );
+    md.insert(
+        "size_refused_blocks".to_string(),
+        meta.size_refused_blocks.to_string(),
+    );
+    if let Some(set_id) = &meta.par2_set_id {
+        md.insert("par2_set_id".to_string(), set_id.clone());
+    }
+    md
+}
+
 impl ScratchStore for R2Scratch {
     async fn head(&self, key: &str) -> Result<Option<StagedFile>, VerifyError> {
         let object = self
@@ -914,24 +940,7 @@ impl ScratchStore for R2Scratch {
     }
 
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &StagedFile) -> Result<(), VerifyError> {
-        let mut md = std::collections::HashMap::new();
-        md.insert("sha256".to_string(), meta.sha256.clone());
-        md.insert("size".to_string(), meta.size.to_string());
-        md.insert("crc32".to_string(), meta.crc32.to_string());
-        if meta.missing {
-            md.insert("missing".to_string(), "1".to_string());
-        }
-        md.insert(
-            "missing_blocks".to_string(),
-            meta.missing_blocks.to_string(),
-        );
-        md.insert(
-            "size_refused_blocks".to_string(),
-            meta.size_refused_blocks.to_string(),
-        );
-        if let Some(set_id) = &meta.par2_set_id {
-            md.insert("par2_set_id".to_string(), set_id.clone());
-        }
+        let md = staged_to_metadata(meta);
         self.bucket
             .put(key.to_string(), bytes)
             .custom_metadata(md)
@@ -2330,5 +2339,80 @@ mod tests {
         .expect_err("out-of-range tally entries are corrupt checkpoint state");
         assert!(!err.transient);
         assert_eq!(err.code, ERR_PROBE_FAILED);
+    }
+
+    fn refusal_test_meta() -> std::collections::HashMap<String, String> {
+        // A staged data-file record as `staged_to_metadata` writes it.
+        [
+            ("sha256", "abc123"),
+            ("size", "512"),
+            ("crc32", "0"),
+            ("missing_blocks", "1"),
+            ("size_refused_blocks", "2"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    #[test]
+    fn staged_from_metadata_adopts_a_present_refusal_count() {
+        // The adopted-after-lost-progress path must keep the refusal
+        // count: resetting it to 0 here would re-enter a size-refused
+        // file as plain missing and spend the repair round this work
+        // exists to prevent.
+        let meta = refusal_test_meta();
+        let staged = staged_from_metadata("k", 512, &meta).expect("record must adopt");
+        assert_eq!(staged.size_refused_blocks, 2);
+        assert_eq!(staged.missing_blocks, 1);
+    }
+
+    #[test]
+    fn staged_from_metadata_backfills_an_absent_refusal_count_to_zero() {
+        // Records written before the field existed predate refusal
+        // tracking: 0 preserves their repair-eligible adoption exactly
+        // as judged then.
+        let mut meta = refusal_test_meta();
+        meta.remove("size_refused_blocks");
+        let staged = staged_from_metadata("k", 512, &meta).expect("record must adopt");
+        assert_eq!(staged.size_refused_blocks, 0);
+        assert_eq!(staged.missing_blocks, 1);
+    }
+
+    #[test]
+    fn staged_from_metadata_backfills_an_unparseable_refusal_count_to_zero() {
+        let mut meta = refusal_test_meta();
+        meta.insert("size_refused_blocks".to_string(), "many".to_string());
+        let staged = staged_from_metadata("k", 512, &meta).expect("record must adopt");
+        assert_eq!(staged.size_refused_blocks, 0);
+    }
+
+    #[test]
+    fn staged_metadata_write_read_round_trips_the_refusal_count() {
+        // The `put` side must write the count `staged_from_metadata`
+        // parses back: deleting the `md.insert` keeps every double-based
+        // test green (they clone the full `StagedFile`), so this map
+        // assertion plus the round trip is the pin.
+        let meta = StagedFile {
+            key: "k".into(),
+            size: 512,
+            sha256: "abc123".into(),
+            missing_blocks: 1,
+            size_refused_blocks: 2,
+            par2_set_id: None,
+            spool: Vec::new(),
+            crc32: 0,
+            missing: false,
+        };
+        let written = staged_to_metadata(&meta);
+        assert_eq!(
+            written.get("size_refused_blocks").map(String::as_str),
+            Some("2"),
+            "the put metadata map must carry the refusal count"
+        );
+        let adopted = staged_from_metadata("k", 512, &written).expect("written record must adopt");
+        assert_eq!(adopted.size_refused_blocks, 2);
+        assert_eq!(adopted.missing_blocks, 1);
+        assert_eq!(adopted.sha256, "abc123");
     }
 }
