@@ -69,7 +69,7 @@
 //! disabled in `wrangler.toml.example` until that boundary lands.
 
 use futures_util::{Stream, StreamExt};
-use worker::{console_log, Date, Env, MessageBuilder, MessageExt, QueueRetryOptionsBuilder};
+use worker::{Date, Env, MessageBuilder, MessageExt, QueueRetryOptionsBuilder};
 
 use crate::dispatch::{
     content_sha256_hex, make_job_id, validate_user_id, INGEST_QUEUE_BINDING, PAYLOAD_KEY_PREFIX,
