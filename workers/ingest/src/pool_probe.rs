@@ -202,7 +202,7 @@ pub async fn call_pool_probe_with_deadline(
     // buffered read with the same ceiling. The drain races the shared
     // deadline (partial progress never re-arms it), so headers plus body
     // share one total budget and a stalled body expires instead of hanging.
-    let bounded_read = async {
+    let body_read = async {
         match response.stream() {
             Ok(stream) => {
                 let mut stream = Box::pin(stream);
@@ -225,12 +225,14 @@ pub async fn call_pool_probe_with_deadline(
             }
         }
     };
-    let bounded_read = Box::pin(bounded_read);
-    let bytes = crate::pool_deadline::race_against_deadline(bounded_read, &mut deadline).await;
+    let body_read = Box::pin(body_read);
+    let bytes = crate::pool_deadline::race_against_deadline(body_read, &mut deadline).await;
     let bytes = match bytes {
         Some(Ok(bytes)) => bytes,
-        Some(Err(read_error)) => return Err(read_error),
-        None => return Err(expired),
+        // An over-cap 200 reply fails closed as Rejected (more bytes
+        // existed); transport failure and expiry share the expired Retry.
+        Some(Err(PoolProbeError::Rejected)) => return Err(PoolProbeError::Rejected),
+        Some(Err(_)) | None => return Err(expired),
     };
     drop(deadline);
     let text = String::from_utf8(bytes).map_err(|_| PoolProbeError::Rejected)?;
