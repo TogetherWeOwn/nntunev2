@@ -14,9 +14,14 @@
 //! - restoring either `yend_size as usize` or `file_size as usize` fails
 //!   `single_part_size_compares_do_not_narrow_declared_u64` on any host
 //!   (source-text pin via `include_str!`, comments stripped first so a
-//!   comment-out cannot hide the narrowing);
-//! - deleting either size check fails the `*_plus_one_is_size_mismatch`
-//!   behavioural pins (they still require `SizeMismatch` for a one-byte lie);
+//!   comment-out cannot hide the narrowing), including the parenthesised
+//!   spelling `(yend_size) as usize` (`narrows_to_usize` skips any run of
+//!   closing parens between the identifier and `as`);
+//! - deleting either size check fails the `*_plus_one_is_size_mismatch` and
+//!   `*_minus_one_is_size_mismatch` behavioural pins (they still require
+//!   `SizeMismatch` for a one-byte lie in either direction), and weakening
+//!   either compare from `!=` to `>` fails the minus-one pins (a declared
+//!   size one byte under the actual payload would otherwise decode `Ok`);
 //! - exact-size articles keep decoding (no-checksum fixtures, so a sibling
 //!   checksum-precedence change cannot turn these red).
 //!
@@ -227,7 +232,8 @@ fn raw_start(chars: &[char], i: usize) -> Option<(usize, usize)> {
     None
 }
 
-/// True when `stripped` contains `name as usize` with any whitespace between
+/// True when `stripped` contains `name as usize` with any whitespace — and
+/// any run of closing parens, so `(name) as usize` also counts — between
 /// the tokens (word-boundary aware, so `my_yend_size` does not match).
 fn narrows_to_usize(stripped: &str, name: &str) -> bool {
     let bytes = stripped.as_bytes();
@@ -240,9 +246,18 @@ fn narrows_to_usize(stripped: &str, name: &str) -> bool {
         let after_ok = after_name >= bytes.len()
             || !(bytes[after_name].is_ascii_alphanumeric() || bytes[after_name] == b'_');
         if before_ok && after_ok {
+            // Skip whitespace and any closing parens wrapping the identifier,
+            // so `(name) as usize` / `((name)) as usize` cannot escape the pin.
             let mut k = after_name;
-            while k < bytes.len() && matches!(bytes[k], b' ' | b'\t' | b'\n' | b'\r') {
-                k += 1;
+            loop {
+                while k < bytes.len() && matches!(bytes[k], b' ' | b'\t' | b'\n' | b'\r') {
+                    k += 1;
+                }
+                if k < bytes.len() && bytes[k] == b')' {
+                    k += 1;
+                    continue;
+                }
+                break;
             }
             if stripped[k..].starts_with("as") {
                 let after_as = k + 2;
@@ -304,6 +319,29 @@ fn single_part_size_compares_do_not_narrow_declared_u64() {
     );
 }
 
+#[test]
+fn narrows_to_usize_detects_parenthesised_narrowing() {
+    // The paren spelling must not escape the source pin above.
+    assert!(narrows_to_usize(
+        "(yend_size) as usize != out.len()",
+        "yend_size"
+    ));
+    assert!(narrows_to_usize(
+        "if ((file_size)) as usize != out.len() {",
+        "file_size"
+    ));
+    // Widening the length side (the correct shape) is not narrowing,
+    // parenthesised or not.
+    assert!(!narrows_to_usize(
+        "if yend_size != out.len() as u64 {",
+        "yend_size"
+    ));
+    assert!(!narrows_to_usize(
+        "if (file_size) != out.len() as u64 {",
+        "file_size"
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // Behavioural controls: green before and after the fix (tiny sizes, no wrap).
 // ---------------------------------------------------------------------------
@@ -325,6 +363,36 @@ fn yend_size_plus_one_is_size_mismatch() {
         decode_part(&text),
         Err(YencError::SizeMismatch {
             expected: 4,
+            actual: 3
+        })
+    ));
+    assert!(matches!(decode(&text), Err(YencError::SizeMismatch { .. })));
+}
+
+#[test]
+fn yend_size_minus_one_is_size_mismatch() {
+    // `=ybegin` truthful, `=yend` under-declares by one: kills a `>`-for-`!=`
+    // weakening of the first compare (declared < actual must still fail).
+    let text = article(3, 2);
+    assert!(matches!(
+        decode_part(&text),
+        Err(YencError::SizeMismatch {
+            expected: 2,
+            actual: 3
+        })
+    ));
+    assert!(matches!(decode(&text), Err(YencError::SizeMismatch { .. })));
+}
+
+#[test]
+fn file_size_minus_one_is_size_mismatch() {
+    // `=yend` truthful, `=ybegin` under-declares by one: kills a `>`-for-`!=`
+    // weakening of the second compare (declared < actual must still fail).
+    let text = article(2, 3);
+    assert!(matches!(
+        decode_part(&text),
+        Err(YencError::SizeMismatch {
+            expected: 2,
             actual: 3
         })
     ));
