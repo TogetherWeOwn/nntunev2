@@ -20,14 +20,14 @@ the deployed-build identity route
 re-read (`e2e/tests/zz-build-identity-final.spec.ts`), the
 scoped-credentials spec (#239), the api-staging-lane workflow pins
 (#407), and the journey-evidence-gate pins (#548) added:
-`npm --prefix e2e run e2e:list` lists 395 tests in 25 files, and
-`(cd apps/web && pnpm exec playwright test --list)` lists 113 tests in
-24 files (94 in 21 files as previously verified, plus the 5-test
-paywall-elapsed-time spec, the 11-test passkey-dismissal spec, and the
-3-test cache-headers spec (#551); the rest of the merged main adds no
-other playwright specs — only worker/API changes, unit tests,
-dependency bumps, and docs — so every other cited line below is
-unchanged). Line numbers
+`npm --prefix e2e run e2e:list` lists 395 tests in 25 files (the `e2e/`
+tree is unchanged from the verified main head — neither side of this
+merge touches it, 25 spec files confirmed on disk), and
+`(cd apps/web && pnpm exec playwright test --list)` lists 127 tests in
+27 files (113 in 24 as previously documented; a fresh `--list` at this
+head also counts the 5-test passkey-in-flight spec, the 2-test
+pricing-plan-button-names spec, and the 7-test
+byop-reauth-paywall-dismissal spec added here). Line numbers
 below are from that head; re-verify with the commands at the end of this
 document whenever a spec is added, renamed, or retitled, and update this
 matrix in the same PR. CI enforces the file and title citations on
@@ -339,6 +339,13 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
     still applies), while genuine finish failures and other ceremony
     errors keep their exact current messages and login stays
     non-enumerating.
+  - `apps/web/tests/byop-reauth-paywall-dismissal.spec.ts` — pins BYOP
+    reauth paywall and dismissal handling: paywalled start/finish show
+    the paywall modal with no failure banner and no vault-save retry,
+    an interrupted ceremony (NotAllowedError/AbortError) shows a
+    retryable dismissed notice enumerating the possible reasons with
+    in-place retry, and genuine finish/ceremony failures keep the exact
+    current banner with the sign-in-again link.
   - `apps/web/tests/smoke.spec.ts` — pins the landing BYOP copy with
     working signup/pricing CTAs, the health/readiness endpoints,
     contract routes rendering their e2e hooks, signup/login/magic-link
