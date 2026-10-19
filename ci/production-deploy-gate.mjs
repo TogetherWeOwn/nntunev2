@@ -254,13 +254,47 @@ export async function requireStagingEvidence(
 // headers (["env"."production"."vars"], [ env . production . vars ]),
 // dotted keys (production.vars.X under [env]), and inline tables
 // (env = { production = { vars = ... } }, including multi-line) all
-// resolve to the same key paths before the beyond-`name` check. Reads
+// resolve to the same key paths before the beyond-`name` check. Basic-string
+// escapes (\uXXXX, \UXXXXXXXX, short escapes) in quoted keys decode before
+// comparison, and triple-quoted multi-line strings are skipped whole, so
+// neither spelling can hide a production table. Reads
 // names only; values are never read or printed.
 // Split a TOML key (table-header inner text or dotted key) into segments,
 // honouring single/double-quoted segments and whitespace around dots, so
 // ["env"."production"."vars"], [ env . production . vars ], and dotted or
 // inline spellings compare equal to their plain form. Unquoted whitespace
-// is insignificant; escape sequences inside basic strings are unescaped.
+// is insignificant; escape sequences inside basic strings decode per TOML
+// (a "\U00000070roduction" segment compares equal to "production").
+// Anything after a backslash that is not a TOML escape is invalid TOML
+// (wrangler rejects it), so it stays literal.
+const TOML_SHORT_ESCAPES = {
+  b: "\b",
+  t: "\t",
+  n: "\n",
+  f: "\f",
+  r: "\r",
+  '"': '"',
+  "\\": "\\",
+};
+
+function decodeTomlKeyEscape(text, i) {
+  const next = text[i + 1];
+  if (next === "u" || next === "U") {
+    const width = next === "u" ? 4 : 8;
+    const hex = text.slice(i + 2, i + 2 + width);
+    if (hex.length === width && /^[0-9a-fA-F]+$/.test(hex)) {
+      try {
+        return { char: String.fromCodePoint(parseInt(hex, 16)), nextIndex: i + 2 + width };
+      } catch {
+        // Invalid scalar: fall through to literal.
+      }
+    }
+  } else if (TOML_SHORT_ESCAPES[next] !== undefined) {
+    return { char: TOML_SHORT_ESCAPES[next], nextIndex: i + 2 };
+  }
+  return { char: next, nextIndex: i + 2 };
+}
+
 function splitTomlKey(text) {
   const segments = [];
   let buf = "";
@@ -273,8 +307,9 @@ function splitTomlKey(text) {
     const ch = text[i];
     if (quote) {
       if (ch === "\\" && quote === '"' && i + 1 < text.length) {
-        buf += text[i + 1];
-        i += 1;
+        const decoded = decodeTomlKeyEscape(text, i);
+        buf += decoded.char;
+        i = decoded.nextIndex - 1;
         continue;
       }
       if (ch === quote) {
@@ -299,19 +334,55 @@ function splitTomlKey(text) {
   return segments;
 }
 
-function stripTomlComment(line) {
+// Strip a `#` comment and drop triple-quoted multi-line strings (values are
+// opaque to the shape check). `state.long` persists across lines: it holds
+// the `"""`/`'''` opener when a previous line left a string unclosed, so an
+// unbalanced quote inside a multi-line value cannot desync later lines.
+function stripTomlComment(line, state) {
+  let out = "";
+  let i = 0;
+  if (state.long) {
+    const opener = state.long;
+    const end = line.indexOf(opener);
+    if (end === -1) return "";
+    state.long = null;
+    i = end + opener.length;
+  }
   let quote = null;
-  for (let i = 0; i < line.length; i += 1) {
+  while (i < line.length) {
     const ch = line[i];
     if (quote) {
-      if (ch === "\\" && quote === '"') i += 1;
-      else if (ch === quote) quote = null;
+      if (ch === "\\" && quote === '"') {
+        out += line.slice(i, i + 2);
+        i += 2;
+        continue;
+      }
+      out += ch;
+      if (ch === quote) quote = null;
+      i += 1;
       continue;
     }
-    if (ch === '"' || ch === "'") quote = ch;
-    else if (ch === "#") return line.slice(0, i);
+    if (ch === "#") break;
+    if (ch === '"' || ch === "'") {
+      const triple = ch.repeat(3);
+      if (line.startsWith(triple, i)) {
+        const closer = line.indexOf(triple, i + 3);
+        if (closer === -1) {
+          state.long = triple;
+          break;
+        }
+        i = closer + 3;
+        continue;
+      }
+      quote = ch;
+      out += ch;
+      i += 1;
+      continue;
+    }
+    out += ch;
+    i += 1;
   }
-  return line;
+  return out;
 }
 
 // First "=" outside quotes and outside nested tables/arrays.
@@ -340,6 +411,7 @@ function joinTomlStatements(text) {
   let buf = "";
   let depth = 0;
   let quote = null;
+  const stripState = { long: null };
   const scan = (fragment) => {
     for (let i = 0; i < fragment.length; i += 1) {
       const ch = fragment[i];
@@ -354,10 +426,10 @@ function joinTomlStatements(text) {
     }
   };
   for (const line of String(text).split("\n")) {
-    const code = stripTomlComment(line);
+    const code = stripTomlComment(line, stripState);
     buf += (buf ? " " : "") + code;
     scan(code);
-    if (depth === 0 && !quote) {
+    if (depth === 0 && !quote && !stripState.long) {
       statements.push(buf);
       buf = "";
     }

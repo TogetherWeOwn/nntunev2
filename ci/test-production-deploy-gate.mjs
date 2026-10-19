@@ -30,6 +30,7 @@ import {
   assertVersionOverride,
   assertExpectedVersionId,
   assertExpectedBuildSha,
+  smoke,
 } from "../bin/smoke.mjs";
 
 const SHA_A = "a".repeat(40);
@@ -309,6 +310,31 @@ describe("assertProductionSecretsShape", () => {
       assert.throws(() => assertProductionSecretsShape(config), /review production secret requirements/, spelling);
     }
   });
+
+  it("refuses unicode-escaped production keys", () => {
+    const bypasses = {
+      unicodeHeader: '["env"."\\u0070roduction"."vars"]\nFOO = "x"\n',
+      unicodeLongHeader: '["\\U00000065nv"."production"."vars"]\nFOO = "x"\n',
+      unicodeInline: 'env = { "\\U00000070roduction" = { vars = { FOO = "x" } } }\n',
+      unicodeDotted: '[env]\n"produc\\u0074ion".vars.FOO = "x"\n',
+    };
+    for (const [spelling, config] of Object.entries(bypasses)) {
+      assert.throws(() => assertProductionSecretsShape(config), /review production secret requirements/, spelling);
+    }
+    // A decoded escape that is NOT production must not over-refuse.
+    assertProductionSecretsShape('["env"."pro\\"duction"]\nname = "x"\n');
+  });
+
+  it("skips triple-quoted strings before later production tables", () => {
+    const bypasses = {
+      basicMultiline: 'description = """foo " bar\nbaz"""\n[env.production.vars]\nFOO = "x"\n',
+      literalMultiline: "description = '''a # b\nc'''\n[env.production.vars]\nFOO = \"x\"\n",
+      bracesInString: 'meta = """{"a": [1, 2]}"""\n[env.production.vars]\nFOO = "x"\n',
+    };
+    for (const [spelling, config] of Object.entries(bypasses)) {
+      assert.throws(() => assertProductionSecretsShape(config), /review production secret requirements/, spelling);
+    }
+  });
 });
 
 describe("resolvePromotionSha", () => {
@@ -390,6 +416,68 @@ describe("smoke identity flags", () => {
     assert.throws(() => assertExpectedBuildSha("abc"), /40-hex/);
     assert.equal(assertVersionOverride(`nntune-web="${UUID}"`), `nntune-web="${UUID}"`);
     assert.throws(() => assertVersionOverride("no-equals"), /version-override must look like/);
+  });
+});
+
+describe("smoke build identity", () => {
+  const ORIGIN = "https://web.nntune.io";
+
+  function stubFetch({ sha = SHA_A } = {}) {
+    return async (url) => {
+      const path = new URL(url).pathname;
+      const bodies = {
+        "/api/health": JSON.stringify({ ok: true, version: "9.9.9" }),
+        "/api/ready": JSON.stringify({ ok: true }),
+        "/api/build": JSON.stringify({ sha }),
+        "/": "<!doctype html><title>NNTune</title>",
+        "/signup": "<!doctype html><title>Get started</title>",
+        "/pricing": "<!doctype html><title>pricing plans</title>",
+        "/login": "<!doctype html><title>Sign in</title>",
+      };
+      return {
+        status: 200,
+        headers: {
+          get: (name) =>
+            name.toLowerCase() === "content-type"
+              ? (path.startsWith("/api/") ? "application/json" : "text/html")
+              : null,
+        },
+        text: async () => bodies[path] ?? "",
+      };
+    };
+  }
+
+  async function runSmoke(fetchImpl, options) {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = fetchImpl;
+    try {
+      return await smoke(ORIGIN, { log: () => {}, ...options });
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  it("returns false when the serving build sha differs from expected", async () => {
+    assert.equal(await runSmoke(stubFetch({ sha: SHA_B }), { expectedBuildSha: SHA_A }), false);
+  });
+
+  it("returns true on exact build sha match", async () => {
+    assert.equal(await runSmoke(stubFetch({ sha: SHA_A }), { expectedBuildSha: SHA_A }), true);
+  });
+
+  it("requires a known serving sha under expectedVersionId", async () => {
+    assert.equal(await runSmoke(stubFetch({ sha: "unknown" }), { expectedVersionId: UUID }), false);
+    assert.equal(await runSmoke(stubFetch({ sha: SHA_A }), { expectedVersionId: UUID }), true);
+  });
+
+  it("throws when versionOverride combines with expectedVersionId", async () => {
+    await assert.rejects(
+      runSmoke(stubFetch(), {
+        versionOverride: `nntune-web="${UUID}"`,
+        expectedVersionId: UUID,
+      }),
+      /without --version-override/,
+    );
   });
 });
 
