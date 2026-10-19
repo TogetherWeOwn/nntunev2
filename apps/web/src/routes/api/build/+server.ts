@@ -16,5 +16,5 @@ import type { RequestHandler } from './$types';
 // BUILD_SHA (no wrangler.toml declares it), so there is no override to
 // lose by serving the bake directly.
 export const GET: RequestHandler = () => {
-	return json({ sha: BUILD_SHA });
+	return json({ sha: BUILD_SHA }, { headers: { 'cache-control': 'no-store' } });
 };

@@ -8,8 +8,9 @@ import type { Handle } from '@sveltejs/kit/hooks';
  * flow back through `resolve`. The Content-Security-Policy header itself is
  * emitted by SvelteKit's `csp` option (see `vite.config.ts`), which owns
  * the per-request nonces; only the static headers belong here. `set` (not
- * `append`) so a route can never weaken or duplicate them, and cache
- * headers set by the demo audio/artwork routes are left untouched.
+ * `append`) so a route can never weaken or duplicate them, and per-route
+ * cache headers (demo audio/artwork, no-store operational endpoints) are
+ * left untouched.
  */
 export const handle: Handle = async ({ event, resolve }) => {
 	const response = await resolve(event);

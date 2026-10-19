@@ -9,6 +9,10 @@ describe('readyResponse', () => {
 		expect(res.status).toBe(200);
 		await expect(res.json()).resolves.toEqual({ ok: true });
 	});
+
+	it('sends Cache-Control: no-store', () => {
+		expect(readyResponse().headers.get('cache-control')).toBe('no-store');
+	});
 });
 
 describe('notReadyResponse', () => {
@@ -18,5 +22,12 @@ describe('notReadyResponse', () => {
 		expect(res.status).toBe(503);
 		expect(res.headers.get('retry-after')).toBe('5');
 		await expect(res.json()).resolves.toEqual({ ok: false });
+	});
+
+	it('sends Cache-Control: no-store alongside Retry-After', () => {
+		const res = notReadyResponse(5);
+
+		expect(res.headers.get('cache-control')).toBe('no-store');
+		expect(res.headers.get('retry-after')).toBe('5');
 	});
 });
