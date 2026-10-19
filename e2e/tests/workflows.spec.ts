@@ -1166,16 +1166,24 @@ test.describe('locked-dependency ci builds (static pin)', () => {
   const readme = readFileSync(new URL('../../README.md', import.meta.url), 'utf8');
 
   // Cargo invocations for one verb inside one ci job: continuations joined,
-  // trailing comments cut so `# --locked` cannot satisfy the locked pin.
+  // trailing comments cut so `# --locked` cannot satisfy the locked pin,
+  // then split on shell separators so each chained `cargo` invocation is
+  // asserted on its own — one --locked token must not credit a sibling
+  // invocation on the same run line.
   const jobCargoSteps = (workflow: string, job: string, verb: string): string[] => {
     const section = jobSection(stripFullLineComments(workflow), job).replace(/\\\r?\n\s*/g, ' ');
     const verbPattern = new RegExp(`\\bcargo\\s+${verb}\\b`);
     return section
       .split('\n')
       .map((line) => line.split(/\s+#.*$/)[0]!)
-      .filter((line) => verbPattern.test(line));
+      .flatMap((line) => line.split(/\s*(?:&&|\|\||;)\s*/))
+      .filter((invocation) => verbPattern.test(invocation));
   };
-  const hasLockedFlag = (command: string): boolean => /(?:^|\s)--locked(?:\s|$)/.test(command);
+  // `--frozen` is cargo's alias for `--locked --offline` (cargo --help), so
+  // it resolves locked and the unlocked pin must see it. Token boundaries
+  // keep pnpm's `--frozen-lockfile` from ever matching.
+  const hasLockedFlag = (command: string): boolean =>
+    /(?:^|\s)--(?:locked|frozen)(?:\s|$)/.test(command);
 
   const assertApiLocked = (workflow: string) => {
     for (const verb of ['test', 'clippy', 'check']) {
@@ -1269,6 +1277,17 @@ test.describe('locked-dependency ci builds (static pin)', () => {
       'cargo test --locked --manifest-path workers/api/Cargo.toml',
       'cargo test --manifest-path workers/api/Cargo.toml # --locked',
     );
+    // Chained-invocation bypass: splitting the api test step into two
+    // `cargo test` invocations on one run line must not let one --locked
+    // token credit the sibling. Both orders must throw.
+    const chainLockedFirst = ciCode.replace(
+      'cargo test --locked --manifest-path workers/api/Cargo.toml',
+      'cargo test --locked --manifest-path workers/api/Cargo.toml --lib && cargo test --manifest-path workers/api/Cargo.toml --doc',
+    );
+    const chainLockedSecond = ciCode.replace(
+      'cargo test --locked --manifest-path workers/api/Cargo.toml',
+      'cargo test --manifest-path workers/api/Cargo.toml --lib && cargo test --locked --manifest-path workers/api/Cargo.toml --doc',
+    );
     // Policy drift the other way: locking an unlocked job without updating
     // the README asymmetry must trip the unlocked pin.
     const lockMb = ciCode.replace(
@@ -1283,6 +1302,20 @@ test.describe('locked-dependency ci builds (static pin)', () => {
       'cargo test --manifest-path workers/repair/Cargo.toml',
       'cargo test --locked --manifest-path workers/repair/Cargo.toml',
     );
+    // `--frozen` is cargo's `--locked --offline` alias: it resolves locked,
+    // so it must trip the unlocked pin exactly like `--locked` does.
+    const frozenMbClippy = ciCode.replace(
+      'cargo clippy --manifest-path workers/mb/Cargo.toml',
+      'cargo clippy --frozen --manifest-path workers/mb/Cargo.toml',
+    );
+    const frozenMbCheck = ciCode.replace(
+      'cargo check --manifest-path workers/mb/Cargo.toml',
+      'cargo check --frozen --manifest-path workers/mb/Cargo.toml',
+    );
+    const frozenRepairWasmClippy = ciCode.replace(
+      'cargo clippy --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown',
+      'cargo clippy --frozen --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown',
+    );
     // Prose drift: rewriting the policy sentence without the job pins (or
     // vice versa) must trip the prose pin.
     const proseLocksAll = readme.replace(
@@ -1294,12 +1327,22 @@ test.describe('locked-dependency ci builds (static pin)', () => {
       'jobs resolve with --locked',
     );
 
-    for (const mutant of [dropTest, dropClippy, dropCheck, commentFlag]) {
+    for (const mutant of [
+      dropTest,
+      dropClippy,
+      dropCheck,
+      commentFlag,
+      chainLockedFirst,
+      chainLockedSecond,
+    ]) {
       expect(() => assertApiLocked(mutant), 'mutant must violate the api locked pin').toThrow();
     }
     expect(() => assertJobUnlocked(lockMb, 'rust-mb', 'mb')).toThrow();
     expect(() => assertJobUnlocked(lockIngest, 'rust-ingest', 'ingest')).toThrow();
     expect(() => assertJobUnlocked(lockRepair, 'rust-repair', 'repair')).toThrow();
+    expect(() => assertJobUnlocked(frozenMbClippy, 'rust-mb', 'mb')).toThrow();
+    expect(() => assertJobUnlocked(frozenMbCheck, 'rust-mb', 'mb')).toThrow();
+    expect(() => assertJobUnlocked(frozenRepairWasmClippy, 'rust-repair', 'repair')).toThrow();
     for (const mutant of [proseLocksAll, proseUnlocksApi]) {
       expect(() => assertReadmeAsymmetry(mutant), 'mutant must violate the prose pin').toThrow();
     }
