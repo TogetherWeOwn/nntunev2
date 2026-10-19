@@ -373,6 +373,10 @@ jobs:
         run: bash containers/mb-import/tests/test_argv_hygiene.sh
       - name: Run mb-import pg-env tests
         run: bash containers/mb-import/tests/test_pg_env.sh
+      - name: Run mb-import runtime-user pin test
+        run: bash containers/mb-import/tests/test_runtime_user.sh
+      - name: Run mb-import runtime-user pin self-test
+        run: bash containers/mb-import/tests/test_runtime_user.sh --self-test
 
   # Real-Postgres migration tests: applies every migrations/*.sql, in order,
   # to an empty throwaway database (twice, to prove idempotency) and runs
@@ -602,6 +606,8 @@ jobs:
         run: grep -q '^RUN cargo build --locked --release -p mb-import-validate' containers/mb-import/Dockerfile
       - name: Build importer image from clean checkout
         run: docker build -f containers/mb-import/Dockerfile -t mb-import:ci .
+      - name: Smoke-test default CMD as the runtime user
+        run: set -o pipefail; docker run --rm mb-import:ci | grep -q '^Usage:'
       # Apply only the mirror-target migrations (base 0001 + importer 0014
       # + track membership 0016); app migrations need the full app schema
       # and run in api-migrations.
