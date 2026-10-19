@@ -78,7 +78,10 @@ SESSION_TTL_SECS = "86400"
 # are unpadded base64url (43 chars for 32 bytes; generate with
 # `openssl rand 32 | basenc --base64url | tr -d '='`, decode with
 # `nntune_api::b64::decode` — padded std base64 is rejected):
-#   VAULT_KEK_BASE64              32-byte KEK, unpadded base64url (versioned; rotate via rewrap job)
+#   VAULT_KEK_BASE64              32-byte KEK, unpadded base64url (single live
+#                                 version; routine rotation via the rewrap job
+#                                 is NOT implemented — see
+#                                 docs/security/kek-rotation.md §7 banner)
 #   VAULT_KEK_VERSION             integer version matching the KEK
 #   SESSION_SECRET_BASE64         HMAC secret for session cookies (256-bit, unpadded base64url)
 #   SESSION_SECRET_PREVIOUS_BASE64  verify-only previous HMAC secret: set ONLY
@@ -95,9 +98,11 @@ SESSION_TTL_SECS = "86400"
 #   NATIVE_REST_PEPPER_BASE64       HMAC pepper for scoped native REST bearer
 #                                 credentials (ADR 0010, migration 0019),
 #                                 32+ bytes unpadded base64url. Dedicated
-#                                 keyring, separate from SUBSONIC_INDEX_PEPPER
-#                                 so either surface rotates without forcing
-#                                 the other. BOTH pepper vars set, or neither:
+#                                 keyring, separate from the planned
+#                                 SUBSONIC_INDEX_PEPPER Subsonic keyring
+#                                 (not wired in the Worker) so either surface
+#                                 rotates without forcing the other. BOTH
+#                                 pepper vars set, or neither:
 #                                 unset, issuance endpoints fail closed
 #                                 per-request and bearer routes 401 while
 #                                 every other route keeps serving; half-set
@@ -105,6 +110,10 @@ SESSION_TTL_SECS = "86400"
 #   NATIVE_REST_PEPPER_VERSION      integer version bound to the pepper above
 #                                 (stored per row; lookup is by the exact
 #                                 composite (pepper_version, key_hmac)).
+#                                 The Worker holds exactly one pair — no
+#                                 dual-pepper window — so pepper rotation
+#                                 currently means reissuing credentials (see
+#                                 ADR 0010 implementation status).
 #   EMAIL_API_KEY                 transactional email provider key (magic-link delivery)
 #   QA_AUTH_TOKEN                 bearer for POST /api/test-codes (staging QA
 #                                 seam only). High-entropy; same value as the

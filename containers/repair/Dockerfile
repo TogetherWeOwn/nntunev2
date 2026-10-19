@@ -21,11 +21,13 @@ RUN curl -fsSL -o par2.tar.xz \
 
 FROM rust:1-bookworm AS server
 WORKDIR /src
-# Cargo.lock is intentionally not tracked for this workspace. Copy the full
-# (dockerignored) workspace so Cargo can resolve all member manifests on a
-# clean checkout, then build the single server package online.
+# The root Cargo.lock is tracked, proven fresh in CI (`cargo metadata
+# --locked`) and audited by cargo-deny. Copy the full (dockerignored)
+# workspace so Cargo can resolve all member manifests on a clean checkout,
+# then build the single server package --locked so the shipped binary only
+# ever links the audited dependency set.
 COPY . .
-RUN cargo build --release -p nntune-repair-server \
+RUN cargo build --locked --release -p nntune-repair-server \
  && install -m0755 target/release/nntune-repair-server /usr/local/bin/nntune-repair-server
 
 FROM debian:bookworm-slim AS runtime

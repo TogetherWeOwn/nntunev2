@@ -13,11 +13,12 @@ worksheet spec, the recording-mbids
 assertion, the staging demo-audio contract spec, the demo-media
 sessionless spec, the PWA manifest spec (#211), the anonymous-Access
 denial specs (#185, #188), the branded-error-page specs (#203), the
-security-headers staging probe, the deployed-build identity route
+security-headers staging probe, the sign-out-everywhere revocation spec,
+the deployed-build identity route
 (#196) merged, the deployed-build promotion-SHA opening assertion spec
 (`e2e/tests/build-identity.spec.ts`), and the closing same-build
 re-read (`e2e/tests/zz-build-identity-final.spec.ts`) added:
-`npm --prefix e2e run e2e:list` lists 378 tests in 24 files, and
+`npm --prefix e2e run e2e:list` lists 379 tests in 25 files, and
 `(cd apps/web && pnpm exec playwright test --list)` lists 110 tests in
 23 files (94 in 21 files as previously verified, plus the 5-test
 paywall-elapsed-time spec and the 11-test passkey-dismissal spec; the
@@ -175,6 +176,25 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   denial), the cross-scope denials, the header-only transport and the
   secret-free list surface — skipping green without staging and failing
   closed once configured. Credential hardening, not journey coverage.
+- `e2e/tests/security-sign-out-everywhere.spec.ts:135`
+  "sign-out-everywhere revokes the session and closes follow-up checks" pins
+  live sign-out-everywhere revocation behind the security page: it mints via
+  `POST /api/test-accounts`, opens a second concurrent session for the same
+  mailbox via `POST /v1/auth/magic/start` plus `POST /api/test-codes` plus
+  `POST /v1/auth/magic/finish` (no session cookie on the finish, mirroring
+  `e2e/tests/login-magic-link.spec.ts`) and requires `GET /v1/vault` to
+  answer 200 with that second cookie pre-revoke, then posts
+  `/v1/session/revoke-all` as the session cookie plus the exact `Origin`
+  (mutations read the `__Host-nntune-session` cookie and ignore the bearer
+  — `session_cookie_value` in `workers/api/src/handlers.rs`), requires 200
+  `{ok:true}` with a clearing `Set-Cookie` (expired via `Max-Age=0`), then
+  requires `GET /v1/vault` to answer 401 and a second live check
+  `POST /v1/session/refresh` to answer 401 with the same revoked cookie,
+  plus `GET /v1/vault` to answer 401 with the second cookie — no rotation
+  path survives the sweep, and a single-session-logout mutant stays green
+  everywhere except that final leg.
+  Skips pre-deploy and fails closed on CI without `QA_AUTH_TOKEN`, mirroring
+  `e2e/tests/login-magic-link.spec.ts`. Session hardening, not journey coverage.
 - `e2e/tests/demo-media-sessionless.spec.ts` pins the sessionless invariant
   live: `e2e/tests/demo-media-sessionless.spec.ts:25` "sessionless GET
   /api/demo/audio serves synthetic bytes (200; 206 for Range)" plus the
