@@ -110,6 +110,22 @@ pub fn classify_body_reply(
     }
 }
 
+/// Fold one more streamed reply chunk into the buffer, enforcing the reply cap
+/// on the running total. Pure so the streaming policy is executed by unit tests
+/// without a live Worker `Env` and pool `Response`: a missing or lying
+/// `Content-Length` falls through to the chunk loop, which can never buffer
+/// more than `MAX_BODY_REPLY_BYTES`, because the `Rejected` fires on the chunk
+/// that would cross it and the excess is never retained. Callers must propagate
+/// the `Err`: a silently truncated prefix handed to `classify_body_reply`
+/// classifies as `Bytes`, not `Rejected`, so truncation is never a fix here.
+fn push_reply_chunk(buf: &mut Vec<u8>, chunk: &[u8]) -> Result<(), PoolBodyError> {
+    if buf.len().saturating_add(chunk.len()) > MAX_BODY_REPLY_BYTES {
+        return Err(PoolBodyError::Rejected);
+    }
+    buf.extend_from_slice(chunk);
+    Ok(())
+}
+
 /// Send one body request to the user's pool and classify the answer.
 ///
 /// The reply body is never buffered past `MAX_BODY_REPLY_BYTES`: a truthful
@@ -169,13 +185,87 @@ pub async fn call_pool_body(env: &Env, req: &BodyRequest) -> Result<BodyFetch, P
             let mut stream = response.stream().map_err(|_| unavailable)?;
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|_| unavailable)?;
-                if buf.len().saturating_add(chunk.len()) > MAX_BODY_REPLY_BYTES {
-                    return Err(PoolBodyError::Rejected);
-                }
-                buf.extend_from_slice(&chunk);
+                push_reply_chunk(&mut buf, &chunk)?;
             }
             buf
         }
     };
     classify_body_reply(status, retry_after.as_deref(), &bytes)
+}
+
+#[cfg(test)]
+mod reply_chunk_tests {
+    //! Executed pins for the streamed cap enforcement (`push_reply_chunk`):
+    //! the retention suite pins the fetcher wiring by source, so these tests
+    //! pin the drain policy itself at the cap boundary, including the
+    //! absent/lying-`Content-Length` path (any declared length falls through to
+    //! this fold). Deleting the check, flipping `>` to `>=`, or truncating to
+    //! the cap must each fail here.
+
+    use super::*;
+
+    fn chunk(n: usize) -> Vec<u8> {
+        vec![0x41u8; n]
+    }
+
+    #[test]
+    fn streamed_chunks_at_exact_cap_classify_as_bytes() {
+        // Multi-chunk body totalling exactly the cap: kept whole, then the
+        // classifier must see every byte as `Bytes` (producer allows `==` cap).
+        let mut buf = Vec::new();
+        let half = MAX_BODY_REPLY_BYTES / 2;
+        assert!(push_reply_chunk(&mut buf, &chunk(half)).is_ok());
+        assert!(push_reply_chunk(&mut buf, &chunk(MAX_BODY_REPLY_BYTES - half)).is_ok());
+        assert_eq!(buf.len(), MAX_BODY_REPLY_BYTES);
+        match classify_body_reply(200, None, &buf) {
+            Ok(BodyFetch::Bytes(bytes)) => assert_eq!(bytes, buf),
+            other => panic!("exactly-at-cap streamed body must pass as Bytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streamed_chunk_one_past_cap_is_rejected() {
+        // Cap+1 spread across chunks: the crossing chunk fails closed, and the
+        // excess byte is never retained.
+        let mut buf = Vec::new();
+        let half = MAX_BODY_REPLY_BYTES / 2;
+        assert!(push_reply_chunk(&mut buf, &chunk(half)).is_ok());
+        assert!(push_reply_chunk(&mut buf, &chunk(MAX_BODY_REPLY_BYTES - half)).is_ok());
+        assert_eq!(
+            push_reply_chunk(&mut buf, &[0x41u8]),
+            Err(PoolBodyError::Rejected)
+        );
+        assert_eq!(
+            buf.len(),
+            MAX_BODY_REPLY_BYTES,
+            "the crossing chunk must be dropped, not retained"
+        );
+    }
+
+    #[test]
+    fn single_chunk_over_cap_is_rejected_without_buffering() {
+        let mut buf = Vec::new();
+        assert_eq!(
+            push_reply_chunk(&mut buf, &chunk(MAX_BODY_REPLY_BYTES + 1)),
+            Err(PoolBodyError::Rejected)
+        );
+        assert!(
+            buf.is_empty(),
+            "an over-cap chunk must buffer nothing, not a truncated prefix"
+        );
+    }
+
+    #[test]
+    fn failed_chunk_leaves_prior_bytes_for_the_rejected_path() {
+        // A lying-low (or absent) declared length reaches this fold with no
+        // pre-check help: the oversize stream must still end `Rejected`, with
+        // only the capped prefix in the buffer and no truncated `Bytes`.
+        let mut buf = Vec::new();
+        assert!(push_reply_chunk(&mut buf, b"hello").is_ok());
+        assert_eq!(
+            push_reply_chunk(&mut buf, &chunk(MAX_BODY_REPLY_BYTES)),
+            Err(PoolBodyError::Rejected)
+        );
+        assert_eq!(buf, b"hello", "the failed push must not retain the excess");
+    }
 }
