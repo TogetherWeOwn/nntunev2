@@ -33,7 +33,7 @@ use nntune_ingest::newznab::{
 };
 
 /// Query string every successful build below must carry verbatim.
-const QUERY: &str = "?t=music&o=json&q=dark%20side%20moon&limit=25&offset=50&cat=3000&cat=3040";
+const QUERY: &str = "?t=music&o=json&q=dark%20side%20moon&limit=25&offset=50&cat=3000,3040";
 
 fn params<'a>(
     base_url: &'a str,
@@ -151,7 +151,7 @@ fn preserved_endpoint_keeps_the_full_key_free_query_shape() {
     assert_eq!(
         url,
         "https://news.example.com/newznab/api\
-         ?t=music&o=json&q=dark%20side%20moon&limit=25&offset=50&cat=3000&cat=3040"
+         ?t=music&o=json&q=dark%20side%20moon&limit=25&offset=50&cat=3000,3040"
     );
     assert!(!url.to_ascii_lowercase().contains("apikey"), "{url}");
     assert!(!url.contains("/api/api"), "{url}");
@@ -242,7 +242,11 @@ fn cap_boundaries_still_build_on_saved_endpoints() {
     );
     assert!(url.contains("&limit=100&offset=10000"), "{url}");
     assert!(!url.contains("/api/api"), "{url}");
-    for cat in &sixteen {
-        assert!(url.contains(&format!("&cat={cat}")), "cat {cat}: {url}");
-    }
+    assert_eq!(
+        url.split('&')
+            .filter_map(|param| param.strip_prefix("cat="))
+            .collect::<Vec<_>>(),
+        ["0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"],
+        "{url}"
+    );
 }

@@ -27,7 +27,7 @@ import { expect, test, type Locator, type Page, type Route } from '@playwright/t
  */
 
 const CHECKOUT_ROUTE = '**/v1/billing/checkout';
-const MOCKED_CHECKOUT_URL = 'https://checkout.example.test/session/fixture';
+const MOCKED_CHECKOUT_URL = 'https://checkout.stripe.com/session/fixture';
 
 interface CheckoutRequestRecord {
 	method: string;
@@ -70,7 +70,7 @@ async function fulfill(route: Route, spec: FulfillSpec): Promise<void> {
 
 /** Fulfill the (mocked) external checkout navigation target locally. */
 async function mockCheckoutDestination(page: Page): Promise<void> {
-	await page.route('https://checkout.example.test/**', (route) =>
+	await page.route('https://checkout.stripe.com/**', (route) =>
 		route.fulfill({
 			status: 200,
 			headers: { 'content-type': 'text/html' },
@@ -128,7 +128,7 @@ async function holdCheckoutDestination(page: Page) {
 		openGate = resolve;
 	});
 
-	await page.route('https://checkout.example.test/**', async (route) => {
+	await page.route('https://checkout.stripe.com/**', async (route) => {
 		arrivals += 1;
 		await gate;
 		await route.fulfill({

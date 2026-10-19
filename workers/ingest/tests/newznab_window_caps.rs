@@ -64,12 +64,22 @@ fn category_cap_boundary_builds_at_sixteen_and_rejects_at_seventeen() {
     let sixteen: Vec<u32> = (0..16).collect();
     let seventeen: Vec<u32> = (0..17).collect();
     let url = build_search_url(&params("x", &sixteen, 25, 0)).expect("16 categories must build");
-    for cat in &sixteen {
-        assert!(
-            url.contains(&format!("&cat={cat}")),
-            "category {cat} must ride the URL"
-        );
-    }
+    // The union rides one comma-delimited `cat` value (Newznab MUSIC-SEARCH);
+    // repeated `&cat=` params are the defect (scalar parsers keep one).
+    let joined = sixteen
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    assert_eq!(
+        url.matches("&cat=").count(),
+        1,
+        "union must ride one cat value: {url}"
+    );
+    assert!(
+        url.contains(&format!("&cat={joined}")),
+        "all 16 categories must ride the union in order: {url}"
+    );
     assert_eq!(
         build_search_url(&params("x", &seventeen, 25, 0)).err(),
         Some("too many categories (max 16)")

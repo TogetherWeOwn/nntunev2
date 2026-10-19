@@ -336,8 +336,14 @@ struct Live {
     /// `PlayInput::now_unix` at play time: the cache write stamped on
     /// `finalize`, so the SWR clock runs from when the bytes were fetched.
     started_at: u64,
-    /// File size declared by the first fetched segment.
+    /// File size for the play: the first fetched segment's declared size,
+    /// or the ranges total when a disagreeing segment 0 was refetched and
+    /// segment 1 corroborated the ranges over a self-inconsistent provider.
     total: u64,
+    /// Segment prefetched while resolving a disagreeing segment 0 (the
+    /// corroborating segment 1): the next `load` for its index ingests it
+    /// instead of fetching it a second time.
+    prefetched: Option<(usize, Decoded)>,
     /// The most recently decoded segment, shared with `pending` (no copy).
     buf: Arc<[u8]>,
     buf_start: u64,
@@ -555,6 +561,18 @@ fn play_authorized(
             ))
         }
     };
+    // Corroborated first-segment agreement: segment 0 alone cannot tell a
+    // lying provider `size=` (ranges win) from lying NZB ranges (provider
+    // wins) — offset and length agree either way. A covering `!= 0`
+    // disagreement refetches the different segment 0 and keeps its declared
+    // size, as before. A `== 0` disagreement refetches the same article
+    // (the discard-and-prefix-walk) and breaks the tie with segment 1: only
+    // when segment 1 corroborates the ranges total against a
+    // self-inconsistent provider does the ranges total define the 206
+    // window; otherwise the provider total stands, so wrong ranges can
+    // never make a playable track unplayable. Single-segment plays keep the
+    // legacy adopt (no second article exists to corroborate).
+    let mut prefetched: Option<(usize, Decoded)> = None;
     if let Some(r) = ranges {
         let agrees = first.file_size == r[r.len() - 1].1
             && first.offset == r[first_seg].0
@@ -596,6 +614,83 @@ fn play_authorized(
                     ));
                 }
             }
+        } else if !agrees && first_seg == 0 && input.segments.len() > 1 {
+            // Same-article refetch, then corroborate with segment 1 on the
+            // same connection. A tie-break failure keeps the legacy provider
+            // path so the later walk surfaces it exactly as before.
+            match fetch_segment(&mut client, &input.segments[0]) {
+                Ok(decoded) => {
+                    first = decoded;
+                }
+                Err(SegmentError::Nntp(e)) => {
+                    let failure = nntp_failure(e, &input.segments[0]);
+                    let keep = if failure.1 == Conn::KeepWarm {
+                        Some(client)
+                    } else {
+                        None
+                    };
+                    return Err(settle(
+                        pool,
+                        meter,
+                        lease,
+                        keep,
+                        failure,
+                        user,
+                        input.track_id,
+                    ));
+                }
+                Err(SegmentError::Decode(e)) => {
+                    return Err(settle(
+                        pool,
+                        meter,
+                        lease,
+                        Some(client),
+                        (PlayError::Decode(e), Conn::KeepWarm),
+                        user,
+                        input.track_id,
+                    ));
+                }
+            }
+            let ranges_total = r[r.len() - 1].1;
+            match fetch_segment(&mut client, &input.segments[1]) {
+                Ok(second) => {
+                    let first_size = first.file_size;
+                    if second.file_size == ranges_total && first_size != ranges_total {
+                        // Segment 1 corroborates the ranges against a
+                        // self-inconsistent provider: ground truth wins and the
+                        // lying `size=` never defines the window.
+                        first.file_size = ranges_total;
+                    }
+                    if second.file_size == ranges_total || second.file_size == first_size {
+                        // Worth one save: the walk consumes this instead of a
+                        // second fetch of segment 1.
+                        prefetched = Some((1, second));
+                    }
+                    // Else all three sizes disagree: drop it and let the walk
+                    // refetch segment 1 on the provider total as before.
+                }
+                Err(SegmentError::Nntp(e)) => {
+                    let failure = nntp_failure(e, &input.segments[1]);
+                    if failure.1 != Conn::KeepWarm {
+                        return Err(settle(
+                            pool,
+                            meter,
+                            lease,
+                            None,
+                            failure,
+                            user,
+                            input.track_id,
+                        ));
+                    }
+                    // Article-local failure: the client is still framed, so
+                    // fall through and let the walk refetch segment 1.
+                }
+                Err(SegmentError::Decode(_)) => {
+                    // Undecodable bytes leave the connection framed; fall
+                    // through and let the walk refetch segment 1.
+                }
+            }
+            first_seg = 0;
         }
     }
     if redialed {
@@ -628,6 +723,7 @@ fn play_authorized(
         cipher_key: input.cipher_key,
         started_at: input.now_unix,
         total: first.file_size,
+        prefetched,
         buf: Arc::from([]),
         buf_start: 0,
         pending: BTreeMap::new(),
@@ -892,8 +988,21 @@ impl Live {
         Ok(())
     }
 
-    /// Fetch + ingest segment `idx`, wherever it sits in the file.
+    /// Fetch + ingest segment `idx`, wherever it sits in the file. A segment
+    /// prefetched during disagreement resolution is ingested without a
+    /// second fetch; anything else goes to the wire as before.
     fn load(&mut self, idx: usize) -> Result<(), Failure> {
+        if self
+            .prefetched
+            .as_ref()
+            .is_some_and(|(pidx, _)| *pidx == idx)
+        {
+            let (_, decoded) = self.prefetched.take().expect("prefetch checked");
+            // The prefetch happened before `Live` was built; the epoch
+            // recorded at construction already bounds it.
+            self.ingest(idx, decoded)?;
+            return Ok(());
+        }
         let mid = self.segments[idx].clone();
         let fetch_epoch = self.provider_error_epoch.load(Ordering::Acquire);
         match fetch_segment(&mut self.client, &mid) {
