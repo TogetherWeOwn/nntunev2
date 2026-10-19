@@ -110,7 +110,7 @@ impl NntpPool {
         let dial = || {
             let config = config.clone();
             async move {
-                let transport = WorkerTransport::connect(&config)
+                let transport = WorkerTransport::connect_pinned(&config)
                     .map_err(|e| nntune_core::Error::Io(std::io::Error::other(e.to_string())))?;
                 NntpClient::connect(transport, &config).await
             }
@@ -146,7 +146,7 @@ impl NntpPool {
         let dial = || {
             let config = config.clone();
             async move {
-                let transport = WorkerTransport::connect(&config)
+                let transport = WorkerTransport::connect_pinned(&config)
                     .map_err(|e| nntune_core::Error::Io(std::io::Error::other(e.to_string())))?;
                 NntpClient::connect(transport, &config).await
             }
