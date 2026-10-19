@@ -109,9 +109,28 @@ pub fn classify_body_reply(
     }
 }
 
+/// Longest one pool body stub call may take, headers plus body sharing one
+/// cancellable deadline. Overridable in tests via
+/// [`call_pool_body_with_deadline`]; production callers use
+/// [`call_pool_body`].
+pub const POOL_BODY_DEADLINE_MS: u64 = 10_000;
+
 /// Send one body request to the user's pool and classify the answer.
 pub async fn call_pool_body(env: &Env, req: &BodyRequest) -> Result<BodyFetch, PoolBodyError> {
+    call_pool_body_with_deadline(env, req, POOL_BODY_DEADLINE_MS).await
+}
+
+/// Body-call worker behind [`call_pool_body`] with an explicit per-call
+/// deadline, so tests can shrink the bound without waiting the default.
+pub async fn call_pool_body_with_deadline(
+    env: &Env,
+    req: &BodyRequest,
+    deadline_ms: u64,
+) -> Result<BodyFetch, PoolBodyError> {
     let unavailable = PoolBodyError::Retry {
+        after_secs: DEFAULT_RETRY_SECS,
+    };
+    let expired = PoolBodyError::Retry {
         after_secs: DEFAULT_RETRY_SECS,
     };
     let body = serde_json::to_string(req).map_err(|_| PoolBodyError::Rejected)?;
@@ -128,12 +147,54 @@ pub async fn call_pool_body(env: &Env, req: &BodyRequest) -> Result<BodyFetch, P
         .with_headers(headers)
         .with_body(Some(JsValue::from_str(&body)));
     let request = Request::new_with_init(POOL_BODY_URL, &init).map_err(|_| unavailable)?;
-    let mut response = stub
-        .fetch_with_request(request)
-        .await
-        .map_err(|_| unavailable)?;
+    // One cancellable deadline spans headers plus the body drain, armed
+    // before the stub fetch so slow headers count against the same budget
+    // as a stalled body (same shape as the MusicBrainz body path).
+    // `worker::Delay` only registers its timer on first poll, so racing
+    // both futures here polls (arms) the deadline from the start. Dropping
+    // the pinned `Delay` releases its timer, and every return below drops
+    // it: expiry, transport failure, and success all release the timer.
+    let mut deadline = Box::pin(worker::Delay::from(std::time::Duration::from_millis(
+        deadline_ms,
+    )));
+    let mut fetch = Box::pin(stub.fetch_with_request(request));
+    let response = std::future::poll_fn(|cx| {
+        use std::task::Poll;
+        // Deadline first: an already-fired deadline aborts even when
+        // headers are also ready.
+        if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        match std::future::Future::poll(fetch.as_mut(), cx) {
+            Poll::Ready(response) => Poll::Ready(Some(response)),
+            Poll::Pending => Poll::Pending,
+        }
+    })
+    .await;
+    let mut response = match response {
+        Some(Ok(response)) => response,
+        Some(Err(_)) | None => return Err(expired),
+    };
     let status = response.status_code();
     let retry_after = response.headers().get("retry-after").ok().flatten();
-    let bytes = response.bytes().await.map_err(|_| unavailable)?;
+    // Reuse the same deadline for the body drain: partial progress never
+    // re-arms it, so headers plus body share one total budget.
+    let mut body_read = Box::pin(response.bytes());
+    let bytes = std::future::poll_fn(|cx| {
+        use std::task::Poll;
+        if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        match std::future::Future::poll(body_read.as_mut(), cx) {
+            Poll::Ready(bytes) => Poll::Ready(Some(bytes)),
+            Poll::Pending => Poll::Pending,
+        }
+    })
+    .await;
+    let bytes = match bytes {
+        Some(Ok(bytes)) => bytes,
+        Some(Err(_)) | None => return Err(expired),
+    };
+    drop(deadline);
     classify_body_reply(status, retry_after.as_deref(), &bytes)
 }
