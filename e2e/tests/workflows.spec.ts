@@ -1569,7 +1569,7 @@ const gateScriptSource = readFileSync(gateScript, 'utf8');
 
 function runGateScript(
   junitXml: string | null,
-  env: Record<string, string> = {},
+  env: Record<string, string | undefined> = {},
 ): { status: number | null; output: string; summary: string } {
   const probe = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'journey-gate-'));
   try {
@@ -1583,7 +1583,7 @@ function runGateScript(
       env: {
         PATH: process.env.PATH,
         JUNIT_PATH: 'test-results/junit.xml',
-        MAX_ALLOWED_SKIPS: '2',
+        MAX_ALLOWED_SKIPS: '1',
         REQUIRE_QA_AUTH_TOKEN: 'false',
         GITHUB_STEP_SUMMARY: summaryFile,
         ...env,
@@ -1637,7 +1637,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(stepBlock).toContain('if: always()');
     expect(stepBlock).toContain(`steps.staging.outputs.configured == 'true'`);
     expect(stepBlock).toContain('node scripts/enforce-journey-evidence.mjs');
-    expect(stepBlock).toContain(`MAX_ALLOWED_SKIPS: '2'`);
+    expect(stepBlock).toContain(`MAX_ALLOWED_SKIPS: '1'`);
     expect(stepBlock).toContain(`REQUIRE_QA_AUTH_TOKEN: 'true'`);
   });
 
@@ -1659,20 +1659,34 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(result.output).toContain('zero journeys ran');
   });
 
-  test('allow-listed fixmes within budget pass with counts', () => {
+  test('only the recording_mbids fixme passes within budget with counts', () => {
     const xml = suiteXml(
       PASSING('signup-byop.spec.ts', 'signup creates an account') +
-        PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
-        FIXME_QUEUE +
+        PASSING('player-queue-order.spec.ts', 'player queue advances in library-selection order') +
         FIXME_MBIDS,
     );
     const result = runGateScript(xml);
     expect(result.status).toBe(0);
-    expect(result.summary).toContain('| 4 | 2 | 2 | 0 |');
+    expect(result.summary).toContain('| 3 | 2 | 1 | 0 |');
     expect(result.summary).toContain('PASS');
   });
 
-  test('allow-listed skips above the budget still fail', () => {
+  test('a queue-order skip is no longer allowed, even within budget', () => {
+    const xml = suiteXml(PASSING('health.spec.ts', 'passing journey') + FIXME_QUEUE);
+    const result = runGateScript(xml);
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('outside the allow-list');
+    expect(result.output).toContain('player-queue-order.spec.ts player queue advances');
+  });
+
+  test('the script default budget is one when MAX_ALLOWED_SKIPS is unset', () => {
+    const xml = suiteXml(PASSING('health.spec.ts', 'passing journey') + FIXME_MBIDS + FIXME_MBIDS);
+    const result = runGateScript(xml, { MAX_ALLOWED_SKIPS: undefined });
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('above the allow-list budget of 1');
+  });
+
+  test('a third skip still fails above the budget', () => {
     const xml = suiteXml(
       PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
         FIXME_QUEUE +
@@ -1732,7 +1746,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   });
 
   test('allow-list reasons name the owning specs', () => {
-    expect(gateScriptSource).toContain('player-queue-order');
+    expect(gateScriptSource).not.toContain('player-queue-order');
     expect(gateScriptSource).toContain('ingest-play-meter');
     expect(gateScriptSource).toContain('reason');
   });
@@ -1746,7 +1760,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   // reporter would stay green here while misreading staging evidence.
   const REPORTER_GREEN =
     '<?xml version="1.0" encoding="UTF-8"?>\n' +
-    '<testsuites id="" name="" tests="4" failures="0" skipped="2" errors="0" time="0.27">\n' +
+    '<testsuites id="" name="" tests="4" failures="0" skipped="1" errors="0" time="0.27">\n' +
     '<testsuite name="ingest-play-meter.spec.ts" timestamp="2026-10-19T03:09:03.424Z" hostname="" tests="2" failures="0" skipped="1" time="0.002" errors="0">\n' +
     '<testcase name="ingest play meter browser › passing journey" classname="ingest-play-meter.spec.ts" time="0.002">\n' +
     '<properties>\n<property name="serial" value="">\n</property>\n</properties>\n' +
@@ -1756,13 +1770,12 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     '<skipped>\n</skipped>\n' +
     '</testcase>\n' +
     '</testsuite>\n' +
-    '<testsuite name="player-queue-order.spec.ts" timestamp="2026-10-19T03:09:03.424Z" hostname="" tests="2" failures="0" skipped="1" time="0" errors="0">\n' +
+    '<testsuite name="player-queue-order.spec.ts" timestamp="2026-10-19T03:09:03.424Z" hostname="" tests="2" failures="0" skipped="0" time="0" errors="0">\n' +
     '<testcase name="queue order › passing journey" classname="player-queue-order.spec.ts" time="0.001">\n' +
     '<properties>\n<property name="serial" value="">\n</property>\n</properties>\n' +
     '</testcase>\n' +
-    '<testcase name="player queue follows library-selection order › player queue advances in library-selection order" classname="player-queue-order.spec.ts">\n' +
-    '<properties>\n<property name="serial" value="">\n</property>\n<property name="fixme" value="">\n</property>\n</properties>\n' +
-    '<skipped>\n</skipped>\n' +
+    '<testcase name="player queue follows library-selection order › player queue advances in library-selection order" classname="player-queue-order.spec.ts" time="0.001">\n' +
+    '<properties>\n<property name="serial" value="">\n</property>\n</properties>\n' +
     '</testcase>\n' +
     '</testsuite>\n' +
     '</testsuites>\n';
@@ -1788,7 +1801,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   test('reporter-shaped green evidence with root counts and paired skips passes', () => {
     const result = runGateScript(REPORTER_GREEN);
     expect(result.status).toBe(0);
-    expect(result.summary).toContain('| 4 | 2 | 2 | 0 |');
+    expect(result.summary).toContain('| 4 | 3 | 1 | 0 |');
     expect(result.summary).toContain('PASS');
   });
 
@@ -1804,7 +1817,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   test('a same-titled skip from another file fails outside the allow-list', () => {
     const xml = suiteXml(
       PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
-        '<testcase classname="other.spec.ts" name="player queue advances in library-selection order"><skipped/></testcase>',
+        FIXME_MBIDS.replace('ingest-play-meter.spec.ts', 'other.spec.ts'),
     );
     const result = runGateScript(xml);
     expect(result.status).not.toBe(0);
@@ -1814,10 +1827,11 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   test('one allow-list entry cannot cover two skips', () => {
     const xml = suiteXml(
       PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
-        FIXME_QUEUE +
-        FIXME_QUEUE,
+        FIXME_MBIDS +
+        FIXME_MBIDS,
     );
-    const result = runGateScript(xml);
+    // Raise only the count ceiling to isolate the consume-once allowance.
+    const result = runGateScript(xml, { MAX_ALLOWED_SKIPS: '2' });
     expect(result.status).not.toBe(0);
     expect(result.output).toContain('outside the allow-list');
   });
@@ -1825,17 +1839,16 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   test('unattributed skips fail closed when the count exceeds listed cases', () => {
     const listed = suiteXml(
       PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
-        FIXME_QUEUE +
         FIXME_MBIDS,
     );
-    const xml = listed.replace('tests="3"', 'tests="4"').replace('skipped="2"', 'skipped="3"');
+    const xml = listed.replace('tests="2"', 'tests="3"').replace('skipped="1"', 'skipped="2"');
     const result = runGateScript(xml, { MAX_ALLOWED_SKIPS: '5' });
     expect(result.status).not.toBe(0);
     expect(result.output).toContain('could not be identified');
   });
 
   test('non-numeric counts fail closed as unparseable', () => {
-    const xml = suiteXml(FIXME_QUEUE).replace('skipped="1"', 'skipped="x"');
+    const xml = suiteXml(FIXME_MBIDS).replace('skipped="1"', 'skipped="x"');
     const result = runGateScript(xml);
     expect(result.status).not.toBe(0);
     expect(result.output).toContain('could not parse');
