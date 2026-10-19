@@ -37,10 +37,19 @@ const CONTAINER_PORT: u16 = 8080;
 /// Container cold-start budget: poll `/health` every 500 ms.
 const HEALTH_ATTEMPTS: u32 = 60;
 /// Longest one Container fetch may take, headers plus body sharing one
-/// cancellable deadline. Both `stage_input` and `container_json` arm
-/// from this constant only, so the budget is overridable in exactly one
-/// place (same `*_MS: u64` shape as the sibling ingest MB deadline).
+/// cancellable deadline. `stage_input` and the `/health` + `/cleanup`
+/// exchanges arm from this constant (size-scaled atop the base where a
+/// request or reply body streams); `/repair` runs par2 synchronously
+/// under the Container's 120 s budget so it arms from
+/// `CONTAINER_REPAIR_DEADLINE_MS` instead (same `*_MS: u64` shape as the
+/// sibling ingest MB deadline).
 const CONTAINER_FETCH_DEADLINE_MS: u64 = 10_000;
+/// `/repair` deadline: the Container defaults to `MAX_TIMEOUT_SECS = 120`
+/// (`containers/repair/src/lib.rs`) and the Worker never sets
+/// `timeout_secs`, so a legitimate repair may take up to 120 s before
+/// headers arrive; 30 s covers the small result-body read and scheduling
+/// margin while still failing a hung Container.
+const CONTAINER_REPAIR_DEADLINE_MS: u64 = 150_000;
 
 fn json_response(status: u16, body: Vec<u8>) -> WorkerResult<Response> {
     let headers = Headers::new();
@@ -342,14 +351,18 @@ impl RepairContainer {
         // One cancellable deadline spans headers plus the body drain,
         // armed before the fetch is issued so slow headers count against
         // the same budget as a stalled body (same shape as the ingest
-        // pool-stub deadline). `Delay` only registers its timer on first
-        // poll, so racing both futures below polls (arms) the deadline
-        // from the start. Dropping the pinned `Delay` releases its timer,
-        // and every return below drops it: expiry, transport failure, and
-        // success all release the timer.
-        let mut deadline = Box::pin(Delay::from(Duration::from_millis(
-            CONTAINER_FETCH_DEADLINE_MS,
-        )));
+        // pool-stub deadline). The upload rides inside `fetch_request`:
+        // the Container only answers 201 after reading and storing the
+        // streamed R2 body, so the total scales with `file.size` atop
+        // the 10 s base (~1 MB/s floor) instead of expiring a large
+        // healthy transfer mid-upload; retries still restart from byte
+        // 0 but no longer hit the same wall. `Delay` only registers its
+        // timer on first poll, so racing both futures below polls (arms)
+        // the deadline from the start. Dropping the pinned `Delay`
+        // releases its timer, and every return below drops it: expiry,
+        // transport failure, and success all release the timer.
+        let budget_ms = CONTAINER_FETCH_DEADLINE_MS.saturating_add(file.size.saturating_div(1024));
+        let mut deadline = Box::pin(Delay::from(Duration::from_millis(budget_ms)));
         let mut fetch = Box::pin(container.fetch_request(request));
         let response = std::future::poll_fn(|cx| {
             use std::task::Poll;
@@ -385,10 +398,13 @@ impl RepairContainer {
             }
         })
         .await;
-        let _ = match drained {
-            Some(Ok(drained)) => drained,
-            Some(Err(_)) | None => return Err(ApiFault::new(502, "container_unavailable")),
-        };
+        // Expiry alone fails the stage: a drain transport error falls
+        // through to the status match below (base `let _ = ...`
+        // semantics), so a known 400/413 stays terminal and a stored 201
+        // stays success instead of becoming a retryable 502.
+        if drained.is_none() {
+            return Err(ApiFault::new(502, "container_unavailable"));
+        }
         drop(deadline);
         match status {
             201 => Ok(()),
@@ -411,25 +427,68 @@ impl RepairContainer {
             "http://container/jobs/{}/r{}/out/{}",
             req.job_id, req.round, output.key
         );
-        let mut response = container
-            .fetch(url, None)
-            .await
-            .map_err(|_| ApiFault::new(502, "container_unavailable"))?;
+        // One cancellable deadline spans the output fetch plus the R2 put
+        // that relays it, armed before the fetch is issued (same shape as
+        // `stage_input` above). The total scales with `output.size` atop
+        // the 10 s base (~1 MB/s floor) so a large healthy output does
+        // not expire mid-stream. Dropping the pinned `Delay` releases its
+        // timer, and every return below drops it.
+        let budget_ms =
+            CONTAINER_FETCH_DEADLINE_MS.saturating_add(output.size.saturating_div(1024));
+        let mut deadline = Box::pin(Delay::from(Duration::from_millis(budget_ms)));
+        let mut fetch = Box::pin(container.fetch(url, None));
+        let response = std::future::poll_fn(|cx| {
+            use std::task::Poll;
+            // Deadline first: an already-fired deadline aborts even when
+            // headers are also ready.
+            if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+                return Poll::Ready(None);
+            }
+            match std::future::Future::poll(fetch.as_mut(), cx) {
+                Poll::Ready(response) => Poll::Ready(Some(response)),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await;
+        let mut response = match response {
+            Some(Ok(response)) => response,
+            Some(Err(_)) | None => return Err(ApiFault::new(502, "container_unavailable")),
+        };
         if response.status_code() != 200 {
             return Err(ApiFault::new(502, "container_unavailable"));
         }
         let stream = response
             .stream()
             .map_err(|_| ApiFault::new(502, "container_unavailable"))?;
-        bucket
-            .put(
-                out_key(&req.scratch_prefix, &output.key),
-                FixedLengthStream::wrap(stream, output.size),
-            )
-            .execute()
-            .await
-            .map_err(|_| ApiFault::new(503, "scratch_unavailable"))?;
-        Ok(())
+        // Reuse the same deadline for the put: partial progress never
+        // re-arms it, so fetch plus put share one total budget. Expiry
+        // fails as the existing 502 container_unavailable; an R2
+        // transport error keeps the existing 503 scratch_unavailable.
+        let mut put = Box::pin(
+            bucket
+                .put(
+                    out_key(&req.scratch_prefix, &output.key),
+                    FixedLengthStream::wrap(stream, output.size),
+                )
+                .execute(),
+        );
+        let stored = std::future::poll_fn(|cx| {
+            use std::task::Poll;
+            if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+                return Poll::Ready(None);
+            }
+            match std::future::Future::poll(put.as_mut(), cx) {
+                Poll::Ready(stored) => Poll::Ready(Some(stored)),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await;
+        drop(deadline);
+        match stored {
+            Some(Ok(_)) => Ok(()),
+            Some(Err(_)) => Err(ApiFault::new(503, "scratch_unavailable")),
+            None => Err(ApiFault::new(502, "container_unavailable")),
+        }
     }
 }
 
@@ -471,12 +530,18 @@ async fn container_json(
     // One cancellable deadline spans headers plus the body read, armed
     // before the fetch is issued so slow headers count against the same
     // budget as a stalled body (same shape as `stage_input` above and
-    // the ingest pool-stub deadline). Dropping the pinned `Delay`
-    // releases its timer, and every return below drops it: expiry,
-    // transport failure, and success all release the timer.
-    let mut deadline = Box::pin(Delay::from(Duration::from_millis(
-        CONTAINER_FETCH_DEADLINE_MS,
-    )));
+    // the ingest pool-stub deadline). `/repair` runs par2 synchronously
+    // under the Container's 120 s budget, so it arms the longer repair
+    // deadline while `/health` and `/cleanup` keep the 10 s base.
+    // Dropping the pinned `Delay` releases its timer, and every return
+    // below drops it: expiry, transport failure, and success all release
+    // the timer.
+    let budget_ms = if path == "/repair" {
+        CONTAINER_REPAIR_DEADLINE_MS
+    } else {
+        CONTAINER_FETCH_DEADLINE_MS
+    };
+    let mut deadline = Box::pin(Delay::from(Duration::from_millis(budget_ms)));
     let mut fetch = Box::pin(port.fetch_request(request));
     let response = std::future::poll_fn(|cx| {
         use std::task::Poll;
