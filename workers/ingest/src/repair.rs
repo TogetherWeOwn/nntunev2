@@ -10,6 +10,8 @@
 
 use worker::{wasm_bindgen::JsValue, Env, Headers, Method, Request, RequestInit};
 
+use futures_util::StreamExt;
+
 use nntune_core::par2::scratch::scratch_prefix;
 
 use crate::jobs::MAX_REPAIR_ROUNDS;
@@ -102,6 +104,11 @@ pub fn classify_repair_reply(status: u16, body: &[u8]) -> RepairCall {
 
 /// Dispatch one repair request through the service binding. Transport
 /// or binding failures are `Retry`, never a guessed terminal outcome.
+///
+/// The reply body streams within `MAX_REPAIR_REPLY_BYTES`: the chunk that
+/// would cross the ceiling returns `Retry` from the length. The remainder
+/// is never retained and no truncated prefix reaches
+/// `classify_repair_reply`.
 pub async fn call_repair(env: &Env, req: &RepairRequest) -> RepairCall {
     let Ok(body) = serde_json::to_string(req) else {
         return RepairCall::Retry;
@@ -125,23 +132,30 @@ pub async fn call_repair(env: &Env, req: &RepairRequest) -> RepairCall {
         Ok(request) => request,
         Err(_) => return RepairCall::Retry,
     };
-    // With the `http` feature the fetcher answers `http::Response`;
-    // convert back to the classic response for a bounded body read.
-    let mut response = match fetcher.fetch_request(request).await {
-        Ok(response) => match worker::Response::try_from(response) {
-            Ok(response) => response,
-            Err(_) => return RepairCall::Retry,
-        },
+    // With the `http` feature the fetcher answers `http::Response`; drain
+    // its body stream within the ceiling so an oversized reply fails closed
+    // from its length instead of buffering the whole body first.
+    let response = match fetcher.fetch_request(request).await {
+        Ok(response) => response,
         Err(error) => {
             worker::console_log!("repair call failed job={}: {:?}", req.job_id, error);
             return RepairCall::Retry;
         }
     };
-    let status = response.status_code();
-    match response.bytes().await {
-        Ok(bytes) => classify_repair_reply(status, &bytes),
-        Err(_) => RepairCall::Retry,
+    let status = response.status().as_u16();
+    let mut stream = response.into_body();
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => return RepairCall::Retry,
+        };
+        if buf.len() + chunk.len() > MAX_REPAIR_REPLY_BYTES {
+            return RepairCall::Retry;
+        }
+        buf.extend_from_slice(&chunk);
     }
+    classify_repair_reply(status, &buf)
 }
 
 #[cfg(test)]
