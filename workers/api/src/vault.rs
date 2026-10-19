@@ -406,6 +406,17 @@ impl IndexerConfig {
         let Some(scheme_end) = self.url.find("://") else {
             return Err(VaultError::Invalid);
         };
+        // `find` locates the FIRST literal `://`, which a decoy planted in
+        // the path or query can shift (`https:@host/api://x`): the scan
+        // would then examine the text after the decoy while the real `@`
+        // sits before it. Both fetch-time guards anchor on the scheme
+        // (`split_authority` requires the text before `://` to equal
+        // `https`; `check_base_url` requires a literal `https://` prefix),
+        // so mirror them: anything else fails closed here instead of
+        // saving a config every fetch rejects.
+        if &self.url[..scheme_end] != "https" {
+            return Err(VaultError::Invalid);
+        };
         let after = &self.url[scheme_end + 3..];
         let authority = after.split(['/', '?', '#']).next().unwrap_or_default();
         // The url crate skips any number of slashes after the scheme for
