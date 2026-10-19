@@ -67,8 +67,11 @@ async function loadOne<T>(read: () => Promise<T>): Promise<LoadOutcome<T>> {
 export const ssr = false;
 
 export const load: PageLoad = async ({ fetch }) => {
-	const sub = await loadOne(() => fetchSubscription(fetch));
-	const use = await loadOne(() => fetchUsage(fetch));
+	// Independent reads share one deadline window; loadOne keeps failures isolated.
+	const [sub, use] = await Promise.all([
+		loadOne(() => fetchSubscription(fetch)),
+		loadOne(() => fetchUsage(fetch))
+	]);
 
 	// A 404 on the subscription is a failure, not "no record yet": signup
 	// always writes a trialing row (ADR 0002 rule 4), so a missing record
