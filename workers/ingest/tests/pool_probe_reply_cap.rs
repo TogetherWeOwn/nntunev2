@@ -425,4 +425,27 @@ fn call_pool_probe_bounds_the_read_before_classification() {
         "the non-200 branch must return classify_reply with an empty body, \
          never the streamed bytes"
     );
+    // Pin the over-cap Rejected passthrough: the raced 200 body read fails
+    // closed as Rejected when more bytes existed; transport failure and expiry
+    // share the expired Retry. Deleting this arm sends an over-cap 200 through
+    // the wildcard expiry arm as expired Retry (redelivered + re-probed)
+    // instead of permanent Rejected.
+    let body_race = body
+        .find("race_against_deadline(body_read")
+        .expect("the bounded 200 read must race body_read against the shared deadline");
+    let after_race = &body[body_race..];
+    let passthrough_rel = after_race
+        .find("Some(Err(PoolProbeError::Rejected)) => return Err(PoolProbeError::Rejected)")
+        .expect(
+            "the body-stage match must pass Rejected through as Rejected \
+             (over-cap 200 fails closed, never expired Retry)",
+        );
+    let expiry_rel = after_race
+        .find("Some(Err(_)) | None => return Err(expired)")
+        .expect("the body-stage match must share transport failure and expiry as expired Retry");
+    assert!(
+        passthrough_rel < expiry_rel,
+        "the Rejected passthrough must precede the body-stage expiry arm, \
+         so an over-cap 200 returns Rejected instead of expired Retry"
+    );
 }
