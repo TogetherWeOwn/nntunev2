@@ -120,6 +120,25 @@ fn parse_reply(line: &[u8]) -> Result<Reply> {
     Ok(Reply { code, text })
 }
 
+/// Validates a caller-supplied NNTP command argument (message-id or group
+/// name) before it reaches the wire. Message-ids are framed as `<id>` and
+/// group names are a bare token, so `<`, `>`, whitespace or control
+/// characters would break out of the framing (`STAT <a> ARTICLE <b>`, an
+/// injected second command line via CRLF). Rejects with [`Error::Malformed`]
+/// before any byte is written. The diagnostic is generic: the argument may
+/// carry control characters that must not reach logs verbatim.
+fn validate_argument(arg: &str) -> Result<()> {
+    if arg
+        .chars()
+        .any(|c| c == '<' || c == '>' || c.is_whitespace() || c.is_control())
+    {
+        return Err(Error::Malformed(
+            "NNTP command argument contains a delimiter-escaping character".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Summary returned by `GROUP`.
 #[derive(Debug, Clone)]
 pub struct GroupInfo {
@@ -217,6 +236,7 @@ impl<T: Transport> NntpClient<T> {
     /// `STAT <message-id>`: returns the article number. `430` becomes
     /// [`Error::ArticleNotFound`].
     pub async fn stat(&mut self, message_id: &str) -> Result<u64> {
+        validate_argument(message_id)?;
         let reply = self.command(&format!("STAT <{message_id}>")).await?;
         match reply.code {
             223 => reply
@@ -234,6 +254,7 @@ impl<T: Transport> NntpClient<T> {
     /// `ARTICLE <message-id>`: appends the raw article (headers + body) to
     /// `out`. `430` becomes [`Error::ArticleNotFound`].
     pub async fn article_to(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<()> {
+        validate_argument(message_id)?;
         let reply = self.command(&format!("ARTICLE <{message_id}>")).await?;
         match reply.code {
             220 => self.transport.read_dot_block(out).await.map_err(Error::Io),
@@ -243,6 +264,7 @@ impl<T: Transport> NntpClient<T> {
 
     /// `BODY <message-id>`: appends just the body to `out`.
     pub async fn body_to(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<()> {
+        validate_argument(message_id)?;
         let reply = self.command(&format!("BODY <{message_id}>")).await?;
         match reply.code {
             222 => self.transport.read_dot_block(out).await.map_err(Error::Io),
@@ -252,6 +274,7 @@ impl<T: Transport> NntpClient<T> {
 
     /// `GROUP <name>`: selects a group and returns its counters.
     pub async fn group(&mut self, name: &str) -> Result<GroupInfo> {
+        validate_argument(name)?;
         let reply = self.command(&format!("GROUP {name}")).await?;
         match reply.code {
             211 => {
@@ -296,6 +319,12 @@ impl<T: Transport> NntpClient<T> {
     }
 
     async fn fetch_many_inner(&mut self, message_ids: &[&str]) -> Result<Vec<FetchOutcome>> {
+        // Validate the whole batch before writing: commands are written
+        // ahead of their replies, so a late escaping id must not leave a
+        // valid prefix on the wire with unread replies outstanding.
+        for id in message_ids {
+            validate_argument(id)?;
+        }
         let mut out = Vec::with_capacity(message_ids.len());
         for chunk in message_ids.chunks(self.max_pipelined()) {
             for id in chunk {
