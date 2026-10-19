@@ -1242,6 +1242,9 @@ test.describe('locked-dependency ci builds (static pin)', () => {
     return section
       .split('\n')
       .map(stripTrailingComment)
+      // Exclude a whole literal echo before splitting quoted separators:
+      // `echo "note; cargo test ..."` must not fabricate a Cargo step.
+      .filter((line) => !literalEcho.test(stripRunPrefix(line)))
       // && / || precede their bare prefixes so each pair splits as one
       // separator. Splitting inside redirections such as 2>&1 is harmless:
       // the cargo segment keeps its flags and the fragments match no verb.
@@ -1417,6 +1420,8 @@ test.describe('locked-dependency ci builds (static pin)', () => {
       (command) => `${String.raw`echo step \#2`} && ${command}`,
       (command) => `${String.raw`echo step\ #2`} && ${command}`,
       (command) => `echo step#2 && ${command}`,
+      (command) => `echo "note; stage" && ${command}`,
+      (command) => `echo 'note; stage' && ${command}`,
       // Actual comments still cannot supply a flag, even after quoted hashes.
       (command) => `${command} # --locked`,
       (command) => `echo "step #2" && ${command} # --locked`,
@@ -1449,6 +1454,28 @@ test.describe('locked-dependency ci builds (static pin)', () => {
       "cargo test --locked --manifest-path workers/api/Cargo.toml --lib && echo 'cargo test --manifest-path workers/api/Cargo.toml --doc'",
     );
     expect(() => assertApiLocked(echoPrintsSingleQuoted)).not.toThrow();
+    // A separator inside literal echo text must not fabricate an executed
+    // Cargo step. Replace the only test invocation so the presence guard
+    // must reject it, regardless of the flags printed in that text.
+    for (const separator of [';', '&&', '||', '&', '|', '|&']) {
+      for (const quote of ["'", '"']) {
+        for (const locked of [false, true]) {
+          const apiEchoOnly = ciCode.replace(
+            'cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets',
+            `echo ${quote}note${separator} cargo test ${locked ? '--locked ' : ''}--manifest-path workers/api/Cargo.toml${quote}`,
+          );
+          const mbEchoOnly = ciCode.replace(
+            'cargo test --manifest-path workers/mb/Cargo.toml --all-targets',
+            `echo ${quote}note${separator} cargo test ${locked ? '--locked ' : ''}--manifest-path workers/mb/Cargo.toml${quote}`,
+          );
+          expect(() => assertApiLocked(apiEchoOnly), 'literal echo is not an api test step').toThrow();
+          expect(
+            () => assertJobUnlocked(mbEchoOnly, 'rust-mb', 'mb'),
+            'literal echo is not an mb test step',
+          ).toThrow();
+        }
+      }
+    }
     // Policy drift the other way: locking an unlocked job without updating
     // the README asymmetry must trip the unlocked pin.
     const lockMb = ciCode.replace(
