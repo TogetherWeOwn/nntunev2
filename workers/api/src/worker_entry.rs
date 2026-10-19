@@ -1470,7 +1470,10 @@ async fn probe_one(addr: IpAddr, port: u16, tls: bool) -> bool {
 }
 
 impl Dialer for SocketDialer {
-    async fn probe(&self, target: &ValidatedTarget, port: u16, tls: bool) -> bool {
+    async fn probe(&self, target: &ValidatedTarget, tls: bool) -> bool {
+        // The dialed port is the validated target's own allowlisted port —
+        // never a caller-supplied substitute.
+        let port = target.port();
         let mut deadline = std::pin::pin!(Delay::from(Duration::from_millis(TOTAL_TIMEOUT_MS)));
         let mut attempts = std::pin::pin!(async {
             for addr in target.addresses().iter().take(MAX_DIAL_ADDRESSES) {
