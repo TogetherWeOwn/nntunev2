@@ -177,7 +177,7 @@ async function expectAllChoicesRestored(page: Page): Promise<void> {
 		await expect(button).toBeEnabled();
 		await expect(button).toHaveText('Choose');
 	}
-	await expect(page.getByRole('button', { name: 'Starting…' })).toHaveCount(0);
+	await expect(page.getByRole('button', { name: /Starting/ })).toHaveCount(0);
 }
 
 /** Give any wrongly-issued second request a chance to arrive, then count. */
@@ -217,7 +217,7 @@ test('held checkout: mouse activation of another plan issues no second request',
 	await buttons.pro20x.click({ force: true }).catch(() => {});
 	await expectExactlyOneRequestAfterSettling(page, held.requests);
 	await expect(buttons.plus, 'pending identity stays on the first plan').toHaveText('Starting…');
-	await expect(page.getByRole('button', { name: 'Starting…' })).toHaveCount(1);
+	await expect(page.getByRole('button', { name: 'Starting Plus…' })).toHaveCount(1);
 
 	held.release(ORDINARY_FAILURE);
 	await expect(page.getByRole('alert')).toContainText('Start checkout failed (500)');
