@@ -18,11 +18,17 @@
 //! Sensitivity (mutants this file catches): accepting any explicit port
 //! breaks the non-443 pins; rejecting an explicit `:443` (e.g. by
 //! string-matching a `:NNNN` suffix instead of the parsed port) breaks
-//! the `:443` pin; checking only `username()` without `password()`
-//! breaks the password-only pin; missing an empty userinfo (`@host`,
-//! `:@host`) breaks those pins; treating an empty fragment as absent
+//! the `:443` pin; missing an empty userinfo (`@host`, `:@host`)
+//! breaks those pins; letting an obfuscated authority hide the raw `@`
+//! from a literal-`://` scan (single slash, tab/newline the parser
+//! strips, backslashes it treats as slashes) breaks the obfuscated
+//! pins; treating an empty fragment as absent
 //! (only rejecting non-empty fragments) breaks the bare-`#` pin;
-//! ignoring the parsed fragment breaks the fragment pins.
+//! ignoring the parsed fragment breaks the fragment pins. Note the
+//! raw-`@` scan already rejects the plain password-only URL, so
+//! `password()` is defense-in-depth rather than what makes that pin
+//! pass; the obfuscated password-only pins catch a missing
+//! fail-closed rule once `password()` is gone.
 //!
 //! Run only this file:
 //!
@@ -81,6 +87,20 @@ fn embedded_userinfo_is_invalid() {
         "https://@index.example.com/api",
         "https://:@index.example.com/api",
         "https://index.example.com@evil.example.com/api",
+        // Obfuscated empty userinfo: the parser strips ASCII tab/newline
+        // and treats backslashes as slashes for HTTPS, so these still
+        // parse with a raw `@` in the authority even though no literal
+        // `://` precedes it.
+        "https:/@index.example.com/api",
+        "https:\n//@index.example.com/api",
+        "https:\t//@index.example.com/api",
+        "https:/\n/@index.example.com/api",
+        "https:\\\\@index.example.com/api",
+        "https:\\//@index.example.com/api",
+        // Obfuscated password-only: same hiding, with a `:secret` the
+        // parsed-password check alone used to catch.
+        "https:\n//:secret@index.example.com/api",
+        "https:\\\\:secret@index.example.com/api",
     ] {
         assert!(
             matches!(indexer(url).validate(&PublicDns), Err(VaultError::Invalid)),
