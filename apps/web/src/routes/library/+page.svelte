@@ -142,7 +142,9 @@
 						<button
 							type="button"
 							class="nt-library-row"
-							aria-pressed={queuedIds.has(track.id)}
+							aria-label={queuedIds.has(track.id)
+								? `${displayTitle(track)}${displayArtist(track) ? ` — ${displayArtist(track)}` : ''} — Queued`
+								: undefined}
 							onclick={() => selectTrack(track.id)}
 						>
 							{displayTitle(track)}

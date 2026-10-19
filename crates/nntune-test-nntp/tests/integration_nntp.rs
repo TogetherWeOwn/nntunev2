@@ -590,11 +590,18 @@ async fn server_stops_serving_after_drop() {
     let server = TestNntpServer::spawn_for_test().await;
     let addr = server.addr();
     drop(server);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(
-        TcpStream::connect(addr).await.is_err(),
-        "server still accepts connections after drop"
-    );
+    // Drop requests cancellation; the accept task releases its listener when
+    // the runtime next polls it. Observe closure rather than a fixed delay.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if TcpStream::connect(addr).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("server still accepts connections after drop");
 }
 
 #[tokio::test]
