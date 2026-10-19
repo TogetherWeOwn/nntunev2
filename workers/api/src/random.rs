@@ -124,17 +124,34 @@ mod tests {
     /// `getrandom::` occurrences beyond production; synthetic mutant
     /// sources are likewise built with `format!`, keeping their banned
     /// spellings outside any scanned statement window.
+    /// Identifier-continue for literal suffixes and raw identifiers
+    /// (conservative XID-Continue: non-ASCII in code outside strings and
+    /// comments only occurs in identifiers, and `is_alphanumeric` misses
+    /// XID-Continue chars like U+203F and U+0301 that rustc eats as suffix).
+    fn ident_continue(c: char) -> bool {
+        c == '_' || c.is_alphanumeric() || !c.is_ascii()
+    }
+
+    /// Identifier-start for raw identifiers (`r#ident`, possibly multi-`#`).
+    fn ident_start(c: char) -> bool {
+        c == '_' || c.is_alphabetic() || !c.is_ascii()
+    }
+
     /// True when the `r` at `chars[i]` starts a raw-string prefix at a token
     /// boundary (mirrors `rustc_lexer`): the maximal identifier-char run
     /// ending at this `r` must be exactly `r`, `br` or `cr` — a digit-led run
     /// like `1r` is excluded by the exact-run rule — and the char before that
     /// run must not be a quote, so a literal suffix (`"a"r`, `'a'r`) never
-    /// counts as a raw prefix.
+    /// counts as a raw prefix. The run walk uses [`ident_continue`] so
+    /// XID-Continue suffixes (`"a"e<U+203F>r`) are read as one suffix, not
+    /// as a bare `r`. Hash-closed raw suffixes (`r#"a"#r`) and raw
+    /// identifiers (`r#r`) are handled by forward token consumption in the
+    /// stripper, not by this backward check.
     fn is_raw_prefix_at(chars: &[char], i: usize) -> bool {
         let mut run_start = i;
         while run_start > 0 {
             let prev = chars[run_start - 1];
-            if prev.is_alphanumeric() || prev == '_' {
+            if ident_continue(prev) {
                 run_start -= 1;
             } else {
                 break;
@@ -197,7 +214,37 @@ mod tests {
                         }
                         i += 1;
                     }
+                    // Consume a following literal suffix (`r#"a"#r`) as part of
+                    // this literal, so its trailing `r` never re-enters the
+                    // raw branch with `#` before it.
+                    while i < chars.len() && ident_continue(chars[i]) {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
                     continue;
+                }
+                // Raw identifier `r#ident` (possibly multi-`#`): consume `r` +
+                // hashes + identifier as one token, so the identifier's
+                // trailing `r` (as in `r#r`) never re-enters the raw branch.
+                // Only bare `r` starts a raw identifier; `br`/`cr` + `#` is an
+                // identifier plus `#` and correctly falls through.
+                if hashes >= 1 && chars.get(j).is_some_and(|&d| ident_start(d)) {
+                    let mut run_start = i;
+                    while run_start > 0 && ident_continue(chars[run_start - 1]) {
+                        run_start -= 1;
+                    }
+                    let run: String = chars[run_start..=i].iter().collect();
+                    if run == "r" {
+                        while i < j {
+                            out.push(chars[i]);
+                            i += 1;
+                        }
+                        while i < chars.len() && ident_continue(chars[i]) {
+                            out.push(chars[i]);
+                            i += 1;
+                        }
+                        continue;
+                    }
                 }
             }
             if c == '/' && next == Some('/') {
@@ -264,6 +311,13 @@ mod tests {
                     }
                     i += 1;
                 }
+                // Consume a following literal suffix (`"a"e<U+203F>r`) as part
+                // of this literal, so its trailing `r` never re-enters the raw
+                // branch.
+                while i < chars.len() && ident_continue(chars[i]) {
+                    out.push(chars[i]);
+                    i += 1;
+                }
                 continue;
             }
             if c == '\'' {
@@ -306,6 +360,12 @@ mod tests {
                     }
                     out.push('\'');
                     i += 1;
+                    // Consume a following literal suffix as part of this char
+                    // literal, mirroring the string branches.
+                    while i < chars.len() && ident_continue(chars[i]) {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
                     continue;
                 }
                 out.push(c);
@@ -863,6 +923,130 @@ mod tests {
             check_secure_random_propagation(&mutant).is_err(),
             "suffix-adjacent string statement must not satisfy the pin"
         );
+    }
+
+    #[test]
+    fn stripper_blanks_raw_identifier_before_plain_string() {
+        // Direct pin for raw-identifier consumption: `r#r` is one raw-identifier
+        // token, so its trailing `r` is not a raw prefix. The following plain
+        // string opens with an escaped quote plus hash; raw-rules blanking
+        // (no escape handling) would close at that inner `"#` and leak the
+        // needles as code.
+        let src = "stringify!(r#r\"\\\"# .map_err(|_| CryptoError::RandomnessUnavailable)?;\");";
+        let stripped = strip_code_for_propagation_pin(src);
+        assert!(
+            !stripped.contains(".map_err"),
+            "raw-ident-adjacent string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("RandomnessUnavailable"),
+            "raw-ident-adjacent string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains('?'),
+            "raw-ident-adjacent string ? must be blanked: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn pin_rejects_raw_identifier_string_carried_statement() {
+        // Checker-level regression for the same bug: a `stringify!` line whose
+        // token stream is a raw identifier `r#r` plus a plain string carrying
+        // the exact expected statement after an escaped quote+hash. It never
+        // executes `getrandom::fill` — zero-filled bytes returned as `Ok` —
+        // yet the raw-ident-blind stripper reports `Ok(())`.
+        let gr = "getrandom";
+        let mutant = format!(
+            "stringify!(r#r\"\\\"# {gr}::fill(&mut bytes).map_err(|_| CryptoError::RandomnessUnavailable)?;\");"
+        );
+        assert!(
+            check_secure_random_propagation(&mutant).is_err(),
+            "raw-ident-adjacent string statement must not satisfy the pin"
+        );
+    }
+
+    #[test]
+    fn stripper_blanks_hash_closed_raw_suffix_before_plain_string() {
+        // Direct pin for literal-suffix consumption: `r#"a"#r` is a raw string
+        // with suffix `r`, so the trailing `r` never re-enters the raw branch.
+        // Without suffix consumption the `#`-before-`r` slips past the quote
+        // guard and the following plain string is blanked with raw rules,
+        // closing at its inner `"#` and leaking the needles.
+        let src =
+            "stringify!(r#\"a\"#r\"\\\"# .map_err(|_| CryptoError::RandomnessUnavailable)?;\");";
+        let stripped = strip_code_for_propagation_pin(src);
+        assert!(
+            !stripped.contains(".map_err"),
+            "hash-suffix-adjacent string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("RandomnessUnavailable"),
+            "hash-suffix-adjacent string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains('?'),
+            "hash-suffix-adjacent string ? must be blanked: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn pin_rejects_hash_closed_raw_suffix_string_carried_statement() {
+        // Checker-level regression for the same bug across `r`/`br`/`cr` raw
+        // literals, each with suffix `r` plus a plain string carrying the exact
+        // expected statement. None executes `getrandom::fill`.
+        let gr = "getrandom";
+        for prefix in ["r", "br", "cr"] {
+            let mutant = format!(
+                "stringify!({prefix}#\"a\"#r\"\\\"# {gr}::fill(&mut bytes).map_err(|_| CryptoError::RandomnessUnavailable)?;\");"
+            );
+            assert!(
+                check_secure_random_propagation(&mutant).is_err(),
+                "{prefix}-suffix-adjacent string statement must not satisfy the pin"
+            );
+        }
+    }
+
+    #[test]
+    fn stripper_blanks_xid_suffix_before_plain_string() {
+        // Direct pin for the XID-Continue run walk: `e<U+203F>r` / `e<U+0301>r`
+        // after a string is one literal suffix (rustc eats the whole run), so
+        // its trailing `r` is not a raw prefix. `is_alphanumeric` is false for
+        // both non-ASCII chars, so a narrow walk reads the run as exactly `r`.
+        for suffix in ["\u{203f}", "\u{301}"] {
+            let src = format!(
+                "stringify!(\"a\"e{suffix}r\"\\\"# .map_err(|_| CryptoError::RandomnessUnavailable)?;\");"
+            );
+            let stripped = strip_code_for_propagation_pin(&src);
+            assert!(
+                !stripped.contains(".map_err"),
+                "xid-suffix-adjacent string body must be blanked: {stripped:?}"
+            );
+            assert!(
+                !stripped.contains("RandomnessUnavailable"),
+                "xid-suffix-adjacent string body must be blanked: {stripped:?}"
+            );
+            assert!(
+                !stripped.contains('?'),
+                "xid-suffix-adjacent string ? must be blanked: {stripped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pin_rejects_xid_suffix_string_carried_statement() {
+        // Checker-level regression for the same bug: string plus XID-Continue
+        // suffix plus plain string carrying the exact expected statement. It
+        // never executes `getrandom::fill`.
+        let gr = "getrandom";
+        for suffix in ["\u{203f}", "\u{301}"] {
+            let mutant = format!(
+                "stringify!(\"a\"e{suffix}r\"\\\"# {gr}::fill(&mut bytes).map_err(|_| CryptoError::RandomnessUnavailable)?;\");"
+            );
+            assert!(
+                check_secure_random_propagation(&mutant).is_err(),
+                "xid-suffix-adjacent string statement must not satisfy the pin"
+            );
+        }
     }
 
     #[test]
