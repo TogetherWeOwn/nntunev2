@@ -23,6 +23,12 @@ export function buildRangeHeader(start: number, end?: number): string {
 	if (end !== undefined && !Number.isFinite(end)) {
 		throw new RangeError(`Invalid seek end: ${String(end)}`);
 	}
+	if (!Number.isSafeInteger(start) && Math.abs(start) > Number.MAX_SAFE_INTEGER) {
+		throw new RangeError(`Invalid seek start: ${String(start)}`);
+	}
+	if (end !== undefined && !Number.isSafeInteger(end) && Math.abs(end) > Number.MAX_SAFE_INTEGER) {
+		throw new RangeError(`Invalid seek end: ${String(end)}`);
+	}
 	const safeStart = Math.max(0, Math.floor(start));
 	if (end === undefined) return `bytes=${safeStart}-`;
 	const safeEnd = Math.max(safeStart, Math.floor(end));
