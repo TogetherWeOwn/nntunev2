@@ -395,6 +395,53 @@ async fn bad_second_reply_discards_batch_and_does_not_start_next_window() {
 }
 
 #[tokio::test]
+async fn bad_first_identity_invalidates_the_pipeline_with_other_replies_pending() {
+    for chunk in [1, 4096] {
+        let (mut client, trace) = support::connect(
+            b"220 1 <foreign@x>\r\nforeign\r\n.\r\n\
+              220 2 <wanted@x>\r\nwanted\r\n.\r\n",
+            chunk,
+            &NntpConfig::default(),
+        )
+        .await;
+        let err = client
+            .fetch_many(&["first@x", "wanted@x"])
+            .await
+            .expect_err("the first reply also needs identity validation");
+        assert_malformed(&err);
+        assert_eq!(written(&trace), Method::Batch.writes());
+        assert!(client.stat("wanted@x").await.is_err());
+        assert_eq!(written(&trace), Method::Batch.writes());
+    }
+}
+
+#[tokio::test]
+async fn bad_identity_in_next_window_discards_previously_completed_window() {
+    let config = NntpConfig {
+        max_pipelined: 2,
+        ..NntpConfig::default()
+    };
+    for chunk in [1, 4096] {
+        let (mut client, trace) = support::connect(
+            b"220 1 <first@x>\r\nfirst\r\n.\r\n\
+              220 2 <wanted@x>\r\nwanted\r\n.\r\n\
+              220 3 <foreign@x>\r\nforeign\r\n.\r\n",
+            chunk,
+            &config,
+        )
+        .await;
+        let err = client
+            .fetch_many(&["first@x", "wanted@x", "next@x"])
+            .await
+            .expect_err("a completed window must not escape as a partial batch");
+        assert_malformed(&err);
+        let before = written(&trace);
+        assert!(client.stat("next@x").await.is_err());
+        assert_eq!(written(&trace), before);
+    }
+}
+
+#[tokio::test]
 async fn prewrite_argument_refusal_keeps_connection_usable_and_emits_no_batch() {
     let (mut client, trace) =
         support::connect(b"223 42 <wanted@x> exists\r\n", 1, &NntpConfig::default()).await;
