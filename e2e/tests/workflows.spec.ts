@@ -1517,3 +1517,184 @@ test.describe('deployed-build identity wiring (static pin)', () => {
     expect(pkg.scripts['test:unit']).toContain('tests/zz-build-identity-final.spec.ts');
   });
 });
+
+// Journey evidence gate: an all-skipped Playwright run still exits 0, so
+// without this gate "staging passed" could mean "nothing ran". The e2e job
+// parses the junit artifact and fails closed on zero/empty/all-skipped
+// evidence, on skips above (or outside) the documented allow-list, and on a
+// configured run missing the QA seam token — while publishing ran / skipped /
+// failed counts to the job summary. The tests below execute the exact
+// checked-in script (not a copy of its logic) against synthetic junit
+// fixtures. Only dummy inputs enter the child; no ambient credentials leak in
+// (the child environment is fully specified, never inherited).
+const gateScript = new URL('../scripts/enforce-journey-evidence.mjs', import.meta.url);
+const gateScriptSource = readFileSync(gateScript, 'utf8');
+
+function runGateScript(
+  junitXml: string | null,
+  env: Record<string, string> = {},
+): { status: number | null; output: string; summary: string } {
+  const probe = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'journey-gate-'));
+  try {
+    mkdirSync(join(probe, 'test-results'), { recursive: true });
+    if (junitXml !== null) writeFileSync(join(probe, 'test-results', 'junit.xml'), junitXml);
+    const summaryFile = join(probe, 'summary.md');
+    const result = spawnSync(process.execPath, [fileURLToPath(gateScript)], {
+      encoding: 'utf8',
+      timeout: 10_000,
+      cwd: probe,
+      env: {
+        PATH: process.env.PATH,
+        JUNIT_PATH: 'test-results/junit.xml',
+        MAX_ALLOWED_SKIPS: '2',
+        REQUIRE_QA_AUTH_TOKEN: 'false',
+        GITHUB_STEP_SUMMARY: summaryFile,
+        ...env,
+      },
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    let summary = '';
+    try {
+      summary = readFileSync(summaryFile, 'utf8');
+    } catch {
+      summary = '';
+    }
+    return { status: result.status, output: result.stdout + result.stderr, summary };
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
+  }
+}
+
+const FIXME_QUEUE =
+  '<testcase classname="player-queue-order.spec.ts" name="player queue advances in library-selection order"><skipped message="fixme"/></testcase>';
+const FIXME_MBIDS =
+  '<testcase classname="ingest-play-meter.spec.ts" name="ingested track carries recording_mbids"><skipped message="fixme"/></testcase>';
+const PASSING = (file: string, name: string) =>
+  `<testcase classname="${file}" name="${name}"/>`;
+
+function suiteXml(testcases: string): string {
+  const tests = (testcases.match(/<testcase\b/g) ?? []).length;
+  const skipped = (testcases.match(/<skipped[\s>/]/g) ?? []).length;
+  const failures = (testcases.match(/<failure[\s>/]/g) ?? []).length;
+  return (
+    '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n' +
+    `<testsuite name="staging" tests="${tests}" failures="${failures}" errors="0" skipped="${skipped}">\n` +
+    testcases +
+    '\n</testsuite>\n</testsuites>\n'
+  );
+}
+
+test.describe('journey evidence gate (all-skipped must fail)', () => {
+  test('journey job carries an always-run evidence gate on configured runs', () => {
+    const section = jobSection(stagingWorkflow, 'e2e');
+    const gateAt = section.indexOf('Enforce journey evidence gate');
+    expect(gateAt, 'e2e job must carry the evidence gate step').toBeGreaterThan(-1);
+    const runAt = section.indexOf('run: npm run e2e:staging');
+    expect(runAt, 'e2e job must still run the full journey').toBeGreaterThan(-1);
+    expect(gateAt, 'gate must run after the full journey').toBeGreaterThan(runAt);
+    const nextStep = section.indexOf('\n      - name:', gateAt + 1);
+    const stepBlock = section.slice(gateAt, nextStep === -1 ? undefined : nextStep);
+    // Runs even when the journey failed (to publish counts) but never
+    // pre-deploy (unconfigured staging produces no evidence by design).
+    expect(stepBlock).toContain('if: always()');
+    expect(stepBlock).toContain(`steps.staging.outputs.configured == 'true'`);
+    expect(stepBlock).toContain('node scripts/enforce-journey-evidence.mjs');
+    expect(stepBlock).toContain(`MAX_ALLOWED_SKIPS: '2'`);
+    expect(stepBlock).toContain(`REQUIRE_QA_AUTH_TOKEN: 'true'`);
+  });
+
+  test('all-skipped evidence fails and reports empty counts', () => {
+    const xml = suiteXml(
+      PASSING('a.spec.ts', 'journey one').replace('/>', '><skipped message="seam unconfigured"/></testcase>') +
+        PASSING('b.spec.ts', 'journey two').replace('/>', '><skipped message="seam unconfigured"/></testcase>'),
+    );
+    const result = runGateScript(xml);
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('every journey skipped');
+    expect(result.summary).toContain('| 2 | 0 | 2 | 0 |');
+  });
+
+  test('zero test cases fail as zero journeys ran', () => {
+    const xml = suiteXml('');
+    const result = runGateScript(xml);
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('zero journeys ran');
+  });
+
+  test('allow-listed fixmes within budget pass with counts', () => {
+    const xml = suiteXml(
+      PASSING('signup-byop.spec.ts', 'signup creates an account') +
+        PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
+        FIXME_QUEUE +
+        FIXME_MBIDS,
+    );
+    const result = runGateScript(xml);
+    expect(result.status).toBe(0);
+    expect(result.summary).toContain('| 4 | 2 | 2 | 0 |');
+    expect(result.summary).toContain('PASS');
+  });
+
+  test('allow-listed skips above the budget still fail', () => {
+    const xml = suiteXml(
+      PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
+        FIXME_QUEUE +
+        FIXME_MBIDS +
+        FIXME_QUEUE.replace('player-queue-order.spec.ts', 'other.spec.ts'),
+    );
+    const result = runGateScript(xml);
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('above the allow-list budget');
+  });
+
+  test('a skip outside the allow-list fails and names the test', () => {
+    const xml = suiteXml(
+      PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
+        '<testcase classname="scoped-credentials.spec.ts" name="lifecycle mints a session"><skipped message="no token"/></testcase>',
+    );
+    const result = runGateScript(xml);
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('outside the allow-list');
+    expect(result.output).toContain('scoped-credentials.spec.ts lifecycle mints a session');
+  });
+
+  test('failures fail the gate without leaking failure text', () => {
+    const marker = 'SENTINEL-FAILURE-VALUE-GATE';
+    const xml = suiteXml(
+      PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
+        `<testcase classname="ingest.spec.ts" name="NZB ingests"><failure message="boom">${marker} in failure text</failure></testcase>`,
+    );
+    const result = runGateScript(xml);
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('failing test(s)');
+    expect(result.output).not.toContain(marker);
+    expect(result.summary).not.toContain(marker);
+  });
+
+  test('absent junit evidence on a configured run fails closed', () => {
+    const result = runGateScript(null, { JUNIT_PATH: 'test-results/absent.xml' });
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('no junit evidence');
+  });
+
+  test('missing seam token fails a token-required run, passes otherwise', () => {
+    const xml = suiteXml(PASSING('health.spec.ts', 'GET /api/health reports ok:true'));
+    const required = runGateScript(xml, { REQUIRE_QA_AUTH_TOKEN: 'true', QA_AUTH_TOKEN: '' });
+    expect(required.status).not.toBe(0);
+    expect(required.output).toContain('QA_AUTH_TOKEN is not set');
+    const provided = runGateScript(xml, {
+      REQUIRE_QA_AUTH_TOKEN: 'true',
+      QA_AUTH_TOKEN: 'dummy-qa-token',
+    });
+    expect(provided.status).toBe(0);
+    const notRequired = runGateScript(xml, { REQUIRE_QA_AUTH_TOKEN: 'false', QA_AUTH_TOKEN: '' });
+    expect(notRequired.status).toBe(0);
+  });
+
+  test('allow-list reasons name the owning specs', () => {
+    expect(gateScriptSource).toContain('player-queue-order');
+    expect(gateScriptSource).toContain('ingest-play-meter');
+    expect(gateScriptSource).toContain('reason');
+  });
+
+});
