@@ -102,12 +102,3 @@ export function parseErrorBody(body: unknown, status: number): ParsedApiError {
 	// Legacy body without a code: derive category and retry policy from status.
 	return { code: fallback.code, message, retryable: fallback.retryable };
 }
-
-/** Read and parse an error `Response` body exactly once. */
-export async function parseErrorResponse(response: Response): Promise<ParsedApiError> {
-	try {
-		return parseErrorBody(await response.json(), response.status);
-	} catch {
-		return parseErrorBody(null, response.status);
-	}
-}
