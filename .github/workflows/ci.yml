@@ -206,6 +206,49 @@ jobs:
       - name: Acceptance-test unreadable-input handling
         run: python3 .github/scripts/test_public_text_read_errors.py
 
+  # Bounded local Cargo pool: the offline wrapper suite plus a shape
+  # check of the shipped pool policy through the wrapper's own
+  # load_policy. No Cargo, network, or host pool needed. Keep this job
+  # id in ci-ok's needs.
+  cargo-pool:
+    name: cargo-pool
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Run the bounded-pool offline suite
+        run: python3 scripts/test_cargo_cache.py
+      - name: Validate the shipped pool policy
+        run: |
+          python3 - <<'EOF'
+          import json
+          import sys
+          import tempfile
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          import cargo_cache as cache
+          with tempfile.TemporaryDirectory() as tmp:
+              pool = Path(tmp) / 'pool'
+              pool.mkdir()
+              policy = json.loads(Path('scripts/cargo_pool_policy.json').read_text())
+              policy.pop('_note', None)
+              (pool / 'policy.json').write_text(json.dumps(policy))
+              for n in range(policy['slots']):
+                  slot = pool / f'slot-{n}'
+                  slot.mkdir()
+                  (slot / 'target').mkdir()
+                  (slot / 'scratch').mkdir()
+                  (slot / 'lock').touch()
+              loaded = cache.load_policy(pool)
+              print('pool policy ok:',
+                    loaded['slots'], 'slots x',
+                    loaded['slot_budget_bytes'], 'bytes, hard limit',
+                    loaded['hard_limit_bytes'])
+          EOF
+
   # Wrangler binding parity: every worker config's required bindings
   # (R2, KV, Queues, Hyperdrive, Analytics Engine, ...) must be present
   # in both staging and prod and match the docs/ops.md inventory. The
@@ -856,7 +899,7 @@ jobs:
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape]
+    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, cargo-pool]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
