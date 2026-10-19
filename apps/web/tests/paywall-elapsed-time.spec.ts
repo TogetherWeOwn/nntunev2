@@ -190,7 +190,14 @@ test('a new limit response while the modal stays open establishes a fresh deadli
 	await page.getByRole('button', { name: 'Manage billing', exact: true }).click();
 	await portalSeen;
 
+	// The Retry control re-runs the loader (subscription, then usage). Wait
+	// for the loader's subscription round-trip — the response that must
+	// precede the modal — instead of racing the 5s dialog assertion against
+	// a cold invalidateAll round-trip on a loaded runner (seen once on CI:
+	// the dialog never mounted within the default timeout).
+	const retriedSubscription = page.waitForResponse('**/v1/me/subscription', { timeout: 15_000 });
 	await page.getByRole('button', { name: 'Retry', exact: true }).click();
+	await retriedSubscription;
 	const dialog = page.getByRole('dialog');
 	await expect(dialog).toBeVisible();
 	await expect(page.getByTestId('paywall-countdown')).toHaveText(/Try again in \d+ seconds\./);
