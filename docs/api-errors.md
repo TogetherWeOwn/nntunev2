@@ -2,9 +2,10 @@
 
 The `api`, `ingest`, `mb`, and `stream` crates define mappings to the same
 JSON error envelope. In this slice, `ingest` and `mb` serialize the envelope
-on their wired HTTP error paths, except ingest's search-throttle 429, which
-stays a legacy `{"error":"too many requests"}` body with `Retry-After`
-(`search_rate_limited_body` in `workers/ingest/src/rate_limit.rs`, served by
+on their wired HTTP error paths, including ingest's search-throttle 429,
+which carries `{code: rate_limited, message, retryable: true}` with
+`Retry-After` (`search_rate_limited_body` in
+`workers/ingest/src/rate_limit.rs`, served by
 `search_rate_limited_response` in `workers/ingest/src/lib.rs`). The API emits
 `reauth_required` from privilege-gated vault mutations (`vault_put` and
 `vault_delete` via `authenticate_privileged`) and `account_deleting` when a
@@ -219,7 +220,7 @@ code, status, or retryable drift):
   `unknown_code_falls_back_to_the_documented_generic` tests.
 - Intake refusals and ingest extras: `workers/ingest/src/nzb_intake.rs`
   (intake codes and caps), `intake_rejection_parts` and `queued_body` in
-  `workers/ingest/src/lib.rs`, and the legacy 429 in
+  `workers/ingest/src/lib.rs`, and the search-throttle 429 envelope in
   `workers/ingest/src/rate_limit.rs`.
 - API and stream wiring scope: `authenticate_privileged`,
   `account_deleting_response`, and `session_error_response` in
