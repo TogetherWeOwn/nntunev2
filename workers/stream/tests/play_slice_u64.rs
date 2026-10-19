@@ -35,7 +35,9 @@
 //! `yenc.rs` with `syn` and inspect token streams, so comments cannot
 //! hide a cast and any host fails. They forbid only the narrowing shapes
 //! named above — never cast `self.pos` / `self.end` / a `buf_start`
-//! difference / `staged_bytes` directly, and never do arithmetic after a
+//! difference (under any alias or parenthesisation: the gate walks each
+//! `as usize` cast's operand for `self.pos`, `self.end` or a `buf_start*`
+//! identifier) / `staged_bytes` directly, and never do arithmetic after a
 //! narrowing cast (`as usize +`). Deliberately unpinned: the exact
 //! widening syntax, local variable names, helper extraction, and the
 //! chunk size.
@@ -110,11 +112,10 @@ fn parse(src: &str, name: &str) -> syn::File {
     syn::parse_file(src).unwrap_or_else(|e| panic!("{name} must parse as Rust: {e}"))
 }
 
-/// Token text of the `impl Iterator for PlayStream` block (comments are
-/// not tokens, so a commented-out cast cannot hide here and a cast named
-/// in a comment cannot false-positive).
-fn play_stream_iterator_tokens() -> String {
-    let file = parse(PLAY_RS, "play.rs");
+/// The `impl Iterator for PlayStream` block (comments are not tokens, so
+/// a commented-out cast cannot hide here and a cast named in a comment
+/// cannot false-positive).
+fn play_stream_iterator_impl(file: &syn::File) -> &syn::ItemImpl {
     for item in &file.items {
         let syn::Item::Impl(item_impl) = item else {
             continue;
@@ -126,17 +127,240 @@ fn play_stream_iterator_tokens() -> String {
         });
         let self_ty = item_impl.self_ty.to_token_stream().to_string();
         if is_iterator && self_ty.contains("PlayStream") {
-            return item_impl.to_token_stream().to_string();
+            return item_impl;
         }
     }
     panic!("play.rs must still contain `impl Iterator for PlayStream`");
 }
 
+/// Token text of the `impl Iterator for PlayStream` block.
+fn play_stream_iterator_tokens() -> String {
+    let file = parse(PLAY_RS, "play.rs");
+    play_stream_iterator_impl(&file)
+        .to_token_stream()
+        .to_string()
+}
+
+/// Which forbidden u64 offset a cast operand mentions, if any: `self.pos`,
+/// `self.end`, or any identifier containing `buf_start` (so a renamed
+/// alias such as `buf_start_local` or a field access `live.buf_start`
+/// counts, under any parenthesisation).
+fn narrowing_operand(expr: &syn::Expr) -> Option<&'static str> {
+    let text = expr.to_token_stream().to_string();
+    if text.contains("self . pos") {
+        Some("`self.pos`")
+    } else if text.contains("self . end") {
+        Some("`self.end`")
+    } else if text
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|token| token.contains("buf_start"))
+    {
+        Some("a `buf_start*` identifier")
+    } else {
+        None
+    }
+}
+
+/// `expr as usize` violations inside one expression: a cast whose operand
+/// token subtree still mentions an unbounded u64 offset. Hand-rolled
+/// `syn::Expr` recursion (this crate's `syn` dev-dependency does not
+/// enable the `visit` feature, and only this test file may change).
+/// Casts inside macro-invocation tokens are not parsed as `Expr` and so
+/// are out of reach here; the literal token patterns in the gate below
+/// still cover their direct spellings.
+fn collect_narrowing_casts(expr: &syn::Expr, violations: &mut Vec<String>) {
+    use syn::Expr;
+    if let Expr::Cast(cast) = expr {
+        if cast.ty.to_token_stream().to_string() == "usize" {
+            if let Some(what) = narrowing_operand(&cast.expr) {
+                violations.push(format!(
+                    "`{} as usize` (narrows {what} before the buffer-length clamp)",
+                    cast.expr.to_token_stream()
+                ));
+            }
+        }
+    }
+    match expr {
+        Expr::Array(array) => {
+            for elem in &array.elems {
+                collect_narrowing_casts(elem, violations);
+            }
+        }
+        Expr::Assign(assign) => {
+            collect_narrowing_casts(&assign.left, violations);
+            collect_narrowing_casts(&assign.right, violations);
+        }
+        Expr::Async(expr) => collect_narrowing_casts_in_block(&expr.block, violations),
+        Expr::Await(expr) => collect_narrowing_casts(&expr.base, violations),
+        Expr::Binary(expr) => {
+            collect_narrowing_casts(&expr.left, violations);
+            collect_narrowing_casts(&expr.right, violations);
+        }
+        Expr::Block(expr) => collect_narrowing_casts_in_block(&expr.block, violations),
+        Expr::Break(expr) => {
+            if let Some(inner) = &expr.expr {
+                collect_narrowing_casts(inner, violations);
+            }
+        }
+        Expr::Call(call) => {
+            collect_narrowing_casts(&call.func, violations);
+            for arg in &call.args {
+                collect_narrowing_casts(arg, violations);
+            }
+        }
+        Expr::Cast(cast) => collect_narrowing_casts(&cast.expr, violations),
+        Expr::Closure(closure) => collect_narrowing_casts(&closure.body, violations),
+        Expr::Const(expr) => collect_narrowing_casts_in_block(&expr.block, violations),
+        Expr::Field(expr) => collect_narrowing_casts(&expr.base, violations),
+        Expr::ForLoop(expr) => {
+            collect_narrowing_casts(&expr.expr, violations);
+            collect_narrowing_casts_in_block(&expr.body, violations);
+        }
+        Expr::Group(group) => collect_narrowing_casts(&group.expr, violations),
+        Expr::If(expr) => {
+            collect_narrowing_casts(&expr.cond, violations);
+            collect_narrowing_casts_in_block(&expr.then_branch, violations);
+            if let Some((_, else_branch)) = &expr.else_branch {
+                collect_narrowing_casts(else_branch, violations);
+            }
+        }
+        Expr::Index(expr) => {
+            collect_narrowing_casts(&expr.expr, violations);
+            collect_narrowing_casts(&expr.index, violations);
+        }
+        Expr::Let(expr) => collect_narrowing_casts(&expr.expr, violations),
+        Expr::Loop(expr) => collect_narrowing_casts_in_block(&expr.body, violations),
+        Expr::Match(expr) => {
+            collect_narrowing_casts(&expr.expr, violations);
+            for arm in &expr.arms {
+                collect_narrowing_casts_in_pat(&arm.pat, violations);
+                collect_narrowing_casts(&arm.body, violations);
+            }
+        }
+        Expr::MethodCall(call) => {
+            collect_narrowing_casts(&call.receiver, violations);
+            for arg in &call.args {
+                collect_narrowing_casts(arg, violations);
+            }
+        }
+        Expr::Paren(expr) => collect_narrowing_casts(&expr.expr, violations),
+        Expr::Range(range) => {
+            if let Some(start) = &range.start {
+                collect_narrowing_casts(start, violations);
+            }
+            if let Some(end) = &range.end {
+                collect_narrowing_casts(end, violations);
+            }
+        }
+        Expr::RawAddr(expr) => collect_narrowing_casts(&expr.expr, violations),
+        Expr::Reference(expr) => collect_narrowing_casts(&expr.expr, violations),
+        Expr::Repeat(expr) => {
+            collect_narrowing_casts(&expr.expr, violations);
+            collect_narrowing_casts(&expr.len, violations);
+        }
+        Expr::Return(expr) => {
+            if let Some(inner) = &expr.expr {
+                collect_narrowing_casts(inner, violations);
+            }
+        }
+        Expr::Struct(expr) => {
+            for field in &expr.fields {
+                collect_narrowing_casts(&field.expr, violations);
+            }
+            if let Some(rest) = &expr.rest {
+                collect_narrowing_casts(rest, violations);
+            }
+        }
+        Expr::Try(expr) => collect_narrowing_casts(&expr.expr, violations),
+        Expr::TryBlock(expr) => collect_narrowing_casts_in_block(&expr.block, violations),
+        Expr::Tuple(expr) => {
+            for elem in &expr.elems {
+                collect_narrowing_casts(elem, violations);
+            }
+        }
+        Expr::Unary(expr) => collect_narrowing_casts(&expr.expr, violations),
+        Expr::Unsafe(expr) => collect_narrowing_casts_in_block(&expr.block, violations),
+        Expr::While(expr) => {
+            collect_narrowing_casts(&expr.cond, violations);
+            collect_narrowing_casts_in_block(&expr.body, violations);
+        }
+        Expr::Yield(expr) => {
+            if let Some(inner) = &expr.expr {
+                collect_narrowing_casts(inner, violations);
+            }
+        }
+        Expr::Continue(_)
+        | Expr::Infer(_)
+        | Expr::Lit(_)
+        | Expr::Macro(_)
+        | Expr::Path(_)
+        | Expr::Verbatim(_)
+        | _ => {}
+    }
+}
+
+/// Match-arm guards are `Pat::Guard` in this `syn` version; a cast in a
+/// guard is an expression too.
+fn collect_narrowing_casts_in_pat(pat: &syn::Pat, violations: &mut Vec<String>) {
+    match pat {
+        syn::Pat::Guard(guard) => {
+            collect_narrowing_casts_in_pat(&guard.pat, violations);
+            collect_narrowing_casts(&guard.guard, violations);
+        }
+        syn::Pat::Or(or) => {
+            for case in &or.cases {
+                collect_narrowing_casts_in_pat(case, violations);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_narrowing_casts_in_block(block: &syn::Block, violations: &mut Vec<String>) {
+    for stmt in &block.stmts {
+        match stmt {
+            syn::Stmt::Local(local) => {
+                if let Some(init) = &local.init {
+                    collect_narrowing_casts(&init.expr, violations);
+                    if let Some((_, diverge)) = &init.diverge {
+                        collect_narrowing_casts(diverge, violations);
+                    }
+                }
+            }
+            syn::Stmt::Expr(expr, _) => collect_narrowing_casts(expr, violations),
+            syn::Stmt::Item(syn::Item::Fn(item_fn)) => {
+                collect_narrowing_casts_in_block(&item_fn.block, violations)
+            }
+            syn::Stmt::Item(_) | syn::Stmt::Macro(_) => {}
+        }
+    }
+}
+
+/// Every `as usize` narrowing of a u64 play offset in
+/// `impl Iterator for PlayStream`, whatever the local alias or
+/// parenthesisation: this is what kills an aliased restore of the old
+/// truncating live window on a 64-bit host.
+fn play_stream_narrowing_casts() -> Vec<String> {
+    let file = parse(PLAY_RS, "play.rs");
+    let item_impl = play_stream_iterator_impl(&file);
+    let mut violations = Vec::new();
+    for item in &item_impl.items {
+        if let syn::ImplItem::Fn(method) = item {
+            collect_narrowing_casts_in_block(&method.block, &mut violations);
+        }
+    }
+    violations
+}
+
 #[test]
 fn play_slicing_keeps_offsets_in_u64_until_final_index() {
     let tokens = play_stream_iterator_tokens();
-    // Token-stream text is single-spaced: `self . pos as usize`.
-    let forbidden: [(&str, &str); 4] = [
+    // Token-stream text is single-spaced: `self . pos as usize`. The
+    // `buf_start` difference is not pinned literally: renaming it to an
+    // alias (`buf_start_local`) would slip a literal pattern yet still
+    // truncate on wasm32, so `play_stream_narrowing_casts` below walks
+    // every `ExprCast` to `usize` instead.
+    let forbidden: [(&str, &str); 3] = [
         (
             "self . pos as usize",
             "the cached window/slice narrows the u64 `pos` before clamping",
@@ -146,20 +370,16 @@ fn play_slicing_keeps_offsets_in_u64_until_final_index() {
             "the cached window narrows the u64 `end` before clamping",
         ),
         (
-            "buf_start) as usize",
-            "a `pos - buf_start` / `end - buf_start` difference is narrowed \
-             before the buffer-length clamp",
-        ),
-        (
             "as usize +",
             "arithmetic runs after a narrowing cast instead of in u64",
         ),
     ];
-    let violations: Vec<String> = forbidden
+    let mut violations: Vec<String> = forbidden
         .iter()
         .filter(|(pattern, _)| tokens.contains(pattern))
         .map(|(pattern, why)| format!("`{pattern}` ({why})"))
         .collect();
+    violations.extend(play_stream_narrowing_casts());
     assert!(
         violations.is_empty(),
         "`impl Iterator for PlayStream` in workers/stream/src/play.rs still \
