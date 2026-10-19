@@ -11,6 +11,9 @@
 //!
 //! Note: a bare `":?"` substring ban misses the alternate spellings (`:#?`
 //! puts `#` between `:` and `?`), so both `":?"` and `"#?"` are banned.
+//! Format params (fill/align/width/precision/hex, e.g. `{e:x?}`, `{e:10?}`)
+//! can also sit between `:` and `?`, so `"?}"` is banned as well — the Debug
+//! `?` is always the final char of a format spec, covering every spelling.
 //!
 //! Slicing helpers below mirror the acceptance file's scoping; the
 //! Test-Author file itself is intentionally untouched.
@@ -101,11 +104,12 @@ fn commit_context() -> String {
 #[test]
 fn commit_context_uses_no_debug_format_specifier() {
     let context = commit_context();
-    for spec in [":?", "#?"] {
+    for spec in [":?", "#?", "?}"] {
         assert!(
             !context.contains(spec),
             "commit failure path must not use the Debug format specifier \
-             (`{{:?}}`, `{{e:?}}`, `{{:#?}}`, `{{e:#?}}` all render the server \
+             (`{{:?}}`, `{{e:?}}`, `{{:#?}}`, `{{e:#?}}`, plus param variants \
+             like `{{e:x?}}`/`{{e:10?}}`, all render the server \
              message/detail via tokio_postgres::Error Debug) — found `{spec}` \
              in:\n{context}"
         );
