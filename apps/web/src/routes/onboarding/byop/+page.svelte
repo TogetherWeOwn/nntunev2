@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { readSignedInEmail } from '#lib/signed-in-email.js';
 	import { serializePublicKeyCredential, toRequestOptions } from '#lib/webauthn.js';
@@ -51,6 +51,16 @@
 	let saveState = $state<'idle' | 'saving' | 'saved' | 'failed'>('idle');
 	let testedConfigKey = $state<string | null>(null);
 	let testRunId = 0;
+	// Independent of result state: invalidating a configuration must not release
+	// an operation that is still awaiting a response or a passkey ceremony.
+	let busy = $state(false);
+	let disposed = false;
+
+	onDestroy(() => {
+		disposed = true;
+		invalidateTest();
+		busy = false;
+	});
 
 	// Keep the wire payload honest: a TLS connection never carries the
 	// plaintext opt-in, so clear a stale acknowledgement when TLS is on.
@@ -76,6 +86,10 @@
 		return JSON.stringify(currentTestInput());
 	}
 
+	function isCurrentTest(runId: number, inputKey: string) {
+		return !disposed && runId === testRunId && inputKey === currentTestKey();
+	}
+
 	function invalidateTest() {
 		testRunId += 1;
 		testedConfigKey = null;
@@ -88,6 +102,7 @@
 	}
 
 	function backTo(previousStep: 1 | 2) {
+		if (disposed || busy || saveState === 'saved') return;
 		invalidateTest();
 		errors = [];
 		step = previousStep;
@@ -109,6 +124,7 @@
 	}
 
 	async function runTest() {
+		if (disposed || busy || saveState === 'saved') return;
 		const input = currentTestInput();
 		const inputKey = JSON.stringify(input);
 		errors = validateProviderConfig(providerInput());
@@ -119,6 +135,7 @@
 			return;
 		}
 
+		busy = true;
 		const runId = ++testRunId;
 		testedConfigKey = null;
 		testState = 'testing';
@@ -126,7 +143,7 @@
 		reauthRequired = false;
 		try {
 			const result: ProviderTestResult = await client.testProviderConnection(input);
-			if (runId !== testRunId || inputKey !== currentTestKey()) return;
+			if (!isCurrentTest(runId, inputKey)) return;
 			// The response is a redacted summary: never echo credentials.
 			if (result.ok) {
 				testedConfigKey = inputKey;
@@ -140,7 +157,7 @@
 				testDetail = 'The server could not reach that provider.';
 			}
 		} catch (error) {
-			if (runId !== testRunId || inputKey !== currentTestKey()) return;
+			if (!isCurrentTest(runId, inputKey)) return;
 			if (error instanceof ApiError && error.paywall) {
 				// The global paywall owns the limit response; avoid a duplicate
 				// inline failure state beneath the modal.
@@ -168,6 +185,9 @@
 						? 'The API is not deployed yet — try again later.'
 						: 'Connection test failed. Check the details and try again.';
 			}
+		} finally {
+			if (testState === 'testing') testState = 'idle';
+			busy = false;
 		}
 	}
 
@@ -183,16 +203,19 @@
 	}
 
 	async function reauthenticateAndSave() {
-		if (reauthState === 'working') return;
+		if (disposed || busy || saveState === 'saved' || !saveReauthRequired) return;
+		const runId = testRunId;
 		const inputKey = currentTestKey();
 		if (testState !== 'ok' || testedConfigKey !== inputKey) return;
 		if (typeof PublicKeyCredential === 'undefined') {
 			reauthState = 'failed';
 			return;
 		}
+		busy = true;
 		reauthState = 'working';
 		try {
 			const options = await client.reauthenticateStart();
+			if (!isCurrentTest(runId, inputKey)) return;
 			const assertion = await navigator.credentials.get({
 				publicKey: toRequestOptions({
 					challenge: options.challenge,
@@ -200,6 +223,7 @@
 					allowCredentials: []
 				})
 			});
+			if (!isCurrentTest(runId, inputKey)) return;
 			if (!(assertion instanceof PublicKeyCredential)) throw new Error('no public-key credential');
 			const serialized = serializePublicKeyCredential(assertion);
 			const response = serialized.response as Record<string, unknown>;
@@ -221,10 +245,9 @@
 				clientDataJson,
 				signature
 			});
-			if (currentTestKey() !== inputKey || testedConfigKey !== inputKey) {
-				throw new Error('provider configuration changed after testing');
-			}
+			if (!isCurrentTest(runId, inputKey) || testedConfigKey !== inputKey) return;
 		} catch (error) {
+			if (!isCurrentTest(runId, inputKey)) return;
 			if (error instanceof ApiError && error.paywall) {
 				// The global paywall owns the limit response; avoid a duplicate
 				// inline failure state beneath the modal.
@@ -237,39 +260,48 @@
 			}
 			reauthState = 'failed';
 			return;
+		} finally {
+			if (reauthState === 'working') reauthState = 'idle';
+			busy = false;
 		}
 
+		// Transfer to save synchronously after releasing the ceremony guard.
 		// Reuse the normal save path so the in-flight state, tested-input guard,
 		// and paywall/error handling stay identical after reauthentication.
 		await save();
 	}
 
 	async function save() {
+		if (disposed || busy || saveState === 'saved') return;
 		const input = currentTestInput();
 		const inputKey = JSON.stringify(input);
-		if (testState !== 'ok' || testedConfigKey !== inputKey || saveState === 'saving') {
+		if (testState !== 'ok' || testedConfigKey !== inputKey) {
 			if (testedConfigKey !== inputKey) invalidateTest();
 			return;
 		}
 
+		busy = true;
 		const runId = testRunId;
 		saveReauthRequired = false;
 		reauthState = 'idle';
 		saveState = 'saving';
 		try {
 			await client.saveProviderConfig(input);
-			if (runId === testRunId && inputKey === currentTestKey()) {
+			if (isCurrentTest(runId, inputKey)) {
 				saveState = 'saved';
 				window.location.href = '/library';
 			}
 		} catch (error) {
-			if (runId !== testRunId || inputKey !== currentTestKey()) return;
+			if (!isCurrentTest(runId, inputKey)) return;
 			if (error instanceof ApiError && error.paywall) {
 				saveState = 'idle';
 				return;
 			}
 			saveReauthRequired = error instanceof ApiError && error.code === 'reauth_required';
 			saveState = 'failed';
+		} finally {
+			if (saveState === 'saving') saveState = 'idle';
+			busy = false;
 		}
 	}
 </script>
@@ -378,7 +410,7 @@
 				class="nt-button nt-button--ghost"
 				type="button"
 				onclick={() => backTo(2)}
-				disabled={saveState === 'saving' || reauthState === 'working'}
+				disabled={busy || saveState === 'saved'}
 			>
 				Back
 			</button>
@@ -387,7 +419,7 @@
 				type="button"
 				onclick={runTest}
 					data-testid="byop-test-connection"
-				disabled={testState === 'testing'}
+				disabled={busy || saveState === 'saved'}
 			>
 				{testState === 'testing' ? 'Testing…' : 'Test connection'}
 			</button>
@@ -398,7 +430,7 @@
 					type="button"
 					onclick={save}
 						data-testid="byop-save"
-					disabled={saveState === 'saving' || saveState === 'saved' || reauthState === 'working'}
+					disabled={busy || saveState === 'saved'}
 				>
 					{saveState === 'saved'
 						? 'Saved'
@@ -432,7 +464,7 @@
 								}}
 							/>
 						</label>
-						<button class="nt-button" type="button" onclick={runTest}>Test again</button>
+						<button class="nt-button" type="button" onclick={runTest} disabled={busy}>Test again</button>
 					</div>
 				{:else}
 					<p data-testid="byop-status" role="alert">{testDetail}</p>
@@ -447,7 +479,7 @@
 						class="nt-button"
 						type="button"
 						onclick={reauthenticateAndSave}
-						disabled={reauthState === 'working'}
+						disabled={busy}
 					>
 						{reauthState === 'working' ? 'Verifying…' : 'Reauthenticate and save'}
 					</button>
