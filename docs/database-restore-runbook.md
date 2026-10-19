@@ -25,9 +25,12 @@ and changes no code or migration.
 - **Execution.** Only the Operator runs provider-side steps, from the
   authorized host path, using the existing secure wiring
   (`PLANETSCALE_MIGRATOR_URL_STAGING`, Hyperdrive bindings). No database
-  URL, password, token, hostname, or personal login identity is printed,
-  copied into a ticket, or committed. Evidence records carry names, dates,
-  and outcomes only.
+  URL, password, token, hostname, account ID, environment value, or
+  personal login identity is printed, copied into a ticket, or committed.
+  Evidence records carry the operational fields §6 requires (names, dates,
+  query expressions, migration numbers, counts, cutover mechanism/time,
+  version identifiers, commit SHAs, run URLs) and outcomes — and nothing
+  sensitive (see the prohibited list in §6).
 - **Claim boundary.** PlanetScale console/CLI behavior below is documented
   from this repository's host receipts, not from a live provider session in
   this workspace. Every platform fact this author could not verify against
@@ -77,12 +80,18 @@ forward-only (§4).
    delete configs, roles, or databases — decommissioning needs the
    data-retention gate per `docs/ops.md` UNDO blocks). Record what was
    paused, when, by whom.
-3. Snapshot the present: record current branch/database, applied migration
-   head (`migrations/manifest.toml` highest number applied to that
-   environment), serving build SHAs (`GET /api/build` for web; Worker
+3. Snapshot the present: record current branch/database, the applied
+   migration head from the target database's authoritative
+   per-database applied-migration record (not the `migrations/manifest.toml`
+   highest number — the manifest is a repository file list, not per-database
+   applied state), serving build SHAs (`GET /api/build` for web; Worker
    version records per `docs/ops.md` future-lanes table), and a read-only
-   row-count/sample of the damage. This snapshot is the baseline the
-   post-restore verification (§5) diffs against.
+   row-count/sample of the damage. Per `docs/adr/0002-data-model.md`
+   the per-database migration runner and its applied-history record are
+   an unimplemented prerequisite: until that runner/record lands, the
+   applied head cannot be established authoritatively and §§3.4/5 are
+   blocked. This snapshot is the baseline the post-restore verification
+   (§5) diffs against.
 4. Rule out forward fix in writing: state why a new migration or
    compensating write cannot reconstruct the data, with the row/sample
    evidence from step 3. If it can, close the restore lane and work the
@@ -117,22 +126,36 @@ forward-only (§4).
    role labels, check expressions, and outcomes — never URLs or secrets
    (same reporting shape as the `docs/ops.md` MB grant follow-up).
 4. **Forward-converge the schema (never rewrite history).** Diff the
-   restored copy's applied-migration head against the live head. Re-apply
-   every migration the snapshot predates as NEW forward applications on
-   the restored copy, in manifest order, through the migrator role — never
-   by editing, renumbering, or deleting migration files
+   restored copy's applied-migration head (from the per-database
+   applied-migration record, §2 step 3) against the live head. Re-apply
+   only manifest entries whose `target` matches the restored database
+   (`app` for `nntunev2_staging`, `mirror` for the MB `postgres`) that the
+   snapshot predates, as NEW forward applications on the restored copy, in
+   manifest order, through that database's own migrator role — never by
+   editing, renumbering, or deleting migration files
    (`migrations/README.md:9`; `applied-edited` / `applied-removed` would
-   fail the gate). If the damage was caused by a bad migration, include
-   its forward correction in this pass.
+   fail the gate). Abort on any entry with a missing or mismatched target
+   (the manifest interleaves targets — e.g. 0001/0014/0016/0017 are
+   `mirror` — so unfiltered re-application would run mirror migrations
+   against the app database and vice versa, which
+   `docs/adr/0002-data-model.md` forbids). If the damage was caused by a
+   bad migration, include its forward correction in this pass. Blocked
+   until the per-database runner/record prerequisite (§2 step 3) lands.
 5. **Vault/KEK pass before writes reopen.** Restored rows may pin older
    `kek_version` values. Per `docs/security/kek-rotation.md` §5 invariant
    3 and §7 RESTORE: confirm the KEK versions the restored rows need are
    still provisioned, and run the re-wrap pass over restored rows BEFORE
-   reopening writes so no row stays pinned to a retired version. Retired
-   key material stays in the operator store until the retire-after date
-   (latest of re-wrap-complete + one window, oldest restorable
-   backup/PITR horizon expiry) — a restore never justifies deleting key
-   material early.
+   reopening writes so no row stays pinned to a retired version. The
+   re-wrap runner and the versioned KEK map (`VAULT_KEK_V<N>`
+   per-version secrets + `VAULT_KEK_CURRENT` write-version var +
+   `rotation_runs` progress table) are **not implemented**
+   (`docs/security/kek-rotation.md` §7 NOT EXECUTABLE banner, §8 gate
+   items; the Worker reads only `VAULT_KEK_BASE64` + `VAULT_KEK_VERSION`):
+   a restore of a vault-bearing (app) database is blocked until they
+   land. Retired key material stays in the operator store until the
+   retire-after date (latest of re-wrap-complete + one window, oldest
+   restorable backup/PITR horizon expiry) — a restore never justifies
+   deleting key material early.
 6. **Cutover (authorized promotion, not a redeploy).** Only after steps
    3–5 are recorded green: repoint the environment's binding (Hyperdrive
    config / migrator URL) to the restored-and-converged target through
@@ -158,14 +181,20 @@ forward-only (§4).
 ## 4. Why a restore never breaks forward-only
 
 A restore moves *data* back in time; it must not move *history* back.
-`migrations_gate.py check_drift` compares applied migrations against the
-base ref and fails on `applied-edited` (contents/target/checksum changed)
-or `applied-removed` (migration missing). Restoring a snapshot that
-predates migration N and then continuing as if N never existed would read
-as history rewrite on the next gate run. The §3.4 forward-convergence
-pass exists to prevent exactly that: the restored copy re-applies every
-missing migration forward, so `manifest.toml` stays strictly increasing
-and checksums intact, and the gate sees only new forward applications.
+`migrations_gate.py check_drift` compares repository migration files and
+manifest entries against the base ref only (git `ls-tree`/`show`) and
+fails on `applied-edited` (contents/target/checksum changed) or
+`applied-removed` (migration missing) — it never reads database state, so
+a green gate proves nothing about whether the restored database was
+converged. Restoring a snapshot that predates migration N and then
+continuing as if N never existed would leave the database behind the
+repository history the gate enforces. The §3.4 forward-convergence pass
+exists to prevent exactly that: the restored copy re-applies every
+missing same-target migration forward, so `manifest.toml` stays strictly
+increasing and checksums intact. Blocked until the per-database
+runner/record prerequisite (§2 step 3) lands — there is currently no
+authoritative applied record for the gate or this runbook to converge
+against.
 If the restored copy cannot converge forward (e.g. a later migration is
 incompatible with older data), stop and escalate — do not edit the old
 migration files to force convergence.
@@ -174,11 +203,18 @@ migration files to force convergence.
 
 - Snapshot timestamp predates the damage; pre/post row counts and samples
   reconcile (expected losses/gaps listed explicitly, none hand-waved).
-- Applied-migration head on the live target equals the pre-incident head
-  plus any forward corrections; `migrations_gate.py` green on the head.
-- KEK re-wrap complete: `SELECT count(*) WHERE kek_version < current`
-  reads 0 twice (two consecutive passes), per the rotation invariant;
-  retire-after date re-recorded against the restore date.
+- Applied-migration head on the live target (per the per-database
+  applied-migration record, §2 step 3) equals the pre-incident head plus
+  any forward corrections; `migrations_gate.py` green on the head
+  (repository-side check only — it does not prove database state, §4).
+- KEK re-wrap complete (app database only; blocked until the §3.5
+  re-wrap runner prerequisite lands): `SELECT count(*) FROM
+  provider_vaults WHERE kek_version < <VAULT_KEK_CURRENT>` reads 0 twice
+  (two consecutive passes, current = the `VAULT_KEK_CURRENT` write
+  version), per the rotation invariant; retire-after date re-recorded
+  against the restore date. For progress by version, the count-only
+  grouped query in `docs/security/kek-rotation.md` §6 (no identifiers
+  or ciphertext).
 - Staging health green, `GET /api/build` matches the serving SHA where
   applicable, post-deploy E2E recorded with run URL.
 - Old target retained; deletion gated, not yet executed.
@@ -200,10 +236,12 @@ migration files to force convergence.
 | Health + E2E run URLs (§3.7) | URLs to runs only |
 | Old-target retention + deletion gate (§3.8) | |
 
-Store the completed record with the incident. Evidence records contain
-names, version identifiers, commit SHAs, and run URLs only — never
-account IDs, tokens, credentials, database URLs, environment values, or
-personal login identities (same rule as `docs/ops.md:547-549`).
+Store the completed record with the incident. Evidence records carry the
+table's operational fields above (names, dates, query expressions,
+migration numbers, counts, cutover mechanism/time, version identifiers,
+commit SHAs, run URLs) — never account IDs, tokens, credentials,
+database URLs, environment values, or personal login identities (same
+prohibited set as `docs/ops.md:547-549`).
 
 ## 7. Unverifiable platform facts (must confirm per incident)
 
