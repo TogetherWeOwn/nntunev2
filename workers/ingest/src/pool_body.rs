@@ -115,23 +115,29 @@ pub fn classify_body_reply(
 /// [`call_pool_body`].
 ///
 /// Sized separately from the probe: one body call is a single article, not
-/// a 500-`STAT` batch. The pool side needs at most one dial
-/// (`UpstreamTimeouts::connect`, 5 s in `workers/stream/src/nntp.rs`) plus
-/// one `BODY` response budget (`UpstreamTimeouts::read`, 10 s total for the
-/// article in `workers/stream/src/nntp.rs`), with one warm-stale redial
-/// (closed-while-idle fails fast on the first `Io`, then a fresh dial)
-/// and 5 s of headroom for DO overhead and the 16 MiB reply transfer:
-/// 5 + 10 + 5 + 5 = 25 s. Well above a cold dial plus a full-budget `BODY`
-/// (15 s) while still bounding a hang.
+/// a 500-`STAT` batch. The pool side needs at most one nominal 5 s dial
+/// allowance plus one nominal 10 s `BODY` response allowance, with one
+/// warm-stale redial (closed-while-idle fails fast on the first `Io`, then
+/// a fresh dial) and 5 s of headroom for DO overhead and the 16 MiB reply
+/// transfer: 5 + 10 + 5 + 5 = 25 s. The pool path dials via `nntune_core`
+/// `WorkerTransport` (per-operation `config.timeout`, default 20 s in
+/// `crates/nntune-core/src/nntp.rs`) with the greeting + `MODE READER` +
+/// `AUTHINFO` handshake in `NntpClient::connect`; the 5 s / 10 s figures
+/// are nominal allowances, not that transport timeout (the playback
+/// `UpstreamTimeouts` in `workers/stream/src/nntp.rs` is a different
+/// client). Well above a cold dial plus a full-budget `BODY` (15 s) while
+/// still bounding a hang.
 pub const POOL_BODY_DEADLINE_MS: u64 = 25_000;
 
-/// One dial allowance inside [`POOL_BODY_DEADLINE_MS`]: matches the stream
-/// client's 5 s connect timeout (counted twice: initial dial plus one
-/// warm-stale redial).
+/// One nominal dial allowance inside [`POOL_BODY_DEADLINE_MS`]: 5 s for the
+/// pool handshake (`NntpClient::connect` over `WorkerTransport`; the
+/// transport's per-operation `config.timeout` defaults to 20 s), counted
+/// twice: initial dial plus one warm-stale redial.
 const BODY_DIAL_ALLOWANCE_MS: u64 = 5_000;
 
-/// One article budget inside [`POOL_BODY_DEADLINE_MS`]: matches the stream
-/// client's 10 s total `BODY`-response budget.
+/// One nominal article allowance inside [`POOL_BODY_DEADLINE_MS`]: 10 s for
+/// a single `BODY` response on the pool path (nominal, not a transport
+/// timeout).
 const BODY_READ_BUDGET_MS: u64 = 10_000;
 
 // Compile-time: the deadline is exactly dial + article + redial-dial +

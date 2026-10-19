@@ -16,9 +16,10 @@
 //!   the helper and map BOTH expiries to the existing `Retry` with
 //!   `DEFAULT_RETRY_SECS` (no new variant).
 //!
-//! Sensitivity: remapping expiry `Retry -> Rejected`, dropping the
-//! body-stage race, raising either constant, or awaiting the fetch
-//! directly (Delay never polled) fails at least one test below.
+//! Sensitivity: remapping expiry `Retry -> Rejected`, changing the expiry
+//! `after_secs`, dropping the body-stage race, raising either constant, or
+//! awaiting the fetch directly (Delay never polled) fails at least one
+//! test below.
 //!
 //! Run only this file:
 //!
@@ -193,12 +194,10 @@ fn probe_races_both_stages_and_expires_to_retry() {
         "probe body drain must reuse the SAME deadline (body-stage race removal fails here)"
     );
     assert!(
-        prod.contains("let expired = PoolProbeError::Retry {"),
-        "probe expiry must reuse the existing Retry variant"
-    );
-    assert!(
-        prod.contains("after_secs: DEFAULT_RETRY_SECS,"),
-        "probe expiry must use DEFAULT_RETRY_SECS"
+        prod.contains(
+            "let expired = PoolProbeError::Retry {\n        after_secs: DEFAULT_RETRY_SECS,\n    };",
+        ),
+        "probe expiry must reuse the existing Retry variant with DEFAULT_RETRY_SECS"
     );
     assert!(
         prod.matches("Some(Err(_)) | None => return Err(expired)")
@@ -224,12 +223,10 @@ fn body_races_both_stages_and_expires_to_retry() {
         "body drain must reuse the SAME deadline (body-stage race removal fails here)"
     );
     assert!(
-        prod.contains("let expired = PoolBodyError::Retry {"),
-        "body expiry must reuse the existing Retry variant"
-    );
-    assert!(
-        prod.contains("after_secs: DEFAULT_RETRY_SECS,"),
-        "body expiry must use DEFAULT_RETRY_SECS"
+        prod.contains(
+            "let expired = PoolBodyError::Retry {\n        after_secs: DEFAULT_RETRY_SECS,\n    };",
+        ),
+        "body expiry must reuse the existing Retry variant with DEFAULT_RETRY_SECS"
     );
     assert!(
         prod.matches("Some(Err(_)) | None => return Err(expired)")

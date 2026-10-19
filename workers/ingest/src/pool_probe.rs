@@ -91,13 +91,17 @@ pub fn classify_reply(
 /// round-trips on the pool side, nominally 15 ms each (7.5 s per batch).
 /// The per-STAT allowance below (50 ms, over 3x nominal) covers a
 /// slow-but-healthy provider at 25 ms per `STAT` (12.5 s per batch) with 2x
-/// headroom, plus one dial (`UpstreamTimeouts::connect`, 5 s in
-/// `workers/stream/src/nntp.rs`). A warm-stale redial fails fast on the
-/// first `Io` (closed-while-idle) before the fresh dial, so a single batch
-/// allowance plus one dial covers the rerun path too. The total (30 s)
-/// equals [`crate::queue_consumer`] `PROBE_DELIVERY_BUDGET_MS`, so one hung
-/// batch holds at most one delivery budget — the same overshoot the driver
-/// already allows for one in-flight batch.
+/// headroom, plus one nominal 5 s dial allowance. The pool path dials via
+/// `nntune_core` `WorkerTransport` (per-operation `config.timeout`, default
+/// 20 s in `crates/nntune-core/src/nntp.rs`) with the greeting + `MODE
+/// READER` + `AUTHINFO` handshake in `NntpClient::connect`; the 5 s is a
+/// nominal allowance for that handshake, not the transport timeout. A
+/// warm-stale redial fails fast on the first `Io` (closed-while-idle)
+/// before the fresh dial, so a single batch allowance plus one dial covers
+/// the rerun path too. The total (30 s) equals [`crate::queue_consumer`]
+/// `PROBE_DELIVERY_BUDGET_MS`, so one hung batch holds at most one
+/// delivery budget — the same overshoot the driver already allows for one
+/// in-flight batch.
 pub const POOL_PROBE_DEADLINE_MS: u64 = 30_000;
 
 /// Per-`STAT` allowance inside [`POOL_PROBE_DEADLINE_MS`]: 50 ms covers the
@@ -105,8 +109,9 @@ pub const POOL_PROBE_DEADLINE_MS: u64 = 30_000;
 /// 2x).
 const PROBE_PER_STAT_ALLOWANCE_MS: u64 = 50;
 
-/// One dial allowance inside [`POOL_PROBE_DEADLINE_MS`]: matches the
-/// stream client's 5 s connect timeout.
+/// One nominal dial allowance inside [`POOL_PROBE_DEADLINE_MS`]: 5 s for the
+/// pool handshake (`NntpClient::connect` over `WorkerTransport`; the
+/// transport's per-operation `config.timeout` defaults to 20 s).
 const PROBE_DIAL_ALLOWANCE_MS: u64 = 5_000;
 
 // Compile-time: the deadline is exactly one full 500-`STAT` batch at the
