@@ -685,12 +685,15 @@ fn duplicate_scopes_are_deduplicated_in_response_and_stored_row() {
 
     // Raw length stays within the cap (5 == ALL_SCOPES.len()), so the
     // request is otherwise valid; only its duplicates are in question.
+    // First-seen order here is stream:read before library:read, which
+    // differs from both canonical ALL_SCOPES order and alphabetical
+    // order, so a canonical- or alphabetical-order dedupe fails this.
     let scopes = [
-        "library:read",
         "stream:read",
         "library:read",
         "stream:read",
         "library:read",
+        "stream:read",
     ];
     assert_eq!(scopes.len(), ALL_SCOPES.len());
 
@@ -702,7 +705,7 @@ fn duplicate_scopes_are_deduplicated_in_response_and_stored_row() {
     let minted: serde_json::Value = serde_json::from_str(&resp.body).expect("mint body is JSON");
     assert_eq!(
         minted["scopes"],
-        serde_json::json!(["library:read", "stream:read"]),
+        serde_json::json!(["stream:read", "library:read"]),
         "response scopes must be deduplicated, first-seen order preserved"
     );
     assert_eq!(minted["expires_at"], NOW + 3600);
@@ -711,7 +714,7 @@ fn duplicate_scopes_are_deduplicated_in_response_and_stored_row() {
     assert_eq!(rows.len(), 1, "valid duplicate-bearing mint stores one row");
     assert_eq!(
         rows[0].record.scopes,
-        vec![Scope::LibraryRead, Scope::StreamRead],
+        vec![Scope::StreamRead, Scope::LibraryRead],
         "stored row must carry the deduplicated scope set"
     );
     assert_eq!(
