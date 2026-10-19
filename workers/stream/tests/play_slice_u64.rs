@@ -30,8 +30,8 @@
 //!
 //! Why source gates: CI hosts are 64-bit, where `as usize` is lossless and
 //! every behavioural case below already passes, so no native behavioural
-//! test can go red on the pre-fix code (a behavioural pin would need a
-//! >4 GiB in-memory body). The three source gates parse `play.rs` /
+//! test can go red on the pre-fix code (a behavioural pin would need an
+//! in-memory body over 4 GiB). The three source gates parse `play.rs` /
 //! `yenc.rs` with `syn` and inspect token streams, so comments cannot
 //! hide a cast and any host fails. They forbid only the narrowing shapes
 //! named above — never cast `self.pos` / `self.end` / a `buf_start`
@@ -210,10 +210,7 @@ fn size_mismatch_actual_field_is_u64() {
             if let syn::Fields::Named(named) = &variant.fields {
                 for field in &named.named {
                     if let Some(ident) = &field.ident {
-                        fields.push((
-                            ident.to_string(),
-                            field.ty.to_token_stream().to_string(),
-                        ));
+                        fields.push((ident.to_string(), field.ty.to_token_stream().to_string()));
                     }
                 }
             }
@@ -277,7 +274,13 @@ impl CachedRig {
             now_unix: NOW_UNIX,
             up_next: None,
         };
-        play(&mut self.pool, &mut self.cache, &mut self.meter, SECRET, &input)
+        play(
+            &mut self.pool,
+            &mut self.cache,
+            &mut self.meter,
+            SECRET,
+            &input,
+        )
     }
 
     /// Drain while checking the chunking invariants every slice must keep:
@@ -305,7 +308,9 @@ impl CachedRig {
 fn cached_full_play_slices_every_chunk_in_order() {
     let plain = body();
     let mut rig = CachedRig::seeded("track-full", plain.clone());
-    let resp = rig.play_range("track-full", None).expect("full play serves");
+    let resp = rig
+        .play_range("track-full", None)
+        .expect("full play serves");
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_len, BODY_LEN as u64);
     assert!(resp.cache_hit);
@@ -454,8 +459,11 @@ impl Drop for Server {
     }
 }
 
+/// `(plaintext, segment message-ids, segment ranges, stub server)`.
+type LiveFixture = (Vec<u8>, Vec<String>, [(u64, u64); 2], Server);
+
 /// Two-segment live fixture over `body()`; identity cipher (key 0).
-fn live_fixture() -> (Vec<u8>, Vec<String>, [(u64, u64); 2], Server) {
+fn live_fixture() -> LiveFixture {
     let plain = body();
     let crc = yenc::crc32(&plain);
     let total = plain.len().div_ceil(SEG_LEN) as u32;
@@ -508,8 +516,14 @@ fn live_play(
         now_unix: NOW_UNIX,
         up_next: None,
     };
-    let resp = play(&mut rig.pool, &mut rig.cache, &mut rig.meter, SECRET, &input)
-        .expect("live play must serve");
+    let resp = play(
+        &mut rig.pool,
+        &mut rig.cache,
+        &mut rig.meter,
+        SECRET,
+        &input,
+    )
+    .expect("live play must serve");
     (resp, rig)
 }
 
@@ -539,12 +553,7 @@ fn live_full_play_slices_across_segment_boundary() {
 fn live_range_crossing_segment_boundary_serves_exact_bytes() {
     let (plain, segments, ranges, server) = live_fixture();
     // 19_995..=20_004 straddles the segment boundary at 20_000.
-    let (resp, mut rig) = live_play(
-        &server,
-        &segments,
-        &ranges,
-        Some("bytes=19995-20004"),
-    );
+    let (resp, mut rig) = live_play(&server, &segments, &ranges, Some("bytes=19995-20004"));
     assert_eq!(resp.status, 206);
     assert_eq!(
         resp.content_range.as_deref(),
@@ -568,12 +577,7 @@ fn live_range_inside_second_segment_serves_exact_bytes() {
     let (plain, segments, ranges, server) = live_fixture();
     // Entirely inside segment 1 (`buf_start = 20_000`): the slice offset
     // is the in-buffer difference, not the absolute file offset.
-    let (resp, mut rig) = live_play(
-        &server,
-        &segments,
-        &ranges,
-        Some("bytes=35000-35099"),
-    );
+    let (resp, mut rig) = live_play(&server, &segments, &ranges, Some("bytes=35000-35099"));
     assert_eq!(resp.status, 206);
     assert_eq!(resp.body_len, 100);
     let served = rig.drain(resp.stream);
