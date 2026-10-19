@@ -18,6 +18,9 @@
 # case-insensitively, and RUN/COPY/ADD heredoc bodies are content, never
 # instructions -- so a USER hidden in a continuation line or a heredoc body,
 # or a lowercase `user root` after the real USER, cannot fool the gate.
+# A non-default `escape` parser directive (backtick continuations) would
+# invalidate the backslash-only line model, so the pin fails closed when
+# the directive prelude sets one.
 # The coupling is intentional and fail-closed: if the shared module cannot
 # be imported, the pin errors instead of passing.
 #
@@ -54,6 +57,10 @@ PLAIN_USER_RE = r"[A-Za-z0-9_.-]+(:[A-Za-z0-9_.-]+)?"
 # Mirrors strconv.Atoi's accepted spellings (optional sign, ASCII digits):
 # whatever the container runtime would take as a UID is judged numerically.
 NUMERIC_RE = re.compile(r"[+-]?[0-9]+")
+# Parser-directive line shape (moby/buildkit directives.go): `# name=value`
+# after the marker, name case-insensitive, blanks around `=` allowed.
+DIRECTIVE_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9]*)\s*=\s*(.+?)\s*$")
+DIRECTIVE_NAMES = frozenset({"syntax", "escape", "check"})
 
 
 def is_root_part(part):
@@ -65,6 +72,33 @@ def is_root_part(part):
     return False
 
 
+def parse_escape_directive(physical):
+    """`(escape, error)` from the directive prelude (None = default backslash).
+
+    Mirrors BuildKit: only leading `# name=value` comments count -- the
+    first blank line, non-comment line, non-directive comment, or unknown
+    name ends the prelude. A repeated directive is a build error.
+    """
+    seen = set()
+    escape = None
+    for raw in physical:
+        token = raw.lstrip()
+        if token == "" or not token.startswith("#"):
+            break
+        match = DIRECTIVE_RE.match(token[1:].lstrip())
+        if match is None:
+            break
+        name = match.group(1).lower()
+        if name not in DIRECTIVE_NAMES:
+            break
+        if name in seen:
+            return escape, f"duplicate '{name}' parser directive"
+        seen.add(name)
+        if name == "escape":
+            escape = match.group(2)
+    return escape, None
+
+
 def scan(dockerfile):
     """Facts about the runtime stage; line model mirrors the FROM guard."""
     with open(dockerfile, "rb") as handle:
@@ -72,6 +106,7 @@ def scan(dockerfile):
     if text.startswith("\ufeff"):
         text = text[1:]
     physical = dc._physical_lines(text)
+    escape, directive_error = parse_escape_directive(physical)
     pending = []  # (delimiter, chomp_tabs) heredoc bodies being skipped
     seen_runtime = False
     post_from_line = 0
@@ -142,6 +177,8 @@ def scan(dockerfile):
         "user_line": user_line,
         "user_value": user_value,
         "stage_lines": stage_lines,
+        "escape": escape,
+        "directive_error": directive_error,
     }
 
 
@@ -151,6 +188,18 @@ def main():
         facts = scan(dockerfile)
     except (OSError, UnicodeDecodeError) as exc:
         print(f"FAIL: cannot read {dockerfile}: {exc}")
+        return 1
+    if facts["directive_error"]:
+        print(
+            f"FAIL: invalid Dockerfile parser directives: "
+            f"{facts['directive_error']}"
+        )
+        return 1
+    if facts["escape"] is not None and facts["escape"] != "\\":
+        print(
+            f"FAIL: Dockerfile sets a non-default escape token "
+            f"({facts['escape']!r}); the pin only models backslash continuations"
+        )
         return 1
     if not facts["seen_runtime"]:
         print(f"FAIL: no 'AS runtime' stage in {dockerfile}")
@@ -440,6 +489,78 @@ USER postgres
 CMD ["x"]
 FIXTURE_EOF
   run_case "env-fake-chown" 1 "$selftest_tmp/env-fake-chown.Dockerfile"
+
+  fixture escape-backslash-valid.Dockerfile <<'FIXTURE_EOF'
+# escape=\
+FROM scratch AS base
+FROM base AS runtime
+WORKDIR /job
+RUN chown -R postgres:postgres /job
+USER postgres
+CMD ["x"]
+FIXTURE_EOF
+  run_case "escape-backslash-valid" 0 "$selftest_tmp/escape-backslash-valid.Dockerfile"
+
+  fixture escape-fake-user.Dockerfile <<'FIXTURE_EOF'
+# escape=`
+FROM scratch AS base
+FROM base AS runtime
+WORKDIR /job
+RUN chown -R postgres:postgres /job
+RUN printf x `
+USER postgres
+CMD ["x"]
+FIXTURE_EOF
+  run_case "escape-fake-user" 1 "$selftest_tmp/escape-fake-user.Dockerfile"
+
+  fixture escape-hidden-root.Dockerfile <<'FIXTURE_EOF'
+# escape=`
+FROM scratch AS base
+FROM base AS runtime
+WORKDIR /job
+RUN chown -R postgres:postgres /job
+USER postgres
+ENV NOTE hi \
+user root
+CMD ["x"]
+FIXTURE_EOF
+  run_case "escape-hidden-root" 1 "$selftest_tmp/escape-hidden-root.Dockerfile"
+
+  fixture escape-spaced-form.Dockerfile <<'FIXTURE_EOF'
+# ESCAPE = `
+FROM scratch AS base
+FROM base AS runtime
+WORKDIR /job
+RUN chown -R postgres:postgres /job
+RUN printf x `
+USER postgres
+CMD ["x"]
+FIXTURE_EOF
+  run_case "escape-spaced-form" 1 "$selftest_tmp/escape-spaced-form.Dockerfile"
+
+  fixture escape-after-comment-ignored.Dockerfile <<'FIXTURE_EOF'
+# regular comment
+# escape=`
+FROM scratch AS base
+FROM base AS runtime
+WORKDIR /job
+RUN chown -R postgres:postgres /job
+USER postgres
+CMD ["x"]
+FIXTURE_EOF
+  run_case "escape-after-comment-ignored" 0 "$selftest_tmp/escape-after-comment-ignored.Dockerfile"
+
+  fixture escape-after-blank-ignored.Dockerfile <<'FIXTURE_EOF'
+
+# escape=`
+FROM scratch AS base
+FROM base AS runtime
+WORKDIR /job
+RUN chown -R postgres:postgres /job
+USER postgres
+CMD ["x"]
+FIXTURE_EOF
+  run_case "escape-after-blank-ignored" 0 "$selftest_tmp/escape-after-blank-ignored.Dockerfile"
 
   run_case "missing-dockerfile" 1 "$selftest_tmp/does-not-exist.Dockerfile"
 
