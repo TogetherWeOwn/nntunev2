@@ -37,7 +37,9 @@ the ADR wins and the deck is wrong.
 
 Rules: `{{time_remaining}}` always rounds **down** (never promise more
 time than is left), and when less than one hour remains it renders in
-minutes. `{{erase_after}}` is always paired with the words "can start",
+minutes. Under one minute it renders as "less than a minute", never
+"0 minutes" — a zero countdown reads as expired while cancelling still
+works. `{{erase_after}}` is always paired with the words "can start",
 never "will start" — the exact start time after the deadline is not
 promised.
 
@@ -139,11 +141,17 @@ The operation state here is `scheduled` for the whole window; do not
 branch this page on the `pending` operation state.
 
 - **Heading:** Deletion scheduled
-- **Body:** Status: **scheduled**. Your grace period ends at
-  {{erase_after}}; erasure can start any time after that. Until erasure
-  starts, you can cancel and your account stays unchanged. While deletion
-  is scheduled, some changes to your account are paused.
+- **Body:** Status: **scheduled**. Nothing has been erased yet. Your
+  grace period ends at {{erase_after}}; erasure can start any time after
+  that. Until erasure starts, you can cancel and your account stays
+  unchanged. While deletion is scheduled, some changes to your account
+  are paused.
 - **Primary action:** Cancel deletion
+
+Past-deadline variant (`erase_after` has passed, operation still
+`scheduled` — §2): replace the grace-period sentence with "Erasure can
+start at any time now. You can still cancel." Keep the same primary
+action.
 
 ### 5.5 Blocked change (a write refused while deletion is scheduled)
 
@@ -162,6 +170,16 @@ variant instead (see also §7).
 - **Body (running):** Erasure of your account has started, so changes
   are no longer possible. This can no longer be cancelled. We will email
   {{email}} when erasure is complete.
+- **Default (state unknown):** if the state is anything other than
+  `scheduled` or `running`, treat it as running — never offer cancel.
+  Only an operation read as `scheduled` may show the scheduled body.
+- **Body (status unavailable):** if the operation read itself fails, the
+  client does not know the state — do not show the running body. It
+  claims erasure has started and can no longer be cancelled, which is
+  false when the operation is still `scheduled` and cancelling still
+  works. Show neutral copy instead: "We could not load your deletion
+  status, so changes stay paused for now. Try again." Keep cancel
+  unavailable until the state is confirmed, and offer a retry.
 
 ## 6. State: cancel the deletion
 
@@ -267,11 +285,12 @@ Do not give a new date unless engineering can stand behind it.
    in §8.1. Negations that reassure ("nothing has been erased yet") are
    required, not banned.
 2. **Explain the grace period every time it matters.** Any surface that
-   mentions the request also states, in plain words: nothing is erased
-   yet, the timing ({{grace_duration}} before the request is made; once
-   scheduled, {{erase_after}} or {{time_remaining}} may stand in for it),
-   and that you can cancel. Do not rely on the user having seen an
-   earlier screen.
+   mentions the request while cancelling is still possible also states,
+   in plain words: nothing is erased yet, the timing ({{grace_duration}}
+   before the request is made; once scheduled, {{erase_after}} or
+   {{time_remaining}} may stand in for it), and that you can cancel. Do
+   not rely on the user having seen an earlier screen. Once cancelling is
+   no longer possible, say so plainly instead (§5.5 running variant, §7).
 3. **No dark patterns.** Cancel-deletion is never hidden, shrunk, or
    labelled with guilt wording ("No, I love my data"). The destructive
    path and the cancel path get equally plain labels.

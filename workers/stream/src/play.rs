@@ -1909,7 +1909,7 @@ mod tests {
 
     #[test]
     fn only_the_first_stale_serve_claims_the_revalidation() {
-        use crate::cache::{CacheStatus, CACHE_FRESH_TTL_SECS};
+        use crate::cache::{CacheStatus, CACHE_FRESH_TTL_SECS, REVALIDATE_CLAIM_TTL_SECS};
 
         let secret = b"s";
         let now_unix = 1_000 + CACHE_FRESH_TTL_SECS + 1;
@@ -1944,6 +1944,32 @@ mod tests {
         assert!(
             !second.needs_revalidate,
             "later stale readers must not each trigger a refresh"
+        );
+
+        // The claim carries the serving time, not a constant: past the
+        // claim TTL the abandoned claim expires and a later stale serve
+        // re-claims. If play passed a fixed time, this serve would see
+        // the first claim as still owned and report no revalidation.
+        let later_unix = now_unix + REVALIDATE_CLAIM_TTL_SECS;
+        let later_token = grant::issue("u", "track-swr", later_unix + 60, secret);
+        let later_input = PlayInput {
+            trace_id: None,
+            token: &later_token,
+            track_id: "track-swr",
+            range: None,
+            server_addr: addr,
+            segments: &[],
+            segment_ranges: None,
+            cipher_key: 0,
+            now_unix: later_unix,
+            up_next: None,
+        };
+        let reclaim =
+            play(&mut pool, &mut cache, &mut meter, secret, &later_input).expect("stale serves");
+        assert_eq!(reclaim.cache_status, CacheStatus::Stale);
+        assert!(
+            reclaim.needs_revalidate,
+            "past the claim TTL a stale serve must re-claim the revalidation"
         );
 
         // The revalidation rewrite landing releases the claim and the entry

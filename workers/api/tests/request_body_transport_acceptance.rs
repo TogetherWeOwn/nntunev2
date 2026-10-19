@@ -12,14 +12,15 @@
 //! No production failure or exploit is claimed; the static control flow is
 //! the defect.
 //!
-//! Test files only: no implementation code is touched here. The Builder
-//! owns all runtime wiring and must never edit this file.
+//! This suite pins the landed seam: `BodyReadError`, `BodyChunkStream`,
+//! `BodySource`, `collect_body`, and `dispatch_collected` in `worker_entry`,
+//! imported below. Do not weaken these pins to make a change pass.
 //!
-//! Failing command (this card, RED until the seam below exists):
+//! Run only this file:
 //!   `cargo test --locked --manifest-path workers/api/Cargo.toml \
 //!     --test request_body_transport_acceptance`
 //!
-//! ## Minimal seam contract (Builder: implement exactly this surface)
+//! ## Pinned seam surface
 //!
 //! In `nntune_api::worker_entry`:
 //!

@@ -332,6 +332,9 @@ test.describe('redirect diagnostics redact URLs (real request)', () => {
       const message = await errorMessage(() => apiGet(request, url, credentialed, CONTEXT));
 
       expectActionableOrdinary(message, 302);
+      expect(message, 'diagnostic lost the malformed-location note').toContain(
+        'location malformed (redacted)',
+      );
       expectAbsent(message, [
         SENT.locMalformed,
         SENT.locMalformedQuery,

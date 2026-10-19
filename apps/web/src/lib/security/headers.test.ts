@@ -38,4 +38,21 @@ describe('cspSources', () => {
 	it.each(['http://api.example.com', 'not a URL'])('rejects invalid API base URL %s', (apiBaseUrl) => {
 		expect(() => cspSources(apiBaseUrl)).toThrow();
 	});
+
+	it.each(['localhost', '127.0.0.1', '::1'])(
+		'permits http loopback %s only with allowHttpLoopback',
+		(host) => {
+			const apiBaseUrl = host === '::1' ? 'http://[::1]:8787' : `http://${host}:8787`;
+			expect(cspSources(apiBaseUrl, { allowHttpLoopback: true })).toEqual([
+				"'self'",
+				apiBaseUrl
+			]);
+			expect(() => cspSources(apiBaseUrl)).toThrow();
+			expect(() => cspSources(apiBaseUrl, { allowHttpLoopback: false })).toThrow();
+		}
+	);
+
+	it('rejects http non-loopback even with allowHttpLoopback', () => {
+		expect(() => cspSources('http://api.example.com', { allowHttpLoopback: true })).toThrow();
+	});
 });

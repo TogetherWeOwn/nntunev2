@@ -288,7 +288,11 @@ this documentation update, nor evidence of separate compute/failure domains.
   sequence-write, and schema/table DDL privileges are denied. A denial must be
   established from the effective role's actual privilege result or a safely
   rolled-back, non-mutating authorization check; do not attempt a write that
-  could change data. No check above was run here, so neither SELECT success nor
+  could change data. Sequence probes are not non-mutating: `nextval` consumes
+  values even when the surrounding transaction rolls back, so sequence-write
+  denial must come from privilege inspection (for example
+  `has_sequence_privilege`), never from a rolled-back `nextval` probe.
+  No check above was run here, so neither SELECT success nor
   write/DDL denial is claimed.
 - Authorized follow-up: the Operator should use the existing secure host-side
   read-only verification path to run and return the checks above, reporting only
