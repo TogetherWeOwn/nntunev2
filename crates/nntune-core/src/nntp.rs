@@ -306,11 +306,20 @@ impl<T: Transport> NntpClient<T> {
 
     /// Pipelined `ARTICLE` fetch: writes up to `max_pipelined` commands
     /// back-to-back (NNTP replies arrive in command order), then reads each
-    /// reply + dot-block in turn. On any error, the batch is discarded and
-    /// the client becomes unusable: later pipelined replies may still be on
-    /// the wire. Reconnect before retrying; never reuse `into_inner()` after
-    /// a failed batch. A per-article `430` returns [`Error::ArticleNotFound`].
+    /// reply + dot-block in turn. On any error after the first byte is
+    /// written, the batch is discarded and the client becomes unusable:
+    /// later pipelined replies may still be on the wire. Reconnect before
+    /// retrying; never reuse `into_inner()` after a failed batch. A
+    /// pre-write argument refusal ([`Error::Malformed`]) writes nothing
+    /// and leaves the connection usable. A per-article `430` returns
+    /// [`Error::ArticleNotFound`].
     pub async fn fetch_many(&mut self, message_ids: &[&str]) -> Result<Vec<FetchOutcome>> {
+        // Pre-write refusal must not poison the connection: nothing is on
+        // the wire yet, so return before entering the invalidating path.
+        // (`fetch_many_inner` re-validates as defence in depth.)
+        for id in message_ids {
+            validate_argument(id)?;
+        }
         let result = self.fetch_many_inner(message_ids).await;
         if result.is_err() {
             self.transport.invalidate();
