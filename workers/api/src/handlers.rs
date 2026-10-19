@@ -885,7 +885,13 @@ fn session_error_response(error: session::SessionError) -> Response {
 }
 
 pub(crate) fn invalid_request() -> Response {
-    json_response(400, serde_json::json!({"error": "invalid request"}))
+    let error = crate::api_error::ApiError::invalid_request("invalid request");
+    Response {
+        status: error.status,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    }
 }
 
 // --- Staging-only QA code seam ----------------------------------------------------------

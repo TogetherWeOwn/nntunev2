@@ -1746,7 +1746,8 @@ pub async fn collect_body<S: BodyChunkStream>(
 /// exactly `bytes` and invokes `handler` once. `Oversized` and
 /// `TransportFailure` invoke NOTHING and answer the handlers' existing
 /// uniform pre-routing rejection (`handlers::invalid_request`: status
-/// 400, body `{"error":"invalid request"}`, no `set_cookie`), so the
+/// 400, body `{"code":"invalid_request","message":"invalid request",
+/// "retryable":false}`, no `set_cookie`), so the
 /// gate can never drift from it. The Worker entry passes a handler that
 /// calls `handlers::handle`, so a rejected body can cause no store,
 /// mailer, DNS, or dialer side effect.
