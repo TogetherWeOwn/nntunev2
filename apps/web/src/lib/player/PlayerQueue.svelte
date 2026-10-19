@@ -20,7 +20,7 @@
 -->
 <p data-testid="now-playing">
 	{#if current}
-		Now playing: {current.title} — {current.artist}
+		Now playing: {current.title}{#if current.artist} — {current.artist}{/if}
 	{:else}
 		Queue is empty
 	{/if}
@@ -44,7 +44,7 @@
 			data-track-id={track.id}
 			aria-current={i === state.currentIndex ? 'true' : undefined}
 		>
-			{track.title} — {track.artist}
+			{track.title}{#if track.artist} — {track.artist}{/if}
 		</li>
 	{/each}
 </ol>
