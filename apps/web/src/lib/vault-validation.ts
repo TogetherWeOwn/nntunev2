@@ -66,6 +66,26 @@ function isBlockedIpv6(host: string): boolean {
 	);
 }
 
+/**
+ * Explicit `:port` digits from a backslash-free raw authority, or null when
+ * no explicit port is present. Bracket-aware like the ingest fetch builder
+ * (`split_host_port`): a leading `[` scans only after the matching `]`,
+ * otherwise the first `:` starts the port. Returns `''` for empty digits
+ * (`host:/path`). The caller must have banned `@`/`?`/`#` already.
+ */
+function rawExplicitPort(authority: string): string | null {
+	if (authority.startsWith('[')) {
+		const close = authority.indexOf(']');
+		if (close === -1) return null;
+		const after = authority.slice(close + 1);
+		if (!after.startsWith(':')) return null;
+		return after.slice(1);
+	}
+	const colon = authority.indexOf(':');
+	if (colon === -1) return null;
+	return authority.slice(colon + 1);
+}
+
 /** Returns a list of human-readable problems; empty means valid. */
 export function validateProviderConfig(form: ProviderForm): string[] {
 	const errors: string[] = [];
@@ -175,11 +195,31 @@ export function validateIndexerUrl(url: string, apiKey: string): string | null {
 	// The ingest fetch model is 443-only: an explicit port other than 443
 	// must fail here with a port-specific message instead of passing client
 	// validation and failing later at the server / ingest boundary. Read the
-	// port from the parsed authority — WHATWG URL normalizes an explicit
-	// `:443` to the empty string (same as portless), while any other explicit
-	// port (including `:0`) survives; colons inside a bracketed IPv6 literal
-	// never surface as `port`.
-	if (parsed.port !== '') {
+	// port from the raw authority, not just the parsed URL: WHATWG
+	// normalization hides forms the fetch builder rejects — empty port
+	// digits (`host:/path`) normalize to an empty `port`, and a backslash
+	// reads as a path separator while Rust splits the authority only on
+	// `/`/`?`/`#` — and the client sends the raw trimmed string. Empty or
+	// non-numeric port digits and a backslash in the authority are malformed
+	// URLs (generic message); all-digit ports other than 443 get the port
+	// message. Kept after the blocked-host check so pinned diagnostics
+	// (e.g. `localhost:8080`) keep their address message.
+	const slash = rest.indexOf('/');
+	const rawAuthority = slash === -1 ? rest : rest.slice(0, slash);
+	if (rawAuthority.includes('\\')) {
+		return 'That indexer URL does not look valid.';
+	}
+	const explicitPort = rawExplicitPort(rawAuthority);
+	if (explicitPort !== null) {
+		if (explicitPort === '' || !/^\d+$/.test(explicitPort)) {
+			return 'That indexer URL does not look valid.';
+		}
+		if (explicitPort !== '443') {
+			return 'Indexer URLs must use port 443.';
+		}
+	} else if (parsed.port !== '') {
+		// Backstop: unreachable while the raw scan agrees with WHATWG, kept
+		// so a future divergence still fails closed on non-443 ports.
 		return 'Indexer URLs must use port 443.';
 	}
 	const key = apiKey.trim();
