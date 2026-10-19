@@ -12,6 +12,8 @@ use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use nntune_core::nntp::NntpConfig;
+use nntune_core::pinned_transport::pinned_rejection_message;
 use nntune_core::transport::{MAX_ARTICLE_BYTES, MAX_LINE_BYTES};
 
 /// Documented worker/API error code for stale provider credentials (S7).
@@ -171,6 +173,9 @@ impl NntpClient {
     /// Open a provider connection with per-upstream timeouts and consume the
     /// greeting. The connect, greeting and first article can share one deadline
     /// so a stale warm connection cannot multiply the segment budget on retry.
+    /// A non-loopback dial on an off-allowlist port is refused with the
+    /// shared `transport_port_not_allowed` code before any TCP dial;
+    /// loopback keeps the ephemeral-port harness contract.
     pub fn connect_with_timeouts(
         addr: &SocketAddr,
         timeouts: UpstreamTimeouts,
@@ -184,6 +189,31 @@ impl NntpClient {
         timeouts: UpstreamTimeouts,
         deadline: &NntpDeadline,
     ) -> Result<Self, NntpError> {
+        // Pinned NNTP endpoint policy: provider (non-loopback) dials fail
+        // closed through the shared core gate before any TCP dial, so an
+        // off-allowlist port is refused without a connection attempt.
+        // Loopback is the local harness (every synthetic-NNTP fixture dials
+        // 127.0.0.1 on an ephemeral port) and stays exempt. This seam
+        // carries only a SocketAddr — no TLS/acknowledgment input — so the
+        // synthetic config asserts TLS: the vault acknowledgment lifts only
+        // TLS, never the port list, and a TLS-first refusal here would mask
+        // the port code this seam must surface.
+        if !addr.ip().is_loopback() {
+            let config = NntpConfig {
+                host: addr.ip().to_string(),
+                port: addr.port(),
+                tls: true,
+                allow_insecure_plaintext: false,
+                username: None,
+                password: None,
+                timeout: timeouts.connect,
+                max_pipelined: 1,
+                max_article_bytes: MAX_ARTICLE_BYTES,
+            };
+            if let Some(rejection) = pinned_rejection_message(&config) {
+                return Err(NntpError::Io(rejection));
+            }
+        }
         let connect_timeout = timeouts.connect.min(deadline.remaining()?);
         if connect_timeout.is_zero() {
             return Err(
