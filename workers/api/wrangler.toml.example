@@ -74,6 +74,17 @@ SESSION_TTL_SECS = "86400"
 # binding = "HYPERDRIVE"
 # id = "<fill in staging/prod id>"
 
+# Workers Logs persistence for the structured api records (the build_sha
+# evidence is read there). Without this block the deployed Worker has
+# observability=null and persists nothing. The `staging-api` lane in
+# `.github/workflows/deploy.yml` generates this block into its staging
+# wrangler config (generated, never committed); this example is the
+# hand-deploy reference, so mirror the block here and uncomment it for a
+# hand staging deploy (`wrangler deploy --env staging`):
+# [env.staging.observability]
+# enabled = true
+# head_sampling_rate = 1
+
 # Secrets (set with `wrangler secret put`, never here). All *BASE64 values
 # are unpadded base64url (43 chars for 32 bytes; generate with
 # `openssl rand 32 | basenc --base64url | tr -d '='`, decode with
