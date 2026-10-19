@@ -85,6 +85,14 @@ pub enum MeterKind {
     /// A pooled connection the provider silently closed was transparently
     /// redialed (no backoff, no quarantine).
     WarmRedial,
+    /// A play terminated because a segment article is gone (`430`/`423`,
+    /// [`crate::play::PlayError::ArticleMissing`]). Terminal content signal:
+    /// the track fails, the pool is fine. Non-serving (`bytes = 0`).
+    ArticleMissing,
+    /// A play terminated because a segment could not be decoded
+    /// ([`crate::play::PlayError::Decode`]). Terminal content signal:
+    /// the track fails, the pool is fine. Non-serving (`bytes = 0`).
+    DecodeFailed,
     /// A flagged reconciliation mismatch. Non-serving: its [`MeterEvent`]
     /// always carries `bytes = 0`; the flagged counts stay on the
     /// [`ReconcileMismatch`] record returned by [`reconcile`].
@@ -107,6 +115,8 @@ pub fn kind_slug(kind: MeterKind) -> &'static str {
         MeterKind::QuarantineEntered => "quarantine_entered",
         MeterKind::QuarantineExited => "quarantine_exited",
         MeterKind::WarmRedial => "warm_redial",
+        MeterKind::ArticleMissing => "article_missing",
+        MeterKind::DecodeFailed => "decode_failed",
         MeterKind::ReconcileMismatch => "play_reconcile_mismatch",
     }
 }
@@ -933,6 +943,8 @@ mod tests {
             kind_slug(MeterKind::QuarantineEntered),
             kind_slug(MeterKind::QuarantineExited),
             kind_slug(MeterKind::WarmRedial),
+            kind_slug(MeterKind::ArticleMissing),
+            kind_slug(MeterKind::DecodeFailed),
             kind_slug(MeterKind::ReconcileMismatch),
         ];
         assert_eq!(
@@ -950,6 +962,8 @@ mod tests {
                 "quarantine_entered",
                 "quarantine_exited",
                 "warm_redial",
+                "article_missing",
+                "decode_failed",
                 "play_reconcile_mismatch"
             ]
         );

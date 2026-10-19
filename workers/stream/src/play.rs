@@ -900,7 +900,12 @@ fn nntp_failure(e: NntpError, message_id: &str) -> Failure {
 
 /// Return the lease (and the connection, if still healthy) and account for
 /// the failure: only provider-level trouble quarantines the pool; a stale
-/// auth session is dropped without either.
+/// auth session is dropped without either. Terminal content failures
+/// (`ArticleMissing`/`Decode`) emit their meter-only signal here — one event
+/// per terminal play — on every `settle` path (first-segment `play()` errors
+/// and later-segment `finalize` errors alike). Background fill work never
+/// reaches `settle` (it finalizes `Ok`), so non-terminal fill failures stay
+/// silent.
 fn settle(
     pool: &mut StreamPool,
     meter: &mut dyn Meter,
@@ -911,6 +916,15 @@ fn settle(
     track: &str,
 ) -> PlayError {
     let lane = lease.lane;
+    match &err {
+        PlayError::ArticleMissing(_) => {
+            meter.emit(ev(MeterKind::ArticleMissing, user, track, 0));
+        }
+        PlayError::Decode(_) => {
+            meter.emit(ev(MeterKind::DecodeFailed, user, track, 0));
+        }
+        _ => {}
+    }
     if conn == Conn::ProviderFailure {
         let was_quarantined = pool.quarantined();
         pool.record_provider_error_for(lease.id);
