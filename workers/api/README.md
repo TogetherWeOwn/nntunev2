@@ -138,6 +138,22 @@ lane skips until they are.
   boundary only and changes no vault, dial, TLS, pool, or credential
   behavior.
 
+### Inline magic-link delivery deadline
+
+After admission and token storage, registration/magic-start wait at most five
+seconds for one mail send. Expiry cancels the send future; the Worker mailer
+attaches an AbortSignal and aborts its fetch when that future is dropped
+(including cancellation of the enclosing request). Fast success and failure
+still return immediately. Delivery errors and timeouts remain ignored, with
+the same generic public envelope and no retry, replacement token, or refund
+of the per-IP/global/per-address admission slots. A timeout does not revoke
+the issued token: abort cannot retract a request already accepted by the
+provider. Synthetic staging-code capture still happens before delivery.
+
+This bounds only the admitted send, not preceding storage operations, and
+is not a delivery guarantee. Native pending-mail tests prove cancellation of
+the Rust future; wasm compilation alone does not prove runtime fetch abort.
+
 ### Staging-only test-code seam (not part of the production surface)
 
 Shipped by the staging-seam build slice — this note records guardrails

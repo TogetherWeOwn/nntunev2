@@ -10,6 +10,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::api_error::ApiError;
+
 /// Quotas attached to one plan tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanLimits {
@@ -211,11 +213,13 @@ pub fn search_retry_after_header(secs: u64) -> String {
     secs.to_string()
 }
 
-/// Generic 429 body for search. ZERO args by construction: the
-/// vault-resolved indexer key, the query and the caller identity cannot
-/// flow into it.
+/// Generic 429 body for search: the standard `rate_limited` error
+/// envelope (`docs/api-errors.md`), rendered through the same
+/// [`ApiError`] all other ingest errors use so the shape cannot drift.
+/// ZERO args by construction: the vault-resolved indexer key, the query
+/// and the caller identity cannot flow into it.
 pub fn search_rate_limited_body() -> String {
-    r#"{"error":"too many requests"}"#.to_string()
+    ApiError::rate_limited("too many requests").body_json()
 }
 
 /// Identity a search throttle decision was made for. The `Debug` impl
