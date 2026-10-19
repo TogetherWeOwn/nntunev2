@@ -69,7 +69,7 @@ NZB upload ───────────────┘                     
   its traits in this tree, and no HTTP response or decision log emitted by
   a running Worker comes from it. Its fake-DNS/fake-transport tests prove
   model behavior only (`tests/indexer_fetch_ssrf_guard.rs`). The separate `workers/api` vault validator
-  (`IndexerConfig::validate` in `workers/api/src/vault.rs:376`) still checks the indexer URL at
+  (`IndexerConfig::validate` in `workers/api/src/vault.rs:361`) still checks the indexer URL at
   save/validate time; it is not an indexer fetch transport either.
 
 ## Indexer fetch policy library — no runtime indexer fetching
@@ -173,7 +173,7 @@ or deployment boundary.
 The required security policy still forbids redirects for indexer fetch:
 `docs/security/threat-model.md` (F-INGEST-01, `docs/security/threat-model.md:61`) requires forbidden
 redirects, and the vault side encodes `INDEXER_ALLOW_REDIRECTS = false`
-(`workers/api/src/vault.rs:47`).
+(`workers/api/src/vault.rs:52`).
 This model instead follows up to 3 re-validated redirects
 (`MAX_REDIRECTS = 3`, `src/indexer_fetch.rs:42`). That discrepancy is **unresolved**: this README
 does not relax the required policy, does not approve live redirect
