@@ -804,6 +804,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac",
  "nntune-logging",
+ "nntune-ssrf-guard",
  "p256",
  "rand 0.8.8",
  "rusqlite",
@@ -826,6 +827,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "nntune-ssrf-guard"
+version = "0.1.0"
 
 [[package]]
 name = "num-traits"

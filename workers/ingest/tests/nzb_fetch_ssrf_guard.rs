@@ -153,6 +153,7 @@ use nntune_ingest::nzb_fetch::{
     FetchRejection, FetchTransport, RawResponse, FETCH_TIMEOUT_MS, MAX_REDIRECTS,
 };
 use nntune_ingest::nzb_intake::{estimate_nzb, MAX_NZB_BYTES};
+use nntune_ssrf_guard::{FORBIDDEN_VECTORS, PUBLIC_CONTROL_VECTORS};
 
 const ALLOWED_HOST: &str = "nzb.example";
 const CDN_HOST: &str = "cdn.example";
@@ -322,6 +323,75 @@ fn metadata_ip_literal_blocked_even_when_allowlisted() {
         let err = validate_fetch_url(url, &config(&[host.as_str()]), &dns)
             .expect_err("non-public literal must be blocked");
         assert_eq!(err, FetchRejection::ForbiddenAddress, "url {url}");
+    }
+}
+
+/// Shared transition/special vectors (single owner:
+/// `nntune_ssrf_guard::FORBIDDEN_VECTORS`): mapped, 6to4, documentation,
+/// Teredo and NAT64 literals are blocked even when allowlisted, via both
+/// the literal and the DNS seams, with no transport call. No literal in
+/// this test may be copied from the shared table: every address comes
+/// from the import above.
+#[test]
+fn shared_transition_vectors_blocked_even_when_allowlisted() {
+    for raw in FORBIDDEN_VECTORS {
+        // Literal seam: the address as a URL host (bracketed v6).
+        let url = format!("https://[{raw}]/x.nzb");
+        let host = url_host_for_log(&url);
+        assert_eq!(host, raw.to_ascii_lowercase(), "log host for {raw}");
+        let dns = FakeDns::default();
+        let err = validate_fetch_url(&url, &config(&[host.as_str()]), &dns)
+            .expect_err("shared forbidden literal must be blocked");
+        assert_eq!(err, FetchRejection::ForbiddenAddress, "vector {raw}");
+        assert_eq!(err.code(), "nzb_fetch_forbidden_address");
+        let mut transport = FakeTransport::default();
+        let err = fetch_nzb(&url, &config(&[host.as_str()]), &dns, &mut transport)
+            .expect_err("shared forbidden literal must be blocked before fetch");
+        assert_eq!(err, FetchRejection::ForbiddenAddress, "vector {raw}");
+        assert!(
+            transport.calls.is_empty(),
+            "blocked before any fetch: {raw}"
+        );
+
+        // DNS seam: an allowlisted name resolving to the vector is blocked.
+        let ip: IpAddr = raw.parse().expect("shared vector must parse");
+        let dns = FakeDns::with(ALLOWED_HOST, &[ip]);
+        let mut transport = FakeTransport::default();
+        let err = fetch_nzb(ALLOWED_URL, &config(&[ALLOWED_HOST]), &dns, &mut transport)
+            .expect_err("shared forbidden DNS answer must be blocked");
+        assert_eq!(err, FetchRejection::ForbiddenAddress, "vector {raw}");
+        assert!(
+            transport.calls.is_empty(),
+            "blocked before any fetch: {raw}"
+        );
+    }
+}
+
+/// Shared public controls (single owner:
+/// `nntune_ssrf_guard::PUBLIC_CONTROL_VECTORS`): public addresses must
+/// NOT be blocked, via both the literal and DNS seams.
+#[test]
+fn shared_public_controls_are_not_blocked() {
+    for raw in PUBLIC_CONTROL_VECTORS {
+        let ip: IpAddr = raw.parse().expect("public control must parse");
+        // Literal seam: a public literal validates with no DNS call.
+        let url = if raw.contains(':') {
+            format!("https://[{raw}]/x.nzb")
+        } else {
+            format!("https://{raw}/x.nzb")
+        };
+        let host = url_host_for_log(&url);
+        let validated = validate_fetch_url(&url, &config(&[host.as_str()]), &FakeDns::default())
+            .expect("public control literal must validate");
+        assert_eq!(validated.addresses, vec![ip], "control {raw}");
+
+        // DNS seam: an allowlisted name resolving only to public controls fetches.
+        let dns = FakeDns::with(ALLOWED_HOST, &[ip]);
+        let mut transport =
+            FakeTransport::default().serve(ALLOWED_URL, ok_response(SMALL_NZB.as_bytes()));
+        let bytes = fetch_nzb(ALLOWED_URL, &config(&[ALLOWED_HOST]), &dns, &mut transport)
+            .expect("public control DNS answer must fetch");
+        assert_eq!(bytes, SMALL_NZB.as_bytes(), "control {raw}");
     }
 }
 

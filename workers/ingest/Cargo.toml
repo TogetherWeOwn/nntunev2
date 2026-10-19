@@ -20,6 +20,9 @@ sha2 = "0.11"
 hex = "0.4"
 # Structured log emitter + trace-ID propagation (docs/logging-standard.md).
 nntune-logging = { version = "0.1.0", path = "../../crates/nntune-logging" }
+# Shared SSRF address guard + test vectors (single owner; nzb/indexer fetch
+# and the api vault guard all delegate here, never fork the predicate).
+nntune-ssrf-guard = { version = "0.1.0", path = "../../crates/nntune-ssrf-guard" }
 crc32fast = "1"
 nntune-core = { version = "0.1.0", path = "../../crates/nntune-core", default-features = false }
 # Hyperdrive Postgres client for the metered-admission ledger (same pattern
