@@ -24,9 +24,9 @@ use worker::{
 use crate::contract::{
     classify_container_reply, container_repair_body, container_unavailable_fault, in_key,
     ingest_reply_body, manifest_digest, manifest_key, out_key, parse_manifest, parse_request, plan,
-    push_chunk_capped, repair_unavailable_fault, result_key, validate_repaired_output_set,
-    ApiFault, ContainerOutcome, FileRole, Plan, RepairRequest, RepairStatus, MAX_REQUEST_BYTES,
-    MAX_RESULT_BYTES,
+    push_chunk_capped, repair_unavailable_fault, result_key, settle_do_reply,
+    validate_repaired_output_set, ApiFault, ContainerOutcome, FileRole, Plan, RepairRequest,
+    RepairStatus, MAX_REQUEST_BYTES, MAX_RESULT_BYTES,
 };
 
 /// Durable Object binding + class fronting the Container.
@@ -51,6 +51,14 @@ const CONTAINER_FETCH_DEADLINE_MS: u64 = 10_000;
 /// headers arrive; 30 s covers the small result-body read and scheduling
 /// margin while still failing a hung Container.
 const CONTAINER_REPAIR_DEADLINE_MS: u64 = 150_000;
+/// Total front-to-DO cutoff: 150 s for the child repair exchange plus 450 s
+/// shared by manifest/result reads, health, input staging, output relay,
+/// result-marker write and cleanup. This is a cutoff, not the sum of all
+/// per-file allowances: slow/large resource-permitted rounds can exceed it.
+/// Ingest waits 660 s (below its enclosing 900 s queue invocation contract),
+/// leaving 60 s to forward this hop's verdict. Serial batch admission remains
+/// a separate consumer-activation gate. See README.md for staging/health bounds.
+const DO_REPAIR_DEADLINE_MS: u64 = 600_000;
 
 fn json_response(status: u16, body: Vec<u8>) -> WorkerResult<Response> {
     let headers = Headers::new();
@@ -147,17 +155,34 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
         Ok(request) => request,
         Err(_) => return fault_response(&repair_unavailable_fault()),
     };
-    let mut response = match stub.fetch_with_request(request).await {
-        Ok(response) => response,
-        Err(error) => {
+    // The settlement polls (registers) Delay before dispatching the lazy
+    // fetch and owns it through body completion, releasing it on every exit.
+    let deadline = Box::pin(Delay::from(Duration::from_millis(DO_REPAIR_DEADLINE_MS)));
+    let fetch = Box::pin(async {
+        let mut response = stub.fetch_with_request(request).await.map_err(|error| {
             console_log!("repair DO call failed job={}: {:?}", parsed.job_id, error);
-            return fault_response(&repair_unavailable_fault());
-        }
-    };
-    let status = response.status_code();
-    match read_response_capped(&mut response, MAX_RESULT_BYTES).await {
-        Ok(bytes) => json_response(status, bytes),
-        Err(()) => fault_response(&ApiFault::new(503, "repair_unavailable")),
+        })?;
+        let status = response.status_code();
+        // Preserve Empty and materialised bodies as well as streamed ones.
+        // Check the materialised length BEFORE cloning; the common settlement
+        // applies the same cap check-before-extend to every streamed chunk.
+        let stream = match response.body() {
+            ResponseBody::Empty => futures_util::stream::empty().boxed_local(),
+            ResponseBody::Body(body) if body.len() > MAX_RESULT_BYTES => return Err(()),
+            ResponseBody::Body(body) => {
+                futures_util::stream::iter([Ok(body.clone())]).boxed_local()
+            }
+            ResponseBody::Stream(_) => response
+                .stream()
+                .map_err(|_| ())?
+                .map(|chunk| chunk.map_err(|_| ()))
+                .boxed_local(),
+        };
+        Ok((status, stream))
+    });
+    match settle_do_reply(fetch, deadline).await {
+        Ok((status, bytes)) => json_response(status, bytes),
+        Err(fault) => fault_response(&fault),
     }
 }
 
