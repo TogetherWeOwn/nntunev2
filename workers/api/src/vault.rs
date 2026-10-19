@@ -385,8 +385,19 @@ impl IndexerConfig {
         // Saved indexer URLs carry no credentials (the API key travels
         // separately) and userinfo disguises the real host
         // (`host@evil` parses host as `evil`), so refuse any of it.
+        // The url crate reports empty userinfo (`@host`, `:@host`) as
+        // username `""` with password `None`, invisible to the accessors,
+        // so also refuse a raw `@` in the authority segment, mirroring
+        // the fetch-time guards (`validate_indexer_url`, `check_base_url`).
         if !parsed.username().is_empty() || parsed.password().is_some() {
             return Err(VaultError::Invalid);
+        }
+        if let Some(scheme_end) = self.url.find("://") {
+            let after = &self.url[scheme_end + 3..];
+            let authority = after.split(['/', '?', '#']).next().unwrap_or_default();
+            if authority.contains('@') {
+                return Err(VaultError::Invalid);
+            }
         }
         // Only the HTTPS default may be addressed: an explicit non-443
         // port is an alternate-service probe. `port()` yields `None` for
