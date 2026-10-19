@@ -255,6 +255,186 @@ fn normalize_query(raw: &str) -> String {
         .to_lowercase()
 }
 
+/// Decode one `application/x-www-form-urlencoded` component (`+` → space,
+/// `%XX` → byte). Returns `None` when the decoded bytes are not valid
+/// UTF-8, so the caller can leave the URL untouched.
+fn form_decode_component(raw: &str) -> Option<String> {
+    fn hex_val(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => match (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b'%' => {
+                out.push(b'%');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Encode one query component as `application/x-www-form-urlencoded`:
+/// space → `+`, bytes outside `[A-Za-z0-9*._-]` → uppercase-hex `%XX`.
+fn form_encode_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for &byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'*' | b'.' | b'_' | b'-' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push('+'),
+            _ => {
+                out.push('%');
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0F) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+/// Canonical edge-cache key for a request URL.
+///
+/// A served search (path exactly `/v1/mb/search` with handler-valid
+/// `q`/`type`/`limit`/`offset`) rewrites to
+/// `<scheme>://<authority>/v1/mb/search?q=<normalized>&type=<kind>&limit=<effective>&offset=<effective>`
+/// so `q` case/whitespace, parameter order, unknown parameters and
+/// limit/offset spellings share one edge entry. Everything else returns
+/// the input unchanged, byte for byte, so `edge_hit` (which runs before
+/// validation) can never serve a request the handler would reject, nor a
+/// real page's body for an above-cap offset. A repeated served parameter
+/// (`q`, `type`, `limit` or `offset`, compared after decoding so encoded
+/// spellings count) is also unserved: `search_route` collects into a
+/// `HashMap` where the last value wins, so keying on any one occurrence
+/// could store a body under another occurrence's identity.
+pub fn canonical_edge_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let scheme = &url[..scheme_end];
+    if scheme.is_empty() {
+        return url.to_string();
+    }
+    let rest = &url[scheme_end + 3..];
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    if authority.is_empty() {
+        return url.to_string();
+    }
+    let remainder = &rest[auth_end..];
+    let path_end = remainder.find(['?', '#']).unwrap_or(remainder.len());
+    if &remainder[..path_end] != "/v1/mb/search" {
+        return url.to_string();
+    }
+    let after_path = &remainder[path_end..];
+    if !after_path.starts_with('?') {
+        return url.to_string();
+    }
+    let query_end = after_path.find('#').unwrap_or(after_path.len());
+    let query = &after_path[1..query_end];
+    if query.is_empty() {
+        return url.to_string();
+    }
+    let mut params = std::collections::HashMap::new();
+    for pair in query.split('&') {
+        let (raw_key, raw_value) = match pair.find('=') {
+            Some(eq) => (&pair[..eq], &pair[eq + 1..]),
+            None => (pair, ""),
+        };
+        let (Some(key), Some(value)) = (
+            form_decode_component(raw_key),
+            form_decode_component(raw_value),
+        ) else {
+            return url.to_string();
+        };
+        // `search_route` collects into a HashMap (last value wins). A
+        // repeated served key would make this key and the served body
+        // disagree, so leave such URLs on their raw key. Duplicate
+        // unknown keys stay allowed: they are dropped either way.
+        let served = matches!(key.as_str(), "q" | "type" | "limit" | "offset");
+        if params.insert(key, value).is_some() && served {
+            return url.to_string();
+        }
+    }
+    let Some(raw_q) = params.get("q") else {
+        return url.to_string();
+    };
+    if raw_q.trim().is_empty() {
+        return url.to_string();
+    }
+    let trimmed = raw_q.trim();
+    let q_chars = trimmed.chars().count();
+    if !(2..=MAX_QUERY_CHARS).contains(&q_chars) {
+        return url.to_string();
+    }
+    if trimmed.chars().any(char::is_control) {
+        return url.to_string();
+    }
+    let Some(kind_str) = params.get("type").map(String::as_str) else {
+        return url.to_string();
+    };
+    if kind_str != "artist" && kind_str != "release" && kind_str != "recording" {
+        return url.to_string();
+    }
+    let effective_limit = match params.get("limit") {
+        None => MAX_PAGE_SIZE as u32,
+        Some(spelling) => match spelling.parse::<u32>() {
+            Ok(0) => return url.to_string(),
+            Ok(n) => n.min(MAX_PAGE_SIZE as u32),
+            Err(_) => MAX_PAGE_SIZE as u32,
+        },
+    };
+    let effective_offset = match params.get("offset") {
+        None => 0,
+        Some(spelling) => match spelling.parse::<u32>() {
+            Ok(n) => {
+                if n > MAX_SEARCH_OFFSET {
+                    return url.to_string();
+                }
+                n
+            }
+            Err(_) => 0,
+        },
+    };
+    let normalized_q = normalize_query(raw_q);
+    format!(
+        "{}://{}/v1/mb/search?q={}&type={}&limit={}&offset={}",
+        scheme,
+        authority,
+        form_encode_component(&normalized_q),
+        kind_str,
+        effective_limit,
+        effective_offset
+    )
+}
+
 /// Stable KV key for a lookup success: `mb:lookup:<kind>:<mbid>`.
 fn lookup_cache_key(kind: Kind, mbid: &str) -> String {
     format!("mb:lookup:{}:{}", kind.as_str(), mbid.to_lowercase())
@@ -1152,14 +1332,20 @@ mod http_layer {
         if api.cache_ttl.is_some() {
             let edge_copy = render(&api)?;
             // Best-effort: an edge-cache failure must not fail the read.
-            let _ = Cache::default().put(req_url, edge_copy).await;
+            let _ = Cache::default()
+                .put(canonical_edge_url(&req_url), edge_copy)
+                .await;
         }
         Ok(response)
     }
 
     async fn edge_hit(req: &Request) -> Option<Response> {
         let url = req.url().ok()?.to_string();
-        Cache::default().get(url, false).await.ok().flatten()
+        Cache::default()
+            .get(canonical_edge_url(&url), false)
+            .await
+            .ok()
+            .flatten()
     }
 
     pub async fn lookup_route(

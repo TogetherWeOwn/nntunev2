@@ -9,7 +9,9 @@
 
 	let email = $state('');
 	let status = $state<'idle' | 'sending' | 'sent' | 'error'>('idle');
-	let passkeyStatus = $state<'idle' | 'working' | 'unsupported' | 'dismissed' | 'error'>('idle');
+	let passkeyStatus = $state<
+		'idle' | 'working' | 'unsupported' | 'dismissed' | 'error' | 'email-required'
+	>('idle');
 
 	const passkeysSupported =
 		typeof window !== 'undefined' &&
@@ -40,8 +42,9 @@
 	}
 
 	async function signInWithPasskey() {
-		if (passkeyStatus === 'working' || email.trim().length === 0) {
-			passkeyStatus = 'error';
+		if (passkeyStatus === 'working') return;
+		if (email.trim().length === 0) {
+			passkeyStatus = 'email-required';
 			return;
 		}
 		if (!passkeysSupported) {
@@ -117,10 +120,19 @@
 	<section aria-labelledby="passkey-heading">
 		<h2 id="passkey-heading">Passkey</h2>
 		<p>Enter your email below, then use your passkey.</p>
-		<button class="nt-button" type="button" onclick={signInWithPasskey}>
+		<button
+			class="nt-button"
+			type="button"
+			onclick={signInWithPasskey}
+			disabled={passkeyStatus === 'working'}
+		>
 			Sign in with passkey
 		</button>
-		{#if passkeyStatus === 'unsupported'}
+		{#if passkeyStatus === 'working'}
+			<p role="status">Signing in with your passkey…</p>
+		{:else if passkeyStatus === 'email-required'}
+			<p role="status">Enter your email to continue with passkey sign-in.</p>
+		{:else if passkeyStatus === 'unsupported'}
 			<p role="status">This browser does not support passkeys — use an email link instead.</p>
 		{:else if passkeyStatus === 'dismissed'}
 			<p role="alert">

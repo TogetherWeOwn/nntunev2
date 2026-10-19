@@ -53,7 +53,7 @@ async function choosePlus(page: Page): Promise<void> {
 	await page.goto('/pricing');
 	await page
 		.getByRole('row', { name: /Plus/ })
-		.getByRole('button', { name: /^Choose$/ })
+		.getByRole('button', { name: /^Choose Plus$/ })
 		.click();
 }
 

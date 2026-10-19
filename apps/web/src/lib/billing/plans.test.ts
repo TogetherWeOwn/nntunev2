@@ -5,6 +5,7 @@ import {
 	isTrialPlan,
 	listPlans,
 	nextPlan,
+	planButtonName,
 	resolveEffectivePlan,
 	streamCapSeconds
 } from './plans';
@@ -43,6 +44,22 @@ describe('plan matrix', () => {
 		expect(nextPlan('plus')?.id).toBe('pro-5x');
 		expect(nextPlan('pro-5x')?.id).toBe('pro-20x');
 		expect(nextPlan('pro-20x')).toBeUndefined();
+	});
+});
+
+describe('planButtonName', () => {
+	it('names each paid plan distinctly when idle', () => {
+		const names = listPlans()
+			.filter((p) => p.id !== 'free')
+			.map((p) => planButtonName(p, null));
+		expect(names).toEqual(['Choose Plus', 'Choose Pro 5x', 'Choose Pro 20x']);
+		expect(new Set(names).size).toBe(names.length);
+	});
+
+	it('keeps the pending plan distinct from the idle ones', () => {
+		expect(planButtonName(getPlan('plus')!, 'plus')).toBe('Starting Plus…');
+		expect(planButtonName(getPlan('pro-5x')!, 'plus')).toBe('Choose Pro 5x');
+		expect(planButtonName(getPlan('pro-20x')!, 'pro-20x')).toBe('Starting Pro 20x…');
 	});
 });
 
