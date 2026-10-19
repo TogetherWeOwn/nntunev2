@@ -392,7 +392,7 @@ impl handlers::Mailer for FakeMailer {
 struct FakeDialer;
 
 impl handlers::Dialer for FakeDialer {
-    async fn probe(&self, _target: &vault::ValidatedTarget, _port: u16, _tls: bool) -> bool {
+    async fn probe(&self, _target: &vault::ValidatedTarget, _tls: bool) -> bool {
         false
     }
 }
