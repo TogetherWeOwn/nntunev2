@@ -74,7 +74,12 @@ forward-only (§4).
 1. Declare the incident: environment (`staging` only, unless the gated
    prod path is invoked), database (`nntunev2_staging` vs MB `postgres`),
    first-seen time, symptom, suspected cause. Staging restores stay on
-   staging; prod data is never touched from a staging authorization.
+   staging; prod data is never touched from a staging authorization —
+   except the MB lane (§3.6): the single shared `nntunev2-mb` config
+   (`HYPERDRIVE_ID_MB`) serves both staging and prod MB reads
+   (`docs/ops.md` PlanetScale Postgres section and environments matrix),
+   so an MB cutover affects both readers together and needs an
+   authorization naming both.
 2. Stop the bleeding without destroying evidence: halt writers that touch
    the affected database (pause the owning deploy/import lane; do not
    delete configs, roles, or databases — decommissioning needs the
@@ -157,15 +162,25 @@ forward-only (§4).
    restorable backup/PITR horizon expiry) — a restore never justifies
    deleting key material early.
 6. **Cutover (authorized promotion, not a redeploy).** Only after steps
-   3–5 are recorded green: repoint the environment's binding (Hyperdrive
-   config / migrator URL) to the restored-and-converged target through
-   the authorized host path, or promote/rename the restore branch per the
-   provider primitive **[UNVERIFIED — confirm in console: whether
-   PlanetScale Postgres cutover is branch-promote, rename, or
+   3–5 are recorded green: repoint the serving Hyperdrive binding to the
+   restored-and-converged target through the authorized host path —
+   app database: `HYPERDRIVE_ID_STAGING` (`nntunev2-staging` config; prod
+   `HYPERDRIVE_ID_PROD` stays reserved) — or promote/rename the restore
+   branch per the provider primitive **[UNVERIFIED — confirm in console:
+   whether PlanetScale Postgres cutover is branch-promote, rename, or
    connection-string repoint, and whether Hyperdrive caches the old
-   origin]**. Staging first always; the prod binding stays reserved until
-   the gated production workflow runs. Never reuse credentials from a
-   deleted branch (cf. `docs/ops.md` consolidation UNDO).
+   origin]**. The `PLANETSCALE_MIGRATOR_URL_*` secret is migration wiring
+   only, never a serving-traffic cutover mechanism. MB lane is different:
+   there are no separate MB staging/prod configs — staging and prod MB
+   reads share the single `nntunev2-mb` config (`HYPERDRIVE_ID_MB`,
+   `docs/ops.md` PlanetScale Postgres section and environments matrix) —
+   so an MB cutover switches both readers at once: it needs an
+   authorization naming both staging and prod readers (a staging-only
+   authorization is insufficient), and staging-first does not apply to MB
+   until separate MB configs exist. App lane stays staging-first always;
+   the prod app binding stays reserved until the gated production
+   workflow runs. Never reuse credentials from a deleted branch (cf.
+   `docs/ops.md` consolidation UNDO).
 7. **Health and E2E.** Verify staging health, deployed-build identity
    (`GET /api/build` 40-hex match where applicable), and the same-run
    post-deploy E2E bar from the `docs/ops.md` staging checklist. For
