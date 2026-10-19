@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { ApiClient, ApiError } from '#lib/api/client.js';
 	import { invalidateLibraryCache } from '#lib/library/cache.js';
@@ -9,7 +9,10 @@
 		stashSignedInEmail
 	} from '#lib/signed-in-email.js';
 
-	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
+	const lifetime = new AbortController();
+	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal: lifetime.signal });
+	let mounted = false;
+	let heading: HTMLHeadingElement | undefined;
 
 	let status = $state<'confirm' | 'working' | 'error' | 'signed-out'>('working');
 	let token = $state<string | null>(null);
@@ -22,7 +25,17 @@
 	// (the real session) is untouched, so the recovery button must stay.
 	let signOutError = $state<string | null>(null);
 
+	// Only a branch change schedules entry focus. Same-branch logout updates
+	// must not steal it from a recovery link the user is already interacting with.
+	$effect(() => {
+		const branch = status;
+		void tick().then(() => {
+			if (mounted && status === branch) heading?.focus();
+		});
+	});
+
 	onMount(() => {
+		mounted = true;
 		// The Worker mails `{origin}/auth/magic?token=…` (worker_entry.rs).
 		// Nothing is redeemed automatically: an auto-redeem would let
 		// anyone who can get a victim to open a link sign the victim into
@@ -34,17 +47,22 @@
 		window.history.replaceState(null, '', window.location.pathname);
 		if (captured === null || captured.length === 0) {
 			status = 'error';
-			return;
+		} else {
+			token = captured;
+			status = 'confirm';
 		}
-		token = captured;
-		status = 'confirm';
+		return () => {
+			mounted = false;
+			lifetime.abort();
+		};
 	});
 
 	async function redeem() {
-		if (status !== 'confirm' || token === null) return;
+		if (!mounted || status !== 'confirm' || token === null) return;
 		status = 'working';
 		try {
 			const result = await client.finishMagicLink(token);
+			if (!mounted) return;
 			invalidateLibraryCache();
 			// Show which account this is on the next screen, before any
 			// provider credential is typed.
@@ -53,6 +71,7 @@
 			}
 			window.location.href = '/onboarding/provider';
 		} catch (error) {
+			if (!mounted) return;
 			if (error instanceof ApiError && error.paywall) {
 				// The token remains available; keep the explicit confirmation
 				// action so the user can retry once the global paywall clears.
@@ -68,12 +87,13 @@
 	}
 
 	async function signOut() {
-		if (signingOut) return;
+		if (!mounted || signingOut) return;
 		signingOut = true;
 		signOutError = null;
 		try {
 			await client.logout();
 		} catch (error) {
+			if (!mounted) return;
 			if (!(error instanceof ApiError && error.status === 401)) {
 				// The HttpOnly cookie is the real session and it is untouched,
 				// so a failed logout must NOT clear the label or show success:
@@ -84,6 +104,7 @@
 			}
 			// A generic 401 means there is no live session to revoke.
 		}
+		if (!mounted) return;
 		invalidateLibraryCache();
 		clearSignedInEmail();
 		signedInEmail = null;
@@ -105,7 +126,7 @@
 </svelte:head>
 
 <main class="nt-wrap">
-	<h1>Sign in</h1>
+	<h1 bind:this={heading} tabindex="-1">Sign in</h1>
 	{#if status === 'confirm'}
 		{#if signedInEmail !== null}
 			<p role="status">

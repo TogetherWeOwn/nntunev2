@@ -18,6 +18,8 @@ export type FetchFn = typeof fetch;
 export interface ApiClientOptions {
 	baseUrl: string;
 	fetchFn?: FetchFn;
+	/** Optional lifetime for requests owned by a mounted component. */
+	signal?: AbortSignal;
 }
 
 export class ApiError extends Error {
@@ -298,10 +300,12 @@ export function toLoginFinishBody(input: LoginFinishInput): Record<string, strin
 export class ApiClient {
 	private readonly baseUrl: string;
 	private readonly fetchFn: FetchFn;
+	private readonly signal?: AbortSignal;
 	private token: string | null = null;
 
-	constructor({ baseUrl, fetchFn }: ApiClientOptions) {
+	constructor({ baseUrl, fetchFn, signal }: ApiClientOptions) {
 		this.baseUrl = baseUrl.replace(/\/+$/, '');
+		this.signal = signal;
 		// Default to a wrapper (not a bare `fetch` reference): calling a stored
 		// `fetch` as `this.fetchFn(...)` sets `this` to the client instance and
 		// browsers/workerd reject it with "Illegal invocation".
@@ -476,7 +480,8 @@ export class ApiClient {
 		// auth/vault spinners always settle. The timer is cleared on settle so
 		// fast requests never wait for it and later requests are unaffected.
 		const controller = new AbortController();
-		const callerSignal = init.signal as AbortSignal | null | undefined;
+		const callerSignal = init.signal ?? this.signal;
+		callerSignal?.throwIfAborted();
 		const onCallerAbort = (): void => controller.abort(callerSignal?.reason);
 		if (callerSignal?.aborted) controller.abort(callerSignal.reason);
 		else callerSignal?.addEventListener('abort', onCallerAbort, { once: true });
@@ -492,6 +497,9 @@ export class ApiClient {
 				headers,
 				credentials: 'include'
 			});
+			// A fetch/body double (or an already-settled transport) can ignore
+			// abort. Never publish a stale result or global paywall afterward.
+			callerSignal?.throwIfAborted();
 			if (!response.ok) {
 				// Read once (capped at 1 MiB) so the paywall and typed error
 				// share the structured contract.
@@ -512,12 +520,15 @@ export class ApiClient {
 					}
 					/* non-JSON error body: use status-based defaults */
 				}
+				callerSignal?.throwIfAborted();
 				const parsed = parseErrorBody(body, response.status);
 				const paywall = paywallFromResponse({ status: response.status, headers: response.headers, body });
 				throw new ApiError(response.status, parsed.code, parsed.message, paywall, parsed.retryable);
 			}
 			try {
-				return { data: (await readCappedJson(response)) as T, status: response.status };
+				const data = (await readCappedJson(response)) as T;
+				callerSignal?.throwIfAborted();
+				return { data, status: response.status };
 			} catch (error) {
 				if (timedOut) throw this.timeoutError();
 				// An over-cap 2xx never parses: surface the typed error, never
