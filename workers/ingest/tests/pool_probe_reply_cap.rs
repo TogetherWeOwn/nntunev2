@@ -374,4 +374,55 @@ fn call_pool_probe_bounds_the_read_before_classification() {
         cap < classify,
         "the size cap must apply before classification, not after parsing"
     );
+    // Pin the in-loop streaming ceiling: the chunk that would cross the cap
+    // fails closed before it is retained. Deleting the three-line
+    // `saturating_add` guard leaves only the buffered-fallback comparison, so
+    // the loop guard itself must be pinned here, not just any cap comparison.
+    assert!(
+        body.lines().any(|line| line.contains("saturating_add")
+            && (line.contains("reply_cap") || line.contains("MAX_PROBE_REPLY_BYTES"))),
+        "the streaming loop must compare buf.len().saturating_add(chunk.len()) \
+         against the reply cap before retaining the chunk"
+    );
+    let saturating = body
+        .find("saturating_add")
+        .expect("streaming loop must accumulate with saturating_add");
+    let extend = body
+        .find("extend_from_slice")
+        .expect("streaming loop must retain chunks with extend_from_slice");
+    assert!(
+        saturating < extend,
+        "the in-loop saturating_add cap check must precede extend_from_slice, \
+         so the over-cap chunk is rejected before it is retained"
+    );
+    // Pin the non-200 early return: a non-200 verdict never reads the body.
+    // Deleting the `status != 200` early return would send every status through
+    // the streaming read, so the branch, its position before the stream, and
+    // the `from_utf8` decode after the stream must all be pinned.
+    let status_branch = body
+        .find("status != 200")
+        .or_else(|| body.find("status!=200"))
+        .expect("non-200 replies must branch on status != 200 before any read");
+    let stream = body
+        .find(".stream()")
+        .expect("the bounded 200 read must stream the body");
+    let decode = body
+        .find("from_utf8")
+        .expect("the streamed bytes must decode with from_utf8 after the stream");
+    assert!(
+        status_branch < stream,
+        "the status != 200 return must precede the streaming read, so non-200 \
+         verdicts never read the body"
+    );
+    assert!(
+        stream < decode,
+        "from_utf8 must follow the stream, so only the bounded 200 bytes decode"
+    );
+    assert!(
+        body[status_branch..stream].contains("return")
+            && body[status_branch..stream].contains("classify_reply")
+            && body[status_branch..stream].contains("\"\""),
+        "the non-200 branch must return classify_reply with an empty body, \
+         never the streamed bytes"
+    );
 }
