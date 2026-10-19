@@ -8,6 +8,7 @@
 //! is checked against the request ([`check_outcome`]) before the tally may
 //! fold it.
 
+use futures_util::StreamExt;
 use worker::{wasm_bindgen::JsValue, Env, Headers, Method, Request, RequestInit};
 
 use crate::probe::{ProbeOutcome, ProbeRequest};
@@ -19,16 +20,17 @@ pub const POOL_BINDING: &str = "NNTP_POOL";
 /// fetch is delivered to the object and never leaves the runtime.
 pub const POOL_PROBE_URL: &str = "https://nntp-pool/probe";
 
-/// Largest pool probe reply accepted before classification. An over-cap
-/// reply fails closed as rejected because more bytes existed; it is never
-/// truncated and parsed.
-pub const MAX_PROBE_REPLY_BYTES: usize = 1024 * 1024;
-
 /// Redelivery delay when the pool gives no `Retry-After`.
 pub const DEFAULT_RETRY_SECS: u32 = 5;
 
 /// Longest `Retry-After` honored; the queue's own backoff caps the rest.
 pub const MAX_RETRY_SECS: u32 = 300;
+
+/// Largest pool probe reply accepted: a `ProbeOutcome` is two id lists plus
+/// the batch index, so anything larger is a contract bug, not bytes to
+/// retain. An oversize body is `Rejected` because more bytes existed, never
+/// parsed from a truncated prefix.
+pub const MAX_PROBE_REPLY_BYTES: usize = 1024 * 1024;
 
 /// Why a probe call produced no usable outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,11 +72,11 @@ pub fn classify_reply(
     retry_after: Option<&str>,
     body: &str,
 ) -> Result<ProbeOutcome, PoolProbeError> {
-    if body.len() > MAX_PROBE_REPLY_BYTES {
-        return Err(PoolProbeError::Rejected);
-    }
     match status {
         200 => {
+            if body.len() > MAX_PROBE_REPLY_BYTES {
+                return Err(PoolProbeError::Rejected);
+            }
             let outcome: ProbeOutcome =
                 serde_json::from_str(body).map_err(|_| PoolProbeError::Rejected)?;
             check_outcome(req, &outcome)?;
@@ -117,7 +119,42 @@ pub async fn call_pool_probe(
         .map_err(|_| unavailable)?;
     let status = response.status_code();
     let retry_after = response.headers().get("retry-after").ok().flatten();
-    let bytes = response.bytes().await.map_err(|_| unavailable)?;
+    // Bounded reply read: stream the body and fail closed on the chunk that
+    // would cross the cap, so no more than the cap is ever retained for any
+    // status. A body that is not streamable falls back to one buffered read
+    // with the same ceiling. A non-200 keeps exactly the verdict
+    // classify_reply maps it to via an empty body (the classifier ignores the
+    // body for non-200), so an over-cap or non-UTF-8 transient stays transient.
+    let bytes = match response.stream() {
+        Ok(stream) => {
+            let mut stream = Box::pin(stream);
+            let mut buf = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|_| unavailable)?;
+                if buf.len().saturating_add(chunk.len()) > MAX_PROBE_REPLY_BYTES {
+                    if status == 200 {
+                        return Err(PoolProbeError::Rejected);
+                    }
+                    return classify_reply(req, status, retry_after.as_deref(), "");
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            buf
+        }
+        Err(_) => {
+            let buf = response.bytes().await.map_err(|_| unavailable)?;
+            if buf.len() > MAX_PROBE_REPLY_BYTES {
+                if status == 200 {
+                    return Err(PoolProbeError::Rejected);
+                }
+                return classify_reply(req, status, retry_after.as_deref(), "");
+            }
+            buf
+        }
+    };
+    if status != 200 {
+        return classify_reply(req, status, retry_after.as_deref(), "");
+    }
     if bytes.len() > MAX_PROBE_REPLY_BYTES {
         return Err(PoolProbeError::Rejected);
     }
