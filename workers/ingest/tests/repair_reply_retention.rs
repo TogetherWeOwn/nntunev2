@@ -29,7 +29,7 @@
 //!   read changes nothing: the pin strips comments before matching, so only
 //!   real code flips it;
 //! - raising/lowering the ceiling flips the classifier controls (verified by
-//!   the pinned TOG-30679 suite, which this file does not touch);
+//!   the pinned ceiling suite, which this file does not touch);
 //! - moving the length check after the JSON parse lets the 65,537-byte
 //!   well-formed repaired reply through, failing
 //!   `ceiling_plus_one_repaired_is_retry_from_length`.
@@ -101,7 +101,7 @@ fn strip_comments(source: &str) -> String {
                 if j < bytes.len() && bytes[j] == b'"' {
                     // Copy the whole raw literal verbatim.
                     let closing: Vec<u8> = std::iter::once(b'"')
-                        .chain(std::iter::repeat(b'#').take(hashes))
+                        .chain(std::iter::repeat_n(b'#', hashes))
                         .collect();
                     out.push_str(&source[i..=j]);
                     i = j + 1;
@@ -109,7 +109,7 @@ fn strip_comments(source: &str) -> String {
                         if i >= bytes.len() {
                             break;
                         }
-                        if source[i..].as_bytes().starts_with(&closing) {
+                        if source.as_bytes()[i..].starts_with(&closing) {
                             out.push_str(&source[i..i + closing.len()]);
                             i += closing.len();
                             break;
