@@ -1279,7 +1279,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     // persists no records (or a sampled subset) and the build_sha log
     // evidence can never be read back reliably.
     expect(section).toMatch(
-      /\[env\.staging\.observability\]\n\s+enabled = true\n\s+head_sampling_rate = 1\n/,
+      /^[ \t]*\[env\.staging\.observability\]\n[ \t]+enabled = true\n[ \t]+head_sampling_rate = 1\n/m,
     );
   };
 
@@ -1372,6 +1372,14 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     // Api lane whose generated config drops the sampling line: the default
     // rate applies instead of the evidenced full sampling.
     const droppedSamplingMutant = jobsBody.replace('          head_sampling_rate = 1\n', '');
+    // Api lane whose generated config comments out the observability header:
+    // the TOML then defines no env.staging.observability table at all (the
+    // two keys fall into env.staging.vars), and an unanchored pin would keep
+    // matching the bracket text inside the comment.
+    const commentedHeaderMutant = jobsBody.replace(
+      '          [env.staging.observability]\n',
+      '          # [env.staging.observability]\n',
+    );
 
     for (const mutant of [
       workerMutant,
@@ -1389,6 +1397,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       noObservabilityMutant,
       zeroSamplingMutant,
       droppedSamplingMutant,
+      commentedHeaderMutant,
     ]) {
       expect(() => assertDeployGuard(mutant), 'mutant must violate the deploy guard').toThrow();
     }
@@ -1412,6 +1421,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     expect(() => assertStagingApi(noObservabilityMutant)).toThrow();
     expect(() => assertStagingApi(zeroSamplingMutant)).toThrow();
     expect(() => assertStagingApi(droppedSamplingMutant)).toThrow();
+    expect(() => assertStagingApi(commentedHeaderMutant)).toThrow();
   });
 });
 
