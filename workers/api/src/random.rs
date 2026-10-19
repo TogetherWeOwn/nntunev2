@@ -284,6 +284,11 @@ mod tests {
     /// otherwise. Takes the source as a parameter (mirroring
     /// `getrandom_offenders` in the paired suite) so self-tests can pin
     /// comment/string-carried mutants without touching production.
+    ///
+    /// The positive check is an EXACT statement match, not a substring
+    /// search: any combinator that swallows the mapped error (`.or(..)`,
+    /// `.or_else(..)`, `.ok()`, ...) changes the statement text and is
+    /// rejected. The banned list below stays for precise diagnostics only.
     fn check_secure_random_propagation(source: &str) -> Result<(), String> {
         // Build needles at runtime so this scanner contributes no raw
         // `getrandom::` text of its own (see module note).
@@ -291,6 +296,8 @@ mod tests {
         let fill_needle = format!("{gr}::fill");
         let call_needle = format!("{gr}::");
         let discard_needle = format!("let _ = {gr}");
+        let fill_call = format!("{fill_needle}(&mut bytes)");
+        let expected = format!("{fill_call}.map_err(|_| CryptoError::RandomnessUnavailable)?;");
         let stripped = strip_code_for_propagation_pin(source);
         let norm = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
         if !norm.contains(&fill_needle) {
@@ -321,12 +328,9 @@ mod tests {
                     ));
                 }
             }
-            if !(stmt.contains(".map_err")
-                && stmt.contains("RandomnessUnavailable")
-                && stmt.contains('?'))
-            {
+            if *stmt != *expected {
                 return Err(format!(
-                    "getrandom statement must map failure to RandomnessUnavailable with ?: {stmt}"
+                    "getrandom statement must be exactly {expected}: {stmt}"
                 ));
             }
             found = true;
@@ -381,13 +385,156 @@ mod tests {
 
     #[test]
     fn pin_rejects_string_carried_needles() {
+        // Needles live INSIDE the audited statement (tuple fabrication):
+        // only string stripping can hide them. A separate-statement
+        // fixture would be vacuous because statement slicing already
+        // excludes it even with no stripping at all.
         let gr = "getrandom";
         let mutant = format!(
-            "let _filled = {gr}::fill(&mut bytes); let _note = \".map_err(|_| CryptoError::RandomnessUnavailable)?;\";"
+            "let _pair = ({gr}::fill(&mut bytes), \".map_err(|_| CryptoError::RandomnessUnavailable)?;\");"
         );
         assert!(
             check_secure_random_propagation(&mutant).is_err(),
             "string-literal needles must not satisfy the pin"
+        );
+    }
+
+    #[test]
+    fn pin_rejects_raw_string_carried_needles() {
+        // Raw-string body carries a `"` before the needles, so the
+        // plain-string branch alone cannot backstop a deleted raw branch.
+        // Built with escaped quotes (no raw literal in test source) and
+        // the fill needle via runtime concat (see module note).
+        let gr = "getrandom";
+        let q = '"';
+        let mutant = format!(
+            "let _pair = ({gr}::fill(&mut bytes), r#{q}a{q}b .map_err(|_| CryptoError::RandomnessUnavailable)?;{q}#);"
+        );
+        assert!(
+            check_secure_random_propagation(&mutant).is_err(),
+            "raw-string needles must not satisfy the pin"
+        );
+    }
+
+    #[test]
+    fn pin_rejects_char_carried_question_mark() {
+        // `map_err` + `RandomnessUnavailable` are real code; the only `?`
+        // is a char literal, so only char stripping rejects it.
+        let gr = "getrandom";
+        let mutant = format!(
+            "let _t = ({gr}::fill(&mut bytes).map_err(|_| CryptoError::RandomnessUnavailable), '?');"
+        );
+        assert!(
+            check_secure_random_propagation(&mutant).is_err(),
+            "char-literal ? must not satisfy the pin"
+        );
+    }
+
+    #[test]
+    fn pin_rejects_swallowed_mapped_error() {
+        // Mapped error followed by a swallowing combinator: all positive
+        // substrings are present in real code, yet RNG failure yields
+        // zero-filled key material.
+        let gr = "getrandom";
+        let mutant = format!(
+            "{gr}::fill(&mut bytes).map_err(|_| CryptoError::RandomnessUnavailable).or(Ok(()))?;"
+        );
+        assert!(
+            check_secure_random_propagation(&mutant).is_err(),
+            "swallowed mapped error must not satisfy the pin"
+        );
+    }
+
+    #[test]
+    fn stripper_blanks_plain_string_needles() {
+        // Direct branch pin: deleting the `"` string branch of
+        // `strip_code_for_propagation_pin` must turn THIS test red (the
+        // checker-level tuple test above stays red either way under the
+        // exact-shape rule, so it cannot pin the branch by itself).
+        let src = "let _note = \".map_err(|_| CryptoError::RandomnessUnavailable)?;\";";
+        let stripped = strip_code_for_propagation_pin(src);
+        assert!(
+            !stripped.contains(".map_err"),
+            "string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("RandomnessUnavailable"),
+            "string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains('?'),
+            "string ? must be blanked: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn stripper_blanks_raw_string_with_inner_quote() {
+        // Body holds a `"` before the needles: with the raw branch
+        // deleted, the plain-string branch blanks only up to the inner
+        // quote and leaves the needles visible, so this goes red.
+        let src = "let _note = r#\"a\"b .map_err(|_| CryptoError::RandomnessUnavailable)?;\"#;";
+        let stripped = strip_code_for_propagation_pin(src);
+        assert!(
+            !stripped.contains(".map_err"),
+            "raw-string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("RandomnessUnavailable"),
+            "raw-string body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains('?'),
+            "raw-string ? must be blanked: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn stripper_blanks_char_question_mark() {
+        let src = "let _q = '?';";
+        let stripped = strip_code_for_propagation_pin(src);
+        assert!(
+            !stripped.contains('?'),
+            "char ? must be blanked: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn stripper_blanks_line_comment_needles() {
+        // Direct pin for the `//` branch: the checker-level trailing
+        // test is subsumed by the exact-shape rule, so this unit test
+        // is what turns red if line-comment stripping breaks.
+        let src = "let x = 1; // .map_err(|_| CryptoError::RandomnessUnavailable)?;";
+        let stripped = strip_code_for_propagation_pin(src);
+        assert!(
+            !stripped.contains(".map_err"),
+            "line-comment body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("RandomnessUnavailable"),
+            "line-comment body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains('?'),
+            "line-comment ? must be blanked: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn stripper_blanks_block_comment_needles() {
+        // Direct pin for the `/* */` branch (same rationale as above).
+        let src = "let x = 1; /* .map_err(|_| CryptoError::RandomnessUnavailable)?; */";
+        let stripped = strip_code_for_propagation_pin(src);
+        assert!(
+            !stripped.contains(".map_err"),
+            "block-comment body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("RandomnessUnavailable"),
+            "block-comment body must be blanked: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains('?'),
+            "block-comment ? must be blanked: {stripped:?}"
         );
     }
 
