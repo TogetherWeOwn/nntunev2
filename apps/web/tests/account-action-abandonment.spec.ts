@@ -164,7 +164,7 @@ async function clientNavigate(page: Page, path: string) {
 		document.body.append(link);
 	}, path);
 	await page.getByTestId('leave-held-action').click();
-	await expect(page).toHaveURL(new RegExp(`${path.replace(/[?]/g, '\\?')}$`));
+	await expect(page).toHaveURL((url) => url.pathname + url.search === path);
 	await page.getByTestId('leave-held-action').evaluate((link) => link.remove());
 	// This exact probe lives only in the original JS realm. A full reload
 	// would lose the pending request and make the negative test meaningless.
