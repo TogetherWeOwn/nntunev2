@@ -1,35 +1,27 @@
-//! Acceptance tests (failing-first) for PR #58 (cache stampede guard):
-//! the open Paperclip Review findings the Land card must resolve.
+//! Acceptance tests for the cache stampede guard (PR #58, landed):
+//! stale serves project to stale observability rows, CI keeps the
+//! migrations gate required, and a post-panic fresh election is a
+//! replacement flight. All three pass on the landed tree.
 //!
-//! Do not edit these tests to make them pass: implement the contract.
-//! Two of the three tests FAIL on the current PR head; the third pins an
-//! untested branch the reviewer mutation-tested (it passes on the head and
-//! fails if the `has_timed_out ||` guard at `stampede.rs:159` is dropped).
+//! Do not weaken these tests to make a change pass: they pin shipped
+//! contracts. If a contract intentionally changes, update the test and
+//! the contract together.
 //!
-//! Contracts to implement (test files only in this card; fixes belong to
-//! the Land card):
+//! Contracts pinned:
 //!
-//! 1. **Stale observability row** (reviewer nit, still open at the 5/5
-//!    head): a stale serve carries `Cache-Status: STALE` on the wire but
-//!    `PlayStream::observe_event` projects it to the Analytics Engine row
-//!    as `hit` — `observability::CacheStatus` has only Hit/Miss while
-//!    `cache::CacheStatus` has Hit/Miss/Stale, so the dashboard can never
-//!    show stale traffic and the header and the row disagree for one play.
-//!    Fix: give the row a distinct stale status (a `Stale` variant rendered
-//!    as `stale`, plus the staging query template and pinned column
-//!    tests), or a distinct row type name. (If the Land doer instead
-//!    documents "stale is intentionally reported as hit", this test needs
-//!    updating with reviewer sign-off — it currently pins distinct.)
-//! 2. **CI keeps the migrations gate**: the PR's `ci.yml` edit drops the
-//!    `migrations-gate` job (manifest integrity + drift, landed on main)
-//!    and removes it from `ci-ok`'s `needs`, so the aggregate check no
-//!    longer requires it. Fix: restore the job and the `needs` entry.
-//! 3. **Post-panic fresh election is a replacement** (reviewer nit,
-//!    carried across two reviews): the doc says a flight a timed-out
-//!    caller goes on to lead is a replacement "even when elected fresh
-//!    after a leader panic" — the only effect of `has_timed_out ||` at
-//!    `stampede.rs:159`. No test pins it: dropping the guard survives the
-//!    whole suite. Fix: keep the guard; this test pins it (exactly 2
+//! 1. **Stale observability row**: a stale serve carries `Cache-Status:
+//!    STALE` on the wire and `PlayStream::observe_event` projects it to
+//!    the Analytics Engine row as `stale` (`observability::CacheStatus`
+//!    has a `Stale` variant rendered `stale`), so the header and the row
+//!    agree for one play.
+//! 2. **CI keeps the migrations gate**: the `migrations-gate` job
+//!    (manifest integrity + drift) stays defined in `ci.yml` and the
+//!    `ci-ok` aggregate still requires it.
+//! 3. **Post-panic fresh election is a replacement**: a flight a
+//!    timed-out caller goes on to lead is a replacement "even when
+//!    elected fresh after a leader panic" — the only effect of
+//!    `has_timed_out ||` at `stampede.rs:161`. Dropping the guard costs
+//!    exactly the extra upstream fetch this test forbids (exactly 2
 //!    upstream fetches, not 3, when a panicking leader is followed by a
 //!    stalling fresh election).
 
@@ -101,10 +93,24 @@ fn ci_keeps_the_migrations_gate_job_required() {
         body.lines().any(|l| l == "  migrations-gate:"),
         "ci.yml must still define the migrations-gate job"
     );
-    let needs = body
-        .lines()
-        .find(|l| l.trim_start().starts_with("needs:") && l.contains("rust-test"))
-        .expect("ci-ok must still declare its needs list");
+    // Scope the assertion to the ci-ok job's own block: a first-match
+    // `needs:` scan would pass while some other job required the gate.
+    let mut in_ci_ok = false;
+    let mut needs = None;
+    for line in body.lines() {
+        if line == "  ci-ok:" {
+            in_ci_ok = true;
+            continue;
+        }
+        if in_ci_ok && line.starts_with("  ") && !line.starts_with("   ") && line.ends_with(':') {
+            break;
+        }
+        if in_ci_ok && line.trim_start().starts_with("needs:") {
+            needs = Some(line);
+            break;
+        }
+    }
+    let needs = needs.expect("ci-ok must still declare its needs list");
     assert!(
         needs.contains("migrations-gate"),
         "ci-ok needs must still require migrations-gate, got: {needs}"

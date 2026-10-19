@@ -74,10 +74,10 @@ test('readiness endpoint reports ok when ready', async ({ request }) => {
  * instance; the library inline instance is gated behind the overLimit=false
  * placeholder and cannot render yet).
  *
- * GAP — the app cannot render this hook yet, so no render pin is possible
- * without an app change (this spec is test-only, no app source touched):
- * audio-player — library/+page.svelte renders it only when currentTrack is
- * set, and that placeholder is always null on main.
+ * Pinned elsewhere: audio-player — library/+page.svelte renders it once a
+ * library row is selected (the queue's current track reveals the
+ * placeholder player with an empty src); the render pin lives in the
+ * library player-queue companion spec, so it is not repeated here.
  */
 test('contract routes resolve and render their e2e hooks', async ({ page, request }) => {
 	for (const href of ['/signup', '/onboarding/byop', '/library', '/library/import']) {

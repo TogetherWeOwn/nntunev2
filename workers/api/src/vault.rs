@@ -102,12 +102,21 @@ pub enum VaultError {
     /// Malformed persisted ciphertext or metadata: server-side stored data is corrupt.
     CorruptStoredData,
     Crypto,
+    /// Secure randomness unavailable while minting a DEK or nonce: HTTP 503
+    /// `service_unavailable`. Never a panic, fallback, or reused nonce/DEK.
+    RandomnessUnavailable,
 }
 
 impl std::fmt::Display for VaultError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Generic: never echo hosts, secrets, or crypto details.
         write!(f, "vault unavailable")
+    }
+}
+
+impl From<crate::random::CryptoError> for VaultError {
+    fn from(_: crate::random::CryptoError) -> Self {
+        VaultError::RandomnessUnavailable
     }
 }
 
@@ -521,10 +530,8 @@ pub struct VaultBlob {
 #[derive(Zeroize, ZeroizeOnDrop)]
 struct Dek([u8; 32]);
 
-fn random_nonce() -> [u8; 12] {
-    let mut n = [0u8; 12];
-    getrandom::fill(&mut n).expect("secure randomness unavailable");
-    n
+fn random_nonce() -> Result<[u8; 12], VaultError> {
+    Ok(crate::random::secure_random_bytes::<12>()?)
 }
 
 // Unpadded-base64url lives in one place: [`crate::b64`] over the `base64`
@@ -540,20 +547,24 @@ fn payload_aad(user_id: &str) -> String {
 }
 
 /// Encrypt `plaintext` (serialized provider+indexer secrets) for `user_id`.
+///
+/// Fail-closed: secure-randomness failure (DEK or either nonce) returns
+/// [`VaultError::RandomnessUnavailable`] (HTTP 503). The success path is
+/// byte-identical: the same 32 DEK bytes and 12-byte nonces through the
+/// same AES-256-GCM + [`crate::b64::encode`] shapes.
 pub fn encrypt_vault(
     kek: &[u8; 32],
     kek_version: u32,
     user_id: &str,
     plaintext: &[u8],
 ) -> Result<VaultBlob, VaultError> {
-    let mut dek_bytes = [0u8; 32];
-    getrandom::fill(&mut dek_bytes).expect("secure randomness unavailable");
+    let mut dek_bytes = crate::random::secure_random_bytes::<32>()?;
     let dek = Dek(dek_bytes);
     dek_bytes.zeroize();
 
     // Wrap the DEK with the KEK (AAD binds user + KEK version).
     let kek_cipher = Aes256Gcm::new_from_slice(kek).map_err(|_| VaultError::Crypto)?;
-    let wrap_nonce = random_nonce();
+    let wrap_nonce = random_nonce()?;
     let wrapped = kek_cipher
         .encrypt(
             &Nonce::from(wrap_nonce),
@@ -566,7 +577,7 @@ pub fn encrypt_vault(
 
     // Encrypt the payload with the DEK (AAD binds user).
     let dek_cipher = Aes256Gcm::new_from_slice(&dek.0).map_err(|_| VaultError::Crypto)?;
-    let payload_nonce = random_nonce();
+    let payload_nonce = random_nonce()?;
     let payload = dek_cipher
         .encrypt(
             &Nonce::from(payload_nonce),
@@ -671,7 +682,7 @@ pub fn rewrap_dek(
 
     // Re-wrap with the new KEK (new AAD: new version).
     let new_cipher = Aes256Gcm::new_from_slice(new_kek).map_err(|_| VaultError::Crypto)?;
-    let new_nonce = random_nonce();
+    let new_nonce = random_nonce()?;
     let wrap_result = new_cipher.encrypt(
         &Nonce::from(new_nonce),
         Payload {
@@ -886,6 +897,23 @@ pub fn audit_event(user_id: &str, action: &str, ok: bool, source_ip: &str, now: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn randomness_unavailable_is_503_service_unavailable() {
+        let err = VaultError::RandomnessUnavailable;
+        // Sealed display carries no crypto internals.
+        assert_eq!(err.to_string(), "vault unavailable");
+        let api = crate::api_error::ApiError::from(err);
+        assert_eq!(
+            (api.code, api.status, api.retryable),
+            ("service_unavailable", 503, true)
+        );
+        assert_eq!(api.message, "service unavailable");
+        assert_eq!(
+            VaultError::from(crate::random::CryptoError::RandomnessUnavailable),
+            VaultError::RandomnessUnavailable
+        );
+    }
 
     /// `cf-connecting-ip` is request-header data
     /// that lands in `audit_log.source_ip`. Anything that is not a literal

@@ -288,7 +288,11 @@ this documentation update, nor evidence of separate compute/failure domains.
   sequence-write, and schema/table DDL privileges are denied. A denial must be
   established from the effective role's actual privilege result or a safely
   rolled-back, non-mutating authorization check; do not attempt a write that
-  could change data. No check above was run here, so neither SELECT success nor
+  could change data. Sequence probes are not non-mutating: `nextval` consumes
+  values even when the surrounding transaction rolls back, so sequence-write
+  denial must come from privilege inspection (for example
+  `has_sequence_privilege`), never from a rolled-back `nextval` probe.
+  No check above was run here, so neither SELECT success nor
   write/DDL denial is claimed.
 - Authorized follow-up: the Operator should use the existing secure host-side
   read-only verification path to run and return the checks above, reporting only
@@ -508,10 +512,35 @@ with these instructions when no single-version 100% deployment exists, so a
 first run fails with guidance instead of orphaning an uploaded version inside
 the promotion action. Re-dispatch the lane after seeding.
 
+### Production Worker secret-shape gate
+
+The production lane refuses any production vars beyond `name` in
+`[env.production]` before uploading a version. The gate step
+(`.github/workflows/deploy-production.yml:226-234`) runs
+`node ci/check-production-secrets-shape.mjs`, which enforces the offline
+policy in `ci/check-production-secrets-shape.mjs:1-7`: the web Worker ships
+no bindings and needs no secrets, so its production env table must carry
+only `name` (current state: `apps/web/wrangler.toml:22-23`). It runs in the
+`deploy-production` job after that job checks out the validated promotion
+SHA (`.github/workflows/deploy-production.yml:203-207`), not in preflight
+(preflight checks out the dispatch tip,
+`.github/workflows/deploy-production.yml:77-79`). It is an offline
+shape check — no credentials, no network — that reads key names only and
+never reads or prints values
+(`ci/check-production-secrets-shape.mjs:6-7`).
+
 - [ ] Exact-head CI: `ci-ok`, `gitleaks` and `pr-lint` green on the promotion
   SHA, plus Paperclip Review 5/5 on that head (merge policy in
   `CONTRIBUTING.md`). A red required check is fixed in code or recorded as
   a flake/quarantine decision with a card link, never dismissed.
+- [ ] Secret-shape gate: the promotion run's `Require production Worker
+  secret shape before upload` step passed on the promotion SHA
+  (`.github/workflows/deploy-production.yml:226-234` runs
+  `ci/check-production-secrets-shape.mjs`, which refuses any
+  `[env.production]` table beyond `name`). Same-checker CI coverage
+  (`.github/workflows/ci.yml:607-621`) is not promotion evidence on its
+  own; require the deploy-production job's pass on the exact head being
+  promoted.
 - [ ] Staging deploy evidence: record the successful push-triggered
   `deploy.yml` run for the promotion SHA, and require its `staging-web` job
   conclusion to be `success` (not `skipped`); verify staging health. This
@@ -583,7 +612,12 @@ Worker in any environment, until that Worker's lane exists and its gates
 pass on the exact head being promoted — for the api Worker that means a
 `staging-api` job conclusion `success` (not `skipped`) on the promotion
 run. The web checklist above is unchanged by this section and remains in
-force alongside the per-Worker evidence table below.
+force alongside the per-Worker evidence table below. The web frontend's
+production lane (`.github/workflows/deploy-production.yml`, disabled by
+default until the launch hostname decision:
+`.github/workflows/deploy-production.yml:6-9`) already exists and is not a
+future lane; its secret-shape gate is recorded in the staging checklist
+above, not in this evidence table.
 
 **Evidence a future Worker staging lane must retain**, per Worker and per
 environment, linked from that promotion's deploy record before rollback can

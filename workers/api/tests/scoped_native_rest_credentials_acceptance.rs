@@ -42,7 +42,9 @@
 //! - `pub struct Pepper<'a> { pub version: u32, pub bytes: &'a [u8] }`
 //!   (manual redacted `Debug`: version only, never the bytes) and
 //!   `pub fn issue_credential(user_id: &str, scopes: &[Scope],
-//!   ttl_secs: u64, now: u64, pepper: &Pepper<'_>) -> IssuedCredential`:
+//!   ttl_secs: u64, now: u64, pepper: &Pepper<'_>)
+//!   -> Result<IssuedCredential, CredentialError>` (randomness failure
+//!   yields `RandomnessUnavailable`, HTTP 503):
 //!   server-generated 256-bit CSPRNG display secret (`ntk_` + base62,
 //!   unique per issue), `record.key_hmac ==
 //!   credential_hmac(&display_once, pepper.bytes)`, `record.key_prefix ==
@@ -57,11 +59,13 @@
 //!   lowercase-hex HMAC-SHA256 over the display secret, deterministic per
 //!   (secret, pepper), pepper-bound (wrong pepper mismatches).
 //! - Errors reuse the repo taxonomy (`docs/api-errors.md`), no new codes:
-//!   `pub enum CredentialError { Unauthenticated, Forbidden }` (`Debug +
-//!   Clone + Copy + PartialEq + Eq`) with `code()` returning
-//!   `"unauthorized"` / `"forbidden"`, `http_status()` returning 401 /
-//!   403, and generic `Display` (`"invalid credential"` / `"insufficient
-//!   scope"` — never which check failed, never any secret material).
+//!   `pub enum CredentialError { Unauthenticated, Forbidden,
+//!   RandomnessUnavailable }` (`Debug + Clone + Copy + PartialEq + Eq`)
+//!   with `code()` returning `"unauthorized"` / `"forbidden"` /
+//!   `"service_unavailable"`, `http_status()` returning 401 / 403 / 503,
+//!   and generic `Display` (`"invalid credential"` / `"insufficient
+//!   scope"` / `"service unavailable"` — never which check failed, never
+//!   any secret material).
 //! - `pub fn authorize(record: &NativeRestRecord, presented_secret: &str,
 //!   required: Scope, now: u64, caller_user_id: &str, peppers:
 //!   &[Pepper<'_>]) -> Result<(), CredentialError>`: every credential-
@@ -151,7 +155,7 @@ fn peppers_current_v1() -> [Pepper<'static>; 1] {
 }
 
 fn issued(scopes: &[Scope], ttl: u64, now: u64) -> IssuedCredential {
-    issue_credential(USER, scopes, ttl, now, &pepper_v1())
+    issue_credential(USER, scopes, ttl, now, &pepper_v1()).expect("issue")
 }
 
 fn ok_authorize(record: &nntune_api::native_rest::NativeRestRecord, secret: &str, scope: Scope) {

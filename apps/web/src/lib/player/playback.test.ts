@@ -78,6 +78,26 @@ describe('createPlayback', () => {
 		expect(calls).toEqual(['pause', 'flush', 'load']);
 	});
 
+	it('releases once when unload is called twice before the flush lands', async () => {
+		const { audio, calls } = fakeAudio();
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => (release = resolve));
+		const playback = createPlayback({
+			audio: () => audio,
+			flush: async () => {
+				calls.push('flush');
+				await gate;
+			}
+		});
+
+		const first = playback.unload();
+		const second = playback.unload();
+		expect(calls).toEqual(['pause', 'flush', 'pause', 'flush']);
+		release();
+		await Promise.all([first, second]);
+		expect(calls.filter((call) => call === 'load')).toHaveLength(1);
+	});
+
 	it('is a no-op while the audio element is not mounted', async () => {
 		const playback = createPlayback({ audio: () => undefined, flush: () => Promise.resolve() });
 		playback.pause();

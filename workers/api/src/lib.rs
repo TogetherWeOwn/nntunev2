@@ -13,6 +13,7 @@ pub mod legacy_playlist_fixtures;
 pub mod library;
 pub mod native_rest;
 pub mod plan_limits;
+pub mod random;
 pub mod rate_limit;
 pub mod session;
 pub mod vault;

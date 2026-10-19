@@ -82,6 +82,13 @@ dev dependencies the harness needs — install it with
 
 ### Test
 
+Local Rust builds go through the bounded Cargo pool wrapper — prefix
+the `cargo` commands below with `python3 scripts/cargo_cache.py run --`,
+e.g. `python3 scripts/cargo_cache.py run -- test --workspace`. Pool rules
+(two slots, exit 75 when refused, never a per-worktree `target/`) live in
+the [agent notes](AGENTS.md#local-rust-builds-the-bounded-cargo-pool);
+checkouts without the pool use the bare commands as listed.
+
 ```sh
 # Rust workspace (core, config, stream, containers/repair, test fixtures)
 cargo test --workspace

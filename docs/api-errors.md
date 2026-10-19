@@ -86,6 +86,7 @@ emit the code.
 | `rate_limited` | 429 | true | api, ingest, stream | Too many requests or no pool connection free right now; retry after backoff. |
 | `internal_error` | 500 | true | api, ingest, mb, stream | Generic unexpected failure, including the unknown-code fallback. |
 | `corrupt_content` | 502 | false | stream | A fetched segment could not be decoded; retrying the same bytes will not help. |
+| `transport_port_not_allowed` | 502 | false | stream | The pinned NNTP endpoint policy refused the provider dial (off-allowlist port) before any connection; redialing the same endpoint can never succeed. |
 | `upstream_unavailable` | 502 | true | ingest, stream | A provider/indexer connection failed or an upstream request failed. |
 | `upstream_circuit_open` | 503 | true | stream | The user's provider pool circuit breaker is open; retry after the supplied `Retry-After` delay. |
 | `service_unavailable` | 503 | true | api, ingest | A backing binding (queue, payload store) is unavailable; nothing was accepted. |
@@ -101,12 +102,17 @@ complete served set; they intentionally carry no `api_error` registry entry
 (`registry_matches_docs_api_errors`, `docs_registry_matches_all_worker_registries`)
 ignore this table by design: its rows use bare codes, never the `| \``
 envelope-registry prefix. Ingest consumes them through `classify_reply` in
-`workers/ingest/src/pool_probe.rs:69-92` (400/413 are `Rejected`, everything
-else is `Retry` with clamped `Retry-After`) and `classify_body_reply` in
-`workers/ingest/src/pool_body.rs:83-111` (exact `{"error":"missing"}` 404 is
-`Missing` data, 413 is `TooLarge` data, 400 is `Rejected`, everything else is
-`Retry`). `retryable` below mirrors that ingest verdict: 4xx request/data
-answers are `false`, redeliverable 5xx answers are `true`.
+`workers/ingest/src/pool_probe.rs:69-99` (400/413/401/403 are `Rejected`,
+everything else is `Retry` with clamped `Retry-After`; a 401/403's
+`Retry-After` is deliberately unread) and `classify_body_reply` in
+`workers/ingest/src/pool_body.rs:83-118` (exact `{"error":"missing"}` 404 is
+`Missing` data, 413 is `TooLarge` data, 400/401/403 are `Rejected`,
+everything else is `Retry` with clamped `Retry-After`, including non-exact
+404s at the default delay). The pool wire never emits 401/403 today (auth
+collapses to 502 `provider_error`); the 401/403 arms fail closed so a
+future auth refusal does not burn all 5 job attempts plus DLQ. `retryable`
+below mirrors that ingest verdict: 4xx request/data answers are `false`,
+redeliverable 5xx answers are `true`.
 
 | code | HTTP status | retryable | owning lane | meaning | served by |
 | --- | --- | --- | --- | --- | --- |
@@ -125,8 +131,11 @@ The repair worker defines its own stable fault shape in
 `ApiFault::new`/`invalid`): an HTTP status plus a machine-readable code
 for logs and operators, carrying no user data. Ingest maps those faults
 in `workers/ingest/src/repair.rs` (`classify_repair_reply`): replies
-with status 400, 404, 409, or 413 are `Unrepairable` (permanent — a
-retry would send the same bytes, so the job fails terminally), provided
+with status 400, 401, 403, 404, 409, or 413 are `Unrepairable`
+(permanent — a retry would send the same bytes, so the job fails
+terminally; the 401/403 arms are auth parity with the pool
+classifiers, since a refusal of the repair caller can never be fixed
+by redelivery), provided
 the reply body does not exceed `MAX_REPAIR_REPLY_BYTES` (oversized
 bodies are `Retry` before the status is checked); a 200
 reply is decided by its `status` field (`repaired` -> `Repaired`,
@@ -155,7 +164,7 @@ container-origin repair-only codes with no registry row (two of the
 six — `invalid_manifest` and `scratch_input_mismatch` — are also
 emitted directly by the repair worker itself:
 `workers/repair/src/contract.rs:123,129` and
-`workers/repair/src/runtime.rs:314,345`). The repair worker also emits
+`workers/repair/src/runtime.rs:358,429`). The repair worker also emits
 `container_unavailable` (502), `scratch_unavailable` (503),
 `repair_unavailable` (500/503), and `scratch_missing` (404) directly
 (not through `leak_code`); those have no registry row either.
@@ -273,9 +282,9 @@ code, status, or retryable drift):
   in `workers/stream/src/probe.rs:98-161`, `BodyReply::from` in
   `workers/stream/src/body.rs:73-101`, route constants and decisions in
   `workers/stream/src/routes.rs:29-107`, pool fetch in
-  `workers/stream/src/runtime.rs:79-200`, consumed by `classify_reply` in
-  `workers/ingest/src/pool_probe.rs:69-92` and `classify_body_reply` in
-  `workers/ingest/src/pool_body.rs:83-111`, pinned by
+  `workers/stream/src/runtime.rs:79-206`, consumed by `classify_reply` in
+  `workers/ingest/src/pool_probe.rs:69-99` and `classify_body_reply` in
+  `workers/ingest/src/pool_body.rs:83-118`, pinned by
   `workers/stream/tests/pool_error_wire_codes.rs` (served set ⊆ pool table).
 
 ## Adding a code

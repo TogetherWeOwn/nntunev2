@@ -189,6 +189,7 @@ impl From<LibraryError> for ApiError {
             LibraryError::NotFound => Self::not_found(e.to_string()),
             LibraryError::AccountDeleting => Self::account_deleting(e.to_string()),
             LibraryError::Invalid => Self::validation_failed(e.to_string()),
+            LibraryError::RandomnessUnavailable => Self::service_unavailable(e.to_string()),
         }
     }
 }
@@ -201,6 +202,7 @@ impl From<AuthError> for ApiError {
         match e {
             AuthError::Invalid => Self::unauthorized(e.to_string()),
             AuthError::Misconfigured => Self::internal_error(e.to_string()),
+            AuthError::RandomnessUnavailable => Self::service_unavailable(e.to_string()),
         }
     }
 }
@@ -213,6 +215,7 @@ impl From<SessionError> for ApiError {
             SessionError::Misconfigured | SessionError::Storage { .. } => {
                 Self::internal_error(e.to_string())
             }
+            SessionError::RandomnessUnavailable => Self::service_unavailable(e.to_string()),
         }
     }
 }
@@ -224,6 +227,7 @@ impl From<VaultError> for ApiError {
             VaultError::CorruptStoredData | VaultError::Crypto => {
                 Self::internal_error(e.to_string())
             }
+            VaultError::RandomnessUnavailable => Self::service_unavailable(e.to_string()),
         }
     }
 }

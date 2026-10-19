@@ -126,9 +126,10 @@ inside every path (threat-model §6 defense in depth).
 
 - Issuance requires an authenticated session passing the privilege-freshness
   gate (immutable auth age within 600 s, F-SESS-01 contract): stale sessions
-  are denied without issuing a key. The implementation PR must pin the
-  CISO-approved stale-session response in `docs/api-errors.md` before clients
-  depend on it. Issuance writes an `audit_log` row and records `created_from_ip`.
+  are denied without issuing a key. The CISO-approved stale-session response
+  is already pinned in `docs/api-errors.md` (`reauth_required`, 401);
+  issuance reuses it, and clients depend on that row. Issuance writes an
+  `audit_log` row and records `created_from_ip`.
 - Expiry is mandatory: user-chosen up to a **365-day maximum**; no
   never-expiring keys. Expired keys fail closed with the generic
   unauthenticated response (no existence oracle).

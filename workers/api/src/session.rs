@@ -78,10 +78,9 @@ pub struct SessionClaims {
     pub rotation_counter: u32,
 }
 
-fn new_session_id() -> String {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).expect("secure randomness unavailable");
-    crate::b64::encode(&bytes)
+fn new_session_id() -> Result<String, SessionError> {
+    let bytes = crate::random::secure_random_bytes::<16>()?;
+    Ok(crate::b64::encode(&bytes))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +101,15 @@ pub enum SessionError {
     Storage {
         user_id: String,
     },
+    /// Secure randomness unavailable while minting a session id: HTTP 503
+    /// `service_unavailable`. Never a panic, fallback, or reused id.
+    RandomnessUnavailable,
+}
+
+impl From<crate::random::CryptoError> for SessionError {
+    fn from(_: crate::random::CryptoError) -> Self {
+        SessionError::RandomnessUnavailable
+    }
 }
 
 /// Stable code for a storage failure (revoke did not commit). Never equal
@@ -118,6 +126,7 @@ impl SessionError {
             SessionError::ReauthRequired => REAUTH_REQUIRED_CODE,
             SessionError::Misconfigured => "internal_error",
             SessionError::Storage { .. } => STORE_UNAVAILABLE_CODE,
+            SessionError::RandomnessUnavailable => "service_unavailable",
         }
     }
 
@@ -129,6 +138,7 @@ impl SessionError {
             SessionError::Invalid => 401,
             SessionError::ReauthRequired => 401,
             SessionError::Misconfigured | SessionError::Storage { .. } => 500,
+            SessionError::RandomnessUnavailable => 503,
         }
     }
 }
@@ -145,6 +155,8 @@ impl std::fmt::Display for SessionError {
             // Distinct from Invalid so the handler prompts for re-auth
             // instead of treating the session as dead; carries no reason.
             Self::ReauthRequired => write!(f, "reauth required"),
+            // Sealed public text: matches the `service_unavailable` envelope.
+            Self::RandomnessUnavailable => write!(f, "service unavailable"),
         }
     }
 }
@@ -232,7 +244,7 @@ pub fn issue_session(
         return Err(SessionError::Invalid);
     }
     let claims = SessionClaims {
-        session_id: new_session_id(),
+        session_id: new_session_id()?,
         user_id: user_id.to_string(),
         created_at: now,
         issued_at: now,
@@ -463,7 +475,7 @@ pub fn reauthenticate_session(
         return Err(SessionError::Invalid);
     }
     let next = SessionClaims {
-        session_id: new_session_id(),
+        session_id: new_session_id()?,
         user_id: old_claims.user_id.clone(),
         created_at: now,
         issued_at: now,
@@ -718,6 +730,24 @@ mod tests {
         assert!(verify_session(secret, "no-dot", 0).is_err());
         assert!(verify_session(secret, "!!!.@@@", 0).is_err());
         assert!(verify_session(secret, "", 0).is_err());
+    }
+
+    #[test]
+    fn randomness_unavailable_is_503_service_unavailable() {
+        let err = SessionError::RandomnessUnavailable;
+        assert_eq!(err.code(), "service_unavailable");
+        assert_eq!(err.http_status(), 503);
+        assert_eq!(err.to_string(), "service unavailable");
+        let api = crate::api_error::ApiError::from(err);
+        assert_eq!(
+            (api.code, api.status, api.retryable),
+            ("service_unavailable", 503, true)
+        );
+        assert_eq!(api.message, "service unavailable");
+        assert_eq!(
+            SessionError::from(crate::random::CryptoError::RandomnessUnavailable),
+            SessionError::RandomnessUnavailable
+        );
     }
 
     #[test]

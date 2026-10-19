@@ -174,10 +174,12 @@ row per metered resource the staging journey touches. Fixed platform fees
 go in their own rows so the variable cost-as-function-of-usage stays
 visible. Analytics Engine is prospective (not currently billed) per
 `docs/cost-basis.md` §5 and §7: quote it separately and exclude it from
-the currently-billed total. The worksheet is not an all-in bill — Durable
-Objects, Containers, Workers Logs, domain/DNS, and any non-Cloudflare,
-non-PlanetScale services are out of scope there and must be listed as
-unpriced here before any total is quoted as complete.
+the currently-billed total. Workers Logs is prospective (no measured
+volume yet) per `docs/cost-basis.md` §5b and §7: quote it separately and
+exclude it from the currently-billed total. The worksheet is not an
+all-in bill — Durable Objects, Containers, domain/DNS, and any
+non-Cloudflare, non-PlanetScale services are out of scope there and must
+be listed as unpriced here before any total is quoted as complete.
 
 | Resource | Unit | Unit price | Price source (link + date) | Usage basis (`measured` + evidence ID / `assumed`, volume) | Formula | Monthly estimate |
 |---|---|---:|---|---|---|---:|
