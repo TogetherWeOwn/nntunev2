@@ -354,6 +354,70 @@ impl IndexerConfig {
         if parsed.scheme() != "https" {
             return Err(VaultError::Invalid);
         }
+        // Saved indexer URLs carry no credentials (the API key travels
+        // separately) and userinfo disguises the real host
+        // (`host@evil` parses host as `evil`), so refuse any of it.
+        // The url crate reports empty userinfo (`@host`, `:@host`) as
+        // username `""` with password `None`, invisible to the accessors,
+        // so also refuse a raw `@` in the authority segment, mirroring
+        // the fetch-time guards (`validate_indexer_url`, `check_base_url`).
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(VaultError::Invalid);
+        }
+        // The url crate strips ASCII tab/newline and treats backslashes as
+        // slashes for https, so obfuscated shapes (`https:` + newline +
+        // `//@host`, `https:\\@host`, single-slash `https:/@host`) parse
+        // with empty userinfo while carrying a raw `@`. The fetch-time
+        // guards reject whitespace and require a literal `https://`
+        // prefix, so mirror them: refuse raw whitespace/backslash and
+        // fail closed when `://` is absent, otherwise the config saves
+        // here and is rejected on every fetch.
+        if self.url.chars().any(|c| c.is_whitespace() || c == '\\') {
+            return Err(VaultError::Invalid);
+        }
+        let Some(scheme_end) = self.url.find("://") else {
+            return Err(VaultError::Invalid);
+        };
+        // `find` locates the FIRST literal `://`, which a decoy planted in
+        // the path or query can shift (`https:@host/api://x`): the scan
+        // would then examine the text after the decoy while the real `@`
+        // sits before it. Both fetch-time guards anchor on the scheme
+        // (`split_authority` requires the text before `://` to equal
+        // `https`; `check_base_url` requires a literal `https://` prefix),
+        // so mirror them: anything else fails closed here instead of
+        // saving a config every fetch rejects.
+        if &self.url[..scheme_end] != "https" {
+            return Err(VaultError::Invalid);
+        };
+        let after = &self.url[scheme_end + 3..];
+        let authority = after.split(['/', '?', '#']).next().unwrap_or_default();
+        // The url crate skips any number of slashes after the scheme for
+        // https, so extra-slash shapes (`https:///@host`, `https:///host`)
+        // parse with a real host while the raw authority above is empty and
+        // its `@` is never seen. Both fetch-time guards reject an empty
+        // computed authority (`split_authority`, `check_base_url`), so
+        // mirror them: an empty authority saves here and is rejected on
+        // every fetch.
+        if authority.is_empty() {
+            return Err(VaultError::Invalid);
+        }
+        if authority.contains('@') {
+            return Err(VaultError::Invalid);
+        }
+        // Only the HTTPS default may be addressed: an explicit non-443
+        // port is an alternate-service probe. `port()` yields `None` for
+        // both the default and an explicit `:443` (default-port
+        // normalization), so both still validate.
+        if let Some(port) = parsed.port() {
+            if port != 443 {
+                return Err(VaultError::Invalid);
+            }
+        }
+        // A fragment is never sent to a server; in a stored base URL it
+        // is smuggled data or a copy-paste error.
+        if parsed.fragment().is_some() {
+            return Err(VaultError::Invalid);
+        }
         let host = parsed
             .host_str()
             .filter(|h| !h.is_empty())
