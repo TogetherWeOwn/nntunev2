@@ -428,12 +428,30 @@ async fn container_json(
         .await
         .map_err(|_| ApiFault::new(502, "container_unavailable"))?;
     let status = response.status_code();
-    let bytes = response
-        .bytes()
-        .await
+    // Cap while streaming: an oversize Container-chosen body to /health,
+    // /repair or /cleanup must abort at MAX_RESULT_BYTES instead of being
+    // buffered whole before rejection (`Response::bytes` folds every chunk
+    // into one Vec). Non-stream bodies are already materialised by the
+    // platform: check the length before cloning; stream bodies are read
+    // chunk by chunk with the same 502 past the cap.
+    match response.body() {
+        ResponseBody::Empty => return Ok((status, Vec::new())),
+        ResponseBody::Body(body) if body.len() > MAX_RESULT_BYTES => {
+            return Err(ApiFault::new(502, "container_unavailable"))
+        }
+        ResponseBody::Body(body) => return Ok((status, body.clone())),
+        ResponseBody::Stream(_) => {}
+    }
+    let mut stream = response
+        .stream()
         .map_err(|_| ApiFault::new(502, "container_unavailable"))?;
-    if bytes.len() > MAX_RESULT_BYTES {
-        return Err(ApiFault::new(502, "container_unavailable"));
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| ApiFault::new(502, "container_unavailable"))?;
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > MAX_RESULT_BYTES {
+            return Err(ApiFault::new(502, "container_unavailable"));
+        }
     }
     Ok((status, bytes))
 }
