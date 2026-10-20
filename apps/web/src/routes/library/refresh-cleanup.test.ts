@@ -301,18 +301,19 @@ describe('preserved refresh behavior', () => {
 		expect(refresher.state.loading).toBe(false);
 	});
 
-	it.each([401, 403])(
-		'%s reports signed-out, invalidates the cache, and clears shown items',
-		async (status) => {
+	it.each([
+		[401, 'You are signed out or do not have access to this library.'],
+		[403, 'You do not have access to this library.']
+	] as const)(
+		'%s reports its auth failure, invalidates the cache, and clears shown items',
+		async (status, expectedLoadError) => {
 			const { refresher, invalidations } = makeRefresher();
 			await refresher.refresh(okFetch([{ id: 'a', title: 'Track a' }]));
 
 			await refresher.refresh((async () =>
 				jsonResponse('{"error":"denied"}', status)) as typeof fetch);
 
-			expect(refresher.state.loadError).toBe(
-				'You are signed out or do not have access to this library.'
-			);
+			expect(refresher.state.loadError).toBe(expectedLoadError);
 			expect(refresher.state.items).toEqual([]);
 			expect(refresher.state.staleAt).toBeNull();
 			expect(invalidations()).toBe(1);

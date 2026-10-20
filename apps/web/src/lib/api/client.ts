@@ -147,6 +147,33 @@ export interface ProviderTestResult {
 	error?: string;
 }
 
+/** Redacted vault metadata only; never return credentials or endpoint details. */
+export interface SavedProviderSummary {
+	provider_configured: boolean;
+	indexer_configured: boolean;
+	/** Unix seconds, or zero when no configuration is stored. */
+	updated_at: number;
+}
+
+function validateSavedProviderSummary(data: unknown, status: number): SavedProviderSummary {
+	if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+		throw vaultTestShapeFailure(status);
+	}
+	const record = data as Record<string, unknown>;
+	if (
+		typeof record.provider_configured !== 'boolean' ||
+		typeof record.indexer_configured !== 'boolean' ||
+		!isFiniteNonNegativeNumber(record.updated_at)
+	) {
+		throw vaultTestShapeFailure(status);
+	}
+	return {
+		provider_configured: record.provider_configured,
+		indexer_configured: record.indexer_configured,
+		updated_at: record.updated_at
+	};
+}
+
 function isFiniteNonNegativeNumber(value: unknown): value is number {
 	return typeof value === 'number' && Number.isFinite(value) && value >= 0;
 }
@@ -321,10 +348,15 @@ export class ApiClient {
 	}
 
 	async post<T>(path: string, body: unknown): Promise<T> {
+		return this.postWithSignal<T>(path, body);
+	}
+
+	private async postWithSignal<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
 		return this.request<T>(path, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify(body)
+			body: JSON.stringify(body),
+			signal
 		});
 	}
 
@@ -340,8 +372,8 @@ export class ApiClient {
 	 * Request an email magic link. Always resolves the same way for unknown
 	 * and known addresses (the API never reveals which emails exist).
 	 */
-	async requestMagicLink(email: string): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>('/v1/auth/magic/start', { email });
+	async requestMagicLink(email: string, signal?: AbortSignal): Promise<MagicLinkResult> {
+		return this.postWithSignal<MagicLinkResult>('/v1/auth/magic/start', { email }, signal);
 	}
 
 	/** Redeem an emailed magic-link token (the `/auth/magic` page). */
@@ -371,23 +403,25 @@ export class ApiClient {
 	 * success body is shape-checked before it returns so a malformed
 	 * `challenge` surfaces as a typed `ApiError`, never a mid-ceremony throw.
 	 */
-	async registerStart(email: string): Promise<RegisterStartResponse> {
+	async registerStart(email: string, signal?: AbortSignal): Promise<RegisterStartResponse> {
 		const { data, status } = await this.requestWithStatus<unknown>(
 			'/v1/auth/passkey/register/start',
 			{
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ email })
+				body: JSON.stringify({ email }),
+				signal
 			}
 		);
 		return validateRegisterStart(data, status);
 	}
 
 	/** Finish passkey enrollment with the attestation + emailed code. */
-	async registerFinish(input: RegisterFinishInput): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>(
+	async registerFinish(input: RegisterFinishInput, signal?: AbortSignal): Promise<MagicLinkResult> {
+		return this.postWithSignal<MagicLinkResult>(
 			'/v1/auth/passkey/register/finish',
-			toRegisterFinishBody(input)
+			toRegisterFinishBody(input),
+			signal
 		);
 	}
 
@@ -395,23 +429,25 @@ export class ApiClient {
 	 * Start passkey login for an email (empty allow-list response). The
 	 * success body is shape-checked before it returns, as in `registerStart`.
 	 */
-	async loginStart(email: string): Promise<LoginStartResponse> {
+	async loginStart(email: string, signal?: AbortSignal): Promise<LoginStartResponse> {
 		const { data, status } = await this.requestWithStatus<unknown>(
 			'/v1/auth/passkey/login/start',
 			{
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ email })
+				body: JSON.stringify({ email }),
+				signal
 			}
 		);
 		return validateLoginStart(data, status);
 	}
 
 	/** Finish passkey login with the assertion. */
-	async loginFinish(input: LoginFinishInput): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>(
+	async loginFinish(input: LoginFinishInput, signal?: AbortSignal): Promise<MagicLinkResult> {
+		return this.postWithSignal<MagicLinkResult>(
 			'/v1/auth/passkey/login/finish',
-			toLoginFinishBody(input)
+			toLoginFinishBody(input),
+			signal
 		);
 	}
 
@@ -419,10 +455,11 @@ export class ApiClient {
 	 * Start a passkey proof bound to the currently authenticated session. The
 	 * success body carries the login-start shape and is checked the same way.
 	 */
-	async reauthenticateStart(): Promise<LoginStartResponse> {
+	async reauthenticateStart(signal?: AbortSignal): Promise<LoginStartResponse> {
 		const { data, status } = await this.requestWithStatus<unknown>(
 			'/v1/session/reauthenticate/start',
 			{
+				signal,
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
 				body: JSON.stringify({})
@@ -432,11 +469,41 @@ export class ApiClient {
 	}
 
 	/** Complete proof-bound reauthentication without affecting ordinary login. */
-	async reauthenticateFinish(input: LoginFinishInput): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>(
-			'/v1/session/reauthenticate/finish',
-			toLoginFinishBody(input)
-		);
+	async reauthenticateFinish(input: LoginFinishInput, signal?: AbortSignal): Promise<MagicLinkResult> {
+		return this.request<MagicLinkResult>('/v1/session/reauthenticate/finish', {
+			method: 'POST',
+			signal,
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify(toLoginFinishBody(input))
+		});
+	}
+
+	/** Read a validated, allowlisted summary of the saved vault. */
+	async getSavedProviderSummary(signal?: AbortSignal): Promise<SavedProviderSummary> {
+		const { data, status } = await this.requestWithStatus<unknown>('/v1/vault', {
+			method: 'GET', signal
+		});
+		return validateSavedProviderSummary(data, status);
+	}
+
+	/** Reachability only, not provider authentication. An empty body selects the stored vault. */
+	async testSavedProviderConnection(signal?: AbortSignal): Promise<ProviderTestResult> {
+		const { data, status } = await this.requestWithStatus<unknown>('/v1/vault/test', {
+			method: 'POST', signal
+		});
+		return validateVaultTestResult(data, status);
+	}
+
+	/** No automatic retries: only a validated both-false summary proves removal. */
+	async deleteSavedProviderConfig(signal?: AbortSignal): Promise<SavedProviderSummary> {
+		const { data, status } = await this.requestWithStatus<unknown>('/v1/vault', {
+			method: 'DELETE', signal
+		});
+		const summary = validateSavedProviderSummary(data, status);
+		if (summary.provider_configured || summary.indexer_configured) {
+			throw vaultTestShapeFailure(status);
+		}
+		return summary;
 	}
 
 	/**
@@ -491,14 +558,14 @@ export class ApiClient {
 			controller.abort(new DOMException(`request timed out after ${API_REQUEST_TIMEOUT_MS}ms`, 'TimeoutError'));
 		}, API_REQUEST_TIMEOUT_MS);
 		try {
+			callerSignal?.throwIfAborted();
 			const response = await this.fetchFn(`${this.baseUrl}${path}`, {
 				...init,
 				signal: controller.signal,
 				headers,
 				credentials: 'include'
 			});
-			// A fetch/body double (or an already-settled transport) can ignore
-			// abort. Never publish a stale result or global paywall afterward.
+			// A transport may ignore abort; never publish an abandoned response.
 			callerSignal?.throwIfAborted();
 			if (!response.ok) {
 				// Read once (capped at 1 MiB) so the paywall and typed error
