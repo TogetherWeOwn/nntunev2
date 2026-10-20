@@ -111,6 +111,17 @@ SHELL_WORDS = frozenset({
     "trap", "eval",
 })
 
+# Shell metacharacters that tokenize a -c script (or trap/eval argument)
+# beyond whitespace: glued forms such as `true;chown`, `(chown ...)` and
+# `true&&chown` must expose the inner chown, or resolver-class deliveries
+# (`/proc/self/exe -c ...`) that name no interpreter keep dead proof.
+INNER_SPLIT_RE = re.compile(r"[\s;|&()<>]+")
+
+
+def inner_words(word):
+    """Split a quoted token the way the RUN shell tokenizes a -c script."""
+    return [piece for piece in INNER_SPLIT_RE.split(word) if piece]
+
 
 def word_matches_names(word, names, require_alnum=True):
     """True if `word` could name (or glob-expand to) one of `names`.
@@ -200,15 +211,16 @@ def scratch_ownership(line, user_name, owned):
     # textual grant. Reject the entire RUN instead of folding those effects
     # in source order. Check every word's basename to catch paths and prefixes
     # (env, command, assignments, busybox), as a glob pattern to catch
-    # expansions (`/bin/da?h`), and split quoted tokens into inner words to
-    # catch string splits (`env -S 'sh -c ...'`). Bare punctuation keeps its
+    # expansions (`/bin/da?h`), and split quoted tokens on shell metacharacters
+    # to catch string splits (`env -S 'sh -c ...'`) and glued scripts
+    # (`true;chown`, `(chown ...)`, `true&&chown`). Bare punctuation keeps its
     # exemption only in argument position; a glob in command position selects
     # the program (`./*` after staging), so it matches there. Even inert
     # mentions fail closed.
     if any(word_matches_names(inner, SHELL_WORDS, require_alnum=index > 0)
            for _, cmd in commands
            for index, word in enumerate(cmd)
-           for inner in word.split()):
+           for inner in inner_words(word)):
         return False
     last_segment = commands[-1][0] if commands else -1
     for segment, cmd in commands:
@@ -219,14 +231,15 @@ def scratch_ownership(line, user_name, owned):
             # Do not interpret RUN flags, assignments, wrappers or executable
             # paths as harmless text. Only bare chown can establish proof;
             # any other chown-shaped command conservatively invalidates it.
-            # Inner words of quoted tokens count too, so deliveries that name
-            # no interpreter (`/proc/self/exe -c 'chown ...'`) still clear
-            # proof via the chown they carry. Command position keeps no
+            # Metachar-split inner words of quoted tokens count too, so
+            # deliveries that name no interpreter (`/proc/self/exe -c ...`,
+            # including glued `true;chown` / `(chown)` / `true&&chown` scripts)
+            # still clear proof via the chown they carry. Command position keeps no
             # punctuation exemption: `./*` may expand to a staged chown.
             if any(word_matches_names(inner, {"chown"},
                                       require_alnum=index > 0)
                    for index, word in enumerate(cmd)
-                   for inner in word.split()):
+                   for inner in inner_words(word)):
                 owned = False
             continue
         args = cmd[1:]
@@ -778,6 +791,12 @@ chown-revoke-shell-rbash	1	RUN rbash -c 'chown root /scratch'
 chown-revoke-shell-env-split	1	RUN env -S 'sh -c "chown root /scratch"'
 chown-revoke-shell-proc-self	1	RUN /proc/self/exe -c 'chown root /scratch'
 chown-revoke-chown-glob-command	1	RUN /usr/bin/cho?n root /scratch
+chown-revoke-procself-glued-semicolon	1	RUN /proc/self/exe -c 'true;chown root /scratch'
+chown-revoke-procself-glued-assign	1	RUN /proc/self/exe -c 'x=1;chown root /scratch'
+chown-revoke-procself-glued-paren	1	RUN /proc/self/exe -c '(chown root /scratch)'
+chown-revoke-procself-glued-and	1	RUN /proc/self/exe -c 'true&&chown root /scratch'
+chown-revoke-procself-glued-pipe	1	RUN /proc/self/exe -c 'true|chown root /scratch'
+chown-revoke-procself-glued-redirect	1	RUN /proc/self/exe -c 'true> /tmp/x;chown root /scratch'
 ORDER_EOF
 
   fixture chown-revoke-workdir-dot.Dockerfile <<'FIXTURE_EOF'
