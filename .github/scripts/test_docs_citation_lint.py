@@ -515,6 +515,108 @@ class TestResolution(unittest.TestCase):
             self.assertIn("does not resolve", hits[0][2])
 
 
+class TestHostResolution(unittest.TestCase):
+    def test_unresolved_recognized_hosts_are_skipped(self):
+        for citation in ("db.example.com:5432", "ghcr.io/org/image:2"):
+            with self.subTest(citation=citation), tempfile.TemporaryDirectory() as tmp:
+                root = make_root(tmp, {"docs/a.md": f"Connect to `{citation}`.\n"})
+                self.assertEqual([], check(root, "docs/a.md"))
+
+    def test_real_hostlike_file_checks_eof_before_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": "See `example.com:99`.\n",
+                    "docs/example.com": "one\ntwo\n",
+                },
+            )
+            hits = check(root, "docs/a.md")
+            self.assertEqual([(1, "example.com:99")], [h[:2] for h in hits])
+            self.assertIn("out of range", hits[0][2])
+
+    def test_real_hostlike_file_checks_symbol_before_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": "Run `run_job` (`example.com:1`).\n",
+                    "docs/example.com": "other\nother\nrun_job\n",
+                },
+            )
+            hits = check(root, "docs/a.md")
+            self.assertEqual([(1, "example.com:1")], [h[:2] for h in hits])
+            self.assertIn("does not land on run_job", hits[0][2])
+
+    def test_hostlike_basename_twin_checks_eof_before_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": (
+                        "Source `scripts/example.com`.\n\n"
+                        "See `example.com:99`.\n"
+                    ),
+                    "scripts/example.com": "one\ntwo\n",
+                },
+            )
+            hits = check(root, "docs/a.md")
+            self.assertEqual([(3, "example.com:99")], [h[:2] for h in hits])
+            self.assertIn("out of range", hits[0][2])
+
+    def test_hostlike_basename_twin_checks_symbol_before_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": (
+                        "Source `scripts/example.com`.\n\n"
+                        "Run `run_job` (`example.com:1`).\n"
+                    ),
+                    "scripts/example.com": "other\nother\nrun_job\n",
+                },
+            )
+            hits = check(root, "docs/a.md")
+            self.assertEqual([(3, "example.com:1")], [h[:2] for h in hits])
+            self.assertIn("does not land on run_job", hits[0][2])
+
+    def test_near_miss_host_suffixes_remain_unresolved(self):
+        for citation in ("example.comm:99", "net.example.rs:99"):
+            with self.subTest(citation=citation), tempfile.TemporaryDirectory() as tmp:
+                root = make_root(tmp, {"docs/a.md": f"See `{citation}`.\n"})
+                self.assertEqual(
+                    [(1, citation, "citation target does not resolve")],
+                    check(root, "docs/a.md"),
+                )
+
+    def test_real_hostlike_file_landing_passes(self):
+        for line in (2, 3):
+            with self.subTest(line=line), tempfile.TemporaryDirectory() as tmp:
+                root = make_root(
+                    tmp,
+                    {
+                        "docs/a.md": f"Run `run_job` (`example.com:{line}`).\n",
+                        "docs/example.com": "other\nother\nrun_job\n",
+                    },
+                )
+                self.assertEqual([], check(root, "docs/a.md"))
+
+    def test_hostlike_basename_twin_landing_passes(self):
+        for line in (2, 3):
+            with self.subTest(line=line), tempfile.TemporaryDirectory() as tmp:
+                root = make_root(
+                    tmp,
+                    {
+                        "docs/a.md": (
+                            "Source `scripts/example.com`.\n\n"
+                            f"Run `run_job` (`example.com:{line}`).\n"
+                        ),
+                        "scripts/example.com": "other\nother\nrun_job\n",
+                    },
+                )
+                self.assertEqual([], check(root, "docs/a.md"))
+
+
 class TestTwinAnchors(unittest.TestCase):
     def test_bare_twin_inherits_anchor(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -573,6 +675,98 @@ class TestTwinAnchors(unittest.TestCase):
 
 
 class TestUnits(unittest.TestCase):
+    def test_blank_line_prevents_adjacent_anchor_binding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": (
+                        "Run `run_job`\n\n"
+                        "(`src/lib.rs:4`) holds the cap.\n"
+                    ),
+                    "src/lib.rs": LIB_RS,
+                },
+            )
+            self.assertEqual([], check(root, "docs/a.md"))
+            occs = occurrences(root, "docs/a.md")
+            self.assertEqual([set()], [o["anchors"] for o in occs])
+            self.assertEqual([3], [o["lineno"] for o in occs])
+
+    def test_soft_wrap_preserves_adjacent_anchor_binding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": "Run `run_job`\n(`src/lib.rs:7`) first.\n",
+                    "src/lib.rs": LIB_RS,
+                },
+            )
+            self.assertEqual([], check(root, "docs/a.md"))
+            occs = occurrences(root, "docs/a.md")
+            self.assertEqual([{"run_job"}], [o["anchors"] for o in occs])
+            self.assertEqual([2], [o["lineno"] for o in occs])
+
+    def test_historical_exemption_does_not_cross_blank_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": (
+                        "On the examined head, this was valid.\n\n"
+                        "See `src/missing.rs:1`.\n"
+                    ),
+                },
+            )
+            self.assertEqual(
+                [(3, "src/missing.rs:1",
+                  "citation target does not resolve")],
+                check(root, "docs/a.md"),
+            )
+
+    def test_historical_exemption_does_not_cross_table_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": (
+                        "| On the examined head | old |\n"
+                        "| Current | `src/missing.rs:1` |\n"
+                    ),
+                },
+            )
+            self.assertEqual(
+                [(2, "src/missing.rs:1",
+                  "citation target does not resolve")],
+                check(root, "docs/a.md"),
+            )
+
+    def test_historical_exemption_does_not_cross_bullet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_root(
+                tmp,
+                {
+                    "docs/a.md": (
+                        "- On the examined head, this was valid.\n"
+                        "- See `src/missing.rs:1`.\n"
+                    ),
+                },
+            )
+            self.assertEqual(
+                [(2, "src/missing.rs:1",
+                  "citation target does not resolve")],
+                check(root, "docs/a.md"),
+            )
+
+    def test_same_unit_historical_exemption_still_applies(self):
+        for text in (
+            "On the examined head, see `src/missing.rs:1`.\n",
+            "| On the examined head | `src/missing.rs:1` |\n",
+            "- On the examined head, see `src/missing.rs:1`.\n",
+        ):
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as tmp:
+                root = make_root(tmp, {"docs/a.md": text})
+                self.assertEqual([], check(root, "docs/a.md"))
+
     def test_anchors_do_not_cross_table_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_root(
