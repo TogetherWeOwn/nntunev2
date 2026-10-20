@@ -16,6 +16,7 @@
 
 	let status = $state<'confirm' | 'working' | 'error' | 'signed-out'>('working');
 	let token = $state<string | null>(null);
+	let redeemError = $state<string | null>(null);
 	// Display-only identity of the current session, when this browser has
 	// one. Named here so a swap-guarded user knows which account is still
 	// signed in and can sign out to redeem the other link.
@@ -59,6 +60,7 @@
 
 	async function redeem() {
 		if (!mounted || status !== 'confirm' || token === null) return;
+		redeemError = null;
 		status = 'working';
 		try {
 			const result = await client.finishMagicLink(token);
@@ -75,6 +77,13 @@
 			if (error instanceof ApiError && error.paywall) {
 				// The token remains available; keep the explicit confirmation
 				// action so the user can retry once the global paywall clears.
+				status = 'confirm';
+				return;
+			}
+			if (!(error instanceof ApiError) || (error.status >= 500 && error.status < 600)) {
+				// Transport failures (including the client's deadline) and server
+				// errors are not token rejections. Retry only on another click.
+				redeemError = 'Could not reach NNTune. Try again.';
 				status = 'confirm';
 				return;
 			}
@@ -127,7 +136,7 @@
 
 <main class="nt-wrap">
 	<h1 bind:this={heading} tabindex="-1">Sign in</h1>
-	{#if status === 'confirm'}
+	{#if status === 'confirm' || status === 'working'}
 		{#if signedInEmail !== null}
 			<p role="status">
 				You're currently signed in as <strong>{signedInEmail}</strong>. This link signs
@@ -141,10 +150,17 @@
 			signed into <em>their</em> account, not yours, and anything you enter next would be
 			saved there.
 		</p>
-		<button class="nt-button" type="button" onclick={redeem}>Sign in with this link</button>
-		<p><a href="/login">Cancel — request a new one</a></p>
-	{:else if status === 'working'}
-		<p role="status">Signing you in…</p>
+		{#if redeemError !== null}
+			<p role="alert">{redeemError}</p>
+		{/if}
+		<button class="nt-button" type="button" onclick={redeem} disabled={status === 'working'}>
+			Sign in with this link
+		</button>
+		{#if status === 'working'}
+			<p role="status">Signing you in…</p>
+		{:else}
+			<p><a href="/login">Cancel — request a new one</a></p>
+		{/if}
 	{:else if status === 'signed-out'}
 		<p role="status">
 			Signed out. If that link belongs to another account, open it again now — or

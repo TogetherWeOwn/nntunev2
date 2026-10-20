@@ -113,7 +113,8 @@ jobs:
           # fails closed instead of executing. Re-pin deliberately when the
           # version above changes, verifying the digest out-of-band first.
           expected_sha256="9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
-          curl -sSL --retry 3 -o "/tmp/${asset}" "${base}/${asset}"
+          curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 \
+            -o "/tmp/${asset}" "${base}/${asset}"
           echo "${expected_sha256}  /tmp/${asset}" | (cd /tmp && sha256sum -c -)
           mkdir -p "$HOME/.cargo/bin"
           tar -xzf "/tmp/${asset}" -C /tmp
@@ -755,6 +756,9 @@ jobs:
           node-version: 26
           cache: npm
           cache-dependency-path: e2e/package-lock.json
+
+      - name: Smoke checker self-tests (offline fixtures only)
+        run: node --test bin/test-smoke-acceptance.mjs
 
       - name: Install e2e dependencies
         working-directory: e2e

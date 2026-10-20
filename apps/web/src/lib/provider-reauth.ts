@@ -38,7 +38,7 @@ export function isIndexerAuthExpired(error: CodedError | null | undefined): bool
  */
 export function reauthPromptFor(code: string | null | undefined): string | null {
 	if (code === PROVIDER_AUTH_EXPIRED_CODE) {
-		return 'Your provider password has expired. Re-enter it below — your session stays signed in, and we test the new password before saving it.';
+		return 'Your provider password has expired. Re-enter it below — your session stays signed in.';
 	}
 	if (code === INDEXER_AUTH_EXPIRED_CODE) {
 		return 'Your indexer rejected its API key. Go back to the indexer step and re-enter the API key — this is separate from your provider password.';
