@@ -115,14 +115,21 @@ SHELL_WORDS = frozenset({
 # for the punctuation exemption: `env *` executes the glob expansion, not an
 # argument. `--` is treated as a plain prefix (fail closed, no flag parsing
 # state), so nested wrappers after it (`env -- env *`) still resolve.
+# timeout/prlimit/setsid/flock/ionice are guaranteed in the repair image
+# (coreutils in bookworm-slim, util-linux apt-installed): a glob behind them
+# IS the program they exec, so they must be chain-transparent too.
 WRAPPER_COMMANDS = frozenset({
     "env", "command", "nice", "nohup", "busybox", "time", "stdbuf",
+    "timeout", "prlimit", "setsid", "flock", "ionice",
 })
 
 # Flags consuming the next word as their argument, per wrapper (exact
 # spellings only: `-uFOO`, `--unset=FOO` and `-o0` take no separate word).
 # `-i` is per-wrapper on purpose: `env -i` takes none while `stdbuf -i`
-# does. Unknown flags never consume, failing closed toward program position.
+# does. Unknown flags on wrappers WITHOUT any consuming flag never consume
+# (certain); unknown flags on wrappers WITH consuming flags are ambiguous
+# (bundled `-iu`, abbreviated `--uns`) and lose the exemption downstream
+# while branching both consume/skip outcomes, failing closed either way.
 WRAPPER_FLAG_ARGS = {
     "env": frozenset({
         "-u", "--unset", "-C", "--chdir", "-S", "--split-string",
@@ -136,7 +143,64 @@ WRAPPER_FLAG_ARGS = {
     "time": frozenset(),
     "nohup": frozenset(),
     "busybox": frozenset(),
+    "timeout": frozenset({"-k", "--kill-after", "-s", "--signal"}),
+    "prlimit": frozenset({"-p", "--pid"}),
+    "setsid": frozenset(),
+    "flock": frozenset({"-w", "--timeout", "-E", "--conflict-exit-code"}),
+    "ionice": frozenset({
+        "-c", "--class", "-n", "--classdata", "-p", "--pid",
+    }),
 }
+
+# Positional operands skipped after a wrapper's flags before its program:
+# `timeout DURATION CMD`, `flock FILE CMD`. Assignments stay transparent
+# everywhere (over-skipping after non-env wrappers only over-revokes).
+WRAPPER_OPERANDS = {
+    "timeout": 1,
+    "flock": 1,
+}
+
+# Exact non-consuming flags (certain, no separate word). `--foo=bar` forms
+# are always attached (certain) except env split-string (program string).
+WRAPPER_NO_ARGS = {
+    "env": frozenset({
+        "-i", "--ignore-environment", "-0", "--null", "-v", "--debug",
+    }),
+    "timeout": frozenset({"--preserve-status", "--foreground"}),
+    "setsid": frozenset({"-c", "--ctty", "-w", "--wait"}),
+    "flock": frozenset({
+        "-s", "--shared", "-x", "--exclusive", "-u", "--unlock",
+        "-n", "--nonblock", "-o", "--close",
+    }),
+    "ionice": frozenset({"-t", "--ignore"}),
+}
+
+# Short-option letters for bundle parsing (`-iu` vs `-n5`): a bundle whose
+# consuming letter has trailing text takes it attached (`-uFOO`: no next
+# word); with nothing left it consumes the next word (`-iu FOO`: FOO taken).
+WRAPPER_SHORT_CONSUMING = {
+    "env": frozenset({"u", "C", "S"}),
+    "nice": frozenset({"n"}),
+    "stdbuf": frozenset({"i", "o", "e"}),
+    "timeout": frozenset({"k", "s"}),
+    "prlimit": frozenset({"p"}),
+    "flock": frozenset({"w", "E"}),
+    "ionice": frozenset({"c", "n", "p"}),
+}
+WRAPPER_SHORT_PLAIN = {
+    "env": frozenset({"i", "0", "v"}),
+    "setsid": frozenset({"c", "w"}),
+    "flock": frozenset({"s", "x", "u", "n", "o"}),
+    "ionice": frozenset({"t"}),
+}
+
+# All GNU env long options (for unique-abbreviation checks). Only
+# split-string needs precise detection: its argument IS the program string.
+ENV_LONGS = frozenset({
+    "ignore-environment", "null", "unset", "chdir", "split-string",
+    "debug", "block-signal", "default-signal", "ignore-signal", "argv0",
+    "help", "version",
+})
 
 ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
 
@@ -200,49 +264,227 @@ def is_flag(word):
     return word == "--" or (word.startswith("-") and word != "-" and len(word) > 1)
 
 
-def is_glob_wrapper(word):
-    """True for non-exact wrapper spellings (`e?v`); consumption ambiguous."""
-    return is_wrapper(word) and posixpath.basename(word) not in WRAPPER_COMMANDS
+def could_be_split_string(prefix):
+    """True if `--prefix` uniquely abbreviates env's `--split-string`."""
+    if not prefix or not "split-string".startswith(prefix):
+        return False
+    return not any(
+        long != "split-string" and long.startswith(prefix)
+        for long in ENV_LONGS
+    )
 
 
-def effective_program_index(cmd):
-    """Index of the first word that is not a prefix, or None.
+def parse_short_bundle(word, wrapper):
+    """Classify a `-xyz` bundle for a wrapper with consuming flags.
 
-    Assignments, wrappers and their flags are transparent: `env -i *`
-    executes the `*` expansion. Flags consuming a following word use the
-    per-wrapper table (exact spellings only); glob wrappers keep no flag-arg
-    knowledge and words downstream of one lose the exemption separately.
-    Unknown flags never consume. Bare `-` is transparent only after an
-    env-capable wrapper (GNU `env -` implies `-i`); elsewhere it is the
-    program.
+    Returns `(kind, value)`: `attached_s` (env `-S` program string in
+    `value`), `attached_data` / `plain` (no separate word), `consumes_next`
+    (next word is data), `consumes_next_s` (next word is the `-S` program
+    string), or `ambiguous` (unknown letter: caller branches both ways).
+    A consuming letter with trailing text takes it attached (`-uFOO`, `-n5`,
+    `-Sfoo`); with nothing left it consumes the next word (`-iu FOO`).
     """
-    last_wrapper = None
-    last_env_capable = False
-    skip_next = False
-    for index, word in enumerate(cmd):
+    consuming = WRAPPER_SHORT_CONSUMING.get(wrapper, frozenset())
+    plain = WRAPPER_SHORT_PLAIN.get(wrapper, frozenset())
+    for offset, letter in enumerate(word[1:]):
+        if letter in consuming:
+            rest = word[2 + offset:]
+            if rest:
+                if wrapper == "env" and letter == "S":
+                    return "attached_s", rest
+                return "attached_data", None
+            if wrapper == "env" and letter == "S":
+                return "consumes_next_s", None
+            return "consumes_next", None
+        if letter in plain:
+            continue
+        return "ambiguous", None
+    return "plain", None
+
+
+def chain_analysis(cmd):
+    """Possible program spans, ambiguous point and `-S` values for `cmd`.
+
+    The outer lexer splits same-quote concatenation (`'en''v'` -> `en`, `v`)
+    that the RUN shell concatenates, so the prefix chain is derived over ALL
+    shell-concatenated segmentations: at each position every join of
+    consecutive words (no length cap: a 12-piece split must not fail open)
+    is tried as an assignment, wrapper, flag, operand or program word.
+    Assignments, wrappers, their flags and wrapper operands (`timeout`
+    DURATION, `flock` FILE) are transparent; the first non-prefix join in
+    each segmentation is a program-span candidate. Flag-arg words are
+    skipped minimally (one word): a split flag-arg's tail is then treated
+    as program position, which only over-revokes. Operand words branch
+    every join length ALONGSIDE the prefix interpretation: the operand
+    itself may be split (`flock '/tmp/''lock' *`) or wrapper/flag-shaped
+    (`flock timeout ?????` locks FILE `timeout` and execs the glob), so
+    only the union over all operand spans reaches the real program;
+    branches that over-skip past it merely add spurious later spans,
+    never remove the true one.
+
+    Ambiguity (glob-spelled wrappers, unknown/bundled/abbreviated flags on
+    wrappers with consuming flags) loses the exemption for every word
+    downstream of its earliest position while branching both outcomes, so
+    the union of program spans covers the real argv either way. Exact `-S` /
+    `--split-string` consumes its word as the program string (env splits it
+    into argv); attached `-S` values (`--split-string=*`, `-S*`, abbreviated
+    `--s*=*`) are returned separately for exemption-free scanning.
+    """
+    program_spans = set()
+    s_values = []
+    ambiguous_from = None
+
+    def mark_ambiguous(pos):
+        nonlocal ambiguous_from
+        if ambiguous_from is None or pos < ambiguous_from:
+            ambiguous_from = pos
+
+    visited = [set() for _ in range(len(cmd) + 1)]
+    # (pos, last_wrapper, env_capable, skip_next, skip_is_s, pending_ops)
+    stack = [(0, None, False, False, False, 0)]
+    while stack:
+        pos, last_wrapper, env_cap, skip_next, skip_is_s, pending = stack.pop()
+        state = (last_wrapper, env_cap, skip_next, skip_is_s, pending)
+        if state in visited[pos]:
+            continue
+        visited[pos].add(state)
+        if pos >= len(cmd):
+            continue
         if skip_next:
-            skip_next = False
+            # Flag-arg word: data keeps the exemption, but an `-S` program
+            # string is split into argv by env, so it loses it instead.
+            # Skipped minimally: a split flag-arg's tail then reads as
+            # program position, which only over-revokes.
+            if skip_is_s:
+                program_spans.add((pos, pos + 1))
+            stack.append((pos + 1, last_wrapper, env_cap, False, False, pending))
             continue
-        if is_assignment(word):
-            continue
-        if is_wrapper(word):
-            base = posixpath.basename(word)
-            last_wrapper = base if base in WRAPPER_COMMANDS else None
-            last_env_capable = word_matches_names(
-                word, {"env"}, require_alnum=True
-            )
-            continue
-        if word == "-" and last_env_capable:
-            continue
-        if is_flag(word):
-            if (
-                last_wrapper is not None
-                and word in WRAPPER_FLAG_ARGS.get(last_wrapper, frozenset())
-            ):
-                skip_next = True
-            continue
-        return index
-    return None
+        for end in range(pos + 1, len(cmd) + 1):
+            word = "".join(cmd[pos:end])
+            if pending > 0:
+                # Operand alternative at EVERY join length AND every shape:
+                # the next argv word is the operand whether it is split
+                # (`flock '/tmp/''lock' *`) or wrapper/flag-shaped (`flock
+                # timeout ?????` locks FILE `timeout` and execs the glob).
+                # Branched ALONGSIDE the prefix interpretation below, never
+                # instead of it: over-branching only over-revokes.
+                stack.append(
+                    (end, last_wrapper, env_cap, False, False, pending - 1)
+                )
+            if word == "":
+                stack.append((end, last_wrapper, env_cap, False, False, pending))
+                continue
+            if is_assignment(word):
+                stack.append((end, last_wrapper, env_cap, False, False, pending))
+                continue
+            if is_wrapper(word):
+                base = posixpath.basename(word)
+                if base not in WRAPPER_COMMANDS:
+                    # Glob-spelled wrapper: consumption unknown.
+                    mark_ambiguous(pos)
+                    stack.append((
+                        end, None,
+                        word_matches_names(word, {"env"}, require_alnum=True),
+                        False, False, 0,
+                    ))
+                else:
+                    stack.append((
+                        end, base,
+                        base == "env" or word_matches_names(
+                            word, {"env"}, require_alnum=True
+                        ),
+                        False, False, WRAPPER_OPERANDS.get(base, 0),
+                    ))
+                continue
+            if word == "-" and env_cap:
+                stack.append((end, last_wrapper, env_cap, False, False, pending))
+                continue
+            if is_flag(word):
+                if last_wrapper is None:
+                    # Flag with no wrapper is really the program (and fails),
+                    # so transparency only over-revokes.
+                    stack.append((end, last_wrapper, env_cap, False, False, pending))
+                    continue
+                consuming = WRAPPER_FLAG_ARGS.get(last_wrapper, frozenset())
+                has_consuming = bool(consuming) or bool(
+                    WRAPPER_SHORT_CONSUMING.get(last_wrapper, frozenset())
+                )
+                if word in consuming:
+                    is_s = last_wrapper == "env" and word in (
+                        "-S", "--split-string",
+                    )
+                    stack.append(
+                        (end, last_wrapper, env_cap, True, is_s, pending)
+                    )
+                    continue
+                if word in WRAPPER_NO_ARGS.get(last_wrapper, frozenset()):
+                    stack.append((end, last_wrapper, env_cap, False, False, pending))
+                    continue
+                if word == "--":
+                    stack.append((end, last_wrapper, env_cap, False, False, pending))
+                    continue
+                if word.startswith("--") and "=" in word:
+                    # Attached long arg: certain, no separate word. An
+                    # attached split-string value is the program string.
+                    if last_wrapper == "env":
+                        prefix, _, value = word[2:].partition("=")
+                        if could_be_split_string(prefix):
+                            s_values.append(value)
+                    stack.append((end, last_wrapper, env_cap, False, False, pending))
+                    continue
+                if (
+                    word.startswith("-")
+                    and not word.startswith("--")
+                    and len(word) > 2
+                    and "=" not in word
+                    and has_consuming
+                ):
+                    kind, value = parse_short_bundle(word, last_wrapper)
+                    if kind == "attached_s":
+                        s_values.append(value)
+                        stack.append(
+                            (end, last_wrapper, env_cap, False, False, pending)
+                        )
+                    elif kind in ("attached_data", "plain"):
+                        stack.append(
+                            (end, last_wrapper, env_cap, False, False, pending)
+                        )
+                    elif kind == "consumes_next":
+                        stack.append(
+                            (end, last_wrapper, env_cap, True, False, pending)
+                        )
+                    elif kind == "consumes_next_s":
+                        stack.append(
+                            (end, last_wrapper, env_cap, True, True, pending)
+                        )
+                    else:
+                        mark_ambiguous(pos)
+                        stack.append(
+                            (end, last_wrapper, env_cap, True, False, pending)
+                        )
+                        stack.append(
+                            (end, last_wrapper, env_cap, False, False, pending)
+                        )
+                    continue
+                if not has_consuming:
+                    # Wrappers without consuming flags never take a separate
+                    # word: unknown flags are certainly transparent.
+                    stack.append((end, last_wrapper, env_cap, False, False, pending))
+                    continue
+                # Unknown flag on a consuming wrapper: could be a bundled or
+                # abbreviated consuming spelling (`-iu`, `--uns`). Branch
+                # both outcomes and lose the exemption downstream.
+                mark_ambiguous(pos)
+                stack.append((end, last_wrapper, env_cap, True, False, pending))
+                stack.append((end, last_wrapper, env_cap, False, False, pending))
+                continue
+            if pending == 0:
+                # First non-prefix join: a possible program argv word.
+                program_spans.add((pos, end))
+            # With operands pending, the operand alternative for this span
+            # was already branched at the top of the loop (all shapes, all
+            # lengths); no program starts inside an operand.
+    return program_spans, ambiguous_from, s_values
 
 
 def concat_candidates(cmd):
@@ -256,32 +498,30 @@ def concat_candidates(cmd):
     `chown` (or shell name) past the per-word scans.
 
     The punctuation exemption follows the EXECUTING shell's command position,
-    not the outer word index. The effective program word (first past the
-    assignment/wrapper/flag prefix chain, with bare `-` transparent after
-    env) loses the exemption, since a glob there selects the executed program
-    (`env *` after staging). Downstream of a glob-spelled wrapper the flag
-    consumption is ambiguous (a union table would both over- and under-skip),
-    so every word there loses the exemption instead. A whitespace-bearing
+    not the outer word index. Every possible program span (first word past
+    the assignment/wrapper/flag/operand prefix chain under any
+    shell-concatenated segmentation, with bare `-` transparent after env and
+    `-S` program strings counted as program position) loses the exemption,
+    since a glob there selects the executed program (`env *`, `timeout 5 *`,
+    `'en''v' *` after staging). Ambiguity (glob-spelled wrappers,
+    bundled/abbreviated flags) loses the exemption for every word
+    downstream of its earliest position instead. A whitespace-bearing
     word is a quoted script the inner shell re-tokenizes, so its inner pieces
     lose the exemption too (the first is inner command position; later ones
-    may follow `;`, `&&`, parens or `exec`). A join starting at the effective
-    program (or downstream of a glob wrapper) that stops before the last word
-    may be a quote-joined program name (`'./'` + `*`), so it loses the
-    exemption as well. Only joins that cannot be one argv word keep it --
-    notably the full-command join, whose words were separated by unquoted
-    whitespace, so the shipped `rm -rf /var/lib/apt/lists/*` cleanup stays
-    green.
+    may follow `;`, `&&`, parens or `exec`). A join starting at a possible
+    program that stops before the last word may be a quote-joined program
+    name (`'./'` + `*`), so it loses the exemption as well. Only joins that
+    cannot be one argv word keep it -- notably the full-command join (a whole
+    command as one program word would leave chown/shells without operands,
+    so the shipped `rm -rf /var/lib/apt/lists/*` cleanup stays green).
+    Attached `-S` program strings are scanned exemption-free separately.
     """
-    eff = effective_program_index(cmd)
-    first_glob = None
-    for pos, candidate in enumerate(cmd):
-        if is_glob_wrapper(candidate):
-            first_glob = pos
-            break
+    program_spans, ambiguous_from, s_values = chain_analysis(cmd)
+    program_starts = {start for start, _ in program_spans}
     for index, word in enumerate(cmd):
-        if eff is not None and index == eff:
+        if (index, index + 1) in program_spans:
             require_alnum = False
-        elif eff is not None and first_glob is not None and index >= first_glob:
+        elif ambiguous_from is not None and index >= ambiguous_from:
             require_alnum = False
         else:
             require_alnum = index > 0 and not any(
@@ -294,18 +534,25 @@ def concat_candidates(cmd):
         for end in range(start, len(cmd)):
             joined += cmd[end]
             if end > start:
-                if eff is None:
+                # Multi-word joins ending at the last word keep the exemption:
+                # as a program they would leave chown/shells without operands
+                # (build-red), so only argument-position matches count there.
+                if end >= last:
                     require_alnum = True
+                elif (start, end + 1) in program_spans:
+                    require_alnum = False
+                elif start in program_starts:
+                    require_alnum = False
+                elif (
+                    ambiguous_from is not None
+                    and start >= ambiguous_from
+                ):
+                    require_alnum = False
                 else:
-                    require_alnum = not (
-                        (start == eff and end < last)
-                        or (
-                            first_glob is not None
-                            and start >= first_glob
-                            and end < last
-                        )
-                    )
+                    require_alnum = True
                 yield joined, require_alnum
+    for value in s_values:
+        yield value, False
 
 
 def scratch_ownership(line, user_name, owned):
@@ -386,11 +633,12 @@ def scratch_ownership(line, user_name, owned):
     # names (`"chown"`, `ch""own`). Consecutive words are also scanned joined
     # bare to catch same-quote concatenation (`'cho''wn'`) the outer lexer
     # splits but the RUN shell concatenates. The bare-punctuation exemption
-    # follows the executing shell's effective command position: the first word
-    # past the assignment/wrapper/flag prefix chain, quoted scripts (the inner
-    # shell re-tokenizes them) and effective-program-starting partial joins (a
-    # quote-joined program name such as `'./'` + `*`) lose it, since a glob
-    # there selects the executed program (`env *` or `./*` after staging).
+    # follows the executing shell's effective command position: every possible
+    # program span past the assignment/wrapper/flag/operand prefix chain under
+    # any shell-concatenated segmentation, quoted scripts (the inner shell
+    # re-tokenizes them) and program-starting partial joins (a quote-joined
+    # program name such as `'./'` + `*`) lose it, since a glob there selects
+    # the executed program (`env *`, `timeout 5 *` or `./*` after staging).
     # Only joins that cannot be one argv word keep the exemption, so the
     # `rm -rf .../lists/*` cleanup stays green. Even inert mentions fail closed.
     if any(word_matches_names(inner, SHELL_WORDS, require_alnum=require_alnum)
@@ -413,9 +661,9 @@ def scratch_ownership(line, user_name, owned):
             # `ch""own` names and same-quote `'cho''wn'` concatenations
             # rejoined across the outer lexer's word split) still clear proof
             # via the chown they carry.
-            # Effective command position (past assignment/wrapper/flag
-            # prefixes) keeps no punctuation exemption: `*` and `./*` may
-            # expand to a staged chown.
+            # Effective command position (past assignment/wrapper/flag/operand
+            # prefixes under any shell-concatenated segmentation) keeps no
+            # punctuation exemption: `*` and `./*` may expand to a staged chown.
             if any(word_matches_names(inner, {"chown"},
                                       require_alnum=require_alnum)
                    for word, require_alnum in concat_candidates(cmd)
@@ -1017,10 +1265,54 @@ chown-revoke-prefixed-punct-glob-globenv-unset	1	RUN e?v -u FOO * root /scratch
 chown-revoke-prefixed-punct-glob-globenv-chdir	1	RUN e?v -C /tmp * root /scratch
 chown-revoke-prefixed-punct-glob-globstdbuf	1	RUN s?dbuf -o L * root /scratch
 chown-revoke-prefixed-punct-glob-globnice	1	RUN n??e -n 5 * root /scratch
+chown-revoke-prefixed-punct-glob-timeout	1	RUN timeout 5 * root /scratch
+chown-revoke-prefixed-punct-glob-timeout-qmark	1	RUN timeout 5 ????? root /scratch
+chown-revoke-prefixed-punct-glob-prlimit	1	RUN prlimit * root /scratch
+chown-revoke-prefixed-punct-glob-prlimit-qmark	1	RUN prlimit ????? root /scratch
+chown-revoke-prefixed-punct-glob-setsid	1	RUN setsid * root /scratch
+chown-revoke-prefixed-punct-glob-setsid-qmark	1	RUN setsid ????? root /scratch
+chown-revoke-prefixed-punct-glob-flock	1	RUN flock /tmp/lock * root /scratch
+chown-revoke-prefixed-punct-glob-flock-qmark	1	RUN flock /tmp/lock ????? root /scratch
+chown-revoke-prefixed-punct-glob-ionice	1	RUN ionice * root /scratch
+chown-revoke-prefixed-punct-glob-ionice-qmark	1	RUN ionice ????? root /scratch
+chown-revoke-prefixed-punct-glob-timeout-flags	1	RUN timeout --preserve-status -s KILL 5 * root /scratch
+chown-revoke-prefixed-punct-glob-flock-flags	1	RUN flock -n -w 5 /tmp/lock * root /scratch
+chown-revoke-prefixed-punct-glob-ionice-class	1	RUN ionice -c 2 -n 0 * root /scratch
+chown-revoke-prefixed-punct-glob-nested-timeout-env	1	RUN timeout 5 env * root /scratch
+chown-revoke-prefixed-punct-glob-nested-env-timeout	1	RUN env timeout 5 * root /scratch
+chown-revoke-prefixed-punct-glob-env-split	1	RUN env -S * root /scratch
+chown-revoke-prefixed-punct-glob-env-split-qmark	1	RUN env -S ????? root /scratch
+chown-revoke-prefixed-punct-glob-env-split-attached	1	RUN env --split-string=* root /scratch
+chown-revoke-prefixed-punct-glob-env-split-bundle	1	RUN env -S* root /scratch
+chown-revoke-prefixed-punct-glob-env-split-abbrev	1	RUN env --s=* root /scratch
+chown-revoke-prefixed-punct-glob-env-split-abbrev-sep	1	RUN env --s * root /scratch
+chown-revoke-prefixed-punct-glob-env-bundle-iu	1	RUN env -iu FOO * root /scratch
+chown-revoke-prefixed-punct-glob-env-abbrev-uns	1	RUN env --uns FOO * root /scratch
+chown-revoke-prefixed-punct-glob-split-env	1	RUN 'en''v' * root /scratch
+chown-revoke-prefixed-punct-glob-split-nice	1	RUN 'ni''ce' * root /scratch
+chown-revoke-prefixed-punct-glob-split-flag	1	RUN env '-''u' FOO * root /scratch
+chown-revoke-prefixed-punct-glob-split-timeout	1	RUN 'ti''meout' 5 * root /scratch
+chown-revoke-prefixed-punct-glob-split-flock	1	RUN 'fl''ock' /tmp/lock * root /scratch
+chown-revoke-prefixed-punct-glob-split-flock-file	1	RUN flock '/tmp/''lock' * root /scratch
+chown-revoke-prefixed-punct-glob-split-timeout-duration	1	RUN timeout '5''5' * root /scratch
+chown-revoke-prefixed-punct-glob-split-flock-file-triple	1	RUN flock '/t''m''p/lock' * root /scratch
+chown-revoke-prefixed-punct-glob-long-split-assignment	1	RUN 'V''E''R''Y''L''O''N''G''V''A''R''=1' * root /scratch
+chown-revoke-prefixed-punct-glob-long-split-path	1	RUN '/u''s''r''/b''i''n''/e''n''v' * root /scratch
+chown-revoke-prefixed-punct-glob-flock-wrapper-file	1	RUN flock timeout ????? root /scratch
+chown-revoke-prefixed-punct-glob-flock-wrapper-file-self	1	RUN flock flock ????? root /scratch
+chown-revoke-prefixed-punct-glob-flock-wrapper-file-short	1	RUN flock timeout ?? root /scratch
+chown-revoke-prefixed-punct-glob-flock-wrapper-file-nested	1	RUN env flock timeout ????? root /scratch
+chown-revoke-prefixed-punct-glob-flock-wrapper-file-split	1	RUN flock 'time''out' ????? root /scratch
 chown-unrelated-echo-glob	0	RUN echo *
 chown-unrelated-rm-glob	0	RUN rm -rf /var/lib/apt/lists/*
 chown-unrelated-env-dash-echo	0	RUN env - echo hi
 chown-unrelated-env-flagarg-star	0	RUN env -u * root /scratch
+chown-unrelated-timeout-echo	0	RUN timeout 5 echo hi
+chown-unrelated-flock-echo	0	RUN flock /tmp/lock echo hi
+chown-unrelated-prlimit-pid	0	RUN prlimit --pid 1
+chown-unrelated-ionice-pid	0	RUN ionice -p 1
+chown-unrelated-setsid-echo	0	RUN setsid echo hi
+chown-unrelated-env-split-echo	0	RUN env -S 'echo hi'
 ORDER_EOF
 
   fixture chown-revoke-workdir-dot.Dockerfile <<'FIXTURE_EOF'
