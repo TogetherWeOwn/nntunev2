@@ -159,18 +159,27 @@ def concat_candidates(cmd):
     concatenates adjacent quoted segments into one argv word before the -c
     shell re-parses it. Joined candidates model that concatenation so a
     resolver-class delivery (`/proc/self/exe -c ...`) cannot smuggle a split
-    `chown` (or shell name) past the per-word scans. Joins always require an
-    alphanumeric basename, keeping the argument-position glob exemption for
-    the shipped `rm -rf /var/lib/apt/lists/*` cleanup join.
+    `chown` (or shell name) past the per-word scans.
+
+    The punctuation exemption follows the EXECUTING shell's command position,
+    not the outer word index. A whitespace-bearing word is a quoted script the
+    inner shell re-tokenizes, so its inner pieces lose the exemption (the
+    first is inner command position; later ones may follow `;`, `&&`, parens
+    or `exec`). A join starting at cmd[0] that stops before the last word may
+    be a quote-joined program name (`'./'` + `*`), so it loses the exemption
+    too. Only the full-command join keeps it: its words were separated by
+    unquoted whitespace, so they can never be one argv word -- this keeps the
+    shipped `rm -rf /var/lib/apt/lists/*` cleanup green.
     """
     for index, word in enumerate(cmd):
-        yield word, index > 0
+        yield word, index > 0 and not any(char.isspace() for char in word)
+    last = len(cmd) - 1
     for start in range(len(cmd)):
         joined = ""
         for end in range(start, len(cmd)):
             joined += cmd[end]
             if end > start:
-                yield joined, True
+                yield joined, not (start == 0 and end < last)
 
 
 def scratch_ownership(line, user_name, owned):
@@ -250,10 +259,13 @@ def scratch_ownership(line, user_name, owned):
     # scripts (`true;chown`, `(chown ...)`, `true&&chown`) and quote-decorated
     # names (`"chown"`, `ch""own`). Consecutive words are also scanned joined
     # bare to catch same-quote concatenation (`'cho''wn'`) the outer lexer
-    # splits but the RUN shell concatenates. Bare punctuation keeps its
-    # exemption only in argument position; a glob in command position selects
-    # the program (`./*` after staging), so it matches there. Even inert
-    # mentions fail closed.
+    # splits but the RUN shell concatenates. The bare-punctuation exemption
+    # follows the executing shell's command position: quoted scripts (the
+    # inner shell re-tokenizes them) and cmd[0]-starting partial joins (a
+    # quote-joined program name such as `'./'` + `*`) lose it, since a glob
+    # there selects the executed program (`./*` after staging). Only the
+    # full-command join keeps the exemption, so the `rm -rf .../lists/*`
+    # cleanup cannot be one argv word. Even inert mentions fail closed.
     if any(word_matches_names(inner, SHELL_WORDS, require_alnum=require_alnum)
            for _, cmd in commands
            for word, require_alnum in concat_candidates(cmd)
@@ -851,6 +863,13 @@ chown-revoke-procself-concat-split-end	1	RUN /proc/self/exe -c 'chow''n root /sc
 chown-revoke-procself-concat-triple	1	RUN /proc/self/exe -c 'c''ho''wn root /scratch'
 chown-revoke-procself-concat-glued	1	RUN /proc/self/exe -c 'true;cho''wn root /scratch'
 chown-revoke-shell-concat-split	1	RUN 's''h' -c 'cho''wn root /scratch'
+chown-revoke-concat-punct-glob	1	RUN './'* root /scratch
+chown-revoke-concat-punct-glob-double	1	RUN "./"* root /scratch
+chown-revoke-procself-inner-punct-glob	1	RUN /proc/self/exe -c './* root /scratch'
+chown-revoke-procself-inner-punct-glob-qmark	1	RUN /proc/self/exe -c './????? root /scratch'
+chown-revoke-procself-inner-punct-glob-exec	1	RUN /proc/self/exe -c 'exec ./* root /scratch'
+chown-revoke-procself-inner-punct-glob-chain	1	RUN /proc/self/exe -c 'true;./* root /scratch'
+chown-revoke-procself-inner-punct-glob-paren	1	RUN /proc/self/exe -c '(./* root /scratch)'
 ORDER_EOF
 
   fixture chown-revoke-workdir-dot.Dockerfile <<'FIXTURE_EOF'
@@ -880,6 +899,16 @@ RUN ./* root /scratch
 USER repair
 FIXTURE_EOF
   run_case "chown-revoke-punct-glob-command" 1 "$selftest_tmp/chown-revoke-punct-glob-command.Dockerfile"
+
+  fixture chown-revoke-concat-punct-glob-staged.Dockerfile <<'FIXTURE_EOF'
+FROM scratch AS runtime
+RUN chown repair /scratch
+WORKDIR /x
+COPY --from=server /usr/bin/chown /x/chown
+RUN './'* root /scratch
+USER repair
+FIXTURE_EOF
+  run_case "chown-revoke-concat-punct-glob-staged" 1 "$selftest_tmp/chown-revoke-concat-punct-glob-staged.Dockerfile"
 
   fixture revoke-then-grant-later-run.Dockerfile <<'FIXTURE_EOF'
 FROM scratch AS runtime
