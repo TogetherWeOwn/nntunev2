@@ -39,6 +39,7 @@ check_dockerfile() {
   PIN_DC_SCRIPTS="$(cd -- "$script_dir/../../../.github/scripts" && pwd)" \
     python3 - "$dockerfile" <<'PYEOF'
 import fnmatch
+import functools
 import os
 import posixpath
 import re
@@ -160,6 +161,43 @@ WRAPPER_OPERANDS = {
     "flock": 1,
 }
 
+# Tools that execute a nested program through flags/operands this gate does
+# not model, guaranteed in the repair image (util-linux apt-installed,
+# findutils in bookworm-slim): precise grammars would need per-tool parsers
+# (`taskset -c 0 CMD` vs `taskset MASK CMD`, `chrt -o 0 CMD`, `setpriv`
+# flags, `choom -n N CMD`, `uclampset -m N CMD`, `setarch ARCH CMD` and its
+# `linux32`/`linux64` shims, `xargs` flags/stdin/`-a`, `unshare` namespace
+# flags), so the chain treats them as exec-ambiguous: every word downstream
+# loses the punctuation exemption. Benign uses (`taskset -c 0 echo hi`)
+# stay green because only glob-shaped words can match. `unshare` cannot
+# prove execution in locked-down sandboxes (userns denied) but plausibly
+# succeeds in standard root builds, so uncertainty fails closed; `nsenter`
+# is out of scope (needs CAP_SYS_ADMIN, absent from standard builds).
+# `chroot` needs no listing: any feasible attack joins `chroot/<root>/*`
+# from a program start, whose basename is the bare glob.
+EXEC_AMBIGUOUS_COMMANDS = frozenset({
+    "taskset", "chrt", "setpriv", "choom", "uclampset",
+    "setarch", "linux32", "linux64", "xargs", "unshare",
+})
+
+# find predicates whose NEXT word is the nested program find execs. `-ok`
+# / `-okdir` are deliberately absent: they prompt on stdin, which is EOF in
+# builds, so they skip without execing; any stdin-feeding shape (heredoc,
+# pipe, redirect) already fails closed in the RUN lexer.
+FIND_EXEC_FLAGS = frozenset({"-exec", "-execdir"})
+
+# find predicates consuming the next word as inert data (a name pattern or a
+# prompted program): the word after one of these is never an `-exec`
+# spelling, so bare `*` there keeps its skip (`-name '*'` is a pattern even
+# when it sole-matches a staged `-exec`; `-ok *` still prompts). Any other
+# post-dash `*` is ambiguous (sole-`-exec` predicate injection is proven).
+# Deliberately minimal: value predicates with implausible glob operands
+# (`-newer *`, `-maxdepth *`) stay fail-closed rather than growing the table.
+FIND_CONSUMING_FLAGS = frozenset({
+    "-name", "-iname", "-path", "-ipath", "-wholename",
+    "-lname", "-ilname", "-ok", "-okdir",
+})
+
 # Exact non-consuming flags (certain, no separate word). `--foo=bar` forms
 # are always attached (certain) except env split-string (program string).
 WRAPPER_NO_ARGS = {
@@ -228,7 +266,7 @@ def inner_words(word):
     return cleaned
 
 
-def word_matches_names(word, names, require_alnum=True):
+def word_matches_names(word, names, require_alnum=True, expandable=False):
     """True if `word` could name (or glob-expand to) one of `names`.
 
     The basename is the pattern and each known name the string, because the
@@ -237,8 +275,18 @@ def word_matches_names(word, names, require_alnum=True):
     in `rm -rf /var/lib/apt/lists/*`) never matches in argument position,
     or every cleanup glob would void the proof; in command position there is
     no exemption, since a glob there selects the executed program.
+    `expandable` marks single command words (and their inner words), which
+    the shell really expands: there any `*`/`?` matches regardless of
+    length or surrounding letters, since length-sensitive fnmatch would miss
+    staged copies under constrained names (`COPY chown /x/foo` + `RUN ./f*
+    ...`, `COPY chown /usr/bin/abcdef` + `RUN ?????? ...`). Multi-word joins
+    and `-S` values pass False: joins model quote-concatenation, whose
+    result the shell never re-expands (literals like `'cho''wn'` still
+    match via fnmatch), and env splits `-S` strings without expanding them.
     """
     base = posixpath.basename(word)
+    if not require_alnum and expandable and ("*" in base or "?" in base):
+        return True
     if require_alnum and not any(char.isalnum() for char in base):
         return False
     return any(fnmatch.fnmatchcase(name, base) for name in names)
@@ -305,6 +353,16 @@ def parse_short_bundle(word, wrapper):
 def chain_analysis(cmd):
     """Possible program spans, ambiguous point and `-S` values for `cmd`.
 
+    Thin wrapper over the memoized core: same verdicts, no recomputation.
+    """
+    spans, amb, s_vals = _chain_cached(tuple(cmd))
+    return set(spans), amb, list(s_vals)
+
+
+@functools.lru_cache(maxsize=4096)
+def _chain_cached(cmd_t):
+    """Possible program spans, ambiguous point and `-S` values for `cmd`.
+
     The outer lexer splits same-quote concatenation (`'en''v'` -> `en`, `v`)
     that the RUN shell concatenates, so the prefix chain is derived over ALL
     shell-concatenated segmentations: at each position every join of
@@ -329,7 +387,19 @@ def chain_analysis(cmd):
     `--split-string` consumes its word as the program string (env splits it
     into argv); attached `-S` values (`--split-string=*`, `-S*`, abbreviated
     `--s*=*`) are returned separately for exemption-free scanning.
+    Exec-ambiguous tools (taskset, xargs, ...) lose the exemption downstream
+    while staying chain-transparent. Past an effective-program find,
+    slash-free globs in the paths span (until the first dash-word/`!`) are
+    program spans, and each `-exec`/`-execdir` tail is re-analyzed as a fresh
+    command so nested wrappers, operands and tools resolve.
+
+    Results are memoized by word tuple: the `-exec` tail recursion revisits
+    the same suffixes once per enclosing `-exec`, which is exponential
+    without the cache (15 nested `-exec`s take seconds) and linear with it.
+    The core is pure (read-only tables, per-call state), so caching only
+    removes recomputation, never changes a verdict.
     """
+    cmd = list(cmd_t)
     program_spans = set()
     s_values = []
     ambiguous_from = None
@@ -395,6 +465,16 @@ def chain_analysis(cmd):
                         ),
                         False, False, WRAPPER_OPERANDS.get(base, 0),
                     ))
+                continue
+            if word_matches_names(word, EXEC_AMBIGUOUS_COMMANDS,
+                                  require_alnum=True):
+                # Exec-ambiguous tool: its flag/operand grammar is unmodeled,
+                # so downstream words lose the exemption while the chain stays
+                # transparent. Split spellings (`'tas''kset'`) resolve through
+                # the join loop like wrappers; only benign-shaped (glob-free)
+                # tails stay green.
+                mark_ambiguous(pos)
+                stack.append((end, None, False, False, False, 0))
                 continue
             if word == "-" and env_cap:
                 stack.append((end, last_wrapper, env_cap, False, False, pending))
@@ -484,7 +564,73 @@ def chain_analysis(cmd):
             # With operands pending, the operand alternative for this span
             # was already branched at the top of the loop (all shapes, all
             # lengths); no program starts inside an operand.
-    return program_spans, ambiguous_from, s_values
+    # `find` re-parses glob expansions as its own syntax, so two find-specific
+    # rules apply past each effective-program find word. (a) Paths span:
+    # words until the first dash-word/`!` are paths, but a slash-free glob
+    # there expands to dash-words find executes (`find * ';'` /
+    # `find ????? ';'` with a staged -execdir run it; even the terminator
+    # can arrive via `?`, so terminator-sensitive precision would be
+    # unsound): such words are program position. `--` never ends the span:
+    # it is end-of-options but expression parsing continues after it
+    # (`find -- * ';'` with a staged `-exec` executes). Slashed globs (`/tmp/*`)
+    # expand to full paths and need no flag here (a trailing partial join
+    # may still fail closed when more words follow), as do words past the
+    # first dash-word. (b) `-exec`/`-execdir` spelling: every word past
+    # find is tested, since even bare `*` sole-matches a staged `-exec`
+    # (`find . -maxdepth 0 * * ... ';'` executes). Exact flag joins match
+    # quote-stripped, so split spellings (`'-ex''ec'`) resolve and their
+    # tail is re-analyzed as a fresh command (targets may hide behind
+    # wrappers, operands or exec-ambiguous tools); glob spellings lose the
+    # exemption downstream instead. Only words consumed as inert data keep
+    # their skip: the single word after a name-pattern predicate or `-ok`
+    # (`-name '*'` is a pattern even when it sole-matches `-exec`; `-ok *`
+    # still prompts). Nested `-exec find ... -exec` needs no special case:
+    # the recursion flags the inner target too (fail-closed on a build-red
+    # shape), and shell-nested finds are already whole-RUN rejections via
+    # SHELL_WORDS.
+    for span_start, span_end in list(program_spans):
+        prog = "".join(cmd[span_start:span_end])
+        prog = prog.replace("'", "").replace('"', "")
+        if not word_matches_names(prog, {"find"}, require_alnum=True):
+            continue
+        for path_pos in range(span_end, len(cmd)):
+            path_word = cmd[path_pos].replace("'", "").replace('"', "")
+            if path_word == "!" or (
+                path_word.startswith("-")
+                and len(path_word) > 1
+                and path_word != "--"
+            ):
+                break
+            if "/" not in path_word and (
+                "*" in path_word or "?" in path_word
+            ):
+                program_spans.add((path_pos, path_pos + 1))
+        for exec_pos in range(span_end, len(cmd)):
+            for exec_end in range(exec_pos + 1, len(cmd) + 1):
+                cand = "".join(cmd[exec_pos:exec_end])
+                cand = cand.replace("'", "").replace('"', "")
+                if exec_end == exec_pos + 1 and exec_pos > 0:
+                    prev = cmd[exec_pos - 1].replace("'", "").replace('"', "")
+                    if prev in FIND_CONSUMING_FLAGS:
+                        continue
+                if cand in FIND_EXEC_FLAGS:
+                    if exec_end < len(cmd):
+                        program_spans.add((exec_end, exec_end + 1))
+                        sub = _chain_cached(tuple(cmd[exec_end:]))
+                        sub_spans, sub_amb, sub_s = sub
+                        for sub_start, sub_end in sub_spans:
+                            program_spans.add((
+                                sub_start + exec_end, sub_end + exec_end
+                            ))
+                        if sub_amb is not None:
+                            mark_ambiguous(sub_amb + exec_end)
+                        s_values.extend(sub_s)
+                elif (
+                    fnmatch.fnmatchcase("-exec", cand)
+                    or fnmatch.fnmatchcase("-execdir", cand)
+                ):
+                    mark_ambiguous(exec_pos)
+    return frozenset(program_spans), ambiguous_from, tuple(s_values)
 
 
 def concat_candidates(cmd):
@@ -500,12 +646,14 @@ def concat_candidates(cmd):
     The punctuation exemption follows the EXECUTING shell's command position,
     not the outer word index. Every possible program span (first word past
     the assignment/wrapper/flag/operand prefix chain under any
-    shell-concatenated segmentation, with bare `-` transparent after env and
-    `-S` program strings counted as program position) loses the exemption,
-    since a glob there selects the executed program (`env *`, `timeout 5 *`,
-    `'en''v' *` after staging). Ambiguity (glob-spelled wrappers,
-    bundled/abbreviated flags) loses the exemption for every word
-    downstream of its earliest position instead. A whitespace-bearing
+    shell-concatenated segmentation, with bare `-` transparent after env,
+    `-S` program strings, find paths-span globs and re-analyzed find
+    `-exec`/`-execdir` tails counted as program position) loses the
+    exemption, since a glob there selects the executed program (`env *`,
+    `timeout 5 *`, `'en''v' *`, `find * ...`, `find . -exec * ...` after
+    staging). Ambiguity (glob-spelled wrappers, bundled/abbreviated flags,
+    exec-ambiguous tools) loses the exemption for every word downstream of
+    its earliest position instead. A whitespace-bearing
     word is a quoted script the inner shell re-tokenizes, so its inner pieces
     lose the exemption too (the first is inner command position; later ones
     may follow `;`, `&&`, parens or `exec`). A join starting at a possible
@@ -515,6 +663,11 @@ def concat_candidates(cmd):
     command as one program word would leave chown/shells without operands,
     so the shipped `rm -rf /var/lib/apt/lists/*` cleanup stays green).
     Attached `-S` program strings are scanned exemption-free separately.
+    Each yield also reports whether the word really undergoes shell
+    expansion: single words (and their inner pieces) do, so a constrained
+    glob there (`./f*`) can select a staged copy and matches regardless of
+    letters; multi-word joins model quote-concatenation, whose result the
+    shell never re-expands, so they match literals only.
     """
     program_spans, ambiguous_from, s_values = chain_analysis(cmd)
     program_starts = {start for start, _ in program_spans}
@@ -527,7 +680,7 @@ def concat_candidates(cmd):
             require_alnum = index > 0 and not any(
                 char.isspace() for char in word
             )
-        yield word, require_alnum
+        yield word, require_alnum, True
     last = len(cmd) - 1
     for start in range(len(cmd)):
         joined = ""
@@ -550,9 +703,9 @@ def concat_candidates(cmd):
                     require_alnum = False
                 else:
                     require_alnum = True
-                yield joined, require_alnum
+                yield joined, require_alnum, False
     for value in s_values:
-        yield value, False
+        yield value, False, False
 
 
 def scratch_ownership(line, user_name, owned):
@@ -632,18 +785,27 @@ def scratch_ownership(line, user_name, owned):
     # scripts (`true;chown`, `(chown ...)`, `true&&chown`) and quote-decorated
     # names (`"chown"`, `ch""own`). Consecutive words are also scanned joined
     # bare to catch same-quote concatenation (`'cho''wn'`) the outer lexer
-    # splits but the RUN shell concatenates. The bare-punctuation exemption
-    # follows the executing shell's effective command position: every possible
+    # splits but the RUN shell concatenates. Single words really expand, so a
+    # constrained glob there (`./f*`) matches regardless of letters (a staged
+    # copy defeats length-sensitive matching); joins and `-S` values match
+    # literals only. The bare-punctuation exemption follows the executing
+    # shell's effective command position: every possible
     # program span past the assignment/wrapper/flag/operand prefix chain under
-    # any shell-concatenated segmentation, quoted scripts (the inner shell
+    # any shell-concatenated segmentation, find paths-span globs,
+    # re-analyzed `-exec`/`-execdir` tails, quoted scripts (the inner shell
     # re-tokenizes them) and program-starting partial joins (a quote-joined
     # program name such as `'./'` + `*`) lose it, since a glob there selects
-    # the executed program (`env *`, `timeout 5 *` or `./*` after staging).
-    # Only joins that cannot be one argv word keep the exemption, so the
-    # `rm -rf .../lists/*` cleanup stays green. Even inert mentions fail closed.
-    if any(word_matches_names(inner, SHELL_WORDS, require_alnum=require_alnum)
+    # the executed program (`env *`, `timeout 5 *`, `find * ...`,
+    # `find . -exec * ...` or `./*` after staging).
+    # Exec-ambiguous tools (taskset, xargs, ...) lose the exemption for every
+    # word downstream. Only joins that cannot be one argv word keep the
+    # exemption, so the `rm -rf .../lists/*` cleanup stays green. Even inert
+    # mentions fail closed.
+    if any(word_matches_names(inner, SHELL_WORDS,
+                                  require_alnum=require_alnum,
+                                  expandable=expandable)
            for _, cmd in commands
-           for word, require_alnum in concat_candidates(cmd)
+           for word, require_alnum, expandable in concat_candidates(cmd)
            for inner in inner_words(word)):
         return False
     last_segment = commands[-1][0] if commands else -1
@@ -665,8 +827,10 @@ def scratch_ownership(line, user_name, owned):
             # prefixes under any shell-concatenated segmentation) keeps no
             # punctuation exemption: `*` and `./*` may expand to a staged chown.
             if any(word_matches_names(inner, {"chown"},
-                                      require_alnum=require_alnum)
-                   for word, require_alnum in concat_candidates(cmd)
+                                      require_alnum=require_alnum,
+                                      expandable=expandable)
+                   for word, require_alnum, expandable
+                   in concat_candidates(cmd)
                    for inner in inner_words(word)):
                 owned = False
             continue
@@ -1303,6 +1467,60 @@ chown-revoke-prefixed-punct-glob-flock-wrapper-file-self	1	RUN flock flock ?????
 chown-revoke-prefixed-punct-glob-flock-wrapper-file-short	1	RUN flock timeout ?? root /scratch
 chown-revoke-prefixed-punct-glob-flock-wrapper-file-nested	1	RUN env flock timeout ????? root /scratch
 chown-revoke-prefixed-punct-glob-flock-wrapper-file-split	1	RUN flock 'time''out' ????? root /scratch
+chown-revoke-prefixed-punct-glob-taskset	1	RUN taskset -c 0 * root /scratch
+chown-revoke-prefixed-punct-glob-chrt	1	RUN chrt -o 0 * root /scratch
+chown-revoke-prefixed-punct-glob-setpriv	1	RUN setpriv * root /scratch
+chown-revoke-prefixed-punct-glob-choom	1	RUN choom -n 100 * root /scratch
+chown-revoke-prefixed-punct-glob-uclampset	1	RUN uclampset -m 0 * root /scratch
+chown-revoke-prefixed-punct-glob-setarch	1	RUN setarch x86_64 * root /scratch
+chown-revoke-prefixed-punct-glob-linux64	1	RUN linux64 * root /scratch
+chown-revoke-prefixed-punct-glob-linux32	1	RUN linux32 * root /scratch
+chown-revoke-prefixed-punct-glob-xargs	1	RUN xargs * root /scratch
+chown-revoke-prefixed-punct-glob-unshare	1	RUN unshare -Urm * root /scratch
+chown-revoke-prefixed-punct-glob-taskset-qmark	1	RUN taskset -c 0 ????? root /scratch
+chown-revoke-prefixed-punct-glob-chrt-qmark	1	RUN chrt -o 0 ????? root /scratch
+chown-revoke-prefixed-punct-glob-setpriv-qmark	1	RUN setpriv ????? root /scratch
+chown-revoke-prefixed-punct-glob-choom-qmark	1	RUN choom -n 100 ????? root /scratch
+chown-revoke-prefixed-punct-glob-uclampset-qmark	1	RUN uclampset -m 0 ????? root /scratch
+chown-revoke-prefixed-punct-glob-setarch-qmark	1	RUN setarch x86_64 ????? root /scratch
+chown-revoke-prefixed-punct-glob-linux64-qmark	1	RUN linux64 ????? root /scratch
+chown-revoke-prefixed-punct-glob-linux32-qmark	1	RUN linux32 ????? root /scratch
+chown-revoke-prefixed-punct-glob-xargs-qmark	1	RUN xargs ????? root /scratch
+chown-revoke-prefixed-punct-glob-unshare-qmark	1	RUN unshare -Urm ????? root /scratch
+chown-revoke-prefixed-punct-glob-taskset-mask	1	RUN taskset 0x1 * root /scratch
+chown-revoke-prefixed-punct-glob-chrt-long	1	RUN chrt --other 0 * root /scratch
+chown-revoke-prefixed-punct-glob-setpriv-flag	1	RUN setpriv --no-new-privs * root /scratch
+chown-revoke-prefixed-punct-glob-xargs-flag	1	RUN xargs -n 1 * root /scratch
+chown-revoke-prefixed-punct-glob-xargs-argfile	1	RUN xargs -a /etc/hosts * root /scratch
+chown-revoke-prefixed-punct-glob-split-taskset	1	RUN 'tas''kset' -c 0 * root /scratch
+chown-revoke-prefixed-punct-glob-split-xargs	1	RUN 'xa''rgs' * root /scratch
+chown-revoke-prefixed-punct-glob-glob-taskset	1	RUN t?skset -c 0 * root /scratch
+chown-revoke-find-exec-punct-glob	1	RUN find . -maxdepth 0 -exec * root /scratch ';'
+chown-revoke-find-execdir-punct-glob	1	RUN find . -maxdepth 0 -execdir * root /scratch ';'
+chown-revoke-find-exec-punct-glob-qmark	1	RUN find . -maxdepth 0 -exec ????? root /scratch ';'
+chown-revoke-find-execdir-punct-glob-qmark	1	RUN find . -maxdepth 0 -execdir ????? root /scratch ';'
+chown-revoke-find-exec-split	1	RUN find . '-ex''ec' * root /scratch ';'
+chown-revoke-find-exec-glob	1	RUN find . -ex?? * root /scratch ';'
+chown-revoke-find-exec-env-prefix	1	RUN env find . -exec * root /scratch ';'
+chown-revoke-find-execdir-timeout-prefix	1	RUN timeout 5 find . -execdir * root /scratch ';'
+chown-revoke-find-exec-path	1	RUN /usr/bin/find . -exec * root /scratch ';'
+chown-revoke-find-exec-literal	1	RUN find . -maxdepth 0 -exec chown root /scratch ';'
+chown-revoke-find-exec-nested-env	1	RUN find . -maxdepth 0 -exec env ????? root /scratch ';'
+chown-revoke-find-exec-nested-taskset	1	RUN find . -maxdepth 0 -exec taskset -c 0 ????? root /scratch ';'
+chown-revoke-find-exec-nested-timeout	1	RUN find . -maxdepth 0 -exec timeout 5 ????? root /scratch ';'
+chown-revoke-find-execdir-wildcard	1	RUN find . -maxdepth 0 ???????? ????? root /scratch ';'
+chown-revoke-find-star-path	1	RUN find * -maxdepth 0
+chown-revoke-find-star-terminator	1	RUN find * -maxdepth 0 ';'
+chown-revoke-find-qmark-terminator	1	RUN find ????? ';'
+chown-revoke-prefixed-punct-glob-wildcard-tool	1	RUN ????????? -m 0 ????? root /scratch
+chown-revoke-punct-glob-constrained-dot	1	RUN ./f* root /scratch
+chown-revoke-punct-glob-constrained-abs	1	RUN /tmp/f* root /scratch
+chown-revoke-punct-glob-constrained-qmark	1	RUN ./?a root /scratch
+chown-revoke-punct-glob-constrained-bare	1	RUN f* root /scratch
+chown-revoke-find-double-star-exec	1	RUN find . -maxdepth 0 * * root /scratch ';'
+chown-revoke-find-exec-deep-nest	1	RUN find . -exec find . -exec find . -exec find . -exec find . -exec find . -exec find . -exec find . -exec find . -exec find . -exec find . -exec find . -exec find . -exec * root /scratch ';'
+chown-revoke-chroot-root-glob	1	RUN chroot / * root /scratch
+chown-revoke-script-qec-glob	1	RUN script -qec '* root /scratch' /dev/null
 chown-unrelated-echo-glob	0	RUN echo *
 chown-unrelated-rm-glob	0	RUN rm -rf /var/lib/apt/lists/*
 chown-unrelated-env-dash-echo	0	RUN env - echo hi
@@ -1313,6 +1531,22 @@ chown-unrelated-prlimit-pid	0	RUN prlimit --pid 1
 chown-unrelated-ionice-pid	0	RUN ionice -p 1
 chown-unrelated-setsid-echo	0	RUN setsid echo hi
 chown-unrelated-env-split-echo	0	RUN env -S 'echo hi'
+chown-unrelated-taskset-echo	0	RUN taskset -c 0 echo hi
+chown-unrelated-chrt-echo	0	RUN chrt -o 0 echo hi
+chown-unrelated-setpriv-echo	0	RUN setpriv echo hi
+chown-unrelated-choom-echo	0	RUN choom -n 100 echo hi
+chown-unrelated-uclampset-echo	0	RUN uclampset -m 0 echo hi
+chown-unrelated-setarch-echo	0	RUN setarch x86_64 echo hi
+chown-unrelated-linux64-echo	0	RUN linux64 echo hi
+chown-unrelated-linux32-echo	0	RUN linux32 echo hi
+chown-unrelated-xargs-echo	0	RUN xargs echo hi
+chown-unrelated-find-name	0	RUN find /tmp -maxdepth 1 -name '*.tmp' -print
+chown-unrelated-find-name-star	0	RUN find . -name '*' -print
+chown-unrelated-find-slash-glob-path	0	RUN find /tmp/*
+chown-unrelated-find-ok-skips	0	RUN find . -maxdepth 0 -ok * root /scratch ';'
+chown-unrelated-find-ok-echo	0	RUN find . -maxdepth 0 -ok echo hi ';'
+chown-unrelated-find-name-qmark	0	RUN find . -name '?????' -print
+chown-unrelated-find-path-star	0	RUN find . -path './*'
 ORDER_EOF
 
   fixture chown-revoke-workdir-dot.Dockerfile <<'FIXTURE_EOF'
