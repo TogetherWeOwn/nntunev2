@@ -69,7 +69,7 @@ NZB upload ───────────────┘                     
   its traits in this tree, and no HTTP response or decision log emitted by
   a running Worker comes from it. Its fake-DNS/fake-transport tests prove
   model behavior only (`tests/indexer_fetch_ssrf_guard.rs`). The separate `workers/api` vault validator
-  (`IndexerConfig::validate` in `workers/api/src/vault.rs:376`) still checks the indexer URL at
+  (`IndexerConfig::validate` in `workers/api/src/vault.rs:361`) still checks the indexer URL at
   save/validate time; it is not an indexer fetch transport either.
 
 ## Indexer fetch policy library — no runtime indexer fetching
@@ -89,16 +89,18 @@ routes are unchanged.
 
 ### What the model checks
 
-- `validate_indexer_url` (`src/indexer_fetch.rs:330`) checks https only
-  (`split_authority`, `src/indexer_fetch.rs:245`), no embedded credentials,
+- `validate_indexer_url` (`src/indexer_fetch.rs:301`) checks https only
+  (`split_authority`, `src/indexer_fetch.rs:216`), no embedded credentials,
   and a 443-only port allowlist (`ALLOWED_INDEXER_PORT = 443`,
-  `src/indexer_fetch.rs:36`; `split_host_port`/`check_port`,
-  `src/indexer_fetch.rs:267-322` — any other explicit port is refused in the
+  `src/indexer_fetch.rs:38`; `split_host_port`/`check_port`,
+  `src/indexer_fetch.rs:238-293` — any other explicit port is refused in the
   model before the transport trait would be called, so the modeled fetch
   cannot be aimed at another port as a scan primitive). Address ranges
-  mirror the `workers/api` vault guard (`v4_is_forbidden`/`ip_is_forbidden`
-  identical in `workers/api/src/vault.rs:196-227` and
-  `src/indexer_fetch.rs:206-237`) — keep the two lists in sync.
+  come from the shared guard crate (`v4_is_forbidden`/`ip_is_forbidden`
+  single-owned in `crates/nntune-ssrf-guard/src/lib.rs:21-53`),
+  imported here (`src/indexer_fetch.rs:34`) and by the `workers/api`
+  vault guard (`workers/api/src/vault.rs:28`) — one list, no copies
+  to keep in sync.
 - Every answer from the supplied `DnsResolver` is checked for forbidden
   ranges (`ip_is_forbidden`, `src/indexer_fetch.rs:221`; one forbidden
   record poisons the whole answer, `src/indexer_fetch.rs:360-363`):
@@ -173,7 +175,7 @@ or deployment boundary.
 The required security policy still forbids redirects for indexer fetch:
 `docs/security/threat-model.md` (F-INGEST-01, `docs/security/threat-model.md:61`) requires forbidden
 redirects, and the vault side encodes `INDEXER_ALLOW_REDIRECTS = false`
-(`workers/api/src/vault.rs:47`).
+(`workers/api/src/vault.rs:52`).
 This model instead follows up to 3 re-validated redirects
 (`MAX_REDIRECTS = 3`, `src/indexer_fetch.rs:42`). That discrepancy is **unresolved**: this README
 does not relax the required policy, does not approve live redirect
@@ -211,14 +213,15 @@ upload routes are unchanged.
   (`allowlist_from_env`, `src/nzb_fetch.rs:114-121`); it
   does not load environment configuration.
 - Every answer from the supplied resolver is checked for forbidden ranges
-  (`ip_is_forbidden`, `src/nzb_fetch.rs:230`; one forbidden record poisons
-  the whole answer, `src/nzb_fetch.rs:368-372`;
-  guard mirrors the `workers/api` vault guard,
-  `workers/api/src/vault.rs:196-227` — keep the two lists in sync)
+  (`ip_is_forbidden` from `crates/nntune-ssrf-guard/src/lib.rs:37`,
+  imported at `src/nzb_fetch.rs:72`; one forbidden record poisons
+  the whole answer, `src/nzb_fetch.rs:340-344`;
+  the vault guard and both ingest fetchers share that one predicate —
+  no per-module lists to keep in sync)
   (loopback, link-local/metadata, private, CGNAT, multicast, reserved and
   documentation, including IPv6 transition space). IP literals skip DNS,
-  not policy (`src/nzb_fetch.rs:359-362`). The result records vetted addresses
-  (`ValidatedUrl`, `src/nzb_fetch.rs:178-186`), not a network binding.
+  not policy (`src/nzb_fetch.rs:331-334`). The result records vetted addresses
+  (`ValidatedUrl`, `src/nzb_fetch.rs:180-188`), not a network binding.
 - `fetch_nzb` (`src/nzb_fetch.rs:436`) models per-hop validation and at most
   3 redirects (`MAX_REDIRECTS = 3`, `src/nzb_fetch.rs:77`; cap enforced at
   `src/nzb_fetch.rs:471-476`; 301/302/303/307/308 per `is_redirect`,
@@ -525,6 +528,17 @@ invocation is claimed here.
 4. No paging on DLQ depth in this slice (out of scope): inspect queue depth
    before bulk redrive so a systemic cause does not re-poison the queue faster
    than it drains.
+
+## Search rate-limit burst check
+
+`scripts/search_rate_limit_burst.sh` sends 11 identical Newznab search requests
+and prints HTTP status codes and `Retry-After` headers to inspect the default
+ten-request throttle (the last request should return 429). Set `INGEST_URL`
+to a local or isolated staging ingest worker; **never point this script at
+production**. Each request has a 10-second connect timeout and a 30-second total
+timeout. Requests are not retried: replaying 429/503 responses would change the
+burst count and hide the observed throttle result. Transport failures stop the
+probe; rerun it explicitly after checking the local/staging worker.
 
 ## Develop
 

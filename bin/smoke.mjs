@@ -83,11 +83,11 @@ function parseArgs(argv) {
     } else if (arg === "--help" || arg === "-h") {
       return { help: true };
     } else if (arg.startsWith("-")) {
-      throw new Error(`unknown flag ${arg}`);
+      throw new Error("unknown flag");
     } else if (out.baseUrl === undefined) {
       out.baseUrl = arg;
     } else {
-      throw new Error(`unexpected argument ${arg}`);
+      throw new Error("unexpected argument");
     }
   }
   return out;
@@ -97,7 +97,12 @@ function assertBaseUrl(raw) {
   if (typeof raw !== "string" || raw === "") {
     throw new Error("base-url is required (an https origin, e.g. https://example.com)");
   }
-  const base = new URL(raw);
+  let base;
+  try {
+    base = new URL(raw);
+  } catch {
+    throw new Error("base-url must be a valid HTTP(S) origin");
+  }
   if (
     !["http:", "https:"].includes(base.protocol) ||
     base.username ||
@@ -111,29 +116,91 @@ function assertBaseUrl(raw) {
   return base;
 }
 
-async function getJson(url, headers, timeoutMs) {
-  const response = await fetch(url, {
-    redirect: "manual",
-    signal: AbortSignal.timeout(timeoutMs),
-    headers,
-  });
-  const text = await response.text();
-  let body;
+const JSON_BYTE_LIMIT = 16 * 1024;
+const HTML_BYTE_LIMIT = 1024 * 1024;
+
+class ProbeError extends Error {}
+
+// Do not await cancellation: a hostile stream's cancel promise can itself stall.
+function cancelBody(body) {
   try {
-    body = JSON.parse(text);
+    void body?.cancel().catch(() => {});
   } catch {
-    return { response, body: undefined, raw: text };
+    // Cleanup must not replace the fixed probe diagnostic.
   }
-  return { response, body, raw: text };
 }
 
-async function getText(url, headers, timeoutMs) {
-  const response = await fetch(url, {
-    redirect: "manual",
-    signal: AbortSignal.timeout(timeoutMs),
-    headers,
+async function getText(url, headers, timeoutMs, byteLimit) {
+  const controller = new AbortController();
+  const expiresAt = performance.now() + timeoutMs;
+  const expired = () => controller.signal.aborted || performance.now() >= expiresAt;
+  let reader;
+  let finished = false;
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new ProbeError("deadline"));
+      controller.abort();
+    }, timeoutMs);
   });
-  return { response, body: await response.text() };
+  const consume = async () => {
+    const response = await fetch(url, { redirect: "manual", signal: controller.signal, headers });
+    // Also clean up a fetch implementation that resolves after abort.
+    if (expired()) {
+      cancelBody(response.body);
+      throw new ProbeError("deadline");
+    }
+    reader = response.body?.getReader();
+    if (response.status !== 200) {
+      const status = Number.isInteger(response.status) && response.status >= 100 && response.status <= 599
+        ? response.status : "invalid";
+      throw new ProbeError(`status ${status}`);
+    }
+    const declaredLength = response.headers.get("content-length");
+    if (declaredLength !== null && /^\d+$/.test(declaredLength) && Number(declaredLength) > byteLimit) {
+      throw new ProbeError("body too large");
+    }
+    // Copy only checked bytes: subarray views could retain an oversized backing buffer.
+    const bytes = new Uint8Array(byteLimit);
+    let length = 0;
+    if (reader) {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (expired()) throw new ProbeError("deadline");
+        if (done) break;
+        if (value.byteLength > byteLimit - length) throw new ProbeError("body too large");
+        bytes.set(value, length);
+        length += value.byteLength;
+      }
+    }
+    finished = true;
+    return new TextDecoder().decode(bytes.subarray(0, length));
+  };
+  try {
+    // One race for the whole request, not one retained deadline handler per chunk.
+    return await Promise.race([consume(), deadline]);
+  } finally {
+    clearTimeout(timer);
+    if (!finished) {
+      if (reader) cancelBody(reader);
+      controller.abort();
+    }
+    reader?.releaseLock();
+  }
+}
+
+async function getJson(url, headers, timeoutMs) {
+  const text = await getText(url, headers, timeoutMs, JSON_BYTE_LIMIT);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new ProbeError("invalid JSON");
+  }
+}
+
+function probeDiagnostic(error) {
+  // Never inspect arbitrary exception messages, causes, names or response data.
+  return error instanceof ProbeError ? error.message : "request failed";
 }
 
 export async function smoke(
@@ -141,68 +208,58 @@ export async function smoke(
   { timeoutMs = 5_000, log = console.log, versionOverride, expectedSha } = {},
 ) {
   const base = assertBaseUrl(baseUrl);
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647) {
+    throw new Error("timeout must be a positive bounded integer in milliseconds");
+  }
   if (versionOverride !== undefined) assertVersionOverride(versionOverride);
   if (expectedSha !== undefined) assertExpectedSha(expectedSha);
   const headers = versionOverride === undefined ? {} : { "Cloudflare-Workers-Version-Overrides": versionOverride };
   let failures = 0;
-  const check = (valid, expected, actual) => {
+  const check = (valid, path, category) => {
     if (!valid) {
       failures += 1;
-      log(`FAIL: expected ${expected}; actual ${actual}`);
+      log(`FAIL ${path} ${category}`);
     }
   };
 
   for (const route of JSON_ROUTES) {
     try {
-      const { response, body } = await getJson(new URL(route.path, base), headers, timeoutMs);
-      check(response.status === 200, `${route.path} status 200`, `${route.path} status ${response.status}`);
+      const body = await getJson(new URL(route.path, base), headers, timeoutMs);
       const keys = body !== null && typeof body === "object" && !Array.isArray(body) ? Object.keys(body).sort() : null;
       check(
         keys !== null && JSON.stringify(keys) === JSON.stringify([...route.keys].sort()),
-        `${route.path} keys ${JSON.stringify(route.keys)}`,
-        `${route.path} keys ${JSON.stringify(keys)}`,
+        route.path, "invalid shape",
       );
       if (route.path === "/api/health" && body && typeof body === "object") {
-        check(body.ok === true, "/api/health ok true", `/api/health ok ${JSON.stringify(body.ok)}`);
-        check(
-          typeof body.version === "string" && body.version.length > 0,
-          "/api/health version non-empty string",
-          `/api/health version ${JSON.stringify(body.version)}`,
-        );
+        check(body.ok === true, route.path, "ok not true");
+        check(typeof body.version === "string" && body.version.length > 0, route.path, "invalid version type or length");
       }
       if (route.path === "/api/ready" && body && typeof body === "object") {
-        check(body.ok === true, "/api/ready ok true", `/api/ready ok ${JSON.stringify(body)}`);
+        check(body.ok === true, route.path, "ok not true");
       }
       if (route.path === "/api/build" && body && typeof body === "object") {
         const sha = body.sha;
         const looksLikeSha = typeof sha === "string" && (SHA_PATTERN.test(sha) || sha === "unknown");
-        check(looksLikeSha, "/api/build sha 40-hex or unknown", `/api/build sha ${JSON.stringify(sha)}`);
-        if (expectedSha !== undefined) {
-          check(sha === expectedSha, `/api/build sha ${expectedSha}`, `/api/build sha ${JSON.stringify(sha)}`);
-        }
+        check(looksLikeSha, route.path, "invalid sha");
+        if (expectedSha !== undefined) check(sha === expectedSha, route.path, "sha mismatch");
       }
     } catch (error) {
       failures += 1;
-      log(`FAIL ${route.path}: ${error instanceof Error ? error.message : String(error)}`);
+      log(`FAIL ${route.path}: ${probeDiagnostic(error)}`);
     }
   }
 
   for (const route of HTML_ROUTES) {
     try {
-      const { response, body } = await getText(new URL(route.path, base), headers, timeoutMs);
-      check(response.status === 200, `${route.path} status 200`, `${route.path} status ${response.status}`);
-      check(
-        route.marker.test(body),
-        `${route.path} body matches ${route.marker}`,
-        `${route.path} body mismatch (${body.length} chars)`,
-      );
+      const body = await getText(new URL(route.path, base), headers, timeoutMs, HTML_BYTE_LIMIT);
+      check(route.marker.test(body), route.path, "marker mismatch");
     } catch (error) {
       failures += 1;
-      log(`FAIL ${route.path}: ${error instanceof Error ? error.message : String(error)}`);
+      log(`FAIL ${route.path}: ${probeDiagnostic(error)}`);
     }
   }
 
-  if (failures === 0) log(`smoke ok: ${base.origin} (${JSON_ROUTES.length + HTML_ROUTES.length} routes)`);
+  if (failures === 0) log(`smoke ok (${JSON_ROUTES.length + HTML_ROUTES.length} routes)`);
   return failures;
 }
 
@@ -221,8 +278,8 @@ async function main() {
   let args;
   try {
     args = parseArgs(process.argv.slice(2));
-  } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error));
+  } catch {
+    console.error("invalid smoke usage");
     printHelp();
     process.exitCode = 2;
     return;
@@ -233,8 +290,8 @@ async function main() {
   }
   try {
     assertBaseUrl(args.baseUrl);
-  } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error));
+  } catch {
+    console.error("invalid smoke usage");
     printHelp();
     process.exitCode = 2;
     return;

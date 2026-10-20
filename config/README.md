@@ -81,7 +81,7 @@ passes on identical fixtures or fixtures that differ in values only.
   required (`:3`) with `config-parity` in needs (`:755`); `cargo test
   --workspace` in `rust-test` (`:47-51`) covers `crates/nntune-config`
   (workspace member per `Cargo.toml:2`).
-- Indexer redirect example: `workers/api/src/vault.rs:46-47`
+- Indexer redirect example: `workers/api/src/vault.rs:51-52`
   (`INDEXER_ALLOW_REDIRECTS = false`),
   `docs/security/threat-model.md:61` (F-INGEST-01 requires redirects to be
   forbidden; the fetch-policy model follows up to 3 re-validated redirects —
