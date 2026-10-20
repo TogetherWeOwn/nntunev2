@@ -13,7 +13,8 @@ import { expect, test, type Page } from '@playwright/test';
  * disabled, re-entry is ignored (exactly one request per user action),
  * and the working state is announced politely.
  *
- * Collapsing every failure into the spent-link state fails the 503 /
+ * Excluding HTTP 500 from retryable failures fails its boundary case.
+ * Collapsing every failure into the spent-link state fails the 500 / 503 /
  * abort / timeout cases; sending token-specific 4xx to the retryable
  * alert fails the generic-state cases; dropping the disabled state,
  * the re-entry guard or the polite announcement fails the held-request
@@ -37,43 +38,48 @@ async function expectRetryableConfirmState(page: Page) {
 	await expect(confirmButton(page)).toBeEnabled();
 }
 
-test('503 on redeem stays on confirm with a retryable alert, then the same link redeems', async ({
-	page
-}) => {
-	let finishPosts = 0;
-	await page.route(FINISH, async (route) => {
-		finishPosts += 1;
-		if (finishPosts === 1) {
-			await route.fulfill({
-				status: 503,
-				contentType: 'application/json',
-				body: JSON.stringify({ error: 'RAW_UPSTREAM_DETAIL_SENTINEL' })
-			});
-		} else {
-			await route.fulfill({
-				status: 200,
-				contentType: 'application/json',
-				body: JSON.stringify({ ok: true, email: 'retry@example.com' })
-			});
-		}
+for (const { status, error } of [
+	{ status: 500, error: 'internal error' },
+	{ status: 503, error: 'RAW_UPSTREAM_DETAIL_SENTINEL' }
+]) {
+	test(`${status} on redeem stays on confirm with a retryable alert, then the same link redeems`, async ({
+		page
+	}) => {
+		let finishPosts = 0;
+		await page.route(FINISH, async (route) => {
+			finishPosts += 1;
+			if (finishPosts === 1) {
+				await route.fulfill({
+					status,
+					contentType: 'application/json',
+					body: JSON.stringify({ error })
+				});
+			} else {
+				await route.fulfill({
+					status: 200,
+					contentType: 'application/json',
+					body: JSON.stringify({ ok: true, email: 'retry@example.com' })
+				});
+			}
+		});
+
+		await page.goto(`/auth/magic?token=fixture-retryable-${status}-token`);
+		await expect(confirmButton(page)).toBeVisible();
+		await confirmButton(page).click();
+
+		await expectRetryableConfirmState(page);
+		// No raw upstream error text is leaked into the page.
+		await expect(page.getByText(error, { exact: false })).toHaveCount(0);
+		// No automatic retry loop: the count stays at one user action.
+		await page.waitForTimeout(1000);
+		expect(finishPosts).toBe(1);
+
+		await confirmButton(page).click();
+		await page.waitForURL('/onboarding/byop');
+		expect(finishPosts).toBe(2);
+		await expect(page.getByText(/signed in as/i)).toContainText('retry@example.com');
 	});
-
-	await page.goto('/auth/magic?token=fixture-retryable-503-token');
-	await expect(confirmButton(page)).toBeVisible();
-	await confirmButton(page).click();
-
-	await expectRetryableConfirmState(page);
-	// No raw upstream error text is leaked into the page.
-	await expect(page.getByText(/RAW_UPSTREAM_DETAIL_SENTINEL/)).toHaveCount(0);
-	// No automatic retry loop: the count stays at one user action.
-	await page.waitForTimeout(1000);
-	expect(finishPosts).toBe(1);
-
-	await confirmButton(page).click();
-	await page.waitForURL('/onboarding/byop');
-	expect(finishPosts).toBe(2);
-	await expect(page.getByText(/signed in as/i)).toContainText('retry@example.com');
-});
+}
 
 test('network failure on redeem stays on confirm with a retryable alert, then the same link redeems', async ({
 	page
@@ -166,7 +172,9 @@ test('held redeem disables confirm, announces working politely, and ignores a se
 
 	await page.goto('/auth/magic?token=fixture-held-token');
 	const confirm = confirmButton(page);
+	const workingAnnouncement = page.getByRole('status').filter({ hasText: /signing you in/i });
 	await expect(confirm).toBeVisible();
+	await expect(workingAnnouncement).toHaveCount(0);
 	await confirm.click();
 
 	// The request is in flight and held by the gate. The confirm button
@@ -177,17 +185,11 @@ test('held redeem disables confirm, announces working politely, and ignores a se
 	const busyConfirm = page.getByRole('button', { name: /sign(ing)? in/i });
 	await expect(busyConfirm).toBeDisabled();
 
-	// The working state is announced politely (non-empty live region).
-	await expect
-		.poll(async () =>
-			page.evaluate(() =>
-				Array.from(document.querySelectorAll('[aria-live="polite"], [role="status"]'))
-					.map((el) => (el.textContent ?? '').trim())
-					.filter(Boolean)
-					.join(' ')
-			)
-		)
-		.not.toBe('');
+	// role="status" is implicitly polite; unrelated consent copy must not
+	// satisfy the working announcement pin. Explicit assertive/off overrides
+	// would break the polite announcement too.
+	await expect(workingAnnouncement).toBeVisible();
+	await expect(workingAnnouncement).not.toHaveAttribute('aria-live', /^(assertive|off)$/);
 
 	// A second activation attempt is ignored: still one request.
 	await busyConfirm.evaluate((el) =>
