@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { readSignedInEmail } from '#lib/signed-in-email.js';
 	import { serializePublicKeyCredential, toRequestOptions } from '#lib/webauthn.js';
@@ -51,6 +51,7 @@
 	let saveState = $state<'idle' | 'saving' | 'saved' | 'failed'>('idle');
 	let testedConfigKey = $state<string | null>(null);
 	let testRunId = 0;
+	onDestroy(() => { testRunId += 1; });
 
 	// Keep the wire payload honest: a TLS connection never carries the
 	// plaintext opt-in, so clear a stale acknowledgement when TLS is on.
@@ -125,7 +126,11 @@
 		testDetail = '';
 		reauthRequired = false;
 		try {
-			const result: ProviderTestResult = await client.testProviderConnection(input);
+			const result: ProviderTestResult = await client.testProviderConnection(input, () => {
+				// Only an explicit Retry may repeat this UI action, and never
+				// after navigation, changed input, or a newer test run.
+				if (runId === testRunId && inputKey === currentTestKey() && step === 3) void runTest();
+			});
 			if (runId !== testRunId || inputKey !== currentTestKey()) return;
 			// The response is a redacted summary: never echo credentials.
 			if (result.ok) {
@@ -133,8 +138,8 @@
 				testState = 'ok';
 				testDetail =
 					result.latencyMs !== undefined
-						? `Connected in ${result.latencyMs} ms.`
-						: 'Connected.';
+						? `Provider connectivity and configuration checks passed in ${result.latencyMs} ms.`
+						: 'Provider connectivity and configuration checks passed.';
 			} else {
 				testState = 'failed';
 				testDetail = 'The server could not reach that provider.';
@@ -371,8 +376,8 @@
 		<section aria-labelledby="test-heading">
 			<h2 id="test-heading">Test the connection</h2>
 			<p>
-				We test <strong>{host || 'your provider'}</strong>
-				{indexerUrl.trim().length > 0 ? 'and your indexer ' : ''}without storing anything yet.
+				We check connectivity to <strong>{host || 'your provider'}</strong> and validate the configuration and addresses{indexerUrl.trim().length > 0 ? ' (including your indexer URL)' : ''}, without storing anything yet.
+				This does not verify provider credentials{indexerUrl.trim().length > 0 ? ' or contact or authenticate to your indexer' : ''}.
 			</p>
 			<button
 				class="nt-button nt-button--ghost"
@@ -412,8 +417,8 @@
 						<h3 id="reauth-heading">Provider credentials expired</h3>
 						<p>{testDetail}</p>
 						<p>
-							Re-enter your password below and test again — your session stays
-							signed in, and the new password is tested before it is saved.
+							Re-enter your password below and repeat the connectivity and configuration checks before saving.
+							These checks do not verify your password. Your session stays signed in.
 						</p>
 						<label>
 							Password

@@ -133,14 +133,30 @@ python3 .github/scripts/public_text_lint.py
 
 Deploys are push-triggered in CI; there is nothing to deploy from a laptop:
 
-- Pushing to `main` runs `.github/workflows/deploy.yml`, which deploys
-  `apps/web` to staging (`staging-web` job) and then sequences the full
-  Playwright journey as `post-deploy-e2e` (same run, only after a successful
-  deploy — a skipped/failed deploy cannot produce a PASS). Only `apps/web`
-  is deployed (no workflow deploys the backend Workers), and staging is
-  secret-gated: without `CLOUDFLARE_API_TOKEN` the `gate` job skips
-  `staging-web` and `post-deploy-e2e`, so fork PRs get neither a deploy
-  nor a staging PASS.
+- Pushing to `main` runs [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml):
+  `staging-web` deploys `apps/web`, then `post-deploy-e2e` sequences the full
+  Playwright journey after that web deploy succeeds. Pull requests use
+  `preview-web` for web previews. The `gate` job checks for
+  `CLOUDFLARE_API_TOKEN`; deploys also require `CLOUDFLARE_ACCOUNT_ID`.
+  Without the token, deploy/preview jobs skip, so fork PRs get neither a
+  deploy nor a staging PASS.
+- The same push also runs the staging-only API Worker lane, `staging-api`,
+  behind the same token gate. Its deploy steps skip if any public Actions
+  variable is missing: `HYPERDRIVE_ID_STAGING`, `API_RP_ID_STAGING` or
+  `API_RP_ORIGIN_STAGING`. When configured, it requires the fail-closed
+  `workers/api/check_hyperdrive_cache.sh` gate (no `--allow-skip`), a canonical
+  HTTPS origin matching the RP ID, and Hyperdrive staging-inventory parity.
+  Only after the cache gate passes does the generated config set
+  `HYPERDRIVE_CACHING_DISABLED=1`; the deploy passes public `BUILD_SHA`.
+- Lane existence or overall workflow success is not API runtime acceptance:
+  even a successful `staging-api` job can have skipped deploy steps. Require
+  a non-skipped API deploy plus exact-build health, activation and rollback
+  evidence under the [per-Worker evidence contract](docs/ops.md#future-worker-deploy-lanes-required-rollback-evidence).
+  `post-deploy-e2e` depends on `staging-web`, not `staging-api`, and does not
+  prove API deploy or rollback. Operator-owned staging configuration and
+  Worker-secret wiring, authorized Access credential injection, and the
+  separate `ingest`, `stream`, `mb` and `repair` deploy lanes remain prerequisites
+  or deferred work; no backend runtime acceptance is claimed here.
 - The exact-head promotion boxes (CI green, deploy run, E2E result, Access
   intact, data-plane guards, rollback pointer) are defined in the
   [Staging promotion checklist](docs/ops.md#staging-promotion-checklist).

@@ -51,6 +51,8 @@ export interface PaywallModel {
 	retryAfterSeconds: number | null;
 	/** Human countdown line for `retryAfterSeconds`; null when there is nothing to count. */
 	countdownText: string | null;
+	/** Explicit UI retry only; omitted when dismissal should just restore focus. Never analytics. */
+	retry?: () => void;
 }
 
 export interface LimitResponseLike {
@@ -249,8 +251,11 @@ export function showPaywall(model: PaywallModel): void {
  * limit response, notify the display listener. Returns the model (or null)
  * so callers can also attach it to their typed error.
  */
-export function paywallFromResponse(res: LimitResponseLike): PaywallModel | null {
+export function paywallFromResponse(res: LimitResponseLike, retry?: () => void): PaywallModel | null {
 	const model = toPaywallModel(res);
-	if (model !== null) showPaywall(model);
+	if (model !== null) {
+		if (model.kind === 'retryable' && retry) model.retry = retry;
+		showPaywall(model);
+	}
 	return model;
 }
