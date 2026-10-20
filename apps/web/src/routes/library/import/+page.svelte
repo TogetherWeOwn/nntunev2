@@ -12,21 +12,26 @@
 		if (!file) return;
 		error = validateImportFile(file);
 		if (error) return;
-		status = 'NZB import is not available yet.';
+		status =
+			'NZB file selected locally — import is not available yet. This page does not upload or process the file or add tracks to your library.';
 	}
 </script>
 
 <svelte:head>
-	<title>NNTune — import</title>
+	<title>NNTune — local NZB selection</title>
 	<meta
 		name="description"
-		content="Check an NZB file's name and size. NZB import is not available yet."
+		content="Select an NZB file locally only. No upload, processing or tracks added."
 	/>
 </svelte:head>
 
 <main class="nt-wrap">
 	<h1>Import</h1>
-	<p>NZB import is not available yet. You can check an NZB file's name and size.</p>
+	<p>
+		NZB import is not available yet. You can choose an NZB file to check its name and size —
+		selection stays local only and this page does not upload or process the file or add tracks to
+		your library.
+	</p>
 	<label>
 		NZB file
 		<input
