@@ -21,7 +21,7 @@ const EXPECTED_MANIFEST = {
 
 const UNWIRED_CAPABILITIES = [
 	['search', /\bsearch(?:ing)?\b/i],
-	['streaming', /\bstreaming\b/i],
+	['streaming', /\bstream\w*\b/i],
 	['library management', /\blibrary(?: management)?\b/i],
 	['offline caching', /\boffline(?:[- ]friendly)? cach(?:e|ing)\b/i]
 ] as const;
@@ -47,6 +47,19 @@ function expectHonestPublicCopy(copy: unknown, surface: string): void {
 		/\b(?:sign[ -]?up|bring[- ]your[- ]own[- ]providers?|BYOP)\b/i
 	);
 }
+
+test('rejects the old streams headline prepended to otherwise honest copy', async () => {
+	// Survivor regression: /\bstreaming\b/i missed the exact old
+	// affirmative headline below, so the mutant was accepted. The
+	// streaming pattern must catch every stream verb form (streams,
+	// streaming, streamed) while honest copy still passes.
+	const honest =
+		'NNTune: search, streaming, library management and offline caching are not wired yet. Sign up and bring your own Usenet provider account.';
+	const mutant = `NNTune streams your music on Cloudflare. ${honest}`;
+
+	expect(() => expectHonestPublicCopy(honest, 'regression control')).not.toThrow();
+	expect(() => expectHonestPublicCopy(mutant, 'regression mutant')).toThrow();
+});
 
 type ManifestIcon = {
 	src?: unknown;
