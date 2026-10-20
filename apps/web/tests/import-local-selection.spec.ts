@@ -93,8 +93,10 @@ test('NZB selection discloses local-only behavior before choosing a file', async
 	expect.soft(copy, 'Make the local-only limitation clear before selection').toMatch(/\b(?:only|just)\b/i);
 	expectNoImportEffects(copy);
 
+	expectLocalSelection(await page.title());
 	const description = await page.locator('meta[name="description"]').getAttribute('content');
 	expectLocalSelection(description ?? '');
+	expectNoImportEffects(description ?? '');
 });
 
 test('NZB selection status says selected locally, not received or imported', async ({ page }) => {
