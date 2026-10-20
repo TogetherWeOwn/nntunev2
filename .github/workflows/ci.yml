@@ -206,6 +206,8 @@ jobs:
         run: python3 .github/scripts/test_public_text_lint.py
       - name: Acceptance-test unreadable-input handling
         run: python3 .github/scripts/test_public_text_read_errors.py
+      - name: Structural-test the pnpm bootstrap retry
+        run: python3 .github/scripts/test_ci_pnpm_retry.py
 
   # Bounded local Cargo pool: the offline wrapper suite plus a shape
   # check of the shipped pool policy through the wrapper's own
@@ -814,7 +816,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      # The pinned self-installer runs one `npm ci` with no retry, so retry
+      # it once in-job. Each attempt recreates its bootstrap dir and exports
+      # PATH/PNPM_HOME only on success; a second failure fails the job.
+      - id: pnpm-setup
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        continue-on-error: true
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Retry pnpm bootstrap once
+        if: steps.pnpm-setup.outcome == 'failure'
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -836,7 +848,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      # The pinned self-installer runs one `npm ci` with no retry, so retry
+      # it once in-job. Each attempt recreates its bootstrap dir and exports
+      # PATH/PNPM_HOME only on success; a second failure fails the job.
+      - id: pnpm-setup
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        continue-on-error: true
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Retry pnpm bootstrap once
+        if: steps.pnpm-setup.outcome == 'failure'
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -858,7 +880,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      # The pinned self-installer runs one `npm ci` with no retry, so retry
+      # it once in-job. Each attempt recreates its bootstrap dir and exports
+      # PATH/PNPM_HOME only on success; a second failure fails the job.
+      - id: pnpm-setup
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        continue-on-error: true
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Retry pnpm bootstrap once
+        if: steps.pnpm-setup.outcome == 'failure'
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -890,7 +922,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      # The pinned self-installer runs one `npm ci` with no retry, so retry
+      # it once in-job. Each attempt recreates its bootstrap dir and exports
+      # PATH/PNPM_HOME only on success; a second failure fails the job.
+      - id: pnpm-setup
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        continue-on-error: true
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Retry pnpm bootstrap once
+        if: steps.pnpm-setup.outcome == 'failure'
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0

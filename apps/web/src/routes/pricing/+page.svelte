@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
 	import {
 		listPlans,
@@ -16,16 +17,21 @@
 	const plans = listPlans();
 	let checkoutError: string | null = $state(null);
 	let pendingPlan: string | null = $state(null);
+	let alive = true;
+	onDestroy(() => {
+		alive = false;
+	});
 
 	async function choose(planId: string) {
 		// Serialize plan selections: ignore any activation while a checkout
 		// request is already in flight (defense in depth alongside the
 		// disabled buttons below).
-		if (pendingPlan !== null) return;
+		if (!alive || pendingPlan !== null) return;
 		checkoutError = null;
 		pendingPlan = planId;
 		try {
 			const url = await startCheckout(planId);
+			if (!alive) return;
 			window.location.href = url;
 			// Keep pendingPlan set on success: assigning location.href only
 			// starts the cross-origin navigation, and the page stays
@@ -33,6 +39,7 @@
 			// lock here would let a second activation issue another
 			// checkout whose navigation replaces this one.
 		} catch (err) {
+			if (!alive) return;
 			try {
 				// Signed-out visitors have no session cookie: send them to signup
 				// with the plan carried along instead of a raw 401 alert.
@@ -43,6 +50,8 @@
 			} finally {
 				pendingPlan = null;
 			}
+		} finally {
+			if (!alive) pendingPlan = null;
 		}
 	}
 </script>
