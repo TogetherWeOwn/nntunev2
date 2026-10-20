@@ -36,20 +36,22 @@
 			loading = state.loading;
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
-			// The queue is per-account: drop tracks the new library no longer
-			// contains, so a 401/403/404 or auth transition cannot leak the
-			// previous account's queue into the next session's Retry. The
-			// current track stays current when it survives the refresh.
+			// Reconcile in user queue order: refresh display metadata and drop
+			// absent IDs (including every entry at an auth boundary). Keep the
+			// surviving current ID, otherwise use the first survivor/empty state.
 			if (queue.tracks.length > 0) {
-				const ids = new Set(state.items.map((track) => track.id));
-				const kept = queue.tracks.filter((track) => ids.has(track.id));
-				if (kept.length !== queue.tracks.length) {
-					const currentId = queueCurrentTrack(queue)?.id ?? null;
-					const rebuilt = createQueue(kept);
-					const index =
-						currentId === null ? -1 : kept.findIndex((track) => track.id === currentId);
-					queue = index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt;
-				}
+				const byId = new Map(state.items.map((track) => [track.id, track]));
+				const kept = queue.tracks.flatMap((track) => {
+					const item = byId.get(track.id);
+					return item
+						? [{ ...track, title: displayTitle(item), artist: displayArtist(item) ?? '' }]
+						: [];
+				});
+				const currentId = queueCurrentTrack(queue)?.id ?? null;
+				const rebuilt = createQueue(kept);
+				const index =
+					currentId === null ? -1 : kept.findIndex((track) => track.id === currentId);
+				queue = index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt;
 			}
 		}
 	});
@@ -119,12 +121,15 @@
 <main class="nt-wrap">
 	<h1>Library</h1>
 
-	{#if loading}
+	{#if loading && items.length === 0}
 		<p role="status">Loading your library…</p>
 	{:else if loadError && items.length === 0}
 		<p role="alert">{loadError}</p>
 		<button class="nt-button" type="button" onclick={() => void refresh()}>Retry</button>
 	{:else}
+		{#if loading}
+			<p role="status">Refreshing your library…</p>
+		{/if}
 		{#if staleAt}
 			<p data-testid="library-stale-badge" role="status">{staleLabel(staleAt)}</p>
 		{/if}
@@ -135,7 +140,7 @@
 		{:else if items.length === 0}
 			<p role="status">Your library is empty. <a href="/library/import">Import an NZB</a> to get started.</p>
 		{:else}
-			<ul data-testid="library-list">
+			<ul data-testid="library-list" aria-busy={loading}>
 				{#each items as track (track.id)}
 					<li class="nt-library-item" data-testid="library-item" data-id={track.id}>
 						<button
@@ -154,7 +159,7 @@
 			<PlayerQueue state={queue} onnext={() => (queue = nextTrack(queue))} />
 		{/if}
 
-		<button class="nt-button nt-button--ghost" type="button" onclick={() => void refresh()}>
+		<button class="nt-button nt-button--ghost" type="button" disabled={loading} onclick={() => void refresh()}>
 			{staleAt ? 'Retry' : 'Refresh'}
 		</button>
 	{/if}

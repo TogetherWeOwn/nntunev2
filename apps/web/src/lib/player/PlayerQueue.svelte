@@ -36,9 +36,9 @@
 </button>
 
 <ol>
-	<!-- Keyed by queue position. Uniqueness comes from the store: addTrack
-		dedupes and restoreQueue rejects duplicates. -->
-	{#each state.tracks as track, i (i)}
+	<!-- Track identity keeps surviving nodes mounted when a refresh removes
+		earlier entries. addTrack dedupes and restoreQueue rejects duplicates. -->
+	{#each state.tracks as track, i (track.id)}
 		<li
 			data-testid="queue-item"
 			data-track-id={track.id}
