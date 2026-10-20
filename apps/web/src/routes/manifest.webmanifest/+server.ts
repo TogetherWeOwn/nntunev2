@@ -9,7 +9,7 @@ const MANIFEST = {
 	name: 'NNTune',
 	short_name: 'NNTune',
 	description:
-		'NNTune streams your music on Cloudflare. Bring your own Usenet provider; we provide search, streaming and library.',
+		'NNTune: search, streaming, library management and offline caching are not wired yet. Sign up and bring your own Usenet provider account.',
 	start_url: '/',
 	scope: '/',
 	display: 'standalone',
