@@ -205,6 +205,8 @@ jobs:
         run: python3 .github/scripts/test_public_text_lint.py
       - name: Acceptance-test unreadable-input handling
         run: python3 .github/scripts/test_public_text_read_errors.py
+      - name: Structural-test the pnpm bootstrap retry
+        run: python3 .github/scripts/test_ci_pnpm_retry.py
 
   # Bounded local Cargo pool: the offline wrapper suite plus a shape
   # check of the shipped pool policy through the wrapper's own
