@@ -88,7 +88,7 @@
 			<p>
 				Status: {data.subscription.status}
 				{#if data.subscription.currentPeriodEnd}
-					· renews {new Date(data.subscription.currentPeriodEnd).toLocaleDateString()}
+					· period ends {new Date(data.subscription.currentPeriodEnd).toLocaleDateString()}
 				{/if}
 				{#if data.subscription.trialEndsAt}
 					· trial ends {new Date(data.subscription.trialEndsAt).toLocaleDateString()}
