@@ -116,7 +116,9 @@ function expectRefusalState(refresher: LibraryRefresher, status: number): void {
 	expect(refresher.state.libraryUnavailable).toBe(status === 404);
 	expect(refresher.state.loadError).toBe(status === 404 ? null : status === 503
 		? 'Library is not reachable right now.'
-		: 'You are signed out or do not have access to this library.');
+		: status === 403
+			? 'You do not have access to this library.'
+			: 'You are signed out or do not have access to this library.');
 }
 
 async function expectRecovery(refresher: LibraryRefresher, storage: SnapshotStorage): Promise<void> {

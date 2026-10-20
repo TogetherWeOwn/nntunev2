@@ -589,6 +589,7 @@ async fn served_corpus_has_no_dangling_yenc_escapes() {
 async fn server_stops_serving_after_drop() {
     let server = TestNntpServer::spawn_for_test().await;
     let addr = server.addr();
+    let _ = Client::connect(&server).await;
     drop(server);
     // Drop requests cancellation; the accept task releases its listener when
     // the runtime next polls it. Observe closure rather than a fixed delay.

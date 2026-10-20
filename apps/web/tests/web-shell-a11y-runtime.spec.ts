@@ -6,7 +6,11 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 
 		test('account navigation moves the current-page marker after client navigation', async ({ page }, testInfo) => {
 			await page.route('**/v1/vault', (route) =>
-				route.fulfill({ status: 200, contentType: 'application/json', body: '{}' })
+				route.fulfill({
+					status: 200,
+					contentType: 'application/json',
+					body: JSON.stringify({ provider_configured: false, indexer_configured: false, updated_at: 0 })
+				})
 			);
 			await page.route('**/v1/me/*', (route) =>
 				route.fulfill({ status: 503, contentType: 'application/json', body: '{}' })
@@ -22,6 +26,13 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 			await expect(nav.getByRole('link', { name: 'Security' })).not.toHaveAttribute('aria-current', 'page');
 			await expect(nav.locator('[aria-current="page"]')).toHaveCount(1);
 			await page.screenshot({ path: testInfo.outputPath('account-billing.png'), fullPage: true });
+
+			await nav.getByRole('link', { name: 'Provider' }).click();
+			await expect(nav.getByRole('link', { name: 'Provider' })).toHaveAttribute('aria-current', 'page');
+			await expect(nav.getByRole('link', { name: 'Billing' })).not.toHaveAttribute('aria-current', 'page');
+			await expect(nav.locator('[aria-current="page"]')).toHaveCount(1);
+			await expect(page.getByRole('heading', { name: 'Saved provider' })).toBeVisible();
+			await page.screenshot({ path: testInfo.outputPath('account-provider.png'), fullPage: true });
 		});
 
 		test('queue announcements stay unchanged on append and update on Next', async ({ page }, testInfo) => {
