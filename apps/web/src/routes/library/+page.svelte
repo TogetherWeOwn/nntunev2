@@ -9,6 +9,7 @@
 		type LibraryItem
 	} from '#lib/library/cache.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
+	import { resolveStreamUrl } from '#lib/library/stream-url.js';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
 	import {
 		addTrack,
@@ -61,9 +62,10 @@
 	// venture slices that own them. The placeholder below keeps its hook
 	// rendered until then.
 	const overLimit = false;
-	// The player block renders off the queue's current track; the <audio>
-	// src stays an empty placeholder until the streaming slice wires it.
+	// Queue metadata alone is not playable media: the player renders only
+	// when resolveStreamUrl finds a real (non-blank) stream URL.
 	const currentTrack = $derived(queueCurrentTrack(queue));
+	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 
 	function displayTitle(track: LibraryItem): string {
 		const title = track.title;
@@ -170,7 +172,7 @@
 	<section aria-label="Usage">
 		<h2>Usage</h2>
 		<p data-testid="usage-meter">
-			Usage metering lands with the usage-meter slice — no streamed bytes recorded yet.
+			Usage information is not available yet.
 		</p>
 	</section>
 
@@ -180,10 +182,10 @@
 		</p>
 	{/if}
 
-	{#if currentTrack}
+	{#if streamUrl}
 		<section aria-label="Player">
 			<h2>Now playing</h2>
-			<audio data-testid="audio-player" controls src=""></audio>
+			<audio data-testid="audio-player" controls src={streamUrl}></audio>
 		</section>
 	{/if}
 </main>
