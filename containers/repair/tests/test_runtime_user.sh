@@ -151,6 +151,28 @@ def word_matches_names(word, names, require_alnum=True):
     return any(fnmatch.fnmatchcase(name, base) for name in names)
 
 
+def concat_candidates(cmd):
+    """Each command word plus every run of consecutive words joined bare.
+
+    The outer RUN lexer (posix=False) splits same-quote concatenation such as
+    `'cho''wn ...'` into separate words (`cho`, `wn ...`), but the RUN shell
+    concatenates adjacent quoted segments into one argv word before the -c
+    shell re-parses it. Joined candidates model that concatenation so a
+    resolver-class delivery (`/proc/self/exe -c ...`) cannot smuggle a split
+    `chown` (or shell name) past the per-word scans. Joins always require an
+    alphanumeric basename, keeping the argument-position glob exemption for
+    the shipped `rm -rf /var/lib/apt/lists/*` cleanup join.
+    """
+    for index, word in enumerate(cmd):
+        yield word, index > 0
+    for start in range(len(cmd)):
+        joined = ""
+        for end in range(start, len(cmd)):
+            joined += cmd[end]
+            if end > start:
+                yield joined, True
+
+
 def scratch_ownership(line, user_name, owned):
     """Apply literal ownership events in order; unsupported syntax clears proof."""
     instr = INSTR_RE.match(line)
@@ -226,13 +248,15 @@ def scratch_ownership(line, user_name, owned):
     # expansions (`/bin/da?h`), and split quoted tokens on shell metacharacters
     # with quote removal to catch string splits (`env -S 'sh -c ...'`), glued
     # scripts (`true;chown`, `(chown ...)`, `true&&chown`) and quote-decorated
-    # names (`"chown"`, `ch""own`). Bare punctuation keeps its
+    # names (`"chown"`, `ch""own`). Consecutive words are also scanned joined
+    # bare to catch same-quote concatenation (`'cho''wn'`) the outer lexer
+    # splits but the RUN shell concatenates. Bare punctuation keeps its
     # exemption only in argument position; a glob in command position selects
     # the program (`./*` after staging), so it matches there. Even inert
     # mentions fail closed.
-    if any(word_matches_names(inner, SHELL_WORDS, require_alnum=index > 0)
+    if any(word_matches_names(inner, SHELL_WORDS, require_alnum=require_alnum)
            for _, cmd in commands
-           for index, word in enumerate(cmd)
+           for word, require_alnum in concat_candidates(cmd)
            for inner in inner_words(word)):
         return False
     last_segment = commands[-1][0] if commands else -1
@@ -246,13 +270,15 @@ def scratch_ownership(line, user_name, owned):
             # any other chown-shaped command conservatively invalidates it.
             # Metachar-split, quote-stripped inner words of quoted tokens count
             # too, so deliveries that name no interpreter (`/proc/self/exe -c
-            # ...`, including glued scripts and quote-decorated `"chown"` /
-            # `ch""own` names) still clear proof via the chown they carry.
+            # ...`, including glued scripts, quote-decorated `"chown"` /
+            # `ch""own` names and same-quote `'cho''wn'` concatenations
+            # rejoined across the outer lexer's word split) still clear proof
+            # via the chown they carry.
             # Command position keeps no
             # punctuation exemption: `./*` may expand to a staged chown.
             if any(word_matches_names(inner, {"chown"},
-                                      require_alnum=index > 0)
-                   for index, word in enumerate(cmd)
+                                      require_alnum=require_alnum)
+                   for word, require_alnum in concat_candidates(cmd)
                    for inner in inner_words(word)):
                 owned = False
             continue
@@ -818,6 +844,13 @@ chown-revoke-procself-quoted-path	1	RUN /proc/self/exe -c '"/usr/bin/chown" root
 chown-revoke-procself-quoted-glued	1	RUN /proc/self/exe -c 'true;"chown" root /scratch'
 chown-revoke-procself-quoted-exec	1	RUN /proc/self/exe -c 'exec "chown" root /scratch'
 chown-revoke-procself-quoted-shell	1	RUN /proc/self/exe -c '"sh" -c "chown root /scratch"'
+chown-revoke-procself-concat-single	1	RUN /proc/self/exe -c 'cho''wn root /scratch'
+chown-revoke-procself-concat-double	1	RUN /proc/self/exe -c "cho""wn root /scratch"
+chown-revoke-procself-concat-split-start	1	RUN /proc/self/exe -c 'c''hown root /scratch'
+chown-revoke-procself-concat-split-end	1	RUN /proc/self/exe -c 'chow''n root /scratch'
+chown-revoke-procself-concat-triple	1	RUN /proc/self/exe -c 'c''ho''wn root /scratch'
+chown-revoke-procself-concat-glued	1	RUN /proc/self/exe -c 'true;cho''wn root /scratch'
+chown-revoke-shell-concat-split	1	RUN 's''h' -c 'cho''wn root /scratch'
 ORDER_EOF
 
   fixture chown-revoke-workdir-dot.Dockerfile <<'FIXTURE_EOF'
