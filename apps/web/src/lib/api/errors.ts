@@ -30,6 +30,7 @@ export const KNOWN_ERROR_CODES = new Set([
 	'corrupt_content',
 	'upstream_unavailable',
 	'upstream_circuit_open',
+	'transport_port_not_allowed',
 	'service_unavailable'
 ]);
 

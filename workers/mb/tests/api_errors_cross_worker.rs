@@ -257,8 +257,8 @@ fn docs_registry_matches_all_worker_registries() {
     // Guard against a silently-empty parse passing vacuously. Counts mirror
     // the registries today; bump them when the "Adding a code" procedure in
     // docs/api-errors.md lands a new row.
-    assert_eq!(rows.len(), 19, "docs registry row count");
-    for (worker, expected) in [("api", 12), ("ingest", 9), ("mb", 4), ("stream", 12)] {
+    assert_eq!(rows.len(), 20, "docs registry row count");
+    for (worker, expected) in [("api", 12), ("ingest", 9), ("mb", 4), ("stream", 13)] {
         let count = decls.iter().filter(|d| d.worker == worker).count();
         assert_eq!(count, expected, "{worker} REGISTRY entry count");
     }

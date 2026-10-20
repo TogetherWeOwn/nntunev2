@@ -408,13 +408,13 @@ behavior changes here.
   This worker performs no indexer fetches; indexer URLs are validated at
   save/test time only (`IndexerConfig::validate`). Saved indexer URLs are
   refused with `VaultError::Invalid` when the shape is wrong: a non-`https`
-  scheme (`vault.rs:354-356`), parsed userinfo (`vault.rs:364-366`), raw
-  whitespace or backslash (`vault.rs:375-377`), a non-literal `https://`
-  scheme prefix (`vault.rs:378-391`), an empty authority or a raw `@` in
+  scheme (`vault.rs:363-365`), parsed userinfo (`vault.rs:373-375`), raw
+  whitespace or backslash (`vault.rs:384-386`), a non-literal `https://`
+  scheme prefix (`vault.rs:387-400`), an empty authority or a raw `@` in
   it — including empty `@host`/`:@host` and obfuscated shapes
   (`https:/@host`, tab/newline splits, backslashes, extra slashes) that
-  the parser would strip or normalize (`vault.rs:401-406`), an explicit
-  non-443 port (`vault.rs:411-415`), or any fragment (`vault.rs:418-420`).
+  the parser would strip or normalize (`vault.rs:410-415`), an explicit
+  non-443 port (`vault.rs:420-424`), or any fragment (`vault.rs:427-429`).
   Indexer fetches must
   forbid redirects (`INDEXER_ALLOW_REDIRECTS = false`, threat-model
   F-INGEST-01). No live indexer fetch transport exists yet;

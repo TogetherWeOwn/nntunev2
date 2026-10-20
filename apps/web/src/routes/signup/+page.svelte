@@ -170,6 +170,8 @@
 					That didn't work — re-enter the code (and invite code, if you have one) from the
 					email and try again. If it keeps failing, start over to get a fresh code.
 				</p>
+			{/if}
+			{#if status === 'code-sent' || status === 'dismissed' || status === 'code-error'}
 				<button class="nt-button nt-button--ghost" type="button" onclick={startOver}>
 					Start over
 				</button>

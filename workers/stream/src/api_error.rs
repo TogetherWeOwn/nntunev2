@@ -67,6 +67,11 @@ pub const REGISTRY: &[CodeSpec] = &[
         retryable: false,
     },
     CodeSpec {
+        code: "transport_port_not_allowed",
+        status: 502,
+        retryable: false,
+    },
+    CodeSpec {
         code: "upstream_unavailable",
         status: 502,
         retryable: true,
@@ -97,6 +102,7 @@ pub fn spec(code: &str) -> CodeSpec {
 fn message_for_server_error(code: &str) -> &'static str {
     match code {
         "corrupt_content" => "content could not be decoded",
+        "transport_port_not_allowed" => "upstream endpoint not allowed",
         "upstream_unavailable" => "upstream unavailable",
         "upstream_circuit_open" => "upstream circuit open",
         _ => "unexpected error",
@@ -163,6 +169,12 @@ impl ApiError {
     pub fn corrupt_content() -> Self {
         Self::by_code("corrupt_content", "content could not be decoded")
     }
+    pub fn transport_port_not_allowed() -> Self {
+        Self::by_code(
+            "transport_port_not_allowed",
+            "upstream endpoint not allowed",
+        )
+    }
     pub fn upstream_unavailable() -> Self {
         Self::by_code("upstream_unavailable", "upstream unavailable")
     }
@@ -222,6 +234,19 @@ mod tests {
         );
         let rate = ApiError::rate_limited();
         assert_eq!((rate.status, rate.retryable), (429, true));
+    }
+
+    #[test]
+    fn transport_port_not_allowed_is_a_non_retryable_502_envelope() {
+        let err = ApiError::transport_port_not_allowed();
+        assert_eq!(
+            (err.code, err.status, err.retryable),
+            ("transport_port_not_allowed", 502, false)
+        );
+        assert_eq!(
+            err.body_json(),
+            r#"{"code":"transport_port_not_allowed","message":"upstream endpoint not allowed","retryable":false}"#
+        );
     }
 
     #[test]

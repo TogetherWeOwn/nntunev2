@@ -256,10 +256,12 @@ jobs:
   # in both staging and prod and match the docs/ops.md inventory. The
   # fixture pair proves the job goes red on drift: `match` must pass,
   # `drift-missing` / `drift-skew` must fail.
+  # These short Python guard jobs allow bounded runner-finalization headroom:
+  # hosted runners can hit a five-minute job limit after all steps pass.
   binding-parity:
     name: binding-parity
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -292,7 +294,7 @@ jobs:
   migrations-gate:
     name: migrations-gate
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     # Compare pushes with their previous tip; comparing main to itself would miss drift.
     env:
       MIGRATIONS_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000' && github.event.before || 'main' }}
@@ -629,7 +631,7 @@ jobs:
   cache-policy:
     name: cache-policy
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
