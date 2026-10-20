@@ -63,6 +63,21 @@ test('error page shows no stack trace or default SvelteKit chrome', async ({ pag
 	expect(html, 'default SvelteKit favicon still served').not.toMatch(/svelte-logo/i);
 });
 
+test('404 error page keeps its current navigation and offers no Reload action', async ({
+	page
+}) => {
+	// The Reload recovery action is for non-404 errors (pinned by the SSR
+	// suite in `src/routes/error-recovery.test.ts`, since no local route
+	// serves a 500). A 404 keeps exactly its current way out: library and
+	// sign-in links, and no reload/try-again button.
+	await page.goto(UNKNOWN_PATHS[0]!);
+
+	await expect(page.getByTestId('error-page')).toBeVisible();
+	await expect(page.locator('a[href="/library"]')).toBeVisible();
+	await expect(page.locator('a[href="/login"]')).toBeVisible();
+	await expect(page.getByRole('button', { name: /reload|try again|retry/i })).toHaveCount(0);
+});
+
 test('error page leaks no secret, hostname, or binding material', async ({ page }) => {
 	await page.goto(UNKNOWN_PATHS[1]!);
 

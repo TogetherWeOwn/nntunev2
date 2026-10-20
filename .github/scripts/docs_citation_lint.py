@@ -35,6 +35,8 @@ For every backticked ``path:N`` / ``path:N-M`` citation in tracked markdown
 
 Out of scope (silently skipped): bare ``:N`` continuations, citations
 without a resolvable path shape (``localhost:3000``, timestamps),
+unresolved host/port or registry/image references with a recognized host
+suffix (e.g. ``db.example.com:5432`` or ``ghcr.io/org/image:2``),
 unbackticked prose citations, and citations embedded in longer backticked
 spans. Anchors never cross table rows, list items, or blank lines, but do
 span soft line wraps. Multi-word backticks are not anchors (except
@@ -76,6 +78,10 @@ _MANIFEST_NAMES = ("Cargo.toml", "wrangler.toml", "package.json")
 _BACKTICK = re.compile(r"`([^`\n]+)`")
 _CITATION = re.compile(r"^([^`\s:]+):(\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*)$")
 _IP_PATH = re.compile(r"^[0-9.]+$")
+_HOSTLIKE_HEAD = re.compile(
+    r"^(?:[a-z0-9-]+\.)+(?:com|net|org|io|dev|internal|local|example)$",
+    re.IGNORECASE,
+)
 _RANGES = re.compile(r"^(\d+)(?:-(\d+))?$")
 _ANCHOR_ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*.*$")
 _ANCHOR_PATH = re.compile(
@@ -458,12 +464,19 @@ def check_source(source_rel, root, line_cache):
         return []
     twins = twin_path_targets(source_rel, root)
     resolved = {}
+    ignored = set()
     for occurrence in occurrences:
         target = resolve_physical(occurrence["path"], source_rel, root)
         if target is None and "/" not in occurrence["path"]:
             candidates = twins.get(Path(occurrence["path"]).name, set())
             if len(candidates) == 1:
                 target = next(iter(candidates))
+        # A hostname/port or numeric image tag is not a missing source
+        # file. Resolve first so real repository paths still get checked.
+        if target is None and _HOSTLIKE_HEAD.fullmatch(
+            occurrence["path"].split("/", 1)[0]
+        ):
+            ignored.add(id(occurrence))
         resolved[id(occurrence)] = target
     twin_anchors = {}
     for occurrence in occurrences:
@@ -474,6 +487,8 @@ def check_source(source_rel, root, line_cache):
         twin_anchors.setdefault(key, set()).update(occurrence["anchors"])
     violations = []
     for occurrence in occurrences:
+        if id(occurrence) in ignored:
+            continue
         lineno = occurrence["lineno"]
         citation = occurrence["citation"]
         target = resolved[id(occurrence)]

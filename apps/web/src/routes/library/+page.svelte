@@ -65,6 +65,7 @@
 	// Queue metadata alone is not playable media: the player renders only
 	// when resolveStreamUrl finds a real (non-blank) stream URL.
 	const currentTrack = $derived(queueCurrentTrack(queue));
+	const queuedIds = $derived(new Set(queue.tracks.map((track) => track.id)));
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 
 	function displayTitle(track: LibraryItem): string {
@@ -148,6 +149,9 @@
 						<button
 							type="button"
 							class="nt-library-row"
+							aria-label={queuedIds.has(track.id)
+								? `${displayTitle(track)}${displayArtist(track) ? ` — ${displayArtist(track)}` : ''} — Queued`
+								: undefined}
 							onclick={() => selectTrack(track.id)}
 						>
 							{displayTitle(track)}

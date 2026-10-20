@@ -69,7 +69,10 @@ USAGE
   exit 0
 fi
 
-dump_dir="$1"
+# Pin the published target once. Later ETL publications may replace the
+# supplied symlink, but every check/hash/read in this run must use this target.
+# Published snapshots must remain immutable and retained while importing.
+dump_dir="$(CDPATH='' cd -- "$1" && pwd -P)"
 : "${DATABASE_URL:?set DATABASE_URL via secret store, never on the command line}"
 
 VALIDATE_BIN="${MB_VALIDATE_BIN:-mb-validate}"
@@ -91,6 +94,31 @@ command -v sort >/dev/null || { echo "import: sort not on PATH" >&2; exit 1; }
 command -v uniq >/dev/null || { echo "import: uniq not on PATH" >&2; exit 1; }
 command -v sha256sum >/dev/null || { echo "import: sha256sum not on PATH" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "import: python3 not on PATH (FK orphan split)" >&2; exit 1; }
+
+# Admission precedes every database mutation, including cursor creation.
+# Do not reject row-level poison here: validation and FK routing stay per chunk.
+for table in artist release recording track; do
+  tsv="$dump_dir/mbdump-$table.tsv"
+  if [[ ! -f "$tsv" || ! -r "$tsv" || ! -s "$tsv" ]]; then
+    echo "import: refusing $tsv (required curated TSV must be present, readable and nonempty)" >&2
+    exit 1
+  fi
+done
+
+if [[ -n "${DUMP_SEQ:-}" ]]; then
+  if [[ ! "$DUMP_SEQ" =~ ^[0-9]+$ ]]; then
+    echo "import: refusing non-integer DUMP_SEQ '$DUMP_SEQ'" >&2
+    exit 1
+  fi
+  # Strip arbitrary zero padding before checking length. Never evaluate long
+  # input as Bash arithmetic (it can wrap); at most ten digits reach arithmetic.
+  DUMP_SEQ="${DUMP_SEQ#"${DUMP_SEQ%%[!0]*}"}"
+  DUMP_SEQ="${DUMP_SEQ:-0}"
+  if (( ${#DUMP_SEQ} > 10 )) || (( 10#$DUMP_SEQ > 2147483647 )); then
+    echo "import: refusing DUMP_SEQ outside PostgreSQL INTEGER range (0..2147483647)" >&2
+    exit 1
+  fi
+fi
 
 # Deliver the connection to psql via the PG* environment, never argv.
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -120,10 +148,6 @@ refuse_all_poison_dump() {
 
 for table in artist release recording track; do
   tsv="$dump_dir/mbdump-$table.tsv"
-  if [[ ! -f "$tsv" ]]; then
-    echo "import: missing $tsv (expected curated TSV; see header comment)" >&2
-    exit 1
-  fi
   prune_sql=""
   final_prune_sql=""
   case "$table" in
@@ -421,11 +445,8 @@ done
 # untouched so the cursor never rewinds. Unset DUMP_SEQ leaves state
 # untouched (fresh DBs stay at the migration seed 0); the operator then
 # seeds last_packet before replication.
+# DUMP_SEQ was normalized and range-checked before the first write.
 if [[ -n "${DUMP_SEQ:-}" ]]; then
-  if [[ ! "$DUMP_SEQ" =~ ^[0-9]+$ ]]; then
-    echo "import: refusing non-integer DUMP_SEQ '$DUMP_SEQ'" >&2
-    exit 1
-  fi
   current_last_packet="$(psql -v ON_ERROR_STOP=1 -tAX -c "SELECT last_packet FROM mb_import_state WHERE id = 1;")"
   if [[ ! "$current_last_packet" =~ ^[0-9]+$ ]]; then
     echo "import: unexpected last_packet '$current_last_packet' in mb_import_state" >&2
