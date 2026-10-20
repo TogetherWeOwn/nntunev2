@@ -29,10 +29,11 @@ production secret-shape gate pin (`e2e/tests/deploy-production.spec.ts`,
 `npm --prefix e2e run e2e:list` lists 434 tests in 28 files (433 in 28
 as previously verified, plus the 1-test secret-shape gate pin in the
 deploy-production spec, now 25 tests), and
-`(cd apps/web && pnpm exec playwright test --list)` lists 151 tests in
-32 files (146 in 31 as previously verified, plus the 5-test
-signup-start-over spec); both re-verified at the current main. Line numbers
-below are from that head; re-verify with the commands at the end of this
+`(cd apps/web && pnpm exec playwright test --list)` lists 165 tests in
+33 files (151 in 32 as previously verified, plus the 14-test
+library-background-refresh spec), re-verified on 2026-10-20 with the
+background-refresh change. Line numbers below are from the cited heads;
+re-verify with the commands at the end of this
 document whenever a spec is added, renamed, or retitled, and update this
 matrix in the same PR. CI enforces the file and title citations on
 every PR (the traceability step in the `e2e-lint` job); line numbers stay
@@ -326,6 +327,13 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
     cache contract: offline retry rendering the stale snapshot with a
     badge, 401/auth-transition invalidation, in-flight response discard,
     last-good preservation, and blocked-storage behavior.
+  - `apps/web/tests/library-background-refresh.spec.ts` — pins loaded
+    list/queue node identity and row focus during held refreshes, busy and
+    disabled refresh controls, usable queue selection/Next, same-ID display
+    corrections in user queue order, partial/all removal, stale failure and
+    recovery, and 401/403/404/auth-transition purges with late-response
+    rejection. Initial loading and the empty audio src stay unchanged;
+    mocked responses do not establish playback or deployment evidence.
   - `apps/web/tests/account-security-library-cache.spec.ts` — pins
     sign-out invalidating library snapshots across tabs (logout, revoke-all,
     and confirmed 401 clear stored snapshots; 500/transport failure claims
