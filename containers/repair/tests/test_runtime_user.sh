@@ -39,6 +39,7 @@ check_dockerfile() {
   PIN_DC_SCRIPTS="$(cd -- "$script_dir/../../../.github/scripts" && pwd)" \
     python3 - "$dockerfile" <<'PYEOF'
 import os
+import posixpath
 import re
 import shlex
 import sys
@@ -168,28 +169,44 @@ def scratch_ownership(line, user_name, owned):
     } for _, cmd in commands):
         return False
     last_segment = commands[-1][0] if commands else -1
-    previous_segment = -1
     for segment, cmd in commands:
-        # An &&-guarded grant may be skipped and rescued by a later ;-list.
-        # In the last nonempty list a skip instead fails RUN (and the build).
-        guaranteed = segment != previous_segment or segment == last_segment
-        previous_segment = segment
+        # Only the final &&-list must execute AND succeed in a green build.
+        # Even its first chown can fail and be rescued by a later ;-list.
+        guaranteed = segment == last_segment
         if cmd[0] != "chown":
+            # Do not interpret RUN flags, assignments, wrappers or executable
+            # paths as harmless text. Only bare chown can establish proof;
+            # any other chown-shaped command conservatively invalidates it.
+            if any(posixpath.basename(word) == "chown" for word in cmd):
+                owned = False
             continue
         args = cmd[1:]
-        if args and args[0] in ("-R", "--recursive"):
+        recursive = bool(args and args[0] in ("-R", "--recursive"))
+        if recursive:
             args = args[1:]
         if args and args[0] == "--":
             args = args[1:]
         if len(args) != 2 or re.fullmatch(PLAIN_USER_RE, args[0]) is None:
             # Unsupported chown operands cannot preserve an earlier proof.
             owned = False
-        elif args[1] in ("/scratch", "/scratch/"):
-            if not matches_owner(args[0]):
+            continue
+        owner, target = args
+        # Relative paths depend on WORKDIR (possibly inherited). Globs may
+        # expand to /scratch. Neither can be proved disjoint statically.
+        if not target.startswith("/") or any(c in target for c in "*?[]"):
+            owned = False
+            continue
+        canonical = posixpath.normpath("/" + target.lstrip("/"))
+        if target in ("/scratch", "/scratch/"):
+            if not matches_owner(owner):
                 # Even a conditional revocation might run: fail closed.
                 owned = False
             elif guaranteed:
                 owned = True
+        elif canonical == "/scratch" or (recursive and canonical == "/"):
+            # Aliases and recursive ancestors may revoke but cannot grant.
+            # Disjoint absolute targets such as /tmp preserve earlier proof.
+            owned = False
     return owned
 
 
@@ -607,14 +624,18 @@ chown-guard-rescued-echo	1	RUN test -d /nope && chown repair /scratch; echo ok
 chown-guard-rescued-cleanup	1	RUN false && chown repair /scratch; rm -rf /var/lib/apt/lists/*
 chown-guard-rescued-after-grant	1	RUN true && chown repair /scratch && false; true
 chown-guard-final-segment	0	RUN true; mkdir -p /scratch && chown repair /scratch;
-chown-unconditional-before-final	0	RUN chown repair /scratch; true && true
+chown-unconditional-before-final	1	RUN chown repair /scratch; true && true
+chown-failed-grant-rescued-mkdir	1	RUN chown repair /scratch; mkdir -p /scratch
+chown-failed-grant-rescued-echo	1	RUN chown repair /scratch; echo ok
+chown-failed-chain-rescued	1	RUN chown repair /scratch && true; echo ok
+chown-failed-grant-rescued-trailing-semicolon	1	RUN chown repair /scratch; true;
 chown-final-chain-followup	0	RUN true && chown repair /scratch && true
 chown-revoke-same-line	1	RUN chown repair /scratch; chown root /scratch
 chown-revoke-and-chain	1	RUN chown repair /scratch && chown root /scratch
 chown-revoke-conditional	1	RUN chown repair /scratch; false && chown root /scratch; true
 chown-revoke-then-grant	0	RUN chown root /scratch; chown repair /scratch
 chown-revoke-then-conditional-grant	1	RUN chown root /scratch; false && chown repair /scratch; true
-chown-revoke-unrelated-path	0	RUN chown repair /scratch; chown root /tmp
+chown-revoke-unrelated-path	0	RUN chown root /tmp; chown repair /scratch
 chown-revoke-trailing-slash	1	RUN chown repair /scratch; chown -R root:root /scratch/
 chown-midword-hash	1	RUN chown repair /scratch#x
 chown-midword-hash-composed	1	RUN mkdir -p "/scratch#x" && chown repair /scratch#x
@@ -652,7 +673,49 @@ chown-regrant-later-run	0	RUN chown root /scratch; chown repair /scratch
 chown-unsupported-later-run	1	RUN echo hi#x; chown root /scratch
 chown-unrelated-later-copy	0	COPY --from=builder source /usr/local/bin/tool
 chown-unrelated-later-run	0	RUN chown root /tmp
+chown-revoke-dot-alias	1	RUN chown root /scratch/.
+chown-revoke-double-leading-slash	1	RUN chown root //scratch
+chown-revoke-double-trailing-slash	1	RUN chown root /scratch//
+chown-revoke-dotdot-alias	1	RUN chown root /tmp/../scratch
+chown-revoke-glob	1	RUN chown root /scrat*
+chown-revoke-question-glob	1	RUN chown root /scratc?
+chown-revoke-recursive-root	1	RUN chown -R root /
+chown-revoke-recursive-root-alias	1	RUN chown --recursive root /tmp/..
+chown-revoke-network-flag	1	RUN --network=none chown root /scratch
+chown-revoke-mount-flag	1	RUN --mount=type=cache,target=/tmp chown root /scratch
+chown-revoke-assignment-prefix	1	RUN FOO=bar chown root /scratch
+chown-revoke-absolute-command	1	RUN /usr/bin/chown root /scratch
+chown-revoke-env-wrapper	1	RUN env chown root /scratch
+chown-revoke-command-wrapper	1	RUN command chown root /scratch
+chown-revoke-composed-prefix	1	RUN FOO=bar env /usr/bin/chown root /scratch
+chown-revoke-conditional-alias	1	RUN false && chown root /scratch/.; true
+chown-revoke-prefixed-same-run	1	RUN chown repair /scratch && env chown root /scratch
+chown-unrelated-recursive-run	0	RUN chown -R root /tmp
+chown-unrelated-normalized-run	0	RUN chown root //tmp/./
+chown-unrelated-prefix-collision	0	RUN chown -R root /scrat
+chown-alias-not-grant	1	RUN chown root /scratch; chown repair /scratch/.
+chown-wrapper-not-grant	1	RUN chown root /scratch; env chown repair /scratch
+chown-regrant-after-wrapper	0	RUN env chown root /scratch; chown repair /scratch
+chown-regrant-after-alias	0	RUN chown root /scratch/.; chown repair /scratch
 ORDER_EOF
+
+  fixture chown-revoke-workdir-dot.Dockerfile <<'FIXTURE_EOF'
+FROM scratch AS runtime
+RUN chown repair /scratch
+WORKDIR /scratch
+RUN chown root .
+USER repair
+FIXTURE_EOF
+  run_case "chown-revoke-workdir-dot" 1 "$selftest_tmp/chown-revoke-workdir-dot.Dockerfile"
+
+  fixture chown-revoke-workdir-relative.Dockerfile <<'FIXTURE_EOF'
+FROM scratch AS runtime
+RUN chown repair /scratch
+WORKDIR /
+RUN chown root scratch
+USER repair
+FIXTURE_EOF
+  run_case "chown-revoke-workdir-relative" 1 "$selftest_tmp/chown-revoke-workdir-relative.Dockerfile"
 
   fixture revoke-then-grant-later-run.Dockerfile <<'FIXTURE_EOF'
 FROM scratch AS runtime
