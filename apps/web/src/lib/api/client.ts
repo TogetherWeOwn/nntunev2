@@ -18,6 +18,8 @@ export type FetchFn = typeof fetch;
 export interface ApiClientOptions {
 	baseUrl: string;
 	fetchFn?: FetchFn;
+	/** Optional lifetime for requests owned by a mounted component. */
+	signal?: AbortSignal;
 }
 
 export class ApiError extends Error {
@@ -325,10 +327,12 @@ export function toLoginFinishBody(input: LoginFinishInput): Record<string, strin
 export class ApiClient {
 	private readonly baseUrl: string;
 	private readonly fetchFn: FetchFn;
+	private readonly signal?: AbortSignal;
 	private token: string | null = null;
 
-	constructor({ baseUrl, fetchFn }: ApiClientOptions) {
+	constructor({ baseUrl, fetchFn, signal }: ApiClientOptions) {
 		this.baseUrl = baseUrl.replace(/\/+$/, '');
+		this.signal = signal;
 		// Default to a wrapper (not a bare `fetch` reference): calling a stored
 		// `fetch` as `this.fetchFn(...)` sets `this` to the client instance and
 		// browsers/workerd reject it with "Illegal invocation".
@@ -544,7 +548,8 @@ export class ApiClient {
 		// auth/vault spinners always settle. The timer is cleared on settle so
 		// fast requests never wait for it and later requests are unaffected.
 		const controller = new AbortController();
-		const callerSignal = init.signal as AbortSignal | null | undefined;
+		const callerSignal = init.signal ?? this.signal;
+		callerSignal?.throwIfAborted();
 		const onCallerAbort = (): void => controller.abort(callerSignal?.reason);
 		if (callerSignal?.aborted) controller.abort(callerSignal.reason);
 		else callerSignal?.addEventListener('abort', onCallerAbort, { once: true });
