@@ -1,17 +1,16 @@
-# Input admission acceptance handoff
+# Input admission acceptance
 
-This is a deliberately RED, test-only handoff against baseline
-`511fbab601c338d8aad2874ca622060116b600bd`. Do not merge the tests alone.
-Continue the acceptance branch with the importer fix in one implementation PR.
-The test author owns corrections; the Builder must not rewrite these tests to
-make the implementation pass.
+Merged passing suite for the importer preflight: one complete snapshot is
+admitted before any database write, and malformed input is refused with zero
+mutation attempts. The test author owns corrections; do not rewrite these
+tests to make an implementation pass.
 
 Protected paths:
 
 - `containers/mb-import/tests/test_input_admission.sh`
 - `containers/mb-import/tests/input_admission/` (this README and both Python files)
 
-## Reproduce
+## Run
 
 From the repository root, as an ordinary unprivileged user:
 
@@ -25,7 +24,11 @@ container, credentials or database is needed. Only a local psql double runs;
 its connection target is a synthetic `.invalid` name. An inherited
 `DATABASE_URL`, `DUMP_SEQ`, `PG*` or `MB_VALIDATE_BIN` is not passed to the
 importer. On a root process, the four unreadability tests explicitly skip;
-use an unprivileged process for the full 40-test result.
+the directory-shape cases run at any privilege. Use an unprivileged process
+for the full 44-test result.
+
+CI runs this suite on every PR (`.github/workflows/ci.yml`,
+"Run mb-import input-admission tests (mock-only)").
 
 Optional diagnostics (captures are synthetic and never contain live data):
 
@@ -42,19 +45,26 @@ configuration, cursor/DLQ/sequence reply state, SQL/COPY/validator JSONL capture
 and numbered importer stdout/stderr. The psql double captures mutation attempts
 before returning any simulated database error; an eventual rollback or range
 error cannot hide a late admission check. Unsupported SQL is a harness error,
-not an expected RED result; request corrections from the test author if the
+not a product failure; request corrections from the test author if the
 process protocol legitimately changes.
 
-## Baseline expectations
+## Expectations
 
-40 tests: **22 failures, 18 passes, no errors or skips** on an unprivileged
-process. The suite must become fully green with the implementation.
+44 tests, all passing, no errors or skips on an unprivileged process:
 
-| Failing group | Cases | Exact behavioral failure |
-| --- | ---: | --- |
-| Publication pin | 2 | First run's COPY bytes are B instead of A (release after artist completion; artist between hashing and chunk read). |
-| Later-file admission | 9 | Missing/empty/unreadable release, recording, track attempt 2, 5, 8 mutations respectively, expected 0. |
-| Sequence admission | 11 | Malformed/overflow sequences attempt 12 mutations, or 13 for the two integer-range cases, expected 0. |
+- Publication pin (2): a replaced `curated` link mid-run still imports only A
+  on the first run, then B on the next.
+- Preflight admission (16): missing, empty, unreadable, or directory-shaped
+  TSV for each of artist, release, recording, track is refused before any
+  write. The directory shape pins the regular-file predicate: a directory is
+  readable and nonempty but not a regular file, so only `-f` refuses it.
+- Sequence admission (11 invalid refused, 8 valid accepted): see the
+  invalid/valid lists below.
+- Green controls (7): ordinary directories with spaces, same-dump skip,
+  independent newer-dump hashes and forward-only upsert SQL, poison and
+  FK-orphan COPY payloads with original raw bytes/line numbers, all-poison
+  refusal on initial and completed paths, and deterministic
+  interrupted-track resume.
 
 Publication switching is synchronous: the psql double atomically replaces the
 relative `curated` link when the artist completion probe runs, or immediately
@@ -70,13 +80,21 @@ space, exponent, text, `2147483648`, `0002147483648`,
 unset/empty, zero on both migration seed and a newer cursor, older/equal,
 forward, `2147483647`, `00042`, and 200 leading zeroes followed by `42`.
 
-Other green controls exercise ordinary directories with spaces, same-dump
-skip, independent newer-dump hashes and forward-only upsert SQL, poison and
-FK-orphan COPY payloads with original raw bytes/line numbers, all-poison refusal
-on initial and completed paths, and deterministic interrupted-track resume.
 The interrupted case stops the second track validation, proves the first
 chunk contains no prune, then proves only the tail is submitted on resume and
 the final transaction includes the prune before sequence seeding.
+
+### Historical baseline (pre-implementation)
+
+Against baseline `511fbab601c338d8aad2874ca622060116b600bd` the original 40
+tests showed **22 failures, 18 passes, no errors or skips** on an unprivileged
+process. The implementation made the suite fully green.
+
+| Failing group | Cases | Exact behavioral failure |
+| --- | ---: | --- |
+| Publication pin | 2 | First run's COPY bytes are B instead of A (release after artist completion; artist between hashing and chunk read). |
+| Later-file admission | 9 | Missing/empty/unreadable release, recording, track attempt 2, 5, 8 mutations respectively, expected 0. |
+| Sequence admission | 11 | Malformed/overflow sequences attempt 12 mutations, or 13 for the two integer-range cases, expected 0. |
 
 ## Evidence boundaries and existing tests
 
@@ -109,6 +127,4 @@ bash containers/mb-import/tests/test_argv_hygiene.sh
 ```
 
 The separate `test_etl_timestamp_contract.sh` also exercises the native
-validator and therefore needs the provisioned bounded Cargo pool. No source,
-existing acceptance test, migration, CI workflow or security fence is changed
-by this handoff.
+validator and therefore needs the provisioned bounded Cargo pool.

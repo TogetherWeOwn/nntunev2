@@ -241,6 +241,9 @@ def missing_case(table, shape):
             path.unlink()
         elif shape == "empty":
             path.write_text("")
+        elif shape == "directory":
+            path.unlink()
+            path.mkdir()
         else:
             if os.geteuid() == 0:
                 self.skipTest("unreadable-file control requires an unprivileged test process")
@@ -253,7 +256,7 @@ def missing_case(table, shape):
 
 
 for table in TABLES:
-    for shape in ("missing", "empty", "unreadable"):
+    for shape in ("missing", "empty", "unreadable", "directory"):
         setattr(InputAdmission, f"test_preflight_{shape}_{table}_before_any_write", missing_case(table, shape))
 
 
