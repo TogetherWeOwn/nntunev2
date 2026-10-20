@@ -12,6 +12,15 @@ import { expect, test, type Page } from '@playwright/test';
  * which also suppresses the live success/error controls. Detached private
  * rune assignments are not directly observable; state assertions below cover
  * storage and the replacement page's visible state, not source-text shapes.
+ *
+ * Security-result classification: a qualifying security result (logout or
+ * revoke-all fulfilled success, or a typed HTTP401) crosses the auth boundary
+ * even when the security route has been abandoned — accessible snapshots,
+ * context and the per-tab identity label are purged and existing consumers
+ * are notified — while the abandoned route itself stays silent (no
+ * navigation, error, message or busy-state writes). Non-qualifying results
+ * (other HTTP failures, network rejection, malformed bodies) purge nothing.
+ * Pricing and billing abandonment keep the full preservation contract.
  */
 const SNAPSHOT = 'nntune.library.snapshot.v1';
 const AUTH_CONTEXT = 'nntune.library.auth-context.v1';
@@ -48,6 +57,8 @@ interface Probe {
 	writes: string[];
 	broadcasts: string[];
 	release: (status: number, body: unknown) => void;
+	releaseRaw: (status: number, rawBody: string) => void;
+	releaseReject: () => void;
 }
 declare global {
 	interface Window { __abandonment: Probe }
@@ -84,18 +95,27 @@ async function fixtures(page: Page, action: Action, allowExternal = false) {
 	await page.route('**/api/library', (route) => route.fulfill({ json: [] }));
 	await page.addInitScript(({ endpoint }) => {
 		const nativeFetch = window.fetch.bind(window);
-		const probe: Probe = { requests: [], rejections: [], writes: [], broadcasts: [], release: () => { throw new Error('No held request'); } };
+		const probe: Probe = {
+			requests: [], rejections: [], writes: [], broadcasts: [],
+			release: () => { throw new Error('No held request'); },
+			releaseRaw: () => { throw new Error('No held request'); },
+			releaseReject: () => { throw new Error('No held request'); }
+		};
 		window.__abandonment = probe;
 		window.addEventListener('unhandledrejection', (event) => probe.rejections.push(String(event.reason)));
 		window.fetch = (input, init) => {
 			const request = new Request(input, init);
 			if (new URL(request.url).pathname !== endpoint) return nativeFetch(input, init);
-			return new Promise<Response>((resolve) => {
+			return new Promise<Response>((resolve, reject) => {
 				void request.clone().json().then((body) => {
 					probe.requests.push({ method: request.method, path: endpoint, body });
 					probe.release = (status, responseBody) => resolve(new Response(JSON.stringify(responseBody), {
 						status, headers: { 'content-type': 'application/json' }
 					}));
+					probe.releaseRaw = (status, rawBody) => resolve(new Response(rawBody, {
+						status, headers: { 'content-type': 'application/json' }
+					}));
+					probe.releaseReject = () => reject(new TypeError('fixture network failure'));
 				});
 			});
 		};
@@ -179,8 +199,26 @@ async function release(page: Page, action: Action, status: number) {
 	}, { status, destination: action.destination });
 }
 
+async function releaseRaw(page: Page, status: number, rawBody: string) {
+	await page.evaluate(({ status, rawBody }) => {
+		window.__abandonment.releaseRaw(status, rawBody);
+	}, { status, rawBody });
+}
+
+async function releaseReject(page: Page) {
+	await page.evaluate(() => {
+		window.__abandonment.releaseReject();
+	});
+}
+
 for (const action of ACTIONS) {
-	for (const status of [200, 500, ...(action.name === 'pricing checkout' || action.path === '/account/security' ? [401] : [])]) {
+	// Qualifying security results (200/401) purge even when abandoned, so only
+	// the non-qualifying 500 keeps the preservation contract there. Pricing
+	// keeps its 401 branch (plan carry to signup); billing keeps 200/500.
+	const preservationStatuses = action.path === '/account/security'
+		? [500]
+		: action.name === 'pricing checkout' ? [200, 500, 401] : [200, 500];
+	for (const status of preservationStatuses) {
 		test(`${action.name}: abandoned ${status} cannot navigate or mutate replacement state`, async ({ page }) => {
 			const observed = await fixtures(page, action);
 			await begin(page, action);
@@ -253,6 +291,132 @@ for (const action of ACTIONS) {
 		expect(await page.evaluate(() => window.__abandonment.rejections)).toEqual([]);
 		expect(observed.pageErrors).toEqual([]);
 		expect(observed.external).toEqual([]);
+	});
+}
+
+const SECURITY_ACTIONS = ACTIONS.filter((action) => action.path === '/account/security');
+const PURGED_STATE = {
+	areas: [
+		{ context: null, scoped: null, legacy: null },
+		{ context: null, scoped: null, legacy: null }
+	],
+	email: null
+};
+
+for (const action of SECURITY_ACTIONS) {
+	for (const status of [200, 401]) {
+		test(`${action.name}: abandoned ${status} purges auth state but stays silent`, async ({ page }) => {
+			const observed = await fixtures(page, action);
+			await begin(page, action);
+			await clientNavigate(page, '/');
+			// Remount before release as well: the purge must happen, but the
+			// fresh instance must show no error, message or busy state.
+			await clientNavigate(page, action.path);
+			await expect(page.getByRole('button', { name: action.button })).toBeEnabled();
+			const seeded = await storedState(page);
+			// The seed survived both navigations: nothing purges on unmount.
+			expect(seeded.email).toBe('fixture@example.com');
+			expect(seeded.areas[0].context).toBe('abandonment-account');
+			observed.navigations.length = 0;
+			await page.evaluate(() => {
+				window.__abandonment.writes.length = 0;
+				window.__abandonment.broadcasts.length = 0;
+			});
+			await release(page, action, status);
+			// Bounded negative-observation window, not a request-arrival sleep:
+			// arrival and teardown were explicitly awaited before release.
+			await page.waitForTimeout(350);
+			// The qualifying result crossed the auth boundary: snapshots,
+			// context and the per-tab identity label are gone in both areas.
+			expect(await storedState(page)).toEqual(PURGED_STATE);
+			const probe = await page.evaluate(() => ({
+				writes: window.__abandonment.writes, broadcasts: window.__abandonment.broadcasts,
+				rejections: window.__abandonment.rejections, requests: window.__abandonment.requests
+			}));
+			// Purge plus the existing cross-tab transition broadcast happened...
+			expect(probe.writes).toContain('removeItem:nntune.library.auth-context.v1');
+			expect(probe.writes).toContain('removeItem:nntune:signed-in-email');
+			expect(probe.writes).toContain('setItem:nntune.library.auth-transition.v1');
+			// ...but the abandoned route wrote no UI, navigation or new transport.
+			expect.soft(probe.broadcasts, 'no BroadcastChannel relay').toEqual([]);
+			expect.soft(observed.external, 'no external navigation attempt').toEqual([]);
+			expect.soft(observed.navigations, 'no stale client navigation').toEqual([]);
+			expect.soft(new URL(page.url()).pathname).toBe(action.path);
+			expect.soft(probe.rejections).toEqual([]);
+			expect.soft(observed.pageErrors).toEqual([]);
+			expect.soft(probe.requests, 'exactly one security request, no retry').toHaveLength(1);
+			await expect.soft(page.getByRole('alert')).toHaveCount(0);
+			if (action.confirm) {
+				await expect.soft(page.getByText(/session expired before other devices/i)).toHaveCount(0);
+			}
+			await expect(page.getByRole('button', { name: action.button })).toBeEnabled();
+		});
+	}
+
+	test(`${action.name}: abandoned network failure purges nothing and stays silent`, async ({ page }) => {
+		const observed = await fixtures(page, action);
+		await begin(page, action);
+		await clientNavigate(page, '/');
+		await clientNavigate(page, action.path);
+		await expect(page.getByRole('button', { name: action.button })).toBeEnabled();
+		const before = await storedState(page);
+		expect(before.email).toBe('fixture@example.com');
+		observed.navigations.length = 0;
+		await page.evaluate(() => {
+			window.__abandonment.writes.length = 0;
+			window.__abandonment.broadcasts.length = 0;
+		});
+		await releaseReject(page);
+		await page.waitForTimeout(350);
+		// A transport failure confirms nothing about the session: no purge,
+		// no notification, no navigation, no error UI on the replacement page.
+		expect.soft(await storedState(page), 'snapshots and signed-in identity survive').toEqual(before);
+		const probe = await page.evaluate(() => ({
+			writes: window.__abandonment.writes, broadcasts: window.__abandonment.broadcasts,
+			rejections: window.__abandonment.rejections, requests: window.__abandonment.requests
+		}));
+		expect.soft(probe.writes, 'no stale storage write').toEqual([]);
+		expect.soft(probe.broadcasts, 'no stale cross-tab invalidation').toEqual([]);
+		expect.soft(observed.navigations, 'no stale client navigation').toEqual([]);
+		expect.soft(new URL(page.url()).pathname).toBe(action.path);
+		expect.soft(probe.rejections).toEqual([]);
+		expect.soft(observed.pageErrors).toEqual([]);
+		expect.soft(probe.requests).toHaveLength(1);
+		await expect.soft(page.getByRole('alert')).toHaveCount(0);
+		await expect(page.getByRole('button', { name: action.button })).toBeEnabled();
+	});
+
+	test(`${action.name}: abandoned 200 with a malformed body purges nothing`, async ({ page }) => {
+		const observed = await fixtures(page, action);
+		await begin(page, action);
+		await clientNavigate(page, '/');
+		await clientNavigate(page, action.path);
+		await expect(page.getByRole('button', { name: action.button })).toBeEnabled();
+		const before = await storedState(page);
+		expect(before.email).toBe('fixture@example.com');
+		observed.navigations.length = 0;
+		await page.evaluate(() => {
+			window.__abandonment.writes.length = 0;
+			window.__abandonment.broadcasts.length = 0;
+		});
+		// A raw 200 whose body rejects under the parsing contract is not a
+		// fulfilled success: it must not purge, notify, navigate or render.
+		await releaseRaw(page, 200, 'not-json{{{');
+		await page.waitForTimeout(350);
+		expect.soft(await storedState(page), 'snapshots and signed-in identity survive').toEqual(before);
+		const probe = await page.evaluate(() => ({
+			writes: window.__abandonment.writes, broadcasts: window.__abandonment.broadcasts,
+			rejections: window.__abandonment.rejections, requests: window.__abandonment.requests
+		}));
+		expect.soft(probe.writes, 'no stale storage write').toEqual([]);
+		expect.soft(probe.broadcasts, 'no stale cross-tab invalidation').toEqual([]);
+		expect.soft(observed.navigations, 'no stale client navigation').toEqual([]);
+		expect.soft(new URL(page.url()).pathname).toBe(action.path);
+		expect.soft(probe.rejections).toEqual([]);
+		expect.soft(observed.pageErrors).toEqual([]);
+		expect.soft(probe.requests).toHaveLength(1);
+		await expect.soft(page.getByRole('alert')).toHaveCount(0);
+		await expect(page.getByRole('button', { name: action.button })).toBeEnabled();
 	});
 }
 
