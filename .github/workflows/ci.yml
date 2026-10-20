@@ -757,6 +757,9 @@ jobs:
           cache: npm
           cache-dependency-path: e2e/package-lock.json
 
+      - name: Smoke checker self-tests (offline fixtures only)
+        run: node --test bin/test-smoke-acceptance.mjs
+
       - name: Install e2e dependencies
         working-directory: e2e
         run: npm ci
