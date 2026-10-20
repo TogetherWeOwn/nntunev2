@@ -88,7 +88,7 @@
 			<p>
 				Status: {data.subscription.status}
 				{#if data.subscription.currentPeriodEnd}
-					· renews {new Date(data.subscription.currentPeriodEnd).toLocaleDateString()}
+					· period ends {new Date(data.subscription.currentPeriodEnd).toLocaleDateString()}
 				{/if}
 				{#if data.subscription.trialEndsAt}
 					· trial ends {new Date(data.subscription.trialEndsAt).toLocaleDateString()}
@@ -104,6 +104,8 @@
 				<li>
 					Streaming: {(data.usage.streamSecondsMonth / 3600).toFixed(1)} / {plan.streamHoursMonth} hrs
 					<progress
+						aria-label="Monthly streaming usage"
+						aria-valuetext={`${(data.usage.streamSecondsMonth / 3600).toFixed(1)} of ${plan.streamHoursMonth} hours used this month`}
 						max={plan.streamHoursMonth * 3600}
 						value={Math.min(data.usage.streamSecondsMonth, plan.streamHoursMonth * 3600)}
 					>

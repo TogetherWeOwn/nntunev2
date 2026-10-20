@@ -59,11 +59,20 @@ run_self_tests() {
   # An exported shell function (not a PATH shim: some sandboxes manage PATH)
   # serves $SHIM_BODY_FILE with HTTP status $SHIM_HTTP_CODE.
   curl() {
-    local out="" want_out=0 arg
+    local out="" connect_timeout="" max_time="" retries="" prev="" arg
     for arg in "$@"; do
-      if [ "$want_out" = "1" ]; then out="$arg"; want_out=0; continue; fi
-      if [ "$arg" = "-o" ]; then want_out=1; fi
+      case "$prev" in
+        -o) out="$arg" ;;
+        --connect-timeout) connect_timeout="$arg" ;;
+        --max-time) max_time="$arg" ;;
+        --retry) retries="$arg" ;;
+      esac
+      prev="$arg"
     done
+    if [ "$connect_timeout" != "10" ] || [ "$max_time" != "30" ] || [ "$retries" != "3" ]; then
+      echo "curl shim: expected --connect-timeout 10 --max-time 30 --retry 3" >&2
+      return 2
+    fi
     cat "$SHIM_BODY_FILE" > "$out"
     printf '%s' "$SHIM_HTTP_CODE"
   }
@@ -136,7 +145,7 @@ fi
 
 resp="$(mktemp)"
 trap 'rm -f "$resp"' EXIT
-code="$(curl -sS -o "$resp" -w '%{http_code}' \
+code="$(curl -sS --connect-timeout 10 --max-time 30 --retry 3 -o "$resp" -w '%{http_code}' \
   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
   -H 'Content-Type: application/json' \
   "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/hyperdrive/configs/$CONFIG_ID")"

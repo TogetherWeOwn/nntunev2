@@ -67,8 +67,11 @@ async function loadOne<T>(read: () => Promise<T>): Promise<LoadOutcome<T>> {
 export const ssr = false;
 
 export const load: PageLoad = async ({ fetch }) => {
-	const sub = await loadOne(() => fetchSubscription(fetch));
-	const use = await loadOne(() => fetchUsage(fetch));
+	// Independent reads share one deadline window; loadOne keeps failures isolated.
+	const [sub, use] = await Promise.all([
+		loadOne(() => fetchSubscription(fetch)),
+		loadOne(() => fetchUsage(fetch))
+	]);
 
 	// A 404 on the subscription is a failure, not "no record yet": signup
 	// always writes a trialing row (ADR 0002 rule 4), so a missing record
@@ -104,11 +107,16 @@ export const load: PageLoad = async ({ fetch }) => {
 	} else {
 		if (subFailed)
 			notices.push('Could not load your subscription — showing trial defaults.');
-		else if (planUnknown && subscription)
+		else if (planUnknown && subscription) {
+			const unconfirmedTrial =
+				subscription.status === 'trialing' ||
+				(subscription.status === 'active' && subscription.planId === 'free');
 			notices.push(
-				`Subscription is ${subscription.status} — manage billing to resolve; showing trial limits meanwhile.`
+				unconfirmedTrial
+					? 'Your trial has ended or could not be confirmed — manage billing to confirm your plan; showing trial defaults.'
+					: `Subscription is ${subscription.status} — manage billing to resolve; showing trial limits meanwhile.`
 			);
-		else if (manageBillingOnly && subscription)
+		} else if (manageBillingOnly && subscription)
 			// Only reachable for in-grace past_due: every other lapsed state
 			// is planUnknown, and only past_due has a grace window. The plan
 			// is confirmed so no other notice renders, yet the failed payment
