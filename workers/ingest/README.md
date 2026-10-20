@@ -526,6 +526,17 @@ invocation is claimed here.
    before bulk redrive so a systemic cause does not re-poison the queue faster
    than it drains.
 
+## Search rate-limit burst check
+
+`scripts/search_rate_limit_burst.sh` sends 11 identical Newznab search requests
+and prints HTTP status codes and `Retry-After` headers to inspect the default
+ten-request throttle (the last request should return 429). Set `INGEST_URL`
+to a local or isolated staging ingest worker; **never point this script at
+production**. Each request has a 10-second connect timeout and a 30-second total
+timeout. Requests are not retried: replaying 429/503 responses would change the
+burst count and hide the observed throttle result. Transport failures stop the
+probe; rerun it explicitly after checking the local/staging worker.
+
 ## Develop
 
 ```sh
