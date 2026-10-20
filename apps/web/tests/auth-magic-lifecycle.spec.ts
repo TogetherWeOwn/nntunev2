@@ -277,12 +277,12 @@ test('missing-token error branch puts focus on its heading or alert', async ({ p
 	await expectBranchFocus(page);
 });
 
-test('confirm to working moves focus off the removed confirm button', async ({ page }) => {
+test('confirm to working moves focus to a stable branch entry target', async ({ page }) => {
 	await deferRequest(page, '/v1/auth/magic/finish', 200);
 	await page.goto(MAGIC_URL);
 	await page.getByRole('button', { name: /sign in with this link/i }).click();
 	await waitForRequest(page);
-	await expect(page.getByRole('status')).toContainText(/signing you in/i);
+	await expect(page.getByRole('status').filter({ hasText: /signing you in/i })).toBeVisible();
 	await expectBranchFocus(page);
 });
 
