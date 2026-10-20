@@ -440,12 +440,12 @@ export class ApiClient {
 	 * The API validates (SSRF guard), dials, and returns a redacted result —
 	 * secrets never come back in the response.
 	 */
-	async testProviderConnection(input: ProviderTestInput): Promise<ProviderTestResult> {
+	async testProviderConnection(input: ProviderTestInput, retry?: () => void): Promise<ProviderTestResult> {
 		const { data, status } = await this.requestWithStatus<unknown>('/v1/vault/test', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify(toVaultSaveBody(input))
-		});
+		}, retry);
 		return validateVaultTestResult(data, status);
 	}
 
@@ -464,7 +464,8 @@ export class ApiClient {
 
 	private async requestWithStatus<T>(
 		path: string,
-		init: RequestInit
+		init: RequestInit,
+		retry?: () => void
 	): Promise<{ data: T; status: number }> {
 		const headers: Record<string, string> = {
 			...((init.headers as Record<string, string> | undefined) ?? {}),
@@ -513,7 +514,7 @@ export class ApiClient {
 					/* non-JSON error body: use status-based defaults */
 				}
 				const parsed = parseErrorBody(body, response.status);
-				const paywall = paywallFromResponse({ status: response.status, headers: response.headers, body });
+				const paywall = paywallFromResponse({ status: response.status, headers: response.headers, body }, retry);
 				throw new ApiError(response.status, parsed.code, parsed.message, paywall, parsed.retryable);
 			}
 			try {
