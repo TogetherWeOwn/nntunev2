@@ -182,7 +182,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
     });
     match settle_do_reply(fetch, deadline).await {
         Ok((status, bytes)) => json_response(status, bytes),
-        Err(fault) => fault_response(&fault),
+        Err(_) => fault_response(&ApiFault::new(503, "repair_unavailable")),
     }
 }
 
