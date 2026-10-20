@@ -168,6 +168,14 @@ def scratch_ownership(line, user_name, owned):
         "done", "case", "esac", "in", "exit", "exec", "return", "eval", ".",
     } for _, cmd in commands):
         return False
+    # Shell interpreters reparse quoted data; traps may run AFTER a later
+    # textual grant. Reject the entire RUN instead of folding those effects
+    # in source order. Check every word's basename to catch paths and prefixes
+    # (env, command, assignments, busybox). Even inert mentions fail closed.
+    if any(posixpath.basename(word) in {
+        "sh", "bash", "dash", "ash", "ksh", "zsh", "su", "trap", "eval",
+    } for _, cmd in commands for word in cmd):
+        return False
     last_segment = commands[-1][0] if commands else -1
     for segment, cmd in commands:
         # Only the final &&-list must execute AND succeed in a green build.
@@ -697,6 +705,32 @@ chown-alias-not-grant	1	RUN chown root /scratch; chown repair /scratch/.
 chown-wrapper-not-grant	1	RUN chown root /scratch; env chown repair /scratch
 chown-regrant-after-wrapper	0	RUN env chown root /scratch; chown repair /scratch
 chown-regrant-after-alias	0	RUN chown root /scratch/.; chown repair /scratch
+chown-revoke-shell-single-quoted	1	RUN sh -c 'chown root /scratch'
+chown-revoke-shell-double-quoted	1	RUN sh -c "chown root /scratch"
+chown-revoke-bash-script	1	RUN bash -c 'chown root /scratch'
+chown-revoke-dash-script	1	RUN dash -c 'chown root /scratch'
+chown-revoke-su-script	1	RUN su -c 'chown root /scratch'
+chown-revoke-shell-same-run	1	RUN chown repair /scratch && sh -c 'chown root /scratch'
+chown-revoke-shell-path	1	RUN /bin/sh -c 'chown root /scratch'
+chown-revoke-shell-env-prefix	1	RUN env /bin/sh -c 'chown root /scratch'
+chown-revoke-shell-command-prefix	1	RUN command sh -c 'chown root /scratch'
+chown-revoke-shell-assignment-prefix	1	RUN FOO=bar sh -c 'chown root /scratch'
+chown-revoke-shell-busybox-prefix	1	RUN busybox sh -c 'chown root /scratch'
+chown-revoke-shell-quoted-name	1	RUN 'sh' -c 'chown root /scratch'
+chown-revoke-shell-adjacent-semicolon	1	RUN sh -c 'true;chown root /scratch'
+chown-revoke-shell-parenthesized	1	RUN sh -c '(chown root /scratch)'
+chown-revoke-shell-regrant-same-run	1	RUN sh -c 'chown root /scratch'; chown repair /scratch
+chown-revoke-trap-after-grant	1	RUN chown repair /scratch && trap 'chown root /scratch' EXIT
+chown-revoke-trap-before-grant	1	RUN trap 'chown root /scratch' EXIT; chown repair /scratch
+chown-revoke-trap-before-grant-chain	1	RUN trap "chown root /scratch" 0 && chown repair /scratch
+chown-revoke-trap-later-run	1	RUN trap 'chown root /scratch' EXIT
+chown-revoke-trap-adjacent-semicolon	1	RUN trap 'true;chown root /scratch' EXIT; chown repair /scratch
+chown-revoke-trap-command-prefix	1	RUN command trap 'chown root /scratch' EXIT; chown repair /scratch
+chown-revoke-eval-command-prefix	1	RUN command eval 'chown root /scratch'
+chown-revoke-nested-shell	1	RUN sh -c "trap 'chown root /scratch' EXIT"
+chown-revoke-unsupported-ash	1	RUN ash -c 'chown root /scratch'
+chown-revoke-unsupported-ksh	1	RUN ksh -c 'chown root /scratch'
+chown-revoke-unsupported-zsh	1	RUN zsh -c 'chown root /scratch'
 ORDER_EOF
 
   fixture chown-revoke-workdir-dot.Dockerfile <<'FIXTURE_EOF'
@@ -725,6 +759,16 @@ RUN true && chown repair /scratch
 USER repair
 FIXTURE_EOF
   run_case "revoke-then-grant-later-run" 0 "$selftest_tmp/revoke-then-grant-later-run.Dockerfile"
+
+  # Unsupported RUNs clear proof, but cannot install traps into a later RUN.
+  while IFS=$'\t' read -r name instruction; do
+    printf 'FROM scratch AS runtime\n%s\nRUN chown repair /scratch\nUSER repair\n' "$instruction" \
+      > "$selftest_tmp/$name.Dockerfile"
+    run_case "$name" 0 "$selftest_tmp/$name.Dockerfile"
+  done <<'RESTORE_EOF'
+chown-regrant-next-run-after-shell	RUN sh -c 'chown root /scratch'
+chown-regrant-next-run-after-trap	RUN trap 'chown root /scratch' EXIT
+RESTORE_EOF
 
   fixture escape-backslash-valid.Dockerfile <<'FIXTURE_EOF'
 # escape=\
