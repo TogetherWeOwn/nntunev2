@@ -6,6 +6,7 @@ async function openPlayer(page: Page) {
 	await page.addInitScript(() => {
 		sessionStorage.removeItem('nntune:demo-queue:v1');
 		const control = {
+			playCalls: 0,
 			mode: 'pending',
 			resolve: () => {},
 			reject: () => {},
@@ -13,6 +14,7 @@ async function openPlayer(page: Page) {
 		};
 		Object.assign(window, { __lifecycle: control });
 		HTMLMediaElement.prototype.play = function () {
+			control.playCalls += 1;
 			if (control.mode === 'reject') return Promise.reject(new Error('private decoder details'));
 			if (control.mode === 'resolve') return Promise.resolve();
 			return new Promise<void>((resolve, reject) => {
@@ -123,6 +125,115 @@ test('native play on a failed resource uses explicit recovery instead of hiding 
 	expect(await failed!.evaluate((el) => el.isConnected)).toBe(false);
 	await settle(page, 'resolve');
 	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+});
+
+async function mediaAction(page: Page, action: 'play' | 'pause') {
+	await page.evaluate((name) => {
+		const control = (window as unknown as { __lifecycle: { handlers: Map<string, () => void> } }).__lifecycle;
+		const handler = control.handlers.get(name);
+		if (!handler) throw new Error(`missing Media Session ${name} handler`);
+		handler();
+	}, action);
+}
+
+async function playCalls(page: Page) {
+	return page.evaluate(() => (window as unknown as { __lifecycle: { playCalls: number } }).__lifecycle.playCalls);
+}
+
+async function naturalEnd(page: Page) {
+	await page.getByTestId('demo-audio').evaluate((el) => {
+		// Browser end-of-media steps set both flags, then fire pause before ended.
+		Object.defineProperty(el, 'paused', { value: true, configurable: true });
+		Object.defineProperty(el, 'ended', { value: true, configurable: true });
+		el.dispatchEvent(new Event('pause'));
+		el.dispatchEvent(new Event('ended'));
+	});
+}
+
+test('natural pause-before-ended advances each track and ends the queue', async ({ page }) => {
+	await openPlayer(page);
+	await page.getByTestId('queue-select-demo-track').click();
+	await settle(page, 'resolve');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+	for (const title of ['Second Signal', 'Third Light']) {
+		await naturalEnd(page);
+		await expect(page.getByTestId('now-playing')).toContainText(title);
+		await expect(page.getByTestId('player-status')).toHaveText('Status: loading');
+		await settle(page, 'resolve');
+		await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+	}
+	await naturalEnd(page);
+	await expect(page.getByTestId('player-status')).toHaveText('Status: ended');
+	await expect(page.getByTestId('now-playing')).toContainText('Third Light');
+	await expect.poll(() => playCalls(page)).toBe(3);
+	await mediaAction(page, 'pause');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: ended');
+});
+
+test('Media Session play resumes once after pause and reloads once after failure', async ({ page }) => {
+	await openPlayer(page);
+	await page.getByTestId('queue-select-demo-track').click();
+	await settle(page, 'resolve');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+	const original = await page.getByTestId('demo-audio').elementHandle();
+	// Ordinary native pause (ended=false) must still pause the transport.
+	await event(page, 'pause');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: paused');
+	await mediaAction(page, 'play');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: loading');
+	await expect.poll(() => playCalls(page)).toBe(2);
+	expect(await original!.evaluate((el) => el.isConnected)).toBe(true);
+	await settle(page, 'resolve');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+	await event(page, 'error');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: error');
+	await mediaAction(page, 'play');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: loading');
+	await expect.poll(() => playCalls(page)).toBe(3);
+	expect(await original!.evaluate((el) => el.isConnected)).toBe(false);
+	await settle(page, 'resolve');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+	await expect(page.getByTestId('player-error')).toHaveCount(0);
+});
+
+test('Media Session pause preserves the error alert and explicit retry', async ({ page }) => {
+	await openPlayer(page);
+	await page.getByTestId('queue-select-demo-track').click();
+	await settle(page, 'reject');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: error');
+	await mediaAction(page, 'pause');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: error');
+	await expect(page.getByRole('alert')).toBeVisible();
+	await expect(page.getByTestId('player-retry')).toBeVisible();
+	await expect.poll(() => playCalls(page)).toBe(1);
+});
+
+test('seek readiness never replaces an active transport state', async ({ page }) => {
+	await openPlayer(page);
+	// Keep media loads pending, but let the independent seek controller use
+	// the local deterministic Range endpoint rather than the held audio route.
+	await page.route('**/api/demo/audio', (route) => route.continue());
+	await page.getByTestId('queue-select-second-signal').click();
+	await expect(page.getByTestId('player-status')).toHaveText('Status: loading');
+	for (const state of ['loading', 'playing', 'paused', 'error', 'ended', 'empty'] as const) {
+		if (state === 'playing') await settle(page, 'resolve');
+		if (state === 'paused') await event(page, 'pause');
+		if (state === 'error') await event(page, 'error');
+		if (state === 'ended') {
+			await page.getByTestId('queue-select-third-light').click();
+			await settle(page, 'resolve');
+			await naturalEnd(page);
+		}
+		if (state === 'empty') await page.getByTestId('queue-clear').click();
+		await expect(page.getByTestId('player-status')).toHaveText(`Status: ${state}`);
+		const result = await page.evaluate(async () => {
+			if (!window.__seekStorm) throw new Error('seek storm hook missing');
+			return window.__seekStorm();
+		});
+		expect(result).toEqual({ completed: 2, aborted: 9, lastBytes: 100 });
+		await expect(page.getByTestId('seek-stats')).toHaveText('completed 2, aborted 9, last 100 bytes');
+		await expect(page.getByTestId('player-status')).toHaveText(`Status: ${state}`);
+	}
 });
 
 test('render synthetic transport states at desktop and mobile sizes', async ({ page }, testInfo) => {

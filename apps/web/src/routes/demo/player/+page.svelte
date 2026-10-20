@@ -97,6 +97,9 @@
 	}
 
 	function handlePause(event: Event): void {
+		// Natural completion fires pause before ended; let handleEnded advance
+		// the queue instead of treating that pause as a newer user intent.
+		if ((event.currentTarget as HTMLAudioElement).ended) return;
 		if (eventForCurrent(event) && (status === 'loading' || status === 'playing')) pauseCurrent();
 	}
 
