@@ -512,3 +512,96 @@ describe("retained contract", () => {
     assert.equal((await runCli(["--help"])).code, 0);
   });
 });
+
+describe("HTTP response guards", () => {
+  // Otherwise valid bodies isolate the status guard from parsing,
+  // exact-shape and HTML-marker checks. Every other route stays happy.
+  for (const { kind, path, type, body } of [
+    { kind: "JSON", path: "/api/health", type: "application/json", body: '{"ok":true,"version":"1"}' },
+    { kind: "HTML", path: "/login", type: "text/html", body: "<html><body>Sign in</body></html>" },
+  ]) {
+    it(`rejects HTTP 500 ${kind} despite an otherwise valid body`, async () => {
+      await withFixture(
+        {
+          [path]: (req, res) => {
+            res.writeHead(500, { "content-type": type, "content-length": Buffer.byteLength(body) });
+            res.end(body);
+          },
+        },
+        async ({ base, hits }) => {
+          const { lines, log } = captureLog();
+          const failures = await smoke(base, { log, timeoutMs: 2_000 });
+          assert.equal(failures, 1, `only ${path}'s HTTP 500 must fail: ${lines.join("\n")}`);
+          assert.ok(!lines.some((l) => l.startsWith("smoke ok")), lines.join("\n"));
+          assert.equal(hits.length, 8, "every route must still be attempted once");
+          assert.equal(new Set(hits.map((h) => h.path)).size, 8);
+        },
+      );
+    });
+  }
+
+  // These aliases would pass their original routes' content checks if
+  // followed. A redirect to another probe route can fail for the wrong
+  // shape even when manual redirect handling has regressed.
+  for (const { kind, path, alias, type, body } of [
+    {
+      kind: "JSON",
+      path: "/api/health",
+      alias: "/health-alias",
+      type: "application/json",
+      body: '{"ok":true,"version":"1"}',
+    },
+    {
+      kind: "HTML",
+      path: "/login",
+      alias: "/login-alias",
+      type: "text/html",
+      body: "<html><body>Sign in</body></html>",
+    },
+  ]) {
+    it(`rejects ${kind} redirects without fetching a valid-content alias`, async () => {
+      await withFixture(
+        {
+          [path]: (req, res) => {
+            res.writeHead(302, { location: alias });
+            res.end();
+          },
+          [alias]: (req, res) => {
+            res.writeHead(200, { "content-type": type, "content-length": Buffer.byteLength(body) });
+            res.end(body);
+          },
+        },
+        async ({ base, hits }) => {
+          const { lines, log } = captureLog();
+          const failures = await smoke(base, { log, timeoutMs: 2_000 });
+          assert.equal(hits.filter((h) => h.path === path).length, 1, `${path} must be attempted once`);
+          assert.equal(hits.filter((h) => h.path === alias).length, 0, `${alias} must never be fetched`);
+          assert.equal(failures, 1, `only ${path}'s redirect must fail: ${lines.join("\n")}`);
+          assert.ok(!lines.some((l) => l.startsWith("smoke ok")), lines.join("\n"));
+          assert.equal(hits.length, 8, "every original route must still be attempted once");
+          assert.equal(new Set(hits.map((h) => h.path)).size, 8);
+        },
+      );
+    });
+  }
+
+  it("rejects a small HTTP 200 login page without the Sign in marker", async () => {
+    const body = "<html><body>Welcome</body></html>";
+    await withFixture(
+      {
+        "/login": (req, res) => {
+          res.writeHead(200, { "content-type": "text/html", "content-length": Buffer.byteLength(body) });
+          res.end(body);
+        },
+      },
+      async ({ base, hits }) => {
+        const { lines, log } = captureLog();
+        const failures = await smoke(base, { log, timeoutMs: 2_000 });
+        assert.equal(failures, 1, `only /login's missing marker must fail: ${lines.join("\n")}`);
+        assert.ok(!lines.some((l) => l.startsWith("smoke ok")), lines.join("\n"));
+        assert.equal(hits.length, 8, "every route must still be attempted once");
+        assert.equal(new Set(hits.map((h) => h.path)).size, 8);
+      },
+    );
+  });
+});
