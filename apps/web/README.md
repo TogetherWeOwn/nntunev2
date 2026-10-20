@@ -48,15 +48,32 @@ of scope here (tracked separately as Wasm enforcement).
 
 The tracked Wrangler config is [`wrangler.toml`](wrangler.toml) in this
 directory (staging/production names, no backend bindings or secret values).
-[`.github/workflows/deploy.yml`](../../.github/workflows/deploy.yml) is
-web-only: a push to `main` deploys `apps/web` to staging and pull requests
-get previews, gated on the `CLOUDFLARE_API_TOKEN` and
-`CLOUDFLARE_ACCOUNT_ID` GitHub Actions secrets (names only; the full account
-ID stays private by repo policy). That workflow does not deploy the backend
-Workers under `workers/`; backend binding activation, migrations, health and
-rollback acceptance are still outstanding — see the
-[operations runbook](../../docs/ops.md). Locally,
-`pnpm --dir apps/web preview` serves the production build.
+[`.github/workflows/deploy.yml`](../../.github/workflows/deploy.yml) runs
+`staging-web` on pushes to `main` and `preview-web` on pull requests. Its
+`gate` job checks for `CLOUDFLARE_API_TOKEN`; deploys also require the
+`CLOUDFLARE_ACCOUNT_ID` secret (names only; the full account ID stays private).
+`post-deploy-e2e` follows a successful `staging-web`, not `staging-api`.
+
+The same push runs the staging-only API Worker lane, `staging-api`, behind
+that token gate. API deploy steps skip unless all public Actions variables
+`HYPERDRIVE_ID_STAGING`, `API_RP_ID_STAGING` and `API_RP_ORIGIN_STAGING` are
+present. A configured deploy requires the fail-closed
+`workers/api/check_hyperdrive_cache.sh` gate (no `--allow-skip`), a canonical
+HTTPS origin matching the RP ID, and Hyperdrive staging-inventory parity.
+The generated API config sets `HYPERDRIVE_CACHING_DISABLED=1` only after the
+cache gate passes, and the deploy passes public `BUILD_SHA`.
+
+Lane existence or overall workflow success — even a successful `staging-api`
+job whose deploy steps skipped — is not a non-skipped API deploy or proof of
+exact-build health, activation or rollback. Follow the
+[per-Worker evidence contract](../../docs/ops.md#future-worker-deploy-lanes-required-rollback-evidence)
+alongside the [web staging checklist](../../docs/ops.md#staging-promotion-checklist).
+Operator-owned staging configuration and Worker-secret wiring, authorized
+Access credential injection, and backend binding activation, migrations,
+health and rollback acceptance remain outstanding. The other backend Workers
+(`ingest`, `stream`, `mb`, `repair`) still have no deploy lanes; production
+promotion remains separate and gated. See the [operations runbook](../../docs/ops.md).
+Locally, `pnpm --dir apps/web preview` serves the production build.
 
 Never commit secrets. `HYPERDRIVE_ID_STAGING`, `HYPERDRIVE_ID_PROD` and
 `HYPERDRIVE_ID_MB` are non-credential GitHub Actions **variables**, not
