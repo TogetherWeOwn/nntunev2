@@ -1,17 +1,18 @@
 //! Rotation grace-window drills at the core-function level.
 //!
-//! Synthetic walk of the rotation ceremony against the exact functions the
-//! Worker calls (`vault::rewrap_dek`, `session::verify_session_dual`): KEK
-//! reads stay green across the write flip, the re-wrap migrates the DEK
-//! only, and session tokens minted under the previous secret authenticate
-//! inside the window and die generically once it ends. All keys are
-//! synthetic fills, never real secrets.
+//! Synthetic walk of the rotation ceremony through the functions that run
+//! it (`vault::rewrap_dek` for the re-wrap pass, `session::verify_session_dual`
+//! on the request path): KEK reads stay green across the write flip, the
+//! re-wrap migrates the DEK only, and session tokens minted under the
+//! previous secret authenticate inside the window and die generically once
+//! it ends. All keys are synthetic fills, never real secrets.
 //!
-//! Owned elsewhere, not re-pinned here:
+//! Owned elsewhere (recur here only as drill controls):
 //! - Re-wrap SQL contract, claim races and runbook text
 //!   (`kek_rotation_acceptance.rs`).
 //! - In-window session auth, refresh migration onto the primary and the
-//!   HTTP envelopes (401 + generic bodies) — the HTTP fixtures.
+//!   HTTP envelopes (401 + generic bodies) — the HTTP acceptance fixtures
+//!   (`pr30_findings_acceptance.rs`).
 //! - Secret length floors and steady-state single-key paths
 //!   (`session_secret_floor_acceptance.rs`, session unit tests).
 //!
@@ -128,12 +129,13 @@ fn session_rotation_window_end_old_tokens_already_dead() {
     session::verify_session_dual(&single, &new_token, NOW + 60)
         .expect("primary-signed token verifies while the window is open");
 
-    // After window_end (created_at + MAX_SESSION_SECS) the old token is dead
-    // under BOTH secrets, and the same-age primary-signed token dies with
-    // it: this death is ordinary expiry, not previous-key removal. Every
-    // failure is the generic `invalid session`; the HTTP layer maps that to
-    // a 401 with the generic auth envelope — never a 500, never a reason
-    // oracle. HTTP behavior itself is pinned by the HTTP fixtures, not here.
+    // After window_end (created_at + MAX_SESSION_SECS + skew) the old token
+    // is dead under BOTH secrets, and the same-age primary-signed token
+    // dies with it. The TTL (3600s) expires first, so this death is ordinary
+    // expiry, not previous-key removal. Every failure is the generic
+    // `invalid session`; the HTTP layer maps that to a 401 with the generic
+    // auth envelope — never a 500, never a reason oracle. HTTP behavior
+    // itself is pinned by the HTTP fixtures, not here.
     let after_window = NOW + session::MAX_SESSION_SECS + session::CLOCK_SKEW_SECS + 1;
     for err in [
         session::verify_session_dual(&window, &old_token, after_window).unwrap_err(),
