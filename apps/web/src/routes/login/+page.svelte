@@ -51,8 +51,9 @@
 	async function signInWithPasskey() {
 		if (passkeyStatus === 'working') return;
 		if (attempt.signal.aborted) return;
-		if (!emailInput?.reportValidity() || email.trim().length === 0) {
-			passkeyStatus = email.trim().length === 0 ? 'email-required' : 'idle';
+		const attemptedEmail = email.trim();
+		if (!emailInput?.reportValidity() || attemptedEmail.length === 0) {
+			passkeyStatus = attemptedEmail.length === 0 ? 'email-required' : 'idle';
 			emailInput?.focus();
 			return;
 		}
@@ -65,7 +66,7 @@
 			// Email-first login: the API answers the same shape for known
 			// and unknown addresses (never an oracle) with an empty
 			// allow-list, and the browser offers any local credential.
-			const options = await client.loginStart(email.trim(), attempt.signal);
+			const options = await client.loginStart(attemptedEmail, attempt.signal);
 			if (attempt.signal.aborted) return;
 			const assertion = await navigator.credentials.get({
 				signal: attempt.signal,
@@ -105,7 +106,7 @@
 				attempt.signal
 			);
 			if (attempt.signal.aborted) return;
-			stashSignedInEmail(email.trim());
+			stashSignedInEmail(attemptedEmail);
 			invalidateLibraryCache();
 			window.location.href = '/onboarding/provider';
 		} catch (error) {
@@ -173,7 +174,7 @@
 					autocomplete="email"
 					bind:this={emailInput}
 					bind:value={email}
-					disabled={status === 'sending'}
+					disabled={status === 'sending' || passkeyStatus === 'working'}
 				/>
 			</label>
 			<button class="nt-button nt-button--ghost" type="submit" disabled={status === 'sending'}>
