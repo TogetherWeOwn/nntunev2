@@ -1177,13 +1177,24 @@ test.describe('locked-dependency ci builds (static pin)', () => {
   // never strip quoted strings wholesale, since double quotes can execute
   // $(cargo ...) and backticks. Ambiguous forms remain fail-closed.
   const stripTrailingComment = (line: string): string => {
-    type Context = { quote?: "'" | '"'; end?: ')' | '`'; depth: number; wordStart: boolean };
+    type Context = { quote?: "'" | '"' | 'ansi-c'; end?: ')' | '`'; depth: number; wordStart: boolean };
     const contexts: Context[] = [{ depth: 0, wordStart: true }];
     for (let index = 0; index < line.length; index += 1) {
       const char = line[index]!;
       const context = contexts[contexts.length - 1]!;
       if (context.quote === "'") {
         if (char === "'") context.quote = undefined;
+        continue;
+      }
+      if (context.quote === 'ansi-c') {
+        if (char === '\\') index += 1;
+        else if (char === "'") context.quote = undefined;
+        continue;
+      }
+      if (context.quote !== '"' && char === '$' && line[index + 1] === "'") {
+        context.quote = 'ansi-c';
+        context.wordStart = false;
+        index += 1;
         continue;
       }
       if (char === '\\') {
@@ -1419,6 +1430,9 @@ test.describe('locked-dependency ci builds (static pin)', () => {
       (command) => `${String.raw`echo 'step \ #2'`} && ${command}`,
       (command) => `${String.raw`echo step \#2`} && ${command}`,
       (command) => `${String.raw`echo step\ #2`} && ${command}`,
+      // ANSI-C quotes allow escaped apostrophes; hashes later in the quoted
+      // word must not truncate the executed sibling on either policy side.
+      (command) => `${String.raw`echo $'step \' #2'`} && ${command}`,
       (command) => `echo step#2 && ${command}`,
       (command) => `echo "note; stage" && ${command}`,
       (command) => `echo 'note; stage' && ${command}`,
@@ -1433,12 +1447,12 @@ test.describe('locked-dependency ci builds (static pin)', () => {
         const apiCommand = `cargo test ${locked ? '--locked ' : ''}--manifest-path workers/api/Cargo.toml --doc`;
         const apiSibling = ciCode.replace(
           'cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets',
-          `cargo test --locked --manifest-path workers/api/Cargo.toml --lib && ${wrap(apiCommand)}`,
+          () => `cargo test --locked --manifest-path workers/api/Cargo.toml --lib && ${wrap(apiCommand)}`,
         );
         const mbCommand = `cargo test ${locked ? '--locked ' : ''}--manifest-path workers/mb/Cargo.toml --doc`;
         const mbSibling = ciCode.replace(
           'cargo test --manifest-path workers/mb/Cargo.toml --all-targets',
-          `cargo test --manifest-path workers/mb/Cargo.toml --lib && ${wrap(mbCommand)}`,
+          () => `cargo test --manifest-path workers/mb/Cargo.toml --lib && ${wrap(mbCommand)}`,
         );
         if (locked) {
           expect(() => assertApiLocked(apiSibling), wrap(apiCommand)).not.toThrow();
