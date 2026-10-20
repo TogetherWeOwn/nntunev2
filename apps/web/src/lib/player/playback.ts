@@ -16,6 +16,9 @@ export interface PlaybackDeps {
 	audio: () => AudioLike | null | undefined;
 	/** Resolves once the DOM reflects the latest state (Svelte's `tick`). */
 	flush: () => Promise<void>;
+	/** Only the current attempt can report an outcome; never passes raw errors. */
+	onPlaybackFailure?: () => void;
+	onPlaybackStarted?: () => void;
 }
 
 export interface Playback {
@@ -26,7 +29,12 @@ export interface Playback {
 	unload(): Promise<void>;
 }
 
-export function createPlayback({ audio, flush }: PlaybackDeps): Playback {
+export function createPlayback({
+	audio,
+	flush,
+	onPlaybackFailure,
+	onPlaybackStarted
+}: PlaybackDeps): Playback {
 	// The latest intent wins: every operation bumps the transport
 	// generation, and an async continuation that wakes up under a newer
 	// generation is inert. Without this, a play awaiting flush would call
@@ -45,13 +53,17 @@ export function createPlayback({ audio, flush }: PlaybackDeps): Playback {
 			// that follows aborts it: the new track would load silent.
 			await flush();
 			if (intent !== latestIntent) return;
+			const element = audio();
+			if (!element) return;
 			try {
-				// Synthetic demo bytes may not decode in every engine; a rejected
-				// play() must never break queue navigation.
-				await audio()?.play();
+				await element.play();
 			} catch {
-				// Intentionally ignored.
+				// Navigation still resolves, but only the current attempt may
+				// expose a failure. A pause/source change often rejects old plays.
+				if (intent === latestIntent && element === audio()) onPlaybackFailure?.();
+				return;
 			}
+			if (intent === latestIntent && element === audio()) onPlaybackStarted?.();
 		},
 		pause() {
 			++latestIntent;

@@ -343,14 +343,14 @@ jobs:
         # always(): publishes ran/skipped/failed counts even when the journey
         # failed, and turns an all-skipped green run red. Skipped pre-deploy
         # (unconfigured staging produces no evidence by design). The skip
-        # budget covers exactly the two documented test.fixme legs (player
-        # queue order, recording_mbids); every other skip fails the job.
+        # budget covers only the remaining recording_mbids test.fixme;
+        # every other skip (including queue order) fails the job.
         # REQUIRE_QA_AUTH_TOKEN keeps a configured run red until the QA
         # test-account seam pair is provisioned (presence only, never values).
         if: always() && steps.staging.outputs.configured == 'true'
         working-directory: e2e
         env:
-          MAX_ALLOWED_SKIPS: '2'
+          MAX_ALLOWED_SKIPS: '1'
           REQUIRE_QA_AUTH_TOKEN: 'true'
           QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
         run: node scripts/enforce-journey-evidence.mjs

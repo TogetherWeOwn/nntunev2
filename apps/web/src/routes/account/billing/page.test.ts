@@ -298,6 +298,50 @@ describe('billing loader with an unconfirmed plan', () => {
 	});
 });
 
+describe('billing period-end wording', () => {
+	describe.each([
+		'active',
+		'trialing',
+		'past_due',
+		'canceled',
+		'incomplete',
+		'unpaid',
+		'paused',
+		'incomplete_expired'
+	] as const)('%s subscription', (status) => {
+		it.each(['2026-11-15T12:00:00Z', null])(
+			'shows only a neutral period end for %s',
+			async (currentPeriodEnd) => {
+				const trialEndsAt = status === 'trialing' ? '2099-11-01T12:00:00Z' : null;
+				const subscription = { ...PAID_SUBSCRIPTION, status, currentPeriodEnd, trialEndsAt };
+				const data = await loadPage(fetchWithSubscription(subscription));
+				const body = await renderPage(data);
+
+				expect(data.subscription).toEqual(subscription);
+				expect(body).toContain(`Status: ${status}`);
+				expect(body).not.toMatch(/renews/i);
+				if (currentPeriodEnd) {
+					expect(body).toContain(`period ends ${new Date(currentPeriodEnd).toLocaleDateString()}`);
+				} else {
+					expect(body).not.toContain('period ends');
+				}
+				if (trialEndsAt) {
+					expect(body).toContain(`trial ends ${new Date(trialEndsAt).toLocaleDateString()}`);
+				} else {
+					expect(body).not.toContain('trial ends');
+				}
+				const confirmed = status === 'active' || status === 'trialing';
+				expect(data.planUnknown).toBe(!confirmed);
+				expect(data.manageBillingOnly).toBe(!confirmed);
+				expect(data.usageStatus === null).toBe(!confirmed);
+				expect(body).toContain(confirmed ? 'Manage billing' : 'Manage billing to resolve');
+				expect(body.includes('Upgrade to pro-20x')).toBe(confirmed);
+				expect(body).not.toContain('Invalid Date');
+			}
+		);
+	});
+});
+
 describe('billing loader rejects malformed successful subscription payloads recoverably', () => {
 	it.each([
 		['empty object', {}],

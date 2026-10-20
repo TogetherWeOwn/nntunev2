@@ -32,9 +32,9 @@ The no-route Worker that fronts the par2 repair Container
   then is `out/result.json` written. Ingest receives a small status
   reply (`{status, exit_code, file_count}`); the full per-file
   result document stays in `out/result.json`.
-  (Sources: `src/contract.rs:209-212,227-251,264-271`
+  (Sources: `src/contract.rs:210-212,234-251,448-455`
   (`manifest_digest`, `plan`, `ingest_reply_body`);
-  `src/runtime.rs:164-260` (`stage_input`, `/repair` call,
+  `src/runtime.rs:284-319,369-457` (`stage_input`, `/repair` call,
   result-marker-last); `workers/ingest/src/verify.rs:270-277,2071-2083`
   — `staging_id` derived from content hashes.)
 - **Container isolation.** The Container is started with internet
@@ -59,8 +59,54 @@ confirmation and the deploy itself are operator actions. Until then
 finish a `Repairing` job (its consumer also remains disabled).
 (Sources: `wrangler.toml:11-13`;
 `workers/ingest/wrangler.toml.example:30-31,52-56`;
-`workers/ingest/src/repair.rs:105-143` (`call_repair`) — binding,
+`workers/ingest/src/repair.rs:158-227` (`call_repair`) — binding,
 transport and body-read failure is `Retry`, never a terminal outcome.)
+
+## Outer-hop deadlines
+
+The front-to-object call has a **600 s** total cutoff
+(`DO_REPAIR_DEADLINE_MS` in `src/runtime.rs`); ingest's service call has
+**660 s** (`REPAIR_CALL_DEADLINE_MS` in `workers/ingest/src/repair.rs`).
+Each timer is polled before dispatch and covers headers **and** the capped
+body until EOF. Partial headers/chunks do not replenish it. The settlement
+owns the cancellable `worker::Delay`, releasing it on success, transport or
+cap refusal, and expiry. Ingest tests can inject milliseconds through
+`call_repair_with_deadline`; both native settlement seams accept a controlled
+deadline future.
+
+These are finite cutoff policies, **not** worst-case capacity promises:
+
+- The child's **150 s** `/repair` exchange covers the synchronous par2 run
+  (default native wall limit 120 s) and its result read, **not** the rest of
+  the object round. The front allows another 450 s shared by manifest/result
+  reads, health, input staging, output relay, marker write and cleanup.
+- Transfer budgets are individually size-scaled (`10_000 + size / 1024`
+  milliseconds). Inputs are staged sequentially; outputs are relayed
+  sequentially. The 8 GiB input ceiling alone permits a single transfer
+  allowance of about 140 minutes. Health has 60 attempts, each with up to
+  a 10 s exchange and a 500 ms sleep (about 630 s total), not a hard 30 s
+  wall-clock ceiling. The outer cutoff can therefore expire while a round
+  is still within its individual resource limits.
+- The enclosing queue invocation contract is **900 s**. One 660 s wait
+  leaves 240 s for other work; this does **not** bound a serial batch of
+  messages. The example consumer's batch size of 10 must be reconciled
+  with that invocation contract before activation. This change leaves the
+  consumer disabled and changes no batching, retries or rollout gates.
+
+Expiry preserves the existing transient verdicts: `RepairCall::Retry` at
+ingest and 503 `repair_unavailable` at the front. Completed replies retain
+existing status classification and byte caps (64 KiB at ingest; 1 MiB at
+the front), without returning truncated prefixes. Synthetic tests drive
+pending headers, stalled/dribbling bodies, cap boundaries and later retries
+through the same settlement seams as the runtime adapters.
+
+**Local settlement is not remote cancellation evidence.** Dropping a Rust
+future and its timer does not prove that the remote Worker, object or
+Container stopped. A round may still complete and write its marker after
+the caller times out. Existing manifest-digest idempotency and
+result-marker-last ordering are unchanged; a later legitimate retry can
+replay a completed matching round without manufacturing terminal success.
+No real service bindings or Containers are exercised by these tests.
 
 ## Checks
 

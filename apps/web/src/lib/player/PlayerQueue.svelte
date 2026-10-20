@@ -18,7 +18,7 @@
 	The host page owns selection and transport (via `onnext`); the panel
 	itself never mutates state.
 -->
-<p data-testid="now-playing">
+<p data-testid="now-playing" role="status">
 	{#if current}
 		Now playing: {current.title}{#if current.artist} — {current.artist}{/if}
 	{:else}
@@ -35,7 +35,7 @@
 	Next
 </button>
 
-<ol>
+<ol aria-label="Playback queue">
 	<!-- Keyed by queue position. Uniqueness comes from the store: addTrack
 		dedupes and restoreQueue rejects duplicates. -->
 	{#each state.tracks as track, i (i)}
