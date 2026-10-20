@@ -18,6 +18,8 @@ const exact = {
 	maxLibraryTracks: 100,
 	ingestJobsDay: 10,
 	cachePriority: 'standard',
+	cacheBytesBudget: 21_474_836_480,
+	cacheRetentionDays: 30,
 	blurb: ''
 } satisfies Plan;
 

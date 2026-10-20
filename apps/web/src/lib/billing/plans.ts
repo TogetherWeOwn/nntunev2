@@ -23,6 +23,10 @@ export interface Plan {
 	maxLibraryTracks: number;
 	ingestJobsDay: number;
 	cachePriority: CachePriority;
+	/** Display-only cache budget in bytes (integer, GiB-denominated). Not enforcement. */
+	cacheBytesBudget: number;
+	/** Display-only cache retention in days. Not enforcement. */
+	cacheRetentionDays: number;
 	blurb: string;
 }
 
@@ -36,6 +40,8 @@ export const PLANS: Plan[] = [
 		maxLibraryTracks: 1000,
 		ingestJobsDay: 5,
 		cachePriority: 'low',
+		cacheBytesBudget: 2_147_483_648,
+		cacheRetentionDays: 7,
 		blurb: '14-day trial. Bring your own Usenet provider.'
 	},
 	{
@@ -47,6 +53,8 @@ export const PLANS: Plan[] = [
 		maxLibraryTracks: 25000,
 		ingestJobsDay: 25,
 		cachePriority: 'standard',
+		cacheBytesBudget: 21_474_836_480,
+		cacheRetentionDays: 30,
 		blurb: 'Base paid tier for everyday listening.'
 	},
 	{
@@ -58,6 +66,8 @@ export const PLANS: Plan[] = [
 		maxLibraryTracks: 100000,
 		ingestJobsDay: 100,
 		cachePriority: 'high',
+		cacheBytesBudget: 107_374_182_400,
+		cacheRetentionDays: 90,
 		blurb: '5x usage for heavy listeners and big libraries.'
 	},
 	{
@@ -69,6 +79,8 @@ export const PLANS: Plan[] = [
 		maxLibraryTracks: 500000,
 		ingestJobsDay: 400,
 		cachePriority: 'highest',
+		cacheBytesBudget: 429_496_729_600,
+		cacheRetentionDays: 90,
 		blurb: '20x usage for households and collectors.'
 	}
 ];
@@ -107,6 +119,19 @@ export function planButtonName(plan: Plan, pendingPlanId: string | null): string
 /** Stream cap in seconds (plans table stores hours). */
 export function streamCapSeconds(plan: Plan): number {
 	return plan.streamHoursMonth * 3600;
+}
+
+/** Bytes in one GiB; cache budgets are GiB-denominated display metadata. */
+export const GIB_BYTES = 1_073_741_824;
+
+/** Readable cache budget for the pricing table (e.g. "20 GiB"). Display-only. */
+export function formatCacheBudget(plan: Plan): string {
+	return `${plan.cacheBytesBudget / GIB_BYTES} GiB`;
+}
+
+/** Readable cache retention for the pricing table (e.g. "30 days"). Display-only. */
+export function formatCacheRetention(plan: Plan): string {
+	return `${plan.cacheRetentionDays} days`;
 }
 
 /**
