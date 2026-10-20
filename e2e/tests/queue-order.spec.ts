@@ -20,6 +20,12 @@ const journey = readFileSync(new URL('./player-queue-order.spec.ts', import.meta
 
 test.describe('queue-order journey wiring (offline)', () => {
   test('ingest resolves and uploads both single-file fixtures in the same account', () => {
+    // Two sequential 240s ingest waits must not inherit the old 300s test bound.
+    const serialAt = journey.indexOf("test.describe.serial('player queue follows library-selection order'");
+    const ingestAt = journey.indexOf("test('NZB fixture ingests and appears in the library'");
+    expect(serialAt).toBeGreaterThan(-1);
+    expect(ingestAt).toBeGreaterThan(serialAt);
+    expect(journey.slice(serialAt, ingestAt)).toContain('test.describe.configure({ timeout: 600_000 });');
     expect(journey).toContain('singleTrack: path.resolve(FIXTURES_DIR, SINGLE_TRACK_FIXTURE_FILE)');
     expect(journey).toContain('secondSingle: path.resolve(FIXTURES_DIR, SECOND_SINGLE_TRACK_FIXTURE_FILE)');
     expect(journey).toMatch(/resolveTwoTrackFixture\([\s\S]*?existsSync/);
