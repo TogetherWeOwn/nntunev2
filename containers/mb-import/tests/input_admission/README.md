@@ -60,7 +60,7 @@ process protocol legitimately changes.
   readable and nonempty but not a regular file, so only `-f` refuses it.
 - Sequence admission (11 invalid refused, 8 valid accepted): see the
   invalid/valid lists below.
-- Green controls (9): ordinary directories with spaces, same-dump skip,
+- Green controls (7): ordinary directories with spaces, same-dump skip,
   independent newer-dump hashes and forward-only upsert SQL, poison and
   FK-orphan COPY payloads with original raw bytes/line numbers, all-poison
   refusal on initial and completed paths, and deterministic
