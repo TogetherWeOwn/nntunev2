@@ -26,15 +26,13 @@
  *
  * Skip allow-list (each entry carries its reason). Only these skips are
  * accepted, and only up to MAX_ALLOWED_SKIPS of them:
- *   - "player queue advances in library-selection order": test.fixme in
- *     e2e/tests/player-queue-order.spec.ts (player queue order not implemented).
  *   - "ingested track carries recording_mbids": test.fixme in
  *     e2e/tests/ingest-play-meter.spec.ts (recording_mbids contract pending).
  *
  * Environment:
  *   JUNIT_PATH            junit evidence to parse (default: test-results/junit.xml,
  *                         relative to the e2e/ working directory in CI).
- *   MAX_ALLOWED_SKIPS     small allow-list budget (default: 2, the two fixmes above).
+ *   MAX_ALLOWED_SKIPS     small allow-list budget (default: 1, the fixme above).
  *   REQUIRE_QA_AUTH_TOKEN 'true' requires QA_AUTH_TOKEN to be set (journey job only;
  *                         the synthetic smoke does not use the account seam).
  *   QA_AUTH_TOKEN         checked for presence only — its value is never read,
@@ -48,7 +46,7 @@
 import { appendFileSync, readFileSync } from 'node:fs';
 
 const JUNIT_PATH = process.env.JUNIT_PATH ?? 'test-results/junit.xml';
-const MAX_ALLOWED_SKIPS = Number(process.env.MAX_ALLOWED_SKIPS ?? '2');
+const MAX_ALLOWED_SKIPS = Number(process.env.MAX_ALLOWED_SKIPS ?? '1');
 const REQUIRE_QA_AUTH_TOKEN = (process.env.REQUIRE_QA_AUTH_TOKEN ?? '') === 'true';
 const SUMMARY_PATH = process.env.GITHUB_STEP_SUMMARY || null;
 
@@ -58,11 +56,6 @@ const TAG = '[journey-gate]';
 // owning spec file AND match string, and each entry is consumed at most
 // once. Reasons live next to the entries so the budget is auditable.
 const ALLOWED_SKIPS = [
-  {
-    file: 'player-queue-order.spec.ts',
-    match: 'player queue advances in library-selection order',
-    reason: 'test.fixme in e2e/tests/player-queue-order.spec.ts (player queue order not implemented)',
-  },
   {
     file: 'ingest-play-meter.spec.ts',
     match: 'ingested track carries recording_mbids',
