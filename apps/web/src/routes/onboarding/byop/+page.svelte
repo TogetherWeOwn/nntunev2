@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { readSignedInEmail } from '#lib/signed-in-email.js';
 	import { serializePublicKeyCredential, toRequestOptions } from '#lib/webauthn.js';
@@ -51,6 +51,7 @@
 	let saveState = $state<'idle' | 'saving' | 'saved' | 'failed'>('idle');
 	let testedConfigKey = $state<string | null>(null);
 	let testRunId = 0;
+	onDestroy(() => { testRunId += 1; });
 
 	// Keep the wire payload honest: a TLS connection never carries the
 	// plaintext opt-in, so clear a stale acknowledgement when TLS is on.
@@ -125,7 +126,11 @@
 		testDetail = '';
 		reauthRequired = false;
 		try {
-			const result: ProviderTestResult = await client.testProviderConnection(input);
+			const result: ProviderTestResult = await client.testProviderConnection(input, () => {
+				// Only an explicit Retry may repeat this UI action, and never
+				// after navigation, changed input, or a newer test run.
+				if (runId === testRunId && inputKey === currentTestKey() && step === 3) void runTest();
+			});
 			if (runId !== testRunId || inputKey !== currentTestKey()) return;
 			// The response is a redacted summary: never echo credentials.
 			if (result.ok) {
