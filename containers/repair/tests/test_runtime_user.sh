@@ -40,6 +40,7 @@ check_dockerfile() {
     python3 - "$dockerfile" <<'PYEOF'
 import os
 import re
+import shlex
 import sys
 
 sys.path.insert(0, os.environ["PIN_DC_SCRIPTS"])
@@ -96,6 +97,88 @@ def parse_escape_directive(physical):
         if name == "escape":
             escape = match.group(2)
     return escape, None
+
+
+def grants_scratch(line, user_name):
+    """Recognize literal grants, not arbitrary shell programs or text mentions."""
+    instr = INSTR_RE.match(line)
+    keyword, value = instr.group(1).lower(), instr.group(2)
+
+    def matches_owner(owner):
+        return (
+            re.fullmatch(PLAIN_USER_RE, owner) is not None
+            and owner.partition(":")[0] == user_name
+        )
+
+    if keyword in ("copy", "add"):
+        # Shell-form COPY/ADD: flags precede sources and the final word is the
+        # destination. JSON form, expansions and duplicate --chown fail closed.
+        try:
+            words = shlex.split(value)
+        except ValueError:
+            return False
+        owners = []
+        while words and words[0].startswith("--"):
+            flag = words.pop(0)
+            if flag.startswith("--chown="):
+                owners.append(flag.removeprefix("--chown="))
+        return (
+            len(owners) == 1
+            and matches_owner(owners[0])
+            and len(words) >= 2
+            and words[-1] in ("/scratch", "/scratch/")
+            and not any(c in value for c in "$`[]\\")
+        )
+
+    # Preserve quotes until AFTER splitting command operators: an echo argument
+    # such as "&&" or ";" must never become a command boundary. Only literal
+    # simple commands joined by && or ; qualify. Pipelines, || (may skip chown),
+    # redirections, substitutions, control flow and exec-form RUN fail closed.
+    lexer = shlex.shlex(value, posix=False, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    commands, command = [], []
+    for token in tokens:
+        if token in ("&&", ";"):
+            if not command:
+                return False
+            commands.append(command)
+            command = []
+        elif (
+            re.fullmatch(r'''(?:[A-Za-z0-9_./:=+*?@%,-]+|'[^']*'|"[^"]*")''', token)
+            and not any(c in token for c in "$`\\")
+        ):
+            command.append(shlex.split(token)[0] if token else "")
+        else:
+            return False
+    if command:
+        commands.append(command)
+    elif tokens and tokens[-1] != ";":
+        return False
+    # These shell words can skip later commands or reinterpret quoted data.
+    if any(cmd[0] in {
+        "if", "then", "else", "elif", "fi", "for", "while", "until", "do",
+        "done", "case", "esac", "in", "exit", "exec", "return", "eval", ".",
+    } for cmd in commands):
+        return False
+    for cmd in commands:
+        if cmd[0] != "chown":
+            continue
+        args = cmd[1:]
+        if args and args[0] in ("-R", "--recursive"):
+            args = args[1:]
+        if args and args[0] == "--":
+            args = args[1:]
+        if (
+            len(args) == 2
+            and matches_owner(args[0])
+            and args[1] in ("/scratch", "/scratch/")
+        ):
+            return True
+    return False
 
 
 def scan(dockerfile):
@@ -243,16 +326,9 @@ def main():
     # The runtime user must own /scratch: the server stages inputs and writes
     # outputs under REPAIR_SCRATCH_DIR=/scratch, so a USER without /scratch
     # ownership breaks repairs at container runtime.
-    # Only RUN/COPY/ADD lines are scanned (a `# chown ... /scratch` remark or an
-    # ENV merely mentioning ownership never qualifies); inline remarks are
-    # stripped and /scratch is anchored with a boundary so /scratchbery-style paths
-    # cannot satisfy the gate.
-    chown_pat = re.compile(
-        "chown.*" + re.escape(user_name) + r"[^\s]*.*/scratch([ \t\v\f\r/\"']|$)"
-    )
-    owned = any(
-        chown_pat.search(line.split("#", 1)[0]) for line in facts["stage_lines"]
-    )
+    # Only RUN/COPY/ADD lines are scanned; the grant must be a command with
+    # exact owner/path operands or a COPY/ADD --chown with exact destination.
+    owned = any(grants_scratch(line, user_name) for line in facts["stage_lines"])
     if not owned:
         print(
             f"FAIL: runtime stage grants '{user_name}' no /scratch ownership "
@@ -488,6 +564,46 @@ USER repair
 CMD ["x"]
 FIXTURE_EOF
   run_case "env-fake-chown" 1 "$selftest_tmp/env-fake-chown.Dockerfile"
+
+  # Ownership operands and shell command position, not chown-shaped text.
+  while IFS=$'\t' read -r name want instruction; do
+    printf 'FROM scratch AS runtime\n%s\nUSER repair\n' "$instruction" \
+      > "$selftest_tmp/$name.Dockerfile"
+    run_case "$name" "$want" "$selftest_tmp/$name.Dockerfile"
+  done <<'OWNERSHIP_EOF'
+chown-echo-text	1	RUN echo "chown -R repair:repair /scratch"
+chown-printf-text	1	RUN printf 'chown repair /scratch' > /entrypoint.sh
+chown-wrongpath-then-mention	1	RUN chown -R repair:repair /tmp && ls /scratch
+chown-subdir-only	1	RUN mkdir -p /scratch/sub && chown -R repair:repair /scratch/sub
+chown-owner-prefix	1	RUN chown -R xrepair:xrepair /scratch
+chown-owner-suffix	1	RUN chown -R repairx:repairx /scratch
+chown-quoted-and-argument	1	RUN echo "&&" chown repair /scratch
+chown-quoted-semicolon-argument	1	RUN echo ";" chown repair /scratch
+chown-quoted-command-text	1	RUN echo 'x; chown repair /scratch'
+chown-quoted-hash-comment	1	RUN echo "#" # chown repair /scratch
+chown-reference-option	1	RUN chown --reference=repair /scratch
+chown-reference-in-operand-position	1	RUN chown --reference=repair /tmp /scratch
+chown-scratch-suffix	1	RUN chown repair /scratchbery
+chown-skipped-or	1	RUN true || chown repair /scratch
+chown-control-flow	1	RUN if false; then chown repair /scratch; fi
+chown-exit-before-grant	1	RUN exit 0; chown repair /scratch
+chown-substitution	1	RUN echo "$(echo '; chown repair /scratch')"
+chown-missing-owner	1	RUN chown :repair /scratch
+chown-no-options	0	RUN chown repair /scratch
+chown-trailing-slash	0	RUN chown -R repair:repair /scratch/
+chown-quoted-operands	0	RUN chown 'repair:repair' "/scratch/"
+chown-semicolon	0	RUN mkdir -p /scratch; chown repair:repair /scratch;
+chown-recursive-end-options	0	RUN chown --recursive -- repair:repair /scratch
+chown-after-quoted-operator	0	RUN echo "&&" && chown repair:repair /scratch
+copy-chown-valid	0	COPY --chown=repair:repair source /scratch
+add-chown-valid	0	ADD --chown=repair source /scratch/
+copy-chown-quoted-valid	0	COPY --chown="repair:repair" source "/scratch/"
+copy-chown-other-owner	1	COPY --chown=xrepair:xrepair source /scratch
+copy-chown-subdir	1	COPY --chown=repair:repair source /scratch/sub
+copy-chown-source-not-destination	1	COPY --chown=repair:repair /scratch /tmp
+copy-chown-mention-not-flag	1	COPY chown-repair-/scratch /tmp
+copy-chown-duplicate	1	COPY --chown=repair --chown=root source /scratch
+OWNERSHIP_EOF
 
   fixture escape-backslash-valid.Dockerfile <<'FIXTURE_EOF'
 # escape=\
