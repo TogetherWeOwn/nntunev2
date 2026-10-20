@@ -163,14 +163,14 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> WorkerResult<Respon
             console_log!("repair DO call failed job={}: {:?}", parsed.job_id, error);
         })?;
         let status = response.status_code();
-        // Preserve Empty and materialised bodies as well as streamed ones.
-        // Check the materialised length BEFORE cloning; the common settlement
-        // applies the same cap check-before-extend to every streamed chunk.
+        // The shared reader preserves Empty and materialised bodies, checking
+        // the length BEFORE cloning. It runs inside this timed fetch future.
+        // Streamed bodies instead drain chunk-by-chunk in the settlement.
         let stream = match response.body() {
-            ResponseBody::Empty => futures_util::stream::empty().boxed_local(),
-            ResponseBody::Body(body) if body.len() > MAX_RESULT_BYTES => return Err(()),
-            ResponseBody::Body(body) => {
-                futures_util::stream::iter([Ok(body.clone())]).boxed_local()
+            ResponseBody::Empty | ResponseBody::Body(_) => {
+                let read = read_response_capped(&mut response, MAX_RESULT_BYTES);
+                let body = read.await?;
+                futures_util::stream::iter([Ok(body)]).boxed_local()
             }
             ResponseBody::Stream(_) => response
                 .stream()
