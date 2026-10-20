@@ -78,14 +78,14 @@
 //!   declaration against the child round it must outlast: one
 //!   object run is manifest/result reads + health + input staging
 //!   + the Container repair (`CONTAINER_REPAIR_DEADLINE_MS` =
-//!   150 s, which covers only the synchronous par2 call, NOT
-//!   staging) + output relay + cleanup, so the budget strictly
-//!   exceeds 150_000 with documented headroom for those stages and
-//!   the enclosing invocation; it is never the 10 s Container base
-//!   and never an unbounded placeholder (< 1 h). The exact value
-//!   is the implementer's documented choice; the relations are
-//!   pinned. Ingest's outer budget outlasting this one is pinned
-//!   in the ingest acceptance suite.
+//!     150 s, which covers only the synchronous par2 call, NOT
+//!     staging) + output relay + cleanup, so the budget strictly
+//!     exceeds 150_000 with documented headroom for those stages and
+//!     the enclosing invocation; it is never the 10 s Container base
+//!     and never an unbounded placeholder (< 1 h). The exact value
+//!     is the implementer's documented choice; the relations are
+//!     pinned. Ingest's outer budget outlasting this one is pinned
+//!     in the ingest acceptance suite.
 //!
 //! What this does NOT prove: dropping a Rust future locally does
 //! not prove the Durable Object or its Container cancelled the
