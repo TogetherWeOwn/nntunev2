@@ -688,7 +688,11 @@ jobs:
   # a PR that introduces breakage (source or target side) can go red;
   # external links are out of scope. The fixture pair proves the job goes
   # red on breakage: `match` must pass, `broken-file` / `broken-anchor`
-  # must fail. Keep this job id in ci-ok's needs.
+  # must fail. The same job also runs the citation lint: backticked
+  # `path:N` / `path:N-M` citations must resolve, stay in range, and land
+  # on their anchor symbols, with the same changed-file scope, whole-tree
+  # pin (so drift from a concurrent merge reds main), and fixture proofs.
+  # Keep this job id in ci-ok's needs.
   docs-links:
     name: docs-links
     runs-on: ubuntu-latest
@@ -740,6 +744,39 @@ jobs:
             # (TrimStart), so prefix with "| " instead of a space.
             printf '%s\n' "$output" | sed 's/^/| /'
             echo "docs-links: $fixture fixture correctly failed"
+          done
+      - name: Check citations in changed docs
+        run: python3 .github/scripts/docs_citation_lint.py --root . --base-ref "$DOCS_LINKS_BASE_REF"
+      - name: Run citation lint self-tests
+        run: python3 .github/scripts/test_docs_citation_lint.py
+      - name: Pin citation lint on whole tree
+        run: python3 .github/scripts/docs_citation_lint.py --root .
+      - name: Citation lint passes on the matching fixture
+        run: python3 .github/scripts/docs_citation_lint.py --root .github/scripts/fixtures/docs-citations/match
+      - name: Citation lint goes red on broken-citation fixtures
+        run: |
+          for fixture in broken-path broken-eof broken-order broken-symbol; do
+            case "$fixture" in
+              broken-path) expected="citation target does not resolve" ;;
+              broken-eof) expected="cited line out of range" ;;
+              broken-order) expected="invalid citation range" ;;
+              broken-symbol) expected="citation does not land on" ;;
+            esac
+            rc=0
+            output=$(python3 .github/scripts/docs_citation_lint.py \
+              --root ".github/scripts/fixtures/docs-citations/$fixture" 2>&1) || rc=$?
+            if [ "$rc" -ne 1 ] || ! printf '%s\n' "$output" | grep -Fq "docs-citations: $expected"; then
+              printf '%s\n' "$output" >&2
+              echo "docs-citations: $fixture must report '$expected' and exit 1, got $rc" >&2
+              exit 1
+            fi
+            # Neutralise workflow commands: the fixture output holds
+            # ::error lines for fixture-relative paths, which would post
+            # phantom annotations on a green job if echoed raw. The
+            # runner strips leading whitespace before matching "::"
+            # (TrimStart), so prefix with "| " instead of a space.
+            printf '%s\n' "$output" | sed 's/^/| /'
+            echo "docs-citations: $fixture fixture correctly failed"
           done
 
   # E2E harness static checks: typecheck + spec discovery with no staging

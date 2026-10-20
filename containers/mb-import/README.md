@@ -27,7 +27,7 @@ missing artist_type, release credit-name rows, track recording, medium
 release);
 the Dockerfile's test stage runs them during the normal image build without
 shipping fixtures in the runtime image. (Sources: `etl.sh:1-14`;
-`etl.py:141-160` (`DUMP_TS`, temp SQLite projection), `:319-335` (immutable
+`etl.py:148-160` (`DUMP_TS`, temp SQLite projection), `:319-335` (immutable
 snapshot + atomic `curated` swap, previous snapshots retained);
 `tests/test_etl.sh`; `Dockerfile:9-17,40-41`;
 `.github/workflows/ci.yml:298-313`.)
@@ -85,7 +85,7 @@ field order; use an extract from the matching schema revision. Derivations:
   validator poison (`negative_position`). (Sources: `etl.py:261-304`
   (canonical recording, membership rows); `migrations/0016_mb_track.sql`;
   `import.sh:316-321` (track FK specs);
-  `crates/mb-import-validate/src/lib.rs:263-267` (`Position` check).)
+  `crates/mb-import-validate/src/lib.rs:267-271` (`Position` check).)
 - Every row gets the single supplied `DUMP_TS`; no row-specific time is created.
   Missing inputs, wrong field counts, and non-empty entity input that projects
   to zero rows fail closed. (Sources: `etl.py:73-87` (missing input, field
@@ -116,7 +116,7 @@ a release/recording/track row whose parent was poisoned or never loaded
 `fk_missing_release` / `fk_missing_recording` instead of aborting the
 chunk. (Sources: `crates/mb-import-validate/src/lib.rs:63-76` (reason
 codes), `:270-349` (`bad_escape` rule);
-`crates/mb-import-validate/src/main.rs:122-135` (`invalid_encoding` on
+`crates/mb-import-validate/src/main.rs:128-135` (`invalid_encoding` on
 non-UTF-8 bytes); `import.sh:316-321,337-391`
 (FK orphan split); `migrations/0014_mb_import_resume_dlq.sql`;
 `migrations/0001_mb_mirror.sql:57-65`.)
