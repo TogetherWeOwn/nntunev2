@@ -75,7 +75,7 @@ async function fixtures(page: Page, action: Action, allowExternal = false) {
 	await page.route('**/v1/**', async (route) => {
 		const path = new URL(route.request().url()).pathname;
 		const body = path === '/v1/plans' ? { plans: PLANS }
-			: path === '/v1/me/subscription' ? { planId: 'free', status: 'active', currentPeriodEnd: null, trialEndsAt: null }
+			: path === '/v1/me/subscription' ? { planId: 'free', status: 'trialing', currentPeriodEnd: null, trialEndsAt: '2030-01-01T00:00:00.000Z' }
 			: path === '/v1/me/usage' ? { period: '2026-10', streamSecondsMonth: 0, concurrentNow: 0, libraryTracks: 0, ingestToday: 0 }
 			: path === '/v1/vault' ? {}
 			: { code: 'unexpected_fixture_request', message: path };
