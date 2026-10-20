@@ -20,10 +20,10 @@ const EXPECTED_MANIFEST = {
 } as const;
 
 const UNWIRED_CAPABILITIES = [
-	['search', /\bsearch(?:ing)?\b/i],
+	['search', /\bsearch\w*\b/i],
 	['streaming', /\bstream\w*\b/i],
-	['library management', /\blibrary(?: management)?\b/i],
-	['offline caching', /\boffline(?:[- ]friendly)? cach(?:e|ing)\b/i]
+	['library management', /\blibrar\w*\b/i],
+	['offline caching', /\boffline(?:[- ]friendly)? cach\w*\b/i]
 ] as const;
 
 function expectHonestPublicCopy(copy: unknown, surface: string): void {
@@ -60,6 +60,36 @@ test('rejects the old streams headline prepended to otherwise honest copy', asyn
 	expect(() => expectHonestPublicCopy(honest, 'regression control')).not.toThrow();
 	expect(() => expectHonestPublicCopy(mutant, 'regression mutant')).toThrow();
 });
+
+// Exercise the real helper, not the regexes in isolation: an honest
+// disclaimer must not excuse a separate affirmative sibling word form.
+for (const [capability, wording, claim] of [
+	['search', 'search', 'NNTune search finds music on Usenet.'],
+	['search', 'searching', 'NNTune is searching Usenet for your music.'],
+	['search', 'searches', 'NNTune searches Usenet for your music.'],
+	['search', 'searched', 'NNTune searched Usenet for your music.'],
+	['library management', 'library', 'NNTune manages your library for you.'],
+	['library management', 'libraries', 'NNTune manages your libraries for you.'],
+	['offline caching', 'offline cache', 'Your offline cache is ready anywhere.'],
+	['offline caching', 'offline caches', 'Your offline caches are ready anywhere.'],
+	['offline caching', 'offline cached', 'Your music is offline cached for travel.'],
+	['offline caching', 'offline caching', 'Offline caching keeps your music ready for travel.'],
+	['offline caching', 'offline-friendly caches', 'Your offline-friendly caches are ready anywhere.'],
+	['offline caching', 'offline friendly cached', 'Your music is offline friendly cached for travel.']
+] as const) {
+	test(`rejects affirmative ${wording} beside otherwise honest copy`, async () => {
+		const honest =
+			'NNTune: search, streaming, library management and offline caching are not wired yet. Sign up and bring your own Usenet provider account.';
+
+		expect(() => expectHonestPublicCopy(honest, 'sibling control')).not.toThrow();
+		expect(() => expectHonestPublicCopy(`${claim} ${honest}`, 'sibling mutant')).toThrow(
+			`${capability} must be explicitly not wired yet`
+		);
+		expect(() =>
+			expectHonestPublicCopy(honest.replace(capability, wording), 'sibling disclosure control')
+		).not.toThrow();
+	});
+}
 
 type ManifestIcon = {
 	src?: unknown;
