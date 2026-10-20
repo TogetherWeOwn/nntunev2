@@ -114,9 +114,9 @@ routes are unchanged.
   (`src/indexer_fetch.rs:142-149`) carrying
   the vetted addresses, the original hostname as `sni_host` (for TLS
   SNI/certificate checks and the Host header), port 443 and
-  `dial_timeout_ms` (`src/indexer_fetch.rs:405-413`). In the model the host is resolved exactly once per
-  hop, so a changed second DNS answer (rebinding) is never consulted by
-  `fetch_indexer` itself.
+  `dial_timeout_ms` in the per-hop `PinnedRequest` (`src/indexer_fetch.rs:406-413`).
+  In the model the host is resolved exactly once per hop, so a changed second
+  DNS answer (rebinding) is never consulted by `fetch_indexer` itself.
 - Every redirect hop (301/302/303/307/308 per `is_redirect`,
   `src/indexer_fetch.rs:375-377`; resolved per `resolve_location`,
   `src/indexer_fetch.rs:350` — absolute / protocol-relative /
@@ -144,7 +144,7 @@ routes are unchanged.
   `indexer_fetch_forbidden_address`, `indexer_fetch_unresolvable_host`,
   `indexer_fetch_too_many_redirects`, `indexer_fetch_dial_timeout`,
   `indexer_fetch_timeout`, `indexer_fetch_upstream_status`. Full URLs
-  must go through `newznab::redact_api_key` (`src/newznab.rs:144`) before any future log line;
+  must go through `newznab::redact_api_key` (`src/newznab.rs:185`) before any future log line;
   no such log is emitted today.
 
 ### Limits of the model
@@ -321,7 +321,7 @@ stub whose NZB references fixture message-ids.
   feedback loop is still open. After a repair round, `Verifying` re-runs
   the verify driver over the pool body route (`src/queue_consumer.rs:696-699`,
   `PoolBodySource::fetch_body` via `call_pool_body` at
-  `src/queue_consumer.rs:792-799`) and does not yet consume the repair
+  `src/queue_consumer.rs:822`) and does not yet consume the repair
   round's `out/` objects (the repair Worker streams outputs back to `out/`
   per `workers/repair/README.md:23-28`; key shapes in
   `workers/repair/src/contract.rs:278-286`), so the `Repairing` step must
