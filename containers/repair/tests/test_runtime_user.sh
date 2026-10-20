@@ -99,8 +99,8 @@ def parse_escape_directive(physical):
     return escape, None
 
 
-def grants_scratch(line, user_name):
-    """Recognize literal grants, not arbitrary shell programs or text mentions."""
+def scratch_ownership(line, user_name, owned):
+    """Apply literal ownership events in order; unsupported syntax clears proof."""
     instr = INSTR_RE.match(line)
     keyword, value = instr.group(1).lower(), instr.group(2)
 
@@ -122,13 +122,11 @@ def grants_scratch(line, user_name):
             flag = words.pop(0)
             if flag.startswith("--chown="):
                 owners.append(flag.removeprefix("--chown="))
-        return (
-            len(owners) == 1
-            and matches_owner(owners[0])
-            and len(words) >= 2
-            and words[-1] in ("/scratch", "/scratch/")
-            and not any(c in value for c in "$`[]\\")
-        )
+        if len(words) < 2 or any(c in value for c in "$`[]\\"):
+            return False
+        if words[-1] not in ("/scratch", "/scratch/"):
+            return owned
+        return len(owners) == 1 and matches_owner(owners[0])
 
     # Preserve quotes until AFTER splitting command operators: an echo argument
     # such as "&&" or ";" must never become a command boundary. Only literal
@@ -136,17 +134,22 @@ def grants_scratch(line, user_name):
     # redirections, substitutions, control flow and exec-form RUN fail closed.
     lexer = shlex.shlex(value, posix=False, punctuation_chars=True)
     lexer.whitespace_split = True
+    # shlex otherwise truncates /scratch#x to /scratch, unlike /bin/sh.
+    # Unquoted # is outside our plain-token subset, even at a word boundary.
+    lexer.commenters = ""
     try:
         tokens = list(lexer)
     except ValueError:
         return False
-    commands, command = [], []
+    commands, command, segment = [], [], 0
     for token in tokens:
         if token in ("&&", ";"):
             if not command:
                 return False
-            commands.append(command)
+            commands.append((segment, command))
             command = []
+            if token == ";":
+                segment += 1
         elif (
             re.fullmatch(r'''(?:[A-Za-z0-9_./:=+*?@%,-]+|'[^']*'|"[^"]*")''', token)
             and not any(c in token for c in "$`\\")
@@ -155,16 +158,22 @@ def grants_scratch(line, user_name):
         else:
             return False
     if command:
-        commands.append(command)
+        commands.append((segment, command))
     elif tokens and tokens[-1] != ";":
         return False
     # These shell words can skip later commands or reinterpret quoted data.
     if any(cmd[0] in {
         "if", "then", "else", "elif", "fi", "for", "while", "until", "do",
         "done", "case", "esac", "in", "exit", "exec", "return", "eval", ".",
-    } for cmd in commands):
+    } for _, cmd in commands):
         return False
-    for cmd in commands:
+    last_segment = commands[-1][0] if commands else -1
+    previous_segment = -1
+    for segment, cmd in commands:
+        # An &&-guarded grant may be skipped and rescued by a later ;-list.
+        # In the last nonempty list a skip instead fails RUN (and the build).
+        guaranteed = segment != previous_segment or segment == last_segment
+        previous_segment = segment
         if cmd[0] != "chown":
             continue
         args = cmd[1:]
@@ -172,13 +181,16 @@ def grants_scratch(line, user_name):
             args = args[1:]
         if args and args[0] == "--":
             args = args[1:]
-        if (
-            len(args) == 2
-            and matches_owner(args[0])
-            and args[1] in ("/scratch", "/scratch/")
-        ):
-            return True
-    return False
+        if len(args) != 2 or re.fullmatch(PLAIN_USER_RE, args[0]) is None:
+            # Unsupported chown operands cannot preserve an earlier proof.
+            owned = False
+        elif args[1] in ("/scratch", "/scratch/"):
+            if not matches_owner(args[0]):
+                # Even a conditional revocation might run: fail closed.
+                owned = False
+            elif guaranteed:
+                owned = True
+    return owned
 
 
 def scan(dockerfile):
@@ -326,9 +338,12 @@ def main():
     # The runtime user must own /scratch: the server stages inputs and writes
     # outputs under REPAIR_SCRATCH_DIR=/scratch, so a USER without /scratch
     # ownership breaks repairs at container runtime.
-    # Only RUN/COPY/ADD lines are scanned; the grant must be a command with
-    # exact owner/path operands or a COPY/ADD --chown with exact destination.
-    owned = any(grants_scratch(line, user_name) for line in facts["stage_lines"])
+    # Apply RUN/COPY/ADD in order: later ownership events can revoke a grant.
+    # Only the literal subset is modeled, not arbitrary filesystem effects;
+    # unsupported syntax clears proof, requiring a subsequent literal grant.
+    owned = False
+    for line in facts["stage_lines"]:
+        owned = scratch_ownership(line, user_name, owned)
     if not owned:
         print(
             f"FAIL: runtime stage grants '{user_name}' no /scratch ownership "
@@ -421,10 +436,10 @@ FIXTURE_EOF
 FROM scratch AS base
 FROM base AS runtime
 WORKDIR /scratch
-RUN chown -R repair:repair /scratch
 RUN cat <<EOF
 USER root
 EOF
+RUN chown -R repair:repair /scratch
 USER repair
 CMD ["x"]
 FIXTURE_EOF
@@ -587,6 +602,24 @@ chown-scratch-suffix	1	RUN chown repair /scratchbery
 chown-skipped-or	1	RUN true || chown repair /scratch
 chown-control-flow	1	RUN if false; then chown repair /scratch; fi
 chown-exit-before-grant	1	RUN exit 0; chown repair /scratch
+chown-guard-rescued-true	1	RUN false && chown repair /scratch; true
+chown-guard-rescued-echo	1	RUN test -d /nope && chown repair /scratch; echo ok
+chown-guard-rescued-cleanup	1	RUN false && chown repair /scratch; rm -rf /var/lib/apt/lists/*
+chown-guard-rescued-after-grant	1	RUN true && chown repair /scratch && false; true
+chown-guard-final-segment	0	RUN true; mkdir -p /scratch && chown repair /scratch;
+chown-unconditional-before-final	0	RUN chown repair /scratch; true && true
+chown-final-chain-followup	0	RUN true && chown repair /scratch && true
+chown-revoke-same-line	1	RUN chown repair /scratch; chown root /scratch
+chown-revoke-and-chain	1	RUN chown repair /scratch && chown root /scratch
+chown-revoke-conditional	1	RUN chown repair /scratch; false && chown root /scratch; true
+chown-revoke-then-grant	0	RUN chown root /scratch; chown repair /scratch
+chown-revoke-then-conditional-grant	1	RUN chown root /scratch; false && chown repair /scratch; true
+chown-revoke-unrelated-path	0	RUN chown repair /scratch; chown root /tmp
+chown-revoke-trailing-slash	1	RUN chown repair /scratch; chown -R root:root /scratch/
+chown-midword-hash	1	RUN chown repair /scratch#x
+chown-midword-hash-composed	1	RUN mkdir -p "/scratch#x" && chown repair /scratch#x
+chown-midword-hash-hides-revoke	1	RUN chown repair /scratch#x; chown root /scratch
+chown-unsupported-after-grant	1	RUN chown repair /scratch; echo hi # comment
 chown-substitution	1	RUN echo "$(echo '; chown repair /scratch')"
 chown-missing-owner	1	RUN chown :repair /scratch
 chown-no-options	0	RUN chown repair /scratch
@@ -604,6 +637,31 @@ copy-chown-source-not-destination	1	COPY --chown=repair:repair /scratch /tmp
 copy-chown-mention-not-flag	1	COPY chown-repair-/scratch /tmp
 copy-chown-duplicate	1	COPY --chown=repair --chown=root source /scratch
 OWNERSHIP_EOF
+
+  # State must carry across mutation instructions, not just a single RUN.
+  while IFS=$'\t' read -r name want instruction; do
+    printf 'FROM scratch AS runtime\nRUN chown repair /scratch\n%s\nUSER repair\n' "$instruction" \
+      > "$selftest_tmp/$name.Dockerfile"
+    run_case "$name" "$want" "$selftest_tmp/$name.Dockerfile"
+  done <<'ORDER_EOF'
+chown-revoke-later-run	1	RUN chown root /scratch
+chown-revoke-later-conditional-run	1	RUN false && chown root /scratch; true
+chown-revoke-later-copy	1	COPY --chown=root source /scratch
+chown-revoke-later-add	1	ADD --chown=root source /scratch/
+chown-regrant-later-run	0	RUN chown root /scratch; chown repair /scratch
+chown-unsupported-later-run	1	RUN echo hi#x; chown root /scratch
+chown-unrelated-later-copy	0	COPY --from=builder source /usr/local/bin/tool
+chown-unrelated-later-run	0	RUN chown root /tmp
+ORDER_EOF
+
+  fixture revoke-then-grant-later-run.Dockerfile <<'FIXTURE_EOF'
+FROM scratch AS runtime
+RUN chown repair /scratch
+RUN chown root /scratch
+RUN true && chown repair /scratch
+USER repair
+FIXTURE_EOF
+  run_case "revoke-then-grant-later-run" 0 "$selftest_tmp/revoke-then-grant-later-run.Dockerfile"
 
   fixture escape-backslash-valid.Dockerfile <<'FIXTURE_EOF'
 # escape=\
