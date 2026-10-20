@@ -119,8 +119,20 @@ INNER_SPLIT_RE = re.compile(r"[\s;|&()<>]+")
 
 
 def inner_words(word):
-    """Split a quoted token the way the RUN shell tokenizes a -c script."""
-    return [piece for piece in INNER_SPLIT_RE.split(word) if piece]
+    """Split a quoted token the way the RUN shell tokenizes a -c script.
+
+    Quote characters are stripped, never split on: quote removal
+    concatenates, so `"chown"`, `'chown'` and `ch""own` are all one word
+    `chown` once the -c shell re-parses the script. Without this,
+    resolver-class deliveries (`/proc/self/exe -c ...`) smuggle a
+    quote-decorated chown past the basename match and keep dead proof.
+    """
+    cleaned = []
+    for piece in INNER_SPLIT_RE.split(word):
+        stripped = piece.replace("'", "").replace('"', "")
+        if stripped:
+            cleaned.append(stripped)
+    return cleaned
 
 
 def word_matches_names(word, names, require_alnum=True):
@@ -212,8 +224,9 @@ def scratch_ownership(line, user_name, owned):
     # in source order. Check every word's basename to catch paths and prefixes
     # (env, command, assignments, busybox), as a glob pattern to catch
     # expansions (`/bin/da?h`), and split quoted tokens on shell metacharacters
-    # to catch string splits (`env -S 'sh -c ...'`) and glued scripts
-    # (`true;chown`, `(chown ...)`, `true&&chown`). Bare punctuation keeps its
+    # with quote removal to catch string splits (`env -S 'sh -c ...'`), glued
+    # scripts (`true;chown`, `(chown ...)`, `true&&chown`) and quote-decorated
+    # names (`"chown"`, `ch""own`). Bare punctuation keeps its
     # exemption only in argument position; a glob in command position selects
     # the program (`./*` after staging), so it matches there. Even inert
     # mentions fail closed.
@@ -231,10 +244,11 @@ def scratch_ownership(line, user_name, owned):
             # Do not interpret RUN flags, assignments, wrappers or executable
             # paths as harmless text. Only bare chown can establish proof;
             # any other chown-shaped command conservatively invalidates it.
-            # Metachar-split inner words of quoted tokens count too, so
-            # deliveries that name no interpreter (`/proc/self/exe -c ...`,
-            # including glued `true;chown` / `(chown)` / `true&&chown` scripts)
-            # still clear proof via the chown they carry. Command position keeps no
+            # Metachar-split, quote-stripped inner words of quoted tokens count
+            # too, so deliveries that name no interpreter (`/proc/self/exe -c
+            # ...`, including glued scripts and quote-decorated `"chown"` /
+            # `ch""own` names) still clear proof via the chown they carry.
+            # Command position keeps no
             # punctuation exemption: `./*` may expand to a staged chown.
             if any(word_matches_names(inner, {"chown"},
                                       require_alnum=index > 0)
@@ -797,6 +811,13 @@ chown-revoke-procself-glued-paren	1	RUN /proc/self/exe -c '(chown root /scratch)
 chown-revoke-procself-glued-and	1	RUN /proc/self/exe -c 'true&&chown root /scratch'
 chown-revoke-procself-glued-pipe	1	RUN /proc/self/exe -c 'true|chown root /scratch'
 chown-revoke-procself-glued-redirect	1	RUN /proc/self/exe -c 'true> /tmp/x;chown root /scratch'
+chown-revoke-procself-quoted-double	1	RUN /proc/self/exe -c '"chown" root /scratch'
+chown-revoke-procself-quoted-single	1	RUN /proc/self/exe -c "'chown' root /scratch"
+chown-revoke-procself-quoted-split	1	RUN /proc/self/exe -c 'ch""own root /scratch'
+chown-revoke-procself-quoted-path	1	RUN /proc/self/exe -c '"/usr/bin/chown" root /scratch'
+chown-revoke-procself-quoted-glued	1	RUN /proc/self/exe -c 'true;"chown" root /scratch'
+chown-revoke-procself-quoted-exec	1	RUN /proc/self/exe -c 'exec "chown" root /scratch'
+chown-revoke-procself-quoted-shell	1	RUN /proc/self/exe -c '"sh" -c "chown root /scratch"'
 ORDER_EOF
 
   fixture chown-revoke-workdir-dot.Dockerfile <<'FIXTURE_EOF'
