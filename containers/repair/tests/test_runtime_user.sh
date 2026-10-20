@@ -111,6 +111,35 @@ SHELL_WORDS = frozenset({
     "trap", "eval",
 })
 
+# Prefix-chain wrappers transparent when locating the effective program word
+# for the punctuation exemption: `env *` executes the glob expansion, not an
+# argument. `--` is treated as a plain prefix (fail closed, no flag parsing
+# state), so nested wrappers after it (`env -- env *`) still resolve.
+WRAPPER_COMMANDS = frozenset({
+    "env", "command", "nice", "nohup", "busybox", "time", "stdbuf",
+})
+
+# Flags consuming the next word as their argument, per wrapper (exact
+# spellings only: `-uFOO`, `--unset=FOO` and `-o0` take no separate word).
+# `-i` is per-wrapper on purpose: `env -i` takes none while `stdbuf -i`
+# does. Unknown flags never consume, failing closed toward program position.
+WRAPPER_FLAG_ARGS = {
+    "env": frozenset({
+        "-u", "--unset", "-C", "--chdir", "-S", "--split-string",
+        "--block-signal", "--default-signal", "--ignore-signal", "--argv0",
+    }),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "stdbuf": frozenset({
+        "-i", "--input", "-o", "--output", "-e", "--error",
+    }),
+    "command": frozenset(),
+    "time": frozenset(),
+    "nohup": frozenset(),
+    "busybox": frozenset(),
+}
+
+ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
+
 # Shell metacharacters that tokenize a -c script (or trap/eval argument)
 # beyond whitespace: glued forms such as `true;chown`, `(chown ...)` and
 # `true&&chown` must expose the inner chown, or resolver-class deliveries
@@ -151,6 +180,71 @@ def word_matches_names(word, names, require_alnum=True):
     return any(fnmatch.fnmatchcase(name, base) for name in names)
 
 
+def is_assignment(word):
+    """True for shell `NAME=value` prefixes (VAR=1, not --chown=...)."""
+    return ASSIGNMENT_RE.fullmatch(word) is not None
+
+
+def is_wrapper(word):
+    """True if `word` could name a prefix-chain wrapper (env, nice, ...).
+
+    Bare punctuation never counts: `*` matches every wrapper by glob but is
+    itself the program position, so it must lose the exemption instead of
+    being skipped as a prefix.
+    """
+    return word_matches_names(word, WRAPPER_COMMANDS, require_alnum=True)
+
+
+def is_flag(word):
+    """True for wrapper flags and `--` (plain prefixes, fail closed)."""
+    return word == "--" or (word.startswith("-") and word != "-" and len(word) > 1)
+
+
+def is_glob_wrapper(word):
+    """True for non-exact wrapper spellings (`e?v`); consumption ambiguous."""
+    return is_wrapper(word) and posixpath.basename(word) not in WRAPPER_COMMANDS
+
+
+def effective_program_index(cmd):
+    """Index of the first word that is not a prefix, or None.
+
+    Assignments, wrappers and their flags are transparent: `env -i *`
+    executes the `*` expansion. Flags consuming a following word use the
+    per-wrapper table (exact spellings only); glob wrappers keep no flag-arg
+    knowledge and words downstream of one lose the exemption separately.
+    Unknown flags never consume. Bare `-` is transparent only after an
+    env-capable wrapper (GNU `env -` implies `-i`); elsewhere it is the
+    program.
+    """
+    last_wrapper = None
+    last_env_capable = False
+    skip_next = False
+    for index, word in enumerate(cmd):
+        if skip_next:
+            skip_next = False
+            continue
+        if is_assignment(word):
+            continue
+        if is_wrapper(word):
+            base = posixpath.basename(word)
+            last_wrapper = base if base in WRAPPER_COMMANDS else None
+            last_env_capable = word_matches_names(
+                word, {"env"}, require_alnum=True
+            )
+            continue
+        if word == "-" and last_env_capable:
+            continue
+        if is_flag(word):
+            if (
+                last_wrapper is not None
+                and word in WRAPPER_FLAG_ARGS.get(last_wrapper, frozenset())
+            ):
+                skip_next = True
+            continue
+        return index
+    return None
+
+
 def concat_candidates(cmd):
     """Each command word plus every run of consecutive words joined bare.
 
@@ -162,24 +256,56 @@ def concat_candidates(cmd):
     `chown` (or shell name) past the per-word scans.
 
     The punctuation exemption follows the EXECUTING shell's command position,
-    not the outer word index. A whitespace-bearing word is a quoted script the
-    inner shell re-tokenizes, so its inner pieces lose the exemption (the
-    first is inner command position; later ones may follow `;`, `&&`, parens
-    or `exec`). A join starting at cmd[0] that stops before the last word may
-    be a quote-joined program name (`'./'` + `*`), so it loses the exemption
-    too. Only the full-command join keeps it: its words were separated by
-    unquoted whitespace, so they can never be one argv word -- this keeps the
-    shipped `rm -rf /var/lib/apt/lists/*` cleanup green.
+    not the outer word index. The effective program word (first past the
+    assignment/wrapper/flag prefix chain, with bare `-` transparent after
+    env) loses the exemption, since a glob there selects the executed program
+    (`env *` after staging). Downstream of a glob-spelled wrapper the flag
+    consumption is ambiguous (a union table would both over- and under-skip),
+    so every word there loses the exemption instead. A whitespace-bearing
+    word is a quoted script the inner shell re-tokenizes, so its inner pieces
+    lose the exemption too (the first is inner command position; later ones
+    may follow `;`, `&&`, parens or `exec`). A join starting at the effective
+    program (or downstream of a glob wrapper) that stops before the last word
+    may be a quote-joined program name (`'./'` + `*`), so it loses the
+    exemption as well. Only joins that cannot be one argv word keep it --
+    notably the full-command join, whose words were separated by unquoted
+    whitespace, so the shipped `rm -rf /var/lib/apt/lists/*` cleanup stays
+    green.
     """
+    eff = effective_program_index(cmd)
+    first_glob = None
+    for pos, candidate in enumerate(cmd):
+        if is_glob_wrapper(candidate):
+            first_glob = pos
+            break
     for index, word in enumerate(cmd):
-        yield word, index > 0 and not any(char.isspace() for char in word)
+        if eff is not None and index == eff:
+            require_alnum = False
+        elif eff is not None and first_glob is not None and index >= first_glob:
+            require_alnum = False
+        else:
+            require_alnum = index > 0 and not any(
+                char.isspace() for char in word
+            )
+        yield word, require_alnum
     last = len(cmd) - 1
     for start in range(len(cmd)):
         joined = ""
         for end in range(start, len(cmd)):
             joined += cmd[end]
             if end > start:
-                yield joined, not (start == 0 and end < last)
+                if eff is None:
+                    require_alnum = True
+                else:
+                    require_alnum = not (
+                        (start == eff and end < last)
+                        or (
+                            first_glob is not None
+                            and start >= first_glob
+                            and end < last
+                        )
+                    )
+                yield joined, require_alnum
 
 
 def scratch_ownership(line, user_name, owned):
@@ -260,12 +386,13 @@ def scratch_ownership(line, user_name, owned):
     # names (`"chown"`, `ch""own`). Consecutive words are also scanned joined
     # bare to catch same-quote concatenation (`'cho''wn'`) the outer lexer
     # splits but the RUN shell concatenates. The bare-punctuation exemption
-    # follows the executing shell's command position: quoted scripts (the
-    # inner shell re-tokenizes them) and cmd[0]-starting partial joins (a
+    # follows the executing shell's effective command position: the first word
+    # past the assignment/wrapper/flag prefix chain, quoted scripts (the inner
+    # shell re-tokenizes them) and effective-program-starting partial joins (a
     # quote-joined program name such as `'./'` + `*`) lose it, since a glob
-    # there selects the executed program (`./*` after staging). Only the
-    # full-command join keeps the exemption, so the `rm -rf .../lists/*`
-    # cleanup cannot be one argv word. Even inert mentions fail closed.
+    # there selects the executed program (`env *` or `./*` after staging).
+    # Only joins that cannot be one argv word keep the exemption, so the
+    # `rm -rf .../lists/*` cleanup stays green. Even inert mentions fail closed.
     if any(word_matches_names(inner, SHELL_WORDS, require_alnum=require_alnum)
            for _, cmd in commands
            for word, require_alnum in concat_candidates(cmd)
@@ -286,8 +413,9 @@ def scratch_ownership(line, user_name, owned):
             # `ch""own` names and same-quote `'cho''wn'` concatenations
             # rejoined across the outer lexer's word split) still clear proof
             # via the chown they carry.
-            # Command position keeps no
-            # punctuation exemption: `./*` may expand to a staged chown.
+            # Effective command position (past assignment/wrapper/flag
+            # prefixes) keeps no punctuation exemption: `*` and `./*` may
+            # expand to a staged chown.
             if any(word_matches_names(inner, {"chown"},
                                       require_alnum=require_alnum)
                    for word, require_alnum in concat_candidates(cmd)
@@ -870,6 +998,29 @@ chown-revoke-procself-inner-punct-glob-qmark	1	RUN /proc/self/exe -c './????? ro
 chown-revoke-procself-inner-punct-glob-exec	1	RUN /proc/self/exe -c 'exec ./* root /scratch'
 chown-revoke-procself-inner-punct-glob-chain	1	RUN /proc/self/exe -c 'true;./* root /scratch'
 chown-revoke-procself-inner-punct-glob-paren	1	RUN /proc/self/exe -c '(./* root /scratch)'
+chown-revoke-prefixed-punct-glob-env	1	RUN env * root /scratch
+chown-revoke-prefixed-punct-glob-env-qmark	1	RUN env ????? root /scratch
+chown-revoke-prefixed-punct-glob-assignment	1	RUN VAR=1 * root /scratch
+chown-revoke-prefixed-punct-glob-command	1	RUN command * root /scratch
+chown-revoke-prefixed-punct-glob-nice	1	RUN nice * root /scratch
+chown-revoke-prefixed-punct-glob-env-assignment	1	RUN env VAR=1 * root /scratch
+chown-revoke-prefixed-punct-glob-env-flag	1	RUN env -i * root /scratch
+chown-revoke-prefixed-punct-glob-chain	1	RUN true && env * root /scratch
+chown-revoke-prefixed-punct-glob-env-unset	1	RUN env -u FOO * root /scratch
+chown-revoke-prefixed-punct-glob-nice-adjust	1	RUN nice -n 5 * root /scratch
+chown-revoke-prefixed-punct-glob-stdbuf	1	RUN stdbuf -o L * root /scratch
+chown-revoke-prefixed-punct-glob-path-env	1	RUN /usr/bin/env * root /scratch
+chown-revoke-prefixed-punct-glob-env-dash	1	RUN env - * root /scratch
+chown-revoke-prefixed-punct-glob-env-dash-assignment	1	RUN VAR=1 env - * root /scratch
+chown-revoke-prefixed-punct-glob-env-dash-flag	1	RUN env -i - * root /scratch
+chown-revoke-prefixed-punct-glob-globenv-unset	1	RUN e?v -u FOO * root /scratch
+chown-revoke-prefixed-punct-glob-globenv-chdir	1	RUN e?v -C /tmp * root /scratch
+chown-revoke-prefixed-punct-glob-globstdbuf	1	RUN s?dbuf -o L * root /scratch
+chown-revoke-prefixed-punct-glob-globnice	1	RUN n??e -n 5 * root /scratch
+chown-unrelated-echo-glob	0	RUN echo *
+chown-unrelated-rm-glob	0	RUN rm -rf /var/lib/apt/lists/*
+chown-unrelated-env-dash-echo	0	RUN env - echo hi
+chown-unrelated-env-flagarg-star	0	RUN env -u * root /scratch
 ORDER_EOF
 
   fixture chown-revoke-workdir-dot.Dockerfile <<'FIXTURE_EOF'
