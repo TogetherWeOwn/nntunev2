@@ -38,6 +38,7 @@ check_dockerfile() {
   command -v python3 >/dev/null 2>&1 || { echo "FAIL: python3 is required to parse $dockerfile" >&2; return 1; }
   PIN_DC_SCRIPTS="$(cd -- "$script_dir/../../../.github/scripts" && pwd)" \
     python3 - "$dockerfile" <<'PYEOF'
+import fnmatch
 import os
 import posixpath
 import re
@@ -98,6 +99,33 @@ def parse_escape_directive(physical):
         if name == "escape":
             escape = match.group(2)
     return escape, None
+
+
+# Words whose presence makes a RUN's ownership effects unprovable: shells
+# reparse quoted data (-c strings, eval arguments) and traps fire after any
+# textual grant. rbash is bash's restricted mode (same -c behavior for plain
+# external commands); runuser is listed defensively (the runtime stage
+# installs util-linux, which ships it).
+SHELL_WORDS = frozenset({
+    "sh", "bash", "dash", "ash", "ksh", "zsh", "rbash", "su", "runuser",
+    "trap", "eval",
+})
+
+
+def word_matches_names(word, names, require_alnum=True):
+    """True if `word` could name (or glob-expand to) one of `names`.
+
+    The basename is the pattern and each known name the string, because the
+    RUN shell expands the Dockerfile's spelling before exec (`/bin/da?h`
+    becomes dash). Bare punctuation with no alphanumerics (notably the `*`
+    in `rm -rf /var/lib/apt/lists/*`) never matches in argument position,
+    or every cleanup glob would void the proof; in command position there is
+    no exemption, since a glob there selects the executed program.
+    """
+    base = posixpath.basename(word)
+    if require_alnum and not any(char.isalnum() for char in base):
+        return False
+    return any(fnmatch.fnmatchcase(name, base) for name in names)
 
 
 def scratch_ownership(line, user_name, owned):
@@ -171,10 +199,16 @@ def scratch_ownership(line, user_name, owned):
     # Shell interpreters reparse quoted data; traps may run AFTER a later
     # textual grant. Reject the entire RUN instead of folding those effects
     # in source order. Check every word's basename to catch paths and prefixes
-    # (env, command, assignments, busybox). Even inert mentions fail closed.
-    if any(posixpath.basename(word) in {
-        "sh", "bash", "dash", "ash", "ksh", "zsh", "su", "trap", "eval",
-    } for _, cmd in commands for word in cmd):
+    # (env, command, assignments, busybox), as a glob pattern to catch
+    # expansions (`/bin/da?h`), and split quoted tokens into inner words to
+    # catch string splits (`env -S 'sh -c ...'`). Bare punctuation keeps its
+    # exemption only in argument position; a glob in command position selects
+    # the program (`./*` after staging), so it matches there. Even inert
+    # mentions fail closed.
+    if any(word_matches_names(inner, SHELL_WORDS, require_alnum=index > 0)
+           for _, cmd in commands
+           for index, word in enumerate(cmd)
+           for inner in word.split()):
         return False
     last_segment = commands[-1][0] if commands else -1
     for segment, cmd in commands:
@@ -185,7 +219,14 @@ def scratch_ownership(line, user_name, owned):
             # Do not interpret RUN flags, assignments, wrappers or executable
             # paths as harmless text. Only bare chown can establish proof;
             # any other chown-shaped command conservatively invalidates it.
-            if any(posixpath.basename(word) == "chown" for word in cmd):
+            # Inner words of quoted tokens count too, so deliveries that name
+            # no interpreter (`/proc/self/exe -c 'chown ...'`) still clear
+            # proof via the chown they carry. Command position keeps no
+            # punctuation exemption: `./*` may expand to a staged chown.
+            if any(word_matches_names(inner, {"chown"},
+                                      require_alnum=index > 0)
+                   for index, word in enumerate(cmd)
+                   for inner in word.split()):
                 owned = False
             continue
         args = cmd[1:]
@@ -731,6 +772,12 @@ chown-revoke-nested-shell	1	RUN sh -c "trap 'chown root /scratch' EXIT"
 chown-revoke-unsupported-ash	1	RUN ash -c 'chown root /scratch'
 chown-revoke-unsupported-ksh	1	RUN ksh -c 'chown root /scratch'
 chown-revoke-unsupported-zsh	1	RUN zsh -c 'chown root /scratch'
+chown-revoke-shell-glob-dash	1	RUN /bin/da?h -c 'chown root /scratch'
+chown-revoke-shell-glob-bash	1	RUN /bin/ba?h -c 'chown root /scratch'
+chown-revoke-shell-rbash	1	RUN rbash -c 'chown root /scratch'
+chown-revoke-shell-env-split	1	RUN env -S 'sh -c "chown root /scratch"'
+chown-revoke-shell-proc-self	1	RUN /proc/self/exe -c 'chown root /scratch'
+chown-revoke-chown-glob-command	1	RUN /usr/bin/cho?n root /scratch
 ORDER_EOF
 
   fixture chown-revoke-workdir-dot.Dockerfile <<'FIXTURE_EOF'
@@ -750,6 +797,16 @@ RUN chown root scratch
 USER repair
 FIXTURE_EOF
   run_case "chown-revoke-workdir-relative" 1 "$selftest_tmp/chown-revoke-workdir-relative.Dockerfile"
+
+  fixture chown-revoke-punct-glob-command.Dockerfile <<'FIXTURE_EOF'
+FROM scratch AS runtime
+RUN chown repair /scratch
+WORKDIR /x
+COPY --from=server /usr/bin/chown /x/a
+RUN ./* root /scratch
+USER repair
+FIXTURE_EOF
+  run_case "chown-revoke-punct-glob-command" 1 "$selftest_tmp/chown-revoke-punct-glob-command.Dockerfile"
 
   fixture revoke-then-grant-later-run.Dockerfile <<'FIXTURE_EOF'
 FROM scratch AS runtime
