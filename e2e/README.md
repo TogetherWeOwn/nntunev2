@@ -198,7 +198,7 @@ How the suite uses them:
   additionally runs the evidence gate
   (`e2e/scripts/enforce-journey-evidence.mjs`): a configured run with no
   junit evidence, zero journeys ran, every journey skipped, more skips than
-  the two documented `test.fixme` legs (player queue order, recording_mbids),
+  the one remaining `test.fixme` leg (recording_mbids),
   any skip outside that allow-list, any failure, or a missing `QA_AUTH_TOKEN`
   fails the job instead of passing silently. Failure artifacts
   are kept 7 days.

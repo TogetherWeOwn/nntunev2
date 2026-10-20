@@ -20,6 +20,7 @@ export interface LibraryRefreshState {
 	loading: boolean;
 	loadError: string | null;
 	libraryUnavailable: boolean;
+	requiresSignIn: boolean;
 }
 
 export interface LibraryRefresherDeps {
@@ -54,7 +55,8 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		staleAt: null,
 		loading: true,
 		loadError: null,
-		libraryUnavailable: false
+		libraryUnavailable: false,
+		requiresSignIn: false
 	};
 	let authenticatedThisLoad = false;
 	let inMemorySnapshot: LibrarySnapshot | null = null;
@@ -71,6 +73,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		state.loading = true;
 		state.loadError = null;
 		state.libraryUnavailable = false;
+		state.requiresSignIn = false;
 		notify();
 		const controller = new AbortController();
 		activeRequest = controller;
@@ -248,7 +251,10 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				deps.invalidateLibraryCache();
 				state.items = [];
 				state.staleAt = null;
-				state.loadError = 'You are signed out or do not have access to this library.';
+				state.requiresSignIn = response.status === 401;
+				state.loadError = state.requiresSignIn
+					? 'You are signed out or do not have access to this library.'
+					: 'You do not have access to this library.';
 				return;
 			}
 			if (!response.ok) throw new Error(`library request failed (${response.status})`);
@@ -302,6 +308,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		clearSnapshot(deps.sessionStorage());
 		state.items = [];
 		state.staleAt = null;
+		state.requiresSignIn = true;
 		state.loadError = 'Your session changed. Sign in again to see this library.';
 		state.loading = false;
 		notify();
