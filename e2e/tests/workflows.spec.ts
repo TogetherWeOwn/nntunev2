@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { readFileSync, readdirSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, symlinkSync } from 'node:fs';
+import { readFileSync, readdirSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, symlinkSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -1938,5 +1938,264 @@ test.describe('mb-import postgres parity (static pin)', () => {
     ] as const) {
       expect(() => assertMbImportPostgresParity(ci, docker), `${name} mutant must fail the pin`).toThrow();
     }
+  });
+});
+
+// Bounded CI downloads (static pin): the cargo-deny and gitleaks installs
+// are checksum-pinned but their curl lines carry the only network bounds in
+// those steps. No other test reads these lines, so a revert to the
+// unbounded forms would stay green without these pins. Each pin slices its
+// own step section, so an identical curl added elsewhere cannot satisfy it.
+const gitleaksWorkflow = readFileSync(new URL('gitleaks.yml', workflowDir), 'utf8');
+
+function stepSection(workflow: string, stepName: string): string {
+  const marker = `- name: ${stepName}\n`;
+  const start = workflow.indexOf(marker);
+  expect(start, `step ${stepName} not found`).toBeGreaterThan(-1);
+  const bodyStart = start + marker.length;
+  const next = /\n      - /.exec(workflow.slice(bodyStart));
+  return workflow.slice(bodyStart, next ? bodyStart + next.index : undefined);
+}
+
+function assertCargoDenyDownloadBounded(section: string): void {
+  expect(section).toContain('curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 \\');
+  expect(section).toContain('| (cd /tmp && sha256sum -c -)');
+}
+
+function assertGitleaksDownloadBounded(section: string): void {
+  expect(section).toContain(
+    'curl -sSfL --connect-timeout 10 --max-time 30 --retry 3 -o "$archive" \\',
+  );
+  expect(section).toContain('| sha256sum --check -');
+}
+
+test.describe('bounded CI downloads (static pin)', () => {
+  test('cargo-deny download fails HTTP errors and stays within 10/30/3', () => {
+    assertCargoDenyDownloadBounded(
+      stepSection(ciWorkflow, 'Install pinned cargo-deny 0.20.2'),
+    );
+  });
+
+  test('gitleaks download stays within 10/30/3', () => {
+    assertGitleaksDownloadBounded(stepSection(gitleaksWorkflow, 'Install gitleaks'));
+  });
+
+  test('cargo-deny flag-removal and value mutants fail the pin', () => {
+    const section = stepSection(ciWorkflow, 'Install pinned cargo-deny 0.20.2');
+    const mutants = [
+      // Exact base revert: unbounded single-line download without -f.
+      section.replace(
+        'curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 \\\n            -o "/tmp/${asset}" "${base}/${asset}"',
+        'curl -sSL --retry 3 -o "/tmp/${asset}" "${base}/${asset}"',
+      ),
+      section.replace('curl -fsSL ', 'curl -sSL '),
+      section.replace(' --connect-timeout 10', ''),
+      section.replace(' --max-time 30', ''),
+      section.replace(' --retry 3', ''),
+      section.replace('--connect-timeout 10', '--connect-timeout 5'),
+      section.replace('--max-time 30', '--max-time 60'),
+      section.replace('--retry 3', '--retry 5'),
+      section.replace('| (cd /tmp && sha256sum -c -)', '| cat'),
+    ];
+    for (const mutant of mutants) {
+      expect(mutant, 'mutant must differ from the pinned section').not.toBe(section);
+      expect(() => assertCargoDenyDownloadBounded(mutant), 'mutant must violate the pin').toThrow();
+    }
+  });
+
+  test('gitleaks flag-removal and value mutants fail the pin', () => {
+    const section = stepSection(gitleaksWorkflow, 'Install gitleaks');
+    const mutants = [
+      // Exact base revert: unbounded download without timeouts or retry.
+      section.replace(
+        'curl -sSfL --connect-timeout 10 --max-time 30 --retry 3 -o "$archive" \\',
+        'curl -sSfL -o "$archive" \\',
+      ),
+      section.replace(' --connect-timeout 10', ''),
+      section.replace(' --max-time 30', ''),
+      section.replace(' --retry 3', ''),
+      section.replace('--connect-timeout 10', '--connect-timeout 5'),
+      section.replace('--max-time 30', '--max-time 60'),
+      section.replace('--retry 3', '--retry 5'),
+      section.replace('| sha256sum --check -', '| cat'),
+    ];
+    for (const mutant of mutants) {
+      expect(mutant, 'mutant must differ from the pinned section').not.toBe(section);
+      expect(() => assertGitleaksDownloadBounded(mutant), 'mutant must violate the pin').toThrow();
+    }
+  });
+});
+
+// Burst probe bounds (static + executed pin): the diagnostic probe must run
+// under `set -euo pipefail`, bound each request to 10/30 seconds, loop
+// exactly 11 attempts, and never retry (one physical request per attempt).
+// Static pins catch flag edits; the executed fixture runs the real script
+// against a stubbed `curl` on PATH — no network, INGEST_URL is never
+// dialed — and proves 11 single-attempt requests, exit 0 on a final
+// 429/503, and fail-fast abort on transport failure.
+const burstScriptPath = fileURLToPath(
+  new URL('../../workers/ingest/scripts/search_rate_limit_burst.sh', import.meta.url),
+);
+const burstScript = readFileSync(burstScriptPath, 'utf8');
+
+function assertBurstProbeStatic(source: string): void {
+  expect(source).toContain('set -euo pipefail');
+  expect(source).toContain(
+    "curl -s --connect-timeout 10 -m 30 -o /dev/null -D - -w '%{http_code}\\n' \\",
+  );
+  expect(source).toContain('for i in $(seq 1 11);');
+  expect(source).not.toContain('--retry');
+}
+
+interface BurstRun {
+  status: number | null;
+  output: string;
+  attempts: number;
+  invocations: string[];
+}
+
+function runBurstProbe(scriptPath: string, stubEnv: Record<string, string>): BurstRun {
+  const probe = mkdtempSync(
+    join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'burst-pin-'),
+  );
+  try {
+    // Stub curl: records each invocation's args, serves 202 until attempt
+    // 11, then the configured final code; STUB_FAIL_AT makes attempt N a
+    // transport failure (exit 7, like a refused connection).
+    writeFileSync(
+      join(probe, 'curl'),
+      `#!/bin/bash
+n=$(cat "$STUB_COUNT" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "$STUB_COUNT"
+printf '%s\\n' "$*" >> "$STUB_RECORD"
+if [ "$STUB_FAIL_AT" = "$n" ]; then exit 7; fi
+if [ "$n" -ge 11 ]; then code="$STUB_FINAL_CODE"; else code=202; fi
+if [ "$code" = "429" ]; then printf 'retry-after: 2\\n'; fi
+printf '%s\\n' "$code"
+`,
+    );
+    chmodSync(join(probe, 'curl'), 0o755);
+    const result = spawnSync('/bin/bash', [scriptPath], {
+      encoding: 'utf8',
+      timeout: 10_000,
+      cwd: probe,
+      env: {
+        PATH: `${probe}:${process.env.PATH}`,
+        INGEST_URL: 'http://stub.invalid',
+        STUB_RECORD: join(probe, 'curl-args.log'),
+        STUB_COUNT: join(probe, 'curl-count'),
+        STUB_FINAL_CODE: '429',
+        STUB_FAIL_AT: '0',
+        ...stubEnv,
+      },
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    const output = result.stdout + result.stderr;
+    let invocations: string[] = [];
+    try {
+      invocations = readFileSync(join(probe, 'curl-args.log'), 'utf8')
+        .split('\n')
+        .filter((line) => line.length > 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    const attempts = output.match(/^attempt \d\d: /gm)?.length ?? 0;
+    return { status: result.status, output, attempts, invocations };
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
+  }
+}
+
+function assertBurstExecutedContract(run: BurstRun, finalCode: string): void {
+  expect(run.status).toBe(0);
+  expect(run.attempts).toBe(11);
+  // One physical request per attempt: exactly 11 stub invocations, each
+  // carrying the 10/30-second bounds and no retry flag.
+  expect(run.invocations).toHaveLength(11);
+  for (const args of run.invocations) {
+    expect(args).toContain('--connect-timeout 10');
+    expect(args).toContain('-m 30');
+    expect(args).not.toContain('--retry');
+  }
+  expect(run.output).toContain(finalCode);
+}
+
+test.describe('burst probe bounds (static + executed pin)', () => {
+  test('probe runs strict with bounded single-attempt requests', () => {
+    assertBurstProbeStatic(burstScript);
+  });
+
+  test('final 429 completes 11 requests and exits 0', () => {
+    const run = runBurstProbe(burstScriptPath, { STUB_FINAL_CODE: '429' });
+    assertBurstExecutedContract(run, '429');
+    expect(run.output).toContain('retry-after');
+  });
+
+  test('final 503 stays observable and exits 0', () => {
+    const run = runBurstProbe(burstScriptPath, { STUB_FINAL_CODE: '503' });
+    assertBurstExecutedContract(run, '503');
+  });
+
+  test('transport failure aborts on the first attempt', () => {
+    const run = runBurstProbe(burstScriptPath, { STUB_FAIL_AT: '1' });
+    expect(run.status).not.toBe(0);
+    expect(run.attempts).toBe(1);
+    expect(run.invocations).toHaveLength(1);
+  });
+
+  test('flag-removal, value, and retry mutants fail the static pin', () => {
+    const mutants = [
+      burstScript.replace('set -euo pipefail', 'set -u'),
+      burstScript.replace(' --connect-timeout 10', ''),
+      burstScript.replace(' -m 30', ''),
+      burstScript.replace(' -m 30', ' -m 30 --retry 3'),
+      burstScript.replace('--connect-timeout 10', '--connect-timeout 5'),
+      burstScript.replace('-m 30', '-m 60'),
+      burstScript.replace('seq 1 11', 'seq 1 5'),
+    ];
+    for (const mutant of mutants) {
+      expect(mutant, 'mutant must differ from the pinned script').not.toBe(burstScript);
+      expect(() => assertBurstProbeStatic(mutant), 'mutant must violate the pin').toThrow();
+    }
+  });
+
+  test('base probe fails open, proving the executed fixture distinguishes it', () => {
+    // Regression proof: the pre-change probe (set -u, unbounded curl) run
+    // through the same stub exits 0 on a first-attempt transport failure
+    // and records unbounded invocations — the executed contract throws on it.
+    const base = burstScript
+      .replace('set -euo pipefail', 'set -u')
+      .replace(' --connect-timeout 10 -m 30', '');
+    expect(base).not.toBe(burstScript);
+    expect(() => assertBurstProbeStatic(base), 'base text must violate the static pin').toThrow();
+    const probe = mkdtempSync(
+      join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'burst-base-'),
+    );
+    try {
+      const mutantPath = join(probe, 'burst-base.sh');
+      writeFileSync(mutantPath, base);
+      const failOpen = runBurstProbe(mutantPath, { STUB_FAIL_AT: '1' });
+      expect(failOpen.status).toBe(0);
+      expect(failOpen.invocations).toHaveLength(11);
+      expect(failOpen.invocations[0]).not.toContain('--connect-timeout');
+      expect(
+        () => assertBurstExecutedContract(failOpen, '429'),
+        'base run must violate the executed contract',
+      ).toThrow();
+    } finally {
+      rmSync(probe, { recursive: true, force: true });
+    }
+  });
+
+  test('ingest README documents the local-only probe', () => {
+    const readme = readFileSync(
+      new URL('../../workers/ingest/README.md', import.meta.url),
+      'utf8',
+    );
+    expect(readme).toContain('scripts/search_rate_limit_burst.sh');
+    expect(readme).toContain('never point this script at');
+    expect(readme).toContain('production');
   });
 });
