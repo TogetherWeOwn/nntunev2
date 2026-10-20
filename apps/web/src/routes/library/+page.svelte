@@ -9,6 +9,7 @@
 		type LibraryItem
 	} from '#lib/library/cache.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
+	import { resolveStreamUrl } from '#lib/library/stream-url.js';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
 	import {
 		addTrack,
@@ -59,9 +60,10 @@
 	// venture slices that own them. The placeholder below keeps its hook
 	// rendered until then.
 	const overLimit = false;
-	// Queue metadata alone is not playable media.
+	// Queue metadata alone is not playable media: the player renders only
+	// when resolveStreamUrl finds a real (non-blank) stream URL.
 	const currentTrack = $derived(queueCurrentTrack(queue));
-	const streamUrl = $derived(currentTrack?.streamUrl.trim() ?? '');
+	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 
 	function displayTitle(track: LibraryItem): string {
 		const title = track.title;
