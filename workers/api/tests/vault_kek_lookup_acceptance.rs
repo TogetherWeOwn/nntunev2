@@ -63,6 +63,23 @@ fn payload() -> Vec<u8> {
     .into_bytes()
 }
 
+// PUT parses the body into `VaultPutBody`, rebuilds `VaultPayload`, and
+// encrypts the re-serialized bytes. `ProviderConfig` always serializes
+// `allow_insecure_plaintext` (serde default applies to deserialize only),
+// so PUT-saved plaintext carries the field the request fixture omits.
+fn canonical_payload() -> Vec<u8> {
+    serde_json::json!({
+        "provider": {
+            "host": HOST, "port": 563, "tls": true,
+            "username": "synthetic-user", "password": "synthetic-password",
+            "max_connections": 4, "allow_insecure_plaintext": false
+        },
+        "indexer": null
+    })
+    .to_string()
+    .into_bytes()
+}
+
 fn encrypted_row(key: &[u8; 32], version: u32, user: &str) -> handlers::VaultRow {
     handlers::VaultRow {
         blob: vault::encrypt_vault(key, version, user, &payload())
@@ -81,6 +98,19 @@ fn assert_round_trip(key: &[u8; 32], user: &str, blob: &vault::VaultBlob) {
     assert!(
         actual == expected,
         "decrypted synthetic payload must round-trip"
+    );
+}
+
+fn assert_put_round_trip(key: &[u8; 32], user: &str, blob: &vault::VaultBlob) {
+    let plaintext = vault::decrypt_vault(key, user, blob).expect("decrypt synthetic fixture");
+    let actual: serde_json::Value =
+        serde_json::from_slice(&plaintext).expect("synthetic plaintext is JSON");
+    let expected: serde_json::Value =
+        serde_json::from_slice(&canonical_payload()).expect("canonical fixture JSON");
+    // Boolean comparison deliberately avoids Debug-printing decrypted data.
+    assert!(
+        actual == expected,
+        "decrypted PUT-saved payload must match the canonicalized shape"
     );
 }
 
@@ -456,7 +486,7 @@ fn current_key_wins() {
     h.put(&config, &cookie);
     let saved = h.row("selector-user");
     assert_eq!(saved.blob.kek_version, CURRENT);
-    assert_round_trip(&current, "selector-user", &saved.blob);
+    assert_put_round_trip(&current, "selector-user", &saved.blob);
     assert!(vault::decrypt_vault(&decoy, "selector-user", &saved.blob).is_err());
 }
 
@@ -479,7 +509,7 @@ fn put_uses_current_key() {
     let saved = h.row(user);
     assert_eq!(saved.blob.kek_version, CURRENT);
     assert_eq!(saved.updated_at, NOW + 1);
-    assert_round_trip(&current, user, &saved.blob);
+    assert_put_round_trip(&current, user, &saved.blob);
     assert!(vault::decrypt_vault(&prior, user, &saved.blob).is_err());
     assert_eq!(h.store.writes.get(), 1);
     assert!(
@@ -678,7 +708,7 @@ fn legacy_single_key_is_preserved() {
     h.put(&config, &cookie);
     let saved = h.row(user);
     assert_eq!(saved.blob.kek_version, legacy_version);
-    assert_round_trip(
+    assert_put_round_trip(
         config.kek_by_version(legacy_version).expect("legacy key"),
         user,
         &saved.blob,
