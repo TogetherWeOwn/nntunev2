@@ -2,6 +2,13 @@
 
 `day1.json` holds 100 videos: 50 `label_music` + 50 `audio_track`.
 
+Scope note (owner 2026-10-21): the spike covers official music videos
+only (externally curated/verified), preferring the official track at
+the best available quality for audio. VEVO authorship + `- Topic`
+auto-tracks are the standing proxy for "official" until the host posts
+the official-media selection research; re-run `build.sh` with new
+selection criteria if that research requires it.
+
 ## Method (`build.sh`)
 
 1. Phase 1: harvest candidate video IDs from server-rendered YouTube

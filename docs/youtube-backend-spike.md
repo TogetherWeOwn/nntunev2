@@ -11,6 +11,20 @@ Owner 2026-10-21: build our own yt-dlp-style YouTube backend on
 Cloudflare Workers, with a residential proxy only for auth/extraction
 if needed — not for streaming bytes.
 
+Owner 2026-10-21 update (scope + proxy rules for this spike):
+
+- The owner's home residential IP (gluetun `mcp-resi-vpn`) may be used
+  ONLY for development/internal testing in this spike, never for
+  anything public-facing. Production must use a separate residential
+  proxy service. No home endpoint, credential or IP literal is committed
+  anywhere; spike dev tooling reads it from local-only config.
+- Scope is official music videos only (externally curated/verified);
+  for audio, prefer the official track at the best available quality.
+  The current corpus classes (VEVO uploads + `- Topic` auto-tracks) are
+  the standing proxy for "official" until the host posts the
+  official-media selection research — the corpus is re-cut if that
+  research requires different selection criteria.
+
 ## GO/NO-GO gate
 
 Are label-video stream URLs bound to the extraction IP? The Day-1
@@ -79,7 +93,10 @@ is the reference for version bumps.
 - Proxy (when needed): HTTP CONNECT via `connect()` + `startTls`, for
   `/player` only (~25 KB/extraction, ~$0.10/1k at ~$4/GB). PO-token
   (BotGuard) cases stay out of the Worker: Browser Rendering as an
-  off-by-default fallback.
+  off-by-default fallback. Spike dev/internal testing may use the home
+  residential IP; production uses a separate residential proxy service
+  (procurement outside this spike) — the home IP never appears in a
+  public-facing path.
 
 ## Day plan
 
@@ -97,10 +114,13 @@ is the reference for version bumps.
 
 ## Open dependencies
 
-- **Proxy account (owner spend OK via the host):** Decodo or similar
-  pay-as-you-go (~$4/GB; the spike needs well under 1 GB). The
-  `connect()` proxy-client slice starts when the endpoint + credentials
-  land as a secret; nothing proxy-dependent runs before that.
+- **Residential egress for spike dev testing (owner 2026-10-21):**
+  the home residential IP via gluetun (`mcp-resi-vpn`), dev/internal
+  only. The `connect()` proxy-client slice starts when the dev path to
+  that endpoint is available (host/operator provides how to reach it
+  from the dev environment); nothing proxy-dependent runs before that.
+  No separate proxy spend is needed inside this spike; production's
+  separate residential service is procured outside it.
 - **Staging deploy** of the measurement worker (needs the runtime-entry
   slice first). No gate numbers exist until bytes are fetched from
   Worker egress.
