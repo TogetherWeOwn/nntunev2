@@ -1032,11 +1032,34 @@ mod tests {
     }
 
     #[test]
+    fn unquoted_hint_selects_first_supported_token() {
+        // Dotted prose (versions, site names) and later supported tokens must
+        // not win: the first token with a supported terminal extension does.
+        for (subject, token) in [
+            (
+                "Album v2.0 - track.flac repair.par2 (1/2)",
+                Some("track.flac"),
+            ),
+            ("www.example.com - track.flac (1/2)", Some("track.flac")),
+        ] {
+            assert_eq!(unquoted_hint_token(subject), token, "{subject:?}");
+            assert_eq!(
+                subject_metadata(subject),
+                (None, "content".to_string(), "flac".to_string()),
+                "{subject:?}"
+            );
+        }
+    }
+
+    #[test]
     fn extension_set_is_closed() {
         assert_eq!(classify_extension("par2"), Some(("par2", "par2")));
         assert_eq!(classify_extension("rar"), Some(("archive", "rar")));
         assert_eq!(classify_extension("r00"), Some(("archive", "rar")));
         assert_eq!(classify_extension("7z"), Some(("archive", "7z")));
+        assert_eq!(classify_extension("flac"), Some(("content", "flac")));
+        assert_eq!(classify_extension("opus"), Some(("content", "opus")));
+        assert_eq!(classify_extension("mp3"), Some(("content", "mp3")));
         assert_eq!(classify_extension("nfo"), Some(("nfo", "other")));
         assert_eq!(classify_extension("cue"), Some(("cue", "other")));
         assert_eq!(classify_extension("txt"), None);
