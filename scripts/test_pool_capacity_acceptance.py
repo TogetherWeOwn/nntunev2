@@ -6,9 +6,10 @@ before the floor check): if floor + slots*budget > fs_size or hard_limit >
 fs_size (statvfs on the pool path), print a structured stderr JSON finding
 and continue unchanged (warning, never refusal).
 
-Positive A-cases (A1, A4-A7) are RED on current code (no warning exists yet)
-and go green when the Builder implements the finding. A2/A3 are no-finding
-negative controls: green before and after by design.
+Positive A-cases (A1, A4-A8) are RED on current code (no warning exists yet)
+and go green when the Builder implements the finding. A2/A3/A9 are no-finding
+negative controls: green before and after by design. A10 pins frsize scaling:
+24 GiB stays silent, 20 GiB warns with the exact byte size.
 
 B-tests pin current behavior and must stay green before and after.
 
@@ -270,6 +271,72 @@ class WarningTests(PoolFixture):
         self.assertLess(kinds.index('pool_provisioning_mismatch'),
                         kinds.index('stale_lease_recovered'),
                         'warning precedes acquire/recovery')
+
+    def test_a8_floor_branch_only_warns_and_admits(self):
+        # Floor-plus-budgets 22 GiB > size 20 GiB, but hard 16 GiB < 20 GiB:
+        # the finding can only come from the floor term (pins the branch a
+        # mutant would drop from the condition).
+        self.save_policy(self.host_policy())
+        self.make_slots()
+        fake = FakeStatvfs(20 * GIB, HOST_FLOOR)
+        err = io.StringIO()
+        with patch.object(os, 'statvfs', return_value=fake):
+            with contextlib.redirect_stderr(err):
+                rc = cache.run_cargo(self.pool, ['check'], cargo=self.true_bin)
+        self.assertEqual(rc, 0, err.getvalue())
+        findings = provisioning_findings(err.getvalue())
+        self.assertEqual(len(findings), 1,
+                         f'expected one floor-branch finding, stderr={err.getvalue()!r}')
+        found = findings[0]
+        self.assertLess(found['hard_limit_bytes'], found['filesystem_size_bytes'],
+                        'hard term must be false so only the floor term can fire')
+        self.assertEqual(found['floor_plus_budgets_bytes'], HOST_FLOOR_PLUS)
+        self.assertEqual(found['filesystem_size_bytes'], 20 * GIB)
+        self.assertEqual(self.leases(), [])
+
+    def test_a9_exact_fit_boundary_has_no_finding(self):
+        # size == floor_plus_budgets (22 GiB): strict greater-than means no
+        # finding (pins the boundary a >= mutant would cross).
+        self.save_policy(self.host_policy())
+        self.make_slots()
+        fake = FakeStatvfs(HOST_FLOOR_PLUS, HOST_FLOOR)
+        err = io.StringIO()
+        with patch.object(os, 'statvfs', return_value=fake):
+            with contextlib.redirect_stderr(err):
+                rc = cache.run_cargo(self.pool, ['check'], cargo=self.true_bin)
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual(provisioning_findings(err.getvalue()), [],
+                         f'exact fit must not warn, stderr={err.getvalue()!r}')
+        self.assertEqual(self.leases(), [])
+
+    def test_a10_frsize_scaling_reports_exact_bytes(self):
+        # Nontrivial frsize: byte size is blocks * frsize, not the raw block
+        # count (pins the scaling factor a mutant would drop).
+        self.save_policy(self.host_policy())
+        self.make_slots()
+        # 24 GiB fits both terms -> silent.
+        err = io.StringIO()
+        with patch.object(os, 'statvfs',
+                          return_value=FakeStatvfs(24 * GIB, HOST_FLOOR, frsize=4096)):
+            with contextlib.redirect_stderr(err):
+                rc = cache.run_cargo(self.pool, ['check'], cargo=self.true_bin)
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual(provisioning_findings(err.getvalue()), [],
+                         f'24 GiB with frsize must not warn, stderr={err.getvalue()!r}')
+        self.assertEqual(self.leases(), [])
+        # 20 GiB exceeds floor-plus (22 GiB) via the floor term only, and the
+        # reported size must be exact bytes, not the block count.
+        err = io.StringIO()
+        with patch.object(os, 'statvfs',
+                          return_value=FakeStatvfs(20 * GIB, HOST_FLOOR, frsize=4096)):
+            with contextlib.redirect_stderr(err):
+                rc = cache.run_cargo(self.pool, ['check'], cargo=self.true_bin)
+        self.assertEqual(rc, 0, err.getvalue())
+        findings = provisioning_findings(err.getvalue())
+        self.assertEqual(len(findings), 1,
+                         f'expected one frsize finding, stderr={err.getvalue()!r}')
+        self.assertEqual(findings[0]['filesystem_size_bytes'], 20 * GIB)
+        self.assertEqual(self.leases(), [])
 
 
 class BehaviorPinTests(PoolFixture):
