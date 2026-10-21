@@ -76,8 +76,10 @@
 	let busy = $state(false);
 	let disposed = false;
 	// Page-owned cancellation: every test/save/reauth request and the passkey
-	// ceremony run under these controllers so reset and unmount fence work
-	// the transport itself ignores. Aborting sends nothing new.
+	// ceremony run under these controllers so an auth-transition reset fences
+	// work the transport itself ignores. Aborting sends nothing new. Plain
+	// unmount intentionally does NOT abort: in-flight work survives
+	// navigation and settles to nothing via the disposed checks below.
 	let requestController: AbortController | null = null;
 	let ceremonyController: AbortController | null = null;
 
@@ -90,7 +92,6 @@
 
 	onDestroy(() => {
 		disposed = true;
-		abortOwnedWork();
 		invalidateTest();
 		busy = false;
 	});
