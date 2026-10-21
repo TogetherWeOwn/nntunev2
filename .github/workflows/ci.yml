@@ -113,7 +113,8 @@ jobs:
           # fails closed instead of executing. Re-pin deliberately when the
           # version above changes, verifying the digest out-of-band first.
           expected_sha256="9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
-          curl -sSL --retry 3 -o "/tmp/${asset}" "${base}/${asset}"
+          curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 \
+            -o "/tmp/${asset}" "${base}/${asset}"
           echo "${expected_sha256}  /tmp/${asset}" | (cd /tmp && sha256sum -c -)
           mkdir -p "$HOME/.cargo/bin"
           tar -xzf "/tmp/${asset}" -C /tmp
@@ -205,6 +206,8 @@ jobs:
         run: python3 .github/scripts/test_public_text_lint.py
       - name: Acceptance-test unreadable-input handling
         run: python3 .github/scripts/test_public_text_read_errors.py
+      - name: Structural-test the pnpm bootstrap retry
+        run: python3 .github/scripts/test_ci_pnpm_retry.py
 
   # Bounded local Cargo pool: the offline wrapper suite plus a shape
   # check of the shipped pool policy through the wrapper's own
@@ -256,10 +259,12 @@ jobs:
   # in both staging and prod and match the docs/ops.md inventory. The
   # fixture pair proves the job goes red on drift: `match` must pass,
   # `drift-missing` / `drift-skew` must fail.
+  # These short Python guard jobs allow bounded runner-finalization headroom:
+  # hosted runners can hit a five-minute job limit after all steps pass.
   binding-parity:
     name: binding-parity
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -292,7 +297,7 @@ jobs:
   migrations-gate:
     name: migrations-gate
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     # Compare pushes with their previous tip; comparing main to itself would miss drift.
     env:
       MIGRATIONS_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000' && github.event.before || 'main' }}
@@ -369,6 +374,8 @@ jobs:
         run: bash containers/mb-import/tests/test_etl.sh
       - name: Run mb-import ETL reference-graph tests
         run: bash containers/mb-import/tests/test_etl_reference_graphs.sh
+      - name: Run mb-import input-admission tests (mock-only)
+        run: bash containers/mb-import/tests/test_input_admission.sh
       - name: Run mb-import argv-hygiene tests
         run: bash containers/mb-import/tests/test_argv_hygiene.sh
       - name: Run mb-import pg-env tests
@@ -633,7 +640,7 @@ jobs:
   cache-policy:
     name: cache-policy
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -685,7 +692,11 @@ jobs:
   # a PR that introduces breakage (source or target side) can go red;
   # external links are out of scope. The fixture pair proves the job goes
   # red on breakage: `match` must pass, `broken-file` / `broken-anchor`
-  # must fail. Keep this job id in ci-ok's needs.
+  # must fail. The same job also runs the citation lint: backticked
+  # `path:N` / `path:N-M` citations must resolve, stay in range, and land
+  # on their anchor symbols, with the same changed-file scope, whole-tree
+  # pin (so drift from a concurrent merge reds main), and fixture proofs.
+  # Keep this job id in ci-ok's needs.
   docs-links:
     name: docs-links
     runs-on: ubuntu-latest
@@ -738,6 +749,39 @@ jobs:
             printf '%s\n' "$output" | sed 's/^/| /'
             echo "docs-links: $fixture fixture correctly failed"
           done
+      - name: Check citations in changed docs
+        run: python3 .github/scripts/docs_citation_lint.py --root . --base-ref "$DOCS_LINKS_BASE_REF"
+      - name: Run citation lint self-tests
+        run: python3 .github/scripts/test_docs_citation_lint.py
+      - name: Pin citation lint on whole tree
+        run: python3 .github/scripts/docs_citation_lint.py --root .
+      - name: Citation lint passes on the matching fixture
+        run: python3 .github/scripts/docs_citation_lint.py --root .github/scripts/fixtures/docs-citations/match
+      - name: Citation lint goes red on broken-citation fixtures
+        run: |
+          for fixture in broken-path broken-eof broken-order broken-symbol; do
+            case "$fixture" in
+              broken-path) expected="citation target does not resolve" ;;
+              broken-eof) expected="cited line out of range" ;;
+              broken-order) expected="invalid citation range" ;;
+              broken-symbol) expected="citation does not land on" ;;
+            esac
+            rc=0
+            output=$(python3 .github/scripts/docs_citation_lint.py \
+              --root ".github/scripts/fixtures/docs-citations/$fixture" 2>&1) || rc=$?
+            if [ "$rc" -ne 1 ] || ! printf '%s\n' "$output" | grep -Fq "docs-citations: $expected"; then
+              printf '%s\n' "$output" >&2
+              echo "docs-citations: $fixture must report '$expected' and exit 1, got $rc" >&2
+              exit 1
+            fi
+            # Neutralise workflow commands: the fixture output holds
+            # ::error lines for fixture-relative paths, which would post
+            # phantom annotations on a green job if echoed raw. The
+            # runner strips leading whitespace before matching "::"
+            # (TrimStart), so prefix with "| " instead of a space.
+            printf '%s\n' "$output" | sed 's/^/| /'
+            echo "docs-citations: $fixture fixture correctly failed"
+          done
 
   # E2E harness static checks: typecheck + spec discovery with no staging
   # needed, so every PR proves the harness still compiles. The live suite
@@ -757,6 +801,9 @@ jobs:
           node-version: 26
           cache: npm
           cache-dependency-path: e2e/package-lock.json
+
+      - name: Smoke checker self-tests (offline fixtures only)
+        run: node --test bin/test-smoke-acceptance.mjs
 
       - name: Install e2e dependencies
         working-directory: e2e
@@ -810,7 +857,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      # The pinned self-installer runs one `npm ci` with no retry, so retry
+      # it once in-job. Each attempt recreates its bootstrap dir and exports
+      # PATH/PNPM_HOME only on success; a second failure fails the job.
+      - id: pnpm-setup
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        continue-on-error: true
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Retry pnpm bootstrap once
+        if: steps.pnpm-setup.outcome == 'failure'
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -832,7 +889,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      # The pinned self-installer runs one `npm ci` with no retry, so retry
+      # it once in-job. Each attempt recreates its bootstrap dir and exports
+      # PATH/PNPM_HOME only on success; a second failure fails the job.
+      - id: pnpm-setup
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        continue-on-error: true
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Retry pnpm bootstrap once
+        if: steps.pnpm-setup.outcome == 'failure'
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -854,7 +921,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      # The pinned self-installer runs one `npm ci` with no retry, so retry
+      # it once in-job. Each attempt recreates its bootstrap dir and exports
+      # PATH/PNPM_HOME only on success; a second failure fails the job.
+      - id: pnpm-setup
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        continue-on-error: true
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Retry pnpm bootstrap once
+        if: steps.pnpm-setup.outcome == 'failure'
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -886,7 +963,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      # The pinned self-installer runs one `npm ci` with no retry, so retry
+      # it once in-job. Each attempt recreates its bootstrap dir and exports
+      # PATH/PNPM_HOME only on success; a second failure fails the job.
+      - id: pnpm-setup
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        continue-on-error: true
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Retry pnpm bootstrap once
+        if: steps.pnpm-setup.outcome == 'failure'
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0

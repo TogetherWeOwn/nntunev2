@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { readFileSync, readdirSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, symlinkSync } from 'node:fs';
+import { readFileSync, readdirSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, symlinkSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -1149,6 +1149,416 @@ test.describe('locked-dependency coverage builds (static pin)', () => {
   });
 });
 
+test.describe('locked-dependency ci builds (static pin)', () => {
+  // The api job is the audited auth/vault-crypto set: its test/clippy/check
+  // steps pass --locked so a missing or stale workers/api/Cargo.lock fails
+  // the build instead of silently re-resolving. Nothing stops a future edit
+  // from dropping one flag while every suite stays green — these cases pin
+  // the three flags offline so such an edit reds test:unit. The
+  // mb/ingest/repair jobs deliberately resolve unlocked (README Test
+  // section); that asymmetry is pinned here too, so a deliberate policy
+  // change must update prose + pin together instead of drifting apart.
+  // `cargo fmt` takes no --locked flag and is excluded from both pins; the
+  // fmt steps still have to exist so the exclusion stays deliberate.
+  const stripFullLineComments = (text: string): string =>
+    text.replace(/^[ \t]*#.*$/gm, '');
+  const ciCode = stripFullLineComments(ciWorkflow);
+  const readme = readFileSync(new URL('../../README.md', import.meta.url), 'utf8');
+
+  // Cargo invocations for one verb inside one ci job: continuations joined,
+  // trailing comments cut so `# --locked` cannot satisfy the locked pin,
+  // then split on the full shell separator set (&&, ||, ;, bare & for
+  // background, bare | for pipe, which also covers |& pipe-stderr) so each
+  // chained `cargo` invocation is asserted on its own — one --locked token
+  // must not credit a sibling invocation on the same run line. Search for
+  // cargo anywhere in each segment: timeout/env, grouping, negation and
+  // quoted assignments can all precede executed cargo. This is a conservative
+  // static pin, not a shell parser. Only a whole literal echo is ignored;
+  // never strip quoted strings wholesale, since double quotes can execute
+  // $(cargo ...) and backticks. Ambiguous forms remain fail-closed.
+  const stripTrailingComment = (line: string): string => {
+    type Context = { quote?: "'" | '"' | 'ansi-c'; end?: ')' | '`'; depth: number; wordStart: boolean };
+    const contexts: Context[] = [{ depth: 0, wordStart: true }];
+    for (let index = 0; index < line.length; index += 1) {
+      const char = line[index]!;
+      const context = contexts[contexts.length - 1]!;
+      if (context.quote === "'") {
+        if (char === "'") context.quote = undefined;
+        continue;
+      }
+      if (context.quote === 'ansi-c') {
+        if (char === '\\') index += 1;
+        else if (char === "'") context.quote = undefined;
+        continue;
+      }
+      if (context.quote !== '"' && char === '$' && line[index + 1] === "'") {
+        context.quote = 'ansi-c';
+        context.wordStart = false;
+        index += 1;
+        continue;
+      }
+      if (char === '\\') {
+        index += 1;
+        context.wordStart = false;
+        continue;
+      }
+      // Substitutions have their own quotes: the inner double quotes in
+      // `echo "$(echo "step #2")"` must not close the outer quoted string.
+      if (char === '$' && line[index + 1] === '(') {
+        context.wordStart = false;
+        contexts.push({ end: ')', depth: 1, wordStart: true });
+        index += 1;
+        continue;
+      }
+      if (char === '`') {
+        if (context.end === '`' && !context.quote) contexts.pop();
+        else {
+          context.wordStart = false;
+          contexts.push({ end: '`', depth: 0, wordStart: true });
+        }
+        continue;
+      }
+      if (context.quote === '"') {
+        if (char === '"') context.quote = undefined;
+        continue;
+      }
+      if (char === "'" || char === '"') {
+        context.quote = char;
+        context.wordStart = false;
+      } else if (char === '(' && context.end === ')') {
+        context.depth += 1;
+        context.wordStart = true;
+      } else if (char === ')' && context.end === ')') {
+        context.depth -= 1;
+        if (context.depth === 0) contexts.pop();
+        else context.wordStart = true;
+      } else if (char === '#' && context.wordStart) {
+        return line.slice(0, index);
+      } else {
+        // A shell comment starts a word, not an escaped space or `step#2`.
+        context.wordStart = /[\s;&|()]/.test(char);
+      }
+    }
+    return line;
+  };
+  const jobCargoSteps = (workflow: string, job: string, verb: string): string[] => {
+    const section = jobSection(stripFullLineComments(workflow), job).replace(/\\\r?\n\s*/g, ' ');
+    // Cargo's global arguments (including rustup's +toolchain selector)
+    // can also sit between the binary and verb. Do not allowlist options:
+    // an unfamiliar one must not hide a sibling invocation from this pin.
+    const cargoVerb = new RegExp(`\\bcargo(?:\\s+\\S+)*?\\s+${verb}\\b`);
+    const stripRunPrefix = (invocation: string): string =>
+      invocation.replace(/^\s*(?:-\s*)?run:\s*/, '').trim();
+    const literalEcho = /^echo(?:\s+(?:'[^']*'|"[^"$`\\]*"|[\w./=-]+))+\s*$/;
+    return section
+      .split('\n')
+      .map(stripTrailingComment)
+      // Exclude a whole literal echo before splitting quoted separators:
+      // `echo "note; cargo test ..."` must not fabricate a Cargo step.
+      .filter((line) => !literalEcho.test(stripRunPrefix(line)))
+      // && / || precede their bare prefixes so each pair splits as one
+      // separator. Splitting inside redirections such as 2>&1 is harmless:
+      // the cargo segment keeps its flags and the fragments match no verb.
+      .flatMap((line) => line.split(/\s*(?:&&|\|\||;|&|\|)\s*/))
+      .filter((invocation) => !literalEcho.test(stripRunPrefix(invocation)))
+      .filter((invocation) => cargoVerb.test(invocation));
+  };
+  // `--frozen` is cargo's alias for `--locked --offline` (cargo --help), so
+  // it resolves locked and the unlocked pin must see it. Token boundaries
+  // keep pnpm's `--frozen-lockfile` from ever matching.
+  const hasLockedFlag = (command: string): boolean =>
+    /(?:^|\s)--(?:locked|frozen)(?:\s|$)/.test(command);
+
+  const assertApiLocked = (workflow: string) => {
+    for (const verb of ['test', 'clippy', 'check']) {
+      const steps = jobCargoSteps(workflow, 'api', verb);
+      expect(steps.length, `api job must keep a cargo ${verb} step`).toBeGreaterThan(0);
+      for (const step of steps) {
+        expect(step, `api cargo ${verb} step must target workers/api`).toContain(
+          'workers/api/Cargo.toml',
+        );
+        expect(
+          hasLockedFlag(step),
+          `api cargo ${verb} step lost its --locked flag: ${step.trim()}`,
+        ).toBe(true);
+      }
+    }
+    expect(
+      jobCargoSteps(workflow, 'api', 'fmt').length,
+      'api job must keep a cargo fmt step',
+    ).toBeGreaterThan(0);
+  };
+
+  const UNLOCKED_JOBS = [
+    { job: 'rust-mb', crate: 'mb' },
+    { job: 'rust-ingest', crate: 'ingest' },
+    { job: 'rust-repair', crate: 'repair' },
+  ] as const;
+
+  const assertJobUnlocked = (workflow: string, job: string, crate: string) => {
+    for (const verb of ['test', 'clippy', 'check']) {
+      const steps = jobCargoSteps(workflow, job, verb);
+      expect(steps.length, `${job} must keep a cargo ${verb} step`).toBeGreaterThan(0);
+      for (const step of steps) {
+        expect(step, `${job} cargo ${verb} step must target workers/${crate}`).toContain(
+          `workers/${crate}/Cargo.toml`,
+        );
+        expect(
+          hasLockedFlag(step),
+          `${job} cargo ${verb} step resolves unlocked per the README Test section: ${step.trim()}`,
+        ).toBe(false);
+      }
+    }
+    expect(
+      jobCargoSteps(workflow, job, 'fmt').length,
+      `${job} must keep a cargo fmt step`,
+    ).toBeGreaterThan(0);
+  };
+
+  const assertReadmeAsymmetry = (prose: string) => {
+    // The exact policy sentences: only api locks, the other three Worker
+    // jobs resolve unlocked. A policy change rewrites these lines and the
+    // job pins above in the same PR — or this reds.
+    expect(prose).toContain('only the api job passes --locked to test/clippy/check');
+    expect(prose).toContain('rust (workers/mb)');
+    expect(prose).toContain('rust (workers/ingest)');
+    expect(prose).toContain('rust (workers/repair)');
+    expect(prose).toContain('jobs resolve without --locked');
+  };
+
+  test('api job passes --locked to test/clippy/check', () => {
+    assertApiLocked(ciCode);
+  });
+
+  test('mb/ingest/repair jobs resolve without --locked (documented asymmetry)', () => {
+    for (const { job, crate } of UNLOCKED_JOBS) {
+      assertJobUnlocked(ciCode, job, crate);
+    }
+  });
+
+  test('README Test section documents the locked/unlocked asymmetry', () => {
+    assertReadmeAsymmetry(readme);
+  });
+
+  test('mutants dropping or adding a --locked flag trip the pins above', () => {
+    // Regression proof for the shared guards: each mutant models one flag
+    // edit and must throw the same helpers the real pins call (not a
+    // restated copy of the expectations).
+    const dropTest = ciCode.replace(
+      'cargo test --locked --manifest-path workers/api/Cargo.toml',
+      'cargo test --manifest-path workers/api/Cargo.toml',
+    );
+    const dropClippy = ciCode.replace(
+      'cargo clippy --locked --manifest-path workers/api/Cargo.toml',
+      'cargo clippy --manifest-path workers/api/Cargo.toml',
+    );
+    const dropCheck = ciCode.replace(
+      'cargo check --locked --manifest-path workers/api/Cargo.toml',
+      'cargo check --manifest-path workers/api/Cargo.toml',
+    );
+    // Trailing-comment bypass: the flag in a `#` comment is not a flag.
+    const commentFlag = ciCode.replace(
+      'cargo test --locked --manifest-path workers/api/Cargo.toml',
+      'cargo test --manifest-path workers/api/Cargo.toml # --locked',
+    );
+    // Chained-invocation bypass: splitting the api test step into two
+    // `cargo test` invocations on one run line must not let one --locked
+    // token credit the sibling. Both orders must throw.
+    const chainLockedFirst = ciCode.replace(
+      'cargo test --locked --manifest-path workers/api/Cargo.toml',
+      'cargo test --locked --manifest-path workers/api/Cargo.toml --lib && cargo test --manifest-path workers/api/Cargo.toml --doc',
+    );
+    const chainLockedSecond = ciCode.replace(
+      'cargo test --locked --manifest-path workers/api/Cargo.toml',
+      'cargo test --manifest-path workers/api/Cargo.toml --lib && cargo test --locked --manifest-path workers/api/Cargo.toml --doc',
+    );
+    // Separator-branch coverage: every alternative in the split pattern
+    // needs its own mutant, or narrowing the split stays green. Semicolon
+    // locked-first, OR locked-second (&& covers both orders above).
+    const chainSemiLockedFirst = ciCode.replace(
+      'cargo test --locked --manifest-path workers/api/Cargo.toml',
+      'cargo test --locked --manifest-path workers/api/Cargo.toml --lib; cargo test --manifest-path workers/api/Cargo.toml --doc',
+    );
+    const chainOrLockedSecond = ciCode.replace(
+      'cargo test --locked --manifest-path workers/api/Cargo.toml',
+      'cargo test --manifest-path workers/api/Cargo.toml --lib || cargo test --locked --manifest-path workers/api/Cargo.toml --doc',
+    );
+    // Bare-separator bypass: background (&) and pipe (|) chain invocations
+    // too. Ampersand locked-first with a trailing wait, pipe locked-second.
+    const chainAmpLockedFirst = ciCode.replace(
+      'cargo test --locked --manifest-path workers/api/Cargo.toml',
+      'cargo test --locked --manifest-path workers/api/Cargo.toml --lib & cargo test --manifest-path workers/api/Cargo.toml --doc & wait',
+    );
+    const chainPipeLockedSecond = ciCode.replace(
+      'cargo test --locked --manifest-path workers/api/Cargo.toml',
+      'cargo test --manifest-path workers/api/Cargo.toml --lib | cargo test --locked --manifest-path workers/api/Cargo.toml --doc',
+    );
+    // Quoted-cargo false positive: an echo printing an unlocked cargo
+    // command after a locked one must NOT trip the pin — echo writes its
+    // argument, it does not execute it.
+    const echoPrintsUnlocked = ciCode.replace(
+      'cargo test --locked --manifest-path workers/api/Cargo.toml',
+      'cargo test --locked --manifest-path workers/api/Cargo.toml --lib && echo "cargo test --manifest-path workers/api/Cargo.toml --doc"',
+    );
+    // Wrappers must not hide a sibling invocation while a plain command
+    // still satisfies the verb-presence check. Exercise both policy sides,
+    // and keep correctly locked/unlocked wrappers valid (not blanket-red).
+    const wrappers: Array<(command: string) => string> = [
+      (command) => `timeout 600 ${command}`,
+      (command) => `(${command})`,
+      (command) => `env ${command}`,
+      (command) => `RUSTFLAGS="-C target-feature=+simd128" ${command}`,
+      (command) => `{ ${command}; }`,
+      (command) => `! ${command}`,
+      (command) => `echo "$(${command})"`,
+      (command) => `echo "\`${command}\`"`,
+      (command) => command.replace(/^cargo /, 'cargo +stable '),
+      (command) => command.replace(/^cargo /, 'cargo --offline '),
+      (command) => command.replace(/^cargo /, 'cargo -q '),
+      (command) => command.replace(/^cargo /, 'cargo --config net.offline=true '),
+      // Literal hashes must not truncate the line before a chained sibling.
+      // Cover quote/escape states as well as a # inside an unquoted word.
+      (command) => `echo "step #2" && ${command}`,
+      (command) => `echo 'step #2' && ${command}`,
+      (command) => `echo \`echo "step #2"\` && ${command}`,
+      (command) => `echo "$(echo 'step #2')" && ${command}`,
+      (command) => `echo "\`echo 'step #2'\`" && ${command}`,
+      (command) => `echo "$(echo "step #2")" && ${command}`,
+      (command) => `echo "\`echo "step #2"\`" && ${command}`,
+      (command) => `echo "$( (echo "step #2") )" && ${command}`,
+      (command) => `${String.raw`echo "step \" #2"`} && ${command}`,
+      (command) => `${String.raw`echo 'step \ #2'`} && ${command}`,
+      (command) => `${String.raw`echo step \#2`} && ${command}`,
+      (command) => `${String.raw`echo step\ #2`} && ${command}`,
+      // ANSI-C quotes allow escaped apostrophes; hashes later in the quoted
+      // word must not truncate the executed sibling on either policy side.
+      (command) => `${String.raw`echo $'step \' #2'`} && ${command}`,
+      (command) => `echo step#2 && ${command}`,
+      (command) => `echo "note; stage" && ${command}`,
+      (command) => `echo 'note; stage' && ${command}`,
+      // Actual comments still cannot supply a flag, even after quoted hashes.
+      (command) => `${command} # --locked`,
+      (command) => `echo "step #2" && ${command} # --locked`,
+      (command) => `${command};# --locked`,
+      (command) => `echo "step #2" && ${command} # "unterminated --locked`,
+    ];
+    for (const wrap of wrappers) {
+      for (const locked of [false, true]) {
+        const apiCommand = `cargo test ${locked ? '--locked ' : ''}--manifest-path workers/api/Cargo.toml --doc`;
+        const apiSibling = ciCode.replace(
+          'cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets',
+          () => `cargo test --locked --manifest-path workers/api/Cargo.toml --lib && ${wrap(apiCommand)}`,
+        );
+        const mbCommand = `cargo test ${locked ? '--locked ' : ''}--manifest-path workers/mb/Cargo.toml --doc`;
+        const mbSibling = ciCode.replace(
+          'cargo test --manifest-path workers/mb/Cargo.toml --all-targets',
+          () => `cargo test --manifest-path workers/mb/Cargo.toml --lib && ${wrap(mbCommand)}`,
+        );
+        if (locked) {
+          expect(() => assertApiLocked(apiSibling), wrap(apiCommand)).not.toThrow();
+          expect(() => assertJobUnlocked(mbSibling, 'rust-mb', 'mb'), wrap(mbCommand)).toThrow();
+        } else {
+          expect(() => assertApiLocked(apiSibling), wrap(apiCommand)).toThrow();
+          expect(() => assertJobUnlocked(mbSibling, 'rust-mb', 'mb'), wrap(mbCommand)).not.toThrow();
+        }
+      }
+    }
+    const echoPrintsSingleQuoted = ciCode.replace(
+      'cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets',
+      "cargo test --locked --manifest-path workers/api/Cargo.toml --lib && echo 'cargo test --manifest-path workers/api/Cargo.toml --doc'",
+    );
+    expect(() => assertApiLocked(echoPrintsSingleQuoted)).not.toThrow();
+    // A separator inside literal echo text must not fabricate an executed
+    // Cargo step. Replace the only test invocation so the presence guard
+    // must reject it, regardless of the flags printed in that text.
+    for (const separator of [';', '&&', '||', '&', '|', '|&']) {
+      for (const quote of ["'", '"']) {
+        for (const locked of [false, true]) {
+          const apiEchoOnly = ciCode.replace(
+            'cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets',
+            `echo ${quote}note${separator} cargo test ${locked ? '--locked ' : ''}--manifest-path workers/api/Cargo.toml${quote}`,
+          );
+          const mbEchoOnly = ciCode.replace(
+            'cargo test --manifest-path workers/mb/Cargo.toml --all-targets',
+            `echo ${quote}note${separator} cargo test ${locked ? '--locked ' : ''}--manifest-path workers/mb/Cargo.toml${quote}`,
+          );
+          expect(() => assertApiLocked(apiEchoOnly), 'literal echo is not an api test step').toThrow();
+          expect(
+            () => assertJobUnlocked(mbEchoOnly, 'rust-mb', 'mb'),
+            'literal echo is not an mb test step',
+          ).toThrow();
+        }
+      }
+    }
+    // Policy drift the other way: locking an unlocked job without updating
+    // the README asymmetry must trip the unlocked pin.
+    const lockMb = ciCode.replace(
+      'cargo test --manifest-path workers/mb/Cargo.toml',
+      'cargo test --locked --manifest-path workers/mb/Cargo.toml',
+    );
+    const lockIngest = ciCode.replace(
+      'cargo test --manifest-path workers/ingest/Cargo.toml',
+      'cargo test --locked --manifest-path workers/ingest/Cargo.toml',
+    );
+    const lockRepair = ciCode.replace(
+      'cargo test --manifest-path workers/repair/Cargo.toml',
+      'cargo test --locked --manifest-path workers/repair/Cargo.toml',
+    );
+    // `--frozen` is cargo's `--locked --offline` alias: it resolves locked,
+    // so it must trip the unlocked pin exactly like `--locked` does.
+    const frozenMbClippy = ciCode.replace(
+      'cargo clippy --manifest-path workers/mb/Cargo.toml',
+      'cargo clippy --frozen --manifest-path workers/mb/Cargo.toml',
+    );
+    const frozenMbCheck = ciCode.replace(
+      'cargo check --manifest-path workers/mb/Cargo.toml',
+      'cargo check --frozen --manifest-path workers/mb/Cargo.toml',
+    );
+    const frozenRepairWasmClippy = ciCode.replace(
+      'cargo clippy --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown',
+      'cargo clippy --frozen --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown',
+    );
+    // Prose drift: rewriting the policy sentence without the job pins (or
+    // vice versa) must trip the prose pin.
+    const proseLocksAll = readme.replace(
+      'only the api job passes --locked to test/clippy/check',
+      'every Worker job passes --locked to test/clippy/check',
+    );
+    const proseUnlocksApi = readme.replace(
+      'jobs resolve without --locked',
+      'jobs resolve with --locked',
+    );
+
+    for (const mutant of [
+      dropTest,
+      dropClippy,
+      dropCheck,
+      commentFlag,
+      chainLockedFirst,
+      chainLockedSecond,
+      chainSemiLockedFirst,
+      chainOrLockedSecond,
+      chainAmpLockedFirst,
+      chainPipeLockedSecond,
+    ]) {
+      expect(() => assertApiLocked(mutant), 'mutant must violate the api locked pin').toThrow();
+    }
+    expect(
+      () => assertApiLocked(echoPrintsUnlocked),
+      'echo printing cargo text must not trip the api locked pin',
+    ).not.toThrow();
+    expect(() => assertJobUnlocked(lockMb, 'rust-mb', 'mb')).toThrow();
+    expect(() => assertJobUnlocked(lockIngest, 'rust-ingest', 'ingest')).toThrow();
+    expect(() => assertJobUnlocked(lockRepair, 'rust-repair', 'repair')).toThrow();
+    expect(() => assertJobUnlocked(frozenMbClippy, 'rust-mb', 'mb')).toThrow();
+    expect(() => assertJobUnlocked(frozenMbCheck, 'rust-mb', 'mb')).toThrow();
+    expect(() => assertJobUnlocked(frozenRepairWasmClippy, 'rust-repair', 'repair')).toThrow();
+    for (const mutant of [proseLocksAll, proseUnlocksApi]) {
+      expect(() => assertReadmeAsymmetry(mutant), 'mutant must violate the prose pin').toThrow();
+    }
+  });
+});
+
 test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)', () => {
   // deploy.yml deploys apps/web plus the one authorized backend lane,
   // `staging-api` (api Worker, staging only); every further backend lane
@@ -1281,6 +1691,15 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     expect(section).toMatch(
       /^[ \t]*\[env\.staging\.observability\]\n[ \t]+enabled = true\n[ \t]+head_sampling_rate = 1\n/m,
     );
+    // Public vars parity: the generated staging config must carry all four
+    // public [env.staging.vars] lines (RP pair from repo vars, session TTL
+    // literal, cache-disabled attestation). A dropped SESSION_TTL_SECS falls
+    // back to a compiled default and a dropped HYPERDRIVE_CACHING_DISABLED
+    // refuses traffic — both merge green without this pin. Names plus
+    // ${...}/literal shape only, never secret values.
+    expect(section).toMatch(
+      /^[ \t]*\[env\.staging\.vars\]\n[ \t]+RP_ID = "\$\{API_RP_ID_STAGING\}"\n[ \t]+RP_ORIGIN = "\$\{API_RP_ORIGIN_STAGING\}"\n[ \t]+SESSION_TTL_SECS = "86400"\n[ \t]+HYPERDRIVE_CACHING_DISABLED = "1"\n/m,
+    );
   };
 
   const assertDeployGuard = (body: string) => {
@@ -1380,6 +1799,51 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       '          [env.staging.observability]\n',
       '          # [env.staging.observability]\n',
     );
+    // Generated staging vars mutants: dropping any one of the four public
+    // vars lines must trip the pin above.
+    const droppedRpIdMutant = jobsBody.replace('          RP_ID = "${API_RP_ID_STAGING}"\n', '');
+    const droppedRpOriginMutant = jobsBody.replace(
+      '          RP_ORIGIN = "${API_RP_ORIGIN_STAGING}"\n',
+      '',
+    );
+    const droppedSessionTtlMutant = jobsBody.replace('          SESSION_TTL_SECS = "86400"\n', '');
+    const droppedCachingDisabledMutant = jobsBody.replace(
+      '          HYPERDRIVE_CACHING_DISABLED = "1"\n',
+      '',
+    );
+    // Semantic vars mutants: each line stays present, so only the exact
+    // literal / repo-var name / header anchor in the pin catches them — a
+    // pin broadened to a generic quoted value or RP name, or one missing
+    // its header anchor, would keep rejecting the drop mutants above yet
+    // accept these.
+    // Shorter session TTL literal than the evidenced one day.
+    const shortSessionTtlMutant = jobsBody.replace(
+      '          SESSION_TTL_SECS = "86400"\n',
+      '          SESSION_TTL_SECS = "3600"\n',
+    );
+    // Cache-disabled attestation flipped off: the Worker would serve with
+    // Hyperdrive caching enabled against the evidenced disabled posture.
+    const cachingNotDisabledMutant = jobsBody.replace(
+      '          HYPERDRIVE_CACHING_DISABLED = "1"\n',
+      '          HYPERDRIVE_CACHING_DISABLED = "0"\n',
+    );
+    // RP_ID wired to the origin repo var (and the converse for RP_ORIGIN):
+    // each exact repo-var name is protected independently.
+    const rpIdSwappedMutant = jobsBody.replace(
+      '          RP_ID = "${API_RP_ID_STAGING}"\n',
+      '          RP_ID = "${API_RP_ORIGIN_STAGING}"\n',
+    );
+    const rpOriginSwappedMutant = jobsBody.replace(
+      '          RP_ORIGIN = "${API_RP_ORIGIN_STAGING}"\n',
+      '          RP_ORIGIN = "${API_RP_ID_STAGING}"\n',
+    );
+    // Commented vars header: the TOML then defines no env.staging.vars
+    // table at all, and an unanchored pin would keep matching the bracket
+    // text inside the comment.
+    const commentedVarsHeaderMutant = jobsBody.replace(
+      '          [env.staging.vars]\n',
+      '          # [env.staging.vars]\n',
+    );
 
     for (const mutant of [
       workerMutant,
@@ -1398,6 +1862,15 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       zeroSamplingMutant,
       droppedSamplingMutant,
       commentedHeaderMutant,
+      droppedRpIdMutant,
+      droppedRpOriginMutant,
+      droppedSessionTtlMutant,
+      droppedCachingDisabledMutant,
+      shortSessionTtlMutant,
+      cachingNotDisabledMutant,
+      rpIdSwappedMutant,
+      rpOriginSwappedMutant,
+      commentedVarsHeaderMutant,
     ]) {
       expect(() => assertDeployGuard(mutant), 'mutant must violate the deploy guard').toThrow();
     }
@@ -1422,6 +1895,15 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     expect(() => assertStagingApi(zeroSamplingMutant)).toThrow();
     expect(() => assertStagingApi(droppedSamplingMutant)).toThrow();
     expect(() => assertStagingApi(commentedHeaderMutant)).toThrow();
+    expect(() => assertStagingApi(droppedRpIdMutant)).toThrow();
+    expect(() => assertStagingApi(droppedRpOriginMutant)).toThrow();
+    expect(() => assertStagingApi(droppedSessionTtlMutant)).toThrow();
+    expect(() => assertStagingApi(droppedCachingDisabledMutant)).toThrow();
+    expect(() => assertStagingApi(shortSessionTtlMutant)).toThrow();
+    expect(() => assertStagingApi(cachingNotDisabledMutant)).toThrow();
+    expect(() => assertStagingApi(rpIdSwappedMutant)).toThrow();
+    expect(() => assertStagingApi(rpOriginSwappedMutant)).toThrow();
+    expect(() => assertStagingApi(commentedVarsHeaderMutant)).toThrow();
   });
 });
 
@@ -1569,7 +2051,7 @@ const gateScriptSource = readFileSync(gateScript, 'utf8');
 
 function runGateScript(
   junitXml: string | null,
-  env: Record<string, string> = {},
+  env: Record<string, string | undefined> = {},
 ): { status: number | null; output: string; summary: string } {
   const probe = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'journey-gate-'));
   try {
@@ -1583,7 +2065,7 @@ function runGateScript(
       env: {
         PATH: process.env.PATH,
         JUNIT_PATH: 'test-results/junit.xml',
-        MAX_ALLOWED_SKIPS: '2',
+        MAX_ALLOWED_SKIPS: '1',
         REQUIRE_QA_AUTH_TOKEN: 'false',
         GITHUB_STEP_SUMMARY: summaryFile,
         ...env,
@@ -1637,7 +2119,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(stepBlock).toContain('if: always()');
     expect(stepBlock).toContain(`steps.staging.outputs.configured == 'true'`);
     expect(stepBlock).toContain('node scripts/enforce-journey-evidence.mjs');
-    expect(stepBlock).toContain(`MAX_ALLOWED_SKIPS: '2'`);
+    expect(stepBlock).toContain(`MAX_ALLOWED_SKIPS: '1'`);
     expect(stepBlock).toContain(`REQUIRE_QA_AUTH_TOKEN: 'true'`);
   });
 
@@ -1659,20 +2141,34 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(result.output).toContain('zero journeys ran');
   });
 
-  test('allow-listed fixmes within budget pass with counts', () => {
+  test('only the recording_mbids fixme passes within budget with counts', () => {
     const xml = suiteXml(
       PASSING('signup-byop.spec.ts', 'signup creates an account') +
-        PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
-        FIXME_QUEUE +
+        PASSING('player-queue-order.spec.ts', 'player queue advances in library-selection order') +
         FIXME_MBIDS,
     );
     const result = runGateScript(xml);
     expect(result.status).toBe(0);
-    expect(result.summary).toContain('| 4 | 2 | 2 | 0 |');
+    expect(result.summary).toContain('| 3 | 2 | 1 | 0 |');
     expect(result.summary).toContain('PASS');
   });
 
-  test('allow-listed skips above the budget still fail', () => {
+  test('a queue-order skip is no longer allowed, even within budget', () => {
+    const xml = suiteXml(PASSING('health.spec.ts', 'passing journey') + FIXME_QUEUE);
+    const result = runGateScript(xml);
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('outside the allow-list');
+    expect(result.output).toContain('player-queue-order.spec.ts player queue advances');
+  });
+
+  test('the script default budget is one when MAX_ALLOWED_SKIPS is unset', () => {
+    const xml = suiteXml(PASSING('health.spec.ts', 'passing journey') + FIXME_MBIDS + FIXME_MBIDS);
+    const result = runGateScript(xml, { MAX_ALLOWED_SKIPS: undefined });
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('above the allow-list budget of 1');
+  });
+
+  test('a third skip still fails above the budget', () => {
     const xml = suiteXml(
       PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
         FIXME_QUEUE +
@@ -1732,7 +2228,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   });
 
   test('allow-list reasons name the owning specs', () => {
-    expect(gateScriptSource).toContain('player-queue-order');
+    expect(gateScriptSource).not.toContain('player-queue-order');
     expect(gateScriptSource).toContain('ingest-play-meter');
     expect(gateScriptSource).toContain('reason');
   });
@@ -1746,7 +2242,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   // reporter would stay green here while misreading staging evidence.
   const REPORTER_GREEN =
     '<?xml version="1.0" encoding="UTF-8"?>\n' +
-    '<testsuites id="" name="" tests="4" failures="0" skipped="2" errors="0" time="0.27">\n' +
+    '<testsuites id="" name="" tests="4" failures="0" skipped="1" errors="0" time="0.27">\n' +
     '<testsuite name="ingest-play-meter.spec.ts" timestamp="2026-10-19T03:09:03.424Z" hostname="" tests="2" failures="0" skipped="1" time="0.002" errors="0">\n' +
     '<testcase name="ingest play meter browser › passing journey" classname="ingest-play-meter.spec.ts" time="0.002">\n' +
     '<properties>\n<property name="serial" value="">\n</property>\n</properties>\n' +
@@ -1756,13 +2252,12 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     '<skipped>\n</skipped>\n' +
     '</testcase>\n' +
     '</testsuite>\n' +
-    '<testsuite name="player-queue-order.spec.ts" timestamp="2026-10-19T03:09:03.424Z" hostname="" tests="2" failures="0" skipped="1" time="0" errors="0">\n' +
+    '<testsuite name="player-queue-order.spec.ts" timestamp="2026-10-19T03:09:03.424Z" hostname="" tests="2" failures="0" skipped="0" time="0" errors="0">\n' +
     '<testcase name="queue order › passing journey" classname="player-queue-order.spec.ts" time="0.001">\n' +
     '<properties>\n<property name="serial" value="">\n</property>\n</properties>\n' +
     '</testcase>\n' +
-    '<testcase name="player queue follows library-selection order › player queue advances in library-selection order" classname="player-queue-order.spec.ts">\n' +
-    '<properties>\n<property name="serial" value="">\n</property>\n<property name="fixme" value="">\n</property>\n</properties>\n' +
-    '<skipped>\n</skipped>\n' +
+    '<testcase name="player queue follows library-selection order › player queue advances in library-selection order" classname="player-queue-order.spec.ts" time="0.001">\n' +
+    '<properties>\n<property name="serial" value="">\n</property>\n</properties>\n' +
     '</testcase>\n' +
     '</testsuite>\n' +
     '</testsuites>\n';
@@ -1788,7 +2283,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   test('reporter-shaped green evidence with root counts and paired skips passes', () => {
     const result = runGateScript(REPORTER_GREEN);
     expect(result.status).toBe(0);
-    expect(result.summary).toContain('| 4 | 2 | 2 | 0 |');
+    expect(result.summary).toContain('| 4 | 3 | 1 | 0 |');
     expect(result.summary).toContain('PASS');
   });
 
@@ -1804,7 +2299,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   test('a same-titled skip from another file fails outside the allow-list', () => {
     const xml = suiteXml(
       PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
-        '<testcase classname="other.spec.ts" name="player queue advances in library-selection order"><skipped/></testcase>',
+        FIXME_MBIDS.replace('ingest-play-meter.spec.ts', 'other.spec.ts'),
     );
     const result = runGateScript(xml);
     expect(result.status).not.toBe(0);
@@ -1814,10 +2309,11 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   test('one allow-list entry cannot cover two skips', () => {
     const xml = suiteXml(
       PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
-        FIXME_QUEUE +
-        FIXME_QUEUE,
+        FIXME_MBIDS +
+        FIXME_MBIDS,
     );
-    const result = runGateScript(xml);
+    // Raise only the count ceiling to isolate the consume-once allowance.
+    const result = runGateScript(xml, { MAX_ALLOWED_SKIPS: '2' });
     expect(result.status).not.toBe(0);
     expect(result.output).toContain('outside the allow-list');
   });
@@ -1825,20 +2321,376 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   test('unattributed skips fail closed when the count exceeds listed cases', () => {
     const listed = suiteXml(
       PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
-        FIXME_QUEUE +
         FIXME_MBIDS,
     );
-    const xml = listed.replace('tests="3"', 'tests="4"').replace('skipped="2"', 'skipped="3"');
+    const xml = listed.replace('tests="2"', 'tests="3"').replace('skipped="1"', 'skipped="2"');
     const result = runGateScript(xml, { MAX_ALLOWED_SKIPS: '5' });
     expect(result.status).not.toBe(0);
     expect(result.output).toContain('could not be identified');
   });
 
   test('non-numeric counts fail closed as unparseable', () => {
-    const xml = suiteXml(FIXME_QUEUE).replace('skipped="1"', 'skipped="x"');
+    const xml = suiteXml(FIXME_MBIDS).replace('skipped="1"', 'skipped="x"');
     const result = runGateScript(xml);
     expect(result.status).not.toBe(0);
     expect(result.output).toContain('could not parse');
   });
 
+});
+
+// mb-import postgres parity: the integration job's service image must stay
+// the same postgres build the shipped image is based on. ci.yml carries a
+// tying comment (re-pin both deliberately) but no enforcement, so a
+// one-sided re-pin would silently test against a newer Postgres than the
+// image ships. This pin asserts exact digest equality (after the `@`)
+// between the mb-import job's service image and the Dockerfile's runtime
+// base FROM, plus tag equality so a tag-only drift cannot hide behind a
+// matching digest. Deliberate bumps change both sides together and stay
+// green; changing either side alone reds.
+const mbImportDockerfile = readFileSync(
+  new URL('../../containers/mb-import/Dockerfile', import.meta.url),
+  'utf8',
+);
+
+function mbImportBaseDigest(dockerfile: string): { tag: string; digest: string } {
+  // Anchored `FROM … AS base`: the runtime base, never the rust validator
+  // stage and never a commented-out line (`# FROM` cannot match `^\s*FROM`).
+  const matches = [
+    ...dockerfile.matchAll(
+      /^\s*FROM\s+postgres:([^\s@]+)@(sha256:[0-9a-f]{64})\s+AS\s+base\b/gim,
+    ),
+  ];
+  expect(matches, 'mb-import Dockerfile must carry exactly one postgres AS base FROM').toHaveLength(1);
+  return { tag: matches[0]![1]!, digest: matches[0]![2]! };
+}
+
+function mbImportServiceDigest(mbImportSection: string): { tag: string; digest: string } {
+  // Anchored `image:` so a commented-out service line cannot satisfy the pin.
+  const matches = [
+    ...mbImportSection.matchAll(
+      /^\s*image:\s*postgres:([^\s@]+)@(sha256:[0-9a-f]{64})\b/gim,
+    ),
+  ];
+  expect(matches, 'mb-import job must carry exactly one postgres service image').toHaveLength(1);
+  return { tag: matches[0]![1]!, digest: matches[0]![2]! };
+}
+
+function assertMbImportPostgresParity(ciWorkflowText: string, dockerfileText: string): void {
+  const service = mbImportServiceDigest(jobSection(ciWorkflowText, 'mb-import'));
+  const base = mbImportBaseDigest(dockerfileText);
+  expect(
+    service.tag,
+    `mb-import postgres tag drift: CI services ${service.tag} vs Dockerfile FROM ${base.tag} (re-pin both deliberately)`,
+  ).toBe(base.tag);
+  expect(
+    service.digest,
+    `mb-import postgres digest drift: CI services ${service.digest} vs Dockerfile FROM ${base.digest} (re-pin both deliberately)`,
+  ).toBe(base.digest);
+}
+
+test.describe('mb-import postgres parity (static pin)', () => {
+  test('CI service image digest equals the shipped Dockerfile base digest', () => {
+    assertMbImportPostgresParity(ciWorkflow, mbImportDockerfile);
+  });
+
+  test('single-side digest or tag mutants fail the pin', () => {
+    // Regression proof for the shared guard: each mutant changes one side
+    // alone (valid hex/tag so extraction still succeeds) and must throw
+    // the same assert the real pin calls, not a restated copy.
+    const base = mbImportBaseDigest(mbImportDockerfile);
+    const flippedLast = base.digest.endsWith('0') ? '1' : '0';
+    const mutantDigest = base.digest.slice(0, -1) + flippedLast;
+    // Derived from the live tag so a deliberate re-tag never turns the tag
+    // mutants into no-ops that red on a correct change.
+    const mutantTag = `${base.tag}-mutant`;
+    const ciImageLine = `image: postgres:${base.tag}@${base.digest}`;
+    const dockerFromLine = `FROM postgres:${base.tag}@${base.digest} AS base`;
+    expect(ciWorkflow, 'CI fixture line for the mutant is missing').toContain(ciImageLine);
+    expect(mbImportDockerfile, 'Dockerfile fixture line for the mutant is missing').toContain(
+      dockerFromLine,
+    );
+    const ciDigestMutant = ciWorkflow.replace(
+      ciImageLine,
+      `image: postgres:${base.tag}@${mutantDigest}`,
+    );
+    const dockerDigestMutant = mbImportDockerfile.replace(
+      dockerFromLine,
+      `FROM postgres:${base.tag}@${mutantDigest} AS base`,
+    );
+    const ciTagMutant = ciWorkflow.replace(
+      ciImageLine,
+      `image: postgres:${mutantTag}@${base.digest}`,
+    );
+    const dockerTagMutant = mbImportDockerfile.replace(
+      dockerFromLine,
+      `FROM postgres:${mutantTag}@${base.digest} AS base`,
+    );
+    for (const [name, ci, docker] of [
+      ['CI digest', ciDigestMutant, mbImportDockerfile],
+      ['Dockerfile digest', ciWorkflow, dockerDigestMutant],
+      ['CI tag', ciTagMutant, mbImportDockerfile],
+      ['Dockerfile tag', ciWorkflow, dockerTagMutant],
+    ] as const) {
+      expect(() => assertMbImportPostgresParity(ci, docker), `${name} mutant must fail the pin`).toThrow();
+    }
+  });
+});
+
+// Bounded CI downloads (static pin): the cargo-deny and gitleaks installs
+// are checksum-pinned but their curl lines carry the only network bounds in
+// those steps. No other test reads these lines, so a revert to the
+// unbounded forms would stay green without these pins. Each pin slices its
+// own step section, so an identical curl added elsewhere cannot satisfy it.
+const gitleaksWorkflow = readFileSync(new URL('gitleaks.yml', workflowDir), 'utf8');
+
+function stepSection(workflow: string, stepName: string): string {
+  const marker = `- name: ${stepName}\n`;
+  const start = workflow.indexOf(marker);
+  expect(start, `step ${stepName} not found`).toBeGreaterThan(-1);
+  const bodyStart = start + marker.length;
+  const next = /\n      - /.exec(workflow.slice(bodyStart));
+  return workflow.slice(bodyStart, next ? bodyStart + next.index : undefined);
+}
+
+function assertCargoDenyDownloadBounded(section: string): void {
+  expect(section).toContain('curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 \\');
+  expect(section).toContain('| (cd /tmp && sha256sum -c -)');
+}
+
+function assertGitleaksDownloadBounded(section: string): void {
+  expect(section).toContain(
+    'curl -sSfL --connect-timeout 10 --max-time 30 --retry 3 -o "$archive" \\',
+  );
+  expect(section).toContain('| sha256sum --check -');
+}
+
+test.describe('bounded CI downloads (static pin)', () => {
+  test('cargo-deny download fails HTTP errors and stays within 10/30/3', () => {
+    assertCargoDenyDownloadBounded(
+      stepSection(ciWorkflow, 'Install pinned cargo-deny 0.20.2'),
+    );
+  });
+
+  test('gitleaks download stays within 10/30/3', () => {
+    assertGitleaksDownloadBounded(stepSection(gitleaksWorkflow, 'Install gitleaks'));
+  });
+
+  test('cargo-deny flag-removal and value mutants fail the pin', () => {
+    const section = stepSection(ciWorkflow, 'Install pinned cargo-deny 0.20.2');
+    const mutants = [
+      // Exact base revert: unbounded single-line download without -f.
+      section.replace(
+        'curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 \\\n            -o "/tmp/${asset}" "${base}/${asset}"',
+        'curl -sSL --retry 3 -o "/tmp/${asset}" "${base}/${asset}"',
+      ),
+      section.replace('curl -fsSL ', 'curl -sSL '),
+      section.replace(' --connect-timeout 10', ''),
+      section.replace(' --max-time 30', ''),
+      section.replace(' --retry 3', ''),
+      section.replace('--connect-timeout 10', '--connect-timeout 5'),
+      section.replace('--max-time 30', '--max-time 60'),
+      section.replace('--retry 3', '--retry 5'),
+      section.replace('| (cd /tmp && sha256sum -c -)', '| cat'),
+    ];
+    for (const mutant of mutants) {
+      expect(mutant, 'mutant must differ from the pinned section').not.toBe(section);
+      expect(() => assertCargoDenyDownloadBounded(mutant), 'mutant must violate the pin').toThrow();
+    }
+  });
+
+  test('gitleaks flag-removal and value mutants fail the pin', () => {
+    const section = stepSection(gitleaksWorkflow, 'Install gitleaks');
+    const mutants = [
+      // Exact base revert: unbounded download without timeouts or retry.
+      section.replace(
+        'curl -sSfL --connect-timeout 10 --max-time 30 --retry 3 -o "$archive" \\',
+        'curl -sSfL -o "$archive" \\',
+      ),
+      section.replace(' --connect-timeout 10', ''),
+      section.replace(' --max-time 30', ''),
+      section.replace(' --retry 3', ''),
+      section.replace('--connect-timeout 10', '--connect-timeout 5'),
+      section.replace('--max-time 30', '--max-time 60'),
+      section.replace('--retry 3', '--retry 5'),
+      section.replace('| sha256sum --check -', '| cat'),
+    ];
+    for (const mutant of mutants) {
+      expect(mutant, 'mutant must differ from the pinned section').not.toBe(section);
+      expect(() => assertGitleaksDownloadBounded(mutant), 'mutant must violate the pin').toThrow();
+    }
+  });
+});
+
+// Burst probe bounds (static + executed pin): the diagnostic probe must run
+// under `set -euo pipefail`, bound each request to 10/30 seconds, loop
+// exactly 11 attempts, and never retry (one physical request per attempt).
+// Static pins catch flag edits; the executed fixture runs the real script
+// against a stubbed `curl` on PATH — no network, INGEST_URL is never
+// dialed — and proves 11 single-attempt requests, exit 0 on a final
+// 429/503, and fail-fast abort on transport failure.
+const burstScriptPath = fileURLToPath(
+  new URL('../../workers/ingest/scripts/search_rate_limit_burst.sh', import.meta.url),
+);
+const burstScript = readFileSync(burstScriptPath, 'utf8');
+
+function assertBurstProbeStatic(source: string): void {
+  expect(source).toContain('set -euo pipefail');
+  expect(source).toContain(
+    "curl -s --connect-timeout 10 -m 30 -o /dev/null -D - -w '%{http_code}\\n' \\",
+  );
+  expect(source).toContain('for i in $(seq 1 11);');
+  expect(source).not.toContain('--retry');
+}
+
+interface BurstRun {
+  status: number | null;
+  output: string;
+  attempts: number;
+  invocations: string[];
+}
+
+function runBurstProbe(scriptPath: string, stubEnv: Record<string, string>): BurstRun {
+  const probe = mkdtempSync(
+    join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'burst-pin-'),
+  );
+  try {
+    // Stub curl: records each invocation's args, serves 202 until attempt
+    // 11, then the configured final code; STUB_FAIL_AT makes attempt N a
+    // transport failure (exit 7, like a refused connection).
+    writeFileSync(
+      join(probe, 'curl'),
+      `#!/bin/bash
+n=$(cat "$STUB_COUNT" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "$STUB_COUNT"
+printf '%s\\n' "$*" >> "$STUB_RECORD"
+if [ "$STUB_FAIL_AT" = "$n" ]; then exit 7; fi
+if [ "$n" -ge 11 ]; then code="$STUB_FINAL_CODE"; else code=202; fi
+if [ "$code" = "429" ]; then printf 'retry-after: 2\\n'; fi
+printf '%s\\n' "$code"
+`,
+    );
+    chmodSync(join(probe, 'curl'), 0o755);
+    const result = spawnSync('/bin/bash', [scriptPath], {
+      encoding: 'utf8',
+      timeout: 10_000,
+      cwd: probe,
+      env: {
+        PATH: `${probe}:${process.env.PATH}`,
+        INGEST_URL: 'http://stub.invalid',
+        STUB_RECORD: join(probe, 'curl-args.log'),
+        STUB_COUNT: join(probe, 'curl-count'),
+        STUB_FINAL_CODE: '429',
+        STUB_FAIL_AT: '0',
+        ...stubEnv,
+      },
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    const output = result.stdout + result.stderr;
+    let invocations: string[] = [];
+    try {
+      invocations = readFileSync(join(probe, 'curl-args.log'), 'utf8')
+        .split('\n')
+        .filter((line) => line.length > 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    const attempts = output.match(/^attempt \d\d: /gm)?.length ?? 0;
+    return { status: result.status, output, attempts, invocations };
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
+  }
+}
+
+function assertBurstExecutedContract(run: BurstRun, finalCode: string): void {
+  expect(run.status).toBe(0);
+  expect(run.attempts).toBe(11);
+  // One physical request per attempt: exactly 11 stub invocations, each
+  // carrying the 10/30-second bounds and no retry flag.
+  expect(run.invocations).toHaveLength(11);
+  for (const args of run.invocations) {
+    expect(args).toContain('--connect-timeout 10');
+    expect(args).toContain('-m 30');
+    expect(args).not.toContain('--retry');
+  }
+  expect(run.output).toContain(finalCode);
+}
+
+test.describe('burst probe bounds (static + executed pin)', () => {
+  test('probe runs strict with bounded single-attempt requests', () => {
+    assertBurstProbeStatic(burstScript);
+  });
+
+  test('final 429 completes 11 requests and exits 0', () => {
+    const run = runBurstProbe(burstScriptPath, { STUB_FINAL_CODE: '429' });
+    assertBurstExecutedContract(run, '429');
+    expect(run.output).toContain('retry-after');
+  });
+
+  test('final 503 stays observable and exits 0', () => {
+    const run = runBurstProbe(burstScriptPath, { STUB_FINAL_CODE: '503' });
+    assertBurstExecutedContract(run, '503');
+  });
+
+  test('transport failure aborts on the first attempt', () => {
+    const run = runBurstProbe(burstScriptPath, { STUB_FAIL_AT: '1' });
+    expect(run.status).not.toBe(0);
+    expect(run.attempts).toBe(1);
+    expect(run.invocations).toHaveLength(1);
+  });
+
+  test('flag-removal, value, and retry mutants fail the static pin', () => {
+    const mutants = [
+      burstScript.replace('set -euo pipefail', 'set -u'),
+      burstScript.replace(' --connect-timeout 10', ''),
+      burstScript.replace(' -m 30', ''),
+      burstScript.replace(' -m 30', ' -m 30 --retry 3'),
+      burstScript.replace('--connect-timeout 10', '--connect-timeout 5'),
+      burstScript.replace('-m 30', '-m 60'),
+      burstScript.replace('seq 1 11', 'seq 1 5'),
+    ];
+    for (const mutant of mutants) {
+      expect(mutant, 'mutant must differ from the pinned script').not.toBe(burstScript);
+      expect(() => assertBurstProbeStatic(mutant), 'mutant must violate the pin').toThrow();
+    }
+  });
+
+  test('base probe fails open, proving the executed fixture distinguishes it', () => {
+    // Regression proof: the pre-change probe (set -u, unbounded curl) run
+    // through the same stub exits 0 on a first-attempt transport failure
+    // and records unbounded invocations — the executed contract throws on it.
+    const base = burstScript
+      .replace('set -euo pipefail', 'set -u')
+      .replace(' --connect-timeout 10 -m 30', '');
+    expect(base).not.toBe(burstScript);
+    expect(() => assertBurstProbeStatic(base), 'base text must violate the static pin').toThrow();
+    const probe = mkdtempSync(
+      join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'burst-base-'),
+    );
+    try {
+      const mutantPath = join(probe, 'burst-base.sh');
+      writeFileSync(mutantPath, base);
+      const failOpen = runBurstProbe(mutantPath, { STUB_FAIL_AT: '1' });
+      expect(failOpen.status).toBe(0);
+      expect(failOpen.invocations).toHaveLength(11);
+      expect(failOpen.invocations[0]).not.toContain('--connect-timeout');
+      expect(
+        () => assertBurstExecutedContract(failOpen, '429'),
+        'base run must violate the executed contract',
+      ).toThrow();
+    } finally {
+      rmSync(probe, { recursive: true, force: true });
+    }
+  });
+
+  test('ingest README documents the local-only probe', () => {
+    const readme = readFileSync(
+      new URL('../../workers/ingest/README.md', import.meta.url),
+      'utf8',
+    );
+    expect(readme).toContain('scripts/search_rate_limit_burst.sh');
+    expect(readme).toContain('never point this script at');
+    expect(readme).toContain('production');
+  });
 });

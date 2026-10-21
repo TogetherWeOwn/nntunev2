@@ -1,32 +1,50 @@
 <script lang="ts">
-	// NZB import shell. The hooks below are the e2e contract
-	// (e2e/helpers/contract.ts TESTIDS); ingest itself lands with the
-	// ingest slice. Until then selecting a file explains that honestly
-	// instead of faking a completed import.
+	import { validateImportFile } from '#lib/library/import-validation.js';
+
 	let status: string | null = $state(null);
+	let error: string | null = $state(null);
 
 	function onFile(event: Event) {
 		const input = event.currentTarget as HTMLInputElement;
+		status = null;
+		error = null;
+		const file = input.files?.[0];
+		if (!file) return;
+		error = validateImportFile(file);
+		if (error) return;
 		status =
-			input.files && input.files.length > 0
-				? 'NZB ingest lands with the ingest slice — file received, not yet processed.'
-				: null;
+			'NZB file selected locally — import is not available yet. This page does not upload or process the file or add tracks to your library.';
 	}
 </script>
 
 <svelte:head>
-	<title>NNTune — import</title>
-	<meta name="description" content="Import an NZB into your NNTune library." />
+	<title>NNTune — local NZB selection</title>
+	<meta
+		name="description"
+		content="Select an NZB file locally only. No upload, processing or tracks added."
+	/>
 </svelte:head>
 
 <main class="nt-wrap">
 	<h1>Import</h1>
-	<p>Choose an NZB file to add its tracks to your library.</p>
+	<p>
+		NZB import is not available yet. You can choose an NZB file to check its name and size —
+		selection stays local only and this page does not upload or process the file or add tracks to
+		your library.
+	</p>
 	<label>
 		NZB file
-		<input data-testid="import-file" type="file" accept=".nzb" onchange={onFile} />
+		<input
+			data-testid="import-file"
+			type="file"
+			accept=".nzb"
+			aria-describedby={error || status ? 'import-feedback' : undefined}
+			onchange={onFile}
+		/>
 	</label>
-	{#if status}
-		<p data-testid="import-status" role="status">{status}</p>
+	{#if error}
+		<p id="import-feedback" data-testid="import-status" role="alert">{error}</p>
+	{:else if status}
+		<p id="import-feedback" data-testid="import-status" role="status">{status}</p>
 	{/if}
 </main>

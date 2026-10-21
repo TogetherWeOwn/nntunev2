@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onDestroy } from 'svelte';
 	import { invalidateAll } from '$app/navigation';
 	import { BillingApiError } from '#lib/billing/billingClient.js';
 	import { getPlan } from '#lib/billing/plans.js';
@@ -25,36 +26,53 @@
 
 	let actionError: string | null = $state(null);
 	let busy: 'checkout' | 'portal' | null = $state(null);
+	let alive = true;
+	onDestroy(() => {
+		alive = false;
+	});
 
 	async function checkout() {
 		// Belt and braces with the loader (which nulls upgradeTo for
 		// portal-only subscriptions): never start a checkout from here when
 		// the subscriber already holds a plan that needs the portal instead.
-		if (!status?.upgradeTo || data.manageBillingOnly) return;
+		if (!alive || !status?.upgradeTo || data.manageBillingOnly) return;
 		actionError = null;
 		busy = 'checkout';
 		try {
 			const { startCheckout } = await import('#lib/billing/billingClient.js');
-			window.location.href = await startCheckout(status.upgradeTo);
+			if (!alive) return;
+			const url = await startCheckout(status.upgradeTo);
+			if (!alive) return;
+			window.location.href = url;
 		} catch (err) {
+			if (!alive) return;
 			if (!(err instanceof BillingApiError && err.paywall)) {
 				actionError = err instanceof Error ? err.message : 'Checkout failed';
 			}
 			busy = null;
+		} finally {
+			if (!alive) busy = null;
 		}
 	}
 
 	async function portal() {
+		if (!alive) return;
 		actionError = null;
 		busy = 'portal';
 		try {
 			const { openPortal } = await import('#lib/billing/billingClient.js');
-			window.location.href = await openPortal();
+			if (!alive) return;
+			const url = await openPortal();
+			if (!alive) return;
+			window.location.href = url;
 		} catch (err) {
+			if (!alive) return;
 			if (!(err instanceof BillingApiError && err.paywall)) {
 				actionError = err instanceof Error ? err.message : 'Portal failed';
 			}
 			busy = null;
+		} finally {
+			if (!alive) busy = null;
 		}
 	}
 </script>
@@ -88,7 +106,7 @@
 			<p>
 				Status: {data.subscription.status}
 				{#if data.subscription.currentPeriodEnd}
-					· renews {new Date(data.subscription.currentPeriodEnd).toLocaleDateString()}
+					· period ends {new Date(data.subscription.currentPeriodEnd).toLocaleDateString()}
 				{/if}
 				{#if data.subscription.trialEndsAt}
 					· trial ends {new Date(data.subscription.trialEndsAt).toLocaleDateString()}
@@ -104,6 +122,8 @@
 				<li>
 					Streaming: {(data.usage.streamSecondsMonth / 3600).toFixed(1)} / {plan.streamHoursMonth} hrs
 					<progress
+						aria-label="Monthly streaming usage"
+						aria-valuetext={`${(data.usage.streamSecondsMonth / 3600).toFixed(1)} of ${plan.streamHoursMonth} hours used this month`}
 						max={plan.streamHoursMonth * 3600}
 						value={Math.min(data.usage.streamSecondsMonth, plan.streamHoursMonth * 3600)}
 					>

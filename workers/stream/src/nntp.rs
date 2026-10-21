@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use nntune_core::nntp::NntpConfig;
-use nntune_core::pinned_transport::pinned_rejection_message;
+use nntune_core::pinned_transport::{validate_nntp_endpoint, TransportRejection};
 use nntune_core::transport::{MAX_ARTICLE_BYTES, MAX_LINE_BYTES};
 
 /// Documented worker/API error code for stale provider credentials (S7).
@@ -48,14 +48,23 @@ pub enum NntpError {
     ArticleTooLarge,
     /// The segment id failed RFC 5536 validation and was never sent.
     InvalidMessageId(String),
+    /// The pinned NNTP endpoint policy refused a non-loopback dial on an
+    /// off-allowlist port before any TCP dial. A local policy verdict, not
+    /// provider ill-health — the provider was never contacted — so it must
+    /// not quarantine the pool (see [`NntpError::is_provider_failure`]).
+    /// Carries the offending port (addressing only, no credentials) and
+    /// reports the same stable `transport_port_not_allowed` code the
+    /// pool path emits via [`TransportRejection::PortNotAllowed`].
+    PortNotAllowed(u16),
 }
 
 impl NntpError {
     /// True when the provider (or the connection to it) is unhealthy, as
     /// opposed to one article being gone (`430`/`423`), one article being
     /// oversize (article cap), stale credentials (`480`/`481` → re-auth
-    /// prompt, not an outage), or one id being malformed, which say nothing
-    /// about the provider and must not quarantine the user's pool.
+    /// prompt, not an outage), one id being malformed, or a local
+    /// endpoint-policy refusal that never contacted the provider, which say
+    /// nothing about the provider and must not quarantine the user's pool.
     pub fn is_provider_failure(&self) -> bool {
         !matches!(
             self,
@@ -63,14 +72,18 @@ impl NntpError {
                 | NntpError::AuthExpired
                 | NntpError::ArticleTooLarge
                 | NntpError::InvalidMessageId(_)
+                | NntpError::PortNotAllowed(_)
         )
     }
 
-    /// Stable worker/API code for this failure. Only [`NntpError::AuthExpired`]
-    /// maps to [`PROVIDER_AUTH_EXPIRED_CODE`].
+    /// Stable worker/API code for this failure.
+    /// [`NntpError::AuthExpired`] maps to [`PROVIDER_AUTH_EXPIRED_CODE`];
+    /// [`NntpError::PortNotAllowed`] reuses the pinned-transport code by
+    /// construction, so the native dial and the pool path cannot drift.
     pub fn code(&self) -> &'static str {
         match self {
             NntpError::AuthExpired => PROVIDER_AUTH_EXPIRED_CODE,
+            NntpError::PortNotAllowed(port) => TransportRejection::PortNotAllowed(*port).code(),
             _ => "request_failed",
         }
     }
@@ -210,8 +223,15 @@ impl NntpClient {
                 max_pipelined: 1,
                 max_article_bytes: MAX_ARTICLE_BYTES,
             };
-            if let Some(rejection) = pinned_rejection_message(&config) {
-                return Err(NntpError::Io(rejection));
+            // Typed gate: the port refusal keeps its `TransportRejection`
+            // identity so callers match the variant, never the message text.
+            // The synthetic config asserts TLS, so only the port arm fires
+            // here; any other rejection stays a generic I/O failure.
+            if let Err(rejection) = validate_nntp_endpoint(&config) {
+                return Err(match rejection {
+                    TransportRejection::PortNotAllowed(port) => NntpError::PortNotAllowed(port),
+                    other => NntpError::Io(other.to_string()),
+                });
             }
         }
         let connect_timeout = timeouts.connect.min(deadline.remaining()?);
@@ -457,6 +477,13 @@ mod tests {
         assert!(!NntpError::ArticleTooLarge.is_provider_failure());
         assert_eq!(NntpError::AuthExpired.code(), PROVIDER_AUTH_EXPIRED_CODE);
         assert!(!NntpError::InvalidMessageId("x".into()).is_provider_failure());
+        // A port refusal never contacted the provider and carries the
+        // pinned-transport code by construction, not `request_failed`.
+        assert!(!NntpError::PortNotAllowed(80).is_provider_failure());
+        assert_eq!(
+            NntpError::PortNotAllowed(80).code(),
+            TransportRejection::PortNotAllowed(80).code()
+        );
         assert!(NntpError::Io("reset".into()).is_provider_failure());
         assert!(NntpError::UnexpectedResponse("502".into()).is_provider_failure());
     }

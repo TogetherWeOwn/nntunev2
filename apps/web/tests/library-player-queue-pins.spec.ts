@@ -9,9 +9,8 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *   refresh drops an earlier-queued id, the queue keeps gesture order and
  *   `now-playing`/`aria-current` still name the advanced-to track instead
  *   of falling back to the first kept track.
- * - The queue's current track reveals the placeholder player: `audio-player`
- *   is absent with an empty queue and attached (with an empty `src`) once
- *   a row is selected. No playback wiring — the streaming slice owns that.
+ * - Queued metadata without a stream URL never reveals an audio element
+ *   or triggers a media request. Playback wiring remains out of scope.
  *
  * Harness note (same as the acceptance spec): `/library` is client-fetched
  * (`ssr = false`), so the click-driven contract is pinned here in the
@@ -91,18 +90,19 @@ test('refresh to a subset keeps the surviving current track current', async ({ p
 	expect(await ariaCurrent(queueItem(page, 'row-zulu'))).toBeNull();
 });
 
-test('selecting a row reveals the audio-player placeholder with an empty src', async ({
+test('selecting a row without a stream URL never creates audio or requests media', async ({
 	page
 }) => {
+	const mediaRequests: string[] = [];
+	page.on('request', (request) => {
+		if (request.resourceType() === 'media') mediaRequests.push(request.url());
+	});
 	await seedLibrary(page);
-
-	// No selection: the Player section stays hidden.
-	await expect(page.getByTestId('audio-player')).toHaveCount(0);
+	await expect(page.locator('audio')).toHaveCount(0);
 
 	await row(page, 'row-mike').click();
-
-	// The queue-derived current track renders the placeholder player.
-	const player = page.getByTestId('audio-player');
-	await expect(player).toBeAttached();
-	await expect(player).toHaveAttribute('src', '');
+	await expect(page.getByTestId('now-playing')).toContainText('Mike Song');
+	await expect(page.getByTestId('audio-player')).toHaveCount(0);
+	await expect(page.locator('audio')).toHaveCount(0);
+	expect(mediaRequests).toEqual([]);
 });

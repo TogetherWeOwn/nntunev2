@@ -9,6 +9,7 @@
 		type LibraryItem
 	} from '#lib/library/cache.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
+	import { resolveStreamUrl } from '#lib/library/stream-url.js';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
 	import {
 		addTrack,
@@ -25,6 +26,7 @@
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
 	let libraryUnavailable = $state(false);
+	let requiresSignIn = $state(false);
 	let queue: QueueState = $state(createQueue([]));
 
 	const refresher = createLibraryRefresher({
@@ -36,6 +38,7 @@
 			loading = state.loading;
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
+			requiresSignIn = state.requiresSignIn;
 			// The queue is per-account: drop tracks the new library no longer
 			// contains, so a 401/403/404 or auth transition cannot leak the
 			// previous account's queue into the next session's Retry. The
@@ -59,9 +62,11 @@
 	// venture slices that own them. The placeholder below keeps its hook
 	// rendered until then.
 	const overLimit = false;
-	// The player block renders off the queue's current track; the <audio>
-	// src stays an empty placeholder until the streaming slice wires it.
+	// Queue metadata alone is not playable media: the player renders only
+	// when resolveStreamUrl finds a real (non-blank) stream URL.
 	const currentTrack = $derived(queueCurrentTrack(queue));
+	const queuedIds = $derived(new Set(queue.tracks.map((track) => track.id)));
+	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 
 	function displayTitle(track: LibraryItem): string {
 		const title = track.title;
@@ -123,6 +128,9 @@
 		<p role="status">Loading your library…</p>
 	{:else if loadError && items.length === 0}
 		<p role="alert">{loadError}</p>
+		{#if requiresSignIn}
+			<a class="nt-button" href="/login">Sign in</a>
+		{/if}
 		<button class="nt-button" type="button" onclick={() => void refresh()}>Retry</button>
 	{:else}
 		{#if staleAt}
@@ -141,6 +149,9 @@
 						<button
 							type="button"
 							class="nt-library-row"
+							aria-label={queuedIds.has(track.id)
+								? `${displayTitle(track)}${displayArtist(track) ? ` — ${displayArtist(track)}` : ''} — Queued`
+								: undefined}
 							onclick={() => selectTrack(track.id)}
 						>
 							{displayTitle(track)}
@@ -165,7 +176,7 @@
 	<section aria-label="Usage">
 		<h2>Usage</h2>
 		<p data-testid="usage-meter">
-			Usage metering lands with the usage-meter slice — no streamed bytes recorded yet.
+			Usage information is not available yet.
 		</p>
 	</section>
 
@@ -175,10 +186,10 @@
 		</p>
 	{/if}
 
-	{#if currentTrack}
+	{#if streamUrl}
 		<section aria-label="Player">
 			<h2>Now playing</h2>
-			<audio data-testid="audio-player" controls src=""></audio>
+			<audio data-testid="audio-player" controls src={streamUrl}></audio>
 		</section>
 	{/if}
 </main>

@@ -48,27 +48,27 @@ gate, COPY-escape check, empty-value rule, then the per-kind shape check
 
 - **Shape:** wrong field count is `column_count`; an empty line is
   `empty_line` (`src/lib.rs:88-94`). UUIDs must be lowercase-or-uppercase
-  hex `8-4-4-4-12` with no braces or `urn:` (`bad_uuid`,
-  `src/lib.rs:353-364`). Smallints must parse as `i16` (`bad_int`,
-  `src/lib.rs:235-241`); durations as non-negative `i32`
-  (`negative_duration`, `src/lib.rs:256-260`); medium/track positions as
-  non-negative `i16` (`negative_position`, `src/lib.rs:261-268`).
+  hex `8-4-4-4-12` with no braces or `urn:` (`bad_uuid`; see
+  `src/lib.rs:356-367`). Smallints must parse as `i16` (`bad_int`,
+  `src/lib.rs:241-244`); durations as non-negative `i32`
+  (`negative_duration`, `src/lib.rs:260-263`); medium/track positions as
+  non-negative `i16` (`negative_position`, `src/lib.rs:268-271`).
   Timestamps are `YYYY-MM-DD`, optionally followed by `T` or space plus
   `HH:MM:SS[.f{1,6}]`; `Z`/`z` may follow either form, while a `±hh`,
   `±hhmm` or `±hh:mm` offset (hours ≤ 15, minutes ≤ 59) is accepted only
   after a time — `HH:MM` without seconds, a date-only value with a numeric
   offset, and >6 fractional digits are `bad_timestamp`. Impossible
   months/days and leap-day on non-leap years are also rejected
-  (`bad_timestamp`, `src/lib.rs:366-501`; seconds required
+  (`is_timestamp`, `src/lib.rs:371-501`; seconds required
   `src/lib.rs:462-472,495`; numeric zone only after a time
   `src/lib.rs:403-409`). Country must be
-  empty or exactly 2 chars (`bad_country`, `src/lib.rs:249-255`).
+  empty or exactly 2 chars (`bad_country`, `src/lib.rs:255-258`).
 - **Escapes:** only the documented COPY text escapes may follow a
   backslash (`\\`, `\b \f \n \r \t \v`, octal `\` + 1-3 octal digits, hex
   `\x` + 1-2 hex digits); anything else — including `\q`, `\o`, `\u`, a
   bare `\x`, `\8`/`\9`, out-of-range `\400`, NUL-producing and
   non-UTF8-decoding sequences, or a raw CR — is `bad_escape`
-  (`src/lib.rs:274-351`). Deliberately stricter than COPY, which would load
+  (`src/lib.rs:293-351`). Deliberately stricter than COPY, which would load
   unknown escapes mangled instead of refusing them.
 - **NULL discipline:** a literal `\N` in a NOT NULL column is
   `null_in_not_null` poison (it would load as NULL and violate the
