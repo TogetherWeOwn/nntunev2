@@ -642,6 +642,7 @@ for (const denied of [['setItem', 'removeItem'], ['getItem']] as const) {
 		await breakStorage(page, [...denied]);
 		await clientNavigate(page, '/library');
 		await expect.poll(() => requestCount(page, '/api/library')).toBe(1);
+		observed.navigations.length = 0;
 
 		await release(page, endpoint, 200, { ok: true });
 
@@ -664,7 +665,7 @@ test('abandoned logout resets the same-window BYOP draft and fences its pending 
 	let saves = 0;
 	let reauthPosts = 0;
 	await page.route('**/v1/vault', async (route) => {
-		saves += 1;
+		if (route.request().method() === 'PUT') saves += 1;
 		await route.fulfill({
 			status: 200,
 			contentType: 'application/json',
