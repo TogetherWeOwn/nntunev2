@@ -30,23 +30,19 @@ const README: &str = include_str!("../README.md");
 /// inside tests can never satisfy these pins.
 fn production_source() -> String {
     let mut out = String::new();
-    let mut rest = LIB_RS;
-    loop {
-        match rest.split_once("#[cfg(test)]") {
-            Some((head, tail)) => {
-                out.push_str(head);
-                // Skip to the end of the test module: the next top-level
-                // `#[cfg(test)]` or end of file. Test modules in this file
-                // are the trailing items, so dropping the remainder after
-                // the first test module is the established slice used by
-                // the in-module build-sha pin.
-                let _ = tail;
-                break;
-            }
-            None => {
-                out.push_str(rest);
-                break;
-            }
+    let rest = LIB_RS;
+    match rest.split_once("#[cfg(test)]") {
+        Some((head, tail)) => {
+            out.push_str(head);
+            // Skip to the end of the test module: the next top-level
+            // `#[cfg(test)]` or end of file. Test modules in this file
+            // are the trailing items, so dropping the remainder after
+            // the first test module is the established slice used by
+            // the in-module build-sha pin.
+            let _ = tail;
+        }
+        None => {
+            out.push_str(rest);
         }
     }
     out
