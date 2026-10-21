@@ -31,8 +31,9 @@ Pool facts:
   slot, disables incremental compilation and dev/test debuginfo in the
   child environment only, and rejects output/config overrides and
   manifests outside the workspace. Acquire evicts other worktrees'
-  subdirs to preserve the slot budget; legacy shared-target slots
-  migrate automatically after a build-output-only check.
+  build-output-only subdirs to preserve the slot budget (protected
+  material refuses the slot, leaving it unchanged); legacy
+  shared-target slots migrate automatically after the same check.
 - Exit 75 means refused: both slots busy, a slot over budget, a stale
   lease needing Operator inspection, a missing/bad pool, or low
   filesystem headroom. Retry later. Never fall back to a per-worktree

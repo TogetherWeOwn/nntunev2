@@ -31,7 +31,7 @@ TERMINAL = {'done', 'cancelled'}
 # refuses it: a verbatim copy without Operator quota evidence must never
 # admit builds claiming the attested hard limit.
 PLACEHOLDER_RECEIPT = 'OPERATOR FILLS AT PROVISIONING'
-# Per-worktree subdir names under a leased slot (TOG-35810): ws-<32 hex>.
+# Per-worktree subdir names under a leased slot: ws-<32 hex>.
 # Cargo dep-info uses relative paths, so a shared slot target/ lets one
 # worktree reuse another tree's artifacts keyed only by mtime (observed
 # duplicate-crate E0631). Each worktree gets its own subdir; acquire evicts
@@ -130,16 +130,23 @@ def _prepare_worktree_dirs(slot, ws_name):
     shared-target layouts (Cargo top-level entries directly under
     target/) after verifying build-output-only provenance; foreign or
     mixed contents refuse the slot for Operator inspection.
+
+    Both parents are fully preflighted (layout, symlink, and veto
+    checks) before either is mutated, and each evicted subdir passes
+    the same preservation veto retention uses: a refused slot is left
+    unchanged, never partially evicted.
     """
+    plans = []
     for parent_name, veto_fn in (('target', preservation_veto),
                                  ('scratch', scratch_preservation_veto)):
         parent = slot / parent_name
         entries = list(parent.iterdir())
         if not entries:
-            (parent / ws_name).mkdir()
+            plans.append((parent, parent_name, [], False))
             continue
         names = {p.name for p in entries}
         if all(WS_DIR_RE.fullmatch(name) for name in names):
+            evict = []
             for entry in entries:
                 if entry.name == ws_name:
                     if entry.is_symlink() or not entry.is_dir():
@@ -150,9 +157,12 @@ def _prepare_worktree_dirs(slot, ws_name):
                 if not entry.is_dir():
                     raise Refusal(f'mixed worktree and foreign contents in '
                                   f'{parent_name}: {slot.name}')
-                shutil.rmtree(entry)
-            (parent / ws_name).mkdir(exist_ok=True)
-            real_directory(parent / ws_name)
+                veto = veto_fn(entry)
+                if veto is not None:
+                    raise Refusal(f'{veto} in {entry.name}; cannot evict '
+                                  f'{slot.name}')
+                evict.append(entry)
+            plans.append((parent, parent_name, evict, False))
             continue
         if any(WS_DIR_RE.fullmatch(name) for name in names):
             raise Refusal(f'mixed worktree and foreign contents in '
@@ -164,14 +174,21 @@ def _prepare_worktree_dirs(slot, ws_name):
         for entry in entries:
             if entry.is_symlink():
                 raise Refusal(f'symlink in {parent_name} during migration: {entry.name}')
-            if entry.is_dir() and not entry.is_symlink():
+        plans.append((parent, parent_name, list(entries), True))
+    for parent, parent_name, evict, is_migration in plans:
+        for entry in evict:
+            if entry.is_symlink():
+                raise Refusal(f'symlink in {parent_name} during eviction: {entry.name}')
+            if entry.is_dir():
                 shutil.rmtree(entry)
             else:
                 entry.unlink()
-        (parent / ws_name).mkdir()
-        print(json.dumps({'finding': 'worktree_layout_migrated', 'slot': slot.name,
-                          'parent': parent_name, 'workspace_subdir': ws_name},
-                         sort_keys=True), file=sys.stderr)
+        (parent / ws_name).mkdir(exist_ok=True)
+        real_directory(parent / ws_name)
+        if is_migration:
+            print(json.dumps({'finding': 'worktree_layout_migrated', 'slot': slot.name,
+                              'parent': parent_name, 'workspace_subdir': ws_name},
+                             sort_keys=True), file=sys.stderr)
     return slot / 'target' / ws_name
 
 
@@ -351,7 +368,7 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
         # Repository tests prefer PAPERCLIP_RUN_SCRATCH_DIR over temp_dir
         # (crates/core/src/mac.rs), so repository scratch selectors must also
         # point at the worktree lease scratch. Child-only overrides; the
-        # parent is unchanged. Per-worktree subdirs (TOG-35810) keep Cargo
+        # parent is unchanged. Per-worktree subdirs keep Cargo
         # dep-info/fingerprints coherent across worktrees sharing a slot.
         env.update(CARGO_TARGET_DIR=str(target), CARGO_BUILD_TARGET_DIR=str(target),
                    CARGO_BUILD_BUILD_DIR=str(target),
@@ -698,7 +715,7 @@ def preservation_veto(target):
     anywhere else is not Cargo output. Unknown foreign top-level entries
     fail closed to a veto.
 
-    Per-worktree layout (TOG-35810): target/ holds only ws-* subdirs, each
+    Per-worktree layout: target/ holds only ws-* subdirs, each
     holding Cargo output. Each subdir is veto-checked with the legacy
     rules; mixed worktree/foreign top levels veto.
     """
@@ -791,7 +808,7 @@ def scratch_preservation_veto(scratch):
     other top-level foreign material still veto. Heuristics are a backstop
     veto only; eligibility still needs the attested classification.
 
-    Per-worktree layout (TOG-35810): scratch/ holds only ws-* subdirs.
+    Per-worktree layout: scratch/ holds only ws-* subdirs.
     Mixed worktree/foreign top levels veto for Operator inspection.
     """
     try:
