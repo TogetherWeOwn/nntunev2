@@ -119,8 +119,9 @@ jobs:
   # Api Worker staging lane (staging only; ingest/mb/stream/repair are
   # follow-up jobs, each with its own evidence). Push to `main` only, gated
   # on the same token gate as staging-web. Serves the staging host on
-  # /v1/* plus the staging-only /api/test-codes seam (routes derived from
-  # API_RP_ID_STAGING); the web Worker owns the catch-all. Passes the
+  # /v1/* and /healthz plus the staging-only /api/test-codes seam
+  # (routes derived from API_RP_ID_STAGING); the web Worker owns the
+  # catch-all. Passes the
   # public BUILD_SHA var so worker log records carry the deploy SHA (never
   # a secret); secrets live only in Cloudflare and are never written here.
   # Fails closed on the Hyperdrive cache-disabled gate (no --allow-skip);
@@ -207,6 +208,12 @@ jobs:
           assert origin == f"https://{rp_id}", "API_RP_ORIGIN_STAGING must be the canonical serialized origin"
           assert re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", rp_id or ""), \
               "API_RP_ID_STAGING must be a bare lowercase hostname (route host)"
+          # Exact-host pin: a stale var (e.g. the superseded v2-staging
+          # host) would pass the shape checks above and silently split the
+          # api routes onto the old host while the web catch-all serves
+          # the new one. Fail the job here instead (names only).
+          assert rp_id == "staging.nntune.com", \
+              "API_RP_ID_STAGING must equal the staging RP ID (staging.nntune.com)"
           # Parity pin: the generated config binds HYPERDRIVE_ID_STAGING
           # directly, bypassing binding-parity (which only reads the
           # committed example). Fail unless it equals the committed staging
@@ -235,17 +242,20 @@ jobs:
           [env.staging]
           name = "nntune-api-staging"
 
-          # Same-host split: this Worker serves /v1/* plus the staging-only
-          # /api/test-codes seam on the staging host, while the web Worker
-          # owns the catch-all (see apps/web/wrangler.toml); the most
-          # specific route wins. Route hosts derive from API_RP_ID_STAGING
-          # (asserted a bare canonical hostname above), so the RP pair and
-          # the serving host cannot drift apart.
+          # Same-host split: this Worker serves /v1/*, /healthz, plus the
+          # staging-only /api/test-codes seam on the staging host, while
+          # the web Worker owns the catch-all (see apps/web/wrangler.toml);
+          # the most specific route wins. Route hosts derive from
+          # API_RP_ID_STAGING (asserted the exact staging host above), so
+          # the RP pair and the serving host cannot drift apart.
           [[env.staging.routes]]
           pattern = "${API_RP_ID_STAGING}/v1/*"
           zone_name = "nntune.com"
           [[env.staging.routes]]
           pattern = "${API_RP_ID_STAGING}/api/test-codes"
+          zone_name = "nntune.com"
+          [[env.staging.routes]]
+          pattern = "${API_RP_ID_STAGING}/healthz"
           zone_name = "nntune.com"
 
           [env.staging.vars]

@@ -19,9 +19,10 @@ directory = ".svelte-kit/cloudflare"
 [env.staging]
 name = "nntune-web-staging"
 # Staging catch-all: the api Worker owns the more specific
-# `staging.nntune.com/v1/*` and `staging.nntune.com/api/test-codes`
-# routes (generated into its staging config by the `staging-api` lane in
-# `.github/workflows/deploy.yml`), and the most specific route wins, so
+# `staging.nntune.com/v1/*`, `staging.nntune.com/healthz` and
+# `staging.nntune.com/api/test-codes` routes (generated into its staging
+# config by the `staging-api` lane in `.github/workflows/deploy.yml`),
+# and the most specific route wins, so
 # those paths reach the api Worker while every other path — including
 # this Worker's own /api/* surfaces — stays here. Same host by design:
 # the session cookie is SameSite=Lax, so the frontend and the API must
