@@ -16,6 +16,12 @@ describe('security.txt', () => {
 		expect(expiresLine).toBeDefined();
 		const expiresValue = expiresLine!.slice('Expires: '.length);
 		expect(expiresValue).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
-		expect(Date.parse(expiresValue)).toBeGreaterThan(Date.now());
+		// Pin the rolling 1-year design: a 60-second window would go stale for
+		// cached checkers and a multi-year window would defeat RFC 9116
+		// staleness, so assert a band around the intended 365 days.
+		const DAY_MS = 24 * 60 * 60 * 1000;
+		const parsed = Date.parse(expiresValue);
+		expect(parsed).toBeGreaterThan(Date.now() + 180 * DAY_MS);
+		expect(parsed).toBeLessThanOrEqual(Date.now() + 366 * DAY_MS);
 	});
 });
