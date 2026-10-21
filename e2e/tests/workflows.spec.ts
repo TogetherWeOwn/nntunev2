@@ -1732,8 +1732,9 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
   // at line starts — so commenting the route out (the pattern text
   // still appears in the file) cannot hold the suite green the way a
   // bare substring check would.
+  const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const assertWebStagingCatchAll = (webWrangler: string, rpId: string) => {
-    const host = rpId.replace(/\./g, '\\.');
+    const host = escapeRegExp(rpId);
     expect(webWrangler).toMatch(
       new RegExp(
         `^[ \\t]*\\[\\[env\\.staging\\.routes\\]\\]\\n[ \\t]*pattern = "${host}/\\*"\\n[ \\t]*zone_name = "nntune\\.com"\\n`,
