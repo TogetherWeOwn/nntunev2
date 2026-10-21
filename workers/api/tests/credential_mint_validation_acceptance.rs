@@ -657,10 +657,13 @@ mod surface_acceptance {
             403
         );
         assert_eq!(
-            request(&h, "GET", "/v1/me", None, Some(&cookie)).status,
+            request(&h, "GET", "/v1/credentials", None, Some(&cookie)).status,
             200
         );
-        assert_eq!(request(&h, "GET", "/v1/me", None, None).status, 401);
+        assert_eq!(
+            request(&h, "GET", "/v1/credentials", None, None).status,
+            401
+        );
         assert_eq!(
             request(&h, "GET", "/v1/credentials", Some(&bearer), None).status,
             401
@@ -705,6 +708,76 @@ mod surface_acceptance {
                 h.store.native_use_calls.get(),
                 before.2 + 1,
                 "single-item route remains authorized"
+            );
+        }
+    }
+
+    #[test]
+    fn options_preflight_answers_exactly_the_served_paths() {
+        // Catch preflight-blocked lawful bearer calls (served native
+        // paths 404 on OPTIONS, so HEAD revalidation and PATCH edits can
+        // never clear a browser preflight) as well as a preflight that
+        // maps unserved, nested or unknown shapes. A presented junk
+        // bearer must not change the preflight posture either.
+        let (h, _cookie) = logged_in_harness();
+        for path in [
+            // Dispatch-known controls: preflight already answers here.
+            "/healthz",
+            "/v1/auth/passkey/register/start",
+            "/v1/auth/passkey/register/finish",
+            "/v1/auth/passkey/login/start",
+            "/v1/auth/passkey/login/finish",
+            "/v1/session/reauthenticate/start",
+            "/v1/session/reauthenticate/finish",
+            "/v1/auth/magic/start",
+            "/v1/auth/magic/finish",
+            "/v1/session/refresh",
+            "/v1/session/logout",
+            "/v1/session/revoke-all",
+            "/v1/vault",
+            "/v1/vault/test",
+            "/v1/vault/test-connection",
+            "/v1/credentials",
+            "/v1/credentials/synthetic-id",
+            // Scope-map-served native paths.
+            "/v1/library",
+            "/v1/artists",
+            "/v1/releases",
+            "/v1/tracks",
+            "/v1/search",
+            "/v1/playlists",
+            "/v1/plays",
+            "/v1/stream",
+            "/v1/ingest",
+            "/v1/playlists/playlist-synthetic",
+        ] {
+            for authorization in [
+                None,
+                Some("Bearer ntk_syntheticJunkPreflight000000000000000"),
+            ] {
+                let response = request(&h, "OPTIONS", path, authorization, None);
+                assert_eq!(
+                    response.status, 204,
+                    "OPTIONS {path}: served paths must preflight"
+                );
+                assert!(response.body.is_empty(), "OPTIONS {path}: empty 204");
+                assert!(response.set_cookie.is_none(), "OPTIONS {path}: no cookie");
+            }
+        }
+        for path in [
+            "/v1/not-a-route",
+            "/nope",
+            "/v1/playlists/playlist-synthetic/tracks",
+            "/v1/playlists/playlist-synthetic/tracks/track-synthetic",
+            "/v1/playlists/playlist-synthetic/",
+            "/v1/playlists//",
+            "/v1/credentials/synthetic-id/extra",
+            "/v1/credentials/",
+        ] {
+            let response = request(&h, "OPTIONS", path, None, None);
+            assert_eq!(
+                response.status, 404,
+                "OPTIONS {path}: unserved shapes stay hidden"
             );
         }
     }
