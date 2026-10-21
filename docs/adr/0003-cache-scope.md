@@ -4,6 +4,7 @@
 - **Date:** 2026-10-13
 - **Revised:** 2026-10-15 — explicit byte/retention budgets, live gauge,
   FK-safe reclamation and renewal-settlement-aware effective-plan lookup.
+- **Revised:** 2026-10-20 — per-environment bucket map and key prefixes.
 
 ## Context
 
@@ -36,17 +37,31 @@ resistance still needs security testing, not a claim based only on headers.
 
 ```text
 nntunev2-audio-{staging,prod}    # immutable audio bytes
-  {sha256hex[0:2]}/{sha256hex[2:4]}/{sha256hex}
+  audio/{sha256hex[0:2]}/{sha256hex[2:4]}/{sha256hex}
 nntunev2-art-{staging,prod}      # validated artwork, original only at launch
-  {sha256hex[0:2]}/{sha256hex[2:4]}/{sha256hex}
+  art/{sha256hex[0:2]}/{sha256hex[2:4]}/{sha256hex}
 nntunev2-archive-{staging,prod}  # retention-checked reserve, not scratch
 ```
 
-Audio/art objects are immutable and hash-verified. Archive buckets have no Worker
-binding by default. Scratch placement for ingest repair and MB dumps is not
-decided here: the ops follow-up must pin placement/retention before using it.
-No archive lifecycle expiry is assumed. The MB implementation must use the
-environment-qualified art bucket, not an invented unsuffixed bucket.
+Each environment uses its own provisioned buckets, as listed in the public
+inventory [`docs/ops.md`](https://github.com/TogetherWeOwn/nntunev2/blob/main/docs/ops.md):
+
+| Environment | Audio bucket (keys under `audio/`) | Art bucket (keys under `art/`) | Archive bucket (reserved) |
+|---|---|---|---|
+| staging | `nntunev2-audio-staging` | `nntunev2-art-staging` | `nntunev2-archive-staging` |
+| prod | `nntunev2-audio-prod` | `nntunev2-art-prod` | `nntunev2-archive-prod` |
+
+`audio/` and `art/` are internal key prefixes inside those buckets, followed by
+the content-addressed path above. The bucket, not the prefix, is the environment
+boundary. A prefix is not a tenant or user scope and authorizes nothing; the
+audio and art authorization rules above apply unchanged.
+
+Audio/art objects are immutable and hash-verified. Archive buckets stay reserved
+with no Worker consumer. This ADR activates no scratch storage for ingest repair
+or MB dumps and decides neither its placement nor its lifecycle; a separate ops
+decision must pin both before use. No archive lifecycle expiry is assumed. The
+MB implementation must use the environment-qualified art bucket, not an invented
+unsuffixed bucket.
 
 ### Writers and refetch
 

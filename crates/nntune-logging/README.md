@@ -89,7 +89,7 @@ the worker-namespaced event, and every field, so anything invalid is an
 - If a value must be represented for diagnosis but may hold secret or
   personal data, the caller substitutes the fixed `[REDACTED]` marker
   before logging; the emitter never invents redaction at the sink
-  (`REDACTED`, `src/lib.rs:24-26`).
+  (`REDACTED`, `src/lib.rs:26`).
 
 ## Caller-supplied timestamp boundary
 

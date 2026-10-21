@@ -6,6 +6,8 @@ import { expect, test } from '@playwright/test';
 //   short_name, start_url, display: standalone, theme_color, and reachable
 //   192px + 512px icons.
 // - App head links the manifest and sets a matching theme-color meta.
+// - Manifest description, home meta description, and the landing paragraph
+//   disclose all four unwired capabilities and point to signup or BYOP setup.
 // Theme color #0b0d12 matches --nt-bg (dark default) in
 // src/lib/design/tokens.css. Name "NNTune" matches the landing heading.
 
@@ -16,6 +18,78 @@ const EXPECTED_MANIFEST = {
 	display: 'standalone',
 	theme_color: '#0b0d12'
 } as const;
+
+const UNWIRED_CAPABILITIES = [
+	['search', /\bsearch\w*\b/i],
+	['streaming', /\bstream\w*\b/i],
+	['library management', /\blibrar\w*\b/i],
+	['offline caching', /\boffline(?:[- ]friendly)? cach\w*\b/i]
+] as const;
+
+function expectHonestPublicCopy(copy: unknown, surface: string): void {
+	expect(typeof copy, `${surface} should contain a description`).toBe('string');
+	const text = (copy as string).replace(/\s+/g, ' ').trim();
+	const sentences = text.split(/[.!?;]+/).filter((sentence) => sentence.trim());
+
+	// Every capability mention needs its own sentence-local disclosure. A
+	// disclaimer elsewhere must not hide an old affirmative product claim.
+	for (const [capability, pattern] of UNWIRED_CAPABILITIES) {
+		const mentions = sentences.filter((sentence) => pattern.test(sentence));
+		expect(mentions.length, `${surface} should disclose ${capability}`).toBeGreaterThan(0);
+		for (const sentence of mentions) {
+			expect(sentence, `${surface}: ${capability} must be explicitly not wired yet`).toMatch(
+				/\bnot (?:yet wired(?: up)?|wired(?: up)? yet)\b/i
+			);
+		}
+	}
+
+	expect(text, `${surface} should point to signup or bring-your-own-provider setup`).toMatch(
+		/\b(?:sign[ -]?up|bring[- ]your[- ]own[- ]providers?|BYOP)\b/i
+	);
+}
+
+test('rejects the old streams headline prepended to otherwise honest copy', async () => {
+	// Survivor regression: /\bstreaming\b/i missed the exact old
+	// affirmative headline below, so the mutant was accepted. The
+	// streaming pattern must catch every stream verb form (streams,
+	// streaming, streamed) while honest copy still passes.
+	const honest =
+		'NNTune: search, streaming, library management and offline caching are not wired yet. Sign up and bring your own Usenet provider account.';
+	const mutant = `NNTune streams your music on Cloudflare. ${honest}`;
+
+	expect(() => expectHonestPublicCopy(honest, 'regression control')).not.toThrow();
+	expect(() => expectHonestPublicCopy(mutant, 'regression mutant')).toThrow();
+});
+
+// Exercise the real helper, not the regexes in isolation: an honest
+// disclaimer must not excuse a separate affirmative sibling word form.
+for (const [capability, wording, claim] of [
+	['search', 'search', 'NNTune search finds music on Usenet.'],
+	['search', 'searching', 'NNTune is searching Usenet for your music.'],
+	['search', 'searches', 'NNTune searches Usenet for your music.'],
+	['search', 'searched', 'NNTune searched Usenet for your music.'],
+	['library management', 'library', 'NNTune manages your library for you.'],
+	['library management', 'libraries', 'NNTune manages your libraries for you.'],
+	['offline caching', 'offline cache', 'Your offline cache is ready anywhere.'],
+	['offline caching', 'offline caches', 'Your offline caches are ready anywhere.'],
+	['offline caching', 'offline cached', 'Your music is offline cached for travel.'],
+	['offline caching', 'offline caching', 'Offline caching keeps your music ready for travel.'],
+	['offline caching', 'offline-friendly caches', 'Your offline-friendly caches are ready anywhere.'],
+	['offline caching', 'offline friendly cached', 'Your music is offline friendly cached for travel.']
+] as const) {
+	test(`rejects affirmative ${wording} beside otherwise honest copy`, async () => {
+		const honest =
+			'NNTune: search, streaming, library management and offline caching are not wired yet. Sign up and bring your own Usenet provider account.';
+
+		expect(() => expectHonestPublicCopy(honest, 'sibling control')).not.toThrow();
+		expect(() => expectHonestPublicCopy(`${claim} ${honest}`, 'sibling mutant')).toThrow(
+			`${capability} must be explicitly not wired yet`
+		);
+		expect(() =>
+			expectHonestPublicCopy(honest.replace(capability, wording), 'sibling disclosure control')
+		).not.toThrow();
+	});
+}
 
 type ManifestIcon = {
 	src?: unknown;
@@ -95,6 +169,30 @@ test('/manifest.webmanifest serves a valid PWA manifest with reachable icons', a
 		const iconContentType = iconResponse.headers()['content-type'] ?? '';
 		expect(iconContentType, `${src} should be served as an image`).toMatch(/image\//);
 	}
+});
+
+test('manifest description discloses unwired capabilities and points to setup', async ({ request }) => {
+	const response = await request.get('/manifest.webmanifest');
+	expect(response.ok()).toBe(true);
+	const manifest = (await response.json()) as Record<string, unknown>;
+
+	expectHonestPublicCopy(manifest.description, 'manifest description');
+});
+
+test('home meta description discloses unwired capabilities and points to setup', async ({ page }) => {
+	await page.goto('/');
+	const description = page.locator('meta[name="description"]');
+	await expect(description).toHaveCount(1);
+
+	expectHonestPublicCopy(await description.getAttribute('content'), 'home meta description');
+});
+
+test('home landing paragraph discloses unwired capabilities and points to setup', async ({ page }) => {
+	await page.goto('/');
+	const paragraph = page.getByRole('main').locator('p').first();
+	await expect(paragraph).toBeVisible();
+
+	expectHonestPublicCopy(await paragraph.innerText(), 'home landing paragraph');
 });
 
 test('app head links the manifest and sets the matching theme-color', async ({ page }) => {

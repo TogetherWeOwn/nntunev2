@@ -1,6 +1,13 @@
 <script lang="ts">
+	import { onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { listPlans, formatPricePerMonth, planButtonName } from '#lib/billing/plans.js';
+	import {
+		listPlans,
+		formatPricePerMonth,
+		formatCacheBudget,
+		formatCacheRetention,
+		planButtonName
+	} from '#lib/billing/plans.js';
 	import {
 		BillingApiError,
 		startCheckout,
@@ -10,16 +17,21 @@
 	const plans = listPlans();
 	let checkoutError: string | null = $state(null);
 	let pendingPlan: string | null = $state(null);
+	let alive = true;
+	onDestroy(() => {
+		alive = false;
+	});
 
 	async function choose(planId: string) {
 		// Serialize plan selections: ignore any activation while a checkout
 		// request is already in flight (defense in depth alongside the
 		// disabled buttons below).
-		if (pendingPlan !== null) return;
+		if (!alive || pendingPlan !== null) return;
 		checkoutError = null;
 		pendingPlan = planId;
 		try {
 			const url = await startCheckout(planId);
+			if (!alive) return;
 			window.location.href = url;
 			// Keep pendingPlan set on success: assigning location.href only
 			// starts the cross-origin navigation, and the page stays
@@ -27,6 +39,7 @@
 			// lock here would let a second activation issue another
 			// checkout whose navigation replaces this one.
 		} catch (err) {
+			if (!alive) return;
 			try {
 				// Signed-out visitors have no session cookie: send them to signup
 				// with the plan carried along instead of a raw 401 alert.
@@ -37,6 +50,8 @@
 			} finally {
 				pendingPlan = null;
 			}
+		} finally {
+			if (!alive) pendingPlan = null;
 		}
 	}
 </script>
@@ -70,7 +85,9 @@
 				<th scope="col">Concurrent</th>
 				<th scope="col">Library</th>
 				<th scope="col">Ingest/day</th>
-				<th scope="col">Cache</th>
+				<th scope="col">Cache budget</th>
+				<th scope="col">Cache retention</th>
+				<th scope="col">Cache priority</th>
 				<th scope="col"><span class="visually-hidden">Action</span></th>
 			</tr>
 		</thead>
@@ -82,8 +99,15 @@
 					<td>{plan.streamHoursMonth}</td>
 					<td>{plan.maxConcurrentStreams}</td>
 					<td>{plan.maxLibraryTracks.toLocaleString()}</td>
-					<td>{plan.ingestJobsDay}</td>
-					<td>{plan.cachePriority}</td>
+					<!-- Trailing {' '} keeps cell values separated in textContent (Svelte
+						strips inter-element whitespace, so without it text extraction
+						jams cells as e.g. "52 GiB7 dayslow" and word-boundary matching
+						on the cache values fails). Rendered output is unchanged:
+						HTML collapses the spaces. -->
+					<td>{plan.ingestJobsDay}{' '}</td>
+					<td>{formatCacheBudget(plan)}{' '}</td>
+					<td>{formatCacheRetention(plan)}{' '}</td>
+					<td>{plan.cachePriority}{' '}</td>
 					<td>
 						{#if plan.id === 'free'}
 							<a href="/signup?plan=free">Start trial</a>
@@ -101,6 +125,16 @@
 			{/each}
 		</tbody>
 	</table>
+
+	<section aria-labelledby="cache">
+		<h2 id="cache">About the plan cache</h2>
+		<p>
+			Cached audio is a reclaimable allowance, not permanent storage. It is not durable
+			storage, not an offline guarantee, and not extra provider storage — entries may be
+			reclaimed to make room. The budgets above are the approved design allowance; cache
+			enforcement is planned and not yet enforced.
+		</p>
+	</section>
 
 	<section aria-labelledby="overage">
 		<h2 id="overage">What happens past the cap</h2>
