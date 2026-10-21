@@ -97,3 +97,8 @@ sha256 = "0784422be11365318a5c9bf8e66bda1f0f7e233d836a9e809182e28d87da4b56"
 file = "0020_stream_play_ledger.sql"
 target = "app"
 sha256 = "cd67e713c0da150acdcfa43a635a587818aaf6b8db4e7102040985291b6f8b4d"
+
+[[migration]]
+file = "0021_library_artifacts.sql"
+target = "app"
+sha256 = "529cd3421478d0666542dd64a32db8f82fd0f483932c4b62b49caa40931c489f"

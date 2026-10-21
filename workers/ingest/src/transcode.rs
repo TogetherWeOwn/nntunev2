@@ -269,7 +269,9 @@ pub const CACHE_OBJECT_PARAM_ORDER: [&str; 5] = [
 /// swept, never served, so account deletion has nothing to fence.
 /// `ON CONFLICT DO NOTHING` — same hash means same bytes, so the
 /// first writer wins and every replay converges. `last_verified_at`
-/// is BIGINT unix seconds; `byte_size` is BIGINT.
+/// is BIGINT unix seconds; `byte_size` is BIGINT. `created_at`
+/// defaults to the DB clock at publication and `ref_count` stays NULL
+/// (advisory, never the sweep mark set).
 pub fn upsert_cache_object_sql() -> &'static str {
     "INSERT INTO cache_objects (content_hash, byte_size, r2_bucket, r2_key, last_verified_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (content_hash) DO NOTHING"
 }
@@ -288,7 +290,9 @@ pub const TRACK_MEDIA_PARAM_ORDER: [&str; 5] = [
 /// `bitrate=64` are literals: the profile is pinned in the statement
 /// so no caller can publish a differently-labelled mapping for these
 /// bytes. `source_job_id` carries the pipeline `job_id` string (the
-/// artifact-table migration types it compatibly).
+/// artifact-table migration types it compatibly). `verified_at` is
+/// BIGINT unix seconds; `last_served_at` is initialized by the schema
+/// default at publication.
 ///
 /// Account-deletion fence (ADR 0002 rule 3): the row is selected
 /// through `writer_fence`, which takes the job owner's `users` row
@@ -309,7 +313,9 @@ pub const CACHE_GRANT_PARAM_ORDER: [&str; 4] =
 /// index, never authorization). `provider_id` is the fetching
 /// provider's UUID text. Fenced like [`upsert_track_media_sql`];
 /// zero-row writes classify through [`select_cache_grant_by_pk_sql`]
-/// plus [`classify_publish_zero_rows`].
+/// plus [`classify_publish_zero_rows`]. `verified_at` is BIGINT unix
+/// seconds; `last_served_at` is initialized by the schema default at
+/// publication.
 pub fn upsert_cache_grant_sql() -> &'static str {
     "INSERT INTO user_cache_grants (user_id, content_hash, provider_id, verified_at) SELECT $1, $2, $3, $4 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id, content_hash) DO NOTHING"
 }
