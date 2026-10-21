@@ -3024,12 +3024,21 @@ mod build_sha_tests {
         }
         // Match the key literal inside the `json!` fields, not the bare
         // substring: `let build_sha = …` alone must never satisfy this.
-        // Four fetch emit sites carry the key, so a dropped key at any one
-        // of them drops the count below four.
+        // The four fetch lines plus the migrated operational emits carry
+        // the key, so a dropped key at any one of them drops the count
+        // below seventeen. The detached library-db failure line owns its
+        // build string under a different binding and is pinned separately.
         assert_eq!(
             production.matches("\"build_sha\": build_sha").count(),
-            4,
-            "all four fetch lines must carry the build_sha key"
+            17,
+            "all seventeen keyed lines must carry the build_sha key"
+        );
+        assert_eq!(
+            production
+                .matches("\"build_sha\": connection_build_sha")
+                .count(),
+            1,
+            "the detached connection-failure line must carry the build_sha key"
         );
         let consumer = include_str!("queue_consumer.rs");
         let consumer_production = consumer
