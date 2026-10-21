@@ -14,6 +14,9 @@
 //! - [`decrypt`]: AES-CBC and rclone-crypt ranged decryption.
 //! - [`par2`]: PAR2 recovery-set parsing and verification. Repair is
 //!   native-only (it shells out to `par2cmdline-turbo` in a Container).
+//! - [`transcode`]: the `opus-64` profile contract (pinned ffmpeg argv,
+//!   Ogg serial normaliser, content-addressed artifact keys) shared by
+//!   the ingest dispatcher and the transcode Container.
 //!
 //! The protocol/parser core uses injected transports. Transport implementations
 //! own network I/O and per-operation timeouts (see [`transport`] and
@@ -25,6 +28,7 @@ pub mod nntp;
 pub mod nzb;
 pub mod par2;
 pub mod pinned_transport;
+pub mod transcode;
 pub mod transport;
 pub mod transports;
 pub mod yenc;

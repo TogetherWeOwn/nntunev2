@@ -49,6 +49,7 @@ pub mod queue_consumer;
 pub mod rate_limit;
 pub mod repair;
 pub mod retry;
+pub mod transcode;
 pub mod verify;
 
 use api_error::ApiError;

@@ -66,6 +66,7 @@ pub const ERR_PROBE_FAILED: &str = "probe_failed";
 pub const ERR_VERIFY_FAILED: &str = "verify_failed";
 pub const ERR_REPAIR_FAILED: &str = "repair_failed";
 pub const ERR_MATCH_FAILED: &str = "match_failed";
+pub const ERR_TRANSCODE_FAILED: &str = "transcode_failed";
 pub const ERR_WRITE_FAILED: &str = "write_failed";
 /// The job owner's account is being deleted, so the library write is
 /// fenced off (ADR 0002 rule 3). Permanent: a fenced writer fails closed
