@@ -3445,6 +3445,9 @@ mod tests {
         native_credential_lookups: RefCell<usize>,
         fail_reauth_revocation: RefCell<bool>,
         fail_reauth_insert: RefCell<bool>,
+        /// Bearer-gate store-error pin: when set, the HMAC lookup fails
+        /// like a production query outage instead of answering Ok.
+        fail_native_credential_lookup: RefCell<bool>,
         /// Users whose `users.deleting_at` is set (ADR 0002 rule 3):
         /// fenced writers refuse them, mirroring the production SQL.
         deleting_users: RefCell<std::collections::HashSet<String>>,
@@ -3908,6 +3911,9 @@ mod tests {
             key_hmac: &str,
         ) -> Result<Option<NativeCredentialRow>, StoreError> {
             *self.native_credential_lookups.borrow_mut() += 1;
+            if *self.fail_native_credential_lookup.borrow() {
+                return Err(StoreError);
+            }
             Ok(self
                 .native_credentials
                 .borrow()
@@ -5615,6 +5621,41 @@ mod tests {
     }
 
     #[test]
+    fn bearer_store_error_collapses_to_the_plain_404() {
+        // Uniform-404 pin, store-error leg: a database failure during the
+        // bearer lookup must answer the same plain 404 a header-absent
+        // caller receives — never a distinct 401 that reopens the
+        // route-existence oracle on the error path. Reverting the lookup
+        // `Err` arm to the pre-slice 401 must fail here.
+        let h = peppered_harness();
+        *h.store.fail_native_credential_lookup.borrow_mut() = true;
+        let lookups = || *h.store.native_credential_lookups.borrow();
+        let base = lookups();
+        let header = Some(format!("Bearer ntk_{}", "0".repeat(43)));
+        let refused = h.call_bearer("GET", "/v1/search", header);
+        let absent = h.call_bearer("GET", "/v1/search", None);
+        assert_eq!(refused.status, 404, "{}", refused.body);
+        assert_eq!(absent.status, 404, "{}", absent.body);
+        assert_eq!(
+            refused.body, absent.body,
+            "store-error body must equal the header-absent body"
+        );
+        assert_eq!(
+            refused.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
+        assert!(refused.set_cookie.is_none(), "no session rescue/refresh");
+        assert!(
+            lookups() > base,
+            "the failing lookup must execute (else the Err arm is unpinned)"
+        );
+        assert!(
+            !refused.body.contains("ntk_"),
+            "no credential material in refusal"
+        );
+    }
+
+    #[test]
     fn bearer_lookup_budget_denial_collapses_to_the_plain_404() {
         // ADR 0010 DoS: a flood of well-formed random `ntk_` tokens shares
         // one per-IP pool claimed before any credential DB work. Exhausting
@@ -5787,6 +5828,29 @@ mod tests {
         // Nested shapes are not credential ids: preflight stays 404 there.
         let resp = h.call_full("OPTIONS", "/v1/credentials/a/b", None, None, Some(ORIGIN));
         assert_eq!(resp.status, 404);
+    }
+
+    #[test]
+    fn options_preflight_pins_session_served_and_trailing_slash_posture() {
+        // Scope-map preflight pin, both legs the served-paths table leaves
+        // open: session-only paths answer 204 (a lawful cookie read must
+        // clear preflight), and the bare trailing-slash playlist shape
+        // stays 404. Narrowing the predicate to Bearer-only must fail the
+        // 204 legs; dropping the trailing-slash arm must fail the 404 leg
+        // (GET would map `/v1/playlists/` via the collection prefix).
+        let h = peppered_harness();
+        for path in ["/v1/me", "/v1/indexers"] {
+            let resp = h.call_full("OPTIONS", path, None, None, Some(ORIGIN));
+            assert_eq!(resp.status, 204, "{path}");
+            assert!(resp.body.is_empty(), "{path}");
+        }
+        let resp = h.call_full("OPTIONS", "/v1/playlists/", None, None, Some(ORIGIN));
+        assert_eq!(resp.status, 404, "{}", resp.body);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
+        assert!(resp.set_cookie.is_none());
     }
 
     #[test]
