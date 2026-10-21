@@ -451,10 +451,32 @@ fn cache_control(ttl_s: u32) -> String {
     format!("public, max-age={ttl_s}")
 }
 
+/// Cached integers must fit the fresh DTO's Rust width: `Release.year`
+/// and `Recording::{track_no, medium_no}` serialize `Option<i16>`, while
+/// `Recording::duration_ms` serializes `Option<i32>`. Anything outside the
+/// signed range — huge `u64`, extreme `i64`, fractions — is a miss. There
+/// is no positivity rule: negative and zero values the DTOs can emit stay
+/// hits.
+/// Predicate form of the width helpers, shared by the lookup and
+/// recordings validators.
+type WidthCheck = fn(&serde_json::Number) -> bool;
+
+fn number_fits_i16(n: &serde_json::Number) -> bool {
+    n.as_i64()
+        .is_some_and(|v| v >= i64::from(i16::MIN) && v <= i64::from(i16::MAX))
+}
+
+fn number_fits_i32(n: &serde_json::Number) -> bool {
+    n.as_i64()
+        .is_some_and(|v| v >= i64::from(i32::MIN) && v <= i64::from(i32::MAX))
+}
+
 /// A cached lookup body is servable only when it matches exactly the shape
 /// a fresh lookup emits for the requested kind: the `kind` tag, the
 /// requested MBID (case-insensitive — keys and repo reads are lowercased),
-/// and every always-emitted field present and correctly typed. Extra
+/// and every always-emitted field present and correctly typed. Numeric
+/// optionals must additionally fit the fresh DTO width (`year`/`track_no`/
+/// `medium_no` are `i16`, `duration_ms` is `i32`). Extra
 /// unknown fields are ignored so forward-compatible writes still hit;
 /// anything else (truncated/non-JSON, non-object, wrong identity, missing
 /// or mistyped fields) is a miss so the poisoned entry is overwritten by
@@ -486,9 +508,13 @@ fn cached_lookup_body_is_fresh_shape(kind: Kind, mbid: &str, body: &str) -> bool
             Some(serde_json::Value::String(_)) | Some(serde_json::Value::Null)
         )
     }
-    fn optional_int(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+    fn optional_int(
+        obj: &serde_json::Map<String, serde_json::Value>,
+        key: &str,
+        fits: WidthCheck,
+    ) -> bool {
         match obj.get(key) {
-            Some(serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => true,
+            Some(serde_json::Value::Number(n)) if fits(n) => true,
             Some(serde_json::Value::Null) => true,
             _ => false,
         }
@@ -504,15 +530,15 @@ fn cached_lookup_body_is_fresh_shape(kind: Kind, mbid: &str, body: &str) -> bool
             required_str(obj, "title")
                 && optional_str(obj, "artist_mbid")
                 && optional_str(obj, "release_type")
-                && optional_int(obj, "year")
+                && optional_int(obj, "year", number_fits_i16)
                 && optional_str(obj, "caa_url")
         }
         Kind::Recording => {
             required_str(obj, "title")
                 && optional_str(obj, "release_mbid")
-                && optional_int(obj, "track_no")
-                && optional_int(obj, "duration_ms")
-                && optional_int(obj, "medium_no")
+                && optional_int(obj, "track_no", number_fits_i16)
+                && optional_int(obj, "duration_ms", number_fits_i32)
+                && optional_int(obj, "medium_no", number_fits_i16)
         }
     }
 }
@@ -763,7 +789,9 @@ pub async fn handle_lookup<R: MbRepo, C: SuccessCache>(
 /// longer than [`RELEASE_RECORDINGS_LIMIT`]. Each entry needs a UUID-shaped
 /// string `mbid` and a string `title`; optional fields (`release_mbid`,
 /// `track_no`, `duration_ms`, `medium_no`) may be missing or null, and when
-/// present must be correctly typed. Extra top-level or per-row fields are
+/// present must be correctly typed. Numeric optionals must additionally fit
+/// the fresh [`Recording`] width (`track_no`/`medium_no` are `i16`,
+/// `duration_ms` is `i32`). Extra top-level or per-row fields are
 /// preserved. Anything else is a miss so the repository is read instead.
 fn is_valid_cached_recordings(body: &str, release_mbid: &str) -> bool {
     let value: serde_json::Value = match serde_json::from_str(body) {
@@ -808,11 +836,16 @@ fn is_valid_cached_recordings(body: &str, release_mbid: &str) -> bool {
                 }
             }
         }
-        for key in ["track_no", "duration_ms", "medium_no"] {
-            if let Some(v) = map.get(key) {
-                if !v.is_null() && !(v.is_i64() || v.is_u64()) {
-                    return false;
-                }
+        let numeric_fields: [(&str, WidthCheck); 3] = [
+            ("track_no", number_fits_i16),
+            ("duration_ms", number_fits_i32),
+            ("medium_no", number_fits_i16),
+        ];
+        for (key, fits) in numeric_fields {
+            match map.get(key) {
+                None | Some(serde_json::Value::Null) => {}
+                Some(serde_json::Value::Number(n)) if fits(n) => {}
+                _ => return false,
             }
         }
     }
@@ -881,9 +914,13 @@ fn search_paged_cache_key(kind: Kind, normalized_q: &str, limit: u32, offset: u3
 /// `limit`/`offset` are the effective page coordinates, and whose `results`
 /// is a typed hit list no longer than the effective limit. Each hit needs a
 /// UUID-shaped string `mbid`, a numeric `score`, and the kind-aware label
-/// (`name` for artists, `title` for releases/recordings). Empty results,
-/// extra fields, null release optionals and uppercase UUIDs stay hits.
-/// Anything else is a miss so the repository is read instead.
+/// (`name` for artists, `title` for releases/recordings). Release hits
+/// additionally require `artist_mbid`/`artist_name` to be strings when
+/// present and non-null, matching fresh [`SearchHit`] output; absence and
+/// null stay compatible, and artist/recording hits never require release
+/// fields. Empty results, extra fields, null release optionals and
+/// uppercase UUIDs stay hits. Anything else is a miss so the repository is
+/// read instead.
 fn is_valid_cached_search(
     body: &str,
     kind: Kind,
@@ -936,6 +973,14 @@ fn is_valid_cached_search(
         }
         if map.get(label_key).and_then(|v| v.as_str()).is_none() {
             return false;
+        }
+        if kind == Kind::Release {
+            for key in ["artist_mbid", "artist_name"] {
+                match map.get(key) {
+                    None | Some(serde_json::Value::Null) | Some(serde_json::Value::String(_)) => {}
+                    _ => return false,
+                }
+            }
         }
     }
     true

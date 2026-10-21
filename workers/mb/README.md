@@ -78,6 +78,17 @@ Hyperdrive-only reads `lib.rs:719-798`.)
   (Sources: success-only envelope `lib.rs:397-421`; KV degrade/no-op
   `lib.rs:675-708`; connect/query errors map to the generic 500
   `lib.rs:719-775` and `src/api_error.rs:101-103`.)
+- Cached bodies must stay compatible with the fresh DTOs or they are
+  treated as misses and fall through to the repository. Numeric optionals
+  must fit the fresh signed width (`year`/`track_no`/`medium_no` are
+  `i16`, `duration_ms` is `i32`): out-of-range, huge unsigned and
+  fractional values miss on lookups and on every release-recordings row.
+  Release search hits must carry string `artist_mbid`/`artist_name` when
+  present and non-null. There is no positivity rule and no
+  required-optional rule: negative values, zero, null, absent optionals,
+  uppercase UUIDs and extra fields stay hits, and artist/recording hits
+  never require release fields. A healthy fresh result replaces the
+  rejected body; a DB miss/error stays non-cacheable.
 - Release responses currently preserve the stored `caa_url` unchanged, so
   lookup cache keys remain environment-independent. When public R2 hosts are
   activated and URLs become environment-specific, include the environment in
