@@ -79,10 +79,7 @@ fn invalid_type_rendering_never_echoes_the_submitted_value() {
     // End to end: a secret-looking submission rejected by `load` still
     // renders without the value.
     let mut kv = HashMap::new();
-    kv.insert(
-        "auth.rp_id".to_string(),
-        "staging.nntune.com".to_string(),
-    );
+    kv.insert("auth.rp_id".to_string(), "staging.nntune.com".to_string());
     kv.insert(
         "auth.rp_origin".to_string(),
         "https://staging.nntune.com".to_string(),
